@@ -567,7 +567,15 @@
   dispatch that passed two of eight once disabled tx relay, addr gossip
   and compact blocks outside unit tests). A peer's traffic is metered by
   the token bucket per message class, then discouraged, then
-  disconnected. Outbound eclipse resistance rotates the extra outbound
+  disconnected. An error raised by a message HANDLER is caught, counted
+  per command and forgiven with the connection kept, which is Core's
+  ProcessMessages catch: the failure is per-peer but the trigger is per
+  message TYPE, so a blanket disconnect drops every peer that sends the
+  message a handler happens to mishandle. A disconnect comes only from a
+  named rule -- one written inside a handler, the framing layer's own bad
+  magic / oversized checks, or a protocol VECTOR over its maximum
+  (a PROTOCOL-LIMIT-ERROR), which is the one deserialization failure Core
+  answers with Misbehaving. Outbound eclipse resistance rotates the extra outbound
   slot on a stale tip (`*max-tip-age-seconds*` is Core's
   nPowTargetSpacing * 3). Everything that decides an outbound dial reads
   OUTBOUND peers only -- the full-relay count, the /16 netgroup set a

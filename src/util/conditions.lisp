@@ -56,6 +56,26 @@ keys, libsecp256k1 returning failure.")
 (define-simple-error wallet-error
   "A wallet-internal failure that is not an RPC-level error code.")
 
+(define-condition protocol-limit-error (serialization-error) ()
+  (:documentation "A peer message declared more elements than the protocol
+allows -- an inv/getdata over MAX_INV_SZ, a headers message over
+MAX_HEADERS_RESULTS, an addr over MAX_ADDR_TO_SEND, a block locator over
+MAX_LOCATOR_SZ.
+
+It is a SERIALIZATION-ERROR, so every caller that already handles malformed
+bytes keeps working; the separate type exists because Core treats this class
+of malformed message differently from every other one. A truncated or
+undecodable payload is caught by ProcessMessages and forgiven
+(net_processing.cpp:5283-5287), but an over-limit vector is a NAMED rule
+inside the handler -- Misbehaving for inv (:4128), getdata (:4219), headers
+and addr, a straight fDisconnect for a getblocks/getheaders locator -- so the
+peer is punished. SAFELY-DISPATCH-PEER-MESSAGE is where the two part."))
+
+(declaim (ftype (function (t &rest t) nil) protocol-limit-error))
+(defun protocol-limit-error (control &rest args)
+  "Signal a PROTOCOL-LIMIT-ERROR whose message is CONTROL formatted with ARGS."
+  (error 'protocol-limit-error :format-control control :format-arguments args))
+
 (define-condition consensus-error (bitcoin-lisp-error simple-error)
   ((reason :initarg :reason :initform nil :reader error-reason))
   (:documentation "A block or transaction failed a consensus rule. REASON is

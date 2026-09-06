@@ -1720,22 +1720,86 @@ handler. Shared by the block-download drain and the at-tip reap pass."
     ;; passed, so those paths never ran outside unit tests and RPC).
     (t (handle-message peer command payload node-ctx)))))
 
+(defvar *message-handler-errors* (make-hash-table :test 'equal)
+  "Command name -> how many times a handler for it raised and the error was
+swallowed by SAFELY-DISPATCH-PEER-MESSAGE.
+
+Forgiving a handler error is Core's posture, but it also hides OUR bugs: a
+deserialization mistake in one handler stops being a disconnect and becomes
+silence. This counter is what keeps it visible. The per-command total rides the
+`net' debug line on every occurrence, and a WARN is emitted whenever a
+command's total reaches a power of ten, so a handler that starts throwing on
+every message is reported at 1, 10, 100, 1000 rather than either drowning the
+log or degrading unnoticed.")
+
+(defun %power-of-ten-p (n)
+  "T when N is 1, 10, 100, ... - the escalation ladder %NOTE-MESSAGE-HANDLER-ERROR
+warns on, so one broken handler costs a bounded number of loud lines."
+  (and (plusp n)
+       (loop for p = 1 then (* p 10)
+             while (<= p n)
+             thereis (= p n))))
+
+(defun %note-message-handler-error (peer command payload condition)
+  "Count and log a handler error SAFELY-DISPATCH-PEER-MESSAGE swallowed.
+Returns the running total for COMMAND."
+  (let ((count (incf (gethash command *message-handler-errors* 0))))
+    ;; Core logs exactly this and nothing else (net_processing.cpp:5283):
+    ;; ProcessMessages(<command>, <n> bytes): Exception ... caught.
+    (bl:log-cat "net"
+                "ProcessMessages(~A, ~D bytes) from ~A: ~A caught (~D so far): ~A"
+                command (length payload) (peer-address peer)
+                (type-of condition) count condition)
+    (when (%power-of-ten-p count)
+      (bl:log-warn "The ~A message handler has raised ~D time~:P (last from ~A: ~A)"
+                   command count (peer-address peer) condition))
+    count))
+
 (defun safely-dispatch-peer-message (peer command payload node-ctx ctx)
-  "Dispatch one already-read message from PEER, isolating failures: a
-malformed/oversized/unprocessable message raises an error that is caught here
-and disconnects only this peer (Bitcoin Core's misbehaving-peer posture), so one
-bad message can neither tear down the drain loop nor escape to the sync thread.
-Returns T if the peer is still connected afterward, NIL if it was disconnected."
+  "Dispatch one already-read message from PEER the way Core's ProcessMessages
+does: the handler's error is caught, logged at debug with the command and the
+payload size, and the CONNECTION IS KEPT (net_processing.cpp:5269-5287 - that
+catch calls LogDebug and nothing else; it never sets fDisconnect and never
+calls Misbehaving). Returns T if the peer is still connected afterward, NIL if
+it was disconnected.
+
+This used to disconnect on any ERROR, which is the opposite of Core and is why
+it mattered: the failure is per-peer but the trigger is per message TYPE, so
+one handler that raises on a shape some implementation actually sends drops
+EVERY peer that sends it, and the outbound refill dials them straight back.
+Five commands were reproducibly affected - ping, pong, feefilter, sendcmpct and
+notfound, each reading a fixed-width field with no length check - and Core
+forgives all five (:4970, :4990, :5123, :3907, :5150 all deserialize unguarded
+and rely on this catch).
+
+A disconnect can now only come from a NAMED rule inside a handler - the
+existing DISCONNECT-PEER / RECORD-MISBEHAVIOR call sites, which carry Core's
+own wording - or from outside this function. Framing failures stay disconnects
+and are upstream of here: RECEIVE-MESSAGE drops the connection itself on bad
+magic and on an oversized payload, as Core does inside Transport::ReceivedBytes
+before ProcessMessage is reached. A dead socket is DRAIN-AND-REAP-PEER's own
+clause and is likewise untouched."
+  ;; Every arm answers the same question -- is this peer still ours? -- because
+  ;; a handler can have dropped it by a named rule of its own whether or not it
+  ;; then signalled.
+  (flet ((still-connected-p () (not (eq (peer-state peer) :disconnected))))
     (handler-case
-      (progn
-        (dispatch-ibd-message peer command payload node-ctx ctx)
-        t)
-    (error (c)
-      (bl:log-warn
-       "Peer ~A sent a malformed/unprocessable ~A message — disconnecting: ~A"
-       (peer-address peer) command c)
-      (handler-case (disconnect-peer peer) (error () nil))
-      nil)))
+        (progn
+          (dispatch-ibd-message peer command payload node-ctx ctx)
+          (still-connected-p))
+      ;; The one deserialization failure Core punishes: a protocol vector that
+      ;; declares more elements than the message may carry. Core checks these
+      ;; limits inside the handler and calls Misbehaving there (inv :4128,
+      ;; getdata :4219, headers, addr) or disconnects outright (a getblocks /
+      ;; getheaders locator over MAX_LOCATOR_SZ); our check sits in the parser,
+      ;; which is what the separate condition type is for. RECORD-MISBEHAVIOR is
+      ;; Misbehaving, noban exemption included.
+      (bl.err:protocol-limit-error (c)
+        (record-misbehavior peer (format nil "~A message: ~A" command c))
+        (still-connected-p))
+      (error (c)
+        (%note-message-handler-error peer command payload c)
+        (still-connected-p)))))
 
 (defun drain-and-reap-peer (peer node-ctx ctx)
   "Pump every currently-readable message from PEER, then reap it if its

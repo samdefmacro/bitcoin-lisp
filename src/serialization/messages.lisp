@@ -485,13 +485,18 @@ connected and would report a string the peer never sent."
     (map 'string #'code-char (br-read-bytes br len))))
 
 (defun br-read-bounded-count (br max name)
-  "Read a CompactSize count from BR and signal an error if it exceeds MAX.
-NAME labels the field. Rejecting an over-limit count up front -- rather than
-looping/allocating for it -- is Bitcoin Core's misbehaving-peer posture for
-protocol vectors (inv, headers, addr, block txns)."
+  "Read a CompactSize count from BR and signal PROTOCOL-LIMIT-ERROR if it
+exceeds MAX. NAME labels the field. Rejecting an over-limit count up front --
+rather than looping/allocating for it -- is Bitcoin Core's misbehaving-peer
+posture for protocol vectors (inv, headers, addr, block txns).
+
+The condition type carries that posture: it is the one deserialization failure
+the message dispatch punishes, because Core's handlers check these limits
+themselves and call Misbehaving, while every other malformed payload is caught
+and forgiven. See PROTOCOL-LIMIT-ERROR and SAFELY-DISPATCH-PEER-MESSAGE."
   (let ((count (br-read-compact-size br)))
     (when (> count max)
-      (serialization-error "~A count ~D exceeds maximum ~D" name count max))
+      (protocol-limit-error "~A count ~D exceeds maximum ~D" name count max))
     count))
 
 (defconstant +max-inv-count+ 50000

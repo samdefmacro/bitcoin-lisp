@@ -18,6 +18,7 @@ consensus / policy errors that carry Core's reject reason.")
    #:config-error
    #:init-error
    #:serialization-error
+   #:protocol-limit-error
    #:storage-error
    #:net-error
    #:crypto-error
