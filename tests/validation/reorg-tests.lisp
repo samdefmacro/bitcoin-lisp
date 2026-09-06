@@ -3283,7 +3283,7 @@ it."
                 ;; The marker names a block the reorg disconnected.
                 (bl.store:txindex-set-best-block txindex losing-tip)
                 (multiple-value-bind (height reason)
-                    (bl.store::%txindex-resume-height txindex chain-state)
+                    (txindex-resume-height txindex chain-state)
                   (is (eq :rewound-to-fork reason)
                       "resumed with ~S, wanted :rewound-to-fork" reason)
                   (is (plusp height)

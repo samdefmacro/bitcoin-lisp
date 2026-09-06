@@ -52,9 +52,10 @@ no in-memory table and no startup replay."
   (k1 0 :type (unsigned-byte 64)))
 
 (defmethod index-name ((index txospender-index)) "txospenderindex")
-(defmethod index-height ((index txospender-index) chainstate)
-  (declare (ignore chainstate))
-  (txospenderindex-height index))
+;;; INDEX-HEIGHT for this index is chainstate-aware and lives in
+;;; node/indexes.lisp beside the rewind that repairs an off-chain marker: the
+;;; fork walk it needs is above this layer. TXOSPENDERINDEX-HEIGHT below is
+;;; the raw stored height, which getindexinfo reports.
 (defmethod index-best-block ((index txospender-index)) (txospenderindex-best-block index))
 (defmethod index-set-best ((index txospender-index) block-hash height)
   (txospenderindex-set-best-block index block-hash height))
@@ -62,7 +63,16 @@ no in-memory table and no startup replay."
   (when (%txospender-index-live-p index)
     (leveldb-delete (txospender-index-db index) *index-meta-key*)))
 (defmethod index-write-block ((index txospender-index) chainstate block block-hash height spent-utxos)
-  (declare (ignore chainstate spent-utxos))
+  "Record BLOCK's spends, refusing one that would sit above a GAP (Core's
+indexes only ever append to a contiguous range; the blockfilterindex refuses
+the same way). Without the refusal a connect above a hole moved the marker
+forward over it, so every later start saw index-height >= tip, skipped the
+backfill, and the hole became permanent -- which is what made a missing
+startup rewind cost a silent wrong answer rather than one slow rebuild."
+  (declare (ignore spent-utxos))
+  (let ((best (index-height index chainstate)))
+    (when (and (>= best 0) (> height (1+ best)))
+      (return-from index-write-block (values nil :noncontiguous))))
   (txospenderindex-add-block index block block-hash)
   (txospenderindex-set-best-block index block-hash height)
   (values t nil))

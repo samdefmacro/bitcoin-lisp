@@ -484,7 +484,11 @@
 
   Invariants: the three-phase flush (blocks, undo, then the coins
   database) is what makes a crash recoverable; an index is only as
-  current as its recorded best block; pruning keeps
+  current as its recorded best block, and that marker is only meaningful
+  while it names a block on the ACTIVE chain -- INDEX-HEIGHT resolves it
+  against the chainstate and INDEX-PREPARE-SYNC rewinds one that has
+  fallen off, undoing the abandoned branch for an index whose records a
+  reconnect does not overwrite; pruning keeps
   `+min-blocks-to-keep+` and never touches a block under a prune lock
   (assumeutxo, rescans); a coins-cache entry that survives a sync carries
   neither DIRTY nor FRESH, since FRESH claims the base view has no such

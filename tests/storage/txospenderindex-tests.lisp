@@ -197,3 +197,153 @@ does not have to test for it — the same contract the txindex has."
                    idx (bl.ser:outpoint-hash (%tsi-outpoint #xE1 0)) 0)))
         (is (null (bl.store:txospenderindex-best-block idx)))
         (is (= -1 (bl.store:txospenderindex-height idx)))))))
+
+;;;; Startup rewind (Core BaseIndex::Sync -> Rewind, index/base.cpp:239/290)
+
+(defun %tsi-hash (byte)
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte))
+
+(defun %tsi-branch-block (prev-hash block-hash outpoint)
+  "A block extending PREV-HASH, identified by BLOCK-HASH, whose one
+non-coinbase transaction spends OUTPOINT. The coinbase's script-sig carries
+four bytes of BLOCK-HASH so sibling blocks serialize -- and their coinbase
+txids hash -- differently."
+  (let ((coinbase
+          (bl.ser:make-transaction
+           :version 1
+           :inputs (vector (bl.ser:make-tx-in
+                            :previous-output (bl.ser:make-outpoint
+                                              :hash (%tsi-hash 0)
+                                              :index #xFFFFFFFF)
+                            :script-sig (subseq block-hash 0 4)
+                            :sequence #xFFFFFFFF))
+           :outputs (vector (bl.ser:make-tx-out
+                             :value 5000000000
+                             :script-pubkey (coerce #(#x51) '(vector (unsigned-byte 8)))))
+           :lock-time 0))
+        (spender
+          (bl.ser:make-transaction
+           :version 2
+           :inputs (vector (bl.ser:make-tx-in
+                            :previous-output outpoint
+                            :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                            :sequence #xFFFFFFFF))
+           :outputs (vector (bl.ser:make-tx-out
+                             :value 1000
+                             :script-pubkey (coerce #(#x51) '(vector (unsigned-byte 8)))))
+           :lock-time 0)))
+    (bl.ser:make-bitcoin-block
+     :header (bl.ser:make-block-header
+              :version 1 :prev-block prev-hash
+              :merkle-root (%tsi-hash 0)
+              :timestamp 1231006505 :bits #x1d00ffff :nonce 0
+              :cached-hash block-hash)
+     :transactions (list coinbase spender))))
+
+(defun %tsi-extend (cs store prev-entry hash outpoint)
+  "Store one block extending PREV-ENTRY, identified by HASH and spending
+OUTPOINT, and enter it in CS's block index. Returns (values entry block)."
+  (let* ((height (1+ (bl.store:block-index-entry-height prev-entry)))
+         (block (%tsi-branch-block (bl.store:block-index-entry-hash prev-entry)
+                                   hash outpoint))
+         (entry (bl.store:make-block-index-entry
+                 :hash hash :height height :chain-work height :status :valid
+                 :header (bl.ser:bitcoin-block-header block)
+                 :prev-entry prev-entry)))
+    (bl.store:store-block store block :height height)
+    (bl.store:add-block-index-entry cs entry)
+    (values entry block)))
+
+(defun %tsi-spender-block-hash (idx outpoint)
+  "The block hash the index records as spending OUTPOINT, or NIL."
+  (let ((locs (bl.store:txospenderindex-locators
+               idx (bl.ser:outpoint-hash outpoint) (bl.ser:outpoint-index outpoint))))
+    (and locs (= 1 (length locs)) (car (first locs)))))
+
+(test txospenderindex-rewinds-a-marker-left-on-an-abandoned-branch
+  "A branch switch that happens while the process is DOWN leaves the marker on
+a block the active chain no longer holds, and the online :block-disconnected
+hook cannot have fired for it. Core repairs that at startup: BaseIndex::Sync
+notices the stored best block is not the parent of the next block to index and
+calls Rewind (index/base.cpp:239), which walks pprev calling CustomRemove per
+block (:290-320) -- and TxoSpenderIndex opts into disconnect_data
+(index/txospenderindex.cpp:73-78) precisely so this index gets that treatment.
+
+Both directions are asserted, and the second is the one that cost a wrong
+answer. Before this, the marker naming an abandoned block at a height at or
+above the tip passed neither of CATCH-UP-INDEX's tests -- prepare-sync was the
+base no-op and the (< index-height tip) guard was satisfied by an off-chain
+marker -- so nothing was rewound AND nothing was backfilled, and the ACTIVE
+chain's spends in that height range were never recorded at all.
+gettxspendingprevout then reported an outpoint that a confirmed transaction
+spends as unspent, which is Core's shape for `nothing spent it' and therefore
+indistinguishable from a real answer."
+  (let ((dir (%tsi-tmpdir "rewind")))
+    (unwind-protect
+         (let ((cs (bl.store:init-chain-state dir))
+               (store (bl.store:init-block-store dir))
+               (idx (bl.store:init-txospender-index dir))
+               (node (bl:make-node)))
+           (unwind-protect
+                (let* ((genesis-hash (bl.store:best-block-hash cs))
+                       (genesis (bl.store:make-block-index-entry
+                                 :hash genesis-hash :height 0 :chain-work 0
+                                 :status :valid
+                                 :header (bl.ser:make-block-header
+                                          :version 1 :prev-block (%tsi-hash 0)
+                                          :merkle-root (%tsi-hash 0)
+                                          :timestamp 1231006505 :bits #x1d00ffff
+                                          :nonce 0 :cached-hash genesis-hash)))
+                       (a1-op (%tsi-outpoint #xA1 0))
+                       (a2-op (%tsi-outpoint #xA2 0))
+                       (b1-op (%tsi-outpoint #xB1 0))
+                       (b2-op (%tsi-outpoint #xB2 0)))
+                  (bl.store:add-block-index-entry cs genesis)
+                  ;; Branch A, indexed while it was the active chain.
+                  (multiple-value-bind (a1 a1-block)
+                      (%tsi-extend cs store genesis (%tsi-hash #x1A) a1-op)
+                    (multiple-value-bind (a2 a2-block)
+                        (%tsi-extend cs store a1 (%tsi-hash #x2A) a2-op)
+                      (bl.store:update-chain-tip
+                       cs (bl.store:block-index-entry-hash a2) 2)
+                      (bl.store:txospenderindex-add-block
+                       idx a1-block (bl.store:block-index-entry-hash a1))
+                      (bl.store:txospenderindex-add-block
+                       idx a2-block (bl.store:block-index-entry-hash a2))
+                      (bl.store:txospenderindex-set-best-block
+                       idx (bl.store:block-index-entry-hash a2) 2)))
+                  ;; Branch B wins while the index is stopped: same heights, so
+                  ;; the marker is not above the tip and the height guard alone
+                  ;; can see nothing wrong with it.
+                  (multiple-value-bind (b1) (%tsi-extend cs store genesis (%tsi-hash #x1B) b1-op)
+                    (multiple-value-bind (b2) (%tsi-extend cs store b1 (%tsi-hash #x2B) b2-op)
+                      (bl.store:update-chain-tip
+                       cs (bl.store:block-index-entry-hash b2) 2)))
+                  (is (equalp (%tsi-hash #x1A) (%tsi-spender-block-hash idx a1-op))
+                      "the fixture did not record branch A")
+                  (is (null (%tsi-spender-block-hash idx b1-op))
+                      "the fixture recorded branch B before the restart")
+                  ;; The restart.
+                  (setf (bl:node-chainstates node) (list cs)
+                        (bl:node-block-store node) store)
+                  (bl:catch-up-index node idx)
+                  ;; The abandoned branch's rows are gone (Core CustomRemove)...
+                  (is (null (%tsi-spender-block-hash idx a1-op))
+                      "branch A's spend survived the rewind")
+                  (is (null (%tsi-spender-block-hash idx a2-op))
+                      "branch A's spend survived the rewind")
+                  ;; ...and the ACTIVE branch is indexed, which is the direction
+                  ;; that answered a false `unspent' before.
+                  (is (equalp (%tsi-hash #x1B) (%tsi-spender-block-hash idx b1-op))
+                      "an outpoint spent on the ACTIVE chain is still reported unspent")
+                  (is (equalp (%tsi-hash #x2B) (%tsi-spender-block-hash idx b2-op))
+                      "an outpoint spent on the ACTIVE chain is still reported unspent")
+                  ;; And the marker names the new tip, so a second start is a
+                  ;; no-op rather than a second rewind.
+                  (multiple-value-bind (hash height)
+                      (bl.store:txospenderindex-best-block idx)
+                    (is (equalp (%tsi-hash #x2B) hash))
+                    (is (= 2 height)))
+                  (is (= 2 (bl.store:index-height idx cs))))
+             (bl.store:close-txospender-index idx)))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
