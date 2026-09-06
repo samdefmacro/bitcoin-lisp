@@ -332,7 +332,7 @@ hands out Core's script at index 0."
               do (is (eql i (bl.wallet::spkm-is-mine
                              spkm (bl.crypto:hex-to-bytes hex)))))
         ;; getnewaddress bech32 = Core's script at index 0
-        (let ((bl.wallet::*rpc-wallet-name* "corevec"))
+        (with-rpc-wallet ("corevec")
           (let ((address (bl.wallet::rpc-getnewaddress
                           node '("" "bech32"))))
             (is (equalp (bl.crypto:hex-to-bytes (first core-scripts))
@@ -377,7 +377,7 @@ out: after a crash-simulating close and reload, no previously issued address
 is ever reissued."
   (with-wallet-test-node (node :network :testnet4 :keypool 5)
     (let ((issued '()))
-      (let ((bl.wallet::*rpc-wallet-name* nil))
+      (with-rpc-wallet (nil)
         (bl.wallet::rpc-createwallet node '("crashy"))
         ;; 7 bech32 (crosses the initial keypool window and forces TopUp),
         ;; plus a few of the other types and a change address.
@@ -408,12 +408,12 @@ is ever reissued."
   "Descriptors, next_index, keys, and the IsMine map are identical after a
 close/reopen (record schema round-trip at the wallet level)."
   (with-wallet-test-node (node :network :testnet4 :keypool 5)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("persist")))
     (let* ((manager (%node-manager node))
            (wallet (gethash "persist" (bl.wallet::wallet-manager-wallets
                                        manager)))
-           (addr1 (let ((bl.wallet::*rpc-wallet-name* nil))
+           (addr1 (with-rpc-wallet (nil)
                     (bl.wallet::rpc-getnewaddress node '("" "bech32"))))
            ;; range_end is legitimately extended by the reload-time TopUp
            ;; (Core LoadExisting -> TopUpKeyPool), so compare descriptor
@@ -426,7 +426,7 @@ close/reopen (record schema round-trip at the wallet level)."
                                                    (bl.wallet::desc-spkm-range-end spkm)))
                                #'string< :key #'first)))
            (descs-before (funcall spkm-state wallet)))
-      (let ((bl.wallet::*rpc-wallet-name* nil))
+      (with-rpc-wallet (nil)
         (bl.wallet::rpc-unloadwallet node '("persist"))
         (bl.wallet::rpc-loadwallet node '("persist")))
       (let* ((wallet2 (gethash "persist" (bl.wallet::wallet-manager-wallets
@@ -516,7 +516,7 @@ reloads to Core's exact scripts (descriptor_tests.cpp sh(wpkh(...)) vector)."
                            "a914bed59fc0024fae941d6e20a3b44a109ae740129287"
                            "a9148483aa1116eb9c05c482a72bada4b1db24af654387")))
       (bl.wallet::create-wallet manager "hardened" :blank t)
-      (let ((bl.wallet::*rpc-wallet-name* "hardened"))
+      (with-rpc-wallet ("hardened")
         (let ((results (bl.wallet::rpc-importdescriptors
                         node (list (list (%ht "desc" desc-str
                                               "timestamp" 1
@@ -525,7 +525,7 @@ reloads to Core's exact scripts (descriptor_tests.cpp sh(wpkh(...)) vector)."
           (is (eq t (%aval "success" (first results))))))
       ;; Reload: SetCache must rebuild the map purely from the persisted
       ;; derived-xpub records (no private keys consulted).
-      (let ((bl.wallet::*rpc-wallet-name* nil))
+      (with-rpc-wallet (nil)
         (bl.wallet::rpc-unloadwallet node '("hardened"))
         (bl.wallet::rpc-loadwallet node '("hardened")))
       (let* ((wallet (gethash "hardened" (bl.wallet::wallet-manager-wallets
@@ -544,7 +544,7 @@ reloads to Core's exact scripts (descriptor_tests.cpp sh(wpkh(...)) vector)."
   "createwallet / loadwallet / unloadwallet / listwallets / listwalletdir
 behave like Core, including the exact error codes."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (is (string= "w1" (%aval "name" (bl.wallet::rpc-createwallet
                                        node '("w1")))))
       (is (equal '("w1") (bl.wallet::rpc-listwallets node nil)))
@@ -569,7 +569,7 @@ behave like Core, including the exact error codes."
       (bl.wallet::rpc-loadwallet node '("w1"))
       (is (equal '("w2" "w1") (bl.wallet::rpc-listwallets node nil)))
       ;; unloadwallet endpoint/param mismatch -> -8; neither -> -8
-      (let ((bl.wallet::*rpc-wallet-name* "w1"))
+      (with-rpc-wallet ("w1")
         (is (= bl.rpc:+rpc-invalid-parameter+
                (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-unloadwallet node '("w2")))))))
@@ -609,9 +609,9 @@ behave like Core, including the exact error codes."
   "disable_private_keys / blank / avoid_reuse land in the flags record and
 getwalletinfo reports Core's fields."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "wo"))
+    (with-rpc-wallet ("wo")
       ;; watch-only + blank + avoid_reuse
-      (let ((bl.wallet::*rpc-wallet-name* nil))
+      (with-rpc-wallet (nil)
         (bl.wallet::rpc-createwallet node '("wo" t t nil t)))
       (let ((info (bl.wallet::rpc-getwalletinfo node nil)))
         (is (string= "wo" (%aval "walletname" info)))
@@ -634,7 +634,7 @@ getwalletinfo reports Core's fields."
              (rpc-error-code-of
               (lambda () (bl.wallet::rpc-getnewaddress node nil))))))
     ;; full wallet: keypool counts are per-side
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("full")))
     (let* ((bl.wallet::*rpc-wallet-name* "full")
            (info (bl.wallet::rpc-getwalletinfo node nil)))
@@ -656,7 +656,7 @@ wallet (-18), no wallet loaded (-18), and ambiguous wallet (-19)."
   (is (null (bl.wallet::wallet-name-from-uri "/walletx/foo")))
   (with-wallet-test-node (node)
     ;; no wallet loaded -> -18
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (is (= bl.rpc:+rpc-wallet-not-found+
              (rpc-error-code-of
               (lambda () (bl.wallet::rpc-getwalletinfo node nil)))))
@@ -670,17 +670,17 @@ wallet (-18), no wallet loaded (-18), and ambiguous wallet (-19)."
              (rpc-error-code-of
               (lambda () (bl.wallet::rpc-getwalletinfo node nil))))))
     ;; endpoint routing picks the named wallet
-    (let ((bl.wallet::*rpc-wallet-name* "r2"))
+    (with-rpc-wallet ("r2")
       (is (string= "r2" (%aval "walletname"
                                (bl.wallet::rpc-getwalletinfo node nil)))))
     ;; unknown wallet endpoint -> -18 with Core's message
-    (let ((bl.wallet::*rpc-wallet-name* "missing"))
+    (with-rpc-wallet ("missing")
       (signals-rpc-error (:code bl.rpc:+rpc-wallet-not-found+ :exact-message "Requested wallet does not exist or is not loaded")
         (bl.wallet::rpc-getwalletinfo node nil)))
     ;; unloadwallet via endpoint (no param)
-    (let ((bl.wallet::*rpc-wallet-name* "r2"))
+    (with-rpc-wallet ("r2")
       (bl.wallet::rpc-unloadwallet node '()))
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (is (equal '("r1") (bl.wallet::rpc-listwallets node nil))))))
 
 (test wallet-disabled-node-rejects-wallet-rpcs
@@ -702,7 +702,7 @@ no-wallet Core build."
   "getnewaddress/getrawchangeaddress issue distinct, IsMine addresses of the
 right form for all four address types (testnet4 prefixes), default bech32."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("types"))
       (let ((wallet (gethash "types"
                              (bl.wallet::wallet-manager-wallets
@@ -742,7 +742,7 @@ right form for all four address types (testnet4 prefixes), default bech32."
 private=true returns xprv-bearing strings; watch-only wallets reject
 private=true."
   (with-wallet-test-node (node :keypool 3)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("ld")))
     (let* ((bl.wallet::*rpc-wallet-name* "ld")
            (result (bl.wallet::rpc-listdescriptors node nil))
@@ -767,9 +767,9 @@ private=true."
         (dolist (d priv-descs)
           (is (search "tprv" (%aval "desc" d))))))
     ;; watch-only wallet rejects private=true
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("ldwo" t)))
-    (let ((bl.wallet::*rpc-wallet-name* "ldwo"))
+    (with-rpc-wallet ("ldwo")
       (is (= bl.rpc:+rpc-wallet-error+
              (rpc-error-code-of
               (lambda () (bl.wallet::rpc-listdescriptors node '(t)))))))))
@@ -779,10 +779,10 @@ private=true."
 required, watch-only rules, label/range constraints; a missing timestamp
 throws out of the whole call."
   (with-wallet-test-node (node :keypool 3)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("imp"))     ; privkeys enabled
       (bl.wallet::rpc-createwallet node '("impwo" t t))) ; watch-only blank
-    (let ((bl.wallet::*rpc-wallet-name* "imp"))
+    (with-rpc-wallet ("imp")
       ;; missing timestamp -> whole-RPC type error
       (is (= bl.rpc:+rpc-type-error+
              (rpc-error-code-of
@@ -807,7 +807,7 @@ throws out of the whole call."
         (is (= bl.rpc:+rpc-wallet-error+ (%aval "code" err)))
         (is (search "without private keys" (%aval "message" err)))))
     ;; watch-only wallet accepts public descriptors, stores + reports them
-    (let ((bl.wallet::*rpc-wallet-name* "impwo"))
+    (with-rpc-wallet ("impwo")
       (let* ((xpub "tpubD6NzVbkrYhZ4XqNGAWGWSzmxGWFwVjVTjZxh2fioKbVYi7Jx8fdbprVWsdW7mHwqjchBVas8TLZG4Xwuz4RKU4iaCqiCvoSkFCzQptqk5Y1")
              (desc (bl.rpc:descriptor-add-checksum
                     (format nil "wpkh(~A/0/*)" xpub)))
@@ -912,7 +912,7 @@ verifymessage; a tampered message verifies false; a valid non-P2PKH (bech32)
 address is -3, an undecodable address -5, and a foreign P2PKH address the
 wallet does not own -4 (Core wallet/rpc/signmessage.cpp error codes)."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("signer")))
     (let* ((bl.wallet::*rpc-wallet-name* "signer")
            (address (bl.wallet::rpc-getnewaddress node '("" "legacy")))
@@ -956,7 +956,7 @@ The persistence half is what makes this more than a getter: a flag that lived
 only in memory would come back on the next load, which for avoid_reuse means
 silently resuming address reuse."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("flags")))
     (let* ((bl.wallet::*rpc-wallet-name* "flags")
            (manager (%node-manager node))
@@ -1011,7 +1011,7 @@ silently succeed, or an operator would believe they had added something.
 The descriptor is built through the SAME path wallet creation uses, so the
 derivation paths cannot drift between the two."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("cwd")))
     (let* ((bl.wallet::*rpc-wallet-name* "cwd")
            (manager (%node-manager node))
@@ -1059,9 +1059,9 @@ derivation paths cannot drift between the two."
 HD root must appear as ONE entry with two descriptors, not two entries — that
 is what tells an operator which key their wallet actually depends on."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("hd")))
-    (let ((bl.wallet::*rpc-wallet-name* "hd"))
+    (with-rpc-wallet ("hd")
       (let ((rows (bl.wallet::rpc-gethdkeys node nil)))
         (is (plusp (length rows)) "a fresh descriptor wallet reported no HD keys")
         ;; A freshly created wallet derives every descriptor from ONE seed, so
@@ -1102,7 +1102,7 @@ hook wired inside the branch."
          (progn
            (ensure-directories-exist dir)
            (with-wallet-test-node (node :keypool 4)
-             (let ((bl.wallet::*rpc-wallet-name* nil))
+             (with-rpc-wallet (nil)
                (bl.wallet::rpc-createwallet node '("notif")))
              (let* ((manager (%node-manager node))
                     (wallet (gethash "notif"
@@ -1158,7 +1158,7 @@ hook wired inside the branch."
 outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
 -> -4."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("recv")))
     (let* ((manager (%node-manager node))
            (wallet (gethash "recv"
@@ -1216,7 +1216,7 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
 (test wallet-keypoolrefill-grows-active-spkms
   "keypoolrefill tops every active SPKM up to newsize; a negative size is -8."
   (with-wallet-test-node (node :keypool 5)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("kp")))
     (let* ((manager (%node-manager node))
            (wallet (gethash "kp"
@@ -1238,7 +1238,7 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
   "simulaterawtransaction reports +owned-output and -owned-input deltas, and
 rejects a double-spend across the array."
   (with-wallet-test-node (node :keypool 4)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("sim")))
     (let* ((manager (%node-manager node))
            (wallet (gethash "sim"
@@ -1282,7 +1282,7 @@ rejects a double-spend across the array."
   "listaddressgroupings clusters addresses co-spent as inputs of one tx and
 keeps an unrelated lone address in its own group."
   (with-wallet-test-node (node :keypool 5)
-    (let ((bl.wallet::*rpc-wallet-name* nil))
+    (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("grp")))
     (let* ((manager (%node-manager node))
            (wallet (gethash "grp"
@@ -1790,7 +1790,7 @@ path is unavailable by construction and only a script path can spend."
            (desc-str (bl.rpc:descriptor-add-checksum
                       (format nil "tr(~A,pk(~A))" internal leaf-wif))))
       (bl.wallet::create-wallet manager "trtree" :blank t)
-      (let ((bl.wallet::*rpc-wallet-name* "trtree"))
+      (with-rpc-wallet ("trtree")
         (let ((results (bl.wallet::rpc-importdescriptors
                         ;; Not "active": Core requires an active descriptor to
                         ;; be ranged, and a fixed tree has no range.
