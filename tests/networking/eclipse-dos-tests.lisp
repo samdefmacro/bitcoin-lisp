@@ -2373,6 +2373,40 @@ every present and future onion peer, silently disabling onion reachability."
       (is (eq (and (bl.net:loopback-address-p addr) t) (and local t))
           "~A: ~A" addr reason))))
 
+(test a-manual-peer-is-never-punished
+  "Core's MaybeDiscourageAndDisconnect has TWO independent exemptions before it
+punishes anyone (net_processing.cpp:5181-5190): NoBan, and then `if
+(pnode.IsManualConn()) { LogWarning(\"Not punishing manually connected peer
+%d!\"); return false; }'. They are independent because a manual connection does
+NOT get NoBan by default -- CConnman gives an outbound dial
+NetPermissionFlags::None and consults vWhitelistedRangeOutgoing only for MANUAL
+connections (net.cpp:510-512).
+
+We had only the NoBan arm, so an -addnode peer that tripped any misbehaviour
+site was disconnected AND discouraged; CONNECT-PEER refuses a discouraged
+address, and that is the call CONNECT-ADDED-NODES makes on every maintenance
+tick, so the operator's pinned peer stayed down -- permanently, since the
+discourage filter is a 50,000-entry FIFO with no time expiry."
+  (let ((bl.net::*discouraged-peers* (bl:make-rejects-filter 128)))
+    (let ((manual (bl.net:make-peer :address "203.0.113.7" :state :ready))
+          (ordinary (bl.net:make-peer :address "203.0.113.8" :state :ready)))
+      (setf (bl.net:peer-manual manual) t)
+      (is-false (bl.net:peer-has-permission-p manual bl.net:+perm-noban+)
+                "the manual peer must hold NO permissions, or this test would ~
+be measuring the NoBan arm")
+      (is-false (bl.net:record-misbehavior manual "unit test")
+                "a manual peer must not be punished")
+      (is (eq :ready (bl.net:peer-state manual))
+          "a manual peer keeps its connection")
+      (is-false (bl.net:peer-discouraged-p "203.0.113.7")
+                "a manual peer's address must stay dialable")
+      ;; Positive control, same run: an ordinary peer at another address is
+      ;; still punished, so the exemption is the manual flag and not the fixture.
+      (is-true (bl.net:record-misbehavior ordinary "unit test")
+               "control: an ordinary peer is still punished")
+      (is (eq :disconnected (bl.net:peer-state ordinary)))
+      (is-true (bl.net:peer-discouraged-p "203.0.113.8")))))
+
 ;;; ============================================================
 ;;; 5. The automatic-dial decision: which candidate, and who is
 ;;;    charged for the failure (Core ThreadOpenConnections)
