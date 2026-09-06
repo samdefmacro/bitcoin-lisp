@@ -166,12 +166,11 @@ headerssync.cpp. src/networking/.")
    #:compact-block-stats
    ;; Peer health
    #:check-peer-health
-   #:record-block-timeout
    #:record-block-received-from-peer
-   #:peer-block-timeout-count
+   #:peer-downloading-since
+   #:peer-stalling-since
    #:peer-last-block-received-time
    #:peer-address
-   #:+max-block-timeouts+
    ;; Peer database (peer-address struct shares symbol with peer accessor above)
    #:make-peer-address
    #:peer-address-net

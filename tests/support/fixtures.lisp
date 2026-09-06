@@ -74,6 +74,16 @@ dependence on the global *random-state*, so runs are reproducible."
       (setf state (ldb (byte 64 0) (logxor state (ash state 17))))
       (mod state n))))
 
+;;;; Source text
+
+(defun project-source-text (relative-path)
+  "The text of RELATIVE-PATH under the repository root, e.g.
+\"src/networking/ibd.lisp\" -- for the tests that assert on what a source file
+says, or no longer says. Two test files ask this of the same file, which is why
+it is a fixture."
+  (uiop:read-file-string
+   (merge-pathnames relative-path (asdf:system-source-directory :bitcoin-lisp))))
+
 ;;;; The IBD context
 
 (defmacro with-ibd-context (&body body)

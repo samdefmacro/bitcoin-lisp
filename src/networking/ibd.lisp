@@ -1073,6 +1073,13 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                              bl:*network*))
              (chain '())       ; peer's chain above last-common, oldest-first
              (result '())
+             ;; Core FindNextBlocks's `waitingfor' and `nodeStaller'
+             ;; (net_processing.cpp:1478, :1514-1531): who holds the first
+             ;; block we find already in flight, and -- if the window end is
+             ;; what stops us with nothing collected -- who is therefore
+             ;; holding the window shut.
+             (waiting-for nil)
+             (staller nil)
              (advancing t))
         ;; Walk from best-known down (skipping above the window) to last-common.
         (let ((e best-known))
@@ -1130,19 +1137,34 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                    (setf (peer-last-common-block-hash peer) hash)))
                 (t
                  (setf advancing nil)
-                 (when (> h window-end) (return-from collect))
-                 ;; Core FindNextBlocks (net_processing.cpp:1533-1536): never ask a
-                 ;; limited (pruned) peer for a block deeper than it retains —
-                 ;; NODE_NETWORK_LIMITED_MIN_BLOCKS-2 = 286 below the peer's best
-                 ;; known. Skip it but keep walking toward the peer's tip, where
-                 ;; shallower blocks become fetchable.
-                 (unless (or (gethash hash in-flight)
-                             (and is-limited
-                                  (>= (- best-known-height h) 286)))
-                   (push hash result)
-                   (when (>= (length result) count)
-                     (return-from collect))))))))
-        (nreverse result)))))
+                 (cond
+                   ;; Core FindNextBlocks (:1514-1521): remember WHO holds the
+                   ;; first block already in flight. This must come before the
+                   ;; window test, as Core's does, or the peer that is holding
+                   ;; the window shut is never identified.
+                   ((gethash hash in-flight)
+                    (unless waiting-for
+                      (setf waiting-for (car (gethash hash in-flight)))))
+                   ;; Core (:1524-1531): the end of the window, with nothing
+                   ;; collected for this peer -- we could fetch if the window
+                   ;; were one larger, so whoever holds its first missing block
+                   ;; is the staller. Never this peer itself.
+                   ((> h window-end)
+                    (when (and (null result) waiting-for
+                               (not (eq waiting-for peer)))
+                      (setf staller waiting-for))
+                    (return-from collect))
+                   ;; Core FindNextBlocks (net_processing.cpp:1533-1536): never ask a
+                   ;; limited (pruned) peer for a block deeper than it retains —
+                   ;; NODE_NETWORK_LIMITED_MIN_BLOCKS-2 = 286 below the peer's best
+                   ;; known. Skip it but keep walking toward the peer's tip, where
+                   ;; shallower blocks become fetchable.
+                   ((and is-limited (>= (- best-known-height h) 286)))
+                   (t
+                    (push hash result)
+                    (when (>= (length result) count)
+                      (return-from collect)))))))))
+        (values (nreverse result) staller)))))
 
 (defun find-historical-blocks-to-download (peer chain-state block-store count)
   "Bitcoin Core TryDownloadingHistoricalBlocks (net_processing.cpp:1445-1472):
@@ -1186,11 +1208,51 @@ partition the retired height-based scheduler used to provide."
     (setf (ibd-context-avg-block-wire-bytes ctx)
           (floor (+ (* 9 (ibd-context-avg-block-wire-bytes ctx)) wire-size) 10))))
 
+(defun %peer-front-in-flight (peer)
+  "(VALUES HASH REQUEST-TIME COUNT) for the block PEER has had in flight
+longest -- Core's state.vBlocksInFlight.front(), the block its download
+timeout is judged on and the one whose delivery re-stamps the clock. COUNT is
+how many blocks the peer holds; HASH and REQUEST-TIME are NIL when it holds
+none. Core keeps an insertion-ordered list per peer; our in-flight table is
+keyed by hash, so the front is the oldest request time."
+  (let ((front nil) (front-time nil) (count 0))
+    (when *ibd-context*
+      (maphash (lambda (hash entry)
+                 (when (eq (car entry) peer)
+                   (incf count)
+                   (when (or (null front-time) (< (cdr entry) front-time))
+                     (setf front hash front-time (cdr entry)))))
+               (ibd-context-in-flight *ibd-context*)))
+    (values front front-time count)))
+
+(defun count-peer-in-flight (peer)
+  "Count in-flight block requests assigned to PEER (Core
+state.vBlocksInFlight.size())."
+  (nth-value 2 (%peer-front-in-flight peer)))
+
+(defun %peers-downloading-from ()
+  "How many peers hold at least one in-flight block -- Core's
+m_peers_downloading_from, which is what widens every peer's download timeout
+so our own saturated downlink cannot evict a fleet of honest peers."
+  (let ((seen '()))
+    (when *ibd-context*
+      (maphash (lambda (hash entry)
+                 (declare (ignore hash))
+                 (pushnew (car entry) seen :test #'eq))
+               (ibd-context-in-flight *ibd-context*)))
+    (length seen)))
+
 (defun mark-block-in-flight (hash peer)
   "Mark a block as being requested from PEER."
   (when *ibd-context*
-    (setf (gethash hash (ibd-context-in-flight *ibd-context*))
-          (cons peer (get-internal-real-time)))))
+    (let ((now (get-internal-real-time)))
+      ;; Core BlockRequested (net_processing.cpp:1258-1266): a peer whose
+      ;; in-flight list goes from EMPTY to non-empty is starting a download
+      ;; batch, and that is when its clock starts.
+      (when (zerop (count-peer-in-flight peer))
+        (setf (peer-downloading-since peer) now))
+      (setf (gethash hash (ibd-context-in-flight *ibd-context*))
+            (cons peer now)))))
 
 (defun mark-block-received (hash)
   "Mark a block as received, removing it from pending and in-flight.
@@ -1208,28 +1270,35 @@ in-flight entry so report-ibd-progress can surface p50/p95."
                (latency-ms (round (* 1000 (- now sent-at))
                                   internal-time-units-per-second)))
           (push (list now (peer-address peer) latency-ms)
-                (ibd-context-delivery-samples *ibd-context*)))))
+                (ibd-context-delivery-samples *ibd-context*))
+          ;; Core RemoveBlockRequest (net_processing.cpp:1221-1231): the FRONT
+          ;; block arriving restarts the download clock for the next one, and
+          ;; ANY delivery clears the stalling stamp -- a peer that is producing
+          ;; blocks is by definition not the one holding the window shut.
+          (when (equalp hash (%peer-front-in-flight peer))
+            (setf (peer-downloading-since peer) now))
+          (setf (peer-stalling-since peer) 0))))
     (remhash hash (ibd-context-in-flight *ibd-context*))
     ;; Clear the per-hash timeout counter so a future re-request of this
     ;; hash (e.g. on a reorg) starts fresh.
     (remhash hash (ibd-context-request-timeouts *ibd-context*))))
 
 (defun compute-block-download-timeout (num-downloading-peers)
-  "Compute block download timeout in seconds based on number of peers.
-Mirrors Bitcoin Core's net_processing.cpp shape but with a longer base
-(90s vs Core's 30s) because testnet4 stress-region blocks (h=51k-67k)
-are multi-MB and routinely take 60-90s wire transit even on healthy
-links. With 30s, every in-flight request to a slow-but-functional peer
-times out before delivery, fires the per-peer record-block-timeout
-counter, and combined with the old +max-block-timeouts+=3 produced a
-mass-eviction death spiral on the stress region. 90s + per-peer 5s
-gives ≈125s with 8 peers — wide enough that a peer mid-transfer
-isn't punished for slow-but-progressing delivery, narrow enough that
-a genuinely dead peer is still cleared in 2 minutes.
+  "How long one in-flight REQUEST may sit before it is re-routed to another
+peer, in seconds. This is our re-routing clock only; the peer-eviction clock is
+Core's, in BLOCK-DOWNLOAD-DEADLINE-TICKS.
 
-  BLOCK_DOWNLOAD_TIMEOUT_BASE = 90 s
-  BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 5 s
-  timeout = base + per_peer * other_peers"
+The base is 90s (vs the 30s Core uses for its stalling rule) because testnet4
+stress-region blocks (h=51k-67k) are multi-MB and routinely take 60-90s of
+wire transit even on healthy links, so a shorter value re-requests blocks that
+are simply still arriving. 90s + per-peer 5s gives ≈125s with 8 peers.
+
+  base = 90 s, per additional peer = 5 s
+  timeout = base + per_peer * other_peers
+
+Deliberately NOT named after Core's BLOCK_DOWNLOAD_TIMEOUT_* constants: those
+are +BLOCK-DOWNLOAD-TIMEOUT-BASE+ and +BLOCK-DOWNLOAD-TIMEOUT-PER-PEER+ below,
+they are expressed in block intervals, and they decide a disconnect."
   (let* ((base 90)
          (per-peer 5)
          (other-peers (max 0 (1- num-downloading-peers))))
@@ -1280,24 +1349,27 @@ so it keeps its full retry budget on reassignment."
         (length orphaned))
       0))
 
-(defun retry-timed-out-requests (&optional peers timeout-seconds)
-  "Remove timed out requests from in-flight so they can be retried.
-When PEERS is provided, tracks per-peer timeouts and disconnects slow
-peers. After a block has timed out +MAX-BLOCK-REQUEST-TIMEOUTS+ times
-it's also dropped from PENDING — competing-fork blocks that peers
-won't serve would otherwise loop forever, blocking IBD termination.
-TIMEOUT-SECONDS overrides the per-block timeout (shorter near the tip)."
+(defun retry-timed-out-requests (&optional timeout-seconds)
+  "Release timed-out in-flight requests so another peer can be asked for them.
+After a block has timed out +MAX-BLOCK-REQUEST-TIMEOUTS+ times it is also
+dropped from PENDING -- competing-fork blocks that peers won't serve would
+otherwise loop forever, blocking IBD termination. TIMEOUT-SECONDS overrides
+the per-block timeout (shorter near the tip).
+
+RE-ROUTING ONLY: this counts nothing against the peer that was holding the
+block, and disconnects nobody. It used to call RECORD-BLOCK-TIMEOUT once per
+timed-out HASH against a per-peer budget of 15, while the per-peer in-flight
+cap is 16 and REQUEST-BLOCKS-FROM-PEERS tops a peer up to that cap in one
+call -- so a peer holding a full window of same-age requests went from 0 to 16
+timeouts in a SINGLE pass and was dropped on one stall round: 125 seconds of
+silence during bulk download, or 30 seconds anywhere within 144 blocks of the
+header tip. Core's floor for the same peer is 600 seconds with one downloading
+peer and 2700 with eight, measured from its last DELIVERY. The eviction
+decision now lives in CHECK-BLOCK-DOWNLOAD-TIMEOUTS, where Core keeps it."
   (let ((timed-out (get-timed-out-requests timeout-seconds))
-        (peers-to-disconnect '())
         (dropped 0))
     (dolist (hash timed-out)
-      (let* ((peer-time (gethash hash (ibd-context-in-flight *ibd-context*)))
-             (peer (car peer-time))
-             (timeouts (gethash hash (ibd-context-request-timeouts *ibd-context*) 0)))
-        ;; Track timeout for this peer
-        (when (and peer peers)
-          (when (record-block-timeout peer)
-            (pushnew peer peers-to-disconnect)))
+      (let ((timeouts (gethash hash (ibd-context-request-timeouts *ibd-context*) 0)))
         ;; Bump the per-hash timeout count.
         (setf (gethash hash (ibd-context-request-timeouts *ibd-context*))
               (1+ timeouts))
@@ -1313,28 +1385,102 @@ TIMEOUT-SECONDS overrides the per-block timeout (shorter near the tip)."
     (when (plusp dropped)
       (bl:log-debug "Dropped ~D pending blocks after ~D timeouts each"
                               dropped +max-block-request-timeouts+))
-    ;; Disconnect peers that hit the timeout limit (only if still connected)
-    (dolist (peer peers-to-disconnect)
-      (when (eq (peer-state peer) :ready)
-        (bl:log-warn "Disconnecting stalling peer ~A"
-                               (peer-address peer))
-        (handler-case
-            (disconnect-peer peer)
-          (error () nil))))
     (length timed-out)))
 
-;;;; Multi-Peer Request Distribution
+;;;; Core's two per-peer block-download disconnects (SendMessages,
+;;;; net_processing.cpp:6094-6122). They are separate rules with separate
+;;;; clocks, and neither is driven by the per-hash retry above.
 
-(defun count-peer-in-flight (peer)
-  "Count in-flight block requests assigned to PEER."
-  (let ((count 0))
-    (when *ibd-context*
-      (maphash (lambda (hash peer-time)
-                 (declare (ignore hash))
-                 (when (eq (car peer-time) peer)
-                   (incf count)))
-               (ibd-context-in-flight *ibd-context*)))
-    count))
+(defconstant +block-download-timeout-base+ 1
+  "Core BLOCK_DOWNLOAD_TIMEOUT_BASE (net_processing.cpp:147): the download
+budget in multiples of the block interval, i.e. 10 minutes on its own.")
+
+(defconstant +block-download-timeout-per-peer+ 1/2
+  "Core BLOCK_DOWNLOAD_TIMEOUT_PER_PEER (:149): half a block interval more
+per OTHER peer we are downloading validated blocks from. Core's comment is the
+reason it exists -- \"We compensate for other peers to prevent killing off
+peers due to our own downstream link being saturated\".")
+
+(defconstant +block-stalling-timeout-default+ 2
+  "Core BLOCK_STALLING_TIMEOUT_DEFAULT (:133), in seconds.")
+
+(defconstant +block-stalling-timeout-max+ 64
+  "Core BLOCK_STALLING_TIMEOUT_MAX (:135), in seconds.")
+
+(defvar *block-stalling-timeout* +block-stalling-timeout-default+
+  "Core PeerManagerImpl::m_block_stalling_timeout. DOUBLES toward
++block-stalling-timeout-max+ every time a peer is dropped for stalling, and
+never falls: the back-off is what stops our own insufficient bandwidth from
+evicting several peers in a row.")
+
+(defun block-download-deadline-ticks (&optional (downloading-peers (%peers-downloading-from)))
+  "How long a peer may go without delivering the FRONT block it holds, in
+internal-time units -- Core's
+nPowTargetSpacing * (BLOCK_DOWNLOAD_TIMEOUT_BASE +
+                     BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * other_downloading_peers)
+(net_processing.cpp:6118). 600s with one downloading peer, 2700s with eight."
+  (round (* bl:+pow-target-spacing-seconds+
+            (+ +block-download-timeout-base+
+               (* +block-download-timeout-per-peer+
+                  (max 0 (1- downloading-peers))))
+            internal-time-units-per-second)))
+
+(defun check-block-download-timeouts (peers &optional (now (get-internal-real-time)))
+  "Core's two per-peer block-download disconnects, one pass over PEERS
+(net_processing.cpp:6094-6122). Returns how many peers were dropped.
+
+The STALLING rule fires only when the download window cannot move -- the peer
+holds the first block we are missing and there is nothing else to ask anyone
+for below the window -- and doubles its own timeout afterwards.
+
+The DOWNLOAD rule is one decision per peer, taken on the front in-flight block
+against the peer's own m_downloading_since, which is stamped when its in-flight
+list fills from empty and re-stamped on every FRONT delivery. It therefore
+measures SILENCE, not request age: a peer mid-transfer on a big block is not
+punished for how long ago we asked.
+
+NOW is Core's current_time, which SendMessages likewise receives rather than
+reads; passing it lets a test place a peer's clock without waiting."
+  (unless *ibd-context*
+    (return-from check-block-download-timeouts 0))
+  (let ((deadline (block-download-deadline-ticks))
+        (dropped 0))
+    ;; LOG-WARN is a macro, so the message is built here and logged once.
+    (flet ((drop (peer message)
+             (bl:log-warn "~A" message)
+             (handler-case (disconnect-peer peer) (error () nil))
+             (incf dropped)))
+      (dolist (peer peers)
+        (when (eq (peer-state peer) :ready)
+          (cond
+            ((and (plusp (peer-stalling-since peer))
+                  (> (- now (peer-stalling-since peer))
+                     (* *block-stalling-timeout* internal-time-units-per-second)))
+             (drop peer (format nil "Peer ~A is stalling block download - disconnecting"
+                                (peer-address peer)))
+             ;; Core (:6103-6106): raise the bar for the NEXT peer so a stall
+             ;; caused by our own downlink cannot take the whole fleet.
+             (let ((next (min (* 2 *block-stalling-timeout*)
+                              +block-stalling-timeout-max+)))
+               (unless (= next *block-stalling-timeout*)
+                 (setf *block-stalling-timeout* next)
+                 (bl:log-debug "Increased stalling timeout temporarily to ~Ds"
+                               next))))
+            ((multiple-value-bind (front front-time count)
+                 (%peer-front-in-flight peer)
+               (declare (ignore front-time))
+               (and (plusp count)
+                    (plusp (peer-downloading-since peer))
+                    (> (- now (peer-downloading-since peer)) deadline)
+                    front))
+             (drop peer (format nil "Timeout downloading blocks from peer ~A ~
+(~Ds since its last delivery) - disconnecting"
+                                (peer-address peer)
+                                (round (- now (peer-downloading-since peer))
+                                       internal-time-units-per-second))))))))
+    dropped))
+
+;;;; Multi-Peer Request Distribution
 
 (defun request-blocks-from-peers (peers chain-state block-store)
   "Request blocks from multiple peers, distributing the load.
@@ -1369,10 +1515,14 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
          (queue-saturated (>= (ibd-context-block-queue-bytes *ibd-context*)
                               +max-block-queue-bytes+))
          (timeout (and (or near-tip queue-saturated) +block-stalling-timeout+))
-         (retried (retry-timed-out-requests peers timeout)))
+         (retried (retry-timed-out-requests timeout)))
     (when (> retried 0)
       (bl:log-warn "Retrying ~D timed out block requests~:[~; (short timeout)~]"
                              retried timeout)))
+
+  ;; The eviction decision, kept apart from the re-routing above: Core's two
+  ;; per-peer rules, judged once per download pass as SendMessages judges them.
+  (check-block-download-timeouts peers)
 
   ;; Backpressure: cap NEW requests so block-queue + in-flight stays bounded.
   ;; When at cap and the next-needed block is missing, only allow ONE request
@@ -1442,15 +1592,19 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     (let ((requests-made 0)
           (peer-requests (make-hash-table :test 'eq))
           (in-flight (ibd-context-in-flight *ibd-context*))
+          (block-hashes '())
           (remaining total-budget))
       (dolist (peer ready-peers)
         (when (plusp remaining)
           (let ((budget (min remaining
                              (max 0 (- max-per-peer (count-peer-in-flight peer)))))
-                (taken 0))
+                (taken 0)
+                (staller nil))
             (when (plusp budget)
-              (dolist (hash (find-blocks-to-download-for-peer
-                             peer chain-state block-store budget))
+              (multiple-value-setq (block-hashes staller)
+                (find-blocks-to-download-for-peer
+                 peer chain-state block-store budget))
+              (dolist (hash block-hashes)
                 (unless (gethash hash in-flight)
                   (mark-block-in-flight hash peer)
                   (push hash (gethash peer peer-requests))
@@ -1469,7 +1623,16 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                       (mark-block-in-flight hash peer)
                       (push hash (gethash peer peer-requests))
                       (incf requests-made)
-                      (decf remaining)))))))))
+                      (decf remaining)))))
+              ;; Core SendMessages (net_processing.cpp:6191-6197), AFTER both
+              ;; walks and their BlockRequested calls: this peer came away with
+              ;; nothing at all to do and someone else is holding the window
+              ;; shut -- start THAT peer's stalling clock, once.
+              (when (and staller
+                         (zerop (count-peer-in-flight peer))
+                         (zerop (peer-stalling-since staller)))
+                (setf (peer-stalling-since staller) (get-internal-real-time))
+                (bl:log-debug "Stall started peer=~A" (peer-address staller)))))))
       (when (zerop requests-made)
         (return-from request-blocks-from-peers 0))
 

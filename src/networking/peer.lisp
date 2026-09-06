@@ -156,8 +156,18 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; *next-inbound-inv-flush*). 0 = not yet scheduled.
   (next-inv-send-time 0 :type integer)
   ;; Health monitoring
-  ;; Block delivery tracking
-  (block-timeout-count 0 :type (unsigned-byte 8))
+  ;; Block delivery tracking.
+  ;;
+  ;; Core CNodeState::m_downloading_since (net_processing.cpp:458): stamped
+  ;; when this peer's in-flight list goes from EMPTY to non-empty, and
+  ;; re-stamped every time the FRONT in-flight block is delivered. So it
+  ;; measures SILENCE since the last delivery, not the age of a request --
+  ;; which is what makes one decision per peer possible. 0 = not downloading.
+  (downloading-since 0 :type integer)
+  ;; Core CNodeState::m_stalling_since (:455): set only when the block
+  ;; download WINDOW cannot move because this peer holds its first missing
+  ;; block, cleared by any delivery. 0 = not stalling.
+  (stalling-since 0 :type integer)
   (last-block-received-time 0 :type integer)  ; internal-real-time of last block from this peer
   (address "" :type string)
   ;; T if the peer connected to us (inbound); NIL if we dialed out (outbound).
@@ -1473,19 +1483,6 @@ sent once no ping is outstanding and this long has passed.")
   "Core TIMEOUT_INTERVAL (net.h:59): a ping left unanswered this long
 disconnects the peer (MaybeSendPing, net_processing.cpp:5487-5494).")
 
-(defconstant +max-block-timeouts+ 15
-  "Per-peer block-request timeout count threshold before disconnect.
-The previous value (3) caused a death-spiral in the testnet4 stress
-region (h=51k-67k): a single 3MB stress block transits the wire in
-30-90s, but the request-timeout fires per in-flight request. With
-multiple in-flight requests to the same peer, all of them time out
-within seconds of each other before any can be reset by a successful
-receive — count rolled past 3 in one tick and the peer was
-disconnected mid-transfer. Raised to 15: tolerates a normal stalled
-batch without evicting peers who are simply mid-transit on big
-blocks. record-block-received-from-peer still resets the count to
-zero on any successful block.")
-
 (defun check-handshake-timeout (peer)
   "Check if a peer has exceeded the handshake timeout.
 Returns :disconnect if the peer should be disconnected, :ok otherwise."
@@ -1557,12 +1554,6 @@ and its age never reset."
        :ping-sent)
       (t :ok))))
 
-(defun record-block-timeout (peer)
-  "Record a block request timeout for PEER.
-Returns T if the peer should be disconnected."
-  (incf (peer-block-timeout-count peer))
-  (>= (peer-block-timeout-count peer) +max-block-timeouts+))
-
 (defun record-block-received-from-peer (peer)
   "Record that we received a block from PEER. Resets stalling state and
 stamps the unix receipt time getpeerinfo reports as \"last_block\" (Core
@@ -1570,8 +1561,7 @@ CNode::m_last_block_time; Core stamps only NEW blocks in ProcessBlock —
 ours stamps every block message, but we request each block once, so
 duplicates are rare)."
   (setf (peer-last-block-received-time peer) (get-internal-real-time))
-  (setf (peer-last-block-time peer) (bl.ser:get-unix-time))
-  (setf (peer-block-timeout-count peer) 0))
+  (setf (peer-last-block-time peer) (bl.ser:get-unix-time)))
 
 ;;; Misbehavior, Discouragement, and Banning
 ;;;

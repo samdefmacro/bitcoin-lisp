@@ -575,7 +575,14 @@
   named rule -- one written inside a handler, the framing layer's own bad
   magic / oversized checks, or a protocol VECTOR over its maximum
   (a PROTOCOL-LIMIT-ERROR), which is the one deserialization failure Core
-  answers with Misbehaving. Outbound eclipse resistance rotates the extra outbound
+  answers with Misbehaving. Block download has TWO separate
+  disconnects and neither is the per-hash retry: releasing a timed-out
+  request re-routes it and costs its holder nothing, while a peer is
+  dropped either for holding the download window shut (its own stalling
+  clock, whose timeout DOUBLES from 2s toward 64s after each use so our
+  own bandwidth cannot evict a fleet) or for going silent past
+  nPowTargetSpacing * (1 + 0.5 * other downloading peers) measured from
+  its LAST DELIVERY, never from when we asked. Outbound eclipse resistance rotates the extra outbound
   slot on a stale tip (`*max-tip-age-seconds*` is Core's
   nPowTargetSpacing * 3). Everything that decides an outbound dial reads
   OUTBOUND peers only -- the full-relay count, the /16 netgroup set a
