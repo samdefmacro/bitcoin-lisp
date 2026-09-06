@@ -197,7 +197,7 @@ byte for byte."
              (bl.store:leveldb-close db))
            ;; Reopen and compare every record byte-for-byte.
            (let* ((db (bl.wallet::wallet-db-open path))
-                  (records (bl.wallet::wallet-db-records db)))
+                  (records (wallet-db-record-list db)))
              (is (= (length written) (length records)))
              (dolist (w written)
                (let ((found (find (car w) records :key #'car :test #'equalp)))

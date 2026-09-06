@@ -25,7 +25,7 @@
 
 (defun %wenc-records (wallet)
   "Every (key . value) pair in WALLET's open database."
-  (bl.wallet::wallet-db-records (bl.wallet::wallet-db wallet)))
+  (wallet-db-record-list (bl.wallet::wallet-db wallet)))
 
 (defun %wenc-encrypt (node &optional (passphrase "hunter2"))
   "encryptwallet through the shipped handler. Named once because every test in
@@ -133,7 +133,7 @@ a complete rebuilt database plus the marker, PATH itself has been renamed into
 REWRITE/superseded/, and the second rename never happened. Built out of the
 same primitives the rewrite uses, since the point is the on-disk shape."
   (let ((records (let ((db (bl.wallet::wallet-db-open path)))
-                   (unwind-protect (bl.wallet::wallet-db-records db)
+                   (unwind-protect (wallet-db-record-list db)
                      (bl.store:leveldb-close db)))))
     (let ((db (bl.wallet::wallet-db-open rewrite :create t)))
       (unwind-protect
@@ -1196,7 +1196,7 @@ whose records are identical, record for record."
           (is (null (bl.wallet::rpc-backupwallet
                      node (list (namestring path)))))
           (is (probe-file path))
-          (setf source-records (bl.wallet::wallet-db-records
+          (setf source-records (wallet-db-record-list
                                 (bl.wallet::wallet-db wallet)))))
       ;; The dump is self-describing and checksummed.
       (let ((first-line (with-open-file (in path) (read-line in))))
@@ -1207,7 +1207,7 @@ whose records are identical, record for record."
       (let* ((restored (gethash "restored"
                                 (bl.wallet::wallet-manager-wallets
                                  (%node-manager node))))
-             (restored-records (bl.wallet::wallet-db-records
+             (restored-records (wallet-db-record-list
                                 (bl.wallet::wallet-db restored))))
         (is (= (length source-records) (length restored-records)))
         ;; Every record key round-trips, in order.
@@ -1318,14 +1318,14 @@ where it would be picked up as a wallet directory."
                 (merge-pathnames "../outside.dump" wallets) wallets))))))
 
 (test wenc-record-scan-refuses-a-truncated-read
-  "wallet-db-records must signal, not return a short list, if the iterator
+  "map-wallet-db-records must signal, not return a short list, if the iterator
 stopped on an error. A backup built from a silently truncated scan is the
 worst possible failure: it looks like a successful backup and restores a
 wallet that is missing keys."
   (with-wallet-test-node (node)
     (with-rpc-wallet ("w")
       (let* ((wallet (%wenc-fresh-wallet node "w"))
-             (full (length (bl.wallet::wallet-db-records
+             (full (length (wallet-db-record-list
                             (bl.wallet::wallet-db wallet)))))
         (is (plusp full))
         ;; The error check is wired in and returns cleanly on a healthy DB.
@@ -1341,6 +1341,118 @@ wallet that is missing keys."
           (bl.wallet::rpc-backupwallet node (list (namestring path)))
           (is (= full (length (bl.wallet::%parse-wallet-dump
                                path (bl.wallet::wallet-network wallet))))))))))
+
+;;; --- The record scan and the dump hold one record, not the database ---
+
+(defparameter +wenc-bulk-records+ 20000
+  "Records in the bulk fixture below. With +WENC-BULK-VALUE-SIZE+ this is
+about 10 MB of values -- enough that holding the whole set is unmistakable in
+the heap, and small enough to build in a couple of seconds.")
+
+(defparameter +wenc-bulk-value-size+ 500)
+
+(defun %wenc-bulk-record-db (directory)
+  "A wallet database at DIRECTORY holding +WENC-BULK-RECORDS+ inert records.
+Returned open; the caller closes it."
+  (let ((db (bl.wallet::wallet-db-open directory :create t))
+        (value (make-array +wenc-bulk-value-size+
+                           :element-type '(unsigned-byte 8) :initial-element 7)))
+    (dotimes (i +wenc-bulk-records+ db)
+      (bl.store:leveldb-put
+       db (bl.wallet::wdb-key-simple (format nil "ga11junk~6,'0D" i)) value))))
+
+(defun %wenc-heap-mib (base)
+  "Whole MiB the live heap sits above BASE. Caller has just collected."
+  (round (- (sb-kernel:dynamic-usage) base) (* 1024 1024)))
+
+(defun %wenc-consed-mib (base)
+  (round (- (sb-ext:get-bytes-consed) base) (* 1024 1024)))
+
+(test wenc-record-scan-streams-one-record-at-a-time
+  "MAP-WALLET-DB-RECORDS is a driver: the callback sees one record at a time
+and the scan retains none of them, which is what keeps loadwallet's peak heap
+off the size of the wallet file. The collecting shape is measured over the
+same database in the same run as the positive control -- a heap ceiling with
+nothing to compare against passes whatever the driver does."
+  (with-temp-directory (dir)
+    (let ((db (%wenc-bulk-record-db (merge-pathnames "db/" dir)))
+          (collected nil)
+          (control 0)
+          (streamed 0)
+          (seen 0))
+      (unwind-protect
+           (progn
+             (sb-ext:gc :full t)
+             (let ((base (sb-kernel:dynamic-usage)))
+               (setf collected (wallet-db-record-list db))
+               (sb-ext:gc :full t)
+               (setf control (%wenc-heap-mib base)))
+             (is (= +wenc-bulk-records+ (length collected)))
+             (setf collected nil)
+             (sb-ext:gc :full t)
+             (let ((base (sb-kernel:dynamic-usage)))
+               (bl.wallet::map-wallet-db-records
+                db (lambda (key value)
+                     (declare (ignore key value))
+                     (incf seen)
+                     (when (= seen (floor +wenc-bulk-records+ 2))
+                       (sb-ext:gc :full t)
+                       (setf streamed (%wenc-heap-mib base))))))
+             (is (= +wenc-bulk-records+ seen))
+             ;; Positive control: collecting really does retain a heap the
+             ;; size of the database.
+             (is (> control 4)
+                 "the collecting shape retained only ~D MiB; the fixture is too small ~
+to measure anything" control)
+             (is (< streamed (floor control 4))
+                 "streaming retained ~D MiB against the collecting shape's ~D"
+                 streamed control))
+        (bl.store:leveldb-close db)))))
+
+(test wenc-backup-does-not-buffer-the-whole-dump
+  "%WRITE-WALLET-DUMP writes and hashes each line as it is produced. The
+positive control is the shape it replaced -- every record hex-encoded into a
+list of lines, concatenated into one body string, then hashed -- run over the
+same database in the same test."
+  (with-temp-directory (dir)
+    (let* ((db-path (merge-pathnames "db/" dir))
+           (db (%wenc-bulk-record-db db-path))
+           (wallet (bl.wallet::make-wallet :name "ga11dump" :path db-path
+                                           :db db :network :regtest))
+           (path (merge-pathnames "dump.txt" dir))
+           (streamed 0)
+           (buffered 0))
+      (unwind-protect
+           (progn
+             (sb-ext:gc :full t)
+             (let ((base (sb-ext:get-bytes-consed)))
+               (bl.wallet::%write-wallet-dump wallet path)
+               (setf streamed (%wenc-consed-mib base)))
+             (is (probe-file path))
+             (sb-ext:gc :full t)
+             (let ((base (sb-ext:get-bytes-consed)))
+               (let* ((lines (mapcar (lambda (record)
+                                       (format nil "~(~A,~A~)"
+                                               (bl.crypto:bytes-to-hex (car record))
+                                               (bl.crypto:bytes-to-hex (cdr record))))
+                                     (wallet-db-record-list db)))
+                      (body (with-output-to-string (s)
+                              (dolist (line lines)
+                                (write-string line s)
+                                (write-char #\Newline s)))))
+                 (is (plusp (length (bl.crypto:hash256
+                                     (flexi-streams:string-to-octets
+                                      body :external-format :latin-1)))))
+                 (setf buffered (%wenc-consed-mib base))))
+             ;; Positive control: buffering the dump really does cost many
+             ;; times the file it writes.
+             (is (> buffered 50)
+                 "the buffered shape consed only ~D MiB; the fixture is too small ~
+to measure anything" buffered)
+             (is (< streamed (floor buffered 3))
+                 "the streaming dump consed ~D MiB against the buffered shape's ~D"
+                 streamed buffered))
+        (bl.store:leveldb-close db)))))
 
 (test wenc-restore-refuses-cross-network-dump
   "The dump records its network. A mainnet backup must not restore onto a

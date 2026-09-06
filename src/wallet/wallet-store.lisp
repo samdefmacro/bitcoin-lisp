@@ -426,23 +426,40 @@ compiles first — can SETF its slots."
                                     (uiop:ensure-directory-pathname path)))
        t))
 
-(defun wallet-db-records (db)
-  "All (key . value) byte-vector pairs in DB, in key order.
+(defun map-wallet-db-records (db function)
+  "Call FUNCTION with the key and the value of every record in DB, in key
+order. Both are fresh byte vectors, so the callback may keep either one.
 
-Signals rather than returning a short list if the scan stopped on an I/O or
+A DRIVER, not a collector: Core's loader never holds more than one record
+either (LoadRecords runs a cursor through a per-type load function,
+walletdb.cpp:471-506), and a wallet's whole record set is the wallet file. A
+caller that needs two orderings iterates twice — LevelDB re-reads are cheap
+next to holding the file in the heap.
+
+Signals rather than stopping quietly if the scan ended on an I/O or
 corruption error: a bad block only makes the iterator go invalid, which is
-indistinguishable from reaching the end. Every caller here — wallet load and
-backup — is wrong in a dangerous way if it silently sees a subset."
-  (let ((out '()))
-    (bl.store:with-leveldb-iterator (iter db)
-      (bl.store:leveldb-iter-seek-to-first iter)
-      (loop while (bl.store:leveldb-iter-valid-p iter)
-            do (push (cons (bl.store:leveldb-iter-key iter)
-                           (bl.store:leveldb-iter-value iter))
-                     out)
-               (bl.store:leveldb-iter-next iter))
-      (bl.store:leveldb-iter-check-error iter))
-    (nreverse out)))
+indistinguishable from reaching the end. Every caller here — wallet load,
+backup and rewrite — is wrong in a dangerous way if it silently sees a
+subset."
+  (declare (type function function))
+  (bl.store:with-leveldb-iterator (iter db)
+    (bl.store:leveldb-iter-seek-to-first iter)
+    (loop while (bl.store:leveldb-iter-valid-p iter)
+          do (funcall function
+                      (bl.store:leveldb-iter-key iter)
+                      (bl.store:leveldb-iter-value iter))
+             (bl.store:leveldb-iter-next iter))
+    (bl.store:leveldb-iter-check-error iter)))
+
+(defmacro with-wallet-db-records ((key value db) &body body)
+  "Run BODY once per record of DB, in key order, with KEY and VALUE bound to
+that record's byte vectors. MAP-WALLET-DB-RECORDS with the callback written
+inline, so the truncated-scan guarantee is the same one."
+  `(map-wallet-db-records
+    ,db
+    (lambda (,key ,value)
+      (declare (ignorable ,key ,value))
+      ,@body)))
 
 ;;; --- Rewriting the database (Core WalletDatabase::Rewrite) ---
 ;;;
@@ -597,12 +614,11 @@ that follows decides which directory gets opened."
                          :direction :output :if-exists :supersede
                          :if-does-not-exist :create)
       (write-line "bitcoin-lisp wallet database rewrite" out))
-    (let ((records (wallet-db-records db))
-          (new-db (wallet-db-open rewrite :create t)))
+    (let ((new-db (wallet-db-open rewrite :create t)))
       (unwind-protect
            (bl.store:with-leveldb-writebatch (batch)
-             (dolist (record records)
-               (bl.store:leveldb-writebatch-put batch (car record) (cdr record)))
+             (with-wallet-db-records (key value db)
+               (bl.store:leveldb-writebatch-put batch key value))
              (bl.store:leveldb-write new-db batch :sync t))
         (bl.store:leveldb-close new-db)))
     (%fsync-wallet-directory rewrite)
