@@ -7286,6 +7286,130 @@ into the finalizer would push three signatures at a 2-of-3 and fail there."
               (handler-case (progn (%p2wsh-multisig-signing 2 3 '(0)) "no error")
                 (error (e) (princ-to-string e))))))
 
+(defun %direct-pushes (script)
+  "The data elements of SCRIPT when it is nothing but direct pushes (an opcode
+byte of 1..75 followed by that many bytes), which is what Core's PushAll emits
+for a scriptSig of the shapes below. Signals rather than returning a short list
+when a byte is not such a push, so a malformed scriptSig cannot read as a
+correct one with fewer elements."
+  (let ((out '()) (i 0) (n (length script)))
+    (loop while (< i n)
+          do (let ((len (aref script i)))
+               (assert (<= 1 len 75) ()
+                       "not a direct push at offset ~D of ~D: opcode ~2,'0X" i n len)
+               (assert (<= (+ i 1 len) n) ()
+                       "push at offset ~D runs past the end of the script" i)
+               (push (subseq script (1+ i) (+ i 1 len)) out)
+               (incf i (1+ len))))
+    (nreverse out)))
+
+(test rpc-signrawtransactionwithkey-p2sh-p2pk
+  "signrawtransactionwithkey signs a P2SH(P2PK) input (input 0), with a
+P2SH(P2PKH) input of the same key (input 1) alongside as the control that would
+fail with it.
+
+Core reaches both by ONE step: ProduceSignature answers SCRIPTHASH by taking
+the redeemScript out of the first SignStep's result and calling SignStep AGAIN
+on it (sign.cpp:743-752), which lands on the very PUBKEY (sign.cpp:643-647) and
+PUBKEYHASH (:648-660) cases a bare script uses; the redeemScript is then
+appended to the result and the whole thing pushed (:790-795). So the scriptSig
+is the bare shape's pushes followed by the redeemScript: <sig> <redeem> for
+P2SH-P2PK and <sig> <pubkey> <redeem> for P2SH-P2PKH, and the signature is over
+the REDEEM script as the subscript, never over the scriptPubKey.
+
+Before the redeem recursion existed this call answered complete=false with
+\"Input 0: unsupported redeemScript type\" and the same for input 1 -- the P2SH
+arm knew only its three segwit/multisig shapes -- so a sh(pk(K)) coin, which
+importdescriptors accepts and the wallet counts, could not be spent at all."
+  (let* ((node (make-test-node))
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (wif (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (pub (bl.crypto:derive-public-key k1))
+         (pkh (bl.crypto:hash160 pub))
+         (rd-pk (concatenate '(vector (unsigned-byte 8))
+                             (vector (length pub)) pub (vector #xac)))
+         (rd-pkh (concatenate '(vector (unsigned-byte 8))
+                              (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+         (spk-sh-pk (concatenate '(vector (unsigned-byte 8))
+                                 (vector #xa9 #x14) (bl.crypto:hash160 rd-pk)
+                                 (vector #x87)))
+         (spk-sh-pkh (concatenate '(vector (unsigned-byte 8))
+                                  (vector #xa9 #x14) (bl.crypto:hash160 rd-pkh)
+                                  (vector #x87)))
+         (spks (vector spk-sh-pk spk-sh-pkh))
+         (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 30))
+         (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 31))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid0 :index 0)
+                               :script-sig empty :sequence #xffffffff)
+                              (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid1 :index 0)
+                               :script-sig empty :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 190000 :script-pubkey rd-pkh))
+              :lock-time 0))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex txid0))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk-sh-pk))
+                              (cons "amount" 0.001d0)
+                              (cons "redeemScript" (bl.crypto:bytes-to-hex rd-pk)))
+                        (list (cons "txid" (bl.rpc:hash-to-hex txid1))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk-sh-pkh))
+                              (cons "amount" 0.001d0)
+                              (cons "redeemScript" (bl.crypto:bytes-to-hex rd-pkh)))))
+         (result (bl.rpc:dispatch-rpc-method
+                  node "signrawtransactionwithkey"
+                  (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))
+                        (list wif) prevtxs))))
+    (is (eq t (cdr (assoc "complete" result :test #'string=)))
+        "signer reported ~S" (cdr (assoc "errors" result :test #'string=)))
+    (let* ((tx2 (bl.ser:parse-tx-payload
+                 (bl.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (ins (bl.ser:transaction-inputs tx2))
+           (spent (make-array 2)))
+      (dotimes (j 2)
+        (setf (aref spent j)
+              (bl.store:make-utxo-entry
+               :value 100000
+               :script-pubkey (coerce (aref spks j)
+                                      '(simple-array (unsigned-byte 8) (*))))))
+      ;; Both inputs pass the full consensus interpreter, which is the only
+      ;; statement that means the coin moved.
+      (dotimes (j 2)
+        (is-true (%verify-tx-input tx2 j spent "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S")
+                 "input ~D does not verify" j))
+      ;; Input 0 (P2SH-P2PK): <sig> <redeemScript>, and nothing else.
+      (let* ((pushes (%direct-pushes (bl.ser:tx-in-script-sig (aref ins 0))))
+             (sig (first pushes)))
+        (is (= 2 (length pushes))
+            "P2SH-P2PK scriptSig carries ~D pushes, Core's is the signature and ~
+the redeemScript" (length pushes))
+        (is (equalp rd-pk (second pushes)))
+        (is-true (and sig
+                      (bl.crypto:verify-signature
+                       (bl.interop:compute-legacy-sighash tx2 0 rd-pk 1)
+                       (subseq sig 0 (1- (length sig)))
+                       pub))
+                 "the P2SH-P2PK signature is not over the redeemScript"))
+      ;; Input 1 (P2SH-P2PKH control): <sig> <pubkey> <redeemScript>.
+      (let* ((pushes (%direct-pushes (bl.ser:tx-in-script-sig (aref ins 1))))
+             (sig (first pushes)))
+        (is (= 3 (length pushes))
+            "P2SH-P2PKH scriptSig carries ~D pushes, Core's is the signature, ~
+the pubkey and the redeemScript" (length pushes))
+        (is (equalp pub (second pushes)))
+        (is (equalp rd-pkh (third pushes)))
+        (is-true (and sig
+                      (bl.crypto:verify-signature
+                       (bl.interop:compute-legacy-sighash tx2 1 rd-pkh 1)
+                       (subseq sig 0 (1- (length sig)))
+                       pub))
+                 "the P2SH-P2PKH signature is not over the redeemScript")))))
+
 ;;; --- createmultisig (Bitcoin Core createmultisig) ---
 ;;; Compressed key pair from Core's createmultisig help example.
 

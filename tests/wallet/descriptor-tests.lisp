@@ -1498,6 +1498,30 @@ sweep still fails but for a coin that looks fine."
                            :test #'string=)
                      "the node did not accept the transaction the wallet signed")))))))
 
+(test sh-p2pk-coin-is-spendable-through-the-wallet-rpcs
+  "sh(pk(K)) -- a P2SH output whose redeemScript is a bare P2PK -- imports,
+receives and, since the P2SH arm learned Core's redeemScript recursion, spends.
+
+Core needs no separate case for it: ProduceSignature answers SCRIPTHASH by
+calling SignStep AGAIN on the redeemScript (sign.cpp:743-752), which lands on
+the same TxoutType::PUBKEY case (:643-647) a bare pk() uses. Our P2SH arm knew
+only its three segwit/multisig shapes, so importdescriptors accepted the
+descriptor, deriveaddresses handed out an address, the funding wallet paid it
+and getbalance counted the coin -- and every spend ended in complete:false with
+\"unsupported redeemScript type\". A coin that looks like the wallet's and is
+not spendable by it is the same shape the bare-P2PK finding above had."
+  (let ((result (descriptor-spend-e2e
+                 (format nil "sh(pk(~A))" (regtest-wif 23))
+                 :suffix "sh-pk")))
+    (is-true (getf result :imported) "importdescriptors refused: ~S" result)
+    (is-true (getf result :address))
+    (is (= 1.0d0 (getf result :balance))
+        "the wallet must count the coin before the spend is even attempted")
+    (is-true (getf result :complete)
+             "signrawtransactionwithwallet reported ~S" (getf result :errors))
+    (is-true (getf result :accepted)
+             "the node refused the spend the wallet signed")))
+
 (test script-num-serializes-like-cscriptnum
   "Core's CScript << int64_t (script.h:433) pushes CScriptNum::serialize, which
 appends a 0x00 sign byte whenever the top bit of the last byte is set.
