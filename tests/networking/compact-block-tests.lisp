@@ -1122,6 +1122,12 @@ about three."
     (is (null (bl.net:peer-compact-block-high-bandwidth-to peer))
         "negotiation must not mark the peer HB")))
 
+(defun %hb-peers ()
+  "The HB announcement list (Core lNodesAnnouncingHeaderAndIDs) as the
+production code left it. The one read of the internal in this file; the tests
+that need an empty list still bind it."
+  bl.net::*hb-announcing-peers*)
+
 (test g7-16-hb-selection-capped-at-three-demoting-oldest
   "Core caps the HB set at 3 and demotes the OLDEST (front of
 lNodesAnnouncingHeaderAndIDs). A peer already selected is only moved to the
@@ -1132,16 +1138,16 @@ protocol anomaly."
       (let ((a (%g716-peer)) (b (%g716-peer)) (c (%g716-peer)) (d (%g716-peer)))
         (dolist (p (list a b c))
           (bl.net:maybe-set-peer-announcing-hb p))
-        (is (equal (list a b c) bl.net::*hb-announcing-peers*))
+        (is (equal (list a b c) (%hb-peers)))
         (is (every #'bl.net:peer-compact-block-high-bandwidth-to
                    (list a b c)))
         ;; Re-selecting an existing peer only reorders it.
         (bl.net:maybe-set-peer-announcing-hb a)
-        (is (equal (list b c a) bl.net::*hb-announcing-peers*)
+        (is (equal (list b c a) (%hb-peers))
             "an already-selected peer moves to the back")
         ;; A fourth peer evicts the oldest (now b).
         (bl.net:maybe-set-peer-announcing-hb d)
-        (is (equal (list c a d) bl.net::*hb-announcing-peers*))
+        (is (equal (list c a d) (%hb-peers)))
         (is (null (bl.net:peer-compact-block-high-bandwidth-to b))
             "the evicted peer must be demoted to low bandwidth")))))
 
@@ -1162,10 +1168,10 @@ the wrong end of the reorg disconnect pool."
         ;; Outbound peer is at the FRONT and is the only outbound entry.
         (dolist (p (list out in1 in2))
           (bl.net:maybe-set-peer-announcing-hb p))
-        (is (equal (list out in1 in2) bl.net::*hb-announcing-peers*))
+        (is (equal (list out in1 in2) (%hb-peers)))
         ;; Promoting another inbound peer must NOT evict the lone outbound one.
         (bl.net:maybe-set-peer-announcing-hb in3)
-        (is (member out bl.net::*hb-announcing-peers*)
+        (is (member out (%hb-peers))
             "the last outbound HB peer must be protected from inbound eviction")
         (is-true (bl.net:peer-compact-block-high-bandwidth-to out))
         (is (null (bl.net:peer-compact-block-high-bandwidth-to in1))
@@ -1178,7 +1184,7 @@ reconstruct the block."
   (let ((bl.net::*hb-announcing-peers* '()))
     (%g716-quiet
       (bl.net:maybe-set-peer-announcing-hb (%g716-peer :version 0))
-      (is (null bl.net::*hb-announcing-peers*)
+      (is (null (%hb-peers))
           "a peer that never signalled compact-block support is not eligible"))))
 
 (test g7-16-disconnected-hb-peer-neither-counts-nor-squats
@@ -1202,7 +1208,7 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
         (dolist (p (list out in1 in2))
           (bl.net:maybe-set-peer-announcing-hb p))
         (bl.net:maybe-set-peer-announcing-hb in3)
-        (is (equal (list out in2 in3) bl.net::*hb-announcing-peers*)
+        (is (equal (list out in2 in3) (%hb-peers))
             "control: a LIVE lone outbound HB peer is protected, in1 is evicted")
         (is (null (bl.net:peer-compact-block-high-bandwidth-to in1)))))
     ;; FIX — identical shape, but `out' goes away through the production
@@ -1219,14 +1225,14 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
           (bl.net:maybe-set-peer-announcing-hb p))
         (bl.net:disconnect-peer out)
         (bl.net:maybe-set-peer-announcing-hb in3)
-        (is (equal (list in1 in2 in3) bl.net::*hb-announcing-peers*)
+        (is (equal (list in1 in2 in3) (%hb-peers))
             "a dead peer must not be counted as outbound, protected, or kept")
-        (is (null (member out bl.net::*hb-announcing-peers*))
+        (is (null (member out (%hb-peers)))
             "the dead peer's slot must be reclaimed, not squatted")
         (is-true (bl.net:peer-compact-block-high-bandwidth-to in1)
                  "a LIVE inbound HB peer must not be evicted to defend a corpse")
         (is (= 3 (count-if #'bl.net::%hb-peer-live-p
-                           bl.net::*hb-announcing-peers*))
+                           (%hb-peers)))
             "all three slots hold peers that can actually announce")))))
 
 ;;;; ------------------------------------------------------------
@@ -1313,7 +1319,7 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
           (%cbp-handle-cmpctblock peer (%g716-cmpctblock-payload bad) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 0 (bl.store:current-height cs))
               "the bogus block must not have connected")
-          (is (null bl.net::*hb-announcing-peers*)
+          (is (null (%hb-peers))
               "a peer delivering an INVALID compact block must not be promoted")
           (is (null (bl.net:peer-compact-block-high-bandwidth-to peer)))))
        ;; CONTROL: the same path with a VALID block does promote — otherwise the
@@ -1323,7 +1329,7 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
           (%cbp-handle-cmpctblock peer (%g716-cmpctblock-payload good) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the good block connected")
-          (is (equal (list peer) bl.net::*hb-announcing-peers*)
+          (is (equal (list peer) (%hb-peers))
               "a peer delivering a VALID compact block earns high bandwidth")
           (is-true (bl.net:peer-compact-block-high-bandwidth-to
                     peer))))))))
@@ -1490,7 +1496,7 @@ fix on half the compact traffic without failing the cmpctblock test."
           (let ((peer (%g716-delivering-peer "198.51.100.21")))
             (%deliver peer (list (make-simple-tx #x99)))
             (is (= 0 (bl.store:current-height cs)))
-            (is (null bl.net::*hb-announcing-peers*)
+            (is (null (%hb-peers))
                 "an INVALID blocktxn completion must not be promoted")))
          ;; CONTROL: the real transactions complete a valid block — promoted.
          (%g716-with-fresh-hb
@@ -1498,7 +1504,7 @@ fix on half the compact traffic without failing the cmpctblock test."
             (%deliver peer (bl.ser:bitcoin-block-transactions good))
             (is (= 1 (bl.store:current-height cs))
                 "the completed block connected")
-            (is (equal (list peer) bl.net::*hb-announcing-peers*)
+            (is (equal (list peer) (%hb-peers))
                 "a VALID blocktxn completion earns high bandwidth"))))))))
 
 (test g7-16-full-block-delivery-earns-hb-promotion
@@ -1525,7 +1531,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
         (let ((peer (%g716-delivering-peer "198.51.100.18")))
           (bl.net::handle-block peer (%g716-block-payload (%g716-corrupt-block b1)) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 0 (bl.store:current-height cs)))
-          (is (null bl.net::*hb-announcing-peers*)
+          (is (null (%hb-peers))
               "an invalid full block must not earn high bandwidth")))
        ;; handle-block with a VALID block: promoted.
        (%g716-with-fresh-hb
@@ -1533,7 +1539,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
           (bl.net::handle-block peer (%g716-block-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the full block connected")
-          (is (equal (list peer) bl.net::*hb-announcing-peers*)
+          (is (equal (list peer) (%hb-peers))
               "a full-block delivery earns high bandwidth, like a compact one")
           (is-true (bl.net:peer-compact-block-high-bandwidth-to peer))))
        ;; The block-download path (dispatch-ibd-message "block"): its header is
@@ -1556,7 +1562,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
               (deliver-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store))
               (is (= 2 (bl.store:current-height cs))
                   "the downloaded block connected")
-              (is (equal (list peer) bl.net::*hb-announcing-peers*)
+              (is (equal (list peer) (%hb-peers))
                   "the block-download path promotes too")
               (is-true (bl.net:peer-compact-block-high-bandwidth-to
                         peer))))))))))
@@ -1694,7 +1700,7 @@ same path must promote."
           (%cbp-handle-cmpctblock a (%g716-cmpctblock-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "control: the first delivery of b1 connected")
-          (is (equal (list a) bl.net::*hb-announcing-peers*)
+          (is (equal (list a) (%hb-peers))
               "control: a genuinely-connecting cmpctblock delivery promotes")))
        (%g716-with-fresh-hb
         (let ((b (%g716-delivering-peer "198.51.100.31")))
@@ -1703,7 +1709,7 @@ same path must promote."
               "the replay connected nothing")
           (is (eq :ready (bl.net:peer-state b))
               "the replayer is NOT punished, so nothing else stops the promotion")
-          (is (null bl.net::*hb-announcing-peers*)
+          (is (null (%hb-peers))
               "replaying our own tip as a cmpctblock must not buy an HB slot")
           (is (null (bl.net:peer-compact-block-high-bandwidth-to b)))))
        ;;; --- full block (handle-block) ---------------------------------
@@ -1713,7 +1719,7 @@ same path must promote."
             (bl.net::handle-block c (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
             (is (= 2 (bl.store:current-height cs))
                 "control: the first delivery of b2 connected")
-            (is (equal (list c) bl.net::*hb-announcing-peers*)
+            (is (equal (list c) (%hb-peers))
                 "control: a genuinely-connecting full block promotes")))
          (%g716-with-fresh-hb
           (let ((d (%g716-delivering-peer "198.51.100.33")))
@@ -1722,7 +1728,7 @@ same path must promote."
                 "the replay connected nothing")
             (is (eq :ready (bl.net:peer-state d))
                 "the replayer is NOT punished")
-            (is (null bl.net::*hb-announcing-peers*)
+            (is (null (%hb-peers))
                 "replaying our own tip as a full block must not buy an HB slot")
             (is (null (bl.net:peer-compact-block-high-bandwidth-to d))))))
        ;;; --- blocktxn completion ---------------------------------------
@@ -1733,7 +1739,7 @@ same path must promote."
             (%g716-blocktxn-deliver e b3 txs cs utxo store mp)
             (is (= 3 (bl.store:current-height cs))
                 "control: the first blocktxn completion of b3 connected")
-            (is (equal (list e) bl.net::*hb-announcing-peers*)
+            (is (equal (list e) (%hb-peers))
                 "control: a genuinely-connecting blocktxn completion promotes")))
          (%g716-with-fresh-hb
           (let ((f (%g716-delivering-peer "198.51.100.35")))
@@ -1742,7 +1748,7 @@ same path must promote."
                 "the replay connected nothing")
             (is (eq :ready (bl.net:peer-state f))
                 "the replayer is NOT punished")
-            (is (null bl.net::*hb-announcing-peers*)
+            (is (null (%hb-peers))
                 "replaying our own tip as a blocktxn completion must not buy an HB slot")
             (is (null (bl.net:peer-compact-block-high-bandwidth-to
                        f))))))))))
@@ -1772,7 +1778,7 @@ the connection gate on its own."
           (bl.net::handle-block a (%g716-block-payload main) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "control: the first sibling connected")
-          (is (equal (list a) bl.net::*hb-announcing-peers*)
+          (is (equal (list a) (%hb-peers))
               "control: the connecting sibling's deliverer is promoted")))
        (%g716-with-fresh-hb
         (let ((b (%g716-delivering-peer "198.51.100.41")))
@@ -1787,7 +1793,7 @@ the connection gate on its own."
 valid-yet-unconnected case, not a rejection")
           (is (eq :ready (bl.net:peer-state b))
               "storing a side branch is not misbehaviour")
-          (is (null bl.net::*hb-announcing-peers*)
+          (is (null (%hb-peers))
               "a stored-but-unconnected block must not earn high bandwidth")
           (is (null (bl.net:peer-compact-block-high-bandwidth-to
                      b)))))))))
