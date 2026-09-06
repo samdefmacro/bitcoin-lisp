@@ -65,6 +65,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:test-pubkey
    #:make-mempool-test-tx
    #:make-spending-test-tx
+   #:multisig-script
    #:bpe-test-id
    #:bpe-simulate
    #:bpe-populated-estimator

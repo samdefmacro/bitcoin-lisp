@@ -7079,15 +7079,6 @@ SPENT-VEC supplying amounts/scriptPubKeys. Returns verify-script's result."
           sig-bytes spk :witness witness-stack :amount amount)
       (bl.interop:set-script-flags nil))))
 
-(defun %multisig-script (m pubs)
-  "OP_m <pub>... OP_n OP_CHECKMULTISIG for the list of compressed PUBS."
-  (apply #'concatenate '(vector (unsigned-byte 8))
-         (vector (+ #x50 m))
-         (append (mapcar (lambda (p) (concatenate '(vector (unsigned-byte 8))
-                                                  (vector (length p)) p))
-                         pubs)
-                 (list (vector (+ #x50 (length pubs)) #xae)))))
-
 (test rpc-signrawtransactionwithkey-p2sh-and-multisig
   "signrawtransactionwithkey signs a tx mixing P2SH-P2WPKH, P2SH-multisig (legacy),
 P2WSH-multisig, P2SH-P2WSH-multisig, and bare multisig inputs; complete=t and EVERY
@@ -7103,8 +7094,8 @@ DERSIG+LOW_S)."
          (pa (bl.crypto:derive-public-key ka))
          (pb (bl.crypto:derive-public-key kb))
          (pkha (bl.crypto:hash160 pa))
-         (ms22 (%multisig-script 2 (list pa pb)))    ; 2-of-2 A,B
-         (ms11 (%multisig-script 1 (list pa)))       ; 1-of-1 A
+         (ms22 (multisig-script 2 (list pa pb)))    ; 2-of-2 A,B
+         (ms11 (multisig-script 1 (list pa)))       ; 1-of-1 A
          ;; redeem/witness + scriptPubKeys
          (rd-p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) pkha))
          (rd-p2wsh (concatenate '(vector (unsigned-byte 8))
@@ -7172,6 +7163,128 @@ DERSIG+LOW_S)."
                :script-pubkey (coerce (aref spks j) '(simple-array (unsigned-byte 8) (*))))))
       (dotimes (j 5)
         (is-true (%verify-tx-input tx2 j spent "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S"))))))
+
+;;; --- Multisig signature collection vs the m-of-n cap (GA11 42a8a239) ---
+
+(defun %p2wsh-multisig-signing (m n held-indices)
+  "Sign one P2WSH bare m-of-n input whose signer holds exactly the keys at
+HELD-INDICES (0-based positions in the witnessScript's pubkey order), and
+report both halves of Core's SignStep split.
+
+Returns (values ecdsa-pairs witness verified-p pubkeys): the pairs
+COMPUTE-INPUT-SIGNATURES collected, the witness stack the SHIPPED
+signrawtransactionwithkey assembled from them, and the consensus
+interpreter's verdict on that witness -- the only evidence that a change to
+either half still spends."
+  (let* ((node (make-test-node))
+         (sks (loop for i from 0 below n
+                    collect (let ((k (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 0)))
+                              (setf (aref k 31) (+ 11 i))
+                              k)))
+         (pks (mapcar #'bl.crypto:derive-public-key sks))
+         (witscript (multisig-script m pks))
+         (spk (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20)
+                           (bl.crypto:sha256 witscript)))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #xC3))
+         (amount 100000)
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
+                                                 :hash prev-txid :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 90000 :script-pubkey spk))
+              :lock-time 0))
+         (pubmap (make-hash-table :test 'equalp))
+         (pairs nil))
+    (dolist (i held-indices)
+      (setf (gethash (nth i pks) pubmap) (nth i sks)))
+    ;; The collection half, read straight off the input-sig.
+    (let ((bl.interop:*current-tx* tx))
+      (multiple-value-bind (sig err)
+          (bl.rpc:compute-input-signatures
+           tx 0 (list spk amount nil witscript)
+           (make-hash-table :test 'equalp) pubmap
+           (make-hash-table :test 'equalp) #x01 nil nil)
+        (when err (error "compute-input-signatures: ~A" err))
+        (setf pairs (bl.rpc:input-sig-ecdsa sig))))
+    ;; The assembly half, through the shipped RPC.
+    (let* ((result (bl.rpc:dispatch-rpc-method
+                    node "signrawtransactionwithkey"
+                    (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))
+                          (loop for i in held-indices
+                                collect (bl.crypto:private-key-to-wif
+                                         (nth i sks) :network :mainnet :compressed t))
+                          (list (list (cons "txid" (bl.rpc:hash-to-hex prev-txid))
+                                      (cons "vout" 0)
+                                      (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
+                                      (cons "amount" (bl.rpc:satoshi->btc amount))
+                                      (cons "witnessScript"
+                                            (bl.crypto:bytes-to-hex witscript)))))))
+           (errors (cdr (assoc "errors" result :test #'string=)))
+           (signed (bl.ser:parse-tx-payload
+                    (bl.crypto:hex-to-bytes
+                     (cdr (assoc "hex" result :test #'string=)))))
+           (spent (vector (bl.store:make-utxo-entry
+                           :value amount
+                           :script-pubkey
+                           (coerce spk '(simple-array (unsigned-byte 8) (*)))))))
+      (when errors
+        (error "signrawtransactionwithkey: ~S" errors))
+      (values pairs
+              (coerce (aref (bl.ser:transaction-witness signed) 0) 'list)
+              (%verify-tx-input signed 0 spent
+                                "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S")
+              pks))))
+
+(test multisig-signing-collects-every-held-key-and-pushes-only-m
+  "GA11 42a8a239. Core's SignStep MULTISIG case calls CreateSig for EVERY key
+in vSolutions and caps only the STACK push at required+1 (script/sign.cpp:
+669-688), with the comment that it must always call CreateSig so that
+sigdata carries all possible signature/pubkey pairs for further PSBT
+processing. Ours stopped COLLECTING at the m-th key, so walletprocesspsbt
+recorded m PSBT_IN_PARTIAL_SIG records where Core records k, and a
+not-yet-finalized PSBT handed to further cosigners carried fewer spares than
+Core would have put there.
+
+The two halves are asserted separately, in Core's numbers:
+  - the collection: a 2-of-3 whose signer holds ALL THREE keys yields 3 pairs;
+  - the cap: the shipped signer's witness is still the CHECKMULTISIG dummy,
+    exactly 2 signatures and the witnessScript, and the consensus interpreter
+    accepts it.
+
+The k = m rows are the control that the collector was never the cap: a
+2-of-3 holding keys 2 and 3 (not 1) yields 2 pairs both before and after, and
+its witness must still verify -- a fix that removed the cap without moving it
+into the finalizer would push three signatures at a 2-of-3 and fail there."
+  ;; k > m: three held keys, Core collects three.
+  (multiple-value-bind (pairs witness verified pks)
+      (%p2wsh-multisig-signing 2 3 '(0 1 2))
+    (is (= 3 (length pairs)))
+    (is (equalp (list (first pks) (second pks) (third pks))
+                (mapcar #'car pairs)))
+    ;; The stack is capped where Core caps it: dummy + 2 sigs + witnessScript.
+    (is (= 4 (length witness)))
+    (is (zerop (length (first witness))))
+    (is-true verified)
+    ;; And the two signatures pushed are the FIRST TWO in pubkey order, the
+    ;; bytes the in-place spend path produced before the collector changed.
+    (is (equalp (cdr (first pairs)) (second witness)))
+    (is (equalp (cdr (second pairs)) (third witness))))
+  ;; k = m, and not the first m keys: unchanged, and still spendable.
+  (multiple-value-bind (pairs witness verified pks)
+      (%p2wsh-multisig-signing 2 3 '(1 2))
+    (is (= 2 (length pairs)))
+    (is (equalp (list (second pks) (third pks)) (mapcar #'car pairs)))
+    (is (= 4 (length witness)))
+    (is-true verified))
+  ;; k < m is still a threshold failure, reported by the shipped signer.
+  (is (search "multisig needs 2 sigs, have 1"
+              (handler-case (progn (%p2wsh-multisig-signing 2 3 '(0)) "no error")
+                (error (e) (princ-to-string e))))))
 
 ;;; --- createmultisig (Bitcoin Core createmultisig) ---
 ;;; Compressed key pair from Core's createmultisig help example.

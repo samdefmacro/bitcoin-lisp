@@ -285,22 +285,28 @@ else NIL. The classification is CLASSIFY-SCRIPT's (Core MatchMultisig)."
     (when (eq type :multisig)
       (values (getf data :m) (getf data :n) (getf data :pubkeys)))))
 
-(defun %collect-multisig-sig-pairs (sighash pubmap pubkeys m sighash-byte)
-  "ECDSA (pubkey . DER||sighash-byte) pairs for the keys we hold among PUBKEYS,
-in pubkey order, capped at M. CHECKMULTISIG requires sigs ordered as the pubkeys
-appear, which iterating PUBKEYS in order preserves. The cap at M matches the
-in-place signer's historical collection (finalize needs exactly M); the PSBT
-signer therefore records at most M partial sigs per multisig input."
-  (let ((pairs '()) (count 0))
+(defun %collect-multisig-sig-pairs (sighash pubmap pubkeys sighash-byte)
+  "ECDSA (pubkey . DER||sighash-byte) pairs for EVERY key we hold among
+PUBKEYS, in pubkey order. CHECKMULTISIG requires sigs ordered as the pubkeys
+appear, which iterating PUBKEYS in order preserves.
+
+No m-of-n cap here, which is Core's split: SignStep's MULTISIG case calls
+CreateSig for every key in vSolutions and caps only the STACK PUSH at
+required+1 (script/sign.cpp:669-688), with the comment `We need to always
+call CreateSig in order to fill sigdata with all possible signatures that we
+can create. This will allow further PSBT processing to work as it needs all
+possible signature and pubkey pairs.' The cap belongs to
+%FINALIZE-INPUT-SIGNATURES, so an m-of-n input signed by k > m held keys
+records k PSBT_IN_PARTIAL_SIG records -- the spares a cosigner workflow needs
+-- while the finalized scriptSig/witness stays byte-identical."
+  (let ((pairs '()))
     (dolist (pub pubkeys (nreverse pairs))
-      (when (< count m)
-        (let ((sk (gethash pub pubmap)))
-          (when sk
-            (push (cons pub (concatenate '(vector (unsigned-byte 8))
-                                         (bl.crypto:sign-ecdsa sk sighash)
-                                         (vector sighash-byte)))
-                  pairs)
-            (incf count)))))))
+      (let ((sk (gethash pub pubmap)))
+        (when sk
+          (push (cons pub (concatenate '(vector (unsigned-byte 8))
+                                       (bl.crypto:sign-ecdsa sk sighash)
+                                       (vector sighash-byte)))
+                pairs))))))
 
 ;;; --- Per-input signing split into (compute signatures) + (finalize) ---
 ;;;
@@ -507,7 +513,7 @@ must be bound by the caller."
                    (values (%collect-multisig-sig-pairs
                             (bl.interop:compute-legacy-sighash
                              tx i subscript sighash-byte)
-                            pubmap pubkeys m sighash-byte)
+                            pubmap pubkeys sighash-byte)
                            m)))
                (bip143-multisig (witscript)
                  (multiple-value-bind (m nn pubkeys) (parse-multisig witscript)
@@ -515,7 +521,7 @@ must be bound by the caller."
                    (values (%collect-multisig-sig-pairs
                             (bl.interop:compute-bip143-sighash
                              witscript amount sighash-byte)
-                            pubmap pubkeys m sighash-byte)
+                            pubmap pubkeys sighash-byte)
                            m)))
                (miniscript-stack (witscript)
                  (%wsh-miniscript-stack witscript tx i amount
@@ -636,9 +642,19 @@ byte-identical to the historical in-place signer's per-arm assembly. A NIL
 scriptsig leaves the input's scriptSig untouched; a NIL witness sets no witness.
 ERROR (a string) means the m-of-n threshold was not met — the same 'multisig
 needs N sigs, have K' report the old signer produced; single-key kinds never
-error here (a missing key already failed in compute-input-signatures)."
+error here (a missing key already failed in compute-input-signatures).
+
+This is also where the m-of-n CAP lives: COMPUTE-INPUT-SIGNATURES hands over
+one pair per HELD key, and SIGS takes the first NEEDED of them in pubkey
+order. That is Core's `if (ret.size() < required + 1) ret.push_back(...)'
+inside SignStep's MULTISIG case (script/sign.cpp:676-680) — the collection is
+uncapped so a PSBT keeps every signature, the stack is capped so the spend is
+the same bytes it always was."
   (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
-    (labels ((sigs () (mapcar #'cdr (input-sig-ecdsa sig)))
+    (labels ((sigs ()
+               (let ((pairs (input-sig-ecdsa sig)))
+                 (mapcar #'cdr (subseq pairs 0 (min (input-sig-needed sig)
+                                                    (length pairs))))))
              (threshold-error (prefix)
                (when (< (length (input-sig-ecdsa sig)) (input-sig-needed sig))
                  (format nil "~Amultisig needs ~D sigs, have ~D"
