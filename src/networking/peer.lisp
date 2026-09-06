@@ -1666,8 +1666,9 @@ misbehavior model is binary (Misbehaving -> m_should_discourage): any single
 call marks the peer for discouragement — there is no accumulating score. The
 address is added to the ephemeral discourage filter (never dialed, preferred
 for eviction, not gossiped) and the connection is dropped. REASON, if given, is
-logged. Returns T, or NIL when PEER holds the noban permission and was
-therefore left alone."
+logged. Returns T, or NIL when PEER was left alone -- because it holds the
+noban permission, or because it is a MANUAL connection; Core exempts both,
+independently."
   (when reason
     (bl:log-cat "net" "Misbehaving peer ~A: ~A"
                           (peer-address peer) reason))
@@ -1680,6 +1681,34 @@ therefore left alone."
   (when (peer-has-permission-p peer +perm-noban+)
     (bl:log-cat "net" "Not punishing whitelisted peer ~A"
                           (peer-address peer))
+    (return-from record-misbehavior nil))
+  ;; Core's SECOND exemption, and it is INDEPENDENT of the first
+  ;; (net_processing.cpp:5187-5190): "We never disconnect or discourage manual
+  ;; peers for bad behavior". A manual connection does not get NoBan by
+  ;; default -- CConnman gives an outbound dial NetPermissionFlags::None and
+  ;; consults vWhitelistedRangeOutgoing only for MANUAL connections
+  ;; (net.cpp:510-512) -- so an -addnode peer with no matching -whitelist
+  ;; ...,out entry holds no permissions at all and is exempt purely by being
+  ;; manual.
+  ;;
+  ;; Without it an operator-pinned peer that trips any misbehaviour site was
+  ;; disconnected AND discouraged, and CONNECT-PEER refuses a discouraged
+  ;; address outright -- which is the very call CONNECT-ADDED-NODES makes from
+  ;; maintain-peers on every tick. Our discourage filter is a 50,000-entry FIFO
+  ;; with no time expiry, so on any node that does not discourage tens of
+  ;; thousands of addresses the entry never rolls out and the pinned peer stays
+  ;; down until the process restarts. That removes the whole point of -addnode:
+  ;; the operator's ability to keep a peer whose implementation we disagree
+  ;; with, which is why Core's exemption exists and why Core logs it as a
+  ;; warning rather than acting.
+  ;;
+  ;; Deliberately a separate test rather than folding MANUAL into
+  ;; PEER-PERMISSION-FLAGS: those flags are address-derived and shared with
+  ;; inbound admission and eviction, and granting a manual peer NoBan would
+  ;; exempt it from those too, which Core does not do.
+  (when (peer-manual peer)
+    (bl:log-warn "Not punishing manually connected peer ~A"
+                 (peer-address peer))
     (return-from record-misbehavior nil))
   ;; Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201):
   ;; disconnect a local peer for bad behaviour but do NOT discourage it,
