@@ -7057,6 +7057,15 @@ yason:encode signals inside rpc-handler — the only way to reach its
 outermost internal-error clause, since handle-single-request catches
 everything a method itself signals.")
 
+(defparameter *jsonrpc-stack-eating-method* "ga11stackeater"
+  "A method whose handler recurses without a base case, so it raises SBCL's
+CONTROL-STACK-EXHAUSTED -- a STORAGE-CONDITION, and NOT an ERROR.")
+
+(defun jsonrpc-eat-the-control-stack (n)
+  "Recurse until the control stack is gone. Not tail-recursive on purpose:
+the caller's frame has to survive the call, or this is a loop."
+  (1+ (jsonrpc-eat-the-control-stack (1+ n))))
+
 (defun call-with-jsonrpc-handler-methods (thunk)
   "Register the handler tests' throwaway dispatch targets, run THUNK, then
 remove them so the global method registry is unchanged."
@@ -7066,9 +7075,18 @@ remove them so the global method registry is unchanged."
   (bl.rpc:register-rpc-method
    *jsonrpc-handler-dotted-method*
    (lambda (node params) (declare (ignore node params)) (cons 1 2)))
+  ;; A handler that raises SBCL's CONTROL-STACK-EXHAUSTED, which is a
+  ;; STORAGE-CONDITION and NOT an ERROR.
+  (bl.rpc:register-rpc-method
+   *jsonrpc-stack-eating-method*
+   (lambda (node params)
+     (declare (ignore node params))
+     (jsonrpc-eat-the-control-stack 0)))
   (unwind-protect (funcall thunk)
-    (remhash *jsonrpc-shape-method* bl.rpc::*rpc-methods*)
-    (remhash *jsonrpc-handler-dotted-method* bl.rpc::*rpc-methods*)))
+    (dolist (method (list *jsonrpc-shape-method*
+                          *jsonrpc-handler-dotted-method*
+                          *jsonrpc-stack-eating-method*))
+      (remhash method bl.rpc::*rpc-methods*))))
 
 (defmacro with-jsonrpc-handler-methods (&body body)
   `(call-with-jsonrpc-handler-methods (lambda () ,@body)))
@@ -7635,3 +7653,41 @@ for the one reason `1' gives it, and FindInsaneSub blames nothing below it."
                                message)
                        "unexpected message tail: ~S"
                        (subseq message (max 0 (- (length message) 80)))))))))))
+
+(test jsonrpc-a-storage-condition-answers-the-caller-and-the-server-serves-on
+  "A STORAGE-CONDITION is a SERIOUS-CONDITION and not an ERROR (probed on SBCL
+2.6.5: (subtypep 'storage-condition 'error) is NIL), so every `(error (e) ...)'
+clause on the request path stepped straight over one. The worker thread died
+holding the connection, and the caller waited for a reply that was never going
+to come.
+
+Two halves, and the second is the point: the connection gets a JSON-RPC error
+object, AND the same server answers the very next request normally -- which is
+what says the thread survived rather than being replaced.
+
+The message is asserted exactly because it is what distinguishes the clause
+under test: the ordinary error clause formats the CONDITION (its report text),
+the storage clause formats its TYPE. A blanket handler would print neither."
+  (with-jsonrpc-handler-methods
+    (multiple-value-bind (status json)
+        (jsonrpc-handler-reply
+         (format nil "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"~A\",\"params\":[]}"
+                 *jsonrpc-stack-eating-method*))
+      (is (eql hunchentoot:+http-ok+ status))
+      (let* ((reply (yason:parse json))
+             (err (and (hash-table-p reply) (gethash "error" reply))))
+        (is-true (hash-table-p err) "expected an error object, got ~S" json)
+        (when (hash-table-p err)
+          (is (eql bl.rpc:+rpc-internal-error+ (gethash "code" err)))
+          (is (string= "Internal error: CONTROL-STACK-EXHAUSTED"
+                       (gethash "message" err))))))
+    ;; ... and the next request is served as if nothing had happened.
+    (multiple-value-bind (status json)
+        (jsonrpc-handler-reply
+         (format nil "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"~A\",\"params\":[]}"
+                 *jsonrpc-shape-method*))
+      (is (eql hunchentoot:+http-ok+ status))
+      (let ((reply (yason:parse json)))
+        (is (eql 42 (and (hash-table-p reply) (gethash "result" reply)))
+            "the server stopped serving after the storage condition: ~S"
+            json)))))
