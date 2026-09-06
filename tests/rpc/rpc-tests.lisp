@@ -5141,8 +5141,39 @@ locktime present in the serialization, which is what made it convincing."
   (is (equal '(#x12345678)
              (crt-sequences (create-raw-tx (crt-one-input :sequence #x12345678)
                                            +crt-data-output+))))
+  ;; The out-of-range cases are RPC-CREATERAWTRANSACTION-SEQUENCE-RANGE below.
   (signals bl.rpc:rpc-error
     (create-raw-tx (crt-one-input :sequence #x100000000) +crt-data-output+)))
+
+(test rpc-createrawtransaction-sequence-range
+  "GA11 ce1283b3. Core's AddInputs reads a per-input sequence only when it
+isNum(), widens it to int64_t and refuses anything outside
+[0, CTxIn::SEQUENCE_FINAL] with \"Invalid parameter, sequence number is out of
+range\" BEFORE it builds the CTxIn (rawtransaction_util.cpp:57-66).
+
+Without that check the value reached (make-tx-in :sequence ...), whose slot is
+declared (unsigned-byte 32), and the raw SB-KERNEL::TYPE-ERROR came out of the
+request boundary as -32603 \"Internal error\" -- a caller's out-of-range
+argument reported as a node fault. The rows are rpc_rawtransaction.py:276-289
+verbatim, both rejections and both round-trips."
+  (dolist (invalid '(-1 4294967296))
+    (is (equal (cons -8 "Invalid parameter, sequence number is out of range")
+               (rpc-error-of
+                (lambda ()
+                  (create-raw-tx (crt-one-input :sequence invalid)
+                                 +crt-data-output+))))
+        "sequence ~D was not refused the way Core refuses it" invalid))
+  (dolist (valid '(1000 4294967294))
+    (is (equal (list valid)
+               (crt-sequences (create-raw-tx (crt-one-input :sequence valid)
+                                             +crt-data-output+)))
+        "sequence ~D did not round-trip" valid))
+  ;; A non-integer sequence is not a Lisp type error either.
+  (is (equal (cons -8 "Invalid parameter, sequence number is out of range")
+             (rpc-error-of
+              (lambda ()
+                (create-raw-tx (crt-one-input :sequence "foo")
+                               +crt-data-output+))))))
 
 (test rpc-createrawtransaction-takes-a-version
   "ConstructTransaction takes a version, defaulting to DEFAULT_RAWTX_VERSION =
