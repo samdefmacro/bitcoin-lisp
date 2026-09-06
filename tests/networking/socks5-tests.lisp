@@ -605,3 +605,64 @@ distinction the old assertion rested on was in the plist, not in behaviour."
   (let ((plist (bl::config-alist->start-node-plist
                 '(("proxy" . "127.0.0.1") ("bind" . "127.0.0.1")) :testnet4)))
     (is (eq t (getf plist :listen)))))
+
+;;; --- -dns / fNameLookup (finding 1f1f28b7) ------------------------------------
+
+(defun %dns-dial (host &key proxy-host proxy-port (name-lookup t))
+  "One MAKE-TCP-CONNECTION under -dns=NAME-LOOKUP, optionally through a proxy
+at PROXY-HOST:PROXY-PORT. Returns :CONNECTED, :REFUSED (NIL with no condition)
+or (:SIGNALLED <type>) — the last being the proof that the LOCAL resolver was
+consulted, since a name-service error is not a socket error and escapes
+MAKE-TCP-CONNECTION's handler."
+  (let ((bl.net:*name-lookup* name-lookup)
+        (bl.net:*proxy* (when proxy-host
+                          (bl.net:make-proxy :host proxy-host :port proxy-port
+                                             :randomize-credentials t))))
+    (handler-case
+        (let ((conn (bl.net:make-tcp-connection host 8333 :timeout 2)))
+          (cond (conn (bl.net:close-connection conn) :connected)
+                (t :refused)))
+      (condition (e) (list :signalled (type-of e))))))
+
+(test dns-off-stops-the-local-lookup-but-not-the-proxied-dial
+  "Core resolves a named dial target with Lookup(pszDest, port, fNameLookup &&
+!HaveNameProxy(), 256) (net.cpp:406): with -dns=0 and no name proxy the lookup
+returns nothing, the address is invalid and the target is never dialed. -dns
+was accepted and dropped here, so a named -addnode/-connect/-seednode still
+emitted one resolver query per target, disclosing the peer list this node was
+configured to reach (GA11 1f1f28b7).
+
+The -dns=1 runs are the positive control: they must reach the resolver, which
+they announce by signalling a name-service condition on a name that cannot
+resolve. A gate that refused every dial would fail them."
+  ;; No proxy: the name would go to the local resolver, so -dns=0 refuses it.
+  (is (equal :refused (%dns-dial "ga11-no-such-host-xyz.invalid" :name-lookup nil)))
+  (let ((consulted (%dns-dial "ga11-no-such-host-xyz.invalid" :name-lookup t)))
+    (is (and (consp consulted) (eq :signalled (first consulted)))
+        "with -dns=1 the local resolver must be consulted, got ~S" consulted))
+  ;; The other half of Core's condition: with a proxy the name travels inside
+  ;; the SOCKS5 CONNECT and no local lookup happens, so -dns=0 changes nothing.
+  (multiple-value-bind (port thread captured)
+      (%fake-socks5-server
+       `((:read 4) (:write #(#x05 #x02))
+         (:read-userpass) (:write #(#x01 #x00))
+         (:read-connect)
+         (:write #(#x05 #x00 #x00 #x01 10 0 0 1 #x20 #x8D))))
+    (is (equal :connected
+               (%dns-dial "seed.example.org" :proxy-host "127.0.0.1"
+                                             :proxy-port port :name-lookup nil))
+        "-dns=0 must not stop a dial whose name never reaches the resolver")
+    (bt:join-thread thread)
+    (let ((hostname (map 'vector #'char-code "seed.example.org")))
+      (is-true (search hostname captured :test #'equalp)
+               "the CONNECT must carry the hostname, unresolved")))
+  ;; And the one string a proxied dial CAN hand the resolver is the proxy's own
+  ;; host, which is what Core resolves under fNameLookup at init.cpp:1722.
+  (is (equal :refused
+             (%dns-dial "seed.example.org" :proxy-host "ga11-no-such-proxy.invalid"
+                                           :proxy-port 9050 :name-lookup nil)))
+  (let ((consulted (%dns-dial "seed.example.org"
+                              :proxy-host "ga11-no-such-proxy.invalid"
+                              :proxy-port 9050 :name-lookup t)))
+    (is (and (consp consulted) (eq :signalled (first consulted)))
+        "with -dns=1 the proxy's own name is resolved, got ~S" consulted)))

@@ -1906,6 +1906,29 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
+(test dns-is-a-real-option
+  "-dns left the accept-and-drop list (GA11 1f1f28b7). Core reads it into
+fNameLookup (init.cpp:1696, DEFAULT_NAME_LOOKUP = true) and every local name
+resolution is gated on it -- the dial target (net.cpp:406), -proxy, -onion,
+-externalip, -i2psam and -torcontrol. It is NOT what gates the DNS seeds; those
+are -dnsseed, and Core queries them with a hardcoded fAllowLookup
+(net.cpp:2371), which is why the two rows stay independent here."
+  (let ((saved bl.net:*name-lookup*))
+    (unwind-protect
+         (progn
+           ;; It defaults TRUE, so setting it to 0 is what proves the wiring.
+           (apply-config-globals '(("dns" . "0")))
+           (is-false bl.net:*name-lookup*)
+           (apply-config-globals '(("dns" . "1")))
+           (is-true bl.net:*name-lookup*))
+      (setf bl.net:*name-lookup* saved)))
+  (is-true bl.net:*name-lookup* "Core DEFAULT_NAME_LOOKUP is true")
+  ;; -dns=0 leaves -dnsseed alone: they are different options.
+  (let ((plist (start-node-plist '("-regtest" "-dns=0"))))
+    (is-false (member :dnsseed plist)))
+  (is-true (bl:known-config-option-p "dns"))
+  (is-false (bl.cfg:core-only-option-p "dns")))
+
 (test addresstype-and-changetype-are-real-options
   "-addresstype and -changetype left the accept-and-drop list (GA11 4d28b231).
 Core parses both with ParseOutputType in CWallet::LoadWalletArgs
