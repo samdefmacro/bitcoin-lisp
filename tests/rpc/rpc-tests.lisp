@@ -988,6 +988,99 @@ regression in either direction shows up."
               "~A ~S answered ~S, Core answers ~S"
               method params got (cons code message)))))))
 
+(test parse-fixed-point-is-cores
+  "PARSE-FIXED-POINT reproduces every vector in Core's test_ParseFixedPoint
+(test/util_tests.cpp:935-1007), at 8 decimals and at the 3 a sat/vB fee rate
+uses. The rejections carry the whole rule: no leading zero run, no bare
+'.1' or trailing '1.', no trailing garbage, a scale that must land in
+[0,18) once the decimals are added, and Core's UPPER_BOUND of 10^18-1
+rather than 2^63-1."
+  (dolist (row '(("0" 8 0) ("1" 8 100000000) ("0.0" 8 0)
+                 ("-0.1" 8 -10000000) ("1.1" 8 110000000)
+                 ("1.10000000000000000" 8 110000000)
+                 ("1.1e1" 8 1100000000) ("1.1e-1" 8 11000000)
+                 ("1000" 8 100000000000) ("-1000" 8 -100000000000)
+                 ("0.00000001" 8 1) ("0.0000000100000000" 8 1)
+                 ("-0.00000001" 8 -1)
+                 ("1000000000.00000001" 8 100000000000000001)
+                 ("9999999999.99999999" 8 999999999999999999)
+                 ("-9999999999.99999999" 8 -999999999999999999)
+                 ("" 8 nil) ("-" 8 nil) ("a-1000" 8 nil) ("-a1000" 8 nil)
+                 ("-1000a" 8 nil) ("-01000" 8 nil) ("00.1" 8 nil)
+                 (".1" 8 nil) ("--0.1" 8 nil)
+                 ("0.000000001" 8 nil) ("-0.000000001" 8 nil)
+                 ("0.00000001000000001" 8 nil)
+                 ("-10000000000.00000000" 8 nil) ("10000000000.00000000" 8 nil)
+                 ("-10000000000.00000001" 8 nil) ("10000000000.00000001" 8 nil)
+                 ("-10000000000.00000009" 8 nil) ("10000000000.00000009" 8 nil)
+                 ("-99999999999.99999999" 8 nil) ("99999909999.09999999" 8 nil)
+                 ("92233720368.54775807" 8 nil) ("92233720368.54775808" 8 nil)
+                 ("-92233720368.54775808" 8 nil) ("-92233720368.54775809" 8 nil)
+                 ("1.1e" 8 nil) ("1.1e-" 8 nil) ("1." 8 nil)
+                 ("0.001" 3 1) ("0.0009" 3 nil) ("31.00100001" 3 nil)
+                 ("31.0011" 3 nil) ("31.99999999" 3 nil)
+                 ("31.999999999999999999999" 3 nil)))
+    (destructuring-bind (text decimals expected) row
+      (let ((got (bl.rpc::parse-fixed-point text decimals)))
+        (is (equal expected got)
+            "ParseFixedPoint(~S, ~D) is ~S in Core, ~S here"
+            text decimals expected got)))))
+
+(test amount-from-value-is-cores
+  "AMOUNT-FROM-VALUE reproduces Core's rpc_parse_monetary_values
+(test/rpc_tests.cpp:280-312), and its number path agrees with its string
+path because Core's does: UniValue keeps a number's source text and
+AmountFromValue parses THAT.
+
+The split between the two messages is Core's and is asserted, not just the
+code: text whose SCALE does not fit is \"Invalid amount\" (1e-9,
+10000000000, 92233720368.54775808 -- the last two look like range errors and
+are not), while text that parses to a value outside [0, MAX_MONEY] is
+\"Amount out of range\" (-1, 21000001)."
+  (dolist (row (list (list "-0.00000001" "Amount out of range")
+                     (list "0" 0) (list "0.00000000" 0) (list "0.00000001" 1)
+                     (list "0.17622195" 17622195) (list "0.5" 50000000)
+                     (list "0.50000000" 50000000) (list "0.89898989" 89898989)
+                     (list "1.00000000" 100000000)
+                     (list "20999999.9999999" 2099999999999990)
+                     (list "20999999.99999999" 2099999999999999)
+                     (list "1e-8" 1) (list "0.1e-7" 1) (list "0.01e-6" 1)
+                     (list "0.00000000000000000000000000000000000001e+30" 1)
+                     (list "10000000000000000000000000000000000000000000000000000000000000000e-64"
+                           100000000)
+                     (list "1e-9" "Invalid amount")
+                     (list "0.000000019" "Invalid amount")
+                     (list "0.00000001000000" 1)
+                     (list "19e-9" "Invalid amount")
+                     (list "0.19e-6" 19)
+                     (list ".19e-6" "Invalid amount")
+                     (list "92233720368.54775808" "Invalid amount")
+                     (list "1e+11" "Invalid amount")
+                     (list "1e11" "Invalid amount")
+                     (list "93e+9" "Invalid amount")
+                     ;; Spellings the hand-rolled parser used to accept, and
+                     ;; Core does not: a leading zero run.
+                     (list "01" "Invalid amount")
+                     (list "00.1" "Invalid amount")
+                     (list "000" "Invalid amount")
+                     ;; The number path, through the same parser.
+                     (list 1 100000000) (list 0 0)
+                     (list 21000000 2100000000000000)
+                     (list 21000001 "Amount out of range")
+                     (list -1 "Amount out of range")
+                     (list 10000000000 "Invalid amount")
+                     (list 0.1d0 10000000) (list 1.0d0 100000000)
+                     (list 1d-8 1) (list 1d-9 "Invalid amount")
+                     (list -1.0d0 "Amount out of range")
+                     (list 1/2 50000000)
+                     (list t "Amount is not a number or string")
+                     (list nil "Amount is not a number or string")))
+    (destructuring-bind (value expected) row
+      (let ((got (handler-case (bl.rpc:amount-from-value value)
+                   (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
+        (is (equal expected got)
+            "AmountFromValue(~S) is ~S in Core, ~S here" value expected got)))))
+
 ;;; --- Method Registry Tests ---
 
 (test method-dispatch-unknown
