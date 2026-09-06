@@ -874,7 +874,8 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
           (when (and (stringp txid) (valid-hex-hash-p txid) (integerp vout) (stringp spk-hex))
             (setf (gethash (cons (parse-hex-hash txid) vout) prevmap)
                   (list (bl.crypto:hex-to-bytes spk-hex)
-                        (when (numberp amount) (round (* amount 100000000)))
+                        ;; Core ParsePrevouts: AmountFromValue when present.
+                        (when amount (amount-from-value amount))
                         (when (stringp redeem-hex) (bl.crypto:hex-to-bytes redeem-hex))
                         (when (stringp ws-hex) (bl.crypto:hex-to-bytes ws-hex)))))))
       ;; Sign whatever the supplied keys can satisfy (shared machinery).
