@@ -1906,6 +1906,33 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
+(test privatebroadcast-is-refused-rather-than-ignored
+  "-privatebroadcast left the accept-and-drop list (GA11 3be511c4). Core
+reserves a pool of short-lived Tor/I2P connections for transactions submitted
+through sendrawtransaction and keeps them out of the mempool entirely
+(net.h:77,89, rpc/mempool.cpp:115-126), and it REFUSES TO START when the option
+is set and neither network is reachable (init.cpp:2257-2265). None of that
+exists here, so that condition can never be satisfied and Core's refusal is the
+honest answer: accepting the flag let a node announce the operator's own
+transactions to its ordinary peers from its own address, which is the
+deanonymisation the option exists to prevent and cannot be undone."
+  (signals error (apply-config-globals '(("privatebroadcast" . "1"))))
+  (let ((reported (handler-case
+                      (progn (apply-config-globals '(("privatebroadcast" . "1")))
+                             "")
+                    (error (e) (princ-to-string e)))))
+    (is-true (search "(-privatebroadcast)" reported)
+             "the refusal must name the option: ~A" reported)
+    (is-true (search "Private broadcast of own transactions requested" reported)
+             "Core's own opening clause, so an operator can grep for it: ~A"
+             reported))
+  ;; Core's default is false, and that case must start normally -- the positive
+  ;; control for a refusal that simply fired on every node.
+  (finishes (apply-config-globals '(("privatebroadcast" . "0"))))
+  (finishes (apply-config-globals '(("regtest" . "1"))))
+  (is-true (bl:known-config-option-p "privatebroadcast"))
+  (is-false (bl.cfg:core-only-option-p "privatebroadcast")))
+
 (test dns-is-a-real-option
   "-dns left the accept-and-drop list (GA11 1f1f28b7). Core reads it into
 fNameLookup (init.cpp:1696, DEFAULT_NAME_LOOKUP = true) and every local name
