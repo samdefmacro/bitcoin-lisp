@@ -726,8 +726,12 @@ per-wtxid object. Status drives which fields are present."
         (base (list (cons "txid" (hash-to-hex
                                   (bl.val:package-tx-result-txid r))))))
     (flet ((btc (sat) (satoshi->btc (or sat 0)))
-           ;; sat/vB -> BTC/kvB, the unit Core reports feerates in.
-           (feerate-btc-kvb (rate) (satoshi->btc (* (or rate 0) 1000))))
+           ;; sat/vB -> BTC/kvB, the unit Core reports feerates in. FLOOR,
+           ;; because Core reports CFeeRate::GetFeePerK(), which is
+           ;; FeeFrac::EvaluateFeeDown(1000) (policy/feerate.h:62) -- an
+           ;; integer sat/kvB rounded DOWN, so the sub-satoshi remainder of a
+           ;; rational sat/vB never reaches the wire.
+           (feerate-btc-kvb (rate) (satoshi->btc (floor (* (or rate 0) 1000)))))
       (ecase status
         (:valid
          (append base

@@ -979,20 +979,75 @@ drives through an EMPTY inputs array are reachable at all."
 
 ;;; --- estimaterawfee (Core rpc/fees.cpp) and decodescript (rpc/rawtransaction.cpp) ---
 
+(defun %raw-fee-bucket-value (bucket key default)
+  "One field of an EstimatorBucket plist, as a double.
+
+A bucket the estimator did not record is NIL, and Core has a STRUCT there
+either way: the default EstimatorBucket (policy/fees/block_policy_estimator.h:
+72-80) has start and end -1 and the four counters 0. The -1 is the sentinel
+the success branch tests to decide whether a fail bucket exists at all, so it
+has to be a value and not a missing key."
+  (let ((value (and bucket (getf bucket key))))
+    (float (if value value default) 1d0)))
+
 (defun %raw-fee-bucket-json (bucket)
-  "One EstimatorBucket as Core renders it (rpc/fees.cpp): the range endpoints
-rounded to whole sat/kvB and the four counters to two decimals."
-  (flet ((r2 (x) (/ (fround (* (float (or x 0) 1d0) 100d0)) 100d0)))
-    `(("startrange" . ,(round (or (getf bucket :start) 0)))
-      ("endrange" . ,(round (or (getf bucket :end) 0)))
-      ("withintarget" . ,(r2 (getf bucket :within-target)))
-      ("totalconfirmed" . ,(r2 (getf bucket :total-confirmed)))
-      ("inmempool" . ,(r2 (getf bucket :in-mempool)))
-      ("leftmempool" . ,(r2 (getf bucket :left-mempool))))))
+  "One EstimatorBucket as Core renders it (rpc/fees.cpp:180-194): the range
+endpoints through round(), the four counters through round(x*100)/100, and
+every one of them spelled by UniValue::setFloat."
+  (flet ((endpoint (key)
+           (json-float (%core-round (%raw-fee-bucket-value bucket key -1))))
+         (counter (key)
+           (json-float (/ (%core-round (* (%raw-fee-bucket-value bucket key 0)
+                                          100d0))
+                          100d0))))
+    `(("startrange" . ,(endpoint :start))
+      ("endrange" . ,(endpoint :end))
+      ("withintarget" . ,(counter :within-target))
+      ("totalconfirmed" . ,(counter :total-confirmed))
+      ("inmempool" . ,(counter :in-mempool))
+      ("leftmempool" . ,(counter :left-mempool)))))
+
+(defun %raw-fee-horizon-json (rate buckets)
+  "One horizon object of estimaterawfee (Core rpc/fees.cpp:196-211).
+
+Core builds it in TWO branches keyed on CFeeRate(0), which estimateRawFee
+returns to mean \"no answer\" -- not \"a fee of zero\":
+
+  - with an answer: feerate, decay, scale, pass, and fail ONLY when the fail
+    bucket's start is not the -1 sentinel (all buckets passed, so there is no
+    failing range to show);
+  - without one: decay, scale, fail, errors, and NO feerate key at all.
+
+decay and scale come FIRST in both and are declared without
+/*optional=*/true (fees.cpp:120-121), which Core ENFORCES at run time whenever
+-rpcdoccheck is set -- and the functional framework sets it in every node's
+config (test_framework/util.py:561). So they are present in every horizon
+object a Core test ever sees. Both were dropped here, in both branches, while
+the no-answer branch invented (\"feerate\" . 0.0) -- a fee of zero where Core
+says it has no estimate -- and omitted the fail bucket."
+  (let ((decay (json-float (or (getf buckets :decay) 0)))
+        (scale (or (getf buckets :scale) 0))
+        ;; Core's estimateRawFee hands back CFeeRate(llround(median)), an
+        ;; integer sat/kvB; ours returns the raw median, so the rounding that
+        ;; the CFeeRate constructor does there happens here -- before the
+        ;; zero-sentinel test, as it does in Core.
+        (rate (floor (+ (float rate 1d0) 1/2))))
+    (if (zerop rate)
+        `(("decay" . ,decay)
+          ("scale" . ,scale)
+          ("fail" . ,(%raw-fee-bucket-json (getf buckets :fail)))
+          ("errors" . #("Insufficient data or no feerate found which meets threshold")))
+        `(("feerate" . ,(satoshi->btc rate))
+          ("decay" . ,decay)
+          ("scale" . ,scale)
+          ("pass" . ,(%raw-fee-bucket-json (getf buckets :pass)))
+          ,@(let ((fail (getf buckets :fail)))
+              (unless (= -1 (%raw-fee-bucket-value fail :start -1))
+                `(("fail" . ,(%raw-fee-bucket-json fail)))))))))
 
 (define-rpc "estimaterawfee" (node params)
   "The raw per-horizon fee estimates and the buckets behind them (Core
-estimaterawfee, rpc/fees.cpp:97-190). PARAMS: (conf_target [threshold]).
+estimaterawfee, rpc/fees.cpp:97-215). PARAMS: (conf_target [threshold]).
 
 Unlike estimatesmartfee this asks ONE horizon at ONE success threshold and
 reports the evidence rather than the max of three estimates — which is what
@@ -1024,18 +1079,8 @@ answer\" mean different things to whoever is reading this."
                   (bl.mp:bpe-estimate-raw-fee
                    conf-target threshold (car horizon))
                 (when rate
-                  (push
-                   (cons (cdr horizon)
-                         `(("feerate" . ,(/ (float rate 1d0) 100000000d0))
-                           ,@(let ((pass (getf buckets :pass)))
-                               (when pass `(("pass" . ,(%raw-fee-bucket-json pass)))))
-                           ,@(let ((fail (getf buckets :fail)))
-                               (when fail `(("fail" . ,(%raw-fee-bucket-json fail)))))
-                           ,@(when (zerop rate)
-                               ;; Core reports why there is no answer rather
-                               ;; than an empty object.
-                               `(("errors" . #("Insufficient data or no feerate found"))))))
-                   result))))))
+                  (push (cons (cdr horizon) (%raw-fee-horizon-json rate buckets))
+                        result))))))
         (or (nreverse result) (make-hash-table :test 'equal))))))
 
 (defun %script-rejects-wrapping-p (script)

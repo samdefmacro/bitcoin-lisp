@@ -22,6 +22,8 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:project-source-text
    #:make-test-connection
    #:signals-rpc-error
+   #:bpe-add-block
+   #:bpe-add-tx
    #:btc-amount
    #:rpc-error-code-of
    #:capture-log-lines

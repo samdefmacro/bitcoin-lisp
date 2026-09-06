@@ -109,6 +109,73 @@ one satoshi, 0.1 for a tenth of a coin -- where Core prints 0.00000001 and
 the reply."
   (text "0" :type string :read-only t))
 
+(defun %core-round (x)
+  "C's round(): the nearest integer as a double, halves AWAY from zero. CL's
+ROUND takes halves to even and returns an INTEGER, which is what turned the
+1e99 infinity feerate bucket into a 99-digit integer."
+  (let ((d (float x 1d0)))
+    (if (minusp d)
+        (- (ffloor (+ (- d) 0.5d0)))
+        (ffloor (+ d 0.5d0)))))
+
+(defun %fixed-digits (value digits)
+  "The non-negative rational VALUE with exactly DIGITS decimals, rounded."
+  (let ((scale (expt 10 digits)))
+    (multiple-value-bind (whole fraction) (truncate (round (* value scale)) scale)
+      (if (zerop digits)
+          (format nil "~D" whole)
+          (format nil "~D.~V,'0D" whole digits fraction)))))
+
+(defun %strip-trailing-zeros (text)
+  "TEXT without the trailing zeros of its fraction, and without a bare point."
+  (if (find #\. text)
+      (let ((end (length text)))
+        (loop while (char= (char text (1- end)) #\0) do (decf end))
+        (when (char= (char text (1- end)) #\.) (decf end))
+        (subseq text 0 end))
+      text))
+
+(defun json-float (value &optional (precision 16))
+  "VALUE as the JSON number token Core writes for a double: what
+`ostringstream << setprecision(16) << x' produces (UniValue::setFloat,
+univalue.cpp:75-82).
+
+C++\\'s default float format is %g -- fixed notation while the decimal exponent
+is in [-4, precision), exponent notation outside it, trailing zeros stripped
+either way. So Core writes 0 (not 0.0), 9813 (not 9813.0), 526.08, and 1e+99
+for the INF_FEERATE bucket boundary. SBCL\\'s float printer and CL\\'s ROUND
+each spell at least one of those differently."
+  (let ((rational (rational (float value 1d0))))
+    (if (zerop rational)
+        (make-json-number "0")
+        (let* ((negative (minusp rational))
+               (magnitude (abs rational))
+               (exponent 0)
+               (sign (if negative "-" "")))
+          (loop while (>= magnitude (expt 10 (1+ exponent))) do (incf exponent))
+          (loop while (< magnitude (expt 10 exponent)) do (decf exponent))
+          ;; Rounding to PRECISION significant digits can carry past ten, and
+          ;; C++ renormalises when it does: the double nearest 1e99 is just
+          ;; under 10^99, so its exponent is 98 and its mantissa rounds to 10
+          ;; -- printed as 1e+99, never 10e+98.
+          (when (>= (round (* (/ magnitude (expt 10 exponent))
+                              (expt 10 (1- precision))))
+                    (expt 10 precision))
+            (incf exponent))
+          (make-json-number
+           (if (or (< exponent -4) (>= exponent precision))
+               (format nil "~A~Ae~A~2,'0D"
+                       sign
+                       (%strip-trailing-zeros
+                        (%fixed-digits (/ magnitude (expt 10 exponent))
+                                       (1- precision)))
+                       (if (minusp exponent) "-" "+")
+                       (abs exponent))
+               (format nil "~A~A" sign
+                       (%strip-trailing-zeros
+                        (%fixed-digits magnitude
+                                       (max 0 (- precision 1 exponent)))))))))))
+
 (defmethod yason:encode ((object json-number) &optional (stream *standard-output*))
   (write-string (json-number-text object) stream)
   object)

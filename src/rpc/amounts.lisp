@@ -253,7 +253,11 @@ own functional tests read these fields as Decimal, which is exactly why the
 difference is invisible to them.
 
 The sign comes from the satoshi count, not from the quotient, so -1000 sat
-prints -0.00001000 rather than 0.00001000."
+prints -0.00001000 rather than 0.00001000.
+
+SATOSHIS is an INTEGER count, as Core's CAmount is: a double here would print
+its own decimal point into the middle of the token."
+  (declare (type integer satoshis))
   (multiple-value-bind (quotient remainder) (truncate (abs satoshis) 100000000)
     (make-json-number (format nil "~:[~;-~]~D.~8,'0D"
                               (minusp satoshis) quotient remainder))))

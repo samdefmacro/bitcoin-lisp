@@ -33,14 +33,6 @@ say where it stands."
 (defun %bpe-first-recorded (est)
   (bl.mp::block-policy-estimator-first-recorded-height est))
 
-(defun %bpe-add-tx (est txid height feerate &rest flags)
-  "BPE-PROCESS-TRANSACTION; FLAGS are Core's NewMempoolTransactionInfo
-keywords."
-  (apply #'bl.mp::bpe-process-transaction est txid height feerate flags))
-
-(defun %bpe-add-block (est height txids)
-  (bl.mp::bpe-process-block est height txids))
-
 
 (defun %bpe-stats (&key (periods 24) (decay 0.9952d0) (scale 2))
   (bl.mp::make-tx-confirm-stats
@@ -196,8 +188,8 @@ both return 0 rather than a fabricated number."
   ;; An estimator that has seen blocks but never counted a transaction has no
   ;; span at all — the clock starts on DATA, not on blocks.
   (let ((empty (bl.mp:make-block-policy-estimator)))
-    (%bpe-add-block empty 100 (list))
-    (%bpe-add-block empty 200 (list))
+    (bpe-add-block empty 100 (list))
+    (bpe-add-block empty 200 (list))
     (is (= 0 (%bpe-first-recorded empty)))
     (is (= 0 (bl.mp::bpe-max-usable-estimate empty)))))
 
@@ -208,9 +200,9 @@ bucket forever."
   (let ((e (bl.mp:make-block-policy-estimator))
         (txid (bpe-test-id 9 9 9)))
     (setf (%bpe-best-height e) 1)
-    (%bpe-add-tx e txid 1 5000d0)
+    (bpe-add-tx e txid 1 5000d0)
     (is (= 1 (%bpe-tracked-count e)))
-    (%bpe-add-block e 2 (list txid))
+    (bpe-add-block e 2 (list txid))
     (is (= 0 (%bpe-tracked-count e)))))
 
 (test estimator-ignores-a-block-it-has-already-seen
@@ -218,8 +210,8 @@ bucket forever."
 decay step would run again and silently age all history by an extra block."
   (let ((e (bpe-simulate :blocks 5)))
     (let ((height (%bpe-best-height e)))
-      (is (= 0 (%bpe-add-block e height '())))
-      (is (= 0 (%bpe-add-block e (1- height) '())))
+      (is (= 0 (bpe-add-block e height '())))
+      (is (= 0 (bpe-add-block e (1- height) '())))
       (is (= height (%bpe-best-height e))))))
 
 ;;;; --- The reporting seam must be CONNECTED ---
@@ -293,7 +285,7 @@ transactions are still tracked. Drives the real connect-block."
             (cb-txid (bl.ser:transaction-hash coinbase)))
        ;; Pretend the coinbase was a tracked mempool transaction entered at
        ;; height 0, so the block at height 1 is a 1-block confirmation.
-       (%bpe-add-tx est cb-txid 0 9000d0)
+       (bpe-add-tx est cb-txid 0 9000d0)
        (is (= 1 (%bpe-tracked-count est)))
        (bl.val:connect-block block1 chain-state block-store utxo-set)
        ;; The hook ran: best height moved and the transaction was untracked by
@@ -496,11 +488,11 @@ had entered at the current tip."
   (let ((est (bl.mp:make-block-policy-estimator))
         (txid (bpe-test-id 7 7 1)))
     (is (= 0 (%bpe-best-height est)))
-    (is-false (%bpe-add-tx est txid 500 20000d0))
+    (is-false (bpe-add-tx est txid 500 20000d0))
     (is (= 0 (%bpe-tracked-count est))
         "a transaction from another height was tracked")
     ;; Positive control: at the estimator's own height it IS tracked.
-    (is-true (%bpe-add-tx est (bpe-test-id 7 7 2) 0 20000d0))
+    (is-true (bpe-add-tx est (bpe-test-id 7 7 2) 0 20000d0))
     (is (= 1 (%bpe-tracked-count est)))))
 
 (test estimator-applies-cores-four-validity-flags
@@ -558,7 +550,7 @@ nothing about the block it names."
            (txid (bl.ser:transaction-hash tx)))
       (bl.mp:accept-validated-tx mempool txid tx 5000 200)
       (is (= 1 (%bpe-tracked-txs est)))
-      (%bpe-add-block est 201 (list txid))
+      (bpe-add-block est 201 (list txid))
       (is (= 0 (%bpe-tracked-txs est)))
       (is (= 0 (%bpe-untracked-txs est))))))
 
@@ -579,17 +571,17 @@ same code path, the only difference is whether the child is fed in."
                           (push txid confirmed))
                         (dotimes (i 20)
                           (let ((txid (bpe-test-id 3 h i)))
-                            (%bpe-add-tx e txid h 20000d0)
+                            (bpe-add-tx e txid h 20000d0)
                             (push txid (cdr (or (assoc h pending)
                                                 (car (push (cons h '()) pending)))))))
                         (dotimes (i 20)
                           (let ((txid (bpe-test-id 4 h i)))
                             ;; The child: an in-mempool parent, so Core's gate
                             ;; refuses it. TRACK-CHILDREN feeds it anyway.
-                            (%bpe-add-tx e txid h 1000d0
+                            (bpe-add-tx e txid h 1000d0
                                          :has-no-mempool-parents track-children)
                             (push txid confirmed)))
-                        (%bpe-add-block e (1+ h) confirmed)))
+                        (bpe-add-block e (1+ h) confirmed)))
              e)))
     (let ((gated (replay nil))
           (ungated (replay t)))
