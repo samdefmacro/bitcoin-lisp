@@ -38,17 +38,33 @@
   ;;;; ScriptError - Error types for script execution
 
   (define-type ScriptError
-    "Errors that can occur during script execution."
+    "Errors that can occur during script execution.
+
+Every variant stands for exactly ONE of Bitcoin Core's SCRIPT_ERR_* values
+(script/script_error.h). SCRIPT-ERROR-NAME below states that correspondence,
+spelled the way Core's own script_tests.json spells it (the script_errors[]
+table in test/script_tests.cpp). Several Core errors are named by more than
+one variant, where our engine splits a case Core does not: SE-StackUnderflow
+and SE-InvalidStackOperation are both INVALID_STACK_OPERATION, SE-InvalidNumber
+and SE-NumberOverflow are both SCRIPTNUM. NO variant stands for more than one
+Core error -- that is what lets the corpus runner compare Core's expected error
+NAME and not only its accept/reject verdict."
     SE-StackUnderflow          ; Attempted to pop from empty stack
     SE-StackOverflow           ; Stack exceeded maximum size (1000)
     SE-InvalidNumber           ; Invalid numeric encoding
     SE-VerifyFailed            ; OP_VERIFY failed
+    SE-EvalFalse               ; Script finished with a false/empty top element
+    SE-EqualVerify             ; OP_EQUALVERIFY failed
+    SE-NumEqualVerify          ; OP_NUMEQUALVERIFY failed
+    SE-CheckSigVerify          ; OP_CHECKSIGVERIFY failed
+    SE-CheckMultisigVerify     ; OP_CHECKMULTISIGVERIFY failed
     SE-OpReturn                ; OP_RETURN encountered
     SE-DisabledOpcode          ; Disabled opcode executed
     SE-UnknownOpcode           ; Unknown opcode
     SE-ScriptTooLarge          ; Script exceeds 10,000 bytes
     SE-TooManyOps              ; More than 201 non-push operations
     SE-InvalidStackOperation   ; Invalid stack operation (e.g., bad index)
+    SE-InvalidAltstackOperation ; OP_FROMALTSTACK with an empty altstack
     SE-UnbalancedConditional   ; Unbalanced IF/ELSE/ENDIF
     SE-InvalidPushData         ; Invalid push data size
     SE-MinimalData             ; Non-minimal data encoding (MINIMALDATA flag)
@@ -58,6 +74,18 @@
     SE-PushSize                ; Push data exceeds 520 bytes
     SE-NumberOverflow          ; Arithmetic operand exceeds 4 bytes
     SE-MinimalIf               ; IF/NOTIF argument not minimal (witness v0, MINIMALIF flag)
+    ;; CHECK(MULTI)SIG operand counts and encodings: one variant per arm of
+    ;; Core's CheckSignatureEncoding / CheckPubKeyEncoding pair
+    ;; (interpreter.cpp:202-227) and per CHECKMULTISIG count check (:1116-1131).
+    SE-SigCount                ; nSigsCount negative or greater than nKeysCount
+    SE-PubkeyCount             ; nKeysCount negative or over MAX_PUBKEYS_PER_MULTISIG
+    SE-SigDer                  ; Signature is not valid strict DER
+    SE-SigHighS                ; Signature S value is unnecessarily high
+    SE-SigHashtype             ; Signature hashtype byte is not a defined one
+    SE-SigNullFail             ; Failed CHECK(MULTI)SIG with a non-empty signature
+    SE-SigNullDummy            ; CHECKMULTISIG dummy argument is not empty
+    SE-SigFindAndDelete        ; A signature was found in the scriptCode
+    SE-PubkeyType              ; Public key is neither compressed nor uncompressed
     ;; Witness errors (SegWit BIP 141)
     SE-WitnessProgramWrongLength   ; Witness program not 20 or 32 bytes for v0
     SE-WitnessProgramWitnessEmpty  ; Empty witness for witness program
@@ -72,12 +100,91 @@
     SE-TaprootMerkleMismatch       ; Merkle proof doesn't match output key
     SE-TapscriptInvalidOpcode      ; Disabled opcode in Tapscript context
     SE-SchnorrSignatureSize        ; Signature not 64 or 65 bytes
+    SE-SchnorrSigHashtype          ; Schnorr signature hashtype byte undefined
     ;; Tapscript-specific errors (BIP 342)
     SE-TapscriptMinimalIf          ; IF/NOTIF argument not empty or [0x01]
     SE-TapscriptCheckmultisig      ; CHECKMULTISIG used in Tapscript (disabled)
     SE-TapscriptInvalidSig         ; Non-empty invalid signature in Tapscript
+    SE-TapscriptEmptyPubkey        ; Empty public key in Tapscript
     SE-TapscriptValidationWeight   ; Exceeded sigop weight budget (BIP 342)
     SE-DiscourageUpgradablePubkeyType) ; Unknown pubkey type in Tapscript when DISCOURAGE flag set
+
+  (declare script-error-name (ScriptError -> String))
+  (define (script-error-name err)
+    "The Bitcoin Core SCRIPT_ERR_* name ERR stands for, spelled as
+script_tests.json spells it (test/script_tests.cpp script_errors[]).
+
+This is the whole error vocabulary in one place, and it is what the corpus
+runner compares against Core's expected error for every failing vector. A
+Core error our engine never reports still has no variant here; a variant
+that named two Core errors would make that comparison meaningless."
+    (match err
+      ;; interpreter.cpp:445-448 and :1226-1232 -- reading and decoding
+      ((SE-UnknownOpcode) "BAD_OPCODE")
+      ((SE-InvalidPushData) "BAD_OPCODE")
+      ((SE-DisabledOpcode) "DISABLED_OPCODE")
+      ((SE-TapscriptInvalidOpcode) "DISABLED_OPCODE")
+      ((SE-InvalidNumber) "SCRIPTNUM")
+      ((SE-NumberOverflow) "SCRIPTNUM")
+      ((SE-MinimalData) "MINIMALDATA")
+      ((SE-MinimalIf) "MINIMALIF")
+      ((SE-TapscriptMinimalIf) "TAPSCRIPT_MINIMALIF")
+      ;; Resource ceilings (interpreter.cpp:429, :448, :453, :1121, :1223)
+      ((SE-ScriptTooLarge) "SCRIPT_SIZE")
+      ((SE-PushSize) "PUSH_SIZE")
+      ((SE-TooManyOps) "OP_COUNT")
+      ((SE-StackOverflow) "STACK_SIZE")
+      ((SE-TapscriptValidationWeight) "TAPSCRIPT_VALIDATION_WEIGHT")
+      ;; Stacks and control flow
+      ((SE-StackUnderflow) "INVALID_STACK_OPERATION")
+      ((SE-InvalidStackOperation) "INVALID_STACK_OPERATION")
+      ((SE-InvalidAltstackOperation) "INVALID_ALTSTACK_OPERATION")
+      ((SE-UnbalancedConditional) "UNBALANCED_CONDITIONAL")
+      ((SE-OpReturn) "OP_RETURN")
+      ;; The verify family: Core gives each *VERIFY opcode its own error
+      ;; (interpreter.cpp:910, :997, :1079, :1212), and SCRIPT_ERR_VERIFY is
+      ;; OP_VERIFY's alone (:663).
+      ((SE-VerifyFailed) "VERIFY")
+      ((SE-EqualVerify) "EQUALVERIFY")
+      ((SE-NumEqualVerify) "NUMEQUALVERIFY")
+      ((SE-CheckSigVerify) "CHECKSIGVERIFY")
+      ((SE-CheckMultisigVerify) "CHECKMULTISIGVERIFY")
+      ((SE-EvalFalse) "EVAL_FALSE")
+      ;; Locktimes (BIP 65/112)
+      ((SE-NegativeLocktime) "NEGATIVE_LOCKTIME")
+      ((SE-UnsatisfiedLocktime) "UNSATISFIED_LOCKTIME")
+      ;; CHECK(MULTI)SIG operands and encodings
+      ((SE-SigCount) "SIG_COUNT")
+      ((SE-PubkeyCount) "PUBKEY_COUNT")
+      ((SE-SigDer) "SIG_DER")
+      ((SE-SigHighS) "SIG_HIGH_S")
+      ((SE-SigHashtype) "SIG_HASHTYPE")
+      ((SE-SigNullFail) "NULLFAIL")
+      ((SE-SigNullDummy) "SIG_NULLDUMMY")
+      ((SE-SigFindAndDelete) "SIG_FINDANDDELETE")
+      ((SE-PubkeyType) "PUBKEYTYPE")
+      ;; Softfork safeness
+      ((SE-DiscourageUpgradableNops) "DISCOURAGE_UPGRADABLE_NOPS")
+      ((SE-DiscourageUpgradableWitnessProgram) "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM")
+      ((SE-DiscourageUpgradablePubkeyType) "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+      ;; Segregated witness
+      ((SE-WitnessProgramWrongLength) "WITNESS_PROGRAM_WRONG_LENGTH")
+      ((SE-WitnessProgramWitnessEmpty) "WITNESS_PROGRAM_WITNESS_EMPTY")
+      ((SE-WitnessProgramMismatch) "WITNESS_PROGRAM_MISMATCH")
+      ((SE-WitnessMalleated) "WITNESS_MALLEATED")
+      ((SE-WitnessUnexpected) "WITNESS_UNEXPECTED")
+      ((SE-WitnessPubkeyType) "WITNESS_PUBKEYTYPE")
+      ;; Taproot. A merkle proof that does not reproduce the output key is
+      ;; SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH in Core (interpreter.cpp:1975),
+      ;; not an error of its own.
+      ((SE-TaprootMerkleMismatch) "WITNESS_PROGRAM_MISMATCH")
+      ((SE-TaprootInvalidControlBlock) "TAPROOT_WRONG_CONTROL_SIZE")
+      ((SE-TaprootInvalidSignature) "SCHNORR_SIG")
+      ((SE-TapscriptInvalidSig) "SCHNORR_SIG")
+      ((SE-SchnorrSignatureSize) "SCHNORR_SIG_SIZE")
+      ((SE-SchnorrSigHashtype) "SCHNORR_SIG_HASHTYPE")
+      ((SE-TapscriptCheckmultisig) "TAPSCRIPT_CHECKMULTISIG")
+      ((SE-TapscriptEmptyPubkey) "TAPSCRIPT_EMPTY_PUBKEY")))
 
   ;;;; ScriptResult - Result type for script operations
 
@@ -506,7 +613,14 @@
   (define (bytes-to-script-num bytes)
     "Convert script bytes to a ScriptNum.
      Uses little-endian encoding with sign bit in MSB.
-     When MINIMALDATA flag is enabled, validates minimal encoding."
+     When MINIMALDATA flag is enabled, validates minimal encoding.
+
+     A non-minimal NUMBER is Core's SCRIPT_ERR_SCRIPTNUM, not
+     SCRIPT_ERR_MINIMALDATA: the check lives in the CScriptNum constructor
+     (script.h), which throws scriptnum_error, and EvalScript's catch turns
+     that into SCRIPTNUM (interpreter.cpp:1226-1228). SCRIPT_ERR_MINIMALDATA
+     is the PUSH rule alone -- CheckMinimalPush at :479-481, which is
+     CHECK-MINIMAL-PUSH here."
     (let ((len (the UFix (coalton-library/vector:length bytes))))
       (if (== len 0)
           (ScriptOk (ScriptNum 0))
@@ -516,7 +630,7 @@
                       (minimal-fn (cl:fdefinition (cl:intern "MINIMAL-NUMBER-ENCODING-P" "BITCOIN-LISP.COALTON.INTEROP"))))
               (cl:when (cl:and (cl:funcall flag-fn "MINIMALDATA")
                                (cl:not (cl:funcall minimal-fn bytes)))
-                (cl:return-from bytes-to-script-num (ScriptErr SE-MinimalData))))
+                (cl:return-from bytes-to-script-num (ScriptErr SE-InvalidNumber))))
             ;; Convert to number
             (cl:let* ((negative (cl:logbitp 7 (cl:aref bytes (cl:1- len))))
                       (abs-value
@@ -1089,6 +1203,9 @@ else. Wiring either of them here rejects scripts Core accepts."
   ;; Helper: call verify-tapscript-signature and map result to UFix status code
   ;; 0=empty-sig 1=ok 2=invalid 3=upgradable-pubkey
   ;; 4=empty-pubkey 5=discourage-pubkeytype 6=weight-exceeded
+  ;; 8=schnorr-sig-size 9=schnorr-sig-hashtype
+  ;; TAPSCRIPT-SIG-STATUS-ERROR below turns every failing status into the Core
+  ;; error it is; only 0, 1 and 3 are not failures.
   (declare tapscript-verify-sig-status ((Vector U8) -> (Vector U8) -> UFix))
   (define (tapscript-verify-sig-status sig pubkey)
     "Call VERIFY-TAPSCRIPT-SIGNATURE and return a UFix status code."
@@ -1115,7 +1232,44 @@ else. Wiring either of them here rejects scripts Core accepts."
             ((cl:eq status :empty-pubkey) 4)
             ((cl:eq status :discourage-upgradable-pubkeytype) 5)
             ((cl:eq status :validation-weight-exceeded) 6)
+            ((cl:eq status :schnorr-sig-size) 8)
+            ((cl:eq status :bad-sighash-type) 9)
             (cl:t 2))))))
+
+  ;; Helper: the Core error a FAILING tapscript signature status stands for.
+  ;; Core sets each of these in EvalChecksigTapscript (interpreter.cpp:346-386)
+  ;; and CheckSchnorrSignature (:1716-1741); the empty-pubkey arm is
+  ;; SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY, which is what this used to report as a
+  ;; plain verify failure.
+  (declare tapscript-sig-status-error (UFix -> ScriptError))
+  (define (tapscript-sig-status-error status)
+    "The ScriptError for a failing TAPSCRIPT-VERIFY-SIG-STATUS code."
+    (cond
+      ((== status 4) SE-TapscriptEmptyPubkey)
+      ((== status 5) SE-DiscourageUpgradablePubkeyType)
+      ((== status 6) SE-TapscriptValidationWeight)
+      ((== status 8) SE-SchnorrSignatureSize)
+      ((== status 9) SE-SchnorrSigHashtype)
+      (True SE-TapscriptInvalidSig)))
+
+  ;; Helper: the Core error the CL side recorded for the CHECKSIG /
+  ;; CHECKMULTISIG that just ran. Both wrappers store the exact arm of
+  ;; CheckSignatureEncoding / CheckPubKeyEncoding (or NULLFAIL / NULLDUMMY /
+  ;; SIG_FINDANDDELETE) that rejected, and these read it back instead of
+  ;; collapsing all of them into one verify failure.
+  (declare last-checksig-error (Unit -> ScriptError))
+  (define (last-checksig-error)
+    "The ScriptError VERIFY-CHECKSIG-FOR-SCRIPT recorded for the last call."
+    (lisp ScriptError ()
+      (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-SCRIPT-ERROR"
+                                             "BITCOIN-LISP.COALTON.INTEROP")))))
+
+  (declare last-checkmultisig-error (Unit -> ScriptError))
+  (define (last-checkmultisig-error)
+    "The ScriptError DO-CHECKMULTISIG-STACK-OP recorded for the last call."
+    (lisp ScriptError ()
+      (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKMULTISIG-SCRIPT-ERROR"
+                                             "BITCOIN-LISP.COALTON.INTEROP")))))
 
   ;; Helper: evaluate IF/NOTIF condition with Tapscript MINIMALIF and witness v0 MINIMALIF
   ;; INVERT: False for OP_IF, True for OP_NOTIF
@@ -1364,7 +1518,7 @@ else. Wiring either of them here rejects scripts Core accepts."
       ;; OP_FROMALTSTACK
       ((OP-FROMALTSTACK)
        (match (stack-pop (context-alt-stack ctx))
-         ((None) (ScriptErr SE-StackUnderflow))
+         ((None) (ScriptErr SE-InvalidAltstackOperation))
          ((Some (Tuple value new-alt))
           (ScriptOk (context-with-main-stack
                      (stack-push value (context-main-stack ctx))
@@ -1394,7 +1548,7 @@ else. Wiring either of them here rejects scripts Core accepts."
              (let ((equal (lisp Boolean (a b) (cl:equalp a b))))
                (if equal
                    (ScriptOk (context-with-main-stack new-stack ctx))
-                   (ScriptErr SE-VerifyFailed))))))))
+                   (ScriptErr SE-EqualVerify))))))))
 
       ;; OP_HASH160 - RIPEMD160(SHA256(x))
       ((OP-HASH160)
@@ -1629,7 +1783,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptOk b)
                    (if (== (script-num-value a) (script-num-value b))
                        (ScriptOk (context-with-main-stack new-stack ctx))
-                       (ScriptErr SE-VerifyFailed)))))))))))
+                       (ScriptErr SE-NumEqualVerify)))))))))))
 
       ;; OP_NUMNOTEQUAL
       ((OP-NUMNOTEQUAL)
@@ -1890,10 +2044,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                        ((or (== result 1) (== result 3))
                         (ScriptOk (context-with-main-stack
                                    (stack-push (true-bytes) new-stack) ctx)))
-                       ((== result 4) (ScriptErr SE-VerifyFailed))
-                       ((== result 5) (ScriptErr SE-DiscourageUpgradablePubkeyType))
-                       ((== result 6) (ScriptErr SE-TapscriptValidationWeight))
-                       (True (ScriptErr SE-TapscriptInvalidSig))))
+                       (True (ScriptErr (tapscript-sig-status-error result)))))
                    ;; Legacy/SegWit v0: Use ECDSA verification
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
@@ -1908,7 +2059,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (let ((strictenc-error (lisp Boolean ()
                                               (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
                        (if strictenc-error
-                           (ScriptErr SE-VerifyFailed)
+                           (ScriptErr (last-checksig-error))
                            (ScriptOk (context-with-main-stack
                                       (stack-push (if valid (true-bytes) (false-bytes)) new-stack)
                                       ctx))))))))))))
@@ -1928,13 +2079,13 @@ else. Wiring either of them here rejects scripts Core accepts."
                    ;; Tapscript: Use Schnorr verification (BIP 342)
                    (let ((result (tapscript-verify-sig-status sig pubkey)))
                      (cond
-                       ((== result 0) (ScriptErr SE-VerifyFailed))
+                       ;; An empty signature is a FAILED check, not an
+                       ;; erroring one, so OP_CHECKSIGVERIFY reports Core's
+                       ;; SCRIPT_ERR_CHECKSIGVERIFY (interpreter.cpp:1079).
+                       ((== result 0) (ScriptErr SE-CheckSigVerify))
                        ((or (== result 1) (== result 3))
                         (ScriptOk (context-with-main-stack new-stack ctx)))
-                       ((== result 4) (ScriptErr SE-VerifyFailed))
-                       ((== result 5) (ScriptErr SE-DiscourageUpgradablePubkeyType))
-                       ((== result 6) (ScriptErr SE-TapscriptValidationWeight))
-                       (True (ScriptErr SE-TapscriptInvalidSig))))
+                       (True (ScriptErr (tapscript-sig-status-error result)))))
                    ;; Legacy/SegWit v0: Use ECDSA verification
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
@@ -1948,10 +2099,10 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (let ((strictenc-error (lisp Boolean ()
                                               (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
                        (if strictenc-error
-                           (ScriptErr SE-VerifyFailed)
+                           (ScriptErr (last-checksig-error))
                            (if valid
                                (ScriptOk (context-with-main-stack new-stack ctx))
-                               (ScriptErr SE-VerifyFailed))))))))))))
+                               (ScriptErr SE-CheckSigVerify))))))))))))
 
       ((OP-CHECKMULTISIG)
        ;; m-of-n multisig verification
@@ -1995,10 +2146,10 @@ else. Wiring either of them here rejects scripts Core accepts."
                ((Tuple3 1 new-stack n-pubkeys)
                 (ScriptOk (context-with-op-count (+ spent n-pubkeys)
                             (context-with-main-stack new-stack ctx))))
-               ((Tuple3 2 _ _) (ScriptErr SE-VerifyFailed))
+               ((Tuple3 2 _ _) (ScriptErr (last-checkmultisig-error)))
                ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
-               ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
-               ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
+               ((Tuple3 4 _ _) (ScriptErr SE-PubkeyCount))
+               ((Tuple3 5 _ _) (ScriptErr SE-SigCount))
                ((Tuple3 7 _ _) (ScriptErr SE-TooManyOps))
                (_ (ScriptErr SE-UnknownOpcode)))))))
 
@@ -2042,11 +2193,11 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((Some (Tuple _ final-stack))
                    (ScriptOk (context-with-op-count (+ spent n-pubkeys)
                                (context-with-main-stack final-stack ctx))))))
-               ((Tuple3 1 _ _) (ScriptErr SE-VerifyFailed))  ; multisig failed
-               ((Tuple3 2 _ _) (ScriptErr SE-VerifyFailed))  ; STRICTENC/NULLDUMMY error
+               ((Tuple3 1 _ _) (ScriptErr SE-CheckMultisigVerify))
+               ((Tuple3 2 _ _) (ScriptErr (last-checkmultisig-error)))
                ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
-               ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
-               ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
+               ((Tuple3 4 _ _) (ScriptErr SE-PubkeyCount))
+               ((Tuple3 5 _ _) (ScriptErr SE-SigCount))
                ((Tuple3 7 _ _) (ScriptErr SE-TooManyOps))
                (_ (ScriptErr SE-UnknownOpcode)))))))
 
@@ -2093,10 +2244,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                                                       (ScriptNum (+ (script-num-value num) 1)))
                                                      new-stack)
                                          ctx)))
-                             ((== result 4) (ScriptErr SE-VerifyFailed))
-                             ((== result 5) (ScriptErr SE-DiscourageUpgradablePubkeyType))
-                             ((== result 6) (ScriptErr SE-TapscriptValidationWeight))
-                             (True (ScriptErr SE-TapscriptInvalidSig)))))))))))))))
+                             (True (ScriptErr (tapscript-sig-status-error result))))))))))))))))
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops unless DISCOURAGE_UPGRADABLE_NOPS flag is set
@@ -2452,8 +2600,15 @@ a consensus split."
                  (cl:equalp (hash160-bytes redeem-hash) expected-hash))
                ;; Hash matches - execute redeem script with remaining stack
                (execute-script-with-stack-tx redeem-script remaining-stack locktime version sequence)
-               ;; Hash mismatch
-               (ScriptErr SE-VerifyFailed)))))))
+               ;; Hash mismatch. Core never reaches its P2SH block in this
+               ;; case: the scriptPubKey `OP_HASH160 <h> OP_EQUAL' has already
+               ;; run and left false on the stack, so VerifyScript stops at
+               ;; `if (!CastToBool(stack.back())) SCRIPT_ERR_EVAL_FALSE'
+               ;; (interpreter.cpp:2028-2030) and its P2SH branch asserts the
+               ;; stack is non-empty (:2064). We fold both passes into one
+               ;; call, so the same rejection surfaces here -- and it is
+               ;; EVAL_FALSE, not a verify failure.
+               (ScriptErr SE-EvalFalse)))))))
 
   ;;; ============================================================
   ;;; SegWit Support (BIP 141)

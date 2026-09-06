@@ -884,7 +884,7 @@ WITNESS_PROGRAM_MISMATCH for stack size != 2 (interpreter.cpp:1938-1940)."
     (multiple-value-bind (success err)
         (bl.interop:validate-taproot-key-path witness program amount)
       (is-false success)
-      (is (eq err :schnorr-signature-size)))))
+      (is (eq err :schnorr-sig-size)))))
 
 (test taproot-tweak-hash-produces-32-bytes
   "Taproot tweak computation produces 32-byte hash."

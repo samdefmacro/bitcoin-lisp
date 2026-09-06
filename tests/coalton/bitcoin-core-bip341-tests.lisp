@@ -264,9 +264,9 @@ directions."
   (multiple-value-bind (status result) (tapsig-status 0 32)
     (is (eq :empty-sig status))
     (is (null result)))
-  (is (eq :invalid-sig (tapsig-status 10 32)))
-  (is (eq :invalid-sig (tapsig-status 63 32)))
-  (is (eq :invalid-sig (tapsig-status 66 32)))
+  (is (eq :schnorr-sig-size (tapsig-status 10 32)))
+  (is (eq :schnorr-sig-size (tapsig-status 63 32)))
+  (is (eq :schnorr-sig-size (tapsig-status 66 32)))
   (is (eq :bad-sighash-type (tapsig-status 65 32 :last-byte #x00)))
   (is (eq :bad-sighash-type (tapsig-status 65 32 :last-byte #x04))))
 
@@ -368,17 +368,20 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
           (bl.interop:*tapscript-amount* 0)
           (bl.interop:*tapscript-leaf-hash* nil)
           (bl.interop::*tapscript-validation-weight-left* 1000))
-      ;; Tapscript CHECKSIG: :bad-sighash-type maps to SE-TapscriptInvalidSig,
+      ;; Tapscript CHECKSIG: :bad-sighash-type maps to SE-SchnorrSigHashtype,
       ;; a hard failure — never a schnorr verification against a short preimage.
       (multiple-value-bind (status result)
           (bl.interop:verify-tapscript-signature sig pk)
         (is (eq :bad-sighash-type status))
         (is (null result)))
       ;; Key path: same input, witness of one 65-byte signature.
+      ;; Key path: Core's error for a hash_type outside the defined set is
+      ;; SCRIPT_ERR_SCHNORR_SIG_HASHTYPE (interpreter.cpp:1515), which is a
+      ;; different value from the ECDSA SIG_HASHTYPE.
       (multiple-value-bind (ok err)
           (bl.interop:validate-taproot-key-path (list sig) pk 0)
         (is (null ok))
-        (is (eq :sig-hashtype err))))))
+        (is (eq :schnorr-sig-hashtype err))))))
 
 ;;;; ============================================================
 ;;;; GA8 tapscript resource limits (S1-3)

@@ -427,68 +427,76 @@ real Bitcoin Core nodes would reject. This matters for:
 
 ### Error Types
 
-| Bitcoin Core ScriptError (45 types) | Coalton ScriptError (31 types) | Notes |
-|--------------------------------------|-------------------------------|-------|
-| `SCRIPT_ERR_OK` | (success case) | |
-| `SCRIPT_ERR_UNKNOWN_ERROR` | — | **Missing** |
-| `SCRIPT_ERR_EVAL_FALSE` | (checked at top level) | |
-| `SCRIPT_ERR_OP_RETURN` | `SE-OpReturn` | Match |
-| `SCRIPT_ERR_SCRIPT_SIZE` | `SE-ScriptTooLarge` | Match |
-| `SCRIPT_ERR_PUSH_SIZE` | `SE-PushSize` | Match |
-| `SCRIPT_ERR_OP_COUNT` | `SE-TooManyOps` | Match |
-| `SCRIPT_ERR_STACK_SIZE` | `SE-StackOverflow` | Match |
-| `SCRIPT_ERR_SIG_COUNT` | — | **Missing** (multisig sig count) |
-| `SCRIPT_ERR_PUBKEY_COUNT` | — | **Missing** (multisig pubkey count) |
-| `SCRIPT_ERR_VERIFY` | `SE-VerifyFailed` | Match |
-| `SCRIPT_ERR_EQUALVERIFY` | (uses SE-VerifyFailed) | Merged |
-| `SCRIPT_ERR_CHECKMULTISIGVERIFY` | (uses SE-VerifyFailed) | Merged |
-| `SCRIPT_ERR_CHECKSIGVERIFY` | (uses SE-VerifyFailed) | Merged |
-| `SCRIPT_ERR_NUMEQUALVERIFY` | (uses SE-VerifyFailed) | Merged |
-| `SCRIPT_ERR_BAD_OPCODE` | `SE-UnknownOpcode` | Match |
-| `SCRIPT_ERR_DISABLED_OPCODE` | `SE-DisabledOpcode` | Match |
-| `SCRIPT_ERR_INVALID_STACK_OPERATION` | `SE-StackUnderflow` / `SE-InvalidStackOperation` | Split |
-| `SCRIPT_ERR_INVALID_ALTSTACK_OPERATION` | — | **Missing** |
-| `SCRIPT_ERR_UNBALANCED_CONDITIONAL` | `SE-UnbalancedConditional` | Match |
-| `SCRIPT_ERR_NEGATIVE_LOCKTIME` | `SE-NegativeLocktime` | Match |
-| `SCRIPT_ERR_UNSATISFIED_LOCKTIME` | `SE-UnsatisfiedLocktime` | Match |
-| `SCRIPT_ERR_SIG_HASHTYPE` | — | **Missing** (bundled in STRICTENC) |
-| `SCRIPT_ERR_SIG_DER` | — | **Missing** (bundled in STRICTENC) |
-| `SCRIPT_ERR_MINIMALDATA` | `SE-MinimalData` | Match |
-| `SCRIPT_ERR_SIG_PUSHONLY` | — | **Missing** (checked at VerifyScript level) |
-| `SCRIPT_ERR_SIG_HIGH_S` | — | **Missing** (bundled in STRICTENC) |
-| `SCRIPT_ERR_PUBKEYTYPE` | `SE-WitnessPubkeyType` | Witness-only variant |
-| `SCRIPT_ERR_CLEANSTACK` | — | **Missing** (checked at VerifyScript level) |
-| `SCRIPT_ERR_MINIMALIF` | `SE-TapscriptMinimalIf` | Tapscript-only |
-| `SCRIPT_ERR_SIG_NULLFAIL` | — | **Missing** (checked in interop) |
-| `SCRIPT_ERR_SIG_NULLDUMMY` | — | **Missing** (checked in interop) |
-| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS` | `SE-DiscourageUpgradableNops` | Match |
-| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM` | `SE-DiscourageUpgradableWitnessProgram` | Match |
-| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION` | — | **Missing** |
-| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_PUBKEYTYPE` | — | **Missing** |
-| `SCRIPT_ERR_DISCOURAGE_OP_SUCCESS` | — | **Missing** |
-| `SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH` | `SE-WitnessProgramWrongLength` | Match |
-| `SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY` | `SE-WitnessProgramWitnessEmpty` | Match |
-| `SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH` | `SE-WitnessProgramMismatch` | Match |
-| `SCRIPT_ERR_WITNESS_MALLEATED` | `SE-WitnessMalleated` | Match |
-| `SCRIPT_ERR_WITNESS_MALLEATED_P2SH` | — | **Missing** |
-| `SCRIPT_ERR_WITNESS_UNEXPECTED` | `SE-WitnessUnexpected` | Match |
-| `SCRIPT_ERR_WITNESS_PUBKEYTYPE` | `SE-WitnessPubkeyType` | Match |
-| `SCRIPT_ERR_SCHNORR_SIG_SIZE` | `SE-SchnorrSignatureSize` | Match |
-| `SCRIPT_ERR_SCHNORR_SIG_HASHTYPE` | — | **Missing** (separate from sig size) |
-| `SCRIPT_ERR_SCHNORR_SIG` | `SE-TaprootInvalidSignature` | Match |
-| `SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE` | `SE-TaprootInvalidControlBlock` | Match |
-| `SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT` | — | **Missing** (no weight budget) |
-| `SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG` | `SE-TapscriptCheckmultisig` | Match |
-| `SCRIPT_ERR_TAPSCRIPT_MINIMALIF` | `SE-TapscriptMinimalIf` | Match |
+| Bitcoin Core SCRIPT_ERR_* | ours | where |
+|---|---|---|
+| `SCRIPT_ERR_OK` | (success) | |
+| `SCRIPT_ERR_UNKNOWN_ERROR` | `:unknown-error` | the fallback of `bl.interop:script-error-name`; no site reports it |
+| `SCRIPT_ERR_EVAL_FALSE` | `SE-EvalFalse` / `:eval-false` | |
+| `SCRIPT_ERR_OP_RETURN` | `SE-OpReturn` | |
+| `SCRIPT_ERR_SCRIPTNUM` | `SE-InvalidNumber`, `SE-NumberOverflow` | |
+| `SCRIPT_ERR_SCRIPT_SIZE` | `SE-ScriptTooLarge` | |
+| `SCRIPT_ERR_PUSH_SIZE` | `SE-PushSize` / `:push-size` | |
+| `SCRIPT_ERR_OP_COUNT` | `SE-TooManyOps` | |
+| `SCRIPT_ERR_STACK_SIZE` | `SE-StackOverflow` / `:stack-size` | |
+| `SCRIPT_ERR_SIG_COUNT` | `SE-SigCount` | |
+| `SCRIPT_ERR_PUBKEY_COUNT` | `SE-PubkeyCount` | |
+| `SCRIPT_ERR_VERIFY` | `SE-VerifyFailed` | OP_VERIFY alone |
+| `SCRIPT_ERR_EQUALVERIFY` | `SE-EqualVerify` / `:equalverify` | |
+| `SCRIPT_ERR_CHECKMULTISIGVERIFY` | `SE-CheckMultisigVerify` | |
+| `SCRIPT_ERR_CHECKSIGVERIFY` | `SE-CheckSigVerify` | |
+| `SCRIPT_ERR_NUMEQUALVERIFY` | `SE-NumEqualVerify` | |
+| `SCRIPT_ERR_BAD_OPCODE` | `SE-UnknownOpcode`, `SE-InvalidPushData` | |
+| `SCRIPT_ERR_DISABLED_OPCODE` | `SE-DisabledOpcode`, `SE-TapscriptInvalidOpcode` | |
+| `SCRIPT_ERR_INVALID_STACK_OPERATION` | `SE-StackUnderflow`, `SE-InvalidStackOperation` | |
+| `SCRIPT_ERR_INVALID_ALTSTACK_OPERATION` | `SE-InvalidAltstackOperation` | |
+| `SCRIPT_ERR_UNBALANCED_CONDITIONAL` | `SE-UnbalancedConditional` | |
+| `SCRIPT_ERR_NEGATIVE_LOCKTIME` | `SE-NegativeLocktime` | |
+| `SCRIPT_ERR_UNSATISFIED_LOCKTIME` | `SE-UnsatisfiedLocktime` | |
+| `SCRIPT_ERR_SIG_HASHTYPE` | `SE-SigHashtype` / `:sig-hashtype` | |
+| `SCRIPT_ERR_SIG_DER` | `SE-SigDer` / `:sig-der` | |
+| `SCRIPT_ERR_MINIMALDATA` | `SE-MinimalData` | the PUSH rule only |
+| `SCRIPT_ERR_SIG_PUSHONLY` | `:sig-pushonly` | VerifyScript level |
+| `SCRIPT_ERR_SIG_HIGH_S` | `SE-SigHighS` / `:sig-high-s` | |
+| `SCRIPT_ERR_SIG_NULLDUMMY` | `SE-SigNullDummy` / `:sig-nulldummy` | |
+| `SCRIPT_ERR_PUBKEYTYPE` | `SE-PubkeyType` / `:pubkeytype` | |
+| `SCRIPT_ERR_CLEANSTACK` | `:cleanstack` | VerifyScript level |
+| `SCRIPT_ERR_MINIMALIF` | `SE-MinimalIf` | |
+| `SCRIPT_ERR_SIG_NULLFAIL` | `SE-SigNullFail` / `:nullfail` | |
+| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS` | `SE-DiscourageUpgradableNops` | |
+| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM` | `SE-DiscourageUpgradableWitnessProgram` | |
+| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION` | `:discourage-upgradable-taproot-version` | |
+| `SCRIPT_ERR_DISCOURAGE_OP_SUCCESS` | `:discourage-op-success` | |
+| `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_PUBKEYTYPE` | `SE-DiscourageUpgradablePubkeyType` | |
+| `SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH` | `SE-WitnessProgramWrongLength` | |
+| `SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY` | `SE-WitnessProgramWitnessEmpty` | |
+| `SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH` | `SE-WitnessProgramMismatch`, `SE-TaprootMerkleMismatch` | a failed Taproot commitment is this error in Core |
+| `SCRIPT_ERR_WITNESS_MALLEATED` | `SE-WitnessMalleated` | |
+| `SCRIPT_ERR_WITNESS_MALLEATED_P2SH` | `:witness-malleated-p2sh` | VerifyScript level |
+| `SCRIPT_ERR_WITNESS_UNEXPECTED` | `SE-WitnessUnexpected` / `:witness-unexpected` | |
+| `SCRIPT_ERR_WITNESS_PUBKEYTYPE` | `SE-WitnessPubkeyType` | |
+| `SCRIPT_ERR_SCHNORR_SIG_SIZE` | `SE-SchnorrSignatureSize` / `:schnorr-sig-size` | |
+| `SCRIPT_ERR_SCHNORR_SIG_HASHTYPE` | `SE-SchnorrSigHashtype` / `:schnorr-sig-hashtype` | |
+| `SCRIPT_ERR_SCHNORR_SIG` | `SE-TaprootInvalidSignature`, `SE-TapscriptInvalidSig` | |
+| `SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE` | `SE-TaprootInvalidControlBlock` | |
+| `SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT` | `SE-TapscriptValidationWeight` | |
+| `SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG` | `SE-TapscriptCheckmultisig` | |
+| `SCRIPT_ERR_TAPSCRIPT_MINIMALIF` | `SE-TapscriptMinimalIf` | |
+| `SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY` | `SE-TapscriptEmptyPubkey` | |
+| `SCRIPT_ERR_OP_CODESEPARATOR` | `:op-codeseparator` | VerifyScript level |
+| `SCRIPT_ERR_SIG_FINDANDDELETE` | `SE-SigFindAndDelete` | |
 
 ### Summary
 
-- Bitcoin Core: **45 distinct error types**
-- Coalton: **31 distinct error types**
-- **14 error types missing or merged** in Coalton
-- Coalton merges several `*VERIFY` errors into generic `SE-VerifyFailed`
-- Signature-related errors (DER, hashtype, HIGH_S, NULLFAIL, NULLDUMMY) are handled in
-  the CL interop layer rather than as Coalton error types
+Every Core error our interpreter can report has exactly one variant or
+keyword, so the `script_tests.json` corpus compares the error NAME as well as
+the accept/reject verdict; the mapping lives in `script-error-name` (the
+engine's variants) and `bl.interop:+script-errors+` (the keywords, with
+Core's `ScriptErrorString` sentence for each). Several of ours may name one
+Core error where our engine splits a case Core does not; none names two.
+Errors Core reaches from `VerifyScript` rather than `EvalScript` --
+CLEANSTACK, SIG_PUSHONLY, WITNESS_MALLEATED_P2SH, OP_CODESEPARATOR -- are
+keywords of the CL layer rather than engine variants, which is where our
+VerifyScript port has them too.
 
 ---
 
