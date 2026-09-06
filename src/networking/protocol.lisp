@@ -338,8 +338,9 @@ MSG_TX and MSG_WITNESS_TX carry a txid, MSG_WTX (BIP339) a wtxid."
 (defvar *tx-in-flight* (make-hash-table :test 'equalp)
   "txid -> (peer . request-internal-real-time); at most one per txid.")
 
-(defstruct (tx-announcement (:constructor %make-tx-announcement (peer ready))
-                            (:conc-name tx-ann-))
+(defstruct (tx-announcement
+            (:constructor %make-tx-announcement (peer ready priority))
+            (:conc-name tx-ann-))
   "One peer's announcement of one txhash — Core's txrequest Announcement
 (txrequest.cpp:52-100). READY is the internal-real-time at which it becomes
 requestable (Core m_time as a reqtime: CANDIDATE_DELAYED until then,
@@ -356,7 +357,12 @@ to bias requests in their favor, worsening transaction censoring attacks\"
 (txrequest.h:45-58)."
   (peer nil)
   (ready 0 :type integer)
-  (completed nil :type boolean))
+  (completed nil :type boolean)
+  ;; %TX-REQUEST-PRIORITY of (txhash, peer), computed once here because none
+  ;; of its three inputs can change for the life of the announcement -- Core
+  ;; likewise pays for it once, by keeping the ByTxHash index SORTED by it
+  ;; rather than recomputing on every GetRequestable.
+  (priority 0 :type unsigned-byte))
 
 (defvar *tx-announcers* (make-hash-table :test 'equalp)
   "hash -> list of TX-ANNOUNCEMENT — failover candidates, each requestable
@@ -448,6 +454,50 @@ computes in AddTxAnnouncement (txdownloadman_impl.cpp:210-219)."
             (remhash (car entry) *tx-peer-in-flight*)))
       (remhash hash *tx-in-flight*))))
 
+(defvar *tx-request-salt* nil
+  "The node-lifetime SipHash key (K0 . K1) that orders tx-request candidates
+-- Core PriorityComputer's m_k0/m_k1, two FastRandomContext draws kept for
+the life of the process (txrequest.cpp:105-110). Drawn lazily so nothing in
+start-up ordering depends on it; two threads racing the first draw is benign
+(both values are equally good). A test binds it to fix the ranking.")
+
+(defun %tx-request-salt ()
+  "The node's tx-request SipHash key, drawn from the OS CSPRNG on first use."
+  (or *tx-request-salt*
+      (setf *tx-request-salt* (random-siphash-key))))
+
+(defun %tx-request-priority (hash peer)
+  "Core's PriorityComputer (txrequest.cpp:112-118):
+
+    SipHash(k0, k1, txhash || peer) >> 1  |  preferred << 63
+
+and the HIGHEST priority wins. Two properties follow, and both are the point
+(txrequest.h:66-84). Preferred (outbound) announcers outrank every
+non-preferred one, because their bit is the most significant. Within a class
+the winner is a function of the transaction and of a per-process secret, so
+it is uniform over the candidates, DIFFERENT for each transaction, and not
+computable by anyone else.
+
+Selecting by announcement order instead -- preferred first, then earliest
+ready -- put the choice entirely in the announcer's hands: a peer that races
+the network's announcements took the request for EVERY transaction rather
+than for a random 1/(number of preferred candidates) of them, and A such
+connections held A consecutive GETDATA_TX_INTERVAL windows with no variance.
+Core models that delay as k * GETDATA_TX_INTERVAL with k hypergeometric
+precisely because the pick is random; announcement order made k its maximum,
+deterministically, at the attacker's choosing.
+
+Announcement TIME keeps its other role -- gating readiness through the
+NONPREF / TXID_RELAY / OVERLOADED delays -- and stops deciding the winner."
+  (let* ((salt (%tx-request-salt))
+         (message (concatenate '(vector (unsigned-byte 8))
+                               hash (int-to-le-bytes (peer-id peer) 8)))
+         (low-bits (ash (bl.crypto:siphash-2-4 (car salt) (cdr salt) message)
+                        -1)))
+    (if (tx-request-preferred-p peer)
+        (logior low-bits (ash 1 63))
+        low-bits)))
+
 (defun %tx-announcement-for (hash peer)
   "Lock held: PEER's announcement of HASH, completed or not (Core's ByPeer
 lookup, which searches both the CANDIDATE_BEST and the non-best key), or NIL."
@@ -528,7 +578,8 @@ count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
     (let* ((now (get-internal-real-time))
            (ready (+ now (%tx-announcement-delay-ticks peer wtxidp
                                                        num-wtxid-peers))))
-      (push (%make-tx-announcement peer ready) (gethash hash *tx-announcers*))
+      (push (%make-tx-announcement peer ready (%tx-request-priority hash peer))
+            (gethash hash *tx-announcers*))
       (incf (gethash peer *tx-peer-announcements* 0))
       (setf (gethash hash *tx-request-wtxid-p*) wtxidp)
       (cond ((gethash hash *tx-in-flight*) nil)
@@ -547,6 +598,15 @@ that — see TX-REQUEST-RECEIVED-RESPONSE, which is what a delivery calls."
   (bt:with-lock-held (*tx-request-lock*)
     (%tx-request-clear-in-flight hash)
     (%tx-announcers-erase hash)))
+
+(defun tx-request-forget-tx (txid wtxid)
+  "ForgetTxHash under BOTH of a transaction's ids — Core writes the pair at
+every point where the transaction is resolved (MempoolAcceptedTx :327-328,
+the orphan branches :418-419 and :434-435, BlockConnected :107-108). One call
+when the transaction has no witness and the two ids are equal."
+  (tx-request-received txid)
+  (unless (equalp wtxid txid)
+    (tx-request-received wtxid)))
 
 (defun tx-request-received-response (peer hash)
   "PEER answered our request for HASH — with the transaction, or with a
@@ -603,50 +663,6 @@ thread. Registered as *peer-disconnect-hook*."
 ;;; first): the tracker must observe every disconnect path.
 (setf *peer-disconnect-hook* #'tx-request-disconnected-peer)
 
-(defvar *tx-request-salt* nil
-  "The node-lifetime SipHash key (K0 . K1) that orders tx-request candidates
--- Core PriorityComputer's m_k0/m_k1, two FastRandomContext draws kept for
-the life of the process (txrequest.cpp:105-110). Drawn lazily so nothing in
-start-up ordering depends on it; two threads racing the first draw is benign
-(both values are equally good). A test binds it to fix the ranking.")
-
-(defun %tx-request-salt ()
-  "The node's tx-request SipHash key, drawn from the OS CSPRNG on first use."
-  (or *tx-request-salt*
-      (setf *tx-request-salt* (random-siphash-key))))
-
-(defun %tx-request-priority (hash peer)
-  "Core's PriorityComputer (txrequest.cpp:112-118):
-
-    SipHash(k0, k1, txhash || peer) >> 1  |  preferred << 63
-
-and the HIGHEST priority wins. Two properties follow, and both are the point
-(txrequest.h:66-84). Preferred (outbound) announcers outrank every
-non-preferred one, because their bit is the most significant. Within a class
-the winner is a function of the transaction and of a per-process secret, so
-it is uniform over the candidates, DIFFERENT for each transaction, and not
-computable by anyone else.
-
-Selecting by announcement order instead -- preferred first, then earliest
-ready -- put the choice entirely in the announcer's hands: a peer that races
-the network's announcements took the request for EVERY transaction rather
-than for a random 1/(number of preferred candidates) of them, and A such
-connections held A consecutive GETDATA_TX_INTERVAL windows with no variance.
-Core models that delay as k * GETDATA_TX_INTERVAL with k hypergeometric
-precisely because the pick is random; announcement order made k its maximum,
-deterministically, at the attacker's choosing.
-
-Announcement TIME keeps its other role -- gating readiness through the
-NONPREF / TXID_RELAY / OVERLOADED delays -- and stops deciding the winner."
-  (let* ((salt (%tx-request-salt))
-         (message (concatenate '(vector (unsigned-byte 8))
-                               hash (int-to-le-bytes (peer-id peer) 8)))
-         (low-bits (ash (bl.crypto:siphash-2-4 (car salt) (cdr salt) message)
-                        -1)))
-    (if (tx-request-preferred-p peer)
-        (logior low-bits (ash 1 63))
-        low-bits)))
-
 (defun %tx-request-selectable-p (ann now)
   "Core IsSelectable (txrequest.cpp:88-92) in our two-table form: the
 announcement is not COMPLETED, its delay has passed (CANDIDATE_READY rather
@@ -655,18 +671,16 @@ than CANDIDATE_DELAYED), and its peer is still usable."
        (<= (tx-ann-ready ann) now)
        (eq (peer-state (tx-ann-peer ann)) :ready)))
 
-(defun %tx-request-best-candidate (hash anns now)
-  "The selectable announcement of HASH in ANNS with the highest
-%TX-REQUEST-PRIORITY at NOW — Core's CANDIDATE_BEST (GetRequestable,
-txrequest.cpp:595-624, over an index sorted by that same priority)."
-  (let ((best nil)
-        (best-priority -1))
+(defun %tx-request-best-candidate (anns now)
+  "The selectable announcement in ANNS with the highest %TX-REQUEST-PRIORITY
+at NOW — Core's CANDIDATE_BEST (GetRequestable, txrequest.cpp:595-624, over
+an index sorted by that same priority)."
+  (let ((best nil))
     (dolist (ann anns best)
-      (when (%tx-request-selectable-p ann now)
-        (let ((priority (%tx-request-priority hash (tx-ann-peer ann))))
-          (when (> priority best-priority)
-            (setf best ann
-                  best-priority priority)))))))
+      (when (and (%tx-request-selectable-p ann now)
+                 (or (null best)
+                     (> (tx-ann-priority ann) (tx-ann-priority best))))
+        (setf best ann)))))
 
 (defun %tx-request-schedule (hash now to-send)
   "Lock held: grant HASH to its best candidate at NOW and add the getdata inv
@@ -675,7 +689,7 @@ a request for HASH is already outstanding or no announcement is selectable —
 Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
   (if (gethash hash *tx-in-flight*)
       to-send
-      (let ((best (%tx-request-best-candidate hash (gethash hash *tx-announcers*) now)))
+      (let ((best (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
         (if (null best)
             to-send
             (let* ((peer (tx-ann-peer best))
@@ -720,11 +734,8 @@ re-check is an optimisation, never a gate."
 (defun %send-tx-getdatas (to-send)
   "Send TO-SEND (peer -> invs, as %TX-REQUEST-SCHEDULE builds it) as one
 getdata per peer, OUTSIDE the tracker lock, and return the number of invs
-sent. Each inv carries the id type its entry was announced under: a wtxid
-entry as MSG_WTX, a txid entry as MSG_TX|witness-flag. Sending every failover
-as MSG_WITNESS_TX regardless — which this used to do — is read by a Core peer
-as a TXID lookup, so a wtxid hash got a notfound back and failover silently
-never worked for segwit txs (a first-announcer-wins censorship primitive)."
+sent. The id type of each inv was decided by TX-REQUEST-INV when the entry
+was scheduled."
   (let ((sent 0))
     (loop for (peer . invs) in to-send
           do (incf sent (length invs))
@@ -791,11 +802,8 @@ without naming networking."
   ;; announcements of transactions that are still unconfirmed for us.
   (unless (bl.store:chain-state-target-blockhash chainstate)
     (map nil (lambda (tx)
-               (let ((txid (bl.ser:transaction-hash tx))
-                     (wtxid (bl.ser:transaction-wtxid tx)))
-                 (tx-request-received txid)
-                 (unless (equalp wtxid txid)
-                   (tx-request-received wtxid))))
+               (tx-request-forget-tx (bl.ser:transaction-hash tx)
+                                     (bl.ser:transaction-wtxid tx)))
          (bl.ser:bitcoin-block-transactions block))))
 
 (defun tx-fetch-inv-type (peer)
@@ -1962,9 +1970,7 @@ waiting on it. PEER is the source, excluded from relay."
     ;; any requests for it" (:325-328): ForgetTxHash under BOTH ids, which is
     ;; the point at which the transaction is genuinely resolved and every
     ;; announcer's slot may be released. A no-op if it was never tracked.
-    (tx-request-received txid)
-    (unless (equalp wtxid txid)
-      (tx-request-received wtxid))
+    (tx-request-forget-tx txid wtxid)
     ;; It may have been in our orphanage (announced by another peer, or held
     ;; while a parent was fetched); Core's EraseTx is a no-op otherwise.
     (bl.mp:orphan-remove
@@ -2095,9 +2101,7 @@ left GetCandidatePeers nothing to find."
     (dolist (candidate (%orphan-resolution-candidates peer txid wtxid))
       (%add-orphan-resolution-candidate candidate tx parents mempool
                                         num-wtxid-peers))
-    (tx-request-received txid)
-    (unless (equalp wtxid txid)
-      (tx-request-received wtxid))))
+    (tx-request-forget-tx txid wtxid)))
 
 (defun %orphan-parents-rejected-p (parent-txids recent-rejects)
   "Core's fRejectedParents scan (txdownloadman_impl.cpp:371-396): T when an
@@ -2226,8 +2230,7 @@ CTX's recent-rejects, when present, caches recently rejected txs."
                              (bl:add-recent-reject recent-rejects txid)
                              (bl:add-recent-reject recent-rejects wtxid)
                              ;; :434-435, beside the two filter inserts.
-                             (tx-request-received txid)
-                             (tx-request-received wtxid))
+                             (tx-request-forget-tx txid wtxid))
                            (%take-orphan-into-orphanage
                             peer tx mempool utxo-set recent-rejects peers))))
                     (t
