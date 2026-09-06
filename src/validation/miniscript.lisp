@@ -904,10 +904,17 @@ or NIL when no satisfaction exists."
     (and sat (+ count sat))))
 
 (defun ms-node-check-ops-limit-p (node)
-  "Core Node::CheckOpsLimit (miniscript.h:1566). A node with no satisfaction
-passes — IsNotSatisfiable is what rejects that, separately."
-  (let ((ops (ms-node-get-ops node)))
-    (or (null ops) (<= ops +ms-max-ops-per-script+))))
+  "Core Node::CheckOpsLimit (miniscript.h:1565-1570). A node with no
+satisfaction passes — IsNotSatisfiable is what rejects that, separately.
+
+Core's FIRST line is `if (IsTapscript(m_script_ctx)) return true;\'. There is
+no 201-op limit to check under tapscript: BIP342 dropped it, and the
+interpreter counts opcodes only for SigVersion BASE and WITNESS_V0
+(interpreter.cpp:450-455) — which is where our own script engine gates it too
+(src/coalton/script.lisp, `(not (flag-enabled \"TAPSCRIPT\"))\')."
+  (or (ms-tapscript-p (ms-node-ctx node))
+      (let ((ops (ms-node-get-ops node)))
+        (or (null ops) (<= ops +ms-max-ops-per-script+)))))
 
 (defconstant +ms-p2wsh-sig-size+ 73
   "Core CalcWitnessSize's sig_size outside tapscript: 1 length byte + a 72-byte

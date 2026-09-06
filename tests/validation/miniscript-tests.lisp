@@ -1135,6 +1135,51 @@ checked against scripts small enough to count by hand. GetOps is
       ;; Either branch is satisfied and the other dissatisfied: two elements.
       (is (= 2 (ss (format nil "or_b(pk(~A),s:pk(~A))" a b)))))))
 
+(defun %ms-wide-thresh (n)
+  "thresh(1,pk(K1),s:pk(K2),...) over N distinct keys: one expression whose
+satisfaction costs 3N - 1 ops and whose script and stack stay well inside both
+contexts' other ceilings."
+  (let ((keys (%ms-distinct-keys n)))
+    (format nil "thresh(1,pk(~A)~{,s:pk(~A)~})" (first keys) (rest keys))))
+
+(test miniscript-the-201-op-limit-is-a-p2wsh-rule
+  "Core's CheckOpsLimit opens with `if (IsTapscript(m_script_ctx)) return
+true;' (miniscript.h:1565-1570). There is nothing to check: BIP342 dropped the
+opcode count, and the interpreter charges opcodes only for SigVersion BASE and
+WITNESS_V0 (interpreter.cpp:450-455) -- which is where our own script engine
+gates it too. Applying the limit under tapscript refused policies this node's
+own script verification would run, and Core accepts.
+
+ONE expression in TWO contexts, so nothing but the per-context rules can move
+the verdict, and the OTHER two per-context ceilings are asserted to be slack:
+the P2WSH stack-item cap is 100 and this needs 70, the P2WSH script cap is
+3,600 and this is 2,590. The narrower expression, sane in both, is what says
+the width itself is not the reason."
+  (let* ((over (%ms-wide-thresh 70))     ; 209 ops
+         (under (%ms-wide-thresh 40))    ; 119 ops
+         (over-node (bl.val:ms-parse over)))
+    (flet ((sane (expr ctx)
+             (bl.val:ms-node-sane-p (bl.val:ms-parse expr :ctx ctx))))
+      (is (= 70 (bl.val:ms-node-get-stack-size over-node))
+          "the P2WSH stack-item cap is 100, so it is not what refuses this")
+      (is (= 2590 (%ms-script-size over-node))
+          "the P2WSH script cap is 3,600, so it is not what refuses this either")
+      ;; Over the op limit: refused under P2WSH, accepted under tapscript.
+      (is-false (sane over :p2wsh))
+      (is-true (sane over :tapscript))
+      ;; Under it: accepted in both, so only the op count separates the two
+      ;; verdicts above.
+      (is-true (sane under :p2wsh))
+      (is-true (sane under :tapscript))))
+  ;; multi_a exists only under tapscript and costs one op per key plus one, so
+  ;; Core's own 999-key ceiling is five times over the P2WSH limit.
+  (let ((node (bl.val:ms-parse
+               (format nil "multi_a(250~{,~A~})" (%ms-distinct-keys 250))
+               :ctx :tapscript)))
+    (is (= 250 (bl.val:ms-node-get-stack-size node)))
+    (is-true (bl.val:ms-node-valid-satisfactions-p node))
+    (is-true (bl.val:ms-node-sane-p node))))
+
 (test ms-resource-limits-do-not-reject-any-of-cores-valid-vectors
   "A guard against the ops/stack port over-rejecting. Every expression Core's
 own corpus marks VALID for P2WSH must pass CheckOpsLimit and CheckStackSize —

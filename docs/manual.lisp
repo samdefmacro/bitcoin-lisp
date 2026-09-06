@@ -916,7 +916,9 @@
   activation. Its regtest deployment windows are the one thing an option
   can move: -vbparams=deployment:start:end[:min_activation_height] rewrites
   them through APPLY-VERSIONBITS-PARAMETERS, on regtest only, exactly as
-  Core's ReadRegTestArgs feeds RegTestOptions."
+  Core's ReadRegTestArgs feeds RegTestOptions. Miniscript's 201-op limit is
+  a P2WSH rule and tapscript has none (miniscript.h:1566), which is also how
+  the script interpreter gates it."
   (bitcoin-lisp.validation package)
   (bitcoin-lisp.validation:validate-transaction-structure function)
   (bitcoin-lisp.validation:validate-transaction-contextual function)
