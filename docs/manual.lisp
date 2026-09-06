@@ -1312,6 +1312,11 @@
 
   Invariants: a wallet's chain view is driven by the node's block and
   mempool notifications (the `wallets-*` entry points), never by polling;
+  a DISCONNECT persists the rolled-back locator every time, where a
+  connect persists only on a wallet-tx change or every 144 blocks (Core
+  SetLastBlockProcessed vs SetLastBlockProcessedInMem) -- an unwritten
+  connect is re-learned by scanning forward, an unwritten disconnect
+  leaves the file naming the abandoned branch;
   the descriptor expansion is cached by descriptor STRING, and every
   script construction change must invalidate it; a stored transaction
   record that will not load is Core's `NEED_RESCAN` -- the wallet still

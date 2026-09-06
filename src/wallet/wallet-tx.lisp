@@ -1132,8 +1132,22 @@ single-hash fallback when the entry is unknown."
                                    (%wallet-chain-locator chain-state
                                                           block-hash)))))))
 
-(defun wallet-block-disconnected (wallet block height)
-  "Core CWallet::blockDisconnected."
+(defun wallet-block-disconnected (wallet chain-state block height)
+  "Core CWallet::blockDisconnected.
+
+Ends in Core's SetLastBlockProcessed (wallet.cpp:1598), not its
+SetLastBlockProcessedInMem half: SetLastBlockProcessed is the in-memory pair
+FOLLOWED BY WriteBestBlock (:681-687), so EVERY disconnect syncs the
+rolled-back locator to the wallet file. That is deliberately unlike the
+connect side, which persists only when a wallet tx changed or every 144
+blocks (:1550-1552) -- a connect that is not written is re-learned by
+scanning forward from the stored locator, while a DISCONNECT that is not
+written leaves the file naming a block on the abandoned branch, which is the
+one direction the load-time catch-up cannot cheaply undo.
+
+CHAIN-STATE is here for the locator: %WALLET-CHAIN-LOCATOR needs the block
+index to build Core's exponential step-back form, and the single-hash
+fallback would make every reorg cost a full rescan on the next load."
   (with-wallet-lock (wallet)
     (loop for tx in (bl.ser:bitcoin-block-transactions block)
           for index from 0
@@ -1159,10 +1173,13 @@ single-hash fallback when the entry is unknown."
                                    (>= (wallet-tx-block-height w) height))
                               (progn (%wtx-apply-state w :inactive) :changed)
                               :unchanged)))))))))
-    (setf (wallet-last-block-hash wallet)
-          (bl.ser:block-header-prev-block
-           (bl.ser:bitcoin-block-header block))
-          (wallet-last-block-height wallet) (1- height))))
+    ;; Core SetLastBlockProcessed(block.height - 1, *block.prev_hash).
+    (let ((prev-hash (bl.ser:block-header-prev-block
+                      (bl.ser:bitcoin-block-header block))))
+      (setf (wallet-last-block-hash wallet) prev-hash
+            (wallet-last-block-height wallet) (1- height))
+      (wallet-write-best-block wallet
+                               (%wallet-chain-locator chain-state prev-hash)))))
 
 ;;; --- Manager fan-outs (called by node/wallet-hooks.lisp's wallet-notify-* hooks) ---
 
@@ -1193,9 +1210,9 @@ node down)."
   (%do-fanout-wallets (wallet manager "block-connected")
     (wallet-block-connected wallet mempool chain-state block block-hash height)))
 
-(defun wallets-block-disconnected (manager block height)
+(defun wallets-block-disconnected (manager chain-state block height)
   (%do-fanout-wallets (wallet manager "block-disconnected")
-    (wallet-block-disconnected wallet block height)))
+    (wallet-block-disconnected wallet chain-state block height)))
 
 (defun wallets-mempool-tx-added (manager mempool tx)
   (%do-fanout-wallets (wallet manager "mempool-tx-added")
