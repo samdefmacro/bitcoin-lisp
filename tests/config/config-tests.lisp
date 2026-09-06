@@ -1940,19 +1940,29 @@ resolution is gated on it -- the dial target (net.cpp:406), -proxy, -onion,
 -externalip, -i2psam and -torcontrol. It is NOT what gates the DNS seeds; those
 are -dnsseed, and Core queries them with a hardcoded fAllowLookup
 (net.cpp:2371), which is why the two rows stay independent here."
-  (let ((saved bl.net:*name-lookup*))
+  (let ((saved bl.net:*name-lookup*)
+        (saved-seed bl:*dns-seed-enabled*))
     (unwind-protect
          (progn
            ;; It defaults TRUE, so setting it to 0 is what proves the wiring.
+           ;; Both specials are set here rather than read as they stand: a
+           ;; :GLOBAL row is only ASSIGNED when its option is present, so an
+           ;; earlier test in this suite leaves whatever it set.
+           (setf bl.net:*name-lookup* t bl:*dns-seed-enabled* t)
            (apply-config-globals '(("dns" . "0")))
            (is-false bl.net:*name-lookup*)
+           ;; And -dns=0 leaves -dnsseed alone: they are different options, and
+           ;; Core's DNS-seed query is not gated on fNameLookup at all.
+           (is-true bl:*dns-seed-enabled* "-dns must not touch -dnsseed")
            (apply-config-globals '(("dns" . "1")))
-           (is-true bl.net:*name-lookup*))
-      (setf bl.net:*name-lookup* saved)))
+           (is-true bl.net:*name-lookup*)
+           ;; The reverse, as the control: -dnsseed=0 leaves -dns alone.
+           (apply-config-globals '(("dnsseed" . "0")))
+           (is-false bl:*dns-seed-enabled*)
+           (is-true bl.net:*name-lookup* "-dnsseed must not touch -dns"))
+      (setf bl.net:*name-lookup* saved
+            bl:*dns-seed-enabled* saved-seed)))
   (is-true bl.net:*name-lookup* "Core DEFAULT_NAME_LOOKUP is true")
-  ;; -dns=0 leaves -dnsseed alone: they are different options.
-  (let ((plist (start-node-plist '("-regtest" "-dns=0"))))
-    (is-false (member :dnsseed plist)))
   (is-true (bl:known-config-option-p "dns"))
   (is-false (bl.cfg:core-only-option-p "dns")))
 
