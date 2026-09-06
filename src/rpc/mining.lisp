@@ -537,7 +537,7 @@ cache above wraps exactly the expensive part and nothing else."
         ("networkhashps" . ,(rpc-getnetworkhashps node nil))
         ("pooledtx" . ,(if mempool (bl.mp:mempool-count mempool) 0))
         ;; BTC/kvB, as Core's ValueFromAmount renders blockMinFeeRate.
-        ("blockmintxfee" . ,(/ bl.mining:*block-min-tx-fee-rate* 100000000.0d0))
+        ("blockmintxfee" . ,(satoshi->btc bl.mining:*block-min-tx-fee-rate*))
         ("chain" . ,(%chain-name network))
         ("next" . (("height" . ,(1+ height))
                    ("bits" . ,(%bits-hex next-bits))

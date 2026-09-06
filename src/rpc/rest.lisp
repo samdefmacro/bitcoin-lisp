@@ -343,8 +343,7 @@ outpoints come from the URI."
               ("utxos" . ,(mapcar
                            (lambda (coin)
                              `(("height" . ,(bl.store:utxo-entry-height coin))
-                               ("value" . ,(/ (bl.store:utxo-entry-value coin)
-                                              100000000.0d0))
+                               ("value" . ,(satoshi->btc (bl.store:utxo-entry-value coin)))
                                ;; Core ScriptToUniv with include_hex and
                                ;; include_address (rest.cpp:1072).
                                ("scriptPubKey"
@@ -594,8 +593,7 @@ before it."
          (mapcar
           (lambda (entry)
             (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
-              `(("value" . ,(/ (bl.store:utxo-entry-value entry)
-                               100000000.0d0))
+              `(("value" . ,(satoshi->btc (bl.store:utxo-entry-value entry)))
                 ;; Core's ScriptToUniv with include_hex and include_address
                 ;; (rest.cpp:303).
                 ("scriptPubKey" . ,(script-to-json spk :network network)))))

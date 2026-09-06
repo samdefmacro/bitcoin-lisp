@@ -794,7 +794,7 @@ status with no scan running returns null; abort with no scan is a no-op."
         ;; Every unspent carries a canonical descriptor with checksum.
         (is (every (lambda (u) (find #\# (cdr (assoc "desc" u :test #'string=))))
                    unspents)))
-      (is (= 2.0 (cdr (assoc "total_amount" r :test #'string=)))))
+      (is (= 2 (btc-amount (cdr (assoc "total_amount" r :test #'string=))))))
     ;; No scan running: status -> null (Core NullUniValue); abort -> a bare
     ;; JSON false (nothing to abort).
     (is (null (bl.rpc::rpc-scantxoutset node (list "status"))))
@@ -1080,6 +1080,47 @@ are not), while text that parses to a value outside [0, MAX_MONEY] is
                    (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
         (is (equal expected got)
             "AmountFromValue(~S) is ~S in Core, ~S here" value expected got)))))
+
+(test amounts-encode-as-cores-number-token
+  "Every BTC amount encodes as the JSON number token Core's ValueFromAmount
+writes (core_io.cpp:286-296): sign, quotient, '.', and exactly eight decimal
+digits -- 1.00000000, not the 1.0 a float printer chooses, and 0.00000001,
+not 1.0e-8.
+
+Asserted on the ENCODED TEXT, because that is the whole divergence: the
+VALUES agreed the entire time, and Core's functional tests read these fields
+as Decimal, which is exactly why they could not see it."
+  (dolist (row '((0 "0.00000000") (1 "0.00000001") (1000 "0.00001000")
+                 (10000000 "0.10000000") (100000000 "1.00000000")
+                 (12345678 "0.12345678") (99999999 "0.99999999")
+                 (5000000000 "50.00000000")
+                 (2099999999999999 "20999999.99999999")
+                 (2100000000000000 "21000000.00000000")
+                 (-1 "-0.00000001") (-1000 "-0.00001000")
+                 (-5000000000 "-50.00000000")))
+    (destructuring-bind (satoshis text) row
+      (let ((encoded (with-output-to-string (out)
+                       (yason:encode (bl.rpc:satoshi->btc satoshis) out))))
+        (is (string= text encoded)
+            "~D satoshis encode as ~S, Core writes ~S" satoshis encoded text))))
+  ;; A whole reply, so the token is not quoted and not re-wrapped on the way
+  ;; through rpc-result->json.
+  (let ((json (with-output-to-string (out)
+                (yason:encode
+                 (bl.rpc::rpc-result->json
+                  (list (cons "amount" (bl.rpc:satoshi->btc 100000000))
+                        (cons "fee" (bl.rpc:satoshi->btc -1))))
+                 out))))
+    (is (search "\"amount\":1.00000000" json) "amount token: ~A" json)
+    (is (search "\"fee\":-0.00000001" json) "fee token: ~A" json)
+    (is-false (search "\"1.00000000\"" json)
+              "the amount was quoted as a string: ~A" json))
+  ;; Positive control for the assertion above: a double in the same slot is
+  ;; what the tree used to emit, and it does NOT match Core's spelling.
+  (let ((double-json (with-output-to-string (out)
+                       (yason:encode (/ 100000000 100000000.0d0) out))))
+    (is (string/= "1.00000000" double-json)
+        "the float path already spells amounts Core's way, so this test is vacuous")))
 
 ;;; --- Method Registry Tests ---
 
@@ -4064,14 +4105,14 @@ verbosity-2 caller prevout objects Core does not send."
       (is-true (assoc "fee" j :test #'string=))
       (is-true p "verbosity 3 must carry a prevout object")
       (is (eql 12 (cdr (assoc "height" p :test #'string=))))
-      (is (= (/ 5000 100000000.0d0) (cdr (assoc "value" p :test #'string=))))
+      (is (= (/ 5000 100000000) (btc-amount (cdr (assoc "value" p :test #'string=)))))
       (is-true (assoc "generated" p :test #'string=))
       (is-true (assoc "scriptPubKey" p :test #'string=))
       ;; The fee is inputs minus outputs, from the coins.
       (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
                              sum (bl.ser:tx-out-value o))))
-        (is (= (/ (- 5000 out-total) 100000000.0d0)
-               (cdr (assoc "fee" j :test #'string=))))))))
+        (is (= (/ (- 5000 out-total) 100000000)
+               (btc-amount (cdr (assoc "fee" j :test #'string=)))))))))
 
 (defun %spk-object-keys (object)
   (mapcar #'car object))
@@ -4617,15 +4658,15 @@ transaction it just priced."
     (%with-stubbed-fee-estimate (node :rate 10)   ; 10 sat/vB = 10000 sat/kvB
       ;; Floor below the estimate: the estimate stands.
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
-        (is (= (/ 10000 100000000.0d0)
-               (cdr (assoc "feerate" result :test #'string=)))))
+        (is (= (/ 10000 100000000)
+               (btc-amount (cdr (assoc "feerate" result :test #'string=))))))
       ;; Floor above the estimate: the floor wins.
       (let ((mempool (bl.rpc:rpc-get-mempool node)))
         (when mempool
           (setf (bl.mp:mempool-min-fee-rate mempool) 50000)
           (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
-            (is (= (/ 50000 100000000.0d0)
-                   (cdr (assoc "feerate" result :test #'string=)))
+            (is (= (/ 50000 100000000)
+                   (btc-amount (cdr (assoc "feerate" result :test #'string=))))
                 "the answer was below the node's own acceptance floor")))))))
 
 (test estimatesmartfee-reports-the-target-the-answer-is-actually-for
@@ -5195,7 +5236,7 @@ inputs array answered that same wrong message."
     (is (assoc "hash_serialized_3" result :test #'string=))
     ;; Empty UTXO set should have 0 txouts
     (is (= (cdr (assoc "txouts" result :test #'string=)) 0))
-    (is (= (cdr (assoc "total_amount" result :test #'string=)) 0))
+    (is (= (btc-amount (cdr (assoc "total_amount" result :test #'string=))) 0))
     (is (= (cdr (assoc "transactions" result :test #'string=)) 0))))
 
 (test rpc-gettxoutsetinfo-with-utxos
@@ -5214,7 +5255,7 @@ inputs array answered that same wrong message."
       (is (= (cdr (assoc "txouts" result :test #'string=)) 3))
       (is (= (cdr (assoc "transactions" result :test #'string=)) 2))
       ;; Total should be 1.75 BTC (returned in BTC, not satoshis)
-      (is (= (cdr (assoc "total_amount" result :test #'string=)) 1.75))
+      (is (= (btc-amount (cdr (assoc "total_amount" result :test #'string=))) 7/4))
       ;; hash_serialized_3 should be a 64-char hex string
       (let ((hash (cdr (assoc "hash_serialized_3" result :test #'string=))))
         (is (stringp hash))
@@ -6429,8 +6470,9 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
            (parse-integer (cdr (assoc "localservices" r :test #'string=))
                           :radix 16)))
     (is (assoc "localrelay" r :test #'string=))
-    (is (floatp (cdr (assoc "relayfee" r :test #'string=))))
-    (is (floatp (cdr (assoc "incrementalfee" r :test #'string=))))
+    ;; Amounts, so number TOKENS carrying Core's ValueFromAmount spelling.
+    (is (plusp (btc-amount (cdr (assoc "relayfee" r :test #'string=)))))
+    (is (plusp (btc-amount (cdr (assoc "incrementalfee" r :test #'string=)))))
     (is (integerp (cdr (assoc "connections_in" r :test #'string=))))
     (is (integerp (cdr (assoc "connections_out" r :test #'string=))))
     (is (assoc "warnings" r :test #'string=))
@@ -6527,7 +6569,7 @@ through yason."
       (is (= 0.5d0 (funcall f "minping")))
       (is (numberp (funcall f "pingwait")))
       ;; feefilter: 1000 sat/kvB -> BTC/kvB.
-      (is (= 1.0d-5 (funcall f "minfeefilter")))
+      (is (= 1/100000 (btc-amount (funcall f "minfeefilter"))))
       ;; timeoffset captured at version receipt; conntime a plausible unix time.
       (is (= -3 (funcall f "timeoffset")))
       (is (> (funcall f "conntime") 1600000000))
@@ -7358,7 +7400,7 @@ Core reports here without converting (rpc/mempool.cpp:461-463, :523-525,
     (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
       (is (= 1 (length r)))
       (is (= 0 (cdr (assoc "weight" (first r) :test #'string=))))
-      (is (zerop (cdr (assoc "fee" (first r) :test #'string=)))))
+      (is (zerop (btc-amount (cdr (assoc "fee" (first r) :test #'string=))))))
     ;; Low-fee parent + CPFP child: one chunk of (20100, pweight+cweight).
     (%add-tx mempool parent :fee 100)
     (%add-tx mempool child :fee 20000)
@@ -7366,7 +7408,7 @@ Core reports here without converting (rpc/mempool.cpp:461-463, :523-525,
     (let* ((r (bl.rpc::rpc-getmempoolentry node (list pid-hex)))
            (fees (cdr (assoc "fees" r :test #'string=))))
       (is (= (+ pweight cweight) (cdr (assoc "chunkweight" r :test #'string=))))
-      (is (= 20100 (round (* 100000000 (cdr (assoc "chunk" fees :test #'string=)))))))
+      (is (= 20100 (* 100000000 (btc-amount (cdr (assoc "chunk" fees :test #'string=)))))))
     ;; getmempoolcluster: one cluster, one chunk, txs in mining order.
     (let* ((r (bl.rpc::rpc-getmempoolcluster node (list cid-hex)))
            (chunks (cdr (assoc "chunks" r :test #'string=))))
@@ -7374,20 +7416,20 @@ Core reports here without converting (rpc/mempool.cpp:461-463, :523-525,
       (is (= (+ pweight cweight) (cdr (assoc "clusterweight" r :test #'string=))))
       (is (= 1 (length chunks)))
       (let ((chunk (first chunks)))
-        (is (= 20100 (round (* 100000000 (cdr (assoc "chunkfee" chunk :test #'string=))))))
+        (is (= 20100 (* 100000000 (btc-amount (cdr (assoc "chunkfee" chunk :test #'string=))))))
         (is (= (+ pweight cweight) (cdr (assoc "chunkweight" chunk :test #'string=))))
         (is (equal (list pid-hex cid-hex) (cdr (assoc "txs" chunk :test #'string=))))))
     ;; The diagram now has the origin plus one cumulative chunk point.
     (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
       (is (= 2 (length r)))
       (is (= (+ pweight cweight) (cdr (assoc "weight" (second r) :test #'string=))))
-      (is (= 20100 (round (* 100000000 (cdr (assoc "fee" (second r) :test #'string=)))))))
+      (is (= 20100 (* 100000000 (btc-amount (cdr (assoc "fee" (second r) :test #'string=)))))))
     ;; A standalone lower-feerate tx appends a second, later diagram point.
     (let ((solo (make-mempool-test-tx :input-id 211)))
       (%add-tx mempool solo :fee 50)
       (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
         (is (= 3 (length r)))
-        (is (= 20150 (round (* 100000000 (cdr (assoc "fee" (third r) :test #'string=))))))))
+        (is (= 20150 (* 100000000 (btc-amount (cdr (assoc "fee" (third r) :test #'string=))))))))
     ;; getmempoolcluster on an absent txid errors like getmempoolentry.
     (signals error
       (bl.rpc::rpc-getmempoolcluster
@@ -7411,10 +7453,10 @@ mining order (parent's first)."
       (is (= 2 (length chunks)))
       (is (equal (list pid-hex) (cdr (assoc "txs" (first chunks) :test #'string=))))
       (is (equal (list cid-hex) (cdr (assoc "txs" (second chunks) :test #'string=))))
-      (is (= 20000 (round (* 100000000
-                             (cdr (assoc "chunkfee" (first chunks) :test #'string=))))))
-      (is (= 100 (round (* 100000000
-                           (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
+      (is (= 20000 (* 100000000
+                      (btc-amount (cdr (assoc "chunkfee" (first chunks) :test #'string=))))))
+      (is (= 100 (* 100000000
+                    (btc-amount (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
 
 ;;; --- /rest/headers active-chain membership ---
 

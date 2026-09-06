@@ -59,7 +59,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   "Return mempool statistics."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
-        (incfee (/ bl.mp:*incremental-relay-fee-rate* 100000000.0d0)))
+        (incfee (satoshi->btc bl.mp:*incremental-relay-fee-rate*)))
     (if mempool
         ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
         ;; Node lock: count/bytes/total-fee must be one consistent snapshot
@@ -67,10 +67,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
         ;; takes pool.cs via the stats getters).
         (with-node-lock (node)
          (let* ((min-fee-sat-kvb (bl.mp:mempool-effective-min-fee-rate mempool))
-               (min-fee-btc-kvb (/ min-fee-sat-kvb 100000000.0d0))
+               (min-fee-btc-kvb (satoshi->btc min-fee-sat-kvb))
                ;; The pool's configured floor (Core m_min_relay_feerate).
-               (relay-fee-btc-kvb (/ (bl.mp:mempool-min-fee-rate mempool)
-                                     100000000.0d0))
+               (relay-fee-btc-kvb (satoshi->btc (bl.mp:mempool-min-fee-rate mempool)))
                (count (bl.mp:mempool-count mempool))
                ;; Core "bytes" = GetTotalTxSize(), the sum of the entries'
                ;; sigop-adjusted VIRTUAL sizes (rpc/mempool.cpp:1040,
@@ -86,7 +85,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
             ;; Core DynamicMemoryUsage(): the malloc-modeled memory usage the
             ;; -maxmempool cap is keyed on (rpc/mempool.cpp:1041).
             ("usage" . ,(bl.mp:mempool-dynamic-usage mempool))
-            ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
+            ("total_fee" . ,(satoshi->btc total-fee-sat))
             ("maxmempool" . ,(bl.mp:mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)
             ("minrelaytxfee" . ,relay-fee-btc-kvb)
@@ -187,13 +186,11 @@ size, exactly Core's GetTxSize-based reporting."
           ("time" . ,(bl.mp:mempool-entry-entry-time entry))
           ("height" . ,(bl.mp:mempool-entry-height entry))
           ("chunkweight" . ,(bl.mp:feefrac-size chunk))
-          ("fees" . (("base" . ,(/ (bl.mp:mempool-entry-fee entry) 100000000.0d0))
-                     ("modified" . ,(/ (bl.mp:mempool-entry-modified-fee entry)
-                                       100000000.0d0))
-                     ("ancestor" . ,(/ afees 100000000.0d0))
-                     ("descendant" . ,(/ dfees 100000000.0d0))
-                     ("chunk" . ,(/ (bl.mp:feefrac-fee chunk)
-                                    100000000.0d0))))
+          ("fees" . (("base" . ,(satoshi->btc (bl.mp:mempool-entry-fee entry)))
+                     ("modified" . ,(satoshi->btc (bl.mp:mempool-entry-modified-fee entry)))
+                     ("ancestor" . ,(satoshi->btc afees))
+                     ("descendant" . ,(satoshi->btc dfees))
+                     ("chunk" . ,(satoshi->btc (bl.mp:feefrac-fee chunk)))))
           ("ancestorcount" . ,acount)
           ("ancestorsize" . ,asize)
           ("descendantcount" . ,dcount)
@@ -298,8 +295,7 @@ what the txgraph holds, so no conversion happens on the way out."
           ("txcount" . ,(reduce #'+ chunks :key (lambda (c) (length (car c)))))
           ("chunks"
            . ,(mapcar (lambda (c)
-                        `(("chunkfee" . ,(/ (bl.mp:feefrac-fee (cdr c))
-                                            100000000.0d0))
+                        `(("chunkfee" . ,(satoshi->btc (bl.mp:feefrac-fee (cdr c))))
                           ("chunkweight" . ,(bl.mp:feefrac-size (cdr c)))
                           ("txs" . ,(mapcar (lambda (h)
                                               (hash-to-hex
@@ -334,7 +330,7 @@ GetFeerateDiagram returns FeePerWeight and the RPC reports f.size verbatim
                      do (incf cum-weight (bl.mp:feefrac-size feerate))
                         (incf cum-fee (bl.mp:feefrac-fee feerate))
                         (push `(("weight" . ,cum-weight)
-                                ("fee" . ,(/ cum-fee 100000000.0d0)))
+                                ("fee" . ,(satoshi->btc cum-fee)))
                               points)
                         (bl.mp:block-builder-include builder))
             (bl.mp:block-builder-finish builder)))))
@@ -729,9 +725,9 @@ per-wtxid object. Status drives which fields are present."
   (let ((status (bl.val:package-tx-result-status r))
         (base (list (cons "txid" (hash-to-hex
                                   (bl.val:package-tx-result-txid r))))))
-    (flet ((btc (sat) (/ (or sat 0) 100000000.0d0))
+    (flet ((btc (sat) (satoshi->btc (or sat 0)))
            ;; sat/vB -> BTC/kvB, the unit Core reports feerates in.
-           (feerate-btc-kvb (rate) (/ (* (or rate 0) 1000) 100000000.0d0)))
+           (feerate-btc-kvb (rate) (satoshi->btc (* (or rate 0) 1000))))
       (ecase status
         (:valid
          (append base

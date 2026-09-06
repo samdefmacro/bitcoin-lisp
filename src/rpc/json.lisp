@@ -95,6 +95,24 @@ field, as it would encode as null."
 ;;; on absence (scantxoutset "status" with no scan running) must keep
 ;;; returning NIL.
 
+(defstruct (json-number (:constructor make-json-number (text))
+                        (:copier nil))
+  "A JSON number whose TEXT is written out verbatim.
+
+Core builds a number as a UniValue of type VNUM carrying the exact digits it
+means and UniValue writes those digits back unchanged, so the SPELLING of a
+number is Core's to choose. A double-float here is spelled by SBCL's float
+printer instead, which prints the shortest text that round-trips -- 1.0e-8 for
+one satoshi, 0.1 for a tenth of a coin -- where Core prints 0.00000001 and
+0.10000000. Every amount the RPC and REST surfaces emit goes through this
+(see SATOSHI->BTC), so no float printer stands between a satoshi count and
+the reply."
+  (text "0" :type string :read-only t))
+
+(defmethod yason:encode ((object json-number) &optional (stream *standard-output*))
+  (write-string (json-number-text object) stream)
+  object)
+
 (defun json-array (list)
   "LIST as a JSON array, rendering [] rather than null when it is empty.
 yason encodes a vector as an array unconditionally, and rpc-result->json

@@ -572,7 +572,7 @@ which is what stops a busy mempool from reassembling a block on every call."
           ;; Core rpc/mining.cpp:429-491: networkhashps, blockmintxfee and the
           ;; "next" block's height/bits/difficulty/target.
           (is (numberp (cdr (assoc "networkhashps" r :test #'string=))))
-          (is (numberp (cdr (assoc "blockmintxfee" r :test #'string=))))
+          (is (numberp (btc-amount (cdr (assoc "blockmintxfee" r :test #'string=)))))
           (let ((next (cdr (assoc "next" r :test #'string=))))
             (is (= 1 (cdr (assoc "height" next :test #'string=))))
             (is (stringp (cdr (assoc "bits" next :test #'string=))))

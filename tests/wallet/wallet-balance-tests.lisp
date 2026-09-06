@@ -22,11 +22,13 @@
 
 ;;; --- Helpers ---
 
-(defun %wb-aval (key alist) (cdr (assoc key alist :test #'string=)))
+(defun %wb-aval (key alist)
+  (btc-amount (cdr (assoc key alist :test #'string=))))
 
 (defun %wb= (a b)
-  "Compare two BTC doubles to sub-satoshi tolerance."
-  (< (abs (- a b)) 1d-6))
+  "Compare two BTC amounts to sub-satoshi tolerance. Either may be an amount
+TOKEN as an RPC emits it (BTC-AMOUNT decodes it) or a plain number."
+  (< (abs (- (btc-amount a) (btc-amount b))) 1d-6))
 
 (defun %wb-wallet-wif (node name address)
   "WIF for ADDRESS's private key, derived from wallet NAME's owning SPKM."

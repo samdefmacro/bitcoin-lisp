@@ -578,7 +578,7 @@ RBF sequences, anti-fee-sniping locktime, script-verifier round trip, and
 balances that reconcile to the satoshi before and after confirmation."
   (with-wallet-chain-node (node "ws-send")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
-      (is (= 50.0d0 (bl.wallet::rpc-getbalance node '())))
+      (is (= 50 (btc-amount (bl.wallet::rpc-getbalance node '()))))
       (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 12345))
              (dest (%wc-optrue-address))
              (dest-spk (nth-value 1 (bl.crypto:decode-address
@@ -624,15 +624,15 @@ balances that reconcile to the satoshi before and after confirmation."
           ;; The committed tx verifies against the exact spent scripts.
           (is (%ws-verify-ok-p node wallet tx))
           ;; Balance before confirmation: change is trusted (own zero-conf).
-          (is (= (/ (- 5000000000 100000000 fee) 100000000.0d0)
-                 (bl.wallet::rpc-getbalance node '())))
+          (is (= (/ (- 5000000000 100000000 fee) 100000000)
+                 (btc-amount (bl.wallet::rpc-getbalance node '()))))
           ;; Confirm; balances identical, gettransaction agrees on the fee.
           (%wc-mine node 1 (%wc-optrue-address))
-          (is (= (/ (- 5000000000 100000000 fee) 100000000.0d0)
-                 (bl.wallet::rpc-getbalance node '())))
+          (is (= (/ (- 5000000000 100000000 fee) 100000000)
+                 (btc-amount (bl.wallet::rpc-getbalance node '()))))
           (let ((gettx (%wc-gettx node txid)))
             (is (= 1 (%aval "confirmations" gettx)))
-            (is (= (/ (- fee) 100000000.0d0) (%aval "fee" gettx)))))))))
+            (is (= (/ (- fee) 100000000) (%aval "fee" gettx)))))))))
 
 (test ws-sffo-single-and-multi
   "Subtract-fee-from-outputs: single recipient pays exactly the fee;
@@ -738,7 +738,7 @@ output of total - fee, wallet empty afterwards."
                   (aref (bl.ser:transaction-outputs tx) 0)))))
         (is (%ws-verify-ok-p node wallet tx))
         (%wc-mine node 1 (%wc-optrue-address))
-        (is (= 0.0d0 (bl.wallet::rpc-getbalance node '())))))))
+        (is (= 0 (btc-amount (bl.wallet::rpc-getbalance node '()))))))))
 
 (test ws-fundrawtransaction-sign-broadcast
   "fundrawtransaction on an externally-built raw tx adds change at the
@@ -1124,7 +1124,7 @@ coin control; excluding them would strand funds)."
       (%wc-mine node 1 addr-b)
       (%wc-mine node 101 (%wc-optrue-address))
       ;; The default balance hides the reused coin ...
-      (is (= 50.0d0 (bl.wallet::rpc-getbalance node '())))
+      (is (= 50 (btc-amount (bl.wallet::rpc-getbalance node '()))))
       ;; ... but sendall sweeps BOTH coins.
       (let* ((result (bl.wallet::rpc-sendall
                       node (list (list (%wc-optrue-address)) nil nil 2)))
@@ -1134,7 +1134,7 @@ coin control; excluding them would strand funds)."
         (is (not (null tx)))
         (is (= 2 (length (bl.ser:transaction-inputs tx)))))
       (%wc-mine node 1 (%wc-optrue-address))
-      (is (= 0.0d0 (bl.wallet::rpc-getbalance node '())))
+      (is (= 0 (btc-amount (bl.wallet::rpc-getbalance node '()))))
       ;; getbalances "used" is empty too: everything left the wallet.
       (let ((balances (%wb-balances node)))
         (is (= 0.0d0 (%wb-aval "trusted" balances)))
@@ -1164,8 +1164,8 @@ wallet without the flag errors."
       ;; avoid_reuse positional: null-padded (the normal way to reach
       ;; fee_rate at position 9) = wallet default -> fine on a wallet
       ;; without the flag; explicit true errors (Core GetAvoidReuseFlag).
-      (is (numberp (bl.wallet::rpc-getbalance
-                    node (list "*" 0 nil nil))))
+      (is (numberp (btc-amount (bl.wallet::rpc-getbalance
+                                node (list "*" 0 nil nil)))))
       (signals-rpc-error (:code -4)
         (bl.wallet::rpc-getbalance node (list "*" 0 nil t)))
       ;; createwallet: explicit descriptors=false is rejected; a null-padded
@@ -1245,7 +1245,7 @@ stores only the 32-byte x coordinate)."
             (is (not (null tx)))
             (is (%ws-verify-ok-p node reloaded tx)))
           (%wc-mine node 1 (%wc-optrue-address))
-          (is (= 0.0d0 (bl.wallet::rpc-getbalance node '()))))))))
+          (is (= 0 (btc-amount (bl.wallet::rpc-getbalance node '())))))))))
 
 (test ws-resubmit-chunking
   "B6: the per-pass resubmission cap chunks work across passes instead of

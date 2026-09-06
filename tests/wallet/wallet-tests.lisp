@@ -41,7 +41,13 @@ datadir; the directory is deleted on unwind."
          (uiop:delete-directory-tree ,dir :validate t
                                           :if-does-not-exist :ignore)))))
 
-(defun %aval (key alist) (cdr (assoc key alist :test #'string=)))
+(defun %aval (key alist)
+  "One field of an RPC result alist, with an amount TOKEN decoded to an exact
+rational (BTC-AMOUNT). Core's functional framework parses its JSON with
+parse_float=Decimal for the same reason: an amount field carries Core's
+ValueFromAmount spelling, and a test asserting a value should not have to
+know how that spelling is written."
+  (btc-amount (cdr (assoc key alist :test #'string=))))
 
 (defun %crash-close-wallet (node name)
   "Simulate a crash: close the wallet DB with no graceful unload bookkeeping
@@ -983,8 +989,9 @@ throws out of the whole call."
 ;;; simulaterawtransaction / listaddressgroupings (wallet-coins.lisp) ---
 
 (defun %wt= (a b)
-  "Two BTC doubles equal to sub-satoshi tolerance."
-  (< (abs (- a b)) 1d-6))
+  "Two BTC amounts equal to sub-satoshi tolerance. Either may be an amount
+TOKEN as an RPC emits it (BTC-AMOUNT decodes it) or a plain number."
+  (< (abs (- (btc-amount a) (btc-amount b))) 1d-6))
 
 (defun %wt-dummy-txid (n)
   "A distinct non-zero 32-byte outpoint hash (so it never reads as coinbase)."
