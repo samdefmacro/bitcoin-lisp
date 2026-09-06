@@ -1763,13 +1763,24 @@ poll forever (incident 2026-05-22: all 7 testnet4 peers stuck in
 CLOSE-WAIT after 48h, sync gap from h=135,913 vs network tip).
 Mirrors Bitcoin Core's SocketHandlerConnected: recv()==0 or send
 error sets pnode->fDisconnect (net.cpp:2204). Returns T iff the peer
-was disconnected (handler-case yielded successfully)."
-  (when (and (peer-connection peer)
-             (not (connection-connected (peer-connection peer))))
-    (bl:log-warn "Peer ~A connection dead — disconnecting"
-                           (peer-address peer))
-    (handler-case (progn (disconnect-peer peer) t)
-      (error () nil))))
+was disconnected (handler-case yielded successfully).
+
+The line says WHY, at Core's level. Core reports the same reap through
+LogDebug(BCLog::NET) with the reason on it -- \"socket closed, disconnecting
+peer=8\", \"socket recv error, ...\" (net.cpp:2196-2215, CNode::DisconnectMsg at
+:709-713) -- so it is silent unless the operator asks for -debug=net. Ours was
+an unconditional WARN reading \"connection dead\", which reported ordinary peer
+turnover as a fault and could not tell a peer that hung up from a BIP324
+authentication failure from a send error of our own. Every liveness VERDICT
+logs its own line and disconnects directly, and DISCONNECT-PEER clears
+PEER-CONNECTION, so nothing that got here was ever a judgement about the peer:
+this line is only ever a socket-level reap."
+  (let ((conn (peer-connection peer)))
+    (when (and conn (not (connection-connected conn)))
+      (bl:log-cat "net" "~A, disconnecting peer=~A"
+                  (connection-disconnect-reason-text conn) (peer-id peer))
+      (handler-case (progn (disconnect-peer peer) t)
+        (error () nil)))))
 
 (defun dispatch-ibd-message (peer command payload node-ctx ctx)
   "Process one wire message from PEER during IBD: connect a received

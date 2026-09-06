@@ -575,7 +575,11 @@
   half-read-message reaper and the ping timeout all are, because Core
   measures every liveness rule against the same constant -- spelled
   separately, the reaper's copy had drifted to a quarter of it and dropped
-  peers Core keeps.
+  peers Core keeps. A connection that dies records WHY: every failure path
+  clears CONNECTED through one helper that stores a reason, so the pump's
+  reap logs Core's own line (the reason, then `disconnecting peer=<id>`)
+  under -debug=net instead of an unconditional warning saying only that a
+  connection is dead.
   `receive-bytes` is resumable and bounded per pass, so one slow
   peer cannot stall the node (a 24-byte header followed by silence once
   froze every peer). Readiness is `poll(2)`, never `select()`. The

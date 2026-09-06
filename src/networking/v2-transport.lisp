@@ -162,10 +162,9 @@ body length is parked on the CONNECTION between passes rather than recomputed."
         (let ((len (bl.crypto:bip324-cipher-decrypt-length
                     (v2-transport-cipher transport) len3)))
           (when (> len +v2-max-contents-len+)
-            (bl.log:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
-                                   len (connection-host conn))
-            (setf (connection-connected conn) nil)
-            (return nil))
+            ;; No line of its own: the reap reports the reason once, the way
+            ;; Core reports every socket-level disconnect once (HANDLE-PEER-FIN).
+            (return (%connection-failed conn :v2-oversize-packet)))
           ;; The cipher has advanced: from here the packet must complete or the
           ;; connection dies.
           (setf (connection-recv-framing conn)
@@ -179,17 +178,13 @@ body length is parked on the CONNECTION between passes rather than recomputed."
       ;; (receive-bytes-resumable has already dropped the connection; say so
       ;; explicitly since the cipher, not just the framing, is unrecoverable.)
       (unless rest
-        (setf (connection-connected conn) nil)
-        (return nil))
+        (return (%connection-failed conn :v2-body-read-failed)))
       (multiple-value-bind (contents ignore)
           (bl.crypto:bip324-cipher-decrypt
            (v2-transport-cipher transport) rest
            (or (v2-transport-recv-aad transport) *v2-empty-bytes*))
         (unless contents
-          (bl.log:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
-                                 (connection-host conn))
-          (setf (connection-connected conn) nil)
-          (return nil))
+          (return (%connection-failed conn :v2-auth-failure)))
         ;; AAD (the peer's garbage) is authenticated by the first packet.
         (setf (v2-transport-recv-aad transport) nil)
         (unless ignore

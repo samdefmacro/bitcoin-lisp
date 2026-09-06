@@ -1460,6 +1460,95 @@ Core's last_send rule and could not stand in for it."
       (setf (bl.net:peer-connect-time peer) 0)
       (is (eq :ok (bl.net:check-peer-health peer))))))
 
+(test dead-connection-reap-names-its-reason
+  "GA11 4db38801: the reap line says WHY, at Core's level.
+
+HANDLE-PEER-FIN consults one thing -- that the connection is no longer
+connected -- and every liveness VERDICT logs its own line and calls
+DISCONNECT-PEER, which clears PEER-CONNECTION, so nothing that reaches this
+line was ever a judgement about the peer: it is always a socket-level reap.
+Core reports the same events through LogDebug(BCLog::NET) with the reason on
+the line -- \"socket closed, disconnecting peer=8\", \"socket recv error, ...\"
+(net.cpp:2196-2215, CNode::DisconnectMsg at :709-713) -- so they are silent
+unless the operator asks for -debug=net. Ours was an unconditional WARN reading
+\"connection dead\", which reported ordinary peer turnover as a fault and could
+not tell a peer that hung up from a send error of our own; for five of the
+seven paths that clear the flag it was the only record of what happened.
+
+Both directions are asserted, so neither half can pass vacuously: absent at the
+default level, present with the net category on."
+  (let ((bl.log:*log-buffer* (make-array bl.log:+log-buffer-size+
+                                         :initial-element nil))
+        (bl.log:*log-buffer-index* 0)
+        (bl.log:*log-buffer-count* 0)
+        (bl.log:*category-log-levels* (make-hash-table :test 'equal :synchronized t))
+        (bl.log::*debug-categories* (make-hash-table :test 'equal))
+        (bl.log:*current-log-level* :info)
+        (bl.log:*log-stream* nil)
+        (bl.log:*log-file-stream* nil))
+    (flet ((reason-of (conn) (bl.net::connection-disconnect-reason conn))
+           (reap (conn)
+             (let ((peer (bl.net:make-peer :connection conn :state :ready
+                                           :address "203.0.113.7")))
+               (drain-peer-once peer (bl.ctx:make-node-context) nil)
+               peer))
+           (logged (needle)
+             (find-if (lambda (e) (and e (search needle e))) bl.log:*log-buffer*)))
+      ;; A hard send failure -- a socket-less connection is one -- is Core's
+      ;; \"socket send error\", and it is one of the five paths that log nothing
+      ;; of their own.
+      (let ((conn (make-test-connection :connected t :host "203.0.113.7")))
+        (is (null (bl.net:send-bytes conn (make-array 3 :element-type '(unsigned-byte 8))))
+            "a send onto a dead socket reports failure")
+        (let ((peer (reap conn)))
+          (is (eq :disconnected (bl.net:peer-state peer))
+              "the reap itself is unchanged")))
+      (is-false (logged "disconnecting")
+                "at the default level the reap says NOTHING, as Core's ~
+LogDebug(BCLog::NET) does not")
+      ;; A peer that hangs up mid-message is Core's \"socket closed\".
+      (is-true (bl:set-category-log-level "net" :debug))
+      (multiple-value-bind (conn client server listener)
+          (%silent-peer-connection 24 12)
+        (unwind-protect
+             (progn
+               (usocket:socket-close client)
+               (sleep 0.2)
+               ;; First pass takes the 12 bytes already in the buffer; the
+               ;; second finds the hangup behind them.
+               (is (eq :incomplete (bl.net::receive-bytes-resumable conn 24)))
+               (is (null (bl.net::receive-bytes-resumable conn 24))
+                   "the read sees the hangup")
+               (reap conn)
+               (let ((entry (logged "disconnecting")))
+                 (is-true entry
+                          "with -debug=net the reap is reported, once")
+                 (when entry
+                   (is-true (search "socket closed, disconnecting peer=" entry)
+                            "Core's shape: the reason, then the peer id -- ~A" entry)))
+               ;; The reason each writer recorded is what the line reads from.
+               (is (eq :peer-closed (reason-of conn))))
+          (usocket:socket-close server)
+          (usocket:socket-close listener)))
+      ;; The send path records its own reason too -- it is one of the five that
+      ;; log nothing themselves, so the reap line is all an operator ever sees.
+      (let ((conn (make-test-connection :connected t)))
+        (bl.net:send-bytes conn (make-array 3 :element-type '(unsigned-byte 8)))
+        (is (eq :send-error (reason-of conn))))
+      ;; Every reason a writer can record has its own wording; the fallback is
+      ;; reached only by a flag cleared outside %CONNECTION-FAILED.
+      (let ((conn (make-test-connection :connected t))
+            (seen '()))
+        (dolist (reason '(:peer-closed :recv-error :recv-incomplete :send-error
+                          :framing-error :v2-oversize-packet :v2-body-read-failed
+                          :v2-auth-failure))
+          (bl.net::%connection-failed conn reason)
+          (push (bl.net::connection-disconnect-reason-text conn) seen))
+        (is (= 8 (length (remove-duplicates seen :test #'string=)))
+            "each reason reads differently, or the line cannot tell them apart")
+        (is (not (member "connection dead" seen :test #'string=))
+            "no recorded reason falls back to the unspecific wording")))))
+
 (test one-trickling-peer-does-not-stall-another
   "THE regression this refactor exists for. Two peers: one announces a large
 payload and delivers almost none of it, the other sends a complete message. A
