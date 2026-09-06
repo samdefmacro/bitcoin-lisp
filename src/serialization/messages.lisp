@@ -330,7 +330,7 @@ divergence from Core's empty CService.)"
               ;; nLocalHostNonce). The default keeps standalone/test callers
               ;; working; the live handshake always passes the peer's own
               ;; nonce so self-connections can be detected.
-              :nonce (or nonce (random (expt 2 64)))
+              :nonce (or nonce (bl.crypto:rand-u64))
               :user-agent user-agent
               :start-height start-height
               :relay relay)))
@@ -345,8 +345,14 @@ divergence from Core's empty CService.)"
   "The 8-byte payload ping and pong share (BIP 31)."
   (with-byte-buf (stream) (bb-write-u64-le stream nonce)))
 
-(defun make-ping-message (&optional (nonce (random (expt 2 64))))
-  "Create a serialized ping message."
+(defun make-ping-message (&optional (nonce (bl.crypto:rand-u64)))
+  "Create a serialized ping message.
+
+The nonce goes out on the wire, so it comes off the OS CSPRNG (Core draws it
+from PeerManagerImpl::m_rng, net_processing.cpp). Publishing draws from
+CL:*RANDOM-STATE* would publish the state of the stream the addrman selection
+and the relay timers share: MT19937 is recoverable in closed form from its own
+output."
   (serialize-message "ping" (%nonce-payload nonce)))
 
 (defun make-pong-message (nonce)
@@ -621,7 +627,7 @@ reads instead of Gray-stream input dispatch."
 
 ;;; Read compact block
 ;;; Write compact block
-(defun build-compact-block (block &key (nonce (random (expt 2 64))))
+(defun build-compact-block (block &key (nonce (bl.crypto:rand-u64)))
   "BLOCK as a BIP152 HeaderAndShortIDs (Core CBlockHeaderAndShortTxIDs,
 blockencodings.cpp:17-38): the header, a nonce, the coinbase prefilled at index
 0, and a 6-byte short ID for every other transaction, keyed by SipHash-2-4 over
@@ -645,8 +651,10 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
        ;; without it every reconstruction would need a getblocktxn round trip.
        :prefilled-txs (list (make-prefilled-tx :index 0 :transaction (first txs)))))))
 
-(defun make-cmpctblock-message (block &key (nonce (random (expt 2 64))))
-  "A cmpctblock message carrying BLOCK as a BIP152 compact block."
+(defun make-cmpctblock-message (block &key (nonce (bl.crypto:rand-u64)))
+  "A cmpctblock message carrying BLOCK as a BIP152 compact block. The nonce is
+published in the message (it keys the short IDs), so it is drawn from the OS
+CSPRNG -- see MAKE-PING-MESSAGE."
   (let ((payload (with-byte-buf (stream)
                    (write-compact-block stream
                                         (build-compact-block block :nonce nonce)))))

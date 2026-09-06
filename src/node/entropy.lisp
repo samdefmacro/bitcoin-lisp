@@ -41,11 +41,22 @@ that never re-seeds therefore replays one fixed sequence on every start, and
 every draw whose entire value is unpredictability becomes a stable fingerprint:
 addr-relay Poisson timers and the initial-broadcast jitter
 (networking/protocol.lisp), addrman's new/tried selection and its GetAddr
-shuffle (networking/addrman.lisp), the sendtxrcncl salt and ping nonces
-(networking/peer.lisp), the VERSION nonce (serialization/messages.lisp). Core
-draws all of these from OS-seeded contexts — FastRandomContext (net.cpp:3728,
-random.h:394) and PeerManagerImpl::m_rng (net_processing.cpp:2009), which is
-deterministic only under the test-only `deterministic_rng` option.
+shuffle (networking/addrman.lisp), the feeler and feefilter delays
+(networking/peer.lisp). Core draws these from OS-seeded contexts —
+FastRandomContext (net.cpp:3728, random.h:394) and PeerManagerImpl::m_rng
+(net_processing.cpp:2009), which is deterministic only under the test-only
+`deterministic_rng` option.
+
+This is the WEAKER of the two guarantees the node needs, and it is all this
+function provides. A re-seeded MT19937 is unpredictable to someone who has seen
+none of its output, but it is not a CSPRNG: 624 consecutive tempered outputs
+recover the state in closed form, forwards and backwards. So nothing whose
+value we PUBLISH may come from here — a ping or compact-block nonce, the
+VERSION nonce, the BIP330 salt would each hand a peer a window onto the same
+stream that chooses which address we dial next. Those draws go through
+BL.CRYPTO:RAND-U64 (src/crypto/random.lisp), which reads the OS source
+directly. What stays here publishes nothing: timers, shuffles and tie-breaks,
+whose timing an observer can watch anyway.
 
 Assigns the GLOBAL value deliberately: SBCL threads read the global binding of
 *random-state* (they do not inherit the starter thread's dynamic bindings), and

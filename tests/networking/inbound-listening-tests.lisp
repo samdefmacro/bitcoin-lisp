@@ -97,6 +97,48 @@ clearnet, Tor and I2P identities and every reconnect."
     (is (> (reduce #'max nonces) (expt 2 32))
         "nonces must span the full 64-bit space")))
 
+(defun %twice-under-one-random-state (thunk)
+  "THUNK's value under the same *random-state* twice -- what two processes
+running the same build produce when the value comes from CL:RANDOM."
+  (list (let ((*random-state* (sb-ext:seed-random-state 90210))) (funcall thunk))
+        (let ((*random-state* (sb-ext:seed-random-state 90210))) (funcall thunk))))
+
+(test published-nonces-are-not-drawn-from-the-shared-random-state
+  "GA11 4a05974e. The VERSION nonce, the ping nonce and the BIP330 salt all go
+out on the wire in cleartext. %FRESH-LOCAL-NONCE already read the OS source and
+is here as a regression guard; the ping nonce, MAKE-VERSION-MESSAGE-BYTES's
+default (what a caller that does not pass one publishes) and the salt were
+(random (expt 2 64)) off the one
+process-global CL:*RANDOM-STATE*, the same MT19937 stream as addrman's
+new/tried selection, the addr-relay reservoir and timers, and the feeler
+cadence. MT19937 is not a CSPRNG: 624 consecutive tempered outputs recover its
+19937-bit state in closed form, and it runs backwards as well as forwards -- so
+a peer collecting our published nonces (one long-lived connection's pings will
+do) learns which address we dial next. Core draws every one of these from a
+FastRandomContext, OS-seeded ChaCha20 (random.h; PeerManagerImpl::m_rng,
+net_processing.cpp).
+
+Replaying one *random-state* is exactly two starts of one build. The nonces
+must still differ; the control at the end shows the harness would catch it if
+they did not. The salt itself is drawn inside %MAYBE-SEND-SENDTXRCNCL, which
+needs a live connection to observe, and shares the source asserted here."
+  (destructuring-bind (a b)
+      (%twice-under-one-random-state #'bl.net::%fresh-local-nonce)
+    (is (/= a b) "two VERSION nonces under one replayed *random-state* were both ~D" a))
+  (destructuring-bind (a b)
+      (%twice-under-one-random-state (lambda () (bl.ser:make-ping-message)))
+    (is (not (equalp a b)) "two ping messages under one replayed *random-state* were identical"))
+  (destructuring-bind (a b)
+      ;; Everything but the nonce pinned, so only the nonce can differ.
+      (%twice-under-one-random-state
+       (lambda () (bl.ser:make-version-message-bytes :timestamp 1757000000)))
+    (is (not (equalp a b)) "two VERSION messages under one replayed *random-state* were identical"))
+  ;; Positive control: the draw these replaced does repeat, so the assertions
+  ;; above are testing the source and not the re-seeding.
+  (destructuring-bind (a b)
+      (%twice-under-one-random-state (lambda () (random (expt 2 64))))
+    (is (= a b) "positive control: CL:RANDOM was expected to replay a re-seeded state")))
+
 (test outbound-handshake-sends-its-own-nonce
   "The VERSION we push must carry THIS connection's nonce, not a fresh
 throwaway — otherwise the registry holds a value that never goes on the wire

@@ -8,12 +8,19 @@
 ;;;; `(random n)` therefore produces an identical stream on every node start,
 ;;;; and everything we draw from it whose whole value is unpredictability —
 ;;;; addr-relay Poisson timers, initial-broadcast jitter, addrman bucket
-;;;; selection and the GetAddr shuffle, ping/reconciliation nonces, and (once
-;;;; merged) the getaddr-cache expiry jitter and the feefilter delays —
-;;;; becomes a stable cross-restart fingerprint. Core draws all of these from
-;;;; OS-seeded contexts: FastRandomContext (random.h:394, net.cpp:3728) and
-;;;; PeerManagerImpl::m_rng (net_processing.cpp:2009), deterministic only under
-;;;; the test-only `deterministic_rng` option.
+;;;; selection and the GetAddr shuffle, the getaddr-cache expiry jitter and the
+;;;; feefilter delays — becomes a stable cross-restart fingerprint. Core draws
+;;;; these from OS-seeded contexts: FastRandomContext (random.h:394,
+;;;; net.cpp:3728) and PeerManagerImpl::m_rng (net_processing.cpp:2009),
+;;;; deterministic only under the test-only `deterministic_rng` option.
+;;;;
+;;;; Seeding is the weaker guarantee, and the values we PUBLISH do not rely on
+;;;; it: the ping, VERSION and compact-block nonces and the BIP330 salt come
+;;;; off the OS CSPRNG through BL.CRYPTO:RAND-U64, because MT19937 is
+;;;; invertible from its own output and publishing a draw would expose the
+;;;; stream that picks which address we dial next (GA11 4a05974e). Those draws
+;;;; are asserted in the crypto and P2P suites; this file covers the stream
+;;;; that stays.
 ;;;;
 ;;;; These tests pin down that the seeding actually RUNS, not merely that two
 ;;;; draws differ (which any PRNG satisfies): SEED-GLOBAL-RANDOM-STATE records

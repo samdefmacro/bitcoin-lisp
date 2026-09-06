@@ -845,7 +845,10 @@ T — declining to offer never fails the handshake."
                ;; reconciliation is pointless when we reject incoming txs.
                (not (ignore-incoming-txs-p))
                (bl.ser:version-message-relay version-msg))
-      (let ((salt (random (expt 2 64))))
+      ;; The salt travels in the sendtxrcncl message, so it comes off the OS
+      ;; CSPRNG rather than the shared MT stream (Core's is a
+      ;; FastRandomContext draw, net_processing.cpp).
+      (let ((salt (bl.crypto:rand-u64)))
         (setf (peer-recon-local-salt peer) salt)
         (send-message peer
                       (bl.ser:make-sendtxrcncl-message salt)))))
@@ -1001,12 +1004,9 @@ our clearnet, Tor and I2P identities and every reconnect. Core keeps the real
 per-connection nonce even on privacy-hardened private-broadcast connections
 where it blanks every other field (net_processing.cpp:1557-1564).
 
-Uses ironclad's CSPRNG: SBCL's *random-state* is neither thread-safe nor
+Uses the OS CSPRNG: SBCL's *random-state* is neither thread-safe nor
 unpredictable, and handshakes run on several threads at once."
-  (let ((bytes (ironclad:random-data 8)))
-    (loop for i from 0 below 8
-          for shift from 0 by 8
-          sum (ash (aref bytes i) shift))))
+  (bl.crypto:rand-u64))
 
 (defun %register-outbound-nonce (nonce)
   (bt:with-lock-held (*outbound-nonce-lock*)
@@ -1431,8 +1431,11 @@ periodic tick rather than once at handshake."
 ;;; Ping/Pong
 
 (defun send-ping (peer)
-  "Send a ping message to the peer."
-  (let ((nonce (random (expt 2 64))))
+  "Send a ping message to the peer.
+
+The nonce is published, so BL.SER:MAKE-PING-MESSAGE's OS-CSPRNG default is
+what draws it -- named here because the pong has to match it."
+  (let ((nonce (bl.crypto:rand-u64)))
     (setf (peer-ping-nonce peer) nonce)
     (setf (peer-last-ping-time peer) (get-internal-real-time))
     (send-message peer (bl.ser:make-ping-message nonce))))
