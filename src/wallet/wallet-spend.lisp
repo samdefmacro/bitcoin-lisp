@@ -1543,9 +1543,14 @@ index or destination string."
 ;;; --- Change type + change address reservation ---
 
 (defun %transaction-change-type (wallet change-type recipients)
-  "Core CWallet::TransactionChangeType. Our m_default_address_type is
-bech32 (DEFAULT_ADDRESS_TYPE), never legacy."
+  "Core CWallet::TransactionChangeType (wallet.cpp:2253-2312). CHANGE-TYPE is
+Core's `coin_control.m_change_type ? *it : wallet.m_default_change_type', so
+either the per-call change_type or -changetype; given, it always wins."
   (when change-type (return-from %transaction-change-type change-type))
+  ;; Core wallet.cpp:2259-2262: a legacy default address type takes legacy
+  ;; change, whatever the recipients are. Reachable since -addresstype exists.
+  (when (eq *wallet-default-address-type* :legacy)
+    (return-from %transaction-change-type :legacy))
   (let ((any-tr nil) (any-wpkh nil) (any-sh nil) (any-pkh nil))
     (dolist (recipient recipients)
       (let ((script (bl.rpc:recipient-script recipient)))
@@ -1967,8 +1972,13 @@ Caller holds node + wallet locks."
                   (+ 10 (bl.ser:compact-size-length (length recipients))))
             (let ((recipients-sum 0)
                   (outputs-to-subtract-fee-from 0)
+                  ;; Core spend.cpp:1092: the coin control's change type, else
+                  ;; the wallet's -changetype default.
                   (change-type (%transaction-change-type
-                                wallet (wcc-change-type cc) recipients)))
+                                wallet
+                                (or (wcc-change-type cc)
+                                    *wallet-default-change-type*)
+                                recipients)))
               (dolist (recipient recipients)
                 (when (%output-dust-p (bl.rpc:recipient-amount recipient)
                                       (bl.rpc:recipient-script recipient))

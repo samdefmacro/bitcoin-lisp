@@ -55,6 +55,23 @@ DEFAULT, so it applies to wallets created after it is set — an already-created
 wallet keeps the size it was made with, which is also Core's behaviour (the
 keypool size is per-wallet state).")
 
+(defvar *wallet-default-address-type* :bech32
+  "Core CWallet::m_default_address_type / -addresstype (DEFAULT_ADDRESS_TYPE =
+bech32, wallet.h:120): the output type a bare getnewaddress hands out, and the
+one getrawchangeaddress falls back to.
+
+A process special rather than a per-wallet slot, like *DEFAULT-KEYPOOL-SIZE*
+above: Core stores it on the wallet but only ever writes it from the node's own
+arguments (LoadWalletArgs, wallet.cpp:2955-2962), so every wallet in a process
+holds the same value. SET-WALLET-DEFAULT-OUTPUT-TYPE is the one writer.")
+
+(defvar *wallet-default-change-type* nil
+  "Core CWallet::m_default_change_type / -changetype (wallet.h:731), an EMPTY
+optional by default -- which is not the same as bech32: unset means
+TransactionChangeType derives the change type from the recipients, and
+getrawchangeaddress falls back to *WALLET-DEFAULT-ADDRESS-TYPE*
+(wallet/rpc/addresses.cpp:99). Set, it wins over both.")
+
 (defconstant +wallet-client-version+ bl.ser:+client-version+
   "Written to the 'version' record on wallet creation: the creating client's
 version, as Core writes its CLIENT_VERSION.")
@@ -2072,6 +2089,23 @@ backend (leveldb, where Core says sqlite)."
                             :message (format nil "Unknown address type '~A'" value)))
       default))
 
+(defun set-wallet-default-output-type (kind value)
+  "Core CWallet::LoadWalletArgs' -addresstype / -changetype half
+(wallet.cpp:2955-2972). KIND is :ADDRESS or :CHANGE; VALUE is the option string.
+
+An empty value leaves the default, as Core's `if (!...empty())' does, and an
+unparseable one is a startup error with Core's own wording -- Core refuses to
+LOAD THE WALLET there, so accepting it silently would hand out addresses of a
+type the operator did not ask for."
+  (unless (and (stringp value) (plusp (length value)))
+    (return-from set-wallet-default-output-type nil))
+  (let ((parsed (%parse-output-type value)))
+    (unless parsed
+      (config-error "Unknown ~(~A~) type '~A'" kind value))
+    (ecase kind
+      (:address (setf *wallet-default-address-type* parsed))
+      (:change (setf *wallet-default-change-type* parsed)))))
+
 (bl.rpc:define-rpc "getnewaddress" (node params)
   "A new receiving address (Bitcoin Core getnewaddress). PARAMS:
  (label address_type); default address type bech32 (wallet.h
@@ -2082,7 +2116,7 @@ DEFAULT_ADDRESS_TYPE)."
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                           :message "Error: This wallet has no available keys"))
       (let* ((label (%label-from-value (first params)))
-             (type (%address-type-arg (second params) :bech32))
+             (type (%address-type-arg (second params) *wallet-default-address-type*))
              (spkm (gethash type (wallet-external-spkms wallet))))
         (unless spkm
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-keypool-ran-out+
@@ -2102,7 +2136,11 @@ getrawchangeaddress). PARAMS: (address_type)."
       (unless (wallet-can-get-addresses wallet t)
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                           :message "Error: This wallet has no available keys"))
-      (let* ((type (%address-type-arg (first params) :bech32))
+      ;; Core: m_default_change_type.value_or(m_default_address_type)
+      ;; (wallet/rpc/addresses.cpp:99).
+      (let* ((type (%address-type-arg (first params)
+                                      (or *wallet-default-change-type*
+                                          *wallet-default-address-type*)))
              (spkm (gethash type (wallet-internal-spkms wallet))))
         (unless spkm
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-keypool-ran-out+

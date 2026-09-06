@@ -1972,3 +1972,47 @@ path is unavailable by construction and only a script path can spend."
               (length stack)))
         (is-true (nth-value 0 (bl.wallet::%verify-tx-scripts tx coins))
                  "the wallet-signed script-path spend does not verify")))))
+
+;;; --- -addresstype / -changetype (finding 4d28b231) --------------------------
+
+(defun %w-bare-addresses (address-type change-type)
+  "(getnewaddress getrawchangeaddress), both called with NO arguments, on a
+regtest wallet whose -addresstype is ADDRESS-TYPE and -changetype CHANGE-TYPE.
+Through the shipped dispatcher, because what this finding is about is the
+address an operator is handed."
+  (with-wallet-chain-node (node "addrtype" :wallet "at")
+    (let ((bl.wallet:*wallet-default-address-type* address-type)
+          (bl.wallet:*wallet-default-change-type* change-type))
+      (list (bl.rpc:dispatch-rpc-method node "getnewaddress" '())
+            (bl.rpc:dispatch-rpc-method node "getrawchangeaddress" '())))))
+
+(test addresstype-and-changetype-are-the-wallets-defaults
+  "Core parses -addresstype into m_default_address_type and -changetype into
+m_default_change_type (wallet.cpp:2955-2972); getnewaddress uses the first
+(rpc/addresses.cpp:53) and getrawchangeaddress
+m_default_change_type.value_or(m_default_address_type) (:99). Both options were
+accepted and dropped and both RPCs hardcoded bech32, so an operator who
+configured taproot kept being handed P2WPKH (GA11 4d28b231).
+
+The unset case is the positive control: it must still be bech32, so a change
+that simply moved the hardcoded type would fail here."
+  (destructuring-bind (recv change) (%w-bare-addresses :bech32 nil)
+    (is (eql 0 (search "bcrt1q" recv)) "unset must stay bech32: ~A" recv)
+    (is (eql 0 (search "bcrt1q" change)) "unset must stay bech32: ~A" change))
+  ;; -addresstype=bech32m: the receiving address follows it, and so does the
+  ;; change address, because -changetype is empty and falls back to it.
+  (destructuring-bind (recv change) (%w-bare-addresses :bech32m nil)
+    (is (eql 0 (search "bcrt1p" recv)) "-addresstype ignored: ~A" recv)
+    (is (eql 0 (search "bcrt1p" change)) "the change fallback ignored it: ~A" change))
+  ;; -changetype wins over the address type for change only.
+  (destructuring-bind (recv change) (%w-bare-addresses :bech32m :p2sh-segwit)
+    (is (eql 0 (search "bcrt1p" recv)))
+    (is (eql 0 (search "2" change)) "-changetype ignored: ~A" change))
+  ;; An unparseable value is refused with Core's own wording rather than
+  ;; silently leaving the default (Core refuses to load the wallet).
+  (signals error (bl.wallet:set-wallet-default-output-type :address "nosuchtype"))
+  (signals error (bl.wallet:set-wallet-default-output-type :change "nosuchtype"))
+  ;; An empty value leaves the default, as Core's `if (!...empty())' does.
+  (let ((bl.wallet:*wallet-default-address-type* :bech32))
+    (bl.wallet:set-wallet-default-output-type :address "")
+    (is (eq :bech32 bl.wallet:*wallet-default-address-type*))))

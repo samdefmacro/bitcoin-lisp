@@ -1906,6 +1906,32 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
+(test addresstype-and-changetype-are-real-options
+  "-addresstype and -changetype left the accept-and-drop list (GA11 4d28b231).
+Core parses both with ParseOutputType in CWallet::LoadWalletArgs
+(wallet.cpp:2955-2972) and refuses to load the wallet on an unknown value; ours
+accepted them and hardcoded bech32 in both address RPCs."
+  (let ((saved (list bl.wallet:*wallet-default-address-type*
+                     bl.wallet:*wallet-default-change-type*)))
+    (unwind-protect
+         (progn
+           (apply-config-globals '(("addresstype" . "bech32m")
+                                   ("changetype" . "p2sh-segwit")))
+           (is (eq :bech32m bl.wallet:*wallet-default-address-type*))
+           (is (eq :p2sh-segwit bl.wallet:*wallet-default-change-type*))
+           ;; Core's wording verbatim, and a refusal rather than the default.
+           (dolist (bad '((("addresstype" . "p2tr")) (("changetype" . "p2tr"))))
+             (signals error (apply-config-globals bad))))
+      (setf bl.wallet:*wallet-default-address-type* (first saved)
+            bl.wallet:*wallet-default-change-type* (second saved))))
+  ;; Core's defaults: bech32 for the address type, and an EMPTY optional for
+  ;; the change type -- which is not the same as bech32.
+  (is (eq :bech32 bl.wallet:*wallet-default-address-type*))
+  (is (null bl.wallet:*wallet-default-change-type*))
+  (dolist (name '("addresstype" "changetype"))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
+
 (test avoidpartialspends-is-a-real-option
   "-avoidpartialspends left the accept-and-drop list (GA11 feecc533). Core
 reads it with GetBoolArg(DEFAULT_AVOIDPARTIALSPENDS = false) in every

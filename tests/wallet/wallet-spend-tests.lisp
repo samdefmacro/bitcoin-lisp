@@ -1417,3 +1417,41 @@ costs no extra fee, and grouping three inputs instead of one does."
       "at Core's default the wallet selects per output")
   (is (= 3 (%ws-aps-inputs t))
       "-avoidpartialspends=1 must sweep every output of the address"))
+
+;;;; -changetype in a built transaction (finding 4d28b231)
+
+(defun %ws-change-types (address-type change-type)
+  "The script types of the outputs of one sendtoaddress to a P2SH destination,
+with -addresstype ADDRESS-TYPE and -changetype CHANGE-TYPE. The recipient is
+always :SCRIPTHASH; the change output is the other one, and its POSITION is
+randomized (Core inserts change at a random index), so callers count types
+rather than reading a position."
+  (with-wallet-chain-node (node "ws-changetype")
+    (%ws-fund-wallet node)
+    (let* ((bl.wallet:*wallet-default-address-type* address-type)
+           (bl.wallet:*wallet-default-change-type* change-type)
+           (dest (%wc-optrue-address))
+           (txid (bl.rpc:parse-hex-hash
+                  (%ws-sendtoaddress
+                   node (list dest 1 nil nil nil nil nil nil nil 10))))
+           (tx (%ws-mempool-tx node txid)))
+      (map 'list (lambda (out)
+                   (bl.val:classify-script (bl.ser:tx-out-script-pubkey out)))
+           (bl.ser:transaction-outputs tx)))))
+
+(test changetype-reaches-the-transaction-the-wallet-builds
+  "Core CreateTransaction passes `coin_control.m_change_type ? *it :
+wallet.m_default_change_type' into TransactionChangeType (spend.cpp:1092), and
+that function's FIRST branch after the explicit type is `if
+m_default_address_type is legacy, use legacy' (wallet.cpp:2259-2262) -- a branch
+that was unreachable here while the default address type was hardcoded bech32.
+
+The default run is the positive control: with neither option set the change
+still follows the recipients (a P2SH recipient takes p2sh-segwit change), so a
+change that simply forced one type would fail there."
+  (is (= 2 (count :scripthash (%ws-change-types :bech32 nil)))
+      "with neither option set the change type follows the recipients")
+  (is (= 1 (count :pubkeyhash (%ws-change-types :bech32 :legacy)))
+      "-changetype must win over the recipient-derived type")
+  (is (= 1 (count :pubkeyhash (%ws-change-types :legacy nil)))
+      "a legacy -addresstype takes legacy change, whatever the recipients are"))

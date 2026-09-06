@@ -9,6 +9,7 @@ the wallet RPCs. Reaches the node through bl.rpc's accessors and the chain
 through the lower packages; the node reaches it only through these exports.")
   (:export
    #:close-wallet-manager
+   #:set-wallet-default-output-type
    #:init-wallet-manager
    #:load-wallets-on-startup
    #:wallet-manager
@@ -23,6 +24,8 @@ through the lower packages; the node reaches it only through these exports.")
   (:export
    #:*wallet-confirm-target*
    #:*wallet-avoid-partial-spends*
+   #:*wallet-default-address-type*
+   #:*wallet-default-change-type*
    #:*wallet-consolidate-feerate*
    #:*wallet-cross-chain*
    #:*wallet-directory*
