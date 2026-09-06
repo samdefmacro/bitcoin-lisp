@@ -1544,8 +1544,10 @@ the unbroadcast set, and no announcement is queued."
 (test rpc-testmempoolaccept-policy-script-reject-reason
   "A consensus-valid but policy-invalid spend (CLEANSTACK: extra scriptSig
 push on a P2SH(OP_TRUE) coin) reports Core's TX_NOT_STANDARD reject-reason
-token \"mempool-script-verify-flag-failed\" (CheckInputScripts,
-validation.cpp:2117) through testmempoolaccept."
+token \"mempool-script-verify-flag-failed\" through testmempoolaccept, with
+Core's ScriptErrorString parenthetical naming the flag that rejected --
+strprintf(\"mempool-script-verify-flag-failed (%s)\", ScriptErrorString(...)),
+CheckInputScripts, validation.cpp:2117."
   (multiple-value-bind (tx utxo mempool)
       (%cleanstack-violation-fixture
        (make-array 4 :element-type '(unsigned-byte 8)
@@ -1559,7 +1561,7 @@ validation.cpp:2117) through testmempoolaccept."
                 (bl.ser:serialize-transaction tx))))
       (let ((r (first (bl.rpc::rpc-testmempoolaccept node (list (list hex))))))
         (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
-        (is (string= "mempool-script-verify-flag-failed"
+        (is (string= "mempool-script-verify-flag-failed (Stack size must be exactly one after execution)"
                      (cdr (assoc "reject-reason" r :test #'string=))))))))
 
 

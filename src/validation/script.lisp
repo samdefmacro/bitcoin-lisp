@@ -443,7 +443,10 @@ scriptPubKey is nothing special and evaluates as an ordinary legacy script,
 so historical pre-segwit spends of such outputs stay valid.
 
 Binds *current-tx* and *current-input-index* for sighash computation.
-Returns T on success, NIL on failure."
+Returns (VALUES T NIL) on success and (VALUES NIL ERROR-KEYWORD) on failure,
+where the keyword is the one Core's SCRIPT_ERR_* value BL.INTEROP names --
+what MemPoolAccept puts in the parenthetical of
+\"mempool-script-verify-flag-failed (%s)\" (validation.cpp:2117-2119)."
   (let ((script-sig (bl.ser:tx-in-script-sig
                      (aref (bl.ser:transaction-inputs tx) input-idx)))
         (script-pubkey (bl.store:utxo-entry-script-pubkey utxo))
@@ -458,7 +461,7 @@ Returns T on success, NIL on failure."
         (bl:log-warn
          "validate-input-script failed: input-idx=~D error=~A"
          input-idx error))
-      success)))
+      (values success error))))
 
 ;;; ============================================================
 ;;; Script Disassembly
