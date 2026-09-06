@@ -327,6 +327,38 @@ bits."
   (let ((len (br-read-compact-size br)))
     (br-read-bytes br len)))
 
+;;;; The character boundary of a serialized string
+;;;
+;;; Core's std::basic_string serializer is a CompactSize length and then the
+;;; raw bytes, with no character conversion at either end (serialize.h:780-793):
+;;; a std::string IS its bytes, and a wallet label or a peer's user agent
+;;; travels as whatever bytes the sender chose. A Lisp string is characters,
+;;; so the conversion has to happen somewhere, and these two functions are the
+;;; only place it does -- the codec rows that read and write a length-prefixed
+;;; string go through them, in both directions and on both surfaces
+;;; (DEFINE-MESSAGE and the wallet's DEFINE-WDB-KEY / DEFINE-WDB-VALUE).
+;;;
+;;; It is UTF-8 because that is what the bytes Core writes are: the RPC layer
+;;; hands us a label decoded from a UTF-8 request body, and writing it back as
+;;; one byte per code point would put a different record on disk than Core's
+;;; for every character above U+007F.
+
+(defun utf8-string-to-bytes (string)
+  "STRING's UTF-8 bytes -- the bytes Core's std::string serializer writes."
+  (sb-ext:string-to-octets string :external-format :utf-8))
+
+(defun bytes-to-utf8-string (bytes)
+  "BYTES decoded as UTF-8, with every invalid sequence REPLACED by U+FFFD.
+
+Replacement, not an error: this side of the boundary is fed by peer-supplied
+bytes, and Core -- which never decodes at all -- accepts any byte sequence
+here, so signalling would refuse a message Core reads. What we cannot do is
+keep the bytes verbatim in a CL string, so a field whose exact bytes matter
+must be read as bytes (:var-bytes), not as a string."
+  (declare (type (vector (unsigned-byte 8)) bytes))
+  (sb-ext:octets-to-string bytes
+                           :external-format '(:utf-8 :replacement #\replacement_character)))
+
 ;;;; Hash tables keyed by octet vectors
 ;;;
 ;;; A txid, wtxid, outpoint key or sighash is a (simple-array (unsigned-byte 8))

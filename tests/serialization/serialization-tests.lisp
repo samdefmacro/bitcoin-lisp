@@ -409,16 +409,21 @@ The 76-byte case is the testnet4 genesis timestamp message."
     (is (= (+ 3 300) (length (push-of 300))))
     (is (typep (push-of 10) '(simple-array (unsigned-byte 8) (*))))))
 
-(defun %version-with-user-agent (n)
-  "A VERSION payload whose user agent is N 'A's, read back; the user agent's
-length, or the error the read signalled."
+(defun %version-with-user-agent-string (string)
+  "A VERSION payload whose user agent is STRING, read back; the user agent's
+length in CHARACTERS, or the error the read signalled."
   (let ((payload (bl.ser:make-version-message-bytes
-                  :user-agent (make-string n :initial-element #\A) :nonce 7)))
+                  :user-agent string :nonce 7)))
     (handler-case
         (bl.bytes:with-byte-reader (s payload)
           (length (bl.ser:version-message-user-agent
                    (bl.ser:read-version-message s))))
       (bl.err:serialization-error (e) e))))
+
+(defun %version-with-user-agent (n)
+  "A VERSION payload whose user agent is N 'A's, read back; the user agent's
+length, or the error the read signalled."
+  (%version-with-user-agent-string (make-string n :initial-element #\A)))
 
 (test version-user-agent-is-limited-to-cores-256-bytes
   "GA11 1052063f. Core reads the subversion through
@@ -492,3 +497,74 @@ stay false, or `every byte is true' would pass here just as well."
            "an absent fRelay means relay (BIP 37)")
   (is-true (%version-relay-for-byte 0 :version 70001)
            "a pre-70002 peer's trailing byte is not an fRelay flag"))
+
+(defun %version-user-agent-field-bytes (string)
+  "The bytes the VERSION message writes for STRING in its :var-string
+user-agent field, CompactSize length prefix included. The field ends five
+bytes before the payload does -- start_height (4) and the fRelay flag (1) --
+and an empty user agent occupies exactly one byte, which locates its start."
+  (let* ((empty (bl.ser:make-version-message-bytes :user-agent "" :nonce 5))
+         (start (- (length empty) 6))
+         (payload (bl.ser:make-version-message-bytes :user-agent string :nonce 5)))
+    (subseq payload start (- (length payload) 5))))
+
+(defun %version-user-agent-from-bytes (bytes)
+  "The character codes of the user agent a VERSION whose user-agent field
+holds the raw BYTES reads back as. The placeholder is the same length, so its
+CompactSize prefix is the one BYTES needs."
+  (let* ((payload (bl.ser:make-version-message-bytes
+                   :user-agent (make-string (length bytes) :initial-element #\A)
+                   :nonce 5)))
+    (replace payload bytes :start1 (- (length payload) 5 (length bytes)))
+    (bl.bytes:with-byte-reader (s payload)
+      (map 'list #'char-code
+           (bl.ser:version-message-user-agent (bl.ser:read-version-message s))))))
+
+(test var-string-fields-are-utf-8-bytes-not-one-byte-per-code-point
+  "GA11 2cae91f5. Core's std::basic_string serializer is a CompactSize length
+and the raw bytes, with no character conversion at either end
+(serialize.h:780-793) -- a std::string IS its bytes. The one codec row behind
+DEFINE-MESSAGE and the wallet's DEFINE-WDB-KEY / DEFINE-WDB-VALUE wrote
+(map '(vector (unsigned-byte 8)) #'char-code value) and read (map 'string
+#'code-char ...), i.e. Latin-1: a character above U+00FF made the WRITE a raw
+TYPE-ERROR, and everything from U+0080 up went to disk as one byte where Core
+writes two or more.
+
+The four classes below are the ones a wallet label spans. The empty string and
+the ASCII case are the controls: they are byte-identical under either encoding,
+so a change that broke them would not pass here.
+
+The READ direction is asserted first on purpose: on the pre-fix code the write
+of a character above U+00FF is a TYPE-ERROR, which ends the test where it
+stands, so anything after it would prove nothing."
+  ;; The read direction, per class. ASCII is the control.
+  (is (equal '(105) (%version-user-agent-from-bytes #(105))))
+  (is (equal (list #xE9) (%version-user-agent-from-bytes #(195 169))))
+  (is (equal (list #x4E2D) (%version-user-agent-from-bytes #(228 184 173))))
+  (is (equal (list #x1F600) (%version-user-agent-from-bytes #(240 159 152 128))))
+  ;; Peer bytes are untrusted and Core never decodes them, so an invalid
+  ;; sequence is REPLACED (U+FFFD) and the message still parses -- signalling
+  ;; would refuse a VERSION Core reads.
+  (is (equal (list #xFFFD #xFFFD 65) (%version-user-agent-from-bytes #(255 254 65)))
+      "invalid UTF-8 must be replaced, not signalled")
+  ;; Core's LIMITED_STRING counts BYTES, so the cap is on the encoding: 128
+  ;; two-byte characters are exactly 256 bytes and parse, 129 do not.
+  (let ((e-acute (code-char #xE9)))
+    (is (= 128 (%version-with-user-agent-string
+                (make-string 128 :initial-element e-acute))))
+    (is-true (typep (%version-with-user-agent-string
+                     (make-string 129 :initial-element e-acute))
+                    'bl.err:serialization-error)
+             "the 256-byte cap must count bytes, not characters"))
+  ;; The write direction, same classes and same bytes.
+  (is (equalp #(0) (%version-user-agent-field-bytes "")))
+  (is (equalp #(2 104 105) (%version-user-agent-field-bytes "hi")))
+  ;; U+00E9, the case that used to write the single byte E9.
+  (is (equalp #(2 195 169)
+              (%version-user-agent-field-bytes (string (code-char #xE9)))))
+  ;; U+4E2D, the case that used to signal.
+  (is (equalp #(3 228 184 173)
+              (%version-user-agent-field-bytes (string (code-char #x4E2D)))))
+  ;; U+1F600, above the BMP: four bytes, one CL character.
+  (is (equalp #(4 240 159 152 128)
+              (%version-user-agent-field-bytes (string (code-char #x1F600))))))

@@ -482,11 +482,14 @@ string itself. NAME labels the error.
 Core THROWS here rather than truncating, and the message the string belongs to
 fails to deserialize, so the peer is dropped by the bad-message path. That is
 the behaviour to copy: a truncated value would leave a misbehaving peer
-connected and would report a string the peer never sent."
+connected and would report a string the peer never sent.
+
+MAX counts BYTES, as Core's does: the limit is on the serialized string, and
+the characters it decodes to are however many UTF-8 makes of them."
   (let ((len (br-read-compact-size br)))
     (when (> len max)
       (serialization-error "~A length ~D exceeds maximum ~D" name len max))
-    (map 'string #'code-char (br-read-bytes br len))))
+    (bytes-to-utf8-string (br-read-bytes br len))))
 
 (defun br-read-bounded-count (br max name)
   "Read a CompactSize count from BR and signal PROTOCOL-LIMIT-ERROR if it
