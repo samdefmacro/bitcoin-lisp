@@ -199,12 +199,16 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
     (let* ((snapshot-p (and (bl.store:chain-state-from-snapshot-blockhash chain-state) t))
            (scratch (when (>= check-level 3) (%verify-db-scratch-view chain-state)))
            (tip-view (bl.store:chain-state-coins-view chain-state))
-           (skipped-l3 (and (>= check-level 3) (null scratch)))
+           ;; Two reasons to skip level 3, and they say different things: no
+           ;; database-backed view at all (a test fixture; a live node always
+           ;; has the cache), or Core's cache-size guard below.
+           (no-coins-db (and (>= check-level 3) (null scratch)))
+           (skipped-l3 no-coins-db)
            (skipped-no-data nil)
            (failure-entry nil)
            (good-transactions 0)
            (entry tip-entry))
-      (when skipped-l3
+      (when no-coins-db
         (bl:log-warn "Skipped verification of level >=3: this chainstate has no coins database"))
       (loop
         (unless (and entry (bl.store:block-index-entry-prev-entry entry)) (return))
@@ -249,7 +253,7 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
       (when (and (>= check-level 4) (not skipped-l3) entry)
         (let ((r (%verify-db-reconnect chain-state block-store scratch entry tip-entry)))
           (unless (eq r :success) (return-from verify-db r))))
-      (when skipped-l3
+      (when (and skipped-l3 (not no-coins-db))
         (bl:log-warn "Skipped verification of level >=3 (insufficient database cache size). Consider increasing -dbcache."))
       (bl:log-info "Verification: No coin database inconsistencies in last ~D block~:P (~D transaction~:P)"
                    (- chain-height (if entry
