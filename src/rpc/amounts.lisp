@@ -91,6 +91,20 @@ least two decimals kept."
   (amount 0 :type integer)
   sffo)
 
+(defun default-input-sequence (replaceable locktime)
+  "The nSequence Core's AddInputs gives an input that names none
+(rpc/rawtransaction_util.cpp:47-56).
+
+REPLACEABLE is `rbf.value_or(true)\', so the DEFAULT is 0xfffffffd -- an
+absent `replaceable\' argument is std::nullopt and value_or makes it true.
+Only an explicit false falls through, and then the locktime decides:
+0xfffffffe keeps nLockTime enforceable, 0xffffffff makes the input final.
+Core has one AddInputs for createrawtransaction, createpsbt and
+walletcreatefundedpsbt, so this has one caller per RPC and no second rule."
+  (cond (replaceable #xfffffffd)
+        ((> locktime 0) #xfffffffe)
+        (t #xffffffff)))
+
 (defun parse-outputs (network outputs-param)
   "Core ParseOutputs over the outputs argument: an object {address: amount,
 \"data\": hex} or an array of single-pair objects. Returns

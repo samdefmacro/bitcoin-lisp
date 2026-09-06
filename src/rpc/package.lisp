@@ -171,6 +171,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:rpc-get-network
    #:rpc-signmessagewithprivkey
    #:satoshi->btc
+   #:default-input-sequence
    #:decode-hex-tx
    #:decode-hex-tx-or-error
    #:decode-tx

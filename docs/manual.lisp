@@ -1088,6 +1088,13 @@
   transaction whose txid names a prefix), and CheckTxScriptsSanity breaks
   the tie. `iswitness\' restricts which readings are tried.
 
+  createrawtransaction, createpsbt and walletcreatefundedpsbt share Core's
+  ONE AddInputs rule for a per-input nSequence (`default-input-sequence\'):
+  `replaceable\' is an OPTIONAL bool whose absence means TRUE, so the
+  default sequence is 0xfffffffd and only an explicit false falls through
+  to 0xfffffffe (locktime set) or 0xffffffff. An all-final transaction
+  makes its own nLockTime unenforceable, which is why the default matters.
+
   Every scriptPubKey object the RPC and REST surfaces emit is
   `script-to-json\', Core's ScriptToUniv, in Core's key order (asm, desc,
   hex, address, type) -- there is no second copy to drift. `decodescript\'
@@ -1107,6 +1114,8 @@
   (bitcoin-lisp.rpc:script->address function)
   (bitcoin-lisp.rpc:decode-tx function)
   (bitcoin-lisp.rpc:decode-hex-tx function)
+  (bitcoin-lisp.rpc:default-input-sequence function)
+  (bitcoin-lisp.rpc:parse-outputs function)
   (bitcoin-lisp.rpc:rpc-get-chain-state function)
   (bitcoin-lisp.rpc::*rpc-named-arg-names* variable)
   (bitcoin-lisp.rpc::*rpc-arg-conversions* variable)

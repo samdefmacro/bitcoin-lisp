@@ -881,65 +881,110 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                                                             (car e) (cdr e)))))
                                     sign-errors))))))))))
 
-(define-rpc "createrawtransaction" (node ((inputs :array) outputs (locktime :or 0)))
-  "Create an unsigned raw transaction."
-  (let ((network (rpc-get-network node)))
-    ;; Validate inputs
-    (unless (and (listp inputs) (> (length inputs) 0))
+(defun %add-inputs (inputs replaceable locktime)
+  "Core AddInputs (rpc/rawtransaction_util.cpp:25-71): the tx-in list for the
+`inputs' argument.
+
+A NULL or EMPTY array means zero inputs and the loop runs zero times --
+createrawtransaction([], {...}) is the standard way to build an unsigned
+funding template and appears at 33 call sites across Core's functional tests.
+REPLACEABLE is `rbf.value_or(true)', already resolved by the caller.
+
+%OBJ-GET, not ASSOC. A JSON object reaches us as a HASH-TABLE from the decoder
+and as an ALIST from the unit tests, and ASSOC on a hash-table is a type error
+- so createrawtransaction failed for every real JSON-RPC client while the
+suite stayed green."
+  (loop for inp in inputs
+        for txid-str = (obj-get inp "txid")
+        for vout = (obj-get inp "vout")
+        for sequence = (obj-get inp "sequence")
+        do (unless (valid-hex-hash-p txid-str)
+             (error 'rpc-error :code +rpc-invalid-parameter+
+                               :message "Invalid input txid"))
+           (unless (integerp vout)
+             (error 'rpc-error :code +rpc-invalid-parameter+
+                               :message "Invalid parameter, missing vout key"))
+           (when (minusp vout)
+             (error 'rpc-error :code +rpc-invalid-parameter+
+                               :message "Invalid parameter, vout cannot be negative"))
+           (when (and sequence
+                      (or (not (integerp sequence))
+                          (not (<= 0 sequence #xffffffff))))
+             (error 'rpc-error :code +rpc-invalid-parameter+
+                               :message "Invalid parameter, sequence number is out of range"))
+        collect (bl.ser:make-tx-in
+                 :previous-output (bl.ser:make-outpoint
+                                   :hash (parse-hex-hash txid-str)
+                                   :index vout)
+                 :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                 :sequence (or sequence
+                               (default-input-sequence replaceable locktime)))))
+
+(define-rpc "createrawtransaction"
+    (node (inputs outputs (locktime :or 0) replaceable version))
+  "Create an unsigned raw transaction (Core createrawtransaction ->
+ConstructTransaction, rpc/rawtransaction_util.cpp:147-171).
+
+Three of ConstructTransaction's five arguments used to be discarded, and each
+absence was visible in the bytes:
+
+  - REPLACEABLE defaults to TRUE, because Core leaves `rbf' as std::nullopt
+    when the argument is absent and AddInputs asks `rbf.value_or(true)'. The
+    per-input sequence was the literal 0xffffffff here, so a transaction built
+    with a LOCKTIME was consensus-FINAL -- all-final sequences make nLockTime
+    unenforceable, and an operator who asked for a timelocked transaction got
+    one that can be mined at once -- and the RBF default was inverted.
+  - VERSION defaults to 2 and is refused outside 1..3, Core's standard range.
+    A caller asking for version 3 (TRUC) got a v2 transaction with silently
+    different relay policy.
+  - An explicit replaceable=TRUE with sequences that contradict it is an
+    error, not a silent override.
+
+The argument ORDER is Core's too (locktime, then version, then inputs, then
+outputs), which is why the outputs diagnostics rpc_rawtransaction.py:293-302
+drives through an EMPTY inputs array are reachable at all."
+  (let ((network (rpc-get-network node))
+        ;; POSITIONAL-ARRAY, not the raw parameter: a top-level [] arrives as
+        ;; the empty-array SENTINEL, which is truthy and is not a list.
+        (input-list (positional-array inputs))
+        ;; Core's std::optional<bool>: value_or(true) for the sequence rule,
+        ;; but only an EXPLICIT true triggers the contradiction check below,
+        ;; which is the whole reason Core keeps the optional.
+        (replaceable-p (positional-bool-or replaceable t)))
+    (unless (or (null inputs) (%positional-array-p inputs))
+      (%json-type-error inputs "array"))
+    (unless (and (integerp locktime) (<= 0 locktime #xffffffff))
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid inputs"))
-    ;; Validate locktime
-    (unless (and (integerp locktime) (>= locktime 0))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid locktime"))
-    ;; Build transaction inputs
-    ;; %OBJ-GET, not ASSOC. A JSON object reaches us as a HASH-TABLE from the
-    ;; decoder and as an ALIST from the unit tests, and ASSOC on a hash-table is
-    ;; a type error — so createrawtransaction failed for every real JSON-RPC
-    ;; client while the suite stayed green. The helper already existed, with a
-    ;; docstring naming this exact split; it just had the wrong callers.
-    (let ((tx-inputs
-            (loop for inp in inputs
-                  for txid-str = (obj-get inp "txid")
-                  for vout = (obj-get inp "vout")
-                  for sequence = (or (obj-get inp "sequence") #xffffffff)
-                  do (unless (valid-hex-hash-p txid-str)
-                       (error 'rpc-error :code +rpc-invalid-parameter+
-                                         :message "Invalid input txid"))
-                     (unless (and (integerp vout) (>= vout 0))
-                       (error 'rpc-error :code +rpc-invalid-parameter+
-                                         :message "Invalid input vout"))
-                  collect (bl.ser:make-tx-in
-                           :previous-output (bl.ser:make-outpoint
-                                             :hash (parse-hex-hash txid-str)
-                                             :index vout)
-                           :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                           :sequence sequence)))
-          ;; Core parses this argument in ONE place — NormalizeOutputs then
-          ;; ParseOutputs (rawtransaction_util.cpp:74-99,101+) — and every RPC
-          ;; taking outputs goes through it. %PARSE-OUTPUTS is that function
-          ;; here, and createrawtransaction was the one caller not using it:
-          ;; it had its own loop accepting the OBJECT form only. So Core's
-          ;; ARRAY-of-single-key-objects form — the order-preserving spelling,
-          ;; which rpc_createmultisig.py:117 and much of the suite use — was
-          ;; answered "Invalid outputs format", as was every "data" OP_RETURN
-          ;; output, and duplicate addresses went unnoticed. Sharing the
-          ;; function is also what keeps the amount and address errors from
-          ;; drifting into a second dialect.
-          (tx-outputs
-            (mapcar (lambda (r)
-                      (bl.ser:make-tx-out
-                       :value (recipient-amount r)
-                       :script-pubkey (recipient-script r)))
-                    (parse-outputs network outputs))))
-      ;; Create transaction
-      (let ((tx (bl.ser:make-transaction
-                 :version 2
-                 :inputs (coerce tx-inputs 'simple-vector)
-                 :outputs (coerce tx-outputs 'simple-vector)
-                 :lock-time locktime)))
-        (bl.crypto:bytes-to-hex
-         (bl.ser:transaction-wire-bytes tx))))))
+                        :message "Invalid parameter, locktime out of range"))
+    (let ((version (or version 2)))
+      (unless (and (integerp version) (<= 1 version 3))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Invalid parameter, version out of range(1~3)"))
+      (let* ((tx-inputs (%add-inputs input-list replaceable-p locktime))
+             ;; Core parses this argument in ONE place -- NormalizeOutputs then
+             ;; ParseOutputs (rawtransaction_util.cpp:74-99,101+) -- and every
+             ;; RPC taking outputs goes through it. %PARSE-OUTPUTS is that
+             ;; function here.
+             (tx-outputs
+               (mapcar (lambda (r)
+                         (bl.ser:make-tx-out
+                          :value (recipient-amount r)
+                          :script-pubkey (recipient-script r)))
+                       (parse-outputs network outputs)))
+             (tx (bl.ser:make-transaction
+                  :version version
+                  :inputs (coerce tx-inputs 'simple-vector)
+                  :outputs (coerce tx-outputs 'simple-vector)
+                  :lock-time locktime)))
+        ;; ConstructTransaction's last check (:167-169): an explicit
+        ;; replaceable=true whose supplied sequences do not signal is a
+        ;; contradiction, not a silent override.
+        (when (and (positional-bool replaceable)
+                   tx-inputs
+                   (not (bl.mp:tx-signals-rbf-p tx)))
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message "Invalid parameter combination: Sequence number(s) contradict replaceable option"))
+        (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx))))))
 
 ;;; --- estimaterawfee (Core rpc/fees.cpp) and decodescript (rpc/rawtransaction.cpp) ---
 
