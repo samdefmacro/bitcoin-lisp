@@ -1106,7 +1106,11 @@
   The last of those is why a CPFP child does not teach the estimator that
   its own low feerate confirmed in one block.
 
-  Traps: an 83 MB mempool.dat turns a restart into a long silent replay
+  Traps: a rule that BOUNDS a later step's work has to RUN before it, and
+  a LET binding runs where it is bound rather than where it is read --
+  rule 5's cluster cap is the bound on the RBF descendant expansion, so
+  the expansion cannot be a sibling binding of the guard that limits it.
+  An 83 MB mempool.dat turns a restart into a long silent replay
   -- load in batches and log progress. The policy estimator must EXIST
   before fee_estimates.dat is loaded, or the file's estimator section is
   discarded on every start. The mining index
