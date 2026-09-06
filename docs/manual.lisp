@@ -955,7 +955,13 @@
   with [error]. `:sighash-decode' is fAttemptSighashDecode and belongs to
   a scriptSig ALONE -- Core passes it from TxToUniv's scriptSig branch
   and decodepsbt's final_scriptSig, and suppresses it for an unspendable
-  script so OP_RETURN data shaped like a signature is not read as one."
+  script so OP_RETURN data shaped like a signature is not read as one.
+
+  CheckMinimalPush is ONE helper, `bl.interop:minimal-push-encoding-p',
+  with no second copy: the interpreter applies it under the MINIMALDATA
+  flag, while miniscript's DecomposeScript applies it UNCONDITIONALLY,
+  because its mapping from a script to an expression has to be one to
+  one."
   (bitcoin-lisp.coalton.script package)
   (bitcoin-lisp.coalton.interop package)
   (bitcoin-lisp.coalton.script:script-error-name function)

@@ -2253,7 +2253,19 @@ Three normalizations, all Core's:
   (let ((ops '())
         (i 0)
         (n (length script)))
-    (flet ((push-op (opcode data) (push (%make-ms-op opcode data) ops)))
+    (flet ((push-op (opcode data) (push (%make-ms-op opcode data) ops))
+           (push-data (opcode start len)
+             ;; Core's `if (IsPushdataOp(opcode)) CheckMinimalPush(..)'
+             ;; branch: every push, whatever its opcode, has to be the
+             ;; shortest encoding of its bytes, or the script is not
+             ;; decomposable. Without it two scripts map onto one
+             ;; miniscript, and the inferred node re-serializes to bytes
+             ;; other than the ones it was given.
+             (when (> (+ start len) n) (return-from ms-decompose-script nil))
+             (let ((data (subseq script start (+ start len))))
+               (unless (bl.interop:minimal-push-encoding-p opcode data)
+                 (return-from ms-decompose-script nil))
+               (push (%make-ms-op opcode data) ops))))
       (loop while (< i n)
             do (let ((op (aref script i)))
                  (incf i)
@@ -2263,27 +2275,19 @@ Three normalizations, all Core's:
                    ;; zero: OP_0 IS zero, and conflating the two makes every
                    ;; data push look like a literal false.
                    ((and (>= op 1) (<= op 75))
-                    (when (> (+ i op) n) (return-from ms-decompose-script nil))
-                    (push-op op (subseq script i (+ i op)))
+                    (push-data op i op)
                     (incf i op))
                    ((= op +ms-op-pushdata1+)
                     (when (>= i n) (return-from ms-decompose-script nil))
                     (let ((len (aref script i)))
                       (incf i)
-                      (when (or (> (+ i len) n) (< len 76))
-                        ;; Non-minimal push: miniscript requires the shortest
-                        ;; encoding, so accepting this would again admit two
-                        ;; scripts for one expression.
-                        (return-from ms-decompose-script nil))
-                      (push-op +ms-op-pushdata1+ (subseq script i (+ i len)))
+                      (push-data op i len)
                       (incf i len)))
                    ((= op +ms-op-pushdata2+)
                     (when (> (+ i 2) n) (return-from ms-decompose-script nil))
                     (let ((len (logior (aref script i) (ash (aref script (1+ i)) 8))))
                       (incf i 2)
-                      (when (or (> (+ i len) n) (< len 256))
-                        (return-from ms-decompose-script nil))
-                      (push-op +ms-op-pushdata2+ (subseq script i (+ i len)))
+                      (push-data op i len)
                       (incf i len)))
                    ((= op +ms-op-pushdata4+) (return-from ms-decompose-script nil))
                    ;; OP_0 pushes nothing; OP_1..OP_16 push their value.
@@ -2314,12 +2318,18 @@ Three normalizations, all Core's:
     (coerce ops 'vector)))
 
 (defun %ms-op-number (op)
-  "The number OP pushes, or NIL. OP_0 is 0; a push of up to 4 bytes is a
-CScriptNum."
+  "The number OP pushes, or NIL (Core ParseScriptNumber, miniscript.cpp:407-419).
+
+OP_0 is 0; every other opcode's payload is read as a CScriptNum with
+fRequireMinimal, so at most four bytes AND the shortest encoding of the value:
+a redundant trailing 0x00 makes the fragment simply unrecognized, which is
+what keeps one miniscript from having two scripts."
   (let ((data (ms-op-data op)))
-    (cond ((null data) nil)
-          ((zerop (length data)) 0)
+    (cond ((= (ms-op-opcode op) +op-0+) 0)
+          ;; No payload and not OP_0: an opcode, not a number.
+          ((zerop (length data)) nil)
           ((> (length data) 4) nil)
+          ((not (bl.interop:minimal-number-encoding-p data)) nil)
           (t
            (let ((v 0))
              (loop for i from (1- (length data)) downto 0
