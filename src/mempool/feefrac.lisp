@@ -27,6 +27,19 @@ The empty feefrac has fee = size = 0; size 0 with nonzero fee is invalid."
   "True when F is the empty feefrac (feefrac.h:120-122; size 0 implies fee 0)."
   (zerop (feefrac-size f)))
 
+(defun feefrac-per-vsize (f)
+  "F re-expressed per VIRTUAL byte: the same fee over ceil(size / 4) — Core's
+ToFeePerVSize (policy/policy.h:196), where WITNESS_SCALE_FACTOR is 4.
+
+The txgraph works in sigop-adjusted WEIGHT, as Core's does, so that a
+per-transaction rounding cannot decide a chunk boundary or a mining order; the
+division to virtual bytes belongs at the CONSUMER boundary, and this is it.
+It is applied where Core applies it and nowhere else: the rolling-minimum-fee
+bump computed from an evicted chunk (txmempool.cpp:869-871) and the block
+assembler's blockMinFeeRate comparison (node/miner.cpp:294-299). The RPCs
+that report a chunk report the WEIGHT, unconverted, as Core's do."
+  (make-feefrac (feefrac-fee f) (ceiling (feefrac-size f) 4)))
+
 (defun feefrac+ (a b)
   "Componentwise sum of A and B (feefrac.h:138-142)."
   (make-feefrac (+ (feefrac-fee a) (feefrac-fee b))

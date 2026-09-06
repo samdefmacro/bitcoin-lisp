@@ -169,12 +169,11 @@ getmempoolentry, getmempoolancestors, and getmempooldescendants.
 
 The chunk fields (Core MempoolEntryDescription + entryToJSON,
 rpc/mempool.cpp:433-465/508-541) report the txgraph chunk this entry mines
-in: \"chunkweight\" is the chunk's total size and fees.\"chunk\" its total
-modified fees. UNIT DIVERGENCE: Core's txgraph measures sigops-adjusted
-WEIGHT (GetAdjustedWeight), ours sigops-adjusted virtual bytes, so
-\"chunkweight\" here is in vB (~ Core's value / 4). \"vsize\" and the
-ancestor/descendant sizes are the sigop-adjusted virtual size, exactly
-Core's GetTxSize-based reporting."
+in: \"chunkweight\" is the chunk's total size and \"chunk\" its total
+modified fees. Both are Core's units: the txgraph measures sigops-adjusted
+WEIGHT on both sides, and Core reports feerate.size here without converting.
+\"vsize\" and the ancestor/descendant sizes are the sigop-adjusted virtual
+size, exactly Core's GetTxSize-based reporting."
   (multiple-value-bind (acount asize afees)
       (bl.mp:mempool-ancestor-stats mempool txid)
     (multiple-value-bind (dcount dsize dfees)
@@ -286,10 +285,9 @@ getmempoolcluster, rpc/mempool.cpp:829-862 + clusterToJSON :474-506):
 clusterweight, txcount, and the cluster's chunks in mining order, each with
 chunkfee (BTC), chunkweight, and its txids in mining order. Core's RPC layer
 reconstructs chunk membership with a size countdown because its graph hides
-chunks; ours exposes them (TXGRAPH-GET-CLUSTER-CHUNKS). UNIT DIVERGENCE:
-Core's clusterweight/chunkweight are sigops-adjusted WEIGHT
-(GetAdjustedWeight); our txgraph measures BIP141 virtual bytes, so those
-fields here are in vB (~ Core / 4)."
+chunks; ours exposes them (TXGRAPH-GET-CLUSTER-CHUNKS). clusterweight and
+chunkweight are Core's sigops-adjusted WEIGHT (GetAdjustedWeight), which is
+what the txgraph holds, so no conversion happens on the way out."
   (let ((mempool (rpc-get-mempool node)))
     ;; Node lock: the chunk walk reads the live txgraph, which the sync
     ;; thread relinearizes on every mempool mutation.
@@ -319,8 +317,9 @@ fields here are in vB (~ Core / 4)."
 getmempoolfeeratediagram — a hidden RPC, rpc/mempool.cpp:609-650 +
 CTxMemPool::GetFeerateDiagram, txmempool.cpp:1082-1102): the cumulative
 (weight, fee-in-BTC) point after each chunk in mining order, starting from
-the (0, 0) origin. UNIT DIVERGENCE: Core's weight axis is sigops-adjusted
-weight; ours is BIP141 virtual bytes (~ Core / 4)."
+the (0, 0) origin. The weight axis is Core's sigops-adjusted weight — its
+GetFeerateDiagram returns FeePerWeight and the RPC reports f.size verbatim
+(rpc/mempool.cpp:641-643), and so does this."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
         (cum-weight 0)

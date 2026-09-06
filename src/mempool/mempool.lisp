@@ -48,14 +48,17 @@ DEFAULT_CLUSTER_LIMIT = 64, hard-capped at MAX_CLUSTER_COUNT_LIMIT = 64
 (mempool_args.cpp:110-112). Read at MAKE-MEMPOOL time (the graph's limits are
 fixed at creation); set from config before the node's mempool is built.")
 
-(defvar *cluster-size-limit* +max-cluster-size+
-  "Max total vsize of a cluster, in SIGOP-ADJUSTED vbytes (entries carry the
-adjusted size). Core -limitclustersize in kvB x 1000 (mempool_args.cpp:37),
-default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101; its txgraph limit is the same
-101k scaled to adjusted WEIGHT (x4, txmempool.cpp:179-181), so ours matches
-up to the per-tx ceiling in SIGOP-ADJUSTED-VSIZE. Core-exact 64/101k
-defaults are non-negotiable for relay compatibility. Read at MAKE-MEMPOOL
-time, like *CLUSTER-COUNT-LIMIT*.")
+(defvar *cluster-size-limit* (floor +max-cluster-size+ 4)
+  "Max total size of a cluster in SIGOP-ADJUSTED VIRTUAL BYTES — Core's
+limits.cluster_size_vbytes, which -limitclustersize sets as kvB x 1000
+(mempool_args.cpp:37), default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101.
+
+The txgraph itself measures WEIGHT, so MAKE-MEMPOOL hands it this value
+scaled by WITNESS_SCALE_FACTOR, exactly as Core's MakeTxGraph is handed
+cluster_size_vbytes * WITNESS_SCALE_FACTOR (txmempool.cpp:179-181). Keeping
+the configured value in vbytes is what leaves the -limitclustersize contract
+unchanged. Core-exact 64/101k defaults are non-negotiable for relay
+compatibility. Read at MAKE-MEMPOOL time, like *CLUSTER-COUNT-LIMIT*.")
 
 (defconstant +default-mempool-expiry-hours+ 336
   "Drop mempool txs older than this (14 days) — Bitcoin Core
@@ -127,14 +130,30 @@ with -bytespersigop.
 
 A DEFPARAMETER, not a DEFCONSTANT: this is relay POLICY, not consensus.")
 
+(defun sigop-adjusted-weight (weight sigops)
+  "The sigop-adjusted WEIGHT: max(WEIGHT, SIGOPS * 20), no division — Core
+GetSigOpsAdjustedWeight (policy.cpp:376-379) and CTxMemPoolEntry's
+GetAdjustedWeight (kernel/mempool_entry.h:114).
+
+This, not the vsize below, is what a transaction contributes to the txgraph
+(Core StageAddition builds FeePerWeight from it, txmempool.cpp:1017) and what
+the cluster size limit is measured in. Dividing first would apply the
+per-transaction ceiling BEFORE the cross-multiplied feerate comparisons, so
+two transactions whose weights differ by 1..3 WU would become
+indistinguishable and per-transaction rounding would accumulate against the
+cluster cap."
+  (max weight (* sigops *bytes-per-sigop*)))
+
 (defun sigop-adjusted-vsize (weight sigops)
   "The sigop-adjusted virtual size: ceil(max(WEIGHT, SIGOPS * 20) / 4) —
-Core GetVirtualTransactionSize (policy.cpp:376-384). This, not the raw
+Core GetVirtualTransactionSize (policy.cpp:381-384), i.e.
+SIGOP-ADJUSTED-WEIGHT rounded up to virtual bytes. This, not the raw
 BIP141 vsize, is Core's mempool-entry size (CTxMemPoolEntry::GetTxSize):
-it prices into the fee floor, RBF rules, TRUC caps, cluster limits, and
-chunk feerates the transactions whose cost to the network is validation
-work rather than bytes."
-  (ceiling (max weight (* sigops *bytes-per-sigop*)) 4))
+it prices into the fee floor, RBF rules, TRUC caps and the reported
+feerates the transactions whose cost to the network is validation
+work rather than bytes. The txgraph does NOT use it — see
+SIGOP-ADJUSTED-WEIGHT."
+  (ceiling (sigop-adjusted-weight weight sigops) 4))
 
 ;;;; Modeled dynamic memory usage (Core DynamicMemoryUsage)
 ;;;;
@@ -320,6 +339,22 @@ neither this RPC nor any other could repair."
         (setf (gethash txid (mempool-deltas mempool)) delta))
     delta))
 
+(defun transaction-graph-weight (tx sigops)
+  "TX's size in the TXGRAPH's unit: its sigop-adjusted WEIGHT (Core
+StageAddition's FeePerWeight(fee, GetSigOpsAdjustedWeight(GetTransactionWeight,
+sigops_cost, nBytesPerSigOp)), txmempool.cpp:1017).
+
+Every place that stages a transaction into the graph -- the mempool add, the
+single-transaction replacement check and the package paths -- asks here, so
+the unit has ONE definition to change."
+  (sigop-adjusted-weight (bl.ser:transaction-weight tx) sigops))
+
+(defun mempool-entry-graph-weight (entry)
+  "ENTRY's size in the txgraph's unit. Derived rather than stored, so it cannot
+drift from the transaction and the sigop count the entry already holds."
+  (transaction-graph-weight (mempool-entry-transaction entry)
+                            (mempool-entry-sigops entry)))
+
 (defun mempool-entry-fee-rate (entry)
   "Fee rate (satoshis per virtual byte) for a mempool entry, using the
 prioritisation-modified fee (Core scores mining/eviction on modified fees)."
@@ -448,8 +483,11 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; parent/child machinery remains for RPC ancestor/descendant reporting,
   ;; TRUC topology checks, and mempool.dat ordering, with the P3 shadow
   ;; equivalence asserts as the standing safety net.
+  ;; The graph's limit is in WEIGHT, the configured one in vbytes: Core's
+  ;; MakeTxGraph(cluster_size_vbytes * WITNESS_SCALE_FACTOR),
+  ;; txmempool.cpp:179-181.
   (graph (make-txgraph :max-cluster-count *cluster-count-limit*
-                       :max-cluster-size *cluster-size-limit*
+                       :max-cluster-size (* 4 *cluster-size-limit*)
                        :fallback-order #'%graph-txid-order)
          :type txgraph))
 
@@ -1055,17 +1093,18 @@ runs unconditionally (validation.cpp:1338-1342)."
     ;; Stage into the txgraph first (Core ChangeSet::StageAddition +
     ;; ProcessDependencies, txmempool.cpp:1005-1071): the modified fee (the
     ;; delta was applied above; Core adds unmodified then SetTransactionFee -
-    ;; one step here), the vsize, and a dependency per in-mempool parent.
+    ;; one step here), the sigop-adjusted WEIGHT (the graph's unit, as it is
+    ;; Core's), and a dependency per in-mempool parent.
     ;; Then enforce the cluster limits (Core CheckMemPoolPolicyLimits ->
     ;; IsOversized, validation.cpp:1020): a dependency whose merged cluster
     ;; would exceed the count/size limits is held pending and the graph
     ;; reports oversized - undo the staged addition and reject. A tx whose
-    ;; own vsize exceeds the size limit is oversized the same way. The
+    ;; own weight exceeds the size limit is oversized the same way. The
     ;; historical 25/25 ancestor/descendant limits no longer reject; they
     ;; are RPC-reporting-only (Core init.cpp:650-659).
     (let ((handle (txgraph-add-transaction
                    graph (mempool-entry-modified-fee entry)
-                   (mempool-entry-vsize entry) txid)))
+                   (mempool-entry-graph-weight entry) txid)))
       (dolist (p parent-txids)
         (txgraph-add-dependency
          graph (mempool-entry-graph-handle (mempool-get mempool p)) handle))
@@ -1323,13 +1362,18 @@ before the diagram, validation.cpp:1020-1022), else :replacement-failed
         ((not (eq (compare-chunks new-diagram old-diagram) :greater))
          :replacement-failed)))
 
-(defun check-rbf-rules (mempool tx new-fee new-vsize direct-conflicts)
+(defun check-rbf-rules (mempool tx new-fee new-vsize new-weight direct-conflicts)
   "Apply the cluster-mempool replacement rules for TX (paying NEW-FEE — the
-prioritisation-MODIFIED fee, like the replaced entries' fees below — over
-NEW-VSIZE) against DIRECT-CONFLICTS (a list of directly-conflicting mempool
-txids). Returns (values ok-p reason replaced-set), where REPLACED-SET is a
-hash-set of all txids that would be evicted (the conflicts plus their
-descendants).
+prioritisation-MODIFIED fee, like the replaced entries' fees below) against
+DIRECT-CONFLICTS (a list of directly-conflicting mempool txids). Returns
+(values ok-p reason replaced-set), where REPLACED-SET is a hash-set of all
+txids that would be evicted (the conflicts plus their descendants).
+
+The candidate's size arrives twice because Core reads it in two units, and
+they are not interchangeable: NEW-VSIZE is the sigop-adjusted VIRTUAL size
+(Core's ws.m_vsize), which rules 3 and 4 price the replacement's bandwidth
+in, and NEW-WEIGHT is the sigop-adjusted WEIGHT the candidate is staged into
+the txgraph with (Core's ChangeSet::StageAddition, txmempool.cpp:1017).
 
 Full-RBF is UNCONDITIONAL: BIP125 rules 1 (signaling) and 2 (no new
 unconfirmed inputs) are gone from node policy (Core validation.cpp:490;
@@ -1375,20 +1419,25 @@ in terms of clusters; and the old feerate-superiority test
                            mempool (mempool-find-parents mempool tx))))
       (multiple-value-bind (old-diagram new-diagram)
           (txgraph-rbf-diagrams graph removed-handles parent-handles
-                                new-fee new-vsize)
+                                new-fee new-weight)
         (let ((verdict (%rbf-diagram-verdict old-diagram new-diagram)))
           (when verdict
             (return-from check-rbf-rules (values nil verdict nil))))))
     (values t nil replaced)))
 
-(defun check-package-rbf-rules (mempool parent-fee parent-vsize
-                                child-fee child-vsize direct-conflicts)
+(defun check-package-rbf-rules (mempool parent-fee parent-vsize parent-weight
+                                child-fee child-vsize child-weight
+                                direct-conflicts)
   "Apply the package RBF rules for a 1-parent-1-child package whose members
 conflict with mempool transactions (Core PackageRBFChecks,
 validation.cpp:1034-1130). PARENT-FEE/CHILD-FEE are the prioritisation-
 modified fees; DIRECT-CONFLICTS the aggregated directly-conflicting mempool
 txids of BOTH package members. Returns (values ok-p reason replaced-set)
-like CHECK-RBF-RULES.
+like CHECK-RBF-RULES, and takes each member's size in the same two units for
+the same reason: the VSIZEs price the anti-DoS rules and the package-versus-
+parent feerate comparison (Core builds both CFeeRates over m_vsize,
+validation.cpp:1102-1103), the WEIGHTs stage the two transactions into the
+txgraph.
 
 The caller enforces Core's shape preconditions first: exactly 2 transactions
 forming child-with-parents (validation.cpp:1047-1050) and NO in-mempool
@@ -1442,8 +1491,8 @@ transactions (validation.cpp:1113-1121)."
     ;; two-transaction changeset, validation.cpp:1113-1121).
     (multiple-value-bind (old-diagram new-diagram)
         (txgraph-package-rbf-diagrams graph (%rbf-entry-handles mempool replaced)
-                                      parent-fee parent-vsize
-                                      child-fee child-vsize)
+                                      parent-fee parent-weight
+                                      child-fee child-weight)
       (let ((verdict (%rbf-diagram-verdict old-diagram new-diagram)))
         (when verdict
           (return-from check-package-rbf-rules (values nil verdict nil)))))
@@ -1451,7 +1500,8 @@ transactions (validation.cpp:1113-1121)."
 
 (defun mempool-package-fits-cluster-limits-p (mempool members)
   "Would admitting the whole package keep every cluster within the 64-tx /
-101-kvB limits? MEMBERS is a list of (tx modified-fee vsize), in package
+101-kvB limits? MEMBERS is a list of (tx modified-fee sigop-adjusted-weight),
+each size in the txgraph's own unit as MEMPOOL-ADD stages it, in package
 (parents-first) order. Stages every member into the txgraph — with a
 dependency per in-mempool parent and per in-package parent — tests
 TXGRAPH-OVERSIZED-P, then unstages, leaving the graph unchanged. This is
@@ -1468,9 +1518,9 @@ further)."
     (unwind-protect
          (progn
            (dolist (m members)
-             (destructuring-bind (tx fee vsize) m
+             (destructuring-bind (tx fee weight) m
                (let* ((txid (bl.ser:transaction-hash tx))
-                      (handle (txgraph-add-transaction graph fee vsize txid)))
+                      (handle (txgraph-add-transaction graph fee weight txid)))
                  (setf (gethash txid staged) handle)
                  (push handle handles)
                  (dolist (p (mempool-find-parents mempool tx))
@@ -1870,14 +1920,21 @@ connects. Returns the number of transactions removed."
     (%with-graph-verify-batch (mempool)
       (loop while (and (plusp (mempool-count mempool))
                        (> (mempool-dynamic-usage mempool) limit))
-            do (multiple-value-bind (handles feerate)
+            do (multiple-value-bind (handles chunk-feerate)
                    (txgraph-get-worst-main-chunk graph)
-                 ;; Feerate in sat/kvB, truncating like Core's
+                 ;; The chunk feerate is fee per sigop-adjusted WEIGHT; Core
+                 ;; converts it at exactly this boundary --
+                 ;; `FeePerVSize feerate = ToFeePerVSize(feeperweight);
+                 ;; CFeeRate removed{feerate.fee, feerate.size}'
+                 ;; (txmempool.cpp:869-871) -- because the rolling minimum fee
+                 ;; is a sat/kvB rate every other fee gate is compared in.
+                 ;; Feerate in sat/kvB then truncates like Core's
                  ;; CFeeRate(fee, size) constructor, plus the incremental
-                 ;; relay fee (txmempool.cpp:870-878).
-                 (let ((rate (+ (truncate (* (feefrac-fee feerate) 1000)
-                                          (feefrac-size feerate))
-                                *incremental-relay-fee-rate*)))
+                 ;; relay fee (txmempool.cpp:872-878).
+                 (let* ((feerate (feefrac-per-vsize chunk-feerate))
+                        (rate (+ (truncate (* (feefrac-fee feerate) 1000)
+                                           (feefrac-size feerate))
+                                 *incremental-relay-fee-rate*)))
                    ;; Core trackPackageRemoved (txmempool.cpp:853-858): the
                    ;; bump also STOPS the decay clock. Nothing lowers the
                    ;; floor again until a block connects, or a newcomer at

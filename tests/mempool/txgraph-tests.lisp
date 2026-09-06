@@ -271,9 +271,13 @@ when G is not oversized)."
 ;;;; Unit tests: basics
 
 (test txgraph-constants
-  "Cluster limits are Core-exact (txgraph.h:18, policy 101 kvB)."
+  "Cluster limits are Core-exact (txgraph.h:18, policy 101 kvB). The graph's
+size cap is in WEIGHT, so it is that 101 kvB times WITNESS_SCALE_FACTOR --
+Core hands MakeTxGraph cluster_size_vbytes * 4 (txmempool.cpp:179-181) -- and
+the vbyte value the operator configures stays 101000."
   (is (= 64 bl.mp:+max-cluster-count+))
-  (is (= 101000 bl.mp:+max-cluster-size+)))
+  (is (= 404000 bl.mp:+max-cluster-size+))
+  (is (= 101000 bl.mp:*cluster-size-limit*)))
 
 (test txgraph-empty-graph
   (let ((g (%tg-new)))
@@ -731,10 +735,10 @@ the always-available queries keep working (txgraph.h:122-134)."
 oversized on its own (Core OVERSIZED_SINGLETON, txgraph.cpp:2244-2259);
 Trim removes it."
   (let* ((g (%tg-new))
-         (huge (%tg-add g 1000 150000)))  ; > 101,000 vB
+         (huge (%tg-add g 1000 500000)))  ; > 404,000 WU
     (is-true (%tg-oversized g))
     (is-true (%tg-exists g huge))
-    (is (%tg-ff= (%tg-feerate g huge) 1000 150000))
+    (is (%tg-ff= (%tg-feerate g huge) 1000 500000))
     (signals error (%tg-anc g huge))
     (is-true (%tg-sane g))
     (let ((removed (%tg-trim g)))

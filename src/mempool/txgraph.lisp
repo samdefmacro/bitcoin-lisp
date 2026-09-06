@@ -46,10 +46,14 @@
 ;;; - MAKE-TXGRAPH takes no acceptable-cost: with no lazy work queue there
 ;;;   is no linearization cost budget to configure.
 
-(defconstant +max-cluster-size+ 101000
-  "Maximum sum of transaction sizes in a cluster, in virtual bytes (Core
--limitclustersize default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB,
-policy/policy.h). Non-negotiable for future relay compatibility.")
+(defconstant +max-cluster-size+ 404000
+  "Maximum sum of transaction sizes in a cluster, in SIGOP-ADJUSTED WEIGHT
+units — Core's MakeTxGraph is handed limits.cluster_size_vbytes *
+WITNESS_SCALE_FACTOR (txmempool.cpp:179-181), i.e. the -limitclustersize
+default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB times four. The graph works
+in weight throughout, so the cap does too; the 101 kvB the operator
+configures lives in BL.MP:*CLUSTER-SIZE-LIMIT*. Non-negotiable for future
+relay compatibility.")
 
 ;;;; Handles
 
@@ -498,8 +502,9 @@ brackets Cluster::Updated with ClearChunkData/CreateChunkData
 
 (defun txgraph-add-transaction (graph fee size &optional data)
   "Add a new transaction with the given fee (satoshis, may be negative) and
-size (virtual bytes, > 0) and return its handle (Core AddTransaction,
-txgraph.cpp:2230-2260). The transaction starts as a singleton cluster.
+size (sigop-adjusted WEIGHT units, > 0 — the graph's own unit, as Core's is)
+and return its handle (Core AddTransaction, txgraph.cpp:2230-2260). The
+transaction starts as a singleton cluster.
 
 DATA is the handle's opaque caller payload (Core's Ref, which AddTransaction
 binds before the Cluster is Updated). Pass it here rather than assigning it to
@@ -990,7 +995,8 @@ GetMainStagingDiagrams, txmempool.cpp:994-1002, txgraph.cpp:2810-2834).
 REMOVED-HANDLES are the transactions the replacement evicts (the direct
 conflicts plus their descendants); PARENT-HANDLES are the candidate's
 in-mempool parents; NEW-FEE/NEW-SIZE describe the candidate (fee in satoshis,
-the prioritisation-modified fee; size in virtual bytes).
+the prioritisation-modified fee; size in the graph's own unit, sigop-adjusted
+WEIGHT).
 
 Returns (values old-diagram new-diagram): each a list of FeeFracs sorted by
 DECREASING feerate — the chunk feerates whose concave cumulative curve is the

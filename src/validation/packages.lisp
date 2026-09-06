@@ -273,6 +273,13 @@ of the per-tx Workspace fields Core's package layer reads back (m_ptx,
 m_base_fees, m_vsize, m_sigops_cost, m_modified_fees, the replaced set)."
   tx txid wtxid fee vsize sigops rset modified-fee)
 
+(defun %pkg-val-graph-weight (v)
+  "V's size in the TXGRAPH's unit — its sigop-adjusted WEIGHT, Core's
+GetSigOpsAdjustedWeight at StageAddition (txmempool.cpp:1017). Derived from
+the transaction and the sigop count the record already holds rather than
+stored beside the VSIZE, so the two units cannot disagree."
+  (bl.mp:transaction-graph-weight (%pkg-val-tx v) (%pkg-val-sigops v)))
+
 (defun %in-package-parents (txns tx)
   "The members of TXNS, in order, that are direct parents of TX — Core
 FindInPackageParents (truc_policy.cpp:18-37). TXNS is topologically sorted,
@@ -402,8 +409,12 @@ passed and REPLACED-SET (a txid hash-set) is what the package evicts."
      (destructuring-bind (parent child) validated
        (multiple-value-bind (ok reason rset)
            (bl.mp:check-package-rbf-rules
-            mempool (%pkg-val-modified-fee parent) (%pkg-val-vsize parent)
-            (%pkg-val-modified-fee child) (%pkg-val-vsize child) conflicts)
+            mempool
+            (%pkg-val-modified-fee parent) (%pkg-val-vsize parent)
+            (%pkg-val-graph-weight parent)
+            (%pkg-val-modified-fee child) (%pkg-val-vsize child)
+            (%pkg-val-graph-weight child)
+            conflicts)
          (if ok
              (values nil rset)
              (values reason nil)))))))
@@ -523,7 +534,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
                        mempool
                        (mapcar (lambda (v) (list (%pkg-val-tx v)
                                                  (%pkg-val-modified-fee v)
-                                                 (%pkg-val-vsize v)))
+                                                 (%pkg-val-graph-weight v)))
                                validated))))
         (return-from %accept-package-subset :too-large-cluster))
       ;; 6. Ephemeral-dust spend check over the whole subset (Core
