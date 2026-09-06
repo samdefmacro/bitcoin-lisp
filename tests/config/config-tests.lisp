@@ -1906,6 +1906,26 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
+(test avoidpartialspends-is-a-real-option
+  "-avoidpartialspends left the accept-and-drop list (GA11 feecc533). Core
+reads it with GetBoolArg(DEFAULT_AVOIDPARTIALSPENDS = false) in every
+CCoinControl constructor (wallet/coincontrol.cpp:9-13), so it belongs in the
+option table as a :GLOBAL row over the special the WCC slot takes its initform
+from -- not at the call sites, which in Core can only ever RAISE the flag."
+  (let ((saved bl.wallet:*wallet-avoid-partial-spends*))
+    (unwind-protect
+         (progn
+           ;; It defaults FALSE, so setting it to 1 is what proves the wiring.
+           (apply-config-globals '(("avoidpartialspends" . "1")))
+           (is-true bl.wallet:*wallet-avoid-partial-spends*)
+           (apply-config-globals '(("avoidpartialspends" . "0")))
+           (is-false bl.wallet:*wallet-avoid-partial-spends*))
+      (setf bl.wallet:*wallet-avoid-partial-spends* saved)))
+  (is-false bl.wallet:*wallet-avoid-partial-spends*
+            "Core DEFAULT_AVOIDPARTIALSPENDS is false")
+  (is-true (bl:known-config-option-p "avoidpartialspends"))
+  (is-false (bl.cfg:core-only-option-p "avoidpartialspends")))
+
 (test rpc-config-keypool-and-walletdir
   "-keypool and -walletdir (Core init.cpp). Both are asserted through their
 EFFECT — a freshly made wallet manager's keypool size, and the directory

@@ -393,6 +393,13 @@
 (define-option "discardfee")
 (define-option "consolidatefeerate")
 (define-option "maxapsfee")
+;; -avoidpartialspends: Core reads it with GetBoolArg(DEFAULT_AVOIDPARTIALSPENDS
+;; = false) in EVERY CCoinControl constructor (wallet/coincontrol.cpp:9-13), so
+;; it is the starting value of every spend the wallet builds -- the WCC slot's
+;; initform here. The other two raisers (the avoid_reuse argument and the
+;; -maxapsfee retry) can then only raise it, as they do in Core.
+(define-option "avoidpartialspends" :type :bool
+  :global bl.wallet:*wallet-avoid-partial-spends*)
 (define-option "txconfirmtarget")
 (define-option "walletrbf")
 (define-option "spendzeroconfchange")
@@ -473,7 +480,7 @@
 
 (define-core-only-options
   "addresstype" "alertnotify"
-  "avoidpartialspends" "blockreconstructionextratxn"
+  "blockreconstructionextratxn"
   "capturemessages"
   "changetype" "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
