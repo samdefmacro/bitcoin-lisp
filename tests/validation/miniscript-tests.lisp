@@ -505,6 +505,94 @@ FromScript refuses an over-sized script before decomposing it (miniscript.h:
       (is (< elapsed 10)
           "refusing a 100,000-byte script took ~,1F s" elapsed))))
 
+(defparameter *ms-deep-wrappers* 100000
+  "How deep the recursion tests nest one tapscript leaf.
+
+Chosen against what the tree walks used to survive, not against what is
+plausible: on this image the script and string builders and the satisfier died
+somewhere under 15,000, the ops/stack/witness/duplicate-key walks under 40,000,
+and FindInsaneSub under 100,000. The ceiling case below goes further still --
+to the largest tree a tapscript leaf can hold at all.")
+
+(defparameter *ms-tapscript-depth-ceiling* 329481
+  "The deepest `n:'-wrapped tree a TAPSCRIPT leaf can hold: `n:' costs exactly
+one script byte, `1' costs one, and Core's MaxScriptSize under tapscript is
+329,482 (miniscript.h:284-292). One more wrapper is a parse failure.")
+
+(defun %ms-deep-leaf (depth &optional leaf)
+  "DEPTH nested `n:' wrappers around LEAF (default `1'). Core's grammar takes
+the whole wrapper run before ONE colon, so this is a single expression whose
+tree is DEPTH nodes deeper than LEAF's."
+  (concatenate 'string (make-string depth :initial-element #\n) ":"
+               (or leaf "1")))
+
+(test miniscript-walkers-do-not-recurse-over-the-tree
+  "Every walk over a miniscript tree runs on an explicit stack, because the
+DEPTH is chosen by whoever wrote the descriptor. A tapscript leaf may be
+329,482 script bytes and `n:' costs one of them, so tr(K,{nnn...n:1}) is a
+15,000-deep tree inside a 30 kB descriptor and a 329,000-deep one inside a
+660 kB descriptor -- both well under the RPC body limit, both parsed in
+milliseconds by Core's iterative Parse.
+
+Recursive walkers answered those with SB-KERNEL::CONTROL-STACK-EXHAUSTED, which
+is a STORAGE-CONDITION and NOT an ERROR: it went straight through the RPC
+boundary's handlers and took the worker thread with it. Core writes every one
+of these over TreeEval for exactly this reason and says so at miniscript.h:569.
+
+The expression is SANE, so no predicate short-circuits before it has walked the
+whole tree, and the assertions are the real answers rather than `it returned'."
+  (let* ((depth *ms-deep-wrappers*)
+         (node (bl.val:ms-parse (%ms-deep-leaf depth (format nil "pk(~A)"
+                                                            *ms-desc-key-a*))
+                                :ctx :tapscript))
+         ;; 100,000 wrapper bytes + a 32-byte x-only key with its push + the
+         ;; OP_CHECKSIG that `pk()' desugars to.
+         (bytes (+ depth 34)))
+    (is (= bytes (%ms-script-size node)))
+    (is (= bytes (length (bl.val:ms-node-script node))))
+    ;; The wrappers, the colon, and "pk(" + 66 hex characters + ")".
+    (is (= (+ depth 71) (length (bl.val:ms-node-to-string node))))
+    (is-true (bl.val:ms-node-valid-p node))
+    (is-true (bl.val:ms-node-valid-satisfactions-p node))
+    (is-true (bl.val:ms-node-non-malleable-p node))
+    (is-true (bl.val:ms-node-needs-signature-p node))
+    (is-false (bl.val:ms-node-timelock-mix-p node))
+    (is-false (bl.val:ms-node-duplicate-keys-p node))
+    (is-false (bl.val:ms-node-not-satisfiable-p node))
+    (is-true (bl.val:ms-node-sane-p node))
+    (is-false (bl.val:ms-find-insane-sub node)
+              "every subexpression of a sane expression is sane")
+    (is (= 1 (bl.val:ms-node-get-stack-size node)))
+    (is (= 66 (bl.val:ms-node-get-witness-size node)) "a BIP340 signature")
+    (let ((witness (bl.val:ms-satisfy node (%ms-satisfier :keys (list *ms-desc-key-a*)))))
+      (is (= 1 (length witness)))
+      (is (equalp (%ms-fake-sig 1) (first witness))))
+    ;; Inference reads the same depth back out of the script, and the node it
+    ;; recovers regenerates the script byte for byte.
+    (let ((back (bl.val:ms-from-script (bl.val:ms-node-script node) :ctx :tapscript)))
+      (is-true back)
+      (is (equalp (bl.val:ms-node-script node) (bl.val:ms-node-script back)))))
+  ;; And the largest tree a tapscript leaf can hold at all. MS-NODE-TO-STRING is
+  ;; left out of this half only for its cost: it prefixes one wrapper letter per
+  ;; level, which is quadratic in the depth here exactly as it is in Core, and
+  ;; the sweep above already covers it.
+  (let* ((depth *ms-tapscript-depth-ceiling*)
+         (node (bl.val:ms-parse (%ms-deep-leaf depth) :ctx :tapscript)))
+    (is (= (1+ depth) (%ms-script-size node)))
+    (is (= (1+ depth) (length (bl.val:ms-node-script node))))
+    (is-true (bl.val:ms-node-valid-p node))
+    (is-true (bl.val:ms-node-valid-satisfactions-p node))
+    (is-false (bl.val:ms-node-duplicate-keys-p node))
+    (is-false (bl.val:ms-find-insane-sub node))
+    ;; `1' takes no signature, so the expression is not sane -- and that is a
+    ;; property of the ROOT, which is why FindInsaneSub blames nothing below it.
+    (is-false (bl.val:ms-node-needs-signature-p node))
+    (is-false (bl.val:ms-node-sane-p node))
+    ;; One more wrapper is over Core's MaxScriptSize, and the parse says so
+    ;; rather than building the tree.
+    (signals bl.val:miniscript-parse-error
+      (bl.val:ms-parse (%ms-deep-leaf (1+ depth)) :ctx :tapscript))))
+
 (test miniscript-descriptors-round-trip-through-their-canonical-string
   "A descriptor's canonical string feeds its checksum and its descriptor ID, so
 a policy that printed back as something else would have two identities — and

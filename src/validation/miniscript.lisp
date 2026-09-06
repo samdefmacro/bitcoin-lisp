@@ -113,6 +113,79 @@ one call site, and a tree half in each context would still TYPE-CHECK while
 producing a script for neither. MS-PARSE binds it; MAKE-MS-NODE defaults from
 it; nothing else has to remember.")
 
+;;;; --- Walking the tree (miniscript.h:617-752) -----------------------------
+;;;;
+;;;; Every algorithm over a miniscript tree goes through MS-TREE-EVAL, and none
+;;;; of them recurses. Core makes the same rule and states the reason at
+;;;; miniscript.h:569 ("Use TreeEval() to avoid a stack-overflow due to
+;;;; recursion") -- it even destroys a Node iteratively (:551-563) so that
+;;;; freeing a deep tree cannot blow the stack either.
+;;;;
+;;;; The depth is attacker-chosen. A tapscript leaf may be 329,482 script bytes
+;;;; and `n:' costs ONE of them, so `tr(K,{nnn...n:1})' is a 15,000-deep tree
+;;;; for a 30 kB descriptor -- and a 329,000-deep one for a 660 kB descriptor,
+;;;; which is still under the RPC body limit. Those parse in milliseconds
+;;;; (MS-PARSE is Core's iterative state machine), and every walk over the
+;;;; result used to raise SB-KERNEL::CONTROL-STACK-EXHAUSTED. That is a
+;;;; STORAGE-CONDITION and not an ERROR, so it went straight through the RPC
+;;;; boundary's error handlers and killed the worker thread instead of
+;;;; answering the caller (GA11 dim-miniscript note (g)).
+
+(defun ms-tree-eval (root up-fn &key down-fn (root-state nil))
+  "Evaluate a function over the tree under ROOT bottom-up, on an EXPLICIT
+stack (Core Node::TreeEvalMaybe, miniscript.h:645-703).
+
+Conceptually DOWN-FN computes a STATE for each node from the root down, and
+UP-FN computes a RESULT for each node from the leaves back up; in practice the
+two interleave over one depth-first traversal, exactly as Core's does.
+
+  DOWN-FN is called as (state node child-index) and returns the state of that
+  child; children are visited in order. It may be NIL, which is Core's
+  DummyState overload (:710-752): every state is then NIL.
+
+  UP-FN is called as (state node child-results) -- the results of NODE's
+  children, in order -- and returns (values result abort-p). A second value of
+  T is Core's `std::nullopt': the traversal stops at once and MS-TREE-EVAL
+  returns (values NIL T). Returning one value never aborts, so a walk that
+  cannot fail simply returns its result.
+
+Returns (values root-result NIL) for a completed walk."
+  ;; Each frame is #(node next-child-index unexpanded-subs state). Keeping the
+  ;; unexpanded subs as a LIST rather than indexing Core's vector matters for
+  ;; thresh, whose subexpression list is bounded only by the script size: NTH
+  ;; per child would make one thresh node quadratic in its own arity.
+  (let ((stack (list (vector root 0 (ms-node-subs root) root-state)))
+        (results (make-array 8 :adjustable t :fill-pointer 0)))
+    (loop
+      (let* ((frame (first stack))
+             (node (svref frame 0))
+             (pending (svref frame 2)))
+        (cond
+          ;; A child not yet expanded: expand it. By the time this frame comes
+          ;; up again, that child's result (and every earlier child's) sits at
+          ;; the end of RESULTS.
+          (pending
+           (let ((child (first pending))
+                 (index (svref frame 1)))
+             (setf (svref frame 1) (1+ index)
+                   (svref frame 2) (rest pending))
+             (push (vector child 0 (ms-node-subs child)
+                           (if down-fn (funcall down-fn (svref frame 3) node index) nil))
+                   stack)))
+          (t
+           (let* ((n (length (ms-node-subs node)))
+                  (top (fill-pointer results))
+                  (children (loop for i from (- top n) below top
+                                  collect (aref results i))))
+             (multiple-value-bind (result abort-p)
+                 (funcall up-fn (svref frame 3) node children)
+               (when abort-p (return (values nil t)))
+               ;; Replace the last N results with this node's.
+               (setf (fill-pointer results) (- top n))
+               (vector-push-extend result results)
+               (pop stack)
+               (unless stack (return (values (aref results 0) nil)))))))))))
+
 (defconstant +ms-locktime-threshold+ 500000000
   "Core LOCKTIME_THRESHOLD: below this an nLockTime is a height, at or above it
 a Unix time.")
@@ -462,43 +535,57 @@ ADDRESS — the same trap the tr() descriptor work hit twice."
           ((< n 256) (concatenate 'vector (vector 76 n) bytes))
           (t (concatenate 'vector (vector 77 (logand n #xFF) (ash n -8)) bytes)))))
 
+(defun %ms-script-buffer ()
+  "An empty, extendable script buffer (Core's CScript before anything is
+written into it)."
+  (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+
+(defun %ms-script-buffer-p (x)
+  "Whether X is a script buffer, as opposed to one of the fixed byte vectors
+%MS-PUSH-DATA and %MS-PUSH-NUMBER return."
+  (and (vectorp x) (array-has-fill-pointer-p x)))
+
 (defun %ms-cat (&rest parts)
-  "Concatenate script fragments, where each part is a byte, a byte vector, or
-a list of those."
-  (let ((out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+  "Concatenate script fragments into one script BUFFER, where each part is a
+byte, a byte vector, or a list of those.
+
+When the FIRST part is already a buffer it is EXTENDED IN PLACE rather than
+copied -- Core's BuildScript does the same thing for the same reason
+(script.h:606-628, `Move or copy the first element instead'). It is what keeps
+ToScript linear over a deep chain of one-byte wrappers: `n:' appends a single
+opcode to its sub's script, so copying the sub each time would make a
+329,000-deep tapscript leaf quadratic in its own size. The buffer a walk hands
+up is consumed by exactly one parent, so extending it destroys nothing anybody
+else can still read."
+  (let ((out (if (%ms-script-buffer-p (first parts))
+                 (pop parts)
+                 (%ms-script-buffer))))
     (labels ((emit (p)
                (cond ((null p))
                      ((integerp p) (vector-push-extend p out))
                      ((listp p) (mapc #'emit p))
                      (t (loop for b across p do (vector-push-extend b out))))))
       (mapc #'emit parts))
-    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+    out))
 
 (defun %ms-identity-key (key)
   "The default key converter: keys are already 33-byte compressed pubkeys."
   key)
 
-(defun ms-node-script (node &optional verify (key-fn #'%ms-identity-key))
-  "The script NODE compiles to (Core Node::ToScript).
+(defun %ms-script-down (verify node index)
+  "Core ToScript's downfn (miniscript.h:797-806): which children inherit the
+-VERIFY flag."
+  (case (ms-node-fragment node)
+    (:wrap-v t)
+    (:wrap-s verify)
+    (:and-v (and (= index 1) verify))
+    (t nil)))
 
-KEY-FN is Core's ToPKBytes converter (miniscript.h's Key template parameter
-plus its context object). It exists because a miniscript inside a DESCRIPTOR
-holds key EXPRESSIONS — an xpub with an origin and a range — not bytes, and the
-same node compiles to a different script at every range index. Keeping the
-conversion a parameter is what lets one parsed node serve a whole range.
-
-VERIFY is Core's flag for the -VERIFY conversion: `v:' on a sub-expression
-whose type lacks the 'x' property is free, because the sub's final opcode has a
--VERIFY form to switch to rather than needing an OP_VERIFY appended. The flag
-has to travel INTO the sub for that, which is why it is a parameter here and
-not something applied afterwards.
-
-It travels FURTHER than the sub of `v:', which is what Core's downfn says
-(miniscript.h:797-806): the sub of `s:' and the SECOND sub of and_v inherit
-their parent's flag, because those two fragments append nothing of their own
-after the sub whose last opcode the -VERIFY form would replace."
+(defun %ms-script-up (verify node sub-scripts key-fn)
+  "Core ToScript's upfn (miniscript.h:810-868): the script of NODE, given the
+scripts of its children and whether an OP_VERIFY follows it."
   (let ((subs (ms-node-subs node)))
-    (flet ((sub (i &optional v) (ms-node-script (nth i subs) v key-fn))
+    (flet ((sub (i) (nth i sub-scripts))
            ;; Core's ToPKBytes is context-aware: a tapscript node serializes
            ;; every key x-only regardless of how it was written
            ;; (descriptor.cpp:1568). Doing it HERE rather than at the two
@@ -527,7 +614,7 @@ after the sub whose last opcode the -VERIFY form would replace."
                   (%ms-push-data (ms-node-data node))
                   (if verify +op-equalverify+ +op-equal+)))
         (:wrap-a (%ms-cat +op-toaltstack+ (sub 0) +op-fromaltstack+))
-        (:wrap-s (%ms-cat +op-swap+ (sub 0 verify)))
+        (:wrap-s (%ms-cat +op-swap+ (sub 0)))
         (:wrap-c (%ms-cat (sub 0) (if verify +op-checksigverify+ +op-checksig+)))
         (:wrap-d (%ms-cat +op-dup+ +op-if+ (sub 0) +op-endif+))
         ;; The sub is built WITH the flag either way (Core's downfn returns
@@ -536,11 +623,11 @@ after the sub whose last opcode the -VERIFY form would replace."
         ;; there and the OP_VERIFY is appended -- but it still reaches a
         ;; deeper and_v/`s:' sub that does have one.
         (:wrap-v (if (mst-subset-p (ms-node-node-type (first subs)) (mst "x"))
-                     (%ms-cat (sub 0 t) +op-verify+)
-                     (sub 0 t)))
+                     (%ms-cat (sub 0) +op-verify+)
+                     (sub 0)))
         (:wrap-j (%ms-cat +ms-op-size+ +op-0notequal+ +op-if+ (sub 0) +op-endif+))
         (:wrap-n (%ms-cat (sub 0) +op-0notequal+))
-        (:and-v (%ms-cat (sub 0) (sub 1 verify)))
+        (:and-v (%ms-cat (sub 0) (sub 1)))
         (:and-b (%ms-cat (sub 0) (sub 1) +op-booland+))
         (:or-b (%ms-cat (sub 0) (sub 1) +op-boolor+))
         (:or-d (%ms-cat (sub 0) +op-ifdup+ +op-notif+ (sub 1) +op-endif+))
@@ -563,11 +650,38 @@ after the sub whose last opcode the -VERIFY form would replace."
                             (rest keys))
                     (%ms-push-number (ms-node-k node))
                     (if verify +ms-op-numequalverify+ +ms-op-numequal+))))
-        (:thresh (%ms-cat (sub 0)
-                          (loop for i from 1 below (length subs)
-                                collect (list (sub i) +op-add+))
+        ;; Walked as a list rather than by index: a thresh's arity is
+        ;; bounded only by the script size, and NTH per subexpression would
+        ;; make one node quadratic in its own arity.
+        (:thresh (%ms-cat (first sub-scripts)
+                          (mapcar (lambda (s) (list s +op-add+)) (rest sub-scripts))
                           (%ms-push-number (ms-node-k node))
                           (if verify +op-equalverify+ +op-equal+)))))))
+(defun ms-node-script (node &optional verify (key-fn #'%ms-identity-key))
+  "The script NODE compiles to (Core Node::ToScript).
+
+KEY-FN is Core's ToPKBytes converter (miniscript.h's Key template parameter
+plus its context object). It exists because a miniscript inside a DESCRIPTOR
+holds key EXPRESSIONS — an xpub with an origin and a range — not bytes, and the
+same node compiles to a different script at every range index. Keeping the
+conversion a parameter is what lets one parsed node serve a whole range.
+
+VERIFY is Core's flag for the -VERIFY conversion: `v:' on a sub-expression
+whose type lacks the 'x' property is free, because the sub's final opcode has a
+-VERIFY form to switch to rather than needing an OP_VERIFY appended. The flag
+has to travel INTO the sub for that, which is why it is a parameter here and
+not something applied afterwards.
+
+It travels FURTHER than the sub of `v:', which is what Core's downfn says
+(miniscript.h:797-806): the sub of `s:' and the SECOND sub of and_v inherit
+their parent's flag, because those two fragments append nothing of their own
+after the sub whose last opcode the -VERIFY form would replace."
+  (coerce (ms-tree-eval node
+                        (lambda (verify node sub-scripts)
+                          (%ms-script-up verify node sub-scripts key-fn))
+                        :down-fn #'%ms-script-down
+                        :root-state verify)
+          '(simple-array (unsigned-byte 8) (*))))
 
 ;;;; --- Construction --------------------------------------------------------
 
@@ -766,8 +880,12 @@ Core's IsSane must negate it."
   "Core Node::CalcOps (miniscript.h:999-1071) as (COUNT SAT DSAT): the static
 non-push opcode count, and the MaxInt number of additional ops in a
 satisfaction and a dissatisfaction."
+  (ms-tree-eval node #'%ms-ops-up))
+
+(defun %ms-ops-up (state node o)
+  "One node's ops triple, given O, its children's."
+  (declare (ignore state))
   (let* ((subs (ms-node-subs node))
-         (o (mapcar #'ms-node-ops subs))
          (c (mapcar #'first o))
          (s (mapcar #'second o))
          (d (mapcar #'third o))
@@ -826,9 +944,12 @@ satisfaction and a dissatisfaction."
 (defun ms-node-stack-size (node)
   "Core Node::CalcStackSize (miniscript.h:1073-1183) as (SAT . DSAT), each a
 SatInfo."
-  (let* ((subs (ms-node-subs node))
-         (ss (mapcar #'ms-node-stack-size subs))
-         (nkeys (length (ms-node-keys node)))
+  (ms-tree-eval node #'%ms-ss-up))
+
+(defun %ms-ss-up (state node ss)
+  "One node's (SAT . DSAT) SatInfo pair, given SS, its children's."
+  (declare (ignore state))
+  (let* ((nkeys (length (ms-node-keys node)))
          (k (ms-node-k node)))
     (macrolet ((sat (i) `(car (nth ,i ss))) (dsat (i) `(cdr (nth ,i ss))))
       (flet ((both (x) (cons x x)))
@@ -896,25 +1017,34 @@ SatInfo."
 a V. An INTERSECTION test, not a subset one: any of the three qualifies."
   (/= 0 (logand (ms-node-node-type node) (mst "BKW"))))
 
-(defun ms-node-get-ops (node)
-  "Core Node::GetOps (miniscript.h:1557): total ops to satisfy non-malleably,
-or NIL when no satisfaction exists."
-  (destructuring-bind (count sat dsat) (ms-node-ops node)
+(defun %ms-get-ops (ops)
+  "Core Node::GetOps (miniscript.h:1557) over an already-computed ops triple."
+  (destructuring-bind (count sat dsat) ops
     (declare (ignore dsat))
     (and sat (+ count sat))))
 
-(defun ms-node-check-ops-limit-p (node)
-  "Core Node::CheckOpsLimit (miniscript.h:1565-1570). A node with no
-satisfaction passes — IsNotSatisfiable is what rejects that, separately.
+(defun ms-node-get-ops (node)
+  "Core Node::GetOps (miniscript.h:1557): total ops to satisfy non-malleably,
+or NIL when no satisfaction exists."
+  (%ms-get-ops (ms-node-ops node)))
 
-Core's FIRST line is `if (IsTapscript(m_script_ctx)) return true;\'. There is
-no 201-op limit to check under tapscript: BIP342 dropped it, and the
-interpreter counts opcodes only for SigVersion BASE and WITNESS_V0
-(interpreter.cpp:450-455) — which is where our own script engine gates it too
-(src/coalton/script.lisp, `(not (flag-enabled \"TAPSCRIPT\"))\')."
+(defun %ms-check-ops-limit-p (node ops)
+  "Core Node::CheckOpsLimit (miniscript.h:1565-1570) over an already-computed
+ops triple. A node with no satisfaction passes — IsNotSatisfiable is what
+rejects that, separately.
+
+Core's FIRST line is `if (IsTapscript(m_script_ctx)) return true;'. There is no
+201-op limit to check under tapscript: BIP342 dropped it, and the interpreter
+counts opcodes only for SigVersion BASE and WITNESS_V0 (interpreter.cpp:450-455
+— which is also where our own script engine gates it, src/coalton/script.lisp
+`(not (flag-enabled \"TAPSCRIPT\"))')."
   (or (ms-tapscript-p (ms-node-ctx node))
-      (let ((ops (ms-node-get-ops node)))
-        (or (null ops) (<= ops +ms-max-ops-per-script+)))))
+      (let ((total (%ms-get-ops ops)))
+        (or (null total) (<= total +ms-max-ops-per-script+)))))
+
+(defun ms-node-check-ops-limit-p (node)
+  "Core Node::CheckOpsLimit (miniscript.h:1566)."
+  (%ms-check-ops-limit-p node (ms-node-ops node)))
 
 (defconstant +ms-p2wsh-sig-size+ 73
   "Core CalcWitnessSize's sig_size outside tapscript: 1 length byte + a 72-byte
@@ -933,9 +1063,12 @@ signature (miniscript.h:1189).")
   "Core Node::CalcWitnessSize (miniscript.h:1187-1237) as (SAT . DSAT), each a
 MaxInt: the maximum witness bytes to satisfy and to dissatisfy NODE
 non-malleably. Excludes the witnessScript push, exactly as Core's does."
-  (let* ((subs (ms-node-subs node))
-         (w (mapcar #'ms-node-witness-size subs))
-         (nkeys (length (ms-node-keys node)))
+  (ms-tree-eval node #'%ms-ws-up))
+
+(defun %ms-ws-up (state node w)
+  "One node's (SAT . DSAT) witness-size pair, given W, its children's."
+  (declare (ignore state))
+  (let* ((nkeys (length (ms-node-keys node)))
          (k (ms-node-k node))
          (tap (ms-tapscript-p (ms-node-ctx node)))
          (sig (if tap +ms-tapscript-sig-size+ +ms-p2wsh-sig-size+))
@@ -987,25 +1120,34 @@ non-malleably, or NIL when no satisfaction exists. Does NOT include the
 witnessScript push."
   (car (ms-node-witness-size node)))
 
+(defun %ms-get-stack-size (node ss)
+  "Core Node::GetStackSize (miniscript.h:1578) over an already-computed pair."
+  (let ((sat (car ss)))
+    (and sat (+ (ms-si-netdiff sat) (if (ms-node-bkw-p node) 1 0)))))
+
 (defun ms-node-get-stack-size (node)
   "Core Node::GetStackSize (miniscript.h:1578): stack elements needed to
 satisfy non-malleably, or NIL when no satisfaction exists."
-  (let ((sat (car (ms-node-stack-size node))))
-    (and sat (+ (ms-si-netdiff sat) (if (ms-node-bkw-p node) 1 0)))))
+  (%ms-get-stack-size node (ms-node-stack-size node)))
 
 (defconstant +ms-max-stack-size+ 1000
   "Core MAX_STACK_SIZE (script.h:43) — the CONSENSUS stack limit, which is what
 bounds a tapscript, since tapscript has no standardness limit on script or
 witness size to bound it earlier.")
 
+(defun %ms-exec-stack-size (node ss)
+  "Core Node::GetExecStackSize (miniscript.h:1584) over an already-computed
+pair."
+  (let ((sat (car ss)))
+    (and sat (+ (ms-si-exec sat) (if (ms-node-bkw-p node) 1 0)))))
+
 (defun ms-node-exec-stack-size (node)
   "Core Node::GetExecStackSize (miniscript.h:1584): the deepest the stack gets
 while EXECUTING, as opposed to the number of witness items handed in."
-  (let ((sat (car (ms-node-stack-size node))))
-    (and sat (+ (ms-si-exec sat) (if (ms-node-bkw-p node) 1 0)))))
+  (%ms-exec-stack-size node (ms-node-stack-size node)))
 
-(defun ms-node-check-stack-size-p (node)
-  "Core Node::CheckStackSize (miniscript.h:1590).
+(defun %ms-check-stack-size-p (node ss)
+  "Core Node::CheckStackSize (miniscript.h:1590) over an already-computed pair.
 
 The two contexts check different things and it is worth seeing why: under
 P2WSH the WITNESS ITEM COUNT is what standardness caps, so the input side is
@@ -1013,33 +1155,48 @@ the binding constraint. Under tapscript neither script nor witness size is
 capped by standardness, so nothing stops execution from reaching the CONSENSUS
 stack limit — which is the thing Core checks there instead."
   (if (ms-tapscript-p (ms-node-ctx node))
-      (let ((exec (ms-node-exec-stack-size node)))
+      (let ((exec (%ms-exec-stack-size node ss)))
         (or (null exec) (<= exec +ms-max-stack-size+)))
-      (let ((ss (ms-node-get-stack-size node)))
-        (or (null ss) (<= ss +ms-max-p2wsh-stack-items+)))))
+      (let ((items (%ms-get-stack-size node ss)))
+        (or (null items) (<= items +ms-max-p2wsh-stack-items+)))))
+
+(defun ms-node-check-stack-size-p (node)
+  "Core Node::CheckStackSize (miniscript.h:1590)."
+  (%ms-check-stack-size-p node (ms-node-stack-size node)))
 
 (defun ms-node-not-satisfiable-p (node)
   "Core Node::IsNotSatisfiable (miniscript.h:1602)."
   (null (ms-node-get-stack-size node)))
 
+(defun %ms-keys-up (state node sub-sets)
+  "Core DuplicateKeyCheck's upfn (miniscript.h:1509-1547): :DUP when this
+subtree repeats a key, and otherwise the SET of the keys it uses — a hash table,
+or NIL for a subtree that names none."
+  (declare (ignore state))
+  (let ((acc nil))
+    (flet ((add (key)
+             (unless acc (setf acc (make-hash-table :test 'equalp)))
+             (when (gethash key acc) (return-from %ms-keys-up :dup))
+             (setf (gethash key acc) t)))
+      (when (member :dup sub-sets) (return-from %ms-keys-up :dup))
+      (dolist (key (ms-node-keys node)) (add key))
+      (dolist (set sub-sets)
+        ;; Core's `if (key_set.size() < sub->size()) std::swap(...)': merge the
+        ;; SMALLER set into the larger, so a chain of nodes does not re-copy
+        ;; the whole key set at every level.
+        (let ((smaller set))
+          (when (and smaller
+                     (or (null acc)
+                         (< (hash-table-count acc) (hash-table-count smaller))))
+            (rotatef acc smaller))
+          (when smaller
+            (loop for key being the hash-keys of smaller do (add key))))))
+    acc))
+
 (defun ms-node-duplicate-keys-p (node)
   "T when any public key appears more than once anywhere in the expression —
-the negation of Core's CheckDuplicateKey (miniscript.h:1688).
-
-Core computes this with a bottom-up merge of per-subtree key sets
-(miniscript.h:1505-1547) so it can share work across a parse; one flat walk is
-the same answer for a single expression."
-  (let ((seen (make-hash-table :test 'equalp))
-        (dup nil))
-    (labels ((walk (n)
-               (when (and n (not dup))
-                 (dolist (key (ms-node-keys n))
-                   (let ((id key))
-                     (when (gethash id seen) (setf dup t) (return))
-                     (setf (gethash id seen) t)))
-                 (mapc #'walk (ms-node-subs n)))))
-      (walk node))
-    dup))
+the negation of Core's CheckDuplicateKey (miniscript.h:1688)."
+  (eq :dup (ms-tree-eval node #'%ms-keys-up)))
 
 (defun ms-node-valid-satisfactions-p (node)
   "Core Node::ValidSatisfactions (miniscript.h:1691)."
@@ -1047,12 +1204,22 @@ the same answer for a single expression."
        (ms-node-check-ops-limit-p node)
        (ms-node-check-stack-size-p node)))
 
-(defun ms-node-sane-subexpression-p (node)
-  "Core Node::IsSaneSubexpression (miniscript.h:1694)."
-  (and (ms-node-valid-satisfactions-p node)
+(defun %ms-sane-subexpression-p (node ops ss keys)
+  "Core Node::IsSaneSubexpression (miniscript.h:1694) over already-computed ops,
+stack sizes and key set — the three things Core caches in the node itself."
+  (and (ms-node-valid-p node)
+       (%ms-check-ops-limit-p node ops)
+       (%ms-check-stack-size-p node ss)
        (ms-node-non-malleable-p node)
        (not (ms-node-timelock-mix-p node))   ; Core's CheckTimeLocksMix, un-inverted
-       (not (ms-node-duplicate-keys-p node))))
+       (not (eq keys :dup))))
+
+(defun ms-node-sane-subexpression-p (node)
+  "Core Node::IsSaneSubexpression (miniscript.h:1694)."
+  (%ms-sane-subexpression-p node
+                            (ms-node-ops node)
+                            (ms-node-stack-size node)
+                            (and (ms-node-duplicate-keys-p node) :dup)))
 
 (defun ms-node-sane-p (node)
   "Core Node::IsSane (miniscript.h:1697): safe as a script on its own."
@@ -1063,14 +1230,26 @@ the same answer for a single expression."
 (defun ms-find-insane-sub (node)
   "Core Node::FindInsaneSub (miniscript.h:1618): the first subexpression, in
 Core's post-order traversal, that is not a sane subexpression. NIL when every
-sub is sane and the insanity is a property of NODE itself."
-  (labels ((walk (n)
-             (dolist (sub (ms-node-subs n))
-               (let ((found (walk sub)))
-                 (when found (return-from walk found))))
-             (unless (ms-node-sane-subexpression-p n) n)))
-    (let ((found (walk node)))
-      (and found (not (eq found node)) found))))
+sub is sane and the insanity is a property of NODE itself.
+
+Core's own version reads cached per-node ops, stack sizes and duplicate-key
+flags, so its IsSaneSubexpression is O(1) and the whole search is one pass.
+Ours has no such cache, so the pass carries those three values UP with it and
+IsSaneSubexpression is answered from what the children already produced —
+otherwise asking each node separately would re-walk its whole subtree and turn
+the search quadratic in the depth an attacker chooses."
+  (let ((found (first (ms-tree-eval node #'%ms-insane-up))))
+    (and found (not (eq found node)) found)))
+
+(defun %ms-insane-up (state node subs)
+  "One node's (INSANE-SUB OPS STACK-SIZE KEY-SET), given SUBS, its children's."
+  (declare (ignore state))
+  (let ((ops (%ms-ops-up nil node (mapcar #'second subs)))
+        (ss (%ms-ss-up nil node (mapcar #'third subs)))
+        (keys (%ms-keys-up nil node (mapcar #'fourth subs))))
+    (list (or (loop for sub in subs thereis (first sub))
+              (unless (%ms-sane-subexpression-p node ops ss keys) node))
+          ops ss keys)))
 
 ;;;; --- Parsing (miniscript.h FromString) -----------------------------------
 ;;;;
@@ -1559,6 +1738,19 @@ most that can honestly be said about the script."
       (string-downcase (bl.crypto:bytes-to-hex (ms-node-data node)))
       (funcall key-fn (first (ms-node-keys node)))))
 
+(defun %ms-to-string-down (wrapped node index)
+  "Core ToString's downfn (miniscript.h:882-892): a node whose own rendering is
+a WRAPPER letter (or one of the four sugared spellings that read as one) makes
+every child a wrapped node, and the colon then belongs to the child."
+  (declare (ignore wrapped index))
+  (let ((subs (ms-node-subs node)))
+    (case (ms-node-fragment node)
+      ((:wrap-a :wrap-s :wrap-d :wrap-v :wrap-j :wrap-n :wrap-c) t)
+      (:and-v (eq (ms-node-fragment (second subs)) :just-1))
+      (:or-i (or (eq (ms-node-fragment (first subs)) :just-0)
+                 (eq (ms-node-fragment (second subs)) :just-0)))
+      (t nil))))
+
 (defun ms-node-to-string (node &optional (key-fn #'%ms-identity-key-string) wrapped)
   "The canonical expression text for NODE (Core Node::ToString).
 
@@ -1570,15 +1762,24 @@ printing the desugared form instead would give the same policy two identities.
 WRAPPED is Core's flag for `my parent is a wrapper': the colon belongs to the
 wrapped node, not to the wrapper, so `a' + `:pk(K)' composes to `a:pk(K)' and a
 run of wrappers needs only one colon."
+  (ms-tree-eval node
+                (lambda (wrapped node sub-strings)
+                  (%ms-to-string-up wrapped node sub-strings key-fn))
+                :down-fn #'%ms-to-string-down
+                :root-state wrapped))
+
+(defun %ms-to-string-up (wrapped node sub-strings key-fn)
+  "Core ToString's upfn (miniscript.h:897-991): the text of NODE, given the
+text of its children."
   (let ((subs (ms-node-subs node))
         (prefix (if wrapped ":" "")))
-    (labels ((sub (i &optional w) (ms-node-to-string (nth i subs) key-fn w))
+    (labels ((sub (i) (nth i sub-strings))
              (frag (i) (ms-node-fragment (nth i subs)))
              (key (k) (funcall key-fn k)))
       (case (ms-node-fragment node)
         ;; Wrappers: the letter, then the sub rendered as a wrapped node.
-        (:wrap-a (concatenate 'string "a" (sub 0 t)))
-        (:wrap-s (concatenate 'string "s" (sub 0 t)))
+        (:wrap-a (concatenate 'string "a" (sub 0)))
+        (:wrap-s (concatenate 'string "s" (sub 0)))
         (:wrap-c (case (frag 0)
                    (:pk-k (format nil "~Apk(~A)" prefix
                                   (key (first (ms-node-keys (nth 0 subs))))))
@@ -1586,19 +1787,19 @@ run of wrappers needs only one colon."
                    ;; to; there is no key in the script to print.
                    (:pk-h (format nil "~Apkh(~A)" prefix
                                   (%ms-key-or-hash-string (nth 0 subs) key-fn)))
-                   (t (concatenate 'string "c" (sub 0 t)))))
-        (:wrap-d (concatenate 'string "d" (sub 0 t)))
-        (:wrap-v (concatenate 'string "v" (sub 0 t)))
-        (:wrap-j (concatenate 'string "j" (sub 0 t)))
-        (:wrap-n (concatenate 'string "n" (sub 0 t)))
+                   (t (concatenate 'string "c" (sub 0)))))
+        (:wrap-d (concatenate 'string "d" (sub 0)))
+        (:wrap-v (concatenate 'string "v" (sub 0)))
+        (:wrap-j (concatenate 'string "j" (sub 0)))
+        (:wrap-n (concatenate 'string "n" (sub 0)))
         (t
          (case (ms-node-fragment node)
            ;; Sugar that is a wrapper in the source text but a combinator here.
            (:and-v (if (eq (frag 1) :just-1)
-                       (concatenate 'string "t" (sub 0 t))
+                       (concatenate 'string "t" (sub 0))
                        (format nil "~Aand_v(~A,~A)" prefix (sub 0) (sub 1))))
-           (:or-i (cond ((eq (frag 0) :just-0) (concatenate 'string "l" (sub 1 t)))
-                        ((eq (frag 1) :just-0) (concatenate 'string "u" (sub 0 t)))
+           (:or-i (cond ((eq (frag 0) :just-0) (concatenate 'string "l" (sub 1)))
+                        ((eq (frag 1) :just-0) (concatenate 'string "u" (sub 0)))
                         (t (format nil "~Aor_i(~A,~A)" prefix (sub 0) (sub 1)))))
            (:andor (if (eq (frag 2) :just-0)
                        (format nil "~Aand_n(~A,~A)" prefix (sub 0) (sub 1))
@@ -1627,7 +1828,7 @@ run of wrappers needs only one colon."
            (:multi-a (format nil "~Amulti_a(~D~{,~A~})" prefix (ms-node-k node)
                              (mapcar #'key (ms-node-keys node))))
            (:thresh (format nil "~Athresh(~D~{,~A~})" prefix (ms-node-k node)
-                            (loop for i from 0 below (length subs) collect (sub i))))
+                            sub-strings))
            (t (internal-error "cannot render miniscript fragment ~S"
                      (ms-node-fragment node)))))))))
 
@@ -1811,173 +2012,180 @@ letting the size comparison pick it."
     (ms-stack-set-available (ms-stack-of pre) avail)))
 
 (defun ms-produce-input (node sat &optional (key-fn #'%ms-identity-key))
-  "Return (values satisfaction dissatisfaction) for NODE (Core ProduceInput)."
-  (let ((subs (mapcar (lambda (s)
-                        (multiple-value-list (ms-produce-input s sat key-fn)))
-                      (ms-node-subs node))))
-    (flet ((xsat () (first (first subs)))   (xnsat () (second (first subs)))
-           (ysat () (first (second subs)))  (ynsat () (second (second subs)))
-           (zsat () (first (third subs)))   (znsat () (second (third subs))))
-      (macrolet ((res (sat-form nsat-form) `(values ,sat-form ,nsat-form)))
-        (ecase (ms-node-fragment node)
-          (:just-0 (res (ms-stack-invalid) (ms-stack-empty)))
-          (:just-1 (res (ms-stack-empty) (ms-stack-invalid)))
-          (:pk-k (res (%ms-sig-stack sat (first (ms-node-keys node)))
-                      (ms-stack-zero)))
-          (:pk-h
-           ;; The key itself is on the stack under the signature, because the
-           ;; script only committed to its hash.
-           ;;
-           ;; No key at all is a node inference produced with no resolver: the
-           ;; hash is known and the key is not, so the branch can be neither
-           ;; satisfied nor dissatisfied. Core cannot reach this state -- its
-           ;; DecodeScript refuses the script instead (miniscript.h:2331-2339)
-           ;; -- and building an element out of the missing key would put a
-           ;; Lisp NIL where a witness wants bytes.
-           (let ((k (first (ms-node-keys node))))
-             (if (null k)
-                 (res (ms-stack-invalid) (ms-stack-invalid))
-                 ;; Core's ctx.ToPKBytes (miniscript.h:1252): the revealed key
-                 ;; is written the way the CONTEXT writes keys, x-only under
-                 ;; tapscript, so it hashes back to what the script checks.
-                 (let ((key (ms-stack-of (%ms-key-bytes (funcall key-fn k)
-                                                        (ms-node-ctx node)))))
-                   (res (ms-stack+ (%ms-sig-stack sat k) key)
-                        (ms-stack+ (ms-stack-zero) key))))))
-          (:older (res (if (and (ms-satisfier-check-older-fn sat)
-                                (funcall (ms-satisfier-check-older-fn sat) (ms-node-k node)))
-                           (ms-stack-empty)
-                           (ms-stack-invalid))
-                       (ms-stack-invalid)))
-          (:after (res (if (and (ms-satisfier-check-after-fn sat)
-                                (funcall (ms-satisfier-check-after-fn sat) (ms-node-k node)))
-                           (ms-stack-empty)
-                           (ms-stack-invalid))
-                       (ms-stack-invalid)))
-          ((:sha256 :ripemd160 :hash256 :hash160)
-           (res (%ms-preimage-stack sat (ms-node-fragment node) (ms-node-data node))
-                (ms-stack-zero32)))
-          ;; The four transparent wrappers change the script, not the witness.
-          ((:wrap-a :wrap-s :wrap-c :wrap-n) (res (xsat) (xnsat)))
-          (:wrap-d (res (ms-stack+ (xsat) (ms-stack-one)) (ms-stack-zero)))
-          (:wrap-v (res (xsat) (ms-stack-invalid)))
-          (:wrap-j
-           ;; Conservative: if the sub is dissatisfiable without a signature at
-           ;; all, assume a nonzero-top dissatisfaction also exists and call
-           ;; ours malleable. The dissatisfaction logic does not track
-           ;; nonzeroness, so this cannot be decided; Core assumes the worse.
-           (res (xsat)
-                (%ms-mark (ms-stack-zero)
-                          :malleable (and (ms-stack-available-p (xnsat))
-                                          (not (ms-stack-has-sig (xnsat)))))))
-          (:and-v (res (ms-stack+ (ysat) (xsat))
-                       (%ms-mark (ms-stack+ (ynsat) (xsat)) :non-canon t)))
-          (:and-b (res (ms-stack+ (ysat) (xsat))
-                       (ms-stack-or
-                        (ms-stack-or (ms-stack+ (ynsat) (xnsat))
-                                     (%ms-mark (ms-stack+ (ysat) (xnsat))
-                                               :malleable t :non-canon t))
-                        (%ms-mark (ms-stack+ (ynsat) (xsat))
-                                  :malleable t :non-canon t))))
-          (:or-b (res (ms-stack-or
-                       (ms-stack-or (ms-stack+ (ynsat) (xsat))
-                                    (ms-stack+ (ysat) (xnsat)))
-                       ;; Satisfying BOTH is overcomplete: an attacker can turn
-                       ;; either half into a dissatisfaction and still spend.
-                       (%ms-mark (ms-stack+ (ysat) (xsat))
-                                 :malleable t :non-canon t))
-                      (ms-stack+ (ynsat) (xnsat))))
-          (:or-c (res (ms-stack-or (xsat) (ms-stack+ (ysat) (xnsat)))
-                      (ms-stack-invalid)))
-          (:or-d (res (ms-stack-or (xsat) (ms-stack+ (ysat) (xnsat)))
-                      (ms-stack+ (ynsat) (xnsat))))
-          (:or-i (res (ms-stack-or (ms-stack+ (xsat) (ms-stack-one))
-                                   (ms-stack+ (ysat) (ms-stack-zero)))
-                      (ms-stack-or (ms-stack+ (xnsat) (ms-stack-one))
-                                   (ms-stack+ (ynsat) (ms-stack-zero)))))
-          (:andor (res (ms-stack-or (ms-stack+ (ysat) (xsat))
-                                    (ms-stack+ (zsat) (xnsat)))
-                       (ms-stack-or (%ms-mark (ms-stack+ (ynsat) (xsat)) :non-canon t)
-                                    (ms-stack+ (znsat) (xnsat)))))
-          (:multi
-           ;; Dynamic programming: SATS[j] is the best stack carrying j valid
-           ;; signatures out of the keys seen so far. SATS[0] starts as one
-           ;; zero because CHECKMULTISIG pops one element too many.
-           (let ((sats (list (ms-stack-zero))))
-             (dolist (key (ms-node-keys node))
-               (let ((sig (%ms-sig-stack sat key))
-                     (next (list (first sats))))
-                 (loop for j from 1 below (length sats)
-                       do (push (ms-stack-or (nth j sats)
-                                             (ms-stack+ (nth (1- j) sats) sig))
-                                next))
-                 (push (ms-stack+ (car (last sats)) sig) next)
-                 (setf sats (nreverse next))))
-             (let ((nsat (ms-stack-zero)))
-               (dotimes (i (ms-node-k node))
-                 (setf nsat (ms-stack+ nsat (ms-stack-zero))))
-               (res (nth (ms-node-k node) sats) nsat))))
-          (:multi-a
-           ;; The same dynamic program as :MULTI, and three things differ --
-           ;; exactly the three that a copy of :MULTI gets wrong (Core
-           ;; miniscript.h:1259-1284 against :1285-1310):
-           ;;
-           ;; - the keys are signed in REVERSE order, because CHECKSIG reads
-           ;;   the FIRST key's signature off the TOP of the stack while
-           ;;   CHECKMULTISIG reads it from the bottom;
-           ;; - SATS[0] starts EMPTY, not as one zero, because there is no
-           ;;   CHECKMULTISIG off-by-one element to absorb;
-           ;; - every step appends something for the current key -- its
-           ;;   signature or a zero -- so the stack carries exactly one
-           ;;   element per key, and dissatisfying is signing none of them.
-           (let* ((keys (ms-node-keys node))
-                  (nkeys (length keys))
-                  (sats (list (ms-stack-empty))))
-             (dotimes (i nkeys)
-               (let ((sig (%ms-sig-stack sat (nth (- nkeys 1 i) keys)))
-                     (next '()))
-                 (push (ms-stack+ (first sats) (ms-stack-zero)) next)
-                 (loop for j from 1 below (length sats)
-                       do (push (ms-stack-or
-                                 (ms-stack+ (nth j sats) (ms-stack-zero))
-                                 (ms-stack+ (nth (1- j) sats) sig))
-                                next))
-                 (push (ms-stack+ (car (last sats)) sig) next)
-                 (setf sats (nreverse next))))
-             ;; Core CHECK_NONFATAL(node.k != 0) plus assert(k < sats.size()).
-             ;; Neither the parser nor the decoder can build such a node, and
-             ;; answering SATS[0] for k = 0 would hand a caller the
-             ;; DISSATISFACTION as though it were a spend.
-             (let ((k (ms-node-k node)))
-               (unless (and (plusp k) (< k (length sats)))
-                 (internal-error "multi_a threshold ~D outside its ~D keys"
-                                 k nkeys))
-               (res (nth k sats) (first sats)))))
-          (:thresh
-           ;; SATS[j] is the best stack satisfying j of the subexpressions seen
-           ;; so far, walking them in REVERSE because the witness is built
-           ;; innermost-first.
-           (let ((sats (list (ms-stack-empty))))
-             (dolist (sub (reverse subs))
-               (let ((s (first sub)) (n (second sub))
-                     (next '()))
-                 (push (ms-stack+ (first sats) n) next)
-                 (loop for j from 1 below (length sats)
-                       do (push (ms-stack-or (ms-stack+ (nth j sats) n)
-                                             (ms-stack+ (nth (1- j) sats) s))
-                                next))
-                 (push (ms-stack+ (car (last sats)) s) next)
-                 (setf sats (nreverse next))))
-             (let ((nsat (ms-stack-invalid)))
-               (loop for i from 0 below (length sats)
-                     do (unless (or (= i 0) (= i (ms-node-k node)))
-                          ;; Any count other than 0 or k is over- or
-                          ;; under-complete: available, but never the right
-                          ;; choice, since the i=0 form always exists.
-                          (%ms-mark (nth i sats) :malleable t :non-canon t))
-                        (unless (= i (ms-node-k node))
-                          (setf nsat (ms-stack-or nsat (nth i sats)))))
-               (res (nth (ms-node-k node) sats) nsat)))))))))
+  "Return (values satisfaction dissatisfaction) for NODE (Core ProduceInput,
+miniscript.h:1319-1486, which is a TreeEval for the same reason everything else
+here is)."
+  (let ((pair (ms-tree-eval node
+                            (lambda (state n subs)
+                              (declare (ignore state))
+                              (%ms-produce-input-up n subs sat key-fn)))))
+    (values (first pair) (second pair))))
+
+(defun %ms-produce-input-up (node subs sat key-fn)
+  "One node's (SATISFACTION DISSATISFACTION), given SUBS, its children's."
+  (flet ((xsat () (first (first subs)))   (xnsat () (second (first subs)))
+         (ysat () (first (second subs)))  (ynsat () (second (second subs)))
+         (zsat () (first (third subs)))   (znsat () (second (third subs))))
+    (macrolet ((res (sat-form nsat-form) `(list ,sat-form ,nsat-form)))
+      (ecase (ms-node-fragment node)
+        (:just-0 (res (ms-stack-invalid) (ms-stack-empty)))
+        (:just-1 (res (ms-stack-empty) (ms-stack-invalid)))
+        (:pk-k (res (%ms-sig-stack sat (first (ms-node-keys node)))
+                    (ms-stack-zero)))
+        (:pk-h
+         ;; The key itself is on the stack under the signature, because the
+         ;; script only committed to its hash.
+         ;;
+         ;; No key at all is a node inference produced with no resolver: the
+         ;; hash is known and the key is not, so the branch can be neither
+         ;; satisfied nor dissatisfied. Core cannot reach this state -- its
+         ;; DecodeScript refuses the script instead (miniscript.h:2331-2339)
+         ;; -- and building an element out of the missing key would put a
+         ;; Lisp NIL where a witness wants bytes.
+         (let ((k (first (ms-node-keys node))))
+           (if (null k)
+               (res (ms-stack-invalid) (ms-stack-invalid))
+               ;; Core's ctx.ToPKBytes (miniscript.h:1252): the revealed key
+               ;; is written the way the CONTEXT writes keys, x-only under
+               ;; tapscript, so it hashes back to what the script checks.
+               (let ((key (ms-stack-of (%ms-key-bytes (funcall key-fn k)
+                                                      (ms-node-ctx node)))))
+                 (res (ms-stack+ (%ms-sig-stack sat k) key)
+                      (ms-stack+ (ms-stack-zero) key))))))
+        (:older (res (if (and (ms-satisfier-check-older-fn sat)
+                              (funcall (ms-satisfier-check-older-fn sat) (ms-node-k node)))
+                         (ms-stack-empty)
+                         (ms-stack-invalid))
+                     (ms-stack-invalid)))
+        (:after (res (if (and (ms-satisfier-check-after-fn sat)
+                              (funcall (ms-satisfier-check-after-fn sat) (ms-node-k node)))
+                         (ms-stack-empty)
+                         (ms-stack-invalid))
+                     (ms-stack-invalid)))
+        ((:sha256 :ripemd160 :hash256 :hash160)
+         (res (%ms-preimage-stack sat (ms-node-fragment node) (ms-node-data node))
+              (ms-stack-zero32)))
+        ;; The four transparent wrappers change the script, not the witness.
+        ((:wrap-a :wrap-s :wrap-c :wrap-n) (res (xsat) (xnsat)))
+        (:wrap-d (res (ms-stack+ (xsat) (ms-stack-one)) (ms-stack-zero)))
+        (:wrap-v (res (xsat) (ms-stack-invalid)))
+        (:wrap-j
+         ;; Conservative: if the sub is dissatisfiable without a signature at
+         ;; all, assume a nonzero-top dissatisfaction also exists and call
+         ;; ours malleable. The dissatisfaction logic does not track
+         ;; nonzeroness, so this cannot be decided; Core assumes the worse.
+         (res (xsat)
+              (%ms-mark (ms-stack-zero)
+                        :malleable (and (ms-stack-available-p (xnsat))
+                                        (not (ms-stack-has-sig (xnsat)))))))
+        (:and-v (res (ms-stack+ (ysat) (xsat))
+                     (%ms-mark (ms-stack+ (ynsat) (xsat)) :non-canon t)))
+        (:and-b (res (ms-stack+ (ysat) (xsat))
+                     (ms-stack-or
+                      (ms-stack-or (ms-stack+ (ynsat) (xnsat))
+                                   (%ms-mark (ms-stack+ (ysat) (xnsat))
+                                             :malleable t :non-canon t))
+                      (%ms-mark (ms-stack+ (ynsat) (xsat))
+                                :malleable t :non-canon t))))
+        (:or-b (res (ms-stack-or
+                     (ms-stack-or (ms-stack+ (ynsat) (xsat))
+                                  (ms-stack+ (ysat) (xnsat)))
+                     ;; Satisfying BOTH is overcomplete: an attacker can turn
+                     ;; either half into a dissatisfaction and still spend.
+                     (%ms-mark (ms-stack+ (ysat) (xsat))
+                               :malleable t :non-canon t))
+                    (ms-stack+ (ynsat) (xnsat))))
+        (:or-c (res (ms-stack-or (xsat) (ms-stack+ (ysat) (xnsat)))
+                    (ms-stack-invalid)))
+        (:or-d (res (ms-stack-or (xsat) (ms-stack+ (ysat) (xnsat)))
+                    (ms-stack+ (ynsat) (xnsat))))
+        (:or-i (res (ms-stack-or (ms-stack+ (xsat) (ms-stack-one))
+                                 (ms-stack+ (ysat) (ms-stack-zero)))
+                    (ms-stack-or (ms-stack+ (xnsat) (ms-stack-one))
+                                 (ms-stack+ (ynsat) (ms-stack-zero)))))
+        (:andor (res (ms-stack-or (ms-stack+ (ysat) (xsat))
+                                  (ms-stack+ (zsat) (xnsat)))
+                     (ms-stack-or (%ms-mark (ms-stack+ (ynsat) (xsat)) :non-canon t)
+                                  (ms-stack+ (znsat) (xnsat)))))
+        (:multi
+         ;; Dynamic programming: SATS[j] is the best stack carrying j valid
+         ;; signatures out of the keys seen so far. SATS[0] starts as one
+         ;; zero because CHECKMULTISIG pops one element too many.
+         (let ((sats (list (ms-stack-zero))))
+           (dolist (key (ms-node-keys node))
+             (let ((sig (%ms-sig-stack sat key))
+                   (next (list (first sats))))
+               (loop for j from 1 below (length sats)
+                     do (push (ms-stack-or (nth j sats)
+                                           (ms-stack+ (nth (1- j) sats) sig))
+                              next))
+               (push (ms-stack+ (car (last sats)) sig) next)
+               (setf sats (nreverse next))))
+           (let ((nsat (ms-stack-zero)))
+             (dotimes (i (ms-node-k node))
+               (setf nsat (ms-stack+ nsat (ms-stack-zero))))
+             (res (nth (ms-node-k node) sats) nsat))))
+        (:multi-a
+         ;; The same dynamic program as :MULTI, and three things differ --
+         ;; exactly the three that a copy of :MULTI gets wrong (Core
+         ;; miniscript.h:1259-1284 against :1285-1310):
+         ;;
+         ;; - the keys are signed in REVERSE order, because CHECKSIG reads
+         ;;   the FIRST key's signature off the TOP of the stack while
+         ;;   CHECKMULTISIG reads it from the bottom;
+         ;; - SATS[0] starts EMPTY, not as one zero, because there is no
+         ;;   CHECKMULTISIG off-by-one element to absorb;
+         ;; - every step appends something for the current key -- its
+         ;;   signature or a zero -- so the stack carries exactly one
+         ;;   element per key, and dissatisfying is signing none of them.
+         (let* ((keys (ms-node-keys node))
+                (nkeys (length keys))
+                (sats (list (ms-stack-empty))))
+           (dotimes (i nkeys)
+             (let ((sig (%ms-sig-stack sat (nth (- nkeys 1 i) keys)))
+                   (next '()))
+               (push (ms-stack+ (first sats) (ms-stack-zero)) next)
+               (loop for j from 1 below (length sats)
+                     do (push (ms-stack-or
+                               (ms-stack+ (nth j sats) (ms-stack-zero))
+                               (ms-stack+ (nth (1- j) sats) sig))
+                              next))
+               (push (ms-stack+ (car (last sats)) sig) next)
+               (setf sats (nreverse next))))
+           ;; Core CHECK_NONFATAL(node.k != 0) plus assert(k < sats.size()).
+           ;; Neither the parser nor the decoder can build such a node, and
+           ;; answering SATS[0] for k = 0 would hand a caller the
+           ;; DISSATISFACTION as though it were a spend.
+           (let ((k (ms-node-k node)))
+             (unless (and (plusp k) (< k (length sats)))
+               (internal-error "multi_a threshold ~D outside its ~D keys"
+                               k nkeys))
+             (res (nth k sats) (first sats)))))
+        (:thresh
+         ;; SATS[j] is the best stack satisfying j of the subexpressions seen
+         ;; so far, walking them in REVERSE because the witness is built
+         ;; innermost-first.
+         (let ((sats (list (ms-stack-empty))))
+           (dolist (sub (reverse subs))
+             (let ((s (first sub)) (n (second sub))
+                   (next '()))
+               (push (ms-stack+ (first sats) n) next)
+               (loop for j from 1 below (length sats)
+                     do (push (ms-stack-or (ms-stack+ (nth j sats) n)
+                                           (ms-stack+ (nth (1- j) sats) s))
+                              next))
+               (push (ms-stack+ (car (last sats)) s) next)
+               (setf sats (nreverse next))))
+           (let ((nsat (ms-stack-invalid)))
+             (loop for i from 0 below (length sats)
+                   do (unless (or (= i 0) (= i (ms-node-k node)))
+                        ;; Any count other than 0 or k is over- or
+                        ;; under-complete: available, but never the right
+                        ;; choice, since the i=0 form always exists.
+                        (%ms-mark (nth i sats) :malleable t :non-canon t))
+                      (unless (= i (ms-node-k node))
+                        (setf nsat (ms-stack-or nsat (nth i sats)))))
+             (res (nth (ms-node-k node) sats) nsat))))))))
 
 (defun ms-satisfy (node sat &key (key-fn #'%ms-identity-key))
   "The witness stack that satisfies NODE, or NIL.

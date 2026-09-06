@@ -7119,10 +7119,13 @@ it through session-verify."
 installed for the duration of the call and sent with the request, so the
 handler authorizes it and reaches the paths under test; :AUTH overrides what
 the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
-:rate-limiter, replaces the global limiter for this one call."
+:rate-limiter, replaces the global limiter for this one call, and NODE, when
+given as :node, is the node the dispatched method receives -- the shape tests
+need none and pass NIL, a method that reads the chain or the network needs one."
   (let* ((rate-limiter (getf request-args :rate-limiter))
+         (node (getf request-args :node))
          (request-args (loop for (k v) on request-args by #'cddr
-                             unless (eq k :rate-limiter)
+                             unless (member k '(:rate-limiter :node))
                                append (list k v)))
          (bl.rpc::*rpc-credentials*
            (%plaintext-credentials *jsonrpc-handler-rpc-user*
@@ -7133,7 +7136,7 @@ the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
          (bl.rpc::*rpc-warmup-status* nil)
          (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
          (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
-         (bl.rpc::*rpc-node* nil)
+         (bl.rpc::*rpc-node* node)
          (bl.rpc::*rpc-rate-limiter* rate-limiter))
     ;; A fresh reply starts at 200; reset explicitly so a request-construction
     ;; hiccup could not pre-seed the status the assertions read back.
@@ -7579,3 +7582,56 @@ approximation."
                "mempool_only did not reach the options slot: ~S" out))
     ;; A name that is neither positional nor a member is still unknown.
     (signals bl.rpc:rpc-error (call "send" "outputs" 1 "nonesuch" 2))))
+
+;;;; --- The request boundary against an attacker-chosen tree depth ----------
+
+(defparameter *jsonrpc-deep-leaf-wrappers* 30000
+  "How deep the boundary test nests the miniscript leaf it posts.
+
+A tapscript leaf may be 329,482 script bytes and `n:' costs one of them, so
+this is a 30 kB descriptor -- three orders of magnitude under the RPC body
+limit -- carrying a 30,000-node tree. On this image the recursive walkers it
+used to reach died somewhere past 15,000.")
+
+(defun jsonrpc-deep-tr-descriptor (wrappers)
+  "tr(K,{n...n:1}) whose leaf nests WRAPPERS `n:' wrappers. The key is the
+generator point's x coordinate, so the descriptor is well-formed and only the
+leaf is unusual."
+  (format nil "tr(79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,~A:1)"
+          (make-string wrappers :initial-element #\n)))
+
+(test jsonrpc-answers-a-deeply-nested-descriptor-instead-of-losing-the-worker
+  "One authenticated getdescriptorinfo used to kill the HTTP worker thread.
+
+The descriptor parses in milliseconds -- Core's Parse is a state machine and so
+is ours -- and then every walk over the resulting tree recursed: ToScript,
+ToString, the ops/stack/witness calculations, the duplicate-key check, the
+satisfier and FindInsaneSub. At this depth they raised
+SB-KERNEL::CONTROL-STACK-EXHAUSTED, which is a STORAGE-CONDITION and NOT an
+ERROR, so neither the (error (e) ...) clause in HANDLE-SINGLE-REQUEST nor the
+one in RPC-HANDLER saw it and the caller got no reply at all.
+
+The answer this asserts is Core's, not merely `some error': tapscript has no
+201-op limit to exceed (miniscript.h:1566), the exec stack stays at 1, and
+every subexpression of the chain is sane -- so IsSane fails on the ROOT alone,
+for the one reason `1' gives it, and FindInsaneSub blames nothing below it."
+  (let* ((descriptor (jsonrpc-deep-tr-descriptor *jsonrpc-deep-leaf-wrappers*))
+         (body (format nil
+                       "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getdescriptorinfo\",\"params\":[\"~A\"]}"
+                       descriptor)))
+    (multiple-value-bind (status json)
+        (jsonrpc-handler-reply body :node (make-test-node))
+      (is (eql hunchentoot:+http-ok+ status)
+          "a 2.0 request always answers 200, even for an error (~S)" status)
+      (let* ((reply (yason:parse json))
+             (err (and (hash-table-p reply) (gethash "error" reply))))
+        (is-true (hash-table-p err) "expected a JSON-RPC error object, got ~S" err)
+        (when (hash-table-p err)
+          (is (eql bl.rpc:+rpc-invalid-address-or-key+ (gethash "code" err)))
+          (let ((message (gethash "message" err)))
+            (is-true (stringp message))
+            (when (stringp message)
+              (is-true (search "is not sane: witnesses without signature exist"
+                               message)
+                       "unexpected message tail: ~S"
+                       (subseq message (max 0 (- (length message) 80)))))))))))
