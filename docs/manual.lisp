@@ -750,7 +750,10 @@
   array reaches a handler as a LIST, a top-level one as the empty-array
   sentinel; build test parameters through the request normalizer, not by
   hand. The wallet learns its `/wallet/<name>` endpoint from
-  `*rpc-request-uri*`, never from the transport."
+  `*rpc-request-uri*`, never from the transport. A STORAGE-CONDITION is NOT
+  an ERROR, so the three request boundaries handle it separately: a stack
+  exhaustion answers -32603 once HANDLER-CASE has unwound, a heap exhaustion
+  is left to propagate (RPC-RECOVERABLE-STORAGE-CONDITION-P)."
   (bitcoin-lisp.rpc package)
   (bitcoin-lisp.rpc:start-rpc-server function)
   (bitcoin-lisp.rpc:stop-rpc-server function)

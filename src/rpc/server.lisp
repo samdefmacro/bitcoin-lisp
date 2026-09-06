@@ -271,6 +271,32 @@ the transform reads RAW parse output, so normalizing first would fold a named
 `false` to NIL before the slot it fills is a top-level positional argument."
   (%normalize-rpc-params (%named-params-to-positional method params)))
 
+(defun rpc-recoverable-storage-condition-p (condition)
+  "Whether a STORAGE-CONDITION raised while serving a request can be answered.
+
+SBCL raises four of these, and none of them is an ERROR -- probed on 2.6.5,
+(subtypep 'storage-condition 'error) is NIL -- so an `(error (e) ...)' clause
+never saw one and the worker thread died holding the connection instead of
+replying. They do not all deserve the same treatment:
+
+  CONTROL-STACK-EXHAUSTED, BINDING-STACK-EXHAUSTED and ALIEN-STACK-EXHAUSTED
+  are recoverable. The stack is a bounded resource that unwinding gives back,
+  and HANDLER-CASE has already unwound by the time a clause runs, so the reply
+  is built with the whole stack available again.
+
+  HEAP-EXHAUSTED-ERROR is not. Building and encoding a reply allocates, which
+  is precisely what just failed, and the shortage is process-wide rather than
+  something this request can give back. It is left to propagate."
+  (typep condition '(or sb-kernel::control-stack-exhausted
+                     sb-kernel::binding-stack-exhausted
+                     sb-kernel::alien-stack-exhausted)))
+
+(defun rpc-resignal-storage-condition (condition)
+  "Re-raise CONDITION, which this boundary will not answer. HANDLER-CASE has
+already unwound, so the original frames are gone; what survives is the
+condition itself and the log line its handler wrote."
+  (error condition))
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -321,7 +347,16 @@ argument was `[]`."
     (error (e)
       (declare (ignore e))
       (error 'rpc-error :code +rpc-parse-error+
-                        :message "Parse error"))))
+                        :message "Parse error"))
+    ;; Not a parse failure: a resource the request exhausted while being read.
+    ;; -32603 says so, where -32700 would blame the caller's JSON.
+    (storage-condition (e)
+      (bl.log:node-log :error "RPC request exhausted a resource while parsing: ~A"
+                       (type-of e))
+      (unless (rpc-recoverable-storage-condition-p e)
+        (rpc-resignal-storage-condition e))
+      (error 'rpc-error :code +rpc-internal-error+
+                        :message "Internal error"))))
 
 (defun rpc-proper-list-p (x)
   "True if X is a proper (nil-terminated) list."
@@ -416,6 +451,15 @@ request and shape the reply (see MAKE-RPC-RESPONSE)."
       (bl.log:node-log :error "RPC internal error: ~A" e)
       (make-rpc-error-response +rpc-internal-error+
                                (format nil "Internal error: ~A" e)
+                               id version
+                               :id-present id-present))
+    (storage-condition (e)
+      (bl.log:node-log :error "RPC method ~A exhausted a resource: ~A"
+                       method (type-of e))
+      (unless (rpc-recoverable-storage-condition-p e)
+        (rpc-resignal-storage-condition e))
+      (make-rpc-error-response +rpc-internal-error+
+                               (format nil "Internal error: ~A" (type-of e))
                                id version
                                :id-present id-present))))
 
@@ -1150,6 +1194,16 @@ nest inside the auth check."
                         s)))
       (error (e)
         (bl.log:node-log :error "RPC handler error: ~A" e)
+        (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
+        (with-output-to-string (s)
+          (yason:encode (make-rpc-error-response +rpc-internal-error+
+                                                 "Internal error"
+                                                 nil :v1)
+                        s)))
+      (storage-condition (e)
+        (bl.log:node-log :error "RPC handler exhausted a resource: ~A" (type-of e))
+        (unless (rpc-recoverable-storage-condition-p e)
+          (rpc-resignal-storage-condition e))
         (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
         (with-output-to-string (s)
           (yason:encode (make-rpc-error-response +rpc-internal-error+
