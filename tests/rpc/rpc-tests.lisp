@@ -7152,8 +7152,10 @@ the global level threshold)."
 
 (test rpc-mempool-cluster-and-diagram
   "Entry chunk fields, getmempoolcluster shape, and the cumulative feerate
-diagram, over a CPFP pair that shares one chunk. Sizes are in vB (our
-txgraph unit; Core uses sigops-adjusted weight)."
+diagram, over a CPFP pair that shares one chunk. The chunk sizes are Core's
+sigops-adjusted WEIGHT, which is the txgraph's unit on both sides and what
+Core reports here without converting (rpc/mempool.cpp:461-463, :523-525,
+:641-643); \"vsize\" and the ancestor/descendant sizes stay virtual bytes."
   (let* ((node (make-test-node))
          (mempool (bl:node-mempool node))
          (parent (make-spending-test-tx (%txid-array 210) :vout 0 :value 50000000))
@@ -7162,35 +7164,35 @@ txgraph unit; Core uses sigops-adjusted weight)."
          (child (make-spending-test-tx pid :vout 0 :value 40000000))
          (cid (bl.ser:transaction-hash child))
          (cid-hex (bl.rpc:hash-to-hex cid))
-         (pvsize (bl.ser:transaction-vsize parent))
-         (cvsize (bl.ser:transaction-vsize child)))
+         (pweight (bl.ser:transaction-weight parent))
+         (cweight (bl.ser:transaction-weight child)))
     ;; Empty mempool: the diagram is just the (0, 0) origin.
     (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
       (is (= 1 (length r)))
       (is (= 0 (cdr (assoc "weight" (first r) :test #'string=))))
       (is (zerop (cdr (assoc "fee" (first r) :test #'string=)))))
-    ;; Low-fee parent + CPFP child: one chunk of (20100, pvsize+cvsize).
+    ;; Low-fee parent + CPFP child: one chunk of (20100, pweight+cweight).
     (%add-tx mempool parent :fee 100)
     (%add-tx mempool child :fee 20000)
-    ;; getmempoolentry chunk fields (fees.chunk in BTC, chunkweight in vB).
+    ;; getmempoolentry chunk fields (fees.chunk in BTC, chunkweight in WU).
     (let* ((r (bl.rpc::rpc-getmempoolentry node (list pid-hex)))
            (fees (cdr (assoc "fees" r :test #'string=))))
-      (is (= (+ pvsize cvsize) (cdr (assoc "chunkweight" r :test #'string=))))
+      (is (= (+ pweight cweight) (cdr (assoc "chunkweight" r :test #'string=))))
       (is (= 20100 (round (* 100000000 (cdr (assoc "chunk" fees :test #'string=)))))))
     ;; getmempoolcluster: one cluster, one chunk, txs in mining order.
     (let* ((r (bl.rpc::rpc-getmempoolcluster node (list cid-hex)))
            (chunks (cdr (assoc "chunks" r :test #'string=))))
       (is (= 2 (cdr (assoc "txcount" r :test #'string=))))
-      (is (= (+ pvsize cvsize) (cdr (assoc "clusterweight" r :test #'string=))))
+      (is (= (+ pweight cweight) (cdr (assoc "clusterweight" r :test #'string=))))
       (is (= 1 (length chunks)))
       (let ((chunk (first chunks)))
         (is (= 20100 (round (* 100000000 (cdr (assoc "chunkfee" chunk :test #'string=))))))
-        (is (= (+ pvsize cvsize) (cdr (assoc "chunkweight" chunk :test #'string=))))
+        (is (= (+ pweight cweight) (cdr (assoc "chunkweight" chunk :test #'string=))))
         (is (equal (list pid-hex cid-hex) (cdr (assoc "txs" chunk :test #'string=))))))
     ;; The diagram now has the origin plus one cumulative chunk point.
     (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
       (is (= 2 (length r)))
-      (is (= (+ pvsize cvsize) (cdr (assoc "weight" (second r) :test #'string=))))
+      (is (= (+ pweight cweight) (cdr (assoc "weight" (second r) :test #'string=))))
       (is (= 20100 (round (* 100000000 (cdr (assoc "fee" (second r) :test #'string=)))))))
     ;; A standalone lower-feerate tx appends a second, later diagram point.
     (let ((solo (make-mempool-test-tx :input-id 211)))
