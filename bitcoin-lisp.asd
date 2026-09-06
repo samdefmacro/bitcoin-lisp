@@ -389,6 +389,8 @@ this same package."
                              (:file "robustness-tests")
                              ;; Serialize<->deserialize round-trip property tests
                              (:file "util/roundtrip-tests")
+                             ;; Core SanitizeString, the peer-string boundary filter
+                             (:file "util/sanitize-tests")
                              ;; Script SCRIPT_VERIFY flag-gating matrix
                              (:file "coalton/script-flag-tests")
                              ;; Inbound listening + handshake

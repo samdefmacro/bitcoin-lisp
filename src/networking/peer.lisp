@@ -1112,8 +1112,16 @@ desirable set to limited peers, as in Core."
                 (peer-services peer) services
                 (peer-start-height peer)
                 (bl.ser:version-message-start-height version-msg)
+                ;; Core stores SanitizeString(strSubVer) as cleanSubVer and
+                ;; keeps the raw string nowhere (net_processing.cpp:3641), so
+                ;; the log line, getpeerinfo's "subver" and every other reader
+                ;; get the filtered form with no further work. The filter is
+                ;; what stops log-line forgery: %log-escape-message passes a
+                ;; newline through, exactly as Core's LogEscapeMessage does,
+                ;; because Core has already dropped it here.
                 (peer-user-agent peer)
-                (bl.ser:version-message-user-agent version-msg)
+                (bl.bytes:sanitize-string
+                 (bl.ser:version-message-user-agent version-msg))
                 ;; Their clock vs ours, captured at receipt (Core Peer::
                 ;; m_time_offset, net_processing.cpp:3646); getpeerinfo
                 ;; "timeoffset".

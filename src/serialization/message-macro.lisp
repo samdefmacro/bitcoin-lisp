@@ -13,6 +13,9 @@
 ;;; of *MESSAGE-FIELD-TYPES* (:u32, :hash256, :var-string, ...), or is one of
 ;;; the compound forms
 ;;;   (:bytes N)                       exactly N raw bytes
+;;;   (:var-string :max N :name STRING) a CompactSize-prefixed string, refused
+;;;                                    above N bytes (Core LIMITED_STRING);
+;;;                                    STRING labels the error
 ;;;   (:struct NAME)                   any type with read-NAME (byte-reader)
 ;;;                                    and write-NAME (byte-buf value), whether
 ;;;                                    a define-message or hand-written
@@ -74,6 +77,19 @@ behind DEFINE-MESSAGE and the wallet's DEFINE-WDB-KEY / DEFINE-WDB-VALUE."
                  `(,(intern (format nil "READ-~A" name) home) ,br)
                  `(,(intern (format nil "WRITE-~A" name) home) ,bb ,value)
                  `(,(intern (format nil "MAKE-~A" name) home)))))
+      ((eq (first type) :var-string)
+       ;; Core LIMITED_STRING(str, N): the length prefix is checked BEFORE any
+       ;; allocation and an over-long one throws, so the message fails and the
+       ;; peer is dropped. Truncating instead would keep a peer that is
+       ;; misbehaving by Core's rules, and would silently change a value the
+       ;; RPC surface reports.
+       (destructuring-bind (&key max name) (rest type)
+         (unless (and max name)
+           (internal-error "define-message: a bounded :var-string needs :max and :name"))
+         (values 'string
+                 `(br-read-limited-string ,br ,max ,name)
+                 `(bb-write-var-bytes ,bb (map '(vector (unsigned-byte 8)) #'char-code ,value))
+                 "")))
       ((eq (first type) :list)
        (destructuring-bind (element &key max name) (rest type)
          (let ((item (gensym "ITEM")))

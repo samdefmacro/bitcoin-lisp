@@ -153,6 +153,66 @@ and self-connection is undetectable while every test still passes."
       (is (= nonce (bl.ser:version-message-nonce parsed))
           "the nonce on the wire must be the peer's own"))))
 
+(test inbound-handshake-stores-a-sanitized-user-agent
+  "GA11 1052063f. The subversion a peer sends is stored on the peer, written to
+debug.log at handshake and returned as getpeerinfo's \"subver\". Core stores
+SanitizeString(strSubVer) as cleanSubVer (net_processing.cpp:3641) and keeps
+the raw string nowhere, so the newline that would forge a debug.log line is
+gone before any of those readers see it -- %log-escape-message passes a newline
+through, deliberately and exactly as Core's LogEscapeMessage does, because the
+boundary filter has already run.
+
+Drives a real handshake over loopback so the assertion covers the STORE, not
+the sanitizer: the client advertises a poisoned user agent and the server side
+must hold the filtered one."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0))
+        (poisoned (concatenate 'string
+                               "/poison:1.0/" (string #\Newline)
+                               "FORGED Shutdown: done"
+                               (string (code-char 27)) "[31m")))
+    (is-true srv)
+    (when srv
+      (unwind-protect
+           (let* ((port (usocket:get-local-port srv))
+                  (stored :never-ran)
+                  (server-thread
+                    (bt:make-thread
+                     (lambda ()
+                       ;; A registry of its own: this stands in for a distinct
+                       ;; node, so our own nonce must not look like a
+                       ;; self-connection.
+                       (let ((bl.net::*outbound-nonces* (make-hash-table :test 'eql)))
+                         (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                           (when conn
+                             (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
+                               (bl.net:perform-inbound-handshake p)
+                               (setf stored (bl.net:peer-user-agent p))
+                               (ignore-errors (bl.net:disconnect-peer p)))))))
+                     :name "test-subver-accept")))
+             (sleep 0.3)
+             (let ((client (let ((bl.ser:*user-agent* poisoned))
+                             (bl.net:connect-peer "127.0.0.1" port))))
+               (is-true client)
+               (when client
+                 (let ((bl.ser:*user-agent* poisoned))
+                   (ignore-errors (bl.net:perform-handshake client)))
+                 (bt:join-thread server-thread)
+                 (is-true (stringp stored)
+                          "the inbound side never stored a user agent (~S)" stored)
+                 (when (stringp stored)
+                   (is (null (find #\Newline stored))
+                       "a newline reached the stored subversion: ~S" stored)
+                   (is (null (find (code-char 27) stored))
+                       "an ESC reached the stored subversion: ~S" stored)
+                   (is (string= (bl.bytes:sanitize-string poisoned) stored)
+                       "the stored subversion is not the sanitized one: ~S" stored)
+                   ;; Positive control: the poisoned agent DID have something to
+                   ;; drop, so a stored raw string would have been caught.
+                   (is (< (length stored) (length poisoned))
+                       "positive control: nothing was dropped from ~S" poisoned))
+                 (ignore-errors (bl.net:disconnect-peer client)))))
+        (bl.net:close-listener srv)))))
+
 (test inbound-handshake-refuses-self-connection
   "THE BUG (G7-19): dialing our own advertised address completed the handshake
 against ourselves. That connection answers ping/pong forever, is never evicted,
