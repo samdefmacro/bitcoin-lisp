@@ -1214,7 +1214,11 @@
 
   Every scriptPubKey object the RPC and REST surfaces emit is
   `script-to-json\', Core's ScriptToUniv, in Core's key order (asm, desc,
-  hex, address, type) -- there is no second copy to drift. `decodescript\'
+  hex, address, type) -- there is no second copy to drift. Its `desc'
+  is Core's InferScript with no signing provider, so the TYPED arms come
+  first -- pk() for a bare pubkey, multi() for a bare multisig, rawtr()
+  for a taproot output whose program is a valid x-only key -- and only
+  then addr(), with raw() last. `decodescript\'
   is that object plus Core's can_wrap and can_wrap_P2WSH gates: a P2SH
   wrapper is offered only for a script that may be wrapped, which is why
   a NULL_DATA, a SCRIPTHASH, a taproot output, an ANCHOR, an unknown

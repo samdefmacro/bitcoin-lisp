@@ -56,7 +56,6 @@
     "bitcoin-lisp.crypto:ellswift-decode"
     "bitcoin-lisp.crypto:muhash-combine"
     "bitcoin-lisp.crypto:muhash-divide"
-    "bitcoin-lisp.crypto:xonly-pubkey-valid-p"
     "bitcoin-lisp.mempool:ancestor-sort-linearization"
     "bitcoin-lisp.mempool:chunk-linearization"
     "bitcoin-lisp.mempool:depgraph-reduced-children"

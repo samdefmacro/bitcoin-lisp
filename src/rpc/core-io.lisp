@@ -6,15 +6,52 @@
 ;;;; takes one is handed. ScriptToAsmStr is BL.VAL:DISASSEMBLE-SCRIPT, next
 ;;;; to the interpreter whose opcode table and CScriptNum decode it shares.
 
+(defun %infer-pubkey-hex (key)
+  "Core InferPubkey (descriptor.cpp:2145-2161) with no signing provider, as
+the hex a pk() or multi() argument carries: NIL for a key it refuses.
+
+The refusal that matters here is IsValidNonHybrid -- header 06/07 is a valid
+SIZE, so the solver reports such a script as PUBKEY, but a hybrid key has no
+descriptor and Core falls through to raw(). The uncompressed-key rule below
+it applies to P2WSH and tapscript, which this function never sees: with no
+provider Core cannot reach a witness script at all."
+  (and (plusp (length key))
+       (member (aref key 0) '(#x02 #x03 #x04))
+       (bl.crypto:bytes-to-hex key)))
+
 (defun scriptpubkey-desc (script network)
-  "Core InferDescriptor for a bare scriptPubKey (no key material available): an
-addressable script infers to addr(<address>), anything else to raw(<hex>), each
-with the appended descriptor checksum. This is the `desc` field on decoded
-outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
-  (let ((addr (script->address script network)))
-    (descriptor-add-checksum
-     (if addr
-         (format nil "addr(~A)" addr)
+  "Core InferDescriptor with the DUMMY signing provider (core_io.cpp:414,
+descriptor.cpp:2691-2831), with the appended checksum: the `desc` field on
+every decoded output (gettxout, decoderawtransaction, getblock verbosity 2/3,
+decodescript, /rest/getutxos).
+
+Core tries the TYPED inferences BEFORE ExtractDestination, and three of them
+need no key material -- a bare pubkey is pk(), a bare multisig is multi(), and
+a taproot output whose program parses as an x-only key is rawtr(). Only after
+those does Core reach AddressDescriptor and, last, RawDescriptor. The arms
+that DO need a provider (pkh, wpkh, sh, wsh and a tr() tree) are left out
+because we pass none either, so Core also lands on addr() for them."
+  (descriptor-add-checksum
+   (multiple-value-bind (type data) (bl.val:classify-script script)
+     (or (case type
+           (:pubkey
+            (let ((hex (%infer-pubkey-hex (getf data :pubkey))))
+              (and hex (format nil "pk(~A)" hex))))
+           (:multisig
+            ;; Never sortedmulti(): that descriptor REORDERS the keys it is
+            ;; given, and a script has already fixed their order.
+            (let ((hexes (mapcar #'%infer-pubkey-hex (getf data :pubkeys))))
+              (when (every #'identity hexes)
+                (format nil "multi(~D~{,~A~})" (getf data :m) hexes))))
+           (:witness-v1-taproot
+            ;; Core builds RawTRDescriptor only for a FULLY VALID x-only key
+            ;; (a point on the curve), so a v1 program that is not one keeps
+            ;; falling through to its address.
+            (let ((program (getf data :witness-program)))
+              (when (bl.crypto:xonly-pubkey-valid-p program)
+                (format nil "rawtr(~A)" (bl.crypto:bytes-to-hex program))))))
+         (let ((addr (script->address script network)))
+           (and addr (format nil "addr(~A)" addr)))
          (format nil "raw(~A)" (bl.crypto:bytes-to-hex script))))))
 
 (defun script-to-json (script &key (include-hex t) network)
