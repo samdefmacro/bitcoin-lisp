@@ -2648,6 +2648,72 @@ confirmed (Core BlockConnected) and rebuilds the most-recent-block tx map
       (bl.val:reset-recent-confirmed)
       (setf bl.val::*most-recent-block-txs* nil))))
 
+(test block-connect-forgets-every-announcement-of-a-confirmed-tx
+  "Core BlockConnected calls m_txrequest.ForgetTxHash on the txid and the
+wtxid of every transaction the block carries (txdownloadman_impl.cpp:107-108),
+beside the recently-confirmed filter inserts. Without it an announcement that
+was outstanding when the block connected survived, and the next scheduler pass
+sent a getdata for a transaction we already knew was confirmed -- which a Core
+peer answers in full out of m_most_recent_block_txs, so we paid a whole
+redundant transaction body and threw it away on the recently-confirmed check.
+
+Driven through the shipped validation-interface signal, which is how
+validation reaches the tracker without naming networking."
+  (bl.net:reset-tx-requests)
+  (let* ((tx (%witness-tx-for-relay))
+         (txid (bl.ser:transaction-hash tx))
+         (wtxid (bl.ser:transaction-wtxid tx))
+         (other (%w9-hash 600001))
+         (a (%make-peer-with-state :ready))
+         (b (%make-peer-with-state :ready))
+         (state (bl.store:make-chain-state)))
+    (unwind-protect
+         (progn
+           (is-true (member 'bl.net::tx-request-block-connected
+                            (bl.vi:validation-hooks :block-connected)))
+           (bl.net:tx-request-wanted-p txid a)
+           (bl.net:tx-request-wanted-p wtxid b t)
+           (bl.net:tx-request-wanted-p other a)
+           (is (equal (list a) (bl.net:tx-request-candidate-peers txid)))
+           (bl.vi:notify-block-connected state (%w9-block-with-tx tx)
+                                         (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 1)
+                                         101 nil)
+           ;; Both ids of the confirmed transaction are forgotten...
+           (is (null (bl.net:tx-request-candidate-peers txid)))
+           (is (null (bl.net:tx-request-candidate-peers wtxid)))
+           (is (null (tx-request-in-flight-peer txid)))
+           ;; ...and nothing else is: the hook clears the block's
+           ;; transactions, not the tracker.
+           (is (equal (list a) (bl.net:tx-request-candidate-peers other))))
+      (bl.val:reset-recent-confirmed)
+      (setf bl.val::*most-recent-block-txs* nil)
+      (bl.net:reset-tx-requests))))
+
+(test a-targeted-chainstates-connect-does-not-touch-the-tracker
+  "The assumeutxo background chainstate re-derives ancient history; Core wires
+the tx-download callbacks to the ACTIVE chainstate only
+(net_processing.cpp:2086-2092), so its connects must not release announcements
+of transactions that are still unconfirmed for us."
+  (bl.net:reset-tx-requests)
+  (let* ((tx (%witness-tx-for-relay))
+         (txid (bl.ser:transaction-hash tx))
+         (a (%make-peer-with-state :ready))
+         (targeted (bl.store:make-chain-state
+                    :target-blockhash (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 9))))
+    (unwind-protect
+         (progn
+           (bl.net:tx-request-wanted-p txid a)
+           (bl.vi:notify-block-connected targeted (%w9-block-with-tx tx)
+                                         (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 1)
+                                         101 nil)
+           (is (equal (list a) (bl.net:tx-request-candidate-peers txid))))
+      (bl.val:reset-recent-confirmed)
+      (setf bl.val::*most-recent-block-txs* nil)
+      (bl.net:reset-tx-requests))))
+
 (test handle-inv-skips-recently-confirmed
   "A tx announcement for a recently-confirmed tx is not requested (Core
 AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."

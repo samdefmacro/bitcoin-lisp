@@ -839,3 +839,40 @@ one redundant full-transaction download per such parent."
           (is-true (bl.mp:orphan-tx pool child-id))
           (is (null (bl.net:tx-request-candidate-peers parent-id)))
           (is (null (tx-request-in-flight-peer parent-id))))))))
+
+(test the-scheduler-drops-a-request-for-a-transaction-we-already-have
+  "Core re-runs AlreadyHaveTx on every requestable announcement immediately
+before turning it into a getdata and ForgetTxHash's anything that now passes
+-- \"just a belt-and-suspenders\" (txdownloadman_impl.cpp:274-284). It covers
+what the block-connect hook cannot: a transaction that reached the mempool by
+a non-P2P route -- an RPC submission, a package member -- between the inv and
+the getdata."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash tx))
+           (inbound (bl.net:init-peer-rate-limiters
+                     (bl.net:make-peer :address "pkgrelay" :state :ready
+                                                 :inbound t
+                                                 :services bl.ser:+node-witness+))))
+      (%with-fresh-rejects (rejects)
+        (let ((ctx (%pr-ctx state utxo mempool rejects)))
+          ;; Control 1: with the transaction still unknown, the context does
+          ;; not stop the request.
+          (is-false (bl.net:tx-request-wanted-p txid inbound))
+          (is (= 1 (backdate-tx-announcements txid)))
+          (is (= 1 (bl.net:process-tx-requests ctx)))
+          ;; It arrives by another route while the next announcement waits.
+          (bl.net:reset-tx-requests)
+          (is-false (bl.net:tx-request-wanted-p txid inbound))
+          (is (= 1 (backdate-tx-announcements txid)))
+          (bl.mp:accept-validated-tx mempool txid tx 50000 200)
+          (is-true (bl.mp:mempool-has mempool txid))
+          (is (= 0 (bl.net:process-tx-requests ctx)))
+          (is (null (bl.net:tx-request-candidate-peers txid)))
+          (is (null (tx-request-in-flight-peer txid)))
+          ;; Control 2: the re-check is what dropped it -- without a context
+          ;; the same announcement is requested.
+          (bl.net:reset-tx-requests)
+          (is-false (bl.net:tx-request-wanted-p txid inbound))
+          (is (= 1 (backdate-tx-announcements txid)))
+          (is (= 1 (bl.net:process-tx-requests))))))))

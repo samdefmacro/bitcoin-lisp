@@ -975,18 +975,26 @@ end now: new headers arrived, or the node is behind known work and
   ;; announcement returns T so %SYNC-PASS
   ;; ends the wait and fetches the block.
   (let* ((cs (node-current-chainstate *node*))
+         (ctx (node->context *node* cs))
          (pump (bl.net:pump-peer-messages
                 (node-peers *node*)
-                (node->context *node* cs)
+                ctx
                 nil)))
     ;; Tx-request scheduler: send
     ;; delayed announcements now due,
     ;; and re-route requests that
     ;; expired (60s) to another
     ;; announcer (Core GetRequestsToSend
-    ;; runs per SendMessages pass).
-    (bl.net:process-tx-requests)
-    (bl.net:retry-timed-out-tx-requests)
+    ;; runs per SendMessages pass). The
+    ;; context is what lets it drop a
+    ;; request for a transaction that
+    ;; has arrived some other way since
+    ;; the announcement (Core's
+    ;; belt-and-suspenders AlreadyHaveTx
+    ;; re-check, txdownloadman_impl.cpp
+    ;; :274-284).
+    (bl.net:process-tx-requests ctx)
+    (bl.net:retry-timed-out-tx-requests ctx)
     ;; Trickled tx announcements: drain
     ;; due per-peer inv queues each
     ;; second (Poisson schedules inside;
