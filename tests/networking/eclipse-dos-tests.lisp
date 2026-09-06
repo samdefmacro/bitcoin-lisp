@@ -69,7 +69,7 @@ dials). Only the two genuine outbound full-relay peers are counted."
 (test send-paused-predicate-tracks-cap
   "connection-send-paused-p flips exactly at the send-buffer cap (Core
 fPauseSend on nSendBufferMaxSize)."
-  (let ((conn (bl.net::make-connection)))
+  (let ((conn (make-test-connection)))
     (setf (send-buffer-bytes conn) 0)
     (is-false (bl.net:connection-send-paused-p conn))
     (setf (send-buffer-bytes conn)
@@ -82,7 +82,7 @@ fPauseSend on nSendBufferMaxSize)."
 (test send-stall-predicate-needs-pending-and-timeout
   "connection-send-stalled-p triggers only when data is buffered AND the socket
 has made no send progress for the stall timeout (Core socket sending timeout)."
-  (let ((conn (bl.net::make-connection))
+  (let ((conn (make-test-connection))
         (units internal-time-units-per-second))
     ;; No pending data: never stalled, even with an ancient progress time.
     (setf (send-buffer-bytes conn) 0
@@ -103,7 +103,7 @@ has made no send progress for the stall timeout (Core socket sending timeout)."
 
 (test close-connection-frees-send-queue
   "Closing a connection releases any buffered unsent bytes."
-  (let ((conn (bl.net::make-connection)))
+  (let ((conn (make-test-connection)))
     (setf (bl.net::connection-send-queue-in conn)
           (list #(1 2 3))
           (bl.net::connection-send-queue-out conn)
@@ -131,7 +131,7 @@ us reading that peer's input (70502bf3)."
                                :element-type '(unsigned-byte 8)))
                  ;; Accept the server side but NEVER read from it — jam the pipe.
                  (server-conn (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
-                 (conn (bl.net::make-connection
+                 (conn (make-test-connection
                         :socket client-sock :host "127.0.0.1" :port port
                         :connected t)))
             (declare (ignorable server-conn))
@@ -186,7 +186,7 @@ else changed, the SAME pending message is read."
              (sender (usocket:socket-connect "127.0.0.1" port
                                              :element-type '(unsigned-byte 8)))
              (accepted (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
-             (conn (bl.net::make-connection
+             (conn (make-test-connection
                     :socket accepted :host "127.0.0.1" :port port :connected t))
              (peer (bl.net:make-peer :state :ready :address "127.0.0.1:8333"
                                      :connection conn)))
@@ -268,7 +268,7 @@ RemoveUnbroadcastTx), so 1 of 2 means exactly one tx went out."
              (sender (usocket:socket-connect "127.0.0.1" port
                                              :element-type '(unsigned-byte 8)))
              (accepted (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
-             (conn (bl.net::make-connection
+             (conn (make-test-connection
                     :socket accepted :host "127.0.0.1" :port port :connected t))
              (peer (bl.net:make-peer :state :ready :address "127.0.0.1:8333"
                                      :connection conn))
@@ -2546,6 +2546,12 @@ a sparse addrman happens to return. Restores the real function on unwind."
                    ,@body)
          (setf (fdefinition 'bl::%addrman-pick-unconnected) ,real)))))
 
+(defun %refill-pick (node &optional used-groups tried-this-pass)
+  "The candidate one try of the shipped refill selection settles on, as
+(HOST PORT) -- Core ThreadOpenConnections' inner loop."
+  (multiple-value-list
+   (bl::%select-refill-candidate node used-groups tried-this-pass)))
+
 (test a-failed-dial-is-not-repeated-inside-the-cooldown
   "Core skips a candidate whose last_try is under 10 minutes old until 30
 candidates have been rejected (net.cpp:2839-2841), on top of addrman's own
@@ -2569,9 +2575,7 @@ which of two addresses is preferred would be a coin flip."
                                  (values *dial-candidate* 8333 0)
                                  (values (format nil "198.~D.0.7" (+ 10 draws))
                                          8333 now)))
-        (is (equal (list *dial-candidate* 8333)
-                   (multiple-value-list
-                    (bl::%select-refill-candidate node '() '())))
+        (is (equal (list *dial-candidate* 8333) (%refill-pick node))
             "an address tried inside the last 10 minutes must be passed over ~
 while an untried one is on offer")))
     ;; The cooldown is a PREFERENCE, not a ban: after 30 rejected candidates
@@ -2582,15 +2586,13 @@ while an untried one is on offer")))
                              (declare (ignore n new-only))
                              (incf draws)
                              (values (format nil "198.~D.0.7" draws) 8333 now))
-        (is (equal (list "198.30.0.7" 8333)
-                   (multiple-value-list
-                    (bl::%select-refill-candidate node '() '())))
+        (is (equal (list "198.30.0.7" 8333) (%refill-pick node))
             "the 30th try must be allowed to take a recently-tried address")))
     ;; And the selection gives up rather than spinning when the book is empty.
     (%with-scripted-draws ((n &key new-only)
                            (declare (ignore n new-only))
                            nil)
-      (is (null (bl::%select-refill-candidate node '() '()))
+      (is (equal '(nil) (%refill-pick node))
           "an empty address book must end the selection, not loop 100 times"))
     ;; The other two skips, on the same scripted sequence: a /16 that already
     ;; holds an outbound peer, and an address this pass has already dialed.
@@ -2601,9 +2603,7 @@ while an untried one is on offer")))
                              (if (= draws 3)
                                  (values *dial-candidate* 8333 0)
                                  (values "198.51.0.7" 8333 0)))
-        (is (equal (list *dial-candidate* 8333)
-                   (multiple-value-list
-                    (bl::%select-refill-candidate node '("198.51") '())))
+        (is (equal (list *dial-candidate* 8333) (%refill-pick node '("198.51")))
             "a /16 already holding an outbound peer must be skipped")))
     (let ((draws 0))
       (%with-scripted-draws ((n &key new-only)
@@ -2613,8 +2613,7 @@ while an untried one is on offer")))
                                  (values *dial-candidate* 8333 0)
                                  (values "198.51.0.7" 8333 0)))
         (is (equal (list *dial-candidate* 8333)
-                   (multiple-value-list
-                    (bl::%select-refill-candidate node '() '("198.51.0.7"))))
+                   (%refill-pick node '() '("198.51.0.7")))
             "an address this pass has already dialed must be skipped")))))
 
 (test a-failed-dial-stamps-the-cooldowns-input

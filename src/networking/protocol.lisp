@@ -18,6 +18,14 @@ which always hold a node, use bl.rpc:with-node-lock (node) instead."
              ,@body)
            (progn ,@body)))))
 
+(defun block-interval-seconds ()
+  "Core consensusParams.nPowTargetSpacing -- the target seconds between blocks.
+
+The constant itself lives in the node layer, above this one, so this is the
+ONE place bl.net names it: every other reader in the package calls this
+instead of reaching up for the symbol."
+  bl:+pow-target-spacing-seconds+)
+
 (defstruct peer-manager
   "Manages connections to multiple peers."
   (peers '() :type list)
@@ -2342,7 +2350,7 @@ cannot be."
   (let* ((tip-proof (max 1 (bl.store:calculate-chain-work tip-bits 0)))
          (sign (if (> to-work from-work) 1 -1))
          (r (abs (- to-work from-work)))
-         (spacing bl:+pow-target-spacing-seconds+))
+         (spacing (block-interval-seconds)))
     (* sign (floor (* r spacing) tip-proof))))
 
 (defun %block-request-allowed-p (chain-state entry best-header)
@@ -2414,7 +2422,7 @@ Core refuses to build a compact block for."
          (> (bl.ser:block-header-timestamp
              (bl.store:block-index-entry-header tip))
             (- (bl.ser:get-unix-time)
-               (* 20 bl:+pow-target-spacing-seconds+))))))
+               (* 20 (block-interval-seconds)))))))
 
 (defun %serve-compact-p (chain-state entry)
   "T when a MSG_CMPCT_BLOCK request for ENTRY should be answered compactly:

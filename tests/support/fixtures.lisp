@@ -74,6 +74,18 @@ dependence on the global *random-state*, so runs are reproducible."
       (setf state (ldb (byte 64 0) (logxor state (ash state 17))))
       (mod state n))))
 
+(defun make-test-connection (&rest initargs
+                             &key socket host port connected last-activity)
+  "A CONNECTION struct built directly, without a dial -- the socket-less (but
+optionally \"connected\") stand-in three test files build to drive the peer
+paths without a listener. Only the arguments actually given are passed on, so
+the struct's own defaults still apply (HOST is a string slot, and forcing NIL
+into it is a type error)."
+  (declare (ignore socket host port connected last-activity))
+  (apply #'bl.net::make-connection
+         (loop for (key value) on initargs by #'cddr
+               unless (null value) append (list key value))))
+
 ;;;; Source text
 
 (defun project-source-text (relative-path)
