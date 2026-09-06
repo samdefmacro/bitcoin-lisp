@@ -1,0 +1,4 @@
+{
+  "_comment": "Findings whose fix commit names a sibling id instead of this one; render-ga11.py consults this map.",
+  "21cf40de": "05111c8b"
+}
