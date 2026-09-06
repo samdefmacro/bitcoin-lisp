@@ -462,6 +462,113 @@ under the consensus script verifier. Runs WITHOUT vendored vectors."
                (bl.interop:*current-spent-utxos* spent))
           (is-true (bl.val:validate-input-script tx2 0 (aref spent 0))))))))
 
+(test descriptorprocesspsbt-p2sh-p2pk-agrees-with-the-in-place-signer
+  "%PSBT-FINALIZE has always carried a P2SH-P2PK and a P2SH-P2PKH arm, but
+nothing could reach them: the per-input signer refused both redeemScript shapes
+with \"unsupported redeemScript type\", so no partial signature was ever
+recorded for one. With the signer's redeemScript recursion in place (Core
+ProduceSignature, sign.cpp:743-752) the two halves have to agree, and this
+compares them over the SAME transaction: descriptorprocesspsbt's finalized
+scriptSigs must be the very bytes signrawtransactionwithkey's in-place
+%FINALIZE-INPUT-SIGNATURES builds. Both paths sign with RFC6979, so a
+difference is a difference in assembly, not in nonce.
+
+descriptorprocesspsbt's complete is Core's PSBTInputSignedAndVerified, so a
+true there is already the script verification of what it assembled.
+
+The spent outputs are carried as NON_WITNESS_UTXO, which is what a legacy P2SH
+input needs and what makes the signature a legacy one."
+  (let* ((node (bl:make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (pub (bl.crypto:derive-public-key sk :compressed t))
+         (pkh (bl.crypto:hash160 pub))
+         (rd-pk (concatenate '(simple-array (unsigned-byte 8) (*))
+                             (vector (length pub)) pub #(#xac)))
+         (rd-pkh (concatenate '(simple-array (unsigned-byte 8) (*))
+                              #(#x76 #xa9 #x14) pkh #(#x88 #xac)))
+         (spk-sh-pk (concatenate '(simple-array (unsigned-byte 8) (*))
+                                 #(#xa9 #x14) (bl.crypto:hash160 rd-pk) #(#x87)))
+         (spk-sh-pkh (concatenate '(simple-array (unsigned-byte 8) (*))
+                                  #(#xa9 #x14) (bl.crypto:hash160 rd-pkh) #(#x87)))
+         (value 100000)
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         ;; The funding transaction, carried whole so its txid authenticates
+         ;; both spent outputs (Core psbt.cpp:76-88 prefers NON_WITNESS_UTXO).
+         (funding (bl.ser:make-transaction
+                   :version 2
+                   :inputs (vector (bl.ser:make-tx-in
+                                    :previous-output
+                                    (bl.ser:make-outpoint
+                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element #x11)
+                                     :index 0)
+                                    :script-sig empty :sequence #xffffffff))
+                   :outputs (vector (bl.ser:make-tx-out :value value :script-pubkey spk-sh-pk)
+                                    (bl.ser:make-tx-out :value value :script-pubkey spk-sh-pkh))
+                   :lock-time 0))
+         (ftxid (bl.ser:transaction-hash funding))
+         (spend (bl.ser:make-transaction
+                 :version 2
+                 :inputs (vector (bl.ser:make-tx-in
+                                  :previous-output (bl.ser:make-outpoint :hash ftxid :index 0)
+                                  :script-sig empty :sequence #xffffffff)
+                                 (bl.ser:make-tx-in
+                                  :previous-output (bl.ser:make-outpoint :hash ftxid :index 1)
+                                  :script-sig empty :sequence #xffffffff))
+                 :outputs (vector (bl.ser:make-tx-out :value (- (* 2 value) 1000)
+                                                      :script-pubkey rd-pkh))
+                 :lock-time 0))
+         (psbt (bl.ser:make-empty-psbt spend)))
+    ;; The Updater's half: each input's spent transaction and redeemScript.
+    (loop for i below 2
+          for rd in (list rd-pk rd-pkh)
+          do (let ((map (aref (bl.ser:psbt-inputs psbt) i)))
+               (bl.ser:psbt-map-set map bl.ser:+psbt-in-non-witness-utxo+ empty
+                                    (bl.ser:transaction-wire-bytes funding))
+               (bl.ser:psbt-map-set map bl.ser:+psbt-in-redeem-script+ empty rd)))
+    (let* ((from-psbt (%psbt-process-with-descriptors
+                       node psbt (list (format nil "sh(pk(~A))" wif)
+                                       (format nil "sh(pkh(~A))" wif))))
+           (in-place
+             (bl.rpc:dispatch-rpc-method
+              node "signrawtransactionwithkey"
+              (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction spend))
+                    (list wif)
+                    (loop for i below 2
+                          for spk in (list spk-sh-pk spk-sh-pkh)
+                          for rd in (list rd-pk rd-pkh)
+                          collect (list (cons "txid" (bl.rpc:hash-to-hex ftxid))
+                                        (cons "vout" i)
+                                        (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
+                                        (cons "amount" 0.001d0)
+                                        (cons "redeemScript" (bl.crypto:bytes-to-hex rd))))))))
+      (flet ((aval (key alist) (cdr (assoc key alist :test #'equal))))
+        (is (eq t (aval "complete" from-psbt))
+            "descriptorprocesspsbt reported ~S" from-psbt)
+        (is (eq t (aval "complete" in-place))
+            "signrawtransactionwithkey reported ~S" (aval "errors" in-place))
+        (let ((a (aval "hex" from-psbt))
+              (b (aval "hex" in-place)))
+          (is-true (and (stringp a) (stringp b)))
+          (when (and (stringp a) (stringp b))
+            (let ((ins-a (bl.ser:transaction-inputs
+                          (bl.ser:parse-tx-payload (bl.crypto:hex-to-bytes a))))
+                  (ins-b (bl.ser:transaction-inputs
+                          (bl.ser:parse-tx-payload (bl.crypto:hex-to-bytes b)))))
+              (dotimes (j 2)
+                (is (equalp (bl.ser:tx-in-script-sig (aref ins-a j))
+                            (bl.ser:tx-in-script-sig (aref ins-b j)))
+                    "input ~D: the PSBT finalizer and the in-place signer ~
+disagree" j))
+              ;; And the shape is Core's, not merely a shared one: <sig>
+              ;; <redeem> for P2SH-P2PK, <sig> <pubkey> <redeem> for P2SH-P2PKH.
+              (let ((ss (bl.ser:tx-in-script-sig (aref ins-a 0))))
+                (is (equalp rd-pk (subseq ss (- (length ss) (length rd-pk))))))
+              (let ((ss (bl.ser:tx-in-script-sig (aref ins-a 1))))
+                (is (equalp rd-pkh (subseq ss (- (length ss) (length rd-pkh)))))
+                (is-true (search pub ss))))))))))
+
 (test descriptorprocesspsbt-signs-a-multipath-branch
   "descriptorprocesspsbt reaches EVERY descriptor a BIP389 string denotes, as
 Core's EvalDescriptorStringOrObject does (rpc/util.cpp:1352-1362). The PSBT here

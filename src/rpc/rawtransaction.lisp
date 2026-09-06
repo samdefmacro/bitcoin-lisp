@@ -460,6 +460,46 @@ changes the txid of a transaction already in flight."
             :check-after-fn (lambda (v) (bl.val:ms-check-after tx i v))))
         (and stack (not malleable) stack)))))
 
+(defun %p2tr-input (spk amount tap-sighash-type tr-keymap tr-scripts pubmap
+                    spent-utxos)
+  "Core's SignStep WITNESS_V1_TAPROOT case (sign.cpp:704-705 -> SignTaproot):
+the signature material for a taproot output SPK, as
+COMPUTE-INPUT-SIGNATURES' own (values input-sig error-string).
+
+Core tries the KEY path first and only then the script paths
+(sign.cpp:558-608): a key-path spend is both cheaper and smaller, and reveals
+nothing about the tree. *current-tx* / *current-spent-utxos* /
+*current-input-index* / *precomputed-sighash* must be bound by the caller --
+the BIP341 sighash commits to all of them."
+  (let* ((output-key (subseq spk 2 34))
+         (sk (gethash output-key tr-keymap))
+         (leaves (and tr-scripts (gethash output-key tr-scripts))))
+    (cond
+      ((and (null sk) (null leaves)) (values nil "no key for P2TR (key path)"))
+      ((null spent-utxos)
+       (values nil "P2TR requires prevtx amounts for all inputs"))
+      (sk
+       (let ((sighash (bl.interop:compute-bip341-sighash
+                       amount tap-sighash-type nil nil)))
+         ;; No sighash is defined for SIGHASH_SINGLE at an input index with no
+         ;; matching output. Signing the omitted-field preimage would hand back
+         ;; a transaction Core rejects, so fail loudly instead.
+         (if (null sighash)
+             (values nil "P2TR SIGHASH_SINGLE has no output at this input index")
+             (values (%make-input-sig
+                      :kind :p2tr :needed 1
+                      :tap (%tap-sig (bl.crypto:taproot-tweak-private-key sk)
+                                     sighash tap-sighash-type))))))
+      (t
+       (multiple-value-bind (stack leaf-sigs leaf)
+           (%tr-script-path-witness leaves amount tap-sighash-type pubmap)
+         (if (null stack)
+             (values nil "no satisfiable script path for P2TR")
+             (values (%make-input-sig :kind :p2tr-script :needed 1
+                                      :stack stack
+                                      :tap-script-sigs leaf-sigs
+                                      :tap-leaf leaf))))))))
+
 (defun compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
                                   precomp spent-utxos &optional (tap-sighash-type #x00)
                                                                 tr-scripts)
@@ -486,6 +526,36 @@ must be bound by the caller."
                                key (bl.interop:compute-legacy-sighash
                                     tx i subscript sighash-byte))
                               (vector sighash-byte)))
+               (p2pk-input (subscript wrapped)
+                 ;; Core's SignStep PUBKEY case, its FIRST (sign.cpp:643-647):
+                 ;; SUBSCRIPT already carries the key, so the key is looked up
+                 ;; by its full bytes -- PUBMAP, which the multisig arms already
+                 ;; use and which therefore holds an uncompressed key too -- and
+                 ;; the only thing produced is the signature. Reached bare, and
+                 ;; for a P2SH-wrapped one by ProduceSignature recursing on the
+                 ;; redeemScript (sign.cpp:743-752), which is WRAPPED here and
+                 ;; NIL for the bare form. combo() expands to the bare script,
+                 ;; so it is the shape a migrated legacy wallet owns.
+                 (let* ((pub (getf (nth-value 1 (bl.val:classify-script subscript))
+                                   :pubkey))
+                        (sk (gethash pub pubmap)))
+                   (unless sk
+                     (fail (if wrapped "no key for P2SH-P2PK" "no key for P2PK")))
+                   (values (%make-input-sig
+                            :kind (if wrapped :p2sh-p2pk :p2pk) :needed 1
+                            :redeem wrapped
+                            :ecdsa (list (cons pub (legacy-sig subscript sk)))))))
+               (p2pkh-input (subscript wrapped)
+                 ;; Core's SignStep PUBKEYHASH case (sign.cpp:648-660), reached
+                 ;; bare and wrapped by the same recursion as P2PK above.
+                 (let ((entry (gethash (subseq subscript 3 23) keymap)))
+                   (unless entry
+                     (fail (if wrapped "no key for P2SH-P2PKH" "no key for P2PKH")))
+                   (values (%make-input-sig
+                            :kind (if wrapped :p2sh-p2pkh :p2pkh) :needed 1
+                            :redeem wrapped
+                            :ecdsa (list (cons (cdr entry)
+                                               (legacy-sig subscript (car entry))))))))
                (bip143-sig (script-code key)
                  (%bip143-sig script-code amount key sighash-byte))
                (p2wpkh-input (pkh wrapped)
@@ -559,59 +629,13 @@ must be bound by the caller."
                                  :needed m :redeem wrapped
                                  :witness-script witness-script :ecdsa pairs)))))))
         (cond
-          ;; Bare P2PK, Core's FIRST SignStep case (sign.cpp:643-647): the
-          ;; scriptPubKey already carries the key, so the key is looked up by
-          ;; its full bytes -- PUBMAP, which the multisig arms already use and
-          ;; which therefore holds an uncompressed key too -- and the only thing
-          ;; produced is the signature. combo() expands to this script, so it is
-          ;; the shape a migrated legacy wallet owns.
-          ((string= type "pubkey")
-           (let* ((pub (getf (nth-value 1 (bl.val:classify-script spk)) :pubkey))
-                  (sk (gethash pub pubmap)))
-             (unless sk (fail "no key for P2PK"))
-             (values (%make-input-sig
-                      :kind :p2pk :needed 1
-                      :ecdsa (list (cons pub (legacy-sig spk sk)))))))
-          ((string= type "pubkeyhash")
-           (let ((entry (gethash (subseq spk 3 23) keymap)))
-             (unless entry (fail "no key for P2PKH"))
-             (values (%make-input-sig
-                      :kind :p2pkh :needed 1
-                      :ecdsa (list (cons (cdr entry) (legacy-sig spk (car entry))))))))
+          ((string= type "pubkey") (p2pk-input spk nil))
+          ((string= type "pubkeyhash") (p2pkh-input spk nil))
           ((string= type "witness_v0_keyhash")
            (p2wpkh-input (subseq spk 2 22) nil))
           ((string= type "witness_v1_taproot")
-           (let* ((output-key (subseq spk 2 34))
-                  (sk (gethash output-key tr-keymap))
-                  (leaves (and tr-scripts (gethash output-key tr-scripts))))
-             (cond
-               ((and (null sk) (null leaves)) (fail "no key for P2TR (key path)"))
-               ((null spent-utxos)
-                (fail "P2TR requires prevtx amounts for all inputs"))
-               ;; Core tries the key path first and only then the script paths
-               ;; (sign.cpp:558-608): a key-path spend is both cheaper and
-               ;; smaller, and reveals nothing about the tree.
-               (sk
-                (let ((sighash (bl.interop:compute-bip341-sighash
-                                amount tap-sighash-type nil nil)))
-                  ;; No sighash is defined for SIGHASH_SINGLE at an input
-                  ;; index with no matching output. Signing the
-                  ;; omitted-field preimage would hand back a transaction
-                  ;; Core rejects, so fail loudly instead.
-                  (unless sighash
-                    (fail "P2TR SIGHASH_SINGLE has no output at this input index"))
-                  (let ((sig (%tap-sig (bl.crypto:taproot-tweak-private-key sk)
-                                       sighash tap-sighash-type)))
-                    (values (%make-input-sig :kind :p2tr :needed 1 :tap sig)))))
-               (t
-                (multiple-value-bind (stack leaf-sigs leaf)
-                    (%tr-script-path-witness leaves amount tap-sighash-type pubmap)
-                  (unless stack
-                    (fail "no satisfiable script path for P2TR"))
-                  (values (%make-input-sig :kind :p2tr-script :needed 1
-                                           :stack stack
-                                           :tap-script-sigs leaf-sigs
-                                           :tap-leaf leaf)))))))
+           (%p2tr-input spk amount tap-sighash-type tr-keymap tr-scripts
+                        pubmap spent-utxos))
           ((string= type "scripthash")   ; P2SH (wrapped)
            (cond
              ((null redeem) (fail "P2SH requires redeemScript"))
@@ -628,7 +652,17 @@ must be bound by the caller."
               (multiple-value-bind (pairs m) (legacy-multisig redeem)
                 (values (%make-input-sig :kind :p2sh-multisig :needed m :redeem redeem
                                          :ecdsa pairs))))
-             (t (fail "unsupported redeemScript type"))))
+             ;; Every remaining redeemScript shape Core can sign is one its
+             ;; SignStep already answers for a BARE script, because
+             ;; ProduceSignature simply calls SignStep again on the
+             ;; redeemScript (sign.cpp:743-752). Only SCRIPTHASH is excluded
+             ;; there (`whichType != TxoutType::SCRIPTHASH'), and a
+             ;; hash-of-a-hash cannot be spent anyway.
+             (t (let ((redeem-type (bl.val:script-type-name redeem)))
+                  (cond
+                    ((string= redeem-type "pubkey") (p2pk-input redeem redeem))
+                    ((string= redeem-type "pubkeyhash") (p2pkh-input redeem redeem))
+                    (t (fail "unsupported redeemScript type")))))))
           ((string= type "witness_v0_scripthash")   ; native P2WSH
            (p2wsh-input (subseq spk 2 34) nil))
           ((parse-multisig spk)   ; bare multisig
@@ -668,6 +702,20 @@ the same bytes it always was."
                   (values (concatenate '(vector (unsigned-byte 8))
                                        (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data (car s)))
                           nil nil)))
+        ;; P2SH-wrapped P2PK / P2PKH: Core appends the redeemScript to the
+        ;; recursion's result and PushAll's the lot (sign.cpp:790-795), so the
+        ;; scriptSig is the bare shape's pushes followed by the redeemScript.
+        (:p2sh-p2pk (let ((s (first (input-sig-ecdsa sig))))
+                      (values (concatenate '(vector (unsigned-byte 8))
+                                           (bl.ser:script-push-data (cdr s))
+                                           (bl.ser:script-push-data (input-sig-redeem sig)))
+                              nil nil)))
+        (:p2sh-p2pkh (let ((s (first (input-sig-ecdsa sig))))
+                       (values (concatenate '(vector (unsigned-byte 8))
+                                            (bl.ser:script-push-data (cdr s))
+                                            (bl.ser:script-push-data (car s))
+                                            (bl.ser:script-push-data (input-sig-redeem sig)))
+                               nil nil)))
         (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                    (values nil (list (cdr s) (car s)) nil)))
         (:p2tr (values nil (list (input-sig-tap sig)) nil))
