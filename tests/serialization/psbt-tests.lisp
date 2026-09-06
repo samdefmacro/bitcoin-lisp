@@ -390,6 +390,39 @@ PSBTInputSignedAndVerified rejects before it verifies anything."
        (bl.ser:bb-finish bb)))
     psbt))
 
+(test psbt-multisig-records-a-signature-for-every-held-key
+  "GA11 42a8a239. Core's SignStep calls CreateSig for EVERY key of a MULTISIG
+and caps only the stack push (script/sign.cpp:669-688); CreateSig records each
+one in sigdata.signatures and PSBTInput::FromSignatureData copies that whole
+map into partial_sigs (psbt.cpp:178). So a 2-of-3 P2WSH input signed by a
+holder of ALL THREE keys carries THREE PSBT_IN_PARTIAL_SIG records for the
+next cosigner, not two -- which is the workflow the Core comment exists for.
+
+The two-key row is the control that the count follows the KEYS HELD and not
+the threshold: it answers 2 both before and after the collector changed."
+  (let* ((sks (loop for i from 0 below 3
+                    collect (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element (+ 21 i))))
+         (wifs (mapcar (lambda (sk) (bl.crypto:private-key-to-wif
+                                     sk :network :regtest :compressed t))
+                       sks))
+         (pks (mapcar (lambda (sk) (bl.crypto:derive-public-key sk :compressed t))
+                      sks))
+         (witscript (multisig-script 2 pks))
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                           #(#x00 #x20) (bl.crypto:sha256 witscript))))
+    (flet ((records-for (signing-wifs)
+             (let ((psbt (%psbt-spending spk 100000)))
+               (bl.ser:psbt-map-set
+                (aref (bl.ser:psbt-inputs psbt) 0)
+                bl.ser:+psbt-in-witness-script+
+                (make-array 0 :element-type '(unsigned-byte 8))
+                witscript)
+               (length (first (%psbt-partial-sigs
+                               (%psbt-sign-with-wifs psbt signing-wifs)))))))
+      (is (= 3 (records-for wifs)))
+      (is (= 2 (records-for (list (first wifs) (second wifs))))))))
+
 (defun %psbt-process-with-descriptors (node psbt descriptors)
   "The descriptorprocesspsbt RPC over a psbt struct."
   (bl.wallet::rpc-descriptorprocesspsbt

@@ -93,3 +93,14 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
                                     (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
                                           (aref s 23) #x88 (aref s 24) #xac) s)))
    :lock-time 0))
+
+;;;; Bare multisig
+
+(defun multisig-script (m pubs)
+  "OP_m <pub>... OP_n OP_CHECKMULTISIG for the list of compressed PUBS."
+  (apply #'concatenate '(vector (unsigned-byte 8))
+         (vector (+ #x50 m))
+         (append (mapcar (lambda (p) (concatenate '(vector (unsigned-byte 8))
+                                                  (vector (length p)) p))
+                         pubs)
+                 (list (vector (+ #x50 (length pubs)) #xae)))))
