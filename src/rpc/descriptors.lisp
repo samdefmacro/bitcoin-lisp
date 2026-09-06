@@ -754,7 +754,13 @@ optional caches); keep the two derivation paths in sync."
   ;; disagree for an xpub in a tapscript leaf.  Core prints that leaf as
   ;; pk(xpub.../1/*) -- an xpub, not x-only hex -- while still pushing the
   ;; 32-byte form into the script (descriptor_tests.cpp:640).
-  (xonly-script-p nil :type boolean))
+  (xonly-script-p nil :type boolean)
+  ;; Core DescriptorImpl::m_warnings (descriptor.cpp:808): non-fatal notes
+  ;; about a descriptor that PARSED. Only the miniscript constructor fills
+  ;; it, and only importdescriptors reads it -- Warnings() has exactly one
+  ;; production caller in Core (wallet/rpc/backup.cpp:243). Strings, in the
+  ;; order the node walk found them.
+  (warnings '() :type list))
 
 (defconstant +max-pubkeys-per-multisig+ 20
   "Core MAX_PUBKEYS_PER_MULTISIG (script/script.h:36): CHECKMULTISIG's limit.")
@@ -1072,6 +1078,22 @@ one of its key expressions makes it several."
         (:sh (%desc-error "A function is needed within P2SH"))
         (t (%desc-error "'~A' is not a valid descriptor function" expr))))))
 
+(defun %miniscript-warnings (node)
+  "Core's MiniscriptDescriptor constructor warnings (descriptor.cpp:1648-1661):
+one line per OLDER fragment whose relative-locktime value part exceeds
+SEQUENCE_LOCKTIME_MASK, because BIP68 carries only 16 bits of value and such
+a lock is enforced masked -- older(100000) is 34464 blocks, a third of what
+its author wrote. The message quotes the RAW k, as Core's strprintf does, and
+AFTER is deliberately not warned about: an absolute locktime has the full
+field, and Core's own vectors keep a no-false-positive case for it
+(descriptor_tests.cpp:1327-1335)."
+  (loop for (raw . kind) in (bl.val:ms-node-unsafe-older-locktimes node)
+        collect (ecase kind
+                  (:height (format nil "height-based relative locktime: older(~D) ~
+> 65535 blocks is unsafe" raw))
+                  (:time (format nil "time-based relative locktime: older(~D) ~
+> (65535 * 512) seconds is unsafe" raw)))))
+
 (defun %parse-miniscript-descriptor (expr network ms-ctx)
   "Parse EXPR as a miniscript whose key arguments are descriptor key
 expressions. Returns a LIST of :miniscript out-descs -- one per BIP389
@@ -1125,7 +1147,8 @@ which is why the context travels with the node rather than being assumed."
              groups "Miniscript: Multipath derivation paths have mismatched lengths")
           (loop for i below max-len
                 collect (if (zerop i)
-                            (make-out-desc :kind :miniscript :node node :keys keys)
+                            (make-out-desc :kind :miniscript :node node :keys keys
+                                           :warnings (%miniscript-warnings node))
                             ;; A later branch needs a node of its own. Ours
                             ;; carries the desc-keys themselves where Core's
                             ;; carries indices into a table it re-points, so the
@@ -1139,7 +1162,9 @@ which is why the context travels with the node rather than being assumed."
                                                 (pop remaining)))
                                 (make-out-desc :kind :miniscript
                                                :node branch-node
-                                               :keys branch-keys))))))))))
+                                               :keys branch-keys
+                                               :warnings (%miniscript-warnings
+                                                          branch-node)))))))))))
 
 (defun %check-miniscript-sane (node)
   "Core's acceptance gate for a miniscript descriptor (descriptor.cpp:2604-2628):
@@ -1222,6 +1247,14 @@ which is exactly how tr(KEY,TREE) would otherwise slip past every predicate
 that only knew about SUB."
   (cond ((out-desc-tree desc) (mapcar #'cdr (out-desc-tree desc)))
         ((out-desc-sub desc) (list (out-desc-sub desc)))))
+
+(defun out-desc-all-warnings (desc)
+  "DESC's own warnings followed by its sub-descriptors', mirroring Core's
+DescriptorImpl::Warnings (descriptor.cpp:1041-1048). The recursion is what
+carries a warning raised on a miniscript node out through the enclosing
+wsh() or tr() -- the descriptor the caller actually holds."
+  (append (out-desc-warnings desc)
+          (mapcan #'out-desc-all-warnings (%out-desc-children desc))))
 
 (defun out-desc-ranged-p (desc)
   (or (some #'desc-key-ranged-p (out-desc-keys desc))

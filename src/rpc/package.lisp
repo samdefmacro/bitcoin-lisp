@@ -133,6 +133,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:make-descriptor-cache
    #:make-recipient
    #:obj-get
+   #:out-desc-all-warnings
    #:out-desc-expand-from-cache
    #:out-desc-expand-with-provider
    #:out-desc-kind

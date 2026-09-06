@@ -1287,10 +1287,18 @@
   types that survive can_wrap_P2WSH with compressed keys. reqSigs and the
   plural addresses are Core's pre-v22 shape and are gone.
 
+  A parsed descriptor carries a WARNINGS channel (Core
+  `DescriptorImpl::Warnings'), aggregated through the sub-descriptors so a
+  note raised on a miniscript node reaches the enclosing wsh() or tr().
+  Only the miniscript parser fills it -- an older() whose value part
+  exceeds BIP68's 16-bit field, which is enforced masked -- and only
+  importdescriptors reads it, which is also the whole of Core's use.
+
   Trap: the recurring failure shape in this tree is correct code with
   the wrong or missing caller -- an index built but never maintained, a
   check present but never reached. Test the wire, not the function."
   (bitcoin-lisp.rpc:with-node-lock macro)
+  (bitcoin-lisp.rpc:out-desc-all-warnings function)
   (bitcoin-lisp.rpc:script-to-json function)
   (bitcoin-lisp.rpc:script->address function)
   (bitcoin-lisp.rpc:decode-tx function)

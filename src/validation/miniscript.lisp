@@ -1206,6 +1206,33 @@ or NIL for a subtree that names none."
 the negation of Core's CheckDuplicateKey (miniscript.h:1688)."
   (eq :dup (ms-tree-eval node #'%ms-keys-up)))
 
+(defun ms-node-unsafe-older-locktimes (node)
+  "Every OLDER fragment in NODE whose relative-locktime VALUE part exceeds
+SEQUENCE_LOCKTIME_MASK, as a list of (RAW-K . :HEIGHT|:TIME) in traversal
+order (Core's MiniscriptDescriptor constructor walk, script/descriptor.cpp:
+1648-1661).
+
+BIP68 carries only 16 bits of value, so older(100000) is ENFORCED as
+100000 & 0xFFFF = 34464 blocks -- about a third of the lock its author
+wrote. Nothing about the script is wrong; the caller is expected to say so.
+The keyword is chosen by SEQUENCE_LOCKTIME_TYPE_FLAG in the RAW k, and the
+raw k is what comes back, because Core's message quotes the number the
+author typed, not the masked one."
+  (let ((found '()))
+    (ms-tree-eval node
+                  (lambda (state n children)
+                    (declare (ignore state children))
+                    (let ((k (ms-node-k n)))
+                      (when (and (eq (ms-node-fragment n) :older)
+                                 (> (logandc2 k +ms-sequence-locktime-type-flag+)
+                                    +ms-sequence-locktime-mask+))
+                        (push (cons k (if (logtest k +ms-sequence-locktime-type-flag+)
+                                          :time
+                                          :height))
+                              found)))
+                    nil))
+    (nreverse found)))
+
 (defun ms-node-valid-satisfactions-p (node)
   "Core Node::ValidSatisfactions (miniscript.h:1691)."
   (and (ms-node-valid-p node)

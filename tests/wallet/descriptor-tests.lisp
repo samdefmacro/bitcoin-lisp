@@ -971,6 +971,58 @@ are identical -- so the wallet's change chain reused its receive addresses."
           (is (string= "wpkh(): Key path value '<0;1>' specifies multipath in a section where multipath is not allowed"
                        (aval "message" (aval "error" result)))))))))
 
+(test miniscript-import-warns-about-an-unsafe-older
+  "GA11 3ded15f3. Core's MiniscriptDescriptor constructor walks the node and
+records a warning for every older() whose value part exceeds
+SEQUENCE_LOCKTIME_MASK (script/descriptor.cpp:1648-1661);
+DescriptorImpl::Warnings aggregates a descriptor's own with its
+sub-descriptors' (:1041-1048), which is what carries the note out through the
+enclosing wsh(); and ProcessDescriptorImport copies them into the
+importdescriptors result (wallet/rpc/backup.cpp:243-245), Core's only
+production reader of Warnings(). We had no warnings channel at all, so
+older(100000) -- enforced by BIP68 as 100000 & 0xFFFF = 34464 blocks, about a
+third of the lock its author wrote -- imported silently.
+
+Core's own four descriptor_older_warnings vectors (test/descriptor_tests.cpp:
+1291-1336), through the shipped importdescriptors. Two of them are required
+NEGATIVE controls: older(65535) is on the safe side of a strictly-greater-than
+boundary, and after() is an ABSOLUTE locktime with the full field, so warning
+about it would be a false positive. Every import still succeeds -- this is a
+report, not a refusal."
+  (with-wallet-chain-node (node "olderwarn")
+    (labels ((rpc (method &rest params)
+               (with-rpc-wallet (nil)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+             (aval (key alist) (cdr (assoc key alist :test #'string=)))
+             (import-warnings (desc)
+               (let ((h (make-hash-table :test 'equal)))
+                 (setf (gethash "desc" h) (bl.rpc:descriptor-add-checksum desc)
+                       (gethash "timestamp" h) "now")
+                 (let ((result (first (rpc "importdescriptors" (list h)))))
+                   (is (eq t (aval "success" result))
+                       "importdescriptors refused ~A: ~S" desc (aval "error" result))
+                   (aval "warnings" result))))
+             (policy (fragment)
+               (format nil "wsh(and_v(v:pk(~A),~A))"
+                       "0379e45b3cf75f9c5f9befd8e9506fb962f6a9d185ac87001ec44a8d3df8d4a9e3"
+                       fragment)))
+      (rpc "createwallet" "wo" t)
+      ;; The boundary value is safe: Core's check is strictly greater than.
+      (is (null (import-warnings (policy "older(65535)"))))
+      ;; Height-based, one over the mask.
+      (is (equal '("height-based relative locktime: older(65536) > 65535 blocks is unsafe")
+                 (import-warnings (policy "older(65536)"))))
+      ;; Time-based: 65536 | SEQUENCE_LOCKTIME_TYPE_FLAG, and the message
+      ;; quotes the RAW k, as Core's strprintf does.
+      (is (equal '("time-based relative locktime: older(4259840) > (65535 * 512) seconds is unsafe")
+                 (import-warnings (policy "older(4259840)"))))
+      ;; No false positive for an absolute timelock.
+      (is (null (import-warnings (policy "after(1000000)"))))
+      ;; The case an operator actually writes: two years asked for, eight
+      ;; months enforced.
+      (is (equal '("height-based relative locktime: older(100000) > 65535 blocks is unsafe")
+                 (import-warnings (policy "older(100000)")))))))
+
 ;;;; --- Key expression order, and inference of wsh(<miniscript>) ------------
 
 (defun %dt-expand-pairs (desc-string)

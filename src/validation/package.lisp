@@ -209,6 +209,7 @@ can. src/validation/.")
    #:ms-node-script
    #:ms-node-timelock-mix-p
    #:ms-node-to-string
+   #:ms-node-unsafe-older-locktimes
    #:ms-node-valid-p
    #:ms-node-valid-satisfactions-p
    #:ms-parse
