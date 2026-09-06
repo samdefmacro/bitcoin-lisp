@@ -153,13 +153,13 @@ bl:start-node: mine a chain, empty the UTXO set underneath it while the
 chainstate and the coins pointer keep naming the tip, and the next start must
 refuse rather than come up and serve the empty set."
   (with-temporary-node (base "test-verifydb-start")
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     (generate-regtest-blocks bl:*node* 8)
     (bl:stop-node)
     ;; A clean restart passes verification.
     (bl.net:reset-ibd-stop)
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     (let* ((cs (bl:node-chain-state bl:*node*))
            (utxo (bl:node-utxo-set bl:*node*))
@@ -173,8 +173,8 @@ refuse rather than come up and serve the empty set."
       (setf bl:*node* nil))
     (bl.net:reset-ibd-stop)
     (signals error
-      (bl:start-node :data-directory base :network :regtest :sync nil
-                     :rpc-port nil :listen nil :console-log nil))))
+      (start-test-node :data-directory base :network :regtest :sync nil
+                       :rpc-port nil :listen nil :console-log nil))))
 
 (test verify-db-passes-over-blocks-that-actually-spend
   "The startup pass must not cry corruption on a healthy node, and a chain of
@@ -188,7 +188,7 @@ NIL for an EMPTY undo record and for an unreadable one alike, so an
 undo-pos-carrying coinbase-only block read as 'bad undo data' and every clean
 restart refused to start."
   (with-temporary-node (base "test-verifydb-spend")
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     ;; 101 blocks so block 1's coinbase is mature, then a block holding a
     ;; transaction that spends it. generateblock, not the mempool: a bare
@@ -224,7 +224,7 @@ restart refused to start."
     ;; The restart runs VerifyDB at startup; reaching here at all means it did
     ;; not refuse.
     (bl.net:reset-ibd-stop)
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     (let ((cs (bl:node-chain-state bl:*node*))
           (store (bl:node-block-store bl:*node*)))

@@ -176,7 +176,7 @@ the first replay flush, restart with no flags. The node must come back AT
 GENESIS with an empty UTXO set -- never at the pre-reindex tip."
   (with-temporary-node (base "test-reindex-crash")
     ;; A chain on disk, committed by a clean shutdown.
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     (generate-regtest-blocks bl:*node* 8)
     (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*))))
@@ -185,7 +185,7 @@ GENESIS with an empty UTXO set -- never at the pre-reindex tip."
     ;; genesis with the marker, wipe) and die with nothing flushed -- exactly
     ;; what a killed process leaves behind.
     (bl.net:reset-ibd-stop)
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     (let ((cs (bl:node-chain-state bl:*node*))
           (utxo (bl:node-utxo-set bl:*node*)))
@@ -202,7 +202,7 @@ GENESIS with an empty UTXO set -- never at the pre-reindex tip."
       (setf bl:*node* nil))
     ;; Ordinary restart, no flags.
     (bl.net:reset-ibd-stop)
-    (bl:start-node :data-directory base :network :regtest :sync nil
+    (start-test-node :data-directory base :network :regtest :sync nil
                    :rpc-port nil :listen nil :console-log nil)
     (let ((cs (bl:node-chain-state bl:*node*))
           (utxo (bl:node-utxo-set bl:*node*)))

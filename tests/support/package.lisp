@@ -24,6 +24,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-deterministic-rng
    #:release-datadir-lock
    #:with-temporary-node
+   #:start-test-node
    #:clear-undo-cache
    #:coins-cache-entries
    #:coins-cache-fresh-count
