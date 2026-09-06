@@ -392,6 +392,10 @@
 ;; DEFAULT_WALLETCROSSCHAIN = false). Accepting and ignoring it made us behave
 ;; as if it were permanently on.
 (define-option "walletcrosschain")
+;; -allowignoredconf: downgrade the shadowed-bitcoin.conf refusal
+;; (CHECK-IGNORED-CONFIG-FILE, Core common/init.cpp:65-95) to a warning. Read by
+;; name in START-NODE-FROM-ARGS, like the RPC knobs above.
+(define-option "allowignoredconf")
 ;; -walletbroadcast: Core fBroadcastTransactions (DEFAULT_WALLETBROADCAST =
 ;; true, wallet.cpp:3068). A start-node keyword rather than a :GLOBAL row so
 ;; every run starts from the default, and because -blocksonly soft-sets it in
@@ -458,7 +462,7 @@
 ;;; init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
 
 (define-core-only-options
-  "addresstype" "alertnotify" "allowignoredconf"
+  "addresstype" "alertnotify"
   "avoidpartialspends" "blockreconstructionextratxn"
   "blocksdir" "capturemessages"
   "changetype" "checkaddrman" "checkblockindex"

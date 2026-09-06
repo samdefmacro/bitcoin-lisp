@@ -282,7 +282,21 @@
   GetArgs, GetBoolArg decide the semantics, not the declaration); moving
   an option out of the core-only list must add a real row or the node
   refuses to start. A `:global` row sets a special; a repeatable option
-  sets its special through `:apply`."
+  sets its special through `:apply`. A `:global` row is only ASSIGNED when
+  the option is present, so an option that must return to its default on
+  every start belongs in a `:key` row that START-NODE re-applies -- which
+  is also why the soft-set half of such an option lives in
+  CONFIG-ALIST->START-NODE-PLIST rather than APPLY-PARAMETER-INTERACTIONS.
+
+  Locating the config file is its own seam, and Core's ordering is
+  load-bearing: the datadir and the config path are recorded BEFORE the
+  file is read, because a `datadir=` line inside it moves the datadir --
+  and the `bitcoin.conf` sitting in the directory it moved to is then
+  ignored. CHECK-IGNORED-CONFIG-FILE refuses to start on that, and on a
+  `-conf=` that shadows the datadir's own file, unless `-allowignoredconf`
+  downgrades it; RESOLVE-CONF-PATH resolves a relative `-conf` against the
+  datadir, and CHECK-CONFIG-FILE-READABLE makes an explicit `-conf` that
+  cannot be opened fatal instead of a silent start on defaults."
   (bitcoin-lisp.config package)
   (bitcoin-lisp.config:define-option macro)
   (bitcoin-lisp.config:define-core-only-options macro)
@@ -1127,6 +1141,9 @@
   (bitcoin-lisp:node-main function)
   (bitcoin-lisp::args->start-node-plist function)
   (bitcoin-lisp::apply-config-globals function)
+  (bitcoin-lisp::resolve-conf-path function)
+  (bitcoin-lisp::check-config-file-readable function)
+  (bitcoin-lisp::check-ignored-config-file function)
   (bitcoin-lisp::signet-chain-params function)
   (bitcoin-lisp::should-persist-mempool-p function)
   (bitcoin-lisp::save-mempool-at-shutdown function)

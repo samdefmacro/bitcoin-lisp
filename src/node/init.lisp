@@ -1706,19 +1706,21 @@ file location."
                    (uiop:ensure-directory-pathname
                     (or (cdr (assoc "datadir" cli :test #'string=))
                         "~/.bitcoin-lisp/"))))
-         (conf-path (or (cdr (assoc "conf" cli :test #'string=))
-                        ;; Ensure a trailing slash so DATADIR is treated as a
-                        ;; directory (else merge-pathnames replaces its last
-                        ;; component).
-                        (merge-pathnames
-                         "bitcoin.conf"
-                         (pathname (if (and (plusp (length datadir))
-                                            (char= (char datadir (1- (length datadir))) #\/))
-                                       datadir
-                                       (concatenate 'string datadir "/"))))))
+         ;; Core records the ORIGINAL datadir and config path before the file
+         ;; is read, because a datadir= line inside it moves the datadir
+         ;; afterwards (common/init.cpp:25-35). Both are needed again below,
+         ;; where the bitcoin.conf of the datadir we ended up in is compared
+         ;; against the one we actually read.
+         (orig-datadir datadir)
+         (conf-explicit-p nil)
+         (conf-path (multiple-value-bind (path explicit-p)
+                        (resolve-conf-path args cli datadir)
+                      (setf conf-explicit-p explicit-p)
+                      path))
          (conf-text (progn
                       (%check-datadir-option cli)
-                      (when (probe-file conf-path)
+                      (check-config-file-readable conf-path conf-explicit-p)
+                      (when (and conf-path (probe-file conf-path))
                         (defer-log :info "Reading config file ~A" conf-path)
                         (alexandria:read-file-into-string conf-path))))
          (conf-texts (%read-config-includes conf-text cli datadir))
@@ -1765,6 +1767,16 @@ file location."
       ;; back to check how an option was actually resolved, so both the wording
       ;; and the JSON rendering of the value are part of the contract.
       (%log-args args conf-texts settings-cells settings-network)
+      ;; The datadir the merged config settled on may not be the one the config
+      ;; file was located from, and the bitcoin.conf sitting in it is then
+      ;; silently ignored -- Core refuses to start on exactly this
+      ;; (common/init.cpp:65-95). Here, after the merge and before anything is
+      ;; created or written.
+      (check-ignored-config-file
+       orig-datadir conf-path
+       (%normalize-datadir (or (getf plist :data-directory) datadir)) cli
+       :allow-ignored (let ((c (assoc "allowignoredconf" merged :test #'string=)))
+                        (and c (conf-parse-bool (cdr c)))))
       ;; BEFORE the settings file is written, because writing it creates the
       ;; network directory and %ENSURE-WALLETS-SUBDIRECTORY only acts on a
       ;; directory that does not exist yet. START-NODE calls it too, for callers
