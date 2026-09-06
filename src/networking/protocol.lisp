@@ -685,6 +685,38 @@ Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
               (cond (bucket (push inv (cdr bucket)) to-send)
                     (t (cons (list peer inv) to-send))))))))
 
+(defun %already-have-and-forget-p (inv mempool recent-rejects)
+  "T when the transaction INV would fetch has arrived by some other route
+since its announcement -- a block confirmed it, an RPC submitted it, a
+package carried it -- in which case its tracker entry is forgotten instead of
+requested. Core's belt-and-suspenders in GetRequestsToSend
+(txdownloadman_impl.cpp:274-284), where every requestable announcement is
+re-checked against AlreadyHaveTx immediately before it becomes a getdata."
+  (let ((hash (bl.ser:inv-vector-hash inv)))
+    (when (%already-have-tx-p hash
+                              (= (bl.ser:inv-vector-type inv)
+                                 bl.ser:+inv-type-wtx+)
+                              mempool recent-rejects)
+      (tx-request-received hash)
+      t)))
+
+(defun %drop-already-have-requests (to-send ctx)
+  "TO-SEND minus the requests CTX says are pointless. Runs OUTSIDE the
+tracker lock: the check reads the mempool and the orphanage, which have locks
+of their own. With no CTX (or no mempool in it) nothing is dropped -- the
+re-check is an optimisation, never a gate."
+  (if (null ctx)
+      to-send
+      (bl.ctx:with-node-context (mempool recent-rejects) ctx
+        (if (null mempool)
+            to-send
+            (loop for (peer . invs) in to-send
+                  for live = (remove-if (lambda (inv)
+                                          (%already-have-and-forget-p
+                                           inv mempool recent-rejects))
+                                        invs)
+                  when live collect (cons peer live))))))
+
 (defun %send-tx-getdatas (to-send)
   "Send TO-SEND (peer -> invs, as %TX-REQUEST-SCHEDULE builds it) as one
 getdata per peer, OUTSIDE the tracker lock, and return the number of invs
@@ -701,11 +733,15 @@ never worked for segwit txs (a first-announcer-wins censorship primitive)."
                (error () nil)))
     sent))
 
-(defun process-tx-requests ()
+(defun process-tx-requests (&optional ctx)
   "Send getdatas for announcements whose delay has passed and that have no
 request outstanding — the scheduler half of Core's GetRequestsToSend
 (txdownloadman_impl.cpp:264-284), run ~1x/second from the sync loop. Each
-hash goes to its best candidate. Returns the number of requests sent."
+hash goes to its best candidate. Returns the number of requests sent.
+
+CTX, the node-context, is optional and enables Core's belt-and-suspenders
+re-check: a hash we have acquired since its announcement is forgotten rather
+than requested (%DROP-ALREADY-HAVE-REQUESTS)."
   (let ((now (get-internal-real-time))
         (to-send '()))                  ; (peer . list-of-invs)
     (bt:with-lock-held (*tx-request-lock*)
@@ -713,7 +749,7 @@ hash goes to its best candidate. Returns the number of requests sent."
                  (declare (ignore anns))
                  (setf to-send (%tx-request-schedule hash now to-send)))
                *tx-announcers*))
-    (%send-tx-getdatas to-send)))
+    (%send-tx-getdatas (%drop-already-have-requests to-send ctx))))
 
 (defun process-tx-requests-for (hashes)
   "The same pass restricted to HASHES — the prompt failover after a peer says
@@ -733,6 +769,34 @@ per-peer index of CANDIDATE_BEST announcements (txrequest.cpp:595-624)."
       (dolist (hash hashes)
         (setf to-send (%tx-request-schedule hash now to-send))))
     (%send-tx-getdatas to-send)))
+
+(bl.vi:define-validation-hook :block-connected tx-request-block-connected
+    (chainstate block block-hash height spent-utxos)
+  "Core BlockConnected's tx-download half (txdownloadman_impl.cpp:98-110): a
+transaction the block just confirmed is RESOLVED, so every peer's tracked
+announcement of it goes, under both ids. Otherwise the next scheduler pass
+sends a getdata for a transaction we already know is confirmed, and a Core
+peer answers it in full out of m_most_recent_block_txs -- a whole redundant
+transaction body that handle-tx then discards on its recently-confirmed
+check.
+
+The recently-confirmed FILTER half of the same Core function lives in
+NOTE-BLOCK-CONNECTED, in the validation layer that owns the filter; this half
+is here because the tracker is, and the hook is what lets validation drive it
+without naming networking."
+  (declare (ignore block-hash height spent-utxos))
+  ;; An assumeutxo TARGETED chainstate re-derives ancient history; Core wires
+  ;; the tx-download callbacks to the ACTIVE chainstate only
+  ;; (net_processing.cpp:2086-2092), and its blocks would otherwise release
+  ;; announcements of transactions that are still unconfirmed for us.
+  (unless (bl.store:chain-state-target-blockhash chainstate)
+    (map nil (lambda (tx)
+               (let ((txid (bl.ser:transaction-hash tx))
+                     (wtxid (bl.ser:transaction-wtxid tx)))
+                 (tx-request-received txid)
+                 (unless (equalp wtxid txid)
+                   (tx-request-received wtxid))))
+         (bl.ser:bitcoin-block-transactions block))))
 
 (defun tx-fetch-inv-type (peer)
   "Inv type for a TXID-based tx getdata to PEER: MSG_TX|MSG_WITNESS_FLAG when
@@ -756,14 +820,15 @@ wtxid-based entry, MSG_TX|witness-flag for a txid-based one — Core's
              (tx-fetch-inv-type peer))
    :hash hash))
 
-(defun retry-timed-out-tx-requests ()
+(defun retry-timed-out-tx-requests (&optional ctx)
   "Re-route each in-flight tx getdata outstanding longer than
 GETDATA_TX_INTERVAL to the next ready announcer; drop tracking for a tx whose
 announcers have all gone away. The expired announcement is marked COMPLETED,
 which is what Core's SetTimePoint does to a REQUESTED entry whose expiry has
 passed (txrequest.cpp:485-500) — the peer keeps the slot it burned, so it may
 not re-announce its way into a second GETDATA_TX_INTERVAL window on the same
-transaction. Returns the number re-requested."
+transaction. Returns the number re-requested. CTX enables the same
+belt-and-suspenders re-check PROCESS-TX-REQUESTS takes it for."
   (let ((now (get-internal-real-time))
         (timeout-ticks (* +tx-request-timeout-seconds+ internal-time-units-per-second))
         (to-send '()))
@@ -788,7 +853,7 @@ transaction. Returns the number re-requested."
                                    (eq (peer-state (tx-ann-peer ann)) :ready))
                                  anns)
                   (%tx-announcers-erase txid))))))))
-    (%send-tx-getdatas to-send)))
+    (%send-tx-getdatas (%drop-already-have-requests to-send ctx))))
 
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
 
