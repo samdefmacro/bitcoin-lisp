@@ -1006,11 +1006,7 @@ absence."
 (Bitcoin Core prioritisetransaction). PARAMS: (txid [dummy] fee-delta) —
 dummy must be 0 or null (legacy priority is gone). The delta also counts for
 mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
-  (let* ((txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
-    (unless txid
-      ;; Core ParseHashV: parse/format failures are -8, util.cpp:117-125.
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid txid"))
+  (let* ((txid (parse-hash-v txid-hex "txid")))
     (unless (or (null dummy) (and (numberp dummy) (zerop dummy)))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."))

@@ -1,9 +1,94 @@
 (in-package #:bitcoin-lisp.rpc)
 
-;;;; Amounts and outputs (Core AmountFromValue / FormatMoney / ParseOutputs /
-;;;; CFeeRate::GetFee): the money helpers every RPC file shares. They used to
-;;;; live in the wallet files, which made mempool and rawtransaction RPCs
-;;;; depend on the wallet for a BTC-to-satoshi parse.
+;;;; Core rpc/util.cpp: the argument parsers every RPC file shares.
+;;;;
+;;;; ParseHashV / ParseHexV for a hash- or hex-valued argument, and
+;;;; AmountFromValue / FormatMoney / ParseOutputs / CFeeRate::GetFee for a
+;;;; money-valued one. The money half used to live in the wallet files, which
+;;;; made mempool and rawtransaction RPCs depend on the wallet for a
+;;;; BTC-to-satoshi parse; the hash half used to be eleven per-call-site
+;;;; spellings of the same check, none of them Core's.
+
+;;; --- Hashes and hex (Core ParseHashV / ParseHexV, rpc/util.cpp:116-142) ---
+
+(defun valid-hex-hash-p (str)
+  "Check if STR is a valid 64-character hex hash."
+  (and (stringp str)
+       (= (length str) 64)
+       (every (lambda (c) (digit-char-p c 16)) str)))
+
+(defun parse-hex-hash (str)
+  "Parse a hex string to byte vector (reversed for internal use)."
+  (when (valid-hex-hash-p str)
+    (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
+      (loop for i from 0 below 32
+            for j from 62 downto 0 by 2
+            do (setf (aref bytes i)
+                     (parse-integer str :start j :end (+ j 2) :radix 16)))
+      bytes)))
+
+(defun hash-to-hex (bytes)
+  "Convert a 32-byte hash to lowercase hex string (reversed for display),
+matching Bitcoin Core's uint256::GetHex."
+  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes bytes)))
+
+(defun hex-string-p (str)
+  "Core IsHex (util/strencodings.cpp:41-47): every character a hex digit, the
+length non-zero and even. The empty string is NOT hex, which is what makes
+ParseHexV's message for a non-string argument end in `(not \'\')\'."
+  (and (stringp str)
+       (plusp (length str))
+       (evenp (length str))
+       (every (lambda (c) (digit-char-p c 16)) str)))
+
+(defun parse-hash-v (value name)
+  "Core ParseHashV (rpc/util.cpp:117-125): the 32-byte hash the argument
+called NAME denotes, in internal (reversed) byte order.
+
+NAME is the argument's name AT THE CORE CALL SITE -- \"hash\" for
+getblockheader, \"blockhash\" for getblock, \"txid\" for gettxout,
+\"parameter 3\" for getrawtransaction's blockhash -- because Core's
+functional tests assert the whole sentence, not just the code. Core has
+exactly two failure branches and this tree had eleven, one per call site
+(\"Invalid block hash\", \"Invalid txid\", \"blockhash must be a hex
+string\", ...), so no Core test could match any of them:
+  - a wrong LENGTH is \"<name> must be of length 64 (not <n>, for '<value>')\";
+  - the right length with a non-hex character is
+    \"<name> must be hexadecimal string (not '<value>')\";
+both RPC_INVALID_PARAMETER (-8). A non-string VALUE is get_str()'s
+RPC_TYPE_ERROR (-3), not -8 -- Core's ExecuteCommand maps UniValue::type_error
+to RPC_TYPE_ERROR (rpc/server.cpp:512-513).
+
+The -8 is for a MALFORMED hash only. A well-formed hash naming no known block
+or transaction is the caller's -5 \"Block not found\", so a handler calls this
+first and looks the hash up afterwards."
+  (unless (stringp value)
+    (%json-type-error value "string"))
+  (or (parse-hex-hash value)
+      (if (/= (length value) 64)
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message (format nil "~A must be of length 64 (not ~D, for '~A')"
+                                             name (length value) value))
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message (format nil "~A must be hexadecimal string (not '~A')"
+                                             name value)))))
+
+(defun parse-hex-v (value name)
+  "Core ParseHexV (rpc/util.cpp:130-138): the bytes the hex argument called
+NAME denotes.
+
+Unlike PARSE-HASH-V this takes any even-length hex string and does NOT
+type-error on a non-string: Core's ParseHexV leaves strHex empty when
+`!v.isStr()\', so a number or an object produces the same
+RPC_INVALID_PARAMETER as bad hex does, ending in `(not \'\')\'."
+  (let ((hex (if (stringp value) value "")))
+    (unless (hex-string-p hex)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "~A must be hexadecimal string (not '~A')"
+                                         name hex)))
+    (bl.crypto:hex-to-bytes hex)))
+
+;;; --- Money (Core AmountFromValue / FormatMoney / ParseOutputs) ---
 
 (defun amount-from-value (value)
   "Core AmountFromValue: a JSON number or decimal string in BTC to
@@ -143,10 +228,11 @@ send/walletcreatefundedpsbt docstrings."
                (setf (gethash key seen) t)
                (push key keys)
                (if (string= key "data")
-                   (let ((data (handler-case (bl.crypto:hex-to-bytes value)
-                                 (error ()
-                                   (error 'rpc-error :code +rpc-invalid-parameter+
-                                                     :message "Data must be hexadecimal string")))))
+                   ;; Core ParseOutputs (rawtransaction_util.cpp:113):
+                   ;; ParseHexV of getValStr() under the name "Data", so the
+                   ;; offending text comes back in the message and a
+                   ;; non-string value reads as the empty string.
+                   (let ((data (parse-hex-v value "Data")))
                      (push (make-recipient :address nil
                                            :script (%op-return-script data)
                                            :amount 0)

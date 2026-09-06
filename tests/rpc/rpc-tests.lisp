@@ -893,6 +893,101 @@ this test against either version of the source."
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
   (is (not (bl.rpc:valid-hex-hash-p nil))))
 
+(defun %rpc-wire-error (node method params)
+  "(code . message) of the rpc-error METHOD signals for PARAMS, or NIL when it
+returns. PARAMS goes through the request normalizer, so the top-level
+sentinels are the ones a wire caller produces."
+  (rpc-error-of
+   (lambda ()
+     (bl.rpc:dispatch-rpc-method node method (wire-params params)))))
+
+(test hash-arguments-answer-core-parse-hash-v
+  "Every hash-valued RPC argument answers Core's ParseHashV sentence, naming
+the argument Core names (rpc/util.cpp:117-125).
+
+Core has TWO failure sentences and this tree had eleven, one per call site
+(\"Invalid block hash\", \"Invalid txid\", \"blockhash must be a hex
+string\", \"blockhash must be a hex string of length 64\", ...), so none of
+Core's eight functional assertions could match any of them. The rows below
+are the (method, argument, code, message) tuples Core produces; the last two
+are the controls that a WELL-FORMED but unknown hash still answers -5, so a
+regression in either direction shows up."
+  (let ((node (make-test-node))
+        (zeros (make-string 64 :initial-element #\0))
+        (non-hex (concatenate 'string "zzz" (make-string 61 :initial-element #\0))))
+    (dolist (row
+             (list
+              ;; blockchain.cpp:639 getblockheader -> "hash"
+              (list "getblockheader" (list "nonsense") -8
+                    "hash must be of length 64 (not 8, for 'nonsense')")
+              (list "getblockheader" (list non-hex) -8
+                    (format nil "hash must be hexadecimal string (not '~A')" non-hex))
+              ;; blockchain.cpp:842 getblock -> "blockhash"
+              (list "getblock" (list "1234") -8
+                    "blockhash must be of length 64 (not 4, for '1234')")
+              ;; blockchain.cpp:541 getblockfrompeer -> "blockhash"
+              (list "getblockfrompeer" (list "1234" 0) -8
+                    "blockhash must be of length 64 (not 4, for '1234')")
+              ;; blockchain.cpp:1828 getchaintxstats -> "blockhash", and it is
+              ;; reached BEFORE the index lookup, so this is -8 and not -5.
+              (list "getchaintxstats" (list 10 "0") -8
+                    "blockhash must be of length 64 (not 1, for '0')")
+              (list "getchaintxstats" (list 10 non-hex) -8
+                    (format nil "blockhash must be hexadecimal string (not '~A')" non-hex))
+              ;; blockchain.cpp:1224 gettxout -> "txid"
+              (list "gettxout" (list "foo" 0) -8
+                    "txid must be of length 64 (not 3, for 'foo')")
+              ;; blockchain.cpp:1732 invalidateblock -> "blockhash"
+              (list "invalidateblock" (list "foo") -8
+                    "blockhash must be of length 64 (not 3, for 'foo')")
+              ;; blockchain.cpp:2955 getblockfilter -> "blockhash"
+              (list "getblockfilter" (list "foo") -8
+                    "blockhash must be of length 64 (not 3, for 'foo')")
+              ;; blockchain.cpp:1519 getdeploymentinfo -> "blockhash"
+              (list "getdeploymentinfo" (list "foo") -8
+                    "blockhash must be of length 64 (not 3, for 'foo')")
+              ;; mempool.cpp:880 getmempoolentry -> "txid"
+              (list "getmempoolentry" (list "foo") -8
+                    "txid must be of length 64 (not 3, for 'foo')")
+              ;; mining.cpp:524 prioritisetransaction -> "txid"
+              (list "prioritisetransaction" (list "foo" 0 100) -8
+                    "txid must be of length 64 (not 3, for 'foo')")
+              ;; txoutproof.cpp:52,63 gettxoutproof -> "txid" / "blockhash"
+              (list "gettxoutproof" (list (list (subseq zeros 0 32))) -8
+                    (format nil "txid must be of length 64 (not 32, for '~A')"
+                            (subseq zeros 0 32)))
+              (list "gettxoutproof" (list (list zeros) (subseq zeros 0 32)) -8
+                    (format nil "blockhash must be of length 64 (not 32, for '~A')"
+                            (subseq zeros 0 32)))
+              ;; rawtransaction.cpp:287,300 getrawtransaction names its
+              ;; arguments by POSITION.
+              (list "getrawtransaction" (list "foo") -8
+                    "parameter 1 must be of length 64 (not 3, for 'foo')")
+              (list "getrawtransaction" (list zeros t "foobar") -8
+                    "parameter 3 must be of length 64 (not 6, for 'foobar')")
+              ;; rawtransaction_util.cpp:38 AddInputs -> "txid"
+              (list "createrawtransaction"
+                    (list (list (list (cons "txid" "foo") (cons "vout" 0)))
+                          (list))
+                    -8 "txid must be of length 64 (not 3, for 'foo')")
+              ;; rawtransaction_util.cpp:113 ParseOutputs -> ParseHexV "Data",
+              ;; the wallet_send.py:277 sentence.
+              (list "createrawtransaction"
+                    (list (list) (list (cons "data" "Hello World")))
+                    -8 "Data must be hexadecimal string (not 'Hello World')")
+              ;; A non-string is get_str()'s RPC_TYPE_ERROR, not -8
+              ;; (rpc/server.cpp:512-513).
+              (list "getblockheader" (list 5) -3
+                    "JSON value of type number is not of expected type string")
+              ;; Controls: a well-formed unknown hash is still -5.
+              (list "getblockheader" (list zeros) -5 "Block not found")
+              (list "getchaintxstats" (list 10 zeros) -5 "Block not found")))
+      (destructuring-bind (method params code message) row
+        (let ((got (%rpc-wire-error node method params)))
+          (is (equal (cons code message) got)
+              "~A ~S answered ~S, Core answers ~S"
+              method params got (cons code message)))))))
+
 ;;; --- Method Registry Tests ---
 
 (test method-dispatch-unknown
@@ -4219,7 +4314,7 @@ The witness reading cannot use it; the legacy reading consumes the lot.")
 arguments, through the dispatcher and the request normalizer."
   (bl.rpc:dispatch-rpc-method
    (make-test-node :network :regtest) "decoderawtransaction"
-   (bl.rpc::%normalize-rpc-params (coerce (cons hex more) 'vector))))
+   (wire-params (cons hex more))))
 
 (defun decode-raw-tx-field (hex key &rest more)
   (cdr (assoc key (apply #'decode-raw-tx hex more) :test #'string=)))
@@ -4866,7 +4961,7 @@ dispatcher and the request normalizer, so an empty array arrives as the
 sentinel and an explicit false as the false one."
   (bl.rpc:dispatch-rpc-method
    (make-test-node :network :regtest) "createrawtransaction"
-   (bl.rpc::%normalize-rpc-params (coerce params 'vector))))
+   (wire-params params)))
 
 (defun crt-one-input (&key (sequence nil sequence-p))
   (list (append (list (cons "txid" +crt-txid+) (cons "vout" 0))
@@ -4981,7 +5076,7 @@ inputs array answered that same wrong message."
   (flet ((outputs-error (outputs)
            (handler-case (progn (create-raw-tx #() outputs) nil)
              (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
-    (is (string= "Data must be hexadecimal string"
+    (is (string= "Data must be hexadecimal string (not 'zz')"
                  (outputs-error (list (cons "data" "zz")))))
     (is (string= "Invalid Bitcoin address: nosuchaddress"
                  (outputs-error (list (cons "nosuchaddress" 1)))))

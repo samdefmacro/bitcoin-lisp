@@ -1243,6 +1243,15 @@
   transaction whose txid names a prefix), and CheckTxScriptsSanity breaks
   the tie. `iswitness\' restricts which readings are tried.
 
+  Every hash- or hex-valued ARGUMENT goes through `parse-hash-v\' /
+  `parse-hex-v\', Core's ParseHashV/ParseHexV, carrying the argument name
+  Core's own call site uses ("hash" for getblockheader, "blockhash" for
+  getblock, "txid" for gettxout, "parameter 3" for getrawtransaction's
+  third): Core has exactly two sentences for a malformed hash and both echo
+  the offending text, and every one of the eleven per-call-site spellings this
+  tree used to carry was unmatched by any Core test. A -8 means MALFORMED; a
+  well-formed hash naming nothing is the handler's own -5.
+
   createrawtransaction, createpsbt and walletcreatefundedpsbt share Core's
   ONE AddInputs rule for a per-input nSequence (`default-input-sequence\'):
   `replaceable\' is an OPTIONAL bool whose absence means TRUE, so the
@@ -1275,6 +1284,8 @@
   (bitcoin-lisp.rpc:decode-tx function)
   (bitcoin-lisp.rpc:decode-hex-tx function)
   (bitcoin-lisp.rpc:default-input-sequence function)
+  (bitcoin-lisp.rpc:parse-hash-v function)
+  (bitcoin-lisp.rpc:parse-hex-v function)
   (bitcoin-lisp.rpc:parse-outputs function)
   (bitcoin-lisp.rpc:rpc-get-chain-state function)
   (bitcoin-lisp.rpc::*rpc-named-arg-names* variable)

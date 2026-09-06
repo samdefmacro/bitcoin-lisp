@@ -43,19 +43,16 @@
         (data-seen nil))
     (let ((tx-inputs
             (loop for inp in inputs
-                  for txid = (bl.rpc:obj-get inp "txid")
+                  for txid = (bl.rpc:parse-hash-v (bl.rpc:obj-get inp "txid") "txid")
                   for vout = (bl.rpc:obj-get inp "vout")
                   for seq = (or (bl.rpc:obj-get inp "sequence")
                                 (bl.rpc:default-input-sequence replaceable locktime))
-                  do (unless (bl.rpc:valid-hex-hash-p txid)
-                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                         :message "Invalid input txid"))
-                     (unless (and (integerp vout) (>= vout 0))
+                  do (unless (and (integerp vout) (>= vout 0))
                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                          :message "Invalid input vout"))
                   collect (bl.ser:make-tx-in
                            :previous-output (bl.ser:make-outpoint
-                                             :hash (bl.rpc:parse-hex-hash txid) :index vout)
+                                             :hash txid :index vout)
                            :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                            :sequence seq))))
       (dolist (out (if (listp outputs) outputs
@@ -1896,8 +1893,6 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
   "Shared body of bumpfee / psbtbumpfee. PARAMS: (txid [options])."
   (let ((wallet (wallet-for-request node))
         (txid-hex (first params)))
-    (unless (and (stringp txid-hex) (bl.rpc:valid-hex-hash-p txid-hex))
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "txid must be a hex string"))
     (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (when (and (not want-psbt)
@@ -1907,7 +1902,7 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
         ;; Core gates BOTH bumpfee and psbtbumpfee: building the
         ;; replacement needs the keypool and, for bumpfee, the signature.
         (wallet-ensure-unlocked wallet)
-        (let ((txid (bl.rpc:parse-hex-hash txid-hex))
+        (let ((txid (bl.rpc:parse-hash-v txid-hex "txid"))
               (cc (make-wcc)))
           (setf (wcc-signal-bip125-rbf cc) t)   ; Core: default true, RBF replacement
           (%bumpfee-options->cc (second params) cc)

@@ -92,79 +92,75 @@ the fee and each input's prevout for a CONFIRMED transaction
 With a blockhash the answer comes from that block alone; without one, the
 mempool first and then the txindex (if enabled). The genesis block coinbase is
 refused before any of that (rawtransaction.cpp:288-293)."
-  (unless (valid-hex-hash-p txid-str)
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "Invalid transaction id"))
-  (%refuse-genesis-coinbase node txid-str)
-  (when (and blockhash-hint (not (valid-hex-hash-p blockhash-hint)))
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "Invalid blockhash"))
-  (let* ((verbosity (%parse-verbosity params 1 0 :allow-bool t))
-         (verbose (plusp verbosity))
-         ;; Core's verbosity 2 adds fee + prevout for a CONFIRMED transaction
-         ;; (rawtransaction.cpp:346-371); a mempool transaction has no undo
-         ;; data, so it stays at the verbosity-1 shape there.
-         (prevouts (>= verbosity 2))
-         (txid-bytes (parse-hex-hash txid-str))
-         ;; Core resolves the blockhash FIRST, under cs_main, and refuses an
-         ;; unknown one before any transaction lookup at all
-         ;; (rawtransaction.cpp:298-305). Answering from the txindex instead
-         ;; hands a caller using this argument as a containment check the
-         ;; transaction from a completely different block.
-         (block-entry (when blockhash-hint
-                        (or (bl.store:get-block-index-entry
-                             (rpc-get-chain-state node)
-                             (parse-hex-hash blockhash-hint))
-                            (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                              :message "Block hash not found")))))
-    (when block-entry
-      (return-from rpc-getrawtransaction
-        (%getrawtransaction-in-block node block-entry txid-bytes
-                                     verbose prevouts)))
+  ;; Core names these arguments by POSITION here (rawtransaction.cpp:287,300),
+  ;; which is the text rpc_rawtransaction.py asserts.
+  (let ((txid-bytes (parse-hash-v txid-str "parameter 1")))
+    (%refuse-genesis-coinbase node txid-str)
+    (let* ((verbosity (%parse-verbosity params 1 0 :allow-bool t))
+           (verbose (plusp verbosity))
+           ;; Core's verbosity 2 adds fee + prevout for a CONFIRMED transaction
+           ;; (rawtransaction.cpp:346-371); a mempool transaction has no undo
+           ;; data, so it stays at the verbosity-1 shape there.
+           (prevouts (>= verbosity 2))
+           ;; Core resolves the blockhash FIRST, under cs_main, and refuses an
+           ;; unknown one before any transaction lookup at all
+           ;; (rawtransaction.cpp:298-305). Answering from the txindex instead
+           ;; hands a caller using this argument as a containment check the
+           ;; transaction from a completely different block.
+           (block-entry (when blockhash-hint
+                          (or (bl.store:get-block-index-entry
+                               (rpc-get-chain-state node)
+                               (parse-hash-v blockhash-hint "parameter 3"))
+                              (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                                :message "Block hash not found")))))
+      (when block-entry
+        (return-from rpc-getrawtransaction
+          (%getrawtransaction-in-block node block-entry txid-bytes
+                                       verbose prevouts)))
 
-    ;; No blockhash: the mempool, then the txindex (Core GetTransaction,
-    ;; node/transaction.cpp:143-158).
-    (let* ((mempool (rpc-get-mempool node))
-           (mempool-entry (when mempool
-                            (bl.mp:mempool-get mempool txid-bytes))))
-      (when mempool-entry
-        (let ((tx (bl.mp:mempool-entry-transaction mempool-entry)))
+      ;; No blockhash: the mempool, then the txindex (Core GetTransaction,
+      ;; node/transaction.cpp:143-158).
+      (let* ((mempool (rpc-get-mempool node))
+             (mempool-entry (when mempool
+                              (bl.mp:mempool-get mempool txid-bytes))))
+        (when mempool-entry
+          (let ((tx (bl.mp:mempool-entry-transaction mempool-entry)))
+            (return-from rpc-getrawtransaction
+              (if verbose
+                  (tx-to-json tx (rpc-get-network node))
+                  (bl.crypto:bytes-to-hex
+                   (bl.ser:transaction-wire-bytes tx)))))))
+
+      ;; No block was named and the mempool has missed, so the txindex is the
+      ;; last place to look — and whether it is enabled also decides which of
+      ;; Core's not-found messages applies.
+      (let* ((tx-index (rpc-get-tx-index node))
+             (indexed (and tx-index (bl.store:tx-index-enabled tx-index)))
+             (location (and indexed (bl.store:txindex-lookup tx-index txid-bytes)))
+             (block-hash (and location (bl.store:tx-location-block-hash location)))
+             (block (and block-hash
+                         (bl.store:get-block (rpc-get-block-store node) block-hash)))
+             (found-tx (and block (find-tx-in-block block txid-bytes))))
+        (when found-tx
           (return-from rpc-getrawtransaction
             (if verbose
-                (tx-to-json tx (rpc-get-network node))
+                (tx-to-json-confirmed found-tx node block-hash
+                                      :block block :prevouts prevouts)
                 (bl.crypto:bytes-to-hex
-                 (bl.ser:transaction-wire-bytes tx)))))))
-
-    ;; No block was named and the mempool has missed, so the txindex is the
-    ;; last place to look — and whether it is enabled also decides which of
-    ;; Core's not-found messages applies.
-    (let* ((tx-index (rpc-get-tx-index node))
-           (indexed (and tx-index (bl.store:tx-index-enabled tx-index)))
-           (location (and indexed (bl.store:txindex-lookup tx-index txid-bytes)))
-           (block-hash (and location (bl.store:tx-location-block-hash location)))
-           (block (and block-hash
-                       (bl.store:get-block (rpc-get-block-store node) block-hash)))
-           (found-tx (and block (find-tx-in-block block txid-bytes))))
-      (when found-tx
-        (return-from rpc-getrawtransaction
-          (if verbose
-              (tx-to-json-confirmed found-tx node block-hash
-                                    :block block :prevouts prevouts)
-              (bl.crypto:bytes-to-hex
-               (bl.ser:transaction-wire-bytes found-tx)))))
-      ;; Not found. Two of Core's four messages are reachable here; the
-      ;; blockhash pair answered above, and the one left out is
-      ;; "Blockchain transactions are still in the process of being indexed",
-      ;; which needs f_txindex_ready — a readiness flag distinct from
-      ;; "enabled", which this txindex does not carry. Inventing an answer for
-      ;; a state we cannot observe would be worse than answering the
-      ;; enabled-and-absent case, which is what a caught-up node is in.
-      (error 'rpc-error :code +rpc-invalid-address-or-key+
-                        :message
-                        (%not-found-transaction-message
-                         (if indexed
-                             "No such mempool or blockchain transaction"
-                             "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries"))))))
+                 (bl.ser:transaction-wire-bytes found-tx)))))
+        ;; Not found. Two of Core's four messages are reachable here; the
+        ;; blockhash pair answered above, and the one left out is
+        ;; "Blockchain transactions are still in the process of being indexed",
+        ;; which needs f_txindex_ready — a readiness flag distinct from
+        ;; "enabled", which this txindex does not carry. Inventing an answer for
+        ;; a state we cannot observe would be worse than answering the
+        ;; enabled-and-absent case, which is what a caught-up node is in.
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message
+                          (%not-found-transaction-message
+                           (if indexed
+                               "No such mempool or blockchain transaction"
+                               "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries")))))))
 
 (defun find-tx-in-block (block txid)
   "Find a transaction in a block by txid. Returns the transaction or NIL."
@@ -892,13 +888,11 @@ and as an ALIST from the unit tests, and ASSOC on a hash-table is a type error
 - so createrawtransaction failed for every real JSON-RPC client while the
 suite stayed green."
   (loop for inp in inputs
-        for txid-str = (obj-get inp "txid")
+        ;; Core AddInputs parses the txid before it reads vout.
+        for txid = (parse-hash-v (obj-get inp "txid") "txid")
         for vout = (obj-get inp "vout")
         for sequence = (obj-get inp "sequence")
-        do (unless (valid-hex-hash-p txid-str)
-             (error 'rpc-error :code +rpc-invalid-parameter+
-                               :message "Invalid input txid"))
-           (unless (integerp vout)
+        do (unless (integerp vout)
              (error 'rpc-error :code +rpc-invalid-parameter+
                                :message "Invalid parameter, missing vout key"))
            (when (minusp vout)
@@ -911,7 +905,7 @@ suite stayed green."
                                :message "Invalid parameter, sequence number is out of range"))
         collect (bl.ser:make-tx-in
                  :previous-output (bl.ser:make-outpoint
-                                   :hash (parse-hex-hash txid-str)
+                                   :hash txid
                                    :index vout)
                  :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                  :sequence (or sequence

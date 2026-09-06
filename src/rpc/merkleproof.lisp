@@ -165,21 +165,13 @@ must be locatable: pass BLOCKHASH, or have txindex enabled. Returns the
 hex-encoded CMerkleBlock."
   (unless (and (listp txids) txids)
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "txids must be a non-empty array"))
-  (let ((wanted (mapcar (lambda (h)
-                          (unless (valid-hex-hash-p h)
-                            (error 'rpc-error :code +rpc-invalid-parameter+
-                                              :message (format nil "Invalid txid ~A" h)))
-                          (parse-hex-hash h))
-                        txids))
+  (let ((wanted (mapcar (lambda (h) (parse-hash-v h "txid")) txids))
         (chain-state (rpc-get-chain-state node))
         (block-store (rpc-get-block-store node)))
     ;; Locate the block: explicit hash, else txindex on the first txid.
     (let* ((block-hash
              (cond
-               (blockhash-hex
-                (unless (valid-hex-hash-p blockhash-hex)
-                  (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid blockhash"))
-                (parse-hex-hash blockhash-hex))
+               (blockhash-hex (parse-hash-v blockhash-hex "blockhash"))
                ((let ((ti (rpc-get-tx-index node)))
                   (and ti (bl.store:tx-index-enabled ti)))
                 (let ((loc (bl.store:txindex-lookup
@@ -215,11 +207,7 @@ hex-encoded CMerkleBlock."
 provided the proof's block is on the active chain (Bitcoin Core
 verifytxoutproof). PARAMS: (proof-hex). Returns the list of txid hex
 strings, or an empty list if the block isn't in the active chain."
-  (unless (stringp proof-hex)
-    (error 'rpc-error :code +rpc-invalid-parameter+ :message "proof must be a hex string"))
-  (let ((bytes (handler-case (bl.crypto:hex-to-bytes proof-hex)
-                 (error () (error 'rpc-error :code +rpc-invalid-parameter+
-                                            :message "Invalid proof hex")))))
+  (let ((bytes (parse-hex-v proof-hex "proof")))
     (multiple-value-bind (header-bytes ntx hashes bits) (parse-merkle-block bytes)
       (multiple-value-bind (root matched) (extract-partial-merkle-tree ntx bits hashes)
         (unless root

@@ -151,6 +151,26 @@ so the log line is part of the behaviour under test."
     (funcall thunk)
     (remove nil (coerce bl.log:*log-buffer* 'list))))
 
+(defun wire-params (values)
+  "VALUES (a list or vector of JSON values) as the positional parameter list a
+handler receives OVER THE WIRE: through the server's own normalizer, so a
+top-level empty array arrives as the truthy empty-array sentinel and an
+explicit false as the false sentinel. A hand-built list can express neither,
+which is why a handler reading such a slot with LISTP passes a suite built by
+hand and answers -8 to every real client.
+
+One reach for the whole test tree; the mining, rawtransaction and dispatch
+suites all build their parameters here."
+  (bl.rpc::%normalize-rpc-params (coerce values 'vector)))
+
+(defun rpc-error-of (thunk)
+  "(code . message) of the rpc-error THUNK signals, or NIL if it returns.
+The message matters as much as the code wherever Core's own tests assert the
+sentence -- ParseHashV, AmountFromValue, the argument type gate."
+  (handler-case (progn (funcall thunk) nil)
+    (bl.rpc:rpc-error (e)
+      (cons (bl.rpc:rpc-error-code e) (bl.rpc:rpc-error-message e)))))
+
 ;;;; Coins-view-cache white-box readers
 
 ;;; The cache's DIRTY/FRESH bookkeeping is internal to BL.STORE, and both

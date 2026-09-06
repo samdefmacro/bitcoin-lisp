@@ -28,7 +28,7 @@ vectors passed this entire suite while answering every real miner -8."
   (let ((req (make-hash-table :test 'equal)))
     (setf (gethash "rules" req) (vector "segwit"))
     (loop for (k v) on extra by #'cddr do (setf (gethash k req) v))
-    (bl.rpc::%normalize-rpc-params (vector req))))
+    (wire-params (list req))))
 
 (defun %gbt (node &optional (params (%gbt-params)))
   "getblocktemplate through its handler, with PARAMS defaulting to a
@@ -1243,7 +1243,7 @@ because a proposal is by definition unmined."
 normalizer the server applies (rpc/server.lisp:825-826, :942-943), so a nested
 array arrives as the LIST a real client produces rather than the vector a test
 would otherwise hand it."
-  (bl.rpc::%normalize-rpc-params (vector req)))
+  (wire-params (list req)))
 
 (defun %gbt-node (&optional (network :regtest))
   "A node with just enough state for getblocktemplate on NETWORK."
@@ -1374,31 +1374,30 @@ whose fixtures stuffed vectors straight into the hash-table.
 This test starts from the JSON text and goes through the real parser and the
 real normalizer, so it cannot be satisfied by a shape no client can send."
   (let ((bl:*network* :regtest))
-    (flet ((wire-params (json)
-             (let* ((req (let ((yason:*parse-json-booleans-as-symbols* t)
-                               (yason:*parse-json-arrays-as-vectors* t))
-                           (yason:parse json)))
-                    (raw (gethash "params" req)))
-               (bl.rpc::%normalize-rpc-params raw))))
+    (flet ((json-params (json)
+             (let ((req (let ((yason:*parse-json-booleans-as-symbols* t)
+                              (yason:*parse-json-arrays-as-vectors* t))
+                          (yason:parse json))))
+               (wire-params (gethash "params" req)))))
       ;; What contrib/signet/miner and every Core functional test send.
-      (let ((params (wire-params "{\"params\":[{\"rules\":[\"segwit\"]}]}")))
+      (let ((params (json-params "{\"params\":[{\"rules\":[\"segwit\"]}]}")))
         (is (equal '("segwit") (bl.rpc::%gbt-client-rules params))
             "the wire shape of a rules array was not understood")
         (is (null (%gbt-error-message (%gbt-node) params))))
       ;; Several rules, as a signet miner sends.
-      (let ((params (wire-params "{\"params\":[{\"rules\":[\"segwit\",\"signet\"]}]}")))
+      (let ((params (json-params "{\"params\":[{\"rules\":[\"segwit\",\"signet\"]}]}")))
         (is (equal '("segwit" "signet") (bl.rpc::%gbt-client-rules params))))
       ;; A bare string is not an array, in Core or here.
-      (let ((params (wire-params "{\"params\":[{\"rules\":\"segwit\"}]}")))
+      (let ((params (json-params "{\"params\":[{\"rules\":\"segwit\"}]}")))
         (is (null (bl.rpc::%gbt-client-rules params)))
         (is-true (%gbt-error-message (%gbt-node) params)))
       ;; An empty array folds to NIL, which is what an absent key gives — and
       ;; that matches Core, where both leave setClientRules empty.
-      (let ((params (wire-params "{\"params\":[{\"rules\":[]}]}")))
+      (let ((params (json-params "{\"params\":[{\"rules\":[]}]}")))
         (is (null (bl.rpc::%gbt-client-rules params)))
         (is-true (%gbt-error-message (%gbt-node) params)))
       ;; A non-string element is a type error, as Core's get_str() makes it.
-      (let ((params (wire-params "{\"params\":[{\"rules\":[7]}]}")))
+      (let ((params (json-params "{\"params\":[{\"rules\":[7]}]}")))
         (is-true (search "not of expected type string"
                          (or (%gbt-error-message (%gbt-node) params) "")))))))
 
@@ -1414,7 +1413,7 @@ empty JSON array at a TOP-LEVEL positional slot does not arrive as NIL but as
 the truthy +JSON-EMPTY-ARRAY+ sentinel, so a handler that reads it with LISTP
 answers a request every real client sends with -8, while a test that passed
 NIL by hand never sees it."
-  (bl.rpc::%normalize-rpc-params (coerce values 'vector)))
+  (wire-params values))
 
 (defun %hashps-node (work-deltas &key (spacing 600) tip-time)
   "A regtest node whose block index holds heights 0..N, N being the length of

@@ -151,7 +151,9 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:parse-descriptor
    #:parse-descriptor-range
    #:parse-descriptors
+   #:parse-hash-v
    #:parse-hex-hash
+   #:parse-hex-v
    #:parse-multisig
    #:parse-multisig-pubkey
    #:parse-outputs
