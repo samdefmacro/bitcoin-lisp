@@ -1020,7 +1020,11 @@
   Invariants: the RPC server comes up early and answers -28 until warmup
   finishes; the sync thread is the only writer of chain state; shutdown
   is cooperative, with a watchdog as the last resort; a node exits with
-  Core's meaning of clean, error and watchdog.
+  Core's meaning of clean, error and watchdog. -blocknotify runs only
+  once the node is past init (Core's POST_INIT gate) -- the same
+  :updated-block-tip event also drives -stopatheight and the periodic
+  flush, which must keep firing during IBD, so each subscriber decides
+  for itself rather than the announcement being filtered.
 
   Traps: a changed DEFCONSTANT needs an image RESTART -- the warm image
   goes stale whichever way the continuable error is answered; a changed
@@ -1046,6 +1050,7 @@
   (bitcoin-lisp:run-node-watchdog function)
   (bitcoin-lisp:effective-prune-target-bytes function)
   (bitcoin-lisp::seed-global-random-state function)
+  (bitcoin-lisp::tip-notification-post-init-p function)
   (bitcoin-lisp::seed-eviction-netgroup-key function)
   (bitcoin-lisp:*blocksonly* variable)
   (bitcoin-lisp:*p2p-port-override* variable)
