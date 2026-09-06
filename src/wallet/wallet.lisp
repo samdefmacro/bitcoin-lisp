@@ -242,6 +242,17 @@ the list is dependency-ordered loads."
 master key is the ONLY marker — no wallet flag records encryption."
   (plusp (hash-table-count (wallet-master-keys wallet))))
 
+(defun wallet-have-crypted-keys-p (wallet)
+  "Core CWallet::HaveCryptedKeys: T when some ScriptPubKeyMan holds an
+encrypted key.
+
+Deliberately not the same question as WALLET-HAS-ENCRYPTION-KEYS-P, which
+only says a master key record exists. The two disagree on exactly one file --
+a wallet with private keys disabled that carries mkey rows and no crypted
+key -- and that disagreement is what Core's post-load cleanup detects."
+  (loop for spkm being the hash-values of (wallet-spkms wallet)
+        thereis (plusp (hash-table-count (desc-spkm-crypted-keys spkm)))))
+
 (defun %wallet-clear-encryption-key (wallet)
   "Drop the decrypted master key and disarm the relock. Zero the vector
 before releasing it so the secret does not linger in whatever heap block
@@ -975,12 +986,21 @@ With PASSPHRASE the wallet is born encrypted, following Core's ordering
 descriptors. Deriving the seed only after encryption is the whole point —
 a plaintext walletdescriptorkey record never reaches the disk at all, so
 there is nothing for a later compaction to have to scrub. The wallet is
-left LOCKED."
+left LOCKED.
+
+A passphrase with DISABLE-PRIVATE-KEYS is refused here rather than in the
+RPC handler because that is where Core refuses it (wallet.cpp:408-413), and
+because the wallet it would produce is the one Core's post-load cleanup has
+to repair: mkey rows with no crypted key, reporting itself encrypted and
+locked with no passphrase that can unlock it."
   (unless (%valid-wallet-name-p name)
     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                       :message (if (and (stringp name) (zerop (length name)))
                                    "Wallet name cannot be empty"
                                    (format nil "Invalid wallet name ~S" name))))
+  (when (and disable-private-keys (stringp passphrase) (plusp (length passphrase)))
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                      :message "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled."))
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (let ((path (wallet-path-for manager name)))
       (when (or (gethash name (wallet-manager-wallets manager))
@@ -1280,6 +1300,48 @@ before this point for every result other than LOAD_OK, NEED_RESCAN included."
                           (wdb-key-simple +wdb-key-version+)
                           (wdb-int32-value +wallet-client-version+))))
 
+(defun %wallet-corrupt-error (wallet)
+  "Signal Core's DBErrors::CORRUPT as the client sees it: `Error loading %s:
+Wallet corrupted` (wallet.cpp:2388-2390) behind LoadWalletInternal's `Wallet
+loading failed. ` prefix (:286-291), which HandleWalletError's default branch
+answers with RPC_WALLET_ERROR (rpc/util.cpp:127-157)."
+  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                    :message (format nil "Wallet loading failed. Error loading ~A: Wallet corrupted"
+                                     (namestring (wallet-path wallet)))))
+
+(defun %wallet-drop-extraneous-master-keys (wallet)
+  "Core's post-load cleanup for a wallet that should not exist: private keys
+disabled, an encryption key present, and no crypted key anywhere
+(walletdb.cpp:1191-1203).
+
+It was once possible to \"encrypt\" a wallet with private keys disabled, and
+the mkey rows that leaves make HasEncryptionKeys report it encrypted forever:
+it loads LOCKED with no passphrase that can unlock it, and every RPC behind
+the unlock gate answers -13 -- importdescriptors and rescanblockchain
+included, which are the two operations such a wallet exists to perform.
+
+Erasing is only safe because there are no crypted keys, which is why Core
+tests all three conditions. A failed erase is DBErrors::CORRUPT there and an
+error here rather than a swallowed one: a half-erased set leaves exactly the
+state this removes."
+  (when (and (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
+             (wallet-has-encryption-keys-p wallet)
+             (not (wallet-have-crypted-keys-p wallet)))
+    (bl:log-info "[~A] Detected extraneous encryption keys in this wallet without private keys. Removing extraneous encryption keys."
+                 (wallet-name wallet))
+    (handler-case
+        (bl.store:with-leveldb-writebatch (batch)
+          (loop for id being the hash-keys of (wallet-master-keys wallet)
+                do (bl.store:leveldb-writebatch-delete batch (wdb-key-mkey id)))
+          (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
+      (bl.err:storage-error (e)
+        (bl:log-warn "[~A] Error: Unable to remove extraneous encryption keys. Wallet corrupt. (~A)"
+                     (wallet-name wallet) e)
+        (%wallet-corrupt-error wallet)))
+    ;; nMasterKeyMaxID is deliberately left where the load put it, as Core
+    ;; leaves it: only mapMasterKeys is cleared.
+    (clrhash (wallet-master-keys wallet))))
+
 (defun %load-wallet-records (wallet warnings &key chain-state)
   "Populate WALLET from its database records. Three scans, each streamed
 straight off the database the way Core's per-type record cursors are
@@ -1324,8 +1386,13 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
       ;; records too).
       (multiple-value-bind (final-warnings rescan-required)
           (wallet-load-tx-records wallet chain-state warnings)
+        ;; Everything below here is Core's "result == LOAD_OK" tail: the
+        ;; version stamp and the extraneous-mkey cleanup both sit after
+        ;; `if (result != DBErrors::LOAD_OK) return result` (walletdb.cpp:
+        ;; 1174-1203), and NEED_RESCAN is not LOAD_OK.
         (unless rescan-required
-          (%wallet-update-client-version wallet last-client has-version-record))
+          (%wallet-update-client-version wallet last-client has-version-record)
+          (%wallet-drop-extraneous-master-keys wallet))
         (values final-warnings rescan-required)))))
 
 (defun load-wallet (manager name &key chain-state)
@@ -1697,13 +1764,12 @@ A non-empty PASSPHRASE creates the wallet already encrypted and locked."
       (when (and passphrase (not (stringp passphrase)))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                           :message "passphrase must be a string"))
+      ;; The empty-passphrase warning is the RPC's (rpc/wallet.cpp:426-431);
+      ;; refusing a passphrase alongside disabled private keys is
+      ;; CREATE-WALLET's, as it is CreateWallet's.
       (when (and (stringp passphrase) (zerop (length passphrase)))
         (push "Empty string given as passphrase, wallet will not be encrypted."
-              warnings))
-      (when (and (stringp passphrase) (plusp (length passphrase))
-                 (bl.rpc:positional-bool (nth 1 params)))
-        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                          :message "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled.")))
+              warnings)))
     (multiple-value-bind (tip-hash tip-height) (%wallet-current-tip node)
       (let ((wallet (create-wallet manager name
                                    :disable-private-keys (bl.rpc:positional-bool
