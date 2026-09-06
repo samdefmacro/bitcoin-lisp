@@ -9,17 +9,21 @@
 ;;;   sh(SCRIPT)  wsh(SCRIPT)  sh(wsh(SCRIPT))
 ;;;   tr(KEY)  tr(KEY,TREE)  rawtr(KEY)
 ;;;   multi_a(k,KEY,...)  sortedmulti_a(k,KEY,...)   [inside tr() only]
+;;;   musig(KEY,...)   [inside tr()/rawtr() only]   miniscript, in wsh() and
+;;;   in a tr() leaf
 ;;; where KEY is a hex pubkey (33/65 bytes; 32-byte x-only inside tr/rawtr),
 ;;; a WIF private key, or an xpub/xprv (tpub/tprv on test networks) with an
 ;;; optional [fingerprint/path] origin prefix, a derivation path using h or '
-;;; hardened markers, and an optional ranged terminal /* or /*h; and TREE is a
-;;; brace-nested taproot script tree.
+;;; hardened markers, an optional BIP389 multipath element <a;b;...>, and an
+;;; optional ranged terminal /* or /*h; and TREE is a brace-nested taproot
+;;; script tree.
 ;;;
-;;; tr() trees are WATCH-ONLY: they parse, print, derive the right bech32m
-;;; address and recognise their own outputs, but nothing here can produce a
-;;; script-path spend. Still out of scope (match Core error text where Core has
-;;; one, otherwise a clear "not supported"): multipath <a;b>, musig, and
-;;; miniscript in a tapscript context.
+;;; A multipath key path makes ONE string denote SEVERAL descriptors, so the
+;;; parser is plural throughout: PARSE-DESCRIPTORS returns the list Core's
+;;; Parse() returns, and PARSE-DESCRIPTOR is its descs.at(0).
+;;;
+;;; Not implemented: musig2 SIGNING (nonce exchange and partial signatures), so
+;;; a musig() descriptor is watch-only however it is imported.
 ;;;
 ;;; Nesting/context rules, key-count limits, and error messages follow Core's
 ;;; ParseScript/ParsePubkey exactly (descriptor.cpp:1745-2673).
@@ -200,17 +204,93 @@ car tracks the marker style; the last hardened marker seen wins, like Core)."
              (%desc-error "Key path value ~D is out of range" num)))
       (logior num (if hardened #x80000000 0)))))
 
+;;; --- Multipath descriptors, BIP389 (Core descriptor.cpp:1789-1851) ---
+;;;
+;;; `wpkh(xpub.../<0;1>/*)` is ONE string that means TWO descriptors — the
+;;; receive chain and the change chain — and it is how Sparrow, Ledger Live,
+;;; BlueWallet, BDK and modern Core exports write a wallet. A node that cannot
+;;; read it cannot import from any of them.
+;;;
+;;; It belongs to the PARSER and not to a string rewriter in front of it,
+;;; because the rules are grammatical: at most one specifier per KEY
+;;; EXPRESSION (several key expressions may each carry one, which is what an
+;;; n-of-m cosigner export looks like), none at all inside an origin, and a
+;;; length that must match across the key expressions of one script. A
+;;; rewriter that only sees `<' both refuses valid descriptors and accepts
+;;; invalid ones. So ParseKeyPath returns a LIST of paths, a key expression a
+;;; list of keys, a script a list of descriptors, and Parse a list.
+
+(defun %multipath-substitutes (elem apostrophe-box)
+  "The values inside a `<a;b;...>` path element, validated as Core validates
+them (descriptor.cpp:1813-1833). Signals with Core's messages."
+  (let* ((inner (subseq elem 1 (1- (length elem))))
+         (parts (uiop:split-string inner :separator ";")))
+    (when (< (length parts) 2)
+      (%desc-error "Multipath key path specifiers must have at least two items"))
+    (let ((seen '()))
+      (dolist (part parts (nreverse seen))
+        (let ((num (%parse-key-path-num part apostrophe-box)))
+          (when (member num seen)
+            (%desc-error "Duplicated key path value ~D in multipath specifier"
+                         (logand num #x7FFFFFFF)))
+          (push num seen))))))
+
 (defun %parse-key-path (elems allow-multipath apostrophe-box)
-  "Parse the path elements of a key expression (Core's ParseKeyPath, minus
-multipath expansion — multipath descriptors are not supported at P0)."
-  (loop for elem in elems
-        collect (if (and (plusp (length elem))
-                         (char= (char elem 0) #\<)
-                         (char= (char elem (1- (length elem))) #\>))
-                    (if allow-multipath
-                        (%desc-error "Multipath descriptors are not supported")
-                        (%desc-error "Key path value '~A' specifies multipath in a section where multipath is not allowed" elem))
-                    (%parse-key-path-num elem apostrophe-box))))
+  "Parse the path elements of a key expression (Core's ParseKeyPath,
+descriptor.cpp:1789-1851). Returns a LIST of paths: one, or -- when a BIP389
+`<a;b;...>' element is present and ALLOW-MULTIPATH -- one per substitute value,
+identical but for that position.
+
+ALLOW-MULTIPATH is false for an origin section, where Core refuses a specifier
+outright (descriptor.cpp:2133); and a SECOND specifier in the same key
+expression is refused whatever the flag says."
+  (let ((path '())
+        (placeholder nil)
+        (substitutes nil))
+    (dolist (elem elems)
+      (if (and (plusp (length elem))
+               (char= (char elem 0) #\<)
+               (char= (char elem (1- (length elem))) #\>))
+          (progn
+            (unless allow-multipath
+              (%desc-error "Key path value '~A' specifies multipath in a section where multipath is not allowed" elem))
+            (when substitutes
+              (%desc-error "Multiple multipath key path specifiers found"))
+            (setf substitutes (%multipath-substitutes elem apostrophe-box)
+                  placeholder (length path))
+            ;; Placeholder for the multipath segment; every branch replaces it.
+            (push 0 path))
+          (push (%parse-key-path-num elem apostrophe-box) path)))
+    (setf path (nreverse path))
+    (if substitutes
+        (mapcar (lambda (value)
+                  (let ((branch (copy-list path)))
+                    (setf (nth placeholder branch) value)
+                    branch))
+                substitutes)
+        (list path))))
+
+(defun %multipath-align (vectors what &optional max-len)
+  "Core's clone-and-length-match over the multipath expansions of one script's
+parts (descriptor.cpp:2374-2384 for multi(), :2519-2530 for tr()'s subscripts,
+:2640-2649 for miniscript, :2044-2074 for musig()). VECTORS is a list of lists;
+returns them all padded to MAX-LEN (the longest by default; tr() passes one
+that also counts its internal key) by repeating a length-1 list's single
+element, and signals WHAT -- the caller's own Core message -- for any other
+length. A single value is CLONED rather than refused: that is what lets
+`multi(2,A/<0;1>/*,B)' pair the plain B with both of A's chains.
+
+The clone is a shared reference, not a copy. Core's Clone() is there because it
+owns its providers through unique_ptr; nothing mutates a parsed key or
+subscript after this point, and each expansion holds one occurrence of it."
+  (let ((max-len (or max-len (reduce #'max vectors :key #'length :initial-value 0))))
+    (values (mapcar (lambda (vec)
+                      (cond ((= (length vec) max-len) vec)
+                            ((= (length vec) 1)
+                             (make-list max-len :initial-element (first vec)))
+                            (t (%desc-error "~A" what))))
+                    vectors)
+            max-len)))
 
 (defun %wif-network-matches-p (wif-version network)
   "Core DecodeSecret: the WIF's version byte must be NETWORK's SECRET_KEY prefix."
@@ -237,6 +317,8 @@ plus key-material sanity."
 
 (defun %parse-desc-key-inner (str ctx network apostrophe-box)
   "Parse a key expression without origin info (Core's ParsePubkeyInner).
+Returns a LIST of desc-keys -- one per BIP389 multipath branch, so exactly one
+for every key expression that carries no `<a;b>' path element.
 CTX is the surrounding context: :top :sh :wsh :wpkh :tr :tr-script :musig.
 
 :MUSIG is a musig() participant. It is deliberately NOT an x-only context —
@@ -263,13 +345,13 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
           (cond ((and valid-header (bl.crypto:public-key-valid-p bytes))
                  (if (or permit-uncompressed (= len 33))
                      (return-from %parse-desc-key-inner
-                       (make-desc-key :pubkey bytes :xonly-p nil))
+                       (list (make-desc-key :pubkey bytes :xonly-p nil)))
                      (%desc-error "Uncompressed keys are not allowed")))
                 ((and (= len 32) (%xonly-context-p ctx))
                  (let ((full (concatenate '(vector (unsigned-byte 8)) #(2) bytes)))
                    (when (bl.crypto:public-key-valid-p full)
                      (return-from %parse-desc-key-inner
-                       (make-desc-key :pubkey full :xonly-p t))))))
+                       (list (make-desc-key :pubkey full :xonly-p t)))))))
           (%desc-error "Pubkey '~A' is invalid" key-str)))
       ;; WIF private key?
       (multiple-value-bind (priv compressed wif-network)
@@ -278,11 +360,11 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
           (unless (or permit-uncompressed compressed)
             (%desc-error "Uncompressed keys are not allowed"))
           (return-from %parse-desc-key-inner
-            (make-desc-key :pubkey (bl.crypto:derive-public-key
-                                    priv :compressed compressed)
-                           :xonly-p (%xonly-context-p ctx)
-                           :privkey priv
-                           :compressed-p compressed)))))
+            (list (make-desc-key :pubkey (bl.crypto:derive-public-key
+                                          priv :compressed compressed)
+                                 :xonly-p (%xonly-context-p ctx)
+                                 :privkey priv
+                                 :compressed-p compressed))))))
     ;; Extended key (with optional derivation path and ranged terminal).
     (let ((k (bl.crypto:bip32-parse key-str)))
       (unless (and k (%extkey-valid-for-network-p k network))
@@ -299,12 +381,15 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
                  (setf derive :hardened
                        (car apostrophe-box) (equal last "*'")
                        path-elems (butlast path-elems)))))
-        (let ((path (%parse-key-path path-elems t apostrophe-box)))
-          (if (bl.crypto:ext-key-privatep k)
-              (make-desc-key :extkey (bl.crypto:bip32-neuter k)
-                             :ext-privkey k
-                             :path path :derive derive)
-              (make-desc-key :extkey k :path path :derive derive)))))))
+        ;; One key per multipath branch, sharing the extkey (Core builds one
+        ;; BIP32PubkeyProvider per path, descriptor.cpp:1948-1950).
+        (let ((neutered (and (bl.crypto:ext-key-privatep k) (bl.crypto:bip32-neuter k))))
+          (mapcar (lambda (path)
+                    (if neutered
+                        (make-desc-key :extkey neutered :ext-privkey k
+                                       :path path :derive derive)
+                        (make-desc-key :extkey k :path path :derive derive)))
+                  (%parse-key-path path-elems t apostrophe-box)))))))
 
 (defparameter *musig-chaincode-hex*
   "868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"
@@ -354,11 +439,11 @@ Every error message here is Core's, verbatim."
           (%desc-error "Invalid musig() expression"))
         ;; Participants. Core parses them in ParseScriptContext::MUSIG, which
         ;; differs from P2TR only in refusing a nested musig().
-        (let ((participants '())
+        (let ((groups '())
               (remaining inner))
           (loop
             (when (zerop (length remaining)) (return))
-            (when participants
+            (when groups
               (unless (char= (char remaining 0) #\,)
                 (%desc-error "musig(): expected ',', got '~C'" (char remaining 0)))
               (setf remaining (subseq remaining 1)))
@@ -374,36 +459,62 @@ Every error message here is Core's, verbatim."
               (push (%with-desc-error-prefix
                      "musig(): "
                      (lambda () (%parse-desc-key arg :musig network)))
-                    participants)))
-          (setf participants (nreverse participants))
-          (unless participants
+                    groups)))
+          (setf groups (nreverse groups))
+          (unless groups
             (%desc-error "musig(): Must contain key expressions"))
-          (let ((key (make-desc-key :musig-participants participants :xonly-p t)))
+          ;; Every property Core reads off a participant it reads off pk.at(0),
+          ;; the first multipath branch (descriptor.cpp:2003-2004).
+          (let ((firsts (mapcar #'first groups))
+                ;; :INITIAL-VALUE, because the standard leaves it open whether
+                ;; REDUCE applies :KEY to a one-element sequence -- and a
+                ;; one-participant musig() is legal.
+                (max-participant-len (reduce #'max groups :key #'length :initial-value 0))
+                (derive :none)
+                (paths (list '())))
             (when (plusp (length rest))
               (unless (char= (char rest 0) #\/)
                 (%desc-error "musig(): expected ',', got '~C'" (char rest 0)))
               (unless (every (lambda (p)
                                (or (desc-key-extkey p) (desc-key-ext-privkey p)))
-                             participants)
+                             firsts)
                 (%desc-error "musig(): derivation requires all participants to be xpubs or xprvs"))
-              (when (some #'desc-key-ranged-p participants)
+              (when (some #'desc-key-ranged-p firsts)
                 (%desc-error "musig(): Cannot have ranged participant keys if musig() also has derivation"))
               (let ((elems (rest (uiop:split-string rest :separator "/")))
                     (apostrophe-box (list nil)))
                 (let ((last (car (last elems))))
                   (cond ((equal last "*")
-                         (setf (desc-key-derive key) :unhardened
+                         (setf derive :unhardened
                                elems (butlast elems)))
                         ((or (equal last "*'") (equal last "*h"))
                          (%desc-error "musig(): Cannot have hardened child derivation"))))
-                (let ((path (%parse-key-path elems t apostrophe-box)))
-                  (when (some (lambda (i) (logbitp 31 i)) path)
-                    (%desc-error "musig(): cannot have hardened derivation steps"))
-                  (setf (desc-key-path key) path))))
-            key))))))
+                (setf paths (%parse-key-path elems t apostrophe-box))
+                (when (some (lambda (path)
+                              (some (lambda (i) (logbitp 31 i)) path))
+                            paths)
+                  (%desc-error "musig(): cannot have hardened derivation steps"))))
+            (flet ((musig-key (participants path)
+                     (make-desc-key :musig-participants participants :xonly-p t
+                                    :path path :derive derive)))
+              (cond
+                ;; The two multipath halves are exclusive: which branch would
+                ;; pair with which (descriptor.cpp:2073-2075)?
+                ((and (> max-participant-len 1) (> (length paths) 1))
+                 (%desc-error "musig(): Cannot have multipath participant keys if musig() is also multipath"))
+                ((> max-participant-len 1)
+                 (let ((aligned (%multipath-align
+                                 groups
+                                 "musig(): Multipath derivation paths have mismatched lengths")))
+                   (loop for i below max-participant-len
+                         collect (musig-key (mapcar (lambda (g) (nth i g)) aligned)
+                                            (first paths)))))
+                (t
+                 (mapcar (lambda (path) (musig-key firsts path)) paths))))))))))
 
 (defun %parse-desc-key (str ctx network)
-  "Parse a key expression with optional [origin] prefix (Core's ParsePubkey)."
+  "Parse a key expression with optional [origin] prefix (Core's ParsePubkey).
+Returns a LIST of desc-keys, one per BIP389 multipath branch."
   ;; musig() cannot be nested inside an origin, so it is recognised before the
   ;; ']' split (Core descriptor.cpp:1962).
   (when (and (>= (length str) 6) (string= "musig(" (subseq str 0 6)))
@@ -413,9 +524,9 @@ Every error message here is Core's, verbatim."
     (when (> (length parts) 2)
       (%desc-error "Multiple ']' characters found for a single pubkey"))
     (if (= (length parts) 1)
-        (let ((key (%parse-desc-key-inner str ctx network apostrophe-box)))
-          (setf (desc-key-apostrophe key) (car apostrophe-box))
-          key)
+        (let ((keys (%parse-desc-key-inner str ctx network apostrophe-box)))
+          (dolist (key keys keys)
+            (setf (desc-key-apostrophe key) (car apostrophe-box))))
         (let ((origin (first parts))
               (key-part (second parts)))
           (when (or (zerop (length origin))
@@ -429,14 +540,20 @@ Every error message here is Core's, verbatim."
                            (length fpr-hex)))
             (unless (%hex-string-p fpr-hex)
               (%desc-error "Fingerprint '~A' is not hex" fpr-hex))
-            (let* ((origin-path (%parse-key-path (rest origin-elems)
-                                                 nil apostrophe-box))
-                   (key (%parse-desc-key-inner key-part ctx network apostrophe-box)))
-              (setf (desc-key-origin-fingerprint key)
-                    (bl.crypto:hex-to-bytes fpr-hex)
-                    (desc-key-origin-path key) origin-path
-                    (desc-key-apostrophe key) (car apostrophe-box))
-              key))))))
+            ;; ALLOW-MULTIPATH is NIL here: an origin is one path, and Core
+            ;; takes path.at(0) knowing there can only be one
+            ;; (descriptor.cpp:2133-2134). A specifier inside an origin is
+            ;; refused outright -- the string rewriter this replaces happily
+            ;; substituted it and produced two descriptors with FABRICATED
+            ;; distinct origins over identical scriptPubKeys.
+            (let* ((origin-path (first (%parse-key-path (rest origin-elems)
+                                                        nil apostrophe-box)))
+                   (keys (%parse-desc-key-inner key-part ctx network apostrophe-box)))
+              (dolist (key keys keys)
+                (setf (desc-key-origin-fingerprint key)
+                      (bl.crypto:hex-to-bytes fpr-hex)
+                      (desc-key-origin-path key) origin-path
+                      (desc-key-apostrophe key) (car apostrophe-box)))))))))
 
 (defun desc-key-ranged-p (key)
   ;; ⚠️ musig(A/0/*,B) is ranged through its PARTICIPANTS even when the musig()
@@ -649,7 +766,8 @@ the script is only bounded by what a spending transaction can carry.")
 
 (defun %parse-multi-keys (inner ctx network name)
   "Parse \"k,KEY,KEY,...\" for multi/sortedmulti/multi_a/sortedmulti_a.
-Returns (values threshold keys kind).
+Returns (values threshold key-groups kind), where KEY-GROUPS holds one LIST of
+desc-keys per key expression -- length one unless that expression is multipath.
 
 The four differ only in their key ceiling and in two checks specific to
 contexts multi_a never appears in, so they share this parser rather than having
@@ -667,17 +785,20 @@ says which is which, so nothing else needs to be passed in."
                           (parse-integer thres-str))))
       (unless (and threshold (<= threshold #xffffffff))
         (%desc-error "Multi threshold '~A' is not valid" thres-str))
-      (let ((keys '()))
+      (let ((groups '()))
         (loop while (plusp (length rest))
               do (unless (char= (char rest 0) #\,)
                    (%desc-error "Multi: expected ',', got '~C'" (char rest 0)))
                  (multiple-value-bind (arg new-rest) (%split-expr (subseq rest 1))
                    (push (%with-desc-error-prefix
                           "Multi: " (lambda () (%parse-desc-key arg ctx network)))
-                         keys)
+                         groups)
                    (setf rest new-rest)))
-        (setf keys (nreverse keys))
-        (let ((n (length keys)))
+        (setf groups (nreverse groups))
+        ;; Every check below reads pks.at(0) of each key expression, the first
+        ;; multipath branch, exactly as Core does (descriptor.cpp:2338-2340).
+        (let ((keys (mapcar #'first groups))
+              (n (length groups)))
           (when (or (zerop n) (> n limit))
             ;; Core writes "multi_a" for the tapscript form and "multisig" for
             ;; the legacy one (descriptor.cpp:2350,2354); byte-identical text.
@@ -697,7 +818,7 @@ says which is which, so nothing else needs to be passed in."
               (when (> script-size 520)
                 (%desc-error "P2SH script is too large, ~D bytes is larger than 520 bytes"
                              script-size))))
-          (values threshold keys kind))))))
+          (values threshold groups kind))))))
 
 (defconstant +taproot-control-max-node-count+ 128
   "Core TAPROOT_CONTROL_MAX_NODE_COUNT (script/interpreter.h:245): the deepest
@@ -705,8 +826,10 @@ a taproot script tree may nest, because the control block carries one 32-byte
 merkle path element per level.")
 
 (defun %parse-tr-tree (expr network)
-  "Parse the TREE argument of tr(KEY,TREE) into a list of (DEPTH . out-desc) in
-Core's parse order (descriptor.cpp:2474-2515).
+  "Parse the TREE argument of tr(KEY,TREE) into a list of (DEPTH . DESCRIPTORS)
+in Core's parse order (descriptor.cpp:2474-2515), where DESCRIPTORS is the leaf
+expression's multipath expansion -- one descriptor unless the leaf is
+multipath.
 
 The algorithm is Core's exactly, and it is worth reading rather than
 reinventing: BRANCHES is the path from the root to whatever is being parsed,
@@ -754,10 +877,47 @@ purely from the depth sequence, so no explicit tree object is ever built."
         (%desc-error "tr(): expected ')' after script expression")))
     (nreverse leaves)))
 
+(defun %multipath-multi-descriptors (threshold groups kind)
+  "One multi()/sortedmulti()/multi_a() descriptor per multipath branch (Core
+descriptor.cpp:2374-2399): the key expressions are length-matched, then the
+i'th key of each becomes the i'th descriptor's key list. The mismatch message
+says `multi()' for the multi_a forms too, as Core's does."
+  (multiple-value-bind (aligned max-len)
+      (%multipath-align groups "multi(): Multipath derivation paths have mismatched lengths")
+    (loop for i below max-len
+          collect (make-out-desc :kind kind :threshold threshold
+                                 :keys (mapcar (lambda (group) (nth i group)) aligned)))))
+
+(defun %multipath-tr-descriptors (internal-keys leaves)
+  "One tr() descriptor per multipath branch (Core descriptor.cpp:2519-2546).
+LEAVES is %PARSE-TR-TREE's (DEPTH . DESCRIPTORS) list. The subscripts are
+length-matched against each other AND against the internal key, which Core
+counts into max_providers_len before it clones either -- so tr() has two
+messages where the other functions have one."
+  (let* ((groups (mapcar #'cdr leaves))
+         (depths (mapcar #'car leaves))
+         (max-len (reduce #'max groups :key #'length
+                                       :initial-value (length internal-keys)))
+         (aligned (%multipath-align
+                   groups "tr(): Multipath subscripts have mismatched lengths" max-len)))
+    (when (and (> (length internal-keys) 1) (/= (length internal-keys) max-len))
+      (%desc-error "tr(): Multipath internal key mismatches multipath subscripts lengths"))
+    (let ((keys (if (= (length internal-keys) max-len)
+                    internal-keys
+                    (make-list max-len :initial-element (first internal-keys)))))
+      (loop for i below max-len
+            collect (make-out-desc
+                     :kind :tr :keys (list (nth i keys))
+                     :tree (mapcar (lambda (depth group) (cons depth (nth i group)))
+                                   depths aligned))))))
+
 (defun %parse-descriptor-body (body ctx network)
   "Parse one script expression (Core's ParseScript). CTX is :top, :sh, :wsh or
 :tr-script — the last being a leaf of a taproot script tree, Core's
-ParseScriptContext::P2TR."
+ParseScriptContext::P2TR.
+
+Returns a LIST of out-descs: one, unless a BIP389 multipath specifier inside
+one of its key expressions makes it several."
   (multiple-value-bind (expr rest) (%split-expr body)
     (unless (zerop (length rest))
       (%desc-error "'~A' is not a valid descriptor" body))
@@ -767,13 +927,15 @@ ParseScriptContext::P2TR."
       ;; pk(KEY) — any of our contexts
       (with-inner (inner "pk")
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :pk
-                         ;; Core: ParseScript builds PKDescriptor(prov, /*xonly=*/
-                         ;; ctx == ParseScriptContext::P2TR) (descriptor.cpp:2286).
-                         :xonly-script-p (%xonly-context-p ctx)
-                         :keys (list (%with-desc-error-prefix
-                                      "pk(): "
-                                      (lambda () (%parse-desc-key inner ctx network)))))))
+          (mapcar (lambda (key)
+                    (make-out-desc :kind :pk
+                                   ;; Core: ParseScript builds PKDescriptor(prov,
+                                   ;; /*xonly=*/ctx == ParseScriptContext::P2TR)
+                                   ;; (descriptor.cpp:2286).
+                                   :xonly-script-p (%xonly-context-p ctx)
+                                   :keys (list key)))
+                  (%with-desc-error-prefix
+                   "pk(): " (lambda () (%parse-desc-key inner ctx network))))))
       ;; pkh(KEY)
       ;;
       ;; ⚠️ Core gates the pkh() DESCRIPTOR on TOP/P2SH/P2WSH only
@@ -784,20 +946,20 @@ ParseScriptContext::P2TR."
       ;; flag is what keeps the leaf hash — and so the ADDRESS — Core's.
       (with-inner (inner "pkh")
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :pkh
-                         :xonly-script-p (%xonly-context-p ctx)
-                         :keys (list (%with-desc-error-prefix
-                                      "pkh(): "
-                                      (lambda () (%parse-desc-key inner ctx network)))))))
+          (mapcar (lambda (key)
+                    (make-out-desc :kind :pkh
+                                   :xonly-script-p (%xonly-context-p ctx)
+                                   :keys (list key)))
+                  (%with-desc-error-prefix
+                   "pkh(): " (lambda () (%parse-desc-key inner ctx network))))))
       ;; combo(KEY) — top level only
       (with-inner (inner "combo")
         (unless (eq ctx :top)
           (%desc-error "Can only have combo() at top level"))
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :combo
-                         :keys (list (%with-desc-error-prefix
-                                      "combo(): "
-                                      (lambda () (%parse-desc-key inner ctx network)))))))
+          (mapcar (lambda (key) (make-out-desc :kind :combo :keys (list key)))
+                  (%with-desc-error-prefix
+                   "combo(): " (lambda () (%parse-desc-key inner ctx network))))))
       ;; multi(k,...) / sortedmulti(k,...) — NOT in a taproot leaf, where
       ;; BIP342 removed CHECKMULTISIG and multi_a() takes over. Core gates
       ;; these on TOP/P2SH/P2WSH and then names the failure explicitly
@@ -808,41 +970,42 @@ ParseScriptContext::P2TR."
           (when (eq ctx :tr-script)
             (%desc-error
              "Can only have multi/sortedmulti at top level, in sh(), or in wsh()"))
-          (multiple-value-bind (threshold keys kind)
+          (multiple-value-bind (threshold groups kind)
               (%parse-multi-keys inner ctx network name)
             (return-from %parse-descriptor-body
-              (make-out-desc :kind kind :threshold threshold :keys keys)))))
+              (%multipath-multi-descriptors threshold groups kind)))))
       ;; multi_a/sortedmulti_a live only in a taproot script leaf — Core gates
       ;; them on ParseScriptContext::P2TR (descriptor.cpp:2320).
       (dolist (name '("multi_a" "sortedmulti_a"))
         (with-inner (inner name)
           (unless (eq ctx :tr-script)
             (%desc-error "Can only have multi_a/sortedmulti_a inside tr()"))
-          (multiple-value-bind (threshold keys kind)
+          (multiple-value-bind (threshold groups kind)
               (%parse-multi-keys inner ctx network name)
             (return-from %parse-descriptor-body
-              (make-out-desc :kind kind :threshold threshold :keys keys)))))
+              (%multipath-multi-descriptors threshold groups kind)))))
       ;; wpkh(KEY) — top level or inside sh()
       (with-inner (inner "wpkh")
         (unless (member ctx '(:top :sh))
           (%desc-error "Can only have wpkh() at top level or inside sh()"))
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :wpkh
-                         :keys (list (%with-desc-error-prefix
-                                      "wpkh(): "
-                                      (lambda () (%parse-desc-key inner :wpkh network)))))))
+          (mapcar (lambda (key) (make-out-desc :kind :wpkh :keys (list key)))
+                  (%with-desc-error-prefix
+                   "wpkh(): " (lambda () (%parse-desc-key inner :wpkh network))))))
       ;; sh(SCRIPT) — top level only
       (with-inner (inner "sh")
         (unless (eq ctx :top)
           (%desc-error "Can only have sh() at top level"))
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :sh :sub (%parse-descriptor-body inner :sh network))))
+          (mapcar (lambda (sub) (make-out-desc :kind :sh :sub sub))
+                  (%parse-descriptor-body inner :sh network))))
       ;; wsh(SCRIPT) — top level or inside sh()
       (with-inner (inner "wsh")
         (unless (member ctx '(:top :sh))
           (%desc-error "Can only have wsh() at top level or inside sh()"))
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :wsh :sub (%parse-descriptor-body inner :wsh network))))
+          (mapcar (lambda (sub) (make-out-desc :kind :wsh :sub sub))
+                  (%parse-descriptor-body inner :wsh network))))
       ;; addr(ADDRESS) — top level only
       (with-inner (inner "addr")
         (unless (eq ctx :top)
@@ -852,18 +1015,19 @@ ParseScriptContext::P2TR."
           (unless type
             (%desc-error "Address is not valid"))
           (return-from %parse-descriptor-body
-            (make-out-desc :kind :addr :address inner :script script-pubkey))))
+            (list (make-out-desc :kind :addr :address inner :script script-pubkey)))))
       ;; tr(KEY) or tr(KEY,TREE) — top level only.
       (with-inner (inner "tr")
         (unless (eq ctx :top)
           (%desc-error "Can only have tr at top level"))
         (multiple-value-bind (arg tr-rest) (%split-expr inner)
-          (let ((internal (%with-desc-error-prefix
-                           "tr(): "
-                           (lambda () (%parse-desc-key arg :tr network)))))
+          (let ((internal-keys (%with-desc-error-prefix
+                                "tr(): "
+                                (lambda () (%parse-desc-key arg :tr network)))))
             (return-from %parse-descriptor-body
               (if (zerop (length tr-rest))
-                  (make-out-desc :kind :tr :keys (list internal))
+                  (mapcar (lambda (key) (make-out-desc :kind :tr :keys (list key)))
+                          internal-keys)
                   ;; Core expects the comma itself here, and its message for a
                   ;; missing one says `tr:' with no parentheses where every
                   ;; other message in this function says `tr():'
@@ -871,8 +1035,9 @@ ParseScriptContext::P2TR."
                   (progn
                     (unless (char= (char tr-rest 0) #\,)
                       (%desc-error "tr: expected ',', got '~C'" (char tr-rest 0)))
-                    (make-out-desc :kind :tr :keys (list internal)
-                                   :tree (%parse-tr-tree (subseq tr-rest 1) network))))))))
+                    (%multipath-tr-descriptors
+                     internal-keys
+                     (%parse-tr-tree (subseq tr-rest 1) network))))))))
       ;; rawtr(KEY) — top level only
       (with-inner (inner "rawtr")
         (unless (eq ctx :top)
@@ -881,10 +1046,9 @@ ParseScriptContext::P2TR."
           (unless (zerop (length rawtr-rest))
             (%desc-error "rawtr(): only one key expected."))
           (return-from %parse-descriptor-body
-            (make-out-desc :kind :rawtr
-                           :keys (list (%with-desc-error-prefix
-                                        "rawtr(): "
-                                        (lambda () (%parse-desc-key arg :tr network))))))))
+            (mapcar (lambda (key) (make-out-desc :kind :rawtr :keys (list key)))
+                    (%with-desc-error-prefix
+                     "rawtr(): " (lambda () (%parse-desc-key arg :tr network)))))))
       ;; raw(HEX) — top level only
       (with-inner (inner "raw")
         (unless (eq ctx :top)
@@ -892,8 +1056,8 @@ ParseScriptContext::P2TR."
         (unless (%hex-string-p inner)
           (%desc-error "Raw script is not hex"))
         (return-from %parse-descriptor-body
-          (make-out-desc :kind :raw
-                         :script (bl.crypto:hex-to-bytes inner))))
+          (list (make-out-desc :kind :raw
+                               :script (bl.crypto:hex-to-bytes inner)))))
       ;; Fallthrough. Inside wsh() Core tries miniscript here, which is what
       ;; makes policy descriptors -- timelocked recovery, decaying multisig --
       ;; expressible at all (Core descriptor.cpp ParseScript).
@@ -910,38 +1074,72 @@ ParseScriptContext::P2TR."
 
 (defun %parse-miniscript-descriptor (expr network ms-ctx)
   "Parse EXPR as a miniscript whose key arguments are descriptor key
-expressions. Returns an :miniscript out-desc.
+expressions. Returns a LIST of :miniscript out-descs -- one per BIP389
+multipath branch (Core descriptor.cpp:2630-2661).
 
 MS-CTX is :P2WSH (inside wsh()) or :TAPSCRIPT (a tr() leaf). Miniscript's type
 rules, its legal fragments and its resource limits are all stated per context,
 which is why the context travels with the node rather than being assumed."
-  (let* ((keys '())
-         (node (handler-case
-                   (let ((bl.val:*ms-key-parser*
-                           (lambda (text)
-                             (let ((key (%with-desc-error-prefix
-                                         "miniscript: "
-                                         (lambda ()
-                                           ;; The KEY context follows the script
-                                           ;; context: a tapscript leaf accepts
-                                           ;; 32-byte x-only keys, wsh() does not.
-                                           (%parse-desc-key
-                                            text
-                                            (if (eq ms-ctx :tapscript) :tr :wsh)
-                                            network)))))
-                               (push key keys)
-                               key))))
-                     (bl.val:ms-parse expr :ctx ms-ctx))
-                 ;; Not a miniscript expression at all -- a bare pubkey, say.
-                 ;; Core only reports a miniscript error when the expression
-                 ;; PARSED and then failed its rules (descriptor.cpp:2600);
-                 ;; an unparseable one falls through to the generic message,
-                 ;; which is far more useful for the common typo.
-                 (bl.val:miniscript-parse-error ()
-                   (%desc-error "A function is needed within ~A"
-                                (if (eq ms-ctx :tapscript) "P2TR" "P2WSH"))))))
-    (%check-miniscript-sane node)
-    (make-out-desc :kind :miniscript :node node :keys (nreverse keys))))
+  (let ((groups '())
+        (key-ctx (if (eq ms-ctx :tapscript) :tr :wsh)))
+    (flet ((parse-node (pick)
+             "Parse EXPR, resolving each key expression through PICK; returns
+              (values node keys-in-parse-order)."
+             (let ((keys '()))
+               (let ((node (handler-case
+                               (let ((bl.val:*ms-key-parser*
+                                       (lambda (text)
+                                         (let ((key (funcall pick text)))
+                                           (push key keys)
+                                           key))))
+                                 (bl.val:ms-parse expr :ctx ms-ctx))
+                             ;; Not a miniscript expression at all -- a bare
+                             ;; pubkey, say. Core only reports a miniscript
+                             ;; error when the expression PARSED and then failed
+                             ;; its rules (descriptor.cpp:2600); an unparseable
+                             ;; one falls through to the generic message, which
+                             ;; is far more useful for the common typo.
+                             (bl.val:miniscript-parse-error ()
+                               (%desc-error "A function is needed within ~A"
+                                            (if (eq ms-ctx :tapscript) "P2TR" "P2WSH"))))))
+                 (values node (nreverse keys))))))
+      (multiple-value-bind (node keys)
+          (parse-node (lambda (text)
+                        (let ((group (%with-desc-error-prefix
+                                      "miniscript: "
+                                      (lambda ()
+                                        ;; The KEY context follows the script
+                                        ;; context: a tapscript leaf accepts
+                                        ;; 32-byte x-only keys, wsh() does not.
+                                        (%parse-desc-key text key-ctx network)))))
+                          (push group groups)
+                          (first group))))
+        (setf groups (nreverse groups))
+        ;; Core checks sanity ONCE, on the node built from the first branch:
+        ;; the check precedes its multipath loop (descriptor.cpp:2604-2661), and
+        ;; its KeyCompare reads m_keys.at(a).at(0) whatever branch is being
+        ;; built. So the verdict is the first branch's, for every branch.
+        (%check-miniscript-sane node)
+        (multiple-value-bind (aligned max-len)
+            (%multipath-align
+             groups "Miniscript: Multipath derivation paths have mismatched lengths")
+          (loop for i below max-len
+                collect (if (zerop i)
+                            (make-out-desc :kind :miniscript :node node :keys keys)
+                            ;; A later branch needs a node of its own. Ours
+                            ;; carries the desc-keys themselves where Core's
+                            ;; carries indices into a table it re-points, so the
+                            ;; expression is parsed again, handing out the i'th
+                            ;; branch of each key expression in the same order.
+                            (let ((remaining (mapcar (lambda (group) (nth i group))
+                                                     aligned)))
+                              (multiple-value-bind (branch-node branch-keys)
+                                  (parse-node (lambda (text)
+                                                (declare (ignore text))
+                                                (pop remaining)))
+                                (make-out-desc :kind :miniscript
+                                               :node branch-node
+                                               :keys branch-keys))))))))))
 
 (defun %check-miniscript-sane (node)
   "Core's acceptance gate for a miniscript descriptor (descriptor.cpp:2604-2628):
@@ -992,73 +1190,26 @@ fine as long as the whole expression does."
               (t ""))))
           (t " is not satisfiable")))))))
 
-;;; --- Multipath descriptors, BIP389 (Core descriptor.cpp:1802-1851) ---
-;;;
-;;; `wpkh(xpub.../<0;1>/*)` is ONE string that means TWO descriptors — the
-;;; receive chain and the change chain — and it is how Sparrow, Ledger Live,
-;;; BlueWallet, BDK and modern Core exports write a wallet. A node that cannot
-;;; read it cannot import from any of them.
-;;;
-;;; Core expands the string into N descriptors and parses each normally
-;;; (Parse() returns a vector). Expanding here rather than threading N paths
-;;; through the key structures keeps every downstream consumer — derivation,
-;;; signing, printing, checksums — working on exactly the descriptors it
-;;; already understands.
-
-(defun %multipath-substitutes (elem)
-  "The values inside a `<a;b;...>` path element, validated as Core validates
-them (descriptor.cpp:1813-1833). Signals with Core's messages."
-  (let* ((inner (subseq elem 1 (1- (length elem))))
-         (parts (uiop:split-string inner :separator ";")))
-    (when (< (length parts) 2)
-      (%desc-error "Multipath key path specifiers must have at least two items"))
-    (let ((seen '())
-          (box (list nil)))
-      (dolist (part parts (nreverse seen))
-        ;; Parse for VALIDATION only — the substituted string keeps the
-        ;; original spelling, so a hardened marker survives as written.
-        (let ((num (%parse-key-path-num part box)))
-          (when (member num seen :key #'car)
-            (%desc-error "Duplicated key path value ~D in multipath specifier"
-                         (logand num #x7FFFFFFF)))
-          (push (cons num part) seen))))))
-
-(defun expand-multipath-descriptor (string)
-  "STRING expanded into the descriptors it denotes: a list of one for an
-ordinary descriptor, or of N for a multipath one (Core Parse, which returns a
-vector of descriptors, descriptor.cpp:1802-1851).
-
-Any checksum is dropped, because it covered the multipath form and not the
-expansions; each result is unchecksummed and the caller adds one if it needs to.
-
-Core allows at most ONE multipath specifier per descriptor and requires at
-least two, distinct, values — all three of those errors are its own text."
-  (let* ((hash (position #\# string))
-         (body (if hash (subseq string 0 hash) string))
-         (start (position #\< body)))
-    (if start
-        (let ((end (position #\> body :start start)))
-          (unless end
-            (%desc-error "Key path value '~A' specifies multipath in a section where multipath is not allowed"
-                         (subseq body start)))
-          (when (position #\< body :start (1+ end))
-            (%desc-error "Multiple multipath key path specifiers found"))
-          (let ((prefix (subseq body 0 start))
-                (suffix (subseq body (1+ end)))
-                (elem (subseq body start (1+ end))))
-            (mapcar (lambda (sub)
-                      (concatenate 'string prefix (cdr sub) suffix))
-                    (%multipath-substitutes elem))))
-        (list string))))
-
-(defun parse-descriptor (string network &key require-checksum)
-  "Parse descriptor STRING (Core's Parse). Returns (values out-desc
-input-checksum) where INPUT-CHECKSUM is the checksum computed over the input
-body (private keys included, as getdescriptorinfo reports it). Signals
-rpc-error with Core's messages on any problem."
+(defun parse-descriptors (string network &key require-checksum)
+  "Parse descriptor STRING (Core's Parse). Returns (values descriptors
+input-checksum): DESCRIPTORS is a LIST, of one out-desc for an ordinary
+descriptor and of one per branch for a BIP389 multipath one. INPUT-CHECKSUM is
+the checksum computed over the input body (private keys included, as
+getdescriptorinfo reports it). Signals rpc-error with Core's messages on any
+problem."
   (multiple-value-bind (body checksum)
       (%check-descriptor-checksum string require-checksum)
     (values (%parse-descriptor-body body :top network) checksum)))
+
+(defun parse-descriptor (string network &key require-checksum)
+  "The first descriptor STRING denotes, and its input checksum. This is Core's
+`descs.at(0)' -- what getdescriptorinfo reports, what deriveaddresses and
+importdescriptors ask isrange/issolvable of, and the whole answer for every
+string that is not multipath. A consumer that must act on ALL of a multipath
+string's descriptors calls PARSE-DESCRIPTORS instead."
+  (multiple-value-bind (descs checksum)
+      (parse-descriptors string network :require-checksum require-checksum)
+    (values (first descs) checksum)))
 
 ;;; --- Descriptor predicates + printing ---
 
@@ -2011,24 +2162,31 @@ Returns (values begin end); Core's ParseRange + ParseDescriptorRange checks."
   "Expand a non-ranged descriptor STRING into a list of
 (script . canonical-descriptor) pairs, where the canonical descriptor carries
 a computed checksum (Core's getScriptFromDescriptor shape, used by
-generatetodescriptor/generateblock). Ranged descriptors are rejected like
-Core's mining RPCs."
-  (let ((desc (parse-descriptor string network)))
-    (when (out-desc-ranged-p desc)
+generatetodescriptor/generateblock). Ranged and multipath descriptors are
+rejected like Core's mining RPCs (rpc/mining.cpp:186-195): both denote more
+than one scriptPubKey, and a coinbase pays exactly one."
+  (let ((descs (parse-descriptors string network)))
+    (when (rest descs)
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"))
-    (let ((canonical (descriptor-add-checksum (out-desc-string desc))))
-      (mapcar (lambda (script) (cons script canonical))
-              (handler-case (out-desc-expand desc 0)
-                (descriptor-derivation-error ()
-                  (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                    :message "Cannot derive script without private keys")))))))
+                        :message "Multipath descriptor not accepted"))
+    (let ((desc (first descs)))
+      (when (out-desc-ranged-p desc)
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"))
+      (let ((canonical (descriptor-add-checksum (out-desc-string desc))))
+        (mapcar (lambda (script) (cons script canonical))
+                (handler-case (out-desc-expand desc 0)
+                  (descriptor-derivation-error ()
+                    (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                      :message "Cannot derive script without private keys"))))))))
 
 (defun descriptor-scanobject-scripts (scanobject network)
   "Expand a scanobject — a descriptor string or {\"desc\": ..., \"range\": ...}
-object — into (values scripts canonical-descriptor). Port of Core's
+object — into a list of (script . canonical-descriptor) pairs. Port of Core's
 EvalDescriptorStringOrObject (rpc/util.cpp:1324): default range [0,1000] for
-ranged descriptors, [0,0] for unranged."
+ranged descriptors, [0,0] for unranged, and every descriptor a BIP389 multipath
+string denotes contributes its own scripts, each paired with ITS canonical
+string rather than the first branch's."
   (multiple-value-bind (desc-str range)
       (cond ((stringp scanobject) (values scanobject nil))
             ((hash-table-p scanobject)
@@ -2041,18 +2199,26 @@ ranged descriptors, [0,0] for unranged."
                                  :message "Scan object needs to be either a string or an object")))
     (multiple-value-bind (low high)
         (if range (parse-descriptor-range range) (values 0 1000))
-      (let* ((desc (parse-descriptor desc-str network))
-             (canonical (descriptor-add-checksum (out-desc-string desc))))
-        (unless (out-desc-ranged-p desc)
+      (let* ((descs (parse-descriptors desc-str network))
+             ;; Once per descriptor, not once per range index: the default
+             ;; range is a thousand wide.
+             (canonicals (mapcar (lambda (desc)
+                                   (descriptor-add-checksum (out-desc-string desc)))
+                                 descs)))
+        ;; Core reads isrange off descs.at(0) (rpc/util.cpp:1347); every branch
+        ;; of one multipath string is ranged or not together.
+        (unless (out-desc-ranged-p (first descs))
           (setf low 0 high 0))
-        (values (loop for i from low to high
-                      append (handler-case (out-desc-expand desc i)
-                               (descriptor-derivation-error ()
-                                 (error 'rpc-error
-                                        :code +rpc-invalid-address-or-key+
-                                        :message (format nil "Cannot derive script without private keys: '~A'"
-                                                         desc-str)))))
-                canonical)))))
+        (loop for i from low to high
+              append (loop for desc in descs
+                           for canonical in canonicals
+                           append (mapcar (lambda (script) (cons script canonical))
+                                          (handler-case (out-desc-expand desc i)
+                                            (descriptor-derivation-error ()
+                                              (error 'rpc-error
+                                                     :code +rpc-invalid-address-or-key+
+                                                     :message (format nil "Cannot derive script without private keys: '~A'"
+                                                                      desc-str)))))))))))
 
 (defun %needle-scripts (scanobjects network)
   "Expand SCANOBJECTS (descriptor strings/objects) into an equalp hash-table
@@ -2060,10 +2226,8 @@ mapping each expanded script (byte vector) to its canonical descriptor
 (scantxoutset/scanblocks/getdescriptoractivity needle set)."
   (let ((needles (make-hash-table :test 'equalp)))
     (dolist (scanobject scanobjects needles)
-      (multiple-value-bind (scripts canonical)
-          (descriptor-scanobject-scripts scanobject network)
-        (dolist (script scripts)
-          (setf (gethash script needles) canonical))))))
+      (loop for (script . canonical) in (descriptor-scanobject-scripts scanobject network)
+            do (setf (gethash script needles) canonical)))))
 
 ;;; --- Script -> address / inferred descriptor ---
 
@@ -2096,16 +2260,27 @@ outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
   "Analyse a descriptor (Bitcoin Core getdescriptorinfo). PARAMS: (descriptor).
 Reports the canonical public form (private keys stripped to public) with its
 checksum, the checksum of the input as given, and the
-isrange/issolvable/hasprivatekeys flags."
+isrange/issolvable/hasprivatekeys flags.
+
+A BIP389 multipath descriptor answers for descs.at(0) like any other, plus a
+`multipath_expansion' array of every branch (rpc/output_script.cpp:206-213).
+This is Core's documented way to validate an export before importing it, so
+answering -5 for a descriptor our own importdescriptors accepts told an
+operator that a valid backup was malformed."
   (let ((network (rpc-get-network node)))
     (unless (stringp desc-str)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
-    (multiple-value-bind (desc input-checksum) (parse-descriptor desc-str network)
-      `(("descriptor" . ,(descriptor-add-checksum (out-desc-string desc)))
-        ("checksum" . ,input-checksum)
-        ("isrange" . ,(json-bool (out-desc-ranged-p desc)))
-        ("issolvable" . ,(json-bool (out-desc-solvable-p desc)))
-        ("hasprivatekeys" . ,(json-bool (out-desc-has-privkeys-p desc)))))))
+    (multiple-value-bind (descs input-checksum) (parse-descriptors desc-str network)
+      (let ((desc (first descs)))
+        `(("descriptor" . ,(descriptor-add-checksum (out-desc-string desc)))
+          ,@(when (rest descs)
+              `(("multipath_expansion"
+                 . ,(map 'vector (lambda (d) (descriptor-add-checksum (out-desc-string d)))
+                         descs))))
+          ("checksum" . ,input-checksum)
+          ("isrange" . ,(json-bool (out-desc-ranged-p desc)))
+          ("issolvable" . ,(json-bool (out-desc-solvable-p desc)))
+          ("hasprivatekeys" . ,(json-bool (out-desc-has-privkeys-p desc))))))))
 
 (define-rpc "deriveaddresses" (node (desc-str range))
   "Derive the address(es) for a descriptor (Bitcoin Core deriveaddresses).
@@ -2116,40 +2291,30 @@ rejected for unranged ones; combo() P2PK scripts are skipped like Core."
          (network (rpc-get-network node)))
     (unless (stringp desc-str)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
-    ;; A multipath descriptor denotes SEVERAL descriptors, and Core returns one
-    ;; address array per expansion — an array of arrays (rpc_deriveaddresses.py
-    ;; :32-33). The multipath PR built the expander for the wallet's import path;
-    ;; deriveaddresses went on refusing multipath outright, because the refusal
-    ;; lives in the key-path parser it reaches first.
-    (let ((expansions (expand-multipath-descriptor desc-str)))
-      (when (rest expansions)
-        ;; The checksum covered the MULTIPATH form, so it is validated here,
-        ;; once, and the expansions carry none — which is why they are derived
-        ;; with require-checksum NIL. Requiring one per expansion answers
-        ;; "Missing checksum" for a descriptor whose checksum was correct.
-        (%check-descriptor-checksum desc-str t)
-        (return-from rpc-deriveaddresses
-          (coerce (mapcar (lambda (one)
-                            (coerce (%derive-addresses-for one range range-given network
-                                                           :require-checksum nil)
-                                    'vector))
-                          expansions)
-                  'vector))))
-    (%derive-addresses-for desc-str range range-given network)))
+    (let* ((descs (parse-descriptors desc-str network :require-checksum t))
+           (first-desc (first descs)))
+      ;; The range checks read descs.at(0), as Core's do
+      ;; (rpc/output_script.cpp:319-327).
+      (when (and (not (out-desc-ranged-p first-desc)) range-given)
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Range should not be specified for an un-ranged descriptor"))
+      (when (and (out-desc-ranged-p first-desc) (not range-given))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Range must be specified for a ranged descriptor"))
+      ;; One address array for an ordinary descriptor; an array OF arrays, one
+      ;; per branch, for a multipath one (rpc/output_script.cpp:330-339).
+      (if (rest descs)
+          (map 'vector
+               (lambda (desc)
+                 (coerce (%derive-addresses-for desc range range-given network) 'vector))
+               descs)
+          (%derive-addresses-for first-desc range range-given network)))))
 
-(defun %derive-addresses-for (desc-str range range-given network
-                              &key (require-checksum t))
-  "The single-descriptor half of DERIVEADDRESSES: DESC-STR's addresses over
-RANGE, as a list."
+(defun %derive-addresses-for (desc range range-given network)
+  "The single-descriptor half of DERIVEADDRESSES: DESC's addresses over RANGE,
+as a list."
   (multiple-value-bind (low high)
       (if range-given (parse-descriptor-range range) (values 0 0))
-    (let ((desc (parse-descriptor desc-str network :require-checksum require-checksum)))
-        (when (and (not (out-desc-ranged-p desc)) range-given)
-          (error 'rpc-error :code +rpc-invalid-parameter+
-                            :message "Range should not be specified for an un-ranged descriptor"))
-        (when (and (out-desc-ranged-p desc) (not range-given))
-          (error 'rpc-error :code +rpc-invalid-parameter+
-                            :message "Range must be specified for a ranged descriptor"))
       (let ((addresses '()))
         (loop for i from low to high
               do (let ((scripts (handler-case (out-desc-expand desc i)
@@ -2168,4 +2333,4 @@ RANGE, as a list."
                                        :message "Descriptor does not have a corresponding address")))))))
         (when (null addresses)
           (error 'rpc-error :code +rpc-misc-error+ :message "Unexpected empty result"))
-        (nreverse addresses)))))
+        (nreverse addresses))))

@@ -199,8 +199,11 @@ Core parity minus the explicit out-of-scopes.
    or testnet-only build flag until P6 encryption lands?
 3. **CoinGrinder**: defer (recommended — it only activates above ~3× long-term feerate; BnB/
    Knapsack/SRD are what run in practice) or port in P4 for full waste-comparison parity?
-4. **Multipath descriptors** `<0;1>` and `createwalletdescriptor`/`gethdkeys`: defer both
-   (Core's default wallets don't emit multipath; niche RPCs).
+4. ~~**Multipath descriptors** `<0;1>` and `createwalletdescriptor`/`gethdkeys`: defer both
+   (Core's default wallets don't emit multipath; niche RPCs).~~ SETTLED: BIP389 multipath is
+   implemented in the parser, where Core has it, so every descriptor consumer gets it
+   (GA11 findings 232c293f / c9da9f50). The premise was wrong twice over: a modern Core
+   export IS multipath, and so is what Sparrow, BDK and Ledger Live write.
 5. **Notification delivery**: keep synchronous hardcoded hooks (recommended, matches our index
    pattern) or build a Core-style async validation-interface queue first? (Queue becomes
    attractive if the GUI's SSE push channel wants the same events — see gui-plan P5.)

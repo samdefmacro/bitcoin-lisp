@@ -118,7 +118,6 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:descriptor-cache-parent-xpubs
    #:descriptor-derivation-error
    #:descriptor-id
-   #:expand-multipath-descriptor
    #:feerate-fee
    #:format-key-path
    #:format-money
@@ -151,6 +150,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:outpoint-key
    #:parse-descriptor
    #:parse-descriptor-range
+   #:parse-descriptors
    #:parse-hex-hash
    #:parse-multisig
    #:parse-multisig-pubkey
