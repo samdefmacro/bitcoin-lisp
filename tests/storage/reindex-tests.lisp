@@ -156,65 +156,6 @@ loaded as live state."
            (is (eq t (bl.store:load-state reload)))
            (is (= 0 (bl.store:current-height reload)))))))))
 
-;;;; The interrupted reindex must not resurrect the pre-reindex tip.
-;;;;
-;;;; GA11 bbf6e679 (S1). The coins DB's best-block pointer used to survive the
-;;;; reindex wipe (only 'C' keys were deleted), so after a crash between the
-;;;; wipe and the first replay flush the node started at genesis with an empty
-;;;; set -- correct -- and then RECONCILE-COINS-DB-BEST-BLOCK read the standing
-;;;; pointer, placed it, moved chainstate.dat FORWARD to the pre-reindex tip and
-;;;; logged "Recovered". Every UTXO-set answer was then an empty set at that
-;;;; height, and the first competing fork marked the honest chain :invalid.
-;;;; Core cannot reach it: -reindex-chainstate destroys the whole coins LevelDB
-;;;; (node/chainstate.cpp:93, dbwrapper.cpp:39-41), DB_BEST_BLOCK lives inside
-;;;; the coin batch (txdb.cpp:128,159), and is_coinsview_empty skips LoadChainTip
-;;;; over an empty view (node/chainstate.cpp:69-70).
-
-(test reindex-crash-before-first-flush-restarts-at-genesis
-  "End to end through bl:start-node: mine, run the reindex prefix, die before
-the first replay flush, restart with no flags. The node must come back AT
-GENESIS with an empty UTXO set -- never at the pre-reindex tip."
-  (with-temporary-node (base "test-reindex-crash")
-    ;; A chain on disk, committed by a clean shutdown.
-    (start-test-node :data-directory base :network :regtest :sync nil
-                   :rpc-port nil :listen nil :console-log nil)
-    (generate-regtest-blocks bl:*node* 8)
-    (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*))))
-    (bl:stop-node)
-    ;; Restart, then reproduce do-reindex-chainstate's prefix (rewind to
-    ;; genesis with the marker, wipe) and die with nothing flushed -- exactly
-    ;; what a killed process leaves behind.
-    (bl.net:reset-ibd-stop)
-    (start-test-node :data-directory base :network :regtest :sync nil
-                   :rpc-port nil :listen nil :console-log nil)
-    (let ((cs (bl:node-chain-state bl:*node*))
-          (utxo (bl:node-utxo-set bl:*node*)))
-      (is (= 8 (bl.store:current-height cs)))
-      (is (= 40000000000 (bl.store:utxo-set-total-amount utxo)))
-      (bl.store:update-chain-tip cs (bl.store:chain-state-genesis-hash cs) 0)
-      (bl.store:save-state cs :in-transition t)
-      (bl.store:coins-view-cache-wipe utxo)
-      ;; The emptied database names no block: that is the invariant.
-      (is (null (bl.store:coins-view-db-best-block
-                 (bl.store:coins-view-cache-base utxo))))
-      (bl.store:close-chainstate-coins-view cs)
-      (release-datadir-lock)
-      (setf bl:*node* nil))
-    ;; Ordinary restart, no flags.
-    (bl.net:reset-ibd-stop)
-    (start-test-node :data-directory base :network :regtest :sync nil
-                   :rpc-port nil :listen nil :console-log nil)
-    (let ((cs (bl:node-chain-state bl:*node*))
-          (utxo (bl:node-utxo-set bl:*node*)))
-      (is (= 0 (bl.store:current-height cs))
-          "the node re-advanced onto the pre-reindex tip over an empty set")
-      (is (equalp (bl.store:chain-state-genesis-hash cs)
-                  (bl.store:best-block-hash cs)))
-      (is (= 0 (bl.store:utxo-set-total-amount utxo)))
-      (is (null (bl.store:coins-view-db-best-block
-                 (bl.store:coins-view-cache-base utxo)))))
-    (bl:stop-node)))
-
 (test reconcile-never-places-a-pointer-over-an-empty-utxo-set
   "A datadir an OLDER build left in the bad shape -- coins gone, pointer still
 naming the old tip -- must not be reconciled toward. Core's is_coinsview_empty

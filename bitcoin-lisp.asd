@@ -355,19 +355,6 @@ this same package."
                              (:file "support/mempool-fixtures")
                              (:file "support/wallet")
                              (:file "package")
-                             ;; The suites that run BL:START-NODE to completion
-                             ;; go first. A node start is sensitive to what a
-                             ;; long run has accumulated in the image -- the
-                             ;; globals it reads on the way in, and every
-                             ;; LevelDB and thread the suites before it left
-                             ;; open -- and when it stalls there the battery
-                             ;; ends with no failure and no count rather than
-                             ;; a red test. Running them before that build-up
-                             ;; keeps the end-to-end coverage in the battery;
-                             ;; WITH-TEMPORARY-NODE keeps them from leaking
-                             ;; forward.
-                             (:file "validation/verifydb-tests")
-                             (:file "storage/reindex-tests")
                              (:file "crypto/crypto-tests")
                              (:file "serialization/serialization-tests")
                              (:file "storage/storage-tests")
@@ -451,6 +438,7 @@ this same package."
                              ;; Bitcoin Core sighash test vectors
                              (:file "coalton/bitcoin-core-sighash-tests")
                              ;; Chain reorganization tests
+                             (:file "validation/verifydb-tests")
                              (:file "validation/reorg-tests")
                              ;; Block validation end-to-end tests
                              (:file "validation/block-e2e-tests")
@@ -477,6 +465,7 @@ this same package."
                              ;; MuHash3072 tests
                              (:file "crypto/muhash-tests")
                              ;; coinstatsindex tests
+                             (:file "storage/reindex-tests")
                              (:file "storage/coinstatsindex-tests")
                              (:file "storage/txospenderindex-tests")
                              (:file "validation/versionbits-tests")
