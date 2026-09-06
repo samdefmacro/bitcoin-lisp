@@ -1070,6 +1070,41 @@ mis-parses almost always produces a different script rather than none."
     (is (>= checked 60) "expected ~60 inferable vectors, checked ~D" checked)
     (is (null bad) "~{~A~^~%~}" (reverse bad))))
 
+(test miniscript-numbers-are-read-the-way-cores-tointegral-reads-them
+  "Core reads every miniscript number with ToIntegral<int64_t> over the exact
+argument span (miniscript.h:1882, :2023, :2030, :2041), and ToIntegral
+(util/strencodings.h:180-189) is std::from_chars plus a full-consumption
+check -- ASCII digits and nothing else. CL's PARSE-INTEGER skips surrounding
+whitespace and accepts a leading sign, so a set of spellings Core rejects
+outright used to parse here.
+
+The harm is a checksum that does not survive the trip: getdescriptorinfo
+returns the checksum of the descriptor AS GIVEN, and importdescriptors
+requires one, so an operator who typed the non-canonical spelling got a
+checksummed string that imports here and will not parse in Core."
+  ;; Controls first: the canonical spellings must still parse.
+  (dolist (expr (list "after(1)"
+                      "older(10)"
+                      (format nil "thresh(1,pk(~A))" *ms-desc-key-a*)
+                      (format nil "multi(1,~A)" *ms-desc-key-a*)))
+    (is-true (%ms-try-parse expr) "~A must still parse" expr))
+  ;; Core's four explicit negatives (miniscript_tests.cpp:707-711). Two of
+  ;; them -- the signed ones -- were rejected here only incidentally, by the
+  ;; range test; the plus forms parsed.
+  (dolist (expr (list "after(-1)"
+                      "after(+1)"
+                      (format nil "thresh(-1,pk(~A))" *ms-desc-key-a*)
+                      (format nil "multi(+1,~A)" *ms-desc-key-a*)))
+    (is-false (%ms-try-parse expr) "~A: Core refuses a signed number" expr))
+  ;; from_chars refuses whitespace too, leading or trailing.
+  (dolist (expr (list "after( 1)"
+                      "after(1 )"
+                      "older( 10)"
+                      (format nil "after(~C1)" #\Tab)))
+    (is-false (%ms-try-parse expr) "~S: Core refuses whitespace" expr))
+  ;; And the full-consumption control, which held before this change too.
+  (is-false (%ms-try-parse "after(1x)")))
+
 (defun %ms-infer-hex (hex &optional (ctx :p2wsh))
   "MS-FROM-SCRIPT of the script HEX spells, as (values node re-serialized-hex)."
   (let ((node (bl.val:ms-from-script (bl.crypto:hex-to-bytes hex) :ctx ctx)))
