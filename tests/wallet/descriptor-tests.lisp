@@ -1351,6 +1351,137 @@ re-sorted would not round-trip to what its owner typed."
     (%check-unparsable "" (format nil "tr(musig(~A,~A)/0)" a b)
                        "tr(): musig(): derivation requires all participants to be xpubs or xprvs")))
 
+;;; The BIP32 halves of musig(), which are where the plain and the cached
+;;; expansion can disagree. Core's own keys, so the expected scripts are its
+;;; expected scripts.
+
+(defparameter +musig-a-prv+
+  "xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc")
+(defparameter +musig-a-pub+
+  "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL")
+(defparameter +musig-b-pub+
+  "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y")
+
+(defun %regtest-tpub (seed)
+  "A deterministic regtest tpub, for the descriptors a regtest wallet parses."
+  (bl.crypto:bip32-serialize
+   (bl.crypto:bip32-neuter
+    (bl.crypto:bip32-master-key
+     (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+     :network :regtest))))
+
+(defun %musig-core-vectors ()
+  "Core descriptor_tests.cpp:1162-1167 as (private public scripts) triples --
+every musig() shape that derives: ranged PARTICIPANTS, a ranged musig()
+DERIVATION, a fixed path on both halves, the aggregate as a tr() internal key
+and inside a tr() LEAF, and one built from the same xpub twice."
+  (let ((a +musig-a-prv+) (p +musig-a-pub+) (b +musig-b-pub+)
+        (wif "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S")
+        (xonly "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"))
+    (list
+     (list (format nil "rawtr(musig(~A/0/*,~A/0/*))" a b)
+           (format nil "rawtr(musig(~A/0/*,~A/0/*))" p b)
+           '(("5120754ccfd18ed4051de3b1144b6145cad4b2999387338dfb85ec392f2963ceaa3a")
+             ("5120be80016576d2691ccc4077bc91d7ece4db34667d6e84829d5e08480cd4bc0b78")
+             ("5120b7139e2f8b92570ad96c40c3b5e6557a5194e288a96df6f29980523365239d58")))
+     (list (format nil "rawtr(musig(~A,~A)/0/*)" a b)
+           (format nil "rawtr(musig(~A,~A)/0/*)" p b)
+           '(("51209508c08832f3bb9d5e8baf8cb5cfa3669902e2f2da19acea63ff47b93faa9bfc")
+             ("51205ca1102663025a83dd9b5dbc214762c5a6309af00d48167d2d6483808525a298")
+             ("51207dbed1b89c338df6a1ae137f133a19cae6e03d481196ee6f1a5c7d1aeb56b166")))
+     (list (format nil "rawtr(musig(~A/0,~A)/1)" a b)
+           (format nil "rawtr(musig(~A/0,~A)/1)" p b)
+           '(("51200e355f2bc9e754268e12bbd337499c2f7ffafc3101c41792709007b25a862532")))
+     (list (format nil "tr(musig(~A,~A)/0/*,pk(~A))" a b wif)
+           (format nil "tr(musig(~A,~A)/0/*,pk(~A))" p b xonly)
+           '(("51201d377b637b5c73f670f5c8a96a2c0bb0d1a682a1fca6aba91fe673501a189782")
+             ("51208950c83b117a6c208d5205ffefcf75b187b32512eb7f0d8577db8d9102833036")
+             ("5120a49a477c61df73691b77fcd563a80a15ea67bb9c75470310ce5c0f25918db60d")))
+     (list (format nil "tr(~A,pk(musig(~A,~A)/0/*))" wif a b)
+           (format nil "tr(~A,pk(musig(~A,~A)/0/*))" xonly p b)
+           '(("512068983d461174afc90c26f3b2821d8a9ced9534586a756763b68371a404635cc8")
+             ("5120368e2d864115181bdc8bb5dc8684be8d0760d5c33315570d71a21afce4afd43e")
+             ("512097a1e6270b33ad85744677418bae5f59ea9136027223bc6e282c47c167b471d5")))
+     (list (format nil "tr(musig(~A/1,~A/1)/2)" a a)
+           (format nil "tr(musig(~A/1,~A/1)/2)" p p)
+           '(("5120a17ceacd6422bd5ffd9f165807b254b7d68ad39f179cc4f11545a6835227e97c"))))))
+
+(test musig-derivation-matches-core-vectors
+  "Core descriptor_tests.cpp:1162-1167. musig() has two halves that derive and
+Core forbids both at once: the PARTICIPANTS may be ranged, in which case they
+derive first and the aggregate is a different key at every index; or the
+musig() itself may carry a path, in which case the aggregate is fixed and the
+path walks the BIP328 synthetic xpub built over it."
+  (loop for (prv pub scripts) in (%musig-core-vectors)
+        do (%check-desc prv pub scripts :range (> (length scripts) 1))))
+
+(test musig-expands-the-same-with-and-without-the-wallet-cache
+  "%DESC-KEY-PUBKEY-AT-CACHED -- the wallet's expansion path, behind
+importdescriptors, the key-pool top-up, spkm-is-mine and descriptorprocesspsbt
+-- had no musig() branch, so a musig key (whose EXTKEY slot is NIL) fell into
+the BIP32 arm and either raised an unhandled TYPE-ERROR, which reached the RPC
+surface as HTTP 500, or was converted into -4 \"Cannot expand descriptor.
+Probably because of hardened derivations without private keys provided\" -- a
+cause that does not apply, since a musig() descriptor cannot have a hardened
+step and the failure was unchanged with both xprvs supplied.
+
+Core has no such split: MuSigPubkeyProvider is a PubkeyProvider like any other
+(descriptor.cpp:597), so Expand and ExpandFromCache go through it exactly as
+they go through a BIP32 key. The three expansions must therefore agree, script
+for script, on every one of Core's own musig vectors."
+  (flet ((cached (desc pos cache)
+           (mapcar #'bl.crypto:bytes-to-hex
+                   (bl.rpc:out-desc-expand-with-provider desc pos nil cache)))
+         (from-cache (desc pos cache)
+           (mapcar #'bl.crypto:bytes-to-hex
+                   (bl.rpc:out-desc-expand-from-cache desc pos cache))))
+    (loop for (nil pub scripts) in (%musig-core-vectors)
+          do (let ((desc (%desc-parse pub :mainnet))
+                   (cache (bl.rpc:make-descriptor-cache)))
+               (loop for expected in scripts
+                     for i from 0
+                     do (is (equal expected (cached desc i cache))
+                            "~A at ~D expands to ~S through the cache path"
+                            pub i (cached desc i cache))
+                        ;; And again from the cache alone, which is what a
+                        ;; watch-only wallet does after a restart.
+                        (is (equal expected (from-cache desc i cache))
+                            "~A at ~D does not come back out of the cache"
+                            pub i))))))
+
+(test musig-descriptors-import-into-a-watch-only-wallet
+  "The finding in the terms an operator sees. musig2 SIGNING is not implemented
+-- src/wallet/psbt.lisp only reads the PSBT_IN_MUSIG2_* fields for decodepsbt --
+so a musig() wallet is watch-only either way; what was lost was the ability to
+watch one at all, plus a 500 on a public RPC surface for a well-formed request.
+
+The last descriptor is the control: a plain tr() xpub through the same wallet,
+so a fixture that could not import anything cannot pass this."
+  (with-wallet-chain-node (node "musig-import")
+    (labels ((rpc (method &rest params)
+               (with-rpc-wallet (nil)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+             (aval (key alist) (cdr (assoc key alist :test #'string=)))
+             (import-desc (s)
+               (let ((request (make-hash-table :test 'equal)))
+                 (setf (gethash "desc" request) (bl.rpc:descriptor-add-checksum s)
+                       (gethash "timestamp" request) "now")
+                 (when (search "/*" s) (setf (gethash "range" request) 3))
+                 (first (rpc "importdescriptors" (list request))))))
+      ;; disable_private_keys: musig() has no private form we could import.
+      (rpc "createwallet" "watch" t)
+      ;; Regtest tpubs, because the node is a regtest one and DecodeExtPubKey
+      ;; reads the network's own prefix -- Core's mainnet vectors above are
+      ;; simply not keys here.
+      (let ((a (%regtest-tpub 11)) (b (%regtest-tpub 12)))
+        (dolist (s (list (format nil "tr(musig(~A,~A))" a b)
+                         (format nil "tr(musig(~A,~A)/0/*)" a b)
+                         (format nil "tr(musig(~A/0/*,~A/0/*))" a b)
+                         (format nil "tr(~A/0/*)" a)))
+          (let ((result (import-desc s)))
+            (is (eq t (aval "success" result))
+                "importdescriptors ~A answered ~S" s (aval "error" result))))))))
+
 ;;;; --- Miniscript in a tapscript context -----------------------------------
 
 (test tr-leaf-miniscript-matches-core-vector

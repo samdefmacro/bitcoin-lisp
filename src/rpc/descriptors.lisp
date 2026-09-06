@@ -516,14 +516,22 @@ used only for DescriptorID stability across versions)."
   (:documentation "Expansion needs private keys (hardened derivation from a
 public-only descriptor) or hit an invalid BIP32 child."))
 
-(defun %musig-key-pubkey-at (key pos)
-  "The pubkey a musig() key expression produces at POS (Core
-MuSigPubkeyProvider::GetPubKey, descriptor.cpp:633).
+(defun %musig-flat-key-p (key)
+  "True when the musig() KEY carries no derivation of its own, so its aggregate
+IS its pubkey. The complement is the shape that derives from a synthetic xpub.
+Core splits the same way when it decides which PubkeyProvider to build for the
+aggregate (descriptor.cpp:654-659)."
+  (and (null (desc-key-path key)) (eq (desc-key-derive key) :none)))
+
+(defun %musig-aggregate-at (key pos)
+  "The MuSig2 aggregate of musig() KEY's participants at POS (Core
+MuSigPubkeyProvider::GetPubKey's aggregation half, descriptor.cpp:637-651).
 
 Two shapes, and they aggregate at different moments:
 
-  musig(A,B)/0/*   — the participants are fixed, so the aggregate is fixed too;
-                     POS derives from the BIP328 SYNTHETIC XPUB built over it.
+  musig(A,B)/0/*   — the participants are fixed, so the aggregate is fixed too
+                     and POS plays no part in it; the caller derives from the
+                     BIP328 SYNTHETIC XPUB built over it.
   musig(A/0/*,B/0/*) — the participants derive first and the aggregate is a
                      different key at every POS.
 
@@ -535,23 +543,37 @@ same descriptor written two ways would be two different ADDRESSES."
   (let* ((participants (desc-key-musig-participants key))
          (ranged (some #'desc-key-ranged-p participants))
          (pubkeys (mapcar (lambda (p) (%desc-key-pubkey-at p (if ranged pos 0)))
-                          participants))
-         (aggregate (bl.crypto:musig-aggregate-pubkeys
-                     (sort (copy-list pubkeys) #'pubkey-lessp))))
-    (unless aggregate
-      (error 'descriptor-derivation-error))
-    (if (and (null (desc-key-path key)) (eq (desc-key-derive key) :none))
-        aggregate
-        (let ((root (%musig-synthetic-xpub aggregate
-                                           (bl.chain:chain-params-name
-                                            (bl.chain:chain-params-of-ext-prefix
-                                             (bl.crypto:ext-key-version
-                                              (or (desc-key-extkey (first participants))
-                                                  (desc-key-ext-privkey (first participants)))))))))
-          (let ((k (bl.crypto:bip32-derive-path root (desc-key-path key))))
-            (when (eq (desc-key-derive key) :unhardened)
-              (setf k (bl.crypto:bip32-derive-child k pos)))
-            (bl.crypto:ext-key-key k))))))
+                          participants)))
+    (or (bl.crypto:musig-aggregate-pubkeys
+         (sort (copy-list pubkeys) #'pubkey-lessp))
+        (error 'descriptor-derivation-error))))
+
+(defun %musig-derivation-root (key pos)
+  "The BIP328 synthetic xpub a non-flat musig() KEY derives from, on the network
+its participants are written for. Fixed for the whole range — a musig() with a
+derivation cannot have ranged participants (descriptor.cpp:2022) — so POS only
+reaches the aggregation, which ignores it in that shape."
+  (let ((first-participant (first (desc-key-musig-participants key))))
+    (%musig-synthetic-xpub
+     (%musig-aggregate-at key pos)
+     (bl.chain:chain-params-name
+      (bl.chain:chain-params-of-ext-prefix
+       (bl.crypto:ext-key-version
+        (or (desc-key-extkey first-participant)
+            (desc-key-ext-privkey first-participant))))))))
+
+(defun %musig-key-pubkey-at (key pos)
+  "The pubkey a musig() key expression produces at POS (Core
+MuSigPubkeyProvider::GetPubKey, descriptor.cpp:633), deriving straight from the
+descriptor's own key material. %DESC-KEY-PUBKEY-AT-CACHED takes the same two
+halves through the wallet cache."
+  (if (%musig-flat-key-p key)
+      (%musig-aggregate-at key pos)
+      (let ((k (bl.crypto:bip32-derive-path (%musig-derivation-root key pos)
+                                            (desc-key-path key))))
+        (when (eq (desc-key-derive key) :unhardened)
+          (setf k (bl.crypto:bip32-derive-child k pos)))
+        (bl.crypto:ext-key-key k))))
 
 (defun %desc-key-pubkey-at (key pos)
   "The pubkey bytes KEY produces at range position POS (Core GetPubKey).
@@ -1681,9 +1703,21 @@ BIP32PubkeyProvider::GetPubKey, descriptor.cpp:425-485). With READ-CACHE, only
 cached xpubs are consulted (Core ExpandFromCache) — a miss signals
 descriptor-derivation-error. Without it, hardened derivation pulls the root
 xprv from PRIVKEY-PROVIDER, and WRITE-CACHE (when given) collects the parent /
-derived / last-hardened xpubs exactly as Core caches them."
+derived / last-hardened xpubs exactly as Core caches them.
+
+musig() arrives here like any other key expression, because in Core it IS one:
+MuSigPubkeyProvider (descriptor.cpp:633-700) aggregates its participants and
+then either returns the aggregate or hands the rest to a BIP32 provider built
+over the BIP328 synthetic xpub and carrying THIS key expression's index, so the
+aggregate's parent/derived xpubs cache under EXPR-INDEX like anyone else's. The
+participants resolve from the descriptor's own key material rather than through
+the cache: our key-expression indexes number the musig() expression, not the
+keys inside it, so there is no index to file a participant's xpub under, and a
+participant is always an xpub or a plain key that the descriptor itself carries."
   (when (desc-key-pubkey key)
     (return-from %desc-key-pubkey-at-cached (desc-key-pubkey key)))
+  (when (and (desc-key-musig-participants key) (%musig-flat-key-p key))
+    (return-from %desc-key-pubkey-at-cached (%musig-aggregate-at key pos)))
   (let* ((path (desc-key-path key))
          (derive (desc-key-derive key))
          (hardened-p (or (eq derive :hardened)
@@ -1720,7 +1754,9 @@ derived / last-hardened xpubs exactly as Core caches them."
                (setf final (bl.crypto:bip32-neuter k))
                (when lh (setf last-hardened (bl.crypto:bip32-neuter lh))))))
           (t
-           (let ((k (desc-key-extkey key)))
+           (let ((k (if (desc-key-musig-participants key)
+                        (%musig-derivation-root key pos)
+                        (desc-key-extkey key))))
              (dolist (entry path)
                (setf k (bl.crypto:bip32-derive-child k entry)))
              (setf parent k)
@@ -1729,6 +1765,14 @@ derived / last-hardened xpubs exactly as Core caches them."
                              k)))))
       (descriptor-derivation-error (e) (error e))
       (error () (error 'descriptor-derivation-error)))
+    ;; Everything below takes an EXT-KEY -- the write-cache stores one and the
+    ;; last form reads one -- and both sit OUTSIDE the handler-case that turns a
+    ;; derivation failure into descriptor-derivation-error. So a key expression
+    ;; this path does not understand has to be stopped here, or it reaches an
+    ;; RPC surface as a raw TYPE-ERROR rather than as Core's -4. A musig() key
+    ;; arrived with FINAL still NIL and did exactly that: importdescriptors
+    ;; answered HTTP 500 / JSON-RPC -32603 for a well-formed request.
+    (unless final (error 'descriptor-derivation-error))
     (when write-cache
       ;; Only cache the parent when there is any unhardened derivation; a
       ;; hardened-ranged terminal caches the derived child instead
