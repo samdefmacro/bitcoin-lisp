@@ -24,6 +24,9 @@ Executed check — `start-node-plist` on
 -timeout=30000 -alertnotify=... -shrinkdebugfile=0 -logips=1 -maxreceivebuffer=1` returns the plist
 `(:LISTEN T :WALLET-NAMES NIL :NETWORK :REGTEST)` — none of the ten reaches a keyword — and
 `supplied-core-only-options` returns all ten, so all ten are named in that warning.
+(Measured at survey time. `-logips` has since been implemented -- finding `559c86ad` -- so it now
+reaches `:log-ips` and is no longer one of the ten. An option LEAVING this list as it gains an
+implementation is the point of the list.)
 
 That is a real correction to the operator's belief, and it is why most rows below are class (a)
 rather than (b). It has one blind spot, and it is where the (c) findings live: **an option Core
@@ -86,7 +89,7 @@ on a node given that option.
 | `-limitancestorsize` | `IsArgSet` ⇒ `InitWarning` "replaced with cluster size limits" (`init.cpp:930`) | accepted; our core-only line warns | a | Core warns and ignores, we warn and ignore |
 | `-limitdescendantcount` | `GetIntArg(..., DEFAULT_DESCENDANT_LIMIT=25)`; deprecated, wallet coin selection only (`node/mempool_args.cpp:41`) | as `-limitancestorcount` | a | same |
 | `-limitdescendantsize` | `IsArgSet` ⇒ `InitWarning` (`init.cpp:933`) | accepted; our core-only line warns | a | same |
-| `-logips` | `GetBoolArg(..., DEFAULT_LOGIPS=false)` → `fLogIPs`; `CNode::LogIP` appends ` peeraddr=` only when on (`net.cpp:704-707`), and `CNode::DisconnectMsg` is that plus `disconnecting peer=<id>` (`net.cpp:709-714`) | **fixed**: a real `define-option` row (`:log-ips`) sets `bl.log:*log-ips*` through `start-node`, `bl.log:log-ip` and `bl.net:disconnect-msg` are Core's two helpers, and all 63 peer-naming log lines in `src/networking/` and `src/node/` name the peer as `peer=<id>` and reach its address only through `log-ip`; the lines Core routes to `LogDebug(BCLog::NET)` moved to `log-cat "net"` | fixed | finding `559c86ad` |
+| `-logips` | `GetBoolArg(..., DEFAULT_LOGIPS=false)` → `fLogIPs`; `CNode::LogIP` appends ` peeraddr=` only when on (`net.cpp:704-707`), and `CNode::DisconnectMsg` is that plus `disconnecting peer=<id>` (`net.cpp:709-714`) | **fixed**: a real `define-option` row (`:log-ips`) sets `bl.log:*log-ips*` through `start-node`, `bl.log:log-ip`, `bl.net:peer-log-name` (Core's `peer=%d%s`) and `bl.net:disconnect-msg` are Core's three helpers, and all 65 peer-naming log lines in `src/networking/` and `src/node/` name the peer as `peer=<id>` and reach its address only through them; the lines Core routes to `LogDebug(BCLog::NET)` moved to `log-cat "net"`, and Core's two ungated LogInfo exceptions (`net.cpp:388`, `:1787`) are matched rather than special-cased | fixed | finding `559c86ad` |
 | `-loglevelalways` | `GetBoolArg(..., DEFAULT_LOGLEVELALWAYS=false)` → always prefix category+level (`init/common.cpp:55`) | our line format is fixed | a | cosmetic; a log-format preference with no behavioural effect |
 | `-logsourcelocations` | `GetBoolArg(..., false)` → prefix file:line:function (`init/common.cpp:54`) | not supported | a | cosmetic developer aid |
 | `-logtimestamps` | `GetBoolArg(..., DEFAULT_LOGTIMESTAMPS=true)` (`init/common.cpp:51`) | timestamps always on, which is Core's default | a | only `-logtimestamps=0` diverges, and that is a formatting preference |
