@@ -488,7 +488,8 @@ to move them (the node must be stopped)."
   "Re-arm every once-per-run latch for this run -- -stopatheight, the shutdown
 coordination, the signal handler, the peers.dat dump clock, the log rate
 limiter, the block-file format, the mempool persistence flags, the wallet
-broadcaster -- so an in-image restart never inherits a previous node's state."
+broadcaster, the warnings map -- so an in-image restart never inherits a
+previous node's state."
   ;; -stopatheight: re-arm the once-only shutdown trigger for this run.
   (setf *stop-at-height-triggered* nil
         *disk-space-abort-triggered* nil)
