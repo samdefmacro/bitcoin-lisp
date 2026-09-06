@@ -505,6 +505,92 @@ Core's condition, so both are here."
         (is (eql bl.wallet::+wallet-client-version+
                  (%stored-client-version path)))))))
 
+;;; --- A walletdescriptor record that will not read (GA11 69862ba9) ---
+
+(defun %damage-descriptor-record (path shape)
+  "Damage the first walletdescriptor record of the CLOSED wallet at PATH.
+
+The three shapes are three different failures in our old code and one single
+class in Core's, which is the whole finding: :FLIP turns a bit inside the
+serialized descriptor string, :NON-CHARSET writes a byte outside Core's
+descriptor INPUT_CHARSET (descriptor.cpp:121-124), and :TRUNCATE cuts the
+value short so the byte reader runs off the end."
+  (let ((db (bl.wallet::wallet-db-open path)))
+    (unwind-protect
+         (dolist (record (wallet-db-record-list db))
+           (when (equal (bl.wallet::wdb-parse-key (car record))
+                        bl.wallet::+wdb-key-walletdescriptor+)
+             (let ((value (copy-seq (cdr record))))
+               (return
+                 (bl.store:leveldb-put
+                  db (car record)
+                  (ecase shape
+                    (:flip (setf (aref value 12) (logxor 1 (aref value 12)))
+                           value)
+                    (:non-charset (setf (aref value 12) 1)
+                                  value)
+                    (:truncate (subseq value 0 (- (length value) 6))))
+                  :sync t)))))
+      (bl.store:leveldb-close db))))
+
+(defun %load-damaged-descriptor-wallet (node shape &key version)
+  "Create wallet wd, unload it, damage its descriptor record per SHAPE (and
+stamp VERSION when given), then load it. Returns the lines that load logged;
+the load itself is expected to signal."
+  (with-rpc-wallet (nil)
+    (bl.wallet::rpc-createwallet node '("wd"))
+    (let ((path (bl.wallet::wallet-path
+                 (gethash "wd" (bl.wallet::wallet-manager-wallets
+                                (%node-manager node))))))
+      (bl.wallet::rpc-unloadwallet node '("wd"))
+      (%damage-descriptor-record path shape)
+      (when version (%set-stored-client-version path version))
+      (capture-log-lines
+       (lambda ()
+         (ignore-errors (bl.wallet::rpc-loadwallet node '("wd"))))))))
+
+(test wallet-unreadable-descriptor-record-is-core-s-unknown-descriptor
+  "GA11 69862ba9. Core runs the descriptor parser inside WalletDescriptor's
+deserializer and throws ios_base::failure for ANY parse failure
+(walletutil.h:41-64), so LoadDescriptorWalletRecords answers a bit flip, a
+non-charset byte and a truncated record with the one DBErrors::UNKNOWN_DESCRIPTOR
+(walletdb.cpp:764-784), worded at wallet.cpp:2400-2404 and reaching the client
+as RPC_WALLET_ERROR. We answered the first two with the descriptor parser's own
+-5 about a checksum or invalid characters, and the third with -32603 carrying an
+SBCL array-index report, because the value codec was unguarded."
+  (dolist (shape '(:flip :non-charset :truncate))
+    (with-wallet-test-node (node)
+      (signals-rpc-error (:code -4
+                          :message "Unrecognized descriptor found. Loading wallet")
+        (with-rpc-wallet (nil)
+          (bl.wallet::rpc-createwallet node '("wd"))
+          (let ((path (bl.wallet::wallet-path
+                       (gethash "wd" (bl.wallet::wallet-manager-wallets
+                                      (%node-manager node))))))
+            (bl.wallet::rpc-unloadwallet node '("wd"))
+            (%damage-descriptor-record path shape)
+            (bl.wallet::rpc-loadwallet node '("wd"))))))))
+
+(test wallet-unreadable-descriptor-logs-core-s-detail-line
+  "The reply is short and fixed; the detail goes to the log, and its middle
+sentence is the one thing last_client picks (walletdb.cpp:782-783). A version
+record from the future says the wallet may be too new; this build's own
+version says the database may be corrupt. Core appends \"\\nDetails: %s\" to
+both, which is where the underlying condition survives without being shipped
+to the client."
+  (with-wallet-test-node (node)
+    (let ((lines (%load-damaged-descriptor-wallet node :truncate :version 999999)))
+      (is-true (find-if (lambda (line)
+                          (search "might have been created on a newer version" line))
+                        lines))
+      (is-true (find-if (lambda (line) (search "Details:" line)) lines))))
+  (with-wallet-test-node (node)
+    (let ((lines (%load-damaged-descriptor-wallet node :truncate)))
+      (is-true (find-if (lambda (line)
+                          (search "database might be corrupted" line))
+                        lines))
+      (is-true (find-if (lambda (line) (search "Details:" line)) lines)))))
+
 (test wallet-hardened-ranged-cache-reload
   "A hardened-ranged descriptor (/*') persists derived-xpub cache records and
 reloads to Core's exact scripts (descriptor_tests.cpp sh(wpkh(...)) vector)."
