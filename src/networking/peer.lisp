@@ -363,9 +363,9 @@ BAN-PEER to :banned — so those two states are our \"already retired\".
 
 Anything that hands a retired peer a RESOURCE must consult this first: the
 peer will never be retired a second time, so whatever it was granted is never
-given back. (REPLACE-DISCONNECTED-PEERS reaps :disconnected peers straight out
-of NODE-PEERS and never reaps :banned ones at all — neither reap runs a
-release, because by then the retirement that set the state already did.)"
+given back. (REPLACE-DISCONNECTED-PEERS reaps both states straight out of
+NODE-PEERS without running a release, because by then the retirement that set
+the state already did.)"
   (not (member (peer-state peer) '(:disconnected :banned))))
 
 ;;; --- Chain-sync protection slots (Core
@@ -1722,30 +1722,38 @@ independently."
   ;; reachability. The disconnect below still happens either way.
   (unless (loopback-address-p (peer-address peer))
     (discourage-peer (peer-address peer)))
-  (when (peer-connection peer)
-    (close-connection (peer-connection peer))
-    (setf (peer-connection peer) nil))
-  (setf (peer-state peer) :disconnected)
-  ;; This retires the peer without going through DISCONNECT-PEER, so it owes
-  ;; the protection slot back itself (Core FinalizeNode runs for every removal,
-  ;; misbehaviour included).
-  (release-outbound-protection peer)
+  ;; Core has exactly ONE node-removal path: however a peer leaves,
+  ;; DisconnectNode leads to FinalizeNode, which unconditionally runs the
+  ;; tx-download manager's DisconnectedPeer, TxOrphanage::EraseForPeer and the
+  ;; Peer-state reset -- MaybeDiscourageAndDisconnect reaches it like every
+  ;; other caller (net_processing.cpp:5171-5207). We had three retirement
+  ;; paths and only DISCONNECT-PEER was complete: this one closed the socket,
+  ;; set the state and released the protection slot, and stopped. No
+  ;; disconnect hook, so the tx-request tracker kept every announcement the
+  ;; peer had made -- keyed by the peer OBJECT, so the struct stayed pinned --
+  ;; no orphanage sweep, and the headers-sync buffer stayed attached.
+  ;; Delegating is the whole fix; DISCONNECT-PEER already does all of it,
+  ;; including the protection release that used to be duplicated here.
+  (disconnect-peer peer)
   t)
 
 (defun ban-peer (peer)
-  "Ban a peer. Sets state to :banned and records ban expiry."
-  (setf (peer-state peer) :banned)
-  ;; Another retirement path that bypasses DISCONNECT-PEER (Core FinalizeNode).
-  (release-outbound-protection peer)
+  "Ban a peer: record the ban expiry, retire the connection through the one
+finalize path, and leave the peer in state :banned.
+
+The retirement is DISCONNECT-PEER's (Core FinalizeNode, reached from every
+removal): this used to open-code a partial teardown and so left the peer's
+tx-request announcements, its orphans and its headers-sync buffer behind. The
+state is set AFTER delegating, because DISCONNECT-PEER sets :disconnected and
+:banned is the stronger fact callers read."
   (let ((address (peer-address peer)))
     (when (and address (plusp (length address)))
       (bt:with-lock-held (*ban-lock*)
         (setf (gethash address *banned-peers*)
               (+ (bl.ser:get-node-time) *default-ban-time-seconds*)))
       (save-banlist)))
-  (when (peer-connection peer)
-    (close-connection (peer-connection peer))
-    (setf (peer-connection peer) nil)))
+  (disconnect-peer peer)
+  (setf (peer-state peer) :banned))
 
 (defun peer-banned-p (address)
   "Check if ADDRESS is currently banned.

@@ -876,3 +876,96 @@ the getdata."
           (is-false (bl.net:tx-request-wanted-p txid inbound))
           (is (= 1 (backdate-tx-announcements txid)))
           (is (= 1 (bl.net:process-tx-requests))))))))
+
+;;;; One finalize step for every retirement path (Core FinalizeNode)
+
+(defun %pr-hash (seed)
+  "A distinct 32-byte hash for SEED."
+  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref h 0) (ldb (byte 8 0) seed)
+          (aref h 1) (ldb (byte 8 8) seed))
+    h))
+
+(test every-retirement-path-runs-the-one-finalize-step
+  "Core has exactly ONE node-removal path: however a peer leaves,
+CConnman::DisconnectNode leads to PeerManagerImpl::FinalizeNode, which
+unconditionally runs the tx-download manager's DisconnectedPeer,
+TxOrphanage::EraseForPeer and the Peer-state reset -- MaybeDiscourageAndDisconnect
+(net_processing.cpp:5171-5207) reaches it like every other caller.
+
+We had three paths and only DISCONNECT-PEER was complete. RECORD-MISBEHAVIOR
+and BAN-PEER open-coded a partial teardown: no disconnect hook, so the
+tx-request tracker kept every announcement the peer had made -- and
+*TX-PEER-ANNOUNCEMENTS* is keyed by the peer OBJECT, so the struct stayed
+pinned -- no orphanage sweep and no headers-sync clear. A peer may announce up
+to +MAX-PEER-TX-ANNOUNCEMENTS+ hashes that resolve for nobody, trip one of the
+misbehaviour sites, and leave that many permanent records behind, then
+reconnect from another address and repeat, so the per-peer cap stops bounding
+the total."
+  (let ((fired '())
+        (real bl.net::*peer-disconnect-hook*))
+    (let ((bl.net::*peer-disconnect-hook*
+            (lambda (peer)
+              (push (bl.net:peer-address peer) fired)
+              (when real (funcall real peer))))
+          (bl.net::*discouraged-peers* (bl:make-rejects-filter 128))
+          (bl.net::*banlist-path* nil))
+      (%with-fresh-rejects (unused-rejects)
+        (progn unused-rejects)
+        (loop for (what address retire)
+                in (list (list "disconnect-peer" "10.7.0.1"
+                               (lambda (p) (bl.net:disconnect-peer p)))
+                         (list "record-misbehavior" "10.7.0.2"
+                               (lambda (p) (bl.net:record-misbehavior p "unit test")))
+                         (list "ban-peer" "10.7.0.3"
+                               (lambda (p) (bl.net:ban-peer p))))
+              for seed from 1
+              do (let ((peer (bl.net:make-peer :address address :state :ready
+                                               :services bl.ser:+node-witness+)))
+                   (dotimes (i 3)
+                     (bl.net:tx-request-wanted-p (%pr-hash (+ (* 100 seed) i)) peer))
+                   ;; The control: without this the "no announcements
+                   ;; afterwards" assertion below holds for a peer that never
+                   ;; announced anything.
+                   (is (= 3 (bl.net:tx-request-count peer))
+                       "control: ~A's peer announced 3 transactions" what)
+                   (setf (bl.net::peer-headers-sync peer) :in-progress)
+                   (funcall retire peer)
+                   (is-true (member address fired :test #'string=)
+                            "~A must run the one finalize step" what)
+                   (is (= 0 (bl.net:tx-request-count peer))
+                       "~A must leave no announcement pinning the peer" what)
+                   (is (null (bl.net::peer-headers-sync peer))
+                       "~A must drop the headers-sync buffer" what)))))
+    (bl.net:clear-ban-list)))
+
+(test a-retired-peers-announcements-are-reclaimed-by-the-sweep
+  "Belt and braces for the same leak: RETRY-TIMED-OUT-TX-REQUESTS only ever
+looked at *TX-IN-FLIGHT*, so a CANDIDATE announcement -- one that was never
+requested -- had no route back at all. %TX-REQUEST-SELECTABLE-P requires a
+:ready peer, so a retired peer's candidate can never become in-flight and can
+never expire; it is released only if some other route resolves the
+transaction, which for a hash that resolves for nobody never happens.
+
+Driven by retiring the peer WITHOUT any of the retirement paths, so the sweep
+is what has to reclaim the record and not the hook."
+  (%with-fresh-rejects (unused-rejects)
+    (progn unused-rejects)
+    (let ((live (%pr-peer))
+          (gone (bl.net:make-peer :address "10.7.0.9" :state :ready
+                                  :services bl.ser:+node-witness+))
+          (hash (%pr-hash 4242))
+          (other (%pr-hash 4243)))
+      (bl.net:tx-request-wanted-p hash gone)
+      (bl.net:tx-request-wanted-p other live)
+      (is (= 1 (bl.net:tx-request-count gone))
+          "control: the peer announced one transaction")
+      (is (= 1 (bl.net:tx-request-count live))
+          "control: the live peer announced one too")
+      ;; Retire it behind the tracker's back -- no hook, no path.
+      (setf (bl.net:peer-state gone) :disconnected)
+      (bl.net:retry-timed-out-tx-requests)
+      (is (= 0 (bl.net:tx-request-count gone))
+          "a retired peer's announcement must be reclaimed by the sweep")
+      (is (= 1 (bl.net:tx-request-count live))
+          "and a live peer's announcement must survive it"))))

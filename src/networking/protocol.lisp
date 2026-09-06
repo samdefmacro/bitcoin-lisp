@@ -879,7 +879,25 @@ belt-and-suspenders re-check PROCESS-TX-REQUESTS takes it for."
                 (unless (find-if (lambda (ann)
                                    (eq (peer-state (tx-ann-peer ann)) :ready))
                                  anns)
-                  (%tx-announcers-erase txid))))))))
+                  (%tx-announcers-erase txid)))))))
+      ;; Reclaim announcements left by a peer that has been retired. The
+      ;; disconnect hook is what normally does this and every retirement path
+      ;; now runs it, but the sweep above only ever looks at *TX-IN-FLIGHT*,
+      ;; so a CANDIDATE announcement -- one that was never requested -- had no
+      ;; route back at all: %TX-REQUEST-SELECTABLE-P requires a :ready peer, so
+      ;; a retired peer's candidate can never become in-flight and can never
+      ;; expire. A peer may announce up to +MAX-PEER-TX-ANNOUNCEMENTS+ hashes
+      ;; that resolve for nobody, so leaving that to one hook is a cap that
+      ;; stops bounding anything the moment a path forgets to call it. This
+      ;; makes the leak unreachable rather than merely unlikely.
+      (let ((retired '()))
+        (maphash (lambda (txid anns)
+                   (dolist (ann anns)
+                     (unless (peer-live-p (tx-ann-peer ann))
+                       (push (cons txid (tx-ann-peer ann)) retired))))
+                 *tx-announcers*)
+        (dolist (item retired)
+          (%tx-request-drop-announcer (car item) (cdr item)))))
     (%send-tx-getdatas (%drop-already-have-requests to-send ctx))))
 
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
