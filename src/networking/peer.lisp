@@ -1489,7 +1489,7 @@ what draws it -- named here because the pong has to match it."
 (defconstant +ping-interval-seconds+ 120
   "Core PING_INTERVAL (net_processing.cpp:122): a keepalive/latency ping is
 sent once no ping is outstanding and this long has passed.")
-(defconstant +ping-timeout-seconds+ 1200
+(defconstant +ping-timeout-seconds+ +timeout-interval-seconds+
   "Core TIMEOUT_INTERVAL (net.h:59): a ping left unanswered this long
 disconnects the peer (MaybeSendPing, net_processing.cpp:5487-5494).")
 

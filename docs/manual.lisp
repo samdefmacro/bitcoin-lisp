@@ -570,6 +570,12 @@
   fPauseSend gate in ProcessMessages), so the work is deferred instead of
   a reply we already decided to send going missing; a peer that never
   drains is dropped by the 20-minute socket-sending timeout, as in Core.
+  That twenty minutes is Core's TIMEOUT_INTERVAL and there is exactly ONE
+  of it: `+timeout-interval-seconds+` is what the send-stall window, the
+  half-read-message reaper and the ping timeout all are, because Core
+  measures every liveness rule against the same constant -- spelled
+  separately, the reaper's copy had drifted to a quarter of it and dropped
+  peers Core keeps.
   `receive-bytes` is resumable and bounded per pass, so one slow
   peer cannot stall the node (a 24-byte header followed by silence once
   froze every peer). Readiness is `poll(2)`, never `select()`. The

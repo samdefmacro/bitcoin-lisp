@@ -887,8 +887,14 @@ while the reader is about to ask for ANNOUNCED-BYTES. Returns
                     (usocket:socket-stream client))
     (force-output (usocket:socket-stream client))
     (sleep 0.2)
-    (values (bl.net::make-connection :socket server :connected t)
+    (values (make-test-connection :socket server :connected t)
             client server listener)))
+
+(defun %message-header-bytes (header)
+  "HEADER on the wire. Five tests in this file frame a message by hand, and the
+serializer is internal, so the reach into it lives here once."
+  (bl.bytes:with-byte-buf (s)
+    (bl.ser::write-message-header s header)))
 
 (defun %run-bounded (thunk &key (limit 8))
   "Run THUNK in a thread. Returns (VALUES finished-p result). A thunk still
@@ -1104,7 +1110,7 @@ above."
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket server :connected t))
+         (conn (make-test-connection :socket server :connected t))
          (chunk (* 100 1024))
          (chunks 10)
          (total (* chunk chunks))
@@ -1150,7 +1156,7 @@ backwards would disconnect every quiet peer on every poll."
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket server :connected t)))
+         (conn (make-test-connection :socket server :connected t)))
     (unwind-protect
          (progn
            ;; Nothing sent at all: a pure idle poll.
@@ -1209,7 +1215,7 @@ fails if only the stall bound is present."
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket server :connected t))
+         (conn (make-test-connection :socket server :connected t))
          (stop nil)
          ;; Ask for more than the rate floor allows within the stall window, so
          ;; the two bounds are distinguishable: 200 KiB at 32 KiB/s = ~6.4s.
@@ -1263,7 +1269,7 @@ Announce just under the limit."
                                            :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket victim-socket
+         (conn (make-test-connection :socket victim-socket
                                                         :connected t))
          (peer (bl.net:make-peer :connection conn :state :ready))
          (announced (1- bl:+max-message-payload+))
@@ -1275,8 +1281,7 @@ Announce just under the limit."
     (unwind-protect
          (progn
            (let ((header-bytes
-                   (bl.bytes:with-byte-buf (s)
-                     (bl.ser::write-message-header s header))))
+                   (%message-header-bytes header)))
              (write-sequence header-bytes (usocket:socket-stream attacker))
              (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
                              (usocket:socket-stream attacker))
@@ -1316,6 +1321,72 @@ Announce just under the limit."
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
 
+(test receive-stall-window-is-cores-timeout-interval
+  "GA11 3cad28cc: the half-read-message reaper's window IS Core's
+TIMEOUT_INTERVAL, and every liveness window in the node is that one number.
+
+Core has no per-message clock at all. CNode::vRecvMsg holds a partially
+received message for as long as the connection lives, and the only
+receive-side rule is InactivityCheck's now > last_recv + TIMEOUT_INTERVAL
+(net.cpp:2040-2046; TIMEOUT_INTERVAL = 20 minutes, net.h:58-59), applied
+whether or not a message is in progress. A tighter window here is therefore a
+rule Core does not have: at 300 s a peer whose link went dead mid-message and
+then came back was dropped anywhere between 5 and 20 minutes where Core keeps
+it, and the drop was followed at once by a redial of the same address.
+
+The trickle case at the end is the control that says what this clock measures.
+It is PROGRESS, not elapsed time: the stamp is renewed by every byte that
+arrives, so a slow but delivering peer is never reaped however long its message
+takes. Without that control the finding reads as \"slow peers are dropped\",
+which is not what the code does."
+  ;; Core's number, written out, so what follows is a claim about Core rather
+  ;; than a restatement of our own constant.
+  (let ((timeout-interval (* 20 60)))
+    (multiple-value-bind (conn client server listener)
+        (%silent-peer-connection 24 12)
+      (unwind-protect
+           (let ((units internal-time-units-per-second))
+             (flet ((expired () (bl.net::connection-receive-expired-p conn))
+                    (read-24 () (bl.net::receive-bytes-resumable conn 24)))
+               (flet ((silent-for (seconds)
+                        ;; Backdate the progress stamp instead of waiting.
+                        (setf (bl.net::connection-recv-last-progress conn)
+                              (- (get-internal-real-time) (* seconds units)))
+                        (expired)))
+                 ;; Half a header consumed: the reaper's precondition.
+                 (is (eq :incomplete (read-24)))
+                 (is (= 12 (bl.net::connection-recv-filled conn))
+                     "the bytes that arrived are parked on the connection")
+                 ;; Inside Core's window Core keeps this peer, so we keep it.
+                 (is-false (silent-for 301)
+                           "301 s of mid-message silence was the whole finding: ~
+Core is 15 more minutes from dropping this peer")
+                 (is-false (silent-for (1- timeout-interval))
+                           "a peer silent for less than TIMEOUT_INTERVAL is one ~
+Core keeps")
+                 ;; Past it Core drops it too, and the slot must not leak.
+                 (is-true (silent-for (1+ timeout-interval))
+                          "past TIMEOUT_INTERVAL the half-read message is reaped")
+                 ;; The trickle control: one arriving byte renews the clock.
+                 (silent-for (1- timeout-interval))
+                 (write-sequence (make-array 1 :element-type '(unsigned-byte 8))
+                                 (usocket:socket-stream client))
+                 (force-output (usocket:socket-stream client))
+                 (sleep 0.2)
+                 (is (eq :incomplete (read-24)))
+                 (is-false (expired)
+                           "a byte that ARRIVES renews the window: this clock ~
+measures progress, not how long the message has taken"))))
+        (usocket:socket-close client)
+        (usocket:socket-close server)
+        (usocket:socket-close listener)))
+    ;; And there is one such window in the node, not four spellings of it.
+    (is (= timeout-interval bl.net::+timeout-interval-seconds+))
+    (is (= timeout-interval bl.net::+receive-stall-timeout-seconds+)
+        "the in-progress reaper must use Core's window, not one of its own")
+    (is (= timeout-interval bl.net::+send-stall-timeout-seconds+))
+    (is (= timeout-interval bl.net::+ping-timeout-seconds+))))
+
 (test one-trickling-peer-does-not-stall-another
   "THE regression this refactor exists for. Two peers: one announces a large
 payload and delivers almost none of it, the other sends a complete message. A
@@ -1337,9 +1408,9 @@ finite, and this makes it nonexistent."
                                               :element-type '(unsigned-byte 8)))
          (fast-socket (usocket:socket-accept listener
                                              :element-type '(unsigned-byte 8)))
-         (slow-conn (bl.net::make-connection :socket slow-socket
+         (slow-conn (make-test-connection :socket slow-socket
                                                              :connected t))
-         (fast-conn (bl.net::make-connection :socket fast-socket
+         (fast-conn (make-test-connection :socket fast-socket
                                                              :connected t))
          (slow-peer (bl.net:make-peer :connection slow-conn
                                                       :state :ready))
@@ -1353,9 +1424,7 @@ finite, and this makes it nonexistent."
                            :command "block"
                            :payload-length (1- bl:+max-message-payload+)
                            :checksum (make-array 4 :element-type '(unsigned-byte 8))))
-                  (header-bytes (bl.bytes:with-byte-buf (s)
-                                  (bl.ser::write-message-header
-                                   s header))))
+                  (header-bytes (%message-header-bytes header)))
              (write-sequence header-bytes (usocket:socket-stream slow-sender))
              (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
                              (usocket:socket-stream slow-sender))
@@ -1404,7 +1473,7 @@ consults expiry."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket victim-socket
+         (conn (make-test-connection :socket victim-socket
                                                         :connected t))
          (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 100 :element-type '(unsigned-byte 8)
@@ -1421,8 +1490,7 @@ consults expiry."
            ;; Peer sends its header and, a moment later, the payload — it is
            ;; never silent for long.
            (let ((header-bytes
-                   (bl.bytes:with-byte-buf (s)
-                     (bl.ser::write-message-header s header))))
+                   (%message-header-bytes header)))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
            (sleep 0.2)
@@ -1462,7 +1530,7 @@ payload and left the connection ALIVE and permanently out of frame."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket victim-socket
+         (conn (make-test-connection :socket victim-socket
                                                         :connected t))
          (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 100 :element-type '(unsigned-byte 8)
@@ -1478,8 +1546,7 @@ payload and left the connection ALIVE and permanently out of frame."
          (progn
            ;; Pass 1: header only.
            (let ((header-bytes
-                   (bl.bytes:with-byte-buf (s)
-                     (bl.ser::write-message-header s header))))
+                   (%message-header-bytes header)))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
            (sleep 0.2)
@@ -1520,7 +1587,7 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket victim-socket
+         (conn (make-test-connection :socket victim-socket
                                                         :connected t))
          (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 8 :element-type '(unsigned-byte 8)
@@ -1535,8 +1602,7 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
     (unwind-protect
          (progn
            (let ((header-bytes
-                   (bl.bytes:with-byte-buf (s)
-                     (bl.ser::write-message-header s header))))
+                   (%message-header-bytes header)))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (write-sequence payload (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
@@ -1562,7 +1628,7 @@ forever."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket victim-socket
+         (conn (make-test-connection :socket victim-socket
                                                         :connected t))
          (peer (bl.net:make-peer :connection conn :state :ready)))
     (unwind-protect
@@ -1597,7 +1663,7 @@ has actually sent (net.cpp:1323-1324)."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bl.net::make-connection :socket victim-socket
+         (conn (make-test-connection :socket victim-socket
                                                         :connected t))
          (announced (1- bl:+max-message-payload+)))
     (unwind-protect
