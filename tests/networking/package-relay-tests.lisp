@@ -766,3 +766,76 @@ in-IBD run must not."
               (deliver-ibd-message peer "tx" (%pr-payload tx) ctx)
               (is-true (bl.mp:mempool-has mempool txid))
               (is (= 1 (length (bl.net:peer-tx-inv-queue relay-target)))))))))))
+
+;;;; Orphan intake: the parent filter and every announcer as a candidate
+;;;; (Core MempoolRejectedTx's orphan branch, txdownloadman_impl.cpp:391-420)
+
+(test orphan-intake-enrols-every-announcer-of-the-orphan
+  "Core's orphan_resolution_candidates starts as {nodeid} and is extended by
+m_txrequest.GetCandidatePeers over the orphan's txid and wtxid (:406-410),
+with MaybeAddOrphanResolutionCandidate and AddTx run for each. Enrolling only
+the delivering peer left resolution with ONE candidate -- and since a peer
+announces a transaction once, the peers that announced this orphan before it
+reached us never offer themselves again, so a stalled sole candidate meant
+waiting out the 60s expiry with no alternative."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((parent (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (parent-id (bl.ser:transaction-hash parent))
+           (child (%pr-tx (list (cons parent-id 0)) (- 100000000 100000)))
+           (child-id (bl.ser:transaction-hash child))
+           (a (%pr-peer))
+           (b (%pr-peer))
+           (inv (subseq (bl.ser:make-inv-message
+                         (list (bl.ser:make-inv-vector
+                                :type bl.ser:+inv-type-witness-tx+
+                                :hash child-id)))
+                        24)))
+      (%with-fresh-rejects (rejects)
+        (let ((ctx (%pr-ctx state utxo mempool rejects)))
+          ;; B announces the child before A delivers it -- exactly the live
+          ;; announcement GetCandidatePeers looks for.
+          (ignore-errors (deliver-inv b inv ctx))
+          (is (equal (list b) (tx-request-announcement-peers child-id)))
+          ;; A delivers it; the parent is unknown, so it goes to the orphanage.
+          (deliver-tx a (%pr-payload child) ctx)
+          (let ((pool (bl.mp:mempool-orphan-pool mempool)))
+            (is-true (bl.mp:orphan-tx pool child-id))
+            ;; BOTH peers are orphanage announcers and both are announcers of
+            ;; the missing parent, so either can resolve it.
+            (is-true (bl.mp:orphan-have-from-peer pool child-id a))
+            (is-true (bl.mp:orphan-have-from-peer pool child-id b))
+            (is (equal (list a b)
+                       (sort (copy-list (bl.net:tx-request-candidate-peers parent-id))
+                             #'< :key #'bl.net:peer-id)))
+            ;; The orphan itself is forgotten by the tracker, and only after
+            ;; the candidates were read off it (:418-419).
+            (is (null (tx-request-announcement-peers child-id :completed t)))))))))
+
+(test orphan-intake-does-not-re-request-a-parent-we-already-hold
+  "Core erases from the parent list everything AlreadyHaveTx covers before
+enrolling anyone (std::erase_if, :391-396). The orphanage is the gap that
+mattered: a parent we are already holding as an orphan was requested again,
+one redundant full-transaction download per such parent."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (declare (ignore funding))
+    (let* ((unknown (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 33))
+           (parent (%pr-tx (list (cons unknown 0)) (- 100000000 50000)))
+           (parent-id (bl.ser:transaction-hash parent))
+           (child (%pr-tx (list (cons parent-id 0)) (- 100000000 100000)))
+           (child-id (bl.ser:transaction-hash child))
+           (a (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (let ((ctx (%pr-ctx state utxo mempool rejects))
+              (pool (bl.mp:mempool-orphan-pool mempool)))
+          ;; The parent arrives first and is itself an orphan.
+          (deliver-tx a (%pr-payload parent) ctx)
+          (is-true (bl.mp:orphan-tx pool parent-id))
+          ;; Positive control: intake really does register a genuinely
+          ;; missing parent -- the parent's own is requested from A.
+          (is (eq a (tx-request-in-flight-peer unknown)))
+          ;; Now the child, whose only missing parent is the orphan we hold.
+          (deliver-tx a (%pr-payload child) ctx)
+          (is-true (bl.mp:orphan-tx pool child-id))
+          (is (null (bl.net:tx-request-candidate-peers parent-id)))
+          (is (null (tx-request-in-flight-peer parent-id))))))))
