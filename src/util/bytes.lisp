@@ -233,6 +233,19 @@ counterpart of flexi-streams:with-input-from-sequence."
     (prog1 (aref (br-data br) p)
       (setf (br-pos br) (the fixnum (1+ p))))))
 
+(defun br-read-bool (br)
+  "Core's bool unserializer (serialize.h:277): `uint8_t f = ser_readdata8(s);
+a = f;' -- the byte is assigned to a bool, so EVERY nonzero byte is true, not
+only the byte 1.
+
+Core writes only 0 and 1, so the difference shows up on another
+implementation's or a fuzzer's bytes; but reading 2 as false is a divergence
+in how we read the wire, and Core's consumers take the value straight
+(net_processing.cpp:3647 fRelay, :3910 sendcmpct_hb) rather than treating a
+byte outside {0,1} as a protocol violation."
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (/= (br-read-u8 br) 0))
+
 (defmacro define-br-read-le (name nbytes)
   "Define NAME (br): read NBYTES little-endian bytes as an unsigned integer
 and advance. Expands to the hand-unrolled AREFs."

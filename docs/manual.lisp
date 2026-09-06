@@ -424,6 +424,10 @@
   peer-supplied string field says its own bound -- `(:var-string :max N
   :name ...)`, Core's LIMITED_STRING -- and an over-long one FAILS the
   message rather than being truncated, which is how the peer gets dropped.
+  A wire boolean is read the way Core reads one: the byte is assigned to
+  the bool (`serialize.h:277`), so EVERY nonzero byte is true and
+  `br-read-bool` is the only place that rule is written down -- a field
+  that tests the byte against 1 rejects what Core accepts.
 
   A transaction is read by Core's UnserializeTransaction, whose shape is
   not `look at the marker byte\': an EMPTY vin is the dummy, the flag byte

@@ -2469,6 +2469,30 @@ relaying (Core's fRelay=true default)."
     (is-true (bl.net:peer-tx-relay-p no-version))
     (is-false (bl.net:peer-tx-relay-p block-relay))))
 
+(test peer-tx-relay-p-reads-frelay-the-way-core-reads-a-bool
+  "GA11 d9ca7c2f. Core unserializes fRelay into a bool -- `uint8_t f =
+ser_readdata8(s); a = f;' (serialize.h:277) -- and assigns it straight to the
+peer's relay state (`tx_relay->m_relay_txs = fRelay', net_processing.cpp:3647),
+so a VERSION carrying fRelay = 2 is a peer that wants transactions. Reading the
+byte as `= 1' made it a peer that does not: excluded from tx inv announcements,
+its tx getdata ignored for the life of the connection, relaytxes=false in
+getpeerinfo.
+
+Driven from the BYTES rather than from a constructed struct, because the defect
+is in the codec and a struct built with :relay t would exercise none of it."
+  (flet ((relay-p (byte)
+           (let ((payload (copy-seq (bl.ser:make-version-message-bytes
+                                     :relay t :nonce 3))))
+             (setf (aref payload (1- (length payload))) byte)
+             (bl.bytes:with-byte-reader (s payload)
+               (bl.net:peer-tx-relay-p
+                (bl.net:make-peer :state :ready :conn-type :outbound-full-relay
+                                  :version (bl.ser:read-version-message s)))))))
+    (is-false (relay-p 0) "fRelay = 0 must still mean no tx relay")
+    (is-true (relay-p 1))
+    (is-true (relay-p 2))
+    (is-true (relay-p 255))))
+
 (test relay-transaction-skips-frelay0-peer
   "No tx announcements are queued for a BIP37/BIP60 fRelay=0 peer (Core only
 builds tx inventory when the TxRelay structure exists — announcing to a
