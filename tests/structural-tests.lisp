@@ -1468,7 +1468,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4129
+(defparameter +test-internal-reference-ceiling+ 4125
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1488,7 +1488,7 @@ sendcmpct through one helper; 4,201 with the mempool and addr-relay batches;
 4,196 once five getdata and gossip reaches moved into tests/support/; 4,187 when the
 spanning-forest tests folded fifteen sfl-linearize reaches into one helper; 4,178 with
 the tapscript signing batch; 4,129 once the tx-relay fixtures (deliver-tx and
-siblings) replaced the per-file reaches.
+siblings) replaced the per-file reaches; 4,125 with the never-opened batch.
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
