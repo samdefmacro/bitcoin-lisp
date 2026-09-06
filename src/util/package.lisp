@@ -152,6 +152,7 @@ inline these compile against them. src/util/bytes.lisp.")
    #:br-pos
    #:br-eof-p
    #:br-read-u8
+   #:br-read-bool
    #:br-read-u16-le
    #:br-read-u32-le
    #:br-read-u64-le

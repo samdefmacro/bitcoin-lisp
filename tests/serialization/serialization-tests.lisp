@@ -444,3 +444,51 @@ claim costs no allocation."
                "a ~D-byte user agent parsed to ~S instead of failing the message" n result)
       (is-true (search "exceeds maximum 256" (princ-to-string result))
                "unexpected error text: ~A" result))))
+
+(defun %version-relay-for-byte (byte &key (version bl.ser:+protocol-version+))
+  "The relay flag a VERSION message whose fRelay byte is BYTE reads back as."
+  (let ((payload (copy-seq (bl.ser:make-version-message-bytes
+                            :version version :relay t :nonce 7))))
+    (setf (aref payload (1- (length payload))) byte)
+    (bl.bytes:with-byte-reader (s payload)
+      (bl.ser:version-message-relay (bl.ser:read-version-message s)))))
+
+(defun %sendcmpct-announce-for-byte (byte)
+  "The high-bandwidth flag a sendcmpct payload whose announce byte is BYTE
+reads back as. The eight bytes after it are the little-endian version 2."
+  (let ((payload (make-array 9 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref payload 0) byte
+          (aref payload 1) 2)
+    (bl.ser:parse-sendcmpct-payload payload)))
+
+(test wire-boolean-is-true-for-every-nonzero-byte
+  "GA11 d9ca7c2f. Core's bool unserializer assigns the raw byte to the bool --
+`uint8_t f = ser_readdata8(s); a = f;' (serialize.h:277) -- so 2 and 255 read
+as TRUE. Three places here tested the byte for equality with 1 instead: the
+generated :bool codec row, the version message's relay :read form and
+PARSE-SENDCMPCT-PAYLOAD, so a peer sending fRelay = 2 was recorded as not
+wanting transactions and a sendcmpct with announce = 2 did not put us in that
+peer's high-bandwidth set. Core writes only 0 and 1, which is what keeps this
+to another implementation's or a fuzzer's bytes.
+
+Byte 1 is the control: it must stay true through the change, and byte 0 must
+stay false, or `every byte is true' would pass here just as well."
+  (is-false (%version-relay-for-byte 0))
+  (is-true (%version-relay-for-byte 1))
+  (is-true (%version-relay-for-byte 2))
+  (is-true (%version-relay-for-byte 255))
+  (is-false (%sendcmpct-announce-for-byte 0))
+  (is-true (%sendcmpct-announce-for-byte 1))
+  (is-true (%sendcmpct-announce-for-byte 2))
+  (is-true (%sendcmpct-announce-for-byte 255))
+  ;; sendcmpct's second value is untouched by the flag's rule.
+  (is (= 2 (nth-value 1 (%sendcmpct-announce-for-byte 2))))
+  ;; The relay field's :READ form still owns the two things the codec row
+  ;; cannot know: BIP 37's absent-means-relay default, and that a peer older
+  ;; than 70002 never sends the byte at all.
+  (is-true (let ((full (bl.ser:make-version-message-bytes :relay nil :nonce 7)))
+             (bl.bytes:with-byte-reader (s (subseq full 0 (1- (length full))))
+               (bl.ser:version-message-relay (bl.ser:read-version-message s))))
+           "an absent fRelay means relay (BIP 37)")
+  (is-true (%version-relay-for-byte 0 :version 70001)
+           "a pre-70002 peer's trailing byte is not an fRelay flag"))

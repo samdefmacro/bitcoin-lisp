@@ -24,7 +24,8 @@ src/serialization/.")
                 #:bb-write-var-bytes #:bb-write-hash256 #:bb-finish #:with-byte-buf
                 #:byte-reader #:make-byte-reader #:make-byte-reader-from
                 #:br-data #:br-pos #:br-eof-p
-                #:br-read-u8 #:br-read-u16-le #:br-read-u32-le #:br-read-u64-le
+                #:br-read-u8 #:br-read-bool
+                #:br-read-u16-le #:br-read-u32-le #:br-read-u64-le
                 #:br-read-i32-le #:br-read-i64-le #:br-read-bytes
                 #:br-read-compact-size #:br-read-var-bytes #:with-byte-reader)
   (:export
@@ -77,6 +78,7 @@ src/serialization/.")
    #:br-pos
    #:br-eof-p
    #:br-read-u8
+   #:br-read-bool
    #:br-read-u16-le
    #:br-read-u32-le
    #:br-read-u64-le

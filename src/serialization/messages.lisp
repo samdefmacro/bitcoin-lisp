@@ -216,10 +216,14 @@ PushNodeVersion).")
   (user-agent (:var-string :max +max-subversion-length+ :name "user agent")
               :default (format-user-agent nil))
   (start-height :i32)
-  ;; relay flag may not be present in older versions (BIP 37): absent means T
+  ;; relay flag may not be present in older versions (BIP 37): absent means T.
+  ;; The :READ form exists only for that absence default -- the byte itself is
+  ;; read by the :bool row's BR-READ-BOOL, so a peer sending fRelay = 2 is a
+  ;; relaying peer here exactly as it is for Core (serialize.h:277,
+  ;; net_processing.cpp:3647).
   (relay :bool :default t
          :read (if (> version 70001)
-                   (= (if (br-eof-p br) 1 (br-read-u8 br)) 1)
+                   (if (br-eof-p br) t (br-read-bool br))
                    t)))
 
 ;;;; Inventory vector
@@ -643,11 +647,15 @@ reads instead of Gray-stream input dispatch."
 ;;; Parse sendcmpct message
 (defun parse-sendcmpct-payload (payload)
   "Parse a sendcmpct message payload.
-   Returns (VALUES announce-flag version)."
+   Returns (VALUES announce-flag version).
+
+Core reads the flag as a bool (`vRecv >> sendcmpct_hb', net_processing.cpp:3910)
+and puts it straight into the peer's high-bandwidth state, so BR-READ-BOOL's
+rule -- any nonzero byte is true -- is the one that applies here too."
   (with-byte-reader (stream payload)
-    (let ((announce (br-read-u8 stream))
+    (let ((announce (br-read-bool stream))
           (version (br-read-u64-le stream)))
-      (values (= announce 1) version))))
+      (values announce version))))
 
 ;;; Make sendcmpct message
 (defun make-sendcmpct-message (high-bandwidth version)

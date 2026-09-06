@@ -122,7 +122,10 @@ writes VALUE to the byte-buf BB."
 (define-message-field-type :u64 (unsigned-byte 64) (br-read-u64-le br) (bb-write-u64-le bb value))
 (define-message-field-type :i32 (signed-byte 32) (br-read-i32-le br) (bb-write-i32-le bb value))
 (define-message-field-type :i64 (signed-byte 64) (br-read-i64-le br) (bb-write-i64-le bb value))
-(define-message-field-type :bool boolean (= (br-read-u8 br) 1) (bb-write-u8 bb (if value 1 0)))
+;; BR-READ-BOOL, not (= byte 1): Core assigns the byte to a bool, so every
+;; nonzero byte is true (serialize.h:277). The writer stays 1/0, which is
+;; Core's `uint8_t f = a'.
+(define-message-field-type :bool boolean (br-read-bool br) (bb-write-u8 bb (if value 1 0)))
 (define-message-field-type :hash256 (simple-array (unsigned-byte 8) (32))
   (br-read-bytes br 32) (bb-write-hash256 bb value))
 (define-message-field-type :var-bytes (simple-array (unsigned-byte 8) (*))
