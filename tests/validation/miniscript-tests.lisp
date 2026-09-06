@@ -132,9 +132,10 @@ have to know about them."
     ;; and_n(X,Y) = andor(X,Y,0)
     (is (eq :andor (frag "and_n(0,1)")))
     (is (equal '(:just-0 :just-1 :just-0) (subfrags "and_n(0,1)")))
-    ;; t:X = and_v(X,1)
-    (is (eq :and-v (frag "t:v:1")))
-    (is (equal '(:wrap-v :just-1) (subfrags "t:v:1")))
+    ;; t:X = and_v(X,1). One colon closes the WHOLE wrapper run, so `tv:1'
+    ;; is t(v(1)) -- Core's grammar has no second colon to write.
+    (is (eq :and-v (frag "tv:1")))
+    (is (equal '(:wrap-v :just-1) (subfrags "tv:1")))
     ;; l:X = or_i(0,X) and u:X = or_i(X,0)
     (is (equal '(:just-0 :older) (subfrags "l:older(1)")))
     (is (equal '(:after :just-0) (subfrags "u:after(1)")))))
@@ -342,7 +343,7 @@ together on purpose: the literal form already failed the ceiling, and that
 divergence between the two is exactly what hid this."
   (let ((over (%ms-sized-policy 6))
         (under (%ms-sized-policy 5)))
-    (is-false (bl.val:ms-node-valid-p (bl.val:ms-parse over)))
+    (signals bl.val:miniscript-parse-error (bl.val:ms-parse over))
     (signals error (bl.rpc:parse-descriptor (format nil "wsh(~A)" over) :mainnet))
     (let ((node (bl.val:ms-parse under)))
       (is (= 3420 (%ms-script-size node)))
@@ -355,6 +356,70 @@ divergence between the two is exactly what hid this."
           "the descriptor form must size the same as the literal-key form")
       (is-true (bl.val:ms-node-valid-p node)))))
 
+(test ms-node-script-size-is-the-length-of-the-script-it-generates
+  "Core derives a node's length in O(1) from its fragment, its first sub's type
+and the SUM of its subs' cached lengths (ComputeScriptLen, miniscript.cpp:
+265-296) and asserts at the end of every parse that its running total agrees
+(miniscript.h:2203).
+
+The equivalent assertion here is over Core's whole corpus in both contexts. It
+is what makes the shape-derived size trustworthy as a ceiling: a size computed
+from the tree that disagreed with the bytes would move the limit silently, in
+either direction."
+  (let ((checked 0) (bad '()))
+    (dolist (v (%ms-vectors))
+      (dolist (ctx '(:p2wsh :tapscript))
+        (let ((node (%ms-try-parse (gethash "ms" v) ctx)))
+          (when node
+            (incf checked)
+            (unless (= (%ms-script-size node)
+                       (length (bl.val:ms-node-script node)))
+              (push (format nil "~A (~A): cached ~D, generated ~D"
+                            (gethash "ms" v) ctx (%ms-script-size node)
+                            (length (bl.val:ms-node-script node)))
+                    bad))))))
+    (is (>= checked 110) "expected ~120 sizeable corpus parses, checked ~D" checked)
+    (is (null bad) "~{~A~^~%~}" (reverse bad))))
+
+(test ms-parse-refuses-a-fragment-with-the-wrong-number-of-arguments
+  "Core's Parse pushes an exact schedule of parser states per fragment —
+WRAPPED_EXPR, COMMA, WRAPPED_EXPR, CLOSE_BRACKET for a binary combinator
+(miniscript.h:2059-2085) — where COMMA fails unless the next character is ','
+and CLOSE_BRACKET fails unless it is ')' (:2187-2196). The schedule IS the
+arity check.
+
+Splitting the argument list on top-level commas and handing the whole list to
+the node constructor checked nothing. A third argument to and_v was DROPPED,
+and the expression then typed, compiled and printed as the two-argument form —
+so wsh(and_v(v:pk(A),older(10),pk(B))) produced the same scriptPubKey as
+wsh(and_v(v:pk(A),older(10))), and coins sent to the address the operator
+believed required B were governed by A plus a timelock alone (GA11 780c1251).
+In the other direction a MISSING argument left a NIL sub for every walker to
+dereference, and the RPC answered -32603 from a raw TYPE-ERROR."
+  (macrolet ((refused (expr)
+               `(signals bl.val:miniscript-parse-error (bl.val:ms-parse ,expr))))
+    ;; Surplus arguments, one per shape that used to swallow them.
+    (refused (format nil "and_v(v:pk(~A),older(10),pk(~A))"
+                     *ms-desc-key-a* *ms-desc-key-b*))
+    (refused "andor(0,1,1,1)")
+    (refused "or_i(0,1,1)")
+    (refused "or_b(0,a:1,1)")
+    (refused (format nil "pk(~A,~A)" *ms-desc-key-a* *ms-desc-key-b*))
+    (refused "older(10,99)")
+    ;; Too few: a parse error, not a TYPE-ERROR out of a NIL sub.
+    (refused (format nil "and_v(v:pk(~A))" *ms-desc-key-a*))
+    (refused (format nil "or_b(pk(~A))" *ms-desc-key-a*))
+    (refused "andor(1,1)")
+    (refused (format nil "thresh(1,pk(~A),and_v(v:pk(~A)))"
+                     *ms-desc-key-a* *ms-desc-key-b*)))
+  ;; The three-key policy and the two-key one are no longer the same address,
+  ;; because the three-key spelling is no longer a descriptor at all.
+  (signals bl.rpc:rpc-error
+    (bl.rpc:parse-descriptor
+     (format nil "wsh(and_v(v:pk(~A),older(10),pk(~A)))"
+             *ms-desc-key-a* *ms-desc-key-b*)
+     :mainnet)))
+
 (test ms-parse-and-inference-are-bounded-in-time
   "TIMING-SENSITIVE, with a deliberately wide margin — it is a bound, not a
 benchmark.
@@ -366,9 +431,11 @@ which is WITHIN the standardness limit, so nothing else refuses it — took 37,
 in an RPC worker, from one authenticated getdescriptorinfo or
 signrawtransactionwithkey call (GA11 d722b087).
 
-What bounds it is that a node's size is now O(1) in its own fragment and its
-subs' cached sizes, so nothing re-serializes a subtree; and that FromScript
-refuses an over-sized script before decomposing it (miniscript.h:2692)."
+What bounds it is not a faster loop. It is Core's running script_size, tested
+at the top of the parse loop, which ends the parse at 3,600 accumulated script
+bytes however long the input is; the node sizes that feed it are O(1); and
+FromScript refuses an over-sized script before decomposing it (miniscript.h:
+2692)."
   (flet ((seconds (thunk)
            (let ((start (get-internal-real-time)))
              (funcall thunk)
@@ -430,11 +497,15 @@ wrapper."
     (is (string= "l:older(1)" (canon "or_i(0,older(1))")))
     (is (string= "u:older(1)" (canon "or_i(older(1),0)")))
     (is (string= "and_n(0,1)" (canon "andor(0,1,0)")))
-    ;; The wrapper run, in both directions.
     (is (string= (format nil "tv:pk(~A)" *ms-desc-key-a*)
-                 (canon (format nil "t:v:pk(~A)" *ms-desc-key-a*))))
-    (is (string= (format nil "tv:pk(~A)" *ms-desc-key-a*)
-                 (canon (format nil "tv:pk(~A)" *ms-desc-key-a*))))))
+                 (canon (format nil "tv:pk(~A)" *ms-desc-key-a*)))))
+  ;; And the run is the ONLY spelling: Core's WRAPPED_EXPR reads one colon and
+  ;; then schedules EXPR, not another WRAPPED_EXPR (miniscript.h:1917-1972), so
+  ;; `t:v:pk(K)' is a parse failure there. Writing the colon per wrapper used to
+  ;; be accepted here, which is the same class of divergence as the dropped
+  ;; argument of GA11 780c1251 -- a string Core refuses, given a meaning.
+  (signals bl.val:miniscript-parse-error
+    (bl.val:ms-parse (format nil "t:v:pk(~A)" *ms-desc-key-a*))))
 
 (test getdescriptorinfo-handles-a-policy-descriptor
   "The RPC the live node failed on. It needs the canonical string, its
