@@ -1204,22 +1204,23 @@ the negation of Core's CheckDuplicateKey (miniscript.h:1688)."
        (ms-node-check-ops-limit-p node)
        (ms-node-check-stack-size-p node)))
 
-(defun %ms-sane-subexpression-p (node ops ss keys)
-  "Core Node::IsSaneSubexpression (miniscript.h:1694) over already-computed ops,
-stack sizes and key set — the three things Core caches in the node itself."
+(defun %ms-sane-subexpression-p (node ops ss duplicate-keys-p)
+  "Core Node::IsSaneSubexpression (miniscript.h:1694) over an already-computed
+ops triple, stack-size pair and duplicate-key verdict — the three things Core
+caches in the node itself."
   (and (ms-node-valid-p node)
        (%ms-check-ops-limit-p node ops)
        (%ms-check-stack-size-p node ss)
        (ms-node-non-malleable-p node)
        (not (ms-node-timelock-mix-p node))   ; Core's CheckTimeLocksMix, un-inverted
-       (not (eq keys :dup))))
+       (not duplicate-keys-p)))
 
 (defun ms-node-sane-subexpression-p (node)
   "Core Node::IsSaneSubexpression (miniscript.h:1694)."
   (%ms-sane-subexpression-p node
                             (ms-node-ops node)
                             (ms-node-stack-size node)
-                            (and (ms-node-duplicate-keys-p node) :dup)))
+                            (ms-node-duplicate-keys-p node)))
 
 (defun ms-node-sane-p (node)
   "Core Node::IsSane (miniscript.h:1697): safe as a script on its own."
@@ -1248,7 +1249,7 @@ the search quadratic in the depth an attacker chooses."
         (ss (%ms-ss-up nil node (mapcar #'third subs)))
         (keys (%ms-keys-up nil node (mapcar #'fourth subs))))
     (list (or (loop for sub in subs thereis (first sub))
-              (unless (%ms-sane-subexpression-p node ops ss keys) node))
+              (unless (%ms-sane-subexpression-p node ops ss (eq keys :dup)) node))
           ops ss keys)))
 
 ;;;; --- Parsing (miniscript.h FromString) -----------------------------------
