@@ -596,7 +596,9 @@ reads instead of Gray-stream input dispatch."
              (dolist (ptx value)
                (let ((abs-index (prefilled-tx-index ptx)))
                  (bb-write-varint bb (- abs-index last-index 1))
-                 (bb-write-bytes bb (serialize-witness-transaction (prefilled-tx-transaction ptx)))
+                 ;; Core's TX_WITH_WITNESS (blockencodings.h PrefilledTransaction):
+                 ;; the marker only for a transaction that HAS witness data.
+                 (bb-write-bytes bb (transaction-wire-bytes (prefilled-tx-transaction ptx)))
                  (setf last-index abs-index))))))
 
 

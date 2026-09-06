@@ -542,13 +542,11 @@ anything to the mempool. Each tx is checked independently against current state
     ;; it does not produce a per-tx allowed=false row.
     (let ((decoded
             (mapcar (lambda (hex-str)
-                      (handler-case
-                          (let ((tx-bytes (bl.crypto:hex-to-bytes hex-str)))
-                            (flexi-streams:with-input-from-sequence (stream tx-bytes)
-                              (bl.ser:read-transaction stream)))
-                        (error ()
-                          (error 'rpc-error :code +rpc-deserialization-error+
-                                            :message "TX decode failed"))))
+                      (decode-hex-tx-or-error
+                       hex-str
+                       (format nil "TX decode failed: ~A Make sure the tx has ~
+at least one input."
+                               (if (stringp hex-str) hex-str ""))))
                     txs)))
       ;; Node lock: validation reads the mempool + UTXO set + tip together;
       ;; a consistent view for the whole batch (Core ProcessTransaction
@@ -645,9 +643,9 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid transaction hex"))
     (handler-case
-        (let* ((tx-bytes (bl.crypto:hex-to-bytes hex-str))
-               (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
-                     (bl.ser:read-transaction stream)))
+        (let* ((tx (decode-hex-tx-or-error
+                    hex-str
+                    "TX decode failed. Make sure the tx has at least one input."))
                (txid (bl.ser:transaction-hash tx)))
           (%check-max-burn tx max-burn)
           ;; Node lock across validate -> accept -> unbroadcast -> announce:
@@ -785,16 +783,14 @@ member may send to a script that can never spend it."
                         :message "Mempool disabled or instance not found"))
     ;; Decode every tx up front; a single decode failure aborts the whole call.
     (let ((package
-            (handler-case
-                (mapcar (lambda (hex)
-                          (let ((bytes (bl.crypto:hex-to-bytes hex)))
-                            (flexi-streams:with-input-from-sequence (s bytes)
-                              (bl.ser:read-transaction s))))
-                        hexes)
-              (error ()
-                ;; Core: RPC_DESERIALIZATION_ERROR (-22), rpc/mempool.cpp:333.
-                (error 'rpc-error :code +rpc-deserialization-error+
-                                  :message "TX decode failed"))))
+            ;; Core: RPC_DESERIALIZATION_ERROR (-22), rpc/mempool.cpp:1371-1374.
+            (mapcar (lambda (hex)
+                      (decode-hex-tx-or-error
+                       hex
+                       (format nil "TX decode failed: ~A Make sure the tx has ~
+at least one input."
+                               (if (stringp hex) hex ""))))
+                    hexes))
             ;; A maxfeerate of 0 disables the rail entirely (Core turns the
             ;; CFeeRate into nullopt, rpc/mempool.cpp:1358-1362).
             (client-maxfeerate (let ((r (%parse-max-fee-rate params 1)))

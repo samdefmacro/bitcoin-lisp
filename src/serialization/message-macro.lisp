@@ -135,7 +135,11 @@ writes VALUE to the byte-buf BB."
 (define-message-field-type :transaction t
   (br-read-transaction br) (bb-write-bytes bb (serialize-transaction value)))
 (define-message-field-type :witness-transaction t
-  (br-read-transaction br) (bb-write-bytes bb (serialize-witness-transaction value)))
+  ;; TRANSACTION-WIRE-BYTES, not SERIALIZE-WITNESS-TRANSACTION: Core's
+  ;; TX_WITH_WITNESS emits the marker only for a transaction that HAS witness
+  ;; data, and a witnessless one written in extended form is a Superfluous
+  ;; witness record its own deserializer refuses.
+  (br-read-transaction br) (bb-write-bytes bb (transaction-wire-bytes value)))
 
 (defmacro define-message (name (&key documentation) &body fields)
   "Define the struct NAME plus READ-NAME (byte-reader -> struct) and

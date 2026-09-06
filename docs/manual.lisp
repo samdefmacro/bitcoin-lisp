@@ -404,6 +404,18 @@
   :name ...)`, Core's LIMITED_STRING -- and an over-long one FAILS the
   message rather than being truncated, which is how the peer gets dropped.
 
+  A transaction is read by Core's UnserializeTransaction, whose shape is
+  not `look at the marker byte\': an EMPTY vin is the dummy, the flag byte
+  after it may be 0 (a legal 0-input 0-output transaction, which
+  CheckTransaction rejects later), and a witness-flagged transaction whose
+  stacks are all empty is a `Superfluous witness record\'. `:allow-witness\'
+  is Core\'s TX_NO_WITNESS, which is what lets the RPC layer read one hex
+  string BOTH ways (see `bl.rpc:decode-tx\'). The WRITER is the mirror:
+  `transaction-wire-bytes\' is TX_WITH_WITNESS and emits the marker only for
+  a transaction that has witness data, while
+  `serialize-witness-transaction\' emits it unconditionally and is a
+  primitive, not the wire form.
+
   Trap: block DESERIALIZATION, not signature checking, is the IBD
   bottleneck (profiled); the byte-reader family is the fast path and the
   stream family is a thin shell kept for the few callers that need it."
@@ -420,6 +432,8 @@
   (bitcoin-lisp.serialization:transaction-hash function)
   (bitcoin-lisp.serialization:transaction-wtxid function)
   (bitcoin-lisp.serialization:serialize-transaction function)
+  (bitcoin-lisp.serialization:transaction-wire-bytes function)
+  (bitcoin-lisp.serialization:read-transaction function)
   (bitcoin-lisp.serialization:bitcoin-block class)
   (bitcoin-lisp.serialization:block-header class)
   (bitcoin-lisp.serialization:block-header-hash function)
@@ -1068,6 +1082,12 @@
   its single dispatch point (Core calls CheckWarmup at the head of every
   handler) and answers HTTP 503 until the node is ready.
 
+  Every transaction hex an RPC is handed goes through `decode-hex-tx\',
+  Core\'s DecodeHexTx: the bytes are read BOTH ways, a reading counts only
+  when it consumes all of them (so trailing bytes are -22 and not a
+  transaction whose txid names a prefix), and CheckTxScriptsSanity breaks
+  the tie. `iswitness\' restricts which readings are tried.
+
   Every scriptPubKey object the RPC and REST surfaces emit is
   `script-to-json\', Core's ScriptToUniv, in Core's key order (asm, desc,
   hex, address, type) -- there is no second copy to drift. `decodescript\'
@@ -1085,6 +1105,8 @@
   (bitcoin-lisp.rpc:with-node-lock macro)
   (bitcoin-lisp.rpc:script-to-json function)
   (bitcoin-lisp.rpc:script->address function)
+  (bitcoin-lisp.rpc:decode-tx function)
+  (bitcoin-lisp.rpc:decode-hex-tx function)
   (bitcoin-lisp.rpc:rpc-get-chain-state function)
   (bitcoin-lisp.rpc::*rpc-named-arg-names* variable)
   (bitcoin-lisp.rpc::*rpc-arg-conversions* variable)

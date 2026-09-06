@@ -276,6 +276,9 @@ this same package."
                                (:file "accessors")
                                (:file "amounts")
                                (:file "descriptors")
+                               ;; Core core_io.cpp: ScriptToUniv and
+                               ;; DecodeHexTx, which every handler below uses.
+                               (:file "core-io")
                                ;; The handlers, one file per Core rpc/*.cpp.
                                (:file "blockchain")
                                (:file "net")

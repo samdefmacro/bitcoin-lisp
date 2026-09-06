@@ -128,33 +128,31 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
          (permitsigdata (bl.rpc:positional-bool (second params))))
     (unless (stringp hexstr)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "hexstring required"))
-    (let ((tx (handler-case
-                  (bl.ser:br-read-transaction
-                   (bl.ser:make-byte-reader-from
-                    (coerce (bl.crypto:hex-to-bytes hexstr)
-                            '(simple-array (unsigned-byte 8) (*)))))
-                (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                                            :message "TX decode failed")))))
-      (let ((has-sig (or (bl.ser:transaction-has-witness-p tx)
-                         (some (lambda (in) (plusp (length (bl.ser:tx-in-script-sig in))))
-                               (bl.ser:transaction-inputs tx)))))
-        (when (and has-sig (not permitsigdata))
-          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                            :message "Inputs must not have scriptSigs and scriptwitnesses. To convert anyway, permitsigdata must be set to true.")))
-      (let ((stripped (bl.ser:make-transaction
-                       :version (bl.ser:transaction-version tx)
-                       :inputs (map 'simple-vector
-                                    (lambda (in)
-                                      (bl.ser:make-tx-in
-                                       :previous-output (bl.ser:tx-in-previous-output in)
-                                       :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                                       :sequence (bl.ser:tx-in-sequence in)))
-                                    (bl.ser:transaction-inputs tx))
-                       :outputs (bl.ser:transaction-outputs tx)
-                       :lock-time (bl.ser:transaction-lock-time tx)
-                       :witness nil)))
-        (bl.ser:encode-psbt
-         (bl.ser:make-empty-psbt stripped))))))
+    (multiple-value-bind (try-no-witness try-witness)
+        (bl.rpc:iswitness-flags (third params))
+      (let ((tx (bl.rpc:decode-hex-tx-or-error hexstr "TX decode failed"
+                                               :try-no-witness try-no-witness
+                                               :try-witness try-witness)))
+        (let ((has-sig (or (bl.ser:transaction-has-witness-p tx)
+                           (some (lambda (in) (plusp (length (bl.ser:tx-in-script-sig in))))
+                                 (bl.ser:transaction-inputs tx)))))
+          (when (and has-sig (not permitsigdata))
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                              :message "Inputs must not have scriptSigs and scriptwitnesses. To convert anyway, permitsigdata must be set to true.")))
+        (let ((stripped (bl.ser:make-transaction
+                         :version (bl.ser:transaction-version tx)
+                         :inputs (map 'simple-vector
+                                      (lambda (in)
+                                        (bl.ser:make-tx-in
+                                         :previous-output (bl.ser:tx-in-previous-output in)
+                                         :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                         :sequence (bl.ser:tx-in-sequence in)))
+                                      (bl.ser:transaction-inputs tx))
+                         :outputs (bl.ser:transaction-outputs tx)
+                         :lock-time (bl.ser:transaction-lock-time tx)
+                         :witness nil)))
+          (bl.ser:encode-psbt
+           (bl.ser:make-empty-psbt stripped)))))))
 
 ;;; --- decodepsbt helpers ---
 
@@ -907,15 +905,11 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
     (unless (and (listp hexes) (>= (length hexes) 1))
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "txs must be a non-empty array of hex transactions"))
-    (let ((txs (mapcar (lambda (h)
-                         (handler-case
-                             (bl.ser:br-read-transaction
-                              (bl.ser:make-byte-reader-from
-                               (coerce (bl.crypto:hex-to-bytes h)
-                                       '(simple-array (unsigned-byte 8) (*)))))
-                           (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                                                       :message "TX decode failed"))))
-                       hexes)))
+    (let ((txs (loop for h in hexes
+                     for idx from 0
+                     collect (bl.rpc:decode-hex-tx-or-error
+                              h (format nil "TX decode failed for tx ~D. Make ~
+sure the tx has at least one input." idx)))))
       (let* ((base (first txs))
              (nin (length (bl.ser:transaction-inputs base)))
              (merged-ins (make-array nin))

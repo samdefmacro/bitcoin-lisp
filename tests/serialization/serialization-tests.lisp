@@ -278,6 +278,29 @@ The zero belongs to BlockWitnessMerkleRoot alone."
       (is (eq high-bw t))
       (is (= version 2)))))
 
+(test compact-block-prefilled-tx-is-core-tx-with-witness
+  "A prefilled transaction is written with Core's TX_WITH_WITNESS, which emits
+the 0x0001 marker only for a transaction that HAS witness data
+(primitives/transaction.h:236-262). This wrote SERIALIZE-WITNESS-TRANSACTION
+unconditionally, so a witnessless prefilled transaction went out as a
+`Superfluous witness record\' -- bytes Core's own deserializer refuses."
+  (let* ((tx (make-compact-block-test-transaction))
+         (cb (bl.ser:make-compact-block
+              :header (make-compact-block-test-header)
+              :nonce 0
+              :short-ids '()
+              :prefilled-txs (list (bl.ser:make-prefilled-tx :index 0 :transaction tx))))
+         (bytes (bl.bytes:with-byte-buf (s) (bl.ser:write-compact-block s cb)))
+         (wire (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx))))
+    (is-false (bl.ser:transaction-has-witness-p tx)
+              "the fixture transaction must carry no witness")
+    (is-true (search wire (bl.crypto:bytes-to-hex bytes))
+             "the prefilled transaction is not TX_WITH_WITNESS bytes")
+    ;; The marker would sit right after the 4-byte version of the embedded tx.
+    (is-false (search (concatenate 'string (subseq wire 0 8) "0001")
+                      (bl.crypto:bytes-to-hex bytes))
+              "a superfluous 0x0001 witness marker was written")))
+
 (test compact-block-roundtrip
   "Compact block should serialize and deserialize correctly."
   (let* ((header (make-compact-block-test-header))

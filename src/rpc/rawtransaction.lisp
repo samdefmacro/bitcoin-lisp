@@ -6,19 +6,19 @@
 
 ;;; --- Extended RPC Methods ---
 
-(define-rpc "decoderawtransaction" (node (hex-str))
-  "Decode a raw transaction hex string to JSON."
-  (unless (and (stringp hex-str) (> (length hex-str) 0))
-    (error 'rpc-error :code +rpc-deserialization-error+
-                      :message "Invalid transaction hex"))
-  (handler-case
-      (let* ((tx-bytes (bl.crypto:hex-to-bytes hex-str))
-             (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
-                   (bl.ser:read-transaction stream))))
-        (tx-to-json tx (rpc-get-network node)))
-    (error (e)
-      (error 'rpc-error :code +rpc-deserialization-error+
-                        :message (format nil "TX decode failed: ~A" e)))))
+(define-rpc "decoderawtransaction" (node (hex-str iswitness))
+  "Decode a raw transaction hex string to JSON (Core decoderawtransaction,
+rpc/rawtransaction.cpp:405-446).
+
+ISWITNESS picks the serialization: absent, Core's DecodeTx reads the bytes
+BOTH ways and keeps the reading that consumes all of them; true reads them as
+witness-serialized only, false as legacy only. It is not decoration -- the two
+readings of one hex string are different transactions with different txids."
+  (multiple-value-bind (try-no-witness try-witness) (iswitness-flags iswitness)
+    (tx-to-json (decode-hex-tx-or-error hex-str "TX decode failed"
+                                        :try-no-witness try-no-witness
+                                        :try-witness try-witness)
+                (rpc-get-network node))))
 
 (defun %not-found-transaction-message (reason)
   "REASON plus the sentence Core appends to every one of getrawtransaction's
@@ -827,11 +827,9 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
       (error 'rpc-error :code +rpc-deserialization-error+ :message "tx hex string required"))
     (unless (listp wifs)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "privkeys must be an array"))
-    (let* ((tx (handler-case
-                   (bl.ser:parse-tx-payload
-                    (bl.crypto:hex-to-bytes hexstring))
-                 (error () (error 'rpc-error :code +rpc-deserialization-error+
-                                             :message "Transaction decode failed"))))
+    (let* ((tx (decode-hex-tx-or-error
+                hexstring
+                "TX decode failed. Make sure the tx has at least one input."))
            (keymap (make-hash-table :test 'equalp))   ; hash160(pubkey) -> (privkey . pubkey)
            (pubmap (make-hash-table :test 'equalp))   ; full pubkey bytes -> privkey (multisig)
            (tr-keymap (make-hash-table :test 'equalp)) ; tweaked taproot output key (32B) -> privkey

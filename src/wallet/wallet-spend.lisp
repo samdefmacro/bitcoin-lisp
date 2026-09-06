@@ -3202,14 +3202,13 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
   (let ((wallet (wallet-for-request node))
         (hexstring (first params))
         (options (second params)))
-    (unless (stringp hexstring)
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                        :message "TX decode failed"))
-    (let ((tx (handler-case
-                  (bl.ser:parse-tx-payload
-                   (bl.crypto:hex-to-bytes hexstring))
-                (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                                            :message "TX decode failed")))))
+    ;; Core's DecodeHexTx with fundrawtransaction's own iswitness argument
+    ;; (wallet/rpc/spend.cpp:805-810).
+    (let ((tx (multiple-value-bind (try-no-witness try-witness)
+                  (bl.rpc:iswitness-flags (third params))
+                (bl.rpc:decode-hex-tx-or-error hexstring "TX decode failed"
+                                               :try-no-witness try-no-witness
+                                               :try-witness try-witness))))
       (bl.rpc:with-node-lock (node)
         (with-wallet-lock (wallet)
           (let ((network (wallet-network wallet))
@@ -3625,14 +3624,9 @@ supported (taproot inputs, until the P5 signer lands sighash plumbing)."
 signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
   (let ((wallet (wallet-for-request node))
         (hexstring (first params)))
-    (unless (stringp hexstring)
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                        :message "TX decode failed. Make sure the tx has at least one input."))
-    (let ((tx (handler-case
-                  (bl.ser:parse-tx-payload
-                   (bl.crypto:hex-to-bytes hexstring))
-                (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                                            :message "TX decode failed. Make sure the tx has at least one input.")))))
+    (let ((tx (bl.rpc:decode-hex-tx-or-error
+               hexstring
+               "TX decode failed. Make sure the tx has at least one input.")))
       (when (zerop (length (bl.ser:transaction-inputs tx)))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                           :message "TX decode failed. Make sure the tx has at least one input."))

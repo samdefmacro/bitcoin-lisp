@@ -221,99 +221,71 @@ Returns a list of byte vectors."
     (loop repeat item-count
           collect (br-read-var-bytes br))))
 
-(defun br-read-transaction (br)
-  "Read a transaction from a byte-reader. Auto-detects BIP 144 witness
-format by checking for marker byte 0x00 where the input count would be.
-Hot path: called per tx during block parsing — index-based reads avoid
+(defun br-read-transaction (br &key (allow-witness t))
+  "Read a transaction from a byte-reader (Core UnserializeTransaction,
+primitives/transaction.h:190-231). ALLOW-WITNESS is Core's
+TransactionSerParams allow_witness: TX_WITH_WITNESS when true (the wire and
+disk format everywhere in the node), TX_NO_WITNESS when false, which
+DECODE-TX needs so it can read the SAME bytes both ways.
+
+Hot path: called per tx during block parsing -- index-based reads avoid
 flexi-streams' Gray-stream input dispatch."
   (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (let* ((version (br-read-i32-le br))
-         (marker (br-read-u8 br)))
-    (if (zerop marker)
-        ;; Witness format: marker=0x00, flag=0x01
-        (let ((flag (br-read-u8 br)))
-          (unless (= flag 1)
-            (serialization-error "Invalid witness flag byte: ~D" flag))
-          (let* ((input-count (br-read-compact-size br))
-                 (inputs (%read-n-vector input-count (br-read-tx-in br)))
-                 (output-count (br-read-compact-size br))
-                 (outputs (%read-n-vector output-count (br-read-tx-out br)))
-                 (witness (%read-n-vector input-count
-                            (br-read-witness-stack br)))
-                 (lock-time (br-read-u32-le br)))
-            (make-transaction :version version
-                              :inputs inputs
-                              :outputs outputs
-                              :lock-time lock-time
-                              :witness witness)))
-        ;; Legacy format: marker was the first byte of input-count.
-        (let* ((input-count
-                 (cond ((< marker 253) marker)
-                       ((= marker 253)
-                        (let ((v (br-read-u16-le br)))
-                          (when (< v 253)
-                            (serialization-error "non-canonical ReadCompactSize"))
-                          v))
-                       ((= marker 254)
-                        (let ((v (br-read-u32-le br)))
-                          (when (< v #x10000)
-                            (serialization-error "non-canonical ReadCompactSize"))
-                          v))
-                       (t
-                        (let ((v (br-read-u64-le br)))
-                          (when (< v #x100000000)
-                            (serialization-error "non-canonical ReadCompactSize"))
-                          v))))
-               ;; Core ReadCompactSize's range check (serialize.h:330-360),
-               ;; which the inline decode above skips.
-               (input-count (if (> input-count +max-compact-size+)
-                                (serialization-error "ReadCompactSize: size too large (~D > ~D)"
-                                       input-count +max-compact-size+)
-                                input-count))
-               (inputs (%read-n-vector input-count (br-read-tx-in br)))
-               (output-count (br-read-compact-size br))
-               (outputs (%read-n-vector output-count (br-read-tx-out br)))
-               (lock-time (br-read-u32-le br)))
-          (make-transaction :version version
-                            :inputs inputs
-                            :outputs outputs
-                            :lock-time lock-time)))))
+         (flags 0)
+         (inputs (%read-n-vector (br-read-compact-size br) (br-read-tx-in br)))
+         (outputs #())
+         (witness nil))
+    ;; An empty vin is Core's dummy marker: read the flag byte and, when it is
+    ;; set, the real vin and vout. A flag of ZERO is a legal 0-input 0-output
+    ;; transaction, not an error -- CheckTransaction rejects it later, which is
+    ;; where Core rejects it too.
+    (if (and (zerop (length inputs)) allow-witness)
+        (progn
+          (setf flags (br-read-u8 br))
+          (unless (zerop flags)
+            (setf inputs (%read-n-vector (br-read-compact-size br) (br-read-tx-in br))
+                  outputs (%read-n-vector (br-read-compact-size br) (br-read-tx-out br)))))
+        (setf outputs (%read-n-vector (br-read-compact-size br) (br-read-tx-out br))))
+    (when (and (logtest flags 1) allow-witness)
+      (setf flags (logxor flags 1))
+      (setf witness (%read-n-vector (length inputs) (br-read-witness-stack br)))
+      (unless (some (lambda (stack) (and stack t)) witness)
+        (serialization-error "Superfluous witness record")))
+    (unless (zerop flags)
+      (serialization-error "Unknown transaction optional data"))
+    (make-transaction :version version
+                      :inputs inputs
+                      :outputs outputs
+                      :lock-time (br-read-u32-le br)
+                      :witness witness)))
 
-(defun read-transaction (stream)
-  "Read a transaction from STREAM.
-Auto-detects BIP 144 witness format by checking for marker byte 0x00
-where the input count would normally be."
+(defun read-transaction (stream &key (allow-witness t))
+  "Read a transaction from STREAM. The stream-shaped BR-READ-TRANSACTION."
   (let* ((version (read-int32-le stream))
-         (marker (read-uint8 stream)))
-    (if (zerop marker)
-        ;; Possible witness format: marker=0x00, check flag
-        (let ((flag (read-uint8 stream)))
-          (unless (= flag 1)
-            (serialization-error "Invalid witness flag byte: ~D" flag))
-          ;; Witness format: inputs, outputs, witness stacks, lock-time
-          (let* ((input-count (read-compact-size stream))
-                 (inputs (%read-n-vector input-count (read-tx-in stream)))
-                 (output-count (read-compact-size stream))
-                 (outputs (%read-n-vector output-count (read-tx-out stream)))
-                 (witness (%read-n-vector input-count
-                            (read-witness-stack stream)))
-                 (lock-time (read-uint32-le stream)))
-            (make-transaction :version version
-                              :inputs inputs
-                              :outputs outputs
-                              :lock-time lock-time
-                              :witness witness)))
-        ;; Legacy format: marker was actually the first byte of input-count
-        ;; Re-parse input count using marker as the compact-size value
-        (let* ((input-count (decode-compact-size-from-first-byte marker stream))
-               (inputs (%read-n-vector input-count (read-tx-in stream)))
-               (output-count (read-compact-size stream))
-               (outputs (%read-n-vector output-count (read-tx-out stream)))
-               (lock-time (read-uint32-le stream)))
-          (make-transaction :version version
-                            :inputs inputs
-                            :outputs outputs
-                            :lock-time lock-time)))))
+         (flags 0)
+         (inputs (%read-n-vector (read-compact-size stream) (read-tx-in stream)))
+         (outputs #())
+         (witness nil))
+    (if (and (zerop (length inputs)) allow-witness)
+        (progn
+          (setf flags (read-uint8 stream))
+          (unless (zerop flags)
+            (setf inputs (%read-n-vector (read-compact-size stream) (read-tx-in stream))
+                  outputs (%read-n-vector (read-compact-size stream) (read-tx-out stream)))))
+        (setf outputs (%read-n-vector (read-compact-size stream) (read-tx-out stream))))
+    (when (and (logtest flags 1) allow-witness)
+      (setf flags (logxor flags 1))
+      (setf witness (%read-n-vector (length inputs) (read-witness-stack stream)))
+      (unless (some (lambda (stack) (and stack t)) witness)
+        (serialization-error "Superfluous witness record")))
+    (unless (zerop flags)
+      (serialization-error "Unknown transaction optional data"))
+    (make-transaction :version version
+                      :inputs inputs
+                      :outputs outputs
+                      :lock-time (read-uint32-le stream)
+                      :witness witness)))
 
 (defun decode-compact-size-from-first-byte (first-byte stream)
   "Decode a CompactSize integer given that FIRST-BYTE has already been read.
@@ -403,7 +375,14 @@ flexi-streams at ~50% of CPU during validation."
     (bb-finish bb)))
 
 (defun serialize-witness-transaction (tx)
-  "Serialize transaction TX to a byte vector in BIP 144 witness format."
+  "Serialize transaction TX to a byte vector in BIP 144 EXTENDED format: the
+0x0001 marker and a witness stack per input, unconditionally.
+
+Not the wire encoding. Core emits the marker only when HasWitness()
+(SerializeTransaction, primitives/transaction.h:236-262), and a witnessless
+transaction written in extended form is what its own deserializer refuses as
+a `Superfluous witness record\'. TRANSACTION-WIRE-BYTES is Core's
+TX_WITH_WITNESS and is what every wire, hex and hash site wants."
   (let ((bb (make-byte-buf))
         (inputs (transaction-inputs tx))
         (outputs (transaction-outputs tx))

@@ -4130,18 +4130,119 @@ safe version — asserted here with a size large enough to have overflowed a
 ;;; --- Extended RPC Method Tests ---
 
 ;;; decoderawtransaction tests
+;;;
+;;; The decoder is Core's DecodeTx (core_io.cpp:156-233): the SAME bytes are
+;;; read twice, once witness-serialized and once legacy, a reading counts only
+;;; when it consumes all of them, and CheckTxScriptsSanity breaks the tie.
 
-(test rpc-decoderawtransaction-valid
-  "Test decoderawtransaction with valid transaction hex"
-  (let* ((node (make-test-node))
-         ;; Simple transaction hex (version + empty inputs/outputs + locktime)
-         ;; This is a minimal valid transaction structure
-         (tx-hex "01000000000000000000")
-         (result (handler-case
-                     (bl.rpc::rpc-decoderawtransaction node (list tx-hex))
-                   (error () nil))))
-    ;; May fail to parse minimal tx, but should not crash
-    (is (or result (not result)))))
+(defparameter +decode-legacy-1-in-1-out+
+  "020000000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff010000000000000000066a040001020300000000"
+  "A plain 66-byte legacy transaction, one input and one OP_RETURN output.")
+
+(defparameter +decode-legacy-only-1-out+
+  "0200000000010000000000000000066a040001020300000000"
+  "25 bytes that decode DIFFERENTLY under the two serializations: the extended
+reading is 0 inputs with a witness flag and no witness data, which Core rejects
+as a Superfluous witness record, and the legacy reading is 0 inputs / 1 output
+consuming every byte. Core answers the legacy one, txid fc4e265b...")
+
+(defparameter +decode-legacy-only-2-out+
+  "0200000000020000000000000000066a04000102030000000000000000066a040001020300000000"
+  "The same shape with two outputs, so the byte after the empty vin is 0x02.
+The witness reading cannot use it; the legacy reading consumes the lot.")
+
+(defun decode-raw-tx (hex &rest more)
+  "decoderawtransaction over the wire: HEX plus any further positional
+arguments, through the dispatcher and the request normalizer."
+  (bl.rpc:dispatch-rpc-method
+   (make-test-node :network :regtest) "decoderawtransaction"
+   (bl.rpc::%normalize-rpc-params (coerce (cons hex more) 'vector))))
+
+(defun decode-raw-tx-field (hex key &rest more)
+  (cdr (assoc key (apply #'decode-raw-tx hex more) :test #'string=)))
+
+(test rpc-decoderawtransaction-refuses-trailing-bytes
+  "Core's DecodeTx ignores any serialization that does not consume the WHOLE
+input (core_io.cpp:180), so a valid transaction hex with extra bytes is -22 and
+not a transaction. We decoded the prefix and echoed back a DIFFERENT, shorter
+transaction whose txid does not mention the bytes the caller sent -- a client
+round-tripping through decoderawtransaction to identify a transaction before
+broadcasting identified the wrong one."
+  (is (string= "f00c3ac7ff076b25a54a87c2b155dcac778cf242459f773c1d85ebc46cdf9381"
+               (decode-raw-tx-field +decode-legacy-1-in-1-out+ "txid"))
+      "positive control: the transaction without trailing bytes still decodes")
+  (is (= 66 (decode-raw-tx-field +decode-legacy-1-in-1-out+ "size")))
+  (dolist (tail (list "deadbeef" (make-string 128 :initial-element #\0)))
+    (let ((e (handler-case
+                 (progn (decode-raw-tx
+                         (concatenate 'string +decode-legacy-1-in-1-out+ tail))
+                        nil)
+               (bl.rpc:rpc-error (e) e))))
+      (is-true e "~D trailing bytes accepted" (floor (length tail) 2))
+      (when e
+        (is (= -22 (bl.rpc:rpc-error-code e)))
+        (is (string= "TX decode failed" (bl.rpc:rpc-error-message e)))))))
+
+(test rpc-decoderawtransaction-reads-both-serializations
+  "A hex string that is only valid under the LEGACY serialization is Core's
+answer, not an error and not a different transaction. Ours committed to the
+witness branch on a leading 0x00 and could not go back: the 25-byte vector came
+out as 0 inputs / 0 outputs, 10 bytes, with 15 bytes silently dropped and a
+txid belonging to no transaction the caller sent, and the two-output one was
+refused outright with `Invalid witness flag byte: 2'."
+  (is (string= "fc4e265bd5a8cc618d3beccb6e68f72d8bedd686b426c77e27326212f7d03227"
+               (decode-raw-tx-field +decode-legacy-only-1-out+ "txid")))
+  (is (= 25 (decode-raw-tx-field +decode-legacy-only-1-out+ "size")))
+  (is (= 0 (length (decode-raw-tx-field +decode-legacy-only-1-out+ "vin"))))
+  (is (= 1 (length (decode-raw-tx-field +decode-legacy-only-1-out+ "vout"))))
+  (is (string= "ee096f9a7e05e7ec97287df87ff74433948f62c013750b32d01ef3f734702b12"
+               (decode-raw-tx-field +decode-legacy-only-2-out+ "txid")))
+  (is (= 2 (length (decode-raw-tx-field +decode-legacy-only-2-out+ "vout")))))
+
+(test rpc-decoderawtransaction-honours-iswitness
+  "The second argument picks the serialization (rpc/rawtransaction.cpp:435-436):
+absent, both are tried; true, only the witness reading; false, only the legacy
+one. It was accepted and IGNORED -- true and false returned the identical
+object."
+  ;; Absent and false both reach the legacy reading.
+  (is (string= "fc4e265bd5a8cc618d3beccb6e68f72d8bedd686b426c77e27326212f7d03227"
+               (decode-raw-tx-field +decode-legacy-only-1-out+ "txid")))
+  (is (string= "fc4e265bd5a8cc618d3beccb6e68f72d8bedd686b426c77e27326212f7d03227"
+               (decode-raw-tx-field +decode-legacy-only-1-out+ "txid"
+                                    bl.rpc:+json-false+)))
+  ;; iswitness true forbids the legacy reading, and the witness reading of
+  ;; these bytes fails.
+  (let ((e (handler-case
+               (progn (decode-raw-tx +decode-legacy-only-1-out+ t) nil)
+             (bl.rpc:rpc-error (e) e))))
+    (is-true e "iswitness=true still decoded a legacy-only transaction")
+    (when e (is (= -22 (bl.rpc:rpc-error-code e)))))
+  ;; Positive control the other way: the ordinary transaction decodes under
+  ;; either flag, so the assertion above is about the SERIALIZATION and not
+  ;; about the argument being rejected out of hand.
+  (is (string= "f00c3ac7ff076b25a54a87c2b155dcac778cf242459f773c1d85ebc46cdf9381"
+               (decode-raw-tx-field +decode-legacy-1-in-1-out+ "txid" t)))
+  (is (string= "f00c3ac7ff076b25a54a87c2b155dcac778cf242459f773c1d85ebc46cdf9381"
+               (decode-raw-tx-field +decode-legacy-1-in-1-out+ "txid"
+                                    bl.rpc:+json-false+))))
+
+(test rpc-decoderawtransaction-refuses-a-superfluous-witness-record
+  "Core throws `Superfluous witness record' for a witness-FLAGGED transaction
+whose witness stacks are all empty (primitives/transaction.h:220-222). We
+accepted it, so the same transaction had two spellings on the wire and the one
+Core refuses re-serialized here as the other."
+  (let* ((legacy +decode-legacy-1-in-1-out+)
+         ;; The same bytes with the 0x0001 marker spliced in after the version
+         ;; and one EMPTY witness stack (0x00) before the locktime.
+         (marked (concatenate 'string (subseq legacy 0 8) "0001" (subseq legacy 8)))
+         (superfluous (concatenate 'string
+                                   (subseq marked 0 (- (length marked) 8))
+                                   "00"
+                                   (subseq marked (- (length marked) 8)))))
+    (is (string= "f00c3ac7ff076b25a54a87c2b155dcac778cf242459f773c1d85ebc46cdf9381"
+                 (decode-raw-tx-field legacy "txid"))
+        "positive control: the plain legacy serialization must decode")
+    (signals bl.rpc:rpc-error (decode-raw-tx superfluous))))
 
 (test rpc-decoderawtransaction-invalid-hex
   "Test decoderawtransaction with invalid hex returns error"
