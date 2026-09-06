@@ -39,6 +39,10 @@ derives from a DIFFERENT option is never supplied, so it is never named**. Two c
   not, with a security, privacy or funds consequence.
 - **(c) implemented elsewhere under a different name** — 10 options / 7 mechanisms. The behaviour
   exists; the option is not wired to it. These should be wired, not dropped.
+- **fixed** — the rows the S2 batch closed: `-allowignoredconf`, `-blocksdir`, `-persistmempool`,
+  `-persistmempoolv1`, `-signetseednode` and `-walletbroadcast` are real options now, each wired
+  to the mechanism its Core reader drives. The class column keeps their original letter in the
+  finding text; the row itself reads `fixed`.
 
 ## The table
 
@@ -90,7 +94,7 @@ on a node given that option.
 | `-rpcworkqueue` | `GetArg(..., DEFAULT_HTTP_WORKQUEUE=64)` → `g_max_queue_depth` (`httpserver.cpp:419`) | no queue-depth knob; `-rpcthreads` caps concurrency (`src/rpc/server.lisp:1420-1424`) | a | a related bound IS configurable; the depth knob's absence changes queueing latency, not any protection |
 | `-shrinkdebugfile` | `GetBoolArg(..., DefaultShrinkDebugFile())`, and that default is **false whenever any `-debug` category is set** (`init/common.cpp:110`, `logging.cpp:167-170`) | `start-file-logging` calls `shrink-log-file` unconditionally (`src/node/logging.lisp:146`) | c | a `-debug` restart discards all but the last 10 MB of the evidence — finding `e9d39df8` |
 | `-signer` | `GetArg("-signer","")` → external signing command (`wallet/external_signer_scriptpubkeyman.cpp:49`) | no external-signer support | a | absent feature; `enumeratesigners`/`displayaddress` are simply not there, so it fails loudly at first use |
-| `-signetseednode` | `GetArgs` (a LIST) → `options.seeds`, which REPLACES `vSeeds` (`chainparams.cpp:28`, `kernel/chainparams.cpp:471`) | dropped; the `:signet` params hardcode the two public signet DNS seeds | c | a custom signet dials the PUBLIC signet instead of the seed node it was given — finding `7f6337e2` |
+| `-signetseednode` | `GetArgs` (a LIST) → `options.seeds`, which REPLACES `vSeeds` (`chainparams.cpp:28`, `kernel/chainparams.cpp:471`) | **fixed**: real repeatable option; `signet-chain-params` instantiates the `:signet` row from it and from `-signetchallenge` (derived magic, cleared seeds, zeroed chain work and assumevalid) | fixed | finding `7f6337e2` |
 | `-stopafterblockimport` | `GetBoolArg(..., DEFAULT_STOPAFTERBLOCKIMPORT=false)` → shut down after `ImportBlocks` (`init.cpp:2031`) | `%import-external-block-files` runs and the node carries on (`src/node/init.lisp:1502`) | a | a scripted bootstrap ends with a node still running rather than exited — visible, no security or funds consequence |
 | `-timeout` | `GetIntArg(..., DEFAULT_CONNECT_TIMEOUT=5000)` ms → `nConnectTimeout`, clamped up if ≤ 0 (`init.cpp:1062`) | `make-tcp-connection` has a hardcoded `:timeout 10` seconds and no caller overrides it (`src/networking/connection.lisp:238`) | a | our fixed 10 s is twice Core's default — more patient, not less; the loss is only that a Tor/high-latency operator cannot raise it |
 | `-unsafesqlitesync` | `GetBoolArg` → SQLite `synchronous=OFF` (`wallet/db.cpp:156`) | we have no SQLite | a | names a database engine this tree does not use |
