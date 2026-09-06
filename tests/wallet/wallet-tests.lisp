@@ -560,9 +560,11 @@ it is -4."
             (load-wallet-rpc "junk"))
           ;; Past the probe and still unopenable: Core's FAILED_LOAD, -4, with
           ;; the engine's own text -- which is what Core puts there too
-          ;; (sqlite.cpp:691-707).
+          ;; (sqlite.cpp:691-707). The message check names the engine, not the
+          ;; shared "Wallet file verification failed." prefix that the three
+          ;; -18 answers above carry as well.
           (%make-damaged-wallet-dir manager "broken" :garbage-manifest)
-          (signals-rpc-error (:code -4 :message "Wallet file verification failed.")
+          (signals-rpc-error (:code -4 :message "LevelDB error")
             (load-wallet-rpc "broken")))))))
 
 ;;; --- A walletdescriptor record that will not read (GA11 69862ba9) ---
