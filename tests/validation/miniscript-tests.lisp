@@ -42,6 +42,7 @@ distinguishes."
 (defun %ms-keys (node) (bl.val::ms-node-keys node))
 (defun %ms-threshold (node) (bl.val::ms-node-k node))
 (defun %ms-top-level-p (node) (bl.val::ms-node-valid-top-level-p node))
+(defun %ms-script-size (node) (bl.val::ms-node-script-size node))
 
 (test miniscript-validity-matches-core-s-corpus
   "Which expressions type, and which do not."
@@ -198,11 +199,16 @@ would otherwise read as `no properties' and the parent could type fine."
 (defparameter *ms-desc-key-b*
   "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
 
+(defun %ms-desc-expand (desc &optional (pos 0))
+  "The scripts DESC expands to at range index POS, around the expansion cache —
+which is keyed by the descriptor STRING, so a cached entry outlives any change
+to how a script is built."
+  (bl.rpc::%out-desc-expand-uncached desc pos))
+
 (defun %ms-desc-spk (string &optional (pos 0))
-  (let ((d (bl.rpc:parse-descriptor string :mainnet)))
-    (string-downcase
-     (bl.crypto:bytes-to-hex
-      (first (bl.rpc::%out-desc-expand-uncached d pos))))))
+  (string-downcase
+   (bl.crypto:bytes-to-hex
+    (first (%ms-desc-expand (bl.rpc:parse-descriptor string :mainnet) pos)))))
 
 (defun %ms-desc-witness-script (string &optional (pos 0))
   (let* ((d (bl.rpc:parse-descriptor string :mainnet))
@@ -290,6 +296,102 @@ point of miniscript is to know so in advance."
                   (format nil "wsh(and_v(v:pk(~A),older(0)))" *ms-desc-key-a*)
                   :mainnet)))
 
+;;; --- Core's parse-time gates: arity, script size, and the cost bound -------
+
+(defun %ms-distinct-keys (count)
+  "COUNT distinct compressed public keys, derived rather than listed: the size
+ceiling only shows up on an expression too large to write out by hand, and
+miniscript refuses a repeated key (CheckDuplicateKey), so they have to differ."
+  (loop for i from 2 below (+ 2 count)
+        collect (string-downcase
+                 (bl.crypto:bytes-to-hex
+                  (bl.crypto:derive-public-key
+                   (let ((v (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element 0)))
+                     (setf (aref v 31) i)
+                     v))))))
+
+(defun %ms-sized-policy (n-multis)
+  "A miniscript body of N-MULTIS 1-of-20 multi() fragments chained with and_v.
+Core's accumulator gives a multi 2 + (n>16) + (k>16) + 34n = 683 bytes and an
+and_v 1, on top of the seed of 1, so five multis come to 1 + 4 + 5*683 = 3,420
+— under the 3,600-byte P2WSH ceiling — and six to 1 + 5 + 6*683 = 4,104, over."
+  (let ((keys (%ms-distinct-keys (* 20 n-multis))))
+    (labels ((chain (multis)
+               (if (rest multis)
+                   (format nil "and_v(v:~A,~A)" (first multis) (chain (rest multis)))
+                   (first multis))))
+      (chain (loop for i from 0 below n-multis
+                   collect (format nil "multi(1,~{~A~^,~})"
+                                   (subseq keys (* i 20) (* (1+ i) 20))))))))
+
+(test ms-parse-enforces-cores-script-size-ceiling
+  "Core carries a running script_size through Parse and returns {} the moment it
+passes MaxScriptSize — MAX_STANDARD_P2WSH_SCRIPT_SIZE, 3,600 bytes, outside
+tapscript (miniscript.h:1912 and :282-294).
+
+Sizing a node by GENERATING its script instead gave up whenever a key was not
+already bytes, and inside a descriptor every key is a key EXPRESSION, so every
+node of every miniscript descriptor reported size 0 and `0 <= 3600' was the only
+test IsValid ever ran for the inputs that reach the RPC. importdescriptors and
+deriveaddresses accepted — and handed out addresses for — a wsh() policy whose
+witnessScript no relay will carry (GA11 05af23cd).
+
+The literal-key form and the descriptor form of ONE expression are checked
+together on purpose: the literal form already failed the ceiling, and that
+divergence between the two is exactly what hid this."
+  (let ((over (%ms-sized-policy 6))
+        (under (%ms-sized-policy 5)))
+    (is-false (bl.val:ms-node-valid-p (bl.val:ms-parse over)))
+    (signals error (bl.rpc:parse-descriptor (format nil "wsh(~A)" over) :mainnet))
+    (let ((node (bl.val:ms-parse under)))
+      (is (= 3420 (%ms-script-size node)))
+      (is (= 3420 (length (bl.val:ms-node-script node))))
+      (is-true (bl.val:ms-node-valid-p node)))
+    (let ((node (bl.rpc:out-desc-node
+                 (bl.rpc:out-desc-sub
+                  (bl.rpc:parse-descriptor (format nil "wsh(~A)" under) :mainnet)))))
+      (is (= 3420 (%ms-script-size node))
+          "the descriptor form must size the same as the literal-key form")
+      (is-true (bl.val:ms-node-valid-p node)))))
+
+(test ms-parse-and-inference-are-bounded-in-time
+  "TIMING-SENSITIVE, with a deliberately wide margin — it is a bound, not a
+benchmark.
+
+Both directions were cubic in their input, because every node sized itself by
+re-serializing its whole subtree, and neither had Core's early ceiling. A
+10,000-character expression took 98 seconds and a 3,600-byte witnessScript —
+which is WITHIN the standardness limit, so nothing else refuses it — took 37,
+in an RPC worker, from one authenticated getdescriptorinfo or
+signrawtransactionwithkey call (GA11 d722b087).
+
+What bounds it is that a node's size is now O(1) in its own fragment and its
+subs' cached sizes, so nothing re-serializes a subtree; and that FromScript
+refuses an over-sized script before decomposing it (miniscript.h:2692)."
+  (flet ((seconds (thunk)
+           (let ((start (get-internal-real-time)))
+             (funcall thunk)
+             (/ (float (- (get-internal-real-time) start))
+                internal-time-units-per-second))))
+    (let* ((expr (concatenate 'string (make-string 10000 :initial-element #\n) ":1"))
+           (elapsed (seconds (lambda () (%ms-try-parse expr)))))
+      (is (< elapsed 10)
+          "parsing a ~D-character expression took ~,1F s" (length expr) elapsed))
+    (let ((script (make-array 3600 :element-type '(unsigned-byte 8)
+                                   :initial-element #x92)))
+      (setf (aref script 0) #x51)
+      (let ((elapsed (seconds (lambda () (bl.val:ms-from-script script)))))
+        (is (< elapsed 10)
+            "inferring from a 3,600-byte witnessScript took ~,1F s" elapsed)))
+    (let* ((huge (make-array 100000 :element-type '(unsigned-byte 8)
+                                    :initial-element #x92))
+           (inferred :unset)
+           (elapsed (seconds (lambda () (setf inferred (bl.val:ms-from-script huge))))))
+      (is-false inferred "a script over the ceiling is not a miniscript")
+      (is (< elapsed 10)
+          "refusing a 100,000-byte script took ~,1F s" elapsed))))
+
 (test miniscript-descriptors-round-trip-through-their-canonical-string
   "A descriptor's canonical string feeds its checksum and its descriptor ID, so
 a policy that printed back as something else would have two identities — and
@@ -307,11 +409,9 @@ getdescriptorinfo failed on the live node with an ECASE fallthrough."
       (is (string= d (bl.rpc:out-desc-string parsed))
           "~A did not round-trip" d)
       ;; And the round-tripped string parses to the same script.
-      (is (equalp (bl.rpc::%out-desc-expand-uncached parsed 0)
-                  (bl.rpc::%out-desc-expand-uncached
-                   (bl.rpc:parse-descriptor
-                    (bl.rpc:out-desc-string parsed) :mainnet)
-                   0))))))
+      (is (equalp (%ms-desc-expand parsed)
+                  (%ms-desc-expand (bl.rpc:parse-descriptor
+                                    (bl.rpc:out-desc-string parsed) :mainnet)))))))
 
 (test miniscript-rendering-re-sugars-and-collapses-wrapper-runs
   "Core prints the sugared spelling, not the expansion — c:pk_k(K) as pk(K),
