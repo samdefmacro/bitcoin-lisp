@@ -405,7 +405,7 @@ verbosity-2 caller gets the fee and no prevout objects."
                                   :initial-value 0))
                 (out-total (loop for o across outputs
                                  sum (bl.ser:tx-out-value o))))
-            `(("fee" . ,(/ (- in-total out-total) 100000000.0d0)))))
+            `(("fee" . ,(satoshi->btc (- in-total out-total))))))
       ("hex" . ,(bl.crypto:bytes-to-hex wire)))))
 
 (defun input-to-json (input &optional witness-stack &key prevout network)
@@ -436,8 +436,7 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
                          . (("generated" . ,(json-bool
                                              (bl.store:utxo-entry-coinbase prevout)))
                             ("height" . ,(bl.store:utxo-entry-height prevout))
-                            ("value" . ,(/ (bl.store:utxo-entry-value prevout)
-                                           100000000.0d0))
+                            ("value" . ,(satoshi->btc (bl.store:utxo-entry-value prevout)))
                             ("scriptPubKey" . ,(script-to-json spk :network network)))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
@@ -449,7 +448,7 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
   "Core TxToUniv's vout entry (core_io.cpp:495-510): value, n and the
 scriptPubKey object SCRIPT-TO-JSON builds."
   (let ((spk (bl.ser:tx-out-script-pubkey output)))
-    `(("value" . ,(/ (bl.ser:tx-out-value output) 100000000.0d0))
+    `(("value" . ,(satoshi->btc (bl.ser:tx-out-value output)))
       ("n" . ,index)
       ("scriptPubKey" . ,(script-to-json spk :network network)))))
 
@@ -640,7 +639,7 @@ accepted but ignored."
               ("confirmations" . ,(if (= utxo-height +mempool-coin-height+)
                                       0
                                       (1+ (- height utxo-height))))
-              ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
+              ("value" . ,(satoshi->btc (bl.store:utxo-entry-value entry)))
               ;; Core ScriptToUniv with include_hex and include_address
               ;; (blockchain.cpp:1253).
               ("scriptPubKey" . ,(script-to-json spk :network network))
@@ -1415,7 +1414,7 @@ walked after it. The walk is bounded local work with no network I/O, and
                        . ,(bl.crypto:bytes-to-hex
                            (bl.store:utxo-entry-script-pubkey entry)))
                       ("desc" . ,desc)
-                      ("amount" . ,(/ value 100000000.0d0))
+                      ("amount" . ,(satoshi->btc value))
                       ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))
                       ("height" . ,height)
                       ,@(let ((hex (blockhash-at height)))
@@ -1428,7 +1427,7 @@ walked after it. The walk is bounded local work with no network I/O, and
         ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
         ;; Core pushes a VARR: no matches is [], not null.
         ("unspents" . ,(json-array (nreverse unspents)))
-        ("total_amount" . ,(/ total-amount 100000000.0d0))))))
+        ("total_amount" . ,(satoshi->btc total-amount))))))
 
 (define-rpc "scantxoutset" (node (action (scanobjects :array)))
   "Scan the UTXO set for outputs matching descriptors (Bitcoin Core
@@ -1569,9 +1568,6 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
 
 ;;; --- UTXO Set Statistics ---
 
-(defun %csi-amount-btc (satoshis)
-  (/ satoshis 100000000.0d0))
-
 (defun %gettxoutsetinfo-from-index (node hash-type hash-or-height)
   "Serve gettxoutsetinfo for a historical height from the coinstatsindex
 (Core's use_index path). HASH-OR-HEIGHT is an integer height or a block-hash
@@ -1639,19 +1635,19 @@ that block's deltas. Only the muhash hash_type is index-backed."
             ("bogosize" . ,(bl.store:coinstats-bogo-size stats))
             ("muhash" . ,(hash-to-hex (bl.crypto:muhash-finalize
                                        (bl.store:coinstats-muhash stats))))
-            ("total_amount" . ,(%csi-amount-btc (bl.store:coinstats-total-amount stats)))
-            ("total_unspendable_amount" . ,(%csi-amount-btc unspendable-total))
+            ("total_amount" . ,(satoshi->btc (bl.store:coinstats-total-amount stats)))
+            ("total_unspendable_amount" . ,(satoshi->btc unspendable-total))
             ("block_info"
-             . (("prevout_spent" . ,(%csi-amount-btc d-prevout))
-                ("coinbase" . ,(%csi-amount-btc d-coinbase))
-                ("new_outputs_ex_coinbase" . ,(%csi-amount-btc d-newout))
-                ("unspendable" . ,(%csi-amount-btc (+ d-uns-genesis d-uns-bip30
+             . (("prevout_spent" . ,(satoshi->btc d-prevout))
+                ("coinbase" . ,(satoshi->btc d-coinbase))
+                ("new_outputs_ex_coinbase" . ,(satoshi->btc d-newout))
+                ("unspendable" . ,(satoshi->btc (+ d-uns-genesis d-uns-bip30
                                                       d-uns-scripts d-uns-unclaimed)))
                 ("unspendables"
-                 . (("genesis_block" . ,(%csi-amount-btc d-uns-genesis))
-                    ("bip30" . ,(%csi-amount-btc d-uns-bip30))
-                    ("scripts" . ,(%csi-amount-btc d-uns-scripts))
-                    ("unclaimed_rewards" . ,(%csi-amount-btc d-uns-unclaimed))))))))))))
+                 . (("genesis_block" . ,(satoshi->btc d-uns-genesis))
+                    ("bip30" . ,(satoshi->btc d-uns-bip30))
+                    ("scripts" . ,(satoshi->btc d-uns-scripts))
+                    ("unclaimed_rewards" . ,(satoshi->btc d-uns-unclaimed))))))))))))
 
 (define-rpc "gettxoutsetinfo" (node ((hash-type :or "hash_serialized_3") hash-or-height))
   "Return statistics about the UTXO set. With a second argument (height or
@@ -1688,7 +1684,7 @@ coinstatsindex (Core's use_index path)."
              (txout-count (bl.store:utxo-count utxo-set))
              (tx-count (bl.store:utxo-set-distinct-txids utxo-set))
              (total-satoshis (bl.store:utxo-set-total-amount utxo-set))
-             (total-btc (/ total-satoshis 100000000.0d0))
+             (total-btc (satoshi->btc total-satoshis))
              (result `(("height" . ,height)
                        ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
                        ("transactions" . ,tx-count)
@@ -2193,8 +2189,7 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
                    (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
                      (when (gethash spk needles)
                        (push `(("type" . "spend")
-                               ("amount" . ,(/ (bl.store:utxo-entry-value entry)
-                                               100000000.0d0))
+                               ("amount" . ,(satoshi->btc (bl.store:utxo-entry-value entry)))
                                ,@base-fields
                                ("spend_txid" . ,(hash-to-hex txid))
                                ("spend_vin" . ,vin)
@@ -2208,8 +2203,7 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
           for spk = (bl.ser:tx-out-script-pubkey out)
           when (gethash spk needles)
             do (push `(("type" . "receive")
-                       ("amount" . ,(/ (bl.ser:tx-out-value out)
-                                       100000000.0d0))
+                       ("amount" . ,(satoshi->btc (bl.ser:tx-out-value out)))
                        ,@base-fields
                        ("txid" . ,(hash-to-hex txid))
                        ("vout" . ,vout)

@@ -240,8 +240,23 @@ accepted."
     satoshis))
 
 (defun satoshi->btc (satoshis)
-  "Satoshis as the BTC double the RPC layer emits."
-  (/ satoshis 100000000.0d0))
+  "Core ValueFromAmount (core_io.cpp:286-296): SATOSHIS as the BTC amount the
+RPC and REST surfaces emit -- a JSON number token spelled \"%s%d.%08d\",
+always eight decimals, trailing zeros and all.
+
+Core keeps that text in the UniValue and writes it back verbatim, so 1 BTC is
+`1.00000000\' and a tenth is `0.10000000\'. Handing yason a double instead
+let SBCL\'s float printer choose the spelling: the shortest text that
+round-trips, which is `1.0\', `0.1\' and -- for one satoshi -- the
+exponent form `1.0e-8\'. The VALUES agreed; the bytes did not, and Core\'s
+own functional tests read these fields as Decimal, which is exactly why the
+difference is invisible to them.
+
+The sign comes from the satoshi count, not from the quotient, so -1000 sat
+prints -0.00001000 rather than 0.00001000."
+  (multiple-value-bind (quotient remainder) (truncate (abs satoshis) 100000000)
+    (make-json-number (format nil "~:[~;-~]~D.~8,'0D"
+                              (minusp satoshis) quotient remainder))))
 
 (defun feerate-fee (rate-sat-kvb size)
   "Core CFeeRate::GetFee at d3056bc: ceil(RATE-SAT-KVB * SIZE / 1000) —

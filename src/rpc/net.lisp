@@ -280,8 +280,7 @@ whatever the cadence is."
                               (bl.net:peer-inbound-onion peer)))))
                  (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
-           ("minfeefilter" . ,(/ (bl.net:peer-feefilter-rate peer)
-                                 100000000.0d0))
+           ("minfeefilter" . ,(satoshi->btc (bl.net:peer-feefilter-rate peer)))
            ("bytessent_per_msg" . ,(bl.net:snapshot-per-msg-table
                                     (bl.net:peer-sent-per-msg peer)))
            ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
@@ -325,10 +324,9 @@ whatever the cadence is."
          (in (count-if #'bl.net:peer-inbound peers))
          ;; The EFFECTIVE -minrelaytxfee (sat/kvB -> BTC/kvB); Core reports
          ;; ::minRelayTxFee.GetFeePerK(), not the compile-time default.
-         (relayfee (/ bl.mp:*min-relay-fee-rate*
-                      100000000.0d0))
+         (relayfee (satoshi->btc bl.mp:*min-relay-fee-rate*))
          ;; *incremental-relay-fee-rate* is sat/kvB -> BTC/kvB.
-         (incfee (/ bl.mp:*incremental-relay-fee-rate* 100000000.0d0)))
+         (incfee (satoshi->btc bl.mp:*incremental-relay-fee-rate*)))
     `(("version" . ,bl.ser:+client-version+)
       ("subversion" . ,bl.ser:*user-agent*)
       ("protocolversion" . 70016)

@@ -260,7 +260,7 @@ all of them silently:
                            (bl.mp:mempool-effective-min-fee-rate mempool)
                            0))
                      (clamped (max rate-sat-kvb floor-sat-kvb)))
-                `(("feerate" . ,(/ clamped 100000000.0d0))
+                `(("feerate" . ,(satoshi->btc clamped))
                   ("blocks" . ,blocks)))))))))
 
 ;;; --- signrawtransactionwithkey (non-wallet, P2PKH + P2WPKH) ---

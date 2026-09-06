@@ -163,6 +163,24 @@ One reach for the whole test tree; the mining, rawtransaction and dispatch
 suites all build their parameters here."
   (bl.rpc::%normalize-rpc-params (coerce values 'vector)))
 
+(defun btc-amount (value)
+  "The BTC amount an RPC field holds, as an exact rational.
+
+Amount fields are JSON number TOKENS carrying Core's ValueFromAmount spelling
+(\"1.00000000\", \"-0.00001000\"), not Lisp numbers, so a test reads one back
+through this instead of comparing against a double whose printed form it does
+not control -- which is what Core's own functional tests do when they read
+these fields as Decimal. A plain number passes through unchanged, so a field
+that is genuinely not an amount still works."
+  (if (not (bl.rpc::json-number-p value))
+      value
+      (let* ((text (bl.rpc::json-number-text value))
+             (negative (char= (char text 0) #\-))
+             (dot (position #\. text))
+             (whole (parse-integer text :start (if negative 1 0) :end dot))
+             (fraction (parse-integer text :start (1+ dot))))
+        (* (if negative -1 1) (+ whole (/ fraction 100000000))))))
+
 (defun rpc-error-of (thunk)
   "(code . message) of the rpc-error THUNK signals, or NIL if it returns.
 The message matters as much as the code wherever Core's own tests assert the

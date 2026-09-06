@@ -1073,7 +1073,7 @@ through and the coins encrypted before the seed rotation are still spendable."
         (%wenc-encrypt node)
         (is (bl.wallet::wallet-is-locked-p wallet))
         ;; The balance is still visible — only signing is blocked.
-        (is (plusp (bl.wallet::rpc-getbalance node '())))
+        (is (plusp (btc-amount (bl.wallet::rpc-getbalance node '()))))
         (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-sendtoaddress node send-args)))))
         (is (= -13 (rpc-error-code-of

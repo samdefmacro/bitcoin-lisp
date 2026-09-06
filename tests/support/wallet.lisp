@@ -132,7 +132,10 @@ like the wallet's and are not spendable by it."
                ;; An explicit fee rate: regtest has no fee history, and the
                ;; fallback is disabled.
                (bl.wallet::*wallet-rng* (make-wallet-rng 77)))
-          (rpc "fund" "sendtoaddress" address (bl.rpc:satoshi->btc pay)
+          ;; The amount as a client sends it: a decimal BTC string, which
+          ;; AmountFromValue parses. SATOSHI->BTC is the OUTPUT side and
+          ;; returns a JSON number token, not a Lisp number.
+          (rpc "fund" "sendtoaddress" address (bl.rpc:format-money pay)
                nil nil nil nil nil nil nil 10)
           (rpc nil "generatetoaddress" 1 optrue)
           (let* ((balance (rpc "desc" "getbalance"))

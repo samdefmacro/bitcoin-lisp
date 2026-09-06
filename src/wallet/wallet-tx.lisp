@@ -1878,10 +1878,10 @@ push order."
               (declare (ignore purpose))
               (push `(,@(when address `(("address" . ,address)))
                       ("category" . "send")
-                      ("amount" . ,(- (/ value 100000000.0d0)))
+                      ("amount" . ,(bl.rpc:satoshi->btc (- value)))
                       ,@(when found `(("label" . ,label)))
                       ("vout" . ,vout)
-                      ("fee" . ,(- (/ fee 100000000.0d0)))
+                      ("fee" . ,(bl.rpc:satoshi->btc (- fee)))
                       ,@long-fields
                       ("abandoned" . ,abandoned))
                     entries)))))
@@ -1905,7 +1905,7 @@ push order."
                                        "immature")
                                       (t "generate"))
                                 "receive"))
-                        ("amount" . ,(/ value 100000000.0d0))
+                        ("amount" . ,(bl.rpc:satoshi->btc value))
                         ,@(when found `(("label" . ,label)))
                         ("vout" . ,vout)
                         ("abandoned" . ,abandoned)
@@ -1932,8 +1932,8 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
                  (from-me (plusp debit))
                  ;; Negative by construction when we funded the tx.
                  (fee (if from-me (- (%tx-value-out tx) debit) 0)))
-            `(("amount" . ,(/ (- net fee) 100000000.0d0))
-              ,@(when from-me `(("fee" . ,(/ fee 100000000.0d0))))
+            `(("amount" . ,(bl.rpc:satoshi->btc (- net fee)))
+              ,@(when from-me `(("fee" . ,(bl.rpc:satoshi->btc fee))))
               ,@(%wallet-tx-json-fields node wallet wtx)
               ("details" . ,(or (%wallet-list-transactions node wallet wtx 0
                                                            nil nil)

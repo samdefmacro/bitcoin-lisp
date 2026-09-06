@@ -392,7 +392,7 @@ fingerprint><path>."
           (let ((txout (bl.ser:br-read-tx-out
                         (bl.ser:make-byte-reader-from wu))))
             (add "witness_utxo"
-                 `(("amount" . ,(/ (bl.ser:tx-out-value txout) 100000000.0d0))
+                 `(("amount" . ,(bl.rpc:satoshi->btc (bl.ser:tx-out-value txout)))
                    ;; Core ScriptToUniv with include_hex and include_address
                    ;; (rpc/rawtransaction.cpp:1130).
                    ("scriptPubKey" . ,(bl.rpc:script-to-json
@@ -490,7 +490,7 @@ fingerprint><path>."
       (when all
         (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
                                sum (bl.ser:tx-out-value o))))
-          (setf result (append result `(("fee" . ,(/ (- in-total out-total) 100000000.0d0))))))))
+          (setf result (append result `(("fee" . ,(bl.rpc:satoshi->btc (- in-total out-total)))))))))
     result))
 
 ;;; --- combinepsbt / joinpsbts ---
@@ -674,7 +674,7 @@ lists and vsize estimation are not computed (no script solving here)."
       (when all
         (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
                                sum (bl.ser:tx-out-value o))))
-          (setf result (append result `(("fee" . ,(/ (- in-total out-total) 100000000.0d0)))))))
+          (setf result (append result `(("fee" . ,(bl.rpc:satoshi->btc (- in-total out-total))))))))
       (append result `(("next" . ,overall))))))
 
 ;;; --- finalizepsbt (input finalizer + extractor) ---
