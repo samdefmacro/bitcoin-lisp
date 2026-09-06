@@ -537,13 +537,18 @@ Returns the number of peers connected."
 
     (log-info "~D candidate peers available" (length addresses))
 
-    ;; Store discovered addresses for reconnection
-    (setf (node-known-addresses node) addresses)
-
+    ;; The candidate list is LOCAL to this first fill. It used to be parked on
+    ;; the node (NODE-KNOWN-ADDRESSES) and re-walked by REPLACE-DISCONNECTED-PEERS
+    ;; forever, in this order, with no cooldown -- so the eight outbound
+    ;; full-relay slots could only ever be filled from a boot-time snapshot and
+    ;; every address learned from addr gossip afterwards was unreachable to the
+    ;; refill. Every candidate dialed here reaches addrman through
+    ;; %RECORD-OUTBOUND-RESULT (success or failure), which is where the refill
+    ;; now draws from.
     (let ((connected 0)
           (start-time (get-internal-real-time))
           (timeout-ticks (* timeout internal-time-units-per-second)))
-      (dolist (candidate (node-known-addresses node))
+      (dolist (candidate addresses)
         ;; Stop if we have enough peers
         (when (>= connected max-peers)
           (return))
@@ -741,6 +746,63 @@ allowing one extra outbound peer"
            (log-info "Tip is advancing again; releasing the extra outbound slot")
            (setf *try-new-outbound-peer* nil)))))
 
+(defconstant +outbound-dial-max-tries+ 100
+  "Core ThreadOpenConnections gives up after 100 addresses fetched from addrman
+and lets the outer loop run again (net.cpp:2787-2791). It is a bound on the
+SELECTION, not on the dialing: every try is a fresh draw.")
+
+(defconstant +outbound-recent-try-seconds+ 600
+  "Core: \"only consider very recently tried nodes after 30 failed attempts\"
+(net.cpp:2839-2841) -- an address whose last_try is under 10 minutes old is
+skipped. This is the back-off the refill had none of: with maintain-peers
+running once per <=30s sync pass, an address that keeps refusing us was
+re-dialled every 30 seconds forever.")
+
+(defconstant +outbound-recent-try-override-tries+ 30
+  "The other half of net.cpp:2839-2841: once 30 candidates have been rejected,
+a recently-tried address is allowed through, so a node whose address book is
+small still dials rather than starving.")
+
+(defun %select-refill-candidate (node used-groups tried-this-pass)
+  "One pass of Core ThreadOpenConnections' inner selection loop
+(net.cpp:2774-2870): up to +OUTBOUND-DIAL-MAX-TRIES+ FRESH addrman draws, each
+tested against the /16 netgroup set our outbound peers already occupy
+(:2825-2827) and against the 10-minute cooldown (:2839-2841). Returns
+(values HOST PORT), or NIL when nothing suitable turned up.
+
+TRIED-THIS-PASS are the hosts this refill pass has already dialed. Core needs
+no such list because ThreadOpenConnections dials at most ONE peer per iteration
+and sleeps between them, so a just-failed address is re-drawn seconds later at
+worst; this pass fills the whole deficit in one go, and without the list a
+book with a single live entry would be dialed once per empty slot.
+
+Every try is a NEW draw, which is the whole point: the refill used to walk a
+boot-time snapshot of addrman picks in fixed order, so an address learned from
+addr gossip after start-up could never fill an outbound slot however long the
+node ran, and a dead boot candidate was re-dialled every 30 seconds forever.
+GetChance and the reachability / bad-port filters are already inside
+SELECT-DIALABLE-ADDRESS, and the already-connected test inside
+%ADDRMAN-PICK-UNCONNECTED."
+  (let ((now (bl.ser:get-unix-time)))
+    (loop for tries from 1 to +outbound-dial-max-tries+
+          do (multiple-value-bind (host port last-try)
+                 (%addrman-pick-unconnected node)
+               (cond
+                 ;; Nothing dialable in the book at all: Core breaks out of the
+                 ;; loop on an invalid address rather than spinning.
+                 ((null host) (return nil))
+                 ;; Already dialed in this pass (see TRIED-THIS-PASS above).
+                 ((member host tried-this-pass :test #'string=))
+                 ;; This /16 already holds an outbound peer.
+                 ((let ((group (bl.net:ip-netgroup host)))
+                    (and group (member group used-groups :test #'equal))))
+                 ;; Tried within the last 10 minutes, and we have not yet been
+                 ;; refused 30 candidates.
+                 ((and last-try
+                       (< (- now last-try) +outbound-recent-try-seconds+)
+                       (< tries +outbound-recent-try-override-tries+)))
+                 (t (return (values host port))))))))
+
 (defun replace-disconnected-peers (node)
   "Replace disconnected peers to maintain target peer count.
 Returns the number of new peers connected."
@@ -780,69 +842,65 @@ Returns the number of new peers connected."
     (when (<= needed 0)
       (return-from replace-disconnected-peers 0))
 
-    ;; Addresses already in use, and the netgroups our OUTBOUND peers hold.
+    ;; The netgroups our OUTBOUND peers hold, rebuilt after every successful
+    ;; dial exactly as Core rebuilds its accumulators from m_nodes on every
+    ;; iteration -- without carrying it forward a single pass could fill
+    ;; several outbound slots from one /16.
     ;;
-    ;; The two lists are deliberately different populations, and Core draws the
-    ;; same line: AlreadyConnectedToAddress (net.cpp:347-351, consulted from
-    ;; OpenNetworkConnection) compares against every node, inbound included,
-    ;; because a second connection to one address is pointless either way —
-    ;; while outbound_ipv46_peer_netgroups is built only from MANUAL /
-    ;; OUTBOUND_FULL_RELAY / BLOCK_RELAY peers. Folding inbound peers into the
-    ;; netgroup set, which this did, is the primitive Core's own comment names:
-    ;; inbound slots are free to fill, so an attacker spread across the /16s of
-    ;; node-known-addresses (a candidate list built once, at start-up) could
-    ;; veto every replacement dial and watch our outbound set drain away.
-    (let* ((peers (node-peers node))
-           (used-addrs (mapcar #'bl.net:peer-address peers))
-           (connected 0))
+    ;; The netgroup set is built only from MANUAL / OUTBOUND_FULL_RELAY /
+    ;; BLOCK_RELAY peers, never from inbound ones: inbound slots are free to
+    ;; fill, so an attacker spread across the /16s of our candidates could
+    ;; otherwise veto every replacement dial and watch the outbound set drain
+    ;; away. The already-connected test is a different population -- Core's
+    ;; AlreadyConnectedToAddress (net.cpp:347-351) looks at every node,
+    ;; inbound included -- and lives inside %ADDRMAN-PICK-UNCONNECTED.
+    (let ((connected 0)
+          (attempts 0)
+          (tried '()))
       (multiple-value-bind (used-groups privacy-peers)
-          (%outbound-netgroup-diversity peers)
-        ;; Core ThreadOpenConnections skips a candidate whose /16 netgroup
-        ;; already holds an outbound peer (net.cpp:2825-2827). connect-to-peers
-        ;; spreads the INITIAL set, but replacements had no netgroup test at
-        ;; all, so hours of churn could concentrate the outbound set in one
-        ;; group — half of an eclipse's preconditions.
-        (dolist (candidate (node-known-addresses node))
+          (%outbound-netgroup-diversity (node-peers node))
+        (loop
+          ;; Core dials at most one peer per outer iteration; this pass fills
+          ;; the whole deficit, so it is bounded by the deficit. A candidate
+          ;; whose dial fails takes a last_try stamp and is cooled off for ten
+          ;; minutes, so the next maintenance tick draws different addresses
+          ;; rather than re-walking the same ones.
+          ;;
           ;; Stop attempting new connect+handshake cycles the moment shutdown is
-          ;; requested — each one can otherwise block (connect timeout + handshake
+          ;; requested -- each one can otherwise block (connect timeout + handshake
           ;; read) and delay the sync thread reaching its node-running checkpoint.
           (when (or (>= connected needed)
+                    (>= attempts needed)
                     (bl.net:ibd-stop-requested-p))
             (return))
-          (let ((addr (car candidate)))
-            (unless (or (member addr used-addrs :test #'string=)
-                        (let ((g (bl.net:ip-netgroup addr)))
-                          (and g (member g used-groups :test #'equal))))
-              (handler-case
-                  (let* ((dial-port (or (cdr candidate)
-                                        (network-port (node-network node))))
-                         (peer (%dial-outbound-peer
-                                node addr dial-port
-                                (%count-addrman-failures-p used-groups
-                                                           privacy-peers))))
-                    (when peer
-                      (setf (bl.net:peer-address peer) addr)
-                      (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
-                        (log-info "Replacement peer connected: ~A" addr)
-                        ;; Send feature negotiation messages
-                        (bl.net:send-post-handshake-messages peer)
-                        ;; Send compact block negotiation (BIP 152)
-                        (bl.net:send-compact-block-negotiation peer)
-                        (bt:with-recursive-lock-held ((node-lock node))
-                          (push peer (node-peers node)))
-                        ;; Core rebuilds both accumulators from m_nodes on
-                        ;; every iteration, so the peer just added occupies its
-                        ;; group for the rest of this refill; without carrying
-                        ;; it forward a single pass could fill several outbound
-                        ;; slots from one /16.
-                        (multiple-value-setq (used-groups privacy-peers)
-                          (%outbound-netgroup-diversity (node-peers node)))
-                        (push addr used-addrs)
-                        (incf connected))
-                      (unless (eq (bl.net:peer-state peer) :ready)
-                        (bl.net:disconnect-peer peer))))
-                (error (c)
-                  (declare (ignore c))))))))
+          (incf attempts)
+          (multiple-value-bind (addr picked-port)
+              (%select-refill-candidate node used-groups tried)
+            (unless addr (return))
+            (push addr tried)
+            (handler-case
+                (let* ((dial-port (or picked-port (network-port (node-network node))))
+                       (peer (%dial-outbound-peer
+                              node addr dial-port
+                              (%count-addrman-failures-p used-groups
+                                                         privacy-peers))))
+                  (when peer
+                    (setf (bl.net:peer-address peer) addr)
+                    (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
+                      (log-info "Replacement peer connected: ~A" addr)
+                      ;; Send feature negotiation messages
+                      (bl.net:send-post-handshake-messages peer)
+                      ;; Send compact block negotiation (BIP 152)
+                      (bl.net:send-compact-block-negotiation peer)
+                      (bt:with-recursive-lock-held ((node-lock node))
+                        (push peer (node-peers node)))
+                      (multiple-value-setq (used-groups privacy-peers)
+                        (%outbound-netgroup-diversity (node-peers node)))
+                      (incf connected))
+                    (unless (eq (bl.net:peer-state peer) :ready)
+                      (bl.net:disconnect-peer peer))))
+              (error (c)
+                (declare (ignore c)))))))
       connected)))
 
 ;;;; Manually-added peers (addnode)
@@ -1049,12 +1107,18 @@ Core's min(8, total): it is an operator knob here (run-node.sh sets 16)."
            :key #'bl.net:peer-conn-type)))
 
 (defun %addrman-pick-unconnected (node &key new-only)
-  "Pick an addrman address (as (values host port)) we're not already connected
-to, or NIL; PORT is NIL when the record has none stored (caller substitutes
-the network default). NEW-ONLY restricts to the 'new' table (for feelers).
-Goes through select-dialable-address so automatic slots (block-relay,
-feelers) only ever draw records dialable under the current config (torv3
-needs a Tor proxy, cjdns needs -cjdnsreachable, i2p never)."
+  "Pick an addrman address, as (values HOST PORT LAST-ATTEMPT), that we are not
+already connected to; NIL when none is found. PORT is NIL when the record has
+none stored (caller substitutes the network default) and LAST-ATTEMPT is the
+record's last_try stamp, which Core's Select returns alongside the address
+(net.cpp:2793, 2839-2841) because the dial loop's cooldown is judged on it.
+NEW-ONLY restricts to the `new' table (for feelers).
+
+Goes through select-dialable-address so automatic slots (the outbound refill,
+block-relay, feelers) only ever draw records dialable under the current config
+(torv3 needs a Tor proxy, cjdns needs -cjdnsreachable, i2p never). The
+already-connected test is Core's AlreadyConnectedToAddress (net.cpp:347-351),
+which likewise looks at EVERY connection, inbound included."
   (let ((ab (node-address-book node)))
     (when ab
       (dotimes (_ 20)
@@ -1064,7 +1128,8 @@ needs a Tor proxy, cjdns needs -cjdnsreachable, i2p never)."
                   (port (bl.net:peer-address-port pa)))
               (unless (peer-connected-to-host-p node host)
                 (return-from %addrman-pick-unconnected
-                  (values host (and (plusp port) port)))))))))))
+                  (values host (and (plusp port) port)
+                          (bl.net:peer-address-last-attempt pa)))))))))))
 
 (defun maintain-block-relay-peers (node)
   "Ensure up to +target-block-relay-peers+ block-relay-only outbound peers.

@@ -48,7 +48,6 @@
   (tor-controller nil)
   (pending-inbound-peers '() :type list)
   (lock (bt:make-recursive-lock "node-lock"))
-  (known-addresses '() :type list)
   ;; setnetworkactive: when NIL, the node makes no new outbound connections and
   ;; accepts no inbound ones (existing peers are dropped on toggle-off).
   (network-active t :type boolean)
