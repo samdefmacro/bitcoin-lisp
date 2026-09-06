@@ -1344,6 +1344,60 @@ would loop forever against a peer the operator pinned."
                     (%g708-peer :best-hash low-hash :conn-type :block-relay)
                     state 1000)))))
 
+(defun %ibd-source ()
+  "The text of src/networking/ibd.lisp, for the assertions below that are
+about what the download loop no longer contains."
+  (uiop:read-file-string
+   (merge-pathnames "src/networking/ibd.lisp"
+                    (asdf:system-source-directory :bitcoin-lisp))))
+
+(test height-based-eviction-is-gone
+  "CONSIDER-PEER-EVICTION dropped any :ready peer whose VERSION message
+advertised a height more than 1000 below ours. Core has no height-based
+eviction at all: nStartingHeight reaches only getpeerinfo and log lines, every
+automatic drop Core does have is restricted to outbound or block-relay
+connections, judges the peer's CURRENT best-known chain WORK, and exempts
+manual and NoBan peers. Ours consulted none of that -- not peer-inbound, not
+peer-manual, not the NoBan permission -- and the number it compared was frozen
+at handshake time, so a peer that had since caught up could not escape it.
+
+Live cost: a node still in its own IBD that connects to us inbound was
+disconnected on sight and kept re-dialling, and an -addnode peer that was
+behind churned forever, because connect-added-nodes redials it on every ~30s
+maintenance tick. The duty it approximated is already ported faithfully as
+CONSIDER-CHAIN-SYNC-EVICTION (Core ConsiderEviction), tested above."
+  (let ((src (%ibd-source)))
+    ;; Positive control for the scan itself: the same search over the same
+    ;; text must find the rule that DID stay, or an empty read would make
+    ;; every absence below vacuously true.
+    (is-true (search "consider-chain-sync-eviction" src)
+             "the ibd.lisp source scan read nothing")
+    (is-false (search "consider-peer-eviction" src)
+              "the height-based eviction rule is back in the download loop"))
+  (is-false (fboundp 'bl.net::consider-peer-eviction)
+            "consider-peer-eviction is defined again")
+  ;; Behavioural half: peers far behind by advertised height, of every kind the
+  ;; old rule hit, survive the eviction rule that replaced it. The outbound
+  ;; peer is the positive control -- it IS a candidate, so the sweep is live.
+  (multiple-value-bind (state tip-hash low-hash) (%g708-chain 1000)
+    (declare (ignore tip-hash))
+    (dolist (peer (list (%g708-peer :best-hash low-hash :inbound t
+                                    :conn-type :inbound :address "10.0.0.1")
+                        (%g708-peer :best-hash low-hash :manual t
+                                    :address "10.0.0.2")))
+      (setf (bl.net:peer-start-height peer) 100)
+      (is (null (bl.net:consider-chain-sync-eviction peer state 1000))
+          "~:[an inbound~;a manual~] peer 5000 blocks behind must not be a ~
+candidate" (bl.net:peer-manual peer))
+      (is (eq :ready (bl.net:peer-state peer))
+          "the peer must still be connected"))
+    (let ((outbound (%g708-peer :best-hash low-hash :address "10.0.0.3")))
+      (setf (bl.net:peer-start-height outbound) 100)
+      (is (eq :armed (bl.net:consider-chain-sync-eviction outbound state 1000))
+          "the surviving rule must still arm an outbound peer on a worse chain")
+      (is (eq :ready (bl.net:peer-state outbound))
+          "arming is not a disconnect: the 20-minute budget is the point"))))
+
 (test g7-08-protection-is-capped-at-four-and-released
   "Core protects at most MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT (4)
 outbound FULL-RELAY peers; block-relay peers are deliberately never protected."
