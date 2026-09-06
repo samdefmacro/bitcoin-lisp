@@ -18,6 +18,8 @@ src/storage/.")
    ;; Block store
    #:block-store
    #:make-block-store
+   #:block-store-blocks-path
+   #:store-blocks-path
    #:init-block-store
    #:*flat-block-files*
    #:*prune-locks*

@@ -8,9 +8,6 @@
 (defvar *data-directory* nil
   "Base directory for all data storage.")
 
-(defvar *blocks-directory* nil
-  "Directory for block files.")
-
 (defstruct block-file-info
   "Per-file accounting for a blk/rev pair (Core CBlockFileInfo, kernel/blockmanager_opts
 or chain.h). HEIGHT-FIRST and HEIGHT-LAST bound what the file contains, and
@@ -42,6 +39,14 @@ form, or in both, stays fully readable whichever way the flag is set.")
 (defstruct block-store
   "Block storage manager."
   (base-path nil :type (or null pathname))
+  ;; Where the blk/rev/xor bulk lives (Core BlockManager m_opts.blocks_dir,
+  ;; ArgsManager::GetBlocksDirPath, common/args.cpp:286-309). Defaults to
+  ;; <base-path>/blocks/ and moves wholesale under -blocksdir, which is how an
+  ;; operator puts hundreds of GB of block data on a second volume while the
+  ;; chainstate stays on a small fast one. The block INDEX does not move: Core
+  ;; keeps it under GetDataDirNet()/blocks/index (init.cpp:1140), so a Core
+  ;; datadir stays readable.
+  (blocks-path nil :type (or null pathname))
   ;; hash -> where the block is: a PATHNAME for a legacy per-block file, or a
   ;; FLAT-FILE-POS for a record inside a blk?????.dat. Both forms coexist for
   ;; the whole life of a store that has ever held either.
@@ -72,17 +77,22 @@ form, or in both, stays fully readable whichever way the flag is set.")
   ;; than touching the filesystem (validation.cpp).
   (total-bytes 0 :type (integer 0)))
 
+(defun store-blocks-path (store)
+  "STORE's blocks directory: BLOCKS-PATH when one was given (-blocksdir), else
+<base-path>/blocks/. One accessor so no site can derive a second answer."
+  (or (block-store-blocks-path store)
+      (merge-pathnames "blocks/" (block-store-base-path store))))
+
 (defun ensure-directories (store)
   "Ensure storage directories exist."
-  (let ((blocks-path (merge-pathnames "blocks/" (block-store-base-path store))))
+  (let ((blocks-path (store-blocks-path store)))
     (ensure-directories-exist blocks-path)
     blocks-path))
 
 (defun block-file-path (store hash)
   "Get the file path for a block with given HASH."
-  (let ((hash-hex (bl.crypto:bytes-to-hex hash)))
-    (merge-pathnames (format nil "blocks/~A.blk" hash-hex)
-                     (block-store-base-path store))))
+  (merge-pathnames (format nil "~A.blk" (bl.crypto:bytes-to-hex hash))
+                   (store-blocks-path store)))
 
 (defun file-size-bytes (path)
   "Size of the file at PATH in bytes, or NIL if it doesn't exist.
@@ -589,15 +599,26 @@ would open a live file with :IF-EXISTS :OVERWRITE at offset 0."
           (block-store-cursor-pos store) last-pos)
     bytes))
 
-(defun init-block-store (base-path)
-  "Initialize a block store at BASE-PATH."
-  (let ((store (make-block-store :base-path (pathname base-path))))
+(defun init-block-store (base-path &key blocks-path)
+  "Initialize a block store at BASE-PATH.
+
+BLOCKS-PATH is where the blk/rev/xor files go (Core BlockManager's
+m_opts.blocks_dir): NIL means <BASE-PATH>/blocks/, and -blocksdir supplies
+another volume. The block index stays under BASE-PATH either way, as Core's
+does (init.cpp:1140)."
+  (let ((store (make-block-store
+                :base-path (pathname base-path)
+                ;; Always filled, so STORE-BLOCKS-PATH is a slot read on the
+                ;; per-block path rather than a merge every STORE-BLOCK.
+                :blocks-path (uiop:ensure-directory-pathname
+                              (or blocks-path
+                                  (merge-pathnames "blocks/" base-path))))))
     (ensure-directories store)
     ;; The obfuscation key is read before anything is scanned: without it every
     ;; record header would look like garbage and the scan would find nothing.
     ;; A key is only CREATED for a directory with no block data in it.
     (setf (block-store-xor-key store)
-          (let* ((blocks-dir (merge-pathnames "blocks/" base-path))
+          (let* ((blocks-dir (store-blocks-path store))
                  (key (read-or-create-xor-key blocks-dir :use-xor *blocks-xor*)))
             ;; -blocksxor=0 on a blocksdir that already holds a random key is
             ;; REFUSED, not silently honoured (Core InitBlocksdirXorKey,
@@ -622,7 +643,7 @@ key was already stored! Stored key: '~A', stored path: '~A'."
     (ensure-directories-exist (datadir-block-index-path base-path))
     ;; Scan for existing blocks (the only full-directory scan — from here
     ;; on, total-bytes is maintained incrementally)
-    (let ((blocks-dir (merge-pathnames "blocks/" base-path))
+    (let ((blocks-dir (store-blocks-path store))
           (total-bytes 0))
       (when (probe-file blocks-dir)
         (dolist (file (directory (merge-pathnames "*.blk" blocks-dir)))

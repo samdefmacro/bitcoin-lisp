@@ -480,10 +480,18 @@
   silently empty forever (it happened to txospenderindex; a structural
   test now checks every index is caught up). A defstruct slot added here
   breaks even a fresh container, because the FASL volume persists --
-  `cold-unit-fresh` after a layout change."
+  `cold-unit-fresh` after a layout change.
+
+  A store has TWO bases. `base-path` is the network data directory and
+  `store-blocks-path` is where the blk/rev/xor bulk goes -- the same split
+  Core makes between `GetDataDirNet()` and `GetBlocksDirPath()`, so
+  `-blocksdir` moves hundreds of GB of block data to a second volume while
+  the block INDEX stays under the datadir and the directory remains
+  readable by Core."
   (bitcoin-lisp.storage package)
   (bitcoin-lisp.storage:block-store class)
   (bitcoin-lisp.storage:init-block-store function)
+  (bitcoin-lisp.storage:store-blocks-path function)
   (bitcoin-lisp.storage:store-block function)
   (bitcoin-lisp.storage:get-block function)
   (bitcoin-lisp.storage:block-exists-p function)
@@ -1144,6 +1152,7 @@
   (bitcoin-lisp::resolve-conf-path function)
   (bitcoin-lisp::check-config-file-readable function)
   (bitcoin-lisp::check-ignored-config-file function)
+  (bitcoin-lisp::blocks-dir-path function)
   (bitcoin-lisp::signet-chain-params function)
   (bitcoin-lisp::should-persist-mempool-p function)
   (bitcoin-lisp::save-mempool-at-shutdown function)

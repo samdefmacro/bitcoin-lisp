@@ -566,9 +566,13 @@ pruning mode announcement (Step 3)."
         (log-info "Transaction relay: DISABLED (safety default)"))))
 
 
-(defun %init-load-chain (network reindex)
+(defun %init-load-chain (network reindex blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
-index, -reindex, and the block-store <-> header-index position map."
+index, -reindex, and the block-store <-> header-index position map.
+
+BLOCKS-DIRECTORY is -blocksdir: the volume the blk/rev/xor files go on. It is
+resolved before the store is opened, and a directory that does not exist is a
+startup refusal rather than a directory we create somewhere else."
   ;; Initialize chain state: the chainstates list starts with the one primary
   ;; chainstate (empty storage suffix, so it loads exactly the files a
   ;; single-chainstate node wrote). A persisted snapshot chainstate would be
@@ -612,7 +616,11 @@ index, -reindex, and the block-store <-> header-index position map."
   ;; Initialize block store
   (log-info "Initializing block storage...")
   (setf (node-block-store *node*)
-        (bl.store:init-block-store (node-data-directory *node*)))
+        (bl.store:init-block-store
+         (node-data-directory *node*)
+         :blocks-path (blocks-dir-path blocks-directory
+                                       (node-data-directory *node*)
+                                       network)))
   ;; Genesis is never RECEIVED, so nothing else ever writes its body. Core has
   ;; it on disk from initialisation, which is what makes blk00000.dat start at
   ;; height 0 for every reader that walks the block files from outside the node.
@@ -1475,7 +1483,8 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (blocksonly nil)
                         (persist-mempool t)
                         (persist-mempool-v1 nil)
-                        (wallet-broadcast t))
+                        (wallet-broadcast t)
+                        (blocks-directory nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1541,6 +1550,9 @@ PERSIST-MEMPOOL: If T (default), replay mempool.dat at startup and write it at
 WALLET-BROADCAST: If T (default), wallet transactions reach the mempool and the
   wire (Core -walletbroadcast / fBroadcastTransactions). NIL keeps a signed
   wallet transaction off both, and -blocksonly soft-sets it NIL
+BLOCKS-DIRECTORY: Core -blocksdir, the volume the blk/rev/xor files go on. The
+  block index stays in the data directory. A directory that does not exist is
+  a startup error
 BLOCKSONLY: If T, reject transactions from network peers (Core -blocksonly,
   default false): fRelay=0 in our version messages, tx announcements/txs
   from peers disconnect them, no feefilter. Local submissions still relay;
@@ -1583,7 +1595,7 @@ Returns the node instance."
   (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1
                           wallet-broadcast)
   (%init-lock-and-banner network)
-  (%init-load-chain network reindex)
+  (%init-load-chain network reindex blocks-directory)
   (%init-recover-chain reindex-chainstate)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
