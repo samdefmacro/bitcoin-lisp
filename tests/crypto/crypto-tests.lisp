@@ -140,6 +140,37 @@
   ;; Testnet address on mainnet
   (is (null (bl.crypto:decode-address "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" :mainnet))))
 
+;;; --- OS randomness (Core random.h) ---
+
+(test rand-u64-is-a-64-bit-os-draw
+  "BL.CRYPTO:RAND-U64 returns 64-bit values that differ from draw to draw.
+Core's equivalent is GetRand<uint64_t>() / FastRandomContext::rand64()."
+  (let ((draws (loop repeat 64 collect (bl.crypto:rand-u64))))
+    (dolist (n draws)
+      (is-true (typep n '(unsigned-byte 64)) "~S is not a 64-bit value" n))
+    (is (= 64 (length (remove-duplicates draws)))
+        "64 draws produced only ~D distinct values"
+        (length (remove-duplicates draws)))
+    ;; The high half is populated too: an implementation that assembled only
+    ;; the low four bytes would pass everything above.
+    (is-true (some (lambda (n) (>= n (expt 2 56))) draws)
+             "no draw of 64 reached the top byte")))
+
+(test rand-u64-does-not-replay-the-random-state
+  "The whole point of the OS source: two processes running the same build --
+which is what replaying one *random-state* is -- must not produce the same
+value. CL:RANDOM would return identical draws here, which is how a DEFVAR
+initform ended up shipping one shared eviction key (GA11 6c83742d)."
+  (let ((a (let ((*random-state* (sb-ext:seed-random-state 1234))) (bl.crypto:rand-u64)))
+        (b (let ((*random-state* (sb-ext:seed-random-state 1234))) (bl.crypto:rand-u64))))
+    (is (/= a b) "two identical *random-state*s produced the same draw ~D" a)
+    ;; Positive control on the harness itself: CL:RANDOM under the same two
+    ;; bindings DOES repeat, so the assertion above is testing the source and
+    ;; not the seeding.
+    (is (= (let ((*random-state* (sb-ext:seed-random-state 1234))) (random (expt 2 64)))
+           (let ((*random-state* (sb-ext:seed-random-state 1234))) (random (expt 2 64))))
+        "positive control: CL:RANDOM was expected to replay a re-seeded state")))
+
 ;;; --- SipHash-2-4 Tests (BIP 152) ---
 
 (test siphash-empty-input

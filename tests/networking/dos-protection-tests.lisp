@@ -543,8 +543,14 @@ a dial target iff a Tor proxy is configured."
 
 (defun %evict-one (node)
   "Drive the shipped inbound eviction (Core AttemptToEvictConnection); T if a
-peer was dropped. The one reach into it in this file."
-  (bl::evict-least-valuable-inbound node))
+peer was dropped. The one reach into it in this file.
+
+Pins the netgroup key: a real node draws it from the OS CSPRNG in INIT-NODE
+and %EVICT-KEYED-NETGROUP signals without it, so a fixture that only calls
+MAKE-NODE has to supply one -- and a FIXED one, or which netgroup the pass
+protects would vary from run to run."
+  (let ((bl::*eviction-netgroup-key* (cons 1 2)))
+    (bl::evict-least-valuable-inbound node)))
 
 (defun %evict-peer (addr &key (ping 1000) (connect-time 5000)
                               (min-ping nil) (tx-time 0) (block-time 0)
@@ -731,6 +737,87 @@ protects clearnet 1..4, leaving exactly the list below."
       (is (equal '(5 6 7 8 20 21 22 23) evictable)
           "the reserve must protect the LONGEST-connected onion peers (10-13) ~
 and leave the freshest (20-23) evictable; got ~S" evictable))))
+
+(defun %netgroup-key (group)
+  "The eviction keying of the /16 netgroup GROUP (\"a.b\"), under whatever key
+is installed. The one reach into %EVICT-KEYED-NETGROUP in this file."
+  (bl::%evict-keyed-netgroup
+   (bl.net:make-peer :address (concatenate 'string group ".1.1"))))
+
+(defun %top-netgroups (keyfn n)
+  "The N netgroups KEYFN ranks highest out of every /16 from 1.0 to 222.255 --
+the set an attacker enumerates offline to find the groups the netgroup pass
+will protect."
+  (let ((rows (loop for a from 1 to 222
+                    append (loop for b from 0 to 255
+                                 collect (let ((g (format nil "~D.~D" a b)))
+                                           (cons g (funcall keyfn g)))))))
+    (mapcar #'car (subseq (sort rows #'> :key #'cdr) 0 n))))
+
+(defun %distinct-first-octets (groups)
+  (length (remove-duplicates
+           (mapcar (lambda (g) (subseq g 0 (position #\. g))) groups)
+           :test #'string=)))
+
+(test eviction-netgroup-key-is-not-drawn-from-the-random-state
+  "GA11 6c83742d. The key behind +EVICT-PROTECT-NETGROUP+ comes from the OS
+CSPRNG, never from CL:*RANDOM-STATE* -- Core draws nSeed0/nSeed1 from a
+default-constructed FastRandomContext when it builds CConnman
+(init.cpp:1642-1648).
+
+It used to be a DEFVAR initform, `(random most-positive-fixnum)', evaluated at
+ASDF LOAD time: before INIT-NODE re-seeds the RNG, so every node drew the
+first value of SBCL's build-time stream and every node drew the SAME one.
+Replaying one *random-state* here is exactly that: two processes running the
+same build. The keys must still differ."
+  (let ((a (let ((*random-state* (sb-ext:seed-random-state 20260906)))
+             (bl::seed-eviction-netgroup-key)))
+        (b (let ((*random-state* (sb-ext:seed-random-state 20260906)))
+             (bl::seed-eviction-netgroup-key))))
+    (is-true (and (consp a) (consp b)))
+    (is (/= (car a) (car b))
+        "two starts of one build drew the same first netgroup word (~D)" (car a))
+    (is (/= (cdr a) (cdr b))
+        "two starts of one build drew the same second netgroup word (~D)" (cdr a))
+    (is (/= (car a) (cdr a))
+        "the two words of one key are the same draw")
+    (dolist (word (list (car a) (cdr a) (car b) (cdr b)))
+      (is-true (typep word '(unsigned-byte 64))
+               "netgroup key word ~S is not a 64-bit value" word))))
+
+(test eviction-netgroup-key-must-have-been-drawn
+  "An undrawn key is a hard error, not a default. A silent fallback is how the
+load-time draw survived unnoticed for as long as it did, and the pass is
+worthless with a key an attacker can guess -- so a node whose wiring is
+dropped must stop, not protect a predictable four."
+  (let ((bl::*eviction-netgroup-key* nil))
+    (signals bl.err:internal-error (%netgroup-key "10.0"))))
+
+(test eviction-netgroup-keying-does-not-cluster-by-prefix
+  "Core keys the netgroup with SipHash-2-4 (CalculateKeyedNetGroup,
+net.cpp:4136-4141), a real PRF. Ours used (sxhash (cons secret group)), and
+SBCL's SXHASH over a string does not avalanche: groups sharing a prefix hash to
+adjacent values, so the highest-ranked netgroups -- the ones the pass protects
+-- were one contiguous block of a single /8. Knowing the key then handed an
+attacker a whole neighbourhood of winners rather than one address at a time.
+
+Deterministic: the key is fixed, so the ranking is."
+  (let ((bl::*eviction-netgroup-key* (cons 1 2)))
+    (let ((top (%top-netgroups #'%netgroup-key 12)))
+      (is (>= (%distinct-first-octets top) 8)
+          "the 12 highest-ranked netgroups fall in only ~D /8~:P (~{~A ~}): the ~
+keying is not avalanching"
+          (%distinct-first-octets top) top)
+      ;; Positive control: the keying this replaced, on the same corpus and the
+      ;; secret every node actually shipped with. Without it a broken ranking
+      ;; could satisfy the assertion above by accident.
+      (let ((sxhash-top (%top-netgroups
+                         (lambda (g) (sxhash (cons 1193941380623146742 g)))
+                         12)))
+        (is (= 1 (%distinct-first-octets sxhash-top))
+            "positive control: the sxhash keying was expected to cluster into ~
+one /8, got ~D (~{~A ~})"
+            (%distinct-first-octets sxhash-top) sxhash-top)))))
 
 (test ban-lock-concurrent-stress
   "Many threads hammering the discourage/ban globals do not crash or corrupt

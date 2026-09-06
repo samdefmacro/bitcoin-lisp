@@ -16,6 +16,13 @@ For testnet, data stays at the base directory (backward compatible)."
   ;; sequence. See SEED-GLOBAL-RANDOM-STATE for what depends on this.
   (seed-global-random-state)
 
+  ;; The inbound-eviction netgroup key, straight off the OS CSPRNG and never
+  ;; from *random-state* -- Core draws its nSeed0/nSeed1 the same way and at
+  ;; the same point, constructing CConnman in AppInitMain (init.cpp:1642-1648).
+  ;; MAKE-NODE below is the only node construction in the tree, so this is the
+  ;; CConnman constructor's position.
+  (seed-eviction-netgroup-key)
+
   ;; Set global network variable
   (setf *network* network)
 

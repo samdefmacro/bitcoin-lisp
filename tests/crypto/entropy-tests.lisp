@@ -91,7 +91,11 @@ Tolerances are ~13 sigma, so this does not flake."
 (test init-node-seeds-the-process-rng
   "The production wiring: INIT-NODE — the head of the only startup path, run
 before start-node builds the address book or dials anything — re-seeds the
-process RNG. Without the call the node runs on SBCL's build-time stream."
+process RNG and draws the inbound-eviction netgroup key. Without the first
+call the node runs on SBCL's build-time stream; without the second the
+netgroup key stays NIL and inbound eviction signals (GA11 6c83742d). Core does
+both at AppInitMain, the netgroup seeds as CConnman's first two constructor
+arguments (init.cpp:1642-1648)."
   (let ((dir (merge-pathnames "test-entropy-init/" (uiop:temporary-directory))))
     (unwind-protect
          ;; init-node also assigns the network globals; bind them so this test
@@ -102,6 +106,7 @@ process RNG. Without the call the node runs on SBCL's build-time stream."
                 (bl.net:*current-port* bl.net:*current-port*)
                 (bl.net:*dns-seeds* bl.net:*dns-seeds*)
                 (bl::*random-state-seed* nil)
+                (bl::*eviction-netgroup-key* nil)
                 (would-have (%entropy-draws 8 (sb-ext:seed-random-state 424242)))
                 (*random-state* (sb-ext:seed-random-state 424242))
                 (node (bl::init-node dir :network :regtest)))
@@ -109,7 +114,10 @@ process RNG. Without the call the node runs on SBCL's build-time stream."
            (is-true (integerp bl::*random-state-seed*)
                     "init-node left *random-state-seed* ~S: it never seeded the RNG"
                     bl::*random-state-seed*)
-           (is (not (equal would-have (%entropy-draws 8)))))
+           (is (not (equal would-have (%entropy-draws 8))))
+           (is-true (consp bl::*eviction-netgroup-key*)
+                    "init-node left the eviction netgroup key ~S: it never drew one"
+                    bl::*eviction-netgroup-key*))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 (test seeded-random-state-reaches-worker-threads
