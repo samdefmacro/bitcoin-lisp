@@ -394,22 +394,41 @@ eval_form() {
   "$workbench" repl eval "$@"
 }
 
-# fiveam: NAME is a raw suite designator, e.g. `dev.sh test :script-tests`;
-# test-all runs the whole :bitcoin-lisp-tests suite (26k+ checks).
+# fiveam: NAME is a suite designator, e.g. `dev.sh test :script-tests` or
+# `dev.sh test bitcoin-lisp.tests::ibd-tests`; test-all runs the whole
+# :bitcoin-lisp-tests suite (37k+ checks).
+#
+# The designator is spliced into the form, so a symbol-named suite given
+# bare (`ibd-tests`, `pkg::ibd-tests`) would be EVALUATED as a variable and
+# the runner would report a backtrace that reads as a red suite.  Quote it
+# unless it is already a keyword or already quoted.
+suite_designator() {
+  case "$1" in
+    :*|\'*) printf '%s' "$1" ;;
+    *) printf "'%s" "$1" ;;
+  esac
+}
+
+# A large suite's `Did N checks` summary is the LAST thing printed, and the
+# default 10k-char output cap drops it; the test entry points raise the cap
+# the way they raise the timeout.
 test_one() {
   if [[ $# -ne 1 ]]; then
     echo "test requires one fiveam suite designator, e.g. :script-tests" >&2
     return 2
   fi
+  local suite; suite=$(suite_designator "$1")
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-600}" \
-    eval_form "(let ((r (fiveam:run $1)))
+  DEV_EVAL_MAX_OUTPUT="${DEV_EVAL_MAX_OUTPUT:-400000}" \
+    eval_form "(let ((r (fiveam:run $suite)))
   (fiveam:explain! r)
-  (unless r (error \"suite $1 selected no tests\"))
-  (unless (fiveam:results-status r) (error \"suite $1 failed\")))"
+  (unless r (error \"suite $suite selected no tests\"))
+  (unless (fiveam:results-status r) (error \"suite $suite failed\")))"
 }
 
 test_all() {
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
+  DEV_EVAL_MAX_OUTPUT="${DEV_EVAL_MAX_OUTPUT:-400000}" \
     eval_form '(let ((r (fiveam:run :bitcoin-lisp-tests)))
   (fiveam:explain! r)
   (unless r (error "suite :bitcoin-lisp-tests selected no tests"))
