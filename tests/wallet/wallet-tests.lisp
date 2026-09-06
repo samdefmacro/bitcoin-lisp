@@ -505,6 +505,70 @@ Core's condition, so both are here."
         (is (eql bl.wallet::+wallet-client-version+
                  (%stored-client-version path)))))))
 
+;;; --- A wallet database that cannot be read (GA11 5b7d945a) ---
+
+(defun %make-damaged-wallet-dir (manager name shape)
+  "Build <wallets>/NAME/ in a damaged state.
+
+:MISSING leaves it absent. :EMPTY makes an empty directory. :GARBAGE-CURRENT
+writes a CURRENT that names nothing -- the shape that fails Core's format
+probe. :GARBAGE-MANIFEST writes a CURRENT naming a MANIFEST that is there and
+is not one, which passes the probe and still cannot be opened, so it is the
+half that must answer -4 rather than -18."
+  (let ((path (bl.wallet::wallet-path-for manager name)))
+    (flet ((write-file (file text)
+             (with-open-file (s (merge-pathnames file path)
+                                :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+               (write-line text s))))
+      (ecase shape
+        (:missing)
+        (:empty (ensure-directories-exist path))
+        (:garbage-current
+         (ensure-directories-exist path)
+         (write-file "CURRENT" "garbage"))
+        (:garbage-manifest
+         (ensure-directories-exist path)
+         (write-file "MANIFEST-000999" "not a manifest")
+         (write-file "CURRENT" "MANIFEST-000999"))))
+    path))
+
+(test wallet-unreadable-database-answers-core-s-database-status
+  "GA11 5b7d945a. Every database failure in Core carries a DatabaseStatus and
+HandleWalletError maps it (rpc/util.cpp:127-157): FAILED_NOT_FOUND and
+FAILED_BAD_FORMAT are -18, everything else is -4, and no Core path answers a
+wallet-load request with an internal error -- protocol.h:34 reserves that for
+\"genuine errors in bitcoind\". Ours let BL.ERR:STORAGE-ERROR escape
+wallet-db-open and the record scan, so a wallet whose file was present but
+unreadable reached the client as -32603 carrying a raw LevelDB string.
+
+The split follows Core's own: the format probe answers -18 before the engine
+is handed the path (MakeDatabase, walletdb.cpp:1329-1382), and a failure after
+it is -4."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet (nil)
+      (let ((manager (%node-manager node)))
+        (flet ((load-wallet-rpc (name)
+                 (bl.wallet::rpc-loadwallet node (list name))))
+          (%make-damaged-wallet-dir manager "gone" :missing)
+          (signals-rpc-error (:code -18 :message "Path does not exist.")
+            (load-wallet-rpc "gone"))
+          ;; Core answers a directory with no data file -18 too, but with the
+          ;; other sentence (wallet_multiwallet.py:305); we used to give the
+          ;; missing-path one for both.
+          (%make-damaged-wallet-dir manager "hollow" :empty)
+          (signals-rpc-error (:code -18 :message "Data is not in recognized format.")
+            (load-wallet-rpc "hollow"))
+          (%make-damaged-wallet-dir manager "junk" :garbage-current)
+          (signals-rpc-error (:code -18 :message "Data is not in recognized format.")
+            (load-wallet-rpc "junk"))
+          ;; Past the probe and still unopenable: Core's FAILED_LOAD, -4, with
+          ;; the engine's own text -- which is what Core puts there too
+          ;; (sqlite.cpp:691-707).
+          (%make-damaged-wallet-dir manager "broken" :garbage-manifest)
+          (signals-rpc-error (:code -4 :message "Wallet file verification failed.")
+            (load-wallet-rpc "broken")))))))
+
 ;;; --- A walletdescriptor record that will not read (GA11 69862ba9) ---
 
 (defun %damage-descriptor-record (path shape)

@@ -1019,7 +1019,9 @@ locked with no passphrase that can unlock it."
                             (if disable-private-keys +wallet-flag-disable-private-keys+ 0)
                             (if blank-flag +wallet-flag-blank-wallet+ 0)
                             (if avoid-reuse +wallet-flag-avoid-reuse+ 0)))
-             (db (wallet-db-open path :create t))
+             (db (handler-case (wallet-db-open path :create t)
+                   (bl.err:storage-error (e)
+                     (%wallet-database-open-error path e))))
              (wallet (make-wallet :name name :path path :db db
                                   :network (wallet-manager-network manager)
                                   :flags flags
@@ -1051,9 +1053,14 @@ locked with no passphrase that can unlock it."
                                                          (wallet-network wallet)))
                   (lock-wallet wallet)))
               (wallet-write-best-block wallet))
+          ;; Creation failed mid-way: close the DB so the directory is not
+          ;; left open, then answer. A storage condition is Core's
+          ;; FAILED_LOAD behind CreateWallet's verification sentence, not an
+          ;; internal error.
+          (bl.err:storage-error (e)
+            (bl.store:leveldb-close db)
+            (%wallet-database-open-error path e))
           (error (e)
-            ;; Creation failed mid-way: close the DB so the directory is not
-            ;; left open, then re-signal.
             (bl.store:leveldb-close db)
             (error e)))
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
@@ -1300,14 +1307,56 @@ before this point for every result other than LOAD_OK, NEED_RESCAN included."
                           (wdb-key-simple +wdb-key-version+)
                           (wdb-int32-value +wallet-client-version+))))
 
-(defun %wallet-corrupt-error (wallet)
+;;; --- Core's DatabaseStatus, as the three wallet paths answer it ---
+;;;
+;;; Every database failure in Core carries a DatabaseStatus and HandleWalletError
+;;; turns it into an RPC code (rpc/util.cpp:127-157): FAILED_NOT_FOUND and
+;;; FAILED_BAD_FORMAT are RPC_WALLET_NOT_FOUND, and everything else -- FAILED_LOAD
+;;; and FAILED_VERIFY included -- is RPC_WALLET_ERROR. No Core path answers a
+;;; wallet request with an internal error; protocol.h:34 reserves that code for
+;;; "genuine errors in bitcoind". Ours let BL.ERR:STORAGE-ERROR escape all three
+;;; entry points, so an unreadable wallet reached the client as -32603 carrying a
+;;; raw LevelDB string, which reads as a node defect and points the operator at
+;;; the wrong thing.
+
+(defun %wallet-database-not-found-error (path)
+  "Core's FAILED_NOT_FOUND / FAILED_BAD_FORMAT at -18: the directory is not
+there, or it holds nothing recognizable as a wallet database. MakeDatabase
+picks between the two sentences exactly this way (walletdb.cpp:1329-1382), and
+Wallet::Verify prefixes them."
+  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
+                    :message (format nil "Wallet file verification failed. Failed to load database path '~A'. ~A"
+                                     (namestring path)
+                                     (if (uiop:directory-exists-p path)
+                                         "Data is not in recognized format."
+                                         "Path does not exist."))))
+
+(defun %wallet-database-open-error (path condition)
+  "Core's FAILED_LOAD for a database that passed the format probe and still
+could not be opened. MakeSQLiteDatabase catches the engine's own runtime_error
+and answers with its text (sqlite.cpp:691-707); LoadWalletInternal and
+CreateWallet both prefix \"Wallet file verification failed. \"
+(wallet.cpp:280-284, 415-420) and HandleWalletError's default branch makes it
+-4. The engine's text is Core's too -- it goes in the reply there -- so it goes
+in ours, with a log line that keeps the path beside it."
+  (bl:log-warn "wallet database at ~A could not be opened: ~A"
+               (namestring path) condition)
+  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                    :message (format nil "Wallet file verification failed. ~A" condition)))
+
+(defun %wallet-corrupt-error (path &optional condition)
   "Signal Core's DBErrors::CORRUPT as the client sees it: `Error loading %s:
 Wallet corrupted` (wallet.cpp:2388-2390) behind LoadWalletInternal's `Wallet
 loading failed. ` prefix (:286-291), which HandleWalletError's default branch
-answers with RPC_WALLET_ERROR (rpc/util.cpp:127-157)."
+answers with RPC_WALLET_ERROR (rpc/util.cpp:127-157). CONDITION, when the
+corruption came with one, is logged rather than shipped -- Core logs what the
+record loader knows and puts only this sentence in the reply."
+  (when condition
+    (bl:log-warn "wallet database at ~A could not be read: ~A"
+                 (namestring path) condition))
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                     :message (format nil "Wallet loading failed. Error loading ~A: Wallet corrupted"
-                                     (namestring (wallet-path wallet)))))
+                                     (namestring path))))
 
 (defun %wallet-drop-extraneous-master-keys (wallet)
   "Core's post-load cleanup for a wallet that should not exist: private keys
@@ -1335,9 +1384,9 @@ state this removes."
                 do (bl.store:leveldb-writebatch-delete batch (wdb-key-mkey id)))
           (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
       (bl.err:storage-error (e)
-        (bl:log-warn "[~A] Error: Unable to remove extraneous encryption keys. Wallet corrupt. (~A)"
-                     (wallet-name wallet) e)
-        (%wallet-corrupt-error wallet)))
+        (bl:log-warn "[~A] Error: Unable to remove extraneous encryption keys. Wallet corrupt."
+                     (wallet-name wallet))
+        (%wallet-corrupt-error (wallet-path wallet) e)))
     ;; nMasterKeyMaxID is deliberately left where the load put it, as Core
     ;; leaves it: only mapMasterKeys is cleared.
     (clrhash (wallet-master-keys wallet))))
@@ -1414,11 +1463,14 @@ height 0 rather than from a locator that no longer describes what loaded."
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                         :message (format nil "Wallet \"~A\" not found." name)))
     (let ((path (wallet-path-for manager name)))
-      (unless (wallet-db-exists-p path)
-        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
-                          :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Path does not exist."
-                                           (namestring path))))
-      (let* ((db (wallet-db-open path))
+      ;; Core's format probe runs before the engine is handed the path, so a
+      ;; directory that is absent or holds no recognizable database is -18 and
+      ;; never a storage condition.
+      (unless (wallet-db-format-recognized-p path)
+        (%wallet-database-not-found-error path))
+      (let* ((db (handler-case (wallet-db-open path)
+                   (bl.err:storage-error (e)
+                     (%wallet-database-open-error path e))))
              (wallet (make-wallet :name name :path path :db db
                                   :network (wallet-manager-network manager)
                                   :keypool-size (wallet-manager-keypool-size manager)))
@@ -1446,6 +1498,11 @@ height 0 rather than from a locator that no longer describes what loaded."
                     do (spkm-top-up wallet spkm))
               (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
                     do (spkm-top-up wallet spkm)))
+          ;; A record scan that stops on a bad block is Core's DBErrors::CORRUPT
+          ;; and answers as one; the LevelDB text stays in the log.
+          (bl.err:storage-error (e)
+            (bl.store:leveldb-close db)
+            (%wallet-corrupt-error path e))
           (error (e)
             (bl.store:leveldb-close db)
             (error e)))
