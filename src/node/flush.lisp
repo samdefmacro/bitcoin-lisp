@@ -206,7 +206,8 @@ window where a crash must be detected at the next startup. Production leaves
 it NIL; crash-safety tests bind it to observe the on-disk marker or abort
 (via THROW) to simulate a crash at the most dangerous point.")
 
-(defun %flush-chainstate (chainstate &key (label "Periodic") force-full-header-index)
+(defun %flush-chainstate (chainstate &key (label "Periodic") force-full-header-index
+                                          (empty-cache t))
   "Synchronously flush one CHAINSTATE (its state file, its coins view, and
 the shared header index) with 3-phase commit (mirrors Bitcoin Core's
 DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
@@ -224,6 +225,15 @@ flush in log lines (\"Periodic\", \"Shutdown\", \"Reindex\").
            rename internally so the file itself is atomic, but it might
            be old-or-new depending on whether the rename completed.
   Phase 3: save-state with in-transition=0 — commits the new chainstate.
+
+EMPTY-CACHE is Core's empty_cache (validation.cpp:2761-2766): true for a
+FORCE_FLUSH and for the two SIZE tiers (fCacheLarge, fCacheCritical), and
+FALSE for a write driven by the DATABASE_WRITE_INTERVAL timer alone. Phase 2
+turns it into Core's `empty_cache ? CoinsTip().Flush() : CoinsTip().Sync()'
+(:2812): both commit the dirty coins in one batch, and only Flush then throws
+the entries away. It defaults to T so a caller that has no size tier to report
+-- shutdown, reindex, the assumeutxo promotion, MAYBE-CRITICAL-FLUSH -- is on
+Core's FORCE_FLUSH/CRITICAL branch, which is where each of them belongs.
 
 The previous non-atomic flush ordered chainstate-then-utxo. If
 interrupted between, on-disk best-height was ahead of the saved UTXO
@@ -271,7 +281,16 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
             ;; rewound away from, and stamping it would record a hash the coins
             ;; no longer match. chainstate.dat (Phase 3 below) remains a second
             ;; record of the tip; startup compares the two.
-            (bl.store:coins-view-cache-flush view :sync t)))
+            ;;
+            ;; Core's `empty_cache ? Flush() : Sync()' (validation.cpp:2812).
+            ;; Sync's caller contract -- the node lock held across the call and
+            ;; the batch creation -- is met here: every drive site of this
+            ;; function runs on the thread that holds it (the validation
+            ;; thread's :updated-block-tip hook, the reorg's critical flush,
+            ;; the shutdown and reindex paths).
+            (if empty-cache
+                (bl.store:coins-view-cache-flush view :sync t)
+                (bl.store:coins-view-cache-sync view :sync t))))
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
           (bl.store:save-state chainstate :in-transition nil))
@@ -358,35 +377,48 @@ connect blocks concurrently but the global time/count triggers reset on any
 flush, so flushing only the triggering one would let the other's dirty
 coins and redo window grow unboundedly. Flushing a clean chainstate is
 cheap (work is proportional to dirty entries). Cheap if no flush needed;
-durable if it does flush (atomic temp+fsync+rename inside save-*)."
+durable if it does flush (atomic temp+fsync+rename inside save-*).
+
+WHICH trigger fired decides whether the coins cache is emptied. Core computes
+empty_cache = FORCE_FLUSH || fCacheLarge || fCacheCritical
+(validation.cpp:2761-2766) and deliberately leaves fPeriodicWrite -- the
+DATABASE_WRITE_INTERVAL timer, the analogue of the time and block-count
+triggers here -- out of it, so a write driven by the clock commits the dirty
+coins and KEEPS the warm entries. Only the SIZE trigger below is Core's
+fCacheLarge, so only it empties, and the fan-out to the other chainstates
+inherits the same answer: a clean chainstate flushed only because a sibling
+triggered must not lose its cache either."
   (declare (ignore hash height))
   (unless *node* (return-from maybe-periodic-flush))
   (let* ((cs (or chainstate (node-current-chainstate *node*)))
-         (view (and cs (bl.store:chain-state-coins-view cs))))
+         (view (and cs (bl.store:chain-state-coins-view cs)))
+         ;; Size trigger (Bitcoin Core dbcache, its CoinsCacheSizeState::LARGE):
+         ;; flush once the coins cache reaches its memory budget, so it can't
+         ;; grow unbounded between the block-count / time flushes. The budget is
+         ;; per-chainstate while an assumeutxo background sync splits it
+         ;; (maybe-rebalance-caches). This is the one trigger that is also Core's
+         ;; empty_cache, so it is bound here rather than tested inline.
+         (cache-large (and view
+                           (>= (bl.store:view-mem-bytes view)
+                               (large-coins-cache-threshold
+                                (chainstate-coins-cache-budget cs))))))
     (incf *blocks-since-flush*)
     (when (zerop *last-flush-universal-time*)
       (setf *last-flush-universal-time* (bl.ser:get-node-time)))
     (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
               (>= (- (bl.ser:get-node-time) *last-flush-universal-time*)
                   +flush-every-n-seconds+)
-              ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
-              ;; reaches its memory budget, so it can't grow unbounded between the
-              ;; block-count / time flushes. The budget is per-chainstate while an
-              ;; assumeutxo background sync splits it (maybe-rebalance-caches).
-              (and view
-                   (>= (bl.store:view-mem-bytes view)
-                       (large-coins-cache-threshold
-                        (chainstate-coins-cache-budget cs)))))
+              cache-large)
       ;; Triggering chainstate first (its cache may be the urgent one),
       ;; then the rest. Per-cycle bookkeeping (trigger resets, ONE major
       ;; GC, memory snapshots) runs once around the whole pass — not per
       ;; chainstate, which would double the stop-the-world GC pauses
       ;; during an assumeutxo background sync.
       (log-memory-snapshot "pre-flush")
-      (%flush-chainstate cs)
+      (%flush-chainstate cs :empty-cache cache-large)
       (dolist (other (node-chainstates *node*))
         (unless (eq other cs)
-          (%flush-chainstate other)))
+          (%flush-chainstate other :empty-cache cache-large)))
       (setf *last-flush-universal-time* (bl.ser:get-node-time)
             *blocks-since-flush* 0)
       #+sbcl (sb-ext:gc :full t)

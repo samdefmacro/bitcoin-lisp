@@ -1344,7 +1344,11 @@
   once the node is past init (Core's POST_INIT gate) -- the same
   :updated-block-tip event also drives -stopatheight and the periodic
   flush, which must keep firing during IBD, so each subscriber decides
-  for itself rather than the announcement being filtered.
+  for itself rather than the announcement being filtered. WHICH trigger
+  fired reaches the flush: a write driven by the clock or the block count
+  syncs the coins cache and KEEPS its entries, and only the size tier, a
+  critical flush, shutdown and reindex empty it (Core's empty_cache,
+  validation.cpp:2761-2766).
 
   Traps: a changed DEFCONSTANT needs an image RESTART -- the warm image
   goes stale whichever way the continuable error is answered; a changed
