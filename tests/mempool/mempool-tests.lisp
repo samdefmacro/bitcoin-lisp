@@ -1574,7 +1574,10 @@ PolicyScriptChecks)."
           (bl.val:validate-transaction-for-mempool
            base2 utxo mempool 100)
         (is (null valid))
-        (is (eq err :mempool-script-verify-flag-failed))))))
+        ;; The reason carries the script error Core would name in its
+        ;; parenthetical: the fixture's scriptSig does not satisfy the P2PKH
+        ;; output it spends, so the failure is the OP_EQUALVERIFY.
+        (is (equal '(:mempool-script-verify-flag-failed :equalverify) err))))))
 
 (test mempool-coinbase-maturity-at-next-block-height
   "Core's mempool acceptance checks maturity at nSpendHeight = tip + 1
@@ -1606,8 +1609,8 @@ to evaluate maturity at the tip height itself, off by one."
         (bl.val:validate-transaction-for-mempool
          tx utxo mempool 99)
       (declare (ignore valid))
-      (is (not (eq err :coinbase-not-mature)))
-      (is (eq err :mempool-script-verify-flag-failed)))))
+      (is (not (equal err :coinbase-not-mature)))
+      (is (equal '(:mempool-script-verify-flag-failed :equalverify) err)))))
 
 ;;;; Wave 9D: two-pass mempool script validation — PolicyScriptChecks
 ;;;; (STANDARD flags) then ConsensusScriptChecks (tip consensus flags),
@@ -1692,7 +1695,8 @@ MANDATORY-only flags and ACCEPTED it."
           (bl.val:validate-transaction-for-mempool
            tx utxo mempool 100)
         (is (null valid))
-        (is (eq err :mempool-script-verify-flag-failed))))
+        ;; And it names WHICH standard flag rejected: Core's SCRIPT_ERR_CLEANSTACK.
+        (is (equal '(:mempool-script-verify-flag-failed :cleanstack) err))))
     ;; Control: the canonical single-push scriptSig sails through BOTH
     ;; passes and is accepted.
     (multiple-value-bind (tx utxo mempool)
@@ -1716,7 +1720,7 @@ consensus-valid but violates MINIMALDATA: rejected by the policy pass."
           (bl.val:validate-transaction-for-mempool
            tx utxo mempool 100)
         (is (null valid))
-        (is (eq err :mempool-script-verify-flag-failed))))))
+        (is (equal '(:mempool-script-verify-flag-failed :minimaldata) err))))))
 
 ;;;; PR3 ancestor/descendant tracking + chained spends
 

@@ -375,9 +375,12 @@ RPC-ARG-CONVERSIONS-MATCH-CORE re-parses Core's client.cpp every battery."
       (is-true in "src/validation/transaction.lisp is unreadable")
       (when in
         (loop for line = (read-line in nil) while line
-              do (let ((at (search "(values nil :" line)))
+              do (let* ((composed (search "(values nil (list :" line))
+                        (at (or composed (search "(values nil :" line))))
                    (when at
-                     (let* ((start (+ at (length "(values nil :")))
+                     (let* ((start (+ at (length (if composed
+                                                     "(values nil (list :"
+                                                     "(values nil :"))))
                             (end (or (position-if-not
                                       (lambda (c) (or (alphanumericp c) (char= c #\-)))
                                       line :start start)
@@ -418,6 +421,31 @@ exactly the set the old mechanical rendering got wrong."
     (is (string= "scriptsig-size" (r :scriptsig-too-large)))
     (is (string= "scriptpubkey" (r :non-standard-output)))
     (is (string= "bare-multisig" (r :bare-multisig)))))
+
+(test script-reject-reason-carries-core-s-script-error-string
+  "Both script passes render Core's `<prefix> (<ScriptErrorString>)'.
+Core builds the reason with
+strprintf(\"mempool-script-verify-flag-failed (%s)\", ScriptErrorString(...))
+(validation.cpp:2117-2119), so a client matching on the reason -- Core's own
+functional suite among them -- reads the script error out of it. The two sites
+return (KEYWORD SCRIPT-ERROR) and the renderer appends the message verbatim.
+The sentences below are ScriptErrorString's own (script/script_error.cpp)."
+  (flet ((r (reason) (bl.val:tx-reject-reason-string reason)))
+    (is (string= "mempool-script-verify-flag-failed (Non-canonical DER signature)"
+                 (r '(:mempool-script-verify-flag-failed :sig-der))))
+    (is (string= "block-script-verify-flag-failed (Script failed an OP_CHECKSIGVERIFY operation)"
+                 (r '(:block-script-verify-flag-failed :checksigverify))))
+    (is (string= "mempool-script-verify-flag-failed (Using non-compressed keys in segwit)"
+                 (r '(:mempool-script-verify-flag-failed :witness-pubkeytype))))
+    ;; A pass that failed on something other than a script -- a coin we could
+    ;; not resolve -- has no script error, and Core's own fallback is the
+    ;; string \"unknown error\".
+    (is (string= "mempool-script-verify-flag-failed (unknown error)"
+                 (r '(:mempool-script-verify-flag-failed nil))))
+    ;; Control: the bare keyword still renders the prefix alone, so the
+    ;; parenthetical really comes from the second element.
+    (is (string= "mempool-script-verify-flag-failed"
+                 (r :mempool-script-verify-flag-failed)))))
 
 (test transaction-no-outputs
   "Transaction without outputs should fail validation."

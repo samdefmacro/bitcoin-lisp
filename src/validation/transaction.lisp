@@ -793,9 +793,10 @@ transaction is refused even on a node told to relay non-standard ones."
     (:bare-multisig            . "bare-multisig")                    ; :152
     (:dust                     . "dust")                             ; :159
     (:missing-ephemeral-spends . "missing-ephemeral-spends")         ; ephemeral_policy.cpp
-    ;; Both script passes carry a "(ScriptErrorString)" parenthetical in Core
-    ;; (validation.cpp:2117,2119) that our sites do not produce yet, so these
-    ;; render as the bare prefix.
+    ;; Both script passes carry Core's "(ScriptErrorString)" parenthetical
+    ;; (validation.cpp:2117,2119). The two sites return the reason as
+    ;; (KEYWORD SCRIPT-ERROR) so TX-REJECT-REASON-STRING can append it; the
+    ;; prefix alone is what a caller with no script error gets.
     (:mempool-script-verify-flag-failed . "mempool-script-verify-flag-failed")
     (:block-script-verify-flag-failed   . "block-script-verify-flag-failed")
     ;; A witness stripped from a spend of a witness program is not its own
@@ -813,14 +814,23 @@ transaction is refused even on a node told to relay non-standard ones."
 
 (defun tx-reject-reason-string (reason)
   "REASON as Core's state.GetRejectReason() spells it.
+REASON is a keyword, or the list (KEYWORD SCRIPT-ERROR) the two script passes
+return: Core renders those as `<prefix> (<ScriptErrorString>)'
+(validation.cpp:2117-2119), and BL.INTEROP:SCRIPT-ERROR-MESSAGE is that string
+verbatim for every error our interpreter reports.
 An unmapped keyword falls back to its downcased name and is caught by test
 rather than by a client: see TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
-  (or (cdr (assoc reason *tx-reject-reasons*))
-      (string-downcase (symbol-name reason))))
+  (if (consp reason)
+      (format nil "~A (~A)"
+              (tx-reject-reason-string (first reason))
+              (bl.interop:script-error-message (second reason)))
+      (or (cdr (assoc reason *tx-reject-reasons*))
+          (string-downcase (symbol-name reason)))))
 
 (defun %policy-script-checks (tx utxo-set extra-coins)
   "Core MemPoolAccept::PolicyScriptChecks (validation.cpp:1132-1153).
-Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
+Returns (VALUES T NIL), or (VALUES NIL (KEYWORD SCRIPT-ERROR)) -- the reason
+carries the script error so it can be rendered with Core's parenthetical."
   ;; Script pass 1 — PolicyScriptChecks (Core MemPoolAccept::
   ;; PolicyScriptChecks, validation.cpp:1132-1153): run the input
   ;; scripts under the full STANDARD flag set (a constant in Core,
@@ -828,19 +838,20 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
   ;; (TX_NOT_STANDARD), reject reason "mempool-script-verify-flag-
   ;; failed (...)" (CheckInputScripts, validation.cpp:2117), which
   ;; the P2P reject cache keys by wtxid only — never misbehavior.
-  (multiple-value-bind (scripts-valid failed-input)
+  (multiple-value-bind (scripts-valid failed-input script-error)
       (validate-transaction-scripts tx utxo-set
                                     :flags +standard-script-verify-flags+
                                     :extra-coins extra-coins)
     (declare (ignore failed-input))
     (unless scripts-valid
       (return-from %policy-script-checks
-        (values nil :mempool-script-verify-flag-failed))))
+        (values nil (list :mempool-script-verify-flag-failed script-error)))))
   (values t nil))
 
 (defun %consensus-script-checks (tx utxo-set current-height extra-coins)
   "Core MemPoolAccept::ConsensusScriptChecks (validation.cpp:1155-1185).
-Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
+Returns (VALUES T NIL), or (VALUES NIL (KEYWORD SCRIPT-ERROR)) -- the reason
+carries the script error so it can be rendered with Core's parenthetical."
   ;; Script pass 2 — ConsensusScriptChecks (Core MemPoolAccept::
   ;; ConsensusScriptChecks -> CheckInputsFromMempoolAndCache,
   ;; validation.cpp:1155-1185): re-run against the CURRENT TIP's
@@ -854,7 +865,7 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
   ;; consensus-fail is a should-never-happen internal error in Core
   ;; ("BUG! ... CheckInputScripts failed against latest-block but
   ;; not STANDARD flags"); we log the same and reject.
-  (multiple-value-bind (scripts-valid failed-input)
+  (multiple-value-bind (scripts-valid failed-input script-error)
       (validate-transaction-scripts tx utxo-set :height current-height
                                     :extra-coins extra-coins)
     (unless scripts-valid
@@ -864,7 +875,7 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
         (bl.ser:transaction-hash tx))
        failed-input)
       (return-from %consensus-script-checks
-        (values nil :block-script-verify-flag-failed))))
+        (values nil (list :block-script-verify-flag-failed script-error)))))
   (values t nil))
 
 (defun %mempool-precheck-context-free (tx)
@@ -1300,7 +1311,10 @@ EXTRA-COINS supplies spent outputs not in the confirmed UTXO set (chained
 mempool spends). An input whose coin cannot be resolved fails the transaction:
 Core asserts the coin is present before verifying (CheckInputScripts,
 validation.cpp:2090), so a missing coin must never mean \"no script to check\".
-Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
+Returns (VALUES T NIL NIL) on success and
+(VALUES NIL INPUT-INDEX SCRIPT-ERROR) on failure, where SCRIPT-ERROR is the
+Core SCRIPT_ERR_* the input failed on -- NIL when the coin was missing, which
+is not a script verdict at all."
   (let* ((inputs (bl.ser:transaction-inputs tx))
          (effective-flags (or flags (compute-script-flags-for-height height)))
          ;; Script-execution cache (Core CheckInputScripts,
@@ -1324,7 +1338,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
               effective-flags))))
     (when (and cache-key
                (bl.interop:script-execution-cached-p cache-key))
-      (return-from validate-transaction-scripts (values t nil)))
+      (return-from validate-transaction-scripts (values t nil nil)))
     (let* ((spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
            (bl.interop:*script-flags* effective-flags)
            (bl.interop:*precomputed-sighash*
@@ -1332,10 +1346,15 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
            (bl.interop:*current-spent-utxos* spent-utxos))
       (dotimes (input-idx (length inputs))
         (let ((utxo (and spent-utxos (aref spent-utxos input-idx))))
-          (unless (and utxo (validate-input-script tx input-idx utxo))
-            (return-from validate-transaction-scripts (values nil input-idx)))))
+          (unless utxo
+            (return-from validate-transaction-scripts (values nil input-idx nil)))
+          (multiple-value-bind (ok script-error)
+              (validate-input-script tx input-idx utxo)
+            (unless ok
+              (return-from validate-transaction-scripts
+                (values nil input-idx script-error))))))
       ;; Stored only after EVERY input succeeded — a partial success must never
       ;; short-circuit a later pass.
       (when cache-key
         (bl.interop:script-execution-cache-store cache-key))
-      (values t nil))))
+      (values t nil nil))))
