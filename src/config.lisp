@@ -169,6 +169,23 @@ submissions still work and are still announced (sendrawtransaction relays,
 per Core BroadcastTransaction), and block relay is unaffected. See
 networking's IGNORE-INCOMING-TXS-P. Set by start-node's :blocksonly keyword.")
 
+(defvar *wallet-broadcast* t
+  "Core CWallet::fBroadcastTransactions / -walletbroadcast (DEFAULT_WALLETBROADCAST
+= true, set once by SetBroadcastTransactions at wallet.cpp:3068).
+
+When NIL a wallet transaction is built, signed and stored in the wallet and
+then goes NOWHERE: Core returns from CommitTransaction BEFORE the local mempool
+(wallet.cpp:2341-2344), ShouldResend returns false (:2063-2064) and
+ResubmitWalletTransactions returns even when forced (:2109-2110). That is the
+whole point of the option -- an announcement links the txid to this node's IP
+and cannot be recalled -- so it is not the same as a caller passing :relay NIL,
+which would still put the transaction into the local mempool for the next
+resubmit pass to announce.
+
+-blocksonly=1 soft-sets it to 0 (Core wallet/init.cpp:95-97); an explicit
+-walletbroadcast=1 wins. Set once per run by START-NODE's :wallet-broadcast
+keyword, so an in-image restart gets the default back.")
+
 (defvar *wallet-max-tx-fee* 10000000
   "Maximum ABSOLUTE fee, in satoshis, a wallet-built (or wallet-resubmitted)
 transaction may pay (Bitcoin Core -maxtxfee, DEFAULT_TRANSACTION_MAXFEE =

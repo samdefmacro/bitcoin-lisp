@@ -1140,6 +1140,7 @@
   (bitcoin-lisp::tip-notification-post-init-p function)
   (bitcoin-lisp::seed-eviction-netgroup-key function)
   (bitcoin-lisp:*blocksonly* variable)
+  (bitcoin-lisp:*wallet-broadcast* variable)
   (bitcoin-lisp:*p2p-port-override* variable)
   (bitcoin-lisp:*assumevalid-override* variable))
 

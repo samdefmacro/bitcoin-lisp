@@ -392,6 +392,11 @@
 ;; DEFAULT_WALLETCROSSCHAIN = false). Accepting and ignoring it made us behave
 ;; as if it were permanently on.
 (define-option "walletcrosschain")
+;; -walletbroadcast: Core fBroadcastTransactions (DEFAULT_WALLETBROADCAST =
+;; true, wallet.cpp:3068). A start-node keyword rather than a :GLOBAL row so
+;; every run starts from the default, and because -blocksonly soft-sets it in
+;; CONFIG-ALIST->START-NODE-PLIST where the other soft-set keywords are decided.
+(define-option "walletbroadcast" :key :wallet-broadcast :type :bool)
 (define-option "keypool")
 (define-option "walletdir" :network-only t)
 (define-option "walletnotify")
@@ -471,4 +476,4 @@
   "signer"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"
-  "version" "walletbroadcast")
+  "version")

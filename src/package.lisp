@@ -43,6 +43,7 @@ init.cpp, node/. src/node/.")
    #:*mainnet-relay-enabled*
    #:*blocksonly*
    ;; Wallet fee rails (config.lisp; consumed by the wallet spend path)
+   #:*wallet-broadcast*
    #:*wallet-max-tx-fee*
    #:*wallet-fallback-fee*
    ;; Pruning
