@@ -2554,6 +2554,14 @@ export looks like."
                 (when (and priv-disabled keys)
                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                     :message "Cannot import private keys to a wallet with private keys disabled"))
+                ;; The parsed descriptor's own warnings, at Core's position:
+                ;; inside the per-descriptor loop right after the expansion
+                ;; check (backup.cpp:243-245). One pass per branch, as Core
+                ;; has it, so a multipath descriptor whose miniscript carries
+                ;; an unsafe older() reports it once per branch.
+                (dolist (one descs)
+                  (dolist (w (bl.rpc:out-desc-all-warnings one))
+                    (push w warnings)))
                 (unless priv-disabled
                   (when (null keys)
                     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
