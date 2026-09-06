@@ -505,6 +505,19 @@ must be bound by the caller."
                            (lambda (v) (bl.val:ms-check-after tx i v))))
                        (and stack (not malleable) stack))))))
         (cond
+          ;; Bare P2PK, Core's FIRST SignStep case (sign.cpp:643-647): the
+          ;; scriptPubKey already carries the key, so the key is looked up by
+          ;; its full bytes -- PUBMAP, which the multisig arms already use and
+          ;; which therefore holds an uncompressed key too -- and the only thing
+          ;; produced is the signature. combo() expands to this script, so it is
+          ;; the shape a migrated legacy wallet owns.
+          ((string= type "pubkey")
+           (let* ((pub (getf (nth-value 1 (bl.val:classify-script spk)) :pubkey))
+                  (sk (gethash pub pubmap)))
+             (unless sk (fail "no key for P2PK"))
+             (values (%make-input-sig
+                      :kind :p2pk :needed 1
+                      :ecdsa (list (cons pub (legacy-sig spk sk)))))))
           ((string= type "pubkeyhash")
            (let ((entry (gethash (subseq spk 3 23) keymap)))
              (unless entry (fail "no key for P2PKH"))
@@ -633,6 +646,10 @@ error here (a missing key already failed in compute-input-signatures)."
                  (format nil "~Amultisig needs ~D sigs, have ~D"
                          prefix (input-sig-needed sig) (length (input-sig-ecdsa sig))))))
       (ecase (input-sig-kind sig)
+        ;; P2PK reveals no pubkey: the scriptPubKey holds it already, so the
+        ;; scriptSig is the signature push alone (Core pushes only `sig`).
+        (:p2pk (let ((s (first (input-sig-ecdsa sig))))
+                 (values (bl.ser:script-push-data (cdr s)) nil nil)))
         (:p2pkh (let ((s (first (input-sig-ecdsa sig))))
                   (values (concatenate '(vector (unsigned-byte 8))
                                        (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data (car s)))
