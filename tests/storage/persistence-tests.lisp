@@ -1097,21 +1097,6 @@ accumulating score); discouragement is NOT a hard ban."
     (is (bl.net:peer-discouraged-p "192.0.2.100"))
     (bl.net:clear-discouraged)))
 
-;;;; Block Timeout Peer Rotation Tests
-
-(test block-timeout-count-tracking
-  "Block timeouts should be tracked per peer; disconnect at +max-block-timeouts+."
-  (let ((peer (bl.net:make-peer))
-        (threshold bl.net:+max-block-timeouts+))
-    (is (= 0 (bl.net:peer-block-timeout-count peer)))
-    ;; First (threshold - 1) timeouts: counter increments but no disconnect.
-    (loop for i from 1 below threshold do
-      (is (not (bl.net:record-block-timeout peer)))
-      (is (= i (bl.net:peer-block-timeout-count peer))))
-    ;; Threshold-th timeout: counter hits threshold, returns T (disconnect).
-    (is (bl.net:record-block-timeout peer))
-    (is (= threshold (bl.net:peer-block-timeout-count peer)))))
-
 ;;;; Chain Reorganization Tests
 
 (test find-fork-point-same-chain

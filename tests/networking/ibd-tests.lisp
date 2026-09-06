@@ -103,8 +103,11 @@
 (test in-flight-tracking
   "Test tracking in-flight block requests."
   (with-ibd-context
+    ;; A real peer, not a keyword stand-in: MARK-BLOCK-IN-FLIGHT stamps the
+    ;; peer's download clock, which is what Core's per-peer timeout is judged
+    ;; against.
     (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
-          (mock-peer :peer))
+          (mock-peer (bl.net:make-peer :address "203.0.113.77")))
 
       ;; Add to pending
       (setf (gethash hash (bl.net:ibd-context-pending-blocks
@@ -413,6 +416,235 @@ won't serve would keep IBD's main loop spinning forever."
       (is (= 0 (hash-table-count
                 (bl.net:ibd-context-pending-blocks
                  bl.net:*ibd-context*)))))))
+
+;;;; Core's two per-peer block-download disconnects
+;;;;
+;;;; Core keeps the re-routing of a slow request and the eviction of a slow
+;;;; PEER strictly apart (net_processing.cpp:6094-6122). We had one mechanism
+;;;; doing both: retry-timed-out-requests called record-block-timeout once per
+;;;; timed-out HASH against a per-peer budget of 15, while the per-peer
+;;;; in-flight cap is 16 and one request-blocks-from-peers call tops a peer up
+;;;; to that cap -- so a peer holding a full window of same-age requests went
+;;;; from 0 to 16 timeouts in a single pass.
+
+(defun %bd-hash (n)
+  "A distinct 32-byte block hash for index N."
+  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref h 0) (ldb (byte 8 0) n)
+          (aref h 1) (ldb (byte 8 8) n)
+          (aref h 2) (ldb (byte 8 16) n))
+    h))
+
+(defun %bd-peer (&optional (address "203.0.113.1"))
+  (bl.net:make-peer :address address :state :ready))
+
+(defparameter *bd-epoch* (* 1000 internal-time-units-per-second)
+  "A synthetic clock origin for the download-timeout tests. GET-INTERNAL-REAL-TIME
+starts near zero at process start, so `now minus ten minutes' is NEGATIVE in a
+freshly started image and every plusp guard reads the stamp as unset -- the
+assertion then passes for the wrong reason. These tests place both the stamp
+and the current time explicitly instead, which is also what Core does: its
+SendMessages receives current_time rather than reading the clock.")
+
+(defun %bd-fill-window (peer count age-seconds &optional (now *bd-epoch*))
+  "Put COUNT blocks in flight from PEER, all requested AGE-SECONDS before NOW,
+and stamp the peer's download clock as MARK-BLOCK-IN-FLIGHT would have."
+  (let ((then (- now (* age-seconds internal-time-units-per-second))))
+    (dotimes (i count)
+      (setf (gethash (%bd-hash i)
+                     (bl.net:ibd-context-in-flight bl.net:*ibd-context*))
+            (cons peer (+ then i)))
+      (setf (gethash (%bd-hash i)
+                     (bl.net:ibd-context-pending-blocks bl.net:*ibd-context*))
+            (+ 100 i)))
+    (setf (bl.net:peer-downloading-since peer) then)))
+
+(test the-retry-path-re-routes-and-evicts-nobody
+  "Releasing a timed-out request so another peer can be asked for it must cost
+the peer that was holding it nothing. It used to cost it one strike out of 15,
+per hash, so a full 16-block window crossing the timeout together disconnected
+the peer in ONE pass: 125 seconds of silence during bulk download, 30 seconds
+anywhere within 144 blocks of the header tip."
+  (let ((src (project-source-text "src/networking/ibd.lisp")))
+    ;; Positive control for the scan: the mechanism that stayed is still named.
+    (is-true (search "retry-timed-out-requests" src)
+             "the ibd.lisp source scan read nothing")
+    (is-false (search "record-block-timeout" src)
+              "the per-hash retry is driving peer eviction again"))
+  (is-false (fboundp 'bl.net::record-block-timeout)
+            "the per-peer timeout strike counter is back")
+  (with-ibd-context
+    (let ((peer (%bd-peer)))
+      (setf (bl.net::ibd-context-request-timeout bl.net:*ibd-context*) 125)
+      ;; RETRY-TIMED-OUT-REQUESTS reads the real clock, so this one window is
+      ;; placed against it rather than against the synthetic epoch.
+      (%bd-fill-window peer 16 200 (get-internal-real-time))
+      (is (= 16 (bl.net::retry-timed-out-requests))
+          "every request past the timeout is released for re-routing")
+      (is (= 0 (hash-table-count
+                (bl.net:ibd-context-in-flight bl.net:*ibd-context*)))
+          "the released requests must leave the in-flight table")
+      (is (eq :ready (bl.net:peer-state peer))
+          "a re-route must not disconnect the peer that was holding the block"))))
+
+(test block-download-timeout-measures-silence-not-request-age
+  "Core's per-peer download timeout (net_processing.cpp:6109-6122) is one
+decision per peer, taken on its front in-flight block against
+m_downloading_since -- the time of its LAST DELIVERY, not the age of the
+request -- and widened by half a block interval per other downloading peer so
+our own saturated downlink cannot evict a fleet of honest peers."
+  ;; The budget itself, against Core's arithmetic.
+  (is (= (* 600 internal-time-units-per-second)
+         (bl.net::block-download-deadline-ticks 1))
+      "one downloading peer: 600s")
+  (is (= (* 2700 internal-time-units-per-second)
+         (bl.net::block-download-deadline-ticks 8))
+      "eight downloading peers: 2700s")
+  (with-ibd-context
+    ;; The verifier's case: 16 in-flight requests, 126 seconds of silence --
+    ;; one second past the old 125s adaptive timeout, and the peer used to be
+    ;; :disconnected after a single retry pass.
+    (let ((peer (%bd-peer)))
+      (%bd-fill-window peer 16 126)
+      (is (= 0 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*))
+          "126s of silence on a full window is nowhere near Core's floor")
+      (is (eq :ready (bl.net:peer-state peer)))))
+  (with-ibd-context
+    ;; Positive control: past Core's deadline the same peer IS dropped, so the
+    ;; assertion above is about the threshold and not about a dead code path.
+    (let ((peer (%bd-peer)))
+      (%bd-fill-window peer 16 601)
+      (is (= 1 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*))
+          "silence past 600s with one downloading peer must disconnect")
+      (is (eq :disconnected (bl.net:peer-state peer)))))
+  (with-ibd-context
+    ;; A peer holding NOTHING is never judged, however long ago it last spoke
+    ;; (Core guards on vBlocksInFlight.size() > 0).
+    (let ((peer (%bd-peer)))
+      (setf (bl.net:peer-downloading-since peer)
+            (- *bd-epoch* (* 5000 internal-time-units-per-second)))
+      (is (= 0 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*)))
+      (is (eq :ready (bl.net:peer-state peer))))))
+
+(test a-front-block-delivery-restamps-the-download-clock
+  "Core RemoveBlockRequest (net_processing.cpp:1221-1231): the clock starts
+when a peer's in-flight list fills from EMPTY, and only the FRONT block
+arriving restarts it -- that is what makes one decision per peer sound. Any
+delivery clears the stalling stamp."
+  ;; GET-INTERNAL-REAL-TIME advances in millisecond steps here even though
+  ;; INTERNAL-TIME-UNITS-PER-SECOND is a million, so two adjacent operations
+  ;; read the SAME value and "the stamp moved" cannot be asserted by comparing
+  ;; before and after. Each case plants a sentinel stamp instead and asks
+  ;; whether the code replaced it.
+  (with-ibd-context
+    (let ((peer (%bd-peer)))
+      (bl.net::mark-block-in-flight (%bd-hash 0) peer)
+      (is (plusp (bl.net:peer-downloading-since peer))
+          "the first request starts the clock")
+      (setf (bl.net:peer-downloading-since peer) 1)
+      (bl.net::mark-block-in-flight (%bd-hash 1) peer)
+      (bl.net::mark-block-in-flight (%bd-hash 2) peer)
+      (is (= 1 (bl.net:peer-downloading-since peer))
+          "topping the peer up must not restart its clock")
+      ;; A NON-front delivery leaves the clock alone, and clears the stall.
+      (setf (bl.net:peer-stalling-since peer) 12345)
+      (bl.net::mark-block-received (%bd-hash 2))
+      (is (= 1 (bl.net:peer-downloading-since peer))
+          "a later block arriving says nothing about the one we are waiting for")
+      (is (zerop (bl.net:peer-stalling-since peer))
+          "any delivery clears the stalling stamp")
+      ;; The FRONT delivery restarts it.
+      (bl.net::mark-block-received (%bd-hash 0))
+      (is (> (bl.net:peer-downloading-since peer) 1)
+          "the front block arriving restarts the clock for the next one"))))
+
+(test the-stalling-rule-doubles-its-own-timeout
+  "Core's stalling rule (net_processing.cpp:6094-6107) fires only for a peer
+whose stalling stamp is set -- i.e. one holding the first block below a window
+that cannot move -- and DOUBLES its timeout from 2s toward 64s after each use,
+so our own insufficient bandwidth cannot evict several peers in a row."
+  (with-ibd-context
+    (let ((bl.net::*block-stalling-timeout* bl.net::+block-stalling-timeout-default+))
+      ;; Control: a peer with no stalling stamp is never dropped by this rule,
+      ;; however long it has been connected.
+      (let ((quiet (%bd-peer "203.0.113.9")))
+        (is (= 0 (bl.net::check-block-download-timeouts (list quiet) *bd-epoch*)))
+        (is (eq :ready (bl.net:peer-state quiet))))
+      (let ((expected bl.net::+block-stalling-timeout-default+))
+        (dolist (address '("203.0.113.1" "203.0.113.2" "203.0.113.3"
+                           "203.0.113.4" "203.0.113.5" "203.0.113.6"
+                           "203.0.113.7"))
+          (let ((peer (%bd-peer address)))
+            (is (= expected bl.net::*block-stalling-timeout*)
+                "the stalling timeout must be ~Ds before dropping ~A"
+                expected address)
+            (setf (bl.net:peer-stalling-since peer)
+                  (- *bd-epoch* (* (1+ expected) internal-time-units-per-second)))
+            (is (= 1 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*))
+                "~A stalled past ~Ds and must be dropped" address expected)
+            (is (eq :disconnected (bl.net:peer-state peer)))
+            (setf expected (min (* 2 expected)
+                                bl.net::+block-stalling-timeout-max+))))
+        (is (= bl.net::+block-stalling-timeout-max+ expected)
+            "the doubling must reach and stop at Core's 64s ceiling")
+        (is (= bl.net::+block-stalling-timeout-max+ bl.net::*block-stalling-timeout*))))))
+
+(test the-window-staller-is-the-peer-holding-its-first-missing-block
+  "Core FindNextBlocks (net_processing.cpp:1514-1531): when the walk reaches
+the end of the download window with nothing to ask THIS peer for, the peer
+holding the first block we found already in flight is the one keeping the
+window shut, and SendMessages (:6191-6197) starts its stalling clock. Without
+this second value nothing ever sets a stalling stamp and Core's stalling rule
+is dead code."
+  (with-temp-directory (dir "bl-staller")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1
+                       :status :valid))
+             (entries (list genesis))
+             (prev genesis))
+        (bl.store:add-block-index-entry state genesis)
+        ;; A peer chain one block PAST the download window (1024 blocks), so
+        ;; the walk runs out of window rather than out of chain.
+        (loop for h from 1 to (+ bl.net::+max-block-queue-size+ 1)
+              do (let ((e (bl.store:make-block-index-entry
+                           :hash (%bd-hash h) :height h
+                           :chain-work (+ 1 h) :prev-entry prev
+                           :status :header-valid)))
+                   (bl.store:add-block-index-entry state e)
+                   (push e entries)
+                   (setf prev e)))
+        (bl.store:update-chain-tip state (%bd-hash 0) 0)
+        (let* ((services (logior bl.ser:+node-network+ bl.ser:+node-witness+))
+               (holder (bl.net:make-peer :address "198.51.100.1" :state :ready
+                                         :services services))
+               (asker (bl.net:make-peer :address "198.51.100.2" :state :ready
+                                        :services services)))
+          (setf (bl.net:peer-best-known-block-hash holder)
+                (%bd-hash (+ bl.net::+max-block-queue-size+ 1))
+                (bl.net:peer-best-known-block-hash asker)
+                (%bd-hash (+ bl.net::+max-block-queue-size+ 1)))
+          (with-ibd-context
+            ;; Everything inside the window is already in flight from HOLDER.
+            (loop for h from 1 to bl.net::+max-block-queue-size+
+                  do (bl.net::mark-block-in-flight (%bd-hash h) holder))
+            (multiple-value-bind (hashes staller)
+                (bl.net::find-blocks-to-download-for-peer asker state store 16)
+              (is (null hashes)
+                  "the window is full, so this peer has nothing to fetch")
+              (is (eq holder staller)
+                  "the peer holding the window's first missing block is the staller"))
+            ;; Control: with the window free the same walk collects blocks and
+            ;; names no staller, so the assertion above is about the window.
+            (clrhash (bl.net:ibd-context-in-flight bl.net:*ibd-context*))
+            (multiple-value-bind (hashes staller)
+                (bl.net::find-blocks-to-download-for-peer asker state store 16)
+              (is (= 16 (length hashes))
+                  "with the window free the walk fills the peer's budget")
+              (is (null staller)
+                  "a peer that can be asked for blocks names no staller"))))))))
 
 (test mark-block-received-clears-timeout-counter
   "A successful receive clears the per-hash timeout counter so a future

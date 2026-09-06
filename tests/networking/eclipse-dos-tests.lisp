@@ -1344,13 +1344,6 @@ would loop forever against a peer the operator pinned."
                     (%g708-peer :best-hash low-hash :conn-type :block-relay)
                     state 1000)))))
 
-(defun %ibd-source ()
-  "The text of src/networking/ibd.lisp, for the assertions below that are
-about what the download loop no longer contains."
-  (uiop:read-file-string
-   (merge-pathnames "src/networking/ibd.lisp"
-                    (asdf:system-source-directory :bitcoin-lisp))))
-
 (test height-based-eviction-is-gone
   "CONSIDER-PEER-EVICTION dropped any :ready peer whose VERSION message
 advertised a height more than 1000 below ours. Core has no height-based
@@ -1366,7 +1359,7 @@ disconnected on sight and kept re-dialling, and an -addnode peer that was
 behind churned forever, because connect-added-nodes redials it on every ~30s
 maintenance tick. The duty it approximated is already ported faithfully as
 CONSIDER-CHAIN-SYNC-EVICTION (Core ConsiderEviction), tested above."
-  (let ((src (%ibd-source)))
+  (let ((src (project-source-text "src/networking/ibd.lisp")))
     ;; Positive control for the scan itself: the same search over the same
     ;; text must find the rule that DID stay, or an empty read would make
     ;; every absence below vacuously true.
