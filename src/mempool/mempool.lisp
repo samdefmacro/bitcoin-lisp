@@ -1337,12 +1337,21 @@ rules 1/2 are wallet/RPC-only now). Rules 3 and 4 survive; rule 5 is redefined
 in terms of clusters; and the old feerate-superiority test
 (PaysMoreThanConflicts) is replaced by the feerate-diagram improvement check
 (Core ReplacementChecks, validation.cpp:981-1032)."
+  ;; Rule 5, BEFORE anything expands the conflict set. Core's
+  ;; GetEntriesForConflicts (rbf.cpp:58-83) tests GetUniqueClusterCount and
+  ;; returns the error string first, and only then runs the CalculateDescendants
+  ;; loop, under the comment "The cluster count limit ensures that we won't do
+  ;; too much work on a single invocation of this function": the cap is the
+  ;; bound on the expansion, so an expansion that precedes it is unbounded by
+  ;; anything. %RBF-CLUSTER-CAPS reads DIRECT-CONFLICTS alone, so it needs
+  ;; nothing the expansion produces. A LET binding is not a statement that runs
+  ;; where the guard reads it -- the verdict is identical either way, and only
+  ;; the work done before the rejection differs.
+  (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
+    (when cap-failure
+      (return-from check-rbf-rules (values nil cap-failure nil))))
   (let ((graph (mempool-graph mempool))
         (replaced (%rbf-replaced-set mempool direct-conflicts)))
-    ;; Rule 5.
-    (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
-      (when cap-failure
-        (return-from check-rbf-rules (values nil cap-failure nil))))
     ;; A replacement must not spend an output of any tx it replaces (Core
     ;; EntriesAndTxidsDisjoint, rbf.cpp:85-98) — that would leave a dangling
     ;; input after the replaced set is evicted. (This is NOT old rule 2, which
@@ -1391,15 +1400,17 @@ totals, the package feerate must STRICTLY exceed the parent's own feerate
 (validation.cpp:1104-1111: the pair must be a chunk on its own — the child
 must not merely pay anti-DoS fees), and the diagram test stages BOTH package
 transactions (validation.cpp:1113-1121)."
+  ;; Rule 5, on the aggregate conflict set ("this limit is not increased in
+  ;; a package RBF", validation.cpp:1076-1082) and, as in the single-tx path,
+  ;; before the descendant expansion it is there to bound (Core
+  ;; GetEntriesForConflicts, rbf.cpp:58-83).
+  (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
+    (when cap-failure
+      (return-from check-package-rbf-rules (values nil cap-failure nil))))
   (let ((graph (mempool-graph mempool))
         (replaced (%rbf-replaced-set mempool direct-conflicts))
         (total-fee (+ parent-fee child-fee))
         (total-vsize (+ parent-vsize child-vsize)))
-    ;; Rule 5, on the aggregate conflict set ("this limit is not increased in
-    ;; a package RBF", validation.cpp:1076-1082).
-    (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
-      (when cap-failure
-        (return-from check-package-rbf-rules (values nil cap-failure nil))))
     ;; Rules 3 and 4 on the package totals (validation.cpp:1092-1099).
     (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
                                  total-fee total-vsize)

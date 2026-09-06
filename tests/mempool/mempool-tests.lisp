@@ -2013,6 +2013,69 @@ CANDIDATES, rbf.cpp:69-74). 100 distinct clusters is allowed."
         (declare (ignore reason))
         (is-true ok)))))
 
+(test rbf-rule5-gates-the-descendant-expansion
+  "Rule 5 is consulted BEFORE the conflict set is expanded to its descendants,
+which is the whole point of Core's arrangement: GetEntriesForConflicts
+(rbf.cpp:58-83) tests GetUniqueClusterCount and returns its error string
+first, and only then runs the CalculateDescendants loop, under the comment
+naming the cluster cap as the bound on that loop.
+
+The two orders produce the SAME verdict, so this observes the ORDER and not
+the result: MEMPOOL-DESCENDANTS -- the per-conflict walk %RBF-REPLACED-SET
+performs, and the only caller of it on this path -- is instrumented, and a
+candidate rejected by rule 5 must leave it uncalled. The accepted candidate
+one cluster below the cap is the positive control: it MUST reach the walk, so
+an instrumentation that never fires cannot pass this vacuously. Both the
+single-transaction and the package entry point are checked."
+  (let* ((mempool (bl.mp:make-mempool))
+         (conflicts '())
+         (walks 0)
+         (real (fdefinition 'bl.mp:mempool-descendants)))
+    ;; 101 independent singleton-cluster txs, one per outpoint.
+    (loop for i from 1 to 101
+          for tx = (%rbf-tx i)
+          do (%add-tx mempool tx :fee 1000)
+             (push (bl.ser:transaction-hash tx) conflicts))
+    (unwind-protect
+         (let ((cand (%rbf-tx 200)))
+           (setf (fdefinition 'bl.mp:mempool-descendants)
+                 (lambda (&rest args) (incf walks) (apply real args)))
+           ;; 101 clusters: rule 5 rejects, and nothing was expanded.
+           (multiple-value-bind (ok reason)
+               (bl.mp:check-rbf-rules mempool cand 100000000
+                                      (bl.ser:transaction-vsize cand) conflicts)
+             (is-false ok)
+             (is (eq reason :too-many-clusters)))
+           (is (zerop walks)
+               "rule 5 rejected the replacement after ~D descendant walks had already run"
+               walks)
+           ;; Positive control: 100 clusters clears the cap, and the same
+           ;; instrumentation does fire.
+           (multiple-value-bind (ok reason)
+               (bl.mp:check-rbf-rules mempool cand 100000000
+                                      (bl.ser:transaction-vsize cand)
+                                      (rest conflicts))
+             (declare (ignore reason))
+             (is-true ok))
+           (is (= 100 walks)
+               "the accepted replacement expanded ~D of its 100 conflicts" walks)
+           ;; The package path has the same arrangement.
+           (setf walks 0)
+           (multiple-value-bind (ok reason)
+               (bl.mp:check-package-rbf-rules mempool 1000 100 100000000 100
+                                              conflicts)
+             (is-false ok)
+             (is (eq reason :too-many-clusters)))
+           (is (zerop walks)
+               "package rule 5 rejected after ~D descendant walks had already run"
+               walks)
+           (bl.mp:check-package-rbf-rules mempool 1000 100 100000000 100
+                                          (rest conflicts))
+           (is (= 100 walks)
+               "the package that cleared the cap expanded ~D of its 100 conflicts"
+               walks))
+      (setf (fdefinition 'bl.mp:mempool-descendants) real))))
+
 (test rbf-rule5-no-transaction-count-cap
   "Rule 5 bounds only the DISTINCT CLUSTER count; there is no cap on how many
 transactions those clusters hold (the old 500-tx gather cap was ours alone —
