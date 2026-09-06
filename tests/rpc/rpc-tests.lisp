@@ -4547,32 +4547,69 @@ node and compares the whole object, so this pins every field, its value and the
 ABSENCE of the ones Core does not emit.")
 
 (test rpc-decodescript-matches-cores-object-corpus
-  "Every object in Core's data/rpc_decodescript.json, field for field.
+  "Every object in Core's data/rpc_decodescript.json, field for field --
+including the bare taproot output's rawtr() desc, which is InferDescriptor's
+typed arm for a P2TR program that parses as an x-only key."
+  (loop for (hex . expected) in +core-decodescript-vectors+
+        for actual = (%decodescript-flat (%decodescript hex :network :regtest))
+        do (loop for (key . want) in expected
+                 for got = (assoc key actual :test #'string=)
+                 do (is-true got "~A: no ~A field" hex key)
+                    (is (string= want (cdr got))
+                        "~A ~A: ~S, Core says ~S" hex key (cdr got) want))
+           (loop for (key . value) in actual
+                 do (is-true (assoc key expected :test #'string=)
+                             "~A: extra field ~A = ~S that Core does not emit"
+                             hex key value))))
 
-One documented divergence: the bare taproot output's `desc\'. Core's
-InferDescriptor answers rawtr(<x-only key>) for a P2TR output whose key it
-cannot resolve; SCRIPTPUBKEY-DESC answers addr(<bech32m>). That is
-InferDescriptor's content, not decodescript's shape, so the row's other three
-fields are asserted and the desc is asserted to be the addr() form we do emit
--- change this line when InferDescriptor learns rawtr()."
-  (let ((taproot "5120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
-    (loop for (hex . expected) in +core-decodescript-vectors+
-          for actual = (%decodescript-flat (%decodescript hex :network :regtest))
-          do (loop for (key . want) in expected
-                   for got = (assoc key actual :test #'string=)
-                   do (cond
-                        ((and (string= hex taproot) (string= key "desc"))
-                         (is (string= "addr(bcrt1pamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhqz6nvlh)#v52jnujz"
-                                      (cdr got))
-                             "~A: known InferDescriptor divergence changed" hex))
-                        (t
-                         (is-true got "~A: no ~A field" hex key)
-                         (is (string= want (cdr got))
-                             "~A ~A: ~S, Core says ~S" hex key (cdr got) want))))
-             (loop for (key . value) in actual
-                   do (is-true (assoc key expected :test #'string=)
-                               "~A: extra field ~A = ~S that Core does not emit"
-                               hex key value)))))
+(test infer-descriptor-answers-cores-typed-descriptors-before-addr
+  "Core's InferScript (descriptor.cpp:2691-2831) tries the TYPED inferences
+BEFORE ExtractDestination, and three of them need no key material: a bare
+pubkey is pk(), a bare multisig is multi(), and a taproot output whose program
+is a fully valid x-only key is rawtr(). Only after those does Core reach
+addr(), and raw() last.
+
+The `desc' field is what a wallet import or an indexer keys on, so answering
+addr()/raw() for all three lost the key and the threshold Core reports. Driven
+through decodescript, which is one of the surfaces that emits the field."
+  ;; Core descriptor_tests.cpp:1149-1157, the four CheckInferDescriptor
+  ;; vectors that need no signing provider. Two of them are the CONTROLS: a
+  ;; hybrid key has no descriptor (InferPubkey refuses header 06/07) and must
+  ;; stay raw(), and an addressable script must stay addr(), so a change that
+  ;; simply always emits a typed descriptor cannot pass.
+  (let ((hybrid "069228de6902abb4f541791f6d7f925b10e2078ccb1298856e5ea5cc5fd667f930eac37a00cc07f9a91ef3c2d17bf7a17db04552ff90ac312a5b8b4caca6c97aa4")
+        (uncompressed "04032540df1d3c7070a8ab3a9cdd304dfc7fd1e6541369c53c4c3310b2537d91059afc8b8e7673eb812a32978dabb78c40f2e423f7757dca61d11838c7aeeb5220")
+        (compressed "03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd")
+        (compressed2 "03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659")
+        ;; The BIP340 test-vector key: a point on the curve, so IsFullyValid.
+        (xonly "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"))
+    (flet ((desc (hex) (let ((d (%decodescript-field
+                                 (%decodescript hex :network :mainnet) "desc")))
+                         ;; The checksum is asserted by the Core object corpus;
+                         ;; here the body is what InferScript decides.
+                         (subseq d 0 (position #\# d)))))
+      (is (string= (format nil "raw(41~Aac)" hybrid)
+                   (desc (format nil "41~Aac" hybrid)))
+          "a hybrid key has no descriptor (descriptor_tests.cpp:1149)")
+      (is (string= "addr(17P7ge56F2QcdHxxRBa2NyzmejFggPwBJ9)"
+                   (desc "76a91445ff7c2327866472639d507334a9a00119dfd32688ac"))
+          "an addressable script is still addr() (descriptor_tests.cpp:1151)")
+      (is (string= (format nil "pk(~A)" uncompressed)
+                   (desc (format nil "41~Aac" uncompressed)))
+          "descriptor_tests.cpp:1157")
+      (is (string= (format nil "pk(~A)" compressed)
+                   (desc (format nil "21~Aac" compressed))))
+      (is (string= (format nil "multi(1,~A,~A)" compressed compressed2)
+                   (desc (format nil "5121~A21~A52ae" compressed compressed2))))
+      (is (string= (format nil "rawtr(~A)" xonly)
+                   (desc (format nil "5120~A" xonly))))
+      ;; A v1 program that is NOT a point on the curve keeps falling through
+      ;; to its address, because Core builds RawTRDescriptor only for a key
+      ;; that IsFullyValid.
+      ;; BIP340 test vector 5, "public key not on the curve".
+      (let ((off-curve "eefdea4cd0b44a0ebd1f1a9e9c6b4d5eddf7d33bb75c6a3f8fbb62b4e0e02e8f"))
+        (is (eql 0 (search "addr(" (desc (format nil "5120~A" off-curve))))
+            "an invalid x-only key must not become rawtr()")))))
 
 (test rpc-decodescript-wraps-only-what-core-wraps
   "can_wrap (rpc/rawtransaction.cpp:496-526). The p2sh field used to be emitted
