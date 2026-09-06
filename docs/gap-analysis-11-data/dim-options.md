@@ -118,8 +118,8 @@ Checked; **already correct**, and re-verified here rather than assumed:
   `-rpcthreads`, `-mintxfee`, `-maxapsfee`, `-keypool`, `-walletnotify`, …) does have a reader in
   `src/node/rpc-config.lisp` — none is registered-but-never-read.
 
-**One defect found**, and it is finding `7f6337e2`: `-signetchallenge` is a real option whose Core
-reader rewrites four DERIVED chain parameters and ours rewrites none. Executed —
+**One defect found**, and it is finding `7f6337e2` (**fixed**): `-signetchallenge` is a real option
+whose Core reader rewrites four DERIVED chain parameters and ours rewrote none. Executed —
 `apply-option-globals` with a custom challenge under `*network* = :signet` leaves the magic
 `#(10 3 207 64)`, the DNS seeds the two public signet ones, `minimum-chain-work` 12396326331576 and
 the genesis hash all at the public signet's values, where Core derives `pchMessageStart` from
@@ -135,4 +135,6 @@ sha256d of the challenge, clears `vSeeds`, and zeroes `nMinimumChainWork` and `d
 - The aggregate inbound memory bound across all peers (the thing `-maxreceivebuffer` bounds per-peer
   in Core) → **dimension 10** (protocol/peer second reader).
 
-Nothing here was fixed; no file under `src/` or `tests/` was touched.
+The six rows marked `fixed` above were closed by the GA11 options-wiring S2 batch
+(findings `7f6337e2`, `212b060f`, `8c442ee3`, `9e7729b8`, `ebb73768`); every other row here is
+unchanged.

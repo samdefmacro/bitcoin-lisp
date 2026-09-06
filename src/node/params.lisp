@@ -115,3 +115,56 @@ mainnet's merkle-root constant across all networks, which was wrong for
 testnet4 (its genesis coinbase differs; Core kernel/chainparams.cpp:367-379)."
   (bl.ser:bitcoin-block-header
    (bl.store:make-genesis-block network)))
+
+;;;; The signet chain, INSTANTIATED from its options
+;;;;
+;;;; Core does not keep signet in a table: SigNetParams is a constructor over
+;;;; SigNetOptions (kernel/chainparams.cpp:437-511), fed by ReadSigNetArgs
+;;;; (chainparams.cpp:26-40) from -signetchallenge and -signetseednode. The
+;;;; challenge is the SEED of the whole chain identity, not one more consensus
+;;;; constant beside the others, so a custom signet is a separate p2p network
+;;;; with its own message start, its own seeds and no inherited chain-work
+;;;; floor. Our :signet row is that constructor's DEFAULT construction; these
+;;;; two functions are the constructor.
+
+(defun signet-message-start (challenge)
+  "The message start (pchMessageStart) of the signet whose block challenge is
+CHALLENGE -- the first four bytes of sha256d over the SERIALIZED challenge
+(Core kernel/chainparams.cpp:507-511: `HashWriter h{}; h << consensus.signet_challenge`).
+
+The challenge is a byte VECTOR, so `<<` writes a CompactSize length prefix and
+then the bytes; hashing the bare script instead yields a different magic and a
+node that no Core peer on the same signet will handshake with. The default
+public signet challenge must come back as 0A03CF40 -- that is the positive
+control the tests keep on this derivation."
+  (let ((buf (bl.bytes:make-byte-buf)))
+    (bl.bytes:bb-write-var-bytes buf challenge)
+    (subseq (bl.crypto:hash256 (bl.bytes:bb-finish buf)) 0 4)))
+
+(defun signet-chain-params (&key challenge seeds)
+  "The chain-params for THIS run's signet (Core SigNetParams(SigNetOptions)).
+
+CHALLENGE is the -signetchallenge script as bytes, or NIL for the public
+signet; SEEDS is the -signetseednode list, which REPLACES the DNS seeds
+whether or not a challenge was given (kernel/chainparams.cpp:471-473).
+
+With a custom challenge Core clears the seeds, zeroes nMinimumChainWork and
+zeroes defaultAssumeValid (:458-465) -- the public signet's accumulated work is
+a floor a fresh private signet can never cross, so inheriting it leaves the node
+permanently in IBD. It does NOT re-derive the genesis block (CreateGenesisBlock
+takes fixed arguments at :514) and it does NOT clear m_assumeutxo_data, which is
+assigned unconditionally at :520-533; both are kept here for the same reason.
+An explicit -minimumchainwork / -assumevalid still wins over the zeroes, because
+those are applied as overrides at their own use sites, which is Core's ordering
+too (ApplyArgsManOptions runs after CreateChainParams)."
+  (let ((params (bl.chain:copy-chain-params
+                 (bl.chain:chain-params-template :signet))))
+    (when challenge
+      (setf (bl.chain:chain-params-magic params) (signet-message-start challenge)
+            (bl.chain:chain-params-minimum-chain-work params) 0
+            (bl.chain:chain-params-assumevalid-hex params) nil
+            (bl.chain:chain-params-dns-seeds params) '()
+            (bl.chain:chain-params-fixed-seeds params) '()))
+    (when seeds
+      (setf (bl.chain:chain-params-dns-seeds params) (copy-list seeds)))
+    params))

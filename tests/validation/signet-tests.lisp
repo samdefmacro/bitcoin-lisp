@@ -204,3 +204,81 @@ reject and 2015 of every 2016 blocks failed :bad-difficulty."
     ;; And mainnet keeps inheriting, as before.
     (let ((bl:*network* :mainnet))
       (is (= bits (bl.val:get-expected-bits 101 prev-entry))))))
+
+;;;; The signet chain instantiated from its options (finding 7f6337e2)
+;;;;
+;;;; Core does not keep signet in a table: SigNetParams is a constructor over
+;;;; SigNetOptions (kernel/chainparams.cpp:437-511) fed by ReadSigNetArgs
+;;;; (chainparams.cpp:26-40). A custom -signetchallenge therefore derives its
+;;;; own message start and clears the public chain's seeds, chain-work floor
+;;;; and assumevalid, and -signetseednode replaces the seed list outright.
+
+(test signet-message-start-is-derived-from-the-challenge
+  "Core kernel/chainparams.cpp:507-511: pchMessageStart is the first four bytes
+of sha256d over the SERIALIZED challenge (a CompactSize length and then the
+script). The positive control is the DEFAULT challenge, which must reproduce
+the public signet's own 0A03CF40 -- without it a derivation that hashed the
+wrong bytes would still 'differ per challenge' and pass."
+  (is (equalp (bl.chain:network-magic :signet)
+              (bl::signet-message-start bl.val:*default-signet-challenge*))
+      "the default challenge must derive the public signet magic 0A03CF40")
+  (let ((a (bl::signet-message-start (bl.crypto:hex-to-bytes "5121ff51ae")))
+        (b (bl::signet-message-start (bl.crypto:hex-to-bytes "5121fe51ae"))))
+    (is (= 4 (length a)))
+    (is (not (equalp a b))
+        "two challenges must give two networks, else custom signets collide"))
+  ;; The length prefix is part of the hash: dropping it is the plausible bug,
+  ;; and it changes the answer.
+  (is (not (equalp (bl::signet-message-start bl.val:*default-signet-challenge*)
+                   (subseq (bl.crypto:hash256 bl.val:*default-signet-challenge*) 0 4)))))
+
+(test signet-options-instantiate-the-chain
+  "-signetchallenge zeroes what the public signet's identity carried and
+-signetseednode replaces the seeds, both through the shipped option path.
+Inheriting the public nMinimumChainWork (12,396,326,331,576) is what keeps a
+private signet permanently in IBD, and inheriting the magic is what puts it on
+the PUBLIC signet's wire."
+  (let ((bl.chain:*chain-params-overrides* bl.chain:*chain-params-overrides*)
+        (bl.val:*signet-challenge* bl.val:*signet-challenge*)
+        (bl.chain:*network* :signet))
+    (flet ((params () (bl.chain:find-chain-params :signet)))
+      ;; (1) a custom challenge with seed nodes
+      (multiple-value-bind (plist merged)
+          (start-node-plist '("-signet"
+                              "-signetchallenge=512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be43051ae"
+                              "-signetseednode=192.0.2.77" "-signetseednode=192.0.2.78"))
+        (declare (ignore plist))
+        (apply-config-globals merged)
+        (is (string= "7ec653a5" (bl.crypto:bytes-to-hex (bl.chain:network-magic :signet))))
+        (is (equal '("192.0.2.77" "192.0.2.78") (bl.chain:network-dns-seeds :signet)))
+        (is (= 0 (bl.chain:chain-params-minimum-chain-work (params))))
+        (is (null (bl.chain:chain-params-assumevalid-hex (params))))
+        (is (null (bl.chain:chain-params-fixed-seeds (params))))
+        ;; Not derived, in Core either: CreateGenesisBlock takes fixed
+        ;; arguments (:514) and m_assumeutxo_data is assigned unconditionally
+        ;; (:520-533).
+        (is (equalp (bl.chain:chain-params-genesis-hash
+                     (bl.chain:chain-params-template :signet))
+                    (bl.chain:chain-params-genesis-hash (params))))
+        (is (= 2 (length (bl.chain:chain-params-assumeutxo (params)))))
+        ;; And it is no longer reported as an option with no effect.
+        (is (null (bl.cfg:supplied-core-only-options merged))))
+      ;; (2) -signetseednode ALONE replaces vSeeds and changes nothing else
+      ;; (Core applies options.seeds outside the challenge branch, :471-473).
+      (multiple-value-bind (plist merged)
+          (start-node-plist '("-signet" "-signetseednode=192.0.2.77"))
+        (declare (ignore plist))
+        (apply-config-globals merged)
+        (is (equal '("192.0.2.77") (bl.chain:network-dns-seeds :signet)))
+        (is (equalp (bl.chain:chain-params-magic
+                     (bl.chain:chain-params-template :signet))
+                    (bl.chain:network-magic :signet)))
+        (is (plusp (bl.chain:chain-params-minimum-chain-work (params)))))
+      ;; (3) neither option: the table row stands, and a previous run's
+      ;; instantiation does not survive into this one.
+      (multiple-value-bind (plist merged) (start-node-plist '("-signet"))
+        (declare (ignore plist))
+        (apply-config-globals merged)
+        (is (null (bl.chain:chain-params-override :signet)))
+        (is (equal '("seed.signet.bitcoin.sprovoost.nl" "seed.signet.achownodes.xyz")
+                   (bl.chain:network-dns-seeds :signet)))))))

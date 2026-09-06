@@ -220,8 +220,14 @@
            (unless (plusp kvb)
              (config-error "limitclustersize must be a positive number of kvB"))
            (setf bl.mp:*cluster-size-limit* (* kvb 1000))))
-;; -signetchallenge: a custom signet block-challenge script.
+;; -signetchallenge: a custom signet block-challenge script, and
+;; -signetseednode: the DNS/peer seeds that REPLACE the chain's own
+;; (Core reads it with GetArgs, so it is a list -- chainparams.cpp:27-29).
+;; Both are consumed by APPLY-PARAMETER-INTERACTIONS, which instantiates the
+;; :signet chain from them the way Core's SigNetParams constructor does; the
+;; challenge also lands here because the block-solution check reads it.
 (define-option "signetchallenge" :type :hex :global bl.val:*signet-challenge*)
+(define-option "signetseednode" :repeatable t)
 ;; -proxy / -onion / -proxyrandomize / -onlynet / -cjdnsreachable form one
 ;; interaction (each reads the others): APPLY-PARAMETER-INTERACTIONS.
 (define-option "proxy")
@@ -456,7 +462,7 @@
   "persistmempoolv1" "printpriority"
   "privatebroadcast" "rpcdoccheck"
   "rpcworkqueue" "shrinkdebugfile"
-  "signer" "signetseednode"
+  "signer"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"
   "version" "walletbroadcast")

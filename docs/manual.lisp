@@ -128,6 +128,8 @@
   (bitcoin-lisp.chainparams:chain-names function)
   (bitcoin-lisp.chainparams:*network* variable)
   (bitcoin-lisp.chainparams:network-magic function)
+  (bitcoin-lisp.chainparams:chain-params-template function)
+  (bitcoin-lisp.chainparams:chain-params-override function)
   (bitcoin-lisp.context package)
   (bitcoin-lisp.context:node-context class)
   (bitcoin-lisp.context:*interrupt-check* variable)
@@ -155,6 +157,14 @@
   (bitcoin-lisp.chainparams:network-magic :mainnet)
   => #(249 190 180 217)
   ```
+
+  A row is the DEFAULT construction, not the last word: an option can
+  instantiate a chain, the way Core's `SigNetParams(SigNetOptions)` is a
+  constructor rather than a table. `-signetchallenge` derives its own
+  message start, clears the seeds and zeroes the chain-work floor;
+  `chain-params-template` is the table row and `chain-params-override` is
+  what this run installed over it, with `find-chain-params` preferring the
+  override.
 
   Hashes are stored in wire order and DISPLAYED reversed; the genesis
   hash a block explorer shows is the stored bytes reversed:
@@ -1116,6 +1126,7 @@
   (bitcoin-lisp:node-main function)
   (bitcoin-lisp::args->start-node-plist function)
   (bitcoin-lisp::apply-config-globals function)
+  (bitcoin-lisp::signet-chain-params function)
   (bitcoin-lisp:sync-blockchain function)
   (bitcoin-lisp:node-status function)
   (bitcoin-lisp:request-node-shutdown function)

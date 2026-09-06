@@ -71,9 +71,42 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
   "Every defined chain, in definition order."
   (mapcar #'chain-params-name *chain-params*))
 
+(defvar *chain-params-overrides* '()
+  "(name . chain-params) rows that REPLACE a table row for this run.
+
+Core builds its CChainParams once per process from the command line
+(CreateChainParams -> SigNetParams(SigNetOptions), kernel/chainparams.cpp:437),
+so an option can change a chain's identity rather than only add to it: a custom
+-signetchallenge derives its own message start, clears the seeds and zeroes the
+chain-work floor. The table below is the DEFAULT construction; this alist holds
+the instantiated row when an option changed it, so the table itself is never
+mutated and a reload of this file cannot lose it.")
+
+(defun chain-params-override (name)
+  "The instantiated chain-params for NAME, or NIL when the table row stands."
+  (cdr (assoc name *chain-params-overrides*)))
+
+(defun (setf chain-params-override) (params name)
+  "Install PARAMS as NAME's row for this run, or remove the override when
+PARAMS is NIL. Always assigning -- with NIL for the no-option case -- is what
+keeps a second run in the same image from inheriting the first one's chain."
+  (setf *chain-params-overrides*
+        (remove name *chain-params-overrides* :key #'car))
+  (when params
+    (push (cons name params) *chain-params-overrides*))
+  params)
+
 (defun find-chain-params (name)
   "The chain-params for NAME (:mainnet, :testnet3, :testnet4, :signet or
-:regtest); an error for an unknown chain."
+:regtest); an error for an unknown chain. An installed override wins over the
+table row (see *CHAIN-PARAMS-OVERRIDES*)."
+  (or (chain-params-override name)
+      (find name *chain-params* :key #'chain-params-name)
+      (config-error "no chain parameters for ~S (known: ~{~S~^ ~})" name (chain-names))))
+
+(defun chain-params-template (name)
+  "NAME's row as the TABLE defines it, ignoring any override -- the template an
+option instantiates from."
   (or (find name *chain-params* :key #'chain-params-name)
       (config-error "no chain parameters for ~S (known: ~{~S~^ ~})" name (chain-names))))
 
