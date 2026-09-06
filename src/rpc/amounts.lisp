@@ -90,57 +90,151 @@ RPC_INVALID_PARAMETER as bad hex does, ending in `(not \'\')\'."
 
 ;;; --- Money (Core AmountFromValue / FormatMoney / ParseOutputs) ---
 
+(defconstant +fixed-point-upper-bound+ (1- (expt 10 18))
+  "Core's UPPER_BOUND (util/strencodings.cpp:252): 10^18-1, the largest
+arbitrary 18-digit decimal that still fits a signed 64-bit integer. Every
+overflow gate in PARSE-FIXED-POINT is against this, not against 2^63-1, so
+9223372036854775807 is rejected exactly as Core rejects it.")
+
+(defun %process-mantissa-digit (ch mantissa tzeros)
+  "Core ProcessMantissaDigit (util/strencodings.cpp:262-276): fold digit CH
+into MANTISSA, returning (values mantissa tzeros) or NIL on overflow.
+
+A '0' is COUNTED rather than multiplied in, and the count is only paid for
+when a non-zero digit follows -- which is why \"1.10000000000000000\" and
+\"0.0000000100000000\" parse while carrying more than 18 digits."
+  (if (char= ch #\0)
+      (values mantissa (1+ tzeros))
+      (let ((m mantissa)
+            (limit (floor +fixed-point-upper-bound+ 10)))
+        (dotimes (i (1+ tzeros))
+          (when (> m limit)
+            (return-from %process-mantissa-digit nil))
+          (setf m (* m 10)))
+        (values (+ m (- (char-code ch) (char-code #\0))) 0))))
+
+(defun parse-fixed-point (text decimals)
+  "Core ParseFixedPoint (util/strencodings.cpp:277-360): TEXT as an integer
+count of 10^-DECIMALS units, or NIL when it does not parse.
+
+One left-to-right scan in Core's order and nothing else is accepted: an
+optional '-', then a mantissa that is either a SINGLE '0' or a 1-9 run (so
+\"01\", \"00.1\" and \"000\" are refused and \".1\" has no leading digit),
+then an optional '.' with at least one digit, then an optional e/E with an
+optional sign and at least one digit, then end-of-string. Trailing garbage,
+a lone '-', \"1.\" and \"1.1e\" all fail.
+
+The scale check is Core's, not a digit count: the exponent, after subtracting
+the fraction length and adding back the counted trailing zeros, plus DECIMALS,
+must land in [0,18). Below 0 the value is finer than one unit (\"0.000000001\"
+at 8 decimals); at 18 or above it cannot be represented (\"1e11\" in BTC).
+That is why Core answers \"Invalid amount\" -- not \"Amount out of range\" --
+for 10000000000 and 92233720368.54775808."
+  (let ((mantissa 0)
+        (exponent 0)
+        (tzeros 0)
+        (mantissa-sign nil)
+        (exponent-sign nil)
+        (ptr 0)
+        (end (length text))
+        (point-ofs 0))
+    (labels ((peek () (and (< ptr end) (char text ptr)))
+             (digitp (c) (and c (char<= #\0 c #\9)))
+             (eat-mantissa-digit ()
+               (multiple-value-bind (m z)
+                   (%process-mantissa-digit (char text ptr) mantissa tzeros)
+                 (unless m (return-from parse-fixed-point nil))
+                 (setf mantissa m tzeros z)
+                 (incf ptr))))
+      (when (eql (peek) #\-)
+        (setf mantissa-sign t)
+        (incf ptr))
+      (cond ((null (peek)) (return-from parse-fixed-point nil)) ; empty, or a lone '-'
+            ((char= (char text ptr) #\0) (incf ptr))            ; a single leading 0
+            ((digitp (char text ptr))
+             (loop while (digitp (peek)) do (eat-mantissa-digit)))
+            (t (return-from parse-fixed-point nil)))            ; missing expected digit
+      (when (eql (peek) #\.)
+        (incf ptr)
+        (unless (digitp (peek)) (return-from parse-fixed-point nil))
+        (loop while (digitp (peek))
+              do (eat-mantissa-digit) (incf point-ofs)))
+      (when (member (peek) '(#\e #\E))
+        (incf ptr)
+        (case (peek)
+          (#\+ (incf ptr))
+          (#\- (setf exponent-sign t) (incf ptr)))
+        (unless (digitp (peek)) (return-from parse-fixed-point nil))
+        (loop while (digitp (peek))
+              do (when (> exponent (floor +fixed-point-upper-bound+ 10))
+                   (return-from parse-fixed-point nil))
+                 (setf exponent (+ (* exponent 10)
+                                   (- (char-code (char text ptr)) (char-code #\0))))
+                 (incf ptr)))
+      (unless (= ptr end) (return-from parse-fixed-point nil)) ; trailing garbage
+      (when exponent-sign (setf exponent (- exponent)))
+      (setf exponent (+ (- exponent point-ofs) tzeros))
+      (when mantissa-sign (setf mantissa (- mantissa)))
+      (incf exponent decimals)
+      (when (or (minusp exponent) (>= exponent 18))
+        (return-from parse-fixed-point nil))
+      (dotimes (i exponent)
+        (when (> (abs mantissa) (floor +fixed-point-upper-bound+ 10))
+          (return-from parse-fixed-point nil))
+        (setf mantissa (* mantissa 10)))
+      (when (> (abs mantissa) +fixed-point-upper-bound+)
+        (return-from parse-fixed-point nil))
+      mantissa)))
+
+(defun %json-number-text (value)
+  "The text Core's UniValue holds for the JSON number VALUE.
+
+UniValue keeps a number's SOURCE TEXT and getValStr() hands it back, so in
+Core AmountFromValue's number path IS its string path: 1e-8 and 0.00000001
+agree, and 10000000000 is refused by ParseFixedPoint's 18-digit rule rather
+than by MoneyRange. Our decoder keeps only the parsed value, so the text is
+rebuilt -- an integer prints exactly, and a float prints with SBCL's shortest
+round-tripping digits, whose exponent marker (d/f/s/l) becomes the e
+ParseFixedPoint reads. A RATIO never arrives over the wire; a Lisp caller's
+1/2 is rendered exactly when it is a whole number of units and left to fail
+otherwise."
+  (etypecase value
+    (integer (format nil "~D" value))
+    (float (map 'string
+                (lambda (c) (if (member c '(#\d #\D #\f #\F #\s #\S #\l #\L)) #\e c))
+                (princ-to-string value)))
+    (ratio (let ((units (* value (expt 10 8))))
+             (if (integerp units)
+                 (multiple-value-bind (whole rest) (truncate (abs units) (expt 10 8))
+                   (format nil "~:[~;-~]~D.~8,'0D" (minusp units) whole rest))
+                 (princ-to-string value))))))
+
 (defun amount-from-value (value)
-  "Core AmountFromValue: a JSON number or decimal string in BTC to
-satoshis, at most 8 fraction digits, within MoneyRange. Sub-satoshi
-precision is REJECTED like Core (which parses the decimal text exactly):
-rationals/integers are checked exactly; floats (JSON doubles, which cannot
-carry the original decimal text) are accepted only when they sit within
-double-representation noise of a whole satoshi — 0.001 sat at amounts
-where doubles are satoshi-exact, scaling with magnitude above ~2^48 sats
-where a double's nearest representation may be off by up to ~0.4 sat."
-  (let ((satoshis
-          (cond
-            ((rationalp value)
-             (let ((scaled (* (rational value) 100000000)))
-               (unless (integerp scaled)
-                 (error 'rpc-error :code +rpc-type-error+
-                                   :message "Invalid amount"))
-               scaled))
-            ((floatp value)
-             ;; JSON numbers arrive as double-floats; the 2^-48 relative
-             ;; slack only covers double-representation noise. Wider
-             ;; single-float slack exists solely for direct Lisp callers
-             ;; (tests) whose literals default to single precision.
-             (let* ((scaled (* (rational value) 100000000))
-                    (nearest (round scaled))
-                    (tolerance (max 1/1000
-                                    (* (abs scaled)
-                                       (if (typep value 'double-float)
-                                           (expt 2 -48)
-                                           (expt 2 -19))))))
-               (unless (<= (abs (- scaled nearest)) tolerance)
-                 (error 'rpc-error :code +rpc-type-error+
-                                   :message "Invalid amount"))
-               nearest))
-            ((stringp value)
-             (let* ((dot (position #\. value))
-                    (whole (if dot (subseq value 0 dot) value))
-                    (frac (if dot (subseq value (1+ dot)) "")))
-               (unless (and (plusp (length whole))
-                            (every #'digit-char-p whole)
-                            (<= (length frac) 8)
-                            (or (null dot) (plusp (length frac)))
-                            (every #'digit-char-p frac))
-                 (error 'rpc-error :code +rpc-type-error+
-                                   :message "Invalid amount"))
-               (+ (* (parse-integer whole) 100000000)
-                  (if (plusp (length frac))
-                      (* (parse-integer frac)
-                         (expt 10 (- 8 (length frac))))
-                      0))))
-            (t (error 'rpc-error :code +rpc-type-error+
-                                 :message "Amount is not a number or string")))))
+  "Core AmountFromValue (rpc/util.cpp:98-108): a JSON number or decimal string
+in BTC to satoshis.
+
+Three lines, because Core is three lines: a value that is neither a number nor
+a string is \"Amount is not a number or string\"; text ParseFixedPoint refuses
+is \"Invalid amount\"; a parsed value outside MoneyRange is \"Amount out of
+range\". All three are RPC_TYPE_ERROR (-3), which is what Core's tests assert.
+
+The distinction between the last two is Core's and is not cosmetic: \"1e-9\",
+\"0.000000019\", \"10000000000\" and \"92233720368.54775808\" are INVALID
+(the scale does not fit), while \"-1\" and \"21000001\" are OUT OF RANGE (they
+parse fine and MoneyRange rejects them). This used to hand-parse the string as
+whole-plus-fraction with no sign, no exponent and no leading-zero rule, so
+Core's own vectors disagreed in both directions: \"1e-8\", \"0.19e-6\" and
+\"1.10000000000000000\" were refused, and \"01\", \"00.1\" and \"000\" were
+accepted."
+  (unless (or (numberp value) (stringp value))
+    (error 'rpc-error :code +rpc-type-error+
+                      :message "Amount is not a number or string"))
+  (let ((satoshis (parse-fixed-point (if (stringp value)
+                                         value
+                                         (%json-number-text value))
+                                     8)))
+    (unless satoshis
+      (error 'rpc-error :code +rpc-type-error+ :message "Invalid amount"))
     (unless (bl.val:money-range-p satoshis)
       (error 'rpc-error :code +rpc-type-error+ :message "Amount out of range"))
     satoshis))
