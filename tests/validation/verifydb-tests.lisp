@@ -152,41 +152,29 @@ CORRUPTED_BLOCK_DB into a hard startup failure. End to end through
 bl:start-node: mine a chain, empty the UTXO set underneath it while the
 chainstate and the coins pointer keep naming the tip, and the next start must
 refuse rather than come up and serve the empty set."
-  (let ((base (merge-pathnames (format nil "test-verifydb-start-~D/"
-                                       (get-internal-real-time))
-                               (uiop:temporary-directory))))
-    (ensure-directories-exist base)
-    (unwind-protect
-         (progn
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           (generate-regtest-blocks bl:*node* 8)
-           (bl:stop-node)
-           ;; A clean restart passes verification.
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           (let* ((cs (bl:node-chain-state bl:*node*))
-                  (utxo (bl:node-utxo-set bl:*node*))
-                  (tip (bl.store:best-block-hash cs)))
-             (is (= 8 (bl.store:current-height cs)))
-             ;; Now the bbf6e679 shape: coins gone, everything else standing.
-             (bl.store:coins-view-cache-wipe utxo)
-             (bl.store:coins-view-cache-sync utxo :sync t :best-block tip)
-             (bl.store:close-chainstate-coins-view cs)
-             (release-datadir-lock)
-             (setf bl:*node* nil))
-           (bl.net:reset-ibd-stop)
-           (signals error
-             (bl:start-node :data-directory base :network :regtest :sync nil
-                            :rpc-port nil :listen nil :console-log nil)))
-      (progn
-        (ignore-errors (when bl:*node* (bl:stop-node)))
-        (ignore-errors (release-datadir-lock))
-        (bl.net:reset-ibd-stop)
-        (ignore-errors (uiop:delete-directory-tree
-                        base :validate t :if-does-not-exist :ignore))))))
+  (with-temporary-node (base "test-verifydb-start")
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    (generate-regtest-blocks bl:*node* 8)
+    (bl:stop-node)
+    ;; A clean restart passes verification.
+    (bl.net:reset-ibd-stop)
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    (let* ((cs (bl:node-chain-state bl:*node*))
+           (utxo (bl:node-utxo-set bl:*node*))
+           (tip (bl.store:best-block-hash cs)))
+      (is (= 8 (bl.store:current-height cs)))
+      ;; Now the bbf6e679 shape: coins gone, everything else standing.
+      (bl.store:coins-view-cache-wipe utxo)
+      (bl.store:coins-view-cache-sync utxo :sync t :best-block tip)
+      (bl.store:close-chainstate-coins-view cs)
+      (release-datadir-lock)
+      (setf bl:*node* nil))
+    (bl.net:reset-ibd-stop)
+    (signals error
+      (bl:start-node :data-directory base :network :regtest :sync nil
+                     :rpc-port nil :listen nil :console-log nil))))
 
 (test verify-db-passes-over-blocks-that-actually-spend
   "The startup pass must not cry corruption on a healthy node, and a chain of
@@ -199,61 +187,49 @@ It is also the test that found the level-2 divergence: GET-UNDO-DATA answers
 NIL for an EMPTY undo record and for an unreadable one alike, so an
 undo-pos-carrying coinbase-only block read as 'bad undo data' and every clean
 restart refused to start."
-  (let ((base (merge-pathnames (format nil "test-verifydb-spend-~D/"
-                                       (get-internal-real-time))
-                               (uiop:temporary-directory))))
-    (ensure-directories-exist base)
-    (unwind-protect
-         (progn
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           ;; 101 blocks so block 1's coinbase is mature, then a block holding
-           ;; a transaction that spends it. generateblock, not the mempool:
-           ;; a bare OP_TRUE output is consensus-valid but not standard.
-           (generate-regtest-blocks bl:*node* 101)
-           (let* ((node bl:*node*)
-                  (cs (bl:node-chain-state node))
-                  (entry (bl.store:get-block-at-height cs 1))
-                  (blk (bl.store:get-block (bl:node-block-store node)
-                                           (bl.store:block-index-entry-hash entry)))
-                  (cb (first (bl.ser:bitcoin-block-transactions blk)))
-                  (out (aref (bl.ser:transaction-outputs cb) 0))
-                  (spend (bl.ser:make-transaction
-                          :version 1
-                          :inputs (vector (bl.ser:make-tx-in
-                                           :previous-output
-                                           (bl.ser:make-outpoint
-                                            :hash (bl.ser:transaction-hash cb) :index 0)
-                                           :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                                           :sequence #xFFFFFFFF))
-                          :outputs (vector (bl.ser:make-tx-out
-                                            :value (- (bl.ser:tx-out-value out) 1000)
-                                            :script-pubkey
-                                            (make-array 1 :element-type '(unsigned-byte 8)
-                                                          :initial-element #x51)))
-                          :lock-time 0)))
-             (bl.rpc::rpc-generateblock
-              node (list "raw(51)"
-                         (list (bl.crypto:bytes-to-hex
-                                (bl.ser:serialize-transaction spend)))))
-             (is (= 102 (bl.store:current-height cs))))
-           (bl:stop-node)
-           ;; The restart runs VerifyDB at startup; reaching here at all means
-           ;; it did not refuse.
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           (let ((cs (bl:node-chain-state bl:*node*))
-                 (store (bl:node-block-store bl:*node*)))
-             (is (= 102 (bl.store:current-height cs)))
-             (dolist (level '(2 3 4))
-               (is (eq :success (bl.val:verify-db cs store :check-level level))
-                   "a healthy spending chain failed verification at level ~D" level)))
-           (bl:stop-node))
-      (progn
-        (ignore-errors (when bl:*node* (bl:stop-node)))
-        (ignore-errors (release-datadir-lock))
-        (bl.net:reset-ibd-stop)
-        (ignore-errors (uiop:delete-directory-tree
-                        base :validate t :if-does-not-exist :ignore))))))
+  (with-temporary-node (base "test-verifydb-spend")
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    ;; 101 blocks so block 1's coinbase is mature, then a block holding a
+    ;; transaction that spends it. generateblock, not the mempool: a bare
+    ;; OP_TRUE output is consensus-valid but not standard.
+    (generate-regtest-blocks bl:*node* 101)
+    (let* ((node bl:*node*)
+           (cs (bl:node-chain-state node))
+           (entry (bl.store:get-block-at-height cs 1))
+           (blk (bl.store:get-block (bl:node-block-store node)
+                                    (bl.store:block-index-entry-hash entry)))
+           (cb (first (bl.ser:bitcoin-block-transactions blk)))
+           (out (aref (bl.ser:transaction-outputs cb) 0))
+           (spend (bl.ser:make-transaction
+                   :version 1
+                   :inputs (vector (bl.ser:make-tx-in
+                                    :previous-output
+                                    (bl.ser:make-outpoint
+                                     :hash (bl.ser:transaction-hash cb) :index 0)
+                                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                    :sequence #xFFFFFFFF))
+                   :outputs (vector (bl.ser:make-tx-out
+                                     :value (- (bl.ser:tx-out-value out) 1000)
+                                     :script-pubkey
+                                     (make-array 1 :element-type '(unsigned-byte 8)
+                                                   :initial-element #x51)))
+                   :lock-time 0)))
+      (bl.rpc::rpc-generateblock
+       node (list "raw(51)"
+                  (list (bl.crypto:bytes-to-hex
+                         (bl.ser:serialize-transaction spend)))))
+      (is (= 102 (bl.store:current-height cs))))
+    (bl:stop-node)
+    ;; The restart runs VerifyDB at startup; reaching here at all means it did
+    ;; not refuse.
+    (bl.net:reset-ibd-stop)
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    (let ((cs (bl:node-chain-state bl:*node*))
+          (store (bl:node-block-store bl:*node*)))
+      (is (= 102 (bl.store:current-height cs)))
+      (dolist (level '(2 3 4))
+        (is (eq :success (bl.val:verify-db cs store :check-level level))
+            "a healthy spending chain failed verification at level ~D" level)))
+    (bl:stop-node)))

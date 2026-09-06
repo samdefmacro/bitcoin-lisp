@@ -174,58 +174,46 @@ loaded as live state."
   "End to end through bl:start-node: mine, run the reindex prefix, die before
 the first replay flush, restart with no flags. The node must come back AT
 GENESIS with an empty UTXO set -- never at the pre-reindex tip."
-  (let ((base (merge-pathnames (format nil "test-reindex-crash-~D/"
-                                       (get-internal-real-time))
-                               (uiop:temporary-directory))))
-    (ensure-directories-exist base)
-    (unwind-protect
-         (progn
-           ;; A chain on disk, committed by a clean shutdown.
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           (generate-regtest-blocks bl:*node* 8)
-           (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*))))
-           (bl:stop-node)
-           ;; Restart, then reproduce do-reindex-chainstate's prefix (rewind to
-           ;; genesis with the marker, wipe) and die with nothing flushed --
-           ;; exactly what a killed process leaves behind.
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           (let ((cs (bl:node-chain-state bl:*node*))
-                 (utxo (bl:node-utxo-set bl:*node*)))
-             (is (= 8 (bl.store:current-height cs)))
-             (is (= 40000000000 (bl.store:utxo-set-total-amount utxo)))
-             (bl.store:update-chain-tip
-              cs (bl.store:chain-state-genesis-hash cs) 0)
-             (bl.store:save-state cs :in-transition t)
-             (bl.store:coins-view-cache-wipe utxo)
-             ;; The emptied database names no block: that is the invariant.
-             (is (null (bl.store:coins-view-db-best-block
-                        (bl.store:coins-view-cache-base utxo))))
-             (bl.store:close-chainstate-coins-view cs)
-             (release-datadir-lock)
-             (setf bl:*node* nil))
-           ;; Ordinary restart, no flags.
-           (bl.net:reset-ibd-stop)
-           (bl:start-node :data-directory base :network :regtest :sync nil
-                          :rpc-port nil :listen nil :console-log nil)
-           (let ((cs (bl:node-chain-state bl:*node*))
-                 (utxo (bl:node-utxo-set bl:*node*)))
-             (is (= 0 (bl.store:current-height cs))
-                 "the node re-advanced onto the pre-reindex tip over an empty set")
-             (is (equalp (bl.store:chain-state-genesis-hash cs)
-                         (bl.store:best-block-hash cs)))
-             (is (= 0 (bl.store:utxo-set-total-amount utxo)))
-             (is (null (bl.store:coins-view-db-best-block
-                        (bl.store:coins-view-cache-base utxo)))))
-           (bl:stop-node))
-      (progn
-        (ignore-errors (when bl:*node* (bl:stop-node)))
-        (bl.net:reset-ibd-stop)
-        (ignore-errors (uiop:delete-directory-tree
-                        base :validate t :if-does-not-exist :ignore))))))
+  (with-temporary-node (base "test-reindex-crash")
+    ;; A chain on disk, committed by a clean shutdown.
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    (generate-regtest-blocks bl:*node* 8)
+    (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*))))
+    (bl:stop-node)
+    ;; Restart, then reproduce do-reindex-chainstate's prefix (rewind to
+    ;; genesis with the marker, wipe) and die with nothing flushed -- exactly
+    ;; what a killed process leaves behind.
+    (bl.net:reset-ibd-stop)
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    (let ((cs (bl:node-chain-state bl:*node*))
+          (utxo (bl:node-utxo-set bl:*node*)))
+      (is (= 8 (bl.store:current-height cs)))
+      (is (= 40000000000 (bl.store:utxo-set-total-amount utxo)))
+      (bl.store:update-chain-tip cs (bl.store:chain-state-genesis-hash cs) 0)
+      (bl.store:save-state cs :in-transition t)
+      (bl.store:coins-view-cache-wipe utxo)
+      ;; The emptied database names no block: that is the invariant.
+      (is (null (bl.store:coins-view-db-best-block
+                 (bl.store:coins-view-cache-base utxo))))
+      (bl.store:close-chainstate-coins-view cs)
+      (release-datadir-lock)
+      (setf bl:*node* nil))
+    ;; Ordinary restart, no flags.
+    (bl.net:reset-ibd-stop)
+    (bl:start-node :data-directory base :network :regtest :sync nil
+                   :rpc-port nil :listen nil :console-log nil)
+    (let ((cs (bl:node-chain-state bl:*node*))
+          (utxo (bl:node-utxo-set bl:*node*)))
+      (is (= 0 (bl.store:current-height cs))
+          "the node re-advanced onto the pre-reindex tip over an empty set")
+      (is (equalp (bl.store:chain-state-genesis-hash cs)
+                  (bl.store:best-block-hash cs)))
+      (is (= 0 (bl.store:utxo-set-total-amount utxo)))
+      (is (null (bl.store:coins-view-db-best-block
+                 (bl.store:coins-view-cache-base utxo)))))
+    (bl:stop-node)))
 
 (test reconcile-never-places-a-pointer-over-an-empty-utxo-set
   "A datadir an OLDER build left in the bad shape -- coins gone, pointer still

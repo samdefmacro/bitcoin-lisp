@@ -68,6 +68,42 @@ STOP-NODE does -- what a killed process leaves behind, and what a test that
 restarts a node over the same directory needs before it can."
   (bl::unlock-data-directory))
 
+(defmacro with-temporary-node ((base-var prefix) &body body)
+  "Run BODY over a fresh datadir bound to BASE-VAR, restoring every
+process-global a full BL:START-NODE leaves behind and deleting the directory
+afterwards. BODY starts and stops the node itself -- some tests start it more
+than once over the same directory.
+
+The one that matters is SB-EXT:*INVOKE-DEBUGGER-HOOK*: START-NODE installs a
+fail-fast hook that logs a condition and calls (sb-ext:exit :code 1), which is
+right for a supervised node and fatal for a test image. Left installed, the
+next unhandled condition ANYWHERE in the run -- another suite's, the test
+runner's -- kills the process instead of being reported, and the battery ends
+mid-test with no failure and no count. The shutdown latches are restored for
+the same reason a shutdown test restores them: a leftover *shutdown-request*
+would stop the next run before it began."
+  (let ((hook (gensym "HOOK")) (node (gensym "NODE")))
+    `(let ((,base-var (ensure-directories-exist
+                       (merge-pathnames (format nil "~A-~D/" ,prefix
+                                                (get-internal-real-time))
+                                        (uiop:temporary-directory))))
+           (,hook sb-ext:*invoke-debugger-hook*)
+           (,node bl:*node*))
+       (bl.net:reset-ibd-stop)
+       (unwind-protect (progn ,@body)
+         (ignore-errors (when bl:*node* (bl:stop-node)))
+         (ignore-errors (release-datadir-lock))
+         (bl.net:reset-ibd-stop)
+         (setf sb-ext:*invoke-debugger-hook* ,hook
+               bl:*node* ,node
+               bl::*shutdown-request* nil
+               bl::*shutdown-complete* nil
+               bl::*stop-node-in-progress* nil
+               bl::*node-starting* nil)
+         (ignore-errors
+          (uiop:delete-directory-tree ,base-var :validate t
+                                                :if-does-not-exist :ignore))))))
+
 ;;;; Reproducible randomness
 
 (defun make-deterministic-rng (seed)
