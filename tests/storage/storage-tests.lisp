@@ -2270,18 +2270,18 @@ exactly this and had NO callers, so nothing recorded progress."
         (unwind-protect
              (progn
                ;; No marker: the whole chain must be scanned.
-               (is (= 0 (bl.store::%txindex-resume-height txindex cs)))
+               (is (= 0 (txindex-resume-height txindex cs)))
                ;; Marker on the active chain at height 2: resume at 3.
                (bl.store:txindex-set-best-block txindex (third hashes))
-               (is (= 3 (bl.store::%txindex-resume-height txindex cs)))
+               (is (= 3 (txindex-resume-height txindex cs)))
                ;; Marker at the tip: nothing left to scan.
                (bl.store:txindex-set-best-block txindex (fifth hashes))
-               (is (= 5 (bl.store::%txindex-resume-height txindex cs)))
+               (is (= 5 (txindex-resume-height txindex cs)))
                ;; Marker naming a block we have never heard of: full rescan.
                (bl.store:txindex-set-best-block
                 txindex (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 99))
-               (is (= 0 (bl.store::%txindex-resume-height txindex cs))))
+               (is (= 0 (txindex-resume-height txindex cs))))
           (bl.store:close-tx-index txindex))))))
 
 (test txindex-is-driven-through-the-node-index-list
@@ -2323,17 +2323,17 @@ missing, unknown, or off-chain -- which is the first question anyone asks."
         (unwind-protect
              (progn
                (is (eq :no-marker
-                       (nth-value 1 (bl.store::%txindex-resume-height
+                       (nth-value 1 (txindex-resume-height
                                      txindex cs))))
                (bl.store:txindex-set-best-block
                 txindex (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 99))
                (is (eq :marker-not-in-index
-                       (nth-value 1 (bl.store::%txindex-resume-height
+                       (nth-value 1 (txindex-resume-height
                                      txindex cs))))
                (bl.store:txindex-set-best-block txindex (third hashes))
                (is (eq :resumed
-                       (nth-value 1 (bl.store::%txindex-resume-height
+                       (nth-value 1 (txindex-resume-height
                                      txindex cs))))
                ;; A block at a height the chain holds, but not THIS block.
                (let* ((fork-hash (make-array 32 :element-type '(unsigned-byte 8)
@@ -2343,7 +2343,7 @@ missing, unknown, or off-chain -- which is the first question anyone asks."
                  (bl.store:add-block-index-entry cs fork)
                  (bl.store:txindex-set-best-block txindex fork-hash)
                  (is (eq :marker-off-chain
-                         (nth-value 1 (bl.store::%txindex-resume-height
+                         (nth-value 1 (txindex-resume-height
                                        txindex cs))))))
           (bl.store:close-tx-index txindex))))))
 
@@ -2359,7 +2359,7 @@ only when its block is STILL on the active chain at the height it claims."
         (unwind-protect
              (progn
                (bl.store:txindex-set-best-block txindex (third hashes))
-               (is (= 3 (bl.store::%txindex-resume-height txindex cs)))
+               (is (= 3 (txindex-resume-height txindex cs)))
                ;; A competing block at the SAME height, now indexed but off-chain:
                ;; the height still exists, but it is not this block any more.
                (let* ((fork-hash (make-array 32 :element-type '(unsigned-byte 8)
@@ -2369,7 +2369,7 @@ only when its block is STILL on the active chain at the height it claims."
                              :status :valid)))
                  (bl.store:add-block-index-entry cs fork)
                  (bl.store:txindex-set-best-block txindex fork-hash)
-                 (is (= 0 (bl.store::%txindex-resume-height txindex cs))
+                 (is (= 0 (txindex-resume-height txindex cs))
                      "an off-chain marker must force a full rescan")))
           (bl.store:close-tx-index txindex))))))
 

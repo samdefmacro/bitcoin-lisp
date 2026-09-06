@@ -193,6 +193,14 @@ mined chain (reindex, coinstatsindex, blockfilter); one helper is what keeps
 the handler's argument shape in one place."
   (bl.rpc::rpc-generatetodescriptor node (list n "raw(51)")))
 
+(defun txindex-resume-height (txindex chain-state)
+  "(values NEXT-HEIGHT REASON) from %TXINDEX-RESUME-HEIGHT -- the height the
+txindex catch-up scan would resume from against CHAIN-STATE, and why. The
+answer is the txindex's whole defence against an off-chain marker (it resolves
+one to the FORK point rather than to genesis), so several suites ask it; they
+ask through here."
+  (bl.store::%txindex-resume-height txindex chain-state))
+
 (defun coins-db-node-fixture (tag)
   "(values node coins-db-path chain-base-path) — a regtest node whose UTXO set
 is a LevelDB-backed coins-view-cache (matching the live node), with undo

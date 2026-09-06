@@ -124,12 +124,16 @@ from where each index left off. A no-op when no index is enabled."
   (dolist (index (node-indexes node))
     (catch-up-index node index)))
 
-(defun %coinstatsindex-fork-height (cs best-hash)
-  "The height of the last block common to the active chain and the branch
-BEST-HASH sits on (Core walks pprev in Rewind / FindForkInGlobalIndex). NIL
-when the header index does not know BEST-HASH — headers are only persisted at
-flush time, so the crash that produces a stale marker can also lose the branch
-it names — or when the two chains do not actually meet."
+(defun %index-fork-entry (cs best-hash)
+  "The last block common to the active chain and the branch BEST-HASH sits on
+(Core walks pprev in Rewind / FindForkInGlobalIndex), as a block-index entry.
+NIL when the header index does not know BEST-HASH — headers are only persisted
+at flush time, so the crash that produces a stale marker can also lose the
+branch it names — or when the two chains do not actually meet.
+
+Shared by the coinstats and spender rewinds: one walk, so two indexes reading
+the same stale marker cannot disagree about where its branch left the active
+chain."
   (let* ((stale (bl.store:get-block-index-entry cs best-hash))
          (tip (and stale (bl.store:get-block-index-entry
                           cs (bl.store:best-block-hash cs))))
@@ -138,7 +142,7 @@ it names — or when the two chains do not actually meet."
     ;; never meet (a broken prev-entry link), so confirm the answer really is
     ;; on the active chain rather than trusting a fail-open result.
     (when (and fork (bl.store:entry-on-active-chain-p cs fork))
-      (bl.store:block-index-entry-height fork))))
+      fork)))
 
 (defun %coinstatsindex-verified-height (csi cs store from)
   "The highest height at or below FROM whose stored record provably belongs to
@@ -188,7 +192,8 @@ trustworthy record could be identified and the index must be rebuilt."
                 best-height
                 (if best-hash (bl.crypto:bytes-to-hex best-hash) "no hash")
                 tip)
-      (let* ((fork (and best-hash (%coinstatsindex-fork-height cs best-hash)))
+      (let* ((fork-entry (and best-hash (%index-fork-entry cs best-hash)))
+             (fork (and fork-entry (bl.store:block-index-entry-height fork-entry)))
              (target (or (and fork
                               (<= fork tip)
                               (bl.store:coinstatsindex-get-stats csi fork)
@@ -207,6 +212,102 @@ trustworthy record could be identified and the index must be rebuilt."
                      (min best-height tip))
            (bl.store:coinstatsindex-clear-best csi)
            -1))))))
+
+(defmethod bl.store:index-prepare-sync ((idx bl.store:txospender-index) cs store)
+  "Rewind a best marker that is not on the active chain (including one left
+above the tip) before backfilling on top of it -- see
+%REWIND-TXOSPENDERINDEX."
+  (%rewind-txospenderindex idx cs store))
+
+(defmethod bl.store:index-height ((idx bl.store:txospender-index) chainstate)
+  "How far the spender index has got ON THE ACTIVE CHAIN.
+
+The stored marker is a (hash, height) pair, and the height is only meaningful
+while the hash is still the active chain's block at it: a marker left on an
+abandoned branch names a height that says nothing about how much of the ACTIVE
+chain is indexed. Answering the raw stored height is what let CATCH-UP-INDEX's
+(< height tip) guard be satisfied by an off-chain marker -- with a no-op
+prepare-sync, nothing was rewound AND nothing was backfilled, so the active
+chain's blocks between the fork point and the marker's height were never
+indexed, and gettxspendingprevout then answered that an output is UNSPENT for
+an outpoint a confirmed transaction spends. Core cannot say this: its height
+comes off a locator resolved against the chain (BaseIndex::Init,
+index/base.cpp:120-131).
+
+Off-chain answers the FORK height, and an unplaceable marker -1 -- both
+strictly below the tip, so the backfill runs whatever prepare-sync did.
+This method lives here rather than in storage because the fork walk needs
+the validation layer, like the coinstats index-write-block below."
+  (let ((hash (bl.store:txospenderindex-best-block idx)))
+    (if (null hash)
+        -1
+        (let ((entry (bl.store:get-block-index-entry chainstate hash)))
+          (if (and entry (bl.store:entry-on-active-chain-p chainstate entry))
+              (bl.store:block-index-entry-height entry)
+              (let ((fork (%index-fork-entry chainstate hash)))
+                (if fork (bl.store:block-index-entry-height fork) -1)))))))
+
+(defun %rewind-txospenderindex (idx cs store)
+  "Make the spender index's best marker name a block on the ACTIVE chain before
+anything backfills on top of it, erasing the abandoned branch's rows on the way
+back (Core BaseIndex::Rewind, index/base.cpp:290-320).
+
+The spender index is the one index here whose stale rows are wrong rather than
+merely old: coinstats and blockfilter records are keyed by HEIGHT, so a
+reconnect overwrites them, while a spender key carries the spending block's
+hash and no height. That is why Core has it opt into disconnect_data
+(index/txospenderindex.cpp:73-78) and implement CustomRemove (:136-139), and
+why the erase is exact: both sides build the outpoint list from the block
+alone, so what the rewind deletes is exactly what the connect wrote.
+
+Until this existed the index had no OFFLINE rewind at all -- INDEX-REWIND-BLOCK
+was reachable only from the live :block-disconnected hook, which cannot fire
+for blocks disconnected while the process was down (a kill with the index ahead
+of the flushed chainstate, or an invalidateblock across a restart).
+
+Returns NIL when the marker was already on the active chain -- the common case,
+and it costs one lookup. Otherwise the height rewound to, or -1 when the branch
+could not be walked and the index must be rebuilt."
+  (multiple-value-bind (best-hash best-height) (bl.store:txospenderindex-best-block idx)
+    (unless best-hash
+      (return-from %rewind-txospenderindex nil))
+    (let ((stale (bl.store:get-block-index-entry cs best-hash))
+          (tip (bl.store:current-height cs)))
+      (when (and stale (bl.store:entry-on-active-chain-p cs stale))
+        (return-from %rewind-txospenderindex nil))
+      (log-warn "Spender index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+                best-height (bl.crypto:bytes-to-hex best-hash) tip)
+      (let ((fork (and stale (%index-fork-entry cs best-hash))))
+        (unless fork
+          (log-warn "Spender index: the branch its marker names cannot be placed ~
+in the header index; rebuilding from genesis")
+          (bl.store:index-clear-best idx)
+          (return-from %rewind-txospenderindex -1))
+        ;; Core's Rewind loop: walk pprev from the stale tip to (not including)
+        ;; the fork point, reading each block and calling CustomRemove. A body
+        ;; we cannot read is Core's ReadBlock failure, which aborts the rewind;
+        ;; here the marker is cleared instead, so the backfill rebuilds rather
+        ;; than leaving a gap nothing will ever fill. The abandoned rows then
+        ;; survive, but they are inert: %TXOSPENDER-CONFIRMED-SPENDER discards
+        ;; any locator whose block is not on the active chain.
+        (let ((fork-hash (bl.store:block-index-entry-hash fork)))
+          (loop for e = stale then (bl.store:block-index-entry-prev-entry e)
+                while (and e (not (equalp (bl.store:block-index-entry-hash e)
+                                          fork-hash)))
+                do (let* ((hash (bl.store:block-index-entry-hash e))
+                          (block (and store (bl.store:get-block store hash))))
+                     (unless block
+                       (log-warn "Spender index: block ~A of the abandoned branch ~
+is unavailable; rebuilding from genesis" (bl.crypto:bytes-to-hex hash))
+                       (bl.store:index-clear-best idx)
+                       (return-from %rewind-txospenderindex -1))
+                     (bl.store:txospenderindex-remove-block idx block hash))))
+        (let ((height (bl.store:block-index-entry-height fork)))
+          (log-warn "Spender index rewound to height ~D (~D block~:P of the abandoned branch erased)"
+                    height (- best-height height))
+          (bl.store:txospenderindex-set-best-block
+           idx (bl.store:block-index-entry-hash fork) height)
+          height)))))
 
 (defvar *index-stall-logged* '()
   "Names of indexes whose non-contiguous refusal has been logged: once per
