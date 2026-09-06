@@ -168,7 +168,6 @@ headerssync.cpp. src/networking/.")
    #:check-peer-health
    #:record-block-timeout
    #:record-block-received-from-peer
-   #:consider-peer-eviction
    #:peer-block-timeout-count
    #:peer-last-block-received-time
    #:peer-address

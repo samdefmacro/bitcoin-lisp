@@ -2880,19 +2880,9 @@ connected. Observed as every p2p_* functional test timing out in
 sync_with_ping, because the node never answered a ping.
 
 CONSIDER-PEER-EVICTION read -1 as a height 1001 behind, so any node past height
-999 disconnected such peers on sight. Core has no height-based eviction at all;
-this rule is ours, and it has to mean what it says."
-  (let ((unknown (bl.net:make-peer :address "10.2.2.2" :state :ready
-                                                    :start-height -1))
-        (behind (bl.net:make-peer :address "10.2.2.3" :state :ready
-                                                   :start-height 5)))
-    ;; Unknown is not "behind", at any height of ours.
-    (is-false (bl.net:consider-peer-eviction unknown 100000)
-              "a peer advertising an unknown height was evicted as if it were behind")
-    ;; A peer that really is far behind still goes.
-    (is-true (bl.net:consider-peer-eviction behind 100000))
-    ;; ...and one that is only a little behind stays.
-    (is-false (bl.net:consider-peer-eviction behind 500)))
+999 disconnected such peers on sight -- the second reader, and the reason the
+whole rule is now gone (see HEIGHT-BASED-EVICTION-IS-GONE). What remains here
+is the sync thread's half."
   ;; The hazard is real: the slot is (UNSIGNED-BYTE 32), so a raw -1 signals.
   ;; Asserted rather than assumed, because if the slot type ever widened this
   ;; test would otherwise keep passing while testing nothing.

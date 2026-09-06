@@ -1573,22 +1573,6 @@ duplicates are rare)."
   (setf (peer-last-block-time peer) (bl.ser:get-unix-time))
   (setf (peer-block-timeout-count peer) 0))
 
-(defun consider-peer-eviction (peer our-height)
-  "Check if PEER should be evicted based on chain quality.
-Peers whose advertised height is significantly behind our validated tip
-are likely unproductive. Returns T if the peer should be disconnected."
-  (and (eq (peer-state peer) :ready)
-       ;; A NEGATIVE advertised height means UNKNOWN, not "far behind". Core's
-       ;; nStartingHeight is a signed int initialised to -1, and a peer that
-       ;; never learned its own height sends exactly that — its own P2P test
-       ;; client always does. Reading -1 as a height made every such peer look
-       ;; 1001 blocks behind, so any node past height 999 disconnected them on
-       ;; sight. Core has no height-based eviction at all; this rule is ours,
-       ;; and it has to mean what it says.
-       (>= (peer-start-height peer) 0)
-       ;; Peer claims a height far behind ours (>1000 blocks)
-       (> our-height (+ (peer-start-height peer) 1000))))
-
 ;;; Misbehavior, Discouragement, and Banning
 ;;;
 ;;; Two distinct mechanisms, mirroring Bitcoin Core's BanMan:

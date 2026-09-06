@@ -2219,22 +2219,6 @@ Asking a peer for headers here returns zero and costs a full round trip."
                      (incf cycle-requested
                            (request-blocks-from-peers peers chain-state block-store))))
 
-                 ;; Per-block request timeout retries (retry-timed-out-requests
-                 ;; in request-blocks-from-peers) is our peer-disconnect path:
-                 ;; if a specific peer fails to deliver multiple requested
-                 ;; blocks within the request-timeout, record-block-timeout
-                 ;; eventually drops them. The previous secondary "no blocks
-                 ;; in 30s" check duplicated this and fired wrongly when our
-                 ;; backpressure was the actual reason peers looked idle.
-                 ;; Bad-chain peers only:
-                 (let ((our-height (bl.store:current-height chain-state)))
-                   (dolist (peer (copy-list peers))
-                     (when (consider-peer-eviction peer our-height)
-                       (bl:log-warn "Evicting peer ~A (height ~D behind our ~D)"
-                                              (peer-address peer)
-                                              (peer-start-height peer) our-height)
-                       (handler-case (disconnect-peer peer) (error () nil)))))
-
                  ;; Periodic progress report
                  (let ((now (get-internal-real-time)))
                    (when (> (- now last-report-time) report-interval)

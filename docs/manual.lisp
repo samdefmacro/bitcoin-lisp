@@ -668,7 +668,6 @@
   (bitcoin-lisp.networking::run-ibd function)
   (bitcoin-lisp.networking:request-ibd-stop function)
   (bitcoin-lisp.networking:ibd-stop-requested-p function)
-  (bitcoin-lisp.networking:consider-peer-eviction function)
   (bitcoin-lisp.networking:discourage-peer function)
   (bitcoin-lisp.networking:ban-address function)
   (bitcoin-lisp.networking:*default-ban-time-seconds* variable)
