@@ -224,18 +224,13 @@ size, exactly Core's GetTxSize-based reporting."
 (defun %mempool-txid-arg (params mempool)
   "Resolve the first param (a big-endian txid hex) to (values internal-txid
 entry), erroring if malformed or not in the mempool."
-  (let ((txid-hex (first params)))
-    (unless (stringp txid-hex)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "txid must be a hex string"))
-    (let ((txid (parse-hex-hash txid-hex)))
-      (unless txid
-        (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid txid"))
-      (let ((entry (and mempool (bl.mp:mempool-get mempool txid))))
-        (unless entry
-          ;; Core: RPC_INVALID_ADDRESS_OR_KEY (-5), rpc/mempool.cpp:887.
-          (error 'rpc-error :code +rpc-invalid-address-or-key+
-                            :message "Transaction not in mempool"))
-        (values txid entry)))))
+  (let* ((txid (parse-hash-v (first params) "txid"))
+         (entry (and mempool (bl.mp:mempool-get mempool txid))))
+    (unless entry
+      ;; Core: RPC_INVALID_ADDRESS_OR_KEY (-5), rpc/mempool.cpp:887.
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Transaction not in mempool"))
+    (values txid entry)))
 
 (define-rpc "getmempoolentry" (node params)
   "Return mempool details for transaction TXID (Bitcoin Core getmempoolentry)."
@@ -378,10 +373,10 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
     (with-node-lock (node)
      (mapcar
       (lambda (op)
-        (let* ((txid-hex (and (hash-table-p op) (gethash "txid" op)))
-               (vout (and (hash-table-p op) (gethash "vout" op)))
-               (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
-          (unless (and txid (integerp vout))
+        (let* ((txid-hex (obj-get op "txid"))
+               (txid (parse-hash-v txid-hex "txid"))
+               (vout (obj-get op "vout")))
+          (unless (integerp vout)
             (error 'rpc-error :code +rpc-invalid-parameter+
                               :message "Invalid parameter, outputs are missing"))
           (when (minusp vout)

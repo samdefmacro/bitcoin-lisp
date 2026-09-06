@@ -252,7 +252,25 @@ wallet) reproduces exactly the live-tracked state."
                  (rpc-error-code-of
                   (lambda ()
                     (bl.wallet::rpc-listsinceblock
-                     node (list (make-string 64 :initial-element #\7))))))))
+                     node (list (make-string 64 :initial-element #\7)))))))
+          ;; A MALFORMED blockhash is ParseHashV's -8, and Core names the
+          ;; argument "blockhash" here (wallet/rpc/transactions.cpp:595) --
+          ;; this used to run through a helper whose message said "txid"
+          ;; whatever it was parsing, in Core's pre-0.21 wording.
+          (is (equal (cons -8 "blockhash must be of length 64 (not 2, for '00')")
+                     (rpc-error-of
+                      (lambda () (bl.wallet::rpc-listsinceblock node (list "00"))))))
+          (is (equal (cons -8 (format nil "blockhash must be hexadecimal string (not '~A')"
+                                      (make-string 64 :initial-element #\z)))
+                     (rpc-error-of
+                      (lambda ()
+                        (bl.wallet::rpc-listsinceblock
+                         node (list (make-string 64 :initial-element #\z)))))))
+          ;; gettransaction names the same helper's argument "txid"
+          ;; (transactions.cpp:730), the wallet_basic.py:172 sentence.
+          (is (equal (cons -8 "txid must be of length 64 (not 2, for '00')")
+                     (rpc-error-of
+                      (lambda () (bl.wallet::rpc-gettransaction node (list "00")))))))
         ;; abortrescan with no scan running: JSON false; not scanning.
         (is (eq 'yason:false (bl.wallet::rpc-abortrescan node nil)))
         (is (eq 'yason:false

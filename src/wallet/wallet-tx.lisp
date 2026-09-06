@@ -1769,12 +1769,6 @@ gate, the prune refusal and the reserver, is unchanged."
 
 ;;; --- Transaction RPCs (wallet/rpc/transactions.cpp) ---
 
-(defun %wallet-parse-txid (value)
-  (unless (and (stringp value) (bl.rpc:valid-hex-hash-p value))
-    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                      :message "txid must be of length 64 (not including any '0x' prefix)"))
-  (bl.rpc:parse-hex-hash value))
-
 (defun %wallet-block-time (node block-hash)
   "The timestamp of BLOCK-HASH's header via the block index (WalletTxToJSON's
 chain.findBlock time lookup). Caller holds the node-lock."
@@ -1923,7 +1917,7 @@ push order."
   "Detailed information about an in-wallet transaction (Bitcoin Core
 gettransaction). PARAMS: (txid include_watchonly verbose)."
   (let ((wallet (wallet-for-request node))
-        (txid (%wallet-parse-txid (first params)))
+        (txid (bl.rpc:parse-hash-v (first params) "txid"))
         (verbose (bl.rpc:positional-bool (third params))))
     (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
@@ -2014,9 +2008,13 @@ include_removed include_change label)."
                (altheight nil)   ; the named block's height (possibly detached)
                (block-entry nil))
           (let ((blockhash-arg (first params)))
-            (when (and blockhash-arg (stringp blockhash-arg)
-                       (plusp (length blockhash-arg)))
-              (let ((bh (%wallet-parse-txid blockhash-arg)))
+            ;; Core reads params[0].get_str() before testing it for
+            ;; emptiness (wallet/rpc/transactions.cpp:594-595), so an empty
+            ;; string means "since genesis" and anything else -- a number
+            ;; included -- goes to ParseHashV under the name "blockhash".
+            (when (and blockhash-arg
+                       (not (equal blockhash-arg "")))
+              (let ((bh (bl.rpc:parse-hash-v blockhash-arg "blockhash")))
                 (setf block-entry
                       (and chain-state
                            (bl.store:get-block-index-entry chain-state bh)))

@@ -115,3 +115,42 @@ tell an empty object from null)."
 JSON-RPC 1.x) or a hash-table (from yason)."
   (cond ((hash-table-p obj) (gethash key obj))
         ((listp obj) (cdr (assoc key obj :test #'string=)))))
+
+;;; --- JSON types (Core univalue) ---
+;;;
+;;; Moved here from blockchain.lisp: the argument parsers (amounts.lisp) and
+;;; every handler above them signal this one type error, so it has to be
+;;; defined below all of them.
+
+(defun %json-type-name (value)
+  "Core's uvTypeName (univalue.cpp:217-226) for VALUE as our decoder represents
+it: null, bool, object, array, string, number.
+
+NIL is \"null\", and it now means that: a top-level positional `[]` arrives as
++json-empty-array+ rather than folding into NIL, so this no longer has to
+guess which of the two it is looking at. That guess is what made
+getrawtransaction(txid, []) answer nothing at all where Core answers -3."
+  (cond ((eq value +json-empty-array+) "array")
+        ((null value) "null")
+        ((eq value t) "bool")
+        ((eq value +json-false+) "bool")
+        ((stringp value) "string")
+        ((numberp value) "number")
+        ((hash-table-p value) "object")
+        ((or (listp value) (vectorp value)) "array")
+        (t "null")))
+
+(defun %json-type-error (value expected)
+  "Signal Core's canonical UniValue type error for VALUE where EXPECTED was
+wanted: \"JSON value of type <actual> is not of expected type <expected>\"
+(univalue.cpp:210-214).
+
+One shape, because Core has one shape. Its functional tests match on this
+string — rpc_rawtransaction.py looks for \"not of expected type number\",
+mempool_accept.py for \"JSON value of type string is not of expected type
+array\" — and each hand-written message here (\"First parameter must be an
+array of tx hex\", \"JSON value is not an integer as expected\") was a
+different sentence saying the same thing, so no caller could match any of them."
+  (error 'rpc-error :code +rpc-type-error+
+                    :message (format nil "JSON value of type ~A is not of expected type ~A"
+                                     (%json-type-name value) expected)))

@@ -4,31 +4,8 @@
 ;;;; chain control, verifychain, the wait* family, UTXO-set snapshots and
 ;;;; scanning, getchaintxstats, gettxoutsetinfo, getblockstats, pruning, and
 ;;;; the BIP157/158 filter RPCs, getdifficulty, getdeploymentinfo and
-;;;; getblockfrompeer. The input-validation helpers every RPC file uses come
-;;;; first.
-
-;;; --- Input Validation ---
-
-(defun valid-hex-hash-p (str)
-  "Check if STR is a valid 64-character hex hash."
-  (and (stringp str)
-       (= (length str) 64)
-       (every (lambda (c) (digit-char-p c 16)) str)))
-
-(defun parse-hex-hash (str)
-  "Parse a hex string to byte vector (reversed for internal use)."
-  (when (valid-hex-hash-p str)
-    (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
-      (loop for i from 0 below 32
-            for j from 62 downto 0 by 2
-            do (setf (aref bytes i)
-                     (parse-integer str :start j :end (+ j 2) :radix 16)))
-      bytes)))
-
-(defun hash-to-hex (bytes)
-  "Convert a 32-byte hash to lowercase hex string (reversed for display),
-matching Bitcoin Core's uint256::GetHex."
-  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes bytes)))
+;;;; getblockfrompeer. The argument parsers every RPC file shares (Core
+;;;; rpc/util.cpp) live in amounts.lisp, which loads before this file.
 
 ;;; --- Blockchain Query Methods ---
 
@@ -210,49 +187,13 @@ the bool branch). Explicit false arrives as the +json-false+ sentinel."
                                  :message "Verbosity was boolean but only integer allowed"))
               (t (%json-type-error v "number"))))))
 
-(defun %json-type-name (value)
-  "Core's uvTypeName (univalue.cpp:217-226) for VALUE as our decoder represents
-it: null, bool, object, array, string, number.
-
-NIL is \"null\", and it now means that: a top-level positional `[]` arrives as
-+json-empty-array+ rather than folding into NIL, so this no longer has to
-guess which of the two it is looking at. That guess is what made
-getrawtransaction(txid, []) answer nothing at all where Core answers -3."
-  (cond ((eq value +json-empty-array+) "array")
-        ((null value) "null")
-        ((eq value t) "bool")
-        ((eq value +json-false+) "bool")
-        ((stringp value) "string")
-        ((numberp value) "number")
-        ((hash-table-p value) "object")
-        ((or (listp value) (vectorp value)) "array")
-        (t "null")))
-
-(defun %json-type-error (value expected)
-  "Signal Core's canonical UniValue type error for VALUE where EXPECTED was
-wanted: \"JSON value of type <actual> is not of expected type <expected>\"
-(univalue.cpp:210-214).
-
-One shape, because Core has one shape. Its functional tests match on this
-string — rpc_rawtransaction.py looks for \"not of expected type number\",
-mempool_accept.py for \"JSON value of type string is not of expected type
-array\" — and each hand-written message here (\"First parameter must be an
-array of tx hex\", \"JSON value is not an integer as expected\") was a
-different sentence saying the same thing, so no caller could match any of them."
-  (error 'rpc-error :code +rpc-type-error+
-                    :message (format nil "JSON value of type ~A is not of expected type ~A"
-                                     (%json-type-name value) expected)))
-
 (define-rpc "getblock" (node (hash-str))
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
 the serialized block hex; 1 (or true) a JSON object with txids; 2 the object
 with full transaction details and each transaction's fee; 3 additionally the
 prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
-  (unless (valid-hex-hash-p hash-str)
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "Invalid block hash"))
-  (let* ((verbosity (%parse-verbosity params 1 1 :allow-bool t))
-         (hash-bytes (parse-hex-hash hash-str))
+  (let* ((hash-bytes (parse-hash-v hash-str "blockhash"))
+         (verbosity (%parse-verbosity params 1 1 :allow-bool t))
          (block-store (rpc-get-block-store node))
          (block (and block-store
                      (bl.store:get-block block-store hash-bytes))))
@@ -514,10 +455,7 @@ scriptPubKey object SCRIPT-TO-JSON builds."
 
 (define-rpc "getblockheader" (node (hash-str (verbose :bool-or t)))
   "Return block header data."
-  (unless (valid-hex-hash-p hash-str)
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "Invalid block hash"))
-  (let* ((hash-bytes (parse-hex-hash hash-str))
+  (let* ((hash-bytes (parse-hash-v hash-str "hash"))
          (chain-state (rpc-get-chain-state node))
          (entry (bl.store:get-block-index-entry chain-state hash-bytes)))
     (unless entry
@@ -663,53 +601,51 @@ a mempool transaction reports null, and an outpoint CREATED by one is
 visible with 0 confirmations (Core's CCoinsViewMemPool +
 mempool.isSpent, rpc/blockchain.cpp gettxout) — previously the argument was
 accepted but ignored."
-  (unless (valid-hex-hash-p txid-str)
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "Invalid txid"))
-  (unless (and (integerp vout) (>= vout 0))
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "Invalid vout"))
-  ;; Node lock: the coin lookup and the bestblock/height it is reported
-  ;; against must come from one consistent chain state (Core gettxout
-  ;; holds cs_main, rpc/blockchain.cpp).
-  (with-node-lock (node)
-   (let* ((txid-bytes (parse-hex-hash txid-str))
-          (utxo-set (rpc-get-utxo-set node))
-          (mempool (and include-mempool (rpc-get-mempool node)))
-          (entry (cond
-                   ;; include_mempool: a mempool spend hides the coin ...
-                   ((and mempool
-                         (bl.mp:mempool-spending-tx
-                          mempool txid-bytes vout))
-                    nil)
-                   ;; ... and a mempool-created output is visible.
-                   (t (or (bl.store:get-utxo utxo-set txid-bytes vout)
-                          (and mempool
-                               (%mempool-view-coin mempool txid-bytes vout)))))))
-    (if entry
-        (let* ((chain-state (rpc-get-chain-state node))
-               ;; The COINS VIEW's own best block, not the chain tip: they
-               ;; differ partway through a reorg's disconnect phase, and Core
-               ;; reports the view's (rpc/blockchain.cpp:1083). Falls back to
-               ;; the tip for a view that tracks no pointer.
-               (best-hash (or (bl.store:coins-view-best-block utxo-set)
-                              (bl.store:best-block-hash chain-state)))
-               (height (bl.store:current-height chain-state))
-               (utxo-height (bl.store:utxo-entry-height entry))
-               (spk (bl.store:utxo-entry-script-pubkey entry))
-               (network (rpc-get-network node)))
-          `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-            ;; Mempool coins report 0 confirmations (Core: nHeight ==
-            ;; MEMPOOL_HEIGHT -> 0).
-            ("confirmations" . ,(if (= utxo-height +mempool-coin-height+)
-                                    0
-                                    (1+ (- height utxo-height))))
-            ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
-            ;; Core ScriptToUniv with include_hex and include_address
-            ;; (blockchain.cpp:1253).
-            ("scriptPubKey" . ,(script-to-json spk :network network))
-            ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
-        nil)))) ; Return null for spent/absent outputs
+  ;; Core parses the txid before it reads n (rpc/blockchain.cpp:1224-1226).
+  (let ((txid-bytes (parse-hash-v txid-str "txid")))
+   (unless (and (integerp vout) (>= vout 0))
+     (error 'rpc-error :code +rpc-invalid-parameter+
+                       :message "Invalid vout"))
+   ;; Node lock: the coin lookup and the bestblock/height it is reported
+   ;; against must come from one consistent chain state (Core gettxout
+   ;; holds cs_main, rpc/blockchain.cpp).
+   (with-node-lock (node)
+     (let* ((utxo-set (rpc-get-utxo-set node))
+            (mempool (and include-mempool (rpc-get-mempool node)))
+            (entry (cond
+                     ;; include_mempool: a mempool spend hides the coin ...
+                     ((and mempool
+                           (bl.mp:mempool-spending-tx
+                            mempool txid-bytes vout))
+                      nil)
+                     ;; ... and a mempool-created output is visible.
+                     (t (or (bl.store:get-utxo utxo-set txid-bytes vout)
+                            (and mempool
+                                 (%mempool-view-coin mempool txid-bytes vout)))))))
+      (if entry
+          (let* ((chain-state (rpc-get-chain-state node))
+                 ;; The COINS VIEW's own best block, not the chain tip: they
+                 ;; differ partway through a reorg's disconnect phase, and Core
+                 ;; reports the view's (rpc/blockchain.cpp:1083). Falls back to
+                 ;; the tip for a view that tracks no pointer.
+                 (best-hash (or (bl.store:coins-view-best-block utxo-set)
+                                (bl.store:best-block-hash chain-state)))
+                 (height (bl.store:current-height chain-state))
+                 (utxo-height (bl.store:utxo-entry-height entry))
+                 (spk (bl.store:utxo-entry-script-pubkey entry))
+                 (network (rpc-get-network node)))
+            `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+              ;; Mempool coins report 0 confirmations (Core: nHeight ==
+              ;; MEMPOOL_HEIGHT -> 0).
+              ("confirmations" . ,(if (= utxo-height +mempool-coin-height+)
+                                      0
+                                      (1+ (- height utxo-height))))
+              ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
+              ;; Core ScriptToUniv with include_hex and include_address
+              ;; (blockchain.cpp:1253).
+              ("scriptPubKey" . ,(script-to-json spk :network network))
+              ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
+          nil))))) ; Return null for spent/absent outputs
 
 ;;; --- Chain control RPCs ---
 
@@ -717,28 +653,23 @@ accepted but ignored."
   "Shared driver for invalidateblock/reconsiderblock: resolve the blockhash param
 and invoke OP (invalidate-block or reconsider-block) with the node's chain
 context. Returns null on success; errors otherwise."
-  (let ((hash-hex (first params)))
-    (unless (stringp hash-hex)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash must be a hex string"))
-    (let ((hash (parse-hex-hash hash-hex)))
-      (unless hash
-        (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid block hash"))
-      ;; Node lock: these ops reorg the active chain, rewrite the UTXO set,
-      ;; and re-add/evict mempool entries — the same mutations the sync
-      ;; thread performs under the lock (Core invalidateblock/
-      ;; reconsiderblock/preciousblock all hold cs_main).
-      (with-node-lock (node)
-        (multiple-value-bind (ok reason)
-            (funcall op
-                     (rpc-get-chain-state node)
-                     (rpc-get-block-store node)
-                     (rpc-get-utxo-set node)
-                     hash
-                     :mempool (rpc-get-mempool node))
-          (unless ok
-            (error 'rpc-error :code +rpc-misc-error+
-                              :message (string-downcase (symbol-name reason))))
-          nil)))))
+  (let ((hash (parse-hash-v (first params) "blockhash")))
+    ;; Node lock: these ops reorg the active chain, rewrite the UTXO set,
+    ;; and re-add/evict mempool entries — the same mutations the sync
+    ;; thread performs under the lock (Core invalidateblock/
+    ;; reconsiderblock/preciousblock all hold cs_main).
+    (with-node-lock (node)
+      (multiple-value-bind (ok reason)
+          (funcall op
+                   (rpc-get-chain-state node)
+                   (rpc-get-block-store node)
+                   (rpc-get-utxo-set node)
+                   hash
+                   :mempool (rpc-get-mempool node))
+        (unless ok
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message (string-downcase (symbol-name reason))))
+        nil))))
 
 (define-rpc "invalidateblock" (node params)
   "Mark a block (and its descendants) invalid and reorg the active chain away from
@@ -829,14 +760,9 @@ the RPC worker thread."
 waitforblock). PARAMS: (blockhash [timeout-ms]); timeout 0 (default) waits
 indefinitely. Returns the tip on match, timeout, or node shutdown. Polls on the
 RPC worker thread."
-  (unless (stringp hash-hex)
-    (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash (hex string) required"))
-  (when (minusp timeout)
-    (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
-  (let ((target (parse-hex-hash hash-hex)))
-    (unless target
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "blockhash must be a 64-character hex string"))
+  (let ((target (parse-hash-v hash-hex "blockhash")))
+    (when (minusp timeout)
+      (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
     (let* ((chain-state (rpc-get-chain-state node))
            (deadline (%wait-deadline timeout)))
       (loop while (and (bl:node-running node)
@@ -923,15 +849,14 @@ type-error message."
      (or (bl.store:get-block-at-height chain-state param)
          (error 'rpc-error :code +rpc-invalid-address-or-key+
                            :message "Block not found")))
-    ((and (stringp param) (valid-hex-hash-p param))
-     (or (bl.store:get-block-index-entry
-          chain-state (parse-hex-hash param))
-         (error 'rpc-error :code +rpc-invalid-address-or-key+
-                           :message "Block not found")))
     (t
-     (error 'rpc-error :code +rpc-invalid-parameter+
-                       :message (format nil "~A must be a block height or a block hash"
-                                        param-name)))))
+     ;; Core's else-branch is ParseHashV(param, "hash_or_height") -- anything
+     ;; that is not a number is parsed as a hash, so a malformed one is -8
+     ;; with the name and the offending text, never an invented sentence.
+     (or (bl.store:get-block-index-entry
+          chain-state (parse-hash-v param param-name))
+         (error 'rpc-error :code +rpc-invalid-address-or-key+
+                           :message "Block not found")))))
 
 (defun %dump-rollback-target-entry (node chain-state tip-entry type options)
   "The block-index entry dumptxoutset should dump at (Core rpc/
@@ -1575,9 +1500,12 @@ interval uses median-time-past, matching Core. txcount/window_tx_count are
 omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
   (let* ((chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
-         (final (if (stringp (second params))
+         ;; Core reaches ParseHashV before the index lookup, so a malformed
+         ;; blockhash is -8 with the offending text and not the -5 an unknown
+         ;; but well-formed one gets (rpc/blockchain.cpp:1826-1836).
+         (final (if (second params)
                     (let ((e (bl.store:get-block-index-entry
-                              chain-state (parse-hex-hash (second params)))))
+                              chain-state (parse-hash-v (second params) "blockhash"))))
                       (unless e
                         (error 'rpc-error :code +rpc-invalid-address-or-key+
                                           :message "Block not found"))
@@ -1659,9 +1587,10 @@ that block's deltas. Only the muhash hash_type is index-backed."
                         :message "hash_serialized_3 is not available for historical heights; use 'muhash'"))
     (let* ((height (cond
                      ((integerp hash-or-height) hash-or-height)
-                     ((and (stringp hash-or-height) (valid-hex-hash-p hash-or-height))
+                     (t
                       (let ((entry (bl.store:get-block-index-entry
-                                    chain-state (parse-hex-hash hash-or-height))))
+                                    chain-state (parse-hash-v hash-or-height
+                                                              "hash_or_height"))))
                         (unless entry
                           (error 'rpc-error :code +rpc-invalid-address-or-key+
                                             :message "Block not found"))
@@ -1673,9 +1602,7 @@ that block's deltas. Only the muhash hash_type is index-backed."
                                  chain-state entry)
                           (error 'rpc-error :code +rpc-invalid-parameter+
                                             :message "Block is not on the active chain; the coinstatsindex holds active-chain statistics only"))
-                        (bl.store:block-index-entry-height entry)))
-                     (t (error 'rpc-error :code +rpc-invalid-parameter+
-                                          :message "hash_or_height must be a height or block hash"))))
+                        (bl.store:block-index-entry-height entry)))))
            (stats (bl.store:coinstatsindex-get-stats csi height))
            (prev (and (plusp height)
                       (bl.store:coinstatsindex-get-stats csi (1- height))))
@@ -2094,12 +2021,7 @@ block connection for as long as that takes. Prefer several small calls."
 (define-rpc "getblockfilter" (node (blockhash-hex (filtertype :or "basic")))
   "Return the BIP157 basic filter and filter header for a block.
 PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
-  (let* ((hash (and (stringp blockhash-hex) (parse-hex-hash blockhash-hex))))
-    (unless hash
-      ;; Core ParseHashV: parse failures are -8 (util.cpp:117-125); only the
-      ;; well-formed-but-unknown lookup below is -5.
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "blockhash must be a hex string of length 64"))
+  (let* ((hash (parse-hash-v blockhash-hex "blockhash")))
     (unless (string-equal filtertype "basic")
       (error 'rpc-error :code +rpc-invalid-address-or-key+
                         :message (format nil "Unknown filtertype ~A" filtertype)))
@@ -2312,8 +2234,8 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
       ;; height order regardless of the order given, matching Core.
       (let ((entries '()))
         (dolist (bhash-hex (and (listp blockhashes) blockhashes))
-          (let* ((hash (and (stringp bhash-hex) (parse-hex-hash bhash-hex)))
-                 (entry (and hash (bl.store:get-block-index-entry chain-state hash))))
+          (let* ((hash (parse-hash-v bhash-hex "blockhash"))
+                 (entry (bl.store:get-block-index-entry chain-state hash)))
             (unless entry
               (error 'rpc-error :code +rpc-invalid-address-or-key+
                                 :message "Block not found"))
@@ -2426,14 +2348,14 @@ optional blockhash param (Bitcoin Core getdeploymentinfo, rpc/blockchain.cpp:
 taproot) using this node's per-network activation heights."
   (let* ((chain-state (rpc-get-chain-state node))
          (network (bl:node-network node))
-         ;; Core takes a hash only (no height form), hence the stringp guard
-         ;; in front of the shared hash-or-height parser.
+         ;; Core takes a hash only, no height form: ParseHashV then
+         ;; LookupBlockIndex (rpc/blockchain.cpp:1519-1524).
          (entry (let ((hex (first params)))
                   (when hex
-                    (unless (stringp hex)
-                      (error 'rpc-error :code +rpc-invalid-parameter+
-                                        :message "blockhash must be hexadecimal string"))
-                    (%parse-hash-or-height-entry chain-state hex "blockhash"))))
+                    (or (bl.store:get-block-index-entry
+                         chain-state (parse-hash-v hex "blockhash"))
+                        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                          :message "Block not found")))))
          (height (if entry
                      (bl.store:block-index-entry-height entry)
                      (bl.store:current-height chain-state)))
@@ -2559,14 +2481,13 @@ the block must not already be downloaded, and the peer must be connected. Sends 
 getdata(MSG_WITNESS_BLOCK) to that peer; the block arrives through the normal
 block-processing path. Returns an empty object. The per-connection send lock makes
 the cross-thread send safe."
-  (unless (and (stringp blockhash-hex) (valid-hex-hash-p blockhash-hex))
-    (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash must be a hex string"))
-  (unless (integerp peer-id)
-    (error 'rpc-error :code +rpc-invalid-parameter+ :message "peer_id must be an integer"))
-  (let* ((hash (parse-hex-hash blockhash-hex))
+  (let* ((hash (parse-hash-v blockhash-hex "blockhash"))
          (chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
          (entry (bl.store:get-block-index-entry chain-state hash)))
+    ;; Core reads peer_id right after ParseHashV, before the index lookup.
+    (unless (integerp peer-id)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "peer_id must be an integer"))
     (unless entry
       (error 'rpc-error :code +rpc-misc-error+ :message "Block header missing"))
     (when (and (bl:pruning-enabled-p)

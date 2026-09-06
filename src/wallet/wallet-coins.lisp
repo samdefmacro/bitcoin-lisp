@@ -740,7 +740,7 @@ include_unsafe query_options)."
               (when (minusp vout-value)
                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Invalid parameter, vout cannot be negative"))
-              (let* ((txid (%wallet-parse-txid txid-value))
+              (let* ((txid (bl.rpc:parse-hash-v txid-value "txid"))
                      (wtx (wallet-get-wallet-tx wallet txid)))
                 (unless wtx
                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
@@ -1011,7 +1011,7 @@ listlabels). PARAMS: (purpose)."
   "Mark an in-wallet transaction and its wallet descendants abandoned
 (Bitcoin Core abandontransaction). PARAMS: (txid)."
   (let ((wallet (wallet-for-request node))
-        (txid (%wallet-parse-txid (first params))))
+        (txid (bl.rpc:parse-hash-v (first params) "txid")))
     (with-wallet-lock (wallet)
       (let ((wtx (wallet-get-wallet-tx wallet txid)))
         (unless wtx

@@ -2963,15 +2963,13 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
   (mapcar (lambda (entry)
             (let ((txid (%opt entry "txid"))
                   (vout (%opt entry "vout")))
-              (unless (and (stringp txid) (bl.rpc:valid-hex-hash-p txid))
-                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                  :message "txid must be of length 64 (not including any '0x' prefix)"))
-              (unless (and (integerp vout) (>= vout 0))
-                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                  :message "Invalid parameter, vout cannot be negative"))
-              (list (bl.rpc:parse-hex-hash txid) vout
-                    (%opt entry "sequence")
-                    (%opt entry "weight"))))
+              (let ((txid-bytes (bl.rpc:parse-hash-v txid "txid")))
+                (unless (and (integerp vout) (>= vout 0))
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                    :message "Invalid parameter, vout cannot be negative"))
+                (list txid-bytes vout
+                      (%opt entry "sequence")
+                      (%opt entry "weight")))))
           inputs-param))
 
 (defun %apply-rpc-inputs (cc inputs rbf locktime)
