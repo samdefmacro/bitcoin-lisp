@@ -19,11 +19,11 @@ never run. This round finished every stage:
 - **Verification**: every finding judged by execution, refute-biased, two lenses for S1/S2
   and one for S3. 95 of 95 confirmed; severities moved in both directions (two S3s raised
   to S2, two S2s lowered to S3, several narrowed, one mechanism corrected).
-- **Fixes**: 94 of 95 landed on `main` (the 95th, `-logips`, is in flight), in 24 worktree
-  batches of one to eight findings grouped by file, each with a reproduction, a test that
+- **Fixes**: 95 of 95 landed on `main`, in 25 worktree batches of one to eight findings
+  grouped by file, plus one follow-ups batch, each with a reproduction, a test that
   fails on the pre-fix source, the Core lines in the commit, and a green cold battery on the
   merged `main` before every push. The battery grew from 35,999 checks at the first push
-  to 37,850 at the latest.
+  to 38,241 at the last.
 
 ## The six S1s
 
@@ -63,7 +63,8 @@ here because it has no id in the survey:
   `error`), killing the worker; reachable once the miniscript parser became linear.
 - **The blockfilterindex shares the txospenderindex's off-chain-marker shape** and had no
   startup rewind; **P2SH(P2PK) was unsignable** (the scripthash arm had no P2PK redeem
-  case). Both are in the follow-ups batch.
+  case). Both fixed in the follow-ups batch; the filter index follows Core's
+  `CustomRemove`, which KEEPS the abandoned filters hash-indexed rather than erasing them.
 - Smaller ones, each fixed in place: an `undefined variable` pair the cold gate only saw
   on a real recompile; submitpackage's effective fee rate rendered as a rational; the
   `:: ` ratchet counting two git-ignored scratch files; two flaky tests whose deadlines
@@ -105,7 +106,7 @@ Named in the commit that scoped each one out:
 
 ## What the round cost, and what it taught
 
-Nine session-limit interruptions (five concurrent Opus agents exhaust a window in roughly
+Ten session-limit interruptions (five concurrent Opus agents exhaust a window in roughly
 five hours); every killed agent was resumed in place and none lost work. Sixty-nine
 lesson lines were recorded in the skills' lessons logs during the round; the ones that
 repeated got mechanical guards instead of a second line: the `::` ratchet's corpus is the
@@ -131,14 +132,14 @@ names the commit(s) whose message carries the id.
 | descriptors | 1/0 | 3/0 | 3/0 |
 | miniscript | 2/0 | 3/0 | 5/0 |
 | never-opened | 0/0 | 5/0 | 2/0 |
-| options | 0/0 | 5/1 | 7/0 |
+| options | 0/0 | 6/0 | 7/0 |
 | p2p-liveness | 0/0 | 6/0 | 3/0 |
 | rpc-util | 0/0 | 5/0 | 12/0 |
 | tx-relay | 0/0 | 5/0 | 6/0 |
 | validation-storage | 1/0 | 3/0 | 1/0 |
 | wallet | 1/0 | 1/0 | 9/0 |
 
-95 findings, 94 fixed, 1 open.
+95 findings, 95 fixed, 0 open.
 
 | dimension | finding | survey | final | verdict | fix |
 |---|---|---|---|---|---|
@@ -172,7 +173,7 @@ names the commit(s) whose message carries the id.
 | never-opened | `2cae91f5` define-message :var-string is Latin-1, not bytes: a wallet label above U+00FF... | S3 | S3 | confirmed | `736e0e17` Serialization: a serialized string is UTF-8 bytes, not one byte per code point (GA11 2cae91f5) |
 | never-opened | `d9ca7c2f` A boolean wire field is true only for the byte 1; Core treats every nonzero b... | S3 | S3 | confirmed | `4ae9377e` Serialization: a wire boolean is true for every nonzero byte (GA11 d9ca7c2f) |
 | options | `212b060f` -persistmempool / -persistmempoolv1 are dropped: mempool.dat is always loaded... | S2 | S2 | confirmed | `4c9e528a` Node: -persistmempool gates both mempool.dat drive sites (212b060f) |
-| options | `559c86ad` -logips is dropped and peer addresses are logged unconditionally at info/warn... | S3 | S2 | confirmed | open |
+| options | `559c86ad` -logips is dropped and peer addresses are logged unconditionally at info/warn... | S3 | S2 | confirmed | `219f2dcd` docs: the option survey records -logips as implemented (GA11 559c86ad); `47d408f9` Net: a peer's address is not in the default log (GA11 559c86ad) |
 | options | `7f6337e2` -signetseednode is dropped and -signetchallenge rewrites none of Core's deriv... | S2 | S2 | confirmed | `39b58ad8` Config: a custom signet is its own network, derived from its challenge (7f6337e2) |
 | options | `8c442ee3` -walletbroadcast is dropped and -blocksonly does not soft-set it: the wallet ... | S2 | S2 | confirmed | `7f4f8fd6` Wallet: -walletbroadcast keeps a signed transaction off the wire (8c442ee3) |
 | options | `9e7729b8` A bitcoin.conf in the datadir shadowed by -conf or by a conf-set datadir= is ... | S2 | S2 | confirmed | `8969900b` Config: the bitcoin.conf we do not read is an error, not a silence (9e7729b8) |
