@@ -519,6 +519,15 @@ reaches the mempool."
           do (error 'rpc-error :code +rpc-verify-error+
                                :message "Unspendable output exceeds maximum configured by user (maxburnamount)")))
 
+(defun %decode-package-member (hex)
+  "One member of a testmempoolaccept / submitpackage array, or Core's -22
+naming the hex that failed (rpc/mempool.cpp:332-335, 1371-1374). Both RPCs
+abort the WHOLE call on a decode failure rather than returning a per-tx
+allowed=false row."
+  (decode-hex-tx-or-error
+   hex (format nil "TX decode failed: ~A Make sure the tx has at least one input."
+               (if (stringp hex) hex ""))))
+
 (define-rpc "testmempoolaccept" (node ((txs :array)))
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
 array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
@@ -540,14 +549,7 @@ anything to the mempool. Each tx is checked independently against current state
     ;; Decode every tx up front: a decode failure aborts the WHOLE call with
     ;; -22 (Core DecodeHexTx -> RPC_DESERIALIZATION_ERROR, rpc/mempool.cpp:333),
     ;; it does not produce a per-tx allowed=false row.
-    (let ((decoded
-            (mapcar (lambda (hex-str)
-                      (decode-hex-tx-or-error
-                       hex-str
-                       (format nil "TX decode failed: ~A Make sure the tx has ~
-at least one input."
-                               (if (stringp hex-str) hex-str ""))))
-                    txs)))
+    (let ((decoded (mapcar #'%decode-package-member txs)))
       ;; Node lock: validation reads the mempool + UTXO set + tip together;
       ;; a consistent view for the whole batch (Core ProcessTransaction
       ;; requires cs_main even for test_accept).
@@ -785,20 +787,12 @@ member may send to a script that can never spend it."
       (error 'rpc-error :code +rpc-client-mempool-disabled+
                         :message "Mempool disabled or instance not found"))
     ;; Decode every tx up front; a single decode failure aborts the whole call.
-    (let ((package
-            ;; Core: RPC_DESERIALIZATION_ERROR (-22), rpc/mempool.cpp:1371-1374.
-            (mapcar (lambda (hex)
-                      (decode-hex-tx-or-error
-                       hex
-                       (format nil "TX decode failed: ~A Make sure the tx has ~
-at least one input."
-                               (if (stringp hex) hex ""))))
-                    hexes))
-            ;; A maxfeerate of 0 disables the rail entirely (Core turns the
-            ;; CFeeRate into nullopt, rpc/mempool.cpp:1358-1362).
-            (client-maxfeerate (let ((r (%parse-max-fee-rate params 1)))
-                                 (and (plusp r) r)))
-            (max-burn (%parse-max-burn-amount params 2)))
+    (let ((package (mapcar #'%decode-package-member hexes))
+          ;; A maxfeerate of 0 disables the rail entirely (Core turns the
+          ;; CFeeRate into nullopt, rpc/mempool.cpp:1358-1362).
+          (client-maxfeerate (let ((r (%parse-max-fee-rate params 1)))
+                               (and (plusp r) r)))
+          (max-burn (%parse-max-burn-amount params 2)))
       ;; Every member is burn-checked before any validation runs
       ;; (rpc/mempool.cpp:1374-1380).
       (dolist (tx package)
