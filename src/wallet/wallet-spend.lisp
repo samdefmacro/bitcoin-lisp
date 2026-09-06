@@ -1542,6 +1542,12 @@ index or destination string."
 
 ;;; --- Change type + change address reservation ---
 
+(defun %effective-change-type (cc)
+  "Core spend.cpp:1092's `coin_control.m_change_type ? *it :
+wallet.m_default_change_type': the per-call change type when the coin control
+carries one, else the wallet's -changetype default."
+  (or (wcc-change-type cc) *wallet-default-change-type*))
+
 (defun %transaction-change-type (wallet change-type recipients)
   "Core CWallet::TransactionChangeType (wallet.cpp:2253-2312). CHANGE-TYPE is
 Core's `coin_control.m_change_type ? *it : wallet.m_default_change_type', so
@@ -1972,13 +1978,8 @@ Caller holds node + wallet locks."
                   (+ 10 (bl.ser:compact-size-length (length recipients))))
             (let ((recipients-sum 0)
                   (outputs-to-subtract-fee-from 0)
-                  ;; Core spend.cpp:1092: the coin control's change type, else
-                  ;; the wallet's -changetype default.
                   (change-type (%transaction-change-type
-                                wallet
-                                (or (wcc-change-type cc)
-                                    *wallet-default-change-type*)
-                                recipients)))
+                                wallet (%effective-change-type cc) recipients)))
               (dolist (recipient recipients)
                 (when (%output-dust-p (bl.rpc:recipient-amount recipient)
                                       (bl.rpc:recipient-script recipient))

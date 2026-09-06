@@ -741,7 +741,7 @@ to make on purpose, so the set is pinned."
     ;; this long or longer. Splitting these would diverge from Core and cost
     ;; the file-by-file comparison this project verifies with, so they stay
     ;; and the reason is recorded here rather than in someone's memory.
-    ("%create-transaction-internal" . 442)       ; wallet/wallet-spend.lisp
+    ("%create-transaction-internal" . 440)       ; wallet/wallet-spend.lisp
                                                  ; Core CreateTransactionInternal 376
     ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
                                                  ; Core sendall 279

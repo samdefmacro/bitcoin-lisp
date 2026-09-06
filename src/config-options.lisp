@@ -65,6 +65,12 @@
 (define-option "logtimemicros" :key :log-time-micros :type :bool)
 ;; -blocknotify: one command, %s replaced by the new best block's hash.
 (define-option "blocknotify" :key :block-notify :type :string)
+;; -alertnotify: the shell command Core runs when a KERNEL warning appears --
+;; a probable consensus split or an unknown rule activating (AlertNotify,
+;; node/kernel_notifications.cpp:30-47,79-85). A :GLOBAL row rather than a
+;; start-node keyword because the warnings registry it drives lives in the
+;; logging layer, next to the other operator hooks.
+(define-option "alertnotify" :global bl.log:*alert-notify-command*)
 (define-option "logthreadnames" :key :log-thread-names :type :bool)
 (define-option "maxconnections" :key :max-connections :type :int)
 (define-option "rpcport" :key :rpc-port :type :int :network-only t)
@@ -511,7 +517,6 @@ node's own address"))))
 ;;; init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
 
 (define-core-only-options
-  "alertnotify"
   "blockreconstructionextratxn"
   "capturemessages"
   "checkaddrman" "checkblockindex"

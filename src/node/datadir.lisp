@@ -63,7 +63,22 @@ common/init.cpp:45-63).
 
 Both the base path and the network path, and only when the path itself is
 being created — an existing datadir keeps whatever layout it has, which is the
-backwards-compatibility rule Core states in that comment."
+backwards-compatibility rule Core states in that comment. Wallet code then USES
+the subdirectory only if it is already there, so this runs whether or not the
+wallet is enabled.
+
+Its caller must run it FIRST, before anything that can create the network
+directory: opening the log file does ENSURE-DIRECTORIES-EXIST on
+<datadir>/<network>/debug.log, and after that the `did this path exist?' test
+below is answered by our own side effect and is always false.
+
+Small, and it was blocking the whole functional-test corpus: the framework
+builds a shared 199-block cache datadir once and copies it per test, and its
+cleanup does `os.rmdir(cache/regtest/wallets)`. With no such directory that
+raises, the cache build FAILS, and every run then falls back on whatever cache
+was last built successfully — which here was one written in the pre-Core
+per-block format, months old. Every non-clean-chain test in the suite was
+running against it."
   (flet ((claim (dir)
            (let ((path (uiop:ensure-directory-pathname dir)))
              (unless (probe-file path)

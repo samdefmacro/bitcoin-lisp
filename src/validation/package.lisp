@@ -86,6 +86,7 @@ can. src/validation/.")
    #:most-recent-block-tx
    #:most-recent-cmpctblock
    #:note-block-connected
+   #:reset-fork-warning-state
    #:reset-recent-confirmed
    ;; The reconsiderable rejects filter (Core's second rejects filter)
    #:*recent-rejects-reconsiderable*

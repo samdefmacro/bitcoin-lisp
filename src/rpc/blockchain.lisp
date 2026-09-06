@@ -76,7 +76,7 @@ matching Bitcoin Core's uint256::GetHex."
                    ("target" . ,(string-downcase
                                  (format nil "~64,'0x" (bl.store:bits-to-target bits))))
                    ("pruned" . ,(json-bool (bl:pruning-enabled-p)))
-                   ("warnings" . #()))))
+                   ("warnings" . ,(bl.log:warnings-for-rpc)))))
     ;; Add pruning-specific fields when pruning is enabled
     (when (bl:pruning-enabled-p)
       (let ((pruned-height (bl.store:chain-state-pruned-height chain-state)))
