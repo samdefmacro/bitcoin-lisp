@@ -448,6 +448,8 @@ this same package."
                              (:file "crypto/bitcoin-core-key-io-tests")
                              (:file "mempool/block-policy-estimator-tests")
                              (:file "node/zmq-tests")
+                             ;; -blocknotify / -shutdownnotify operator hooks
+                             (:file "node/notify-tests")
                              ;; BIP 158 compact block filter tests
                              (:file "storage/blockfilter-tests")
                              ;; BIP 174 PSBT tests
