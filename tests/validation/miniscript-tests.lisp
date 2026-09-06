@@ -173,6 +173,52 @@ grow by one byte."
     (is (= (1+ (length plain)) (length verified)))
     (is (= #x69 (aref verified (1- (length verified)))) "OP_VERIFY appended")))
 
+(test miniscript-verify-reaches-the-opcode-through-and-v
+  "The -VERIFY flag travels FURTHER than the sub of `v:'. Core's ToScript
+downfn (miniscript.h:797-806) hands the parent's flag to the sub of `s:' and to
+the SECOND sub of and_v, because neither fragment writes anything after that
+sub -- so its last opcode is still the script's last opcode, and still the one
+to switch.
+
+Dropping it there wrote OP_CHECKSIG where Core writes OP_CHECKSIGVERIFY. The
+two are the same LENGTH, so ComputeScriptLen agreed with the bytes and the
+size check could not see it; what came out was a different witnessScript, a
+different P2WSH address, and a V-typed expression that leaves a boolean on the
+stack. `wsh()' of it was sane, importable, and deriveaddresses handed the
+operator that address."
+  (let* ((a "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (b "03fe72c435413d33d48ac09c9161ba8b09683215439d62b7940502bda8b202e6ce")
+         (node (bl.val:ms-parse
+                (format nil "and_v(v:and_v(v:pk(~A),pk(~A)),older(10))" a b)))
+         (script (bl.val:ms-node-script node)))
+    ;; <a> CHECKSIGVERIFY <b> CHECKSIGVERIFY OP_10 CHECKSEQUENCEVERIFY.
+    (is (string= (concatenate 'string "21" a "ad21" b "ad5ab2")
+                 (string-downcase (bl.crypto:bytes-to-hex script))))
+    (is (= (%ms-script-size node) (length script))))
+  ;; And the consequence, through the node's own script verification: the same
+  ;; nesting over hash preimages does not SPEND unless the inner and_v's second
+  ;; sub ends in OP_EQUALVERIFY.
+  (let* ((pres (loop for i from 1 to 3
+                     collect (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element i)))
+         (hashes (mapcar #'bl.crypto:sha256 pres))
+         (hex (mapcar (lambda (h) (string-downcase (bl.crypto:bytes-to-hex h)))
+                      hashes))
+         (node (bl.val:ms-parse
+                (format nil "and_v(v:and_v(v:sha256(~A),sha256(~A)),sha256(~A))"
+                        (first hex) (second hex) (third hex))))
+         (script (bl.val:ms-node-script node))
+         (sat (bl.val:make-ms-satisfier
+               :preimage-fn (lambda (kind hash)
+                              (declare (ignore kind))
+                              (loop for p in pres
+                                    for h in hashes
+                                    when (equalp hash h) return p))))
+         (witness (bl.val:ms-satisfy node sat)))
+    (is (= 3 (length witness)))
+    (is-true (%ms-verify-p2wsh script witness 100000)
+             "the nested and_v policy must actually spend")))
+
 (test miniscript-invalid-expressions-have-no-type-rather-than-erroring
   "The calculus's error channel is a type of zero, not a condition. That is why
 a sub-expression that fails to type must poison its parent explicitly — a zero
