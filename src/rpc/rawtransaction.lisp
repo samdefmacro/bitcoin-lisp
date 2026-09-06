@@ -1026,12 +1026,7 @@ object a Core test ever sees. Both were dropped here, in both branches, while
 the no-answer branch invented (\"feerate\" . 0.0) -- a fee of zero where Core
 says it has no estimate -- and omitted the fail bucket."
   (let ((decay (json-float (or (getf buckets :decay) 0)))
-        (scale (or (getf buckets :scale) 0))
-        ;; Core's estimateRawFee hands back CFeeRate(llround(median)), an
-        ;; integer sat/kvB; ours returns the raw median, so the rounding that
-        ;; the CFeeRate constructor does there happens here -- before the
-        ;; zero-sentinel test, as it does in Core.
-        (rate (floor (+ (float rate 1d0) 1/2))))
+        (scale (or (getf buckets :scale) 0)))
     (if (zerop rate)
         `(("decay" . ,decay)
           ("scale" . ,scale)

@@ -95,6 +95,29 @@ field, as it would encode as null."
 ;;; on absence (scantxoutset "status" with no scan running) must keep
 ;;; returning NIL.
 
+(defun json-array (list)
+  "LIST as a JSON array, rendering [] rather than null when it is empty.
+yason encodes a vector as an array unconditionally, and rpc-result->json
+passes vectors through as atoms, so a non-empty LIST is returned unchanged
+(letting rpc-result->json recurse into nested objects) while the empty case
+becomes a literal empty vector."
+  (or list #()))
+
+(defun json-object (alist)
+  "ALIST as a JSON object, rendering {} rather than null when it is empty —
+the object-valued counterpart of JSON-ARRAY (rpc-result->json turns a
+non-empty (string . value) alist into a hash-table by itself, but cannot
+tell an empty object from null)."
+  (or alist (make-hash-table :test 'equal)))
+
+(defun obj-get (obj key)
+  "Read KEY from a JSON object that arrived as either an alist (from tests /
+JSON-RPC 1.x) or a hash-table (from yason)."
+  (cond ((hash-table-p obj) (gethash key obj))
+        ((listp obj) (cdr (assoc key obj :test #'string=)))))
+
+;;; --- Numbers Core spells itself (UniValue::setFloat) ---
+
 (defstruct (json-number (:constructor make-json-number (text))
                         (:copier nil))
   "A JSON number whose TEXT is written out verbatim.
@@ -108,6 +131,10 @@ one satoshi, 0.1 for a tenth of a coin -- where Core prints 0.00000001 and
 (see SATOSHI->BTC), so no float printer stands between a satoshi count and
 the reply."
   (text "0" :type string :read-only t))
+
+(defmethod yason:encode ((object json-number) &optional (stream *standard-output*))
+  (write-string (json-number-text object) stream)
+  object)
 
 (defun %core-round (x)
   "C's round(): the nearest integer as a double, halves AWAY from zero. CL's
@@ -150,56 +177,33 @@ each spell at least one of those differently."
         (make-json-number "0")
         (let* ((negative (minusp rational))
                (magnitude (abs rational))
+               (sign (if negative "-" ""))
                (exponent 0)
-               (sign (if negative "-" "")))
-          (loop while (>= magnitude (expt 10 (1+ exponent))) do (incf exponent))
-          (loop while (< magnitude (expt 10 exponent)) do (decf exponent))
+               (power 1))
+          ;; The decimal exponent, carrying 10^exponent alongside so the search
+          ;; costs one bignum multiply per step rather than one EXPT.
+          (loop while (>= magnitude (* power 10)) do (incf exponent) (setf power (* power 10)))
+          (loop while (< magnitude power) do (decf exponent) (setf power (/ power 10)))
           ;; Rounding to PRECISION significant digits can carry past ten, and
           ;; C++ renormalises when it does: the double nearest 1e99 is just
           ;; under 10^99, so its exponent is 98 and its mantissa rounds to 10
           ;; -- printed as 1e+99, never 10e+98.
-          (when (>= (round (* (/ magnitude (expt 10 exponent))
-                              (expt 10 (1- precision))))
+          (when (>= (round (* (/ magnitude power) (expt 10 (1- precision))))
                     (expt 10 precision))
-            (incf exponent))
+            (incf exponent)
+            (setf power (* power 10)))
           (make-json-number
            (if (or (< exponent -4) (>= exponent precision))
                (format nil "~A~Ae~A~2,'0D"
                        sign
                        (%strip-trailing-zeros
-                        (%fixed-digits (/ magnitude (expt 10 exponent))
-                                       (1- precision)))
+                        (%fixed-digits (/ magnitude power) (1- precision)))
                        (if (minusp exponent) "-" "+")
                        (abs exponent))
                (format nil "~A~A" sign
                        (%strip-trailing-zeros
                         (%fixed-digits magnitude
                                        (max 0 (- precision 1 exponent)))))))))))
-
-(defmethod yason:encode ((object json-number) &optional (stream *standard-output*))
-  (write-string (json-number-text object) stream)
-  object)
-
-(defun json-array (list)
-  "LIST as a JSON array, rendering [] rather than null when it is empty.
-yason encodes a vector as an array unconditionally, and rpc-result->json
-passes vectors through as atoms, so a non-empty LIST is returned unchanged
-(letting rpc-result->json recurse into nested objects) while the empty case
-becomes a literal empty vector."
-  (or list #()))
-
-(defun json-object (alist)
-  "ALIST as a JSON object, rendering {} rather than null when it is empty —
-the object-valued counterpart of JSON-ARRAY (rpc-result->json turns a
-non-empty (string . value) alist into a hash-table by itself, but cannot
-tell an empty object from null)."
-  (or alist (make-hash-table :test 'equal)))
-
-(defun obj-get (obj key)
-  "Read KEY from a JSON object that arrived as either an alist (from tests /
-JSON-RPC 1.x) or a hash-table (from yason)."
-  (cond ((hash-table-p obj) (gethash key obj))
-        ((listp obj) (cdr (assoc key obj :test #'string=)))))
 
 ;;; --- JSON types (Core univalue) ---
 ;;;
