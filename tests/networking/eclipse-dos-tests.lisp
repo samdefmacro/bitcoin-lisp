@@ -83,23 +83,22 @@ fPauseSend on nSendBufferMaxSize)."
   "connection-send-stalled-p triggers only when data is buffered AND the socket
 has made no send progress for the stall timeout (Core socket sending timeout)."
   (let ((conn (make-test-connection))
-        (units internal-time-units-per-second))
-    ;; No pending data: never stalled, even with an ancient progress time.
-    (setf (send-buffer-bytes conn) 0
-          (bl.net::connection-last-send-progress conn)
-          (- (get-internal-real-time)
-             (* (1+ bl.net::+send-stall-timeout-seconds+) units)))
-    (is-false (bl.net:connection-send-stalled-p conn))
-    ;; Pending data but recent progress: not stalled.
-    (setf (send-buffer-bytes conn) 500
-          (bl.net::connection-last-send-progress conn)
-          (get-internal-real-time))
-    (is-false (bl.net:connection-send-stalled-p conn))
-    ;; Pending data AND stale progress: stalled.
-    (setf (bl.net::connection-last-send-progress conn)
-          (- (get-internal-real-time)
-             (* (1+ bl.net::+send-stall-timeout-seconds+) units)))
-    (is-true (bl.net:connection-send-stalled-p conn))))
+        (units internal-time-units-per-second)
+        (window bl.net::+send-stall-timeout-seconds+))
+    (flet ((no-progress-for (seconds)
+             (setf (bl.net::connection-last-send-progress conn)
+                   (- (get-internal-real-time) (* seconds units)))))
+      ;; No pending data: never stalled, even with an ancient progress time.
+      (setf (send-buffer-bytes conn) 0)
+      (no-progress-for (1+ window))
+      (is-false (bl.net:connection-send-stalled-p conn))
+      ;; Pending data but recent progress: not stalled.
+      (setf (send-buffer-bytes conn) 500)
+      (no-progress-for 0)
+      (is-false (bl.net:connection-send-stalled-p conn))
+      ;; Pending data AND stale progress: stalled.
+      (no-progress-for (1+ window))
+      (is-true (bl.net:connection-send-stalled-p conn)))))
 
 (test close-connection-frees-send-queue
   "Closing a connection releases any buffered unsent bytes."

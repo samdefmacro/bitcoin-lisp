@@ -22,7 +22,15 @@ a slow peer, with nothing to retry it and the peer waiting forever on a
 request we had already consumed. What bounds a peer that never drains is the
 20-minute send-stall disconnect below, not a dropped message.")
 
-(defconstant +send-stall-timeout-seconds+ (* 20 60)
+(defconstant +timeout-interval-seconds+ (* 20 60)
+  "Core TIMEOUT_INTERVAL (net.h:58-59), the ONE twenty-minute window every
+liveness rule in Core is measured against: both inactivity rules of
+CConnman::InactivityCheck (net.cpp:2032-2046) and MaybeSendPing's ping timeout
+(net_processing.cpp:5488-5497). Named once here so the rules that share it
+cannot drift apart -- ours had three separate spellings of it and one of them
+had drifted to a quarter of the value.")
+
+(defconstant +send-stall-timeout-seconds+ +timeout-interval-seconds+
   "Disconnect a peer whose socket has accepted no bytes for this long while
 unsent data is buffered (Bitcoin Core InactivityCheck \"socket sending
 timeout\": now > m_last_send + TIMEOUT_INTERVAL, net.h TIMEOUT_INTERVAL =
@@ -624,17 +632,33 @@ waiting. The pump no longer waits on anyone, so it applies
 is Core's position, reached the way Core reaches it: by never blocking on a
 peer rather than by picking a kinder number.")
 
-(defconstant +receive-stall-timeout-seconds+ 300
+(defconstant +receive-stall-timeout-seconds+ +timeout-interval-seconds+
   "How long a peer may deliver NOTHING toward a message it has already begun
 before the pump reaps it (CONNECTION-RECEIVE-EXPIRED-P).
 
-Generous on purpose, and the resumable reader is what makes that affordable.
-While the reader blocked, a stalled peer held the whole pump, so the bound had
-to be tight (a stall window plus a minimum byte rate) and every second of
-slack was a second of node-wide freeze. Now a stalled peer costs one connection
-slot and its partial buffer (=< +MAX-MESSAGE-PAYLOAD+) and nothing else, so the
-bound only has to stop the slot leaking — Core's shape, an inactivity timeout
-(20 minutes there) rather than a delivery-rate requirement.
+Core's window, because this is Core's rule. Core has no per-message clock at
+all: CNode::vRecvMsg holds a partially received message for as long as the
+connection lives, and the only receive-side rule is InactivityCheck's
+`now > last_recv + TIMEOUT_INTERVAL` (net.cpp:2040-2046), applied the same
+whether or not a message is in progress. A tighter window here is therefore a
+rule Core does not have -- it drops a peer whose link goes dead mid-message and
+then recovers, where Core keeps it -- so it is set to TIMEOUT_INTERVAL and the
+two windows are equal.
+
+The reaper itself stays, and this is the one place ours and Core's SHAPES
+genuinely differ. Core's coverage comes from a socket handler that consults
+last_recv on every pass; our pump has no such per-pass rule, so without this a
+peer that sends a header and goes silent produces nothing readable, is skipped
+by the drain every cycle, and parks its partial message for the life of the
+connection. What that costs is now one connection slot and at most
++MAX-MESSAGE-PAYLOAD+ of buffer -- the resumable reader is what made the
+generous bound affordable. While the reader still BLOCKED, a stalled peer held
+the whole pump, so the bound had to be tight (a stall window plus a minimum
+byte rate) and every second of slack was a second of node-wide freeze.
+
+Note what the clock measures: PROGRESS, not elapsed time. The stamp is renewed
+by any byte that arrives (RECEIVE-BYTES-RESUMABLE), so a slow but delivering
+peer never trips this however long its message takes; only total silence does.
 
 It must also stay well ABOVE the longest pump cycle. The budget is measured
 from the last byte that ARRIVED, and during IBD one cycle can be minutes of
