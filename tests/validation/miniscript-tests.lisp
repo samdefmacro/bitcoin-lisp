@@ -1076,6 +1076,56 @@ mis-parses almost always produces a different script rather than none."
     (is (>= checked 60) "expected ~60 inferable vectors, checked ~D" checked)
     (is (null bad) "~{~A~^~%~}" (reverse bad))))
 
+(defun %ms-infer-hex (hex &optional (ctx :p2wsh))
+  "MS-FROM-SCRIPT of the script HEX spells, as (values node re-serialized-hex)."
+  (let ((node (bl.val:ms-from-script (bl.crypto:hex-to-bytes hex) :ctx ctx)))
+    (values node
+            (and node (string-downcase
+                       (bl.crypto:bytes-to-hex (bl.val:ms-node-script node)))))))
+
+(test inference-refuses-a-script-written-in-a-non-minimal-encoding
+  "Core CheckMinimalPush (script.cpp:373-396), applied to every pushdata
+opcode inside DecomposeScript (miniscript.cpp:396-397), plus CScriptNum's
+fRequireMinimal inside ParseScriptNumber (:407-419).
+
+Miniscript's premise is that a script and an expression map ONE TO ONE, so a
+push that is not the shortest encoding of its bytes -- or a number carrying a
+redundant trailing byte -- is not a miniscript at all. The reachable path is
+signrawtransactionwithkey, whose miniscript arm infers a node from a
+CALLER-supplied witnessScript: we used to sign a script Core refuses to sign,
+and to report a descriptor that re-serializes to different bytes."
+  ;; Controls: the minimal spellings must still infer AND still re-serialize
+  ;; to the bytes they came from, so the new rule cannot pass by refusing
+  ;; everything.
+  (dolist (row '(("5ab2" "older(10)")
+                 ("5ab1" "after(10)")
+                 ;; 128 needs a second byte even minimally (the sign byte),
+                 ;; so this is a MINIMAL multi-byte CScriptNum.
+                 ("028000b2" "older(128)")))
+    (destructuring-bind (hex expr) row
+      (multiple-value-bind (node reser) (%ms-infer-hex hex)
+        (is-true node "~A must still infer" hex)
+        (when node
+          (is (string= expr (bl.val:ms-node-to-string node)))
+          (is (string= hex reser) "~A re-serialized as ~A" hex reser)))))
+  ;; Each of these was inferred before and is refused by Core.
+  (dolist (hex '("010ab2"     ; one-byte push of 10: OP_1..OP_16 was required
+                 "010ab1"
+                 "020a00b2"   ; [0a 00]: a non-minimal CScriptNum for 10
+                 "020a00b1"
+                 "0181b2"     ; one-byte push of 0x81: OP_1NEGATE was required
+                 "4c0120b1")) ; PUSHDATA1 of a single byte
+    (is-false (%ms-infer-hex hex) "~A is not minimally encoded" hex))
+  ;; multi()'s two counts go through the same rule.
+  (destructuring-bind (k1 k2) (%ms-distinct-keys 2)
+    (let ((minimal (format nil "5121~A21~A52ae" k1 k2))
+          (pushed (format nil "010121~A21~A0102ae" k1 k2)))
+      (multiple-value-bind (node reser) (%ms-infer-hex minimal)
+        (is-true node "the minimal multi(1,..) must still infer")
+        (when node (is (string= minimal reser))))
+      (is-false (%ms-infer-hex pushed)
+                "OP_1/OP_2 were required for multi()'s counts"))))
+
 (test inference-recovers-the-expression-not-just-the-script
   "For everything except pkh, the inferred node prints back as the original
 expression — which is what makes inference useful for describing an unknown

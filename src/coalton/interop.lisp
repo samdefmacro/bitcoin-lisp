@@ -2672,50 +2672,30 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
 ;;; MINIMALDATA Validation
 ;;; ============================================================
 
-(defun minimal-push-encoding-p (opcode data-len data)
-  "Check if a push operation uses minimal encoding.
-   OPCODE is the push opcode byte (0x01-0x4b for direct, 0x4c-0x4e for PUSHDATA).
-   DATA-LEN is the length of data being pushed.
-   DATA is the actual data bytes (for checking if content could use OP_0/OP_1-16/OP_1NEGATE).
-   Returns T if encoding is minimal, NIL if not."
-  (cond
-    ;; Direct push (0x01-0x4b): check if data content could use a special opcode
-    ((<= opcode #x4b)
-     (cond
-       ;; Empty data should use OP_0 (0x00), not 0x01 with 0 bytes
-       ;; Actually, 0x01 with 0 bytes is invalid; but 0x01 0x00 (push 1 byte of 0x00) is not minimal
-       ;; Empty should be OP_0, not a direct push
-       ((zerop data-len) nil)  ; Empty should use OP_0
+(defun minimal-push-encoding-p (opcode data)
+  "Core CheckMinimalPush (script/script.cpp:373-396): the push of DATA under
+OPCODE is the SHORTEST encoding of those bytes.
 
-       ;; Single byte push - check if value could use OP_N or OP_1NEGATE
-       ;; Note: OP_0 pushes empty array, not [0x00], so 0x00 is NOT caught here
-       ((= data-len 1)
-        (let ((byte (aref data 0)))
-          (cond
-            ;; 0x81 (-1) should use OP_1NEGATE
-            ((= byte #x81) nil)
-            ;; 0x01-0x10 should use OP_1 through OP_16
-            ((and (>= byte 1) (<= byte 16)) nil)
-            ;; Other single bytes (including 0x00) are fine
-            (t t))))
+OPCODE is a pushdata opcode -- OP_0 through OP_PUSHDATA4. OP_1NEGATE and
+OP_1..OP_16 are minimal by definition and Core asserts they never reach here.
 
-       ;; Multi-byte push is always fine for direct push
-       (t t)))
-
-    ;; OP_PUSHDATA1 (0x4c): only valid for lengths > 75 (but <= 255)
-    ((= opcode #x4c)
-     (> data-len 75))
-
-    ;; OP_PUSHDATA2 (0x4d): only valid for lengths > 255 (but <= 65535)
-    ((= opcode #x4d)
-     (> data-len 255))
-
-    ;; OP_PUSHDATA4 (0x4e): only valid for lengths > 65535
-    ((= opcode #x4e)
-     (> data-len 65535))
-
-    ;; Unknown opcode
-    (t t)))
+Two callers: the interpreter's MINIMALDATA rule, and miniscript, which
+enforces it UNCONDITIONALLY because its script-to-expression mapping has to be
+one to one -- a redundant encoding would give one expression two scripts
+(miniscript.cpp:396-397, solver.cpp:71-72)."
+  (let ((len (length data)))
+    (cond
+      ;; Should have used OP_0.
+      ((zerop len) (zerop opcode))
+      ;; Should have used OP_1..OP_16, or OP_1NEGATE for 0x81. Note OP_0
+      ;; pushes the EMPTY array and not [0x00], so a one-byte push of zero
+      ;; IS the minimal encoding of those bytes.
+      ((and (= len 1) (or (<= 1 (aref data 0) 16) (= (aref data 0) #x81))) nil)
+      ;; Must have used the direct-length opcode, then PUSHDATA1, PUSHDATA2.
+      ((<= len 75) (= opcode len))
+      ((<= len 255) (= opcode #x4c))
+      ((<= len 65535) (= opcode #x4d))
+      (t t))))
 
 (defun minimal-number-encoding-p (bytes)
   "Check if script number bytes are minimally encoded.

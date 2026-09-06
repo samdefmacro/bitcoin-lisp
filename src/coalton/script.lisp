@@ -744,7 +744,7 @@ that named two Core errors would make that comparison meaningless."
       (cl:let* ((flag-fn (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP")))
                 (minimal-fn (cl:fdefinition (cl:intern "MINIMAL-PUSH-ENCODING-P" "BITCOIN-LISP.COALTON.INTEROP"))))
         (cl:if (cl:and (cl:funcall flag-fn "MINIMALDATA")
-                       (cl:not (cl:funcall minimal-fn opcode (cl:length data) data)))
+                       (cl:not (cl:funcall minimal-fn opcode data)))
                (ScriptErr SE-MinimalData)
                (ScriptOk Unit)))))
 
