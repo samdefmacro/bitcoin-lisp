@@ -393,6 +393,15 @@
 (define-option "discardfee")
 (define-option "consolidatefeerate")
 (define-option "maxapsfee")
+;; -addresstype / -changetype: the output type a bare getnewaddress hands out
+;; and the change type a spend uses (Core CWallet::LoadWalletArgs,
+;; wallet.cpp:2955-2972, DEFAULT_ADDRESS_TYPE = bech32 and an EMPTY optional
+;; for the change type). An unparseable value is a startup error with Core's
+;; own wording -- Core refuses to load the wallet over it.
+(define-option "addresstype"
+  :apply (lambda (v) (bl.wallet:set-wallet-default-output-type :address v)))
+(define-option "changetype"
+  :apply (lambda (v) (bl.wallet:set-wallet-default-output-type :change v)))
 ;; -avoidpartialspends: Core reads it with GetBoolArg(DEFAULT_AVOIDPARTIALSPENDS
 ;; = false) in EVERY CCoinControl constructor (wallet/coincontrol.cpp:9-13), so
 ;; it is the starting value of every spend the wallet builds -- the WCC slot's
@@ -479,10 +488,10 @@
 ;;; init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
 
 (define-core-only-options
-  "addresstype" "alertnotify"
+  "alertnotify"
   "blockreconstructionextratxn"
   "capturemessages"
-  "changetype" "checkaddrman" "checkblockindex"
+  "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
   "discover" "dns"
