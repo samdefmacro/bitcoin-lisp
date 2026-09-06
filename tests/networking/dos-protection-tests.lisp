@@ -1387,6 +1387,79 @@ measures progress, not how long the message has taken"))))
     (is (= timeout-interval bl.net::+send-stall-timeout-seconds+))
     (is (= timeout-interval bl.net::+ping-timeout-seconds+))))
 
+(test peertimeout-gates-every-liveness-verdict
+  "GA11 1b4b73fe: -peertimeout is Core's master gate for every liveness
+disconnect, and InactivityCheck's timing rules exist at all.
+
+ShouldRunInactivityChecks -- m_connected + m_peer_connect_timeout < now
+(net.cpp:2003-2006) -- guards all four rules of InactivityCheck (:2008-2058)
+and, on its own first line, MaybeSendPing's ping timeout, whose comment says
+\"To disable the check during testing, increase -peertimeout\"
+(net_processing.cpp:5488-5497). Core's functional framework writes
+peertimeout=999999999 into every node's bitcoin.conf so that mocktime jumps
+disconnect nobody (test_framework/util.py:570-574); under exactly that setting
+we still dropped a peer whose ping had gone unanswered for 1200 s.
+
+The rules themselves were missing too: there was no last_recv rule, and
+CONNECTION-SEND-STALLED-P additionally requires data pending, so it is not
+Core's last_send rule and could not stand in for it."
+  (let* ((conn (make-test-connection :connected t :host "203.0.113.7"))
+         (peer (bl.net:make-peer :connection conn :state :ready
+                                 :address "203.0.113.7"))
+         ;; Core's TIMEOUT_INTERVAL (net.h:58-59), written out.
+         (window (* 20 60))
+         (units internal-time-units-per-second))
+    (flet ((connected-ago (seconds)
+             (setf (bl.net:peer-connect-time peer)
+                   (- (get-internal-real-time) (* seconds units))))
+           (talking-now ()
+             (setf (bl.net:connection-last-send-time conn) (bl.ser:get-node-time)
+                   (bl.net:connection-last-recv-time conn) (bl.ser:get-node-time))))
+      (connected-ago 3600)
+      (talking-now)
+      ;; 1. The ping timeout, which is what an operator raises the knob for.
+      (setf (bl.net:peer-ping-nonce peer) 7
+            (bl.net:peer-last-ping-time peer)
+            (- (get-internal-real-time)
+               (* (1+ window) units)))
+      (is (eq :disconnect (bl.net:check-peer-health peer))
+          "at the default -peertimeout the ping ladder is unchanged")
+      (let ((bl:*handshake-timeout-seconds* 999999999))
+        (is (eq :ok (bl.net:check-peer-health peer))
+            "the value Core's own test framework writes must silence it"))
+      ;; 2. Core's receive rule, which we did not have at all.
+      (setf (bl.net:peer-ping-nonce peer) nil
+            (bl.net:peer-last-ping-time peer) (get-internal-real-time))
+      (setf (bl.net:connection-last-recv-time conn)
+            (- (bl.ser:get-node-time) (1+ window)))
+      (is (eq :disconnect (bl.net:check-peer-health peer))
+          "socket receive timeout: nothing received for TIMEOUT_INTERVAL")
+      (let ((bl:*handshake-timeout-seconds* 999999999))
+        (is (eq :ok (bl.net:check-peer-health peer))
+            "and it is behind the same gate"))
+      ;; 3. Core's send rule reads the send TIME, so it fires with an EMPTY
+      ;;    queue -- where the backpressure signal is silent by construction.
+      (talking-now)
+      (setf (bl.net:connection-last-send-time conn)
+            (- (bl.ser:get-node-time) (1+ window)))
+      (is-false (bl.net:connection-send-stalled-p conn)
+                "the backpressure signal needs data pending, so it says nothing here")
+      (is (eq :disconnect (bl.net:check-peer-health peer))
+          "socket sending timeout: nothing sent for TIMEOUT_INTERVAL")
+      ;; 4. Nothing ever sent or received inside the first -peertimeout seconds.
+      (talking-now)
+      (setf (bl.net:connection-last-recv-time conn) 0)
+      (is (eq :disconnect (bl.net:check-peer-health peer))
+          "socket no message in first N seconds")
+      ;; 5. The gate itself: inside the connect grace period nothing is judged.
+      (connected-ago 1)
+      (is (eq :ok (bl.net:check-peer-health peer))
+          "a peer younger than -peertimeout is exempt from every rule above")
+      ;; ... and an unstamped connect time stays exempt, as CHECK-HANDSHAKE-TIMEOUT
+      ;; has always read a 0.
+      (setf (bl.net:peer-connect-time peer) 0)
+      (is (eq :ok (bl.net:check-peer-health peer))))))
+
 (test one-trickling-peer-does-not-stall-another
   "THE regression this refactor exists for. Two peers: one announces a large
 payload and delivers almost none of it, the other sends a complete message. A

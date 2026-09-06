@@ -1491,56 +1491,116 @@ what draws it -- named here because the pong has to match it."
 sent once no ping is outstanding and this long has passed.")
 (defconstant +ping-timeout-seconds+ +timeout-interval-seconds+
   "Core TIMEOUT_INTERVAL (net.h:59): a ping left unanswered this long
-disconnects the peer (MaybeSendPing, net_processing.cpp:5487-5494).")
+disconnects the peer (MaybeSendPing, net_processing.cpp:5487-5494) -- behind
+SHOULD-RUN-INACTIVITY-CHECKS-P, like every other liveness verdict.")
+
+(defun should-run-inactivity-checks-p (peer &optional (now (get-internal-real-time)))
+  "T once PEER has been connected for longer than -peertimeout: Core's
+CConnman::ShouldRunInactivityChecks, `node.m_connected + m_peer_connect_timeout
+< now` (net.cpp:2003-2006).
+
+In Core this is the master gate for EVERY liveness disconnect, not one timeout
+among several: it guards all four rules of InactivityCheck (net.cpp:2008-2058)
+and, less obviously, MaybeSendPing's ping timeout, whose own comment says \"To
+disable the check during testing, increase -peertimeout\"
+(net_processing.cpp:5488-5497). That is what makes -peertimeout the knob that
+silences liveness disconnects wholesale -- Core's functional framework writes
+peertimeout=999999999 into every node's bitcoin.conf so that mocktime jumps do
+not disconnect peers (test/functional/test_framework/util.py:570-574). Ours
+disconnected on an outstanding ping at 1200 s under exactly that setting,
+because the ping timeout was not gated by the knob.
+
+A peer whose CONNECT-TIME was never stamped is exempt, the same reading
+CHECK-HANDSHAKE-TIMEOUT has always given a 0."
+  (let ((connected-at (peer-connect-time peer)))
+    (and (not (zerop connected-at))
+         (< (+ connected-at (* bl:*handshake-timeout-seconds*
+                               internal-time-units-per-second))
+            now))))
+
+(defun inactivity-check-reason (conn &optional (unix-now (bl.ser:get-node-time)))
+  "Why CONN fails Core's CConnman::InactivityCheck (net.cpp:2008-2052), worded
+as Core words the line, or NIL when it passes. The caller applies
+SHOULD-RUN-INACTIVITY-CHECKS-P first, as Core's InactivityCheck does on its own
+first line; that gate is the only part of the check that is about the PEER
+rather than about its socket, which is why it is not asked here.
+
+Core's three timing rules, in Core's order: nothing ever sent or received,
+nothing SENT for TIMEOUT_INTERVAL, nothing RECEIVED for TIMEOUT_INTERVAL. They
+read the connection's LAST-SEND-TIME / LAST-RECV-TIME -- the times themselves,
+as Core's m_last_send / m_last_recv are, both already maintained on every
+accepted write and completed read -- and not the send queue.
+CONNECTION-SEND-STALLED-P remains the separate, tighter backpressure signal it
+is: it additionally requires data pending, so it is not this rule and cannot
+stand in for it. Core's fourth rule, the unfinished handshake, is peer state
+and lives in CHECK-HANDSHAKE-TIMEOUT.
+
+The receive rule is suspended for a SEND-PAUSED peer, and that is not a
+divergence but the consequence of one. Core's socket handler keeps receiving
+from a peer whose send buffer is over the cap, so its m_last_recv advances;
+our pump stops reading such a peer entirely (DRAIN-AND-REAP-PEER, Core's
+fPauseSend gate one level up in ProcessMessages), so its LAST-RECV-TIME would
+go stale for our own reason and this rule would disconnect a peer for the pause
+we imposed on it. A peer that never drains is still bounded --
+CONNECTION-SEND-STALLED-P fires on the same window."
+  (let ((last-send (connection-last-send-time conn))
+        (last-recv (connection-last-recv-time conn)))
+    (cond
+      ((or (zerop last-recv) (zerop last-send))
+       (format nil "socket no message in first ~D seconds~@[~A~]~@[~A~]"
+               bl:*handshake-timeout-seconds*
+               (and (zerop last-recv) ", never received from peer")
+               (and (zerop last-send) ", never sent to peer")))
+      ((> unix-now (+ last-send +timeout-interval-seconds+))
+       (format nil "socket sending timeout: ~Ds" (- unix-now last-send)))
+      ((and (> unix-now (+ last-recv +timeout-interval-seconds+))
+            (not (connection-send-paused-p conn)))
+       (format nil "socket receive timeout: ~Ds" (- unix-now last-recv))))))
 
 (defun check-handshake-timeout (peer)
-  "Check if a peer has exceeded the handshake timeout.
-Returns :disconnect if the peer should be disconnected, :ok otherwise."
-  (when (and (member (peer-state peer) '(:connected :connecting :handshaking))
-             (not (zerop (peer-connect-time peer))))
-    (let* ((now (get-internal-real-time))
-           (elapsed-secs (/ (float (- now (peer-connect-time peer)))
-                            (float internal-time-units-per-second))))
-      (when (> elapsed-secs bl:*handshake-timeout-seconds*)
+  "Check if a peer has exceeded the handshake timeout -- Core InactivityCheck's
+last rule, `if (!node.fSuccessfullyConnected)` behind ShouldRunInactivityChecks
+(net.cpp:2003-2006, 2053-2058). Returns :disconnect if the peer should be
+disconnected, :ok otherwise.
+
+The gate IS the rule here: Core's own condition is that the connection has
+outlived -peertimeout without finishing its handshake, so this asks
+SHOULD-RUN-INACTIVITY-CHECKS-P rather than recomputing the same arithmetic."
+  (if (and (member (peer-state peer) '(:connected :connecting :handshaking))
+           (should-run-inactivity-checks-p peer))
+      (progn
         (bl:log-warn "Handshake timeout for peer ~A (~,1Fs elapsed)"
-                               (peer-address peer) elapsed-secs)
-        (return-from check-handshake-timeout :disconnect))))
-  :ok)
+                     (peer-address peer)
+                     (/ (float (- (get-internal-real-time) (peer-connect-time peer)))
+                        (float internal-time-units-per-second)))
+        :disconnect)
+      :ok))
 
-(defun check-peer-health (peer)
-  "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
-Also checks handshake timeout for peers that haven't completed handshake.
+(defun maybe-send-ping (peer &optional (now (get-internal-real-time)))
+  "Core PeerManagerImpl::MaybeSendPing (net_processing.cpp:5487-5510). Returns
+:disconnect, :ping-sent or :ok.
 
-The ping half is Core's MaybeSendPing (net_processing.cpp:5487-5510): while a
-ping is outstanding, nothing is sent and the peer is disconnected once it has
-gone unanswered for +ping-timeout-seconds+; with none outstanding, a new ping
-goes out +ping-interval-seconds+ after the last one was sent. Both clocks are
-the send time of the last ping, so an outstanding ping is never overwritten
-and its age never reset."
-  ;; Send-side upkeep, regardless of state: retry buffered unsent bytes
-  ;; (non-blocking), and disconnect a peer whose socket has accepted nothing
-  ;; for +send-stall-timeout-seconds+ while data is pending (Core
-  ;; InactivityCheck \"socket sending timeout\").
-  (let ((conn (peer-connection peer)))
-    (when (and conn (connection-connected conn))
-      (flush-send-buffer conn)
-      (when (connection-send-stalled-p conn)
-        (bl:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
-                               (peer-address peer)
-                               (connection-send-queue-bytes conn))
-        (return-from check-peer-health :disconnect))))
+While a ping is outstanding nothing new is sent, and the peer is disconnected
+once it has gone unanswered for +PING-TIMEOUT-SECONDS+ -- but only once the
+-peertimeout gate is open, which is what Core puts on the first line of this
+function. SENDING a ping is NOT gated: Core's pingSend arms below the gate, so
+a node started with a huge -peertimeout still pings and still measures latency,
+it just never disconnects for the answer.
 
-  ;; Check handshake timeout for non-ready peers
-  (unless (eq (peer-state peer) :ready)
-    (return-from check-peer-health (check-handshake-timeout peer)))
-
+Both clocks are the send time of the last ping, so an outstanding ping is never
+overwritten and its age never reset."
   (let* ((last (peer-last-ping-time peer))
-         (age (and last (- (get-internal-real-time) last))))
+         (age (and last (- now last))))
     (cond
       ((peer-ping-nonce peer)
-       (if (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
-           :disconnect
-           :ok))
+       (cond
+         ((and (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
+               (should-run-inactivity-checks-p peer now))
+          (bl:log-cat "net" "ping timeout: ~,1Fs, disconnecting peer=~A"
+                      (/ (float age) (float internal-time-units-per-second))
+                      (peer-id peer))
+          :disconnect)
+         (t :ok)))
       ;; Never pinged: due NOW, as Core's is.
       ;;
       ;; This was `(- (get-internal-real-time) 0)` against a 0 initform, and
@@ -1563,6 +1623,42 @@ and its age never reset."
        (send-ping peer)
        :ping-sent)
       (t :ok))))
+
+(defun check-peer-health (peer)
+  "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
+
+Every DISCONNECT verdict below is behind SHOULD-RUN-INACTIVITY-CHECKS-P, Core's
+one gate in front of every liveness rule; what is not gated is the upkeep that
+is not a verdict -- flushing the send buffer, and sending the ping itself.
+Inside the gate the rules are Core's: the send-buffer backpressure signal, then
+InactivityCheck's timing rules (INACTIVITY-CHECK-REASON), then the unfinished
+handshake (CHECK-HANDSHAKE-TIMEOUT, which is InactivityCheck's fourth rule),
+then MaybeSendPing (MAYBE-SEND-PING)."
+  (let ((conn (peer-connection peer))
+        (now (get-internal-real-time)))
+    (when (and conn (connection-connected conn))
+      ;; Upkeep, not a verdict, so it runs whether or not the gate is open:
+      ;; retry buffered unsent bytes, non-blocking (Core's periodic
+      ;; SocketSendData).
+      (flush-send-buffer conn)
+      (when (should-run-inactivity-checks-p peer now)
+        ;; Buffered data the socket has accepted nothing of for the stall
+        ;; window (Core InactivityCheck "socket sending timeout", narrowed by
+        ;; the pending-data test to the backpressure case).
+        (when (connection-send-stalled-p conn)
+          (bl:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
+                       (peer-address peer)
+                       (connection-send-queue-bytes conn))
+          (return-from check-peer-health :disconnect))
+        (let ((reason (inactivity-check-reason conn)))
+          (when reason
+            (bl:log-cat "net" "~A, disconnecting peer=~A" reason (peer-id peer))
+            (return-from check-peer-health :disconnect)))))
+    ;; A peer that has not finished its handshake is not yet pingable; the
+    ;; handshake rule is behind the same gate, inside CHECK-HANDSHAKE-TIMEOUT.
+    (unless (eq (peer-state peer) :ready)
+      (return-from check-peer-health (check-handshake-timeout peer)))
+    (maybe-send-ping peer now)))
 
 (defun record-block-received-from-peer (peer)
   "Record that we received a block from PEER. Resets stalling state and
