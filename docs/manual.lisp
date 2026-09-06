@@ -670,7 +670,21 @@
   clock, whose timeout DOUBLES from 2s toward 64s after each use so our
   own bandwidth cannot evict a fleet) or for going silent past
   nPowTargetSpacing * (1 + 0.5 * other downloading peers) measured from
-  its LAST DELIVERY, never from when we asked. Outbound eclipse resistance rotates the extra outbound
+  its LAST DELIVERY, never from when we asked. -peertimeout is the GATE in
+  front of every liveness verdict, not one timeout among several: Core's
+  ShouldRunInactivityChecks guards all four InactivityCheck rules and, on
+  its own first line, MaybeSendPing's ping timeout, which is how raising
+  the knob silences liveness disconnects wholesale -- Core's functional
+  framework writes peertimeout=999999999 into every node so that mocktime
+  jumps disconnect nobody. Behind that gate are Core's rules themselves:
+  nothing ever sent or received inside the first -peertimeout seconds,
+  nothing SENT for TIMEOUT_INTERVAL, nothing RECEIVED for TIMEOUT_INTERVAL,
+  and an unfinished handshake. The receive rule is suspended while a peer
+  is send-paused, because our pump -- unlike Core's socket thread -- stops
+  READING a paused peer, so its last-recv would measure our own pause;
+  CONNECTION-SEND-STALLED-P, which additionally wants data pending, stays
+  the separate backpressure signal and bounds that peer anyway.
+  Outbound eclipse resistance rotates the extra outbound
   slot on a stale tip (`*max-tip-age-seconds*` is Core's
   nPowTargetSpacing * 3). The outbound refill IS
   ThreadOpenConnections: every try is a FRESH addrman draw, up to 100

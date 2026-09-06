@@ -1007,9 +1007,17 @@ even a header. Each must be distinguishable from absence."
 one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
   (is (= 120 bl.net::+ping-interval-seconds+))
   (is (= 1200 bl.net::+ping-timeout-seconds+))
+  ;; Every peer here is stamped as long-connected: the ping TIMEOUT is behind
+  ;; Core's ShouldRunInactivityChecks (net.cpp:2003-2006, and MaybeSendPing's
+  ;; own first line), so a peer still inside its -peertimeout grace period is
+  ;; not judged at all. PEERTIMEOUT-GATES-EVERY-LIVENESS-VERDICT covers the
+  ;; gate itself; this test is the ladder behind it.
   (flet ((peer-with-ping (age-seconds &key (nonce 7))
            (let ((peer (bl.net:make-peer :state :ready)))
-             (setf (bl.net:peer-ping-nonce peer) nonce
+             (setf (bl.net:peer-connect-time peer)
+                   (- (get-internal-real-time)
+                      (* 3600 internal-time-units-per-second))
+                   (bl.net:peer-ping-nonce peer) nonce
                    (bl.net:peer-last-ping-time peer)
                    (- (get-internal-real-time)
                       (* age-seconds internal-time-units-per-second)))

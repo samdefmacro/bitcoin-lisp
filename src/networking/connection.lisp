@@ -34,11 +34,13 @@ had drifted to a quarter of the value.")
   "Disconnect a peer whose socket has accepted no bytes for this long while
 unsent data is buffered (Bitcoin Core InactivityCheck \"socket sending
 timeout\": now > m_last_send + TIMEOUT_INTERVAL, net.h TIMEOUT_INTERVAL =
-20min; m_last_send advances only when the kernel accepts bytes). Core's check
-runs even with an empty queue but is kept alive by periodic pings; ours is
-additionally gated on data actually pending, which avoids false positives
-without changing the effective behavior (a jammed socket always has data
-pending — the pings themselves buffer up).")
+20min; m_last_send advances only when the kernel accepts bytes).
+
+Narrower than Core's rule on purpose: this one additionally requires data to
+be pending, which makes it a BACKPRESSURE signal -- a socket that is jammed
+rather than merely quiet. Core's own rule, with no such condition, is the send
+arm of INACTIVITY-CHECK-REASON; the two share this window and cover the same
+peer from two directions.")
 
 (defstruct connection
   "A TCP connection to a Bitcoin peer."
@@ -526,8 +528,11 @@ buffer drains below the cap. Nothing already queued is discarded."
 
 (defun connection-send-stalled-p (conn)
   "T when CONN has had unsent data buffered while the socket accepted nothing
-for +send-stall-timeout-seconds+ (Core InactivityCheck \"socket sending
-timeout\"). check-peer-health disconnects such peers."
+for +send-stall-timeout-seconds+ -- the backpressure half of Core
+InactivityCheck's \"socket sending timeout\". CHECK-PEER-HEALTH disconnects such
+peers, behind the -peertimeout gate like every other liveness verdict. Core's
+unconditional form of the same rule is the send arm of INACTIVITY-CHECK-REASON;
+this one asks additionally that data be pending, so it cannot stand in for it."
   (and (plusp (connection-send-queue-bytes conn))
        (> (- (get-internal-real-time) (connection-last-send-progress conn))
           (* +send-stall-timeout-seconds+ internal-time-units-per-second))))
