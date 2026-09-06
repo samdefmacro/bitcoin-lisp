@@ -141,6 +141,13 @@
 (define-option "networkactive" :key :network-active :type :bool)
 (define-option "rest" :key :rest :type :bool)
 (define-option "blocksonly" :key :blocksonly :type :bool)
+;; -persistmempool: Core ShouldPersistMempool (node/mempool_persist_args.cpp:13,
+;; DEFAULT_PERSIST_MEMPOOL = true) gates BOTH the startup replay and the
+;; shutdown dump. -persistmempoolv1 selects the older version-1 dump layout
+;; (node/mempool_args.cpp:106). Start-node keywords rather than :GLOBAL rows so
+;; an omitted option restores the default on every start.
+(define-option "persistmempool" :key :persist-mempool :type :bool)
+(define-option "persistmempoolv1" :key :persist-mempool-v1 :type :bool)
 (define-option "acceptstalefeeestimates" :key :accept-stale-fee-estimates :type :bool)
 (define-option "sync" :key :sync :type :bool)
 
@@ -458,8 +465,7 @@
   "limitdescendantcount" "limitdescendantsize" "logips"
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"
-  "natpmp" "peerbloomfilters" "persistmempool"
-  "persistmempoolv1" "printpriority"
+  "natpmp" "peerbloomfilters" "printpriority"
   "privatebroadcast" "rpcdoccheck"
   "rpcworkqueue" "shrinkdebugfile"
   "signer"

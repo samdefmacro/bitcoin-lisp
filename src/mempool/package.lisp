@@ -137,6 +137,7 @@ src/mempool/.")
    #:mempool-dat-path
    #:save-mempool-file
    #:read-mempool-file
+   #:*persist-mempool-v1*
    #:mempool-entry-size
    #:mempool-entry-usage
    #:mempool-entry-vsize

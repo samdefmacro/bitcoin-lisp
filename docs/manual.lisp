@@ -960,7 +960,8 @@
   (bitcoin-lisp.mempool:make-orphan-pool function)
   (bitcoin-lisp.mempool:fee-estimator class)
   (bitcoin-lisp.mempool:estimate-fee-rate function)
-  (bitcoin-lisp.mempool:save-mempool-file function))
+  (bitcoin-lisp.mempool:save-mempool-file function)
+  (bitcoin-lisp.mempool:*persist-mempool-v1* variable))
 
 (defsection @mining (:title "mining: block templates")
   "Core: `node/miner.cpp`. Transaction selection walks the mempool's
@@ -1127,6 +1128,8 @@
   (bitcoin-lisp::args->start-node-plist function)
   (bitcoin-lisp::apply-config-globals function)
   (bitcoin-lisp::signet-chain-params function)
+  (bitcoin-lisp::should-persist-mempool-p function)
+  (bitcoin-lisp::save-mempool-at-shutdown function)
   (bitcoin-lisp:sync-blockchain function)
   (bitcoin-lisp:node-status function)
   (bitcoin-lisp:request-node-shutdown function)

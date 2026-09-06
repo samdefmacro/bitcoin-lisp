@@ -1490,6 +1490,14 @@ READ-MEMPOOL-FILE.")
   "Absolute file offset of the first obfuscated byte: 8 for the version plus 9
 for the key's vector serialization.")
 
+(defvar *persist-mempool-v1* nil
+  "Core -persistmempoolv1 / CTxMemPool::Options::persist_v1_dat
+(node/mempool_args.cpp:106, read at node/mempool_persist.cpp:182). When true
+the dump is written in version 1: no obfuscation key record and no obfuscation,
+so a Core node too old to know version 2 can read it. The READER accepts both
+versions either way; only the writer follows this flag. Set once per run by
+START-NODE.")
+
 (defun mempool-dat-path (data-directory)
   "Path of the mempool persistence file under DATA-DIRECTORY, or NIL."
   (when data-directory
@@ -1556,7 +1564,7 @@ recompute the parents-first ordering, which on a large mempool is not cheap."
         (write-sequence txid s)))
      (length ordered))))
 
-(defun core-mempool-file-bytes (mempool &key key)
+(defun core-mempool-file-bytes (mempool &key key (v1 *persist-mempool-v1*))
   "MEMPOOL as a complete Core-format mempool.dat. Returns (values bytes count).
 
 COUNT rides out with the bytes so the caller does not have to recompute the
@@ -1565,32 +1573,48 @@ mempool that walk is not cheap, and the shutdown save is on the critical path
 of a restart.
 
 KEY is the 8-byte obfuscation key; a fresh random one is generated when it is
-not supplied. Passing it is what lets a test assert an exact byte layout."
-  (let* ((key (or key
-                  (let ((k (make-array +core-mempool-obfuscation-key-size+
-                                       :element-type '(unsigned-byte 8))))
-                    (dotimes (i (length k) k)
-                      (setf (aref k i) (random 256))))))
+not supplied. Passing it is what lets a test assert an exact byte layout.
+
+V1 writes Core's version-1 layout instead (-persistmempoolv1): the version word
+alone, then an UNOBFUSCATED payload -- Core DumpMempool skips both the key
+record and SetObfuscation when persist_v1_dat is set
+(node/mempool_persist.cpp:181-191), so a KEY is meaningless there and is
+ignored."
+  (let* ((key (unless v1
+                (or key
+                    (let ((k (make-array +core-mempool-obfuscation-key-size+
+                                         :element-type '(unsigned-byte 8))))
+                      (dotimes (i (length k) k)
+                        (setf (aref k i) (random 256)))))))
          (count 0)
          (payload (multiple-value-bind (bytes n) (%core-mempool-payload mempool)
                     (setf count n)
-                    bytes)))
-    (assert (= (length key) +core-mempool-obfuscation-key-size+))
-    ;; The key offset is the ABSOLUTE file position of each byte, so the
-    ;; payload starts at 17 and its first byte pairs with key byte 1.
-    (let ((obfuscated (copy-seq payload)))
-      (bl.store:obfuscate! obfuscated key
-                                       :key-offset +core-mempool-payload-offset+)
-      (values
-       (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-        (bl.ser:write-uint64-le s +core-mempool-dump-version+)
-        ;; The key is serialized as a VECTOR: a compact-size length then the
-        ;; bytes (util/obfuscation.h:61-68). Nine bytes, not eight.
-        (bl.ser:write-compact-size
-         s +core-mempool-obfuscation-key-size+)
-        (write-sequence key s)
-        (write-sequence obfuscated s))
-       count))))
+                    bytes))
+         ;; Version 1 writes the payload as it stands; version 2 obfuscates a
+         ;; copy. The copy is only made when it is needed, because on a live
+         ;; node this payload is the whole mempool.
+         (body (cond (v1 payload)
+                     (t (let ((obfuscated (copy-seq payload)))
+                          ;; The key offset is the ABSOLUTE file position of
+                          ;; each byte, so the payload starts at 17 and its
+                          ;; first byte pairs with key byte 1.
+                          (bl.store:obfuscate!
+                           obfuscated key
+                           :key-offset +core-mempool-payload-offset+)
+                          obfuscated)))))
+    (assert (or v1 (= (length key) +core-mempool-obfuscation-key-size+)))
+    (values
+     (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+       (bl.ser:write-uint64-le s (if v1
+                                     +core-mempool-dump-version-no-xor-key+
+                                     +core-mempool-dump-version+))
+       ;; The key is serialized as a VECTOR: a compact-size length then the
+       ;; bytes (util/obfuscation.h:61-68). Nine bytes, not eight.
+       (unless v1
+         (bl.ser:write-compact-size s +core-mempool-obfuscation-key-size+)
+         (write-sequence key s))
+       (write-sequence body s))
+     count)))
 
 (defun read-core-mempool-file-bytes (data)
   "Parse DATA as a Core mempool.dat. Returns

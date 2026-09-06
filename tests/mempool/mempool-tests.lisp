@@ -3530,3 +3530,105 @@ expression can keep Core's shape."
     (is (zerop (bl.mp:mempool-decayed-rolling-min-fee-rate
                 mempool (+ t0 (* 400 86400)))))
     (is (zerop (%rolling-min-fee mempool)))))
+
+;;;; -persistmempool / -persistmempoolv1 (finding 212b060f)
+;;;;
+;;;; Core reads the flag once (ShouldPersistMempool,
+;;;; node/mempool_persist_args.cpp:13-16) and gates BOTH drive sites with it:
+;;;; the startup LoadMempool (init.cpp:2047, an EMPTY path rather than a
+;;;; skipped call) and the shutdown DumpMempool (init.cpp:338-340, which also
+;;;; requires GetLoadTried).
+
+(test persistmempoolv1-writes-cores-version-1-layout
+  "-persistmempoolv1 selects MEMPOOL_DUMP_VERSION_NO_XOR_KEY: the version word
+alone, then an UNOBFUSCATED payload -- Core DumpMempool writes no key record and
+calls SetObfuscation({}) on that branch (node/mempool_persist.cpp:181-191). The
+version-2 write is the positive control: without it a writer that emitted
+nothing at all would satisfy every assertion below."
+  (let* ((mempool (bl.mp:make-mempool))
+         (tx (make-mempool-test-tx))
+         (txid (bl.ser:transaction-hash tx))
+         (key (%mp-key8 1 2 3 4 5 6 7 8)))
+    (bl.mp:mempool-add mempool txid (make-mempool-entry-for-tx tx))
+    (let ((v2 (bl.mp::core-mempool-file-bytes mempool :key key :v1 nil))
+          (v1 (bl.mp::core-mempool-file-bytes mempool :key key :v1 t)))
+      ;; positive control: the default is still Core's version 2, key and all
+      (is (equalp #(2 0 0 0 0 0 0 0) (subseq v2 0 8)))
+      (is (= 8 (aref v2 8)))
+      (is (equalp key (subseq v2 9 17)))
+      ;; version 1: no key record at all, and the payload starts at 8
+      (is (equalp #(1 0 0 0 0 0 0 0) (subseq v1 0 8)))
+      (is (= (- (length v2) 9) (length v1))
+          "version 1 must be exactly the nine bytes of the key record shorter")
+      (is (= 1 (aref v1 8)) "the transaction count must be written in the clear")
+      ;; and both round-trip through the reader, which knows both versions
+      (dolist (bytes (list v1 v2))
+        (multiple-value-bind (entries residual ok)
+            (bl.mp::read-core-mempool-file-bytes bytes)
+          (declare (ignore residual))
+          (is-true ok)
+          (is (equalp txid (bl.ser:transaction-hash (first (first entries))))))))))
+
+(defun %mempool-dat-version (path)
+  "The u64 version word a mempool.dat opens with: Core writes 1 under
+-persistmempoolv1 and 2 otherwise."
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((head (make-array 8 :element-type '(unsigned-byte 8))))
+      (read-sequence head in)
+      (loop with acc = 0
+            for i from 7 downto 0
+            do (setf acc (+ (ash acc 8) (aref head i)))
+            finally (return acc)))))
+
+(test persist-mempool-gates-both-drive-sites
+  "-persistmempool=0 must stop the startup replay AND the shutdown dump, and a
+node whose replay never finished must not overwrite the dump it was reading
+(Core GetLoadTried). Every branch is asserted against a real file on disk, so a
+gate that returned the right NIL while still writing would fail."
+  (with-temp-directory (dir)
+    (let* ((node (make-test-node :network :regtest))
+           (tx (make-mempool-test-tx))
+           (txid (bl.ser:transaction-hash tx))
+           (path (bl.mp:mempool-dat-path dir))
+           (bl::*persist-mempool* t)
+           (bl::*mempool-load-tried* t))
+      (setf (bl:node-data-directory node) dir)
+      (bl.mp:mempool-add (bl:node-mempool node) txid (make-mempool-entry-for-tx tx))
+      ;; (1) positive control: on, and the replay finished => the file is written
+      (is (= 1 (bl::save-mempool-at-shutdown node)))
+      (is-true (probe-file path))
+      (is (equal (namestring path) (namestring (bl::mempool-load-path node))))
+      (is (= 2 (%mempool-dat-version path)))
+      ;; (2) -persistmempoolv1 reaches the writer through the same call
+      (let ((bl.mp:*persist-mempool-v1* t))
+        (is (= 1 (bl::save-mempool-at-shutdown node)))
+        (is (= 1 (%mempool-dat-version path))))
+      ;; (3) -persistmempool=0: nothing is read and nothing is written
+      (delete-file path)
+      (let ((bl::*persist-mempool* nil))
+        (is (null (bl::mempool-load-path node))
+            "-persistmempool=0 must hand LoadMempool an empty path")
+        (is (null (bl::save-mempool-at-shutdown node)))
+        (is (null (probe-file path))))
+      ;; (4) the replay never finished: the existing dump is left alone
+      (is (= 1 (bl::save-mempool-at-shutdown node)))
+      (let ((before (with-open-file (in path :element-type '(unsigned-byte 8))
+                      (file-length in)))
+            (bl::*mempool-load-tried* nil))
+        (is (null (bl::save-mempool-at-shutdown node)))
+        (is (= before (with-open-file (in path :element-type '(unsigned-byte 8))
+                        (file-length in))))))))
+
+(test persist-mempool-options-reach-start-node
+  "Both names are real options now, so they feed START-NODE keywords instead of
+being reported as accepted-and-ignored."
+  (multiple-value-bind (plist merged)
+      (start-node-plist '("-regtest" "-persistmempool=0" "-persistmempoolv1=1"))
+    (is (eq nil (getf plist :persist-mempool)))
+    (is (member :persist-mempool plist) "the keyword must be present, not defaulted")
+    (is (eq t (getf plist :persist-mempool-v1)))
+    (is (null (bl.cfg:supplied-core-only-options merged))))
+  (multiple-value-bind (plist merged) (start-node-plist '("-regtest"))
+    (declare (ignore merged))
+    (is (not (member :persist-mempool plist))
+        "an absent option must leave START-NODE's own default in force")))

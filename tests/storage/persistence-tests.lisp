@@ -1864,7 +1864,15 @@ hook installed, so this covers the wiring and not just the ordering."
 
 (defun %shutdown-test-node (base)
   "A minimal running node over BASE with the state stop-node persists: one
-chainstate with a dirty coin, a mempool, an address book, a data directory."
+chainstate with a dirty coin, a mempool, an address book, a data directory.
+
+It stands in for a node that has FINISHED starting, so the mempool load-tried
+latch is set the way the startup path sets it (Core SetLoadTried after
+LoadMempool, init.cpp:2048). Without it the shutdown dump is correctly skipped
+-- Core does not overwrite a good mempool.dat from a node that never read one
+-- and a test about teardown ORDERING would be measuring the persist gate
+instead. That gate has its own test, on both branches."
+  (setf bl::*mempool-load-tried* t)
   (let ((node (bl:make-node :network :regtest)))
     (setf (bl:node-data-directory node) base
           (bl:node-chainstates node)
