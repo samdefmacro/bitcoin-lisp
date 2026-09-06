@@ -591,11 +591,29 @@
   which is what keeps a repeated address inside its two destinations for
   the period.
 
+  Which peer is asked for a transaction is Core's txrequest state machine:
+  an announcement is CANDIDATE while its NONPREF/TXID_RELAY/OVERLOADED delay
+  runs and after it, REQUESTED while its getdata is outstanding, and
+  COMPLETED -- never deleted -- once the peer answered notfound, let the
+  request expire, or delivered something, so it cannot re-announce its way
+  into a second window and its MAX_PEER_TX_ANNOUNCEMENTS budget stays
+  charged; the whole txhash is forgotten only when the LAST non-completed
+  announcement completes, or at a genuine resolution (mempool acceptance, a
+  connected block, orphan intake, a non-reconsiderable rejection). Among the
+  candidates the winner is `SipHash(node salt, txhash || peer) | preferred <<
+  63`, highest first, so it is uniform, per-transaction and not computable by
+  an announcer -- selecting by announcement order handed every request to
+  whoever announced first. A delivery completes ONE announcement
+  (ReceivedResponse), which is what stops an unsolicited witness-malleated
+  twin from releasing every honest announcer of a txid.
+
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.
-  The is-IBD answer is a one-way latch. A reorg used to be triggered only
-  by an ARRIVING block -- the sync pass now re-evaluates the best chain
-  itself."
+  The is-IBD answer is a one-way latch -- and both halves of Core's IBD gate
+  on transactions read it, the inv handler and the tx handler, so a test
+  driving either has to say which side of it the node is on. A reorg used to
+  be triggered only by an ARRIVING block -- the sync pass now re-evaluates
+  the best chain itself."
   (bitcoin-lisp.networking:peer class)
   (bitcoin-lisp.networking:connect-peer function)
   (bitcoin-lisp.networking:disconnect-peer function)
