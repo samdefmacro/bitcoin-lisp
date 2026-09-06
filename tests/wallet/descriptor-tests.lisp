@@ -1432,7 +1432,7 @@ sweep still fails but for a coin that looks fine."
           (is-true coin "the wallet does not even see the coin")
           (is (eq t (aval "spendable" coin))
               "the wallet reports the coin unspendable, so the finding is elsewhere")
-          (is (= 50.0d0 (aval "amount" coin)))
+          (is (= 50 (btc-amount (aval "amount" coin))))
           ;; The spend an operator asks for. Before the P2PK arm this raised
           ;; RPC -6 "Signing transaction failed" and moved nothing.
           (let ((txid (rpc "sendtoaddress"

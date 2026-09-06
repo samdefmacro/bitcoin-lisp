@@ -138,7 +138,9 @@ like the wallet's and are not spendable by it."
           (rpc "fund" "sendtoaddress" address (bl.rpc:format-money pay)
                nil nil nil nil nil nil nil 10)
           (rpc nil "generatetoaddress" 1 optrue)
-          (let* ((balance (rpc "desc" "getbalance"))
+          ;; The balance comes back as an amount TOKEN; decode it so a caller
+          ;; can compare it with a number (BTC-AMOUNT).
+          (let* ((balance (btc-amount (rpc "desc" "getbalance")))
                  (coin (first (rpc "desc" "listunspent")))
                  (spend (bl.ser:make-transaction
                          :version 2

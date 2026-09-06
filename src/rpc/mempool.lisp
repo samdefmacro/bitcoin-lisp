@@ -61,7 +61,8 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   (let ((mempool (rpc-get-mempool node))
         (incfee (satoshi->btc bl.mp:*incremental-relay-fee-rate*)))
     (if mempool
-        ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
+        ;; Rates are sat/kvB (Core CFeeRate); SATOSHI->BTC spells them
+        ;; BTC/kvB the way ValueFromAmount does.
         ;; Node lock: count/bytes/total-fee must be one consistent snapshot
         ;; while the sync thread adds/evicts entries (Core getmempoolinfo
         ;; takes pool.cs via the stats getters).
