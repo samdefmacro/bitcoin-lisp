@@ -2534,3 +2534,131 @@ the pre-existing conditions sit under the hierarchy."
   (is-true (subtypep 'bl.err:consensus-error 'bl.err:bitcoin-lisp-error))
   (is (eq :bad-txns-vin-empty
           (bl.err:error-reason (make-condition 'bl.err:consensus-error :reason :bad-txns-vin-empty)))))
+
+;;; --- Core's InitConfig ordering: the config file that is NOT read ----------
+;;; Finding 9e7729b8. Core records the original datadir and config path before
+;;; the file is read (common/init.cpp:34-35), because a datadir= line inside it
+;;; moves the datadir, and then refuses to start if the directory it moved to
+;;; holds a bitcoin.conf of its own (:65-95).
+
+(defun %write-conf (dir text)
+  "Write TEXT as DIR/bitcoin.conf and return the path."
+  (let ((path (merge-pathnames "bitcoin.conf" (uiop:ensure-directory-pathname dir))))
+    (ensure-directories-exist path)
+    (with-open-file (out path :direction :output :if-exists :supersede)
+      (write-string text out))
+    path))
+
+(test conf-path-is-resolved-the-way-core-resolves-it
+  "Core AbsPathForConfigVal (common/config.cpp:226-232): an absolute -conf
+stands, a RELATIVE one is joined onto the base datadir -- not the working
+directory. And an explicitly named -conf that cannot be opened is FATAL
+(:139-142), where we fell through to no configuration at all."
+  (with-temp-directory (dir)
+    (let ((conf (%write-conf dir (format nil "prune=550~%"))))
+      ;; relative, against the datadir
+      (is (equal (namestring conf)
+                 (namestring (bl::resolve-conf-path
+                              (list (format nil "-datadir=~A" (namestring dir))
+                                    "-conf=bitcoin.conf")
+                              (list (cons "datadir" (namestring dir))
+                                    (cons "conf" "bitcoin.conf"))
+                              (namestring dir)))))
+      ;; absolute, as given
+      (is (equal (namestring conf)
+                 (namestring (bl::resolve-conf-path
+                              (list (format nil "-conf=~A" (namestring conf)))
+                              (list (cons "conf" (namestring conf)))
+                              (namestring dir)))))
+      ;; no -conf: the datadir's own bitcoin.conf, and NOT explicit
+      (multiple-value-bind (path explicit-p)
+          (bl::resolve-conf-path '() '() (namestring dir))
+        (is (equal (namestring conf) (namestring path)))
+        (is (null explicit-p)))
+      ;; -noconf: no file at all
+      (is (null (bl::resolve-conf-path '("-noconf") '(("conf" . "0"))
+                                       (namestring dir))))
+      ;; readable check: present is fine, absent-and-explicit is fatal,
+      ;; absent-and-implicit is not (that is the default path).
+      (is (eq conf (bl::check-config-file-readable conf t)))
+      (let ((missing (merge-pathnames "nope.conf" (uiop:ensure-directory-pathname dir))))
+        (is (search "could not be opened"
+                    (%config-refusal (bl::check-config-file-readable missing t))))
+        (is (null (%config-refusal (bl::check-config-file-readable missing nil))))))))
+
+(test a-datadir-bitcoin-conf-that-is-not-the-file-we-read-is-fatal
+  "Both of Core's shadowing shapes. The assertions are on the SETTING that
+lives only in the shadowed file, not on the error text: what is lost is the
+whole second file -- here a prune target, so an unpruned sync onto a disk
+sized for a pruned one."
+  (with-temp-directory (root)
+    (let* ((a (merge-pathnames "dirA/" root))
+           (b (merge-pathnames "dirB/" root))
+           (c (merge-pathnames "dirC/" root))
+           (alt (merge-pathnames "alt.conf" root)))
+      (ensure-directories-exist b)
+      (%write-conf a (format nil "chain=regtest~%datadir=~A~%prune=1000~%"
+                             (namestring b)))
+      (%write-conf b (format nil "chain=regtest~%prune=2000~%"))
+      (%write-conf c (format nil "chain=regtest~%prune=550~%"))
+      (with-open-file (out alt :direction :output :if-exists :supersede)
+        (format out "chain=regtest~%"))
+      ;; (1) conf-set datadir=: dirB's own prune=2000 is nowhere in the result.
+      (let* ((text (alexandria:read-file-into-string
+                    (merge-pathnames "bitcoin.conf" a)))
+             (plist (start-node-plist '() text)))
+        (is (= 1000 (getf plist :prune))
+            "the file we read decided the prune target")
+        (is (equal (namestring b) (namestring (uiop:ensure-directory-pathname
+                                               (getf plist :data-directory))))
+            "and it moved the data directory to one holding another config file")
+        (let ((refusal (%config-refusal
+                        (bl::check-ignored-config-file
+                         a (merge-pathnames "bitcoin.conf" a) b '()))))
+          (is (search "which is ignored" refusal))
+          (is (search (namestring b) refusal) "the ignored file must be named")
+          (is (search "data directory" refusal)
+              "with no -conf, Core attributes the override to the data directory")
+          (is (search "allowignoredconf" refusal)))
+        ;; -allowignoredconf=1 downgrades it to a warning, and the warning is
+        ;; queued for debug.log rather than lost to the console.
+        (let ((bl:*deferred-log-lines* nil))
+          (is (null (%config-refusal
+                     (bl::check-ignored-config-file
+                      a (merge-pathnames "bitcoin.conf" a) b '()
+                      :allow-ignored t))))
+          (is (= 1 (length bl:*deferred-log-lines*)))
+          (is (eq :warn (first (first bl:*deferred-log-lines*))))))
+      ;; (2) -conf shadowing the datadir's file: the source clause names the
+      ;; command line argument instead.
+      (let ((refusal (%config-refusal
+                      (bl::check-ignored-config-file
+                       c alt c (list (cons "conf" (namestring alt)))))))
+        (is (search "command line argument" refusal))
+        (is (search "-conf=" refusal)))
+      ;; (3) -noconf: Core logs, it does not refuse.
+      (let ((bl:*deferred-log-lines* nil))
+        (is (null (%config-refusal
+                   (bl::check-ignored-config-file c nil c '()))))
+        (is (= 1 (length bl:*deferred-log-lines*)))
+        (is (eq :info (first (first bl:*deferred-log-lines*)))))
+      ;; (4) POSITIVE CONTROL: the ordinary case -- the datadir's own file IS
+      ;; the one we read -- must stay silent, or the check would refuse every
+      ;; node that ever starts.
+      (let ((bl:*deferred-log-lines* nil))
+        (is (null (%config-refusal
+                   (bl::check-ignored-config-file
+                    c (merge-pathnames "bitcoin.conf" c) c '()))))
+        (is (null bl:*deferred-log-lines*)))
+      ;; (5) and a datadir with no bitcoin.conf at all is silent too.
+      (is (null (%config-refusal
+                 (bl::check-ignored-config-file root alt root '())))))))
+
+(test allowignoredconf-is-a-real-option-now
+  "It has to be, or the node reports the very flag that governs the check as
+having no effect."
+  (multiple-value-bind (plist merged)
+      (start-node-plist '("-regtest" "-allowignoredconf=1"))
+    (declare (ignore plist))
+    (is (null (bl.cfg:supplied-core-only-options merged)))
+    (is (equal "1" (cfg "allowignoredconf" merged)))))

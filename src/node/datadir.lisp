@@ -5,6 +5,19 @@
 by REMOVE-PID-FILE; Core's g_generated_pid serves the same purpose — a pid file
 we did NOT create is never removed.")
 
+(defun %abs-path-for-config-val (path datadir)
+  "PATH resolved the way Core resolves a config-file path value
+(AbsPathForConfigVal with net_specific=false, common/config.cpp:226-232): an
+absolute path stands as given, a relative one is joined onto the BASE data
+directory -- NOT the process's working directory.
+
+Ours used the -conf value verbatim, so `-conf=bitcoin.conf` alongside
+`-datadir=/srv/node` read nothing at all where Core reads
+/srv/node/bitcoin.conf, and the node came up on defaults."
+  (if (uiop:absolute-pathname-p path)
+      (pathname path)
+      (merge-pathnames path (uiop:ensure-directory-pathname datadir))))
+
 (defun pid-file-path (pid-arg data-directory)
   "Where -pid points: PID-ARG, prefixed by DATA-DIRECTORY when relative (Core
 GetPidFile -> AbsPathForConfigVal, init.cpp:178-181). NIL when -pid was
@@ -14,10 +27,7 @@ negated, which Core treats as \"write no pid file\" (init.cpp:185)."
                    ((or (string= pid-arg "0") (string= pid-arg "")) nil)
                    (t pid-arg))))
     (when arg
-      (if (uiop:absolute-pathname-p arg)
-          (pathname arg)
-          (merge-pathnames arg (uiop:ensure-directory-pathname
-                                (or data-directory "./")))))))
+      (%abs-path-for-config-val arg (or data-directory "./")))))
 
 (defun write-pid-file (pid-arg data-directory)
   "Write our PID where -pid says (Core CreatePidFile, init.cpp:183-199).
@@ -81,6 +91,104 @@ fine; that is the default path, and creating THAT is the intended behaviour."
           (error 'bl.cfg:config-parse-error
                  :message (format nil "specified data directory \"~A\" does not exist"
                                   datadir)))))))
+
+(alexandria:define-constant +bitcoin-conf-filename+ "bitcoin.conf"
+  :test #'equal
+  :documentation "Core BITCOIN_CONF_FILENAME (common/args.h).")
+
+(defun %conf-negated-p (args)
+  "T when -noconf was given (Core IsArgNegated for -conf, which makes
+GetPathArg return an EMPTY path and suppresses the config file entirely).
+Read from the command-line rows rather than the parsed alist, because
+`-noconf` and `-conf=0` both reduce to the value 0 and only the first is
+Core's JSON false."
+  (let ((rows (remove-if-not (lambda (row) (string= (first row) "conf"))
+                             (bl.cfg:cli-settings-rows args))))
+    (and rows (bl.cfg:setting-row-negated-p (car (last rows))))))
+
+(defun resolve-conf-path (args cli datadir)
+  "Where the config file is, as Core's ReadConfigFiles resolves it
+(common/config.cpp:122-142 + AbsPathForConfigVal). Returns
+ (values path explicit-p): PATH is NIL under -noconf, the -conf value resolved
+against DATADIR when one was given, and <datadir>/bitcoin.conf otherwise.
+EXPLICIT-P says whether -conf named it, which is what makes an unreadable file
+FATAL rather than a silent fall-through to no configuration at all."
+  (let ((conf (cdr (assoc "conf" cli :test #'string=))))
+    (cond
+      ((%conf-negated-p args) (values nil t))
+      ((and conf (plusp (length conf)))
+       (values (%abs-path-for-config-val conf datadir) t))
+      (t (values (%abs-path-for-config-val +bitcoin-conf-filename+ datadir) nil)))))
+
+(defun check-config-file-readable (conf-path explicit-p)
+  "Core: an explicitly specified config file MUST be readable -- the error is
+`specified config file ... could not be opened.` (common/config.cpp:139-142).
+We fell through to no config at all, so a typo in -conf started a node on
+defaults -- and a default-configured node on mainnet is an unpruned sync with
+no rpcauth."
+  (when (and conf-path explicit-p (not (probe-file conf-path)))
+    (error 'bl.cfg:config-parse-error
+           :message (format nil "specified config file \"~A\" could not be opened."
+                            (namestring conf-path))))
+  conf-path)
+
+(defun %same-file-p (a b)
+  "Core fs::equivalent: the same file on disk, not merely the same spelling."
+  (let ((ta (ignore-errors (truename a)))
+        (tb (ignore-errors (truename b))))
+    (and ta tb (equal (namestring ta) (namestring tb)))))
+
+(defun check-ignored-config-file (orig-datadir conf-path effective-datadir cli
+                                  &key allow-ignored)
+  "Refuse to start when the EFFECTIVE data directory holds a bitcoin.conf that
+is not the file we read -- Core common/init.cpp:65-95.
+
+Two shapes reach it, and Core's comment (:25-33) says why neither may be
+silent: a `datadir=` line INSIDE the config file moves the data directory, and
+the bitcoin.conf sitting in the directory it moved to is then ignored; and a
+`-conf=` on the command line shadows the bitcoin.conf in the data directory.
+Either way the operator's whole second file -- prune, rpcauth, bind, txindex --
+is dropped with nothing in the log, and the node runs on defaults for all of it.
+
+ORIG-DATADIR is the data directory as the command line and the defaults gave
+it, before the config file was read; EFFECTIVE-DATADIR is what the merged
+config settled on. CONF-PATH is the file that was actually read, NIL under
+-noconf. ALLOW-IGNORED is -allowignoredconf, which downgrades the refusal to a
+warning and is the only way past it."
+  (let* ((base (uiop:ensure-directory-pathname effective-datadir))
+         (base-config (merge-pathnames +bitcoin-conf-filename+ base)))
+    (when (probe-file base-config)
+      (cond
+        ((null conf-path)
+         (defer-log :info "Data directory \"~A\" contains a \"~A\" file which is ~
+explicitly ignored using -noconf."
+                    (namestring base) +bitcoin-conf-filename+))
+        ;; The ordinary case: the file we read IS the datadir's own.
+        ((%same-file-p conf-path base-config))
+        (t
+         (let* ((cli-conf (cdr (assoc "conf" cli :test #'string=)))
+                (source (if (and cli-conf (plusp (length cli-conf)))
+                            (format nil "command line argument \"-conf=~A\"" cli-conf)
+                            (format nil "data directory \"~A\""
+                                    (namestring (uiop:ensure-directory-pathname
+                                                 orig-datadir)))))
+                (text (format nil
+                              "Data directory \"~A\" contains a \"~A\" file which is ignored, ~
+because a different configuration file \"~A\" from ~A is being used instead. ~
+Possible ways to address this would be to:~%~
+- Delete or rename the \"~A\" file in data directory \"~A\".~%~
+- Change datadir= or conf= options to specify one configuration file, not two, ~
+and use includeconf= to include any other configuration files."
+                              (namestring base) +bitcoin-conf-filename+
+                              (namestring conf-path) source
+                              +bitcoin-conf-filename+ (namestring base))))
+           (if allow-ignored
+               (defer-log :warn "~A" text)
+               (error 'bl.cfg:config-parse-error
+                      :message
+                      (format nil "~A~%- Set allowignoredconf=1 option to treat this ~
+condition as a warning, not an error."
+                              text)))))))))
 
 (defun %read-config-includes (conf-text cli datadir)
   "Resolve -includeconf, returning the list of config texts to merge (the main
