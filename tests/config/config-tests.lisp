@@ -349,7 +349,7 @@ merged config alist (options with no start-node keyword)."
         (bl:*permit-bare-multisig* nil)
         (bl.val:*signet-challenge*
           bl.val:*default-signet-challenge*))
-    (bl::apply-config-globals
+    (apply-config-globals
      '(("datacarrier" . "0") ("datacarriersize" . "100000")
        ("permitbaremultisig" . "1") ("signetchallenge" . "5121ff")))
     (is (eq nil bl:*accept-datacarrier*))
@@ -366,7 +366,7 @@ count is hard-capped at 64 like Core (mempool_args.cpp:110-112)."
           bl.mp:*cluster-count-limit*)
         (bl.mp:*cluster-size-limit*
           bl.mp:*cluster-size-limit*))
-    (bl::apply-config-globals
+    (apply-config-globals
      '(("limitclustercount" . "32") ("limitclustersize" . "50")))
     (is (= 32 bl.mp:*cluster-count-limit*))
     (is (= 50000 bl.mp:*cluster-size-limit*))    ; kvB -> vB
@@ -376,11 +376,11 @@ count is hard-capped at 64 like Core (mempool_args.cpp:110-112)."
       (is (= 32 (bl.mp::txgraph-max-cluster-count graph)))
       (is (= 50000 (bl.mp::txgraph-max-cluster-size graph))))
     ;; Out-of-range values are init errors.
-    (signals error (bl::apply-config-globals
+    (signals error (apply-config-globals
                     '(("limitclustercount" . "65"))))
-    (signals error (bl::apply-config-globals
+    (signals error (apply-config-globals
                     '(("limitclustercount" . "0"))))
-    (signals error (bl::apply-config-globals
+    (signals error (apply-config-globals
                     '(("limitclustersize" . "0"))))))
 
 (test config-args-returns-merged-alist
@@ -405,29 +405,29 @@ of the default set; -cjdnsreachable admits cjdns."
         (bl.net:*proxy* nil)
         (bl.net:*onion-proxy* nil))
     ;; Default: no -onlynet, no proxy, no flags => IP only.
-    (bl::apply-config-globals '())
+    (apply-config-globals '())
     (is (equal '(:ipv4 :ipv6) bl.net:*reachable-networks*))
     (is (null bl.net:*cjdns-reachable*))
     ;; -proxy makes onion reachable (Core: onion proxy follows -proxy).
-    (bl::apply-config-globals '(("proxy" . "127.0.0.1:9050")))
+    (apply-config-globals '(("proxy" . "127.0.0.1:9050")))
     (is-true (bl.net:reachable-network-p :torv3))
     (is-false (bl.net:reachable-network-p :i2p))
     (setf bl.net:*proxy* nil
           bl.net:*onion-proxy* nil)
     ;; Repeatable -onlynet restricts the set.
-    (bl::apply-config-globals
+    (apply-config-globals
      (bl.cfg:parse-cli-args '("-onlynet=ipv4" "-onlynet=ipv6")))
     (is (equal '(:ipv4 :ipv6) bl.net:*reachable-networks*))
-    (bl::apply-config-globals
+    (apply-config-globals
      (bl.cfg:parse-cli-args '("-onlynet=ipv4")))
     (is (equal '(:ipv4) bl.net:*reachable-networks*))
     (is-false (bl.net:reachable-network-p :ipv6))
     ;; -cjdnsreachable admits cjdns to the default set.
-    (bl::apply-config-globals '(("cjdnsreachable" . "1")))
+    (apply-config-globals '(("cjdnsreachable" . "1")))
     (is-true bl.net:*cjdns-reachable*)
     (is-true (bl.net:reachable-network-p :cjdns))
     ;; -onlynet=onion with a proxy works; onion-only set results.
-    (bl::apply-config-globals
+    (apply-config-globals
      (append (bl.cfg:parse-cli-args '("-onlynet=onion"))
              '(("proxy" . "127.0.0.1:9050"))))
     (is (equal '(:torv3) bl.net:*reachable-networks*))
@@ -449,14 +449,14 @@ without -cjdnsreachable."
         (bl.net:*onion-proxy-explicit* nil)
         (bl.net:*proxy* nil)
         (bl.net:*onion-proxy* nil))
-    (signals error (bl::apply-config-globals '(("onlynet" . "tor"))))
-    (signals error (bl::apply-config-globals
+    (signals error (apply-config-globals '(("onlynet" . "tor"))))
+    (signals error (apply-config-globals
                     '(("onlynet" . "onion") ("listenonion" . "0"))))
     ;; With the default -listenonion, -onlynet=onion alone is legal: the
     ;; onion proxy arrives later over the torcontrol connection.
-    (finishes (bl::apply-config-globals '(("onlynet" . "onion"))))
-    (signals error (bl::apply-config-globals '(("onlynet" . "i2p"))))
-    (signals error (bl::apply-config-globals '(("onlynet" . "cjdns"))))))
+    (finishes (apply-config-globals '(("onlynet" . "onion"))))
+    (signals error (apply-config-globals '(("onlynet" . "i2p"))))
+    (signals error (apply-config-globals '(("onlynet" . "cjdns"))))))
 
 ;;; --- G7-03: -onlynet clearnet exclusion must disable DNS seeding ------------
 ;;;
@@ -483,20 +483,20 @@ tests cannot leak reachability or seed state into each other."
 (defun %dnsseed-after (&rest cli)
   "Value of *dns-seed-enabled* after applying CLI, from a clean t default."
   (%with-net-config-globals
-    (bl::apply-config-globals (bl.cfg:parse-cli-args cli))
+    (apply-config-globals (bl.cfg:parse-cli-args cli))
     bl:*dns-seed-enabled*))
 
 (defun %force-dns-seed-after (&rest cli)
   "Value of *force-dns-seed* after applying CLI, from a clean NIL default."
   (%with-net-config-globals
-    (bl::apply-config-globals (bl.cfg:parse-cli-args cli))
+    (apply-config-globals (bl.cfg:parse-cli-args cli))
     bl::*force-dns-seed*))
 
 (defun %config-globals-refusal (&rest cli)
   "The message APPLY-CONFIG-GLOBALS refuses CLI with, or NIL when it accepts
 CLI."
   (%with-net-config-globals
-    (%config-refusal (bl::apply-config-globals (bl.cfg:parse-cli-args cli)))))
+    (%config-refusal (apply-config-globals (bl.cfg:parse-cli-args cli)))))
 
 (test config-onlynet-clearnet-exclusion-disables-dnsseed
   "G7-03: -onlynet excluding IPv4 and IPv6 soft-sets -dnsseed=0
@@ -587,7 +587,7 @@ discarded every DNS seed of a proxied node."
     ;; (no DNS is performed on this branch, so the test does no network I/O)
     ;; and every one must survive the filter.
     (%with-net-config-globals
-      (bl::apply-config-globals
+      (apply-config-globals
        (bl.cfg:parse-cli-args '("-proxy=127.0.0.1:9050")))
       (let ((dns (bl.net:discover-peers seeds)))
         (is (equal seeds dns))
@@ -600,7 +600,7 @@ discarded every DNS seed of a proxied node."
     ;; -proxy together with a clearnet-containing -onlynet: seeding stays on
     ;; (soft-set does not fire) and the hostnames stay dialable.
     (%with-net-config-globals
-      (bl::apply-config-globals
+      (apply-config-globals
        (bl.cfg:parse-cli-args '("-onlynet=onion" "-onlynet=ipv6"
                                        "-proxy=127.0.0.1:9050")))
       (is-true bl:*dns-seed-enabled*)
@@ -616,7 +616,7 @@ is dropped along with every clearnet literal."
   (let ((onion '("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"))
         (seeds (bl:network-dns-seeds :mainnet)))
     (%with-net-config-globals
-      (bl::apply-config-globals
+      (apply-config-globals
        (bl.cfg:parse-cli-args '("-onlynet=onion" "-proxy=127.0.0.1:9050")))
       (is (equal '(:torv3) bl.net:*reachable-networks*))
       ;; Layer 1.
@@ -631,7 +631,7 @@ is dropped along with every clearnet literal."
       (is (equal onion (bl::%reachable-seed-addresses onion))))
     ;; cjdns-only is equally clearnet-free with a proxy configured.
     (%with-net-config-globals
-      (bl::apply-config-globals
+      (apply-config-globals
        (bl.cfg:parse-cli-args '("-onlynet=cjdns" "-cjdnsreachable=1"
                                        "-proxy=127.0.0.1:9050")))
       (is-false bl:*dns-seed-enabled*)
@@ -1307,7 +1307,7 @@ does, and are stored as satoshis."
                      bl.mp:*bytes-per-sigop*)))
     (unwind-protect
          (progn
-           (bl::apply-config-globals
+           (apply-config-globals
             '(("dustrelayfee" . "0.00004")
               ("incrementalrelayfee" . "0.00002")
               ("bytespersigop" . "40")))
@@ -1327,7 +1327,7 @@ does, and are stored as satoshis."
                  (("incrementalrelayfee" . "x"))
                  (("bytespersigop" . "0"))
                  (("bytespersigop" . "-1"))))
-    (signals error (bl::apply-config-globals bad)))
+    (signals error (apply-config-globals bad)))
   ;; All three are known options and no longer reported as ignored.
   (dolist (name '("dustrelayfee" "incrementalrelayfee" "bytespersigop"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
@@ -1342,7 +1342,7 @@ constants. Each asserts the EFFECT, not the assignment."
                      bl.store:*blocks-xor*)))
     (unwind-protect
          (progn
-           (bl::apply-config-globals
+           (apply-config-globals
             '(("maxtipage" . "3600") ("maxsigcachesize" . "4")
               ("fastprune" . "1") ("blocksxor" . "0")))
            ;; -maxtipage: how old the tip may be before the node still calls
@@ -1372,7 +1372,7 @@ constants. Each asserts the EFFECT, not the assignment."
   ;; Malformed values are refused.
   (dolist (bad '((("maxtipage" . "-1")) (("maxsigcachesize" . "0"))
                  (("maxsigcachesize" . "x"))))
-    (signals error (bl::apply-config-globals bad)))
+    (signals error (apply-config-globals bad)))
   ;; All four are known and no longer reported as ignored.
   (dolist (name '("maxtipage" "maxsigcachesize" "fastprune" "blocksxor"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
@@ -1630,13 +1630,13 @@ one Core's ThreadOpenConnections would have taken."
     (unwind-protect
          (progn
            (setf bl:*dns-seed-enabled* t)
-           (bl::apply-config-globals '(("connect" . "1.2.3.4")))
+           (apply-config-globals '(("connect" . "1.2.3.4")))
            (is-false bl:*dns-seed-enabled*)
            (setf bl:*dns-seed-enabled* t)
-           (bl::apply-config-globals '(("maxconnections" . "0")))
+           (apply-config-globals '(("maxconnections" . "0")))
            (is-false bl:*dns-seed-enabled*)
            ;; Explicit -dnsseed=1 wins over the interaction.
-           (bl::apply-config-globals
+           (apply-config-globals
             '(("connect" . "1.2.3.4") ("dnsseed" . "1")))
            (is-true bl:*dns-seed-enabled*))
       (setf bl:*dns-seed-enabled* saved)))
@@ -1666,7 +1666,7 @@ Core's is: a typo'd range grants nothing and the operator never finds out."
         (saved-force bl.net:*whitelist-force-relay*))
     (unwind-protect
          (progn
-           (bl::apply-config-globals
+           (apply-config-globals
             '(("whitelistrelay" . "0") ("whitelistforcerelay" . "1")))
            ;; -whitelistrelay defaults TRUE and -whitelistforcerelay FALSE, so
            ;; only these values prove the wiring.
@@ -1768,7 +1768,7 @@ over budget from the first message."
            (is (= 0 (bl.net:outbound-target-bytes-left)))
            (is (= 0 (bl.net:max-outbound-time-left-in-cycle)))
            ;; A target reached by the hard limit.
-           (bl::apply-config-globals '(("maxuploadtarget" . "10")))
+           (apply-config-globals '(("maxuploadtarget" . "10")))
            (is (= (* 10 1024 1024) bl.net:*max-upload-target*))
            (setf bl.net::*max-outbound-cycle-start*
                  (bl.ser:get-unix-time)
@@ -1788,7 +1788,7 @@ over budget from the first message."
            (is-true (bl.net:outbound-target-reached-p t))
            ;; With a target large enough for the buffer, historical serving is
            ;; allowed again while the hard limit is far away.
-           (bl::apply-config-globals '(("maxuploadtarget" . "10T")))
+           (apply-config-globals '(("maxuploadtarget" . "10T")))
            (is-false (bl.net:outbound-target-reached-p t))
            ;; The cycle counter rolls after 24h rather than accumulating
            ;; forever — a target that could only ever be reached once is not a
@@ -1828,7 +1828,7 @@ over budget from the first message."
                      bl.net:*max-send-buffer-bytes*)))
     (unwind-protect
          (progn
-           (bl::apply-config-globals
+           (apply-config-globals
             '(("peertimeout" . "90") ("maxsendbuffer" . "2000")))
            (is (= 90 bl:*handshake-timeout-seconds*))
            ;; Core's -maxsendbuffer is in KILOBYTES and it multiplies by 1000,
@@ -1843,7 +1843,7 @@ over budget from the first message."
   (is (= 60 bl:*handshake-timeout-seconds*))
   (dolist (bad '((("peertimeout" . "0")) (("maxsendbuffer" . "-1"))
                  (("maxsendbuffer" . "x"))))
-    (signals error (bl::apply-config-globals bad)))
+    (signals error (apply-config-globals bad)))
   (dolist (name '("peertimeout" "maxsendbuffer"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))

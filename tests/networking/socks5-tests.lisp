@@ -477,7 +477,7 @@ to -proxy."
     (unwind-protect
         (progn
           ;; -proxy with default randomize; onion follows proxy.
-          (bl::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
+          (apply-config-globals '(("proxy" . "127.0.0.1:9150")))
           (let ((p bl.net:*proxy*))
             (is-true p)
             (is (equal "127.0.0.1" (bl.net:proxy-host p)))
@@ -485,13 +485,13 @@ to -proxy."
             (is-true (bl.net:proxy-randomize-credentials p))
             (is (eq p bl.net:*onion-proxy*)))
           ;; -proxyrandomize=0 disables stream isolation.
-          (bl::apply-config-globals
+          (apply-config-globals
            '(("proxy" . "10.0.0.1") ("proxyrandomize" . "0")))
           (let ((p bl.net:*proxy*))
             (is (= 9050 (bl.net:proxy-port p)))
             (is-false (bl.net:proxy-randomize-credentials p)))
           ;; -onion overrides the onion proxy only.
-          (bl::apply-config-globals
+          (apply-config-globals
            '(("proxy" . "10.0.0.1") ("onion" . "10.0.0.2:9051")))
           (is (equal "10.0.0.1" (bl.net:proxy-host
                                  bl.net:*proxy*)))
@@ -500,7 +500,7 @@ to -proxy."
           (is (= 9051 (bl.net:proxy-port
                        bl.net:*onion-proxy*)))
           ;; -noproxy parses as proxy=0 and clears the proxy.
-          (bl::apply-config-globals
+          (apply-config-globals
            (bl.cfg:parse-cli-args '("-noproxy")))
           (is (null bl.net:*proxy*)))
       (setf bl.net:*proxy* old-proxy
@@ -519,7 +519,7 @@ dial is refused."
           bl.net:*cjdns-reachable*))
     (unwind-protect
         (progn
-          (bl::apply-config-globals
+          (apply-config-globals
            '(("proxy" . "127.0.0.1:9150") ("onion" . "0")))
           (is-true bl.net:*proxy*)
           (is (null bl.net:*onion-proxy*))
@@ -530,12 +530,12 @@ dial is refused."
             (is (null proxy))
             (is (stringp refusal)))
           ;; -noonion parses to onion=0 and behaves identically.
-          (bl::apply-config-globals
+          (apply-config-globals
            (append (bl.cfg:parse-cli-args '("-noonion"))
                    '(("proxy" . "127.0.0.1:9150"))))
           (is (null bl.net:*onion-proxy*))
           ;; And plain -proxy (no -onion) re-enables: torv3 dialable again.
-          (bl::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
+          (apply-config-globals '(("proxy" . "127.0.0.1:9150")))
           (is-true (bl.net:dialable-network-p :torv3))
           (is-true (bl.net:reachable-network-p :torv3)))
       (setf bl.net:*proxy* old-proxy

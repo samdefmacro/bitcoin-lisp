@@ -31,6 +31,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:coins-cache-entry-fresh-p
    #:coins-cache-entry-dirty-p
    #:start-node-plist
+   #:apply-config-globals
    #:rest-request
    #:deliver-getdata
    #:deliver-tx
