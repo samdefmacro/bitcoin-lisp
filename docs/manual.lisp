@@ -918,7 +918,17 @@
   them through APPLY-VERSIONBITS-PARAMETERS, on regtest only, exactly as
   Core's ReadRegTestArgs feeds RegTestOptions. Miniscript's 201-op limit is
   a P2WSH rule and tapscript has none (miniscript.h:1566), which is also how
-  the script interpreter gates it."
+  the script interpreter gates it.
+
+  Miniscript is the one part of this layer whose input DEPTH an attacker
+  picks: `n:' costs one script byte and a tapscript leaf may be 329,482 of
+  them, so a descriptor well under the RPC body limit carries a
+  hundred-thousand-node tree. The parser and every walk over the result run
+  on an EXPLICIT stack -- MS-PARSE is Core's state machine, and everything
+  else goes through MS-TREE-EVAL (Core TreeEval, miniscript.h:645-752). Do
+  not add a recursive walker: what one raises is a STORAGE-CONDITION, which
+  is not an ERROR, so it escapes the RPC boundary and takes the worker thread
+  with it."
   (bitcoin-lisp.validation package)
   (bitcoin-lisp.validation:validate-transaction-structure function)
   (bitcoin-lisp.validation:validate-transaction-contextual function)
