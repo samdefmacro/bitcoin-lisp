@@ -746,57 +746,139 @@ The path is caller-supplied and only has to exist, so without a bound
 until the image dies. A real wallet dump is a few records per key plus one
 line per transaction; four million lines is far beyond any of ours.")
 
+(defun %map-dump-lines (path fn)
+  "Call FN with (BUFFER LENGTH) for each line of the file at PATH, as bytes,
+with READ-LINE's notion of a line: split on LF, the terminator not included,
+a last line without one still a line. BUFFER is reused from call to call and
+valid only for the call. The reader holds one 64 KiB chunk and one line,
+whatever the file's size. Returns the number of lines."
+  (let ((chunk (make-array 65536 :element-type '(unsigned-byte 8)))
+        (line (make-array 256 :element-type '(unsigned-byte 8)))
+        (len 0)
+        (count 0))
+    (declare (type fixnum len count))
+    (flet ((deliver ()
+             (incf count)
+             (funcall fn line len)
+             (setf len 0)))
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+        (loop for end = (read-sequence chunk in)
+              while (plusp end)
+              do (loop for i from 0 below end
+                       for byte = (aref chunk i)
+                       do (cond ((= byte 10) (deliver))
+                                (t (when (= len (length line))
+                                     (let ((grown (make-array (* 2 len)
+                                                              :element-type '(unsigned-byte 8))))
+                                       (replace grown line)
+                                       (setf line grown)))
+                                   (setf (aref line len) byte)
+                                   (incf len))))))
+      (when (plusp len) (deliver)))
+    count))
+
+(defun %dump-hex-bytes (buffer start end)
+  "The bytes the hex digits BUFFER[START, END) spell, either case. An odd
+length or a byte that is not a hex digit is an error, as HEX-TO-BYTES's is."
+  (unless (evenp (- end start))
+    (wallet-error "odd-length hex field in wallet dump"))
+  (let ((out (make-array (ash (- end start) -1) :element-type '(unsigned-byte 8))))
+    (flet ((nibble (b)
+             (cond ((<= 48 b 57) (- b 48))
+                   ((<= 97 b 102) (- b 87))
+                   ((<= 65 b 70) (- b 55))
+                   (t (wallet-error "non-hex byte ~D in wallet dump" b)))))
+      (loop for i from start below end by 2
+            for j from 0
+            do (setf (aref out j)
+                     (logior (ash (nibble (aref buffer i)) 4)
+                             (nibble (aref buffer (1+ i)))))))
+    out))
+
+(defun %dump-line-string (buffer length)
+  "The first LENGTH bytes of BUFFER as the string they spell, one character
+per byte (the dump is ASCII; this is the latin-1 reading the file had before)."
+  (map 'string #'code-char (subseq buffer 0 length)))
+
 (defun %parse-wallet-dump (path network)
   "The dump's (key . value) byte pairs, or NIL if PATH is not a valid dump
 for NETWORK. Everything is verified — magic, version, network, format, hex,
-and the checksum over the whole file — BEFORE the caller creates anything."
+and the checksum over the whole file — BEFORE the caller creates anything.
+
+Two passes over the file, each a stream of lines (%MAP-DUMP-LINES). The
+first hashes every line but the last into the checksum and keeps only the
+three header lines and that last one, so a file of any size costs one line
+of heap until it has been verified; the second decodes the records, the one
+thing the caller needs whole (it writes them in a single batch). Before this
+the whole file was read into a list of lines and concatenated into one body
+string before anything was checked -- several times the file, for a path the
+caller chose. Core has no dump reader of its own: restorewallet copies the
+SQLite file (wallet.cpp:472-525, fs::copy_file), and nothing there holds a
+backup in memory either."
   (handler-case
-      (let ((lines '()))
-        (with-open-file (in path :direction :input
-                                 :element-type 'character
-                                 :external-format :latin-1)
-          (loop for line = (read-line in nil nil)
-                for count from 0
-                while line
-                do (when (>= count +wallet-dump-max-lines+)
-                     (return-from %parse-wallet-dump nil))
-                   (push line lines)))
-        (setf lines (nreverse lines))
+      (let ((digest (ironclad:make-digest :sha256))
+            (header (make-array 3 :initial-element nil))
+            ;; The line before the current one, so it can be hashed once the
+            ;; current line proves it was not the checksum line. One buffer,
+            ;; grown when a line outruns it, never reallocated per line.
+            (previous (make-array 256 :element-type '(unsigned-byte 8)))
+            (previous-len 0)
+            (count 0)
+            (records '()))
+        (declare (type fixnum previous-len count))
+        ;; Pass 1: hash the body, keep the header and the last line.
+        (setf count
+              (%map-dump-lines
+               path
+               (lambda (buffer len)
+                 (when (plusp count)
+                   (ironclad:update-digest digest previous :end previous-len)
+                   (ironclad:update-digest digest +wallet-dump-newline+))
+                 (when (< count 3)
+                   (setf (aref header count) (%dump-line-string buffer len)))
+                 (when (> len (length previous))
+                   (setf previous (make-array len :element-type '(unsigned-byte 8))))
+                 (replace previous buffer :end2 len)
+                 (setf previous-len len)
+                 (incf count)
+                 (when (> count +wallet-dump-max-lines+)
+                   (return-from %parse-wallet-dump nil)))))
         ;; header(3) + checksum(1)
-        (when (< (length lines) 4)
+        (when (< count 4)
           (return-from %parse-wallet-dump nil))
-        (let* ((checksum-line (car (last lines)))
-               (body-lines (butlast lines))
-               (body (with-output-to-string (s)
-                       (dolist (line body-lines)
-                         (write-string line s)
-                         (write-char #\Newline s)))))
-          (unless (and (> (length checksum-line) 9)
-                       (string= "checksum," checksum-line :end2 9)
-                       (equalp (bl.crypto:hex-to-bytes
-                                (subseq checksum-line 9))
-                               (bl.crypto:hash256
-                                (flexi-streams:string-to-octets
-                                 body :external-format :latin-1))))
-            (return-from %parse-wallet-dump nil))
-          (unless (and (string= (first body-lines)
-                                (format nil "~A,~D" +wallet-dump-magic+
-                                        +wallet-dump-version+))
-                       ;; The network line is our application_id: Core keeps
-                       ;; the network magic in the SQLite header and refuses
-                       ;; a cross-network file, and a mainnet backup must
-                       ;; not restore onto a testnet node.
-                       (string= (second body-lines)
-                                (format nil "network,~(~A~)" network))
-                       (string= (third body-lines) "format,leveldb"))
-            (return-from %parse-wallet-dump nil))
-          (loop for line in (cdddr body-lines)
-                for comma = (position #\, line)
-                unless comma do (return-from %parse-wallet-dump nil)
-                collect (cons (bl.crypto:hex-to-bytes
-                               (subseq line 0 comma))
-                              (bl.crypto:hex-to-bytes
-                               (subseq line (1+ comma)))))))
+        ;; PREVIOUS now holds the last line: "checksum,<hex of hash256(body)>".
+        (let ((prefix (map '(vector (unsigned-byte 8)) #'char-code "checksum,")))
+          (unless (and (> previous-len 9)
+                       (equalp prefix (subseq previous 0 9))
+                       (equalp (%dump-hex-bytes previous 9 previous-len)
+                               (bl.crypto:sha256 (ironclad:produce-digest digest))))
+            (return-from %parse-wallet-dump nil)))
+        (unless (and (string= (aref header 0)
+                              (format nil "~A,~D" +wallet-dump-magic+
+                                      +wallet-dump-version+))
+                     ;; The network line is our application_id: Core keeps
+                     ;; the network magic in the SQLite header and refuses
+                     ;; a cross-network file, and a mainnet backup must
+                     ;; not restore onto a testnet node.
+                     (string= (aref header 1)
+                              (format nil "network,~(~A~)" network))
+                     (string= (aref header 2) "format,leveldb"))
+          (return-from %parse-wallet-dump nil))
+        ;; Pass 2: decode the record lines, header and checksum excluded.
+        (let ((index 0)
+              (last (1- count)))
+          (%map-dump-lines
+           path
+           (lambda (buffer len)
+             (when (and (>= index 3) (< index last))
+               (let ((comma (position 44 buffer :end len)))
+                 (unless comma
+                   (return-from %parse-wallet-dump nil))
+                 (push (cons (%dump-hex-bytes buffer 0 comma)
+                             (%dump-hex-bytes buffer (1+ comma) len))
+                       records)))
+             (incf index))))
+        (nreverse records))
     (error () nil)))
 
 (defun %resolved-directory (path)
