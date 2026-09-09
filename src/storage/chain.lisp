@@ -261,11 +261,24 @@ target is set."
   (let ((ancestors (chain-state-target-ancestors chain-state)))
     (when ancestors (1- (length ancestors)))))
 
-(defun best-header-entry (chain-state)
-  "The most-work non-invalid header entry in the block index (Core
-m_best_header; recomputed by scan like Core RecalculateBestHeader,
-validation.cpp:6379-6388). O(index size) — fine for its callers
-(snapshot-activation preconditions, RPC), not for per-block paths."
+(defvar *best-header-by-index*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "Core ChainstateManager::m_best_header (validation.h:1078), one per block
+INDEX: the most-work entry not known to be invalid, kept by
+ADD-BLOCK-INDEX-ENTRY and read by BEST-HEADER-ENTRY.
+
+Keyed by the index TABLE rather than kept in a chain-state slot because the
+index is shared by every chainstate of one node (a snapshot chainstate is
+built on the primary's, node/assumeutxo.lisp) while chain-state structs are
+per role -- Core keeps m_best_header on the MANAGER for the same reason -- so a
+per-struct slot would let two structs disagree about one index. Weak on the
+key so a test's index leaves with it.")
+
+(defun recalculate-best-header (chain-state)
+  "Scan the whole block index for the most-work non-invalid entry and make it
+the best header -- Core RecalculateBestHeader (validation.cpp:6275-6283), and
+what LoadBlockIndex does over the loaded index (validation.cpp:4951-4952).
+O(index size): BEST-HEADER-ENTRY calls it only when it has no answer."
   (let ((best nil))
     (maphash (lambda (hash entry)
                (declare (ignore hash))
@@ -275,7 +288,24 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
                                  (block-index-entry-chain-work best))))
                  (setf best entry)))
              (chain-state-block-index chain-state))
+    (when best
+      (setf (gethash (chain-state-block-index chain-state) *best-header-by-index*)
+            best))
     best))
+
+(defun best-header-entry (chain-state)
+  "The most-work non-invalid header entry in the block index -- Core
+m_best_header. O(1): the entry ADD-BLOCK-INDEX-ENTRY last recorded, unless
+that entry has since been marked :invalid (Core recalculates in
+InvalidateBlock, validation.cpp:3638-3668) or the index was loaded whole and
+nothing has been recorded for it yet, when RECALCULATE-BEST-HEADER scans once
+and records the answer. Cheap enough for the per-transaction and per-getdata
+paths, which is what Core's cached pointer is for."
+  (let ((best (gethash (chain-state-block-index chain-state)
+                       *best-header-by-index*)))
+    (if (and best (not (eq (block-index-entry-status best) :invalid)))
+        best
+        (recalculate-best-header chain-state))))
 
 (defun network-genesis-hash (network)
   "NETWORK's genesis block hash, 32 bytes in wire order (chain-params-genesis-hash)."
@@ -410,10 +440,24 @@ the position once it exists."
   (gethash hash (chain-state-block-index state)))
 
 (defun add-block-index-entry (state entry)
-  "Add a block index entry to the chain state."
-  (setf (gethash (block-index-entry-hash entry)
-                 (chain-state-block-index state))
-        entry))
+  "Add a block index entry to the chain state, and make it the best header
+when it carries strictly more work than the current one -- Core
+BlockManager::AddToBlockIndex (node/blockstorage.cpp:249-251), whose
+comparison is `best_header->nChainWork < pindexNew->nChainWork', so an
+equal-work entry never displaces the one seen first. An entry added already
+marked :invalid is one Core's AcceptBlockHeader would have refused before
+AddToBlockIndex ran, so it does not compete. While no best header has been
+recorded for this index, none is recorded here either: the first
+BEST-HEADER-ENTRY scans, which is how a loaded index gets its answer."
+  (let ((index (chain-state-block-index state)))
+    (setf (gethash (block-index-entry-hash entry) index) entry)
+    (let ((best (gethash index *best-header-by-index*)))
+      (when (and best
+                 (not (eq (block-index-entry-status entry) :invalid))
+                 (> (block-index-entry-chain-work entry)
+                    (block-index-entry-chain-work best)))
+        (setf (gethash index *best-header-by-index*) entry)))
+    entry))
 
 (defun best-block-hash (state)
   "Return the hash of the best (tip) block."

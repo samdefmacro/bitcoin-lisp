@@ -532,9 +532,15 @@
   because pruning deletes the lowest-numbered pair first and leaves a
   hole.
 
-  The header index and its delta log are shared by every chainstate on a
-  datadir (they take no storage-suffix), so what binds the delta to the
-  snapshot it extends is a per-BASE-PATH record, not a chain-state slot:
+  The best header -- Core's m_best_header, the most-work entry not known to
+  be invalid -- is kept per block INDEX by ADD-BLOCK-INDEX-ENTRY and read
+  O(1) by BEST-HEADER-ENTRY, which rescans only when the recorded entry has
+  been marked invalid or the index was loaded whole; getblockchaininfo's
+  `headers', the getdata off-chain test and IsCurrentForFeeEstimation's
+  third arm all read it. The header index and its delta log are shared by
+  every chainstate on a datadir (they take no storage-suffix), so what binds
+  the delta to the snapshot it extends is a per-BASE-PATH record, not a
+  chain-state slot:
   Core keeps the block index in BlockManager, outside any chainstate, and
   a per-chainstate copy of that binding let a snapshot chainstate and the
   primary invalidate each other's log. Replaying that log MUTATES the entry

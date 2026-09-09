@@ -4154,6 +4154,12 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
                                     (block-descends-from-p entry e)))
                        (setf (bl.store:block-index-entry-status e) :header-valid)))
                    (bl.store:chain-state-block-index chain-state))
+          ;; Core's ResetBlockFailureFlags (validation.cpp:3743-3762) leaves
+          ;; m_best_header where InvalidateBlock moved it, so until the next
+          ;; restart's LoadBlockIndex a reconsidered branch with more work is
+          ;; not Core's best header. Ours is recomputed now, which is what
+          ;; that restart would report.
+          (bl.store:recalculate-best-header chain-state)
           (let ((tip (bl.store:get-block-index-entry
                       chain-state (bl.store:best-block-hash chain-state)))
                 (target (best-valid-tip chain-state block-store)))
