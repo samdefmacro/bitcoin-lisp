@@ -56,6 +56,6 @@ the services gate (CNode::ExpectServicesFromConn)."
               (apply #'bl.net:make-peer args))))
       (is-true (expects :conn-type :outbound-full-relay))
       (is-true (expects :conn-type :block-relay))
-      (is-false (expects :conn-type :outbound-full-relay :manual t))
+      (is-false (expects :conn-type :manual))
       (is-false (expects :conn-type :feeler))
       (is-false (expects :conn-type :inbound)))))

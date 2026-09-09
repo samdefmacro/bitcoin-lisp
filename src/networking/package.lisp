@@ -116,7 +116,8 @@ headerssync.cpp. src/networking/.")
    #:maybe-send-feefilter
    #:maybe-start-reconciliation
    #:fee-filter-round
-   #:peer-manual
+   #:peer-manual-p
+   #:peer-permissions
    #:peer-outbound-or-block-relay-p
    #:loopback-address-p
    #:peer-conn-type

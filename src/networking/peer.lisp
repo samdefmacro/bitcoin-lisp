@@ -57,11 +57,6 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; wire (NIL = none yet); NEXT-SEND-FEEFILTER is a unix time, 0 = due now.
   (fee-filter-sent nil)
   (next-send-feefilter 0 :type integer)
-  ;; Operator-pinned connection (-addnode / addnode onetry). Core types these
-  ;; ConnectionType::MANUAL and exempts them from every automatic eviction; we
-  ;; carry the fact as a flag because our -addnode peers are otherwise typed
-  ;; :outbound-full-relay and would be indistinguishable.
-  (manual nil)
   ;; OUR nonce for this one connection, sent in the VERSION we push (Core
   ;; CNode::nLocalHostNonce, net.h:994). Per-connection, never node-wide.
   (local-nonce 0 :type (unsigned-byte 64))
@@ -201,6 +196,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;;                         don't request addrs from it
   ;;   :feeler               short-lived probe of an addrman "new" address to
   ;;                         validate it into "tried" (anti-eclipse), then close
+  ;;   :manual               operator-named destination (-addnode, -connect,
+  ;;                         addnode RPC): full relay like :outbound-full-relay,
+  ;;                         but outside every automatic slot budget, never
+  ;;                         auto-evicted and never punished (Core MANUAL)
+  ;;   :addr-fetch           one-shot -seednode dial, closed once it answers
   (conn-type :inbound :type keyword)
   ;; T once we have answered this peer's getaddr (Bitcoin Core m_getaddr_recvd):
   ;; one address response per connection, to limit address-stamping spam.
@@ -454,7 +454,6 @@ case of a peer whose best-known beats our low tip but misses the work floor."
     (when (and (not (peer-chain-sync-protect peer))
                (peer-live-p peer)
                (not (peer-inbound peer))
-               (not (peer-manual peer))
                (eq (peer-conn-type peer) :outbound-full-relay)
                (< *protected-outbound-count* +max-outbound-peers-to-protect+))
       (setf (peer-chain-sync-protect peer) t)
@@ -771,15 +770,19 @@ on chain-quality grounds — Core CNode::IsOutboundOrBlockRelayConn
 
 Two halves matter equally. It must INCLUDE :block-relay, which the word
 \"outbound\" does not obviously cover in our vocabulary. And it must EXCLUDE
-manual (-addnode) peers: ours are typed :outbound-full-relay, and
-connect-added-nodes redials every missing added node on the ~30s maintenance
-tick, so a plain not-inbound test would produce a
+:manual (-addnode) peers: connect-added-nodes redials every missing added node
+on the ~30s maintenance tick, so admitting one would produce a
 connect -> getheaders -> disconnect -> reconnect loop every 30 seconds against
 a peer the operator explicitly pinned. Feelers and inbound are excluded too."
   (and (not (peer-inbound peer))
-       (not (peer-manual peer))
        (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
        t))
+
+(defun peer-manual-p (peer)
+  "Core CNode::IsManualConn (net.h:791): PEER is an operator-named connection
+(-addnode, -connect, the addnode RPC). Such a peer is typed :manual by the
+dial sites in src/node/peers.lisp; nothing else produces the type."
+  (eq (peer-conn-type peer) :manual))
 
 ;;; Handshake
 
@@ -1254,8 +1257,9 @@ version handshake may proceed (over whichever transport), NIL to give up."
                                     near-tip)
   "Outbound version handshake (we initiate): send version+caps, receive the
 peer's version, send verack, await theirs. CONN-TYPE sets the peer's connection
-type (:outbound-full-relay, :block-relay, or :feeler) before the version is
-sent, so a block-relay/feeler peer advertises relay=0 and skips wtxidrelay.
+type (:outbound-full-relay, :block-relay, :feeler, :addr-fetch or :manual)
+before the version is sent, so a block-relay/feeler peer advertises relay=0 and
+skips wtxidrelay.
 When TRY-V2 (default: whenever the v2 transport is enabled and supported), the
 BIP324 encrypted transport is established first, reconnecting as v1 if the peer
 turns out not to speak it. Returns T on success."
@@ -1784,15 +1788,33 @@ the loopback itself and takes every onion peer with it."
                                       (parse-integer address :end dot))))
                     (and first-octet (or (= first-octet 127) (= first-octet 0)))))))))
 
+(defun peer-permissions (peer)
+  "Core CNode::m_permission_flags for PEER, derived rather than stored — see
+the divergence note in netaddress.lisp, and PEER-PERMISSION-FLAGS for what an
+inbound onion peer's address is worth.
+
+An inbound peer's flags come from -whitebind and the INCOMING ranges
+(net.cpp:1755-1772). An outbound connection starts from
+NetPermissionFlags::None and consults the OUTGOING ranges only when it is
+MANUAL (net.cpp:510-512):
+
+    std::vector<NetWhitelistPermissions> whitelist_permissions =
+        conn_type == ConnectionType::MANUAL ? vWhitelistedRangeOutgoing
+                                            : std::vector<NetWhitelistPermissions>{};
+
+so an automatic outbound peer inside a `noban,out@' range holds nothing. We
+applied the ,out ranges to every outbound peer, which handed an addrman-chosen
+peer that happened to fall inside the operator's range the operator's own
+trusted-peer exemptions."
+  (cond ((peer-inbound peer)
+         (peer-permission-flags (peer-address peer) t (peer-inbound-onion peer)))
+        ((peer-manual-p peer)
+         (peer-permission-flags (peer-address peer) nil))
+        (t 0)))
+
 (defun peer-has-permission-p (peer flag)
-  "T when PEER holds FLAG (Core CNode::HasPermission). Derived from the peer's
-address, direction and onion-ness — see the divergence note in netaddress.lisp
-for why the flags are computed rather than stored, and PEER-PERMISSION-FLAGS
-for what an inbound onion peer's address is worth."
-  (permission-flag-set-p
-   (peer-permission-flags (peer-address peer) (peer-inbound peer)
-                          (peer-inbound-onion peer))
-   flag))
+  "T when PEER holds FLAG (Core CNode::HasPermission over PEER-PERMISSIONS)."
+  (permission-flag-set-p (peer-permissions peer) flag))
 
 (defun record-misbehavior (peer &optional reason)
   "Discourage and disconnect PEER for a protocol violation. Bitcoin Core's
@@ -1821,9 +1843,9 @@ independently."
   ;; peers for bad behavior". A manual connection does not get NoBan by
   ;; default -- CConnman gives an outbound dial NetPermissionFlags::None and
   ;; consults vWhitelistedRangeOutgoing only for MANUAL connections
-  ;; (net.cpp:510-512) -- so an -addnode peer with no matching -whitelist
-  ;; ...,out entry holds no permissions at all and is exempt purely by being
-  ;; manual.
+  ;; (net.cpp:510-512, PEER-PERMISSIONS here) -- so an -addnode peer with no
+  ;; matching -whitelist ...,out entry holds no permissions at all and is
+  ;; exempt purely by its connection type.
   ;;
   ;; Without it an operator-pinned peer that trips any misbehaviour site was
   ;; disconnected AND discouraged, and CONNECT-PEER refuses a discouraged
@@ -1837,10 +1859,10 @@ independently."
   ;; warning rather than acting.
   ;;
   ;; Deliberately a separate test rather than folding MANUAL into
-  ;; PEER-PERMISSION-FLAGS: those flags are address-derived and shared with
+  ;; PEER-PERMISSIONS: those flags are address-derived and shared with
   ;; inbound admission and eviction, and granting a manual peer NoBan would
   ;; exempt it from those too, which Core does not do.
-  (when (peer-manual peer)
+  (when (peer-manual-p peer)
     (bl:log-warn "Not punishing manually connected ~A"
                  (peer-log-name peer))
     (return-from record-misbehavior nil))
