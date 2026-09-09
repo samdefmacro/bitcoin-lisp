@@ -164,6 +164,7 @@ src/storage/.")
    #:entry-target-ancestor-p
    #:chain-state-target-height
    #:best-header-entry
+   #:recalculate-best-header
    ;; Per-chainstate coins-view lifecycle
    #:open-chainstate-coins-view
    #:close-chainstate-coins-view

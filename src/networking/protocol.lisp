@@ -996,27 +996,29 @@ within *max-tip-age-seconds* of now — Core UpdateIBDStatus
   "Core IsCurrentForFeeEstimation (validation.cpp:280-292): may what the
 mempool accepts right now teach the fee estimator anything?
 
-Not during initial block download, and not while the tip is older than
-MAX_FEE_ESTIMATION_TIP_AGE -- in either state the node is catching up, so the
-number of blocks a transaction waits says nothing about the fee market.
+Not during initial block download, not while the tip is older than
+MAX_FEE_ESTIMATION_TIP_AGE, and not while the tip is more than one block
+behind the best header (`m_chain.Height() < m_best_header->nHeight - 1') --
+in each state the node is catching up, so the number of blocks a transaction
+waits says nothing about the fee market. One block behind is current: that is
+the ordinary gap between a header's arrival and its body's.
 
 It lives here, beside INITIAL-BLOCK-DOWNLOAD-P, because that latch does; Core
 keeps it in validation.cpp next to the ATMP call sites that read it.
-
-DIVERGENCE: Core has a third arm, `m_chain.Height() < m_best_header->nHeight
-- 1', which needs a cached most-work HEADER. Ours is BEST-HEADER-ENTRY, an
-O(index) scan, and this predicate runs once per accepted transaction. The two
-arms above cover the same state for every case the estimator can observe -- a
-node whose headers run ahead of its blocks is either in IBD or has a stale
-tip -- and erring towards `current' only ever admits data, never invents it."
+BEST-HEADER-ENTRY is Core's cached m_best_header, O(1), which is what lets a
+predicate that runs once per accepted transaction ask it."
   (and (not (initial-block-download-p chain-state))
        (let* ((tip-hash (bl.store:best-block-hash chain-state))
               (tip (and tip-hash
-                        (bl.store:get-block-index-entry chain-state tip-hash))))
+                        (bl.store:get-block-index-entry chain-state tip-hash)))
+              (best (bl.store:best-header-entry chain-state)))
          (and tip
               (>= (bl.ser:block-header-timestamp
                    (bl.store:block-index-entry-header tip))
                   (- (bl.ser:get-unix-time) +max-fee-estimation-tip-age+))
+              (or (null best)
+                  (>= (bl.store:block-index-entry-height tip)
+                      (1- (bl.store:block-index-entry-height best))))
               t))))
 
 (defun count-wtxid-relay-peers (peers)
@@ -2551,9 +2553,8 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
   (bl.ctx:with-node-context (chain-state mempool block-store) ctx
   (let ((blocks-served 0)
         (not-found '())
-        ;; Computed at most once per getdata, and only if an off-chain block is
-        ;; actually asked for: BEST-HEADER-ENTRY is an O(index) scan and this is
-        ;; a request path. (Making it O(1) is the deferred m_best_header work.)
+        ;; Read at most once per getdata, and only if an off-chain block is
+        ;; actually asked for, as Core reads m_best_header once per request.
         (best-header :unset))
     (flet ((best-header ()
              (when (eq best-header :unset)

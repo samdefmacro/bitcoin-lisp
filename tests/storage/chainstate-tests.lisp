@@ -179,3 +179,63 @@ semantics."
     (setf (bl:node-chain-state node) cs2)
     (is (equal (list cs2) (bl:node-chainstates node)))
     (is (eq view (bl:node-utxo-set node)))))
+
+;;;; The best header (Core ChainstateManager::m_best_header, validation.h:1078)
+
+(defun %cs-entry (byte height work prev &optional (status :header-valid))
+  (bl.store:make-block-index-entry
+   :hash (%cs-hash byte) :height height :chain-work work :prev-entry prev
+   :status status))
+
+(test best-header-follows-the-most-work-valid-entry
+  "BEST-HEADER-ENTRY is Core's m_best_header: ADD-BLOCK-INDEX-ENTRY moves it to
+an entry with strictly more work (BlockManager::AddToBlockIndex,
+node/blockstorage.cpp:249-251), an equal-work entry leaves it where it is, an
+entry added as :invalid never takes it, and when the best header itself is
+marked invalid the next-best valid entry takes over (InvalidateBlock,
+validation.cpp:3638-3668)."
+  (let* ((cs (bl.store:make-chain-state))
+         (g (%cs-entry 0 0 1 nil :valid))
+         (a1 (%cs-entry 1 1 3 g))
+         (b1 (%cs-entry 2 1 2 g))
+         (a2 (%cs-entry 3 2 5 a1))
+         (a2-twin (%cs-entry 4 2 5 a1))
+         (bad (%cs-entry 5 2 9 b1 :invalid)))
+    (is (null (bl.store:best-header-entry cs)) "an empty index has no best header")
+    (bl.store:add-block-index-entry cs g)
+    (is (eq g (bl.store:best-header-entry cs)))
+    (bl.store:add-block-index-entry cs a1)
+    (bl.store:add-block-index-entry cs b1)
+    (is (eq a1 (bl.store:best-header-entry cs)) "more work wins, less does not move it")
+    (bl.store:add-block-index-entry cs a2)
+    (is (eq a2 (bl.store:best-header-entry cs)))
+    (bl.store:add-block-index-entry cs a2-twin)
+    (is (eq a2 (bl.store:best-header-entry cs)) "equal work keeps the first")
+    (bl.store:add-block-index-entry cs bad)
+    (is (eq a2 (bl.store:best-header-entry cs))
+        "an entry known to be invalid never becomes the best header")
+    ;; invalidateblock on a2: the best header has to move off it.
+    (setf (bl.store:block-index-entry-status a2) :invalid)
+    (is (eq a2-twin (bl.store:best-header-entry cs))
+        "the next-best valid entry takes over")
+    (setf (bl.store:block-index-entry-status a2-twin) :invalid)
+    (is (eq a1 (bl.store:best-header-entry cs)))
+    ;; A header arriving after the recalculation is tracked again.
+    (let ((a3 (%cs-entry 6 2 4 a1)))
+      (bl.store:add-block-index-entry cs a3)
+      (is (eq a3 (bl.store:best-header-entry cs))))))
+
+(test best-header-is-shared-by-every-chainstate-on-one-index
+  "The block index is one table shared by the chainstates of a node (the
+assumeutxo snapshot chainstate is built on the primary's), and Core keeps
+m_best_header on the MANAGER, outside any chainstate. A header added through
+one chainstate is the best header seen through the other."
+  (let* ((primary (bl.store:make-chain-state))
+         (snapshot (bl.store:make-chain-state
+                    :block-index (bl.store:chain-state-block-index primary)))
+         (g (%cs-entry 0 0 1 nil :valid))
+         (h1 (%cs-entry 1 1 2 g)))
+    (bl.store:add-block-index-entry primary g)
+    (is (eq g (bl.store:best-header-entry snapshot)))
+    (bl.store:add-block-index-entry snapshot h1)
+    (is (eq h1 (bl.store:best-header-entry primary)))))

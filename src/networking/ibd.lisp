@@ -3033,8 +3033,8 @@ header we hold only on a FORK.
 
 The two disjuncts are Core's; the order here is an optimisation. The
 active-chain test walks down from the block tip and costs nothing when ENTRY is
-at that tip (the at-tip announcement case), while best-header-entry rescans the
-whole index — Core maintains m_best_header incrementally, we do not."
+at that tip (the at-tip announcement case), while the best-header test walks
+the best header's ancestry down to ENTRY's height."
   (and entry
        (or (bl.store:entry-on-active-chain-p chain-state entry)
            (let ((best (bl.store:best-header-entry chain-state)))

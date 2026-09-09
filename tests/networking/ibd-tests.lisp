@@ -1533,6 +1533,57 @@ recent with enough chain work; never flips back until reset-ibd-stop."
     (is-true (bl.net:initial-block-download-p
               (%make-ibd-latch-state (- now (* 48 60 60)))))))
 
+(defun %add-header-only-entries (state n)
+  "Extend STATE's index with N header-only entries above its tip, each with
+one more unit of work than the last, and return the highest."
+  (let ((prev (bl.store:get-block-index-entry
+               state (bl.store:best-block-hash state))))
+    (dotimes (i n prev)
+      (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element (+ 100 i))))
+        (setf prev (bl.store:make-block-index-entry
+                    :hash hash
+                    :height (1+ (bl.store:block-index-entry-height prev))
+                    :prev-entry prev
+                    :chain-work (1+ (bl.store:block-index-entry-chain-work prev))
+                    :status :header-valid
+                    :header (bl.store:block-index-entry-header prev)))
+        (bl.store:add-block-index-entry state prev)))))
+
+(test fee-estimation-is-not-current-while-headers-run-two-ahead
+  "Core IsCurrentForFeeEstimation's third arm (validation.cpp:288-290): a tip
+more than one block behind the best header is not current, even when it is
+fresh and IBD is over -- the node is catching up, so what the mempool accepts
+now says nothing about the fee market. One block behind IS current: that is the
+ordinary state between a header's arrival and its body's."
+  (let ((bl.net:*cached-is-ibd* nil)
+        (bl:*network* :regtest)
+        (now (bl.ser:get-unix-time)))
+    ;; Control: a fresh tip with no header beyond it is current.
+    (is-true (bl.net:current-for-fee-estimation-p (%make-ibd-latch-state now)))
+    (let ((one-ahead (%make-ibd-latch-state now)))
+      (%add-header-only-entries one-ahead 1)
+      (is-true (bl.net:current-for-fee-estimation-p one-ahead)))
+    (let ((two-ahead (%make-ibd-latch-state now)))
+      (%add-header-only-entries two-ahead 2)
+      (is-false (bl.net:current-for-fee-estimation-p two-ahead)))
+    ;; A more-work header chain that is INVALID does not count: the best
+    ;; header is the most-work entry that is not known to be bad.
+    (let ((invalid-ahead (%make-ibd-latch-state now)))
+      (setf (bl.store:block-index-entry-status
+             (%add-header-only-entries invalid-ahead 3))
+            :invalid)
+      (is-false (bl.net:current-for-fee-estimation-p invalid-ahead)
+                "two valid headers still run ahead of the tip")
+      (dolist (i '(100 101))
+        (setf (bl.store:block-index-entry-status
+               (bl.store:get-block-index-entry
+                invalid-ahead (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element i)))
+              :invalid))
+      (is-true (bl.net:current-for-fee-estimation-p invalid-ahead)
+               "with every header above the tip invalid, the tip is the best header"))))
+
 (test handle-inv-tx-fetch-gated-during-ibd
   "During IBD, tx invs are not recorded in the request tracker and no
 getdata is attempted (Core net_processing.cpp:4176-4180)."
