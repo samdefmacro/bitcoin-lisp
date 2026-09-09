@@ -459,3 +459,28 @@ reach into the router from each of them."
     (values (bl.rpc::rest-handle node (hunchentoot:script-name*))
             (hunchentoot:return-code*)
             (hunchentoot:content-type*))))
+
+(defun captured-sends (thunk)
+  "Call THUNK with SEND-MESSAGE replaced by a recorder and return the raw
+messages it sent, in order, restoring the real definition under
+UNWIND-PROTECT. A test peer owns no socket, so the production SEND-MESSAGE
+drops everything and a test could assert nothing about what went on the
+wire. Returns the framed bytes rather than a command or a parsed payload,
+so one fixture serves a test about the command sequence and a test about a
+payload field alike."
+  (let ((sent '())
+        (real (fdefinition 'bl.net:send-message)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.net:send-message)
+                 (lambda (peer bytes)
+                   (declare (ignore peer))
+                   (push bytes sent)
+                   t))
+           (funcall thunk))
+      (setf (fdefinition 'bl.net:send-message) real))
+    (nreverse sent)))
+
+(defun message-command (bytes)
+  "The command a v1-framed message BYTES carries (bytes 4-15 of the header)."
+  (bl.ser:bytes-to-command (subseq bytes 4 16)))
