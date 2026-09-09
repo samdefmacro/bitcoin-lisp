@@ -336,7 +336,9 @@
   `-conf=` that shadows the datadir's own file, unless `-allowignoredconf`
   downgrades it; RESOLVE-CONF-PATH resolves a relative `-conf` against the
   datadir, and CHECK-CONFIG-FILE-READABLE makes an explicit `-conf` that
-  cannot be opened fatal instead of a silent start on defaults."
+  cannot be opened fatal instead of a silent start on defaults, and a
+  DIRECTORY at the config path -- named or default -- fatal in Core's own
+  words (common/config.cpp:134-141) instead of a stream error in the read."
   (bitcoin-lisp.config package)
   (bitcoin-lisp.config:define-option macro)
   (bitcoin-lisp.config:define-core-only-options macro)

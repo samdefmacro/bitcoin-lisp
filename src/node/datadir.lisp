@@ -155,15 +155,28 @@ FATAL rather than a silent fall-through to no configuration at all."
       (t (values (%abs-path-for-config-val +bitcoin-conf-filename+ datadir) nil)))))
 
 (defun check-config-file-readable (conf-path explicit-p)
-  "Core: an explicitly specified config file MUST be readable -- the error is
-`specified config file ... could not be opened.` (common/config.cpp:139-142).
+  "Core ReadConfigFiles' two refusals (common/config.cpp:134-141), in Core's
+order and words. A DIRECTORY at the path is `Config file \"...\" is a
+directory.' whether -conf named it or it is the datadir's own bitcoin.conf;
+only then, and only for a file -conf named EXPLICITLY, an unopenable one is
+`specified config file \"...\" could not be opened.'.
+
 We fell through to no config at all, so a typo in -conf started a node on
 defaults -- and a default-configured node on mainnet is an unpruned sync with
-no rpcauth."
-  (when (and conf-path explicit-p (not (probe-file conf-path)))
-    (error 'bl.cfg:config-parse-error
-           :message (format nil "specified config file \"~A\" could not be opened."
-                            (namestring conf-path))))
+no rpcauth -- and a directory passed PROBE-FILE (which answers its truename)
+only to die in the read with `Is a directory', a stream error naming no
+option. init/common.cpp:131's `(is directory, not file)' warning is the
+same case seen from a later step: bitcoind never gets there, because
+ReadConfigFiles has already refused."
+  (when conf-path
+    (when (uiop:directory-exists-p conf-path)
+      (error 'bl.cfg:config-parse-error
+             :message (format nil "Config file \"~A\" is a directory."
+                              (namestring conf-path))))
+    (when (and explicit-p (not (probe-file conf-path)))
+      (error 'bl.cfg:config-parse-error
+             :message (format nil "specified config file \"~A\" could not be opened."
+                              (namestring conf-path)))))
   conf-path)
 
 (defun %same-file-p (a b)
