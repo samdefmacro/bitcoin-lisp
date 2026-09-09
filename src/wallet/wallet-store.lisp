@@ -50,6 +50,14 @@
 ;;; %WBUF / %WBR pair is byte-buf / byte-reader (bl.bytes), which the record
 ;;; schema below and this file's own codecs use. Moving the three callers of
 ;;; the stream pair onto bl.bytes retires it.
+;;;
+;;; A std::string is its BYTES behind a compactsize (serialize.h:779-784), and
+;;; both substrates encode a CL string as UTF-8 -- the same rule as the
+;;; :var-string row of DEFINE-MESSAGE. A string that reaches the wallet from a
+;;; client's JSON holds code points that were UTF-8 on the wire, so UTF-8 puts
+;;; Core's bytes on disk (CWalletTx::mapValue, wallet/transaction.h:167); and an
+;;; ASCII string's UTF-8 bytes are its ASCII bytes, so every record written
+;;; while these codecs were ASCII reads back unchanged.
 
 (defmacro %wser ((stream) &body body)
   "Serialize BODY's stream writes into a fresh (simple-array (unsigned-byte 8))."
@@ -57,14 +65,11 @@
            '(simple-array (unsigned-byte 8) (*))))
 
 (defun %wser-string (s str)
-  "std::string: compactsize length + raw bytes."
-  (bl.ser:write-var-bytes
-   s (flexi-streams:string-to-octets str :external-format :ascii)))
+  "std::string: compactsize length + the string's UTF-8 bytes."
+  (bl.ser:write-var-bytes s (bl.ser:utf8-string-to-bytes str)))
 
 (defun %wread-string (s)
-  (flexi-streams:octets-to-string
-   (bl.ser:read-var-bytes s)
-   :external-format :ascii))
+  (bl.ser:bytes-to-utf8-string (bl.ser:read-var-bytes s)))
 
 (defmacro %wparse ((stream bytes &key (start 0)) &body body)
   "Deserialize BODY's stream reads from BYTES starting at START."
@@ -76,9 +81,8 @@
   `(bl.bytes:with-byte-buf (,buf) ,@body))
 
 (defun %wser-string-into (bb str)
-  "std::string into the byte-buf BB: compactsize length + ASCII bytes."
-  (bl.bytes:bb-write-var-bytes
-   bb (flexi-streams:string-to-octets str :external-format :ascii)))
+  "std::string into the byte-buf BB: compactsize length + the string's UTF-8 bytes."
+  (bl.bytes:bb-write-var-bytes bb (bl.ser:utf8-string-to-bytes str)))
 
 (defmacro %wbr ((reader bytes) &body body)
   "Deserialize BODY's byte-reader reads from BYTES."
@@ -322,8 +326,7 @@ string, then the output type's code."
 type string in the schema is shorter than 253 bytes, so its compactsize
 prefix is always a single byte."
   (let ((type-len (aref key-bytes 0)))
-    (values (flexi-streams:octets-to-string
-             (subseq key-bytes 1 (1+ type-len)) :external-format :ascii)
+    (values (bl.ser:bytes-to-utf8-string (subseq key-bytes 1 (1+ type-len)))
             (subseq key-bytes (1+ type-len)))))
 
 ;;; --- Record values ---
