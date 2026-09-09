@@ -104,3 +104,20 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
                                                   (vector (length p)) p))
                          pubs)
                  (list (vector (+ #x50 (length pubs)) #xae)))))
+
+(defun one-input-tx-hex (txid-hex vout spk)
+  "The hex of a one-input, one-output transaction spending TXID-HEX:VOUT to
+SPK -- the raw transaction a signrawtransaction* prevtxs entry describes the
+input of. Both signers' prevtxs tests build their request from it."
+  (bl.crypto:bytes-to-hex
+   (bl.ser:transaction-wire-bytes
+    (bl.ser:make-transaction
+     :version 2
+     :inputs (vector (bl.ser:make-tx-in
+                      :previous-output (bl.ser:make-outpoint
+                                        :hash (bl.rpc:parse-hex-hash txid-hex)
+                                        :index vout)
+                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                      :sequence #xffffffff))
+     :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey spk))
+     :lock-time 0))))

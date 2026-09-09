@@ -791,6 +791,42 @@ sendrawtransaction accepts it. Preset locktime/sequence survive."
             (is (not (null (%ws-mempool-tx
                             node (bl.rpc:parse-hex-hash txid-hex)))))))))))
 
+(test signrawtransactionwithwallet-refuses-a-malformed-prevtxs-entry-in-cores-words
+  "The wallet signer runs the same ParsePrevouts as signrawtransactionwithkey
+(Core wallet/rpc/spend.cpp:922 -> rpc/rawtransaction_util.cpp:190-310), so a
+malformed entry is refused with the same code and sentence; the full branch
+table is signrawtransactionwithkey's test, these are the non-object,
+RPCTypeCheckObj and negative-vout rows. Core passes the wallet NO keystore
+(spend.cpp:922, nullptr), so redeemScript/witnessScript are not read there:
+a P2SH output without one is not refused, the positive control. This handler
+answered -8 \"Missing txid, vout, or scriptPubKey in prevtxs\", a sentence of
+its own. Driven through the dispatcher, unqualified: the sole loaded wallet
+is the request's wallet (Core GetWalletForJSONRPCRequest)."
+  (with-wallet-chain-node (node "ws-prevtxs")
+    (multiple-value-bind (wallet) (%ws-fund-wallet node)
+      (declare (ignore wallet))
+      (let* ((txid (format nil "~64,'0D" 1))
+             (spk-hex "76a91460baa0f494b38ce3c940dea67f3804dc52d1fb9488ac")
+             (raw (one-input-tx-hex txid 0 (bl.crypto:hex-to-bytes spk-hex))))
+        (flet ((answer (&rest entries)
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method
+                     node "signrawtransactionwithwallet"
+                     (wire-params (list raw entries))))))
+               (entry (&rest kvs)
+                 (loop for (k v) on kvs by #'cddr collect (cons k v))))
+          (is (equal (cons -22 "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}")
+                     (answer "abc")))
+          (is (equal (cons -3 "Missing scriptPubKey")
+                     (answer (entry "txid" txid "vout" 0))))
+          (is (equal (cons -3 "JSON value of type string for field vout is not of expected type number")
+                     (answer (entry "txid" txid "vout" "0" "scriptPubKey" spk-hex))))
+          (is (equal (cons -22 "vout cannot be negative")
+                     (answer (entry "txid" txid "vout" -1 "scriptPubKey" spk-hex))))
+          (is (null (answer (entry "txid" txid "vout" 0
+                                   "scriptPubKey" (format nil "a914~40,'0D87" 0))))))))))
+
 (test ws-signraw-watch-only-partial
   "signrawtransactionwithwallet on a watch-only wallet returns
 complete:false with Core's per-input errors array."

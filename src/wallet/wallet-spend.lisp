@@ -3658,38 +3658,12 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
           (multiple-value-bind (sighash-byte sighash-default-p)
               (%wallet-sighash-byte (third params))
             (let ((coins (%wallet-input-coins node wallet tx)))
-            ;; ParsePrevouts: caller-supplied prevout data overrides/extends.
-            (dolist (prevtx (and (listp (second params)) (second params)))
-              (let ((txid (%opt prevtx "txid"))
-                    (vout (%opt prevtx "vout"))
-                    (spk-hex (%opt prevtx "scriptPubKey"))
-                    (amount (%opt prevtx "amount"))
-                    (redeem-hex (%opt prevtx "redeemScript"))
-                    (witness-hex (%opt prevtx "witnessScript")))
-                (unless (and (stringp txid) (bl.rpc:valid-hex-hash-p txid)
-                             (integerp vout) (stringp spk-hex))
-                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                    :message "Missing txid, vout, or scriptPubKey in prevtxs"))
-                (when (minusp vout)
-                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                    :message "vout cannot be negative"))
-                (let* ((key (cons (bl.rpc:parse-hex-hash txid) vout))
-                       (script (bl.crypto:hex-to-bytes spk-hex))
-                       (known (gethash key coins)))
-                  (when (and known (not (equalp (first known) script)))
-                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                                      :message "Previous output scriptPubKey mismatch"))
-                  (setf (gethash key coins)
-                        (list script
-                              (if amount
-                                  (bl.rpc:amount-from-value amount)
-                                  (and known (second known)))
-                              (if (stringp redeem-hex)
-                                  (bl.crypto:hex-to-bytes redeem-hex)
-                                  (and known (third known)))
-                              (if (stringp witness-hex)
-                                  (bl.crypto:hex-to-bytes witness-hex)
-                                  (and known (fourth known))))))))
+            ;; Core ParsePrevouts with a NULL keystore (wallet/rpc/spend.cpp:
+            ;; 922): caller-supplied prevout data overrides/extends what the
+            ;; wallet knows, every malformed entry refused in Core's words;
+            ;; redeemScript/witnessScript are not read here, the wallet holds
+            ;; its own scripts.
+            (bl.rpc:parse-prevouts (bl.rpc:positional-array (second params)) coins)
             ;; Explicit non-DEFAULT sighash types cannot be honored on
             ;; taproot inputs yet (the P2TR arm signs keypath
             ;; SIGHASH_DEFAULT): refuse rather than silently sign with a

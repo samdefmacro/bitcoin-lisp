@@ -3098,6 +3098,94 @@ internal error."
           "the two JSON shapes produced different results:~%  ~A~%  ~A"
           from-alist from-hash))))
 
+(test signrawtransactionwithkey-refuses-a-malformed-prevtxs-entry-in-cores-words
+  "Core ParsePrevouts (rpc/rawtransaction_util.cpp:190-310) refuses every
+malformed prevtxs entry with a specific code and sentence; this handler
+SKIPPED any entry that was not a well-formed {txid, vout, scriptPubKey}
+triple, signed without it, and reported the input as lacking a prevtx. Every
+row below is one Core branch, in Core's order of checks:
+  - a non-object entry, -22 (:197);
+  - RPCTypeCheckObj over scriptPubKey/txid/vout -- a std::map, so the keys
+    are checked in SORTED order -- \"Missing <key>\" and the type sentence,
+    both -3 (rpc/util.cpp:56-68);
+  - ParseHashO txid and ParseHexO scriptPubKey, -8 in ParseHashV's words,
+    and getInt<int> on a vout that is no whole int32, whose plain
+    std::runtime_error is -1 rather than -3 (rpc/server.cpp:512-515);
+  - a negative vout, -22 (:213);
+  - a scriptPubKey that disagrees with the coin already known for the
+    outpoint -- here the previous entry -- -22 with both scripts' asm (:221);
+  - and, since this RPC hands Core a keystore, the redeemScript/witnessScript
+    rules for a P2SH or P2WSH output (:241-305): type-checked, at least one
+    present, consistent with each other, and matching the scriptPubKey.
+Positive controls: a well-formed P2PKH entry and a P2SH entry whose
+redeemScript hashes to the output are not refused."
+  (let* ((bl:*network* :regtest)
+         (node (bl:make-node :network :regtest))
+         (txid (format nil "~64,'0D" 1))
+         (spk-hex "76a91460baa0f494b38ce3c940dea67f3804dc52d1fb9488ac")
+         (spk (bl.crypto:hex-to-bytes spk-hex))
+         (wpkh-hex "001460baa0f494b38ce3c940dea67f3804dc52d1fb94")
+         (op-true (bl.crypto:hex-to-bytes "51"))
+         (p2sh-of-true (bl.crypto:bytes-to-hex
+                        (concatenate '(vector (unsigned-byte 8))
+                                     #(#xa9 #x14) (bl.crypto:hash160 op-true) #(#x87))))
+         (p2sh-zeros (format nil "a914~40,'0D87" 0))
+         (p2wsh-zeros (format nil "0020~64,'0D" 0))
+         (raw (one-input-tx-hex txid 0 spk)))
+    (flet ((answer (&rest entries)
+             (%rpc-wire-error node "signrawtransactionwithkey"
+                              (list raw (vector) entries)))
+           (entry (&rest kvs)
+             (loop for (k v) on kvs by #'cddr collect (cons k v))))
+      (is (equal (cons -22 "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}")
+                 (answer "abc")))
+      (is (equal (cons -22 "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}")
+                 (answer 5)))
+      ;; RPCTypeCheckObj: sorted keys, so scriptPubKey is missed first.
+      (is (equal (cons -3 "Missing scriptPubKey") (answer (entry "txid" txid "vout" 0))))
+      (is (equal (cons -3 "Missing txid") (answer (entry "scriptPubKey" spk-hex "vout" 0))))
+      (is (equal (cons -3 "Missing vout") (answer (entry "scriptPubKey" spk-hex "txid" txid))))
+      (is (equal (cons -3 "JSON value of type number for field txid is not of expected type string")
+                 (answer (entry "txid" 5 "vout" 0 "scriptPubKey" spk-hex))))
+      (is (equal (cons -3 "JSON value of type string for field vout is not of expected type number")
+                 (answer (entry "txid" txid "vout" "0" "scriptPubKey" spk-hex))))
+      ;; ParseHashO / getInt / ParseHexO, in that order.
+      (let ((zs (make-string 64 :initial-element #\z)))
+        (is (equal (cons -8 (format nil "txid must be hexadecimal string (not '~A')" zs))
+                   (answer (entry "txid" zs "vout" 0 "scriptPubKey" spk-hex)))))
+      (is (equal (cons -1 "JSON integer out of range")
+                 (answer (entry "txid" txid "vout" 1.5d0 "scriptPubKey" spk-hex))))
+      (is (equal (cons -22 "vout cannot be negative")
+                 (answer (entry "txid" txid "vout" -1 "scriptPubKey" spk-hex))))
+      (is (equal (cons -8 "scriptPubKey must be hexadecimal string (not 'zz')")
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" "zz"))))
+      ;; Two entries for one outpoint that disagree: Core's message carries
+      ;; both scripts as asm.
+      (is (equal (cons -22 (format nil "Previous output scriptPubKey mismatch:~%~
+OP_DUP OP_HASH160 60baa0f494b38ce3c940dea67f3804dc52d1fb94 OP_EQUALVERIFY OP_CHECKSIG~%~
+vs:~%0 60baa0f494b38ce3c940dea67f3804dc52d1fb94"))
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" spk-hex)
+                         (entry "txid" txid "vout" 0 "scriptPubKey" wpkh-hex))))
+      ;; The keystore branch: P2SH and P2WSH outputs need their script.
+      (is (equal (cons -8 "Missing redeemScript/witnessScript")
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" p2sh-zeros))))
+      (is (equal (cons -3 "JSON value of type number for field redeemScript is not of expected type string")
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" p2sh-zeros
+                                "redeemScript" 5))))
+      (is (equal (cons -8 "redeemScript does not correspond to witnessScript")
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" p2sh-zeros
+                                "redeemScript" "51" "witnessScript" "52"))))
+      (is (equal (cons -8 "redeemScript/witnessScript does not match scriptPubKey")
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" p2sh-zeros
+                                "redeemScript" "51"))))
+      (is (equal (cons -8 "redeemScript/witnessScript does not match scriptPubKey")
+                 (answer (entry "txid" txid "vout" 0 "scriptPubKey" p2wsh-zeros
+                                "witnessScript" "51"))))
+      ;; Positive controls.
+      (is (null (answer (entry "txid" txid "vout" 0 "scriptPubKey" spk-hex))))
+      (is (null (answer (entry "txid" txid "vout" 0 "scriptPubKey" p2sh-of-true
+                               "redeemScript" "51")))))))
+
 (test deriveaddresses-expands-a-multipath-descriptor
   "A multipath descriptor denotes SEVERAL descriptors, and Core's
 deriveaddresses returns one address array per expansion — an array of arrays
