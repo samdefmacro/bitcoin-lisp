@@ -340,6 +340,24 @@ REDEEM/WITNESS-SCRIPT are the P2SH/P2WSH sub-scripts to reveal."
   (tap-script-sigs nil :type list)   ; list of (xonly leaf-hash sig)
   (tap-leaf nil))                    ; (script . control-block) of the leaf used
 
+(defun input-sig-witness-p (sig)
+  "True when SIG is a segwit (witness) signature -- the kinds for which Core's
+ProduceSignature sets SignatureData.witness (script/sign.cpp:757-789): the
+P2WPKH and P2WSH arms, the miniscript satisfier that lives inside the P2WSH
+arm, and every WITNESS_V1_TAPROOT solution, key path or script path.
+SignPSBTInput's require_witness_sig reads that flag (psbt.cpp:488).
+
+An ECASE over the whole kind vocabulary rather than a list of the witness
+kinds: a kind added below and left out of a positive list is silently a
+legacy signature, refused wherever the witness_utxo is the only prevout --
+which is how :p2tr-script and the two miniscript kinds were refused for as
+long as the list was written by hand. A kind missing here signals instead."
+  (ecase (input-sig-kind sig)
+    ((:p2pk :p2pkh :p2sh-p2pk :p2sh-p2pkh :multisig :p2sh-multisig) nil)
+    ((:p2wpkh :p2sh-p2wpkh :p2wsh :p2sh-p2wsh :p2wsh-miniscript
+      :p2sh-p2wsh-miniscript :p2tr :p2tr-script)
+     t)))
+
 (defun %tap-sig (privkey sighash tap-sighash-type)
   "A BIP341 signature: 64 bytes for SIGHASH_DEFAULT, else 65 with the sighash
 byte appended (Core's CreateSchnorrSig, sign.cpp:340)."

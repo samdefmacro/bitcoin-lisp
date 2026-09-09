@@ -2073,3 +2073,38 @@ label is the control: identical under either encoding."
               do (is (equal (list address) (address-for label))
                      "label class ~D did not survive the wallet file"
                      (char-code (char label 0))))))))
+
+;;; --- SignPSBTInput's require_witness_sig and the taproot script path ---------
+
+(test walletprocesspsbt-signs-a-tr-script-path-from-the-witness-utxo-alone
+  "Core SignPSBTInput's require_witness_sig (psbt.cpp:428-435, :488) refuses a
+NON-witness signature over an input whose only prevout source is the
+witness_utxo, and ProduceSignature sets sigdata.witness for every segwit
+solution -- the taproot SCRIPT path included (sign.cpp:781-786). Ours named the
+witness kinds by hand and left the script path out, so a tr() tree input
+carried by its witness_utxo alone -- the shape a PSBT from another creator
+arrives in -- was refused as if it were a legacy spend.
+
+The internal key is a bare pubkey the wallet holds no secret for, so only the
+script path can spend. The same input with a non_witness_utxo attached is the
+control that the signer itself is fine."
+  (with-wallet-test-node (node :network :regtest :keypool 2)
+    (let* ((internal "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+           (desc (bl.rpc:descriptor-add-checksum
+                  (format nil "tr(~A,pk(~A))" internal (regtest-wif 41)))))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "trtree" nil t))
+      (with-rpc-wallet ("trtree")
+        (let ((imported (first (bl.rpc:dispatch-rpc-method
+                                node "importdescriptors"
+                                (list (list (%ht "desc" desc "timestamp" "now")))))))
+          (is (eq t (%aval "success" imported)) "importdescriptors refused: ~S" imported))
+        (let* ((address (first (bl.rpc:dispatch-rpc-method node "deriveaddresses" (list desc))))
+               (spk (nth-value 1 (bl.crypto:decode-address address :regtest))))
+          (flet ((complete-p (psbt)
+                   (%aval "complete"
+                          (bl.rpc:dispatch-rpc-method
+                           node "walletprocesspsbt" (list (bl.ser:encode-psbt psbt))))))
+            (is (eq t (complete-p (%psbt-funded-spending spk 100000)))
+                "control: the tree input does not sign even with its non_witness_utxo")
+            (is (eq t (complete-p (%psbt-spending spk 100000)))
+                "a tr() script-path input carried by witness_utxo alone was refused")))))))

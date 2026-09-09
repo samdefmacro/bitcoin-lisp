@@ -1137,14 +1137,6 @@ RECORD-P is true when EFFECTIVE is non-default and must be written to the input
     (values eff
             (if taproot (/= eff #x00) (and (/= eff #x00) (/= eff #x01))))))
 
-(defun %input-sig-witness-p (sig)
-  "True when the input-sig SIG is a segwit (witness) signature — the kinds for
-which Core's ProduceSignature sets SignatureData.witness. Legacy kinds (:p2pk,
-:p2pkh, :p2sh-p2pk, :p2sh-p2pkh, :multisig, :p2sh-multisig) are false."
-  (and (member (bl.rpc:input-sig-kind sig)
-               '(:p2wpkh :p2tr :p2wsh :p2sh-p2wpkh :p2sh-p2wsh))
-       t))
-
 (defun %psbt-require-witness-sig-p (map)
   "Core SignPSBTInput's require_witness_sig: an input whose only prevout source is
 the witness_utxo (no non_witness_utxo) can only be signed with a witness
@@ -1310,7 +1302,7 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
               ;; authenticate a non-witness spend).
               (unless (or err
                           (and (%psbt-require-witness-sig-p map)
-                               (not (%input-sig-witness-p sig))))
+                               (not (bl.rpc:input-sig-witness-p sig))))
                 (when (and (bl.rpc:input-sig-redeem sig)
                            (not (bl.ser:psbt-map-find
                                  map bl.ser:+psbt-in-redeem-script+)))
