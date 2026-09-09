@@ -936,9 +936,7 @@ the total."
                 in (list (list "disconnect-peer" "10.7.0.1"
                                (lambda (p) (bl.net:disconnect-peer p)))
                          (list "record-misbehavior" "10.7.0.2"
-                               (lambda (p) (bl.net:record-misbehavior p "unit test")))
-                         (list "ban-peer" "10.7.0.3"
-                               (lambda (p) (bl.net:ban-peer p))))
+                               (lambda (p) (bl.net:record-misbehavior p "unit test"))))
               for seed from 1
               do (let ((peer (bl.net:make-peer :address address :state :ready
                                                :services bl.ser:+node-witness+)))

@@ -3904,8 +3904,8 @@ nothing: it counts as NEITHER inbound nor outbound in the census (:1297), can
 never be the protected front (:1303-1305), and a promotion targeting a gone
 node mutates nothing at all (ForNode returns without running the lambda). We
 hold the peer STRUCT rather than an id, so nothing resolves to nothing for us
-and we have to ask the struct: :disconnected / :banned is our \"gone\"."
-  (not (member (peer-state peer) '(:disconnected :banned))))
+and we have to ask the struct: :disconnected is our \"gone\"."
+  (not (eq (peer-state peer) :disconnected)))
 
 (defun maybe-set-peer-announcing-hb (peer)
   "Promote PEER to high-bandwidth compact-block announcements after it

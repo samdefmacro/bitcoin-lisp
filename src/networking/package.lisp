@@ -289,7 +289,6 @@ headerssync.cpp. src/networking/.")
    #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior
-   #:ban-peer
    #:peer-banned-p
    #:clear-ban-list
    #:ban-address

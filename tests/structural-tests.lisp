@@ -41,9 +41,8 @@
     "bitcoin-lisp:stop-file-logging"
 
     ;; Superseded, or written and never wired. Includes the legacy utxo-set
-    ;; API that coins-view-cache replaced, REQUEST-HEADERS beside the live
-    ;; REQUEST-HEADERS-FOR-IBD, and BAN-PEER, which nothing calls because
-    ;; misbehaviour discourages and setban bans by address.
+    ;; API that coins-view-cache replaced and REQUEST-HEADERS beside the live
+    ;; REQUEST-HEADERS-FOR-IBD.
     ;; Called only from top-level forms -- the EVAL-WHEN at the end of every
     ;; package file, the surface registrations at the end of rest.lisp and
     ;; ui.lisp; xref records calls from named functions only.
@@ -75,7 +74,6 @@
     "bitcoin-lisp.mempool:topological-subset-p"
     "bitcoin-lisp.mempool:txgraph-get-ancestors-union"
     "bitcoin-lisp.mempool:txgraph-get-descendants-union"
-    "bitcoin-lisp.networking:ban-peer"
     "bitcoin-lisp.networking:clear-discouraged"
     "bitcoin-lisp.networking:clear-pending-compact-block"
     "bitcoin-lisp.networking:compact-block-stats"
