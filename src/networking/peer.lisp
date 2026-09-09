@@ -5,7 +5,7 @@
 ;;; Handles the state machine for Bitcoin peer connections.
 
 (deftype peer-state ()
-  '(member :disconnected :connecting :connected :handshaking :ready :banned))
+  '(member :disconnected :connecting :connected :handshaking :ready))
 
 ;;; Monotonic per-node peer ids (Bitcoin Core CNode::id), assigned at peer
 ;;; creation. Exposed via getpeerinfo "id" and used by getblockfrompeer to name a
@@ -386,15 +386,15 @@ Core's `!pfrom.fDisconnect`.
 Core marks a node it has decided to retire with fDisconnect and then refuses
 to give it anything more; the socket handler reaps it on the next pass and
 FinalizeNode runs. We have no fDisconnect flag: our retirement paths set the
-state instead — DISCONNECT-PEER and RECORD-MISBEHAVIOR to :disconnected,
-BAN-PEER to :banned — so those two states are our \"already retired\".
+state instead — every retirement path ends in DISCONNECT-PEER, which sets
+:disconnected — so that state is our \"already retired\".
 
 Anything that hands a retired peer a RESOURCE must consult this first: the
 peer will never be retired a second time, so whatever it was granted is never
-given back. (REPLACE-DISCONNECTED-PEERS reaps both states straight out of
+given back. (REPLACE-DISCONNECTED-PEERS reaps that state straight out of
 NODE-PEERS without running a release, because by then the retirement that set
 the state already did.)"
-  (not (member (peer-state peer) '(:disconnected :banned))))
+  (not (eq (peer-state peer) :disconnected)))
 
 ;;; --- Chain-sync protection slots (Core
 ;;; m_outbound_peers_with_protect_from_disconnect) ---
@@ -1706,8 +1706,10 @@ duplicates are rare)."
 ;;;    violation marks the peer for discouragement — there is no accumulating
 ;;;    ban score, and loose (non-block) transaction-validation failures do not
 ;;;    count as misbehavior at all.
-;;;  - Banning (manual): ban-peer / *banned-peers*, an explicit address ban with
-;;;    an expiry (e.g. for a future setban RPC). Unaffected by misbehavior.
+;;;  - Banning (manual): ban-address / *banned-peers*, an explicit ADDRESS ban
+;;;    with an expiry. Core's BanMan::Ban is reached from the setban RPC alone
+;;;    (rpc/net.cpp:799-808 via node/interfaces.cpp:233); misbehaviour never
+;;;    bans, so there is no per-peer ban entry point here either.
 
 (defconstant +ban-duration-seconds+ (* 24 60 60)
   "Default ban duration: 24 hours (Bitcoin Core DEFAULT_MISBEHAVING_BANTIME,
@@ -1868,24 +1870,6 @@ independently."
   ;; including the protection release that used to be duplicated here.
   (disconnect-peer peer)
   t)
-
-(defun ban-peer (peer)
-  "Ban a peer: record the ban expiry, retire the connection through the one
-finalize path, and leave the peer in state :banned.
-
-The retirement is DISCONNECT-PEER's (Core FinalizeNode, reached from every
-removal): this used to open-code a partial teardown and so left the peer's
-tx-request announcements, its orphans and its headers-sync buffer behind. The
-state is set AFTER delegating, because DISCONNECT-PEER sets :disconnected and
-:banned is the stronger fact callers read."
-  (let ((address (peer-address peer)))
-    (when (and address (plusp (length address)))
-      (bt:with-lock-held (*ban-lock*)
-        (setf (gethash address *banned-peers*)
-              (+ (bl.ser:get-node-time) *default-ban-time-seconds*)))
-      (save-banlist)))
-  (disconnect-peer peer)
-  (setf (peer-state peer) :banned))
 
 (defun peer-banned-p (address)
   "Check if ADDRESS is currently banned.

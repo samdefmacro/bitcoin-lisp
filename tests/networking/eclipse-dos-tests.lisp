@@ -1486,8 +1486,8 @@ slot. Ours is PEER-LIVE-P.
 
 This is the leak from the other end. A retirement releases the slot, but it
 only ever happens ONCE — replace-disconnected-peers reaps :disconnected peers
-straight out of node-peers with no release, and never reaps :banned peers at
-all — so a slot granted AFTER the retirement is never given back. Four of them
+straight out of node-peers with no release — so a slot granted AFTER the
+retirement is never given back. Four of them
 exhaust every slot for the life of the process and no peer can be protected
 again, which is precisely the state P2 exists to prevent."
   (let ((bl.net::*protected-outbound-count* 0))
@@ -1507,23 +1507,8 @@ again, which is precisely the state P2 exists to prevent."
       (is (= 1 bl.net::*protected-outbound-count*)
           "a refused grant must leave the counter untouched")
       (is-false (bl.net::peer-chain-sync-protect dead)
-                "and must not set the per-peer flag"))
-    ;; Retired through the real BAN-PEER. Worse than :disconnected: nothing
-    ;; ever reaps a banned peer, so a slot granted here is lost outright.
-    (let ((banned (%g708-peer :address "198.51.100.78")))
-      (unwind-protect
-           (progn
-             (bl.net:ban-peer banned)
-             (is (eq :banned (bl.net:peer-state banned))
-                 "precondition: the peer really is banned")
-             (is-false (bl.net:peer-live-p banned))
-             (is-false (bl.net:maybe-protect-outbound-peer banned)
-                       "a :banned peer must never be granted a slot")
-             (is (= 1 bl.net::*protected-outbound-count*)
-                 "a refused grant must leave the counter untouched")
-             (is-false (bl.net::peer-chain-sync-protect banned)))
-        ;; ban-peer writes the process-global ban list; put it back.
-        (bl.net:unban-address "198.51.100.78")))))
+                "and must not set the per-peer flag"))))
+
 
 (test g7-08-headers-from-a-retired-peer-do-not-grant-protection
   "The same refusal through the PRODUCTION path — ingest-headers-from-peer ->
@@ -1569,20 +1554,8 @@ so the only thing that differs is the peer's liveness."
         (is-false (bl.net::peer-chain-sync-protect peer)
                   "a retired peer must not be protected by the headers path")
         (is (= 0 bl.net::*protected-outbound-count*)
-            "and the counter must not move"))
-      ;; Same batch, peer already banned.
-      (let ((bl.net::*protected-outbound-count* 0)
-            (peer (%g708-peer :address "198.51.100.79")))
-        (unwind-protect
-             (progn
-               (bl.net:ban-peer peer)
-               (is (= 1 (ingest "test-g708-banned/" peer))
-                   "the batch is still processed — the peer is what changed")
-               (is-false (bl.net::peer-chain-sync-protect peer)
-                         "a banned peer must not be protected by the headers path")
-               (is (= 0 bl.net::*protected-outbound-count*)
-                   "and the counter must not move"))
-          (bl.net:unban-address "198.51.100.79"))))))
+            "and the counter must not move")))))
+
 ;;;; GA8 W3: the low-work drop must fire only where Core evaluates it
 ;;;;
 ;;;; Core reaches the disconnect solely through

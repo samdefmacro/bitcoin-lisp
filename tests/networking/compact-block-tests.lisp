@@ -1214,8 +1214,8 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
     ;; FIX — identical shape, but `out' goes away through the production
     ;; disconnect path first. Nothing calls into the HB code on disconnect: the
     ;; list's only reader re-reads liveness, so it does not matter WHICH of the
-    ;; several paths that kill a peer (disconnect-peer, record-misbehavior,
-    ;; ban-peer) got there.
+    ;; several paths that kill a peer (disconnect-peer, record-misbehavior)
+    ;; got there.
     (let ((bl.net::*hb-announcing-peers* '()))
       (let ((out (%g716-peer))
             (in1 (%g716-peer :inbound t))

@@ -2596,7 +2596,7 @@ getheaders. Total budget before a disconnect is 20min + 2min.")
 
 ;;; The protection half (maybe-protect-outbound-peer / release-outbound-protection
 ;;; and their counter) lives in peer.lisp: the slot must be released from
-;;; disconnect-peer, record-misbehavior and ban-peer (Core FinalizeNode), and
+;;; disconnect-peer and record-misbehavior (Core FinalizeNode), and
 ;;; peer.lisp loads before this file.
 
 (defun consider-chain-sync-eviction (peer chain-state now)
