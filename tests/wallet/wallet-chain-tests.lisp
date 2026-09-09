@@ -959,3 +959,48 @@ instead of an operator told why."
         (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw"))))
       (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
       (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw"))))))
+
+;;; --- CWalletTx mapValue strings are Core's bytes ---------------------------
+
+(test wallet-tx-map-value-holds-cores-utf-8-bytes
+  "CWalletTx::mapValue is std::map<std::string, std::string>
+(wallet/transaction.h:167, :222) and a std::string serializes as its BYTES
+behind a compactsize (serialize.h:779-784), so the comment a client sent in
+its JSON request -- UTF-8 on the wire -- lands on disk as those same bytes.
+The stream codec here was ASCII: a comment with any character above U+007F
+could not be written at all. UTF-8 keeps an ASCII record byte-identical (the
+golden bytes below are what every existing wallet holds) and puts Core's
+bytes on disk for everything else. Built with CODE-CHAR so this source file
+stays ASCII."
+  (let* ((prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+         (tx (%wc-spend-tx prev 0 12345 (p2sh-optrue-script-pubkey)))
+         (e-acute (string (code-char #xE9)))
+         (cjk (coerce (list (code-char #x4E2D) (code-char #x6587)) 'string)))
+    (flet ((record-with (comment)
+             (let ((wtx (bl.wallet::make-wallet-tx :tx tx :txid (bl.ser:transaction-hash tx))))
+               (setf (bl.wallet::wallet-tx-map-value wtx) (list (cons "comment" comment)))
+               (bl.wallet::wallet-tx-record-value wtx)))
+           (comment-of (bytes)
+             (cdr (assoc "comment"
+                         (bl.wallet::wallet-tx-map-value
+                          (bl.wallet::parse-wallet-tx-record bytes))
+                         :test #'string=))))
+      ;; Golden: an ASCII comment is exactly the bytes it always was,
+      ;; 07 "comment" 02 "hi".
+      (let ((bytes (record-with "hi")))
+        (is-true (search #(7 99 111 109 109 101 110 116 2 104 105) bytes)
+                 "the ASCII record changed on disk")
+        (is (equal "hi" (comment-of bytes))))
+      ;; U+00E9 is TWO UTF-8 bytes, never the single Latin-1 byte.
+      (let ((bytes (record-with e-acute)))
+        (is-true (search (vector 7 99 111 109 109 101 110 116 2 #xC3 #xA9) bytes)
+                 "U+00E9 is not on disk as its UTF-8 bytes")
+        (is-false (search (vector 7 99 111 109 109 101 110 116 1 #xE9) bytes)
+                  "U+00E9 is on disk as one Latin-1 byte")
+        (is (equal e-acute (comment-of bytes))))
+      ;; Two CJK characters: six bytes, and the round trip is the same string.
+      (let ((bytes (record-with cjk)))
+        (is-true (search (vector 7 99 111 109 109 101 110 116 6 #xE4 #xB8 #xAD #xE6 #x96 #x87)
+                         bytes)
+                 "the CJK comment is not on disk as its UTF-8 bytes")
+        (is (equal cjk (comment-of bytes)))))))
