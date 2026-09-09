@@ -25,6 +25,22 @@ of distinct transactions can have them."
             (aref w 2) 0))
     w))
 
+(defun %rc-reconcildiff (sent)
+  "The (success ask) of the one reconcildiff in SENT, or NIL when SENT is not
+exactly one reconcildiff message."
+  (when (and (= 1 (length sent))
+             (string= "reconcildiff" (message-command (first sent))))
+    (multiple-value-list
+     (bl.ser:parse-reconcildiff-payload (subseq (first sent) 24)))))
+
+(defun %rc-sketch-payload (short-ids capacity)
+  "A sketch message payload, header stripped, as the handler sees it: what a
+peer holding SHORT-IDS would answer a reqrecon with at CAPACITY."
+  (subseq (bl.ser:make-sketch-message
+           (bl.net::ms-sketch-serialize
+            (bl.net::recon-build-sketch short-ids capacity)))
+          24))
+
 (defun %rc-count (set)
   "How many transactions SET is holding for reconciliation. This file's one
 reader for that, since almost every test here asserts on it."
@@ -562,3 +578,148 @@ of the set."
       (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) w)
                "positive control: the inv was taken in as known")
       (is (= 1 (%rc-count set)) "and only the announced one left the set"))))
+
+(test a-failed-round-makes-the-responder-flood-its-snapshot
+  "The responder's failure path. It answered reqrecon with a sketch over a
+frozen snapshot; when the initiator gives up, BIP-330 says 'If success=0
+(reconciliation failure), receiver should announce all transactions from the
+reconciliation set via an inv message', and the snapshot 'is cleared by the
+sender and the receiver of the message'. The responder never has a ROUND --
+only the initiator opens one -- and the old path reached for that round, found
+none, and announced nothing: every transaction the initiator could not decode
+stayed unannounced until some later round happened to settle it."
+  (let* ((peer (%rc-peer :registered t :we-initiate nil :inbound t))
+         (wtxids (loop for i from 70 below 75 collect (%rc-wtxid i)))
+         (set (%rc-hold peer wtxids))
+         (ctx (bl.ctx:make-node-context)))
+    ;; reqrecon freezes the snapshot and is answered with a sketch.
+    (let ((sent (captured-sends
+                 (lambda ()
+                   (bl.net:handle-message
+                    peer "reqrecon"
+                    (subseq (bl.ser:make-reqrecon-message 5 0.25d0) 24) ctx)))))
+      (is (equal '("sketch") (mapcar #'message-command sent))))
+    ;; A transaction arriving mid-round is not part of this round.
+    (%rc-hold peer (list (%rc-wtxid 75)))
+    (bl.net:handle-message peer "reconcildiff"
+                           (subseq (bl.ser:make-reconcildiff-message nil '()) 24)
+                           ctx)
+    (is (= 5 (length (bl.net:peer-tx-inv-queue peer)))
+        "everything the sketch described is announced the ordinary way")
+    (is (= 1 (%rc-count set))
+        "the one that arrived after the snapshot waits for the next round")
+    ;; The snapshot is cleared with it: a second failure notice, with no
+    ;; reqrecon in between, has nothing left to flood.
+    (bl.net:handle-message peer "reconcildiff"
+                           (subseq (bl.ser:make-reconcildiff-message nil '()) 24)
+                           ctx)
+    (is (= 5 (length (bl.net:peer-tx-inv-queue peer)))
+        "and the snapshot is cleared: nothing is announced twice")
+    (is (= 1 (%rc-count set)))))
+
+(test a-failed-extension-makes-the-initiator-report-and-flood
+  "The initiator's failure path, end to end through the handlers. BIP-330: when
+the extension does not decode either, the initiator 'terminates the
+reconciliation right away by sending a reconcildiff message with the failure
+flag set', and that message 'should also be accompanied with announcing all
+transactions from the ... set snapshot'. Then the positive control: a round
+that DECODES closes the same round, announcing only the difference."
+  (let* ((peer (%rc-peer :registered t :we-initiate t))
+         (wtxids (loop for i from 40 below 45 collect (%rc-wtxid i)))
+         (ids (%rc-short-ids wtxids))
+         (set (%rc-hold peer wtxids))
+         (ctx (bl.ctx:make-node-context))
+         ;; Capacity 2 over two ids we do not hold, against our five: a
+         ;; difference of seven cannot decode at two, and the decode is a
+         ;; pure function of these fixed inputs.
+         (undecodable (%rc-sketch-payload '(#xAAAAAAAA #xBBBBBBBB) 2)))
+    (let ((sent (captured-sends
+                 (lambda () (bl.net:maybe-start-reconciliation peer 100000)))))
+      (is (equal '("reqrecon") (mapcar #'message-command sent))))
+    ;; The first sketch does not decode: one extension is asked for.
+    (let ((sent (captured-sends
+                 (lambda () (bl.net:handle-message peer "sketch" undecodable ctx)))))
+      (is (equal '("reqsketchext") (mapcar #'message-command sent))))
+    (is (null (bl.net:peer-tx-inv-queue peer))
+        "nothing is flooded while the extension is pending")
+    ;; The extension does not decode either: report the failure and flood.
+    (let* ((sent (captured-sends
+                  (lambda () (bl.net:handle-message peer "sketch" undecodable ctx))))
+           (diff (%rc-reconcildiff sent)))
+      (is-true diff "exactly one reconcildiff is sent")
+      (when diff
+        (is-false (first diff) "with success=0")
+        (is (null (second diff)) "asking for nothing")))
+    (is (= 5 (length (bl.net:peer-tx-inv-queue peer)))
+        "the whole snapshot is announced the ordinary way")
+    (is (= 0 (%rc-count set)))
+    (is-false (%rc-round-open-p peer) "and the round is closed")
+    ;; Positive control: the next round decodes -- the peer holds our five and
+    ;; one more -- so it asks for that one, announces nothing, and closes.
+    (setf (bl.net:peer-tx-inv-queue peer) '())
+    (%rc-hold peer wtxids)
+    (bl.net:maybe-start-reconciliation peer 200000)
+    (let* ((sent (captured-sends
+                  (lambda ()
+                    (bl.net:handle-message
+                     peer "sketch" (%rc-sketch-payload (cons #xAAAAAAAA ids) 3) ctx))))
+           (diff (%rc-reconcildiff sent)))
+      (is-true diff "exactly one reconcildiff is sent")
+      (when diff
+        (is-true (first diff) "with success=1")
+        (is (equal (list #xAAAAAAAA) (second diff)) "asking for the one we lack")))
+    (is (null (bl.net:peer-tx-inv-queue peer))
+        "the peer was missing nothing of ours")
+    (is (= 0 (%rc-count set)))
+    (is-false (%rc-round-open-p peer))))
+
+(test a-malformed-sketch-ends-the-round-for-both-sides
+  "A sketch that cannot even be read ends the round the way a failed decode
+does: the initiator floods its snapshot AND tells the responder so, because
+the responder keeps its snapshot 'until a reconcildiff message is received'
+(BIP-330) and would otherwise hold it until the next reqrecon replaced it."
+  (let* ((peer (%rc-peer :registered t :we-initiate t))
+         (set (%rc-hold peer (loop for i from 50 below 53 collect (%rc-wtxid i))))
+         (ctx (bl.ctx:make-node-context)))
+    (bl.net:maybe-start-reconciliation peer 100000)
+    (let ((sent (captured-sends
+                 (lambda ()
+                   ;; Five bytes: not a whole number of 32-bit field elements.
+                   (bl.net:handle-message
+                    peer "sketch"
+                    (subseq (bl.ser:make-sketch-message
+                             (make-array 5 :element-type '(unsigned-byte 8)
+                                           :initial-element 1))
+                            24)
+                    ctx)))))
+      (is (equal '(nil nil) (%rc-reconcildiff sent))
+          "one reconcildiff, success=0, asking for nothing"))
+    (is (= 3 (length (bl.net:peer-tx-inv-queue peer))))
+    (is (= 0 (%rc-count set)))
+    (is-false (%rc-round-open-p peer))))
+
+(test identical-sets-reconcile-to-nothing-and-succeed
+  "Two peers holding the same transactions is the steady state Erlay exists
+for: 'directly connected pairs of nodes are aware they have nothing to learn
+from each other' (BIP-330). Their sketches cancel to zero, which DECODES -- to
+the empty difference. Treating an empty decode as a failed one sent every such
+round through an extension and then flooded the whole set, so the peers that
+agreed most completely paid the most bandwidth."
+  (let* ((peer (%rc-peer :registered t :we-initiate t))
+         (wtxids (loop for i from 40 below 45 collect (%rc-wtxid i)))
+         (ids (%rc-short-ids wtxids))
+         (set (%rc-hold peer wtxids))
+         (ctx (bl.ctx:make-node-context)))
+    (bl.net:maybe-start-reconciliation peer 100000)
+    (let* ((sent (captured-sends
+                  (lambda ()
+                    (bl.net:handle-message
+                     peer "sketch" (%rc-sketch-payload ids 3) ctx))))
+           (diff (%rc-reconcildiff sent)))
+      (is-true diff "no extension: the round is decided by the first sketch")
+      (when diff
+        (is-true (first diff) "and decided as a success")
+        (is (null (second diff)) "with nothing to ask for")))
+    (is (null (bl.net:peer-tx-inv-queue peer)) "nothing to announce")
+    (is (= 0 (%rc-count set)) "and the whole snapshot is settled")
+    (is-false (%rc-round-open-p peer))))

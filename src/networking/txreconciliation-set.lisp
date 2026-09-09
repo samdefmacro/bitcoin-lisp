@@ -71,7 +71,10 @@ path answers with a plain inv."
              id))))
 
 (defun recon-set-remove (set k0 k1 wtxid)
-  "Drop WTXID — it was announced another way, or it left the mempool."
+  "Drop WTXID: the peer is known to hold it (%MARK-TX-KNOWN-TO-PEER is the one
+caller), so there is nothing left to reconcile. A transaction that left the
+mempool is not dropped here; the inv flush skips it when it comes to be
+announced."
   (remhash (recon-short-id k0 k1 wtxid) (recon-set-by-short-id set)))
 
 (defun recon-set-wtxid (set short-id)
@@ -183,16 +186,26 @@ holding transactions back to reconcile with nobody else would only delay them."
 
 Returns (values short-ids ok-p). A NIL id list with OK-P false is the ordinary
 `difference was bigger than the sketch' outcome, which the caller answers with
-an extension rather than a failure."
+an extension rather than a failure.
+
+A NIL id list with OK-P TRUE is the other empty answer, and the common one:
+the two sides hold the same transactions, so the sketches cancel to zero and
+the difference is empty. MS-DECODE returns NIL for both -- an empty list is
+NIL -- and this used to read the cancelled sketch as a failed decode, so the
+peers that agreed most completely went through an extension and then flooded
+their whole sets on every round. A zero merged sketch is checked here, before
+the decoder, so the two empties stay apart."
   (let* ((capacity (length their-sketch))
          (mine (recon-build-sketch (recon-round-local-ids round) capacity))
-         (merged (ms-sketch-merge mine their-sketch))
-         (decoded (ms-decode merged)))
+         (merged (ms-sketch-merge mine their-sketch)))
     (setf (recon-round-their-sketch round) their-sketch
           (recon-round-capacity round) capacity)
-    (if decoded
-        (values decoded t)
-        (values nil nil))))
+    (if (every #'zerop merged)
+        (values '() t)
+        (let ((decoded (ms-decode merged)))
+          (if decoded
+              (values decoded t)
+              (values nil nil))))))
 
 (defun recon-round-missing-ids (round decoded-ids)
   "Of the differing short IDs, the ones WE do not have — the set to ask for.
@@ -302,17 +315,34 @@ handshake and no reconciliation set at all (see this file's header)."
     (when set (recon-set-clear-snapshot set))
     (values ask announce)))
 
-(defun recon-abandon-round (peer)
-  "Give up on the round and fall back to announcing everything in the snapshot
-— BIP-330's flood fallback. A failed reconciliation costs bandwidth, never
-transactions."
-  (let* ((round (peer-recon-round peer))
-         (set (peer-recon-set peer))
-         (ids (and round (recon-round-local-ids round)))
-         (announce (recon-settle-ids set ids)))
-    (setf (peer-recon-round peer) nil)
+(defun recon-flood-snapshot (peer)
+  "The failure path for EITHER role: settle everything in this peer's frozen
+snapshot and return the wtxids to announce -- BIP-330's fallback to flooding.
+A failed reconciliation costs bandwidth, never transactions.
+
+The initiator's snapshot is the one RECON-START-ROUND froze (the round's
+LOCAL-IDS are that same list); the responder's is the one
+RECON-RESPOND-TO-REQUEST froze to answer reqrecon. The responder has no round
+object -- only the initiator opens one -- which is why this reads the set's
+snapshot and not the round: the responder's reconcildiff(success=0) path used
+to reach for a round it never had, find none, and announce nothing, so
+everything the initiator could not decode stayed unannounced until some later
+round happened to settle it. BIP-330: `If success=0 (reconciliation failure),
+receiver should announce all transactions from the reconciliation set via an
+inv message', and the snapshot `is cleared by the sender and the receiver of
+the message'. A transaction that arrived after the snapshot was taken is not
+part of this round; it stays in the set for the next one."
+  (let* ((set (peer-recon-set peer))
+         (announce (and set (recon-settle-ids set (recon-set-snapshot set)))))
     (when set (recon-set-clear-snapshot set))
     announce))
+
+(defun recon-abandon-round (peer)
+  "The INITIATOR gives up on its round: close it and flood the snapshot. The
+caller sends the reconcildiff(success=0) that tells the responder to do the
+same with its own snapshot."
+  (setf (peer-recon-round peer) nil)
+  (recon-flood-snapshot peer))
 
 (defun maybe-start-reconciliation (peer now)
   "The timer entry point: open a round with PEER if it is due. Returns T when

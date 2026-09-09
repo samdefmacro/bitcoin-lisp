@@ -3439,6 +3439,12 @@ answer or ask for an extension."
       (error (e)
         (bl:log-cat "txreconciliation" "sketch from ~A failed: ~A"
                     (peer-log-name peer) e)
+        ;; A sketch that cannot even be read ends the round the way a failed
+        ;; decode does, for BOTH sides: the responder keeps its snapshot
+        ;; "until a reconcildiff message is received" (BIP-330), so it has
+        ;; to be told, or it holds that snapshot until the next reqrecon
+        ;; replaces it.
+        (send-message peer (bl.ser:make-reconcildiff-message nil '()))
         (%announce-wtxids peer (recon-abandon-round peer))))))
 
 (defun %handle-reqsketchext (peer)
@@ -3463,18 +3469,23 @@ RECON-FINISH-ROUND retires the initiator's: the ids the initiator asked for
 are settled because we are announcing them now, and the rest of the snapshot
 is settled because it cancelled in the sketch, which only happens when both
 sides already hold it. Retiring only the asked-for ids left the cancelled ones
-in the set for the life of the connection."
+in the set for the life of the connection.
+
+A FAILURE floods the snapshot through RECON-FLOOD-SNAPSHOT, the responder's
+half of BIP-330's fallback. This is the responder: it has no round to abandon
+(only the initiator opens one), and reaching for that round here used to find
+NIL and announce nothing."
   (handler-case
       (multiple-value-bind (ok ask)
           (bl.ser:parse-reconcildiff-payload payload)
         (let ((set (peer-recon-set peer)))
-          (if ok
-              (progn
-                (%announce-wtxids peer (recon-settle-ids set ask))
-                (when set
-                  (recon-settle-ids set (recon-set-snapshot set))))
-              (%announce-wtxids peer (recon-abandon-round peer)))
-          (when set (recon-set-clear-snapshot set))))
+          (cond (ok
+                 (%announce-wtxids peer (recon-settle-ids set ask))
+                 (when set
+                   (recon-settle-ids set (recon-set-snapshot set))
+                   (recon-set-clear-snapshot set)))
+                (t
+                 (%announce-wtxids peer (recon-flood-snapshot peer))))))
     (error (e)
       (bl:log-cat "txreconciliation" "reconcildiff from ~A failed: ~A"
                   (peer-log-name peer) e))))

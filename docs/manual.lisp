@@ -839,7 +839,18 @@
   ids that CANCELLED in the sketch cancelled precisely because both sides
   hold them. Retiring only the difference left the cancelled ids in the set
   for the life of the connection, so every later sketch was sized against
-  dead weight -- the bandwidth Erlay exists to save.
+  dead weight -- the bandwidth Erlay exists to save. Three more BIP-330
+  rules with no Core reader behind them: a set is bounded
+  (`+recon-max-set-size+`, and a transaction that finds it full is announced
+  by inv rather than dropped); a transaction the peer is known to hold --
+  it announced or sent it, or we announced it -- leaves its set
+  (`%mark-tx-known-to-peer`, the one place Core's known-filter insert
+  lives); and a FAILED round floods the frozen snapshot on BOTH sides
+  (`recon-flood-snapshot`): the responder has no round object, only the
+  initiator opens one, and a failure path that reached for the responder's
+  round found NIL and announced nothing. Two sides holding the same
+  transactions cancel to a ZERO sketch, which is the empty difference and a
+  success, not a failed decode.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.
