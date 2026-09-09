@@ -306,7 +306,11 @@ it, so they run on a network where relay is on."
           (bl.net::peer-recon-registered p) registered
           (bl.net::peer-recon-we-initiate p) we-initiate)
     (when registered
-      (setf (bl.net::peer-recon-k0 p) k0
+      ;; A reconciling peer negotiated wtxid relay: reconciliation needs it
+      ;; (BIP-330, and the verack check that forgets the state without it),
+      ;; and the set is keyed by the same wtxid its inventory uses.
+      (setf (bl.net:peer-wtxid-relay p) t
+            (bl.net::peer-recon-k0 p) k0
             (bl.net::peer-recon-k1 p) k1))
     p))
 
@@ -521,3 +525,40 @@ hold: one the twin holds, the full peer must announce instead."
       (is (equalp (second held-by-draw)
                   (first (first (bl.net:peer-tx-inv-queue full)))))
       (is (= cap (%rc-count set)) "and the set does not grow past the cap"))))
+
+(test a-transaction-we-announce-leaves-the-peers-reconciliation-set
+  "Once the peer has been told about a transaction by inv there is nothing left
+to reconcile: BIP-330 keeps in the set what 'would have been announced using
+INV messages absent this protocol', and this one WAS announced. Left in, it
+would cost sketch capacity every round until a round happened to settle it. The
+site is the known-filter insert of Core's inv flush (net_processing.cpp:
+6060-6083): a transaction the peer knows is one it has nothing to learn about."
+  (%with-relay-network
+    (let* ((peer (%rc-peer :registered t))
+           (kept (%rc-wtxid 90))
+           (told (%rc-wtxid 91))
+           (set (%rc-hold peer (list kept told))))
+      (push (list told told 0) (bl.net:peer-tx-inv-queue peer))
+      (flush-peer-invs peer)
+      (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) told)
+               "positive control: the flush did announce it")
+      (is (= 1 (%rc-count set)) "the announced transaction left the set")
+      ;; The other one is what stayed: announcing it empties the set.
+      (push (list kept kept 0) (bl.net:peer-tx-inv-queue peer))
+      (flush-peer-invs peer)
+      (is (= 0 (%rc-count set))))))
+
+(test a-transaction-the-peer-announces-to-us-leaves-its-set
+  "The peer just told us it has this transaction, so a sketch can teach it
+nothing about it. Core marks it known to the peer (AddKnownTx,
+net_processing.cpp:4174); with a reconciliation set the same fact takes it out
+of the set."
+  (%with-relay-network
+    (let* ((peer (%rc-peer :registered t))
+           (w (%rc-wtxid 92))
+           (set (%rc-hold peer (list w (%rc-wtxid 93)))))
+      (deliver-inv peer (tx-inv-payload bl.ser:+inv-type-wtx+ w)
+                   (bl.ctx:make-node-context))
+      (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) w)
+               "positive control: the inv was taken in as known")
+      (is (= 1 (%rc-count set)) "and only the announced one left the set"))))
