@@ -267,17 +267,14 @@ whatever the cadence is."
            ("addr_processed" . ,(bl.net:peer-addr-processed peer))
            ("addr_rate_limited" . ,(bl.net:peer-addr-rate-limited peer))
            ;; The -whitelist / -whitebind permissions this peer holds (Core
-           ;; getpeerinfo "permissions", rpc/net.cpp). Was hardcoded empty.
-           ;; Core reports the stored m_permission_flags, so this must ask the
-           ;; same question the enforcement sites ask -- onion-ness included,
-           ;; or an inbound onion peer is REPORTED holding a loopback range's
-           ;; grant that nothing will honour.
+           ;; getpeerinfo "permissions", rpc/net.cpp). Core reports the stored
+           ;; m_permission_flags, so this asks the same question the
+           ;; enforcement sites ask (PEER-PERMISSIONS: direction, connection
+           ;; type and onion-ness), or a peer is REPORTED holding a grant
+           ;; nothing will honour.
            ("permissions"
             . ,(let ((names (bl.net:permission-flag-names
-                             (bl.net:peer-permission-flags
-                              (bl.net:peer-address peer)
-                              (bl.net:peer-inbound peer)
-                              (bl.net:peer-inbound-onion peer)))))
+                             (bl.net:peer-permissions peer))))
                  (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
            ("minfeefilter" . ,(satoshi->btc (bl.net:peer-feefilter-rate peer)))
@@ -285,19 +282,9 @@ whatever the cadence is."
                                     (bl.net:peer-sent-per-msg peer)))
            ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
                                     (bl.net:peer-recv-per-msg peer)))
-           ;; Core ConnectionType string (block-relay-only/feeler peers get
-           ;; no tx relay).
-           ;; A manual peer's TYPE is "manual" in Core — ConnectionType::MANUAL
-           ;; is a first-class member of the enum (node/connection_types.cpp:13),
-           ;; not an outbound-full-relay peer carrying a flag. We keep it as a
-           ;; flag internally because the outbound-slot budgets are written
-           ;; against the automatic types, and Core's manual peer likewise
-           ;; occupies none of them; what has to agree is the REPORT.
-           ("connection_type" . ,(if (and (bl.net:peer-manual peer)
-                                          (not (bl.net:peer-inbound peer)))
-                                     "manual"
-                                     (%connection-type-string
-                                      (bl.net:peer-conn-type peer))))
+           ;; Core ConnectionTypeAsString (node/connection_types.cpp:9-25).
+           ("connection_type" . ,(%connection-type-string
+                                  (bl.net:peer-conn-type peer)))
            ;; Core TransportTypeAsString: the BIP324 v2 session lives in
            ;; connection-transport (NIL = plaintext v1). Peers surface
            ;; here only after the handshake, so "detecting" never applies.

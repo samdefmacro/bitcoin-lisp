@@ -216,11 +216,10 @@ could make them to prevent us from connecting to certain peers.\" ADDR_FETCH
 and FEELER are excluded as \"short-lived outbound connections [that] should
 not affect how we select outbound peers from addrman\" — ours reach
 NODE-PEERS through establish-outbound-peer's -seednode call, so the
-conn-type test is doing real work and a plain not-inbound test would not.
-Manual peers are typed :outbound-full-relay here and so are counted, which
-is Core's MANUAL case."
+conn-type test is doing real work and a plain not-inbound test would not."
   (and (not (bl.net:peer-inbound peer))
-       (member (bl.net:peer-conn-type peer) '(:outbound-full-relay :block-relay))
+       (member (bl.net:peer-conn-type peer)
+               '(:manual :outbound-full-relay :block-relay))
        t))
 
 (defun %outbound-netgroup-diversity (peers)
@@ -834,9 +833,9 @@ Returns the number of new peers connected."
   ;; keeps m_max_outbound_block_relay distinct from
   ;; m_max_outbound_full_relay); folding them in here would let 2 idle
   ;; block-relay slots starve replacement of a dropped full-relay peer.
-  ;; (Known simplification vs Core: addnode peers are typed
-  ;; :outbound-full-relay in our code, so they do count here, whereas Core's
-  ;; MANUAL connections are additive.)
+  ;; Manual (-addnode / -connect) peers are :manual and so do not count either:
+  ;; Core opens them under their own semaphore (semAddnode,
+  ;; ThreadOpenAddedConnections net.cpp:2973), additive to the automatic set.
   (let* ((active-count (count-outbound-full-relay-peers (node-peers node)))
          (needed (- (outbound-dial-budget node) active-count)))
     (when (<= needed 0)
@@ -986,15 +985,17 @@ talking to."
          t)))
 
 (defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay)
-                                                    manual count-failure)
+                                                    count-failure)
   "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
-node-peers. CONN-TYPE (:outbound-full-relay or :block-relay) sets the peer's
-connection type; MANUAL tags an operator-pinned (-addnode / addnode onetry)
-peer, Core's ConnectionType::MANUAL — set BEFORE the handshake, because the
-VERSION-time services gate exempts manual peers (Core ExpectServicesFromConn)
-and connect-added-nodes redials a missing added node every ~30 s, so gating one
-would loop forever. Returns the peer or NIL. MUST run on the sync thread so
-node-peers stays single-writer. No-op when networking is disabled.
+node-peers. CONN-TYPE sets the peer's connection type: :outbound-full-relay,
+:block-relay, :addr-fetch, :feeler, or :manual for an operator-named
+destination (-addnode, -connect, addnode onetry; Core ConnectionType::MANUAL,
+net.cpp:2541 and :2986). The type is set by the handshake BEFORE the version
+is sent, because the VERSION-time services gate exempts manual peers (Core
+ExpectServicesFromConn) and connect-added-nodes redials a missing added node
+every ~30 s, so gating one would loop forever. Returns the peer or NIL. MUST
+run on the sync thread so node-peers stays single-writer. No-op when
+networking is disabled.
 
 COUNT-FAILURE defaults to NIL, and every caller that names a destination — the
 -seednode addr-fetch, -connect, -addnode, `addnode onetry' and the
@@ -1009,7 +1010,6 @@ it passes %COUNT-ADDRMAN-FAILURES-P."
         (let ((peer (%dial-outbound-peer node host port count-failure)))
           (when peer
             (setf (bl.net:peer-address peer) host)
-            (when manual (setf (bl.net:peer-manual peer) t))
             (if (bl.net:perform-handshake peer :conn-type conn-type
                                                         :near-tip (bl.net:near-tip-p (node-chain-state node)))
                 (progn
@@ -1048,7 +1048,7 @@ runs). Distinct from connect-added-nodes only in which list it walks."
     (dolist (spec *connect-nodes*)
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
         (unless (peer-connected-to-endpoint-p node host port)
-          (establish-outbound-peer node host port :manual t))))))
+          (establish-outbound-peer node host port :conn-type :manual))))))
 
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
@@ -1061,7 +1061,7 @@ then keep every \"add\" peer connected. Honors network-active."
       (dolist (spec onetry)
         (multiple-value-bind (host port) (parse-node-endpoint node spec)
           (unless (peer-connected-to-endpoint-p node host port)
-            (establish-outbound-peer node host port :manual t)))))
+            (establish-outbound-peer node host port :conn-type :manual)))))
     ;; addconnection (regtest testing RPC): one dial per request, of the
     ;; connection TYPE the caller named — which is the whole point of the RPC,
     ;; since a test cannot otherwise ask for a block-relay or feeler slot.
@@ -1075,7 +1075,7 @@ then keep every \"add\" peer connected. Honors network-active."
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
         (unless (peer-connected-to-endpoint-p node host port)
-          (establish-outbound-peer node host port :manual t))))))
+          (establish-outbound-peer node host port :conn-type :manual))))))
 
 (defconstant +target-block-relay-peers+ 2
   "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry

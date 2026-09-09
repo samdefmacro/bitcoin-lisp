@@ -878,10 +878,9 @@ whose best-known block is that entry."
             :hash hash :height 1 :chain-work work :status :header-valid))
     (values state hash)))
 
-(defun %g718-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash)
+(defun %g718-peer (&key (conn-type :outbound-full-relay) inbound best-hash)
   (let ((p (bl.net:make-peer :inbound inbound)))
     (setf (bl.net:peer-conn-type p) conn-type
-          (bl.net:peer-manual p) manual
           (bl.net:peer-state p) :ready)
     (when best-hash
       (setf (bl.net:peer-best-known-block-hash p) best-hash))
@@ -1160,17 +1159,16 @@ actually goes out."
 
 (test g7-18-outbound-or-block-relay-predicate
   "Core IsOutboundOrBlockRelayConn (net.h:771-785). Both halves matter: it must
-INCLUDE :block-relay, and it must EXCLUDE manual (-addnode) peers — ours are
-typed :outbound-full-relay, and connect-added-nodes redials them every ~30s, so
-a plain not-inbound test would loop connect/disconnect against a peer the
-operator pinned."
+INCLUDE :block-relay, and it must EXCLUDE :manual (-addnode) peers —
+connect-added-nodes redials them every ~30s, so a plain not-inbound test would
+loop connect/disconnect against a peer the operator pinned."
   (is-true (bl.net:peer-outbound-or-block-relay-p
             (%g718-peer :conn-type :outbound-full-relay)))
   (is-true (bl.net:peer-outbound-or-block-relay-p
             (%g718-peer :conn-type :block-relay))
            ":block-relay must be included")
   (is-false (bl.net:peer-outbound-or-block-relay-p
-             (%g718-peer :conn-type :outbound-full-relay :manual t))
+             (%g718-peer :conn-type :manual))
             "manual -addnode peers must be excluded")
   (is-false (bl.net:peer-outbound-or-block-relay-p
              (%g718-peer :conn-type :feeler)))
@@ -1200,7 +1198,7 @@ of IBD — a step toward IBD eclipse."
                    p state t)
                   "a full batch must not trigger the drop"))
       ;; Manual and inbound peers are exempt.
-      (let ((p (%g718-peer :best-hash hash :manual t)))
+      (let ((p (%g718-peer :best-hash hash :conn-type :manual)))
         (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)
                   "manual peers must never be auto-dropped"))
@@ -1270,11 +1268,10 @@ claim as its best-known."
     (bl.store:update-chain-tip state tip-hash 100)
     (values state tip-hash low-hash)))
 
-(defun %g708-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash protect
+(defun %g708-peer (&key (conn-type :outbound-full-relay) inbound best-hash protect
                         (address "test"))
   (let ((p (bl.net:make-peer :inbound inbound :address address)))
     (setf (bl.net:peer-conn-type p) conn-type
-          (bl.net:peer-manual p) manual
           (bl.net:peer-state p) :ready
           (bl.net::peer-chain-sync-protect p) protect)
     (when best-hash
@@ -1326,12 +1323,17 @@ has answered for itself."
       (is (zerop (bl.net::peer-chain-sync-timeout peer))))))
 
 (test g7-08-exempt-peers-are-never-evicted
-  "Manual, inbound and protected peers are outside the eviction logic. Manual
-matters most: connect-added-nodes redials them every ~30s, so evicting one
-would loop forever against a peer the operator pinned."
+  "Manual, inbound and protected peers are outside the eviction logic (Core
+ConsiderEviction gates on IsOutboundOrBlockRelayConn, net_processing.cpp:5298,
+which excludes MANUAL). Manual matters most: connect-added-nodes redials them
+every ~30s, so evicting one would loop forever against a peer the operator
+pinned. The full-relay peer is the positive control: the same chain arms it."
   (multiple-value-bind (state tip-hash low-hash) (%g708-chain 1000)
     (declare (ignore tip-hash))
-    (dolist (peer (list (%g708-peer :best-hash low-hash :manual t)
+    (is (eq :armed (bl.net:consider-chain-sync-eviction
+                    (%g708-peer :best-hash low-hash) state 1000))
+        "control: an automatic full-relay peer on the worse chain is armed")
+    (dolist (peer (list (%g708-peer :best-hash low-hash :conn-type :manual)
                         (%g708-peer :best-hash low-hash :inbound t)
                         (%g708-peer :best-hash low-hash :protect t)
                         (%g708-peer :best-hash low-hash :conn-type :feeler)))
@@ -1350,7 +1352,7 @@ eviction at all: nStartingHeight reaches only getpeerinfo and log lines, every
 automatic drop Core does have is restricted to outbound or block-relay
 connections, judges the peer's CURRENT best-known chain WORK, and exempts
 manual and NoBan peers. Ours consulted none of that -- not peer-inbound, not
-peer-manual, not the NoBan permission -- and the number it compared was frozen
+the connection type, not the NoBan permission -- and the number it compared was frozen
 at handshake time, so a peer that had since caught up could not escape it.
 
 Live cost: a node still in its own IBD that connects to us inbound was
@@ -1375,12 +1377,12 @@ CONSIDER-CHAIN-SYNC-EVICTION (Core ConsiderEviction), tested above."
     (declare (ignore tip-hash))
     (dolist (peer (list (%g708-peer :best-hash low-hash :inbound t
                                     :conn-type :inbound :address "10.0.0.1")
-                        (%g708-peer :best-hash low-hash :manual t
+                        (%g708-peer :best-hash low-hash :conn-type :manual
                                     :address "10.0.0.2")))
       (setf (bl.net:peer-start-height peer) 100)
       (is (null (bl.net:consider-chain-sync-eviction peer state 1000))
           "~:[an inbound~;a manual~] peer 5000 blocks behind must not be a ~
-candidate" (bl.net:peer-manual peer))
+candidate" (bl.net:peer-manual-p peer))
       (is (eq :ready (bl.net:peer-state peer))
           "the peer must still be connected"))
     (let ((outbound (%g708-peer :best-hash low-hash :address "10.0.0.3")))
@@ -1915,11 +1917,10 @@ peer that has nothing more to give."
 
 (defun %p3-peer (&key (conn-type :outbound-full-relay) (address "1.2.3.4")
                       (announcement 0) (last-block 0) (connected 0)
-                      protect manual)
+                      protect)
   (let ((p (bl.net:make-peer :address address)))
     (setf (bl.net:peer-conn-type p) conn-type
           (bl.net:peer-state p) :ready
-          (bl.net:peer-manual p) manual
           (bl.net::peer-chain-sync-protect p) protect
           (bl.net:peer-last-block-announcement p) announcement
           (bl.net:peer-last-block-time p) last-block
@@ -1946,13 +1947,13 @@ the peer back; a rotation that ignores it hands the eclipse attacker the one
 peer that proved it has the good chain.
 
 MANUAL is the operator's own -addnode. Core gets that exemption free because
-MANUAL is a distinct connection type, but we type addnode peers
-:outbound-full-relay, so ours has to be explicit — the plan's §2 names
-evicting operator-pinned peers as a design-breaking regression."
+MANUAL is a distinct connection type, and so do we now that -addnode peers are
+typed :manual — the plan's §2 names evicting operator-pinned peers as a
+design-breaking regression."
   ;; The protected/manual peers are the STALEST, so they would be chosen first
   ;; if the filters did not fire.
   (let* ((protected (%p3-peer :address "1.0.0.1" :announcement 1 :protect t))
-         (manual    (%p3-peer :address "1.0.0.2" :announcement 2 :manual t))
+         (manual    (%p3-peer :address "1.0.0.2" :announcement 2 :conn-type :manual))
          (ordinary  (%p3-peer :address "1.0.0.3" :announcement 9000))
          (peers (list protected manual ordinary)))
     (is (eq ordinary (bl.net:select-extra-full-relay-eviction peers))
@@ -2360,9 +2361,8 @@ address, and that is the call CONNECT-ADDED-NODES makes on every maintenance
 tick, so the operator's pinned peer stayed down -- permanently, since the
 discourage filter is a 50,000-entry FIFO with no time expiry."
   (let ((bl.net::*discouraged-peers* (bl:make-rejects-filter 128)))
-    (let ((manual (bl.net:make-peer :address "203.0.113.7" :state :ready))
+    (let ((manual (%manual-peer "203.0.113.7"))
           (ordinary (bl.net:make-peer :address "203.0.113.8" :state :ready)))
-      (setf (bl.net:peer-manual manual) t)
       (is-false (bl.net:peer-has-permission-p manual bl.net:+perm-noban+)
                 "the manual peer must hold NO permissions, or this test would ~
 be measuring the NoBan arm")
@@ -2410,7 +2410,7 @@ ThreadOpenConnections does."
 (defun %dial-named-destination (node host port)
   "Drive the shipped dial for a destination somebody NAMED: -addnode,
 -connect, `addnode onetry', -seednode and the addconnection RPC all land here."
-  (bl::establish-outbound-peer node host port :manual t))
+  (bl::establish-outbound-peer node host port :conn-type :manual))
 
 (defun %hosts-dialed-by (thunk &optional proxy-failed)
   "The hosts the code under test asked BL.NET:CONNECT-PEER for while THUNK ran.
@@ -2811,3 +2811,142 @@ still make room."
         (is (null non-onion) "control: nothing survives the filter here")
         (is-true (every #'bl.net:peer-inbound-onion all-onion)
                  "so the evictor must fall back to the full set and still evict")))))
+
+;;; ============================================================
+;;; 6. MANUAL is a connection type (Core ConnectionType::MANUAL)
+;;; ============================================================
+;;;
+;;; Core types every operator-named destination -- -connect (net.cpp:2541),
+;;; -addnode and `addnode onetry' (ThreadOpenAddedConnections, :2986) --
+;;; ConnectionType::MANUAL, and every rule that treats such a peer specially
+;;; keys on that type: IsManualConn for the no-punish rule
+;;; (net_processing.cpp:5188), IsFullOutboundConn for the slot budgets and the
+;;; rotation (net.cpp:2444-2473, net_processing.cpp:5415), the netgroup switch
+;;; (net.cpp:2671-2674), the per-network path count (net.cpp:3041) and the
+;;; outgoing whitelist ranges (net.cpp:510-512). We carried the fact as a flag
+;;; on an :outbound-full-relay peer, so each of those sites had to remember the
+;;; flag by hand, and the ones that did not (the path count, the netgroup set,
+;;; the outgoing ranges) diverged.
+
+(defun %manual-peer (address)
+  "A ready MANUAL peer at ADDRESS -- what -addnode, -connect and `addnode
+onetry' produce."
+  (bl.net:make-peer :address address :state :ready :conn-type :manual))
+
+(test a-named-destination-is-dialed-as-a-manual-connection
+  "The drive sites: `addnode add', `addnode onetry' and -connect must hand
+:manual to the handshake, which is where a peer's type is set
+(PERFORM-HANDSHAKE), and the addconnection test RPC must still hand over the
+type it was asked for (Core AddConnection, net.cpp:1873). CONNECT-PEER is
+stubbed to return a socketless peer and PERFORM-HANDSHAKE to refuse it, so the
+sweep runs the real dial path up to the one call that receives the type and
+nothing past it (NEAR-TIP-P is stubbed too: the probe node has no chain state,
+and the dial's handler-case would otherwise swallow that as a failed dial)."
+  (let ((seen '())
+        (real-connect (fdefinition 'bl.net:connect-peer))
+        (real-near-tip (fdefinition 'bl.net:near-tip-p))
+        (real-handshake (fdefinition 'bl.net:perform-handshake)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.net:connect-peer)
+                 (lambda (host &optional port &rest more)
+                   (declare (ignore port more))
+                   (bl.net:make-peer :address host :state :connected))
+                 (fdefinition 'bl.net:near-tip-p)
+                 (lambda (chain-state) (declare (ignore chain-state)) nil)
+                 (fdefinition 'bl.net:perform-handshake)
+                 (lambda (peer &rest args)
+                   (push (cons (bl.net:peer-address peer) (getf args :conn-type))
+                         seen)
+                   nil))
+           (let ((node (%dial-probe-node '())))
+             (setf (bl:node-added-nodes node) (list "203.0.113.1:8333")
+                   (bl:node-pending-onetry node) (list "203.0.113.2:8333")
+                   bl:*pending-test-connections*
+                   (list (cons "203.0.113.3:8333" :block-relay)))
+             (bl::connect-added-nodes node)
+             (let ((bl::*connect-nodes* (list "203.0.113.4:8333")))
+               (bl::connect-specified-nodes node))))
+      (setf (fdefinition 'bl.net:connect-peer) real-connect
+            (fdefinition 'bl.net:near-tip-p) real-near-tip
+            (fdefinition 'bl.net:perform-handshake) real-handshake
+            bl:*pending-test-connections* '()))
+    (flet ((type-of-host (host) (cdr (assoc host seen :test #'string=))))
+      (is (= 4 (length seen)) "control: all four destinations reached the handshake: ~S" seen)
+      (is (eq :manual (type-of-host "203.0.113.1")) "addnode add: ~S" seen)
+      (is (eq :manual (type-of-host "203.0.113.2")) "addnode onetry: ~S" seen)
+      (is (eq :manual (type-of-host "203.0.113.4")) "-connect: ~S" seen)
+      (is (eq :block-relay (type-of-host "203.0.113.3"))
+          "addconnection keeps the type it was asked for: ~S" seen))))
+
+(test manual-peers-count-as-a-path-to-their-network
+  "Core protects a full-relay peer from the extra-outbound rotation when it is
+our only OUTBOUND_FULL_RELAY-or-MANUAL connection on its network
+(net_processing.cpp:5421-5422; MultipleManualOrFullOutboundConns reads
+m_network_conn_counts, which IsManualOrFullOutboundConn peers raise, net.cpp:3041).
+A MANUAL peer on the same network is another path there, so the automatic peer
+becomes evictable; a block-relay peer is not counted, and the manual peers
+themselves are never candidates (IsFullOutboundConn, :5415)."
+  (let ((auto (%p3-peer :address "1.0.0.1" :announcement 1)))
+    (is (null (bl.net:select-extra-full-relay-eviction (list auto)))
+        "control: our only full-relay peer on ipv4 is protected")
+    (is (null (bl.net:select-extra-full-relay-eviction
+               (list auto (%p3-peer :address "1.0.0.2" :conn-type :block-relay))))
+        "a block-relay peer is not a MANUAL-or-FULL-OUTBOUND path")
+    (is (eq auto (bl.net:select-extra-full-relay-eviction
+                  (list auto (%manual-peer "1.0.0.2"))))
+        "a manual peer on the same network makes the automatic one evictable")
+    (is (null (bl.net:select-extra-full-relay-eviction
+               (list (%manual-peer "1.0.0.2") (%manual-peer "1.0.0.3"))))
+        "the manual peers themselves are never rotated out")))
+
+(test a-manual-peer-occupies-a-netgroup-in-the-diversity-set
+  "Core's netgroup switch inserts the groups of MANUAL, OUTBOUND_FULL_RELAY and
+BLOCK_RELAY peers (net.cpp:2671-2674) and a candidate in an occupied /16 is
+skipped (:2825-2827), so an -addnode peer in the candidate's /16 vetoes the
+dial exactly as an automatic one does."
+  (flet ((dialed (peer)
+           (%hosts-dialed-by
+            (lambda ()
+              (%refill-outbound
+               (%dial-probe-node (and peer (list peer)) (%candidate-book)))))))
+    (is (equal (list *dial-candidate*) (dialed nil))
+        "control: with no peers at all the candidate is dialed")
+    (is (null (dialed (%manual-peer "203.0.113.47")))
+        "a manual peer in the candidate's /16 must veto it")
+    (is (equal (list *dial-candidate*) (dialed (%manual-peer "198.51.100.47")))
+        "a manual peer in another /16 must not veto it")))
+
+(test manual-peers-leave-the-full-relay-slots-to-fill
+  "Core counts nOutboundFullRelay with IsFullOutboundConn (net.cpp:2656) and
+opens manual connections under their own semaphore (semAddnode,
+ThreadOpenAddedConnections :2973), so eight -addnode peers leave all eight
+automatic full-relay slots empty and the refill still dials. The manual peers
+sit in /16s the candidate does not share."
+  (let ((manual (loop for i from 1 to 8
+                      collect (%manual-peer (format nil "10.~D.0.1" i)))))
+    (is (equal (list *dial-candidate*)
+               (%hosts-dialed-by
+                (lambda ()
+                  (%refill-outbound
+                   (%dial-probe-node manual (%candidate-book))))))
+        "eight manual peers must not satisfy the outbound target")))
+
+(test whitelist-ranges-reach-an-outbound-peer-only-when-it-is-manual
+  "Core hands an outbound connection NetPermissionFlags::None and consults
+vWhitelistedRangeOutgoing only for ConnectionType::MANUAL (net.cpp:510-512), so
+a `noban,out@' range grants nothing to an automatic outbound peer inside it --
+and nothing to an inbound one, the direction being wrong."
+  (%with-whitelist (:entries '("noban,out@10.0.0.0/8"))
+    (flet ((noban-p (peer) (bl.net:peer-has-permission-p peer bl.net:+perm-noban+)))
+      (is-true (noban-p (%manual-peer "10.1.2.3"))
+               "control: the manual peer in the range holds the grant")
+      (is-false (noban-p (bl.net:make-peer :address "10.1.2.3" :state :ready
+                                           :conn-type :outbound-full-relay))
+                "an automatic full-relay peer must hold no range permission")
+      (is-false (noban-p (bl.net:make-peer :address "10.1.2.3" :state :ready
+                                           :conn-type :block-relay))
+                "nor a block-relay one")
+      (is-false (noban-p (bl.net:make-peer :address "10.1.2.3" :state :ready
+                                           :inbound t))
+                "an out-only grant reaches no inbound peer"))))

@@ -624,7 +624,13 @@
   not name a port on Core's IsBadPort deny-list, or a gossiped
   `victim:25' turns the node into someone else's SMTP client. Storage
   and relay are deliberately unfiltered, as in Core, and manual
-  connections bypass addrman entirely. A failed dial says WHOSE fault it
+  connections bypass addrman entirely. An operator-named destination
+  (-addnode, -connect, the addnode RPC) is a :manual peer, Core's
+  ConnectionType::MANUAL (PEER-MANUAL-P): it fills none of the automatic
+  slot budgets, is never auto-evicted or punished, counts as a path to
+  its network for the extra-outbound rotation, and is the only outbound
+  peer a `,out' whitelist range reaches (PEER-PERMISSIONS). A failed
+  dial says WHOSE fault it
   was: MAKE-TCP-CONNECTION's second value is Core's
   `proxy_connection_failed', raised only when the TCP connect to the
   SOCKS5 proxy itself failed and never for a handshake the proxy

@@ -3229,27 +3229,31 @@ the chain."
 (test manual-peers-report-connection-type-manual
   "ConnectionType::MANUAL is a first-class member of Core's enum
 (node/connection_types.cpp:13), so an addnode peer's getpeerinfo
-connection_type is \"manual\" — not \"outbound-full-relay\" with a flag
-somewhere else. rpc_net.py asserts exactly that (:125).
-
-We keep it as a flag internally on purpose: the outbound-slot budgets are
-written against the automatic types, and a manual peer occupies none of them in
-Core either. What has to agree is the report."
+connection_type is \"manual\" -- rpc_net.py asserts exactly that (:125) -- and
+its \"permissions\" are the ones Core stores on the CNode: an outbound
+connection starts from NetPermissionFlags::None and consults the OUTGOING
+whitelist ranges only when it is MANUAL (net.cpp:510-512), so a `,out' range
+shows up on the manual peer and not on the automatic one inside it."
   (let ((node (make-test-node))
-        (manual (bl.net:make-peer :address "10.1.1.1" :state :ready))
+        (manual (bl.net:make-peer :address "10.1.1.1" :state :ready
+                                  :conn-type :manual))
         (auto (bl.net:make-peer :address "10.1.1.2" :state :ready
-                                       :conn-type :outbound-full-relay))
-        (inbound (bl.net:make-peer :address "10.1.1.3" :state :ready :inbound t)))
-    (setf (bl.net:peer-manual manual) t)
-    ;; An INBOUND peer is never "manual", whatever flags it carries: Core's
-    ;; inbound connections are ConnectionType::INBOUND, full stop.
-    (setf (bl.net:peer-manual inbound) t)
+                                :conn-type :outbound-full-relay))
+        (inbound (bl.net:make-peer :address "10.1.1.3" :state :ready :inbound t))
+        (bl.net:*whitelist-entries*
+          (list (bl.net:parse-whitelist-entry "noban,out@10.0.0.0/8")))
+        (bl.net:*whitebind-flags* 0))
     (setf (bl:node-peers node) (list manual auto inbound))
     (let* ((rows (bl.rpc::%peerinfo-rows node))
-           (types (mapcar (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))
-                          rows)))
-      (is (equal '("manual" "outbound-full-relay" "inbound") types)
-          "connection_type: ~S" types))))
+           (field (lambda (name)
+                    (mapcar (lambda (r) (cdr (assoc name r :test #'string=)))
+                            rows))))
+      (is (equal '("manual" "outbound-full-relay" "inbound")
+                 (funcall field "connection_type"))
+          "connection_type: ~S" (funcall field "connection_type"))
+      (is (equalp '(#("noban" "download") #() #())
+                  (funcall field "permissions"))
+          "permissions: ~S" (funcall field "permissions")))))
 
 (test submitted-blocks-are-announced-to-peers
   "RELAY-BLOCK existed and had exactly one caller — the P2P receive path — so a

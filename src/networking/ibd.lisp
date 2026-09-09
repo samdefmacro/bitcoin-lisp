@@ -2716,7 +2716,7 @@ looks healthy."
   (let ((net (%peer-network peer)))
     (> (count-if (lambda (p)
                    (and (peer-live-p p)
-                        (eq (peer-conn-type p) :outbound-full-relay)
+                        (member (peer-conn-type p) '(:outbound-full-relay :manual))
                         (eq (%peer-network p) net)))
                  peers)
        1)))
@@ -2756,11 +2756,9 @@ Four filters, each of which changes the answer:
   - live peers only (Core's `!pfrom.fDisconnect');
   - never a chain-sync-protected peer (:5419) — P2 hands out that flag
     precisely so this rotation cannot take the peer back;
-  - never a MANUAL peer. Core gets this free because MANUAL is a separate
-    connection type from OUTBOUND_FULL_RELAY; we type -addnode peers as
-    :outbound-full-relay (see replace-disconnected-peers), so without this
-    clause the rotation would evict the operator's pinned peers — the exact
-    regression the plan's §2 forbids;
+  - never a :manual peer, which the first filter already delivers: MANUAL is
+    a separate connection type from OUTBOUND_FULL_RELAY in Core and here, so
+    the operator's pinned peers are never candidates;
   - never our only full-relay-or-manual connection on a network
     (MultipleManualOrFullOutboundConns, :5422), so rotation cannot cost us our
     last Tor or I2P path.
@@ -2776,7 +2774,6 @@ simply has not seen a new block yet."
              (and (eq (peer-conn-type p) :outbound-full-relay)
                   (peer-live-p p)
                   (not (peer-chain-sync-protect p))
-                  (not (peer-manual p))
                   (%multiple-full-outbound-on-network-p peers p)))
            peers)))
     (when candidates
