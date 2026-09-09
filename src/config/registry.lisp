@@ -186,7 +186,6 @@ rejects, \"Invalid value for -x=v (must be a positive integer)\" for an
               n))
       (:money (or (conf-parse-money raw)
                   (config-error "Invalid amount for -~A=~A" name raw)))
-      (:hex (bl.crypto:hex-to-bytes raw))
       (:byte-units (conf-parse-byte-units raw))
       (:loglevel (conf-parse-loglevel raw))
       (:loglevel-global (conf-parse-loglevel-global raw)))))

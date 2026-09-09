@@ -252,12 +252,29 @@
              (config-error "limitclustersize must be a positive number of kvB"))
            (setf bl.mp:*cluster-size-limit* (* kvb 1000))))
 ;; -signetchallenge: a custom signet block-challenge script, and
-;; -signetseednode: the DNS/peer seeds that REPLACE the chain's own
-;; (Core reads it with GetArgs, so it is a list -- chainparams.cpp:27-29).
-;; Both are consumed by APPLY-PARAMETER-INTERACTIONS, which instantiates the
-;; :signet chain from them the way Core's SigNetParams constructor does; the
-;; challenge also lands here because the block-solution check reads it.
-(define-option "signetchallenge" :type :hex :global bl.val:*signet-challenge*)
+;; -signetseednode: the DNS/peer seeds that REPLACE the chain's own. Core
+;; reads BOTH with GetArgs (ReadSigNetArgs, chainparams.cpp:28-40), so both
+;; are lists here: the seeds because every one counts, the challenge because
+;; Core refuses a SECOND one outright -- a scalar row would have quietly kept
+;; the last command-line value or the first bitcoin.conf line. Both are
+;; consumed by APPLY-PARAMETER-INTERACTIONS, which instantiates the :signet
+;; chain from them the way Core's SigNetParams constructor does; the
+;; challenge also lands in its special because the block-solution check
+;; reads it.
+(define-option "signetchallenge" :repeatable t
+  :apply (lambda (values)
+           ;; Core's two init errors, word for word (chainparams.cpp:33-38):
+           ;; exactly one value, and TryParseHex must accept it. With no
+           ;; value the special keeps what it has -- the public signet
+           ;; challenge, which is Core's default too.
+           (when values
+             (when (rest values)
+               (config-error "-signetchallenge cannot be multiple values."))
+             (let ((challenge (conf-try-parse-hex (first values))))
+               (unless challenge
+                 (config-error "-signetchallenge must be hex, not '~A'."
+                               (first values)))
+               (setf bl.val:*signet-challenge* challenge)))))
 (define-option "signetseednode" :repeatable t)
 ;; -proxy / -onion / -proxyrandomize / -onlynet / -cjdnsreachable form one
 ;; interaction (each reads the others): APPLY-PARAMETER-INTERACTIONS.

@@ -144,6 +144,26 @@ NIL for non-hex / over-long input."
                                  v)))
         (bl.crypto:hex-to-bytes padded)))))
 
+(defun conf-try-parse-hex (value)
+  "Core TryParseHex (util/strencodings.cpp:50-68) as raw bytes: pairs of hex
+digits, with IsSpace characters (space, \\f, \\n, \\r, \\t, \\v) skipped
+between pairs. NIL when a pair is cut short or holds a non-hex character;
+the EMPTY string is an empty vector, not a refusal, as Core's is."
+  (let ((bytes '()) (i 0) (n (length value)))
+    (loop
+      (when (>= i n)
+        (return (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                           :initial-contents (nreverse bytes))))
+      (let ((c (char value i)))
+        (incf i)
+        (unless (member c '(#\Space #\Page #\Newline #\Return #\Tab #.(code-char 11)))
+          (when (>= i n) (return nil))
+          (let ((high (digit-char-p c 16))
+                (low (digit-char-p (char value i) 16)))
+            (incf i)
+            (unless (and high low) (return nil))
+            (push (logior (ash high 4) low) bytes)))))))
+
 ;;; -uacomment / BIP14 subversion (Core init.cpp:1676-1686)
 ;;;
 ;;; The 256-byte cap itself is BL.SER:+MAX-SUBVERSION-LENGTH+: it is Core's

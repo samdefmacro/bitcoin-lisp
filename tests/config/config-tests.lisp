@@ -395,6 +395,47 @@ start-node-from-args can apply the global-only options."
     (is (equal "0" (cdr (assoc "datacarrier" merged :test #'string=))))
     (is (equal "5121ff" (cdr (assoc "signetchallenge" merged :test #'string=))))))
 
+(test a-second-signetchallenge-is-an-init-error-in-cores-words
+  "Core ReadSigNetArgs (chainparams.cpp:31-40) reads -signetchallenge with
+GetArgs, so EVERY occurrence counts -- two on the command line, two lines in
+bitcoin.conf, or one of each -- and more than one is
+`-signetchallenge cannot be multiple values.'; a value TryParseHex refuses
+(util/strencodings.cpp:50-68: pairs of hex digits, whitespace between pairs
+skipped) is `-signetchallenge must be hex, not '<value>'.'. Ours collapsed a
+repeated value to one -- the LAST on the command line, the FIRST in a file --
+and a non-hex value escaped as an ironclad error naming no option. Positive
+controls: one value, from either source, still reaches the challenge."
+  (flet ((apply-args (args &optional conf)
+           ;; The refusal message, or the challenge the merged config applied.
+           (let ((bl.val:*signet-challenge* bl.val:*default-signet-challenge*))
+             (multiple-value-bind (plist merged) (start-node-plist args conf)
+               (declare (ignore plist))
+               (or (%config-refusal (apply-config-globals merged))
+                   bl.val:*signet-challenge*)))))
+    (let ((twice "-signetchallenge cannot be multiple values."))
+      (is (equal twice (apply-args '("-signet" "-signetchallenge=5121ff"
+                                     "-signetchallenge=5121fe"))))
+      (is (equal twice (apply-args '("-signet" "-signetchallenge=5121ff")
+                                   (format nil "signetchallenge=5121fe~%"))))
+      (is (equal twice (apply-args '("-signet")
+                                   (format nil "signetchallenge=5121ff~%~
+signetchallenge=5121fe~%")))))
+    (is (equal "-signetchallenge must be hex, not 'zz'."
+               (apply-args '("-signet" "-signetchallenge=zz"))))
+    (is (equal "-signetchallenge must be hex, not '5121f'."
+               (apply-args '("-signet" "-signetchallenge=5121f"))))
+    (is (equalp (bl.crypto:hex-to-bytes "5121ff")
+                (apply-args '("-signet" "-signetchallenge=5121ff"))))
+    (is (equalp (bl.crypto:hex-to-bytes "5121ff")
+                (apply-args '("-signet") (format nil "signetchallenge=5121ff~%"))))
+    ;; TryParseHex itself: whitespace between pairs is skipped, an odd digit
+    ;; count and a non-hex character are refused, and the empty string is an
+    ;; EMPTY script rather than a refusal.
+    (is (equalp (bl.crypto:hex-to-bytes "5121ff") (bl.cfg:conf-try-parse-hex "51 21 ff")))
+    (is (null (bl.cfg:conf-try-parse-hex "512")))
+    (is (null (bl.cfg:conf-try-parse-hex "51zz")))
+    (is (equalp #() (bl.cfg:conf-try-parse-hex "")))))
+
 ;;; --- -onlynet / -cjdnsreachable (network reachability) ----------------------
 
 (test config-onlynet-reachability
