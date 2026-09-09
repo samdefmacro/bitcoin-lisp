@@ -75,6 +75,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    ;; chain.lisp
    #:make-test-chain-hashes
    #:make-versionbits-chain
+   #:make-versionbits-chain-with-tip
    #:make-reorg-test-block
    #:make-forged-body-block
    #:make-two-coinbase-block

@@ -172,3 +172,44 @@ rather than null."
       (setf bl.log:*alert-notify-command* saved)))
   (is-true (bl:known-config-option-p "alertnotify"))
   (is-false (bl.cfg:core-only-option-p "alertnotify")))
+
+(test unknown-new-rules-warning-reaches-the-rpc-array
+  "Core's UpdateTip scans every version bit no deployment of ours claims and
+raises kernel::Warning::UNKNOWN_NEW_RULES_ACTIVATED, `Unknown new rules
+activated (versionbit %%i)', for each one whose window has gone ACTIVE -- and
+only for those: a bit that has merely LOCKED_IN goes into the tip's log line and
+never into the warnings map (validation.cpp:2894-2911). Nothing here ran that
+scan, so an operator polling `warnings' -- or waiting to be paged by
+-alertnotify -- learned nothing at all while a soft fork this binary cannot
+enforce activated on the chain it was following.
+
+Driven through the tip announcement rather than by calling the subscriber,
+because the bug was that no subscriber existed.
+
+Two controls, both of which raise the warning if their gate is dropped: the
+same chain one period earlier, where bit 13 has only locked in; and the ACTIVE
+chain announced during initial block download, which is Core's `if
+(!IsInitialBlockDownload())' (:2900) and the reason a sync from scratch does
+not run a 29-bit window scan per block."
+  (with-network (:regtest)
+    (%with-clean-warnings
+      ;; No node, so the other tip subscribers (the periodic flush,
+      ;; -stopatheight, -blocknotify) decline on their own guards.
+      (let ((bl:*node* nil))
+        (flet ((announce (blocks ibd)
+                 (multiple-value-bind (cs tip)
+                     (make-versionbits-chain-with-tip blocks :signal-bit 13)
+                   ;; Bound, not assigned: the latch is process-wide and never
+                   ;; flips back, so the suites after this one must see what
+                   ;; they saw before it.
+                   (let ((bl.net:*cached-is-ibd* ibd))
+                     (bl.vi:notify-updated-block-tip
+                      cs (bl.store:block-index-entry-hash tip)
+                      (bl.store:block-index-entry-height tip)))
+                   (bl.log:warnings-for-rpc))))
+          (is (equalp #() (announce 432 t))
+              "a tip announced during IBD must not be scanned")
+          (is (equalp #() (announce 288 nil))
+              "a bit that has only locked in is not a warning")
+          (is (equal '("Unknown new rules activated (versionbit 13)")
+                     (announce 432 nil))))))))

@@ -130,6 +130,8 @@ can. src/validation/.")
    #:versionbits-state-name
    #:versionbits-since-height
    #:versionbits-statistics
+   ;; Core WarningBitsConditionChecker: the bits no deployment of ours claims
+   #:check-unknown-activations
    ;; Core BIP9Info / BIP9Stats, the shape getdeploymentinfo renders
    #:versionbits-info
    #:vb-stats-period
