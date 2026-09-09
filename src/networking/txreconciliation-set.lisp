@@ -47,13 +47,28 @@ announce the real transaction once the difference is known."
 
 (defun recon-set-size (set) (hash-table-count (recon-set-by-short-id set)))
 
+(defconstant +recon-max-set-size+ 3000
+  "The most transactions one peer's reconciliation set holds.
+
+A set has to be bounded: BIP-330 puts set_size on the wire as a uint16 in
+reqrecon, and every entry costs sketch capacity on every round until it
+settles. The figure is the MAX_SET_SIZE of the Core Erlay work that d3056bc
+does not yet carry (its tracker has no set at all), so it is a ported number
+without a ported reader to check against. A transaction that finds the set
+full is announced by inv instead -- the fallback is flooding, never dropping.")
+
 (defun recon-set-add (set k0 k1 wtxid)
-  "Queue WTXID for reconciliation. Returns the short ID, or NIL if it was
-already queued."
-  (let ((id (recon-short-id k0 k1 wtxid)))
-    (unless (gethash id (recon-set-by-short-id set))
-      (setf (gethash id (recon-set-by-short-id set)) (copy-seq wtxid))
-      id)))
+  "Queue WTXID for reconciliation. Returns its short ID -- also when it was
+already queued, which is a no-op -- or NIL when the set is full, in which case
+the caller announces the transaction the ordinary way instead. Core's Erlay
+branch shapes AddToSet the same way: a refusal at MAX_SET_SIZE that the relay
+path answers with a plain inv."
+  (let ((id (recon-short-id k0 k1 wtxid))
+        (table (recon-set-by-short-id set)))
+    (cond ((gethash id table) id)
+          ((>= (hash-table-count table) +recon-max-set-size+) nil)
+          (t (setf (gethash id table) (copy-seq wtxid))
+             id))))
 
 (defun recon-set-remove (set k0 k1 wtxid)
   "Drop WTXID — it was announced another way, or it left the mempool."
