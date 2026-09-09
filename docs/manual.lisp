@@ -1354,10 +1354,12 @@
   loads, and the catch-up rescans from height 0 instead of from the
   stored locator, which no longer describes what is in memory; the record
   scan is a DRIVER (`map-wallet-db-records`), so a load and a backup cost
-  one record of heap and not the wallet file, while a scan stopped by a bad
-  block still signals rather than returning a short set; and every failure
-  of the database itself answers Core's `DatabaseStatus` pair -- the cheap
-  format probe (`wallet-db-format-recognized-p`, Core's `IsSQLiteFile`)
+  one record of heap and not the wallet file, and a restore reads its dump
+  as a stream of lines and verifies it before it decodes a record, while a
+  scan stopped by a bad block still signals rather than returning a short
+  set; and every failure of the database itself answers Core's
+  `DatabaseStatus` pair -- the cheap format probe
+  (`wallet-db-format-recognized-p`, Core's `IsSQLiteFile`)
   gives -18, anything past it gives -4, and a storage condition never
   reaches a client as an internal error. The
   options Core reads once into a wallet field are process specials here

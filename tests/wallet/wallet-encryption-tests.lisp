@@ -1197,7 +1197,7 @@ success while leaving nothing behind."
            (with-extension (merge-pathnames "backup.dump" dir)))
       (%wenc-fresh-wallet node "w")
       (dolist (path (list no-extension with-extension))
-        (is (null (bl.wallet::rpc-backupwallet node (list (namestring path)))))
+        (is (null (bl.rpc:dispatch-rpc-method node "backupwallet" (list (namestring path)))))
         (is (probe-file path))
         ;; And no stray temp file survives.
         (is (null (probe-file (make-pathname
@@ -1205,8 +1205,8 @@ success while leaving nothing behind."
                                                   (pathname-name path) ".tmp")
                                :defaults path)))))
       ;; Both restore cleanly.
-      (bl.wallet::rpc-restorewallet
-       node (list "r1" (namestring no-extension)))
+      (bl.rpc:dispatch-rpc-method
+       node "restorewallet" (list "r1" (namestring no-extension)))
       (is (bl.wallet::wallet-is-mine
            (loaded-wallet (%node-manager node) "r1")
            (%address-script
@@ -1297,16 +1297,16 @@ whose records are identical, record for record."
       (with-rpc-wallet ("w")
         (let ((wallet (%wenc-fresh-wallet node "w")))
           (bl.wallet::rpc-getnewaddress node '())
-          (is (null (bl.wallet::rpc-backupwallet
-                     node (list (namestring path)))))
+          (is (null (bl.rpc:dispatch-rpc-method
+                     node "backupwallet" (list (namestring path)))))
           (is (probe-file path))
           (setf source-records (wallet-db-record-list
                                 (bl.wallet::wallet-db wallet)))))
       ;; The dump is self-describing and checksummed.
       (let ((first-line (with-open-file (in path) (read-line in))))
         (is (equal "BITCOIN_LISP_WALLET_DUMP,1" first-line)))
-      (let ((result (bl.wallet::rpc-restorewallet
-                     node (list "restored" (namestring path)))))
+      (let ((result (bl.rpc:dispatch-rpc-method
+                     node "restorewallet" (list "restored" (namestring path)))))
         (is (equal "restored" (%aval "name" result))))
       (let* ((restored (loaded-wallet (%node-manager node) "restored"))
              (restored-records (wallet-db-record-list
@@ -1342,9 +1342,9 @@ ciphertext — and the restored copy unlocks with the original passphrase."
       (with-rpc-wallet ("enc")
         (let ((wallet (%wenc-fresh-wallet node "enc" :passphrase "hunter2")))
           (is (bl.wallet::wallet-is-locked-p wallet))
-          (is (null (bl.wallet::rpc-backupwallet
-                     node (list (namestring path)))))))
-      (bl.wallet::rpc-restorewallet node (list "enc2" (namestring path)))
+          (is (null (bl.rpc:dispatch-rpc-method
+                     node "backupwallet" (list (namestring path)))))))
+      (bl.rpc:dispatch-rpc-method node "restorewallet" (list "enc2" (namestring path)))
       (let ((restored (loaded-wallet (%node-manager node) "enc2")))
         (is (bl.wallet::wallet-has-encryption-keys-p restored))
         (is (bl.wallet::wallet-is-locked-p restored))
@@ -1358,21 +1358,21 @@ restore must not leave a wallet directory behind."
     (let ((path (%wenc-backup-path node "w")))
       (with-rpc-wallet ("w")
         (%wenc-fresh-wallet node "w")
-        (bl.wallet::rpc-backupwallet node (list (namestring path))))
+        (bl.rpc:dispatch-rpc-method node "backupwallet" (list (namestring path))))
       (is (= -8 (rpc-error-code-of
-                 (lambda () (bl.wallet::rpc-restorewallet
-                             node (list "" (namestring path)))))))
+                 (lambda () (bl.rpc:dispatch-rpc-method
+                             node "restorewallet" (list "" (namestring path)))))))
       (is (= -8 (rpc-error-code-of
-                 (lambda () (bl.wallet::rpc-restorewallet
-                             node (list "../evil" (namestring path)))))))
+                 (lambda () (bl.rpc:dispatch-rpc-method
+                             node "restorewallet" (list "../evil" (namestring path)))))))
       (is (= -8 (rpc-error-code-of
-                 (lambda () (bl.wallet::rpc-restorewallet
-                             node (list "missing" "/nonexistent/backup.dump"))))))
+                 (lambda () (bl.rpc:dispatch-rpc-method
+                             node "restorewallet" (list "missing" "/nonexistent/backup.dump"))))))
       ;; Restoring onto an occupied destination — including a live wallet's
       ;; own directory, which Core reports the same way.
       (is (= -36 (rpc-error-code-of
-                  (lambda () (bl.wallet::rpc-restorewallet
-                              node (list "w" (namestring path)))))))
+                  (lambda () (bl.rpc:dispatch-rpc-method
+                              node "restorewallet" (list "w" (namestring path)))))))
       ;; A corrupt dump: flip a byte in a record line.
       (let ((corrupt (merge-pathnames "corrupt.dump"
                                       (uiop:ensure-directory-pathname
@@ -1388,8 +1388,8 @@ restore must not leave a wallet directory behind."
                                      line)
                                  out))))
         (is (= -18 (rpc-error-code-of
-                    (lambda () (bl.wallet::rpc-restorewallet
-                                node (list "from-corrupt" (namestring corrupt)))))))
+                    (lambda () (bl.rpc:dispatch-rpc-method
+                                node "restorewallet" (list "from-corrupt" (namestring corrupt)))))))
         ;; Nothing was created for the rejected restore.
         (is (not (uiop:directory-exists-p
                   (bl.wallet::wallet-directory (%node-manager node)
@@ -1409,8 +1409,8 @@ where it would be picked up as a wallet directory."
       (let ((traversal (namestring
                         (merge-pathnames "w/../../wallets/sneaky.dump" wallets))))
         (is (= -4 (rpc-error-code-of
-                   (lambda () (bl.wallet::rpc-backupwallet
-                               node (list traversal))))))
+                   (lambda () (bl.rpc:dispatch-rpc-method
+                               node "backupwallet" (list traversal))))))
         (is (null (probe-file (merge-pathnames "sneaky.dump" wallets)))))
       ;; The resolver itself, directly.
       (is (bl.wallet::%path-under-p
@@ -1439,7 +1439,7 @@ wallet that is missing keys."
            (bl.store:leveldb-iter-check-error iter)))
         ;; And a dump of a healthy wallet carries every record.
         (let ((path (%wenc-backup-path node "w")))
-          (bl.wallet::rpc-backupwallet node (list (namestring path)))
+          (bl.rpc:dispatch-rpc-method node "backupwallet" (list (namestring path)))
           (is (= full (length (bl.wallet::%parse-wallet-dump
                                path (bl.wallet::wallet-network wallet))))))))))
 
@@ -1562,7 +1562,7 @@ testnet node — Core gets this from the network magic in the SQLite header."
     (let ((path (%wenc-backup-path node "w")))
       (with-rpc-wallet ("w")
         (%wenc-fresh-wallet node "w")
-        (bl.wallet::rpc-backupwallet node (list (namestring path))))
+        (bl.rpc:dispatch-rpc-method node "backupwallet" (list (namestring path))))
       (let ((foreign (merge-pathnames "foreign.dump"
                                       (uiop:ensure-directory-pathname
                                        (bl.wallet::wallet-manager-data-directory
@@ -1578,8 +1578,8 @@ testnet node — Core gets this from the network magic in the SQLite header."
                                      line)
                                  out))))
         (is (= -18 (rpc-error-code-of
-                    (lambda () (bl.wallet::rpc-restorewallet
-                                node (list "foreign" (namestring foreign)))))))))))
+                    (lambda () (bl.rpc:dispatch-rpc-method
+                                node "restorewallet" (list "foreign" (namestring foreign)))))))))))
 
 (test wenc-backup-refuses-unsafe-destinations
   "backupwallet maps every failure to Core's single error, and refuses to
@@ -1590,19 +1590,182 @@ write into the wallets directory (where it would look like a wallet)."
       (let ((manager (%node-manager node)))
         ;; An existing directory as the destination.
         (is (= -4 (rpc-error-code-of
-                   (lambda () (bl.wallet::rpc-backupwallet
-                               node (list (namestring
+                   (lambda () (bl.rpc:dispatch-rpc-method
+                               node "backupwallet" (list (namestring
                                            (bl.wallet::wallets-directory
                                             manager))))))))
         ;; Inside the wallets directory.
         (is (= -4 (rpc-error-code-of
-                   (lambda () (bl.wallet::rpc-backupwallet
-                               node (list (namestring
+                   (lambda () (bl.rpc:dispatch-rpc-method
+                               node "backupwallet" (list (namestring
                                            (merge-pathnames
                                             "sneaky.dump"
                                             (bl.wallet::wallets-directory
                                              manager)))))))))
         ;; A directory that does not exist.
         (is (= -4 (rpc-error-code-of
-                   (lambda () (bl.wallet::rpc-backupwallet
-                               node (list "/nonexistent/dir/backup.dump"))))))))))
+                   (lambda () (bl.rpc:dispatch-rpc-method
+                               node "backupwallet" (list "/nonexistent/dir/backup.dump"))))))))))
+
+;;; --- restorewallet reads its dump as a stream of lines ----------------------
+
+(defun %wenc-write-dump (path lines &key (checksum t))
+  "Write LINES to PATH as a dump; with CHECKSUM, a checksum line computed over
+LINES follows them, so an edited header is judged on its own merits and not by
+the checksum the edit would otherwise also have broken."
+  (with-open-file (out path :direction :output :if-exists :supersede
+                            :if-does-not-exist :create :external-format :latin-1)
+    (dolist (line lines) (write-line line out))
+    (when checksum
+      (write-line (format nil "checksum,~(~A~)"
+                          (bl.crypto:bytes-to-hex
+                           (bl.crypto:hash256
+                            (flexi-streams:string-to-octets
+                             (format nil "~{~A~%~}" lines) :external-format :latin-1))))
+                  out))))
+
+(defun %wenc-write-big-dump (path header record count checksum)
+  "A dump at PATH: the HEADER lines, RECORD (one line, without its newline)
+repeated COUNT times, then CHECKSUM -- :VALID for the real one, or a string
+written verbatim as the last line. Written in 10,000-record chunks so a
+multi-million-line file costs seconds to build."
+  (let* ((line (flexi-streams:string-to-octets (format nil "~A~%" record)
+                                                :external-format :latin-1))
+         (chunk-lines 10000)
+         (chunk (let ((c (make-array (* chunk-lines (length line))
+                                     :element-type '(unsigned-byte 8))))
+                  (dotimes (i chunk-lines c)
+                    (replace c line :start1 (* i (length line))))))
+         (digest (ironclad:make-digest :sha256)))
+    (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :supersede :if-does-not-exist :create)
+      (flet ((octets (string)
+               (flexi-streams:string-to-octets string :external-format :latin-1))
+             (emit (octets)
+               (write-sequence octets out)
+               (ironclad:update-digest digest octets)))
+        (dolist (h header) (emit (octets (format nil "~A~%" h))))
+        (multiple-value-bind (chunks rest) (floor count chunk-lines)
+          (dotimes (i chunks) (emit chunk))
+          (dotimes (i rest) (emit line)))
+        (write-sequence
+         (octets (if (eq checksum :valid)
+                     (format nil "checksum,~(~A~)~%"
+                             (bl.crypto:bytes-to-hex
+                              (bl.crypto:sha256 (ironclad:produce-digest digest))))
+                     checksum))
+         out)))))
+
+(defun %wenc-restore-verdict (node name path)
+  "(values code message) of the rpc-error restorewallet signals for NAME from
+PATH, or NIL when it succeeded."
+  (handler-case
+      (progn (bl.rpc:dispatch-rpc-method node "restorewallet"
+                                         (list name (namestring path)))
+             nil)
+    (bl.rpc:rpc-error (e)
+      (values (bl.rpc:rpc-error-code e) (bl.rpc:rpc-error-message e)))))
+
+(defun %wenc-backup-header (node path)
+  "The three header lines of a fresh backup of wallet \"w\" written to PATH."
+  (with-rpc-wallet ("w")
+    (%wenc-fresh-wallet node "w")
+    (bl.rpc:dispatch-rpc-method node "backupwallet" (list (namestring path))))
+  (subseq (uiop:read-file-lines path) 0 3))
+
+(test wenc-restore-rejects-each-malformed-dump
+  "Every rejection %PARSE-WALLET-DUMP makes, one file each, all answered with
+Core's verification sentence at RPC_WALLET_NOT_FOUND (-18) and none creating a
+wallet. The header variants carry a RECOMPUTED checksum, so what refuses them
+is the header check and not the checksum the edit would otherwise also break.
+The control comes first: the same body rewritten unchanged restores."
+  (with-wallet-test-node (node)
+    (let* ((path (%wenc-backup-path node "w"))
+           (variant (%wenc-backup-path node "variant")))
+      (%wenc-backup-header node path)
+      (let ((body (butlast (uiop:read-file-lines path))))
+        (%wenc-write-dump variant body)
+        (is (null (%wenc-restore-verdict node "ok" variant))
+            "control: the rewritten dump does not restore")
+        (flet ((refused (label lines &key (checksum t))
+                 (%wenc-write-dump variant lines :checksum checksum)
+                 (let ((name (format nil "bad-~A" label)))
+                   (multiple-value-bind (code message) (%wenc-restore-verdict node name variant)
+                     (is (= -18 code) "~A was not refused (~S)" label code)
+                     (is (eql 0 (search "Wallet file verification failed" message))
+                         "~A: ~A" label message))
+                   (is (not (uiop:directory-exists-p
+                             (bl.wallet::wallet-directory (%node-manager node) name)))
+                       "~A left a wallet directory behind" label))))
+          ;; Fewer than four lines: the header alone, no checksum.
+          (refused "header-only" (subseq body 0 3) :checksum nil)
+          ;; A checksum line that is missing, wrong, or too short to hold one.
+          (refused "no-checksum-line" body :checksum nil)
+          (refused "wrong-checksum" (append body (list "checksum,00")) :checksum nil)
+          (refused "short-checksum-line" (append body (list "checksum")) :checksum nil)
+          ;; Each header line, with a checksum that vouches for the edit.
+          (refused "magic" (cons "OTHER_WALLET_DUMP,1" (cdr body)))
+          (refused "version" (cons "BITCOIN_LISP_WALLET_DUMP,2" (cdr body)))
+          (refused "network" (list* (first body) "network,mainnet" (cddr body)))
+          (refused "format" (list* (first body) (second body) "format,sqlite" (cdddr body)))
+          ;; Record lines: no separator, odd hex, a byte that is not hex.
+          (refused "record-without-comma" (append body (list "deadbeef")))
+          (refused "record-odd-hex" (append body (list "dead,bee")))
+          (refused "record-non-hex" (append body (list "dead,beez"))))))))
+
+(test wenc-restore-refuses-a-dump-over-the-line-cap
+  "+WALLET-DUMP-MAX-LINES+ bounds what restorewallet reads from a
+caller-supplied path. A dump ONE line over it, with a valid checksum, is
+refused with the verification sentence before a record is decoded; a cap that
+did not fire would go on to write four million records and fail (or not)
+somewhere else, under another sentence."
+  (with-wallet-test-node (node)
+    (let* ((path (%wenc-backup-path node "w"))
+           (big (%wenc-backup-path node "big"))
+           (header (%wenc-backup-header node path)))
+      ;; header(3) + records + checksum(1) = cap + 1 lines.
+      (%wenc-write-big-dump big header "00,00"
+                            (- bl.wallet::+wallet-dump-max-lines+ 3) :valid)
+      (multiple-value-bind (code message) (%wenc-restore-verdict node "big" big)
+        (is (= -18 code) "the over-cap dump was answered ~S" code)
+        (is (eql 0 (search "Wallet file verification failed" message)) "~A" message)))))
+
+(test wenc-restore-does-not-buffer-the-whole-dump
+  "%PARSE-WALLET-DUMP reads the file as a stream of lines, hashing each one as
+it goes and holding one line at a time. The whole-file shape it replaced --
+every line read into a list, concatenated into one body string, then hashed --
+is the positive control, run over the same file in the same test. The file is
+200,000 records with a truncated checksum line, so it is refused (-18) after
+the scan and not one record is kept."
+  (with-wallet-test-node (node)
+    (let* ((path (%wenc-backup-path node "w"))
+           (big (%wenc-backup-path node "big"))
+           (header (%wenc-backup-header node path))
+           (streamed 0)
+           (buffered 0))
+      (%wenc-write-big-dump big header
+                            (format nil "~64,'0X,~64,'0Xff" 0 0) 200000
+                            (format nil "checksum,dead~%"))
+      (sb-ext:gc :full t)
+      (let ((base (sb-ext:get-bytes-consed)))
+        (is (= -18 (%wenc-restore-verdict node "big" big)))
+        (setf streamed (%wenc-consed-mib base)))
+      (sb-ext:gc :full t)
+      (let ((base (sb-ext:get-bytes-consed)))
+        (let* ((lines (uiop:read-file-lines big))
+               (body (with-output-to-string (s)
+                       (dolist (line (butlast lines))
+                         (write-string line s)
+                         (write-char #\Newline s)))))
+          (is (plusp (length (bl.crypto:hash256
+                              (flexi-streams:string-to-octets
+                               body :external-format :latin-1)))))
+          (setf buffered (%wenc-consed-mib base))))
+      ;; Positive control: buffering the dump really does cost many times the
+      ;; file it reads.
+      (is (> buffered 50)
+          "the buffered shape consed only ~D MiB; the fixture is too small ~
+to measure anything" buffered)
+      (is (< streamed (floor buffered 10))
+          "the streaming parse consed ~D MiB against the buffered shape's ~D"
+          streamed buffered))))
