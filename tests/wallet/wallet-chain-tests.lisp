@@ -379,14 +379,21 @@ connect would not pass."
         ;; single-hash fallback, which would cost a full rescan on load.
         (is (= 2 (length locator)))))))
 
-(defun %wc-mutate-proof (proof-hex offset byte)
+(defun %wc-mutate-proof (proof-hex offset)
   "PROOF-HEX with the header byte at OFFSET (0-based, within the 80-byte
-header) replaced by BYTE. The merkle root sits at 36..67 and nTime at 68..71,
-which is how the functional test wallet_importprunedfunds.py builds its two
-bad proofs: a mutated root breaks ExtractMatches, a mutated nTime changes the
-block HASH while leaving the proof internally consistent."
+header) INVERTED. The merkle root sits at 36..67 and nTime at 68..71, which is
+how the functional test wallet_importprunedfunds.py builds its two bad proofs:
+a mutated root breaks ExtractMatches, a mutated nTime changes the block HASH
+while leaving the proof internally consistent.
+
+The byte is complemented rather than set to a chosen value because the proof
+this fixture produces is not deterministic -- the wallet's keys are fresh per
+run, so the coinbase txid, and with it the merkle root, is random. Assigning a
+literal (#xEF at 36, #x00 at 68) left the proof UNCHANGED whenever the random
+byte already held it, and an unchanged proof imports, which is a 1-in-256 red
+per offset. XOR #xFF cannot be a no-op."
   (let ((bytes (bl.crypto:hex-to-bytes proof-hex)))
-    (setf (aref bytes offset) byte)
+    (setf (aref bytes offset) (logxor (aref bytes offset) #xFF))
     (bl.crypto:bytes-to-hex bytes)))
 
 (test pruned-funds-import-and-remove
@@ -455,17 +462,19 @@ these two is that they refuse a proof that does not hold up."
           (rpc nil "loadwallet" "w")
           (is (= 101 (aval "confirmations" (rpc "w" "gettransaction" cb))))
           ;; --- the errors, in Core's own words ---
+          ;; The clean proof imported above is the control for the two mutated
+          ;; ones: the mutation is the only reason they are refused.
           ;; -22, the message the spending paths use.
           (is (= -22 (import-code "w" "696e76616c6964207478" proof)))
           (is (string= "TX decode failed. Make sure the tx has at least one input."
                        (import-message "w" "696e76616c6964207478" proof)))
           ;; A proof whose header no longer commits to the tree it carries.
           (is (string= "Something wrong with merkleblock"
-                       (import-message "w" rawtx (%wc-mutate-proof proof 36 #xEF))))
+                       (import-message "w" rawtx (%wc-mutate-proof proof 36))))
           ;; A header nothing in the block index knows: nTime moved, so the
           ;; proof is still internally consistent but names another block.
           (is (string= "Block not found in chain"
-                       (import-message "w" rawtx (%wc-mutate-proof proof 68 #x00))))
+                       (import-message "w" rawtx (%wc-mutate-proof proof 68))))
           ;; A proof for a block that IS ours, of a transaction that is not in it.
           (let* ((b2 (first (%wc-mine node 1 (%wc-optrue-address))))
                  (other-proof (rpc nil "gettxoutproof"
