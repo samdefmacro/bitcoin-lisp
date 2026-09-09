@@ -82,27 +82,60 @@ here because it has no id in the survey:
 - **Core functional tests as verdicts**: run by the verifiers where a finding cited one;
   not a separate lane.
 
-## Left out, deliberately, for GA12
+## Left out, deliberately, for GA12 — closed 2026-09-09
 
-Named in the commit that scoped each one out:
+Named in the commit that scoped each one out; every item but the last was closed in the
+follow-up round of 2026-09-07 to 2026-09-09 (five worktree batches, each with a pre-fix-red
+test and the Core lines in its commit, merged onto `main` behind a green cold battery: the
+battery grew from 38,270 to 38,440 checks). The commit that closed each item follows it.
 
 - Core's RPC arity check (`IsValidNumArgs`, -1 with the help text); extra arguments are
-  still ignored.
+  still ignored. → "RPC: a call with the wrong number of arguments is refused with the usage
+  line" (a per-position required flag generated from Core's tables; `getblockcount(null)`
+  had been pinned as accepted).
 - `IsCurrentForFeeEstimation`'s third arm (best header height) — our best-header lookup is
-  a linear scan and the check runs per accepted transaction.
+  a linear scan and the check runs per accepted transaction. → "Storage: the best header is
+  kept, and fee estimation asks it" (Core's cached `m_best_header`, keyed by the block-index
+  table the two chainstates share).
 - `UNKNOWN_NEW_RULES_ACTIVATED` needs a `WarningBitsConditionChecker` inside the BIP9 state
-  machine.
+  machine. → "Validation: an unknown soft fork activating on our chain is a warning" (Core
+  warns on ACTIVE only and never unsets it; the threshold cache became Core's per-period
+  shape, without which the warning scan recounted every period since genesis per block).
 - Erlay: `recon-set-remove` has no caller in `src/`, `recon-set-add` has no cap, and the
-  responder's failure path abandons a round it never has.
+  responder's failure path abandons a round it never has. → three "Erlay:" commits (a full
+  set falls back to flooding; a transaction the peer is known to hold leaves the set; a
+  failed round floods the snapshot on both sides, and an all-zero sketch is a success, not a
+  failed decode). Core at d3056bc carries only the handshake, so BIP-330 is the oracle.
 - `ms-produce-input` indexes its satisfaction lists with `nth`; `ms-node-to-string` is
-  quadratic at the tapscript ceiling, as Core's is.
+  quadratic at the tapscript ceiling, as Core's is. → "Miniscript: the satisfier's SATS
+  tables are simple-vectors" (witness bytes pinned before and after). `ms-node-to-string`
+  stays as it is, matching Core's `ToString`.
 - The wallet dump restore (`%parse-wallet-dump`) still buffers the file; the older wallet
-  stream codec (`%wser-string`) is still ASCII.
+  stream codec (`%wser-string`) is still ASCII. → "Wallet: restorewallet reads its dump as a
+  stream of lines" (487 MiB consed before the first check on a 25 MiB dump, now 4 KiB) and
+  "Wallet: CWalletTx mapValue strings are Core's UTF-8 bytes on disk" (ASCII records read
+  back unchanged).
 - `ban-peer` has no production caller; `addnode` peers are typed outbound-full-relay, not
-  manual, so they remain in the chain-sync eviction set.
+  manual, so they remain in the chain-sync eviction set. → "Net: a ban is an address fact set
+  by setban, and no peer is ever 'banned'" (Core's `Misbehaving` only discourages; the dead
+  function is gone) and "Net: an operator-named peer is a :manual connection, not a flagged
+  outbound one".
 - `-signetchallenge` given twice is accepted; `-conf` naming a directory is not Core's
-  distinct error; `signrawtransactionwithkey` skips a malformed `prevtxs` entry silently.
-- The differential harness above.
+  distinct error; `signrawtransactionwithkey` skips a malformed `prevtxs` entry silently. →
+  the two "Config:" commits with Core's exact messages, and "RPC: a malformed prevtxs entry
+  is refused in Core's words" (Core's `ParsePrevouts`, every code and sentence; a non-int32
+  `vout` is -1, not -3, because `getInt` throws a plain runtime error).
+- The differential harness above — STILL OPEN: no Core binary can be built here.
+
+Closed alongside, from the follow-up notes rather than this list: a taproot script-path or
+miniscript PSBT input carried only by its `witness_utxo` was refused as a legacy spend
+("Wallet: a taproot script path signs from the witness_utxo alone, as any witness kind
+does"); `decodescript`'s `rawtr()` had already landed under finding `8f138c13`; and
+`wallet-set-address-book` needed no change, since Core's `SetAddressBookWithDB`
+(wallet.cpp:2480-2507) mutates the in-memory book before it writes, as ours does. One test
+flake surfaced by the batteries was fixed: a proof-corruption helper assigned a literal byte
+that the random fixture already held about one run in 256, so the "corrupted" proof
+imported clean.
 
 ## What the round cost, and what it taught
 

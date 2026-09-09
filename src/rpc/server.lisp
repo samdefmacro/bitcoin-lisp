@@ -114,7 +114,7 @@ bare name, and an alias pattern shows only its first spelling (GetFirstName,
 :912-915).
 
 Core renders an ARR or an OBJ argument as its INNER arguments -- `[fixedrate,
-...]', `{"key":"str",...}' -- or as the oneline_description its declaration
+...]', `{key:str,...}' -- or as the oneline_description its declaration
 overrides that with. Neither is in these tables (they carry top-level
 arguments only), so a structured argument shows as its bare name here. That
 is the one place RPC-USAGE-LINE is shorter than Core's first help line."
