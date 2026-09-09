@@ -1669,3 +1669,95 @@ signatures are 71 or 72 bytes."
           (declare (ignore bytes))
           (is (= elems len)
               "estimated ~D witness elements, signer produced ~D" elems len))))))
+
+;;;; The satisfier's dynamic programs (Core ProduceInput, miniscript.h:1259-1335)
+;;;; index their SATS table with SVREF on a simple-vector, as Core indexes a
+;;;; std::vector; the list-and-NTH version they replaced made each multi,
+;;;; multi_a and thresh node quadratic in its own arity. The bytes must not
+;;;; move: these digests were recorded from the LIST version and re-checked
+;;;; against the vector one before the swap was committed.
+
+(defun %ms-witness-digest (witness)
+  "(values element-count sha256-hex) over WITNESS, each element prefixed by its
+length so a boundary shift cannot hide in a same-length concatenation."
+  (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
+                             :adjustable t :fill-pointer 0)))
+    (dolist (e witness)
+      (vector-push-extend (length e) bytes)
+      (loop for b across e do (vector-push-extend b bytes)))
+    (values (length witness)
+            (string-downcase
+             (bl.crypto:bytes-to-hex
+              (bl.crypto:sha256
+               (coerce bytes '(simple-array (unsigned-byte 8) (*)))))))))
+
+(defun %ms-hash-thresh (n k)
+  "(values node satisfier) for thresh(K, sha256(H0), s:sha256(H1) ...) over N
+distinct hashes under tapscript -- the one context whose 10,000-byte script
+limit (Core MAX_SCRIPT_SIZE) admits a few hundred subexpressions. Every third
+preimage is known, so the program has real choices to make at every step."
+  (let* ((pres (loop for i from 0 below n
+                     collect (let ((p (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0)))
+                               (setf (aref p 0) (logand i 255)
+                                     (aref p 1) (ash i -8))
+                               p)))
+         (hashes (mapcar #'bl.crypto:sha256 pres))
+         (known (make-hash-table :test 'equalp))
+         (expr (with-output-to-string (s)
+                 (format s "thresh(~D" k)
+                 (loop for h in hashes for i from 0
+                       do (format s ",~Asha256(~A)" (if (zerop i) "" "s:")
+                                  (string-downcase (bl.crypto:bytes-to-hex h))))
+                 (format s ")"))))
+    (loop for p in pres for h in hashes for i from 0
+          when (zerop (mod i 3)) do (setf (gethash h known) p))
+    (values (bl.val:ms-parse expr :ctx :tapscript)
+            (bl.val:make-ms-satisfier
+             :preimage-fn (lambda (kind hash)
+                            (declare (ignore kind))
+                            (gethash hash known))))))
+
+(test satisfier-dynamic-programs-keep-their-bytes-on-vectors
+  "thresh, multi_a and multi each fold their subexpressions through one
+SATS-table step; the step's output is pinned here element for element, on a
+300-way thresh with choices at every step, an 8-key multi_a signed by four of
+them, and a 2-of-3 CHECKMULTISIG signed by the last two.
+
+The thresh also has to finish inside a bound that is a HANG guard, not a
+complexity proof: at the largest thresh the tapscript script limit allows,
+the list version took 40 ms here and the vector one 29 ms, so no bound generous
+enough for a shared runner tells them apart. The digests are the check."
+  (multiple-value-bind (node sat) (%ms-hash-thresh 300 100)
+    (let* ((t0 (get-internal-real-time))
+           (witness (bl.val:ms-satisfy node sat))
+           (elapsed (/ (- (get-internal-real-time) t0)
+                       internal-time-units-per-second)))
+      (is (< elapsed 5) "a 300-way thresh took ~,2F s" elapsed)
+      (multiple-value-bind (count digest) (%ms-witness-digest witness)
+        (is (= 300 count))
+        (is (string= "4073ac65396b8625c958268f55381e487166d4a64df7735480b93d1adecc408e"
+                     digest)))))
+  (let* ((keys (loop for i from 1 to 8
+                     collect (let ((k (make-array 33 :element-type '(unsigned-byte 8)
+                                                     :initial-element i)))
+                               (setf (aref k 0) 2)
+                               (string-downcase (bl.crypto:bytes-to-hex k)))))
+         (node (bl.val:ms-parse (format nil "multi_a(3,~{~A~^,~})" keys)
+                                :ctx :tapscript))
+         (sat (%ms-satisfier :keys (list (first keys) (third keys)
+                                         (fourth keys) (seventh keys)))))
+    (multiple-value-bind (count digest)
+        (%ms-witness-digest (bl.val:ms-satisfy node sat))
+      (is (= 8 count))
+      (is (string= "b6ddc183503bf6ae35b3770e2d0ea9fe2ddb32c0347a0c425203427561025051"
+                   digest))))
+  (let* ((key-c "0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+         (node (bl.val:ms-parse (format nil "multi(2,~A,~A,~A)"
+                                        *ms-desc-key-a* *ms-desc-key-b* key-c)))
+         (sat (%ms-satisfier :keys (list *ms-desc-key-b* key-c))))
+    (multiple-value-bind (count digest)
+        (%ms-witness-digest (bl.val:ms-satisfy node sat))
+      (is (= 3 count))
+      (is (string= "c6fe805512227a15a42f77ed4d939a52a3de4fa9a30900bdb85f8bb79fa49016"
+                   digest)))))
