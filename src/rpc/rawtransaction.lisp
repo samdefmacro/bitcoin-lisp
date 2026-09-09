@@ -884,6 +884,163 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                     errors))))))
     (nreverse errors)))
 
+(defun %json-object-p (value)
+  "T when VALUE is a JSON object as the request layer delivers one: a
+hash-table from the wire, a (string . value) alist from the tests. NIL is
+null (or an empty array), not an object -- Core's isObject."
+  (or (hash-table-p value)
+      (and (consp value)
+           (every (lambda (cell) (and (consp cell) (stringp (car cell)))) value))))
+
+(defun rpc-type-check-obj (obj expected &key allow-null)
+  "Core RPCTypeCheckObj (rpc/util.cpp:56-68) without fStrict: EXPECTED is
+((key . uvTypeName) ...) in the order Core's std::map visits the keys --
+SORTED by key, which decides which of two missing keys is named. A missing
+key is -3 \"Missing <key>\"; a present key of another type is -3 \"JSON
+value of type <actual> for field <key> is not of expected type <type>\".
+ALLOW-NULL is fAllowNull: a missing key passes and only a present one is
+typed. Absent and null are one thing here, as find_value's null makes them
+in Core; a nested false or [] has folded to NIL too and reads as missing."
+  (loop for (key . type) in expected
+        for value = (obj-get obj key)
+        do (cond ((null value)
+                  (unless allow-null
+                    (error 'rpc-error :code +rpc-type-error+
+                                      :message (format nil "Missing ~A" key))))
+                 ((string/= (%json-type-name value) type)
+                  (error 'rpc-error
+                         :code +rpc-type-error+
+                         :message (format nil "JSON value of type ~A for field ~A ~
+is not of expected type ~A" (%json-type-name value) key type))))))
+
+(defun %find-coins (node tx)
+  "Core FindCoins (node/coin.cpp:12-27) for TX's inputs: the coin each input
+spends, from the mempool view first (an unconfirmed parent's output) and the
+chainstate's coins otherwise, as an EQUALP hash (txid . vout) ->
+(script-pubkey amount nil nil) -- the map PARSE-PREVOUTS then extends and
+SIGN-TX-INPUTS reads. An input nothing knows is simply absent, which is
+Core's cleared, IsSpent coin. A node without a chainstate (the unit tests'
+bare node) knows no coin."
+  (let ((coins (make-hash-table :test 'equalp)))
+    (with-node-lock (node)
+      (let ((utxo-set (rpc-get-utxo-set node))
+            (mempool (rpc-get-mempool node)))
+        (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
+          (let* ((op (bl.ser:tx-in-previous-output in))
+                 (txid (bl.ser:outpoint-hash op))
+                 (vout (bl.ser:outpoint-index op))
+                 (entry (or (%mempool-view-coin mempool txid vout)
+                            (and utxo-set (bl.store:get-utxo utxo-set txid vout)))))
+            (when entry
+              (setf (gethash (cons txid vout) coins)
+                    (list (bl.store:utxo-entry-script-pubkey entry)
+                          (bl.store:utxo-entry-value entry)
+                          nil nil)))))))
+    coins))
+
+(defun parse-prevouts (prevtxs coins &key keystore-p)
+  "Core ParsePrevouts (rpc/rawtransaction_util.cpp:190-310): fold the
+prevtxs argument PREVTXS -- NIL, or a list of JSON objects -- into COINS, the
+(txid . vout) -> (script-pubkey amount redeem witness-script) map the signer
+reads, refusing every malformed entry with Core's code and sentence, in
+Core's order of checks:
+  - an entry that is not an object, -22 (:197);
+  - RPCTypeCheckObj over scriptPubKey/txid/vout, -3 (:202-207);
+  - ParseHashO txid (-8, ParseHashV's words, :209), getInt<int> vout (:211;
+    a vout that is no whole int32 is -1 \"JSON integer out of range\", NOT
+    -3 -- getInt throws a plain std::runtime_error), a negative vout (-22,
+    :213), ParseHexO scriptPubKey (-8, :217);
+  - a scriptPubKey that disagrees with the coin COINS already holds for the
+    outpoint -- FindCoins' or an earlier entry's -- -22 with both scripts'
+    asm (:221-228);
+  - and with KEYSTORE-P (Core's non-null keystore: signrawtransactionwithkey
+    passes one, the wallet signer passes nullptr, wallet/rpc/spend.cpp:922),
+    for a P2SH or P2WSH scriptPubKey the redeemScript/witnessScript rules
+    (:241-305): each a string if present (-3), at least one present (-8
+    \"Missing redeemScript/witnessScript\"), a redeemScript that differs from
+    the witnessScript must be its P2WSH form (-8 \"redeemScript does not
+    correspond to witnessScript\"), and the script must hash to the output
+    (-8 \"redeemScript/witnessScript does not match scriptPubKey\").
+Core keys the scripts into the keystore by hash; here they land in the
+outpoint's entry in the shape SIGN-TX-INPUTS reads: for P2SH the redeem is
+the script whose hash the output carries -- the witnessScript's P2WSH form
+for P2SH-P2WSH -- and the witness-script is the script under it. Without a
+keystore the entry keeps whatever COINS knew.
+
+One deliberate difference: an entry without an amount keeps the amount COINS
+already knew, where Core replaces the coin outright and lets a missing
+amount default to MAX_MONEY -- a segwit signature over that amount verifies
+against itself and nothing else, which nobody wants back."
+  ;; A prevtxs that is not an array at all keeps the handlers' historical
+  ;; leniency (ignored) where Core's get_array would throw; only the ENTRIES
+  ;; are Core's business here.
+  (dolist (p (and (listp prevtxs) prevtxs) coins)
+    (unless (%json-object-p p)
+      (error 'rpc-error :code +rpc-deserialization-error+
+                        :message "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}"))
+    (rpc-type-check-obj p '(("scriptPubKey" . "string") ("txid" . "string")
+                            ("vout" . "number")))
+    (let* ((txid (parse-hash-v (obj-get p "txid") "txid"))
+           (vout (obj-get p "vout")))
+      ;; getInt<int> on a VNUM whose digits are not a whole int32 throws a
+      ;; PLAIN std::runtime_error, not UniValue::type_error, so ExecuteCommand
+      ;; answers RPC_MISC_ERROR (-1) here and not -3 (rpc/server.cpp:512-515,
+      ;; univalue.h:138-149).
+      (unless (typep vout '(signed-byte 32))
+        (error 'rpc-error :code +rpc-misc-error+ :message "JSON integer out of range"))
+      (when (minusp vout)
+        (error 'rpc-error :code +rpc-deserialization-error+
+                          :message "vout cannot be negative"))
+      (let* ((spk (parse-hex-v (obj-get p "scriptPubKey") "scriptPubKey"))
+             (key (cons txid vout))
+             (known (gethash key coins))
+             (amount (obj-get p "amount"))
+             (redeem (third known))
+             (witness (fourth known)))
+        (when (and known (not (equalp (first known) spk)))
+          (error 'rpc-error
+                 :code +rpc-deserialization-error+
+                 :message (format nil "Previous output scriptPubKey mismatch:~%~A~%vs:~%~A"
+                                  (bl.val:disassemble-script (first known))
+                                  (bl.val:disassemble-script spk))))
+        (when keystore-p
+          (let ((type (bl.val:classify-script spk)))
+            (when (member type '(:scripthash :witness-v0-scripthash))
+              (rpc-type-check-obj p '(("redeemScript" . "string")
+                                      ("witnessScript" . "string"))
+                                  :allow-null t)
+              (let ((rs (obj-get p "redeemScript"))
+                    (ws (obj-get p "witnessScript")))
+                (when (and (null rs) (null ws))
+                  (error 'rpc-error :code +rpc-invalid-parameter+
+                                    :message "Missing redeemScript/witnessScript"))
+                ;; Core works from the witnessScript when it has one.
+                (let* ((script (if ws
+                                   (parse-hex-v ws "witnessScript")
+                                   (parse-hex-v rs "redeemScript")))
+                       (p2wsh (%script-p2wsh script)))
+                  (when (and ws rs (string/= ws rs)
+                             (not (equalp (parse-hex-v rs "redeemScript") p2wsh)))
+                    (error 'rpc-error :code +rpc-invalid-parameter+
+                                      :message "redeemScript does not correspond to witnessScript"))
+                  (cond ((eq type :witness-v0-scripthash)
+                         (unless (equalp spk p2wsh)
+                           (error 'rpc-error :code +rpc-invalid-parameter+
+                                             :message "redeemScript/witnessScript does not match scriptPubKey"))
+                         (setf redeem nil witness script))
+                        ;; traditional P2SH, or P2WSH encoded as P2SH
+                        ((equalp spk (%script-p2sh script))
+                         (setf redeem script witness nil))
+                        ((equalp spk (%script-p2sh p2wsh))
+                         (setf redeem p2wsh witness script))
+                        (t
+                         (error 'rpc-error :code +rpc-invalid-parameter+
+                                           :message "redeemScript/witnessScript does not match scriptPubKey"))))))))
+        (setf (gethash key coins)
+              (list spk
+                    (if amount (amount-from-value amount) (second known))
+                    redeem witness))))))
+
 (define-rpc "signrawtransactionwithkey" (node params)
   "Sign inputs of a raw transaction with the supplied WIF private keys (Bitcoin
 Core signrawtransactionwithkey). Supports P2PKH, P2WPKH, P2TR key-path, bare
@@ -893,7 +1050,6 @@ PARAMS: (hexstring privkeys [prevtxs] [sighashtype]). Each prevtxs entry is
 being spent (amount, in BTC, is required for any segwit input; P2TR also needs
 amounts on ALL inputs; redeemScript for P2SH; witnessScript for P2WSH). P2TR signs
 with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
-  (declare (ignore node))
   (let ((hexstring (first params))
         (wifs (positional-array (second params)))
         (prevtxs (positional-array (third params)))
@@ -908,7 +1064,9 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
            (keymap (make-hash-table :test 'equalp))   ; hash160(pubkey) -> (privkey . pubkey)
            (pubmap (make-hash-table :test 'equalp))   ; full pubkey bytes -> privkey (multisig)
            (tr-keymap (make-hash-table :test 'equalp)) ; tweaked taproot output key (32B) -> privkey
-           (prevmap (make-hash-table :test 'equalp))) ; (txid . vout) -> (spk amount-sats redeem witness-script)
+           ;; (txid . vout) -> (spk amount-sats redeem witness-script), seeded
+           ;; with what the node itself knows about the inputs.
+           (prevmap (%find-coins node tx)))
       ;; Key map: derive each WIF's pubkey (per its compression flag) -> key-id.
       (dolist (wif wifs)
         (multiple-value-bind (sk compressed) (bl.crypto:wif-to-private-key wif)
@@ -921,29 +1079,10 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
           (let ((qx (bl.interop:compute-tweaked-pubkey
                      (bl.crypto:derive-xonly-pubkey sk))))
             (when qx (setf (gethash qx tr-keymap) sk)))))
-      ;; Prevout map from prevtxs (carries optional redeemScript / witnessScript).
-      ;; %OBJ-GET, not ASSOC: each element is a JSON object, which arrives as a
-      ;; HASH-TABLE from a real client and an ALIST from these tests, and ASSOC
-      ;; on a hash-table is a type error. That error escaped as
-      ;; "-32603 Internal error: The value #<HASH-TABLE ...> is not of type
-      ;; LIST" — signrawtransactionwithkey could not be called with prevtxs by
-      ;; any real client (rpc_signrawtransactionwithkey.py:71 does exactly
-      ;; that), while every unit test passed by handing it alists. Same defect
-      ;; and same fix as createrawtransaction's inputs.
-      (dolist (pt (and (listp prevtxs) prevtxs))
-        (let ((txid (obj-get pt "txid"))
-              (vout (obj-get pt "vout"))
-              (spk-hex (obj-get pt "scriptPubKey"))
-              (amount (obj-get pt "amount"))
-              (redeem-hex (obj-get pt "redeemScript"))
-              (ws-hex (obj-get pt "witnessScript")))
-          (when (and (stringp txid) (valid-hex-hash-p txid) (integerp vout) (stringp spk-hex))
-            (setf (gethash (cons (parse-hex-hash txid) vout) prevmap)
-                  (list (bl.crypto:hex-to-bytes spk-hex)
-                        ;; Core ParsePrevouts: AmountFromValue when present.
-                        (when amount (amount-from-value amount))
-                        (when (stringp redeem-hex) (bl.crypto:hex-to-bytes redeem-hex))
-                        (when (stringp ws-hex) (bl.crypto:hex-to-bytes ws-hex)))))))
+      ;; Core ParsePrevouts with a keystore (rpc/rawtransaction.cpp:769): the
+      ;; caller's prevtxs entries extend and override what the node knows,
+      ;; and every malformed entry is refused rather than skipped.
+      (parse-prevouts prevtxs prevmap :keystore-p t)
       ;; Sign whatever the supplied keys can satisfy (shared machinery).
       (let ((sign-errors (sign-tx-inputs tx prevmap keymap pubmap tr-keymap
                                           sighash-byte)))

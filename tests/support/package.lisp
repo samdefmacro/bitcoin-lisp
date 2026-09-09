@@ -29,6 +29,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:capture-log-lines
    #:rpc-error-of
    #:wire-params
+   #:one-input-tx-hex
    #:make-deterministic-rng
    #:clear-undo-cache
    #:txindex-resume-height
