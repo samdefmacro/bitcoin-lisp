@@ -129,6 +129,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:input-sig-tap
    #:input-sig-tap-leaf
    #:input-sig-tap-script-sigs
+   #:input-sig-witness-p
    #:input-sig-witness-script
    #:key-xonly-bytes
    #:make-descriptor-cache

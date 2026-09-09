@@ -946,3 +946,88 @@ whole test out before it asserted anything."
                "createpsbt([]) raised instead of building: ~A" with-sentinel)
       (is (equal with-nil with-sentinel)
           "createpsbt([]) and createpsbt(null) disagree"))))
+
+;;;; --- SignPSBTInput's require_witness_sig (GA11 left-out) ---------------------
+
+(defun %psbt-funded-spending (spk value)
+  "Like %PSBT-SPENDING, but the input carries BOTH a witness_utxo and the
+non_witness_utxo that authenticates it (a funding transaction whose txid the
+prevout names). With the full previous transaction present Core's SignPSBTInput
+takes its prevout from it and require_witness_sig stays false (psbt.cpp:419-427),
+so this is the control that a signature the witness-only shape refuses is one the
+signer can produce."
+  (let* ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (funding (bl.ser:make-transaction
+                   :version 2
+                   :inputs (vector (bl.ser:make-tx-in
+                                    :previous-output
+                                    (bl.ser:make-outpoint
+                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element #x22)
+                                     :index 0)
+                                    :script-sig empty :sequence #xffffffff))
+                   :outputs (vector (bl.ser:make-tx-out :value value :script-pubkey spk))
+                   :lock-time 0))
+         (spend (bl.ser:make-transaction
+                 :version 2
+                 :inputs (vector (bl.ser:make-tx-in
+                                  :previous-output
+                                  (bl.ser:make-outpoint
+                                   :hash (bl.ser:transaction-hash funding) :index 0)
+                                  :script-sig empty :sequence #xffffffff))
+                 :outputs (vector (bl.ser:make-tx-out
+                                   :value (- value 1000) :script-pubkey spk))
+                 :lock-time 0))
+         (psbt (bl.ser:make-empty-psbt spend))
+         (map (aref (bl.ser:psbt-inputs psbt) 0))
+         (bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-tx-out bb (bl.ser:make-tx-out :value value :script-pubkey spk))
+    (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty (bl.ser:bb-finish bb))
+    (bl.ser:psbt-map-set map bl.ser:+psbt-in-non-witness-utxo+ empty
+                         (bl.ser:transaction-wire-bytes funding))
+    psbt))
+
+(test descriptorprocesspsbt-refuses-a-legacy-signature-over-the-witness-utxo-alone
+  "Core SignPSBTInput's require_witness_sig (psbt.cpp:428-435, :488): an input
+whose only prevout source is the witness_utxo cannot authenticate a NON-witness
+spend, so a legacy signature over it is refused (PSBTError::INCOMPLETE) and no
+partial signature is recorded. This is the positive control for the predicate
+that decides which signatures are witness ones: a P2PKH input carried by its
+witness_utxo alone must stay unsigned, and the same input with the
+non_witness_utxo attached must sign -- so the refusal is the gate, not the
+signer."
+  (let* ((node (bl:make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 33))
+         (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (pub (bl.crypto:derive-public-key sk :compressed t))
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                           #(#x76 #xa9 #x14) (bl.crypto:hash160 pub) #(#x88 #xac)))
+         (descriptors (list (format nil "pkh(~A)" wif))))
+    (let ((refused (%psbt-process-with-descriptors node (%psbt-spending spk 100000)
+                                                   descriptors)))
+      (is (eq yason:false (cdr (assoc "complete" refused :test #'equal)))
+          "a legacy signature over the witness_utxo alone was accepted")
+      (is (null (first (%psbt-partial-sigs
+                        (bl.ser:decode-psbt (cdr (assoc "psbt" refused :test #'equal))))))
+          "a partial signature was recorded for the refused legacy input"))
+    (let ((signed (%psbt-process-with-descriptors node (%psbt-funded-spending spk 100000)
+                                                  descriptors)))
+      (is (eq t (cdr (assoc "complete" signed :test #'equal)))
+          "control: the same P2PKH input does not sign with its non_witness_utxo"))))
+
+(test input-sig-witness-p-answers-for-every-kind
+  "INPUT-SIG-WITNESS-P is an ECASE over the whole kind vocabulary
+COMPUTE-INPUT-SIGNATURES produces, so a kind it does not know signals rather
+than passing as a legacy signature. The partition is Core's: every kind whose
+solution ProduceSignature marks sigdata.witness (script/sign.cpp:757-789) is
+true, the six legacy shapes false, and the three kinds the hand-written list
+left out -- the taproot script path and both miniscript wrappings -- are
+witness ones."
+  (flet ((witness-p (kind)
+           (bl.rpc:input-sig-witness-p (bl.rpc::%make-input-sig :kind kind))))
+    (dolist (kind '(:p2pk :p2pkh :p2sh-p2pk :p2sh-p2pkh :multisig :p2sh-multisig))
+      (is-false (witness-p kind) "~S is a legacy kind" kind))
+    (dolist (kind '(:p2wpkh :p2sh-p2wpkh :p2wsh :p2sh-p2wsh :p2tr
+                    :p2tr-script :p2wsh-miniscript :p2sh-p2wsh-miniscript))
+      (is-true (witness-p kind) "~S is a witness kind" kind))
+    (signals error (witness-p :not-a-kind))))
