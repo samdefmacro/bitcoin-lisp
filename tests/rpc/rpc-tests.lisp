@@ -1163,8 +1163,10 @@ The first row is rpc_blockchain.py:496-506 byte for byte."
                                       (list bl.rpc:+json-false+)))))
     (is (search "JSON value of type array is not of expected type string"
                 (cdr (%rpc-wire-error node "getblockheader" (list (vector))))))
-    ;; A null argument passes, as Core's MatchesType does for an optional one.
-    (is (null (%rpc-wire-error node "getblockcount" (list nil))))
+    ;; A null argument passes, as Core's MatchesType does for an optional one
+    ;; -- in a slot the method actually declares: getblockcount declares none,
+    ;; so a null there is Core's arity error and not a type one.
+    (is (null (%rpc-wire-error node "help" (list nil))))
     ;; skip_type_check positions are not gated: getblock takes a BOOL
     ;; verbosity (blockchain.cpp:771-772), so this reaches the handler and
     ;; fails its lookup instead.
@@ -1174,6 +1176,60 @@ The first row is rpc_blockchain.py:496-506 byte for byte."
     ;; Positive controls: correctly typed calls are not refused by the gate.
     (is (null (%rpc-wire-error node "getnetworkhashps" (list 120 -1))))
     (is (null (%rpc-wire-error node "help" (list "getblockcount"))))))
+
+(test rpc-call-with-the-wrong-number-of-arguments-is-the-help-text
+  "Core gates the argument COUNT before it gates their types and before the
+handler body: RPCHelpMan::HandleRequest throws the help text when
+IsValidNumArgs(request.params.size()) is false (rpc/util.cpp:644), which is
+`num_required_args <= n <= m_args.size()\' -- num_required_args being the
+position AFTER the last RPCArg::Optional::NO argument, not the count of
+required ones (:733-745). HelpResult is a plain std::runtime_error that only
+the `help\' method catches (rpc/server.cpp:94), so an ordinary call lands in
+ExecuteCommand's catch-all: RPC_MISC_ERROR (-1) with the help text as the
+message (:514-515).
+
+This node ignored extra positional arguments entirely and let a missing
+required one reach the handler as NIL. Core's own tests assert the -1 by
+looking for the method name inside the message
+(rpc_rawtransaction.py:255-259, rpc_estimatefee.py:21-22, rpc_help.py:126),
+and the message here is the first line of that help text -- all of it this
+node has, since no method carries Core's description and result sections.
+
+Named-argument requests need no separate gate: %REQUEST-PARAMS runs the
+transform to positional before DISPATCH-RPC-METHOD sees the parameters at
+all, which is the order Core reaches transformNamedArguments in
+(rpc/server.cpp:506-509)."
+  (let ((node (make-test-node))
+        (zeros (make-string 64 :initial-element #\0)))
+    (flet ((answer (method &rest params)
+             (%rpc-wire-error node method params)))
+      ;; One argument too many, for a method that declares none and for one
+      ;; that declares a single optional one. The second is rpc_help.py:126.
+      (is (equal (cons -1 "uptime") (answer "uptime" 1)))
+      (is (equal (cons -1 "help ( \"command\" )") (answer "help" "a" "b")))
+      ;; Too few: the one required argument of getblockhash.
+      (is (equal (cons -1 "getblockhash height") (answer "getblockhash")))
+      ;; An OPTIONAL argument before a required one still has to be passed --
+      ;; prioritisetransaction's `dummy\' sits between txid and fee_delta, so
+      ;; two arguments are too few even though only two are required.
+      (is (equal (cons -1 "prioritisetransaction \"txid\" ( dummy ) fee_delta")
+                 (answer "prioritisetransaction" zeros 0)))
+      ;; Positive controls. Exactly the maximum still RUNS: help echoes the
+      ;; method name it was given.
+      (is (null (answer "help" "getblockcount")))
+      (is (equal "getblockcount"
+                 (bl.rpc:dispatch-rpc-method node "help"
+                                             (wire-params (list "getblockcount")))))
+      ;; Trailing optional arguments may still be omitted, all of them.
+      (is (null (answer "help")))
+      (is (null (answer "getrawmempool")))
+      (is (null (answer "uptime")))
+      ;; A method this node registers and Core does not declare has no row and
+      ;; is not gated: migrateblocks takes two arguments and a third reaches
+      ;; the handler, which answers for its own first one. STRUCTURAL-TESTS
+      ;; pins that set to migrateblocks alone.
+      (is (equal (cons -8 "nblocks must be a positive integer")
+                 (answer "migrateblocks" 0 0 0))))))
 
 (test rpc-arg-types-table-agrees-with-the-names-table
   "Both generated tables come from the same RPCHelpMan declarations

@@ -909,10 +909,13 @@
   `Wrong type passed:\' plus a `Position N (name)\' object, and the types
   are DATA generated from Core alongside the argument names, so a position
   Core does not gate -- AMOUNT, RANGE, skip_type_check -- is not gated
-  here. Core's ARITY check (-1 with the help text for a count outside
-  [required, declared]) is NOT ported: it needs each argument's
-  required/optional fallback and the method's help text, which is the rest
-  of RPCHelpMan. The REST interface and the web UI register their
+  here. Core's ARITY check runs first (`check-rpc-arg-count',
+  IsValidNumArgs): fewer arguments than the position after the method's
+  last REQUIRED one, or more than it declares, is -1 carrying the help
+  text -- here the one-line usage summary, all of that text this tree has,
+  built from the same generated tables. A method Core does not declare has
+  no row and is not gated; STRUCTURAL-TESTS pins that set to
+  `migrateblocks'. The REST interface and the web UI register their
   HTTP surfaces with REGISTER-HTTP-SURFACE at the end of their files;
   the server never names them.
 
@@ -937,6 +940,9 @@
   (bitcoin-lisp.rpc:dispatch-rpc-method function)
   (bitcoin-lisp.rpc::check-rpc-arg-types function)
   (bitcoin-lisp.rpc::*rpc-arg-types* variable)
+  (bitcoin-lisp.rpc::check-rpc-arg-count function)
+  (bitcoin-lisp.rpc::rpc-usage-line function)
+  (bitcoin-lisp.rpc::*rpc-arg-required* variable)
   (bitcoin-lisp.rpc:set-rpc-warmup-status function)
   (bitcoin-lisp.rpc:finish-rpc-warmup function)
   (bitcoin-lisp.rpc::parse-json-rpc-request function)
