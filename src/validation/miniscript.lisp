@@ -2159,24 +2159,22 @@ here is)."
          ;; Dynamic programming: SATS[j] is the best stack carrying j valid
          ;; signatures out of the keys seen so far. SATS[0] starts as one
          ;; zero because CHECKMULTISIG pops one element too many.
-         (let ((sats (list (ms-stack-zero))))
+         ;;
+         ;; SATS is a simple-vector, as Core's `sats' is a std::vector
+         ;; (miniscript.h:1287-1311). Indexing a LIST with NTH here made
+         ;; every step quadratic in the keys seen so far.
+         (let ((sats (vector (ms-stack-zero))))
            (dolist (key (ms-node-keys node))
-             (let ((sig (%ms-sig-stack sat key))
-                   (next (list (first sats))))
-               (loop for j from 1 below (length sats)
-                     do (push (ms-stack-or (nth j sats)
-                                           (ms-stack+ (nth (1- j) sats) sig))
-                              next))
-               (push (ms-stack+ (car (last sats)) sig) next)
-               (setf sats (nreverse next))))
+             (setf sats (%ms-dp-step sats (svref sats 0)
+                                     (%ms-sig-stack sat key) nil)))
            (let ((nsat (ms-stack-zero)))
              (dotimes (i (ms-node-k node))
                (setf nsat (ms-stack+ nsat (ms-stack-zero))))
-             (res (nth (ms-node-k node) sats) nsat))))
+             (res (svref sats (ms-node-k node)) nsat))))
         (:multi-a
          ;; The same dynamic program as :MULTI, and three things differ --
          ;; exactly the three that a copy of :MULTI gets wrong (Core
-         ;; miniscript.h:1259-1284 against :1285-1310):
+         ;; miniscript.h:1259-1285 against :1287-1311):
          ;;
          ;; - the keys are signed in REVERSE order, because CHECKSIG reads
          ;;   the FIRST key's signature off the TOP of the stack while
@@ -2188,18 +2186,11 @@ here is)."
          ;;   element per key, and dissatisfying is signing none of them.
          (let* ((keys (ms-node-keys node))
                 (nkeys (length keys))
-                (sats (list (ms-stack-empty))))
-           (dotimes (i nkeys)
-             (let ((sig (%ms-sig-stack sat (nth (- nkeys 1 i) keys)))
-                   (next '()))
-               (push (ms-stack+ (first sats) (ms-stack-zero)) next)
-               (loop for j from 1 below (length sats)
-                     do (push (ms-stack-or
-                               (ms-stack+ (nth j sats) (ms-stack-zero))
-                               (ms-stack+ (nth (1- j) sats) sig))
-                              next))
-               (push (ms-stack+ (car (last sats)) sig) next)
-               (setf sats (nreverse next))))
+                (sats (vector (ms-stack-empty))))
+           (dolist (key (reverse keys))
+             (let ((zero (ms-stack-zero)))
+               (setf sats (%ms-dp-step sats (ms-stack+ (svref sats 0) zero)
+                                       (%ms-sig-stack sat key) zero))))
            ;; Core CHECK_NONFATAL(node.k != 0) plus assert(k < sats.size()).
            ;; Neither the parser nor the decoder can build such a node, and
            ;; answering SATS[0] for k = 0 would hand a caller the
@@ -2208,32 +2199,47 @@ here is)."
              (unless (and (plusp k) (< k (length sats)))
                (internal-error "multi_a threshold ~D outside its ~D keys"
                                k nkeys))
-             (res (nth k sats) (first sats)))))
+             (res (svref sats k) (svref sats 0)))))
         (:thresh
          ;; SATS[j] is the best stack satisfying j of the subexpressions seen
          ;; so far, walking them in REVERSE because the witness is built
          ;; innermost-first.
-         (let ((sats (list (ms-stack-empty))))
+         (let ((sats (vector (ms-stack-empty))))
            (dolist (sub (reverse subs))
-             (let ((s (first sub)) (n (second sub))
-                   (next '()))
-               (push (ms-stack+ (first sats) n) next)
-               (loop for j from 1 below (length sats)
-                     do (push (ms-stack-or (ms-stack+ (nth j sats) n)
-                                           (ms-stack+ (nth (1- j) sats) s))
-                              next))
-               (push (ms-stack+ (car (last sats)) s) next)
-               (setf sats (nreverse next))))
+             (let ((s (first sub)) (n (second sub)))
+               (setf sats (%ms-dp-step sats (ms-stack+ (svref sats 0) n) s n))))
            (let ((nsat (ms-stack-invalid)))
              (loop for i from 0 below (length sats)
                    do (unless (or (= i 0) (= i (ms-node-k node)))
                         ;; Any count other than 0 or k is over- or
                         ;; under-complete: available, but never the right
                         ;; choice, since the i=0 form always exists.
-                        (%ms-mark (nth i sats) :malleable t :non-canon t))
+                        (%ms-mark (svref sats i) :malleable t :non-canon t))
                       (unless (= i (ms-node-k node))
-                        (setf nsat (ms-stack-or nsat (nth i sats)))))
-             (res (nth (ms-node-k node) sats) nsat))))))))
+                        (setf nsat (ms-stack-or nsat (svref sats i)))))
+             (res (svref sats (ms-node-k node)) nsat))))))))
+
+(defun %ms-dp-step (sats first taken skipped)
+  "One step of the three satisfaction dynamic programs above. SATS is a
+simple-vector whose element J is the best stack with J of the elements seen so
+far satisfied; this folds in one more element, whose satisfaction is TAKEN and
+whose dissatisfaction is SKIPPED -- NIL for CHECKMULTISIG, which pushes nothing
+for a key it passes over. FIRST is the new SATS[0], because the three programs
+differ in how the skipped element shows up there.
+
+Returns a fresh vector one longer than SATS: Core's `next_sats' in ProduceInput
+(miniscript.h:1273-1283 multi_a, :1300-1309 multi, :1324-1332 thresh)."
+  (let* ((len (length sats))
+         (next (make-array (1+ len))))
+    (setf (svref next 0) first)
+    (loop for j from 1 below len
+          do (setf (svref next j)
+                   (ms-stack-or (if skipped
+                                    (ms-stack+ (svref sats j) skipped)
+                                    (svref sats j))
+                                (ms-stack+ (svref sats (1- j)) taken))))
+    (setf (svref next len) (ms-stack+ (svref sats (1- len)) taken))
+    next))
 
 (defun ms-satisfy (node sat &key (key-fn #'%ms-identity-key))
   "The witness stack that satisfies NODE, or NIL.
