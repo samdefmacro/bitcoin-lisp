@@ -1165,7 +1165,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                ;; negotiation, so HASH is the id this peer's filter is keyed
                ;; by. Without this we announce every transaction we accept
                ;; straight back to the peers that announced it to us.
-               (bl:add-recent-reject (peer-announced-txs peer) hash)
+               (%mark-tx-known-to-peer peer hash)
                (when (and mempool
                           ;; Core requests announced txs only outside IBD —
                           ;; their inputs won't resolve against a stale UTXO
@@ -2301,8 +2301,7 @@ CTX's recent-rejects, when present, caches recently rejected txs."
               ;; net_processing.cpp:4491-4492 -- the filter is keyed by the
               ;; id THIS peer's inventory uses, which is what the relay path
               ;; looks up.
-              (bl:add-recent-reject (peer-announced-txs peer)
-                                    (%peer-inv-hash peer txid wtxid))
+              (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
               ;; Check recent rejects and recently-confirmed before expensive
               ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
               ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
@@ -3490,6 +3489,22 @@ to announce; the announcement itself is the same inv path everything else uses."
   (or (peer-recon-set peer)
       (setf (peer-recon-set peer) (make-recon-set))))
 
+(defun %mark-tx-known-to-peer (peer hash)
+  "Record that PEER holds the transaction its inventory calls HASH: it
+announced or sent it to us, or we announced it. This is Core's AddKnownTx /
+m_tx_inventory_known_filter insert (net_processing.cpp:4174, :4491-4492,
+:6019, :6083), with the one consequence BIP-330 adds: a transaction the peer
+already has is out of its reconciliation set. The set holds what `would have
+been announced using INV messages absent this protocol', and this one was --
+left in, it would cost sketch capacity every round until a round happened to
+settle it. A reconciling peer negotiated wtxid relay, so HASH is the wtxid the
+set is keyed by. Core d3056bc has no set to remove from; the BIP is the
+oracle."
+  (bl:add-recent-reject (peer-announced-txs peer) hash)
+  (let ((set (peer-recon-set peer)))
+    (when (and set (peer-recon-k0 peer))
+      (recon-set-remove set (peer-recon-k0 peer) (peer-recon-k1 peer) hash))))
+
 (defun %recon-hold-p (peer wtxid txid peers)
   "T when this transaction should wait for reconciliation with PEER rather than
 being announced now.
@@ -3610,7 +3625,7 @@ Core's `continue` before nRelayedTransactions++."
                             ;; BIP 133 feefilter, evaluated at flush time.
                             (or (zerop (peer-feefilter-rate peer))
                                 (>= fee-rate-per-kb (peer-feefilter-rate peer))))
-                   (bl:add-recent-reject (peer-announced-txs peer) known)
+                   (%mark-tx-known-to-peer peer known)
                    (incf count)
                    (push inv invs)))))
     ;; Whatever the budget did not reach stays queued.
@@ -3668,8 +3683,7 @@ that connected mid-flush would see it."
              ;; PEER-LAST-INV-SEQUENCE, snapshotted below, not this filter.
              (let ((inv (%peer-tx-inv peer txid
                                       (bl.mp:mempool-entry-wtxid entry))))
-               (bl:add-recent-reject (peer-announced-txs peer)
-                                     (bl.ser:inv-vector-hash inv))
+               (%mark-tx-known-to-peer peer (bl.ser:inv-vector-hash inv))
                (push inv invs)))))))
     (when invs
       (handler-case
