@@ -1,6 +1,6 @@
 """Extract each RPC method's top-level argument NAMES -- and, with --types,
-their RPCArg::Type -- from Core's RPCHelpMan declarations, in declaration
-order.
+their RPCArg::Type, or with --required, which of them Core REQUIRES --
+from Core's RPCHelpMan declarations, in declaration order.
 
 The names are what transformNamedArguments matches a JSON-RPC named parameter
 against (rpc/server.cpp), so they are the table a server needs to accept named
@@ -57,14 +57,22 @@ def scan_to_top_comma(s, i, stop):
 def arg_entries_from_vector(s, i):
     """Parse a brace-literal vector of RPCArg entries at s[i]=='{'.
 
-    Returns [(name, type)], the type being the RPCArg::Type token of the entry
-    or None when the entry carries skip_type_check (Core then runs no gate on
-    it at all -- getblock's verbosity, which accepts a bool as well as a
+    Returns [(name, type, required)], the type being the RPCArg::Type token of
+    the entry or None when the entry carries skip_type_check (Core then runs no
+    gate on it at all -- getblock's verbosity, which accepts a bool as well as a
     number). A nested inner argument's skip_type_check disarms its OUTER entry
-    too; that errs toward NOT checking, which is the safe direction."""
+    too; that errs toward NOT checking, which is the safe direction.
+
+    `required' is RPCArg::IsOptional() inverted (rpc/util.cpp:923-930): true
+    only for a fallback spelled RPCArg::Optional::NO. It is read from the
+    identifiers at the entry's OWN nesting depth, never from the substring of
+    the whole entry, so an inner argument's Optional::NO cannot make an
+    optional OBJ or ARR argument look required -- the direction that would
+    reject calls Core accepts."""
     entries, depth, expect = [], 0, False
     name = None
     type_ = None
+    req = None
     start = None
     while i < len(s):
         c = s[i]
@@ -78,14 +86,14 @@ def arg_entries_from_vector(s, i):
         if c == '{':
             depth += 1
             if depth == 2:
-                expect = True; name = None; type_ = None; start = i
+                expect = True; name = None; type_ = None; req = None; start = i
             i += 1; continue
         if c == '}':
             depth -= 1
             if depth == 1 and name is not None:
                 if 'skip_type_check' in s[start:i]:
                     type_ = None
-                entries.append((name, type_))
+                entries.append((name, type_, bool(req)))
                 name = None
             if depth == 0: return entries
             i += 1; continue
@@ -95,6 +103,8 @@ def arg_entries_from_vector(s, i):
             ident = s[i:j]
             m = re.fullmatch(r'RPCArg::Type::(\w+)', ident)
             if m and type_ is None: type_ = m.group(1)
+            if req is None and re.fullmatch(r'RPCArg::(Optional::\w+|Default\w*)', ident):
+                req = (ident == 'RPCArg::Optional::NO')
             i = j; continue
         if depth == 1 and (c.isalpha() or c == '_'):
             j = i
@@ -111,18 +121,27 @@ def arg_entries_from_vector(s, i):
 def arg_names_from_vector(s, i):
     return [e[0] for e in arg_entries_from_vector(s, i)]
 
+
+def const_required(txt, i):
+    """The fallback of a shared RPCArg constant whose header ends at TXT[i]."""
+    j = skip_trivia(txt, i)
+    if j < len(txt) and txt[j] == ',':
+        j = skip_trivia(txt, j + 1)
+    return txt.startswith('RPCArg::Optional::NO', j)
+
+
 # Shared RPCArg constants, both spellings Core uses.
 ARG_CONSTS = {}
 for path in ALL:
     txt = open(path, encoding='utf-8', errors='replace').read()
     for m in re.finditer(r'RPCArg\s+(\w+)\s*\{\s*"([^"]+)"\s*,\s*RPCArg::Type::(\w+)', txt):
-        ARG_CONSTS[m.group(1)] = (m.group(2), m.group(3))
+        ARG_CONSTS[m.group(1)] = (m.group(2), m.group(3), const_required(txt, m.end()))
     for m in re.finditer(r'RPCArg\s+(\w+)\s*\{\s*"([^"]+)"', txt):
-        ARG_CONSTS.setdefault(m.group(1), (m.group(2), None))
+        ARG_CONSTS.setdefault(m.group(1), (m.group(2), None, const_required(txt, m.end())))
     for m in re.finditer(r'\b(\w+)\s*=\s*RPCArg\{\s*\n?\s*"([^"]+)"\s*,\s*RPCArg::Type::(\w+)', txt):
-        ARG_CONSTS[m.group(1)] = (m.group(2), m.group(3))
+        ARG_CONSTS[m.group(1)] = (m.group(2), m.group(3), const_required(txt, m.end()))
     for m in re.finditer(r'\b(\w+)\s*=\s*RPCArg\{\s*\n?\s*"([^"]+)"', txt):
-        ARG_CONSTS.setdefault(m.group(1), (m.group(2), None))
+        ARG_CONSTS.setdefault(m.group(1), (m.group(2), None, const_required(txt, m.end())))
 
 UNRESOLVED = set()
 
@@ -190,11 +209,14 @@ for path in ALL:
             results[method] = results[helper]
 
 WANT_TYPES = '--types' in sys.argv
+WANT_REQUIRED = '--required' in sys.argv
 for n in sorted(results):
-    if WANT_TYPES:
-        print(n, [(a, t) for (a, t) in results[n]])
+    if WANT_REQUIRED:
+        print(n, [r for (a, t, r) in results[n]])
+    elif WANT_TYPES:
+        print(n, [(a, t) for (a, t, r) in results[n]])
     else:
-        print(n, [a for (a, t) in results[n]])
+        print(n, [a for (a, t, r) in results[n]])
 print('TOTAL', len(results), file=sys.stderr)
 if unresolved_methods:
     print('UNRESOLVED METHODS', unresolved_methods, file=sys.stderr)

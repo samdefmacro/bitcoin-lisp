@@ -107,6 +107,84 @@ the two are always in step."
   (let ((names (cdr (assoc method *rpc-named-arg-names* :test #'string=))))
     (or (nth (1- position) names) (format nil "arg~D" position))))
 
+(defun %rpc-arg-usage (name type)
+  "Core RPCArg::ToString(oneline=true) (rpc/util.cpp:1249-1290) for the
+argument NAME of TYPE: a string argument is quoted, every other one is its
+bare name, and an alias pattern shows only its first spelling (GetFirstName,
+:912-915).
+
+Core renders an ARR or an OBJ argument as its INNER arguments -- `[fixedrate,
+...]', `{"key":"str",...}' -- or as the oneline_description its declaration
+overrides that with. Neither is in these tables (they carry top-level
+arguments only), so a structured argument shows as its bare name here. That
+is the one place RPC-USAGE-LINE is shorter than Core's first help line."
+  (let ((first-name (subseq name 0 (or (position #\| name) (length name)))))
+    (if (member type '(:str :str-hex))
+        (format nil "\"~A\"" first-name)
+        first-name)))
+
+(defun rpc-usage-line (method)
+  "METHOD's one-line usage summary: the first line of the help text Core's
+RPCHelpMan::ToString builds (rpc/util.cpp:773-790) -- the method name, then
+every declared argument, with a run of optional ones wrapped in `( )'.
+
+This is as much of the help text as this node has: no method here carries
+Core's description, argument and result sections, so the arity gate throws
+this line where Core throws the whole document. The first token is the
+method name either way, which is what Core's own functional tests assert on
+(rpc_rawtransaction.py:255-259, rpc_estimatefee.py:21-22)."
+  (let ((names (cdr (assoc method *rpc-named-arg-names* :test #'string=)))
+        (types (cdr (assoc method *rpc-arg-types* :test #'string=)))
+        (required (cdr (assoc method *rpc-arg-required* :test #'string=))))
+    (with-output-to-string (out)
+      (write-string method out)
+      (let ((was-optional nil))
+        (loop for name in names
+              for rest-required = required then (cdr rest-required)
+              for rest-types = types then (cdr rest-types)
+              do (write-char #\Space out)
+                 (cond ((car rest-required)
+                        (when was-optional (write-string ") " out))
+                        (setf was-optional nil))
+                       (t
+                        (unless was-optional (write-string "( " out))
+                        (setf was-optional t)))
+                 (write-string (%rpc-arg-usage name (car rest-types)) out))
+        (when was-optional (write-string " )" out))))))
+
+(defun check-rpc-arg-count (method params)
+  "Core RPCHelpMan::IsValidNumArgs (rpc/util.cpp:733-745), run at the one
+dispatch point before any handler body: a call carrying fewer positional
+arguments than the position after METHOD's last REQUIRED one, or more than it
+declares at all, is refused.
+
+Core throws the help text for it (HelpResult, rpc/util.cpp:644), and
+HelpResult is a plain std::runtime_error that only the `help' method catches
+(rpc/server.cpp:94), so an ordinary call gets ExecuteCommand's
+`catch (const std::exception&)' -- RPC_MISC_ERROR (-1) with the help text as
+the message (rpc/server.cpp:514-515). That is the -1 Core's functional tests
+match a method name inside.
+
+Extra positional arguments used to be IGNORED here and a missing required one
+reached the handler as NIL, so all three shapes Core refuses at
+rpc_rawtransaction.py:255-259 -- createrawtransaction with none, with one,
+and with seven arguments -- ran. A method this node registers but Core does
+not declare has no row and is not gated; STRUCTURAL-TESTS pins that set, so a
+Core method cannot fall out of the table unnoticed.
+
+Named arguments are already positional here: %REQUEST-PARAMS runs the
+transform first, as Core reaches transformNamedArguments before the actor
+(rpc/server.cpp:506-509)."
+  (let ((row (assoc method *rpc-arg-required* :test #'string=)))
+    (when row
+      (let* ((required-flags (cdr row))
+             (total (length required-flags))
+             (required (or (position t required-flags :from-end t) -1))
+             (given (length params)))
+        (unless (<= (1+ required) given total)
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message (rpc-usage-line method)))))))
+
 (defun check-rpc-arg-types (method params)
   "Core's RPCHelpMan argument type gate (rpc/util.cpp:647-657), run once
 before the handler body.
@@ -163,8 +241,11 @@ than \"no such method\" for a method that does exist."
       ;; Core's exact message (server.cpp:499) — no method-name suffix.
       (error 'rpc-error :code +rpc-method-not-found+
                         :message "Method not found"))
-    ;; Core checks the declared argument types once, here, before the handler
-    ;; body runs (RPCHelpMan::HandleRequest, rpc/util.cpp:647-657).
+    ;; Core checks the argument COUNT and then the declared argument types
+    ;; once, here, before the handler body runs (RPCHelpMan::HandleRequest,
+    ;; rpc/util.cpp:644-657 -- the arity gate is first, so a call with the
+    ;; wrong number of arguments is the help text and not a type complaint).
+    (check-rpc-arg-count method params)
     (check-rpc-arg-types method params)
     ;; In-flight for as long as the handler runs, so getrpcinfo can report it.
     (with-active-rpc-command (method)

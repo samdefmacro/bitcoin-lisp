@@ -34,6 +34,12 @@ declaration order, so a named-parameter call can be laid out positionally.")
 RPCArg::Type in declaration order. Generated into rpc/core-tables.lisp; read
 by CHECK-RPC-ARG-TYPES, the gate DISPATCH-RPC-METHOD runs before any handler.")
 
+(defvar *rpc-arg-required* '()
+  "((method required-p ...) ...): for every method, one flag per positional
+argument saying whether Core declares it RPCArg::Optional::NO. Generated into
+rpc/core-tables.lisp; read by CHECK-RPC-ARG-COUNT -- the gate
+DISPATCH-RPC-METHOD runs before CHECK-RPC-ARG-TYPES -- and by RPC-USAGE-LINE.")
+
 (defvar *rpc-named-only-args* '()
   "((method option-name ...) ...): the members of each method's
 OBJ_NAMED_PARAMS options object, which a named-parameter call may pass at

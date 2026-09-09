@@ -1023,6 +1023,89 @@ only, so the source text reads in any package."
     (assert (and (consp table) (stringp (car (first table)))))
     table))
 
+(defun %core-rpc-arg-required ()
+  "Core's per-argument required flags per RPC method, read from the quoted
+alist that src/rpc/core-tables.lisp sets *rpc-arg-required* to -- strings, T
+and NIL only, so the source text reads in any package."
+  (let* ((text (%source-text))
+         (at (search "(setf *rpc-arg-required*" text))
+         (table (second (read-from-string text t nil :start (position #\' text :start at)))))
+    (assert (and (consp table) (stringp (car (first table)))))
+    table))
+
+(defun %define-rpc-method-names (text)
+  "Every method name a DEFINE-RPC form in TEXT registers: both spellings --
+`(define-rpc \"name\"' in the RPC package's own files, `(bl.rpc:define-rpc
+\"name\"' in the wallet's -- and both name forms, one string or an alias list
+whose every string is a method of its own."
+  (let ((names '()) (start 0))
+    (loop
+      (let ((at (search "define-rpc " text :start2 start)))
+        (unless at (return))
+        (setf start (+ at (length "define-rpc ")))
+        ;; Only the macro CALL: prose and the DEFMACRO itself have a space
+        ;; or nothing before the name, never the paren or the nickname colon.
+        (when (and (plusp at) (member (char text (1- at)) '(#\( #\:)))
+          (case (char text start)
+            (#\" (let ((close (position #\" text :start (1+ start))))
+                   (when close (push (subseq text (1+ start) close) names))))
+            (#\( (let ((end (position #\) text :start start)))
+                   (when end
+                     (loop with i = (1+ start)
+                           for open = (position #\" text :start i :end end)
+                           while open
+                           do (let ((close (position #\" text :start (1+ open) :end end)))
+                                (unless close (return))
+                                (push (subseq text (1+ open) close) names)
+                                (setf i (1+ close)))))))))))
+    (sort (remove-duplicates names :test #'string=) #'string<)))
+
+(defparameter +rpc-methods-with-no-core-argument-row+
+  '("migrateblocks")
+  "The methods DEFINE-RPC registers that Core does not declare, and whose
+argument count CHECK-RPC-ARG-COUNT therefore cannot gate. migrateblocks
+converts this tree's legacy per-block files into the flat blk?????.dat
+format; Core has only ever had the flat format, so it has no counterpart and
+no RPCHelpMan row to gate against. Anything else arriving here is a CORE
+method whose row fell out of the generated table -- which turns that method's
+arity gate off silently, the failure this list exists to make loud.")
+
+(test every-rpc-method-has-a-core-argument-row
+  "CHECK-RPC-ARG-COUNT (src/rpc/server.lisp) gates a call's argument count
+against *rpc-arg-required*, and skips a method with no row. That skip is
+what makes the gate able to go vacuous: a regenerated table that lost rows
+would disable the check for those methods and every existing test would stay
+green. So the set of registered methods with no row is pinned, and the two
+generated tables are checked argument for argument against each other."
+  ;; Positive controls: the scanner sees both spellings and the alias list,
+  ;; and is not fooled by the macro's own definition.
+  (is (equal '("echo" "echojson" "getblock")
+             (%define-rpc-method-names
+              "(define-rpc \"getblock\" (node (h)) \"doc\" h)
+(bl.rpc:define-rpc (\"echo\" \"echojson\") (node params) \"doc\" params)")))
+  (is (null (%define-rpc-method-names
+             "(defmacro define-rpc (names (node params) &body body) nil)")))
+  (let* ((required (%core-rpc-arg-required))
+         (names (%core-rpc-arg-names))
+         (defined (%define-rpc-method-names (%source-text)))
+         (ungated (set-difference defined (mapcar #'first required) :test #'string=)))
+    (is (< 100 (length defined))
+        "only ~D define-rpc methods found in src/; the scanner stopped seeing them"
+        (length defined))
+    (%check-pinned-set ungated +rpc-methods-with-no-core-argument-row+
+                       "+RPC-METHODS-WITH-NO-CORE-ARGUMENT-ROW+"
+                       "a registered method with no *rpc-arg-required* row is not \
+arity-gated at all")
+    (let ((disagree (loop for row in required
+                          for named = (assoc (first row) names :test #'string=)
+                          unless (and named (= (length (rest row)) (length (rest named))))
+                            collect (first row))))
+      (is (null disagree)
+          "~D method~:P whose *rpc-arg-required* row is a different length from its ~
+*rpc-named-arg-names* row: ~S -- both come out of one parse of Core, so they ~
+disagree only when a regeneration dropped arguments on one side" (length disagree)
+          disagree))))
+
 (test rpc-specs-stay-within-core-arity
   "A define-rpc parameter spec names the method's positions in Core's order,
 so it can never claim MORE positions than Core's RPCHelpMan declares
