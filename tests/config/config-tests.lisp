@@ -2717,14 +2717,36 @@ directory. And an explicitly named -conf that cannot be opened is FATAL
         (is (null explicit-p)))
       ;; -noconf: no file at all
       (is (null (bl::resolve-conf-path '("-noconf") '(("conf" . "0"))
-                                       (namestring dir))))
-      ;; readable check: present is fine, absent-and-explicit is fatal,
-      ;; absent-and-implicit is not (that is the default path).
-      (is (eq conf (bl::check-config-file-readable conf t)))
-      (let ((missing (merge-pathnames "nope.conf" (uiop:ensure-directory-pathname dir))))
-        (is (search "could not be opened"
-                    (%config-refusal (bl::check-config-file-readable missing t))))
-        (is (null (%config-refusal (bl::check-config-file-readable missing nil))))))))
+                                       (namestring dir)))))))
+
+(test a-config-file-that-is-a-directory-is-fatal-in-cores-words
+  "Core ReadConfigFiles (common/config.cpp:134-141) has two refusals, in this
+order and in these words: a DIRECTORY at the config path is `Config file
+\"<path>\" is a directory.' whether -conf named it or it is the datadir's own
+bitcoin.conf, and only then is an explicitly named file that cannot be opened
+`specified config file \"<path>\" could not be opened.'. A directory used to
+pass the check (PROBE-FILE answers a truename for one) and the read that
+followed died with a stream error naming no option. Positive controls: a
+readable file is handed back untouched, and the DEFAULT path may be absent."
+  (with-temp-directory (dir)
+    (flet ((check (path explicit-p)
+             (bl::check-config-file-readable path explicit-p)))
+      (let* ((conf (%write-conf dir (format nil "prune=550~%")))
+             (base (uiop:ensure-directory-pathname dir))
+             (subdir (make-pathname :name "confdir" :defaults base))
+             (missing (merge-pathnames "nope.conf" base)))
+        (ensure-directories-exist (uiop:ensure-directory-pathname subdir))
+        (is (eq conf (check conf t)))
+        (is (eq conf (check conf nil)))
+        (dolist (explicit-p '(t nil))
+          (is (equal (format nil "Config file \"~A\" is a directory."
+                             (namestring subdir))
+                     (%config-refusal (check subdir explicit-p)))
+              "a directory at the config path, explicit-p ~A" explicit-p))
+        (is (equal (format nil "specified config file \"~A\" could not be opened."
+                           (namestring missing))
+                   (%config-refusal (check missing t))))
+        (is (null (%config-refusal (check missing nil))))))))
 
 (test a-datadir-bitcoin-conf-that-is-not-the-file-we-read-is-fatal
   "Both of Core's shadowing shapes. The assertions are on the SETTING that
