@@ -123,6 +123,9 @@ so on any other chain the option is inert. An unparsable field or an unknown
 deployment name raises rather than being skipped -- a silently ignored typo
 leaves the test running against the window it was trying to move."
   (setf *vbparams-deployments* nil)
+  ;; The states cached for the old table describe a chain whose known
+  ;; deployments have just changed; see CLEAR-VERSIONBITS-WARNING-CACHE.
+  (clear-versionbits-warning-cache)
   (when specs
     (let ((deployments (mapcar #'copy-vb-deployment
                                (rest (assoc :regtest *versionbits-deployments*)))))
@@ -158,14 +161,21 @@ leaves the test running against the window it was trying to move."
 
 ;;;; --- The threshold state machine (versionbits.cpp:27-114) ---------------
 
-(defun %vb-condition-p (entry deployment)
-  "Core's ThresholdConditionChecker::Condition (versionbits_impl.h): the block
-sets the versionbits top bits and has this deployment's bit set."
-  (let ((v (bl.ser:block-header-version
-            (bl.store:block-index-entry-header entry))))
-    (and (= (logand v +vb-top-mask+) +vb-top-bits+)
-         (logbitp (vb-deployment-bit deployment) v)
-         t)))
+(defun %vb-condition-p (chain-state entry checker)
+  "Core's ThresholdConditionChecker::Condition: the block sets the versionbits
+top bits and has this deployment's bit set (versionbits_impl.h:66-77).
+
+CHECKER is a VB-DEPLOYMENT, or the VB-WARNING-CHECKER for one bit, whose
+Condition is the other one Core defines (versionbits.cpp:323-329). That
+predicate is the ONLY thing the two differ in, here as in Core, where they are
+two subclasses of one abstract checker."
+  (if (vb-warning-checker-p checker)
+      (%vb-warning-condition-p chain-state entry checker)
+      (let ((v (bl.ser:block-header-version
+                (bl.store:block-index-entry-header entry))))
+        (and (= (logand v +vb-top-mask+) +vb-top-bits+)
+             (logbitp (vb-deployment-bit checker) v)
+             t))))
 
 (defun %vb-period-start (chain-state entry period)
   "ENTRY snapped DOWN to the last block of its retarget period, or NIL for the
@@ -183,31 +193,54 @@ so pindexPrev is moved to the boundary before any walking
                (bl.store:entry-ancestor-at-height entry target))))))
 
 (defvar *versionbits-state-cache* nil
-  "Per-call memo for VERSIONBITS-STATE: an EQ table from deployment to an EQ
-table from boundary entry to state. NIL disables memoising.
+  "The threshold-state cache in force: an EQ table from checker to an EQ table
+from PERIOD BOUNDARY entry to state. NIL means each VERSIONBITS-STATE gets a
+fresh one, which still shares the work within that one call.
 
-Core keeps a persistent cache keyed by CBlockIndex* (versionbits.cpp:204, and
-every GetStateFor writes into it at :113). Ours is bound for the duration of
-one getdeploymentinfo call instead, which is where the cost actually is and
-which cannot go stale across a reorg because it does not outlive the call.
+The second table is Core's ThresholdConditionCache, and GetStateFor both reads
+it to STOP the walk back and writes every boundary it computes on the way
+forward (versionbits.cpp:49-113). Keying on the boundary rather than on the
+block asked about is what makes it worth anything: all PERIOD blocks of a period
+share one entry, so a tip that moved by one block costs a lookup instead of a
+walk back to the deployment's start.
 
-Without it VERSIONBITS-SINCE-HEIGHT calls VERSIONBITS-STATE once per period and
-each of those walks back to the deployment's start — on mainnet taproot at the
-current tip that is order 10^7 prev-entry hops per call, and the handler is
-also reachable through /rest/deploymentinfo.")
+A boundary's state is a function of that boundary's ancestors, which never
+change, so an entry can never go stale -- not across a reorg either, since the
+competing branch is made of different entries. WITH-VERSIONBITS-CACHE binds a
+per-call table for getdeploymentinfo; *VERSIONBITS-WARNING-CACHE* is the
+persistent one Core keeps on its VersionBitsCache object.
+
+Without any of this VERSIONBITS-SINCE-HEIGHT calls VERSIONBITS-STATE once per
+period and each of those walks back to the deployment's start — on mainnet
+taproot at the current tip that is order 10^7 prev-entry hops per call, and the
+handler is also reachable through /rest/deploymentinfo.")
+
+(defvar *versionbits-warning-cache*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "Core VersionBitsCache's m_warning_caches and m_caches (versionbits.h:78-80),
+which live as long as the node does.
+
+CHECK-UNKNOWN-ACTIVATIONS runs on every tip change, and its checkers never
+FAIL and never leave STARTED on their own -- nothing times them out -- so with
+a per-call cache every block would recount every period of the chain since
+genesis, for all 29 bits. Weak on the checker so the deployment states a
+-vbparams table leaves behind go with it, and the inner tables are weak on the
+boundary entry so a test's synthetic chain does too.")
 
 (defmacro with-versionbits-cache (&body body)
   `(let ((*versionbits-state-cache* (make-hash-table :test 'eq)))
      ,@body))
 
-(defun %vb-cached-state (deployment entry thunk)
-  (if *versionbits-state-cache*
-      (let ((per-dep (or (gethash deployment *versionbits-state-cache*)
-                         (setf (gethash deployment *versionbits-state-cache*)
-                               (make-hash-table :test 'eq)))))
-        (multiple-value-bind (v present) (gethash entry per-dep)
-          (if present v (setf (gethash entry per-dep) (funcall thunk)))))
-      (funcall thunk)))
+(defun %vb-cache-for (checker)
+  "CHECKER's boundary -> state table in the cache now in force — Core's
+`ThresholdConditionCache& cache' argument, which GetStateFor always has. A
+fresh table when no cache is bound, so the walk below is written one way."
+  (let ((outer *versionbits-state-cache*))
+    (if outer
+        (or (gethash checker outer)
+            (setf (gethash checker outer)
+                  (make-hash-table :test 'eq :weakness :key :synchronized t)))
+        (make-hash-table :test 'eq))))
 
 (defun %vb-mtp (chain-state entry)
   "ENTRY's median time past, or NIL for the block before genesis.
@@ -224,65 +257,80 @@ it is part of VERSIONBITS-STATE's, which getdeploymentinfo calls."
   (declare (ignore chain-state))
   (and entry (compute-median-time-past-from-entry entry)))
 
-(defun versionbits-state (chain-state entry deployment)
+(defun versionbits-state (chain-state entry checker)
   "The BIP9 state of the block that would follow ENTRY — Core's
 GetStateFor(pindexPrev) (versionbits.cpp:27-114). ENTRY may be NIL, meaning the
-block before genesis.
+block before genesis. CHECKER is a VB-DEPLOYMENT, or the VB-WARNING-CHECKER for
+one bit (see CHECK-UNKNOWN-ACTIVATIONS).
 
 Returns one of :defined :started :locked-in :active :failed."
-  (%vb-cached-state deployment entry
-   (lambda () (%versionbits-state-1 chain-state entry deployment))))
-
-(defun %versionbits-state-1 (chain-state entry deployment)
-  (let ((start (vb-deployment-start-time deployment))
-        (period (vb-deployment-period deployment)))
+  (let ((start (vb-deployment-start-time checker)))
     ;; Both special start times short-circuit before any chain walk
-    ;; (versionbits.cpp:33-40).
+    ;; (versionbits.cpp:33-40), which is what lets them be answered with no
+    ;; block index at all.
     (cond
-      ((= start +vb-always-active+) (return-from %versionbits-state-1 :active))
-      ((= start +vb-never-active+) (return-from %versionbits-state-1 :failed)))
-    (let ((cursor (%vb-period-start chain-state entry period))
-          (to-compute '()))
-      ;; Walk BACK in whole periods until a period whose MTP is before the start
-      ;; time — everything at or below that is DEFINED and needs no further walk
-      ;; (versionbits.cpp:48-63).
-      (loop
-        (when (null cursor) (return))
-        (when (< (%vb-mtp chain-state cursor) start) (return))
-        (push cursor to-compute)
-        (let ((h (- (bl.store:block-index-entry-height cursor) period)))
-          (setf cursor (and (>= h 0)
-                            (bl.store:entry-ancestor-at-height cursor h)))))
-      ;; Walk FORWARD, one transition per period (versionbits.cpp:69-110).
-      (let ((state :defined))
-        (dolist (boundary to-compute state)
-          (ecase state
-            (:defined
-             (when (>= (%vb-mtp chain-state boundary) start)
-               (setf state :started)))
-            (:started
-             (let ((count 0)
-                   (walker boundary))
-               (dotimes (i period)
-                 (unless walker (return))
-                 (when (%vb-condition-p walker deployment) (incf count))
-                 ;; prev-entry, not a fresh ancestor lookup per step: this
-                 ;; runs PERIOD times (2016 on the real chains) and an
-                 ;; ancestor walk inside it would be quadratic.
-                 (setf walker (bl.store:block-index-entry-prev-entry walker)))
-               (cond
-                 ;; Threshold wins over timeout when both hold in one period
-                 ;; (versionbits.cpp:92-96).
-                 ((>= count (vb-deployment-threshold deployment)) (setf state :locked-in))
-                 ((>= (%vb-mtp chain-state boundary) (vb-deployment-timeout deployment))
-                  (setf state :failed)))))
-            (:locked-in
-             ;; LOCKED_IN can never go to FAILED; it waits whole periods until
-             ;; the activation height (versionbits.cpp:97-103).
-             (when (>= (1+ (bl.store:block-index-entry-height boundary))
-                       (vb-deployment-min-activation-height deployment))
-               (setf state :active)))
-            ((:active :failed))))))))
+      ((= start +vb-always-active+) :active)
+      ((= start +vb-never-active+) :failed)
+      (t (%versionbits-state-1 chain-state entry checker)))))
+
+(defun %versionbits-state-1 (chain-state entry checker)
+  (let* ((start (vb-deployment-start-time checker))
+         (period (vb-deployment-period checker))
+         (cache (%vb-cache-for checker))
+         ;; A block's state is always the state of the first block of its
+         ;; period, so both the walk and the cache key are the boundary
+         ;; (versionbits.cpp:43-46).
+         (cursor (%vb-period-start chain-state entry period))
+         (to-compute '())
+         (state nil))
+    ;; Walk BACK in whole periods to the first boundary whose state is already
+    ;; known, or the first one whose MTP is before the start time — everything
+    ;; at or below that is DEFINED (versionbits.cpp:48-63).
+    (loop
+      (multiple-value-bind (known present) (gethash cursor cache)
+        (when present
+          (setf state known)
+          (return)))
+      (when (or (null cursor) (< (%vb-mtp chain-state cursor) start))
+        (setf (gethash cursor cache) :defined
+              state :defined)
+        (return))
+      (push cursor to-compute)
+      (let ((h (- (bl.store:block-index-entry-height cursor) period)))
+        (setf cursor (and (>= h 0)
+                          (bl.store:entry-ancestor-at-height cursor h)))))
+    ;; Walk FORWARD, one transition per period, recording each boundary as Core
+    ;; does — that record is what ends the walk above next time
+    ;; (versionbits.cpp:69-113).
+    (dolist (boundary to-compute state)
+      (ecase state
+        (:defined
+         (when (>= (%vb-mtp chain-state boundary) start)
+           (setf state :started)))
+        (:started
+         (let ((count 0)
+               (walker boundary))
+           (dotimes (i period)
+             (unless walker (return))
+             (when (%vb-condition-p chain-state walker checker) (incf count))
+             ;; prev-entry, not a fresh ancestor lookup per step: this
+             ;; runs PERIOD times (2016 on the real chains) and an
+             ;; ancestor walk inside it would be quadratic.
+             (setf walker (bl.store:block-index-entry-prev-entry walker)))
+           (cond
+             ;; Threshold wins over timeout when both hold in one period
+             ;; (versionbits.cpp:92-96).
+             ((>= count (vb-deployment-threshold checker)) (setf state :locked-in))
+             ((>= (%vb-mtp chain-state boundary) (vb-deployment-timeout checker))
+              (setf state :failed)))))
+        (:locked-in
+         ;; LOCKED_IN can never go to FAILED; it waits whole periods until
+         ;; the activation height (versionbits.cpp:97-103).
+         (when (>= (1+ (bl.store:block-index-entry-height boundary))
+                   (vb-deployment-min-activation-height checker))
+           (setf state :active)))
+        ((:active :failed)))
+      (setf (gethash boundary cache) state))))
 
 (defun versionbits-since-height (chain-state entry deployment)
   "The height of the first block of the period in which this deployment
@@ -340,7 +388,7 @@ is the easy mistake, and an all-signalling chain cannot catch it."
     (let ((signalling (make-array elapsed :element-type 'bit :initial-element 0)))
       (dotimes (i elapsed)
         (unless walker (return))
-        (when (%vb-condition-p walker deployment)
+        (when (%vb-condition-p chain-state walker deployment)
           (incf count)
           (setf (sbit signalling (- elapsed 1 i)) 1))
         (setf walker (bl.store:block-index-entry-prev-entry walker)))
@@ -483,3 +531,149 @@ name order, not in the order the deployments are declared."
     (if (vb-deployment-optional-rule-p deployment)
         name
         (concatenate 'string "!" name))))
+
+;;;; --- The bits nobody claimed (versionbits.cpp:295-345) --------------------
+;;;;
+;;;; A soft fork this node has never heard of announces itself the same way one
+;;;; it knows does: blocks start setting a version bit. Core runs the BIP9 state
+;;;; machine over every bit no deployment of ours would set, and once such a bit
+;;;; has locked in and activated it says so, because from that moment the
+;;;; majority hashrate is enforcing rules this binary does not know.
+
+(defconstant +versionbits-num-bits+ 29
+  "Core VERSIONBITS_NUM_BITS (versionbits.h:25): the bits below the three
+top bits, any of which a deployment we have never heard of could be using.")
+
+(defparameter *min-bip9-warning-heights*
+  '((:mainnet . 483840)                 ; segwit activation + one window
+    (:testnet3 . 836640)                ; likewise
+    (:testnet4 . 0)
+    (:signet . 0)
+    (:regtest . 0))
+  "Core consensus.MinBIP9WarningHeight (kernel/chainparams.cpp:95, 226, 333,
+490, 574): the height below which an unexpected version bit says nothing,
+because the chain's own history is full of blocks that set bits for reasons
+older than BIP9. Transcribed here rather than added to CHAIN-PARAMS for the
+reason *VERSIONBITS-DEPLOYMENTS* is: this file is the only reader, and a value
+that sits beside the table it belongs to is one a reader can check against
+Core.")
+
+(defstruct (vb-warning-checker (:include vb-deployment)
+                               (:constructor %make-vb-warning-checker))
+  "Core WarningBitsConditionChecker (versionbits.cpp:295-330): the BIP9 state
+machine run over ONE bit, as though a deployment we have never heard of were
+using it.
+
+It is NOT a deployment — it appears in no chain's deployment list and
+getdeploymentinfo never sees one — but it IS a threshold-condition checker, so
+it carries the same window fields and runs through the same VERSIONBITS-STATE.
+That is Core's relationship between its two checker classes exactly, and the
+only member they do not share is Condition.
+
+Its window is the whole of time (BeginTime 0, EndTime int64 max), so it can
+never FAIL: nothing but signalling ever moves it out of STARTED."
+  ;; Core's two extra members: the chain's MinBIP9WarningHeight, and the
+  ;; consensus params Condition reads to ask what a bit would mean to us.
+  (min-warning-height 0 :type integer)
+  (network :mainnet :type keyword))
+
+(defun %vb-warning-window (network)
+  "(values PERIOD THRESHOLD) for NETWORK's warning checkers — Core
+WarningBitsConditionChecker's constructor (versionbits.cpp:309-315): 2016 and
+BIP341's 90% on mainnet, and on every test chain the difficulty adjustment
+interval with BIP9's suggested 75%."
+  (if (eq network :mainnet)
+      (values 2016 1815)
+      (let ((period (bl.store:difficulty-adjustment-interval network)))
+        (values period (truncate (* period 3) 4)))))
+
+(defvar *vb-warning-checkers* (make-hash-table :test 'equal :synchronized t)
+  "(NETWORK . BIT) -> VB-WARNING-CHECKER, interned. Core builds a checker per
+scan but hands it the PERSISTENT m_warning_caches.at(bit) (versionbits.cpp:
+333-345); ours reaches its cache through its own identity, so the identity is
+what has to be stable.")
+
+(defun vb-warning-checker (network bit)
+  "NETWORK's warning checker for BIT."
+  (let ((key (cons network bit)))
+    (or (gethash key *vb-warning-checkers*)
+        (setf (gethash key *vb-warning-checkers*)
+              (multiple-value-bind (period threshold) (%vb-warning-window network)
+                (%make-vb-warning-checker
+                 :name (format nil "unknown-bit-~D" bit)
+                 :bit bit
+                 :start-time 0
+                 :timeout +vb-no-timeout+
+                 :min-activation-height 0
+                 :threshold threshold
+                 :period period
+                 :network network
+                 :min-warning-height
+                 (or (cdr (assoc network *min-bip9-warning-heights*)) 0)))))))
+
+(defun clear-versionbits-warning-cache ()
+  "Forget every cached threshold state. Called when the deployment table
+changes under us (-vbparams), because the warning condition below reads that
+table through COMPUTE-BLOCK-VERSION: Core builds its chainparams once and so
+never has to."
+  (clrhash *versionbits-warning-cache*))
+
+(defun %vb-bit-claimed-p (chain-state entry bit network)
+  "T when a deployment we know about would set BIT in the version of a block
+built on ENTRY — Core's `((::ComputeBlockVersion(pindex->pprev, m_params,
+m_caches) >> m_bit) & 1) == 0', asked one bit at a time (versionbits.cpp:328).
+
+The same answer as reading COMPUTE-BLOCK-VERSION's value: that value is
+VERSIONBITS_TOP_BITS ORed with the Mask() of every STARTED or LOCKED_IN
+deployment, each mask a single bit, and the top bits all sit above
+VERSIONBITS_NUM_BITS. Asked this way it costs a threshold-state lookup only for
+a deployment that uses the bit — no work at all for the twenty-seven bits no
+deployment has ever claimed, which are exactly the bits this whole scan is
+about. Computing the whole version instead would run the state machine for
+every deployment on every block of every period, and each of those lookups
+walks back to a period boundary through PREV-ENTRY (Core's GetAncestor is a
+skip list; BL.STORE:ENTRY-ANCESTOR-AT-HEIGHT is a walk), which on a synced
+mainnet node is minutes of validation thread on the first block past IBD."
+  (dolist (deployment (versionbits-deployments network) nil)
+    (when (and (= (vb-deployment-bit deployment) bit)
+               (member (versionbits-state chain-state entry deployment)
+                       '(:started :locked-in)))
+      (return t))))
+
+(defun %vb-warning-condition-p (chain-state entry checker)
+  "Core WarningBitsConditionChecker::Condition (versionbits.cpp:323-329): the
+block is at or above the chain's MinBIP9WarningHeight, carries the versionbits
+top bits, sets this bit — and the bit is NOT one a block WE would build on the
+same parent sets, i.e. no deployment we know of explains it.
+
+Core's clause order, which is also cheapest-first: the last clause is the only
+one that touches the chain, and it is reached only for a block that actually
+signals the bit."
+  (let ((bit (vb-deployment-bit checker))
+        (v (bl.ser:block-header-version
+            (bl.store:block-index-entry-header entry))))
+    (and (>= (bl.store:block-index-entry-height entry)
+             (vb-warning-checker-min-warning-height checker))
+         (= (logand v +vb-top-mask+) +vb-top-bits+)
+         (logbitp bit v)
+         (not (%vb-bit-claimed-p chain-state
+                                 (bl.store:block-index-entry-prev-entry entry)
+                                 bit
+                                 (vb-warning-checker-network checker))))))
+
+(defun check-unknown-activations (chain-state entry &optional (network bl:*network*))
+  "The version bits an unknown soft fork appears to be deploying on the chain
+ending at ENTRY: a list of (BIT . ACTIVE-P) in bit order — Core
+VersionBitsCache::CheckUnknownActivations (versionbits.cpp:333-345). A bit
+appears once its own BIP9 window has LOCKED_IN, and ACTIVE-P says which of the
+two states it has reached.
+
+Only bits no deployment of ours would set are counted, so our own signalling
+can never raise this; that is the whole of %VB-WARNING-CONDITION-P's last
+clause."
+  (let ((*versionbits-state-cache* *versionbits-warning-cache*))
+    (loop for bit from 0 below +versionbits-num-bits+
+          for state = (versionbits-state chain-state entry
+                                         (vb-warning-checker network bit))
+          when (member state '(:locked-in :active))
+            collect (cons bit (eq state :active)))))

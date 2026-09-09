@@ -47,6 +47,18 @@ all-signalling chain the record reads the same forwards and backwards."
           (setf prev e))))
     (values cs prev)))
 
+(defun make-versionbits-chain-with-tip (n &rest args)
+  "MAKE-VERSIONBITS-CHAIN, plus the chain-state tip pointers that
+GET-BLOCK-AT-HEIGHT walks back from -- without them every height lookup on the
+synthetic chain answers NIL, and VERSIONBITS-STATE reads NIL as `the block
+before genesis' and reports DEFINED for the whole ladder."
+  (multiple-value-bind (chain-state last) (apply #'make-versionbits-chain n args)
+    (setf (bl.store:chain-state-best-block-hash chain-state)
+          (bl.store:block-index-entry-hash last)
+          (bl.store:chain-state-best-height chain-state)
+          (bl.store:block-index-entry-height last))
+    (values chain-state last)))
+
 (defun make-reorg-test-block (prev-hash block-hash height
                               &key (value 5000000000)
                                    (timestamp (+ 1231006505 (* height 600)))

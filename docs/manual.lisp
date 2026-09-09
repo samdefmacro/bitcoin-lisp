@@ -1122,7 +1122,15 @@
   Its regtest deployment windows are the one thing an option
   can move: -vbparams=deployment:start:end[:min_activation_height] rewrites
   them through APPLY-VERSIONBITS-PARAMETERS, on regtest only, exactly as
-  Core's ReadRegTestArgs feeds RegTestOptions. Miniscript's 201-op limit is
+  Core's ReadRegTestArgs feeds RegTestOptions. The same state machine also
+  runs over the bits NO deployment of ours claims, one checker per bit
+  (Core WarningBitsConditionChecker): CHECK-UNKNOWN-ACTIVATIONS answers
+  which of them have locked in or activated, and the node's tip hook turns
+  an activated one into the UNKNOWN_NEW_RULES_ACTIVATED warning. Its cache
+  is keyed by PERIOD BOUNDARY, as Core's ThresholdConditionCache is, and
+  the walk both reads it to stop and writes every boundary it computes --
+  those checkers never leave STARTED, so a cache that did less would
+  recount the whole chain on every block. Miniscript's 201-op limit is
   a P2WSH rule and tapscript has none (miniscript.h:1566), which is also how
   the script interpreter gates it.
 
@@ -1157,6 +1165,7 @@
   (bitcoin-lisp.validation:apply-versionbits-parameters function)
   (bitcoin-lisp.validation:compute-block-version function)
   (bitcoin-lisp.validation:versionbits-gbt-status function)
+  (bitcoin-lisp.validation:check-unknown-activations function)
   (bitcoin-lisp.validation:check-signet-block-solution function))
 
 (defsection @mempool (:title "mempool: the pool and its policy")
@@ -1470,7 +1479,13 @@
   once the node is past init (Core's POST_INIT gate) -- the same
   :updated-block-tip event also drives -stopatheight and the periodic
   flush, which must keep firing during IBD, so each subscriber decides
-  for itself rather than the announcement being filtered. WHICH trigger
+  for itself rather than the announcement being filtered. The unknown-bit
+  scan Core's UpdateTip runs is a subscriber here for the same reason: it
+  needs the IBD latch, which lives in the net layer, and validation must
+  not name it. It raises UNKNOWN_NEW_RULES_ACTIVATED on an ACTIVE bit and
+  nothing ever takes that back -- Core has no warningUnset for it, because
+  what it reports (this binary does not know what the majority is
+  enforcing) stays true until the binary is replaced. WHICH trigger
   fired reaches the flush: a write driven by the clock or the block count
   syncs the coins cache and KEEPS its entries, and only the size tier, a
   critical flush, shutdown and reindex empty it (Core's empty_cache,

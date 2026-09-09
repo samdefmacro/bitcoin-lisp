@@ -6,7 +6,8 @@
 ;;;; An operator hook: run a shell command when something happens. The runner
 ;;;; itself (RUN-NOTIFY-COMMAND) lives in src/logging.lisp, early enough that the
 ;;;; wallet can reach it for -walletnotify; what lives here is the set of hooks
-;;;; the NODE fires.
+;;;; the NODE fires -- including the one that raises a warning an operator is
+;;;; paged about, which is -alertnotify's only producer outside validation.
 
 (defvar *block-notify-command* nil
   "Shell command to run when the best block changes; %s is replaced by the
@@ -62,6 +63,41 @@ a filter on the announcement."
              (tip-notification-post-init-p chainstate))
     (run-notify-command *block-notify-command*
                         :value (bl.crypto:bytes-to-hex hash))))
+
+(bl.vi:define-validation-hook :updated-block-tip warn-unknown-new-rules
+    (chainstate hash height)
+  "Raise UNKNOWN_NEW_RULES_ACTIVATED while the chain is activating a soft fork
+this node has never heard of -- Core Chainstate::UpdateTip (validation.cpp:
+2894-2911), which runs CheckUnknownActivations on the new tip and, for each bit
+whose own BIP9 window has gone ACTIVE, calls warningSet with `Unknown new rules
+activated (versionbit %i)' (:2903-2905). A bit that has only LOCKED_IN goes into
+the tip's log line and never into the warnings map: the rules it announces are
+not being enforced by anyone yet.
+
+Nothing ever takes it back. Core has no warningUnset for this id -- the only
+warningUnset in validation.cpp is LARGE_WORK_INVALID_CHAIN's (:1956) -- because
+the fact it reports does not stop being true: this binary does not know what
+the majority hashrate is now enforcing, and it will not know until it is
+replaced. RESET-WARNINGS at start-up is what clears it.
+
+Here rather than in validation for the reason TIP-NOTIFICATION-POST-INIT-P
+gives: the scan is Core's `if (!IsInitialBlockDownload())' (:2900), and the IBD
+latch lives in the net layer. That gate is not a nicety either -- without it a
+sync from scratch would run the 29-bit window scan on every block it connects.
+The ACTIVE chainstate only, like Core's UpdateTip, which returns early on any
+other (:2882-2891)."
+  (declare (ignore height))
+  (when (and chainstate
+             (not (bl.store:chain-state-target-blockhash chainstate))
+             (tip-notification-post-init-p chainstate))
+    (let ((tip (bl.store:get-block-index-entry chainstate hash)))
+      (when tip
+        (loop for (bit . activep) in (bl.val:check-unknown-activations chainstate tip)
+              for message = (format nil "Unknown new rules activated (versionbit ~D)"
+                                    bit)
+              do (if activep
+                     (bl.log:set-kernel-warning :unknown-new-rules-activated message)
+                     (log-info "~A" message)))))))
 
 (defun run-shutdown-notify ()
   "Run every -shutdownnotify command and WAIT for it (Core joins them,

@@ -353,18 +353,6 @@ move the window for every later chain in the same image."
     (bl.val:apply-versionbits-parameters nil))
   (is (equal (list 0 (1- (expt 2 63)) 0) (%testdummy-window))))
 
-(defun %versionbits-chain-with-tip (n &rest args)
-  "MAKE-VERSIONBITS-CHAIN, plus the chain-state tip pointers that
-GET-BLOCK-AT-HEIGHT walks back from -- without them every height lookup on the
-synthetic chain answers NIL, and VERSIONBITS-STATE reads NIL as `the block
-before genesis' and reports DEFINED for the whole ladder."
-  (multiple-value-bind (chain-state last) (apply #'make-versionbits-chain n args)
-    (setf (bl.store:chain-state-best-block-hash chain-state)
-          (bl.store:block-index-entry-hash last)
-          (bl.store:chain-state-best-height chain-state)
-          (bl.store:block-index-entry-height last))
-    (values chain-state last)))
-
 (defun %vbparams-ladder (chain-state entries specs)
   "The BIP9 state of regtest testdummy after each of ENTRIES, under SPECS."
   (bl.val:apply-versionbits-parameters specs)
@@ -385,7 +373,7 @@ a min_activation_height beyond the tip holds LOCKED_IN where the default is
 already ACTIVE. Block i is timestamped 1000000 + 600i, so the median time past
 at the boundaries 143/287/431 is 1082800/1169200/1255600."
   (with-network (:regtest)
-    (multiple-value-bind (cs last) (%versionbits-chain-with-tip 576 :signal-bit 28)
+    (multiple-value-bind (cs last) (make-versionbits-chain-with-tip 576 :signal-bit 28)
       (let ((boundaries (list (bl.store:get-block-at-height cs 143)
                               (bl.store:get-block-at-height cs 287)
                               (bl.store:get-block-at-height cs 431)
@@ -403,7 +391,7 @@ at the boundaries 143/287/431 is 1082800/1169200/1255600."
                ;; A timeout the chain passes without signalling is FAILED, which
                ;; the regtest default (NO_TIMEOUT) can never reach.
                (multiple-value-bind (quiet-cs quiet-last)
-                   (%versionbits-chain-with-tip 432)
+                   (make-versionbits-chain-with-tip 432)
                  (let ((quiet (list (bl.store:get-block-at-height quiet-cs 143)
                                     quiet-last)))
                    (is (equal '(:started :started 144)
@@ -420,7 +408,7 @@ window produces, and getblocktemplate reads the same table through
 VERSIONBITS-GBT-STATUS and COMPUTE-BLOCK-VERSION (rpc/mining.cpp:598-640): an
 override nothing reads is not an override."
   (with-network (:regtest)
-    (multiple-value-bind (cs last) (%versionbits-chain-with-tip 576 :signal-bit 28)
+    (multiple-value-bind (cs last) (make-versionbits-chain-with-tip 576 :signal-bit 28)
       (let ((node (make-test-node :network :regtest)))
         (setf (bl:node-chain-state node) cs)
         (unwind-protect
@@ -494,7 +482,7 @@ all-signalling chain a reversed record reads identically, which is why Core's
 own rpc_blockchain.py assertion (`#' * (height - 143) at height 207, the second
 case below) cannot catch that mistake."
   (with-network (:regtest)
-    (let* ((cs (%versionbits-chain-with-tip
+    (let* ((cs (make-versionbits-chain-with-tip
                 209 :signal-bit 28 :signal-when (lambda (h) (zerop (mod h 3)))))
            (bip9 (%testdummy-bip9 cs))
            (stats (%bip9-value bip9 "statistics"))
@@ -521,7 +509,7 @@ case below) cannot catch that mistake."
                "and ends at the block being reported on, which does not"))
     ;; Core's own vector: an all-signalling regtest chain at height 207 reports
     ;; '#' * (height - 143) (rpc_blockchain.py:240).
-    (let* ((bip9 (%testdummy-bip9 (%versionbits-chain-with-tip 208 :signal-bit 28)))
+    (let* ((bip9 (%testdummy-bip9 (make-versionbits-chain-with-tip 208 :signal-bit 28)))
            (signalling (%bip9-value bip9 "signalling")))
       (is (string= (make-string 64 :initial-element #\#) signalling)))))
 
@@ -548,7 +536,7 @@ string still there), ACTIVE (no statistics object at all)."
   (with-network (:regtest)
     (flet ((shape (blocks)
              (let* ((bip9 (%testdummy-bip9
-                           (%versionbits-chain-with-tip blocks :signal-bit 28)))
+                           (make-versionbits-chain-with-tip blocks :signal-bit 28)))
                     (stats (%bip9-value bip9 "statistics")))
                (list (%bip9-value bip9 "status")
                      (mapcar #'car stats)
@@ -560,14 +548,14 @@ string still there), ACTIVE (no statistics object at all)."
       (is (equal '("active" nil nil) (shape 433))))
     ;; The STARTED values themselves are unchanged.
     (let ((stats (%bip9-value (%testdummy-bip9
-                               (%versionbits-chain-with-tip 208 :signal-bit 28))
+                               (make-versionbits-chain-with-tip 208 :signal-bit 28))
                               "statistics")))
       (is (= 108 (%bip9-value stats "threshold")))
       (is (eq t (%bip9-value stats "possible"))))
     ;; The override is Info's, not the counting walk's: at the same LOCKED_IN
     ;; block VERSIONBITS-STATISTICS still reports the deployment's threshold
     ;; and the raw arithmetic, as Core's GetStateStatisticsFor does.
-    (multiple-value-bind (cs last) (%versionbits-chain-with-tip 300 :signal-bit 28)
+    (multiple-value-bind (cs last) (make-versionbits-chain-with-tip 300 :signal-bit 28)
       (let ((dep (%dep "testdummy" :regtest)))
         (multiple-value-bind (period threshold elapsed count possible)
             (bl.val:versionbits-statistics cs last dep)
@@ -579,3 +567,66 @@ string still there), ACTIVE (no statistics object at all)."
           (is (eq :locked-in current))
           (is (= 0 (bl.val:vb-stats-threshold stats)))
           (is (null (bl.val:vb-stats-possible stats))))))))
+
+;;;; The bits nobody claimed (Core WarningBitsConditionChecker)
+
+(test unknown-version-bits-walk-their-own-bip9-window
+  "Core runs the BIP9 state machine over every version bit no deployment of
+ours would set -- WarningBitsConditionChecker, whose window is the whole of
+time (BeginTime 0, EndTime int64 max) so that only signalling can ever move it,
+at 2016/1815 on mainnet and the difficulty adjustment interval at BIP9's
+suggested 75%% on a test chain (versionbits.cpp:295-330) -- and
+CheckUnknownActivations reports every bit that reached LOCKED_IN or ACTIVE
+(:333-345). We ran it over nothing at all: an unknown soft fork could lock in
+and activate on the chain we were following and the node had no opinion about
+it.
+
+Regtest's warning window is 144 blocks at a threshold of 108, so a chain
+signalling bit 13 throughout locks in at the boundary at height 287 and
+activates at the one at 431 -- and it is the TIP's period that decides, which
+is why 288 and 431 answer the same thing.
+
+Two controls, because a check that says `bit set' rather than `bit unclaimed
+and over threshold' would pass the assertions above. Bit 28 is testdummy's, and
+COMPUTE-BLOCK-VERSION sets it on exactly the blocks that signal it, so no
+amount of signalling there is unknown; and 96 signalling blocks out of 144 --
+a clear majority, below the threshold -- report nothing."
+  (with-network (:regtest)
+    (flet ((rows (blocks &rest args)
+             (multiple-value-bind (cs tip)
+                 (apply #'make-versionbits-chain-with-tip blocks args)
+               (bl.val:check-unknown-activations cs tip))))
+      ;; The period the bit is counted in: STARTED, nothing to report yet.
+      (is (equal '() (rows 287 :signal-bit 13)))
+      ;; LOCKED_IN from the boundary at 287 up to the one at 431 ...
+      (is (equal '((13)) (rows 288 :signal-bit 13)))
+      (is (equal '((13)) (rows 431 :signal-bit 13)))
+      ;; ... and ACTIVE from there on.
+      (is (equal '((13 . t)) (rows 432 :signal-bit 13)))
+      ;; A deployment we know about explains its own bit.
+      (is (equal '() (rows 432 :signal-bit 28)))
+      ;; Two blocks in three signal: 96 of 144, under the threshold.
+      (is (equal '() (rows 432 :signal-bit 13
+                            :signal-when (lambda (h) (plusp (mod h 3))))))
+      ;; And the empty case, which every assertion above is read against.
+      (is (equal '() (rows 432))))))
+
+(test unknown-version-bits-below-the-warning-height-say-nothing
+  "Core's condition opens with `pindex->nHeight >= MinBIP9WarningHeight'
+(versionbits.cpp:325). That height is segwit's activation plus one confirmation
+window on the two chains with a pre-BIP9 past to ignore -- 483840 on mainnet,
+836640 on testnet3 (kernel/chainparams.cpp:95, 226) -- and zero on the three
+that have none.
+
+Three whole mainnet windows of blocks setting bit 13 therefore report nothing.
+The same chain read as regtest, where the floor is zero, reports the bit
+active: without the floor the mainnet read would report it too."
+  (let ((blocks 6048))
+    (with-network (:mainnet)
+      (multiple-value-bind (cs tip)
+          (make-versionbits-chain-with-tip blocks :signal-bit 13)
+        (is (equal '() (bl.val:check-unknown-activations cs tip)))))
+    (with-network (:regtest)
+      (multiple-value-bind (cs tip)
+          (make-versionbits-chain-with-tip blocks :signal-bit 13)
+        (is (equal '((13 . t)) (bl.val:check-unknown-activations cs tip)))))))
