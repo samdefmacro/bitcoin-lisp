@@ -87,7 +87,7 @@ here because it has no id in the survey:
 Named in the commit that scoped each one out; every item but the last was closed in the
 follow-up round of 2026-09-07 to 2026-09-09 (five worktree batches, each with a pre-fix-red
 test and the Core lines in its commit, merged onto `main` behind a green cold battery: the
-battery grew from 38,270 to 38,440 checks). The commit that closed each item follows it.
+battery grew from 38,270 to 38,475 checks). The commit that closed each item follows it.
 
 - Core's RPC arity check (`IsValidNumArgs`, -1 with the help text); extra arguments are
   still ignored. → "RPC: a call with the wrong number of arguments is refused with the usage
