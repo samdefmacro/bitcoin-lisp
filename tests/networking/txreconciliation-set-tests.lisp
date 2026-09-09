@@ -13,7 +13,17 @@
 ;;;; kind of verification, and worth saying so.
 
 (defun %rc-wtxid (n)
-  (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
+  "The Nth distinct test wtxid. Below 256 every byte is N, as it always was;
+above, the second byte carries the high bits, so a test that needs thousands
+of distinct transactions can have them."
+  (let ((w (make-array 32 :element-type '(unsigned-byte 8)
+                          :initial-element (ldb (byte 8 0) n))))
+    (when (> n 255)
+      ;; Byte 2 marks the wide form: without it, 257 (bytes 01 01 01 ...) IS
+      ;; wtxid 1, and every multiple of 257 collides the same way.
+      (setf (aref w 1) (ldb (byte 8 8) n)
+            (aref w 2) 0))
+    w))
 
 (defun %rc-count (set)
   "How many transactions SET is holding for reconciliation. This file's one
@@ -27,6 +37,15 @@ set is created on first use, exactly as the relay path creates it."
   (let ((set (bl.net::%peer-recon-set peer)))
     (dolist (w wtxids set)
       (bl.net::recon-set-add set k0 k1 w))))
+
+(defun %rc-short-ids (wtxids &key (k0 11) (k1 22))
+  "The short IDs of WTXIDS under the salt %RC-PEER gives a registered peer."
+  (mapcar (lambda (w) (bl.net::recon-short-id k0 k1 w)) wtxids))
+
+(defun %rc-round-open-p (peer)
+  "Whether PEER has a reconciliation round in flight -- the initiator's state,
+which a closed round leaves empty."
+  (and (bl.net::peer-recon-round peer) t))
 
 (test short-ids-are-per-peer-and-never-zero
   "Salted per peer so an observer on one link cannot tell which transactions a
@@ -57,8 +76,10 @@ once the difference is known."
       (is-true id)
       (is (= 1 (%rc-count set)))
       (is (equalp wtxid (bl.net::recon-set-wtxid set id)))
-      ;; Adding the same transaction again is a no-op, not a duplicate.
-      (is-false (bl.net::recon-set-add set 1 2 wtxid))
+      ;; Adding the same transaction again is a no-op, not a duplicate -- and
+      ;; not a refusal either: NIL is reserved for a FULL set, which the relay
+      ;; path answers by announcing the transaction instead.
+      (is (= id (bl.net::recon-set-add set 1 2 wtxid)))
       (is (= 1 (%rc-count set)))
       ;; Removal is by wtxid, resolved through the same salt.
       (bl.net::recon-set-remove set 1 2 wtxid)
@@ -391,7 +412,7 @@ peers it has."
 overhead, and Erlay exists to remove overhead."
   (let ((peer (%rc-peer :registered t)))
     (is-false (bl.net::recon-start-round peer 100000))
-    (is-false (bl.net::peer-recon-round peer))))
+    (is-false (%rc-round-open-p peer))))
 
 (test abandoning-a-round-announces-everything-rather-than-losing-it
   "The flood fallback. A reconciliation that cannot decode costs bandwidth —
@@ -406,7 +427,7 @@ way and leaves the set."
           "every held transaction must be announced after a failed round")
       (is (= 0 (%rc-count set))
           "and leave the set, so it is not announced twice")
-      (is-false (bl.net::peer-recon-round peer)))))
+      (is-false (%rc-round-open-p peer)))))
 
 (test a-successful-round-retires-the-whole-snapshot
   "After a round DECODES, the peer holds every transaction the frozen snapshot
@@ -426,8 +447,7 @@ here; Core ships no reconciliation set to compare against."
     ;; The peer held SHARED, so those cancel in the sketch and the decoded
     ;; difference is OURS-ONLY alone.
     (multiple-value-bind (ask announce)
-        (bl.net::recon-finish-round
-         peer (mapcar (lambda (w) (bl.net::recon-short-id 11 22 w)) ours-only))
+        (bl.net::recon-finish-round peer (%rc-short-ids ours-only))
       (is (null ask) "nothing to request: the peer was missing nothing")
       (is (= 3 (length announce))))
     (is (= 0 (%rc-count set))
@@ -441,7 +461,7 @@ both sides holding it looks like."
   (let* ((peer (%rc-peer :registered t))
          (wtxids (loop for i from 70 below 78 collect (%rc-wtxid i)))
          (set (%rc-hold peer wtxids))
-         (asked (bl.net::recon-short-id 11 22 (first wtxids))))
+         (asked (first (%rc-short-ids wtxids))))
     ;; RECON-RESPOND-TO-REQUEST freezes the set like this before it sketches.
     (bl.net::recon-set-take-snapshot set)
     (bl.net::%handle-reconcildiff
@@ -450,3 +470,54 @@ both sides holding it looks like."
         "only the asked-for transaction is announced")
     (is (= 0 (%rc-count set))
         "and the seven that cancelled leave the set with it")))
+
+;;; --- Bounds, settlement and the failure paths (GA11 left-outs) -----------------
+;;;
+;;; Still BIP-330 territory: Core d3056bc ships the sendtxrcncl handshake and no
+;;; reconciliation set, so the BIP is the oracle for everything below and the
+;;; Core lines cited are the known-filter sites the set behaviour hangs off.
+
+(test a-full-reconciliation-set-falls-back-to-flooding
+  "A set has to be bounded: BIP-330 sends set_size as a uint16 in reqrecon, and
+every entry costs sketch capacity on every round until it settles. The bound is
+3000 -- the MAX_SET_SIZE of the Core Erlay work that d3056bc does not yet carry
+-- and a transaction that finds the set full is ANNOUNCED, not dropped: the
+fallback everywhere in Erlay is flooding. Pinned as a literal here, as the q
+scale is, so a change to the constant has to change the test too.
+
+The fanout draw is deterministic in (wtxid, peer salt), so a TWIN peer with the
+same salt and an empty set is the oracle for which transactions the draw would
+hold: one the twin holds, the full peer must announce instead."
+  (%with-relay-network
+    (let* ((cap 3000)
+           (full (%rc-peer :registered t))
+           (twin (%rc-peer :registered t))
+           (others (loop repeat 7 collect (%rc-peer :registered t)))
+           (set (%rc-hold full (loop for i from 0 below (1- cap)
+                                     collect (%rc-wtxid i))))
+           ;; The first two candidates past the fill that the draw HOLDS.
+           (held-by-draw
+             (loop for i from cap
+                   for w = (%rc-wtxid i)
+                   do (setf (bl.net:peer-tx-inv-queue twin) '())
+                      (bl.net:relay-transaction w nil (cons twin others)
+                                                :wtxid w :fee-rate 1)
+                   when (null (bl.net:peer-tx-inv-queue twin))
+                     collect w into held
+                   when (= 2 (length held))
+                     return held)))
+      (is (= (1- cap) (%rc-count set)))
+      ;; Positive control: one slot left, so a held candidate is held.
+      (bl.net:relay-transaction (first held-by-draw) nil (cons full others)
+                                :wtxid (first held-by-draw) :fee-rate 1)
+      (is (null (bl.net:peer-tx-inv-queue full))
+          "below the cap the transaction is reconciled, not announced")
+      (is (= cap (%rc-count set)))
+      ;; The set is full: the next one the draw would hold is announced.
+      (bl.net:relay-transaction (second held-by-draw) nil (cons full others)
+                                :wtxid (second held-by-draw) :fee-rate 1)
+      (is (= 1 (length (bl.net:peer-tx-inv-queue full)))
+          "a full set falls back to an ordinary announcement")
+      (is (equalp (second held-by-draw)
+                  (first (first (bl.net:peer-tx-inv-queue full)))))
+      (is (= cap (%rc-count set)) "and the set does not grow past the cap"))))

@@ -3378,22 +3378,26 @@ reach here anyway — their senders are disconnected)."
         ;; what stops an adversary timing the first announcement to find the
         ;; origin. Reconciliation is off unless -txreconciliation was set AND
         ;; the peer completed the handshake, so this branch is dead by default.
-        (if (%recon-hold-p peer wtxid txid peers)
-            (recon-set-add (%peer-recon-set peer)
-                           (peer-recon-k0 peer) (peer-recon-k1 peer)
-                           (or wtxid txid))
-            ;; Core PushTxInventory is one insert into m_tx_inventory_to_send
-            ;; and nothing else (net_processing.cpp:2261-2263). Two things
-            ;; used to happen here that Core does not do: the entry was NCONCd
-            ;; onto the tail, walking the whole queue, and then a LENGTH walked
-            ;; it again to NTHCDR the excess past 5,000 off the FRONT --
-            ;; silently discarding the OLDEST announcements, which nothing
-            ;; ever re-queues, so those transactions were never announced to
-            ;; this peer at all. A PUSH is Core's O(1) insert; the flush
-            ;; restores announcement order and drains faster as the queue
-            ;; grows (%TX-INV-BROADCAST-MAX).
-            (push (list txid wtxid fee-rate-per-kb)
-                  (peer-tx-inv-queue peer)))))))
+        ;;
+        ;; A FULL set refuses (RECON-SET-ADD returns NIL at
+        ;; +RECON-MAX-SET-SIZE+) and the transaction takes the ordinary path
+        ;; below instead: the fallback is flooding, never dropping.
+        (unless (and (%recon-hold-p peer wtxid txid peers)
+                     (recon-set-add (%peer-recon-set peer)
+                                    (peer-recon-k0 peer) (peer-recon-k1 peer)
+                                    wtxid))
+          ;; Core PushTxInventory is one insert into m_tx_inventory_to_send
+          ;; and nothing else (net_processing.cpp:2261-2263). Two things
+          ;; used to happen here that Core does not do: the entry was NCONCd
+          ;; onto the tail, walking the whole queue, and then a LENGTH walked
+          ;; it again to NTHCDR the excess past 5,000 off the FRONT --
+          ;; silently discarding the OLDEST announcements, which nothing
+          ;; ever re-queues, so those transactions were never announced to
+          ;; this peer at all. A PUSH is Core's O(1) insert; the flush
+          ;; restores announcement order and drains faster as the queue
+          ;; grows (%TX-INV-BROADCAST-MAX).
+          (push (list txid wtxid fee-rate-per-kb)
+                (peer-tx-inv-queue peer)))))))
 
 (defun %handle-reqrecon (peer payload)
   "The peer wants to reconcile: size a sketch against what it says it holds and
