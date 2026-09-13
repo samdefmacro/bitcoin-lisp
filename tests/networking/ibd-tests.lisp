@@ -4526,3 +4526,37 @@ missing (p2p_node_network_limited.py:105-110)."
                   (is (equalp (loop for h from 1 to 5 collect (%bd-hash h))
                               hashes)
                       "the batch is ascending in height, so its tip arrives last"))))))))))
+
+(test the-initial-getheaders-goes-out-once-per-peer
+  "Core's SendMessages guards its initial getheaders with `!state.fSyncStarted'
+and sets that flag when one goes out (net_processing.cpp:5797-5821), so a peer
+is asked ONCE and every later request needs a specific trigger -- an
+unconnecting announcement, an inv naming a block we lack, a maximally-sized
+batch -- each throttled by MaybeSendGetHeaders. Ours broadcast one getheaders
+per ready peer on EVERY sync pass. The 2-minute throttle cannot stand in for
+the latch: Core clears m_last_getheaders_timestamp on any connecting headers
+(net_processing.cpp:3043), which an announcing peer produces constantly.
+p2p_sendheaders.py:334 announces a block by inv and asserts that no getheaders
+follows; the next pass's broadcast failed it."
+  (with-network (:regtest)
+    (let* ((state (bl.store:make-chain-state))
+           (genesis (bl.store:make-block-index-entry
+                     :hash (%bd-hash 0) :height 0 :chain-work 1
+                     :status :valid)))
+      (bl.store:add-block-index-entry state genesis)
+      (bl.store:add-block-index-entry
+       state (bl.store:make-block-index-entry
+              :hash (%bd-hash 1) :height 1 :chain-work 2
+              :prev-entry genesis :status :valid))
+      (bl.store:update-chain-tip state (%bd-hash 1) 1)
+      (let ((peer (bl.net:make-peer :address "198.51.100.4" :state :ready))
+            (other (bl.net:make-peer :address "198.51.100.5" :state :ready)))
+        (flet ((broadcast (&rest peers)
+                 (length (captured-sends
+                          (lambda ()
+                            (bl.net::broadcast-initial-getheaders
+                             peers state))))))
+          (is (= 1 (broadcast peer)) "the first pass asks the peer")
+          (is (= 0 (broadcast peer)) "a later pass does not ask it again")
+          (is (= 1 (broadcast peer other))
+              "control: a peer we have not opened header sync with still gets one"))))))
