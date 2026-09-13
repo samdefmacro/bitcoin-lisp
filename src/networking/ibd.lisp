@@ -1033,9 +1033,19 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                      chain-state (bl.store:best-block-hash chain-state)))
          (tip-work (if tip-entry
                        (bl.store:block-index-entry-chain-work tip-entry) 0)))
-    ;; Peer has nothing more-work than our tip, or is below minimum chain work.
+    ;; Peer has nothing we do not already have at least as much work as, or is
+    ;; below minimum chain work. Core's test is STRICTLY less than the tip's
+    ;; work (net_processing.cpp:1407), not "not more than": an EQUAL-work chain
+    ;; is interesting, because its blocks are the ones this node needs to hold
+    ;; a tiebreak -- to serve the sibling, to reorg onto it if ours is later
+    ;; invalidated, and because the first BODY to arrive is what decides which
+    ;; of two equal-work siblings becomes the tip. Refusing equal work left the
+    ;; node with a header it would never fetch: feature_chain_tiebreaks.py:76
+    ;; sends the sibling of the current tip and waits for the getdata, and the
+    ;; node logged "peer chain not heavier than our tip (best-known h=2, tip
+    ;; h=2)" instead.
     (when (or (null best-known)
-              (<= (bl.store:block-index-entry-chain-work best-known) tip-work)
+              (< (bl.store:block-index-entry-chain-work best-known) tip-work)
               (< (bl.store:block-index-entry-chain-work best-known)
                  (bl:minimum-chain-work bl:*network*)))
       ;; Under -debug=net, say WHICH gate closed. "gate open, nothing servable"
@@ -1046,8 +1056,8 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
        "no-download ~A: ~A (best-known ~:[none~;h=~:*~D~], tip h=~D)"
        (peer-log-name peer)
        (cond ((null best-known) "peer availability unknown")
-             ((<= (bl.store:block-index-entry-chain-work best-known) tip-work)
-              "peer chain not heavier than our tip")
+             ((< (bl.store:block-index-entry-chain-work best-known) tip-work)
+              "peer chain lighter than our tip")
              (t "peer chain below minimum chain work"))
        (and best-known (bl.store:block-index-entry-height best-known))
        (if tip-entry (bl.store:block-index-entry-height tip-entry) -1))
