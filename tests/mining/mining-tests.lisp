@@ -1036,6 +1036,53 @@ with a count of zero."
      (is (= 0 (bl.store:current-height
                (bl:node-chain-state node)))))))
 
+(test generateblock-reports-testblockvalidity-in-cores-words
+  "Core's generateblock reports a failed dry run as strprintf(
+\"TestBlockValidity failed: %s\", state.ToString()) (rpc/mining.cpp:392), and
+ConnectBlock built that state by relaying the TRANSACTION's verdict into the
+block's: state.Invalid(BLOCK_CONSENSUS, tx_state.GetRejectReason(),
+tx_state.GetDebugMessage() + \" in transaction \" + tx.GetHash().ToString())
+(validation.cpp:2532-2537). For a spend of an outpoint nothing has,
+CheckTxInputs sets `bad-txns-inputs-missingorspent' and `CheckTxInputs: inputs
+missing/spent' (consensus/tx_verify.cpp:167-170), so the whole sentence is the
+one feature_block.py:157 matches.
+
+Ours printed the raw keyword through ~A: `TestBlockValidity failed:
+MISSING-INPUT' -- upper case, our own vocabulary, no debug message, no txid."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "genblk-words"))
+           (bogus (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element 66)
+                           0 1000 :version 1))
+           (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction bogus)))
+           (txid (bl.rpc:hash-to-hex (bl.ser:transaction-hash bogus))))
+      (is (equal (cons -25 (format nil "TestBlockValidity failed: bad-txns-inputs-missingorspent, CheckTxInputs: inputs missing/spent in transaction ~A"
+                                   txid))
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method
+                     node "generateblock"
+                     (wire-params (list "raw(51)" (list hex) bl.rpc:+json-false+)))))))
+      ;; Control: a block with no offending transaction still mines, so the
+      ;; verdict above is that transaction's and not the dry run refusing
+      ;; everything.
+      (is (stringp (cdr (assoc "hash"
+                               (bl.rpc:dispatch-rpc-method
+                                node "generateblock"
+                                (wire-params (list "raw(51)" (vector))))
+                               :test #'string=))))
+      ;; The two renderings Core keeps apart: BIP22 (submitblock) reports the
+      ;; reject reason alone, ToString() adds the debug message.
+      (is (string= "bad-txns-inputs-missingorspent"
+                   (bl.val:block-reject-reason '(:missing-input "detail here"))))
+      (is (string= "bad-txns-inputs-missingorspent, detail here"
+                   (bl.val:block-reject-reason-string '(:missing-input "detail here"))))
+      ;; A block verdict that is not a relayed transaction one keeps its own
+      ;; name, and the block sigop budget is Core's, not the transaction one.
+      (is (string= "unexpected-witness"
+                   (bl.val:block-reject-reason :unexpected-witness)))
+      (is (string= "bad-blk-sigops" (bl.val:block-reject-reason :too-many-sigops))))))
+
 ;;;; Wave 7: BIP94 timewarp clamp on template mintime (Core GetMinimumTime,
 ;;;; node/miner.cpp:36-47) + TestBlockValidity on assembled templates
 ;;;; (node/miner.cpp:227-231, validation.cpp:4495)
