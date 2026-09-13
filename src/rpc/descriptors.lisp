@@ -640,7 +640,7 @@ Core splits the same way when it decides which PubkeyProvider to build for the
 aggregate (descriptor.cpp:654-659)."
   (and (null (desc-key-path key)) (eq (desc-key-derive key) :none)))
 
-(defun %musig-aggregate-at (key pos)
+(defun %musig-aggregate-at (key pos &optional privkey-provider)
   "The MuSig2 aggregate of musig() KEY's participants at POS (Core
 MuSigPubkeyProvider::GetPubKey's aggregation half, descriptor.cpp:637-651).
 
@@ -659,56 +659,71 @@ BIP328's KeySort. BIP327 aggregation is order-sensitive, so without the sort the
 same descriptor written two ways would be two different ADDRESSES."
   (let* ((participants (desc-key-musig-participants key))
          (ranged (some #'desc-key-ranged-p participants))
-         (pubkeys (mapcar (lambda (p) (%desc-key-pubkey-at p (if ranged pos 0)))
+         (pubkeys (mapcar (lambda (p)
+                            (%desc-key-pubkey-at p (if ranged pos 0)
+                                                 privkey-provider))
                           participants)))
     (or (bl.crypto:musig-aggregate-pubkeys
          (sort (copy-list pubkeys) #'pubkey-lessp))
         (error 'descriptor-derivation-error))))
 
-(defun %musig-derivation-root (key pos)
+(defun %musig-derivation-root (key pos &optional privkey-provider)
   "The BIP328 synthetic xpub a non-flat musig() KEY derives from, on the network
 its participants are written for. Fixed for the whole range — a musig() with a
 derivation cannot have ranged participants (descriptor.cpp:2022) — so POS only
 reaches the aggregation, which ignores it in that shape."
   (let ((first-participant (first (desc-key-musig-participants key))))
     (%musig-synthetic-xpub
-     (%musig-aggregate-at key pos)
+     (%musig-aggregate-at key pos privkey-provider)
      (bl.chain:chain-params-name
       (bl.chain:chain-params-of-ext-prefix
        (bl.crypto:ext-key-version
         (or (desc-key-extkey first-participant)
             (desc-key-ext-privkey first-participant))))))))
 
-(defun %musig-key-pubkey-at (key pos)
+(defun %musig-key-pubkey-at (key pos &optional privkey-provider)
   "The pubkey a musig() key expression produces at POS (Core
 MuSigPubkeyProvider::GetPubKey, descriptor.cpp:633), deriving straight from the
 descriptor's own key material. %DESC-KEY-PUBKEY-AT-CACHED takes the same two
 halves through the wallet cache."
   (if (%musig-flat-key-p key)
-      (%musig-aggregate-at key pos)
-      (let ((k (bl.crypto:bip32-derive-path (%musig-derivation-root key pos)
-                                            (desc-key-path key))))
+      (%musig-aggregate-at key pos privkey-provider)
+      (let ((k (bl.crypto:bip32-derive-path
+                (%musig-derivation-root key pos privkey-provider)
+                (desc-key-path key))))
         (when (eq (desc-key-derive key) :unhardened)
           (setf k (bl.crypto:bip32-derive-child k pos)))
         (bl.crypto:ext-key-key k))))
 
-(defun %desc-key-pubkey-at (key pos)
+(defun %desc-key-pubkey-at (key pos &optional privkey-provider)
   "The pubkey bytes KEY produces at range position POS (Core GetPubKey).
 Signals descriptor-derivation-error when hardened derivation is required but
 only public key material is available.
+
+PRIVKEY-PROVIDER is Core's `const SigningProvider& arg', which GetPubKey takes
+and which MuSigPubkeyProvider hands to every participant in turn
+(descriptor.cpp:633-668). It is what lets a HARDENED path expand from a
+descriptor carrying only the xpub: the secret comes from the wallet, not from
+the string. Without it a stored musig() whose participant reads
+xpub/86h/1h/0h/0/* -- which is what a wallet stores after importing the xprv
+form -- could not be expanded at all, and the import died at its keypool
+top-up.
 
 Note: %desc-key-pubkey-at-cached below performs the same derivation through
 the wallet's persistent xpub cache (Core folds both into one GetPubKey with
 optional caches); keep the two derivation paths in sync."
   (when (desc-key-musig-participants key)
-    (return-from %desc-key-pubkey-at (%musig-key-pubkey-at key pos)))
+    (return-from %desc-key-pubkey-at
+      (%musig-key-pubkey-at key pos privkey-provider)))
   (if (desc-key-pubkey key)
       (desc-key-pubkey key)
       (let* ((hardened (or (eq (desc-key-derive key) :hardened)
                            (some (lambda (i) (logbitp 31 i)) (desc-key-path key))))
              (root (cond ((and hardened (desc-key-ext-privkey key))
                           (desc-key-ext-privkey key))
-                         (hardened (error 'descriptor-derivation-error))
+                         (hardened (or (and privkey-provider
+                                            (desc-key-root-xprv key privkey-provider))
+                                       (error 'descriptor-derivation-error)))
                          (t (desc-key-extkey key)))))
         (handler-case
             (let ((k (bl.crypto:bip32-derive-path root (desc-key-path key))))
@@ -1901,7 +1916,8 @@ participant is always an xpub or a plain key that the descriptor itself carries.
   (when (desc-key-pubkey key)
     (return-from %desc-key-pubkey-at-cached (desc-key-pubkey key)))
   (when (and (desc-key-musig-participants key) (%musig-flat-key-p key))
-    (return-from %desc-key-pubkey-at-cached (%musig-aggregate-at key pos)))
+    (return-from %desc-key-pubkey-at-cached
+      (%musig-aggregate-at key pos privkey-provider)))
   (let* ((path (desc-key-path key))
          (derive (desc-key-derive key))
          (hardened-p (or (eq derive :hardened)
@@ -1939,7 +1955,7 @@ participant is always an xpub or a plain key that the descriptor itself carries.
                (when lh (setf last-hardened (bl.crypto:bip32-neuter lh))))))
           (t
            (let ((k (if (desc-key-musig-participants key)
-                        (%musig-derivation-root key pos)
+                        (%musig-derivation-root key pos privkey-provider)
                         (desc-key-extkey key))))
              (dolist (entry path)
                (setf k (bl.crypto:bip32-derive-child k entry)))
