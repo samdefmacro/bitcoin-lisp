@@ -503,15 +503,17 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
     ;; package RBF). Failure lands on the CHILD alone, carrying the package
     ;; feerate (Core FeeFailure on workspaces.back()).
     (let ((pkg-feerate (if (zerop total-vsize) 0 (/ total-fee total-vsize)))
-          (min-fee (bl.mp:mempool-effective-min-fee-rate mempool))
           (includes (mapcar #'%pkg-val-wtxid validated))
           (pkg-replaced nil))
-      (when (< (* total-fee 1000) (* min-fee (max total-vsize 1)))
-        (let ((child-res (gethash (%pkg-val-wtxid (car (last validated))) results)))
-          (%mark-result-invalid child-res :insufficient-fee)
-          (setf (package-tx-result-effective-feerate child-res) pkg-feerate
-                (package-tx-result-effective-includes child-res) includes))
-        (return-from %accept-package-subset :insufficient-fee))
+      ;; Core CheckFeeRate over the package (validation.cpp:1610): the same
+      ;; two reasons, dynamic floor first.
+      (let ((reason (fee-floor-reason mempool total-fee (max total-vsize 1))))
+        (when reason
+          (let ((child-res (gethash (%pkg-val-wtxid (car (last validated))) results)))
+            (%mark-result-invalid child-res reason)
+            (setf (package-tx-result-effective-feerate child-res) pkg-feerate
+                  (package-tx-result-effective-includes child-res) includes))
+          (return-from %accept-package-subset reason)))
       ;; 4. Package RBF: a multi-tx subset that conflicts with the mempool is
       ;; only acceptable as a Core package replacement
       ;; (validation.cpp:1511-1516). Package-level failure: no member results.
@@ -702,8 +704,8 @@ mempool, exactly as in Core's early return.
                  ;; (Core individual_results_nonfinal): it stands unless the
                  ;; package-feerate phase overwrites it.
                  ((and (> (length package) 1)
-                       (member err '(:insufficient-fee :replacement-failed
-                                     :missing-input)))
+                       (member err '(:insufficient-fee :mempool-min-fee-not-met
+                                     :replacement-failed :missing-input)))
                   (%mark-result-invalid res err)
                   (push tx deferred))
                  (t

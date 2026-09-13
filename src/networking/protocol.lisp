@@ -1882,7 +1882,7 @@ block-relay-only peer (Core SetupAddressRelay)."
 ;;; Transaction handling
 
 (alexandria:define-constant +reconsiderable-tx-failures+
-  '(:insufficient-fee :replacement-failed :mempool-full)
+  '(:insufficient-fee :mempool-min-fee-not-met :replacement-failed :mempool-full)
   :test #'equalp :documentation "The rejection reasons Bitcoin Core classifies TX_RECONSIDERABLE — \"fails
 some policy, but might be acceptable if submitted in a (different) package\"
 (consensus/validation.h:48). Core's four sites: both fee-floor failures in

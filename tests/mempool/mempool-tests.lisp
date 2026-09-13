@@ -2375,6 +2375,28 @@ minimum."
     (is (= 100 (bl.mp:mempool-effective-min-fee-rate
                 mempool (+ (bl.ser:get-unix-time) (* 100 86400)))))))
 
+
+(test fee-floor-reasons-are-cores-two
+  "Core's CheckFeeRate (validation.cpp:699-712) names the pool's dynamic floor
+first -- `mempool min fee not met` when GetMinFee is positive and the fee is
+under it -- and only then the static relay floor, `min relay fee not met`.
+Ours compared against the max of the two rates and could only ever say the
+second, so mempool_limit.py:212, which fills the pool and then sends a tx under
+the raised floor, read the wrong reason. Rates in sat/kvB: at the default
+relay floor of 100, 200 vB need 20 sat; a rolling floor of 5,000 needs 1,000."
+  (let ((mempool (bl.mp:make-mempool))
+        (now (bl.ser:get-unix-time)))
+    (is (null (bl.val:fee-floor-reason mempool 20 200 now)) "control: at the relay floor")
+    (is (eq :insufficient-fee (bl.val:fee-floor-reason mempool 19 200 now)))
+    (%set-rolling-min-fee mempool 5000 now)
+    (is (eq :mempool-min-fee-not-met (bl.val:fee-floor-reason mempool 999 200 now)))
+    (is (eq :mempool-min-fee-not-met (bl.val:fee-floor-reason mempool 19 200 now))
+        "under both floors the dynamic one is named, as Core tests it first")
+    (is (null (bl.val:fee-floor-reason mempool 1000 200 now)) "control: at the dynamic floor")
+    (is (equal "mempool min fee not met"
+               (bl.val:tx-reject-reason-string :mempool-min-fee-not-met)))
+    (is (equal "min relay fee not met"
+               (bl.val:tx-reject-reason-string :insufficient-fee)))))
 ;;;; Min non-witness size (65 B) + witness standardness
 
 (defun %zbytes (n &optional (fill 0))

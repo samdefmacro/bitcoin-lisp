@@ -803,12 +803,9 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; reason in Core: the script pass fails and reports itself. Ours pre-gates
     ;; the doomed execution, so it reports what that pass would have.
     (:witness-stripped         . "mempool-script-verify-flag-failed")
-    ;; UNSPLIT: Core has two fee reasons — "mempool min fee not met" when the
-    ;; pool's dynamic floor rejects (validation.cpp:705) and this one against
-    ;; the static relay floor (:709). Our single check compares against the
-    ;; effective rate, which is the max of the two, so it cannot say which
-    ;; term bound it. Splitting the check is the fix; naming the common case
-    ;; is the honest rendering until then.
+    ;; Core's two fee-floor reasons (CheckFeeRate, validation.cpp:703-711):
+    ;; the pool's dynamic floor first, then the static relay floor.
+    (:mempool-min-fee-not-met  . "mempool min fee not met")
     (:insufficient-fee         . "min relay fee not met"))
   "Our validation keywords in Core's reject-reason vocabulary.")
 
@@ -961,6 +958,23 @@ keeps the two from ever describing different transactions."
   (bl.mp:check-rbf-rules mempool tx modified-fee vsize
                          (bl.mp:transaction-graph-weight tx sigops)
                          direct-conflicts))
+
+(defun fee-floor-reason (mempool fee vsize &optional (now (bl.ser:get-unix-time)))
+  "Core's CheckFeeRate (validation.cpp:699-712) for FEE satoshis over VSIZE
+vbytes: :MEMPOOL-MIN-FEE-NOT-MET when the pool's dynamic floor (GetMinFee,
+here MEMPOOL-DECAYED-ROLLING-MIN-FEE-RATE) is positive and FEE is under it,
+:INSUFFICIENT-FEE when FEE is under -minrelaytxfee, NIL when neither. In that
+order, as Core tests them: a full pool answers `mempool min fee not met`
+(mempool_limit.py:212), and only a pool with no dynamic floor answers `min
+relay fee not met`. Rates are sat/kvB, compared as fee*1000 against
+rate*vsize. One check used the max of the two rates and could only ever name
+the second reason."
+  (let ((rolling (bl.mp:mempool-decayed-rolling-min-fee-rate mempool now)))
+    (cond ((and (plusp rolling) (< (* fee 1000) (* rolling vsize)))
+           :mempool-min-fee-not-met)
+          ((< (* fee 1000) (* (bl.mp:mempool-min-fee-rate mempool) vsize))
+           :insufficient-fee)
+          (t nil))))
 
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
@@ -1214,13 +1228,11 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; tx is part of a package evaluated at the package feerate, and for
           ;; reorg re-adds (Core: !bypass_limits && !package_feerates &&
           ;; CheckFeeRate, validation.cpp:945).
-          (when (and (not skip-fee-check)
-                     (not bypass-limits)
-                     (< (* modified-fee-value 1000)
-                        (* (bl.mp:mempool-effective-min-fee-rate mempool)
-                           vsize)))
-            (return-from validate-transaction-for-mempool
-              (values nil :insufficient-fee nil)))
+          (unless (or skip-fee-check bypass-limits)
+            (let ((reason (fee-floor-reason mempool modified-fee-value vsize)))
+              (when reason
+                (return-from validate-transaction-for-mempool
+                  (values nil reason nil)))))
 
           ;; BIP431 TRUC (v3) topology: inheritance + ancestor/descendant/size
           ;; limits for this tx and its unconfirmed relatives. Runs on every tx
