@@ -510,8 +510,16 @@ times before pausing."
       (remhash hash in-flight)
       (cond
         ((<= count +max-block-revalidation-attempts+)
+         ;; The verdict is rendered as Core's BlockValidationState::ToString()
+         ;; spells it (consensus/validation.h:110-121), the way Core's own
+         ;; "AcceptBlock FAILED (%s)" does (validation.cpp:4457): ~A on the
+         ;; keyword printed UPPER CASE, and the functional framework greps
+         ;; debug.log for the lower-case reason -- p2p_segwit.py:145 waits for
+         ;; `unexpected-witness', and THIS is the line an unsolicited block
+         ;; rejected by the download drain writes.
          (bl:log-error "Block ~D validation failed: ~A (attempt ~D/~D)"
-                                 height error count +max-block-revalidation-attempts+)
+                                 height (bl.val:block-reject-reason-string error)
+                                 count +max-block-revalidation-attempts+)
          (unless (gethash hash pending)
            (setf (gethash hash pending) height)))
         ((= count (1+ +max-block-revalidation-attempts+))
