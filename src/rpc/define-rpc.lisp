@@ -68,12 +68,33 @@ rpc/core-tables.lisp.")
 `help <name>', never listed by a bare `help'."
   (and (member method *rpc-hidden-methods* :test #'string=) t))
 
+(defvar *rpc-help-details* '()
+  "((method . thunk) ...): help text a method COMPUTES when asked, appended to
+its docstring by RPC-METHOD-DESCRIPTION.
+
+Core's help is built at call time from live data -- getpeerinfo's `network'
+field documents itself as \"Network (\" + Join(GetNetworkNames(...)) + \")\"
+(rpc/net.cpp:137) -- and a docstring is a literal, so anything derived from
+the node's own tables needs a thunk to stay true as those tables change.")
+
+(defun register-rpc-help-detail (method thunk)
+  "Have `help METHOD' append THUNK's string to METHOD's description."
+  (setf *rpc-help-details*
+        (append (remove method *rpc-help-details* :key #'car :test #'string=)
+                (list (cons method thunk)))))
+
 (defun rpc-method-description (method)
   "METHOD's prose description: the docstring of the function DEFINE-RPC made
-for it, which is this node's stand-in for Core's RPCHelpMan m_description.
-NIL when the method is unknown or carries no docstring."
-  (let ((symbol (cdr (assoc method *rpc-registry* :test #'string=))))
-    (and symbol (documentation symbol 'function))))
+for it -- this node's stand-in for Core's RPCHelpMan m_description -- plus
+whatever REGISTER-RPC-HELP-DETAIL computes for it. NIL when the method is
+unknown and carries neither."
+  (let* ((symbol (cdr (assoc method *rpc-registry* :test #'string=)))
+         (doc (and symbol (documentation symbol 'function)))
+         (detail (cdr (assoc method *rpc-help-details* :test #'string=)))
+         (extra (and detail (funcall detail))))
+    (cond ((and doc extra) (format nil "~A~%~%~A" doc extra))
+          (extra)
+          (t doc))))
 
 (defun register-rpc-method (name handler)
   "Install HANDLER (a function of NODE and PARAMS) as method NAME."

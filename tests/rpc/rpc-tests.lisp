@@ -9849,3 +9849,35 @@ hidden method listed."
           (is-false (search "unknown command" text)
                     "help ~A answered ~S" hidden text)
           (is (eql 0 (search hidden text))))))))
+
+(test getpeerinfo-help-names-the-networks-it-can-report
+  "Core documents getpeerinfo's `network' field with the list it generates
+from the Network enum itself (rpc/net.cpp:137):
+
+    {RPCResult::Type::STR, \"network\",
+     \"Network (\" + Join(GetNetworkNames(/*append_unroutable=*/true), \", \")
+     + \")\"}
+
+and rpc_net.py:131 greps the rendered help for that parenthesised list:
+
+    assert \"(ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)\" in
+           self.nodes[0].help(\"getpeerinfo\")
+
+It is a check on the node, not on prose: the same NETWORK-NAMES list is what
+getaddrmaninfo enumerates, so a network this node learns to speak cannot
+appear in one and not the other."
+  (let* ((node (make-test-node))
+         (text (bl.rpc:dispatch-rpc-method
+                node "help" (wire-params (list "getpeerinfo")))))
+    (is (eql 0 (search (format nil "getpeerinfo~%~%") text)))
+    (is-true (search "(ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)" text)
+             "getpeerinfo's help did not name the networks: ~S" text)
+    ;; The same list drives getaddrmaninfo's per-network counts, so the help
+    ;; cannot drift from what the node reports.
+    (let ((counts (bl.rpc:dispatch-rpc-method
+                   node "getaddrmaninfo" (wire-params '()))))
+      (dolist (name '("ipv4" "ipv6" "onion" "i2p" "cjdns"))
+        (is-true (assoc name counts :test #'string=)
+                 "getaddrmaninfo reports no ~A row" name))
+      ;; not_publicly_routable is documented but never counted, as in Core.
+      (is-false (assoc "not_publicly_routable" counts :test #'string=)))))
