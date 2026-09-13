@@ -61,7 +61,12 @@ flag that says whether a thread is busy. That is not a progress figure: it
 answers 1.0 for a node one block past genesis with a million to go, which is
 the single number every wallet and every operator uses to decide whether the
 node can be trusted yet."
-  (let ((count (and entry (%cached-chain-tx-count entry block-store))))
+  (let ((count (and entry
+                    (bl.store:block-index-entry-header entry)
+                    (%cached-chain-tx-count entry block-store))))
+    ;; No entry, no header to date it by, or no chain transaction count -- a
+    ;; header with no body, a pruned ancestor -- is 0.0: Core's answer for
+    ;; m_chain_tx_count == 0 is no estimate rather than a made-up one.
     (if (or (null count) (zerop count))
         0.0d0
         (multiple-value-bind (data-time data-count data-rate)
