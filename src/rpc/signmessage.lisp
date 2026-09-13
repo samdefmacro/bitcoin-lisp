@@ -54,22 +54,27 @@ not refer to key\", and malformed base64 -5 \"Malformed base64 encoding\"."
   (unless (and (stringp address) (stringp sig-b64) (stringp message))
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message "address, signature and message are required"))
-  ;; MessageVerify ERR_INVALID_ADDRESS / ERR_ADDRESS_NO_KEY: the address
-  ;; must decode, and must be base58 P2PKH (only key-hash addresses can be
-  ;; message-verified). base58check-decode's payload is the 20-byte key-id.
-  (multiple-value-bind (ver payload)
-      (handler-case (bl.crypto:base58check-decode address 21)
+  ;; MessageVerify ERR_INVALID_ADDRESS / ERR_ADDRESS_NO_KEY
+  ;; (common/signmessage.cpp:57-68): DecodeDestination first, then
+  ;; `std::get_if<PKHash>(&destination) == nullptr' — the address must decode
+  ;; AND must be a key-hash (P2PKH) address, because only a key-hash address
+  ;; names a public key. Reading the base58 PAYLOAD LENGTH alone is not that
+  ;; test: a P2SH address decodes to twenty bytes as well, so sh(wpkh(K)) took
+  ;; the verify path, compared the script hash with the recovered key's
+  ;; hash160 and answered `false' where Core refuses the question.
+  (multiple-value-bind (type script-pubkey)
+      (handler-case (bl.crypto:decode-address address (rpc-get-network node))
         (error () (values nil nil)))
-    (declare (ignore ver))
-    (unless (and payload (= (length payload) 20))
-      (if (nth-value 0 (ignore-errors
-                        (bl.crypto:decode-address
-                         address (rpc-get-network node))))
-          (error 'rpc-error :code +rpc-type-error+
-                            :message "Address does not refer to key")
-          (error 'rpc-error :code +rpc-invalid-address-or-key+
-                            :message "Invalid address")))
-    (let ((sig65 (handler-case (cl-base64:base64-string-to-usb8-array sig-b64)
+    (unless type
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Invalid address"))
+    (unless (eq type :p2pkh)
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "Address does not refer to key"))
+    ;; The P2PKH scriptPubKey is OP_DUP OP_HASH160 <20> ... — the key-id is
+    ;; the push body, the CKeyID Core compares the recovered pubkey against.
+    (let ((payload (subseq script-pubkey 3 23))
+          (sig65 (handler-case (cl-base64:base64-string-to-usb8-array sig-b64)
                    (error ()
                      (error 'rpc-error :code +rpc-invalid-address-or-key+
                                        :message "Malformed base64 encoding")))))

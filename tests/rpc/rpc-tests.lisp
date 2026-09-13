@@ -7217,6 +7217,31 @@ address, and a malformed signature all fail. The signature is deterministic."
     (signals-rpc-error (:code -5)
       (bl.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg)))))
 
+(test rpc-verifymessage-p2sh-address-is-not-a-key
+  "verifymessage refuses a P2SH address with Core's -3 `Address does not refer
+to key' instead of answering false. Core's MessageVerify asks DecodeDestination
+for a PKHash and a script hash is not one (common/signmessage.cpp:57-68); a
+P2SH address base58-decodes to the same TWENTY bytes a P2PKH address does, so
+checking only the payload LENGTH let sh(wpkh(K)) reach the verify path and
+compare the script hash against the recovered key's hash160
+(rpc_signmessagewithprivkey.py:44)."
+  (let* ((node (make-test-node))   ; testnet3
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 7) k))
+         (wif (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (msg "This is just a test message")
+         (pub (bl.crypto:derive-public-key k1))
+         (p2pkh (bl.crypto:encode-p2pkh-address (bl.crypto:hash160 pub) :testnet3))
+         ;; sh(wpkh(K)): the P2SH address of the key's P2WPKH redeemScript.
+         (redeem (concatenate '(vector (unsigned-byte 8))
+                              #(#x00 #x14) (bl.crypto:hash160 pub)))
+         (p2sh (bl.crypto:encode-p2sh-address (bl.crypto:hash160 redeem) :testnet3))
+         (sig (bl.rpc:rpc-signmessagewithprivkey node (list wif msg))))
+    ;; Control: the SAME key's P2PKH address still verifies true.
+    (is (eq t (bl.rpc::rpc-verifymessage node (list p2pkh sig msg))))
+    (signals-rpc-error (:code -3 :exact-message "Address does not refer to key")
+      (bl.rpc::rpc-verifymessage node (list p2sh sig msg)))))
+
 (test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
   "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input
 (input 1) with a supplied key; complete is T, and each produced signature
