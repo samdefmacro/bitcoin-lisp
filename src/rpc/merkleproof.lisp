@@ -183,12 +183,26 @@ takes the active chain's block at the coin's height."
   "Build a merkle proof that the given TXIDs are in a block (Bitcoin Core
 gettxoutproof). PARAMS: (txids [blockhash]). On this pruned node the block
 must be locatable: pass BLOCKHASH, or have txindex enabled. Returns the
-hex-encoded CMerkleBlock."
+hex-encoded CMerkleBlock.
+
+The argument is Core's std::set<Txid> (txoutproof.cpp:46-56): an empty array
+and a repeated txid are each refused by name before any lookup, and the set is
+what the found-count below is compared against."
   (unless (and (listp txids) txids)
-    (error 'rpc-error :code +rpc-invalid-parameter+ :message "txids must be a non-empty array"))
-  (let ((wanted (mapcar (lambda (h) (parse-hash-v h "txid")) txids))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Parameter 'txids' cannot be empty"))
+  (let ((wanted '())
         (chain-state (rpc-get-chain-state node))
         (block-store (rpc-get-block-store node)))
+    ;; setTxids.insert: a second copy of one txid is refused, naming it
+    ;; (txoutproof.cpp:51-56, rpc_txoutproof.py:88).
+    (dolist (h txids)
+      (let ((hash (parse-hash-v h "txid")))
+        (when (member hash wanted :test #'equalp)
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message (format nil "Invalid parameter, duplicated txid: ~A" h)))
+        (push hash wanted)))
+    (setf wanted (nreverse wanted))
     ;; Locate the block: explicit hash, else txindex on the first txid.
     (let* ((block-hash
              (cond
@@ -209,13 +223,20 @@ hex-encoded CMerkleBlock."
       (let* ((txs (bl.ser:bitcoin-block-transactions block))
              (txids-vec (map 'vector #'bl.ser:transaction-hash txs))
              (match (make-array (length txids-vec) :initial-element nil)))
-        ;; Flag the requested txids; every one must be in the block.
-        (dolist (w wanted)
-          (let ((idx (position w txids-vec :test #'equalp)))
-            (unless idx
-              (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                :message "Not all txids found in the specified block"))
-            (setf (aref match idx) t)))
+        ;; Core counts how many of the block's transactions are in setTxids
+        ;; and rejects once, on the COUNT, naming the block it read rather
+        ;; than the txid it missed: the block may be one it retrieved itself
+        ;; from a coin or the txindex, not one the caller specified
+        ;; (txoutproof.cpp:109-118, rpc_txoutproof.py:84).
+        (let ((found 0))
+          (dolist (w wanted)
+            (let ((idx (position w txids-vec :test #'equalp)))
+              (when idx
+                (incf found)
+                (setf (aref match idx) t))))
+          (unless (= found (length wanted))
+            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                              :message "Not all transactions found in specified or retrieved block")))
         (multiple-value-bind (bits hashes) (build-partial-merkle-tree txids-vec match)
           (let ((header-bytes (bl.ser:serialize-block-header
                                (bl.ser:bitcoin-block-header block))))
