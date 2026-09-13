@@ -296,6 +296,28 @@ keyword; absent from the plist when not given."
     (is (eq t (getf on :force-compact-db)))
     (is (null (getf off :force-compact-db)))))
 
+
+(test norpccookiefile-disables-the-cookie-file
+  "-norpccookiefile reaches the RPC layer as the value \"0\" -- what Core makes
+of -rpccookiefile=0 as well -- and GenerateAuthCookie then answers DISABLED
+(rpc/request.cpp:115): no cookie file is written, InitRPCAuthentication logs
+`RPC authentication cookie file generation is disabled.` and the node runs on
+(httprpc.cpp:261-262); only -rpcauth users can authenticate. Ours dropped the
+negation on the floor (a negated scalar has no row in the merged alist) and
+wrote the cookie anyway, so rpc_users.py's test_norpccookiefile found the file
+it asserted absent."
+  ;; The merged alist already renders the negation as Core's "0"; the RPC
+  ;; layer then read that as a cookie file NAMED 0.
+  (is (equal "0" (cdr (assoc "rpccookiefile"
+                             (nth-value 1 (start-node-plist '("-norpccookiefile") nil))
+                             :test #'string=))))
+  (let ((bl.rpc:*rpc-cookie-file* nil))
+    (bl:apply-rpc-config-globals '(("rpccookiefile" . "0")))
+    (is (eq :disabled bl.rpc:*rpc-cookie-file*)
+        "\"0\" is the negation: no cookie file, not a file named 0")
+    (bl:apply-rpc-config-globals '(("rpccookiefile" . "elsewhere.cookie")))
+    (is (equal "elsewhere.cookie" bl.rpc:*rpc-cookie-file*)
+        "control: a real name is still a path")))
 (test config-plist-server-and-debug-shortcuts
   "-server enables RPC on the network default port; -debug => loglevel debug."
   (let ((plist (bl::config-alist->start-node-plist
@@ -1470,7 +1492,7 @@ there is a READ error, not a link error."
                      bl.rpc:*rpc-server-timeout*)))
     (unwind-protect
          (progn
-           (bl::apply-rpc-config-globals
+           (bl:apply-rpc-config-globals
             '(("rpccookiefile" . "/tmp/x.cookie") ("rpccookieperms" . "group")
               ("rpcthreads" . "8") ("rpcservertimeout" . "45")))
            (is (equal "/tmp/x.cookie" bl.rpc:*rpc-cookie-file*))
@@ -1492,7 +1514,7 @@ there is a READ error, not a link error."
            (is (equal "/data/dir/.cookie"
                       (namestring (bl.rpc::rpc-cookie-path "/data/dir/"))))
            ;; 0 means no timeout, as in Core.
-           (bl::apply-rpc-config-globals '(("rpcservertimeout" . "0")))
+           (bl:apply-rpc-config-globals '(("rpcservertimeout" . "0")))
            (is-false bl.rpc:*rpc-server-timeout*))
       (setf bl.rpc:*rpc-cookie-file* (first saved)
             bl.rpc:*rpc-cookie-perms* (second saved)
@@ -1507,7 +1529,7 @@ there is a READ error, not a link error."
   ;; an unrecognised audience is an error rather than a silent default.
   (dolist (bad '((("rpccookieperms" . "everyone")) (("rpcthreads" . "0"))
                  (("rpcservertimeout" . "-1"))))
-    (signals error (bl::apply-rpc-config-globals bad)))
+    (signals error (bl:apply-rpc-config-globals bad)))
   (dolist (name '("rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
@@ -1948,7 +1970,7 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
                      bl.wallet:*wallet-cross-chain*)))
     (unwind-protect
          (progn
-           (bl::apply-rpc-config-globals
+           (bl:apply-rpc-config-globals
             '(("mintxfee" . "0.00002") ("discardfee" . "0.0002")
               ("consolidatefeerate" . "0.0003") ("maxapsfee" . "0.0001")
               ("txconfirmtarget" . "12") ("walletrbf" . "0")
@@ -1980,7 +2002,7 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
   ;; Malformed values are refused rather than silently leaving the default.
   (dolist (bad '((("mintxfee" . "notanumber")) (("txconfirmtarget" . "0"))
                  (("txconfirmtarget" . "x")) (("maxapsfee" . "zz"))))
-    (signals error (bl::apply-rpc-config-globals bad)))
+    (signals error (bl:apply-rpc-config-globals bad)))
   (dolist (name '("mintxfee" "discardfee" "consolidatefeerate" "maxapsfee"
                   "txconfirmtarget" "walletrbf" "spendzeroconfchange"
                   "walletrejectlongchains" "walletcrosschain"))
@@ -2103,7 +2125,7 @@ would pass even if no struct ever consulted it."
         (saved-dir bl.wallet:*wallet-directory*))
     (unwind-protect
          (progn
-           (bl::apply-rpc-config-globals '(("keypool" . "37")))
+           (bl:apply-rpc-config-globals '(("keypool" . "37")))
            (is (= 37 (bl.wallet::wallet-manager-keypool-size
                       (bl.wallet::make-wallet-manager
                        :data-directory #p"/tmp/kp/"))))
@@ -2114,10 +2136,10 @@ would pass even if no struct ever consulted it."
              (setf bl.wallet:*wallet-directory* nil)
              (is (equal #p"/tmp/dd/wallets/"
                         (bl.wallet::wallets-directory manager)))
-             (bl::apply-rpc-config-globals '(("walletdir" . "purses")))
+             (bl:apply-rpc-config-globals '(("walletdir" . "purses")))
              (is (equal #p"/tmp/dd/purses/"
                         (bl.wallet::wallets-directory manager)))
-             (bl::apply-rpc-config-globals
+             (bl:apply-rpc-config-globals
               '(("walletdir" . "/srv/keys")))
              (is (equal #p"/srv/keys/"
                         (bl.wallet::wallets-directory manager)))))
@@ -2125,7 +2147,7 @@ would pass even if no struct ever consulted it."
             bl.wallet:*wallet-directory* saved-dir)))
   ;; Core rejects -keypool=0; so do we, rather than making an unusable wallet.
   (dolist (bad '((("keypool" . "0")) (("keypool" . "-1")) (("keypool" . "x"))))
-    (signals error (bl::apply-rpc-config-globals bad)))
+    (signals error (bl:apply-rpc-config-globals bad)))
   (dolist (name '("keypool" "walletdir"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))

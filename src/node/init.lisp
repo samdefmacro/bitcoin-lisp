@@ -2,6 +2,13 @@
 
 ;;;; Startup Sequence
 
+(defun init-message (text)
+  "Core's uiInterface.InitMessage as the non-GUI build logs it: `init message:
+<TEXT>` (noui.cpp:56). The functional framework waits on these lines --
+rpc_users.py for `Done loading`, feature_init.py for `Verifying blocks` and
+`Starting network threads` -- so the wording is Core's, ellipsis included."
+  (log-info "init message: ~A" text))
+
 (defun init-node (data-directory &key (network :mainnet) (log-level :info))
   "Initialize a new node with the given data directory and network.
 For mainnet, data is stored in a 'mainnet' subdirectory.
@@ -845,6 +852,7 @@ down from, and whether the coins behind it are there is the question being
 asked. A skipped level 3 is a warning unless -checkblocks or -checklevel was
 given explicitly, Core's require_full_verification (init.cpp:1390)."
   (unless reindex-chainstate
+    (init-message "Verifying blocks…")             ; init.cpp:1407
     (dolist (cs (node-chainstates *node*))
       (let ((view (bl.store:chain-state-coins-view cs)))
         (unless (or (null view) (null (bl.store:coins-view-best-block view)))
@@ -938,7 +946,7 @@ it; the indexes (Step 8) and -forcecompactdb."
   (setf *mempool-load-tried* (not (interrupt-requested-p)))
 
   ;; Initialize peer address book
-  (log-info "Loading peer address book...")
+  (init-message "Loading P2P addresses…")         ; init.cpp:1636
   (setf (node-address-book *node*) (bl.net:make-address-book))
   (let ((peers-path (bl.net:peers-dat-path (node-data-directory *node*))))
     (when (bl.net:load-address-book (node-address-book *node*) peers-path)
@@ -1445,6 +1453,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
   (bl.rpc:finish-rpc-warmup)
   (when rpc-port
     (log-info "RPC server ready"))
+  (init-message "Done loading")                    ; init.cpp:2295
 
   ;; -startupnotify, once the node is actually up (Core init.cpp:529).
   (dolist (command startup-notify)
@@ -1468,6 +1477,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
       (setf (node-last-tip-advance-time *node*) (bl.ser:get-node-time)
             (node-last-tip-height *node*)
             (if cs (bl.store:current-height cs) 0)))
+    (init-message "Starting network threads…")     ; net.cpp:3495
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda () (%sync-thread-loop max-peers))
@@ -1643,6 +1653,7 @@ Returns the node instance."
   (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1
                           wallet-broadcast)
   (%init-lock-and-banner network)
+  (init-message "Loading block index…")          ; init.cpp:1396
   (%init-load-chain network reindex blocks-directory)
   (%init-recover-chain reindex-chainstate)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))

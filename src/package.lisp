@@ -73,6 +73,8 @@ init.cpp, node/. src/node/.")
    #:known-config-option-p
    #:asmap-file-path
    #:start-rpc-early
+   #:init-message
+   #:apply-rpc-config-globals
    #:defer-log
    #:*category-log-levels*
    #:category-log-level

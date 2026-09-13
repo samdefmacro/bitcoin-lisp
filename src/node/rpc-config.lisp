@@ -11,7 +11,9 @@ APPLY-CONFIG-GLOBALS."
     ;; -rpccookiefile: where the auth cookie goes (Core init.cpp:710). A
     ;; relative path hangs off the data directory.
     (let ((v (lk "rpccookiefile")))
-      (when v (setf bl.rpc:*rpc-cookie-file* v)))
+      ;; "0" is the negation (-norpccookiefile): no cookie file at all, Core's
+      ;; GenerateAuthCookieResult::DISABLED (rpc/request.cpp:115).
+      (when v (setf bl.rpc:*rpc-cookie-file* (if (string= v "0") :disabled v))))
     ;; -rpccookieperms=owner|group|all (Core init.cpp:711). Loosening who may
     ;; read the cookie is loosening who may drive the RPC, so an unrecognised
     ;; audience is an error rather than a silent fall back to the default.
