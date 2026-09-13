@@ -1051,3 +1051,53 @@ witness ones."
                     :p2tr-script :p2wsh-miniscript :p2sh-p2wsh-miniscript))
       (is-true (witness-p kind) "~S is a witness kind" kind))
     (signals error (witness-p :not-a-kind))))
+
+(test psbt-process-without-finalize-reports-the-psbt-it-returns
+  "Core's two process RPCs read `complete' -- and the optional `hex' it gates
+-- off the PSBT THEY RETURN. walletprocesspsbt computes it in FillPSBT over
+psbtx itself (wallet.cpp:2231-2235) and descriptorprocesspsbt over psbtx in
+its own loop (rawtransaction.cpp:2051-2071); both predicates start at
+PSBTInputSigned, which asks for a final_scriptSig or final_scriptWitness
+(psbt.cpp:320-323). With finalize=false the returned PSBT has neither, so
+complete is false and the `hex' key is absent:
+
+    processed_psbt = self.nodes[0].walletprocesspsbt(psbt=psbtx, finalize=False)
+    assert \"hex\" not in processed_psbt            (rpc_psbt.py:480-481)
+
+We answered from a finalized COPY, so an unfinalized PSBT came back with
+complete=true and a hex -- a network transaction the returned PSBT cannot
+produce. The caller's route to that hex is finalizepsbt, which is what
+rpc_psbt.py:485 then calls, and it gives the same bytes."
+  (let* ((node (bl:make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (pub (bl.crypto:derive-public-key sk :compressed t))
+         (value 100000)
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                           #(#x00 #x14) (bl.crypto:hash160 pub)))
+         (descriptors (list (format nil "wpkh(~A)" wif))))
+    (flet ((field (result name) (cdr (assoc name result :test #'equal)))
+           (process (finalize)
+             (bl.rpc:dispatch-rpc-method
+              node "descriptorprocesspsbt"
+              (wire-params
+               (list (bl.ser:encode-psbt (%psbt-spending spk value))
+                     descriptors nil t finalize)))))
+      ;; Control: finalize=true completes and hands back the network tx.
+      (let ((finalized (process t)))
+        (is (eq t (field finalized "complete")))
+        (is (stringp (field finalized "hex")))
+        ;; finalize=false signs the same input and stops there.
+        (let ((unfinalized (process bl.rpc:+json-false+)))
+          (is (eq bl.rpc:+json-false+ (field unfinalized "complete"))
+              "an unfinalized PSBT is not complete")
+          (is (null (field unfinalized "hex"))
+              "an unfinalized PSBT must carry no hex; got ~S"
+              (field unfinalized "hex"))
+          ;; It is signed, though: finalizepsbt turns it into the same bytes
+          ;; the finalize=true call produced (rpc_psbt.py:485-493).
+          (let ((final (bl.rpc:dispatch-rpc-method
+                        node "finalizepsbt"
+                        (wire-params (list (field unfinalized "psbt"))))))
+            (is (eq t (field final "complete")))
+            (is (equal (field finalized "hex") (field final "hex")))))))))
