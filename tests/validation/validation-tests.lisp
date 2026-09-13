@@ -2282,9 +2282,9 @@ would be rejected for the wrong reason and prove nothing about the bound."
           (largest (sig 33 32)))  ; 71 body bytes = 72 with the hashtype byte
       (is (= 73 (length too-big)) "control: this is the 74-byte signature")
       (is (= 71 (length largest)) "control: this is the largest Core accepts")
-      (is-false (bl.interop::check-der-signature-format too-big)
+      (is-false (bl.interop:check-der-signature-format too-big)
                 "74 bytes with the hashtype: Core rejects on size, so must we")
-      (is-true (bl.interop::check-der-signature-format largest)
+      (is-true (bl.interop:check-der-signature-format largest)
                "72 bytes with the hashtype is legal — the fix must not
                 over-tighten and start rejecting valid signatures"))))
 

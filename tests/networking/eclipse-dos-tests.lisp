@@ -2400,7 +2400,7 @@ ThreadOpenConnections does."
   (let ((node (bl:make-node)))
     (setf (bl:node-network-active node) t
           (bl:node-peers node) peers
-          (bl::node-address-book node) book)
+          (bl:node-address-book node) book)
     node))
 
 (defun %refill-outbound (node)

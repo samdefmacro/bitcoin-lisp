@@ -157,7 +157,7 @@ measuring the fixture."
         (peer nil))
     (setf peer (bl.net:make-peer
                 :connection conn :state :ready :address "127.0.0.1"))
-    (bl.net::init-peer-rate-limiters peer)
+    (bl.net:init-peer-rate-limiters peer)
     peer))
 
 (defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer)))
@@ -171,13 +171,13 @@ drain loop uses. Returns (values still-connected peer)."
   "Give PEER an outstanding ping carrying NONCE, the way SEND-PING leaves it:
 the nonce AND the send time, without which RECORD-PONG has no clock to
 subtract and raises for a reason that has nothing to do with the payload."
-  (setf (bl.net::peer-ping-nonce peer) nonce
-        (bl.net::peer-last-ping-time peer) (get-internal-real-time))
+  (setf (bl.net:peer-ping-nonce peer) nonce
+        (bl.net:peer-last-ping-time peer) (get-internal-real-time))
   peer)
 
 (defun %outstanding-ping (peer)
   "PEER's unanswered ping nonce, or NIL once the round trip is closed."
-  (bl.net::peer-ping-nonce peer))
+  (bl.net:peer-ping-nonce peer))
 
 (defun %handler-error-count (command)
   "How many handler errors for COMMAND the dispatch has swallowed."
