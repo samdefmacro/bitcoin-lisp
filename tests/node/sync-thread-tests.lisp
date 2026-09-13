@@ -54,7 +54,8 @@ peer placed in node-peers directly was answered by one tick."
                       (is (null (bl:node-peers node)) "control: nothing admitted yet")
                       (bl.net:send-message client (bl.ser:make-ping-message 42))
                       (sleep 0.2)
-                      (%idle-tick)
+                      (is-true (%idle-tick)
+                               "a tick that admitted a peer ends the wait, so the sync pass asks it for headers now")
                       (is-true (member server-peer (bl:node-peers node))
                                "the tick must admit the pending inbound peer")
                       (is (null (bl:node-pending-inbound-peers node)))
@@ -89,3 +90,17 @@ not the handshake, which inbound-listening-tests covers."
              (is (null bl:*pending-test-connections*)
                  "one idle tick must consume the addconnection queue"))
         (setf (bl:node-running node) nil)))))
+
+(test idle-tick-with-nothing-pending-keeps-waiting
+  "Control for the admitted-peer exit above: a tick on a node with no peer
+pending, none queued to dial and no headers arriving returns NIL, so the
+30-second wait is not cut short for no reason."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (bl:*pending-test-connections* '()))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t)
+           (is-false (%idle-tick)))
+      (setf (bl:node-running node) nil))))
