@@ -809,20 +809,43 @@ transaction is refused even on a node told to relay non-standard ones."
     (:insufficient-fee         . "min relay fee not met"))
   "Our validation keywords in Core's reject-reason vocabulary.")
 
+(defparameter *tx-reject-debug-messages*
+  ;; keyword -> Core's state.GetDebugMessage(), where Core writes a CONSTANT
+  ;; one. Core's ValidationState carries the debug message beside the reject
+  ;; reason and joins them with ", " in ToString(), which is the string
+  ;; sendrawtransaction throws and the string ConnectBlock relays into a block
+  ;; verdict. Only the constant ones live here: Core builds the rest with
+  ;; strprintf over values only the failing site holds (a coinbase depth, two
+  ;; FormatMoney amounts), and a site that wants one of those passes it as the
+  ;; second element of (KEYWORD DETAIL) instead.
+  '((:missing-input . "CheckTxInputs: inputs missing/spent"))  ; tx_verify.cpp:169
+  "Core's constant debug messages, keyed by our reject-reason keyword.")
+
+(defun tx-reject-debug-message (reason)
+  "Core's state.GetDebugMessage() for REASON, or NIL where Core writes none."
+  (cdr (assoc (if (consp reason) (first reason) reason)
+              *tx-reject-debug-messages*)))
+
 (defun tx-reject-reason-string (reason)
-  "REASON as Core's state.GetRejectReason() spells it.
-REASON is a keyword, or the list (KEYWORD SCRIPT-ERROR) the two script passes
-return: Core renders those as `<prefix> (<ScriptErrorString>)'
+  "REASON as Core's state.ToString() spells it.
+REASON is a keyword, the list (KEYWORD SCRIPT-ERROR) the two script passes
+return -- Core renders those as `<prefix> (<ScriptErrorString>)'
 (validation.cpp:2117-2119), and BL.INTEROP:SCRIPT-ERROR-MESSAGE is that string
-verbatim for every error our interpreter reports.
+verbatim for every error our interpreter reports -- or the list (KEYWORD
+DEBUG-STRING), which is Core's reject reason and debug message and renders as
+`<reason>, <debug>' (consensus/validation.h:112-121). A STRING second element
+is the debug message; anything else is a script error.
 An unmapped keyword falls back to its downcased name and is caught by test
 rather than by a client: see TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
-  (if (consp reason)
-      (format nil "~A (~A)"
-              (tx-reject-reason-string (first reason))
-              (bl.interop:script-error-message (second reason)))
-      (or (cdr (assoc reason *tx-reject-reasons*))
-          (string-downcase (symbol-name reason)))))
+  (cond ((and (consp reason) (stringp (second reason)))
+         (format nil "~A, ~A"
+                 (tx-reject-reason-string (first reason)) (second reason)))
+        ((consp reason)
+         (format nil "~A (~A)"
+                 (tx-reject-reason-string (first reason))
+                 (bl.interop:script-error-message (second reason))))
+        (t (or (cdr (assoc reason *tx-reject-reasons*))
+               (string-downcase (symbol-name reason))))))
 
 (defun %policy-script-checks (tx utxo-set extra-coins)
   "Core MemPoolAccept::PolicyScriptChecks (validation.cpp:1132-1153).

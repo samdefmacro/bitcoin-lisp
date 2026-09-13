@@ -630,7 +630,11 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
           ;; attempt), so Core reports it "inconclusive" (rpc/mining.cpp:
           ;; 1091-1095): neither rejected nor the new tip.
           ((eq reason :weaker-chain) "inconclusive")
-          (t (string-downcase (symbol-name reason)))))))))
+          ;; BIP22 reports the REJECT REASON alone -- Core's
+          ;; BIP22ValidationResult returns state.GetRejectReason(), not
+          ;; ToString(), so a verdict carrying a debug message still answers
+          ;; in one word (rpc/mining.cpp:38-46).
+          (t (bl.val:block-reject-reason reason))))))))
 
 (define-rpc "submitheader" (node (hex))
   "Validate and add a block header to the header index (Bitcoin Core
@@ -878,8 +882,13 @@ and {hash} is returned; otherwise {hash, hex}."
                      (bl.val:test-block-validity
                       block chain-state (rpc-get-utxo-set node))
                    (unless ok
+                     ;; Core: strprintf("TestBlockValidity failed: %s",
+                     ;; state.ToString()) (rpc/mining.cpp:392) -- the reject
+                     ;; reason and, after a comma, the debug message.
+                     ;; feature_block.py:157 matches the whole of it.
                      (error 'rpc-error :code +rpc-verify-error+
-                                       :message (format nil "TestBlockValidity failed: ~A" reason))))
+                                       :message (format nil "TestBlockValidity failed: ~A"
+                                                        (bl.val:block-reject-reason-string reason)))))
                  block))))
       (unless (bl.mining:mine-block block)
         (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
@@ -892,7 +901,8 @@ and {hash} is returned; otherwise {hash, hex}."
                 ;; activation itself (Core "ProcessNewBlock, block not
                 ;; accepted", rpc/mining.cpp:158).
                 (error 'rpc-error :code +rpc-verify-error+
-                                  :message (format nil "Block not accepted: ~A" reason)))
+                                  :message (format nil "Block not accepted: ~A"
+                                                   (bl.val:block-reject-reason-string reason))))
               `(("hash" . ,hash-hex)))
             `(("hash" . ,hash-hex)
               ("hex" . ,(bl.crypto:bytes-to-hex

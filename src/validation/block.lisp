@@ -1919,7 +1919,28 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                                                       :pending-utxos pending-utxos
                                                       :spent-outpoints spent-outpoints)
                    (unless valid
-                     (return-from %contextual-check-block (values nil error nil)))
+                     ;; Core's ConnectBlock relays the TRANSACTION's verdict
+                     ;; into the block's state and appends the offending txid
+                     ;; to its debug message: state.Invalid(BLOCK_CONSENSUS,
+                     ;; tx_state.GetRejectReason(), tx_state.GetDebugMessage()
+                     ;; + " in transaction " + tx.GetHash().ToString())
+                     ;; (validation.cpp:2532-2537). That whole sentence is
+                     ;; what generateblock reports and what feature_block.py
+                     ;; :157 matches: "bad-txns-inputs-missingorspent,
+                     ;; CheckTxInputs: inputs missing/spent in transaction
+                     ;; <txid>". Two of Core's CheckTxInputs debug messages
+                     ;; are built by strprintf from a coinbase depth or two
+                     ;; FormatMoney amounts and are not reproduced here; those
+                     ;; verdicts carry the position alone.
+                     (return-from %contextual-check-block
+                       (values nil
+                               (list error
+                                     (format nil "~@[~A ~]in transaction ~A"
+                                             (tx-reject-debug-message error)
+                                             (bl.crypto:bytes-to-hex
+                                              (bl.crypto:reverse-bytes
+                                               (bl.ser:transaction-hash tx)))))
+                               nil)))
                    ;; fee is now a Satoshi type, use typed addition
                    (setf total-fees (bl.interop:satoshi+ total-fees fee))
                    ;; Core ConnectBlock (validation.cpp:2539-2544) range-checks
@@ -3175,10 +3196,18 @@ above for why each exclusion could otherwise poison a recoverable block.")
 *deterministic-invalid-block-errors*) — i.e. safe to permanently mark the failing
 block :invalid. Any other value — a transient control keyword, a corrupt-body /
 witness-dependent failure, or an unrecognized keyword — returns NIL, defaulting
-to the SAFE non-poisoning (recoverable) behavior."
-  (and (keywordp error)
-       (member error *deterministic-invalid-block-errors*)
-       t))
+to the SAFE non-poisoning (recoverable) behavior.
+
+A verdict that carries a debug message is the list (REASON DETAIL), Core's
+reject reason plus GetDebugMessage(); the question is about the REASON, so the
+detail is read past. Missing that is how attaching Core's `CheckTxInputs:
+inputs missing/spent in transaction <txid>' to a missing-input verdict would
+silently stop a fork block that spends a nonexistent output from being marked
+invalid."
+  (let ((reason (if (consp error) (first error) error)))
+    (and (keywordp reason)
+         (member reason *deterministic-invalid-block-errors*)
+         t)))
 
 (defvar *best-invalid-entry* nil
   "The most-work block-index entry known to be INVALID — Core
@@ -3297,26 +3326,58 @@ CheckBlock when it was stored, so failing one now means the bytes changed and
 every CheckBlock verdict is transient there. Here the body has never been
 stored and the verdict is its first, so only the mutation class is exempt.")
 
+(defparameter *block-reject-reasons*
+  ;; Our block verdicts whose Core reject reason is NOT the downcased keyword,
+  ;; with the site Core sets each at. Most of them are ConnectBlock relaying a
+  ;; TRANSACTION verdict into the block's state -- Core passes
+  ;; tx_state.GetRejectReason() through, so the block wears the transaction's
+  ;; word (validation.cpp:2532-2537, :2585-2589) -- which is why a blanket
+  ;; fallthrough to *TX-REJECT-REASONS* would be wrong: :too-many-sigops is
+  ;; the BLOCK budget here and "bad-txns-too-many-sigops" there.
+  '((:missing-input              . "bad-txns-inputs-missingorspent")     ; tx_verify.cpp:168
+    (:coinbase-not-mature        . "bad-txns-premature-spend-of-coinbase"); :180
+    (:input-values-out-of-range  . "bad-txns-inputvalues-outofrange")     ; :187
+    (:insufficient-funds         . "bad-txns-in-belowout")               ; :197
+    (:fee-out-of-range           . "bad-txns-fee-outofrange")            ; :209
+    (:accumulated-fee-out-of-range . "bad-txns-accumulated-fee-outofrange") ; validation.cpp:2541
+    (:duplicate-txid             . "bad-txns-BIP30")                     ; :2468
+    (:bad-sequence-lock          . "bad-txns-nonfinal")                  ; :2555
+    (:too-many-sigops            . "bad-blk-sigops")                     ; :2567
+    (:coinbase-too-large         . "bad-cb-amount"))                     ; :2609
+  "Block verdicts in Core's reject-reason vocabulary. A keyword with no entry
+is its own downcased name, which is what most of ours already are
+(bad-txnmrklroot, unexpected-witness, ...).")
+
+(defun block-reject-reason (error)
+  "ERROR's Core reject reason alone -- state.GetRejectReason(). This is what
+BIP22 reports (submitblock), where ToString() would add the debug message."
+  (let ((reason (if (consp error) (first error) error)))
+    (cond ((null reason) "Valid")
+          ((keywordp reason) (or (cdr (assoc reason *block-reject-reasons*))
+                                 (string-downcase (symbol-name reason))))
+          (t (princ-to-string reason)))))
+
 (defun block-reject-reason-string (error)
   "ERROR, a VALIDATE-BLOCK / ACCEPT-BLOCK-BODY verdict, as Core's
 BlockValidationState::ToString() spells it (consensus/validation.h:110-121):
-the reject reason, lower case, with a debug message after a comma when the
-verdict carries one as (REASON DETAIL). Our keywords are named after Core's
-reject reasons already (bad-txnmrklroot, unexpected-witness, ...); logging
-them with ~A printed them UPPER CASE, and the functional framework greps the
-debug log for Core's spelling (p2p_segwit.py: `unexpected-witness`)."
-  (cond ((consp error)
-         (format nil "~A, ~A" (block-reject-reason-string (first error))
-                 (second error)))
-        ((keywordp error) (string-downcase (symbol-name error)))
-        ((null error) "Valid")
-        (t (princ-to-string error))))
+the reject reason, lower case, with the debug message after a comma when the
+verdict carries one as (REASON DETAIL). Our keywords are mostly named after
+Core's reject reasons already (bad-txnmrklroot, unexpected-witness, ...);
+logging them with ~A printed them UPPER CASE, and the functional framework
+greps the debug log for Core's spelling (p2p_segwit.py: `unexpected-witness`).
+The ones that are not are in *BLOCK-REJECT-REASONS*."
+  (if (and (consp error) (second error))
+      (format nil "~A, ~A" (block-reject-reason error) (second error))
+      (block-reject-reason error)))
 
 (defun %mutated-block-error-p (error)
-  "T iff ERROR is one of *MUTATED-BLOCK-ERRORS* (Core BLOCK_MUTATED)."
-  (and (keywordp error)
-       (member error *mutated-block-errors*)
-       t))
+  "T iff ERROR is one of *MUTATED-BLOCK-ERRORS* (Core BLOCK_MUTATED). Reads
+the reject reason out of a (REASON DETAIL) verdict, which is the same
+question."
+  (let ((reason (if (consp error) (first error) error)))
+    (and (keywordp reason)
+         (member reason *mutated-block-errors*)
+         t)))
 
 (defun accept-block-body (block chain-state &key current-time)
   "Bitcoin Core ChainstateManager::AcceptBlock's validity gate

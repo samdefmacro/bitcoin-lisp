@@ -22,6 +22,7 @@ can. src/validation/.")
    #:validate-transaction-scripts
    #:validate-transaction-for-mempool
    #:fee-floor-reason
+   #:block-reject-reason
    #:block-reject-reason-string
    ;; Core's reject-reason vocabulary (keyword -> state.GetRejectReason())
    #:tx-reject-reason-string
