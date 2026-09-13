@@ -2095,6 +2095,69 @@ MAX_BURN_EXCEEDED (-25), and the default cap is 0 (rpc/mempool.cpp:92-103)."
         (is-false (search "maxburnamount" msg)))
       (is (= 0 (bl.mp:mempool-count mempool))))))
 
+(test testmempoolaccept-leaves-the-rest-blank-when-a-precheck-fails
+  "Core validates a package in two passes: PreChecks for every member, then
+PolicyScriptChecks for every member, filling in a member's result only once it
+has passed the second (validation.cpp:1444-1474, :1533-1551). It returns at the
+first failure of either, and rpc/mempool.cpp:352-395 emits txid and wtxid alone
+for every member with no result. So WHICH pass failed decides what the caller
+is told about the others:
+
+  a PreChecks failure -- missing inputs here -- leaves every other member
+  blank, because none of them has a result yet (rpc_packages.py:106-111);
+  a script failure leaves the members BEFORE it in full (:118-120).
+
+Ours validated each member to completion in turn and emitted a full verdict for
+every one it reached, so an otherwise valid package with one garbage member
+came back with three complete answers Core does not give -- answers about
+transactions whose signatures Core deliberately never checked."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    ;; Two more confirmed outputs, so the good members are independent.
+    (dolist (index '(1 2))
+      (bl.store:add-utxo utxo-set funding-txid index 100000000
+                         (p2sh-optrue-script-pubkey) 1 :coinbase nil))
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bl.net:make-peer :state :ready)))
+           (good (loop for index from 0 below 3
+                       collect (%pkg-tx funding-txid index 99999000)))
+           (garbage (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element 0)
+                             5 1000))
+           (bad-script (let ((tx (%pkg-tx funding-txid 0 99999000)))
+                         (setf (bl.ser:tx-in-script-sig
+                                (aref (bl.ser:transaction-inputs tx) 0))
+                               (make-array 0 :element-type '(unsigned-byte 8)))
+                         tx)))
+      (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
+             (keys (row) (mapcar #'car row))
+             (aval (row key) (cdr (assoc key row :test #'string=))))
+        ;; Every member on its own is accepted, so the blanks below are the
+        ;; package rule and not three broken transactions.
+        (let ((solo (bl.rpc::rpc-testmempoolaccept
+                     node (list (mapcar #'hex good)))))
+          (is (equal '(t t t) (mapcar (lambda (r) (aval r "allowed")) solo))))
+        ;; The garbage member's inputs are missing: a PreChecks failure.
+        (let ((r (bl.rpc::rpc-testmempoolaccept
+                  node (list (append (mapcar #'hex good) (list (hex garbage)))))))
+          (is (= 4 (length r)))
+          (is (equal '(("txid" "wtxid") ("txid" "wtxid") ("txid" "wtxid"))
+                     (mapcar #'keys (subseq r 0 3)))
+              "a member Core never finished validating came back with a verdict")
+          (is (eq 'yason:false (aval (fourth r) "allowed")))
+          (is (string= "missing-inputs" (aval (fourth r) "reject-reason"))))
+        ;; A script failure is the other pass: the member before it keeps its
+        ;; full result.
+        (let ((r (bl.rpc::rpc-testmempoolaccept
+                  node (list (list (hex (second good)) (hex bad-script))))))
+          (is (= 2 (length r)))
+          (is (eq t (aval (first r) "allowed"))
+              "a member Core had already finished lost its verdict")
+          (is (eq 'yason:false (aval (second r) "allowed")))
+          (is (search "mempool-script-verify-flag-failed"
+                      (aval (second r) "reject-reason"))))
+        ;; Still a dry run.
+        (is (= 0 (bl.mp:mempool-count mempool)))))))
+
 (test rpc-testmempoolaccept-max-fee-exceeded
   "Over the rail, testmempoolaccept reports allowed=false with reject-reason
 \"max-fee-exceeded\" and then stops filling in verdicts: every later member
