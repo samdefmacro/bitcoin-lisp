@@ -1060,14 +1060,31 @@ sync thread with node-running still T is a socket-reading zombie)."
 
 (defun %sync-idle-tick (second)
   "One sub-second tick of the sync thread's wait between sync passes (Core's
-per-peer ProcessMessages / SendMessages duties, bounded): flush unsent bytes,
-pump every peer's readable messages with the full node context, run the
-tx-request scheduler, trickle tx and addr announcements, rebroadcasts, the
-wallet resend timer, local-address adverts, feefilter and reconciliation
-rounds, and the at-tip liveness signal; SECOND is the whole second (1..30) this tick falls
-in, and only gates the behind-known-work exit. Returns T when the wait should
-end now: new headers arrived, or the node is behind known work and
+per-peer ProcessMessages / SendMessages duties, bounded): admit the peers the
+listener and the dial RPCs handed over, flush unsent bytes, pump every peer's
+readable messages with the full node context, run the tx-request scheduler,
+trickle tx and addr announcements, rebroadcasts, the wallet resend timer,
+local-address adverts, feefilter and reconciliation rounds, and the at-tip
+liveness signal; SECOND is the whole second (1..30) this tick falls in, and
+only gates the behind-known-work exit. Returns T when the wait should end
+now: new headers arrived, or the node is behind known work and
 +BEHIND-RETRY-SECONDS+ have passed."
+  ;; Admit the peers that arrived during
+  ;; the wait BEFORE the pump reads, or
+  ;; they sit in the hand-off list until
+  ;; the next cycle merges them: the
+  ;; listener's handshaked inbound peers,
+  ;; and the addnode-onetry / addconnection
+  ;; dials. Core has no such gap -- an
+  ;; accepted socket joins m_nodes at once
+  ;; (net.cpp:1854-1858) and ProcessMessages
+  ;; runs on it continuously. Measured
+  ;; before this: every functional test's
+  ;; python peer waited up to 30 s for its
+  ;; first reply, and each addconnection
+  ;; took a whole cycle.
+  (merge-inbound-peers *node*)
+  (dial-queued-nodes *node*)
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the
   ;; periodic half of Core's

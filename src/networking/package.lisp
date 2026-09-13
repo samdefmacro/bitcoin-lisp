@@ -132,6 +132,7 @@ headerssync.cpp. src/networking/.")
    #:make-inbound-peer
    #:send-message
    #:receive-message
+   #:receive-message-blocking
    #:perform-handshake
    #:perform-inbound-handshake
    #:send-post-handshake-messages

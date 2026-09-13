@@ -3368,7 +3368,7 @@ get notfound). Runs over a loopback socket pair."
                     ;; the payload had not fully landed yet, making this timing-
                     ;; dependent.
                     (multiple-value-bind (command payload)
-                        (bl.net::receive-message-blocking
+                        (bl.net:receive-message-blocking
                          client :timeout 5)
                       (is (equal "tx" command))
                       (when payload
