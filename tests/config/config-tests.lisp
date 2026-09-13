@@ -1617,6 +1617,51 @@ immediately; -blocknotify is detached, so it is polled for."
   (is-true (bl.log:run-notify-command "exit 1" :wait t))
   (is-false (bl.log:run-notify-command "echo %s" :value "not hex")))
 
+(defun %path-mode (path)
+  "PATH's permission bits (the low nine of st_mode)."
+  (logand (sb-posix:stat-mode (sb-posix:stat (namestring path))) #o777))
+
+(test the-node-process-creates-owner-only-files
+  "Core's main() runs SetupEnvironment before anything else, and its umask half
+sets the process mask to 0077 (common/system.cpp:91-94, bitcoind.cpp:269), so
+the data directory, the wallets directory, debug.log, the RPC cookie and every
+block file come out owner-only without a chmod at any of those sites.
+
+Ours ran under whatever mask the invoking shell had. On a default Linux or
+macOS login that is 022, so the datadir was drwxr-xr-x and debug.log was
+world-readable -- on a wallet-bearing node that publishes the operator's
+transaction history to every account on the machine.
+feature_posix_fs_permissions.py:25 asserts 0700 on the chain directory and the
+wallets directory and 0600 on debug.log."
+  (let* ((dir (merge-pathnames (format nil "bl-umask-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (saved (sb-posix:umask #o022)))
+    (unwind-protect
+         (flet ((make-pair (name)
+                  (let ((sub (merge-pathnames (format nil "~A/" name) dir)))
+                    (ensure-directories-exist sub)
+                    (with-open-file (out (merge-pathnames "f" sub)
+                                         :direction :output
+                                         :if-exists :supersede
+                                         :if-does-not-exist :create)
+                      (write-line "x" out))
+                    (list (%path-mode sub) (%path-mode (merge-pathnames "f" sub))))))
+           ;; Control: under the usual login mask, a directory and a file this
+           ;; process creates are readable by everyone.
+           (is (equal (list #o755 #o644) (make-pair "loose"))
+               "the control mask did not produce group/world-readable modes")
+           ;; With Core's mask installed, the same two creations are owner-only.
+           (bl::setup-environment)
+           (is (equal (list #o700 #o600) (make-pair "tight"))))
+      (sb-posix:umask saved)
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore))))
+  ;; And the mask is installed by the executable's entry point, before it has
+  ;; looked at an argument -- the datadir is created further down.
+  (is-true (member 'bl::node-main
+                   (mapcar #'car (sb-introspect:who-calls 'bl::setup-environment)))
+           "node-main no longer installs Core's private umask"))
+
 (test pid-file-is-written-and-removed
   "-pid (Core CreatePidFile/RemovePidFile, init.cpp:178-208). Asserted through
 the FILE: a pid file that is computed and never written is exactly the kind of
