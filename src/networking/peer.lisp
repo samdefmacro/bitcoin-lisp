@@ -2006,16 +2006,26 @@ a failed dump only logs (Core LogError in DumpBanlist)."
         nil))))
 
 (defun load-banlist (&optional (path *banlist-path*))
-  "Load the manual ban list from PATH (Core BanMan ctor LoadBanlist),
-dropping already-expired entries (Core SweepBanned). Returns the number of
-active bans loaded; NIL when the file is absent/unreadable."
+  "Open the manual ban list at PATH: Core BanMan's constructor, which is
+LoadBanlist() and then DumpBanlist() (banman.cpp:17-22), dropping
+already-expired entries (Core SweepBanned). Returns the number of active bans
+loaded; NIL when the file was absent or unreadable, in which case it has been
+RECREATED before this returns."
   ;; Core logs "Recreating the banlist database" whenever CBanDB::Read fails
   ;; (banman.cpp:41), and an ABSENT file is one of those failures — a fresh
   ;; datadir has no banlist.json. Returning NIL silently was the gap:
   ;; p2p_disconnect_ban.py greps for the line on a node that has never banned
   ;; anyone.
+  ;;
+  ;; The failed read also sets m_is_dirty (banman.cpp:43), so the DumpBanlist
+  ;; the constructor runs next WRITES the empty list back out; after a read
+  ;; that succeeded nothing is dirty and that dump writes nothing
+  ;; (banman.cpp:56), which is why the recreate lives in these two branches
+  ;; and not after the parse. p2p_disconnect_ban.py:43-47 deletes
+  ;; banlist.json, restarts the node, and asserts the file is there again.
   (unless (and path (probe-file path))
     (bl:log-info "Recreating the banlist database")
+    (save-banlist path)
     (return-from load-banlist nil))
   (when (and path (probe-file path))
     (handler-case
@@ -2041,6 +2051,11 @@ active bans loaded; NIL when the file is absent/unreadable."
         ;; behavioural oracle, and they read the log.
         (bl:log-info "Recreating the banlist database")
         (bl:log-warn "Could not read banlist ~A: ~A" path e)
+        ;; Core's failed-read branch is m_banned = {} (banman.cpp:42), so a
+        ;; half-parsed file leaves no bans behind and the recreate writes the
+        ;; empty list.
+        (bt:with-lock-held (*ban-lock*) (clrhash *banned-peers*))
+        (save-banlist path)
         nil))))
 
 ;;; Per-Peer Rate Limiting
