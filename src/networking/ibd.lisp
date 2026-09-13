@@ -2600,6 +2600,22 @@ transferring nothing. Falls back to the header-tip locator at genesis."
      peer
      (bl.ser:make-getheaders-message locator))))
 
+(defun header-sync-candidate-p (peer)
+  "T when this node opens header sync with PEER, as Core's SendMessages decides
+ (net_processing.cpp:5782-5797). The peer must be handshaked; it must be able to
+serve blocks -- CanServeBlocks, NODE_NETWORK or NODE_NETWORK_LIMITED among the
+services it advertised (net_processing.cpp:1153-1156) -- and it must not be an
+ADDR-FETCH connection, which exists only to answer one getaddr and is closed
+again: CanServeBlocks(peer) && !node.IsAddrFetchConn() at :5782.
+
+p2p_addrfetch.py:54 asserts exactly the last clause: an addr-fetch peer is sent
+a getaddr and NO getheaders. Ours asked every ready peer."
+  (and (eq (peer-state peer) :ready)
+       (not (eq (peer-conn-type peer) :addr-fetch))
+       (logtest (peer-services peer)
+                (logior bl.ser:+node-network+ bl.ser:+node-network-limited+))
+       t))
+
 (defun broadcast-initial-getheaders (peers chain-state)
   "Send the INITIAL getheaders — locator one block back from our header tip —
 to every ready peer we have not opened header sync with yet. Phase 1 learned
@@ -2626,7 +2642,7 @@ next broadcast failed it."
   (let ((locator (build-header-locator-pprev chain-state)))
     (when locator
       (dolist (peer peers)
-        (when (and (eq (peer-state peer) :ready)
+        (when (and (header-sync-candidate-p peer)
                    (not (peer-headers-sync-started peer)))
           (setf (peer-headers-sync-started peer) t)
           (ignore-errors
@@ -3552,7 +3568,7 @@ or dead-fork peer was re-picked every cycle and pinned the tip for hours."
   (dolist (peer (sort (copy-list peers) #'> :key #'peer-start-height) nil)
     (when *ibd-stop-requested*
       (return nil))
-    (when (eq (peer-state peer) :ready)
+    (when (header-sync-candidate-p peer)
       (setf (ibd-context-header-sync-peer ctx) peer)
       (multiple-value-bind (count stalled)
           (funcall sync-fn peer chain-state
