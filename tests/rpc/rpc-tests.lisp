@@ -1698,6 +1698,25 @@ used to emit it verbatim, which yason cannot encode."
     (is (assoc "connections" result :test #'string=))
     (is (assoc "networkactive" result :test #'string=))))
 
+
+(test rpc-getnetworkinfo-counts-live-peers-only
+  "connections / connections_in / connections_out count the peers getpeerinfo
+lists. Core counts m_nodes (GetNodeCount, net.cpp:3769-3781) and erases a
+closed connection from it on the next socket round (DisconnectNodes,
+net.cpp:1909-1939); ours keeps a :disconnected peer in node-peers until the
+sync cycle reaps it, and getnetworkinfo counted it while getpeerinfo did not
+-- the framework's disconnect_p2ps waits on the one and check_node_connections
+reads the other (p2p_add_connections.py:73)."
+  (let ((node (make-test-node)))
+    (setf (bl:node-peers node)
+          (list (bl.net:make-peer :address "10.0.0.1" :state :ready :inbound nil)
+                (bl.net:make-peer :address "10.0.0.2" :state :ready :inbound t)
+                (bl.net:make-peer :address "10.0.0.3" :state :disconnected :inbound nil)))
+    (let ((result (bl.rpc:dispatch-rpc-method node "getnetworkinfo" '())))
+      (flet ((field (name) (cdr (assoc name result :test #'string=))))
+        (is (= 2 (field "connections")) "a :disconnected peer is not a connection")
+        (is (= 1 (field "connections_in")))
+        (is (= 1 (field "connections_out")))))))
 (test rpc-getnetworkinfo-localrelay-blocksonly
   "localrelay = !IgnoresIncomingTxs (Core): true on a test network by
 default, json-false under -blocksonly."

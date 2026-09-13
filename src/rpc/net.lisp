@@ -302,7 +302,15 @@ whatever the cadence is."
   "Return network state information (Bitcoin Core getnetworkinfo)."
   (declare (ignore params))
   (let* ((network (rpc-get-network node))
-         (peers (rpc-get-peers node))
+         ;; Live peers only, as getpeerinfo already lists: Core counts m_nodes
+         ;; (GetNodeCount, net.cpp:3769-3781), and DisconnectNodes erases a
+         ;; closed connection from m_nodes on the next socket round
+         ;; (net.cpp:1909-1939). Ours keeps a :disconnected peer in node-peers
+         ;; until the sync cycle reaps it, so the framework saw its test peers
+         ;; gone from getpeerinfo while connections_out still counted them
+         ;; (p2p_add_connections.py:73, 10 == 0 after disconnect_p2ps).
+         (peers (remove-if (lambda (p) (eq (bl.net:peer-state p) :disconnected))
+                           (rpc-get-peers node)))
          ;; THE service bits we advertise on the wire (peer.lisp local-services,
          ;; Core g_local_services) — the one composition; do not duplicate it
          ;; here. Names via the shared %service-names (Core GetServicesNames).
