@@ -104,7 +104,9 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-wallet-chain-node
    #:with-wallet-chain-node
    #:regtest-wif
-   #:descriptor-spend-e2e))
+   #:descriptor-spend-e2e
+   ;; fixtures.lisp (handshake)
+   #:with-private-outbound-nonces))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

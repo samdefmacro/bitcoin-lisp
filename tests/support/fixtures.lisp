@@ -502,3 +502,16 @@ reply this way (the sync thread's idle tick, the new-tip announcement)."
 reconstruction reads. Five IBD tests reset it between blocks; one reach here
 instead of one per test."
   (setf bl.val::*most-recent-block-txs* nil))
+
+;;;; A handshake fixture for loopback dials
+
+(defmacro with-private-outbound-nonces (&body body)
+  "Run BODY with a FRESH self-connection nonce registry, so a loopback dial is
+not (correctly) refused as a self-connection. A real dial to our own listener
+puts the dialer's nonce in the registry the inbound side then checks, which is
+exactly what Core's `connected to self' check is for (net_processing.cpp:3649);
+whichever of the two sides stands in for a distinct node gets its own registry
+here. Dynamic bindings are thread-local, so this affects only the thread that
+runs BODY."
+  `(let ((bl.net::*outbound-nonces* (make-hash-table :test 'eql)))
+     ,@body))
