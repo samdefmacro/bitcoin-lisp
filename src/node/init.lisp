@@ -2,7 +2,7 @@
 
 ;;;; Startup Sequence
 
-(defun init-node (data-directory &key (network :testnet3) (log-level :info))
+(defun init-node (data-directory &key (network :mainnet) (log-level :info))
   "Initialize a new node with the given data directory and network.
 For mainnet, data is stored in a 'mainnet' subdirectory.
 For testnet, data stays at the base directory (backward compatible)."
@@ -1474,7 +1474,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
            :name "bitcoin-sync-thread"))))
 
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
-                        (network :testnet3)
+                        (network :mainnet)
                         (log-level :info)
                         (log-file nil)
                         (log-rate-limit t)

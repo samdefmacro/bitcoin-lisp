@@ -9,9 +9,9 @@ Consensus-critical code must match Bitcoin Core behavior exactly.
 Reference implementation: refs/bitcoin/ (cloned Bitcoin Core repo) is the canonical spec.
 When implementing consensus rules, read the corresponding Bitcoin Core source code directly.
 
-Supported networks:
-- Testnet (default): port 18333, RPC 18332
-- Mainnet: port 8333, RPC 8332, relay disabled by default
+Supported networks (the default chain is MAINNET, as in Core; decided 2026-09-13):
+- Mainnet (default): port 8333, RPC 8332, relay disabled by default
+- Testnet3: port 18333, RPC 18332; testnet4, signet and regtest as in Core
 
 Wallet: descriptor-only wallet in progress per docs/wallet-plan.md (no BDB/legacy
 wallets, no BIP39). Wallet support is enabled by default on test networks,

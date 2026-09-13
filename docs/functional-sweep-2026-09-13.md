@@ -141,12 +141,11 @@ not a node without RPC" (`start-rpc-early` signals `init-error` when
 
 ## Seen alongside, not yet fixed
 
-- **Mainnet is not our default chain.** `mining_mainnet.py` and
+- **Mainnet was not our default chain.** `mining_mainnet.py` and
   `rpc_validateaddress.py` write a config with no chain selector and expect
-  mainnet; our CLI defaults to testnet3 (`resolve-network-from-config`), so
-  the default-section options are refused as testnet-unsuitable. A project
-  decision (CLAUDE.md names testnet as the default), not a bug in the
-  section check, which matches Core's `GetUnsuitableSectionOnlyArgs`.
+  mainnet; our CLI defaulted to testnet3, so the default-section options were
+  refused as testnet-unsuitable. Decided 2026-09-13: mainnet is the default,
+  as in Core ("Config: the default chain is mainnet, as Core's is").
 - **`tool_bitcoin.py`** wants a `bitcoin` multiplexer binary; declared absent
   in `scripts/conformance-config.sh` like `bitcoin-cli`.
 - **Three init-error texts** the framework waits 60 s for and never sees:

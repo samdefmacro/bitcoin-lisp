@@ -255,7 +255,13 @@ global keys to the first file's last section."
 ;;; --- network resolution -----------------------------------------------------
 
 (test resolve-network-precedence
-  (is (eq :testnet3 (bl.cfg:resolve-network-from-config '())))          ; default
+  ;; No selector at all is MAINNET, as in Core (ArgsManager::GetChainType,
+  ;; args.cpp:851); testnet3 was this node's default until 2026-09-13.
+  (is (eq :mainnet (bl.cfg:resolve-network-from-config '())))
+  (is (eq :testnet3 (bl.cfg:resolve-network-from-config '(("testnet" . "1")))))
+  (is (= 8332 (getf (start-node-plist '("-server") nil) :rpc-port))
+      "-server with no chain selector binds mainnet's RPC port, as Core does")
+  (is (eq :mainnet (getf (start-node-plist '() nil) :network)))
   (is (eq :mainnet (bl.cfg:resolve-network-from-config '(("chain" . "main")))))
   (is (eq :testnet4 (bl.cfg:resolve-network-from-config '(("testnet4" . "1")))))
   (is (eq :signet (bl.cfg:resolve-network-from-config '(("signet" . "1")))))
