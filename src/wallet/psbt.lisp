@@ -1459,35 +1459,39 @@ Returns T when EVERY input is final."
                     (setf complete nil)))))))
     complete))
 
-(defun %psbt-copy (psbt)
-  "A deep copy of PSBT via its serialization."
-  (bl.ser:decode-psbt
-   (bl.ser:encode-psbt psbt)))
-
 (defun %psbt-signer-result (psbt finalize verify)
   "The {psbt, complete, hex?} object of walletprocesspsbt / descriptorprocesspsbt.
-When FINALIZE, PSBT is finalized in place; completeness and the extracted hex
-are computed from a finalized COPY either way.
+When FINALIZE, PSBT is finalized in place; `complete' and the extracted hex
+are then read off the PSBT THIS CALL RETURNS, which is where Core reads them.
 
 VERIFY is the difference between Core's two callers. walletprocesspsbt reports
 the AND of PSBTInputSignedAndVerified (wallet.cpp:2231-2235), so an input
 counts only once its assembled scripts VERIFY against the spent output;
 descriptorprocesspsbt reports the AND of PSBTInputSigned
 (rawtransaction.cpp:2060-2063), where the final fields being present is
-enough.
+enough. Both predicates begin at the same place -- an input with no
+final_scriptSig and no final_scriptWitness is not signed (psbt.cpp:320-323)
+-- so an unfinalized PSBT is never complete, whichever caller asked.
 
-DIVERGENCE: Core computes both over the psbt it returns, so with
-finalize=false its complete is false and no hex comes back. We answer from
-the finalized copy, so the caller still learns whether the PSBT is ready."
+That is the whole answer to `finalize=false': the returned PSBT has no final
+fields, so `complete' is false and NO hex comes back. This used to answer
+from a finalized COPY, on the reasoning that the caller still learns whether
+the PSBT is ready -- but the extra key is a promise the returned psbt cannot
+keep, and rpc_psbt.py:480-481 reads it as one:
+
+    processed_psbt = self.nodes[0].walletprocesspsbt(psbt=psbtx, finalize=False)
+    assert \"hex\" not in processed_psbt
+
+A caller that wants the network transaction calls finalizepsbt, which is what
+:485 then does."
   (when finalize (%psbt-finalize-in-place psbt))
-  (let* ((trial (%psbt-copy psbt))
-         (complete (and (%psbt-finalize-in-place trial)
-                        (or (not verify)
-                            (%psbt-inputs-signed-and-verified-p trial)))))
+  (let ((complete (and (every #'%psbt-input-signed-p (bl.ser:psbt-inputs psbt))
+                       (or (not verify)
+                           (%psbt-inputs-signed-and-verified-p psbt)))))
     (append `(("psbt" . ,(bl.ser:encode-psbt psbt))
               ("complete" . ,(bl.rpc:json-bool complete)))
             (when complete
-              `(("hex" . ,(%psbt-extract-hex trial)))))))
+              `(("hex" . ,(%psbt-extract-hex psbt)))))))
 
 ;;; --- walletprocesspsbt (wallet/rpc/spend.cpp:1573) ---
 
