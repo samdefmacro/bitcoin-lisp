@@ -1245,15 +1245,26 @@ header's cached hash)."
             (vector (list (witness-reserved-value)))
             (bl.ser:transaction-cached-weight coinbase) nil))))
 
-(defun block-witness-stripped-p (block)
+(defun block-witness-stripped-p (block &optional height)
   "T if BLOCK carries a witness commitment in its coinbase outputs but its coinbase
-witness is NOT exactly one 32-byte item — i.e. the block arrived witness-stripped
-(or is malformed). Such a block can never pass BIP141 validation
-(bad-witness-nonce-size), so it must not be persisted: a witness-stripped block
-stored on a competing fork failed every reorg attempt and wedged testnet4 (see
-project_cmpctblock_witness_wedge). Height/network-independent — a block that
-commits to witness data ALWAYS carries the 32-byte reserved value, so this never
-fires on a legitimate block.
+witness is NOT exactly one 32-byte item -- at a HEIGHT where BIP141 is active.
+Core judges the commitment only then (ContextualCheckBlock,
+validation.cpp:4021: commitpos found AND DeploymentActiveAfter(prev, SEGWIT)
+AND no coinbase witness); below activation a coinbase may carry the
+commitment output with no witness, which is exactly what its own miner
+produces there (GenerateCoinbaseCommitment adds the output unconditionally,
+:4029-4049, and the reserved witness only once active) and what a peer serves
+for a block it was asked for without MSG_WITNESS_FLAG. With HEIGHT given the
+answer is NIL below activation; without it the shape alone decides, as before
+-- p2p_segwit.py (segwit at 120) had node1 refuse every block node0 mined
+below 120 as `stripped` (2026-09-13).
+
+Once active, such a block arrived witness-stripped (or is malformed) and can
+never pass BIP141 validation (bad-witness-nonce-size), so it must not be
+persisted: a witness-stripped block stored on a competing fork failed every
+reorg attempt and wedged testnet4 (see project_cmpctblock_witness_wedge). An
+active-era block that commits to witness data ALWAYS carries the 32-byte
+reserved value, so this never fires on a legitimate one.
 
 Note the block hash is identical for the stripped and witness-complete copies (the
 witness is not covered by the header/merkle root), so callers must treat this as
@@ -1261,6 +1272,7 @@ witness is not covered by the header/merkle root), so callers must treat this as
   (let* ((txs (bl.ser:bitcoin-block-transactions block))
          (coinbase (first txs)))
     (and coinbase
+         (or (null height) (segwit-active-at-height-p height))
          (find-witness-commitment coinbase)
          (let* ((cb-witness (bl.ser:transaction-witness coinbase))
                 (cb-stack (and cb-witness (plusp (length cb-witness)) (aref cb-witness 0))))
@@ -3829,7 +3841,8 @@ comment above."
         (dolist (entry (reorg-to-connect r))
           (let* ((block-hash (bl.store:block-index-entry-hash entry))
                  (block (bl.store:get-block block-store block-hash)))
-            (when (and block (block-witness-stripped-p block))
+            (when (and block (block-witness-stripped-p
+                              block (bl.store:block-index-entry-height entry)))
               (bl:log-warn
                "REORG: stored block at height ~D is witness-stripped; pruning for witness-complete re-download"
                (bl.store:block-index-entry-height entry))

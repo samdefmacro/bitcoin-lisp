@@ -1042,7 +1042,19 @@ witness-stripped block never persists (the testnet4 BAD-WITNESS-NONCE-SIZE wedge
                 (blk (%coinbase-with-commitment (list short))))))
     ;; no commitment -> never stripped
     (is (null (bl.val:block-witness-stripped-p
-               (blk (make-coinbase-transaction :value 5000000000 :height 1)))))))
+               (blk (make-coinbase-transaction :value 5000000000 :height 1)))))
+    ;; With a HEIGHT: below BIP141 activation the commitment is not judged at
+    ;; all (Core ContextualCheckBlock, validation.cpp:4021), so the same
+    ;; commitment-without-witness coinbase is NOT stripped at mainnet height
+    ;; 100 and IS at 500,000 -- p2p_segwit.py (segwit at 120) had node1 refuse
+    ;; every block node0 mined below 120 as stripped.
+    (let ((bl:*network* :mainnet))
+      (is-false (bl.val:block-witness-stripped-p
+                 (blk (%coinbase-with-commitment '())) 100)
+                "below activation a commitment without witness is a pre-segwit block")
+      (is-true (bl.val:block-witness-stripped-p
+                (blk (%coinbase-with-commitment '())) 500000)
+               "control: past activation the same block is stripped"))))
 
 ;;;; Block Script Validation Tests
 
