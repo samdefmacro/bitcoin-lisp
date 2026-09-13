@@ -4480,3 +4480,49 @@ activation and the log said UNEXPECTED-WITNESS."
                  "the line carries Core's lower-case reason")
         (is-false (find "UNEXPECTED-WITNESS" lines :test #'search)
                   "and not the keyword's upper-case name")))))
+
+(test block-requests-go-out-oldest-first
+  "Core's SendMessages walks vToDownload -- which FindNextBlocksToDownload fills
+in ASCENDING height -- and emplaces each hash into vGetData in that order
+(net_processing.cpp:6180-6190), so a peer answers a batch oldest block first and
+the batch's tip arrives LAST. Ours collected the ascending walk with PUSH and
+sent the list unreversed, so every getdata asked for the newest block first: a
+caller that waits for the TIP and then reads the blocks below it finds them
+missing (p2p_node_network_limited.py:105-110)."
+  (with-temp-directory (dir "bl-getdata-order")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1
+                       :status :valid))
+             (prev genesis))
+        (bl.store:add-block-index-entry state genesis)
+        (loop for h from 1 to 5
+              do (let ((e (bl.store:make-block-index-entry
+                           :hash (%bd-hash h) :height h
+                           :chain-work (+ 1 h) :prev-entry prev
+                           :status :header-valid)))
+                   (bl.store:add-block-index-entry state e)
+                   (setf prev e)))
+        (bl.store:update-chain-tip state (%bd-hash 0) 0)
+        (let ((peer (bl.net:make-peer
+                     :address "198.51.100.9" :state :ready
+                     :services (logior bl.ser:+node-network+
+                                       bl.ser:+node-witness+))))
+          (setf (bl.net:peer-best-known-block-hash peer) (%bd-hash 5))
+          (with-ibd-context
+            (let* ((sent (captured-sends
+                          (lambda ()
+                            (bl.net::request-blocks-from-peers
+                             (list peer) state store))))
+                   (getdata (find "getdata" sent :key #'message-command
+                                                 :test #'string=)))
+              (is-true getdata "one getdata went out")
+              (when getdata
+                (let ((hashes (map 'list #'bl.ser:inv-vector-hash
+                                   (bl.ser:parse-inv-payload (subseq getdata 24)))))
+                  (is (= 5 (length hashes)) "all five missing blocks are asked for")
+                  (is (equalp (loop for h from 1 to 5 collect (%bd-hash h))
+                              hashes)
+                      "the batch is ascending in height, so its tip arrives last"))))))))))
