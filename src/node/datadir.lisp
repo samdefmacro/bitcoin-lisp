@@ -465,3 +465,19 @@ path the operator never typed. Kept a STRING because the config layer treats it
 as one."
   (when datadir
     (namestring (uiop:ensure-directory-pathname datadir))))
+
+(defun asmap-file-path (asmap data-directory network)
+  "Where -asmap's value points (Core init.cpp:1588-1594): an absolute path
+as given, a relative one under the NETWORK data directory -- GetDataDirNet,
+so `-asmap=ASN_map` on regtest is <datadir>/regtest/ASN_map, not
+<datadir>/ASN_map, which is where a file the framework wrote there is NOT.
+The boolean spellings (a bare -asmap, -asmap=1) ask for the embedded map
+(init.cpp:1611-1626), which this node does not carry: :EMBEDDED, for the
+caller to refuse as Core does without ENABLE_EMBEDDED_ASMAP."
+  (cond
+    ((or (string= asmap "") (string= asmap "1")) :embedded)
+    ((uiop:absolute-pathname-p asmap) (pathname asmap))
+    (t (merge-pathnames asmap
+                        (network-data-path
+                         (uiop:ensure-directory-pathname (or data-directory "./"))
+                         network)))))

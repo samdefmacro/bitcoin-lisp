@@ -292,6 +292,26 @@ operator was trying to close."
   (is-true (bl:known-config-option-p "asmap"))
   (is-false (bl.cfg:core-only-option-p "asmap")))
 
+
+(test asmap-relative-path-hangs-off-the-network-data-directory
+  "Core anchors a relative -asmap at GetDataDirNet (init.cpp:1591-1593): on
+regtest `-asmap=ASN_map` is <datadir>/regtest/ASN_map. Ours hung it off the
+datadir ROOT, so feature_asmap.py's relative-path case, which writes the file
+into the chain directory, failed with `Could not find asmap file`. Mainnet's
+chain directory IS the root, so nothing changes there; an absolute path is
+taken as given; and the boolean spellings ask for the embedded map, which a
+build without one refuses (init.cpp:1622-1625) instead of falling back."
+  (let ((base (format nil "/tmp/bl-asmap-~D/" (get-internal-real-time))))
+    (is (equal (concatenate 'string base "regtest/ASN_map")
+               (namestring (bl:asmap-file-path "ASN_map" base :regtest))))
+    (is (equal (concatenate 'string base "testnet4/ASN_map")
+               (namestring (bl:asmap-file-path "ASN_map" base :testnet4))))
+    (is (equal (concatenate 'string base "ASN_map")
+               (namestring (bl:asmap-file-path "ASN_map" base :mainnet))))
+    (is (equal "/etc/bitcoin/ip_asn.map"
+               (namestring (bl:asmap-file-path "/etc/bitcoin/ip_asn.map" base :regtest))))
+    (is (eq :embedded (bl:asmap-file-path "1" base :regtest)))
+    (is (eq :embedded (bl:asmap-file-path "" base :regtest)))))
 (test addr-fetch-peer-disconnects-once-it-delivers-addresses
   "An addr-fetch peer (-seednode) exists only to hand over addresses and is
 disconnected as soon as it does (Core net_processing.cpp:4117-4121). Core

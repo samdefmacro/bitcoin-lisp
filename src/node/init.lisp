@@ -424,12 +424,12 @@ to move them (the node must be stopped)."
   ;; that silently kept /16 bucketing after being told to use an ASN map would
   ;; have exactly the eclipse exposure the operator was closing.
   (setf bl.net:*asmap* nil)
-  (when (and asmap (stringp asmap) (plusp (length asmap))
-             (not (string= asmap "0")))
-    (let ((path (if (uiop:absolute-pathname-p asmap)
-                    asmap
-                    (merge-pathnames asmap (uiop:ensure-directory-pathname
-                                            (or data-directory "./"))))))
+  (when (and asmap (stringp asmap) (not (string= asmap "0")))
+    (let ((path (asmap-file-path asmap data-directory network)))
+      ;; A bare -asmap asks for Core's embedded map; a build without one
+      ;; refuses (init.cpp:1622-1625), it does not fall back to /16.
+      (when (eq path :embedded)
+        (config-error "Embedded asmap data not available"))
       (bl.net:load-asmap-file path)
       (log-info "Using asmap version ~A for IP bucketing"
                 (bl.net:asmap-version))))
