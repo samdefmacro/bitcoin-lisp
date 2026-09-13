@@ -1296,6 +1296,20 @@ chainstate exists (effective-prune-target-bytes)."
            ;; "Unable to load UTXO snapshot: <reason>. (<path>)".
            (error 'rpc-error :code +rpc-internal-error+
                              :message (format nil "Unable to load UTXO snapshot: ~A. (~A)"
+                                              (apply #'format nil fmt args) path)))
+         (population-error (fmt &rest args)
+           ;; Core splits the activation in two, and the split is VISIBLE in
+           ;; the message: ActivateSnapshot's own preconditions report their
+           ;; reason directly, while everything PopulateAndValidateSnapshot
+           ;; refuses comes back through cleanup_bad_snapshot as "Population
+           ;; failed: <reason>" (validation.cpp:5716-5718). Its checks are the
+           ;; assumeutxo HEIGHT entry, the work comparison, and every per-coin,
+           ;; EOF and hash_serialized_3 verdict below (:5796-5936).
+           ;; feature_assumeutxo.py builds each of its expected messages that
+           ;; way (:87, :219), so a reason without the prefix matches none of
+           ;; them.
+           (error 'rpc-error :code +rpc-internal-error+
+                             :message (format nil "Unable to load UTXO snapshot: Population failed: ~A. (~A)"
                                               (apply #'format nil fmt args) path))))
     (let* ((network (rpc-get-network node))
            (chain-state (rpc-get-chain-state node))
@@ -1322,9 +1336,6 @@ chainstate exists (effective-prune-target-bytes)."
               (load-error "The base block header (~A) is part of an invalid chain"
                           (hash-to-hex base-hash)))
             (let ((base-height (bl.store:block-index-entry-height base-entry)))
-              (unless (= base-height (bl:assumeutxo-data-height au))
-                (load-error "Assumeutxo height in snapshot metadata not recognized (~D) - refusing to load snapshot"
-                            base-height))
               ;; The base must lie on the best header chain (Core
               ;; m_best_header->GetAncestor(height) == base).
               (let ((best (bl.store:best-header-entry chain-state)))
@@ -1333,6 +1344,18 @@ chainstate exists (effective-prune-target-bytes)."
                                   best base-height)
                                  base-entry))
                   (load-error "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo.")))
+              (when (and mempool (plusp (bl.mp:mempool-count mempool)))
+                (load-error "Can't activate a snapshot when mempool not empty"))
+              ;; --- PopulateAndValidateSnapshot begins here
+              ;; (validation.cpp:5780-5936), and every verdict from here on
+              ;; wears the "Population failed: " prefix. The assumeutxo HEIGHT
+              ;; entry and the work comparison are its first two checks --
+              ;; Core runs the work comparison here as well as after the load
+              ;; ("a duplicate check ... so that we avoid doing the long work
+              ;; of staging a snapshot that isn't actually usable").
+              (unless (= base-height (bl:assumeutxo-data-height au))
+                (population-error "Assumeutxo height in snapshot metadata not recognized (~D) - refusing to load snapshot"
+                                  base-height))
               ;; The snapshot must be a more-work chain than the active tip
               ;; (Core CBlockIndexWorkComparator; height as the tiebreak
               ;; for work-less synthetic chains in tests).
@@ -1348,10 +1371,10 @@ chainstate exists (effective-prune-target-bytes)."
                                  base-entry)))
                 (unless (or (> base-work tip-work)
                             (and (= base-work tip-work) (> base-height tip-height)))
-                  (load-error "Work does not exceed active chainstate (node already at or past height ~D)"
-                              base-height)))
-              (when (and mempool (plusp (bl.mp:mempool-count mempool)))
-                (load-error "Can't activate a snapshot when mempool not empty"))
+                  ;; Core's sentence has no parenthetical (validation.cpp:5807)
+                  ;; and feature_assumeutxo.py:219 matches it whole, including
+                  ;; the full stop the wrapper adds.
+                  (population-error "Work does not exceed active chainstate")))
               ;; --- Populate + verify into a NEW snapshot chainstate ---
               ;; (see %populate-snapshot-chainstate). Any failure leaves
               ;; the node untouched.
@@ -1360,7 +1383,7 @@ chainstate exists (effective-prune-target-bytes)."
                (lambda ()
                  (%populate-snapshot-chainstate
                   node in au base-hash base-entry base-height coins-count
-                  #'load-error)))
+                  #'population-error)))
               `(("coins_loaded" . ,coins-count)
                 ("tip_hash" . ,(hash-to-hex base-hash))
                 ("base_height" . ,base-height)
