@@ -496,3 +496,9 @@ reply this way (the sync thread's idle tick, the new-tip announcement)."
              (when command
                (return (values command payload))))
            (sleep 0.05)))
+
+(defun clear-recent-block-txs ()
+  "Forget the last connected block's transaction map that the compact-block
+reconstruction reads. Five IBD tests reset it between blocks; one reach here
+instead of one per test."
+  (setf bl.val::*most-recent-block-txs* nil))

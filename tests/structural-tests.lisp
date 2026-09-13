@@ -1552,7 +1552,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 3924
+(defparameter +test-internal-reference-ceiling+ 3926
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1572,7 +1572,7 @@ sendcmpct through one helper; 4,201 with the mempool and addr-relay batches;
 4,196 once five getdata and gossip reaches moved into tests/support/; 4,187 when the
 spanning-forest tests folded fifteen sfl-linearize reaches into one helper; 4,178 with
 the tapscript signing batch; 4,129 once the tx-relay fixtures (deliver-tx and
-siblings) replaced the per-file reaches; 4,125 with the never-opened batch; 3,959 with the GA11 left-out net-peers and wallet batches; 3,957 with its rpc-config batch; 3,927 once thirty stale reaches named symbols their packages already exported; 3,924 when three parallel round-3 batches met at 3,932 and eight more stale reaches paid for the seam.
+siblings) replaced the per-file reaches; 4,125 with the never-opened batch; 3,959 with the GA11 left-out net-peers and wallet batches; 3,957 with its rpc-config batch; 3,927 once thirty stale reaches named symbols their packages already exported; 3,926 when three parallel round-3 batches met at 3,932: two stale reaches and a shared reset fixture for a five-times-reached special paid for the seam.
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
