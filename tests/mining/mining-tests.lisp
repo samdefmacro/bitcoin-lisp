@@ -1913,11 +1913,12 @@ writes a newline, and neither read could match it."
     (is (string= expected
                  (bl.rpc:dispatch-rpc-method node "help"
                                              (wire-params (list "generate")))))
-    ;; Control: a method that registers no help text still answers with its
-    ;; own name, and an unknown one still says so.
-    (is (string= "getblockcount"
-                 (bl.rpc:dispatch-rpc-method node "help"
-                                             (wire-params (list "getblockcount")))))
+    ;; Control: a method that registers no help text answers with its own
+    ;; document (the name, then its description), and an unknown one still
+    ;; says so.
+    (is (uiop:string-prefix-p (format nil "getblockcount~%")
+                              (bl.rpc:dispatch-rpc-method node "help"
+                                                          (wire-params (list "getblockcount")))))
     (is (string= "help: unknown command: nosuchrpc"
                  (bl.rpc:dispatch-rpc-method node "help"
                                              (wire-params (list "nosuchrpc")))))))

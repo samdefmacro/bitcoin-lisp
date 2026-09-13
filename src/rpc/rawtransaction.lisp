@@ -822,7 +822,9 @@ transaction and the next signer can pick it up. Discarding it, as this used
 to, made a 2-of-3 unsignable by two wallets in turn: each pass rebuilt the
 input from nothing and the first cosigner's signature was never in the hex
 the second one saw."
-  (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        ;; The single-key arms' one (pubkey . signature) pair.
+        (s (first (input-sig-ecdsa sig))))
     (labels ((sigs ()
                (let* ((pairs (input-sig-ecdsa sig))
                       (needed (input-sig-needed sig))
@@ -837,28 +839,23 @@ the second one saw."
       (ecase (input-sig-kind sig)
         ;; P2PK reveals no pubkey: the scriptPubKey holds it already, so the
         ;; scriptSig is the signature push alone (Core pushes only `sig`).
-        (:p2pk (let ((s (first (input-sig-ecdsa sig))))
-                 (values (bl.ser:script-push-data (cdr s)) nil nil)))
-        (:p2pkh (let ((s (first (input-sig-ecdsa sig))))
-                  (values (concatenate '(vector (unsigned-byte 8))
-                                       (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data (car s)))
-                          nil nil)))
+        (:p2pk (values (bl.ser:script-push-data (cdr s)) nil nil))
+        (:p2pkh (values (concatenate '(vector (unsigned-byte 8))
+                                     (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data (car s)))
+                        nil nil))
         ;; P2SH-wrapped P2PK / P2PKH: Core appends the redeemScript to the
         ;; recursion's result and PushAll's the lot (sign.cpp:790-795), so the
         ;; scriptSig is the bare shape's pushes followed by the redeemScript.
-        (:p2sh-p2pk (let ((s (first (input-sig-ecdsa sig))))
-                      (values (concatenate '(vector (unsigned-byte 8))
-                                           (bl.ser:script-push-data (cdr s))
-                                           (bl.ser:script-push-data (input-sig-redeem sig)))
-                              nil nil)))
-        (:p2sh-p2pkh (let ((s (first (input-sig-ecdsa sig))))
-                       (values (concatenate '(vector (unsigned-byte 8))
-                                            (bl.ser:script-push-data (cdr s))
-                                            (bl.ser:script-push-data (car s))
-                                            (bl.ser:script-push-data (input-sig-redeem sig)))
-                               nil nil)))
-        (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
-                   (values nil (list (cdr s) (car s)) nil)))
+        (:p2sh-p2pk (values (concatenate '(vector (unsigned-byte 8))
+                                         (bl.ser:script-push-data (cdr s))
+                                         (bl.ser:script-push-data (input-sig-redeem sig)))
+                            nil nil))
+        (:p2sh-p2pkh (values (concatenate '(vector (unsigned-byte 8))
+                                          (bl.ser:script-push-data (cdr s))
+                                          (bl.ser:script-push-data (car s))
+                                          (bl.ser:script-push-data (input-sig-redeem sig)))
+                             nil nil))
+        (:p2wpkh (values nil (list (cdr s) (car s)) nil))
         (:p2tr (values nil (list (input-sig-tap sig)) nil))
         ;; Pay-to-anchor: no scriptSig, no witness, no error. Core's
         ;; ProduceSignature reaches none of its witness branches for
@@ -870,9 +867,8 @@ the second one saw."
         ;; the control block (BIP341). %TR-SCRIPT-PATH-WITNESS already appended
         ;; the last two, so there is nothing to assemble here.
         (:p2tr-script (values nil (input-sig-stack sig) nil))
-        (:p2sh-p2wpkh (let ((s (first (input-sig-ecdsa sig))))
-                        (values (bl.ser:script-push-data (input-sig-redeem sig))
-                                (list (cdr s) (car s)) nil)))
+        (:p2sh-p2wpkh (values (bl.ser:script-push-data (input-sig-redeem sig))
+                              (list (cdr s) (car s)) nil))
         (:p2wsh (values nil (concatenate 'list (list empty) (sigs)
                                          (list (input-sig-witness-script sig)))
                         (threshold-error "")))
