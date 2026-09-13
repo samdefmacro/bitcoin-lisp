@@ -1020,6 +1020,40 @@ input witness stack is CB-WITNESS-STACK (a list of byte-vectors, or NIL for none
      :lock-time 0
      :witness (vector cb-witness-stack))))
 
+
+(test block-rejections-are-logged-in-cores-words
+  "Core logs a rejected block with BlockValidationState::ToString(): the reject
+reason in lower case, a debug message after a comma
+(consensus/validation.h:110-121). Ours logged the verdict keyword with ~A,
+which prints UPPER CASE, and the functional framework greps debug.log for
+Core's spelling (p2p_segwit.py:145 waits for `unexpected-witness`). The
+keywords are Core's names already; this pins the rendering, and that the
+body gate logs through it."
+  (is (equal "unexpected-witness" (bl.val:block-reject-reason-string :unexpected-witness)))
+  (is (equal "bad-txnmrklroot" (bl.val:block-reject-reason-string :bad-txnmrklroot)))
+  (is (equal "bad-blk-length, size limits failed"
+             (bl.val:block-reject-reason-string '(:bad-blk-length "size limits failed"))))
+  (is (equal "Valid" (bl.val:block-reject-reason-string nil)))
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "reject-words"))
+           (cs (bl:node-chain-state node))
+           (good (let ((b (bl.mining:assemble-full-block cs (bl:node-mempool node)
+                                                          :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+                   (bl.mining:mine-block b) b))
+           ;; The mined header over a different body: the merkle root no longer
+           ;; matches, Core's bad-txnmrklroot.
+           (bad (bl.ser:make-bitcoin-block
+                 :header (bl.ser:bitcoin-block-header good)
+                 :transactions (list (make-simple-tx #x77)))))
+      (multiple-value-bind (ok reason)
+          (bl.val:accept-block-body bad cs)
+        (is-false ok "control: the corrupted body is refused")
+        (is (keywordp reason))
+        (let ((lines (capture-log-lines (lambda () (bl.val:accept-block-body bad cs)))))
+          (is-true (find (string-downcase (symbol-name reason)) lines :test #'search)
+                   "the rejection line carries Core's lower-case reason")
+          (is-false (find (symbol-name reason) lines :test #'search)
+                    "and not the keyword's upper-case name"))))))
 (test block-witness-stripped-p-detects-missing-nonce
   "block-witness-stripped-p is T when a block commits to witness but its coinbase
 witness is missing or not exactly one 32-byte item, and NIL for a witness-complete

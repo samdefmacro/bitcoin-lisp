@@ -3297,6 +3297,21 @@ CheckBlock when it was stored, so failing one now means the bytes changed and
 every CheckBlock verdict is transient there. Here the body has never been
 stored and the verdict is its first, so only the mutation class is exempt.")
 
+(defun block-reject-reason-string (error)
+  "ERROR, a VALIDATE-BLOCK / ACCEPT-BLOCK-BODY verdict, as Core's
+BlockValidationState::ToString() spells it (consensus/validation.h:110-121):
+the reject reason, lower case, with a debug message after a comma when the
+verdict carries one as (REASON DETAIL). Our keywords are named after Core's
+reject reasons already (bad-txnmrklroot, unexpected-witness, ...); logging
+them with ~A printed them UPPER CASE, and the functional framework greps the
+debug log for Core's spelling (p2p_segwit.py: `unexpected-witness`)."
+  (cond ((consp error)
+         (format nil "~A, ~A" (block-reject-reason-string (first error))
+                 (second error)))
+        ((keywordp error) (string-downcase (symbol-name error)))
+        ((null error) "Valid")
+        (t (princ-to-string error))))
+
 (defun %mutated-block-error-p (error)
   "T iff ERROR is one of *MUTATED-BLOCK-ERRORS* (Core BLOCK_MUTATED)."
   (and (keywordp error)
@@ -3346,7 +3361,7 @@ when it may not."
       (when valid
         (return-from accept-block-body (values t nil)))
       (bl:log-warn "Block ~A rejected before storage: ~A"
-                   (bl.crypto:bytes-to-hex hash) error)
+                   (bl.crypto:bytes-to-hex hash) (block-reject-reason-string error))
       (when (and entry (not (%mutated-block-error-p error)))
         (%mark-block-subtree-invalid chain-state entry))
       (values nil error))))

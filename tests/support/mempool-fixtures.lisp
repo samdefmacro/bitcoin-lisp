@@ -69,3 +69,22 @@ decides whether the cheap ones also confirm or sit unconfirmed forever."
 
 (defun bpe-populated-estimator (&key (blocks 40))
   (bpe-simulate :blocks blocks))
+
+(defun make-simple-tx (id-byte)
+  "Create a simple transaction with a unique identifier byte. Moved verbatim
+from the compact-block tests once a second file (the block-rejection log
+test) wanted the same throwaway body."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                  :previous-output (bl.ser:make-outpoint
+                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                      :initial-element id-byte)
+                                    :index 0)
+                  :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                  :sequence #xffffffff))
+   :outputs (vector (bl.ser:make-tx-out
+                   :value 50000
+                   :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                              :initial-element #x76)))
+   :lock-time 0))

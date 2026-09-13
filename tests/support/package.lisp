@@ -92,6 +92,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    ;; mempool-fixtures.lisp
    #:+optrue-redeem+
    #:p2sh-optrue-script-pubkey
+   #:make-simple-tx
    #:make-package-fixture
    ;; wallet.lisp
    #:make-wallet-rng
