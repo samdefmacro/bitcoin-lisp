@@ -119,6 +119,7 @@ headerssync.cpp. src/networking/.")
    #:peer-manual-p
    #:peer-permissions
    #:peer-outbound-or-block-relay-p
+   #:peer-expects-services-p
    #:loopback-address-p
    #:peer-conn-type
    #:peer-relays-txs-p
