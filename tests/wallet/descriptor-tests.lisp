@@ -525,6 +525,37 @@ the cache; different descriptors/indices don't collide."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getdescriptorinfo node (list "raw(51)#deadbeef")))))
 
+(test an-empty-descriptor-is-named-not-an-internal-error
+  "Core's Split(sp, '#') of an empty descriptor yields one empty span, so \"\"
+is a body like any other: CheckChecksum computes over it and ParseScript then
+names it, -5 `'' is not a valid descriptor function'
+(rpc_getdescriptorinfo.py:41). Where a checksum is REQUIRED the same empty
+body is `Missing checksum' instead.
+
+UIOP:SPLIT-STRING answers NIL for the empty string rather than one empty part,
+so the body was NIL, the checksum loop ran ACROSS over NIL, and the TYPE-ERROR
+came out of the request boundary as -32603 Internal error -- the node
+reporting itself broken for a caller's empty string."
+  (let ((node (make-test-node)))
+    (is (equal (cons -5 "'' is not a valid descriptor function")
+               (rpc-error-of
+                (lambda () (bl.rpc:dispatch-rpc-method node "getdescriptorinfo"
+                                                       (wire-params (list "")))))))
+    (is (equal (cons -5 "Missing checksum")
+               (rpc-error-of
+                (lambda () (bl.rpc:dispatch-rpc-method node "deriveaddresses"
+                                                       (wire-params (list "")))))))
+    ;; Controls: a non-empty unknown function is named the same way, and a
+    ;; real descriptor still parses.
+    (is (equal (cons -5 "'frobnicate(51)' is not a valid descriptor function")
+               (rpc-error-of
+                (lambda () (bl.rpc:dispatch-rpc-method node "getdescriptorinfo"
+                                                       (wire-params (list "frobnicate(51)")))))))
+    (is (stringp (cdr (assoc "descriptor"
+                             (bl.rpc:dispatch-rpc-method
+                              node "getdescriptorinfo" (wire-params (list "raw(51)")))
+                             :test #'string=))))))
+
 ;;; --- deriveaddresses (Core test/functional/rpc_deriveaddresses.py) ---
 
 (defun %addr-script (address network)
