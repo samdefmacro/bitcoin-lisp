@@ -1739,6 +1739,26 @@ default, json-false under -blocksonly."
     (is (integerp result))
     (is (>= result 0))))
 
+(test rpc-getconnectioncount-counts-live-peers-only
+  "getconnectioncount is GetNodeCount(ConnectionDirection::Both) over m_nodes
+ (rpc/net.cpp:79, net.cpp:3769-3781), and DisconnectNodes erases a closed
+connection from m_nodes on the next socket round (net.cpp:1909-1939). Ours
+kept a :disconnected peer in node-peers until the sync cycle reaped it, so
+p2p_nobloomfilter_messages.py:31 -- which asserts 0 as soon as its peer's
+socket closes -- read 1. ping walks the same list."
+  (let ((node (make-test-node)))
+    (setf (bl:node-peers node)
+          (list (bl.net:make-peer :address "10.0.0.1" :state :ready :inbound t)
+                (bl.net:make-peer :address "10.0.0.2" :state :disconnected
+                                  :inbound t)))
+    (is (= 1 (bl.rpc:dispatch-rpc-method node "getconnectioncount" '()))
+        "a :disconnected peer is not a connection")
+    (setf (bl:node-peers node)
+          (list (bl.net:make-peer :address "10.0.0.2" :state :disconnected
+                                  :inbound t)))
+    (is (= 0 (bl.rpc:dispatch-rpc-method node "getconnectioncount" '()))
+        "the last peer's disconnection leaves no connections")))
+
 ;;; --- Mempool Method Tests (6.5) ---
 
 (test rpc-getmempoolinfo

@@ -157,9 +157,7 @@ leave getpeerinfo (disconnect_nodes, test_framework.py:626), which is generous
 against 50ms and hopeless against 30s. Filtering here is not a workaround for
 the reap cadence: reporting a peer we have closed the socket on is wrong
 whatever the cadence is."
-  (let ((peers (sort (remove-if (lambda (p)
-                                  (eq (bl.net:peer-state p) :disconnected))
-                                (rpc-get-peers node))
+  (let ((peers (sort (rpc-get-connected-peers node)
                      #'< :key #'bl.net:peer-id))
         (chain-state (rpc-get-chain-state node))
         (now (get-internal-real-time)))
@@ -309,8 +307,7 @@ whatever the cadence is."
          ;; until the sync cycle reaps it, so the framework saw its test peers
          ;; gone from getpeerinfo while connections_out still counted them
          ;; (p2p_add_connections.py:73, 10 == 0 after disconnect_p2ps).
-         (peers (remove-if (lambda (p) (eq (bl.net:peer-state p) :disconnected))
-                           (rpc-get-peers node)))
+         (peers (rpc-get-connected-peers node))
          ;; THE service bits we advertise on the wire (peer.lisp local-services,
          ;; Core g_local_services) — the one composition; do not duplicate it
          ;; here. Names via the shared %service-names (Core GetServicesNames).
@@ -352,9 +349,16 @@ whatever the cadence is."
       ("warnings" . ,(bl.log:warnings-for-rpc)))))
 
 (define-rpc "getconnectioncount" (node params)
-  "Return the number of connected peers."
+  "Return the number of connected peers.
+
+Core answers connman.GetNodeCount(ConnectionDirection::Both) (rpc/net.cpp:79),
+the size of m_nodes, and DisconnectNodes erases a closed connection from
+m_nodes on the next socket round (net.cpp:1909-1939). Counting NODE-PEERS
+instead reported a peer this node had already dropped for the rest of the sync
+cycle -- p2p_nobloomfilter_messages.py:31 asserts 0 the moment its peer's
+socket closes."
   (declare (ignore params))
-  (length (rpc-get-peers node)))
+  (length (rpc-get-connected-peers node)))
 
 (define-rpc "ping" (node params)
   "Queue a ping to every connected peer (Bitcoin Core ping). The round-trip
@@ -362,7 +366,7 @@ result later surfaces in getpeerinfo's pingtime. Returns null. send-ping is a
 no-op on a peer whose connection has dropped, and ignore-errors guards against a
 peer disconnecting mid-send."
   (declare (ignore params))
-  (dolist (peer (rpc-get-peers node))
+  (dolist (peer (rpc-get-connected-peers node))
     (ignore-errors (bl.net:send-ping peer)))
   nil)
 
