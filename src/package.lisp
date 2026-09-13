@@ -71,6 +71,7 @@ init.cpp, node/. src/node/.")
    #:cli-parse-error
    #:unknown-config-file-keys
    #:known-config-option-p
+   #:asmap-file-path
    #:defer-log
    #:*category-log-levels*
    #:category-log-level
