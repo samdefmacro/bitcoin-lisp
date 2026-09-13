@@ -1516,12 +1516,25 @@ nonstandard, and Core wraps it like any other nonstandard script."
                               `(("p2sh" . ,(bl.crypto:encode-p2sh-address
                                             (bl.crypto:hash160 script) network)))))
                 (when (%script-can-wrap-p2wsh-p type data)
-                  (let ((segwit (%decodescript-segwit-script script type data)))
+                  (let ((segwit (%decodescript-segwit-script script type data))
+                        ;; Core's `provider' for the segwit object: the script
+                        ;; it was handed, filed under the P2WSH program it
+                        ;; derived from it (`provider.scripts[CScriptID(script)]
+                        ;; = script', rpc/rawtransaction.cpp:571). It is what
+                        ;; lets InferDescriptor recurse INTO the witness
+                        ;; program and answer wsh(<miniscript>) instead of the
+                        ;; addr() of a program whose script nobody named --
+                        ;; rpc_decodescript.py:281, the miniscript-compatible
+                        ;; offered HTLC. Nothing else is inferred with a
+                        ;; provider, here or in Core.
+                        (provider (bl.bytes:make-octets-hash-table)))
+                    (setf (gethash (bl.crypto:sha256 script) provider) script)
                     (setf result
                           (append result
                                   `(("segwit"
                                      . ,(append
-                                         (script-to-json segwit :network network)
+                                         (script-to-json segwit :network network
+                                                                :witness-scripts provider)
                                          `(("p2sh-segwit"
                                             . ,(bl.crypto:encode-p2sh-address
                                                 (bl.crypto:hash160 segwit)
