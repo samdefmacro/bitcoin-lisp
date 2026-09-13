@@ -668,6 +668,55 @@ is dead code."
               (is (null staller)
                   "a peer that can be asked for blocks names no staller"))))))))
 
+(test an-equal-work-sibling-is-still-worth-downloading
+  "Core's FindNextBlocksToDownload declines a peer only when its best-known
+block has STRICTLY LESS work than our tip (net_processing.cpp:1407), and
+HeadersDirectFetchBlocks fetches at tip work <= last header's work (:2830).
+Equal work is interesting: among two siblings of equal work the tip is decided
+by which BODY arrived first, so a node that never fetches the sibling cannot
+hold the tiebreak, cannot serve it, and cannot reorg onto it when its own tip
+is invalidated.
+
+Ours declined at `not more work than our tip\', so a sibling header sat in the
+index forever with no body. feature_chain_tiebreaks.py:76 sends exactly that
+header and waits for the getdata; the node logged `peer chain not heavier than
+our tip (best-known h=2, tip h=2)\' and sent nothing."
+  (with-temp-directory (dir "bl-tiebreak")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1
+                       :status :valid))
+             ;; Two siblings of genesis, same height and the same chain work.
+             (ours (bl.store:make-block-index-entry
+                    :hash (%bd-hash 1) :height 1 :chain-work 2
+                    :prev-entry genesis :status :valid))
+             (sibling (bl.store:make-block-index-entry
+                       :hash (%bd-hash 2) :height 1 :chain-work 2
+                       :prev-entry genesis :status :header-valid))
+             ;; And one strictly lighter chain, as the control that the gate
+             ;; still closes on something.
+             (lighter (bl.store:make-block-index-entry
+                       :hash (%bd-hash 3) :height 1 :chain-work 1
+                       :prev-entry genesis :status :header-valid)))
+        (dolist (e (list genesis ours sibling lighter))
+          (bl.store:add-block-index-entry state e))
+        (bl.store:update-chain-tip state (%bd-hash 1) 1)
+        (let* ((services (logior bl.ser:+node-network+ bl.ser:+node-witness+))
+               (peer (bl.net:make-peer :address "198.51.100.7" :state :ready
+                                       :services services))
+               (poor (bl.net:make-peer :address "198.51.100.8" :state :ready
+                                       :services services)))
+          (setf (bl.net:peer-best-known-block-hash peer) (%bd-hash 2)
+                (bl.net:peer-best-known-block-hash poor) (%bd-hash 3))
+          (with-ibd-context
+            (is (equalp (list (%bd-hash 2))
+                        (bl.net::find-blocks-to-download-for-peer peer state store 16))
+                "the equal-work sibling was not requested")
+            (is (null (bl.net::find-blocks-to-download-for-peer poor state store 16))
+                "a strictly lighter chain is still nothing to fetch")))))))
+
 (test mark-block-received-clears-timeout-counter
   "A successful receive clears the per-hash timeout counter so a future
 re-request (e.g. after a reorg) starts fresh."
