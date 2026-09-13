@@ -4542,7 +4542,7 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
             (bl.crypto:bytes-to-hex block-hash)
             (peer-log-name peer))
            (return-from handle-cmpctblock nil))
-          (t (setf (peer-pending-compact-block peer) nil)))))
+          (t (clear-pending-compact-block peer)))))
 
     ;; (Core's dedup — `pindex->nChainWork <= tip->nChainWork || pindex->nTx
     ;; != 0` — now lives in COMPACT-BLOCK-HEADER-VERDICT's :ALREADY-HAVE arm,
@@ -4614,6 +4614,18 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
                 :missing-indexes missing-indexes
                 :request-time (get-internal-real-time)
                 :use-wtxid use-wtxid))
+         ;; Core marks the block IN FLIGHT against this peer before it even
+         ;; builds the request (BlockRequested, net_processing.cpp:4668),
+         ;; because the getblocktxn round trip is a block download like any
+         ;; other: it is what stops the scheduler asking a second peer for the
+         ;; same block, and mapBlocksInFlight is where getpeerinfo's
+         ;; `inflight' array comes from (rpc/net.cpp:275-281).
+         ;; p2p_mutated_blocks.py:76-78 reads exactly that, between the
+         ;; getblocktxn and the answer:
+         ;;     assert_equal([101], peer_info_prior_to_attack[0]["inflight"])
+         ;; Ours tracked the reconstruction only in the per-peer pending slot,
+         ;; so the array was empty.
+         (mark-block-in-flight block-hash peer)
          ;; Send getblocktxn request
          (send-message peer
                        (bl.ser:make-getblocktxn-message
@@ -4657,7 +4669,7 @@ punished outright (:3487-3491)."
         ;; (net_processing.cpp:3487-3491).
         (when (/= (length txs) (length missing-indexes))
           (bl:log-warn "blocktxn transaction count mismatch")
-          (setf (peer-pending-compact-block peer) nil)
+          (clear-pending-compact-block peer)
           (increment-compact-block-failure)
           (record-misbehavior peer
                               "invalid compact block/non-matching block transactions")
@@ -4671,8 +4683,9 @@ punished outright (:3487-3491)."
         (let ((block (bl.ser:make-bitcoin-block
                       :header (pending-compact-block-header pending)
                       :transactions (coerce transactions 'list))))
-          ;; Clear pending state
-          (setf (peer-pending-compact-block peer) nil)
+          ;; Clear pending state, and with it the in-flight entry the
+          ;; getblocktxn made: the block is here.
+          (clear-pending-compact-block peer)
 
           ;; Validate and connect
           (increment-compact-block-success)
@@ -4720,11 +4733,23 @@ punished outright (:3487-3491)."
         (when (> elapsed-secs +compact-block-timeout-seconds+)
           (bl:log-warn "Compact block reconstruction timed out")
           (let ((block-hash (pending-compact-block-block-hash pending)))
-            (setf (peer-pending-compact-block peer) nil)
+            (clear-pending-compact-block peer)
             (request-full-block peer block-hash)))))))
 
 (defun clear-pending-compact-block (peer)
-  "Clear any pending compact block reconstruction for PEER."
+  "Give up on PEER's pending compact-block reconstruction: drop the pending
+slot AND the in-flight entry the getblocktxn made for it.
+
+Core pairs BlockRequested with RemoveBlockRequest on every path that
+abandons a compact-block round trip -- an invalid message
+(net_processing.cpp:4681), a short-id collision it will not chase (:4692),
+a slot it declines (:4721) -- and the delivered block clears the entry
+through the normal receive path. A port that marks the block in flight and
+forgets one of those paths leaves a peer permanently holding a block
+nothing will ask anyone else for, so every clear site goes through here."
+  (let ((pending (peer-pending-compact-block peer)))
+    (when pending
+      (drop-block-in-flight (pending-compact-block-block-hash pending) peer)))
   (setf (peer-pending-compact-block peer) nil))
 
 ;;; Compact block metrics

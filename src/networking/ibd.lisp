@@ -1262,6 +1262,22 @@ so our own saturated downlink cannot evict a fleet of honest peers."
       (setf (gethash hash (ibd-context-in-flight *ibd-context*))
             (cons peer now)))))
 
+(defun drop-block-in-flight (hash peer)
+  "Core RemoveBlockRequest(hash, from_peer) (net_processing.cpp:1200-1236):
+forget that HASH was requested from PEER, without counting it as delivered.
+
+MARK-BLOCK-RECEIVED is the DELIVERY path -- it records latency and restarts
+the download clock; this is the ABANDONMENT path, for a request given up on
+(a compact-block reconstruction replaced, timed out, or refused). Does
+nothing when the entry belongs to another peer, as Core's equal_range scan
+does."
+  (when *ibd-context*
+    (let* ((table (ibd-context-in-flight *ibd-context*))
+           (entry (gethash hash table)))
+      (when (and entry (eq (car entry) peer))
+        (remhash hash table)
+        t))))
+
 (defun mark-block-received (hash)
   "Mark a block as received, removing it from pending and in-flight.
 Records delivery latency (now - request-time) for the corresponding
