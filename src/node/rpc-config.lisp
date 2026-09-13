@@ -90,7 +90,7 @@ APPLY-CONFIG-GLOBALS."
 (defmethod bl.rpc:rpc-server-data-directory ((node node))
   (node-data-directory node))
 
-(defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
+(defun start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
                          rpc-user rpc-password rpc-auth rpc-allow-ip
                          rpc-whitelist rpc-whitelist-default
                          rest-enabled network webui webui-supplied-p
@@ -121,6 +121,14 @@ point and answers -28 for every method until FINISH-RPC-WARMUP."
                                                     :ui-enabled webui-enabled
                                                     :ui-directory webui-path
                                                     :warmup "Loading...")))
+    ;; Core: AppInitServers false -> InitError, and the node exits 1 with this
+    ;; exact line on stderr (init.cpp:1559-1561). start-rpc-server has already
+    ;; logged WHY (a malformed -rpcauth or -rpcallowip, a port in use, a
+    ;; credential that would not install); a node that carried on without its
+    ;; RPC server was alive, unreachable and, to the functional framework's
+    ;; assert_start_raises_init_error, wrong for sixty seconds.
+    (unless server
+      (init-error "Unable to start HTTP server. See debug log for details."))
     ;; -webuiopen: pop the local browser at the dashboard. Logged, never
     ;; fatal (open-browser-to-ui catches everything).
     (when (and server webui-enabled webui-open)
