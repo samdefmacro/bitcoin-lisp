@@ -50,7 +50,7 @@ PARAMS: (privkey-wif message). Returns the base64 recoverable signature."
 its P2PKH key-id matches ADDRESS. Returns a bare JSON boolean; like Core
 (rpc/signmessage.cpp:41-57 mapping MessageVerify results), an undecodable
 address throws -5 \"Invalid address\", a non-P2PKH address -3 \"Address does
-not refer to key\", and malformed base64 -5 \"Malformed base64 encoding\"."
+not refer to key\", and malformed base64 -3 \"Malformed base64 encoding\"."
   (unless (and (stringp address) (stringp sig-b64) (stringp message))
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message "address, signature and message are required"))
@@ -74,9 +74,12 @@ not refer to key\", and malformed base64 -5 \"Malformed base64 encoding\"."
     ;; The P2PKH scriptPubKey is OP_DUP OP_HASH160 <20> ... — the key-id is
     ;; the push body, the CKeyID Core compares the recovered pubkey against.
     (let ((payload (subseq script-pubkey 3 23))
+          ;; ERR_MALFORMED_SIGNATURE is RPC_TYPE_ERROR (-3), not -5: Core
+          ;; groups it with the address-is-not-a-key arm rather than with the
+          ;; undecodable address (rpc/signmessage.cpp:41-57).
           (sig65 (handler-case (cl-base64:base64-string-to-usb8-array sig-b64)
                    (error ()
-                     (error 'rpc-error :code +rpc-invalid-address-or-key+
+                     (error 'rpc-error :code +rpc-type-error+
                                        :message "Malformed base64 encoding")))))
       (json-bool
        (ignore-errors

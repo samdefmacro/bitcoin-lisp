@@ -1234,6 +1234,7 @@
   (bitcoin-lisp.mempool:mempool-has function)
   (bitcoin-lisp.mempool:mempool-remove-recursive function)
   (bitcoin-lisp.mempool:mempool-trim-to-size function)
+  (bitcoin-lisp.mempool:mempool-limit-size function)
   (bitcoin-lisp.mempool:mempool-update-for-reorg function)
   (bitcoin-lisp.mempool:*max-mempool-bytes* variable)
   (bitcoin-lisp.mempool:mempool-effective-min-fee-rate function)
