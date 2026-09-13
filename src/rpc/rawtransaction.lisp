@@ -1194,28 +1194,40 @@ and as an ALIST from the unit tests, and ASSOC on a hash-table is a type error
 - so createrawtransaction failed for every real JSON-RPC client while the
 suite stayed green."
   (loop for inp in inputs
-        ;; Core AddInputs parses the txid before it reads vout.
-        for txid = (parse-hash-v (obj-get inp "txid") "txid")
-        for vout = (obj-get inp "vout")
-        for sequence = (obj-get inp "sequence")
-        do (unless (integerp vout)
-             (error 'rpc-error :code +rpc-invalid-parameter+
-                               :message "Invalid parameter, missing vout key"))
-           (when (minusp vout)
-             (error 'rpc-error :code +rpc-invalid-parameter+
-                               :message "Invalid parameter, vout cannot be negative"))
-           (when (and sequence
-                      (or (not (integerp sequence))
-                          (not (<= 0 sequence #xffffffff))))
-             (error 'rpc-error :code +rpc-invalid-parameter+
-                               :message "Invalid parameter, sequence number is out of range"))
-        collect (bl.ser:make-tx-in
-                 :previous-output (bl.ser:make-outpoint
-                                   :hash txid
-                                   :index vout)
-                 :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                 :sequence (or sequence
-                               (default-input-sequence replaceable locktime)))))
+        collect
+        (progn
+          ;; Core AddInputs reads the entry through `input.get_obj()'
+          ;; (rawtransaction_util.cpp:37) BEFORE it looks for any key, so an
+          ;; entry that is not an object is UniValue's type error naming the
+          ;; type it got. Without this gate the key lookup on a non-object
+          ;; simply answered nothing and the diagnostic blamed the missing
+          ;; txid: `createrawtransaction(["foo"], {})' answered `JSON value of
+          ;; type null is not of expected type string' where Core answers
+          ;; `... of type string is not of expected type object'
+          ;; (rpc_rawtransaction.py:267).
+          (unless (%json-object-p inp) (%json-type-error inp "object"))
+          ;; Core AddInputs parses the txid before it reads vout.
+          (let ((txid (parse-hash-v (obj-get inp "txid") "txid"))
+                (vout (obj-get inp "vout"))
+                (sequence (obj-get inp "sequence")))
+            (unless (integerp vout)
+              (error 'rpc-error :code +rpc-invalid-parameter+
+                                :message "Invalid parameter, missing vout key"))
+            (when (minusp vout)
+              (error 'rpc-error :code +rpc-invalid-parameter+
+                                :message "Invalid parameter, vout cannot be negative"))
+            (when (and sequence
+                       (or (not (integerp sequence))
+                           (not (<= 0 sequence #xffffffff))))
+              (error 'rpc-error :code +rpc-invalid-parameter+
+                                :message "Invalid parameter, sequence number is out of range"))
+            (bl.ser:make-tx-in
+             :previous-output (bl.ser:make-outpoint
+                               :hash txid
+                               :index vout)
+             :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+             :sequence (or sequence
+                           (default-input-sequence replaceable locktime)))))))
 
 (define-rpc "createrawtransaction"
     (node (inputs outputs (locktime :or 0) replaceable version))

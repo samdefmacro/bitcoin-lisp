@@ -5721,6 +5721,32 @@ verbatim, both rejections and both round-trips."
                 (create-raw-tx (crt-one-input :sequence "foo")
                                +crt-data-output+))))))
 
+(test createrawtransaction-inputs-entry-is-read-as-an-object-first
+  "Core's AddInputs reads each `inputs' entry through input.get_obj()
+(rawtransaction_util.cpp:37) BEFORE it looks for any key, so an entry that is
+not an object is UniValue's own type error naming the type it got:
+rpc_rawtransaction.py:267 asks createrawtransaction([\"foo\"], {}) for `JSON
+value of type string is not of expected type object'.
+
+Ours went straight to the key lookup, which answers nothing for a string, so
+the diagnostic blamed the missing txid and reported the type of THAT -- `JSON
+value of type null is not of expected type string', which is the answer Core
+gives one line later (:268) for an entry that IS an object and simply has no
+txid. Both rows are asserted here: the second is the control that the new gate
+did not swallow the case it must let through."
+  (is (equal (cons -3 "JSON value of type string is not of expected type object")
+             (rpc-error-of (lambda () (create-raw-tx (list "foo") +crt-data-output+)))))
+  (is (equal (cons -3 "JSON value of type number is not of expected type object")
+             (rpc-error-of (lambda () (create-raw-tx (list 7) +crt-data-output+)))))
+  (is (equal (cons -3 "JSON value of type null is not of expected type string")
+             (rpc-error-of
+              (lambda ()
+                (create-raw-tx (list (make-hash-table :test 'equal))
+                               +crt-data-output+)))))
+  ;; And a well-formed entry still builds the transaction.
+  (is (equal '(#xfffffffd)
+             (crt-sequences (create-raw-tx (crt-one-input) +crt-data-output+)))))
+
 (test rpc-createrawtransaction-takes-a-version
   "ConstructTransaction takes a version, defaulting to DEFAULT_RAWTX_VERSION =
 2 and refused outside TX_MIN_STANDARD_VERSION..TX_MAX_STANDARD_VERSION = 1..3
