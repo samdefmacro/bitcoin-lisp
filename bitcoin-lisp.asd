@@ -457,6 +457,8 @@ this same package."
                              (:file "node/zmq-tests")
                              ;; -blocknotify / -shutdownnotify operator hooks
                              (:file "node/notify-tests")
+                             ;; the sync thread's idle tick admits and reads new peers
+                             (:file "node/sync-thread-tests")
                              ;; BIP 158 compact block filter tests
                              (:file "storage/blockfilter-tests")
                              ;; BIP 174 PSBT tests

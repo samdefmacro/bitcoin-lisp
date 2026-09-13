@@ -3949,7 +3949,7 @@ just that something connected."
     (setf bl:*pending-test-connections* '()))
   ;; And the queue is actually drained where peers are dialed — a request that
   ;; is only ever queued is exactly the shape of bug this repo keeps finding.
-  (is-true (member 'bl::connect-added-nodes
+  (is-true (member 'bl::dial-queued-nodes
                    (mapcar #'car
                            (sb-introspect:who-sets
                             'bl:*pending-test-connections*)))))

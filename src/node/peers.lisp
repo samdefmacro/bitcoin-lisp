@@ -1050,9 +1050,17 @@ runs). Distinct from connect-added-nodes only in which list it walks."
         (unless (peer-connected-to-endpoint-p node host port)
           (establish-outbound-peer node host port :conn-type :manual))))))
 
-(defun connect-added-nodes (node)
-  "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
-then keep every \"add\" peer connected. Honors network-active."
+(defun dial-queued-nodes (node)
+  "Drain the two RPC-queued dial lists on the sync thread: one-shot addnode
+\"onetry\" requests and addconnection requests. Honors network-active.
+
+Runs from every idle tick as well as at the top of each sync cycle, because
+Core answers both without waiting: `addnode onetry' wakes
+ThreadOpenAddedConnections at once, and `addconnection' dials on the RPC
+thread itself (CConnman::AddConnection, net.cpp:1871-1907 calls
+OpenNetworkConnection before returning). Queued here and drained a whole
+30-second cycle later, the functional framework's add_outbound_p2p_connection
+sat on getpeerinfo for most of that cycle, once per connection."
   (when (node-network-active node)
     ;; One-shot onetry dials (Core addnode onetry).
     (let ((onetry (bt:with-recursive-lock-held ((node-lock node))
@@ -1070,7 +1078,16 @@ then keep every \"add\" peer connected. Honors network-active."
                       (setf *pending-test-connections* nil)))))
       (dolist (request queued)
         (multiple-value-bind (host port) (parse-node-endpoint node (car request))
-          (establish-outbound-peer node host port :conn-type (cdr request)))))
+          (establish-outbound-peer node host port :conn-type (cdr request)))))))
+
+(defun connect-added-nodes (node)
+  "Service addnode requests on the sync thread: drain the queued dials
+(DIAL-QUEUED-NODES), then keep every \"add\" peer connected. Honors
+network-active. The reconnect sweep stays per cycle: Core retries an added
+node it failed to reach every 60 seconds (ThreadOpenAddedConnections,
+net.cpp:2992-2993), so it must not run at tick rate."
+  (when (node-network-active node)
+    (dial-queued-nodes node)
     ;; Maintain persistent added-node connections.
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
