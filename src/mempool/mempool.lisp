@@ -912,12 +912,32 @@ to the txgraph's worst chunk (P5)."
 (defconstant +truc-descendant-limit+ 2
   "A TRUC tx's descendant set (incl. self) must be <= this (Core TRUC_DESCENDANT_LIMIT).")
 
+(defun %truc-hash-name (hash)
+  "HASH in Core's display order -- uint256::ToString()."
+  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))
+
+(defun %truc-names (tx)
+  "How Core names a transaction inside a TRUC-violation message: its txid,
+then its wtxid in parentheses -- strprintf(\"%s (wtxid=%s)\", ...) at every one
+of truc_policy.cpp's six sites."
+  (format nil "~A (wtxid=~A)"
+          (%truc-hash-name (bl.ser:transaction-hash tx))
+          (%truc-hash-name (bl.ser:transaction-wtxid tx))))
+
 (defun single-truc-checks (mempool tx vsize direct-conflicts)
   "BIP431 TRUC (v3) topology checks for a single new TX at mempool acceptance,
 a port of Core policy SingleTRUCChecks (truc_policy.cpp:171-264). VSIZE is TX's
 virtual size; DIRECT-CONFLICTS the list of mempool txids it replaces (RBF).
-Returns (values t NIL NIL) when acceptable, else (values NIL reason-keyword
+Returns (values t NIL NIL) when acceptable, else (values NIL (KEYWORD DETAIL)
 sibling-txid-or-NIL).
+
+Every one of Core's six verdicts here is ONE reject reason, \"TRUC-violation\"
+(validation.cpp:971), with the informative half in the debug message that
+SingleTRUCChecks itself returns -- `version=3 tx <txid> (wtxid=<wtxid>) is too
+big: 10001 > 10000 virtual bytes'. That is what state.ToString() prints and
+what sendrawtransaction throws, which is why the verdict carries the sentence
+rather than a keyword alone (mempool_truc.py:69 and its six siblings match
+it).
 
 Enforces: v3<->non-v3 spend inheritance (both directions); v3 tx <= 10000 vsize;
 at most 1 unconfirmed ancestor and, for a child of an unconfirmed TRUC parent,
@@ -933,35 +953,53 @@ Core PreChecks validation.cpp:950-970) may then treat the sibling as a
 to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
   (let* ((version (bl.ser:transaction-version tx))
          (parents (mempool-find-parents mempool tx))
-         (v3 (= version +truc-version+)))
+         (v3 (= version +truc-version+))
+         (self (%truc-names tx)))
     ;; 1. TRUC / non-TRUC inheritance, both directions.
     (dolist (p parents)
       (let* ((pe (mempool-get mempool p))
              (pv (and pe (bl.ser:transaction-version
                           (mempool-entry-transaction pe)))))
         (when pe
-          (cond
-            ((and (not v3) (= pv +truc-version+))
-             (return-from single-truc-checks (values nil :truc-nonv3-spends-v3)))
-            ((and v3 (/= pv +truc-version+))
-             (return-from single-truc-checks (values nil :truc-v3-spends-nonv3)))))))
+          (let ((them (%truc-names (mempool-entry-transaction pe))))
+            (cond
+              ((and (not v3) (= pv +truc-version+))
+               (return-from single-truc-checks
+                 (values nil (list :truc-nonv3-spends-v3
+                                   (format nil "non-version=3 tx ~A cannot spend from version=3 tx ~A"
+                                           self them)))))
+              ((and v3 (/= pv +truc-version+))
+               (return-from single-truc-checks
+                 (values nil (list :truc-v3-spends-nonv3
+                                   (format nil "version=3 tx ~A cannot spend from non-version=3 tx ~A"
+                                           self them))))))))))
     ;; 2. The remaining rules apply only to v3 transactions.
     (unless v3 (return-from single-truc-checks (values t nil)))
     ;; 3. Size cap.
     (when (> vsize +truc-max-vsize+)
-      (return-from single-truc-checks (values nil :truc-tx-too-big)))
+      (return-from single-truc-checks
+        (values nil (list :truc-tx-too-big
+                          (format nil "version=3 tx ~A is too big: ~D > ~D virtual bytes"
+                                  self vsize +truc-max-vsize+)))))
     ;; 4. Ancestor limit: parents + self must be within the limit.
     (when (> (+ (length parents) 1) +truc-ancestor-limit+)
-      (return-from single-truc-checks (values nil :truc-too-many-ancestors)))
+      (return-from single-truc-checks
+        (values nil (list :truc-too-many-ancestors
+                          (format nil "tx ~A would have too many ancestors" self)))))
     ;; 5. Child-of-unconfirmed-parent rules.
     (when parents
       (let ((parent (first parents)))
         ;; The parent must have no ancestors of its own (it + self + new > 2).
         (when (> (+ (mempool-ancestor-stats mempool parent) 1) +truc-ancestor-limit+)
-          (return-from single-truc-checks (values nil :truc-too-many-ancestors)))
+          (return-from single-truc-checks
+            (values nil (list :truc-too-many-ancestors
+                              (format nil "tx ~A would have too many ancestors" self)))))
         ;; A child spending a TRUC parent is size-limited.
         (when (> vsize +truc-child-max-vsize+)
-          (return-from single-truc-checks (values nil :truc-child-too-big)))
+          (return-from single-truc-checks
+            (values nil (list :truc-child-too-big
+                              (format nil "version=3 child tx ~A is too big: ~D > ~D virtual bytes"
+                                      self vsize +truc-child-max-vsize+)))))
         ;; The parent may have at most this one child (unless its existing child
         ;; is being replaced). descendant-stats/ancestor-stats counts include self.
         (let* ((descendants (mempool-descendants mempool parent))   ; excludes parent
@@ -977,9 +1015,15 @@ to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
             ;; reorg-created multi-child / grandchild shapes).
             (let ((sibling (when (= 1 (hash-table-count descendants))
                              (loop for d being the hash-keys of descendants
-                                   return d))))
+                                   return d)))
+                  (pe (mempool-get mempool parent)))
               (return-from single-truc-checks
-                (values nil :truc-descendant-limit
+                (values nil
+                        (list :truc-descendant-limit
+                              (format nil "tx ~A would exceed descendant count limit"
+                                      (if pe
+                                          (%truc-names (mempool-entry-transaction pe))
+                                          (%truc-hash-name parent))))
                         (when (and sibling
                                    (= 2 (mempool-ancestor-stats mempool sibling)))
                           sibling))))))))

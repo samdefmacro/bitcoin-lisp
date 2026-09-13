@@ -2702,18 +2702,18 @@ and descendant limits of 1, and the 1000-vsize child cap."
       (is-true (ok (%truc-tx root :version 2 :vout 6)))
       ;; inheritance: non-v3 spending the v3 parent -> rejected
       (multiple-value-bind (o r) (ok (%truc-tx v3-pid :version 2))
-        (is-false o) (is (eq :truc-nonv3-spends-v3 r)))
+        (is-false o) (is (eq :truc-nonv3-spends-v3 (first r))))
       ;; inheritance: v3 spending the v2 parent -> rejected
       (multiple-value-bind (o r) (ok (%truc-tx v2-pid :version 3))
-        (is-false o) (is (eq :truc-v3-spends-nonv3 r)))
+        (is-false o) (is (eq :truc-v3-spends-nonv3 (first r))))
       ;; a v3 child of the v3 parent is fine (1 ancestor, 1 descendant)
       (is-true (ok (%truc-tx v3-pid :version 3)))
       ;; v3 child too big (> 1000 vsize) -> rejected
       (multiple-value-bind (o r) (ok (%truc-tx v3-pid :version 3) 1001)
-        (is-false o) (is (eq :truc-child-too-big r)))
+        (is-false o) (is (eq :truc-child-too-big (first r))))
       ;; v3 tx too big (> 10000 vsize) -> rejected even without a parent
       (multiple-value-bind (o r) (ok (%truc-tx root :version 3 :vout 7) 10001)
-        (is-false o) (is (eq :truc-tx-too-big r))))))
+        (is-false o) (is (eq :truc-tx-too-big (first r)))))))
 
 (test truc-descendant-limit-one-child
   "A v3 parent may have at most one unconfirmed child; a second fails the
@@ -2735,7 +2735,7 @@ truc_policy.cpp:233-262)."
       ;; descendant whose only ancestor is the parent).
       (multiple-value-bind (o r sibling)
           (bl.mp:single-truc-checks mempool (%truc-tx pid :version 3 :vout 1) 200 nil)
-        (is-false o) (is (eq :truc-descendant-limit r))
+        (is-false o) (is (eq :truc-descendant-limit (first r)))
         (is (equalp cid1 sibling)))
       ;; ... unless the existing child is being replaced anyway.
       (is-true (bl.mp:single-truc-checks
@@ -2759,8 +2759,48 @@ GetAncestorCount(sibling)==2, truc_policy.cpp:250-252)."
     (%add-tx mempool grandchild)
     (multiple-value-bind (o r sibling)
         (bl.mp:single-truc-checks mempool (%truc-tx pid :version 3 :vout 1) 200 nil)
-      (is-false o) (is (eq :truc-descendant-limit r))
+      (is-false o) (is (eq :truc-descendant-limit (first r)))
       (is (null sibling)))))
+
+(test truc-violations-are-cores-one-reason-and-its-sentence
+  "Core has ONE reject reason for every TRUC verdict -- \"TRUC-violation\"
+(validation.cpp:971) -- and puts which rule failed in the debug message
+SingleTRUCChecks returns, so state.ToString(), the string sendrawtransaction
+throws, reads
+
+  TRUC-violation, version=3 tx <txid> (wtxid=<wtxid>) is too big: 10001 > 10000 virtual bytes
+
+(truc_policy.cpp:199-203). mempool_truc.py:69 matches all but the numbers, and
+its five siblings match the other five sentences. Ours answered the downcased
+keyword, `truc-tx-too-big': our own vocabulary, no transaction named, no
+numbers."
+  (let* ((mempool (bl.mp:make-mempool))
+         (root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 72))
+         (heavy (%truc-tx root :version 3 :vout 3))
+         (names (format nil "~A (wtxid=~A)"
+                        (bl.rpc:hash-to-hex (bl.ser:transaction-hash heavy))
+                        (bl.rpc:hash-to-hex (bl.ser:transaction-wtxid heavy)))))
+    (multiple-value-bind (ok reason)
+        (bl.mp:single-truc-checks mempool heavy 10001 nil)
+      (is-false ok)
+      (is (string= (format nil "TRUC-violation, version=3 tx ~A is too big: 10001 > 10000 virtual bytes"
+                           names)
+                   (bl.val:tx-reject-reason-string reason))))
+    ;; The child cap is its own sentence under the same reason.
+    (let* ((parent (%truc-tx root :version 3 :vout 4))
+           (pid (bl.ser:transaction-hash parent))
+           (child (%truc-tx pid :version 3)))
+      (%add-tx mempool parent)
+      (multiple-value-bind (ok reason)
+          (bl.mp:single-truc-checks mempool child 1001 nil)
+        (is-false ok)
+        (is (string= (format nil "TRUC-violation, version=3 child tx ~A (wtxid=~A) is too big: 1001 > 1000 virtual bytes"
+                             (bl.rpc:hash-to-hex (bl.ser:transaction-hash child))
+                             (bl.rpc:hash-to-hex (bl.ser:transaction-wtxid child)))
+                     (bl.val:tx-reject-reason-string reason)))))
+    ;; Control: a verdict that is not a TRUC one keeps its own reason.
+    (is (string= "bad-txns-inputs-missingorspent"
+                 (bl.val:tx-reject-reason-string :missing-input)))))
 
 (test v3-now-standard
   "v3 is a standard tx version (TRUC enabled): +max-standard-tx-version+ = 3."

@@ -793,6 +793,16 @@ transaction is refused even on a node told to relay non-standard ones."
     (:bare-multisig            . "bare-multisig")                    ; :152
     (:dust                     . "dust")                             ; :159
     (:missing-ephemeral-spends . "missing-ephemeral-spends")         ; ephemeral_policy.cpp
+    ;; BIP431 TRUC. Core has ONE reject reason for all six verdicts
+    ;; SingleTRUCChecks / PackageTRUCChecks can return (validation.cpp:971,
+    ;; :1480); which rule failed is in the debug message the check returns,
+    ;; and the keyword is how we carry that distinction internally.
+    (:truc-tx-too-big          . "TRUC-violation")
+    (:truc-child-too-big       . "TRUC-violation")
+    (:truc-too-many-ancestors  . "TRUC-violation")
+    (:truc-descendant-limit    . "TRUC-violation")
+    (:truc-nonv3-spends-v3     . "TRUC-violation")
+    (:truc-v3-spends-nonv3     . "TRUC-violation")
     ;; Both script passes carry Core's "(ScriptErrorString)" parenthetical
     ;; (validation.cpp:2117,2119). The two sites return the reason as
     ;; (KEYWORD SCRIPT-ERROR) so TX-REJECT-REASON-STRING can append it; the
