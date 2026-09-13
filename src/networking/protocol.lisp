@@ -229,6 +229,36 @@ Core also refuses a permitted request once -maxuploadtarget is spent
        (disconnect-peer peer)))
     (t (handle-mempool-request peer payload ctx))))
 
+(defun %refuse-bloom-filter-message (peer command)
+  "Drop PEER for a BIP37 filter message. Core answers filterload, filteradd and
+filterclear with this line and a disconnect whenever it does not advertise
+NODE_BLOOM (net_processing.cpp:5051-5056, :5076-5081, :5104-5109). This node
+never advertises NODE_BLOOM -- LOCAL-SERVICES has no bit for it and BIP37
+serving is not implemented -- so all three are always refused, which is the
+same answer Core gives under -peerbloomfilters=0.
+
+The line is Core's own, with CNode::DisconnectMsg at the end;
+p2p_nobloomfilter_messages.py sends each of the three and waits for the
+connection to close."
+  (bl:log-cat "net" "~A received despite not offering bloom services, ~A"
+              command (disconnect-msg peer))
+  (disconnect-peer peer))
+
+(define-p2p-handler "filterload" (peer payload ctx)
+  "BIP37: refused, because this node does not offer bloom services."
+  (declare (ignore payload ctx))
+  (%refuse-bloom-filter-message peer "filterload"))
+
+(define-p2p-handler "filteradd" (peer payload ctx)
+  "BIP37: refused, because this node does not offer bloom services."
+  (declare (ignore payload ctx))
+  (%refuse-bloom-filter-message peer "filteradd"))
+
+(define-p2p-handler "filterclear" (peer payload ctx)
+  "BIP37: refused, because this node does not offer bloom services."
+  (declare (ignore payload ctx))
+  (%refuse-bloom-filter-message peer "filterclear"))
+
 (define-p2p-handler "verack" (peer payload ctx)
   "A second verack, after the handshake already completed. Core ignores it
 with this exact line rather than disconnecting (net_processing.cpp:3822)
