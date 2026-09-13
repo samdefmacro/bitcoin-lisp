@@ -496,7 +496,7 @@ the replaced tx's is rejected and the pool is untouched."
           (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state)
         (declare (ignore results))
-        (is (eq :insufficient-fee msg))
+        (is (eq :package-rbf-insufficient-fee msg))
         (is (null replaced)))
       (is (bl.mp:mempool-has mempool aid))
       (is (not (bl.mp:mempool-has mempool pid))))))
@@ -579,7 +579,7 @@ not input-conflict with the first."
   "A second TRUC child that pays enough EVICTS its sibling through the RBF
 economics instead of being rejected on the descendant limit (Core PreChecks
 sibling eviction, validation.cpp:950-970); one that does not pay is rejected
-on the economics (:insufficient-fee), and with sibling eviction disabled the
+on the economics (:rbf-insufficient-fee), and with sibling eviction disabled the
 TRUC error surfaces unchanged."
   (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (declare (ignore chain-state))
@@ -598,21 +598,21 @@ TRUC error surfaces unchanged."
           (bl.val:validate-transaction-for-mempool
            poor utxo-set mempool 200)
         (is-false valid)
-        (is (eq :insufficient-fee err)))
+        (is (eq :rbf-insufficient-fee (first err))))
       ;; With sibling eviction disabled (the multi-tx package context), the
       ;; TRUC descendant-limit error surfaces instead.
       (multiple-value-bind (valid err)
           (bl.val:validate-transaction-for-mempool
            rich utxo-set mempool 200 :allow-sibling-eviction nil)
         (is-false valid)
-        (is (eq :truc-descendant-limit err)))
+        (is (eq :truc-descendant-limit (first err))))
       ;; :skip-rbf-check alone also disables the fallthrough — with the
       ;; economics skipped there is nothing to evaluate the eviction.
       (multiple-value-bind (valid err)
           (bl.val:validate-transaction-for-mempool
            rich utxo-set mempool 200 :skip-rbf-check t)
         (is-false valid)
-        (is (eq :truc-descendant-limit err)))
+        (is (eq :truc-descendant-limit (first err))))
       ;; Paying enough: the sibling is the replaced set; accepting evicts it.
       (multiple-value-bind (valid err fee replaced)
           (bl.val:validate-transaction-for-mempool

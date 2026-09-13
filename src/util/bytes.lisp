@@ -450,3 +450,23 @@ to remove."
       (if (every #'safep string)
           string
           (remove-if-not #'safep string)))))
+
+;;;; Money, rendered (Core util/moneystr.cpp)
+;;;;
+;;;; Beside SANITIZE-STRING for the same reason: a Core util/ helper that two
+;;;; layers far apart both need. The RPC layer answers amounts with it, and
+;;;; the mempool writes it into PaysForRBF's rejection ("not enough additional
+;;;; fees to relay; <a> < <b>", policy/rbf.cpp:110-122) from well below the
+;;;; RPC layer, where it cannot see it.
+
+(defun format-money (satoshis)
+  "SATOSHIS as Core's FormatMoney (util/moneystr.cpp:19-43): a BTC decimal
+string with trailing zeros trimmed, never fewer than two decimals, and a
+leading minus for a negative amount."
+  (multiple-value-bind (quotient remainder) (truncate (abs satoshis) 100000000)
+    (let ((str (format nil "~D.~8,'0D" quotient remainder)))
+      (let ((end (length str)))
+        (loop while (and (char= (char str (1- end)) #\0)
+                         (digit-char-p (char str (- end 3))))
+              do (decf end))
+        (concatenate 'string (if (minusp satoshis) "-" "") (subseq str 0 end))))))

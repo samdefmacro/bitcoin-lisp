@@ -1917,21 +1917,27 @@ block-relay-only peer (Core SetupAddressRelay)."
 ;;; Transaction handling
 
 (alexandria:define-constant +reconsiderable-tx-failures+
-  '(:insufficient-fee :mempool-min-fee-not-met :replacement-failed :mempool-full)
+  '(:insufficient-fee :mempool-min-fee-not-met :rbf-insufficient-fee
+    :replacement-failed :mempool-full)
   :test #'equalp :documentation "The rejection reasons Bitcoin Core classifies TX_RECONSIDERABLE — \"fails
 some policy, but might be acceptable if submitted in a (different) package\"
 (consensus/validation.h:48). Core's four sites: both fee-floor failures in
-CheckFeeRate (validation.cpp:703-711), the RBF anti-DoS fee check (:1010)
-and the RBF diagram check (:1028) — our :replacement-failed — and \"mempool
-full\", i.e. a tx that self-evicted on the post-add trim (:1399-1402).
+CheckFeeRate (validation.cpp:703-711), the RBF anti-DoS fee check (:1010) —
+our :rbf-insufficient-fee — and the RBF diagram check (:1028) — our
+:replacement-failed — and \"mempool full\", i.e. a tx that self-evicted on the
+post-add trim (:1399-1402).
 
 NOT reconsiderable, and so still cached in the MAIN filter: :too-large-cluster
 (Core TX_MEMPOOL_POLICY, validation.cpp:1020-1022) — a cluster-limit failure
 is not a fee problem and a package cannot fix it.")
 
 (defun %reconsiderable-failure-p (reason)
-  "T if REASON is one Core would mark TX_RECONSIDERABLE."
-  (and (member reason +reconsiderable-tx-failures+) t))
+  "T if REASON is one Core would mark TX_RECONSIDERABLE. A verdict that
+carries Core's debug message is the list (KEYWORD DETAIL); the class is the
+KEYWORD's."
+  (and (member (if (consp reason) (first reason) reason)
+               +reconsiderable-tx-failures+)
+       t))
 
 (defun %cache-tx-rejection (tx reason recent-rejects)
   "Core MempoolRejectedTx's caching rules, for the first_time_failure=false
