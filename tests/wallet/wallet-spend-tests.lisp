@@ -163,8 +163,11 @@ text exactly and errors on >8 fraction digits); legit amounts still parse."
 (test ws-positional-bool-plumbing
   "Explicit false survives JSON parsing as the +json-false+ sentinel at
 top-level positional positions (distinguishable from null/omitted, Core's
-isNull semantics); nested objects/arrays keep the historical present-p
-folding; the %positional-bool helpers decode all three states."
+isNull semantics) and inside an ARRAY, where nothing reads by presence and a
+handler that reports the TYPE of an element it refuses needs the element to
+still have one; an object MEMBER keeps the present-p folding, because there a
+truthy sentinel would read as present-and-true. The %positional-bool helpers
+decode all three states."
   (multiple-value-bind (type method params)
       (bl.rpc::parse-json-rpc-request
        "{\"method\":\"x\",\"params\":[true,false,null,{\"a\":false,\"b\":true},[false]],\"id\":1}")
@@ -178,7 +181,7 @@ folding; the %positional-bool helpers decode all three states."
         (is (null a))
         (is (eq t present)))
       (is (eq t (gethash "b" obj))))
-    (is (equal '(nil) (fifth params))))
+    (is (equal (list bl.rpc:+json-false+) (fifth params))))
   (is (null (bl.rpc:positional-bool
              bl.rpc:+json-false+)))
   (is (null (bl.rpc:positional-bool nil)))
