@@ -46,7 +46,13 @@ getblockchaininfo (initialblockdownload/pruned), getnetworkinfo
 (networkactive is true here; localrelay honest), getmempoolinfo (loaded
 true), gettxout coinbase, testmempoolaccept allowed — spot-checked through
 the real yason pipeline."
-  (let* ((node (make-test-node))
+  (let* (;; initialblockdownload is now Core's latched IsInitialBlockDownload
+         ;; (rpc/blockchain.cpp:1422), which on a node with no tip at all is
+         ;; TRUE. Bind the latch so this test asks what it is about -- how a
+         ;; false boolean is ENCODED -- rather than inheriting whichever value
+         ;; an earlier suite in the same image left in the global.
+         (bl.net:*cached-is-ibd* nil)
+         (node (make-test-node))
          (chain (wave10-encode (bl.rpc::rpc-getblockchaininfo node nil))))
     (is (search "\"initialblockdownload\":false" chain))
     (is (search "\"pruned\":false" chain))
