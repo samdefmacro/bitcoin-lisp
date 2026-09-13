@@ -1541,14 +1541,28 @@ recent with enough chain work; never flips back until reset-ibd-stop."
     (is-true (bl.net:initial-block-download-p
               (%make-ibd-latch-state (- now (* 48 60 60)))))))
 
+(defun %header-only-hash (i)
+  "The hash of the Ith header-only entry %ADD-HEADER-ONLY-ENTRIES adds.
+
+The last byte is what makes it safe. %MAKE-IBD-LATCH-STATE derives its TIP
+hash as a UNIFORM 32-byte array of (mod timestamp 251), so a uniform 100/101/102
+here was the same hash as the tip whenever the clock landed on one of them --
+about eight runs in a thousand. ADD-BLOCK-INDEX-ENTRY then REPLACED the tip's
+own entry with a header-only one at tip+1, the chain came out one entry shorter
+than the test meant, and the fee-estimation assertions read the tip as only one
+block behind the best header. Seen once in a cold battery, 2026-09-13."
+  (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                             :initial-element (+ 100 i))))
+    (setf (aref hash 31) #xEE)
+    hash))
+
 (defun %add-header-only-entries (state n)
   "Extend STATE's index with N header-only entries above its tip, each with
 one more unit of work than the last, and return the highest."
   (let ((prev (bl.store:get-block-index-entry
                state (bl.store:best-block-hash state))))
     (dotimes (i n prev)
-      (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
-                                 :initial-element (+ 100 i))))
+      (let ((hash (%header-only-hash i)))
         (setf prev (bl.store:make-block-index-entry
                     :hash hash
                     :height (1+ (bl.store:block-index-entry-height prev))
@@ -1583,11 +1597,10 @@ ordinary state between a header's arrival and its body's."
             :invalid)
       (is-false (bl.net:current-for-fee-estimation-p invalid-ahead)
                 "two valid headers still run ahead of the tip")
-      (dolist (i '(100 101))
+      (dolist (i '(0 1))
         (setf (bl.store:block-index-entry-status
                (bl.store:get-block-index-entry
-                invalid-ahead (make-array 32 :element-type '(unsigned-byte 8)
-                                             :initial-element i)))
+                invalid-ahead (%header-only-hash i)))
               :invalid))
       (is-true (bl.net:current-for-fee-estimation-p invalid-ahead)
                "with every header above the tip invalid, the tip is the best header"))))
