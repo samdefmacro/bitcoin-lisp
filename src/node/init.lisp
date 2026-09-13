@@ -1968,6 +1968,27 @@ file location."
 ;;;; every stop asserts the exit code AND that stderr is EMPTY
 ;;;; (test_node.py:497-509). That shape is what NODE-MAIN provides.
 
+(defconstant +private-umask+ #o077
+  "Core's private_umask (common/system.cpp:92): the file-creation mask a node
+process runs under, so everything it writes is owner-only.")
+
+(defun setup-environment ()
+  "Core SetupEnvironment (common/system.cpp:91-94), the umask half: every file
+and directory this process creates is owner-only.
+
+Core calls it as the first statement of main(), before the datadir exists, so
+the data directory, the wallets directory, debug.log, the RPC cookie and every
+block file inherit 0700/0600 from the mask rather than from a chmod at each
+site. Ours ran under the invoking shell's mask, which on a default Linux or
+macOS login is 022: the datadir came out world-readable (drwxr-xr-x) and so did
+debug.log, which on a wallet-bearing node publishes the operator's transaction
+history to every account on the machine. feature_posix_fs_permissions.py:25
+asserts the three modes.
+
+Returns the previous mask, which is what umask(2) returns."
+  #+unix (sb-posix:umask +private-umask+)
+  #-unix 0)
+
 (defun %argv-option-name (arg)
   "The option name in ARG (\"-foo=1\" -> \"foo\"), or NIL when ARG is not an
 option. Leading dashes and the value are stripped, as Core's ArgsManager does."
@@ -1996,6 +2017,10 @@ stderr back at EVERY node stop and fails the test unless it is exactly empty
 every test that stops a node. Startup FAILURES do go to stderr, which is also
 Core's behaviour and what assert_start_raises_init_error reads."
   (sb-ext:disable-debugger)
+  ;; Core's main() runs SetupEnvironment first, before it has looked at a
+  ;; single argument (bitcoind.cpp:269): the mask has to be in place before
+  ;; ANYTHING is created, datadir included.
+  (setup-environment)
   (let ((args (rest sb-ext:*posix-argv*)))
     (handler-case
         (cond
