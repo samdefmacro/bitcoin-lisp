@@ -912,8 +912,9 @@ to the txgraph's worst chunk (P5)."
 (defconstant +truc-descendant-limit+ 2
   "A TRUC tx's descendant set (incl. self) must be <= this (Core TRUC_DESCENDANT_LIMIT).")
 
-(defun %truc-hash-name (hash)
-  "HASH in Core's display order -- uint256::ToString()."
+(defun %hash-display-name (hash)
+  "HASH in Core's display order -- uint256::ToString(), which is how every
+rejection message names a transaction."
   (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))
 
 (defun %truc-names (tx)
@@ -921,8 +922,8 @@ to the txgraph's worst chunk (P5)."
 then its wtxid in parentheses -- strprintf(\"%s (wtxid=%s)\", ...) at every one
 of truc_policy.cpp's six sites."
   (format nil "~A (wtxid=~A)"
-          (%truc-hash-name (bl.ser:transaction-hash tx))
-          (%truc-hash-name (bl.ser:transaction-wtxid tx))))
+          (%hash-display-name (bl.ser:transaction-hash tx))
+          (%hash-display-name (bl.ser:transaction-wtxid tx))))
 
 (defun single-truc-checks (mempool tx vsize direct-conflicts)
   "BIP431 TRUC (v3) topology checks for a single new TX at mempool acceptance,
@@ -1023,7 +1024,7 @@ to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
                               (format nil "tx ~A would exceed descendant count limit"
                                       (if pe
                                           (%truc-names (mempool-entry-transaction pe))
-                                          (%truc-hash-name parent))))
+                                          (%hash-display-name parent))))
                         (when (and sibling
                                    (= 2 (mempool-ancestor-stats mempool sibling)))
                           sibling))))))))
@@ -1416,14 +1417,36 @@ fee estimator, not replacement."
              replaced)
     orig-fees))
 
-(defun %rbf-pays-for-rbf-p (orig-fees new-fee new-vsize)
-  "Rules 3 and 4 (Core PaysForRBF, rbf.cpp:106-123): the replacement must pay
+(defun %rbf-pays-for-rbf (orig-fees new-fee new-vsize txid)
+  "Rules 3 and 4 (Core PaysForRBF, rbf.cpp:100-124): the replacement must pay
 at least the total fee of what it replaces (rule 3) PLUS its own bandwidth at
 the incremental relay fee rate — 0.1 sat/vB, not the 1 sat/vB relay floor
-(rule 4)."
-  (and (>= new-fee orig-fees)
-       (>= (- new-fee orig-fees)
-           (ceiling (* new-vsize *incremental-relay-fee-rate*) 1000))))
+(rule 4).
+
+Returns NIL when both hold, else Core's own sentence for the rule that failed
+-- the debug message the caller hands to the rejection. The two are different
+failures and Core says which, naming the replacement and both amounts in BTC.
+TXID is what the failure is attributed to: the candidate for a single
+replacement, the CHILD for a package one (validation.cpp:1091-1096)."
+  (let ((required (ceiling (* new-vsize *incremental-relay-fee-rate*) 1000))
+        (name (if txid (%hash-display-name txid) "")))
+    (cond ((< new-fee orig-fees)
+           (format nil "rejecting replacement ~A, less fees than conflicting txs; ~A < ~A"
+                   name
+                   (bl.bytes:format-money new-fee)
+                   (bl.bytes:format-money orig-fees)))
+          ((< (- new-fee orig-fees) required)
+           (format nil "rejecting replacement ~A, not enough additional fees to relay; ~A < ~A"
+                   name
+                   (bl.bytes:format-money (- new-fee orig-fees))
+                   (bl.bytes:format-money required))))))
+
+(defun %rbf-pays-for-rbf-p (orig-fees new-fee new-vsize)
+  "The verdict of %RBF-PAYS-FOR-RBF without its sentence, for the package path:
+Core attributes that failure to the package's CHILD (validation.cpp:1091-1096)
+and CHECK-PACKAGE-RBF-RULES is given fees and sizes, not transactions, so it
+has nothing to name."
+  (null (%rbf-pays-for-rbf orig-fees new-fee new-vsize nil)))
 
 (defun %rbf-diagram-verdict (old-diagram new-diagram)
   "The economic verdict on a staged replacement's before/after diagrams:
@@ -1479,9 +1502,17 @@ in terms of clusters; and the old feerate-superiority test
                      replaced)
         (return-from check-rbf-rules (values nil :spends-conflicting-tx nil))))
     ;; Rules 3 and 4 against the total fees of everything being replaced.
-    (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
-                                 new-fee new-vsize)
-      (return-from check-rbf-rules (values nil :insufficient-fee nil)))
+    ;; Core's reject reason here is "insufficient fee" (validation.cpp:
+    ;; 1009-1011), NOT CheckFeeRate's "min relay fee not met": two different
+    ;; rejections that shared one keyword here, so an RBF failure announced
+    ;; itself as a relay-floor one. wallet_resendwallettransactions.py:110
+    ;; matches "insufficient fee, rejecting replacement".
+    (let ((detail (%rbf-pays-for-rbf (%rbf-replaced-fees mempool replaced)
+                                     new-fee new-vsize
+                                     (bl.ser:transaction-hash tx))))
+      (when detail
+        (return-from check-rbf-rules
+          (values nil (list :rbf-insufficient-fee detail) nil))))
     ;; Economic test (Core ImprovesFeerateDiagram, rbf.cpp:127-140): the
     ;; replacement must STRICTLY improve the mempool's feerate diagram. Stage
     ;; the removal of the replaced set and the addition of the candidate in a
@@ -1533,10 +1564,15 @@ transactions (validation.cpp:1113-1121)."
         (replaced (%rbf-replaced-set mempool direct-conflicts))
         (total-fee (+ parent-fee child-fee))
         (total-vsize (+ parent-vsize child-vsize)))
-    ;; Rules 3 and 4 on the package totals (validation.cpp:1092-1099).
+    ;; Rules 3 and 4 on the package totals (validation.cpp:1092-1099). Core's
+    ;; reject reason for the PACKAGE failure is its own sentence, "package RBF
+    ;; failed: insufficient anti-DoS fees" (:1097-1098), and neither it nor
+    ;; the single-transaction "insufficient fee" is CheckFeeRate's "min relay
+    ;; fee not met" -- all three shared one keyword here.
     (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
                                  total-fee total-vsize)
-      (return-from check-package-rbf-rules (values nil :insufficient-fee nil)))
+      (return-from check-package-rbf-rules
+        (values nil :package-rbf-insufficient-fee nil)))
     ;; Package feerate must strictly exceed the parent feerate, compared
     ;; EXACTLY. Core's PackageRBFChecks compares CFeeRate objects, and at this
     ;; revision CFeeRate holds a FeeFrac whose operator<=> delegates to

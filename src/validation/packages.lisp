@@ -704,8 +704,12 @@ mempool, exactly as in Core's early return.
                  ;; (Core individual_results_nonfinal): it stands unless the
                  ;; package-feerate phase overwrites it.
                  ((and (> (length package) 1)
-                       (member err '(:insufficient-fee :mempool-min-fee-not-met
-                                     :replacement-failed :missing-input)))
+                       ;; A verdict carrying Core's debug message is the list
+                       ;; (KEYWORD DETAIL); the class is the keyword's.
+                       (member (if (consp err) (first err) err)
+                               '(:insufficient-fee :mempool-min-fee-not-met
+                                 :rbf-insufficient-fee
+                                 :replacement-failed :missing-input)))
                   (%mark-result-invalid res err)
                   (push tx deferred))
                  (t

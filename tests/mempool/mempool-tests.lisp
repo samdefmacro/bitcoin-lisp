@@ -1895,7 +1895,54 @@ minimum fee past its feerate, so an equal-feerate retry cannot loop."
         (bl.mp:check-rbf-rules mempool repl 500 rvsize rweight
                                (list orig-txid))
       (is-false ok)
-      (is (eq reason :insufficient-fee)))))
+      (is (eq (first reason) :rbf-insufficient-fee)))))
+
+(test rbf-fee-rejection-is-cores-insufficient-fee-sentence
+  "The replacement rules' anti-DoS arithmetic is Core's THIRD fee rejection,
+and none of the three shares a reject reason with the others: CheckFeeRate has
+`mempool min fee not met' and `min relay fee not met' (validation.cpp:703-711)
+while ReplacementChecks has `insufficient fee' (:1009-1011), carrying
+PaysForRBF's own sentence as the debug message -- which of rules 3 and 4
+failed, the transaction named, both amounts in BTC (policy/rbf.cpp:100-124).
+So sendrawtransaction throws
+
+  insufficient fee, rejecting replacement <txid>, not enough additional fees to relay; 0.00000001 < 0.0000002
+
+and wallet_resendwallettransactions.py:110 matches its first half.
+
+All three rejections shared :INSUFFICIENT-FEE here, so an RBF failure
+announced itself as the static relay floor -- a different rule with a
+different remedy."
+  (let* ((mempool (bl.mp:make-mempool))
+         (orig (%rbf-tx 180))
+         (orig-txid (bl.ser:transaction-hash orig))
+         (repl (%rbf-tx 180 :value 40000000))
+         (repl-name (bl.rpc:hash-to-hex (bl.ser:transaction-hash repl)))
+         (rweight (bl.ser:transaction-weight repl)))
+    (%add-tx mempool orig :fee 10000)
+    ;; Rule 3: the replacement pays less than what it replaces.
+    (multiple-value-bind (ok reason)
+        (bl.mp:check-rbf-rules mempool repl 9000 200 rweight (list orig-txid))
+      (is-false ok)
+      (is (string= (format nil "insufficient fee, rejecting replacement ~A, less fees than conflicting txs; 0.00009 < 0.0001"
+                           repl-name)
+                   (bl.val:tx-reject-reason-string reason))))
+    ;; Rule 4: more than what it replaces, but not by its own bandwidth --
+    ;; 200 vB at the 100 sat/kvB incremental rate is 20 satoshis.
+    (multiple-value-bind (ok reason)
+        (bl.mp:check-rbf-rules mempool repl 10001 200 rweight (list orig-txid))
+      (is-false ok)
+      (is (string= (format nil "insufficient fee, rejecting replacement ~A, not enough additional fees to relay; 0.00000001 < 0.0000002"
+                           repl-name)
+                   (bl.val:tx-reject-reason-string reason))))
+    ;; The package form is its own reason (validation.cpp:1097-1098).
+    (is (string= "package RBF failed: insufficient anti-DoS fees"
+                 (bl.val:tx-reject-reason-string :package-rbf-insufficient-fee)))
+    ;; Controls: the two fee FLOORS keep their own words.
+    (is (string= "min relay fee not met"
+                 (bl.val:tx-reject-reason-string :insufficient-fee)))
+    (is (string= "mempool min fee not met"
+                 (bl.val:tx-reject-reason-string :mempool-min-fee-not-met)))))
 
 (test rbf-full-rbf-unconditional
   "Cluster mempool drops BIP125 rule 1: a NON-signaling mempool tx is
@@ -1989,14 +2036,14 @@ incremental relay fee) still reject before the diagram is consulted."
         (bl.mp:check-rbf-rules mempool repl 9000 rvsize rweight
                                (list orig-txid))
       (is-false ok)
-      (is (eq reason :insufficient-fee)))
+      (is (eq (first reason) :rbf-insufficient-fee)))
     ;; Rule 4: fee above the replaced fee but not by enough to cover the
     ;; replacement's own bandwidth (needs at least ceil(rvsize*100/1000) extra).
     (multiple-value-bind (ok reason)
         (bl.mp:check-rbf-rules mempool repl (1+ 10000) rvsize rweight
                                (list orig-txid))
       (is-false ok)
-      (is (eq reason :insufficient-fee)))))
+      (is (eq (first reason) :rbf-insufficient-fee)))))
 
 (test rbf-rule5-cluster-cap
   "Rule 5: conflicting directly with more than 100 distinct clusters is
@@ -2840,14 +2887,14 @@ cover the replaced fees (plus its own bandwidth) is rejected."
         (bl.mp:check-package-rbf-rules
          mempool 10 100 400 5000 100 400 (list orig-txid))
       (is-false ok)
-      (is (eq reason :insufficient-fee)))
+      (is (eq reason :package-rbf-insufficient-fee)))
     ;; Rule 4: totals exceed the replaced fee but not by the pair's own
     ;; bandwidth at 100 sat/kvB (needs ceil(200*100/1000) = 20 extra).
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
          mempool 10 100 400 10009 100 400 (list orig-txid))
       (is-false ok)
-      (is (eq reason :insufficient-fee)))))
+      (is (eq reason :package-rbf-insufficient-fee)))))
 
 (test package-rbf-rules-feerate-must-exceed-parent
   "The package feerate must STRICTLY exceed the parent's own feerate — the

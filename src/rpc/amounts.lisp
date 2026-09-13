@@ -272,16 +272,12 @@ rates never occur in the wallet."
   (declare (type integer rate-sat-kvb size))
   (ceiling (* rate-sat-kvb size) 1000))
 
-(defun format-money (satoshis)
-  "Core FormatMoney: BTC decimal string, trailing zeros trimmed but at
-least two decimals kept."
-  (multiple-value-bind (quotient remainder) (truncate (abs satoshis) 100000000)
-    (let ((str (format nil "~D.~8,'0D" quotient remainder)))
-      (let ((end (length str)))
-        (loop while (and (char= (char str (1- end)) #\0)
-                         (digit-char-p (char str (- end 3))))
-              do (decf end))
-        (concatenate 'string (if (minusp satoshis) "-" "") (subseq str 0 end))))))
+;;; Core's FormatMoney is BL:FORMAT-MONEY, defined in the util layer and
+;;; imported into this package (rpc/package.lisp). It lives down there because
+;;; policy code far below the RPC layer writes money into its diagnostics too
+;;; -- PaysForRBF's "not enough additional fees to relay; <a> < <b>"
+;;; (policy/rbf.cpp:110-122) is a mempool string. BL.RPC:FORMAT-MONEY still
+;;; names it, and every caller here and in the wallet is unchanged.
 
 (defstruct recipient
   address        ; destination string, or NIL for data outputs

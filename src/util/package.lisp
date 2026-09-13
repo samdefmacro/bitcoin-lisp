@@ -170,7 +170,13 @@ inline these compile against them. src/util/bytes.lisp.")
    #:make-octets-hash-table
    #:with-byte-reader
    ;; Core SanitizeString (util/strencodings.cpp)
-   #:sanitize-string))
+   #:sanitize-string
+   ;; Core FormatMoney (util/moneystr.cpp) -- here for the same reason
+   ;; SANITIZE-STRING is: a Core util/ helper two layers far apart both need.
+   ;; The RPC layer answers amounts with it; the mempool writes it into
+   ;; PaysForRBF's rejection (policy/rbf.cpp:110-122) from well below the RPC
+   ;; layer, and cannot see it there.
+   #:format-money))
 
 (defpackage #:bitcoin-lisp.chainparams
   (:documentation "Per-chain parameters (Core CChainParams): one

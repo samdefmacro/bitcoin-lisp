@@ -816,7 +816,15 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; Core's two fee-floor reasons (CheckFeeRate, validation.cpp:703-711):
     ;; the pool's dynamic floor first, then the static relay floor.
     (:mempool-min-fee-not-met  . "mempool min fee not met")
-    (:insufficient-fee         . "min relay fee not met"))
+    (:insufficient-fee         . "min relay fee not met")
+    ;; And the THIRD fee rejection, which is not a floor at all: the
+    ;; replacement rules' anti-DoS arithmetic (PaysForRBF). Core's reject
+    ;; reason is "insufficient fee" for a single replacement
+    ;; (validation.cpp:1009-1011) and a sentence of its own for a package one
+    ;; (:1097-1098). All three shared :INSUFFICIENT-FEE here, so an RBF
+    ;; rejection announced itself as a relay-floor one.
+    (:rbf-insufficient-fee     . "insufficient fee")
+    (:package-rbf-insufficient-fee . "package RBF failed: insufficient anti-DoS fees"))
   "Our validation keywords in Core's reject-reason vocabulary.")
 
 (defparameter *tx-reject-debug-messages*

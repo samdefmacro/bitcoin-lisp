@@ -378,7 +378,7 @@ the caller."
     (multiple-value-bind (msg results)
         (bl.val:validate-package-for-mempool
          (list parent child) utxo mempool state)
-      (is (eq :insufficient-fee msg))
+      (is (eq :package-rbf-insufficient-fee msg))
       (let ((pres (%result-for results parent))
             (cres (%result-for results child)))
         (is (not (null pres)))

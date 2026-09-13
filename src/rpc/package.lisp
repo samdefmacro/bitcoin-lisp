@@ -18,6 +18,10 @@ the methods one file per Core rpc/*.cpp, the REST interface and the web
 UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:local-nicknames (#:bt #:bordeaux-threads))
+  ;; Core's FormatMoney lives in the util layer, because policy code below
+  ;; this one writes money into its diagnostics (PaysForRBF, policy/rbf.cpp).
+  ;; BL.RPC:FORMAT-MONEY keeps naming it for the handlers and the wallet.
+  (:import-from #:bitcoin-lisp.bytes #:format-money)
   (:export
    ;; Server control
    #:start-rpc-server
