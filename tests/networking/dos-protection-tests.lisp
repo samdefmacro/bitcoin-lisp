@@ -1069,6 +1069,80 @@ bounds file descriptors rather than expressing an opinion about the peer."
       (bl.net:clear-ban-list)
       (bl.net:clear-discouraged))))
 
+(test a-bare-whitelist-range-grants-cores-implicit-permissions
+  "A -whitelist entry written with no `perm@' prefix carries only Core's
+Implicit marker, and AddWhitelistPermissionFlags CLEARS that marker and
+replaces it with the default set every time the flags are used
+(net.cpp:578-584):
+
+    if (NetPermissions::HasFlag(flags, NetPermissionFlags::Implicit)) {
+        NetPermissions::ClearFlag(flags, NetPermissionFlags::Implicit);
+        if (whitelist_forcerelay) AddFlag(flags, ForceRelay);
+        if (whitelist_relay)      AddFlag(flags, Relay);
+        AddFlag(flags, Mempool);
+        AddFlag(flags, NoBan);
+    }
+
+So `-whitelist=127.0.0.1' means noban, mempool and relay. We recorded the
+marker and never expanded it, which made a bare range grant NOTHING: it
+passed no predicate and getpeerinfo listed no permissions.
+
+rpc_setban.py is the visible cost. It bans 127.0.0.1 on node 1, restarts it
+with `-whitelist=127.0.0.1' and reconnects (:44-47); with the marker inert
+the accept-time ban gate still dropped the peer -- `connection from
+127.0.0.1 dropped (banned)' in node 1's log -- and connect_nodes timed out."
+  (bl.net:clear-ban-list)
+  (bl.net:clear-discouraged)
+  (let ((node (bl:make-node))
+        (host "198.51.100.21")
+        (outside "198.51.100.22"))
+    (unwind-protect
+         (let ((bl.net:*whitelist-entries*
+                 (list (bl.net:parse-whitelist-entry "198.51.100.21/32"))))
+           (let ((flags (bl.net:peer-permission-flags host t)))
+             ;; Core's four defaults, with -whitelistrelay on and
+             ;; -whitelistforcerelay off (its own defaults).
+             (is-true (bl.net:permission-flag-set-p flags bl.net:+perm-noban+)
+                      "a bare range must grant noban")
+             (is-true (bl.net:permission-flag-set-p flags bl.net:+perm-mempool+))
+             (is-true (bl.net:permission-flag-set-p flags bl.net:+perm-relay+))
+             (is-false (bl.net:permission-flag-set-p
+                        flags bl.net:+perm-force-relay+)
+                       "-whitelistforcerelay defaults to false")
+             ;; The marker is gone, so getpeerinfo never renders it.
+             (is-false (member "implicit" (bl.net:permission-flag-names flags)
+                               :test #'string=)))
+           ;; An address outside the range is still granted nothing.
+           (is (= 0 (bl.net:peer-permission-flags outside t)))
+           ;; The two -whitelist*relay knobs steer the expansion, as in Core.
+           (let ((bl.net:*whitelist-relay* nil))
+             (is-false (bl.net:permission-flag-set-p
+                        (bl.net:peer-permission-flags host t)
+                        bl.net:+perm-relay+)))
+           (let ((bl.net:*whitelist-force-relay* t))
+             (is-true (bl.net:permission-flag-set-p
+                       (bl.net:peer-permission-flags host t)
+                       bl.net:+perm-force-relay+)))
+           ;; And the point of it all: the accept-time ban gate lets the
+           ;; operator's own range back in. Controls first -- the ban is real
+           ;; and an unlisted address is still refused.
+           (bl.net:ban-address host 3600)
+           (bl.net:ban-address outside 3600)
+           (is-true (bl.net:peer-banned-p host))
+           (is-true (%admit-inbound node host)
+                    "a bare -whitelist range must survive our own ban list")
+           (multiple-value-bind (allowed reason) (%admit-inbound node outside)
+             (is-false allowed)
+             (is (eq :banned reason))))
+      (bl.net:clear-ban-list)
+      (bl.net:clear-discouraged)))
+  ;; An EXPLICIT grant carries no marker and is not widened.
+  (let ((bl.net:*whitelist-entries*
+          (list (bl.net:parse-whitelist-entry "bloom@198.51.100.21/32"))))
+    (is (= bl.net:+perm-bloom-filter+
+           (bl.net:peer-permission-flags "198.51.100.21" t))
+        "an explicit permission list must not pick up the implicit defaults")))
+
 (test inbound-admission-ignores-a-range-grant-for-an-onion-listener
   "Core computes inbound_onion from the accepting socket's bind and hands the
 whitelist lookup NO address for it (net.cpp:1767-1772), BEFORE the two ban

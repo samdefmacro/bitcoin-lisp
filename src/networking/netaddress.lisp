@@ -795,15 +795,46 @@ and from inbound eviction. Only ranges are skipped; -whitebind's flags belong
 to the LISTENING SOCKET, not to an address, so they still apply — Core fills
 them in before this call and never revisits them (net.cpp:1755-1758)."
   (let ((flags (if inbound *whitebind-flags* 0)))
-    (when inbound-onion
-      (return-from peer-permission-flags flags))
-    (dolist (entry *whitelist-entries* flags)
-      (when (and (or (eq (whitelist-entry-direction entry) :both)
-                     (eq (whitelist-entry-direction entry)
-                         (if inbound :in :out)))
-                 (address-in-subnets-p address
-                                       (list (whitelist-entry-subnet entry))))
-        (setf flags (logior flags (whitelist-entry-flags entry)))))))
+    (unless inbound-onion
+      (dolist (entry *whitelist-entries*)
+        (when (and (or (eq (whitelist-entry-direction entry) :both)
+                       (eq (whitelist-entry-direction entry)
+                           (if inbound :in :out)))
+                   (address-in-subnets-p address
+                                         (list (whitelist-entry-subnet entry))))
+          (setf flags (logior flags (whitelist-entry-flags entry))))))
+    (expand-implicit-permissions flags)))
+
+(defun expand-implicit-permissions (flags)
+  "Core AddWhitelistPermissionFlags' tail (net.cpp:578-584): a grant written
+with NO `perm@' prefix carries only the Implicit marker, and that marker is
+CLEARED and replaced by the default set the moment the flags are used --
+
+    if (NetPermissions::HasFlag(flags, NetPermissionFlags::Implicit)) {
+        NetPermissions::ClearFlag(flags, NetPermissionFlags::Implicit);
+        if (whitelist_forcerelay) AddFlag(flags, ForceRelay);
+        if (whitelist_relay)      AddFlag(flags, Relay);
+        AddFlag(flags, Mempool);
+        AddFlag(flags, NoBan);
+    }
+
+-- so `-whitelist=127.0.0.1' means noban, mempool and (by
+-whitelistrelay's default) relay. PARSE-PERMISSION-FLAGS recorded the marker
+and nothing expanded it, so a bare range granted NOTHING: it survived every
+predicate that asks PERMISSION-FLAG-SET-P, and getpeerinfo listed no
+permissions for such a peer.
+
+The visible cost was the ban exemption. rpc_setban.py bans 127.0.0.1 on node
+1, restarts it with `-whitelist=127.0.0.1' and reconnects (:44-47); with the
+marker inert the accept-time ban gate still dropped the peer -- `connection
+from 127.0.0.1 dropped (banned)' -- and the reconnect never happened."
+  (if (logtest flags +perm-implicit+)
+      (logior (logandc2 flags +perm-implicit+)
+              (if *whitelist-force-relay* +perm-force-relay+ 0)
+              (if *whitelist-relay* +perm-relay+ 0)
+              +perm-mempool+
+              +perm-noban+)
+      flags))
 
 (defun permission-flag-set-p (flags flag)
   "T when FLAGS grants FLAG — Core NetPermissions::HasFlag,
