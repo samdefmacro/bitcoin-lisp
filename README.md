@@ -259,7 +259,7 @@ sbcl --load quicklisp.lisp \
 ### Running the Node
 
 ```lisp
-;; Start the node on testnet (default)
+;; Start the node on mainnet (the default chain, as in Core)
 (bitcoin-lisp:start-node)
 
 ;; Or with custom options
@@ -282,11 +282,11 @@ sbcl --load quicklisp.lisp \
 ### Network Selection
 
 ```lisp
-;; Testnet (default, recommended for development)
-(bitcoin-lisp:start-node :network :testnet)
-
-;; Mainnet (real Bitcoin network)
+;; Mainnet (real Bitcoin network) is the default, as in Core
 (bitcoin-lisp:start-node :network :mainnet)
+
+;; Testnet4 (recommended for development)
+(bitcoin-lisp:start-node :network :testnet4)
 ```
 
 **Important notes about mainnet:**
@@ -319,7 +319,7 @@ Directory structure:
     └── utxo.dat
 ```
 
-Note: Testnet data stays at the root directory for backward compatibility. Mainnet data is stored in a `mainnet/` subdirectory.
+Note: the data directory follows Core's layout: mainnet at the root, the other chains in `testnet3/`, `testnet4/`, `signet/` and `regtest/`.
 
 ### Log Levels
 

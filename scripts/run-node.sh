@@ -42,7 +42,9 @@
 #
 set -euo pipefail
 
-NETWORK="${1:-testnet4}"
+# The network is REQUIRED: the CLI defaults to mainnet, as Core does, and a
+# supervisor that forgot its argument must not silently pick a chain either way.
+NETWORK="${1:?usage: scripts/run-node.sh <testnet4|mainnet|regtest>}"
 
 # --- Toolchain / paths (override via env) ------------------------------------
 BL_ROOT="${BL_ROOT:-/data/bitcoin-lisp}"

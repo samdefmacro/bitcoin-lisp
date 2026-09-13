@@ -158,9 +158,14 @@ file against it, so `testnet4=1` in the file left us scoping to the DEFAULT
 network's section and silently dropping the whole [testnet4] block."
   (nth-value 1 (parse-bitcoin-conf-sections text nil)))
 
-(defun resolve-network-from-config (alist &optional (default :testnet3))
+(defun resolve-network-from-config (alist &optional (default :mainnet))
   "Determine the network from a merged config ALIST. Honors -regtest/-signet/
--testnet4/-testnet flags and -chain=main|test|testnet4|signet|regtest.
+-testnet4/-testnet flags and -chain=main|test|testnet4|signet|regtest. With
+no selector at all the chain is MAINNET, as it is in Core (ArgsManager::
+GetChainType, args.cpp:851 returns ChainType::MAIN); this node defaulted to
+testnet3 until 2026-09-13, so every test in Core's functional suite that
+writes a config with no selector (mining_mainnet.py, rpc_validateaddress.py)
+started on the wrong chain and refused its own [main] options.
 
 More than one selector is an ERROR, as it is in Core (args.cpp:839-841,
 \"Invalid combination of -regtest, -signet, -testnet, -testnet4 and -chain. Can
