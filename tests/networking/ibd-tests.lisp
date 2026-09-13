@@ -3111,7 +3111,7 @@ confirmed (Core BlockConnected) and rebuilds the most-recent-block tx map
           (bl.val:reset-recent-confirmed)
           (is-false (bl.val:recently-confirmed-p txid)))
       (bl.val:reset-recent-confirmed)
-      (setf bl.val::*most-recent-block-txs* nil))))
+      (setf bl.val:*most-recent-block-txs* nil))))
 
 (test block-connect-forgets-every-announcement-of-a-confirmed-tx
   "Core BlockConnected calls m_txrequest.ForgetTxHash on the txid and the
@@ -3152,7 +3152,7 @@ validation reaches the tracker without naming networking."
            ;; transactions, not the tracker.
            (is (equal (list a) (bl.net:tx-request-candidate-peers other))))
       (bl.val:reset-recent-confirmed)
-      (setf bl.val::*most-recent-block-txs* nil)
+      (setf bl.val:*most-recent-block-txs* nil)
       (bl.net:reset-tx-requests))))
 
 (test a-targeted-chainstates-connect-does-not-touch-the-tracker
@@ -3176,7 +3176,7 @@ of transactions that are still unconfirmed for us."
                                          101 nil)
            (is (equal (list a) (bl.net:tx-request-candidate-peers txid))))
       (bl.val:reset-recent-confirmed)
-      (setf bl.val::*most-recent-block-txs* nil)
+      (setf bl.val:*most-recent-block-txs* nil)
       (bl.net:reset-tx-requests))))
 
 (test handle-inv-skips-recently-confirmed
@@ -3206,7 +3206,7 @@ AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
           (is-true (bl.net:tx-request-wanted-p wtxid probe t)))
       (bl.net:reset-tx-requests)
       (bl.val:reset-recent-confirmed)
-      (setf bl.val::*most-recent-block-txs* nil))))
+      (setf bl.val:*most-recent-block-txs* nil))))
 
 ;;;; getdata anti-probing gate + flush sequence snapshots
 
@@ -3274,7 +3274,7 @@ observed via the unbroadcast-set removal that fires on every serve."
           (deliver-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
           (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))
       (bl.val:reset-recent-confirmed)
-      (setf bl.val::*most-recent-block-txs* nil))))
+      (setf bl.val:*most-recent-block-txs* nil))))
 
 (test getdata-from-frelay0-peer-ignored
   "Tx getdata from an fRelay=0 peer is ignored outright — no serve (Core
@@ -3651,13 +3651,13 @@ and a second getheaders would desynchronise it."
              ;; No pindexLast (nothing of the batch is in our index) — there is
              ;; no advancing locator to ask from, so stay quiet rather than
              ;; re-ask from our own tip and loop.
-             (setf (bl.net::peer-last-getheaders-time peer) 0)
+             (setf (bl.net:peer-last-getheaders-time peer) 0)
              (bl.net::%maybe-request-more-headers peer state nil t)
              (is (= 1 sent) "no pindexLast means no advancing locator")
              ;; Full batch while a low-work sync owns this peer: that driver
              ;; sends its own follow-up, so this one must stay quiet.
              (setf (bl.net:peer-headers-sync peer) :in-progress
-                   (bl.net::peer-last-getheaders-time peer) 0)
+                   (bl.net:peer-last-getheaders-time peer) 0)
              (bl.net::%maybe-request-more-headers peer state entry t)
              (is (= 1 sent) "a low-work sync owns its own follow-up"))
         (setf (symbol-function 'bl.net::%maybe-send-getheaders) real)))))
