@@ -886,18 +886,6 @@ whose best-known block is that entry."
       (setf (bl.net:peer-best-known-block-hash p) best-hash))
     p))
 
-(defmacro %with-whitelist ((&key entries (whitebind 0)) &body body)
-  "Run BODY with exactly ENTRIES (a list of -whitelist spec strings) parsed and
-installed, and WHITEBIND as the -whitebind flags. Bound, not set: the whitelist
-is global start-up configuration, and a test that leaked it would grant
-permissions to every peer in every later test."
-  `(let ((bl.net:*whitelist-entries*
-           (mapcar (lambda (spec)
-                     (or (bl.net:parse-whitelist-entry spec)
-                         (error "test fixture: unparseable -whitelist ~S" spec)))
-                   ,entries))
-         (bl.net:*whitebind-flags* ,whitebind))
-     ,@body))
 
 (test net-permission-flags-parse-as-cores-do
   "Core TryParsePermissionFlags (net_permissions.cpp:26-90). The two implication
@@ -959,7 +947,7 @@ less than the operator asked for, silently."
 direction the operator named — \"noban@...,out\" grants nothing to an inbound
 peer from that range. -whitebind's flags reach inbound peers only, since they
 describe a listening socket."
-  (%with-whitelist (:entries '("noban@10.0.0.0/8"))
+  (with-whitelist (:entries '("noban@10.0.0.0/8"))
     (is (= bl.net:+perm-noban+
            (logand (bl.net:peer-permission-flags "10.1.2.3" t)
                    bl.net:+perm-noban+)))
@@ -967,12 +955,12 @@ describe a listening socket."
     (is (= 0 (bl.net:peer-permission-flags "11.1.2.3" t)))
     ;; An address that does not parse is refused, never defaulted in.
     (is (= 0 (bl.net:peer-permission-flags "not-an-address" t))))
-  (%with-whitelist (:entries '("noban,out@10.0.0.0/8"))
+  (with-whitelist (:entries '("noban,out@10.0.0.0/8"))
     (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" t))
         "an out-only grant reached an inbound peer")
     (is (plusp (bl.net:peer-permission-flags "10.1.2.3" nil))))
   ;; -whitebind: inbound only.
-  (%with-whitelist (:entries '() :whitebind bl.net:+perm-mempool+)
+  (with-whitelist (:entries '() :whitebind bl.net:+perm-mempool+)
     (is (plusp (bl.net:peer-permission-flags "10.1.2.3" t)))
     (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" nil)))))
 
@@ -989,7 +977,7 @@ and asserts at :45 that node0 reconnects and at :47 that getpeerinfo lists
 `noban'. Ours logged \"connection from 127.0.0.1 dropped (banned)\" for the
 whole 60-second wait, because the matching entry contributed only a bit nobody
 reads."
-  (%with-whitelist (:entries '("127.0.0.1"))
+  (with-whitelist (:entries '("127.0.0.1"))
     (let ((flags (bl.net:peer-permission-flags "127.0.0.1" t)))
       (is (= bl.net:+perm-noban+ (logand flags bl.net:+perm-noban+))
           "a bare range must grant noban, which is what survives a setban")
@@ -1003,12 +991,12 @@ reads."
           "and the marker itself is never a permission")))
   ;; -whitelistforcerelay flips exactly one of those.
   (let ((bl.net:*whitelist-force-relay* t))
-    (%with-whitelist (:entries '("127.0.0.1"))
+    (with-whitelist (:entries '("127.0.0.1"))
       (is-true (bl.net:permission-flag-set-p
                 (bl.net:peer-permission-flags "127.0.0.1" t)
                 bl.net:+perm-force-relay+))))
   (let ((bl.net:*whitelist-relay* nil))
-    (%with-whitelist (:entries '("127.0.0.1"))
+    (with-whitelist (:entries '("127.0.0.1"))
       (is (= 0 (logand (bl.net:peer-permission-flags "127.0.0.1" t)
                        bl.net:+perm-relay+))
           "-whitelistrelay=0 withholds relay and nothing else")
@@ -1017,9 +1005,9 @@ reads."
                      bl.net:+perm-noban+)))))
   ;; An address the range does not cover is still granted nothing at all,
   ;; and an explicit grant is left exactly as written.
-  (%with-whitelist (:entries '("127.0.0.1"))
+  (with-whitelist (:entries '("127.0.0.1"))
     (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" t))))
-  (%with-whitelist (:entries '("noban@127.0.0.1"))
+  (with-whitelist (:entries '("noban@127.0.0.1"))
     (is (= 0 (logand (bl.net:peer-permission-flags "127.0.0.1" t)
                      bl.net:+perm-mempool+))
         "an explicit noban grant must not pick up the implicit defaults")))
@@ -1046,24 +1034,24 @@ drops, and from inbound eviction.
 
 -whitebind is deliberately NOT skipped: those flags describe the listening
 SOCKET, not an address, and Core fills them in before this call."
-  (%with-whitelist (:entries '("noban@127.0.0.1/32"))
+  (with-whitelist (:entries '("noban@127.0.0.1/32"))
     (is (= bl.net:+perm-noban+ (bl.net:peer-permission-flags "127.0.0.1" t))
         "control: an ordinary inbound peer at that address is granted noban")
     (is (= 0 (bl.net:peer-permission-flags "127.0.0.1" t t))
         "an inbound onion peer must earn nothing from the range"))
   ;; A permissive range is the realistic operator mistake, and it must not
   ;; reach the onion peers either.
-  (%with-whitelist (:entries '("all@127.0.0.0/8"))
+  (with-whitelist (:entries '("all@127.0.0.0/8"))
     (is (plusp (bl.net:peer-permission-flags "127.0.0.1" t))
         "control: the wide range does grant a clearnet loopback peer")
     (is (= 0 (bl.net:peer-permission-flags "127.0.0.1" t t))))
   ;; -whitebind survives: the socket said so, not the address.
-  (%with-whitelist (:entries '("noban@127.0.0.1/32")
+  (with-whitelist (:entries '("noban@127.0.0.1/32")
                     :whitebind bl.net:+perm-mempool+)
     (is (= bl.net:+perm-mempool+
            (bl.net:peer-permission-flags "127.0.0.1" t t))))
   ;; And through the accessor the rest of the tree consults.
-  (%with-whitelist (:entries '("noban@127.0.0.1/32"))
+  (with-whitelist (:entries '("noban@127.0.0.1/32"))
     (let ((onion (%g718-peer :inbound t))
           (clearnet (%g718-peer :inbound t)))
       (setf (bl.net:peer-address onion) "127.0.0.1"
@@ -1091,7 +1079,7 @@ makes the agreement a thing to keep: the row must ask the same question the
 enforcement sites ask, onion-ness included, or an inbound onion peer is
 reported holding a loopback range's grant that nothing will honour — the
 operator reads `noban' on a peer this node would still ban."
-  (%with-whitelist (:entries '("noban@127.0.0.1/32"))
+  (with-whitelist (:entries '("noban@127.0.0.1/32"))
     (let* ((node (bl:make-node))
            (onion (bl.net:make-peer :address "127.0.0.1" :inbound t :state :ready))
            (clearnet (bl.net:make-peer :address "127.0.0.1" :inbound t :state :ready)))
@@ -1110,7 +1098,7 @@ address must still say noban")))))
 dropping the connection would not deliver the option — the point of
 -whitelist=noban is that a peer the operator trusts survives our opinion of its
 behaviour."
-  (%with-whitelist (:entries '("noban@10.0.0.0/8"))
+  (with-whitelist (:entries '("noban@10.0.0.0/8"))
     (let ((p (%g718-peer :inbound t)))
       (setf (bl.net:peer-address p) "10.1.2.3")
       (is-false (bl.net:record-misbehavior p "test"))
@@ -1140,7 +1128,7 @@ turn a link they meant to keep block-only into a tx firehose."
                (with-tx-relay-out-of-ibd
                  (deliver-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context)))
                (eq :disconnected (bl.net:peer-state p)))))
-      (%with-whitelist (:entries '("relay@10.0.0.0/8"))
+      (with-whitelist (:entries '("relay@10.0.0.0/8"))
         ;; Control: without the permission, -blocksonly drops the sender.
         (is-true (dropped-p "11.1.2.3" :outbound-full-relay))
         ;; With it, the -blocksonly clause no longer applies.
@@ -1167,7 +1155,7 @@ unlimited addresses; everyone else spends tokens."
              (setf (bl.net:peer-address p) address)
              ;; An EMPTY bucket, so any processing at all proves the exemption.
              (setf (bl.net::peer-addr-token-bucket p) 0d0)
-             (%with-whitelist (:entries entries)
+             (with-whitelist (:entries entries)
                (ingest-gossiped-addresses
                 p addrs (length addrs) book nil))
              (bl.net:peer-addr-rate-limited p))))
@@ -1191,7 +1179,7 @@ actually goes out."
                ;; is what %g718-peer leaves behind.
                (values (%cbp-capture-sends
                         (lambda ()
-                          (%with-whitelist (:entries entries)
+                          (with-whitelist (:entries entries)
                             (bl.net:handle-message p "mempool" (make-array 0 :element-type
                                                        '(unsigned-byte 8)) (bl.ctx:make-node-context :mempool mp)))))
                        (bl.net:peer-state p)))))
@@ -2985,7 +2973,7 @@ sit in /16s the candidate does not share."
 vWhitelistedRangeOutgoing only for ConnectionType::MANUAL (net.cpp:510-512), so
 a `noban,out@' range grants nothing to an automatic outbound peer inside it --
 and nothing to an inbound one, the direction being wrong."
-  (%with-whitelist (:entries '("noban,out@10.0.0.0/8"))
+  (with-whitelist (:entries '("noban,out@10.0.0.0/8"))
     (flet ((noban-p (peer) (bl.net:peer-has-permission-p peer bl.net:+perm-noban+)))
       (is-true (noban-p (%manual-peer "10.1.2.3"))
                "control: the manual peer in the range holds the grant")

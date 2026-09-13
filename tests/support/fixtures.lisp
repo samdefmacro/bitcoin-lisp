@@ -515,3 +515,18 @@ here. Dynamic bindings are thread-local, so this affects only the thread that
 runs BODY."
   `(let ((bl.net::*outbound-nonces* (make-hash-table :test 'eql)))
      ,@body))
+
+;;;; -whitelist / -whitebind configuration
+
+(defmacro with-whitelist ((&key entries (whitebind 0)) &body body)
+  "Run BODY with exactly ENTRIES (a list of -whitelist spec strings) parsed and
+installed, and WHITEBIND as the -whitebind flags. Bound, not set: the whitelist
+is global start-up configuration, and a test that leaked it would grant
+permissions to every peer in every later test."
+  `(let ((bl.net:*whitelist-entries*
+           (mapcar (lambda (spec)
+                     (or (bl.net:parse-whitelist-entry spec)
+                         (error "test fixture: unparseable -whitelist ~S" spec)))
+                   ,entries))
+         (bl.net:*whitebind-flags* ,whitebind))
+     ,@body))

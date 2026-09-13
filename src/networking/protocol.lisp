@@ -2282,6 +2282,28 @@ mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
              (when (> (incf reconsiderable) 1)
                (return t)))))))
 
+(defun %force-relay-known-tx (peer txid wtxid mempool peers)
+  "Core's ForceRelay arm of the TX handler (net_processing.cpp:4509-4521): a
+transaction we already have, arriving again from a peer holding ForceRelay, is
+relayed onward when it is in the mempool -- \"allowing the node to function as
+a gateway for nodes hidden behind it\" -- and reported and dropped when it is
+not. Both log lines are Core's own wording; p2p_permissions.py:121 greps for
+the first."
+  ;; Core's uint256::ToString() order, which is how it spells a transaction in
+  ;; both lines.
+  (flet ((shown (hash) (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))))
+    (let ((entry (bl.mp:mempool-get mempool txid)))
+      (if (null entry)
+          (bl:log-info "Not relaying non-mempool transaction ~A (wtxid=~A) from forcerelay peer=~D"
+                       (shown txid) (shown wtxid) (peer-id peer))
+          (let ((vsize (bl.mp:mempool-entry-vsize entry))
+                (fee (bl.mp:mempool-entry-fee entry)))
+            (bl:log-info "Force relaying tx ~A (wtxid=~A) from peer=~D"
+                         (shown txid) (shown wtxid) (peer-id peer))
+            (relay-transaction txid peer peers
+                               :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                               :wtxid wtxid))))))
+
 (define-p2p-handler ("tx" :needs-mempool t :rate-bucket peer-rate-limit-tx) (peer payload ctx)
   "Handle a tx message. Validate, add to mempool, and relay.
 CTX's recent-rejects, when present, caches recently rejected txs."
@@ -2343,6 +2365,21 @@ CTX's recent-rejects, when present, caches recently rejected txs."
               ;; id THIS peer's inventory uses, which is what the relay path
               ;; looks up.
               (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
+              ;; A transaction we ALREADY HAVE, from a peer holding
+              ;; ForceRelay: relay it onward anyway. Core's ReceivedTx answers
+              ;; should_validate=false for anything AlreadyHaveTx knows -- the
+              ;; mempool among its sources -- and the ForceRelay arm that
+              ;; follows exists so "the node can function as a gateway for
+              ;; nodes hidden behind it" (net_processing.cpp:4508-4521); it
+              ;; relays when the transaction is in the mempool and says so
+              ;; when it is not. Ours parsed the permission and read it
+              ;; nowhere, so p2p_permissions.py:121-123 -- a forcerelay peer
+              ;; re-sending a transaction node1 already holds, asserting node0
+              ;; receives it -- waited out its sixty seconds.
+              (when (and (peer-has-permission-p peer +perm-force-relay+)
+                         (%already-have-tx-p wtxid t mempool recent-rejects))
+                (%force-relay-known-tx peer txid wtxid mempool peers)
+                (return-from handle-tx nil))
               ;; Check recent rejects and recently-confirmed before expensive
               ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
               ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
