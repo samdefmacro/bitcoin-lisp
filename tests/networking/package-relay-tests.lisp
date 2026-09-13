@@ -987,3 +987,52 @@ is what has to reclaim the record and not the hook."
           "a retired peer's announcement must be reclaimed by the sweep")
       (is (= 1 (bl.net:tx-request-count live))
           "and a live peer's announcement must survive it"))))
+
+(test a-forcerelay-peers-known-transaction-is-relayed-onward
+  "Core's TX handler, on a transaction ReceivedTx already knows: \"Always relay
+transactions received from peers with forcerelay permission, even if they were
+already in the mempool, allowing the node to function as a gateway for nodes
+hidden behind it\" (net_processing.cpp:4508-4521). It announces the
+transaction when the mempool holds it, and logs that it is NOT relaying one
+the mempool does not.
+
+Ours parsed the ForceRelay permission and then read it nowhere in the tree.
+p2p_permissions.py restarts node1 with -whitelist=forcerelay@127.0.0.1, puts a
+transaction in its mempool, connects node0, re-sends the same transaction, and
+at :121-123 greps node1's log for `Force relaying tx <txid> (wtxid=<wtxid>)
+from peer=0' while waiting for the transaction to reach node0's mempool.
+Nothing was announced and nothing was logged."
+  (with-network (:regtest)
+   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((tx (%pkg-tx funding 0 (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash tx))
+           (ordinary (%pr-peer))
+           (downstream (%pr-peer)))
+      (setf (bl.net:peer-address ordinary) "10.9.9.9"
+            (bl.net:peer-inbound ordinary) t
+            (bl.net:peer-address downstream) "10.9.9.10")
+      (%with-fresh-rejects (rejects)
+        ;; It reaches the mempool with nobody to announce it to, so the queue
+        ;; below starts empty and every entry in it came from a re-send.
+        (deliver-tx ordinary (%pr-payload tx)
+                    (%pr-ctx state utxo mempool rejects nil))
+        (is-true (bl.mp:mempool-has mempool txid)
+                 "the transaction is in the mempool to begin with")
+        (is (null (bl.net:peer-tx-inv-queue downstream)))
+        ;; The same transaction again from a peer holding no permissions: the
+        ;; node already has it, so nothing goes out. This is the control.
+        (with-whitelist (:entries '())
+          (deliver-tx ordinary (%pr-payload tx)
+                      (%pr-ctx state utxo mempool rejects (list downstream)))
+          (is (null (bl.net:peer-tx-inv-queue downstream))
+              "an ordinary peer's duplicate must not be re-announced"))
+        ;; And again from a forcerelay peer: announced onward.
+        (with-whitelist (:entries '("forcerelay@10.9.9.9"))
+          (is-true (bl.net:peer-has-permission-p ordinary bl.net:+perm-force-relay+)
+                   "control: the range does grant this peer forcerelay")
+          (deliver-tx ordinary (%pr-payload tx)
+                      (%pr-ctx state utxo mempool rejects (list downstream)))
+          (is (= 1 (length (bl.net:peer-tx-inv-queue downstream)))
+              "a forcerelay peer's duplicate is announced to everyone else")
+          (is (equalp txid (first (first (bl.net:peer-tx-inv-queue downstream))))
+              "and it is that transaction")))))))
