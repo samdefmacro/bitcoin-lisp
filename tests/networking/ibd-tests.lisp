@@ -3694,6 +3694,9 @@ whole node's.
 The wait is now a pump pass. Here the chosen peer says nothing at all while a
 second peer sends a headers message; that second peer must still be served."
   (let* ((bl:*network* :regtest)
+         ;; In IBD: the silent-peer wait is what this test is about. Out of
+         ;; IBD sync-headers no longer waits (see the tip test below).
+         (bl.net:*cached-is-ibd* t)
          (state (%hdr-sync-chain-state "starve"))
          (listener (usocket:socket-listen "127.0.0.1" 0
                                           :element-type '(unsigned-byte 8)))
@@ -3728,7 +3731,7 @@ second peer sends a headers message; that second peer must still be served."
            ;; Short idle window so the test does not sit out the real one.
            (let ((bl.net::+header-sync-idle-passes+ 3))
              (multiple-value-bind (received stalled)
-                 (bl.net::sync-headers
+                 (bl.net:sync-headers
                   quiet state :ctx ctx
                   :utxo-set (bl.store:make-utxo-set))
                (declare (ignore received))
@@ -3741,6 +3744,44 @@ second peer sends a headers message; that second peer must still be served."
            (usocket:socket-close talker-client))
       (usocket:socket-close listener))))
 
+
+(test header-sync-at-the-tip-sends-getheaders-and-does-not-wait
+  "Out of IBD, Core's SendMessages sends a new peer its initial getheaders and
+moves on (net_processing.cpp:5797-5810): the reply, if any, is ingested by the
+message pump, and a peer that never answers is nobody's problem. Ours waited
+out the silent budget (~10 s per silent peer) on the sync thread, admitting no
+inbound and making no dial meanwhile, so the functional framework's python
+peers -- which never answer a getheaders -- cost every test one 20-second
+pass per connection (p2p_add_connections.py, 2026-09-13 sweep). Control: the
+starvation test above, in IBD, still sees the wait and reports the stall."
+  (let* ((bl:*network* :regtest)
+         (bl.net:*cached-is-ibd* nil)
+         (state (%hdr-sync-chain-state "tip-no-wait"))
+         (listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (let* ((port (usocket:get-local-port listener))
+                (client (usocket:socket-connect "127.0.0.1" port
+                                                :element-type '(unsigned-byte 8)))
+                (server (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+                (quiet (bl.net:make-peer
+                        :state :ready
+                        :connection (make-test-connection
+                                     :socket server :connected t)))
+                (started (get-internal-real-time)))
+           (multiple-value-bind (received stalled)
+               (bl.net:sync-headers quiet state :utxo-set (bl.store:make-utxo-set))
+             (is (= 0 received))
+             (is-false stalled "a silent peer at the tip is not a stall")
+             (is (< (/ (- (get-internal-real-time) started)
+                       internal-time-units-per-second)
+                    2)
+                 "sync-headers must return at once, not after the silent budget"))
+           (is (plusp (gethash "getheaders" (bl.net:peer-sent-per-msg quiet) 0))
+               "the initial getheaders was still sent")
+           (usocket:socket-close client))
+      (usocket:socket-close listener))))
 ;;;; --- getdata block-serving guards (G7-10, Core net_processing.cpp) ---------
 
 (defun %gd-header (&key (timestamp 1700000000) (bits #x1d00ffff) (seed 1))
