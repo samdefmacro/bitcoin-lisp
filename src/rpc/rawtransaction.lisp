@@ -285,7 +285,87 @@ else NIL. The classification is CLASSIFY-SCRIPT's (Core MatchMultisig)."
     (when (eq type :multisig)
       (values (getf data :m) (getf data :n) (getf data :pubkeys)))))
 
-(defun %collect-multisig-sig-pairs (sighash pubmap pubkeys sighash-byte)
+(defun %input-stack-elements (tx index)
+  "Every data element already sitting in input INDEX of TX -- its witness
+items plus the data pushes of its scriptSig.
+
+Core recovers a partially-signed input\'s signatures by RUNNING its script with
+a SignatureExtractorChecker, which records every CHECKSIG that passes
+(DataFromTransaction, script/sign.cpp:603-628). What matters is only which
+BYTES are candidates, so the elements are returned unsorted and untyped: a
+witnessScript, a redeemScript or a dummy simply fails to verify as a
+signature and falls out of %MULTISIG-EXISTING-SIGS on its own."
+  (let ((elements '())
+        (witness (bl.ser:transaction-witness tx))
+        (script-sig (bl.ser:tx-in-script-sig
+                     (aref (bl.ser:transaction-inputs tx) index))))
+    (when (and witness (< index (length witness)))
+      (dolist (item (aref witness index))
+        (when (and (vectorp item) (plusp (length item)))
+          (push item elements))))
+    ;; The scriptSig of a signed legacy input is nothing but data pushes, so
+    ;; the only opcodes that can appear are the push ones; anything else ends
+    ;; the walk rather than being guessed at.
+    (when script-sig
+      (let ((n (length script-sig))
+            (pos 0))
+        (loop while (< pos n)
+              do (let ((op (aref script-sig pos)))
+                   (multiple-value-bind (len next)
+                       (cond ((<= 1 op 75) (values op (1+ pos)))
+                             ((= op #x4c)
+                              (if (< (+ pos 1) n)
+                                  (values (aref script-sig (1+ pos)) (+ pos 2))
+                                  (values nil nil)))
+                             ((= op #x4d)
+                              (if (< (+ pos 2) n)
+                                  (values (logior (aref script-sig (+ pos 1))
+                                                  (ash (aref script-sig (+ pos 2)) 8))
+                                          (+ pos 3))
+                                  (values nil nil)))
+                             ;; OP_0 and every non-push opcode: skip it, and
+                             ;; stop at anything that cannot be walked.
+                             ((zerop op) (values 0 (1+ pos)))
+                             (t (values nil nil)))
+                     (unless len (return))
+                     (when (> (+ next len) n) (return))
+                     (when (plusp len)
+                       (push (subseq script-sig next (+ next len)) elements))
+                     (setf pos (+ next len)))))))
+    elements))
+
+(defun %multisig-existing-sigs (pubkeys elements sighash-for-type)
+  "The (pubkey -> signature) pairs ALREADY present in a multisig input, as an
+EQUALP hash. ELEMENTS are the input\'s current stack elements and
+SIGHASH-FOR-TYPE maps a sighash TYPE BYTE to the digest that script would be
+signed under, so an element carrying any hashtype can be checked on its own
+terms -- which is what Core\'s TransactionSignatureChecker does for the
+extractor (script/interpreter.cpp CheckECDSASignature).
+
+This is the half of Core\'s SignTransaction that lets a SECOND wallet finish
+what a first one started: DataFromTransaction runs before ProduceSignature
+(script/sign.cpp:729-742) and CreateSig returns a signature already in
+sigdata rather than making a new one (script/sign.cpp:559-566). Without it
+every signing pass rebuilt the input from scratch and dropped the other
+cosigner\'s work, so an m-of-n transaction could never be completed by
+passing it around."
+  (let ((found (bl.bytes:make-octets-hash-table)))
+    (dolist (element elements found)
+      (let ((len (length element)))
+        ;; A DER signature plus its hashtype byte. 9 is the shortest possible
+        ;; (two 1-byte integers), 73 the longest Core accepts.
+        (when (<= 9 len 73)
+          (let ((der (subseq element 0 (1- len)))
+                (hash (funcall sighash-for-type (aref element (1- len)))))
+            (when hash
+              (dolist (pub pubkeys)
+                (unless (gethash pub found)
+                  (when (ignore-errors
+                         (values (bl.crypto:verify-signature hash der pub)))
+                    (setf (gethash pub found) element)))))))))))
+
+(defun %collect-multisig-sig-pairs (sighash pubmap pubkeys sighash-byte
+                                    &optional existing)
   "ECDSA (pubkey . DER||sighash-byte) pairs for EVERY key we hold among
 PUBKEYS, in pubkey order. CHECKMULTISIG requires sigs ordered as the pubkeys
 appear, which iterating PUBKEYS in order preserves.
@@ -301,12 +381,17 @@ records k PSBT_IN_PARTIAL_SIG records -- the spares a cosigner workflow needs
 -- while the finalized scriptSig/witness stays byte-identical."
   (let ((pairs '()))
     (dolist (pub pubkeys (nreverse pairs))
-      (let ((sk (gethash pub pubmap)))
-        (when sk
-          (push (cons pub (concatenate '(vector (unsigned-byte 8))
-                                       (bl.crypto:sign-ecdsa sk sighash)
-                                       (vector sighash-byte)))
-                pairs))))))
+      (let ((already (and existing (gethash pub existing)))
+            (sk (gethash pub pubmap)))
+        (cond
+          ;; Core CreateSig consults sigdata.signatures FIRST and returns what
+          ;; is there (script/sign.cpp:559-566), so a cosigner's signature is
+          ;; carried through rather than replaced by one of ours.
+          (already (push (cons pub already) pairs))
+          (sk (push (cons pub (concatenate '(vector (unsigned-byte 8))
+                                           (bl.crypto:sign-ecdsa sk sighash)
+                                           (vector sighash-byte)))
+                    pairs)))))))
 
 ;;; --- Per-input signing split into (compute signatures) + (finalize) ---
 ;;;
@@ -601,7 +686,13 @@ must be bound by the caller."
                    (values (%collect-multisig-sig-pairs
                             (bl.interop:compute-legacy-sighash
                              tx i subscript sighash-byte)
-                            pubmap pubkeys sighash-byte)
+                            pubmap pubkeys sighash-byte
+                            (%multisig-existing-sigs
+                             pubkeys (%input-stack-elements tx i)
+                             (lambda (type)
+                               (ignore-errors
+                                (bl.interop:compute-legacy-sighash
+                                 tx i subscript type)))))
                            m)))
                (bip143-multisig (witscript)
                  (multiple-value-bind (m nn pubkeys) (parse-multisig witscript)
@@ -609,7 +700,13 @@ must be bound by the caller."
                    (values (%collect-multisig-sig-pairs
                             (bl.interop:compute-bip143-sighash
                              witscript amount sighash-byte)
-                            pubmap pubkeys sighash-byte)
+                            pubmap pubkeys sighash-byte
+                            (%multisig-existing-sigs
+                             pubkeys (%input-stack-elements tx i)
+                             (lambda (type)
+                               (ignore-errors
+                                (bl.interop:compute-bip143-sighash
+                                 witscript amount type)))))
                            m)))
                (miniscript-stack (witscript)
                  (%wsh-miniscript-stack witscript tx i amount
@@ -701,12 +798,25 @@ one pair per HELD key, and SIGS takes the first NEEDED of them in pubkey
 order. That is Core's `if (ret.size() < required + 1) ret.push_back(...)'
 inside SignStep's MULTISIG case (script/sign.cpp:676-680) — the collection is
 uncapped so a PSBT keeps every signature, the stack is capped so the spend is
-the same bytes it always was."
+the same bytes it always was.
+
+A stack SHORT of the threshold is still returned, padded with empty elements
+to required + 1, ALONGSIDE the error. That is Core's SignStep too: it pads
+(`for (size_t i = 0; i + ret.size() < required + 1; ++i) ret.emplace_back();',
+script/sign.cpp:684-687) and SignTransaction then calls UpdateInput
+regardless of the result, so a partially signed input is WRITTEN into the
+transaction and the next signer can pick it up. Discarding it, as this used
+to, made a 2-of-3 unsignable by two wallets in turn: each pass rebuilt the
+input from nothing and the first cosigner's signature was never in the hex
+the second one saw."
   (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
     (labels ((sigs ()
-               (let ((pairs (input-sig-ecdsa sig)))
-                 (mapcar #'cdr (subseq pairs 0 (min (input-sig-needed sig)
-                                                    (length pairs))))))
+               (let* ((pairs (input-sig-ecdsa sig))
+                      (needed (input-sig-needed sig))
+                      (taken (mapcar #'cdr (subseq pairs 0 (min needed (length pairs))))))
+                 (append taken
+                         (make-list (max 0 (- needed (length taken)))
+                                    :initial-element empty))))
              (threshold-error (prefix)
                (when (< (length (input-sig-ecdsa sig)) (input-sig-needed sig))
                  (format nil "~Amultisig needs ~D sigs, have ~D"
@@ -744,19 +854,13 @@ the same bytes it always was."
         (:p2sh-p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                         (values (bl.ser:script-push-data (input-sig-redeem sig))
                                 (list (cdr s) (car s)) nil)))
-        (:p2wsh (let ((err (threshold-error "")))
-                  (if err
-                      (values nil nil err)
-                      (values nil (concatenate 'list (list empty) (sigs)
-                                               (list (input-sig-witness-script sig)))
-                              nil))))
-        (:p2sh-p2wsh (let ((err (threshold-error "")))
-                       (if err
-                           (values nil nil err)
-                           (values (bl.ser:script-push-data (input-sig-redeem sig))
-                                   (concatenate 'list (list empty) (sigs)
-                                                (list (input-sig-witness-script sig)))
-                                   nil))))
+        (:p2wsh (values nil (concatenate 'list (list empty) (sigs)
+                                         (list (input-sig-witness-script sig)))
+                        (threshold-error "")))
+        (:p2sh-p2wsh (values (bl.ser:script-push-data (input-sig-redeem sig))
+                             (concatenate 'list (list empty) (sigs)
+                                          (list (input-sig-witness-script sig)))
+                             (threshold-error "")))
         ;; Miniscript: the satisfier already produced the whole stack, and there
         ;; is no CHECKMULTISIG dummy to prepend. Core appends the witnessScript
         ;; after the satisfaction unconditionally (sign.cpp:777).
@@ -769,20 +873,15 @@ the same bytes it always was."
                  (append (input-sig-stack sig)
                          (list (input-sig-witness-script sig)))
                  nil))
-        (:multisig (let ((err (threshold-error "")))
-                     (if err
-                         (values nil nil err)
-                         (values (apply #'concatenate '(vector (unsigned-byte 8))
-                                        (vector 0) (mapcar #'bl.ser:script-push-data (sigs)))
-                                 nil nil))))
-        (:p2sh-multisig (let ((err (threshold-error "P2SH-")))
-                          (if err
-                              (values nil nil err)
-                              (values (apply #'concatenate '(vector (unsigned-byte 8))
-                                             (vector 0)
-                                             (append (mapcar #'bl.ser:script-push-data (sigs))
-                                                     (list (bl.ser:script-push-data (input-sig-redeem sig)))))
-                                      nil nil))))))))
+        (:multisig (values (apply #'concatenate '(vector (unsigned-byte 8))
+                                  (vector 0) (mapcar #'bl.ser:script-push-data (sigs)))
+                           nil (threshold-error "")))
+        (:p2sh-multisig
+         (values (apply #'concatenate '(vector (unsigned-byte 8))
+                        (vector 0)
+                        (append (mapcar #'bl.ser:script-push-data (sigs))
+                                (list (bl.ser:script-push-data (input-sig-redeem sig)))))
+                 nil (threshold-error "P2SH-")))))))
 
 (defun build-spent-utxos (inputs prevmap)
   "Vector of storage:utxo-entry for every input (the spent outputs, needed for the
@@ -848,14 +947,20 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                 (if err
                     (push (cons i err) errors)
                     (multiple-value-bind (ss wit ferr) (%finalize-input-signatures sig)
-                      (cond
-                        (ferr (push (cons i ferr) errors))
-                        (t (setf (aref signed i) t)
-                           (when ss
-                             (setf (bl.ser:tx-in-script-sig in) ss))
-                           (when wit
-                             (setf (aref witness i) wit)
-                             (setf any-witness t)))))))
+                      ;; Core's SignTransaction calls UpdateInput with whatever
+                      ;; ProduceSignature managed (script/sign.cpp:729-745), so
+                      ;; a PARTIAL multisig input goes into the transaction and
+                      ;; the error is recorded next to it. The verification rail
+                      ;; below runs only on inputs we finished, which is why the
+                      ;; flag and the write are separate here.
+                      (if ferr
+                          (push (cons i ferr) errors)
+                          (setf (aref signed i) t))
+                      (when ss
+                        (setf (bl.ser:tx-in-script-sig in) ss))
+                      (when wit
+                        (setf (aref witness i) wit)
+                        (setf any-witness t)))))
               (push (cons i "no prevtx scriptPubKey provided") errors))))
       (when (or any-witness (bl.ser:transaction-witness tx))
         (setf (bl.ser:transaction-witness tx) witness))

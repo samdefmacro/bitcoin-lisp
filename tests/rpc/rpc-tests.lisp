@@ -7741,6 +7741,106 @@ into the finalizer would push three signatures at a 2-of-3 and fail there."
               (handler-case (progn (%p2wsh-multisig-signing 2 3 '(0)) "no error")
                 (error (e) (princ-to-string e))))))
 
+(test multisig-signing-carries-a-cosigners-signature-through
+  "Two wallets finish a 2-of-3 P2WSH between them, which is the whole point of
+an m-of-n: the first pass writes what it has, the second reads it back and
+completes it.
+
+Core does this in two halves. SignTransaction runs DataFromTransaction before
+ProduceSignature and calls UpdateInput with whatever came out
+(script/sign.cpp:729-745), so a partially signed input is WRITTEN into the
+transaction -- SignStep pads the short stack to required + 1 with empty
+elements (:684-687) rather than abandoning it. And CreateSig returns a
+signature already present in sigdata instead of making a new one (:559-566),
+so the cosigner's work is carried through rather than replaced.
+
+We had neither: a stack short of the threshold was discarded, so the first
+pass emitted an input with no witness at all, and the second pass rebuilt
+that input from nothing. A 2-of-3 could be signed by a wallet holding two
+keys and by nobody else (wallet_importdescriptors.py:583)."
+  (let* ((node (make-test-node))
+         (sks (loop for i from 0 below 3
+                    collect (let ((k (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 0)))
+                              (setf (aref k 31) (+ 41 i))
+                              k)))
+         (pks (mapcar #'bl.crypto:derive-public-key sks))
+         (witscript (multisig-script 2 pks))
+         (spk (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20)
+                           (bl.crypto:sha256 witscript)))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #xD4))
+         (amount 100000)
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
+                                                 :hash prev-txid :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 90000 :script-pubkey spk))
+              :lock-time 0))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex prev-txid))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
+                              (cons "amount" (/ amount 1d8))
+                              (cons "witnessScript" (bl.crypto:bytes-to-hex witscript)))))
+         (spent (vector (bl.store:make-utxo-entry
+                         :value amount
+                         :script-pubkey
+                         (coerce spk '(simple-array (unsigned-byte 8) (*)))))))
+    (flet ((sign-with (hex index)
+             (bl.rpc:dispatch-rpc-method
+              node "signrawtransactionwithkey"
+              (list hex
+                    (list (bl.crypto:private-key-to-wif
+                           (nth index sks) :network :mainnet :compressed t))
+                    prevtxs)))
+           (field (result name) (cdr (assoc name result :test #'string=))))
+      (let* ((first-pass (sign-with (bl.crypto:bytes-to-hex
+                                     (bl.ser:serialize-transaction tx))
+                                    0))
+             (partial-hex (field first-pass "hex"))
+             (partial (bl.ser:parse-tx-payload (bl.crypto:hex-to-bytes partial-hex)))
+             ;; Read defensively: with the partial input dropped there is no
+             ;; witness vector at all, and the assertions below have to be
+             ;; able to SAY that rather than die reading it.
+             (partial-witness (let ((w (bl.ser:transaction-witness partial)))
+                                (if (and w (plusp (length w)))
+                                    (coerce (aref w 0) 'list)
+                                    '()))))
+        (is (eq 'yason:false (field first-pass "complete"))
+            "one key of a 2-of-3 cannot complete it")
+        ;; The partial input is in the hex, padded the way Core pads it:
+        ;; dummy, the one signature, an empty placeholder, the witnessScript.
+        (is (= 4 (length partial-witness))
+            "the partial witness was dropped instead of written")
+        (is (equal '(0 t 0 t)
+                   (list (length (or (first partial-witness) #()))
+                         (and (plusp (length (or (second partial-witness) #()))) t)
+                         (length (or (third partial-witness) #()))
+                         (and (equalp witscript (fourth partial-witness)) t)))
+            "the padded stack is not dummy / signature / placeholder / script")
+        ;; The second cosigner reads that signature back and finishes it.
+        (let* ((second-pass (sign-with partial-hex 1))
+               (signed (bl.ser:parse-tx-payload
+                        (bl.crypto:hex-to-bytes (field second-pass "hex"))))
+               (final (let ((w (bl.ser:transaction-witness signed)))
+                        (if (and w (plusp (length w)))
+                            (coerce (aref w 0) 'list)
+                            '()))))
+          (is (eq t (field second-pass "complete"))
+              "the second key did not complete the input: ~S"
+              (field second-pass "errors"))
+          (is (= 4 (length final)))
+          ;; The first cosigner's signature survived verbatim, in pubkey order.
+          (is (equalp (second partial-witness) (second final))
+              "the first signature was replaced instead of carried through")
+          (is (plusp (length (or (third final) #()))))
+          (is-true (%verify-tx-input signed 0 spent
+                                     "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S")
+                   "the completed witness does not spend"))))))
+
 (defun %direct-pushes (script)
   "The data elements of SCRIPT when it is nothing but direct pushes (an opcode
 byte of 1..75 followed by that many bytes), which is what Core's PushAll emits
