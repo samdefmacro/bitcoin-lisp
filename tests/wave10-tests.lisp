@@ -775,6 +775,41 @@ are swept at load (Core BanMan LoadBanlist/SweepBanned)."
       (clrhash bl.net:*banned-peers*)
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
+(test wave10-banlist-recreated-when-absent
+  "Core BanMan's constructor runs LoadBanlist() and then DumpBanlist()
+(banman.cpp:17-22); a read that fails -- an absent banlist.json among them --
+sets m_is_dirty (banman.cpp:41-44), so start-up writes the file back out.
+p2p_disconnect_ban.py:43-47 deletes banlist.json, restarts the node and
+asserts the file exists again. A read that SUCCEEDED leaves nothing dirty and
+DumpBanlist writes nothing (banman.cpp:56), so a load must not disturb the
+file it just read."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames (format nil "wave10-banrecreate-~D/" (get-universal-time))
+                                (uiop:temporary-directory))))
+         (path (merge-pathnames "banlist.json" dir))
+         (bl.net:*banlist-path* path))
+    (unwind-protect
+         (progn
+           ;; A datadir with no banlist.json: start-up recreates it, empty.
+           (is (not (probe-file path)))
+           (is (null (bl.net:load-banlist)))
+           (is-true (probe-file path))
+           (is (equal '() (bl.net:list-bans)))
+           ;; A banlist that is there is read, and reading it does not rewrite
+           ;; the file: the contents survive verbatim.
+           (bl.net:ban-address "203.0.113.5" 3600)
+           (let ((written (with-open-file (in path)
+                            (let ((s (make-string (file-length in))))
+                              (subseq s 0 (read-sequence s in))))))
+             (clrhash bl.net:*banned-peers*)
+             (is (eql 1 (bl.net:load-banlist)))
+             (is (string= written
+                          (with-open-file (in path)
+                            (let ((s (make-string (file-length in))))
+                              (subseq s 0 (read-sequence s in))))))))
+      (clrhash bl.net:*banned-peers*)
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 (test wave10-peers-dump-cadence
   "maybe-dump-peer-addresses writes peers.dat on the 15-minute cadence and
 not before (Core DumpAddresses every DUMP_PEERS_INTERVAL)."
