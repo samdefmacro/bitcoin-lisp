@@ -9783,12 +9783,17 @@ that echoed the string back gave neither, and the test's next line is
   (let ((node (make-test-node)))
     (flet ((args (arg9)
              (wire-params (list nil nil nil nil nil nil nil nil nil arg9))))
-      ;; Every other argument, arg9 included, is still echoed unchanged.
-      (is (equal (list nil nil nil nil nil nil nil nil nil "harmless")
-                 (bl.rpc:dispatch-rpc-method node "echo" (args "harmless"))))
-      (is (equalp (coerce (list nil nil nil nil nil nil nil nil nil "harmless")
-                          'vector)
-                  (bl.rpc:dispatch-rpc-method node "echojson" (args "harmless"))))
+      ;; Every other argument, arg9 included, is still echoed unchanged --
+      ;; and as an ARRAY, because Core answers `return request.params;' (a
+      ;; UniValue VARR). A no-argument call is therefore [] and not null,
+      ;; which rpc_named_arguments.py:28 asserts: assert_equal(node.echo(), []).
+      (dolist (method '("echo" "echojson"))
+        (is (equalp (coerce (list nil nil nil nil nil nil nil nil nil "harmless")
+                            'vector)
+                    (bl.rpc:dispatch-rpc-method node method (args "harmless"))))
+        (is (equalp #() (bl.rpc:dispatch-rpc-method
+                         node method (wire-params (list))))
+            "~A with no arguments must answer [], not null" method))
       ;; Both names carry the trigger, because Core builds both from one body.
       (dolist (method '("echo" "echojson"))
         (let ((err (rpc-error-of

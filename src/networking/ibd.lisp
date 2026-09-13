@@ -406,7 +406,19 @@ request for it has timed out too many times."
   "Block hashes currently requested from PEER and not yet received — the
 source of getpeerinfo's \"inflight\" heights (Core CNodeStateStats::
 vHeightInFlight). Snapshots the synchronized in-flight table under its lock
-so RPC threads can read while the sync thread mutates."
+so RPC threads can read while the sync thread mutates.
+
+Core has ONE map for both halves of `a block this peer owes us': BlockRequested
+files a plain getdata download (net_processing.cpp:6189) and a compact-block
+getblocktxn round trip (:4668) in the same mapBlocksInFlight, and
+GetNodeStateStats reads it. We keep the compact-block half on the PEER as well
+— PEER-PENDING-COMPACT-BLOCK — and that half is the only one an RPC thread can
+be sure of seeing: PUMP-PEER-MESSAGES binds *IBD-CONTEXT* thread-locally to a
+context of its own for the drain, so a mark the pump made is not in the context
+this function reads here. Reporting the union is what makes the answer true
+from any thread, which is the whole point of the field
+(p2p_mutated_blocks.py:76-78 reads it over RPC while a getblocktxn is
+outstanding)."
   (let ((result '()))
     (when *ibd-context*
       (let ((in-flight (ibd-context-in-flight *ibd-context*)))
@@ -417,6 +429,10 @@ so RPC threads can read while the sync thread mutates."
                           in-flight)))
           #+sbcl (sb-ext:with-locked-hash-table (in-flight) (scan))
           #-sbcl (scan))))
+    (let ((pending (peer-pending-compact-block peer)))
+      (when pending
+        (pushnew (pending-compact-block-block-hash pending) result
+                 :test #'equalp)))
     result))
 
 (defun queue-missing-fork-blocks (missing-blocks)

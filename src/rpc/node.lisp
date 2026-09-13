@@ -164,7 +164,12 @@ internal-bug path end to end, and rpc_misc.py:32-45 requires the call either to
 kill the node or to answer with that error. A node that echoed the string back
 answered neither, and the test's `assert False' fired on the line after the
 call. Both names share this body because Core builds them from one
-RPCHelpMan (`static RPCHelpMan echo(const std::string& name)', :277)."
+RPCHelpMan (`static RPCHelpMan echo(const std::string& name)', :277).
+
+The answer is Core's `return request.params;' -- a UniValue VARR, so a call
+with NO arguments answers [] and not null. A bare Lisp list gets that right
+for every case but the empty one, where NIL encodes as null:
+rpc_named_arguments.py:28 is `assert_equal(node.echo(), [])'."
   (let ((arg9 (nth 9 params)))
     (when (and (stringp arg9) (string= arg9 "trigger_internal_bug"))
       (error 'rpc-error
@@ -172,7 +177,7 @@ RPCHelpMan (`static RPCHelpMan echo(const std::string& name)', :277)."
              :message (str-format-internal-bug
                        "request.params[9].get_str() != \"trigger_internal_bug\""
                        "src/rpc/node.lisp (%ECHO-ARGUMENTS)"))))
-  (or params '()))
+  (coerce params 'vector))
 
 (define-rpc "echo" (node params)
   "Return the arguments unchanged (Core echo, rpc/node.cpp:279). It exists for
@@ -206,7 +211,7 @@ without depending on what any real method does with them. Core builds echo and
 echojson from ONE RPCHelpMan (rpc/node.cpp:277-311), so the arg9 internal-bug
 trigger is this method's too."
   (declare (ignore node))
-  (coerce (%echo-arguments params) 'vector))
+  (%echo-arguments params))
 
 (defun %dump-all-command-conversions ()
   "Core CRPCTable::dumpArgMap / RPCHelpMan::GetArgMap (rpc/util.cpp:833-863):

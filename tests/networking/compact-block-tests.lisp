@@ -1852,8 +1852,16 @@ block forever that nothing would ask anyone else for."
        (is-true (bl.net:peer-pending-compact-block peer))
        (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes peer))
            "a compact block awaiting getblocktxn must be in flight from its peer")
+       ;; And it is reported from a thread that shares no IBD context with the
+       ;; drain that made the mark -- which is every RPC thread, because
+       ;; PUMP-PEER-MESSAGES binds *IBD-CONTEXT* thread-locally to a context of
+       ;; its own. This is the case the live node actually answers in.
+       (let ((bl.net:*ibd-context* nil))
+         (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes peer))
+             "the answer must not depend on the reader sharing the pump's context"))
        ;; And getpeerinfo reports its HEIGHT, which is what the framework reads.
-       (let ((node (bl:make-node :network :regtest)))
+       (let ((node (bl:make-node :network :regtest))
+             (bl.net:*ibd-context* nil))
          (setf (bl:node-chain-state node) state
                (bl:node-utxo-set node) utxo
                (bl:node-mempool node) mempool
