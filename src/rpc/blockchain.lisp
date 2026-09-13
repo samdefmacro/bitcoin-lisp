@@ -187,6 +187,29 @@ the bool branch). Explicit false arrives as the +json-false+ sentinel."
                                  :message "Verbosity was boolean but only integer allowed"))
               (t (%json-type-error v "number"))))))
 
+(defun block-body-checked (chain-state block-store hash)
+  "The block for HASH, or the error Core raises for it: GetBlockChecked /
+GetRawBlockChecked over CheckBlockDataAvailability (rpc/blockchain.cpp:
+671-700). -5 `Block not found` for a hash the index does not know; -1 `Block
+not available (pruned data)` for an entry below the prune point; -1 `Block
+not available (not fully downloaded)` for a header the index holds whose body
+never arrived -- a headers-only chain tip, which rpc_getblockfrompeer.py and
+rpc_getblockstats.py both ask about. Every RPC that reads a body by hash
+answers through this one; getblock, getblockstats and gettxoutproof used to
+call a missing body `Block not found` (-5), the answer for an unknown hash."
+  (let ((entry (bl.store:get-block-index-entry chain-state hash)))
+    (unless entry
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Block not found"))
+    (or (and block-store (bl.store:get-block block-store hash))
+        (error 'rpc-error
+               :code +rpc-misc-error+
+               :message (if (and (bl:pruning-enabled-p)
+                                 (<= (bl.store:block-index-entry-height entry)
+                                     (bl.store:chain-state-pruned-height chain-state)))
+                            "Block not available (pruned data)"
+                            "Block not available (not fully downloaded)")))))
+
 (define-rpc "getblock" (node (hash-str))
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
 the serialized block hex; 1 (or true) a JSON object with txids; 2 the object
@@ -195,12 +218,10 @@ prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
   (let* ((hash-bytes (parse-hash-v hash-str "blockhash"))
          (verbosity (%parse-verbosity params 1 1 :allow-bool t))
          (block-store (rpc-get-block-store node))
-         (block (and block-store
-                     (bl.store:get-block block-store hash-bytes))))
-    (unless block
-      ;; Core getblock: RPC_INVALID_ADDRESS_OR_KEY (-5), blockchain.cpp:855.
-      (error 'rpc-error :code +rpc-invalid-address-or-key+
-                        :message "Block not found"))
+         ;; Core getblock: LookupBlockIndex then GetRawBlockChecked
+         ;; (blockchain.cpp:851-859): -5 for an unknown hash, -1 for a known
+         ;; header without its body.
+         (block (block-body-checked (rpc-get-chain-state node) block-store hash-bytes)))
     (cond
       ((<= verbosity 0) ;; Hex of the block's wire (witness-complete) bytes
        (bl.crypto:bytes-to-hex
@@ -1809,10 +1830,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
     ;; wrong subsidy and mediantime instead of erroring.
     (let* ((entry (%parse-hash-or-height-entry chain-state hash-or-height))
            (block-hash (bl.store:block-index-entry-hash entry))
-           (block (bl.store:get-block block-store block-hash)))
-      (unless block
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
-                          :message "Block not found"))
+           (block (block-body-checked chain-state block-store block-hash)))
       (let* ((height (bl.store:block-index-entry-height entry))
              (header (bl.ser:bitcoin-block-header block))
              (txs (bl.ser:bitcoin-block-transactions block))
