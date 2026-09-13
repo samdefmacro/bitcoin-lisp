@@ -182,7 +182,7 @@ log line of the node itself."
   ;; -pid: written once the log exists, so a failure is on the record, and
   ;; before any long-running startup work, so a supervisor watching for the
   ;; file does not have to wait out a reindex to learn our PID.
-  (let ((path (write-pid-file pid-file data-directory)))
+  (let ((path (write-pid-file pid-file data-directory network)))
     (when path (log-info "PID file: ~A" path)))
 
   ;; -debug=<category> / -debugexclude=<category> (Core init/common.cpp).
