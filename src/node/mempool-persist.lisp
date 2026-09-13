@@ -84,9 +84,10 @@ queues. Returns T when the tx was found in the mempool and queued."
   "Load a mempool.dat-format file through the normal acceptance path (Core
 LoadMempool): prioritisation deltas first (so fee policy sees them), then per-tx
 validation against the current UTXO set — stale entries (spent inputs, reorged
-context) simply fail and are dropped. Entries are loaded regardless of age (no
-expiry filter, unlike Core): mempool-expire prunes old entries on the next block
-connection anyway. Residual deltas (txs not in the saved pool) are re-applied
+context) simply fail and are dropped. An entry already older than
+-mempoolexpiry is skipped without being validated at all, as Core skips it
+(node/mempool_persist.cpp:103,119-121): the acceptance path would run
+LimitMempoolSize and throw it straight back out. Residual deltas (txs not in the saved pool) are re-applied
 last, then the saved unbroadcast set for txs that made it back into the pool
 (Core node/mempool_persist.cpp:134-141) — unless APPLY-UNBROADCAST is NIL,
 which is the importmempool RPC's default (Core apply_unbroadcast_set,
@@ -118,7 +119,7 @@ missing or corrupt."
         (let ((mempool (node-mempool node))
               (utxo-set (node-utxo-set node))
               (chain-state (node-chain-state node))
-              (accepted 0) (failed 0) (unbroadcast-count 0)
+              (accepted 0) (failed 0) (expired 0) (unbroadcast-count 0)
               (total (length entries))
               (tried 0)
               (next-tenth 0))
@@ -157,6 +158,14 @@ missing or corrupt."
                     (height (bl.store:current-height chain-state)))
                 (when (and apply-fee-delta-priority (not (zerop delta)))
                   (bl.mp:mempool-prioritise mempool txid delta))
+                ;; An entry already outside the expiry window never reaches
+                ;; the acceptance path: Core tests nTime against
+                ;; now - expiry and counts it as expired
+                ;; (node/mempool_persist.cpp:103,119-121). The delta above is
+                ;; applied first, where Core applies it (:99-102).
+                (if (<= entry-time (- (bl.ser:get-unix-time)
+                                      (* bl.mp:*mempool-expiry-hours* 3600)))
+                    (incf expired)
                 ;; CHAIN-STATE gates the finality/BIP68 checks — a saved tx
                 ;; that is no longer minable in the next block must not
                 ;; reload (Core LoadMempool goes through the full
@@ -182,7 +191,7 @@ missing or corrupt."
                                    chain-state)))
                          (incf accepted)
                          (incf failed)))
-                    (t (incf failed)))))))
+                    (t (incf failed))))))))
           ;; The residual map is gated on the same option as the per-entry
           ;; deltas (mempool_persist.cpp:128-132) — importmempool must not
           ;; import a foreign node's prioritisation by either route.
@@ -196,6 +205,6 @@ missing or corrupt."
             (dolist (txid unbroadcast)
               (when (bl.mp:mempool-add-unbroadcast mempool txid)
                 (incf unbroadcast-count))))
-          (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas, ~D waiting for initial broadcast"
-                    accepted failed (length residual) unbroadcast-count)
+          (log-info "Imported mempool: ~D accepted, ~D failed, ~D expired, ~D residual deltas, ~D waiting for initial broadcast"
+                    accepted failed expired (length residual) unbroadcast-count)
           (values accepted failed (length residual))))))

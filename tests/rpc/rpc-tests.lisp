@@ -2305,7 +2305,12 @@ for the pool."
 
 (defun %write-mempool-file (path)
   "Write a mempool.dat holding three INDEPENDENT txs (so reload order cannot
-matter), one of them unbroadcast. Returns the list of txids."
+matter), one of them unbroadcast. Returns the list of txids.
+
+The entries are stamped with the current time, as a real dump's are: the
+reload runs the full acceptance path, and that path now runs Core's
+LimitMempoolSize, so an entry dated at the epoch would be expired the moment
+it came back."
   (multiple-value-bind (node funding-txid) (%mempool-node 3)
     (let ((mempool (bl:node-mempool node))
           (txids '()))
@@ -2313,7 +2318,8 @@ matter), one of them unbroadcast. Returns the list of txids."
         (let* ((tx (%pkg-tx funding-txid i (- 100000000 10000)))
                (txid (bl.ser:transaction-hash tx)))
           (bl.mp:mempool-add
-           mempool txid (bl.mp:make-entry-from-tx tx 10000 200))
+           mempool txid (bl.mp:make-entry-from-tx
+                         tx 10000 200 :entry-time (bl.ser:get-unix-time)))
           (push txid txids)))
       (bl.mp:mempool-add-unbroadcast mempool (first txids))
       (bl.mp:save-mempool-file mempool path)
@@ -2419,9 +2425,14 @@ rpc/mempool.cpp:1115-1116)."
              (declare (ignore utxo-set chain-state))
              (let ((tx (%pkg-tx funding-txid 0 (- 100000000 10000))))
                (setf txid (bl.ser:transaction-hash tx))
+               ;; A current entry time, as a real dump carries: the startup
+               ;; load keeps the saved time (use_current_time defaults off)
+               ;; and now skips anything already past -mempoolexpiry.
                (is (eq :ok (bl.mp:mempool-add
                             mempool txid
-                            (bl.mp:make-entry-from-tx tx 10000 200))))
+                            (bl.mp:make-entry-from-tx
+                             tx 10000 200
+                             :entry-time (bl.ser:get-unix-time)))))
                (bl.mp:mempool-add-unbroadcast mempool txid)
                (bl.mp:save-mempool-file mempool path)))
            ;; importmempool default: entries load, unbroadcast NOT applied.

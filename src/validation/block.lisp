@@ -3060,7 +3060,7 @@ disconnected blocks."
                (length (bl.ser:transaction-outputs tx))))))
       (bl.mp:mempool-update-for-reorg mempool readded)
       (remove-reorged-nonfinal-mempool-entries mempool utxo-set height chain-state)
-      (bl.mp:mempool-trim-to-size mempool))))
+      (bl.mp:mempool-limit-size mempool))))
 
 (defun %rollback-partial-reorg (chain-state block-store utxo-set
                                 connected to-disconnect old-tip-entry)

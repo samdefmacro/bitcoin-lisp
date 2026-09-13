@@ -46,16 +46,20 @@ returning (values :ok entry)."
          (old-tx (make-mempool-test-tx :input-id 1))
          (old-txid (bl.ser:transaction-hash old-tx))
          (new-tx (make-mempool-test-tx :input-id 2))
-         (new-txid (bl.ser:transaction-hash new-tx)))
+         (new-txid (bl.ser:transaction-hash new-tx))
+         ;; A recent, distinctive entry time: ACCEPT-VALIDATED-TX runs Core's
+         ;; LimitMempoolSize, so an entry stamped in 1970 would be expired the
+         ;; moment it went in and the eviction under test never observed.
+         (entered (- (bl.ser:get-unix-time) 5)))
     (is (eq :ok (bl.mp:mempool-add
                  mempool old-txid (make-mempool-entry-for-tx old-tx))))
     (multiple-value-bind (result entry)
         (bl.mp:accept-validated-tx
          mempool new-txid new-tx 15000 0
-         :entry-time 1000001 :replaced (list old-txid))
+         :entry-time entered :replaced (list old-txid))
       (is (eq :ok result))
       (is (= 15000 (bl.mp:mempool-entry-fee entry)))
-      (is (= 1000001 (bl.mp:mempool-entry-entry-time entry))))
+      (is (= entered (bl.mp:mempool-entry-entry-time entry))))
     (is (null (bl.mp:mempool-get mempool old-txid)))
     (is (bl.mp:mempool-get mempool new-txid))))
 
@@ -2357,6 +2361,76 @@ output of the same parent tx survives."
               mempool (+ (bl.ser:get-unix-time)
                          (* bl.mp::+default-mempool-expiry-hours+ 3600)
                          1))))
+    (is (= 0 (bl.mp:mempool-count mempool)))))
+
+(test accepting-a-transaction-expires-the-stale-ones
+  "Expiry is checked when a transaction is ACCEPTED, not only when a block
+connects. Core's LimitMempoolSize runs Expire then TrimToSize
+(validation.cpp:264-275) and the acceptance path calls it after every
+successful add that is neither a package submission nor bypassing limits
+(validation.cpp:1392-1394). mempool_expiry.py relies on exactly that: it moves
+the mock clock past the window and then broadcasts an UNRELATED transaction to
+make the node look, because nothing else would.
+
+We ran the sweep on block connection alone, so on a chain with no blocks
+(which is the whole of that test) a transaction older than -mempoolexpiry
+stayed in the pool and getmempoolentry kept answering for it
+(mempool_expiry.py:87)."
+  (let* ((bl.mp:*mempool-expiry-hours* 1)
+         (now (bl.ser:get-unix-time))
+         ;; The node's clock, driven forward explicitly, the way
+         ;; mempool_expiry.py drives it with setmocktime.
+         (bl.ser:*mock-time* now)
+         (mempool (bl.mp:make-mempool))
+         (parent (make-mempool-test-tx :input-id 140))
+         (ptxid (bl.ser:transaction-hash parent))
+         (child (make-spending-test-tx ptxid))
+         (ctxid (bl.ser:transaction-hash child))
+         (trigger (make-mempool-test-tx :input-id 141))
+         (ttxid (bl.ser:transaction-hash trigger)))
+    ;; The pair enters now and is still inside the window.
+    (is (eq :ok (bl.mp:accept-validated-tx mempool ptxid parent 1000 0
+                                           :entry-time now)))
+    (is (eq :ok (bl.mp:accept-validated-tx mempool ctxid child 1000 0
+                                           :entry-time now)))
+    (is (= 2 (bl.mp:mempool-count mempool)))
+    ;; Nothing has connected; time simply passes. Accepting an unrelated
+    ;; transaction an hour and five seconds later is the only event.
+    (setf bl.ser:*mock-time* (+ now 3605))
+    (is (eq :ok (bl.mp:accept-validated-tx mempool ttxid trigger 1000 0)))
+    (is (null (bl.mp:mempool-get mempool ptxid))
+        "the expired parent is gone")
+    (is (null (bl.mp:mempool-get mempool ctxid))
+        "and its child went with it")
+    (is (bl.mp:mempool-get mempool ttxid)
+        "the transaction that triggered the sweep is still there")))
+
+(test the-expiry-sweep-skips-a-pool-that-cannot-have-expired
+  "MEMPOOL-EXPIRE stands in for Core's entry_time index (txmempool.cpp:811-827,
+which stops at the first entry inside the window) with a lower bound on the
+oldest entry time, because LimitMempoolSize now runs after every accepted
+transaction and a hash-table walk per acceptance would be O(mempool) work a
+peer can drive. The bound must be maintained, not merely consulted: a sweep
+that finds nothing must still say so, and one that removes entries must leave
+a bound the NEXT sweep can trust."
+  (let* ((bl.mp:*mempool-expiry-hours* 1)
+         (mempool (bl.mp:make-mempool))
+         (now (bl.ser:get-unix-time))
+         (a (make-mempool-test-tx :input-id 150))
+         (b (make-mempool-test-tx :input-id 151)))
+    (is (eq :ok (bl.mp:accept-validated-tx mempool (bl.ser:transaction-hash a)
+                                           a 1000 0 :entry-time now)))
+    ;; Inside the window: nothing expires, however often it is asked.
+    (is (= 0 (bl.mp:mempool-expire mempool (+ now 60))))
+    (is (= 1 (bl.mp:mempool-count mempool)))
+    ;; Past the window: the sweep finds it.
+    (is (= 1 (bl.mp:mempool-expire mempool (+ now 3601))))
+    ;; A newer entry added after that sweep is still seen when ITS time comes
+    ;; -- the bound left behind must not hide it.
+    (is (eq :ok (bl.mp:accept-validated-tx mempool (bl.ser:transaction-hash b)
+                                           b 1000 0 :entry-time (+ now 3601))))
+    (is (= 0 (bl.mp:mempool-expire mempool (+ now 3602))))
+    (is (= 1 (bl.mp:mempool-expire mempool (+ now 7202))))
     (is (= 0 (bl.mp:mempool-count mempool)))))
 
 ;;;; Mempool deferrals: dynamic rolling minimum fee

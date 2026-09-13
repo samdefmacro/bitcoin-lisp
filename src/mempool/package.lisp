@@ -181,6 +181,7 @@ src/mempool/.")
    #:*mempool-expiry-hours*
    #:*min-relay-fee-rate*
    #:mempool-trim-to-size
+   #:mempool-limit-size
    #:*cluster-count-limit*
    #:*cluster-size-limit*
    #:mempool-effective-min-fee-rate
