@@ -1083,3 +1083,50 @@ bumps it by NONPREF_PEER_TX_DELAY and then waits for the getdata."
            (is (not (eq asked (tx-request-in-flight-peer hash)))
                "and the fallback announcer is the one now asked")))
     (bl.net:reset-tx-requests)))
+
+(test a-rejected-transaction-is-logged-the-way-core-logs-it
+  "Core's ProcessInvalidTx opens with
+LogDebug(BCLog::MEMPOOLREJ, \"%s (wtxid=%s) from peer=%d was not accepted:
+%s\", txid, wtxid, nodeid, state.ToString()) (net_processing.cpp:3131-3135) --
+every transaction a peer sends that the mempool refuses, before any caching
+decision. We logged nothing at all on that path.
+
+p2p_permissions.py:133-138 sends a transaction with a zero-value output and
+greps for that line ending in `dust'; the second send of the same transaction
+greps for the forcerelay line that follows it."
+  (with-network (:regtest)
+    (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+      (let* ((tx (bl.ser:make-transaction
+                  :version 2
+                  :inputs (vector (bl.ser:make-tx-in
+                                   :previous-output (bl.ser:make-outpoint
+                                                     :hash funding :index 0)
+                                   :script-sig (%p2sh-optrue-scriptsig)
+                                   :sequence #xffffffff))
+                  :outputs (vector (bl.ser:make-tx-out
+                                    :value (- 100000000 50000)
+                                    :script-pubkey (p2sh-optrue-script-pubkey))
+                                   ;; The dust: an output worth nothing.
+                                   (bl.ser:make-tx-out
+                                    :value 0
+                                    :script-pubkey (p2sh-optrue-script-pubkey)))
+                  :lock-time 0))
+             (txid (bl.ser:transaction-hash tx))
+             (wtxid (bl.ser:transaction-wtxid tx))
+             (peer (%pr-peer)))
+        (flet ((shown (hash)
+                 (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))))
+          (%with-fresh-rejects (rejects)
+            (multiple-value-bind (ignored log)
+                (log-text-of "mempoolrej"
+                             (lambda ()
+                               (deliver-tx peer (%pr-payload tx)
+                                           (%pr-ctx state utxo mempool rejects))))
+              (declare (ignore ignored))
+              (is-false (bl.mp:mempool-has mempool txid)
+                        "the dusty transaction is refused")
+              (is-true (search (format nil "~A (wtxid=~A) from peer=~D was not accepted: dust"
+                                       (shown txid) (shown wtxid)
+                                       (bl.net:peer-id peer))
+                               log)
+                       "and Core's rejection line names it, in Core's words"))))))))

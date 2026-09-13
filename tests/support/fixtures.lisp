@@ -530,3 +530,20 @@ permissions to every peer in every later test."
                    ,entries))
          (bl.net:*whitebind-flags* ,whitebind))
      ,@body))
+
+;;;; Capturing what a code path LOGS
+
+(defun log-text-of (category thunk)
+  "Call THUNK with log CATEGORY enabled and the log stream captured; return
+(VALUES thunk-result log-text). Core's functional tests grep debug.log for
+these lines, so the wording is behaviour and gets asserted, not just the
+effect."
+  (let ((out (make-string-output-stream))
+        (was-on (bl.log:log-category-enabled-p category)))
+    (unwind-protect
+         (let ((bl.log:*log-stream* out))
+           (bl.log:enable-log-category category)
+           ;; VALUES is left-to-right, so THUNK runs before the stream is
+           ;; drained.
+           (values (funcall thunk) (get-output-stream-string out)))
+      (unless was-on (bl.log:disable-log-category category)))))

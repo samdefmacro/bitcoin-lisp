@@ -1110,12 +1110,46 @@ guesses a 64-bit CSPRNG value."
          (self-connection-nonce-p
           (bl.ser:version-message-nonce version)))))
 
+(defun %greatest-common-version (peer)
+  "Core's greatest_common_version = min(nVersion, PROTOCOL_VERSION)
+(net_processing.cpp:3668), the number the post-VERSION capability messages are
+gated on. A peer whose VERSION we have not read yet -- our OUTBOUND path sends
+first -- counts as speaking our own version, which is what we assumed before
+this gate existed."
+  (let ((theirs (peer-version peer)))
+    (if theirs
+        (min (bl.ser:version-message-version theirs) bl.ser:+protocol-version+)
+        bl.ser:+protocol-version+)))
+
+(defun %send-post-version-capabilities (peer)
+  "The post-VERSION capability messages, in Core's order and under Core's
+gates (net_processing.cpp:3715-3726):
+
+  wtxidrelay (BIP339) when greatest_common_version >= WTXID_RELAY_VERSION;
+  sendaddrv2 (BIP155) when greatest_common_version >= 70016, which Core calls
+  a courtesy -- \"some implementations reject messages they don't know\".
+
+Both must come after VERSION and before VERACK. Ours sent sendaddrv2 to every
+peer and gated wtxidrelay on whether OUR side relays transactions, which is
+not a condition Core has at all: p2p_leak.py:123 opens a peer announcing
+protocol 70015 and asserts at :154-155 that neither message arrives.
+
+The gate bites on the INBOUND path, where the peer's VERSION is already in
+hand. On the OUTBOUND path we still send these with our own VERSION, before
+theirs arrives -- Core sends them from its VERSION handler in both directions
+-- so %GREATEST-COMMON-VERSION reads our own version there and both messages
+go out, as they always did. Returns T."
+  (let ((common (%greatest-common-version peer)))
+    (when (>= common bl.ser:+wtxid-relay-version+)
+      (send-message peer (bl.ser:make-wtxidrelay-message)))
+    (when (>= common 70016)
+      (send-message peer (bl.ser:make-sendaddrv2-message))))
+  t)
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
-VERACK). Returns T if the version was sent. On a block-relay/feeler connection
-the version's relay flag is 0 and we skip wtxidrelay (Core does not negotiate
-tx relay on those)."
+VERACK). Returns T if the version was sent."
   (let* ((services (local-services))
          (relays (peer-relays-txs-p peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
@@ -1145,12 +1179,7 @@ tx relay on those)."
          (version-msg (bl.ser:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)
-      ;; wtxidrelay only makes sense when we relay txs (BIP339); skip it on
-      ;; block-relay/feeler connections, as Core does.
-      (when relays
-        (send-message peer (bl.ser:make-wtxidrelay-message)))
-      (send-message peer (bl.ser:make-sendaddrv2-message))
-      t)))
+      (%send-post-version-capabilities peer))))
 
 (defconstant +min-peer-proto-version+ 31800
   "Core MIN_PEER_PROTO_VERSION (protocol_version.h:18): a peer announcing an

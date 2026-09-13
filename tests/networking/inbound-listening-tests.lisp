@@ -293,10 +293,14 @@ runs with its own outbound-nonce registry so the inbound side does not
                (setf client-thread
                      (bt:make-thread
                       (lambda ()
-                        (with-private-outbound-nonces
-                          (let ((c (bl.net:connect-peer "127.0.0.1" port)))
-                            (when (and c (bl.net:perform-handshake c))
-                              (setf good c)))))
+                        ;; An unhandled condition in a test thread drops a
+                        ;; non-interactive image into the debugger, which
+                        ;; reads as a hung suite.
+                        (ignore-errors
+                         (with-private-outbound-nonces
+                           (let ((c (bl.net:connect-peer "127.0.0.1" port)))
+                             (when (and c (bl.net:perform-handshake c))
+                               (setf good c))))))
                       :name "test-inbound-client"))
                ;; TIMING-SENSITIVE, with a wide margin on purpose: the whole
                ;; question is latency, and the two answers are ~0.05 s (the
@@ -328,3 +332,71 @@ runs with its own outbound-nonce registry so the inbound side does not
           (dolist (p (bl:node-pending-inbound-peers node))
             (ignore-errors (bl.net:disconnect-peer p)))
           (bl.net:close-listener srv))))))
+
+(test the-post-version-capabilities-follow-the-negotiated-version
+  "Core gates the two post-VERSION capability messages on
+greatest_common_version = min(their nVersion, PROTOCOL_VERSION)
+(net_processing.cpp:3668): wtxidrelay at WTXID_RELAY_VERSION (70016,
+:3715-3717) and sendaddrv2 at 70016 too, which Core's own comment calls a
+courtesy -- \"some implementations reject messages they don't know\"
+(:3719-3726).
+
+Ours sent sendaddrv2 to every peer whatever it announced, and gated
+wtxidrelay on whether OUR side relays transactions, which is not one of
+Core's conditions. p2p_leak.py:123 connects a peer announcing protocol 70015
+and asserts at :154-155 that it received neither message; both arrived.
+
+Driven over a real loopback pair: the client sends a raw VERSION of the given
+protocol and collects every command the node sends back."
+  (flet ((commands-for (their-version)
+           (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+             (is-true srv)
+             (when srv
+               (unwind-protect
+                    (let* ((port (usocket:get-local-port srv))
+                           (server
+                             (bt:make-thread
+                              (lambda ()
+                                (ignore-errors
+                                 (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                                   (when conn
+                                     (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
+                                       (bl.net:perform-inbound-handshake p)
+                                       (sleep 0.4)
+                                       (ignore-errors (bl.net:disconnect-peer p)))))))
+                              :name "test-caps-server")))
+                      (sleep 0.2)
+                      (let ((client (bl.net:connect-peer "127.0.0.1" port))
+                            (commands '()))
+                        (unwind-protect
+                             (when client
+                               (bl.net:send-bytes
+                                (bl.net:peer-connection client)
+                                (bl.ser:serialize-message
+                                 "version"
+                                 (bl.ser:make-version-message-bytes
+                                  :version their-version)))
+                               (bl.net:send-bytes
+                                (bl.net:peer-connection client)
+                                (bl.ser:make-verack-message))
+                               (loop repeat 60
+                                     do (let ((c (bl.net:receive-message client)))
+                                          (if c (push c commands) (sleep 0.02)))))
+                          (when client (ignore-errors (bl.net:disconnect-peer client)))
+                          (ignore-errors (bt:join-thread server)))
+                        (nreverse commands)))
+                 (bl.net:close-listener srv))))))
+    (let ((modern (commands-for 70016))
+          (old (commands-for 70015)))
+      (flet ((sent (commands name) (and (member name commands :test #'string=) t)))
+        ;; Control first: the node answered both clients at all.
+        (is-true (sent modern "version") "control: the node answered the modern client")
+        (is-true (sent old "version") "control: the node answered the old client")
+        (is-true (sent modern "wtxidrelay")
+                 "a 70016 peer is offered wtxid relay")
+        (is-true (sent modern "sendaddrv2")
+                 "and addrv2")
+        (is-false (sent old "wtxidrelay")
+                  "a 70015 peer must not be offered wtxid relay")
+        (is-false (sent old "sendaddrv2")
+                  "nor addrv2, which Core withholds as a courtesy below 70016")))))

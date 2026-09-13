@@ -108,7 +108,9 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    ;; fixtures.lisp (handshake)
    #:with-private-outbound-nonces
    ;; fixtures.lisp (net permissions)
-   #:with-whitelist))
+   #:with-whitelist
+   ;; fixtures.lisp (logging)
+   #:log-text-of))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))
