@@ -89,6 +89,12 @@ each character instead — latin-1 — and so could not express this test at all
 
 ;;; --- JSON-RPC Parsing Tests ---
 
+(defun %testmempoolaccept (node hexes &rest rest)
+  "testmempoolaccept through its handler, for HEXES and any trailing positional
+arguments. One reach for the whole file: the handler is internal to BL.RPC
+(only DISPATCH-RPC-METHOD is exported) and eight tests drive it."
+  (bl.rpc::rpc-testmempoolaccept node (cons hexes rest)))
+
 (test json-rpc-parse-valid-request
   "Test parsing valid JSON-RPC request"
   (let ((body "{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}"))
@@ -179,11 +185,10 @@ empty array, so it earns the COUNT error, not a type error
             "null verbosity must not be read as a type error")))
     ;; The other direction: empty is an array, so the count error.
     (signals-rpc-error (:code -8 :message "Array must contain between")
-      (bl.rpc::rpc-testmempoolaccept
-       node (list bl.rpc::+json-empty-array+)))
+      (%testmempoolaccept node bl.rpc::+json-empty-array+))
     ;; And null is not an array at all.
     (signals-rpc-error (:code -3)
-      (bl.rpc::rpc-testmempoolaccept node (list nil)))))
+      (%testmempoolaccept node nil))))
 
 (test getrawtransaction-not-found-speaks-cores-sentence
   "Core selects one of four not-found messages and appends the same sentence to
@@ -1968,7 +1973,7 @@ the unbroadcast set, and no announcement is queued."
            (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
            (hex (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))))
-      (let ((r (first (bl.rpc::rpc-testmempoolaccept node (list (list hex))))))
+      (let ((r (first (%testmempoolaccept node (list hex)))))
         (is (eq t (cdr (assoc "allowed" r :test #'string=)))))
       (is (= 0 (bl.mp:mempool-count mempool)))
       (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))
@@ -1992,7 +1997,7 @@ CheckInputScripts, validation.cpp:2117."
                  (bl.net:make-peer :state :ready)))
           (hex (bl.crypto:bytes-to-hex
                 (bl.ser:serialize-transaction tx))))
-      (let ((r (first (bl.rpc::rpc-testmempoolaccept node (list (list hex))))))
+      (let ((r (first (%testmempoolaccept node (list hex)))))
         (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
         (is (string= "mempool-script-verify-flag-failed (Stack size must be exactly one after execution)"
                      (cdr (assoc "reject-reason" r :test #'string=))))))))
@@ -2133,12 +2138,11 @@ transactions whose signatures Core deliberately never checked."
              (aval (row key) (cdr (assoc key row :test #'string=))))
         ;; Every member on its own is accepted, so the blanks below are the
         ;; package rule and not three broken transactions.
-        (let ((solo (bl.rpc::rpc-testmempoolaccept
-                     node (list (mapcar #'hex good)))))
+        (let ((solo (%testmempoolaccept node (mapcar #'hex good))))
           (is (equal '(t t t) (mapcar (lambda (r) (aval r "allowed")) solo))))
         ;; The garbage member's inputs are missing: a PreChecks failure.
-        (let ((r (bl.rpc::rpc-testmempoolaccept
-                  node (list (append (mapcar #'hex good) (list (hex garbage)))))))
+        (let ((r (%testmempoolaccept
+                  node (append (mapcar #'hex good) (list (hex garbage))))))
           (is (= 4 (length r)))
           (is (equal '(("txid" "wtxid") ("txid" "wtxid") ("txid" "wtxid"))
                      (mapcar #'keys (subseq r 0 3)))
@@ -2147,8 +2151,8 @@ transactions whose signatures Core deliberately never checked."
           (is (string= "missing-inputs" (aval (fourth r) "reject-reason"))))
         ;; A script failure is the other pass: the member before it keeps its
         ;; full result.
-        (let ((r (bl.rpc::rpc-testmempoolaccept
-                  node (list (list (hex (second good)) (hex bad-script))))))
+        (let ((r (%testmempoolaccept
+                  node (list (hex (second good)) (hex bad-script)))))
           (is (= 2 (length r)))
           (is (eq t (aval (first r) "allowed"))
               "a member Core had already finished lost its verdict")
@@ -2172,14 +2176,14 @@ once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
                 (bl.ser:serialize-transaction parent)))
            (ch (bl.crypto:bytes-to-hex
                 (bl.ser:serialize-transaction child)))
-           (r (bl.rpc::rpc-testmempoolaccept node (list (list ph ch)))))
+           (r (%testmempoolaccept node (list ph ch))))
       (is (eq 'yason:false (cdr (assoc "allowed" (first r) :test #'string=))))
       (is (string= "max-fee-exceeded"
                    (cdr (assoc "reject-reason" (first r) :test #'string=))))
       ;; Unfinished: no verdict at all on the child.
       (is (equal '("txid" "wtxid") (mapcar #'car (second r))))
       ;; Rail off -> the parent is allowed again.
-      (let ((off (bl.rpc::rpc-testmempoolaccept node (list (list ph) 0))))
+      (let ((off (%testmempoolaccept node (list ph) 0)))
         (is (eq t (cdr (assoc "allowed" (first off) :test #'string=)))))
       ;; Still a dry run either way.
       (is (= 0 (bl.mp:mempool-count mempool))))))
@@ -6528,7 +6532,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
          (tx (make-mempool-test-tx :input-id 210))
          (hex (bl.crypto:bytes-to-hex
                (bl.ser:serialize-transaction tx)))
-         (result (bl.rpc::rpc-testmempoolaccept node (list (list hex)))))
+         (result (%testmempoolaccept node (list hex))))
     (is (listp result))
     (is (= 1 (length result)))
     (let ((r (first result)))
