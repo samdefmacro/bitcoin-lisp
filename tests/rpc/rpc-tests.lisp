@@ -563,7 +563,7 @@ recovers exactly the matched leaves, across tree sizes and match sets."
       (multiple-value-bind (bits hashes)
           (bl.rpc::build-partial-merkle-tree txid-vec match)
         (multiple-value-bind (xroot xmatched xindices)
-            (bl.rpc::extract-partial-merkle-tree ntx bits hashes)
+            (bl.rpc:extract-partial-merkle-tree ntx bits hashes)
           (is (equalp root xroot) "ntx=~D root mismatch" ntx)
           (is (equal (sort (copy-list want) #'<) xindices) "ntx=~D indices" ntx)
           (is (= (length want) (length xmatched)))
@@ -583,15 +583,15 @@ recovers exactly the matched leaves, across tree sizes and match sets."
       (let* ((header (make-array 80 :element-type '(unsigned-byte 8) :initial-element 7))
              (bytes (bl.rpc::serialize-merkle-block header ntx hashes bits)))
         (multiple-value-bind (h2 ntx2 hashes2 bits2)
-            (bl.rpc::parse-merkle-block bytes)
+            (bl.rpc:parse-merkle-block bytes)
           (is (equalp header h2))
           (is (= ntx ntx2))
           (is (equalp hashes hashes2))
           ;; bits round-trip up to the byte padding zeros
           (is (equal bits (subseq bits2 0 (length bits))))
           ;; and re-extract gives the same root
-          (is (equalp (bl.rpc::extract-partial-merkle-tree ntx bits hashes)
-                      (bl.rpc::extract-partial-merkle-tree ntx2 bits2 hashes2))))))))
+          (is (equalp (bl.rpc:extract-partial-merkle-tree ntx bits hashes)
+                      (bl.rpc:extract-partial-merkle-tree ntx2 bits2 hashes2))))))))
 
 (test txoutproof-tamper-detected
   "Flipping a hash in the partial tree changes the recomputed root."
@@ -605,7 +605,7 @@ recovers exactly the matched leaves, across tree sizes and match sets."
         (bl.rpc::build-partial-merkle-tree txid-vec match)
       (let ((tampered (mapcar #'copy-seq hashes)))
         (setf (aref (first tampered) 0) (logxor (aref (first tampered) 0) #xff))
-        (is (not (equalp root (bl.rpc::extract-partial-merkle-tree
+        (is (not (equalp root (bl.rpc:extract-partial-merkle-tree
                                ntx bits tampered))))))))
 
 (test rpc-txoutproof-roundtrip
@@ -8781,7 +8781,7 @@ anything — and that the count comparison rejects it."
         ;; matched, so all three bits are set (Core TraverseAndExtract reads a
         ;; bit per visited node, and at height 0 a set bit means a matched
         ;; leaf whose hash is consumed).
-        (bl.rpc::extract-partial-merkle-tree 2 (list t t t) (list a b))
+        (bl.rpc:extract-partial-merkle-tree 2 (list t t t) (list a b))
       (is (equalp real-root forged-root)
           "the forged 2-tx proof must reproduce the REAL 4-tx root — that is
            what makes the root check useless here")
@@ -8800,11 +8800,11 @@ anything — and that the count comparison rejects it."
 transactions'): the count drives the tree shape, so it must be bounded first.
 MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT = 4000000 / 240 = 16666."
   (let ((h (first (%proof-hashes 1))))
-    (is-false (bl.rpc::extract-partial-merkle-tree 16667 (list t) (list h))
+    (is-false (bl.rpc:extract-partial-merkle-tree 16667 (list t) (list h))
               "one over the cap must be refused")
     ;; And the cap must not reject a legitimate small proof.
     (multiple-value-bind (root matched)
-        (bl.rpc::extract-partial-merkle-tree 1 (list t) (list h))
+        (bl.rpc:extract-partial-merkle-tree 1 (list t) (list h))
       (declare (ignore matched))
       (is (equalp h root) "a single-transaction proof still works"))))
 

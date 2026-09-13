@@ -50,14 +50,14 @@ forked one detached /bin/sh per connected block, as fast as blocks connect."
       (let ((bl::*block-notify-command* "true"))
         ;; In IBD: not one run, however many tips go by.
         (let ((bl.net:*cached-is-ibd* t))
-          (dotimes (i 50) (bl::notify-block-tip cs hash i)))
+          (dotimes (i 50) (bl:notify-block-tip cs hash i)))
         (is (zerop calls)
             "-blocknotify ran ~D time~:P during initial block download" calls)
         ;; Positive control: past init it DOES run, once per tip update. Without
         ;; this the assertion above would also pass with the hook unwired.
         (let ((bl.net:*cached-is-ibd* nil))
-          (bl::notify-block-tip cs hash 51)
-          (bl::notify-block-tip cs hash 52))
+          (bl:notify-block-tip cs hash 51)
+          (bl:notify-block-tip cs hash 52))
         (is (= 2 calls)
             "positive control: -blocknotify must run once per tip update past init, ran ~D"
             calls)
@@ -66,7 +66,7 @@ forked one detached /bin/sh per connected block, as fast as blocks connect."
         (let ((bl.net:*cached-is-ibd* nil)
               (background (bl.store:make-chain-state)))
           (setf (bl.store:chain-state-target-blockhash background) hash)
-          (bl::notify-block-tip background hash 53)
+          (bl:notify-block-tip background hash 53)
           (is (= 2 calls)
               "a background (targeted) chainstate's tip must not fire -blocknotify"))))))
 
@@ -85,7 +85,7 @@ when the node has left initial block download."
     (%counting-notify-commands (calls)
       (let ((bl::*block-notify-command* nil)
             (bl.net:*cached-is-ibd* nil))
-        (bl::notify-block-tip cs hash 9))
+        (bl:notify-block-tip cs hash 9))
       (is (zerop calls)))))
 
 ;;; --- -alertnotify and the warnings registry (finding c053f780) --------------

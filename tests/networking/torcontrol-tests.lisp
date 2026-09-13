@@ -789,10 +789,10 @@ no retry, no disconnect)."
   "PEER's next self-announcement deadline (Core Peer::m_next_local_addr_send;
 0 = never announced). SETF-able so a test can make a peer due again without
 waiting out an exponential draw."
-  (bl.net::peer-next-local-addr-send peer))
+  (bl.net:peer-next-local-addr-send peer))
 
 (defun (setf %local-addr-deadline) (ticks peer)
-  (setf (bl.net::peer-next-local-addr-send peer) ticks))
+  (setf (bl.net:peer-next-local-addr-send peer) ticks))
 
 (test self-announcement-is-alone-once-then-rides-the-gossip-queue
   "Core sends only the FIRST self-announcement as its own message -- its
@@ -809,7 +809,7 @@ was never lifted, so our address could never have ridden the queue at all."
   (with-tor-globals
     ;; Core gates the self-announcement on !IsInitialBlockDownload; the latch
     ;; is already off here so the pass reaches the announcement at all.
-    (let ((bl.net::*cached-is-ibd* nil)
+    (let ((bl.net:*cached-is-ibd* nil)
           (ip (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)))
       (bl.net:add-local :ipv4 ip 8333 bl.net:+local-manual+)
       (let ((peer (bl.net:make-peer :state :ready :addr-relay-enabled t

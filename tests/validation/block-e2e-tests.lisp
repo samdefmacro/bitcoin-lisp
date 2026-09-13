@@ -107,21 +107,21 @@
 (test block-first-tx-must-be-coinbase
   "First transaction must be a coinbase."
   (let ((regular-tx (make-e2e-regular-tx)))
-    (is (not (bl.val::is-coinbase-tx regular-tx)))))
+    (is (not (bl.val:is-coinbase-tx regular-tx)))))
 
 (test coinbase-tx-detection
   "Coinbase transaction should be detected correctly."
   (let ((coinbase (make-e2e-coinbase-tx)))
-    (is (bl.val::is-coinbase-tx coinbase))))
+    (is (bl.val:is-coinbase-tx coinbase))))
 
 (test block-non-coinbase-after-first
   "Non-first transactions must not be coinbase."
   (let ((coinbase (make-e2e-coinbase-tx))
         (regular (make-e2e-regular-tx)))
     ;; First is coinbase - good
-    (is (bl.val::is-coinbase-tx coinbase))
+    (is (bl.val:is-coinbase-tx coinbase))
     ;; Second is regular - good
-    (is (not (bl.val::is-coinbase-tx regular)))))
+    (is (not (bl.val:is-coinbase-tx regular)))))
 
 ;;; UTXO set operations during block connection
 
