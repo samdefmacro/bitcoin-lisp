@@ -224,6 +224,8 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:chain-params-headers-sync-params
    #:chain-params-minimum-chain-work
    #:chain-params-assumevalid-hex
+   #:chain-tx-data
+   #:chain-pow-target-spacing
    #:chain-params-assumeutxo
    #:chain-params-prune-after-height
    #:chain-params-bech32-hrp
