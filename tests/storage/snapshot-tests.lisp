@@ -453,6 +453,54 @@ a non-empty mempool — all rejected before the coin stream is touched."
         (is (%snap-err-matches (%snap-load-err node snap5)
                                -32603 "Work does not exceed"))))))
 
+(test snapshot-rejections-say-which-half-refused-them
+  "Core splits snapshot activation in two and the split is visible in every
+message. ActivateSnapshot's own preconditions report their reason directly,
+while everything PopulateAndValidateSnapshot refuses comes back through
+cleanup_bad_snapshot as `Population failed: <reason>' (validation.cpp:
+5716-5718) -- the assumeutxo HEIGHT entry, the work comparison and every
+per-coin, EOF and hash_serialized_3 verdict (:5796-5936).
+
+feature_assumeutxo.py builds its expected messages that way: :219 asks for
+`Unable to load UTXO snapshot: Population failed: Work does not exceed active
+chainstate.' and :87 wraps every bad-file case the same. Ours carried no
+prefix anywhere, and the work sentence also had a parenthetical Core does not
+write, so neither could match. The rows are asserted WHOLE here, the prefixed
+one beside an unprefixed one."
+  (with-temp-directory (dir)
+    (let* ((bl:*prune-target-mib* nil)
+           (h5 (%snap-fill 32 5))
+           (zero32 (%snap-fill 32 0))
+           (node (%snap-node dir h5 5))
+           (chain (bl:node-chain-state node))
+           (snap5 (%snap-write-file (merge-pathnames "w5.dat" dir)
+                                    :base-hash h5 :count 0))
+           (path (namestring (truename (merge-pathnames "w5.dat" dir)))))
+      (let ((bl:*assumeutxo-data-override* (list (%snap-au 5 h5 zero32))))
+        ;; ActivateSnapshot half: no prefix.
+        (bl.mp:mempool-add (bl:node-mempool node) (%snap-fill 32 #x44)
+                           (bl.mp:make-entry-from-tx
+                            (bl.ser:make-transaction
+                             :version 1
+                             :inputs (vector (bl.ser:make-tx-in
+                                              :previous-output (bl.ser:make-outpoint
+                                                                :hash zero32 :index #xffffffff)
+                                              :script-sig (%snap-fill 1 #x51)
+                                              :sequence #xffffffff))
+                             :outputs (vector (bl.ser:make-tx-out
+                                               :value 1000
+                                               :script-pubkey (%snap-cat #(#x6A))))
+                             :lock-time 0)
+                            0 0))
+        (is (string= (format nil "Unable to load UTXO snapshot: Can't activate a snapshot when mempool not empty. (~A)" path)
+                     (bl.rpc:rpc-error-message (%snap-load-err node snap5))))
+        (setf (bl:node-mempool node) (bl.mp:make-mempool))
+        ;; PopulateAndValidateSnapshot half: prefixed, and the work sentence
+        ;; is Core's whole sentence.
+        (bl.store:update-chain-tip chain h5 5)
+        (is (string= (format nil "Unable to load UTXO snapshot: Population failed: Work does not exceed active chainstate. (~A)" path)
+                     (bl.rpc:rpc-error-message (%snap-load-err node snap5))))))))
+
 (test snapshot-content-rejections
   "PopulateAndValidateSnapshot's per-coin and stream checks (validation.cpp
 :5816-5936): coin height above the base, MoneyRange violation, group
