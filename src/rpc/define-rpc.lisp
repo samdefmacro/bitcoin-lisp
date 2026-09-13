@@ -57,6 +57,24 @@ rpc_generate.py:129-132). A method with no entry answers as it always did.")
   "Record TEXT as the answer of `help NAME'."
   (setf (gethash name *rpc-help-texts*) text))
 
+(defvar *rpc-hidden-methods* '()
+  "(method ...): the methods Core files under the category \"hidden\", which
+CRPCTable::help leaves out of the ALL-COMMANDS listing while still answering
+`help <name>' for each of them (rpc/server.cpp:310-311). Generated into
+rpc/core-tables.lisp.")
+
+(defun rpc-method-hidden-p (method)
+  "T when METHOD is in Core's \"hidden\" category -- answered by
+`help <name>', never listed by a bare `help'."
+  (and (member method *rpc-hidden-methods* :test #'string=) t))
+
+(defun rpc-method-description (method)
+  "METHOD's prose description: the docstring of the function DEFINE-RPC made
+for it, which is this node's stand-in for Core's RPCHelpMan m_description.
+NIL when the method is unknown or carries no docstring."
+  (let ((symbol (cdr (assoc method *rpc-registry* :test #'string=))))
+    (and symbol (documentation symbol 'function))))
+
 (defun register-rpc-method (name handler)
   "Install HANDLER (a function of NODE and PARAMS) as method NAME."
   (setf (gethash name *rpc-methods*) handler))

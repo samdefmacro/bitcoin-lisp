@@ -1252,12 +1252,13 @@ all, which is the order Core reaches transformNamedArguments in
       ;; two arguments are too few even though only two are required.
       (is (equal (cons -1 "prioritisetransaction \"txid\" ( dummy ) fee_delta")
                  (answer "prioritisetransaction" zeros 0)))
-      ;; Positive controls. Exactly the maximum still RUNS: help echoes the
-      ;; method name it was given.
+      ;; Positive controls. Exactly the maximum still RUNS: help answers with
+      ;; that method's document, which OPENS with its usage line (Core
+      ;; RPCHelpMan::ToString, rpc/util.cpp:773-793).
       (is (null (answer "help" "getblockcount")))
-      (is (equal "getblockcount"
-                 (bl.rpc:dispatch-rpc-method node "help"
-                                             (wire-params (list "getblockcount")))))
+      (is (eql 0 (search (format nil "getblockcount~%~%")
+                         (bl.rpc:dispatch-rpc-method
+                          node "help" (wire-params (list "getblockcount"))))))
       ;; Trailing optional arguments may still be omitted, all of them.
       (is (null (answer "help")))
       (is (null (answer "getrawmempool")))
@@ -7098,8 +7099,9 @@ address (with network), and per-input sequence — the fields explorers expect."
     (is (stringp h))
     (is (search "stop" h))
     (is (search "getnetworkhashps" h)))
-  ;; A known method echoes its name; an unknown one reports so.
-  (is (string= "uptime" (bl.rpc::rpc-help nil (list "uptime"))))
+  ;; A known method answers with its document, which opens on its usage line
+  ;; (Core RPCHelpMan::ToString); an unknown one reports so.
+  (is (eql 0 (search (format nil "uptime~%~%") (bl.rpc::rpc-help nil (list "uptime")))))
   (is (search "unknown" (bl.rpc::rpc-help nil (list "nope-xyz")))))
 
 (test rpc-getmemoryinfo-and-getrpcinfo-shape
@@ -9803,3 +9805,47 @@ that echoed the string back gave neither, and the test's next line is
                      (cdr err))
              "~A's message was ~S" method (cdr err))
             (is-true (search "Please report this issue here:" (cdr err)))))))))
+
+;;; --- help: one method's document, and Core's hidden category ---------------
+
+(test help-answers-a-methods-document-and-hides-cores-hidden-category
+  "Core's CRPCTable::help (rpc/server.cpp:295-330) answers `help <name>' with
+that method's RPCHelpMan::ToString -- the usage line, a blank line, then the
+description (rpc/util.cpp:773-793) -- and leaves the methods it files under
+the category \"hidden\" out of the bare listing while still answering for
+them by name (:310-311).
+
+Two of Core's own tests read exactly that:
+
+  rpc_named_arguments.py:21  assert h.startswith('getblockchaininfo\\n')
+  rpc_orphans.py:152-153     assert 'getorphantxs' not in node.help()
+                             assert 'unknown command: getorphantxs' not in
+                                    node.help('getorphantxs')
+
+Answering the bare method name satisfied neither: no newline, and every
+hidden method listed."
+  (let ((node (make-test-node)))
+    (flet ((help (&rest params)
+             (bl.rpc:dispatch-rpc-method node "help" (wire-params params))))
+      ;; A method's document opens with `<name>\n\n' and carries its prose.
+      (let ((text (help "getblockchaininfo")))
+        (is (eql 0 (search (format nil "getblockchaininfo~%~%") text))
+            "help getblockchaininfo began ~S" (subseq text 0 (min 60 (length text)))))
+      ;; The usage line carries the declared arguments, as Core's does.
+      (is (eql 0 (search (format nil "getblockhash height~%~%") (help "getblockhash"))))
+      ;; An unknown command is unchanged (rpc_help.py:133).
+      (is (string= "help: unknown command: foo" (help "foo")))
+      ;; The listing omits Core's hidden category but keeps ordinary methods,
+      ;; and `help <name>' still answers for a hidden one.
+      (let ((listing (help)))
+        (is-false (search "getorphantxs" listing)
+                  "a hidden method must not appear in the bare listing")
+        (is-false (search "setmocktime" listing))
+        (is-false (search "invalidateblock" listing))
+        (is-true (search "getblockchaininfo" listing))
+        (is-true (search "getblockcount" listing)))
+      (dolist (hidden '("getorphantxs" "setmocktime" "invalidateblock"))
+        (let ((text (help hidden)))
+          (is-false (search "unknown command" text)
+                    "help ~A answered ~S" hidden text)
+          (is (eql 0 (search hidden text))))))))
