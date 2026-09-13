@@ -339,6 +339,47 @@ stops being applied."
         (unless bar (return nil))
         (setf start (1+ bar))))))
 
+(defun %collect-named-only-options (method names remaining)
+  "Move METHOD's named-only option members out of REMAINING and into a fresh
+object at its OBJ_NAMED_PARAMS slot -- the named_only half of Core's
+transformNamedArguments loop (rpc/server.cpp:408-415). NAMES is the method's
+positional argument-name list.
+
+Core does it inline in ONE loop over GetArgNames, where the members sit at the
+OBJ_NAMED_PARAMS argument's own position, so a name that is BOTH a member and
+a positional argument goes to whichever comes first. That is not hypothetical:
+send and sendall declare conf_target, estimate_mode and fee_rate positionally
+AND inside options (Core marks those members .also_positional) and the
+positional slot is earlier, so it wins. Collecting the members first without
+that rule would bury a positional argument in the options object.
+
+The slot is found by TYPE and not by the name \"options\": listunspent calls
+its own \"query_options\", so a lookup by name found no slot and dropped every
+member it had just collected, with no error."
+  (let* ((options '())
+         (option-names (cdr (assoc method *rpc-named-only-args* :test #'string=)))
+         (types (cdr (assoc method *rpc-arg-types* :test #'string=)))
+         (opt-slot (or (position :obj-named-params types)
+                       (position-if (lambda (n) (%named-arg-slot n "options"))
+                                    names))))
+    (dolist (opt option-names)
+      (let ((positional-slot
+              (position-if (lambda (n) (%named-arg-slot n opt)) names)))
+        (unless (and positional-slot opt-slot (< positional-slot opt-slot))
+          (multiple-value-bind (v present) (gethash opt remaining)
+            (when present
+              (remhash opt remaining)
+              (push (cons opt v) options))))))
+    (setf options (nreverse options))
+    (when options
+      (let ((slot-name (and opt-slot (nth opt-slot names))))
+        (when (and slot-name (not (gethash slot-name remaining)))
+          (setf (gethash slot-name remaining)
+                (let ((h (make-hash-table :test 'equal)))
+                  (dolist (kv options h)
+                    (setf (gethash (car kv) h) (cdr kv))))))))
+    remaining))
+
 (defun %named-params-to-positional (method params)
   "PARAMS as a positional list, mapping a JSON object onto METHOD's argument
 names (Core transformNamedArguments, rpc/server.cpp:368-470). A params ARRAY is
@@ -371,44 +412,7 @@ argument already reaches every handler."
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Parameter args must be an array"))
             (setf positional (coerce args 'list))))
-        ;; Named-only members of the method's options object, collected out
-        ;; before the positional slots are matched. Core does it inline in one
-        ;; loop over GetArgNames (rpc/server.cpp:408-415), where the members
-        ;; sit at the OBJ_NAMED_PARAMS argument's own position, so a name that
-        ;; is BOTH a member and a positional argument goes to whichever comes
-        ;; first. That is not hypothetical: send and sendall declare
-        ;; conf_target, estimate_mode and fee_rate positionally AND inside
-        ;; options (Core marks those members .also_positional) and the
-        ;; positional slot is earlier, so it wins. Collecting the members
-        ;; first without that rule would bury a positional argument in the
-        ;; options object.
-        (let* ((options '())
-               (option-names (cdr (assoc method *rpc-named-only-args*
-                                         :test #'string=)))
-               ;; The OBJ_NAMED_PARAMS slot, found by TYPE rather than by the
-               ;; name "options": listunspent calls its own "query_options",
-               ;; so a name lookup found no slot and silently dropped every
-               ;; option it had just collected.
-               (types (cdr (assoc method *rpc-arg-types* :test #'string=)))
-               (opt-slot (or (position :obj-named-params types)
-                             (position-if (lambda (n) (%named-arg-slot n "options"))
-                                          names))))
-          (dolist (opt option-names)
-            (let ((positional-slot
-                    (position-if (lambda (n) (%named-arg-slot n opt)) names)))
-              (unless (and positional-slot opt-slot (< positional-slot opt-slot))
-                (multiple-value-bind (v present) (gethash opt remaining)
-                  (when present
-                    (remhash opt remaining)
-                    (push (cons opt v) options))))))
-          (setf options (nreverse options))
-          (when options
-            (let ((slot-name (and opt-slot (nth opt-slot names))))
-              (when (and slot-name (not (gethash slot-name remaining)))
-                (setf (gethash slot-name remaining)
-                      (let ((h (make-hash-table :test 'equal)))
-                        (dolist (kv options h)
-                          (setf (gethash (car kv) h) (cdr kv)))))))))
+        (%collect-named-only-options method names remaining)
         (let ((slots '()))
           (loop for name-spec in names
                 for index from 0
