@@ -58,6 +58,20 @@ getchainstates, which reports every chainstate)."
   (bt:with-recursive-lock-held ((bl:node-lock node))
     (copy-list (bl:node-peers node))))
 
+(defun rpc-get-connected-peers (node)
+  "The peers Core's CConnman::GetNodeCount counts: m_nodes, which
+DisconnectNodes erases a closed connection from on the next socket round
+ (net.cpp:3769-3781 and :1909-1939).
+
+Ours keeps a :disconnected peer in NODE-PEERS until the sync cycle reaps it,
+and a sync cycle can be half a minute, so every RPC that answers \"how many
+peers\" must ask this rather than RPC-GET-PEERS. getpeerinfo and getnetworkinfo
+already filtered here; getconnectioncount did not, and
+p2p_nobloomfilter_messages.py:31 read 1 immediately after the node itself had
+closed the socket the framework had already seen close."
+  (remove-if (lambda (peer) (eq (bl.net:peer-state peer) :disconnected))
+             (rpc-get-peers node)))
+
 (defun rpc-get-mempool (node)
   "Get mempool with lock protection."
   (bt:with-recursive-lock-held ((bl:node-lock node))

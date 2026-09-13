@@ -358,7 +358,10 @@ miner."
   ;; Core avoids by checking first. This file previously did the reverse and
   ;; said it was Core's order.
   (when (eq (bl:node-network node) :mainnet)
-    (when (zerop (length (rpc-get-peers node)))
+    ;; Core reads connman.GetNodeCount(ConnectionDirection::Both)
+    ;; (rpc/mining.cpp:767), which is m_nodes -- the live connections, not one
+    ;; this node has already closed and not yet reaped.
+    (when (zerop (length (rpc-get-connected-peers node)))
       (error 'rpc-error :code +rpc-client-not-connected+
                         :message "Bitcoin is not connected!"))
     (when (rpc-is-syncing node)
