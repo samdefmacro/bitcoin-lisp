@@ -131,6 +131,35 @@ last_block stamps every block received (Core stamps only NEW blocks)."
   ;; NIL list would encode as null.
   (json-array (%peerinfo-rows node)))
 
+(defun network-names (&optional append-unroutable)
+  "Core GetNetworkNames (netbase.cpp:130-142): the names of every publicly
+routable network, in Network-enum order, with \"not_publicly_routable\"
+appended when APPEND-UNROUTABLE. NET_INTERNAL is never named.
+
+Core has ONE such function and two callers that have to agree: getaddrmaninfo
+enumerates the networks it reports counts for (rpc/net.cpp:1103), and
+getpeerinfo's help renders the list into the `network' field's own
+description (:137). Keeping one list here is what makes rpc_net.py:131 --
+which greps that help for the parenthesised list -- a check on the node
+rather than on a comment."
+  (append '("ipv4" "ipv6" "onion" "i2p" "cjdns")
+          (when append-unroutable '("not_publicly_routable"))))
+
+(defun %getpeerinfo-network-help ()
+  "getpeerinfo's `network' result line, built the way Core builds it:
+
+    {RPCResult::Type::STR, \"network\",
+     \"Network (\" + Join(GetNetworkNames(/*append_unroutable=*/true), \", \")
+     + \")\"}                                          (rpc/net.cpp:137)
+
+rpc_net.py:131 asserts the parenthesised list appears in
+help(\"getpeerinfo\") -- Core's own way of catching a node whose documented
+networks have drifted from the ones it reports."
+  (format nil "Result:~%  \"network\" : \"str\",    (string) Network (~{~A~^, ~})"
+          (network-names t)))
+
+(register-rpc-help-detail "getpeerinfo" #'%getpeerinfo-network-help)
+
 (defun %peerinfo-rows (node)
   "One getpeerinfo row (a field alist) per CONNECTED peer — the body of Core's
 getpeerinfo loop, rpc/net.cpp:107-227.
@@ -410,7 +439,9 @@ authoritative running counts."
   (let ((book (bl:node-address-book node))
         ;; name -> (new . tried)
         (tally (make-hash-table :test 'equal))
-        (networks '("ipv4" "ipv6" "onion" "i2p" "cjdns")))
+        ;; Core enumerates the Network enum, skipping NET_UNROUTABLE and
+        ;; NET_INTERNAL (rpc/net.cpp:1103) -- GetNetworkNames' own set.
+        (networks (network-names)))
     (dolist (n networks) (setf (gethash n tally) (cons 0 0)))
     (when book
       (maphash
