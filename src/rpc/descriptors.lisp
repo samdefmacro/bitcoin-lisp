@@ -1889,9 +1889,14 @@ which the wallet stores the root private key."
 the xprv embedded at parse time; otherwise reconstructs it from the 32-byte
 secret PRIVKEY-PROVIDER returns for the root pubkey's keyid (Core
 BIP32PubkeyProvider::GetExtKey: copy depth/fingerprint/child/chaincode from
-the xpub, substitute the private key material)."
+the xpub, substitute the private key material).
+
+A key expression that is NOT BIP32 -- a raw pubkey or a WIF key -- has no
+extended key and answers NIL, the way Core has no GetExtKey to call on a
+ConstPubkeyProvider at all (descriptor.cpp PubkeyProvider hierarchy). It used
+to hash the absent xpub and signal a type error out of the middle of an RPC."
   (or (desc-key-ext-privkey key)
-      (when privkey-provider
+      (when (and privkey-provider (desc-key-extkey key))
         (let* ((pub (desc-key-extkey key))
                (priv (funcall privkey-provider (%desc-key-root-keyid key))))
           (when priv

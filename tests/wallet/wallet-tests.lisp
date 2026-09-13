@@ -1239,6 +1239,57 @@ is what tells an operator which key their wallet actually depends on."
                (active (bl.wallet::rpc-gethdkeys node (list opts))))
           (is (= 1 (length active))))))))
 
+(test gethdkeys-ignores-a-key-expression-with-no-extended-key
+  "Core wallet/rpc/wallet.cpp:701-704: gethdkeys asks the descriptor for
+GetPubKeys(desc_pubkeys, desc_xpubs) and then iterates the XPUBS only, so a
+key expression that is a raw pubkey or a WIF key contributes nothing at all.
+
+Every functional test's default wallet carries exactly such a descriptor:
+the framework imports combo(<WIF>) into it at setup
+(test/functional/test_framework/util.py:740-748, called from
+test_framework.py:411), and that SPKM is inactive, so only a gethdkeys
+WITHOUT active_only reaches it. Ours asked such a key for its root xprv,
+which hashed a NIL extended key, and both wallet_gethdkeys.py:94 and
+wallet_createwalletdescriptor.py:34 answered -32603 Internal error.
+
+wallet_gethdkeys.py:107-114 is the other half: a wallet holding ONLY a
+WIF-key descriptor reports no HD keys, rather than reporting one or
+erroring."
+  (with-wallet-test-node (node :keypool 4)
+    (with-rpc-wallet (nil)
+      (bl.wallet::rpc-createwallet node '("hd")))
+    (with-rpc-wallet ("hd")
+      (let ((rows (bl.wallet::rpc-gethdkeys node nil)))
+        (is (= 1 (length rows))
+            "~D roots before the combo() import" (length rows)))
+      ;; The framework's coinbase import, verbatim in shape.
+      (let ((results (bl.wallet::rpc-importdescriptors
+                      node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
+                                                    (format nil "combo(~A)" (regtest-wif 9)))
+                                            "timestamp" 0
+                                            "label" "coinbase"))))))
+        (is (eq t (%aval "success" (first results)))
+            "the combo(WIF) import failed, so the case under test never arose"))
+      (let ((rows (bl.wallet::rpc-gethdkeys node nil)))
+        (is (= 1 (length rows))
+            "~D roots after importing a WIF-key descriptor" (length rows))
+        (is (every (lambda (row)
+                     (let ((xpub (cdr (assoc "xpub" row :test #'string=))))
+                       (and (stringp xpub) (plusp (length xpub)))))
+                   rows)
+            "a row without an xpub came back")))
+    ;; A wallet whose only descriptor is a WIF key has no HD key at all.
+    (with-rpc-wallet (nil)
+      (bl.wallet::rpc-createwallet node (list "lonekey" nil t)))
+    (with-rpc-wallet ("lonekey")
+      (let ((results (bl.wallet::rpc-importdescriptors
+                      node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
+                                                    (format nil "wpkh(~A)" (regtest-wif 11)))
+                                            "timestamp" 0))))))
+        (is (eq t (%aval "success" (first results)))))
+      (is (zerop (length (bl.wallet::rpc-gethdkeys node nil)))
+          "a WIF-only wallet reported an HD key"))))
+
 (test walletnotify-runs-on-every-add-to-wallet
   "-walletnotify (Core wallet.cpp:1125-1150). Asserted through the FILE the
 hook creates, and specifically on a RE-ADD of the same transaction in the same

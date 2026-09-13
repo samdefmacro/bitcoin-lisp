@@ -2247,7 +2247,16 @@ which is the whole point of the RPC."
                (when (or active (not active-only))
                  (dolist (key (bl.rpc:out-desc-ordered-keys (desc-spkm-desc spkm)))
                    ;; Only BIP32 keys are HD keys; a raw pubkey or WIF key in a
-                   ;; descriptor has no xpub to report.
+                   ;; descriptor has no xpub to report. Core splits the two
+                   ;; apart -- GetPubKeys(desc_pubkeys, desc_xpubs) -- and then
+                   ;; iterates the XPUBS ALONE (wallet/rpc/wallet.cpp:701-704),
+                   ;; so the extended key is what decides whether a key
+                   ;; expression is here at all. Asking a WIF key for its root
+                   ;; xprv first hashed a NIL extended key instead, and every
+                   ;; functional test's default wallet holds such a descriptor:
+                   ;; the framework imports combo(<WIF>) into it at set-up
+                   ;; (test/functional/test_framework/util.py:740-748), and a
+                   ;; gethdkeys without active_only reaches it.
                    ;;
                    ;; The private root comes from %DESC-KEY-ROOT-XPRV, not from
                    ;; the parsed key: a STORED descriptor keeps only the xpub,
@@ -2255,10 +2264,13 @@ which is the whole point of the RPC."
                    ;; desc-key-ext-privkey alone reported has_private FALSE for
                    ;; every wallet that had been written to disk — which is
                    ;; every real one.
-                   (let* ((xprv (bl.rpc:desc-key-root-xprv
-                                 key (spkm-privkey-provider wallet spkm)))
+                   (let* ((embedded-xprv (bl.rpc:desc-key-ext-privkey key))
                           (xpub-key (or (bl.rpc:desc-key-extkey key)
-                                        (and xprv (bl.crypto:bip32-neuter xprv)))))
+                                        (and embedded-xprv
+                                             (bl.crypto:bip32-neuter embedded-xprv))))
+                          (xprv (and xpub-key
+                                     (bl.rpc:desc-key-root-xprv
+                                      key (spkm-privkey-provider wallet spkm)))))
                      (when xpub-key
                        (let* ((xpub (bl.crypto:bip32-serialize xpub-key))
                               ;; Core's has_private is HasPrivKey(
