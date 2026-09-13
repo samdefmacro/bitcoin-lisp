@@ -9,6 +9,87 @@
 
 ;;; --- Blockchain Query Methods ---
 
+(defvar *chain-tx-count-memo* nil
+  "(BLOCK-HASH . CHAIN-TX-COUNT) for the last block %CACHED-CHAIN-TX-COUNT was
+asked about, or NIL.
+
+Core keeps this number in the block index itself (CBlockIndex::m_chain_tx_count,
+written by ReceivedBlockTransactions), so reading it costs nothing; ours is a
+walk to genesis. One slot is enough because the only caller asks about the tip:
+a repeated call while the tip stands still answers from the memo, and a call
+one block later extends the memo by that block instead of walking again.")
+
+(defun %cached-chain-tx-count (entry block-store)
+  "Transactions in the chain up to and including ENTRY, memoized (see
+*CHAIN-TX-COUNT-MEMO*). NIL when any block's count is unknown."
+  (let* ((memo *chain-tx-count-memo*)
+         (hash (bl.store:block-index-entry-hash entry))
+         (prev (bl.store:block-index-entry-prev-entry entry)))
+    (cond
+      ((and memo (equalp (car memo) hash)) (cdr memo))
+      ;; One block past the memo: add this block's own count rather than
+      ;; walking the whole chain again.
+      ((and memo prev
+            (equalp (car memo) (bl.store:block-index-entry-hash prev))
+            (%entry-tx-count entry block-store))
+       (let ((total (+ (cdr memo) (%entry-tx-count entry block-store))))
+         (setf *chain-tx-count-memo* (cons hash total))
+         total))
+      (t
+       (let ((total (%chain-tx-count entry block-store)))
+         (when total (setf *chain-tx-count-memo* (cons hash total)))
+         total)))))
+
+(defun %guess-verification-progress (chain-state entry block-store network)
+  "How far through the chain ENTRY is, as Core's
+ChainstateManager::GuessVerificationProgress (validation.cpp:5522-5556).
+
+The estimate is transactions seen over transactions expected: the chain's
+transaction count at ENTRY, divided by that count extrapolated to now at the
+chain's measured transaction rate (BL.CHAIN:CHAIN-TX-DATA). Core takes the
+elapsed time from the BLOCK's timestamp normally, but from the best HEADER's
+height when ENTRY is within two hours of now -- a height-based estimate
+quantizes cleanly to 1.0 at the tip, where a miner-set timestamp does not.
+Capped at 1.0.
+
+An entry whose chain transaction count is unknown -- a header with no body, a
+pruned ancestor -- is 0.0, exactly as Core answers for m_chain_tx_count == 0:
+no estimate rather than a made-up one.
+
+Ours reported 0.0 while a sync pass was running and 1.0 otherwise, read off a
+flag that says whether a thread is busy. That is not a progress figure: it
+answers 1.0 for a node one block past genesis with a million to go, which is
+the single number every wallet and every operator uses to decide whether the
+node can be trusted yet."
+  (let ((count (and entry (%cached-chain-tx-count entry block-store))))
+    (if (or (null count) (zerop count))
+        0.0d0
+        (multiple-value-bind (data-time data-count data-rate)
+            (bl.chain:chain-tx-data network)
+          (let* ((now (bl.ser:get-unix-time))
+                 (block-time (bl.ser:block-header-timestamp
+                              (bl.store:block-index-entry-header entry)))
+                 (height (bl.store:block-index-entry-height entry))
+                 (best-header (bl.store:best-header-entry chain-state))
+                 (best-height (and best-header
+                                   (bl.store:block-index-entry-height best-header)))
+                 (elapsed-from
+                   (if (and best-height
+                            (<= (abs (- now block-time)) (* 2 60 60))
+                            (>= best-height height))
+                       (- now (* (- best-height height)
+                                 (bl.chain:chain-pow-target-spacing network)))
+                       block-time))
+                 (expected
+                   (if (<= count data-count)
+                       (+ data-count (* (- now data-time) data-rate))
+                       (+ count (* (- now elapsed-from) data-rate)))))
+            ;; A zero denominator is C++ division by zero on a double, which is
+            ;; +inf and clamps to 1.0 -- not a signalled error.
+            (if (zerop expected)
+                1.0d0
+                (min (/ (float count 1d0) (float expected 1d0)) 1.0d0)))))))
+
 (define-rpc "getblockchaininfo" (node params)
   "Return blockchain state information."
   (declare (ignore params))
@@ -16,7 +97,6 @@
          (height (bl.store:current-height chain-state))
          (best-hash (bl.store:best-block-hash chain-state))
          (network (rpc-get-network node))
-         (syncing (rpc-is-syncing node))
          (block-store (rpc-get-block-store node))
          (tip (and best-hash (bl.store:get-block-index-entry chain-state best-hash)))
          (tip-header (and tip (bl.store:block-index-entry-header tip)))
@@ -40,7 +120,11 @@
                                              (bl.val:compute-median-time-past
                                               chain-state best-hash))
                                         0))
-                   ("verificationprogress" . ,(if syncing 0.0 1.0))
+                   ;; Core reports GuessVerificationProgress of the active tip
+                   ;; (rpc/blockchain.cpp:1421), not whether a sync thread is
+                   ;; running.
+                   ("verificationprogress"
+                    . ,(%guess-verification-progress chain-state tip block-store network))
                    ;; Core reports chainman.IsInitialBlockDownload()
                    ;; (rpc/blockchain.cpp:1422) -- the LATCHED verdict of
                    ;; UpdateIBDStatus, "the tip has minimum chain work and is
@@ -101,7 +185,7 @@
                            . ,(bl.crypto:bytes-to-hex challenge))))))))
     result))
 
-(defun %getchainstates-entry (chain-state syncing)
+(defun %getchainstates-entry (node chain-state)
   "Per-chainstate object for getchainstates — fields per Core's
 RPCHelpForChainstate (rpc/blockchain.cpp): snapshot_blockhash appears only
 for a snapshot chainstate, and validated reflects its assumeutxo status."
@@ -121,8 +205,13 @@ for a snapshot chainstate, and validated reflects its assumeutxo status."
       ("target" . ,(string-downcase
                     (format nil "~64,'0x" (bl.store:bits-to-target bits))))
       ("difficulty" . ,(%difficulty-from-bits bits))
-      ;; Consistent with getblockchaininfo: 1.0 at tip, 0.0 while syncing.
-      ("verificationprogress" . ,(if syncing 0.0d0 1.0d0))
+      ;; The same GuessVerificationProgress getblockchaininfo reports, for
+      ;; THIS chainstate's tip (Core rpc/blockchain.cpp:3474, which asks it of
+      ;; each chainstate in turn).
+      ("verificationprogress"
+       . ,(%guess-verification-progress chain-state tip
+                                        (rpc-get-block-store node)
+                                        (rpc-get-network node)))
       ;; We don't split a coinsdb vs coinstip cache; report the chainstate's
       ;; coins-cache budget (per-chainstate while an assumeutxo background
       ;; sync splits it — Core MaybeRebalanceCaches) for the tip cache and 0
@@ -143,8 +232,7 @@ from the node's chainstates list in Core's order: the historical chainstate
 first (when assumeutxo background validation is in progress), the current
 (active) chainstate last."
   (declare (ignore params))
-  (let* ((syncing (rpc-is-syncing node))
-         (chainstates (rpc-get-chainstates node))
+  (let* ((chainstates (rpc-get-chainstates node))
          (current (bl.store:select-current-chainstate chainstates))
          (historical (bl.store:select-historical-chainstate chainstates))
          ;; Core reports m_best_header's height, which can exceed every
@@ -152,8 +240,8 @@ first (when assumeutxo background validation is in progress), the current
          (best-header (bl.store:best-header-entry current))
          (entries (append
                    (when historical
-                     (list (%getchainstates-entry historical syncing)))
-                   (list (%getchainstates-entry current syncing)))))
+                     (list (%getchainstates-entry node historical)))
+                   (list (%getchainstates-entry node current)))))
     `(("headers" . ,(if best-header
                         (bl.store:block-index-entry-height best-header)
                         (bl.store:current-height current)))

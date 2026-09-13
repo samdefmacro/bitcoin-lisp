@@ -104,6 +104,45 @@ table row (see *CHAIN-PARAMS-OVERRIDES*)."
       (find name *chain-params* :key #'chain-params-name)
       (config-error "no chain parameters for ~S (known: ~{~S~^ ~})" name (chain-names))))
 
+(defparameter *chain-tx-data*
+  '((:mainnet  1772055173 1315805869 5.40111006496122d0)
+    (:testnet3 1772051651  536108416 0.02691479016257117d0)
+    (:testnet4 1772013387   14191421 0.01848579579528412d0)
+    (:signet   1772055248   28676833 0.06736623436338929d0)
+    (:regtest           0          0 0.001d0))
+  "Core's CChainParams::chainTxData per chain: (NETWORK TIME TX-COUNT RATE).
+
+One row per chain from kernel/chainparams.cpp -- mainnet :193, testnet3 :302,
+testnet4 :415, signet :451, regtest :669 -- at the project's Core pin. TIME is
+the UNIX timestamp of a measurement, TX-COUNT the number of transactions in the
+chain at that moment, and RATE the transactions per second observed over the
+4,096 blocks before it. Nothing consensus-critical reads them: they are the
+denominator of GuessVerificationProgress, the only way a node can say how far
+through a sync it is before it has the chain to count.
+
+Kept beside the chain table rather than inside CHAIN-PARAMS because that struct
+is a defstruct whose layout every module compiles against; this data is read by
+one caller. A signet with a custom -signetchallenge gets Core's zero row
+(:463-467) rather than the default challenge's; we report the default row for
+every signet, which overstates progress on a private signet and nothing else.")
+
+(defun chain-tx-data (name)
+  "(VALUES TIME TX-COUNT RATE) for chain NAME -- Core's chainTxData. All three
+are zero for a chain with no row, which is what Core's default ChainTxData{}
+holds and what GuessVerificationProgress reads as `no estimate'."
+  (let ((row (assoc name *chain-tx-data*)))
+    (if row
+        (values (second row) (third row) (fourth row))
+        (values 0 0 0d0))))
+
+(defun chain-pow-target-spacing (name)
+  "Core consensus.nPowTargetSpacing for chain NAME, in seconds: ten minutes on
+every chain Core ships (kernel/chainparams.cpp:98, 229, 336, 486, 577). A
+reader rather than a literal at the call site, so a chain that ever differs is
+added here."
+  (declare (ignore name))
+  (* 10 60))
+
 (defun chain-params-template (name)
   "NAME's row as the TABLE defines it, ignoring any override -- the template an
 option instantiates from."

@@ -2842,6 +2842,51 @@ recorded. The two entries below differ in exactly that."
                      (%rpc-wire-error node "getblock"
                                       (list (make-string 64 :initial-element #\3))))))))))
 
+(test verificationprogress-is-core-s-estimate-not-a-sync-flag
+  "Core's verificationprogress is GuessVerificationProgress of the active tip
+(rpc/blockchain.cpp:1421 -> validation.cpp:5522-5556): the chain's transaction
+count at that block over the same count extrapolated to now at the chain's
+measured transaction rate, capped at 1.0. getchainstates reports the same
+figure per chainstate (:3474).
+
+Ours was `(if syncing 0.0 1.0)' -- read off the flag that says whether a sync
+THREAD is running. That answers 0.0 for a fully synced node whose background
+pass happens to be awake, and 1.0 for a node one block past genesis between
+passes; it is the number every wallet and operator uses to decide whether this
+node can be trusted yet."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "verifprog"))
+           (cs (bl:node-chain-state node))
+           (addr (bl.crypto:encode-p2pkh-address
+                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 4)
+                  :regtest)))
+      (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list 5 addr))
+      ;; The flag the old answer was read off, set the wrong way round: a node
+      ;; sitting on its own tip is fully verified whatever a thread is doing.
+      (setf (bl:node-syncing node) t)
+      (let ((p (cdr (assoc "verificationprogress"
+                           (bl.rpc::rpc-getblockchaininfo node nil)
+                           :test #'string=))))
+        (is (typep p 'double-float))
+        (is (= 1.0d0 p)
+            "a node at its own tip reported ~S while a sync pass was running" p))
+      ;; And a block BELOW the best header is a fraction, not a flag. Regtest's
+      ;; chainTxData has tx_count 0 and a deliberately non-zero rate
+      ;; (kernel/chainparams.cpp:669), so the estimate is
+      ;; count / (count + elapsed * rate) with elapsed taken from the height
+      ;; gap -- strictly between 0 and 1 for any block behind the tip.
+      (flet ((progress (entry)
+               (bl.rpc::%guess-verification-progress
+                cs entry (bl:node-block-store node) :regtest)))
+        (let ((p-low (progress (bl.store:get-block-at-height cs 1))))
+          (is (< 0d0 p-low) "a block below the tip reported no progress at all")
+          (is (< p-low 1d0) "a block below the tip reported full verification"))
+        (is (= 1.0d0 (progress (bl.store:get-block-index-entry
+                                cs (bl.store:best-block-hash cs)))))
+        ;; A block with no chain transaction count -- no entry at all here --
+        ;; is 0.0, which is Core's answer rather than a made-up figure.
+        (is (= 0.0d0 (progress nil)))))))
+
 (test gettxoutproof-finds-the-block-through-an-unspent-output
   "Without a blockhash Core looks for an unspent output of any given txid in
 the coins view and takes the block at that coin's height (txoutproof.cpp:
