@@ -976,6 +976,54 @@ describe a listening socket."
     (is (plusp (bl.net:peer-permission-flags "10.1.2.3" t)))
     (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" nil)))))
 
+(test a-whitelist-range-with-no-permissions-grants-cores-defaults
+  "Core's -whitelist parser marks a range written with no permissions at all
+Implicit (net_permissions.cpp:30-36), and Implicit is not a grant: it resolves
+to Core's default set at the end of AddWhitelistPermissionFlags
+(net.cpp:578-584) -- mempool and noban always, relay under -whitelistrelay
+(DEFAULT_WHITELISTRELAY true), forcerelay under -whitelistforcerelay (default
+false). Ours left the bit set and granted nothing.
+
+rpc_setban.py bans 127.0.0.1 on node1, restarts it with `-whitelist=127.0.0.1',
+and asserts at :45 that node0 reconnects and at :47 that getpeerinfo lists
+`noban'. Ours logged \"connection from 127.0.0.1 dropped (banned)\" for the
+whole 60-second wait, because the matching entry contributed only a bit nobody
+reads."
+  (%with-whitelist (:entries '("127.0.0.1"))
+    (let ((flags (bl.net:peer-permission-flags "127.0.0.1" t)))
+      (is (= bl.net:+perm-noban+ (logand flags bl.net:+perm-noban+))
+          "a bare range must grant noban, which is what survives a setban")
+      (is (= bl.net:+perm-mempool+ (logand flags bl.net:+perm-mempool+)))
+      (is (= bl.net:+perm-relay+ (logand flags bl.net:+perm-relay+))
+          "-whitelistrelay defaults to true, so relay comes with it")
+      (is-false (bl.net:permission-flag-set-p flags bl.net:+perm-force-relay+)
+                "-whitelistforcerelay defaults to false, so forcerelay does not")
+      (is (not (member "implicit" (bl.net:permission-flag-names flags)
+                       :test #'string=))
+          "and the marker itself is never a permission")))
+  ;; -whitelistforcerelay flips exactly one of those.
+  (let ((bl.net:*whitelist-force-relay* t))
+    (%with-whitelist (:entries '("127.0.0.1"))
+      (is-true (bl.net:permission-flag-set-p
+                (bl.net:peer-permission-flags "127.0.0.1" t)
+                bl.net:+perm-force-relay+))))
+  (let ((bl.net:*whitelist-relay* nil))
+    (%with-whitelist (:entries '("127.0.0.1"))
+      (is (= 0 (logand (bl.net:peer-permission-flags "127.0.0.1" t)
+                       bl.net:+perm-relay+))
+          "-whitelistrelay=0 withholds relay and nothing else")
+      (is (= bl.net:+perm-noban+
+             (logand (bl.net:peer-permission-flags "127.0.0.1" t)
+                     bl.net:+perm-noban+)))))
+  ;; An address the range does not cover is still granted nothing at all,
+  ;; and an explicit grant is left exactly as written.
+  (%with-whitelist (:entries '("127.0.0.1"))
+    (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" t))))
+  (%with-whitelist (:entries '("noban@127.0.0.1"))
+    (is (= 0 (logand (bl.net:peer-permission-flags "127.0.0.1" t)
+                     bl.net:+perm-mempool+))
+        "an explicit noban grant must not pick up the implicit defaults")))
+
 (test an-inbound-onion-peers-address-earns-it-no-permissions
   "Core skips the address-range whitelist for a Tor inbound, and its comment
 is the whole argument:
