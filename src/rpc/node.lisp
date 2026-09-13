@@ -184,7 +184,9 @@ reason the method exists — it is undocumented and for testing only."
 
 (define-rpc "help" (node params)
   "List available RPC methods, or echo the name of a known one (Bitcoin Core
-help). A full per-method help text is out of scope.
+help). A full per-method help text is out of scope, except for the methods
+whose help text IS their behaviour: those register it in *RPC-HELP-TEXTS* and
+are answered from there, as Core answers every method from its own RPCHelpMan.
 
 The undocumented \"dump_all_command_conversions\" argument returns the
 argument-conversion table instead (Core rpc/server.cpp:135-138); it is what
@@ -195,9 +197,9 @@ rpc_help.py uses to check this node against Core's client.cpp."
       ((equal method "dump_all_command_conversions")
        (%dump-all-command-conversions))
       ((and method (stringp method))
-       (if (gethash method *rpc-methods*)
-           method
-           (format nil "help: unknown command: ~A" method)))
+       (cond ((gethash method *rpc-help-texts*))
+             ((gethash method *rpc-methods*) method)
+             (t (format nil "help: unknown command: ~A" method))))
       (t
        (let ((names '()))
          (maphash (lambda (k v) (declare (ignore v)) (push k names)) *rpc-methods*)
