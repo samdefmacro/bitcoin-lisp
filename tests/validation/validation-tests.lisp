@@ -1030,7 +1030,14 @@ Core's spelling (p2p_segwit.py:145 waits for `unexpected-witness`). The
 keywords are Core's names already; this pins the rendering, and that the
 body gate logs through it."
   (is (equal "unexpected-witness" (bl.val:block-reject-reason-string :unexpected-witness)))
-  (is (equal "bad-txnmrklroot" (bl.val:block-reject-reason-string :bad-txnmrklroot)))
+  ;; The two verdicts whose Core reject reason is NOT the keyword's own name
+  ;; (+CORE-REJECT-REASON-NAMES+). Asked with :BAD-TXNMRKLROOT this used to
+  ;; look right while the keyword VALIDATE-BLOCK actually returns is
+  ;; :BAD-MERKLE-ROOT, so the rendering nothing produces was the one pinned;
+  ;; mining_basic.py:472 asserts the merkle name of submitblock and :443 the
+  ;; proof-of-work one.
+  (is (equal "bad-txnmrklroot" (bl.val:block-reject-reason-string :bad-merkle-root)))
+  (is (equal "high-hash" (bl.val:block-reject-reason-string :bad-proof-of-work)))
   (is (equal "bad-blk-length, size limits failed"
              (bl.val:block-reject-reason-string '(:bad-blk-length "size limits failed"))))
   (is (equal "Valid" (bl.val:block-reject-reason-string nil)))
