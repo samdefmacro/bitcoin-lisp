@@ -383,11 +383,11 @@ typo in a caller's key is an error rather than a silently ignored field."
                   (unless allow-null
                     (error 'rpc-error :code +rpc-type-error+
                                       :message (format nil "Missing ~A" key))))
-                 ((string/= (%json-type-name value) type)
+                 ((string/= (json-type-name value) type)
                   (error 'rpc-error
                          :code +rpc-type-error+
                          :message (format nil "JSON value of type ~A for field ~A ~
-is not of expected type ~A" (%json-type-name value) key type)))))
+is not of expected type ~A" (json-type-name value) key type)))))
   (when strict
     (dolist (k (obj-keys obj))
       (unless (assoc k expected :test #'string=)
