@@ -2807,6 +2807,44 @@ back with no blockhash and no txindex; a txid with no coin gets Core's text."
       (is (equal (cons -5 "Transaction not yet in block")
                  (%rpc-wire-error node "gettxoutproof"
                                   (list (list (make-string 64 :initial-element #\2)))))))))
+
+(test gettxoutproof-reads-its-txids-as-cores-set
+  "gettxoutproof's argument is a std::set<Txid> in Core, and three of
+rpc_txoutproof.py's rows read it as one: an empty array is -8 \"Parameter
+'txids' cannot be empty\" (:86), a repeated txid is -8 \"Invalid parameter,
+duplicated txid: <hex>\" (:88), and a set whose members do not all live in the
+one block Core ends up reading is -5 \"Not all transactions found in specified
+or retrieved block\" (:84). The last sentence says `or retrieved' because the
+block may be one Core found for itself from a coin or the txindex rather than
+one the caller named (txoutproof.cpp:46-56, :109-118).
+
+Ours had a sentence of its own for each: \"txids must be a non-empty array\",
+no duplicate check at all (the second copy simply re-flagged the same leaf),
+and \"Not all txids found in the specified block\" raised on the FIRST missing
+txid rather than on the count."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "txoutproof-set"))
+           (hashes (generate-regtest-blocks node 2))
+           (cb (mapcar (lambda (h)
+                         (first (cdr (assoc "tx"
+                                            (bl.rpc:dispatch-rpc-method
+                                             node "getblock" (list h))
+                                            :test #'string=))))
+                       hashes)))
+      (is (= 2 (length cb)) "control: two blocks, two coinbase txids")
+      (is (equal (cons -8 "Parameter 'txids' cannot be empty")
+                 (%rpc-wire-error node "gettxoutproof" (list (vector)))))
+      (is (equal (cons -8 (format nil "Invalid parameter, duplicated txid: ~A"
+                                  (first cb)))
+                 (%rpc-wire-error node "gettxoutproof"
+                                  (list (list (first cb) (first cb))))))
+      (is (equal (cons -5 "Not all transactions found in specified or retrieved block")
+                 (%rpc-wire-error node "gettxoutproof" (list cb))))
+      ;; Control: one of them alone still proves, so the count check is not
+      ;; refusing everything.
+      (is (stringp (bl.rpc:dispatch-rpc-method node "gettxoutproof"
+                                               (list (list (first cb)))))))))
+
 (test rpc-start-failure-is-an-init-error
   "Core's AppInitMain turns a false from AppInitServers into
 InitError(\"Unable to start HTTP server. See debug log for details.\")
