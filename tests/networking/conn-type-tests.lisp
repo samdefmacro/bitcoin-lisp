@@ -113,17 +113,21 @@ offer the expected services' lines where Core writes nine."
                            (server
                              (bt:make-thread
                               (lambda ()
-                                (let ((conn (bl.net:accept-connection srv :timeout 10)))
-                                  (when conn
-                                    (bl.net:send-bytes
-                                     conn
-                                     (bl.ser:serialize-message
-                                      "version"
-                                      (bl.ser:make-version-message-bytes
-                                       :services services)))
-                                    (bl.net:send-bytes conn (bl.ser:make-verack-message))
-                                    (loop repeat 100 until done do (sleep 0.05))
-                                    (bl.net:close-connection conn))))
+                                ;; An unhandled condition in a test thread
+                                ;; drops a non-interactive image into the
+                                ;; debugger, which reads as a hung suite.
+                                (ignore-errors
+                                 (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                                   (when conn
+                                     (bl.net:send-bytes
+                                      conn
+                                      (bl.ser:serialize-message
+                                       "version"
+                                       (bl.ser:make-version-message-bytes
+                                        :services services)))
+                                     (bl.net:send-bytes conn (bl.ser:make-verack-message))
+                                     (loop repeat 100 until done do (sleep 0.05))
+                                     (bl.net:close-connection conn)))))
                               :name "test-services-peer")))
                       (sleep 0.2)
                       (let ((peer (bl.net:connect-peer "127.0.0.1" port)))

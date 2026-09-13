@@ -2427,6 +2427,18 @@ CTX's recent-rejects, when present, caches recently rejected txs."
                     (bl.val:validate-transaction-for-mempool
                      tx utxo-set mempool current-height :chain-state chain-state))
                 (unless valid
+                  ;; Core logs every rejection a peer's transaction earns,
+                  ;; before any of the caching decisions below: ProcessInvalidTx
+                  ;; opens with LogDebug(BCLog::MEMPOOLREJ, "%s (wtxid=%s) from
+                  ;; peer=%d was not accepted: %s", txid, wtxid, nodeid,
+                  ;; state.ToString()) (net_processing.cpp:3131-3135). We logged
+                  ;; nothing at all here, and p2p_permissions.py:133-138 greps
+                  ;; for exactly that line.
+                  (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
+                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))
+                              (peer-id peer)
+                              (bl.val:tx-reject-reason-string error))
                   (cond
                     ;; Missing inputs => hold as an orphan (not a real reject);
                     ;; a later parent will trigger re-evaluation. Request the

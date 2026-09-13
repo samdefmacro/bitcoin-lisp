@@ -2472,15 +2472,7 @@ captured; return (VALUES thunk-result log-text). Core's functional tests grep
 debug.log for these lines -- p2p_addrv2_relay.py:81 for the whole sendaddrv2
 line, p2p_sendtxrcncl.py:217 and :181 for the sendtxrcncl ones -- so the
 wording is behaviour and gets asserted, not just the effect."
-  (let ((out (make-string-output-stream))
-        (was-on (bl.log:log-category-enabled-p "net")))
-    (unwind-protect
-         (let ((bl.log:*log-stream* out))
-           (bl.log:enable-log-category "net")
-           ;; VALUES is left-to-right, so THUNK runs before the stream is
-           ;; drained.
-           (values (funcall thunk) (get-output-stream-string out)))
-      (unless was-on (bl.log:disable-log-category "net")))))
+  (log-text-of "net" thunk))
 
 (defun %post-verack-delivery (peer command payload)
   "Deliver COMMAND to PEER through the shipped dispatcher; return (VALUES

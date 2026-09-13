@@ -186,6 +186,10 @@ reach."
 ;;;; Version message
 
 (defconstant +protocol-version+ 70016)
+(defconstant +wtxid-relay-version+ 70016
+  "Core WTXID_RELAY_VERSION (protocol_version.h): the protocol version at
+which BIP339 wtxid relay was introduced, and the gate on the WTXIDRELAY
+message (net_processing.cpp:3715).")
 (defconstant +node-network+ 1)
 (defconstant +node-witness+ (ash 1 3))
 (defconstant +node-network-limited+ (ash 1 10))  ; BIP 159: pruned node
