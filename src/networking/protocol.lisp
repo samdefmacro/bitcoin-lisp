@@ -2569,11 +2569,20 @@ copied."
   (setf (peer-getdata-queue peer)
         (nconc (peer-getdata-queue peer) invs)))
 
-(define-p2p-handler ("getdata" :rate-bucket peer-rate-limit-getdata) (peer payload ctx)
+(define-p2p-handler ("getdata") (peer payload ctx)
   "Handle a getdata message: append every requested inv to the peer's pending
 getdata queue and serve what we can right now (Core's GETDATA branch,
 net_processing.cpp:4258-4262 — the insert and the ProcessGetData call are one
-step). PROCESS-PEER-GETDATA is the serving half and the resume point."
+step). PROCESS-PEER-GETDATA is the serving half and the resume point.
+
+No rate bucket. Core places NO limit at all on INCOMING getdata beyond the
+message-size cap -- MAX_GETDATA_SZ is 1000 and its own comment says it is `not
+used in processing incoming GETDATA for compatibility\' (net_processing.cpp:
+127-128). The bound Core relies on is the one PROCESS-PEER-GETDATA already
+enforces: a peer whose send buffer is over -maxsendbuffer is send-paused and
+served nothing more until it drains. A token bucket on TOP of that disconnects
+a peer for asking for exactly what this node announced to it, which is what a
+node doing its job looks like from the other side."
   (queue-getdata peer (bl.ser:parse-inv-payload payload))
   (process-peer-getdata peer ctx))
 

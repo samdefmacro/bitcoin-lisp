@@ -71,7 +71,6 @@ run on a loaded machine (2026-09-05)."
     (is (not (null (bl.net::peer-rate-limit-inv peer))))
     (is (not (null (bl.net::peer-rate-limit-tx peer))))
     (is (not (null (bl.net::peer-rate-limit-addr peer))))
-    (is (not (null (bl.net::peer-rate-limit-getdata peer))))
     (is (not (null (bl.net::peer-rate-limit-headers peer))))))
 
 (defparameter +p2p-commands-this-node-handles+
@@ -138,6 +137,34 @@ HANDLE-MESSAGE, and an unknown command answers NIL."
     (is (bl.net:check-peer-rate-limit peer "ping"))
     (is (bl.net:check-peer-rate-limit peer "pong"))
     (is (bl.net:check-peer-rate-limit peer "version"))))
+
+(test getdata-is-never-rate-limited
+  "Core places NO limit on INCOMING getdata: MAX_GETDATA_SZ is 1000 and its own
+comment says it is `not used in processing incoming GETDATA for compatibility\'
+(net_processing.cpp:127-128). The bound Core relies on is the send buffer --
+ProcessGetData stops serving a peer whose queue is over -maxsendbuffer, which
+PROCESS-PEER-GETDATA already does.
+
+We also had a token bucket on top of it (20/s, burst 100) whose miss
+DISCONNECTS. A node that announces its own blocks is asked for them, one
+getdata per inv, and mining a few hundred blocks with a peer attached is enough
+to blow the burst: in the 2026-09-13 sweep, feature_csv_activation.py:181 and
+feature_versionbits_warning.py:54 both end with `Rate limit exceeded on getdata
+messages, disconnecting peer=0\' in the node log, the peer having asked only for
+what this node told it about."
+  (let ((peer (bl.net:make-peer)))
+    (bl.net:init-peer-rate-limiters peer)
+    ;; Far past any burst a bucket could have had.
+    (is (= 1000 (loop repeat 1000
+                      count (bl.net:check-peer-rate-limit peer "getdata")))
+        "a getdata was refused")
+    ;; Positive control: the mechanism still works for a command that HAS a
+    ;; bucket, so this test cannot pass by the limiter being gone entirely.
+    (let ((limited (bl.net:make-peer)))
+      (let ((bl:*rate-limit-addr* '(1.0 . 2.0)))
+        (bl.net:init-peer-rate-limiters limited))
+      (dotimes (i 2) (bl.net:check-peer-rate-limit limited "addr"))
+      (is-false (bl.net:check-peer-rate-limit limited "addr")))))
 
 (test check-peer-rate-limit-rejects-flood
   "Rate limit check should reject when burst is exceeded."
@@ -315,7 +342,6 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
   (is (consp bl:*rate-limit-inv*))
   (is (consp bl:*rate-limit-tx*))
   (is (consp bl:*rate-limit-addr*))
-  (is (consp bl:*rate-limit-getdata*))
   (is (consp bl:*rate-limit-headers*))
   (is (consp bl:*rpc-rate-limit*))
   ;; Constants

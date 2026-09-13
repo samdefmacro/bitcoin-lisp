@@ -298,9 +298,6 @@ wipe a 50k-slot ring per block for nothing."
 (defvar *rate-limit-addr* '(1.0 . 10.0)
   "Rate limit for ADDR/ADDRV2 messages: (rate-per-sec . burst).")
 
-(defvar *rate-limit-getdata* '(20.0 . 100.0)
-  "Rate limit for GETDATA messages: (rate-per-sec . burst).")
-
 (defvar *rate-limit-headers* '(10.0 . 50.0)
   "Rate limit for HEADERS messages: (rate-per-sec . burst).")
 

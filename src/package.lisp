@@ -126,7 +126,6 @@ init.cpp, node/. src/node/.")
    #:*rate-limit-inv*
    #:*rate-limit-tx*
    #:*rate-limit-addr*
-   #:*rate-limit-getdata*
    #:*rate-limit-headers*
    #:*rate-limit-serve*
    #:*rpc-rate-limit*
