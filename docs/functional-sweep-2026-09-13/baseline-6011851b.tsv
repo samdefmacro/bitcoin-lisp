@@ -1,0 +1,264 @@
+status	test	failpoint	signature
+FAIL	example_test	example_test.py:190	RPC -344 'waitforblockheight' RPC took longer than 30.000000 seconds. Consider 
+FAIL	feature_abortnode	feature_abortnode.py:39	AssertionError: Predicate ''''
+FAIL	feature_addrman	feature_addrman.py:65	AssertionError: [node 0] Expected message(s) ['Loaded 0 addresses from peers.dat'] not found in log:
+TIMEOUT	feature_anchors	-	TIMEOUT
+FAIL	feature_asmap	feature_asmap.py:66	test_framework.test_node.FailedToStartError: [node 0] bitcoind exited with status 1 during initializ
+FAIL	feature_assumeutxo	feature_assumeutxo.py:220	AssertionError: Expected substring not found in error message:
+FAIL	feature_assumevalid	feature_assumevalid.py:146	AssertionError: [node 0] Expected message(s) ['Enabling script verification at block #1 (5df7e8ee993
+FAIL	feature_bind_extra	feature_bind_extra.py:94	AssertionError: not({('00000000', 13676)} == {('7f000001', 13679)})
+SKIP	feature_bind_port_discover	-	SKIP
+SKIP	feature_bind_port_externalip	-	SKIP
+FAIL	feature_bip68_sequence	feature_bip68_sequence.py:114	AssertionError: No exception raised
+FAIL	feature_block	feature_block.py:157	AssertionError: Expected substring not found in error message:
+PASS	feature_blocksdir	-	PASS
+PASS	feature_blocksxor	-	PASS
+FAIL	feature_chain_tiebreaks	feature_chain_tiebreaks.py:76	AssertionError: Predicate ''''
+FAIL	feature_cltv	feature_cltv.py:95	AssertionError: not({'type': 'buried', 'active': False, 'height': 111} == {'active': True, 'height':
+FAIL	feature_coinstatsindex	feature_coinstatsindex.py:82	KeyError: 'disk_size'
+SKIP	feature_coinstatsindex_compatibility	-	SKIP
+FAIL	feature_config_args	feature_config_args.py:255	AssertionError: [node 0] Unable to connect to bitcoind after 60s (ignored errors: {'missing_credenti
+FAIL	feature_csv_activation	feature_csv_activation.py:181	AssertionError: [node 0] Expected message(s) ['bad-txns-nonfinal'] not found in log:
+FAIL	feature_dbcrash	feature_dbcrash.py:73	test_framework.test_node.FailedToStartError: [node 0] bitcoind exited with status 1 during initializ
+FAIL	feature_dersig	feature_dersig.py:93	AssertionError: not(100 == 101)
+PASS	feature_dirsymlinks	-	PASS
+PASS	feature_discover	-	PASS
+PASS	feature_fastprune	-	PASS
+TIMEOUT	feature_fee_estimation	-	TIMEOUT
+FAIL	feature_filelock	feature_filelock.py:34	AssertionError: [node 1] Expected message "Error: Cannot obtain a lock on directory /workspace/build
+PASS	feature_framework_miniwallet	-	PASS
+PASS	feature_framework_startup_failures	-	PASS
+PASS	feature_framework_testshell	-	PASS
+PASS	feature_framework_unit_tests	-	PASS
+PASS	feature_help	-	PASS
+FAIL	feature_includeconf	feature_includeconf.py:59	AssertionError: Unexpected stderr  != warning: -includeconf cannot be used from included files; igno
+FAIL	feature_index_prune	feature_index_prune.py:103	AssertionError: not(246 == 248)
+FAIL	feature_init	feature_init.py:256	AssertionError
+PASS	feature_loadblock	-	PASS
+PASS	feature_logging	-	PASS
+FAIL	feature_maxtipage	feature_maxtipage.py:39	AssertionError: not(False == True)
+FAIL	feature_maxuploadtarget	feature_maxuploadtarget.py:122	AssertionError: [node 0] Expected message(s) ['historical block serving limit reached, disconnecting
+FAIL	feature_minchainwork	feature_minchainwork.py:87	AssertionError
+FAIL	feature_notifications	feature_notifications.py:85	RPC -8 Invalid wallet name "\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0
+FAIL	feature_nulldummy	feature_nulldummy.py:144	AssertionError: not(block-script-verify-flag-failed (Dummy CHECKMULTISIG argument must be zero) == s
+FAIL	feature_port	feature_port.py:32	AssertionError: [node 0] Expected message(s) ['Bound to 0.0.0.0:15045', 'Bound to 127.0.0.1:15046'] 
+FAIL	feature_posix_fs_permissions	feature_posix_fs_permissions.py:25	AssertionError
+FAIL	feature_presegwit_node_upgrade	feature_presegwit_node_upgrade.py:39	AssertionError: [node 0] bitcoind should have exited within 60s with expected error Witness data for
+TIMEOUT	feature_proxy	-	TIMEOUT
+TIMEOUT	feature_pruning	-	TIMEOUT
+FAIL	feature_rbf	feature_rbf.py:112	AssertionError: not(min relay fee not met == insufficient fee)
+FAIL	feature_reindex	feature_reindex.py:71	AssertionError: [node 0] Expected message(s) ['LoadExternalBlockFile: Out of order block', 'LoadExte
+FAIL	feature_reindex_init	feature_reindex_init.py:23	AssertionError: [node 0] bitcoind should have exited within 60s with expected error Error initializi
+FAIL	feature_reindex_readonly	feature_reindex_readonly.py:78	AssertionError: [node 0] Expected message(s) ['Reindexing finished'] not found in log:
+FAIL	feature_remove_pruned_files_on_startup	feature_remove_pruned_files_on_startup.py:64	AssertionError: not(6 == 4)
+FAIL	feature_segwit	feature_segwit.py:115	AssertionError: Block sync timed out after 60s:
+PASS	feature_settings	-	PASS
+PASS	feature_shutdown	-	PASS
+FAIL	feature_signet	feature_signet.py:102	AssertionError: not(bad-signet-solution == bad-signet-blksig)
+PASS	feature_startupnotify	-	PASS
+FAIL	feature_taproot	feature_taproot.py:1433	AssertionError: Missing error message 'Opcode missing or not understood' from block response 'script
+PASS	feature_uacomment	-	PASS
+SKIP	feature_unsupported_utxo_db	-	SKIP
+FAIL	feature_utxo_set_hash	feature_utxo_set_hash.py:70	AssertionError: not(9552d85ad863f6059ec1c3631c99231df8e412b40e7bac405108e9fb0b27256d == e0b4c80f2880
+FAIL	feature_versionbits_warning	feature_versionbits_warning.py:54	AssertionError
+SKIP	interface_bitcoin_cli	-	SKIP
+FAIL	interface_http	interface_http.py:100	AssertionError: not(405 == 404)
+SKIP	interface_ipc	-	SKIP
+SKIP	interface_ipc_mining	-	SKIP
+TIMEOUT	interface_rest	-	TIMEOUT
+FAIL	interface_rpc	interface_rpc.py:144	AssertionError: not([{'jsonrpc': '2.0', 'result': 0, 'id': 1}, {'jsonrpc': '2.0', 'error': {'code': 
+SKIP	interface_usdt_coinselection	-	SKIP
+SKIP	interface_usdt_mempool	-	SKIP
+SKIP	interface_usdt_net	-	SKIP
+SKIP	interface_usdt_utxocache	-	SKIP
+SKIP	interface_usdt_validation	-	SKIP
+TIMEOUT	interface_zmq	-	TIMEOUT
+FAIL	mempool_accept	mempool_accept.py:78	AssertionError: not([{'txid': '7941d0e4ff376490cd0b0c992dd20088d0a73745b99e217efa9796724a22e234', 'a
+FAIL	mempool_accept_wtxid	mempool_accept_wtxid.py:59	AssertionError: not([{'txid': '760109e552566e675592fa9c663acd873d327e0b4c0f242e273830e09c12feaa', 'w
+FAIL	mempool_cluster	mempool_cluster.py:319	KeyError: 'optimal'
+SKIP	mempool_compatibility	-	SKIP
+FAIL	mempool_datacarrier	mempool_datacarrier.py:57	KeyError: 'maxdatacarriersize'
+PASS	mempool_dust	-	PASS
+FAIL	mempool_ephemeral_dust	mempool_ephemeral_dust.py:160	AssertionError: not(dust == transaction failed)
+FAIL	mempool_expiry	mempool_expiry.py:87	AssertionError: No exception raised
+FAIL	mempool_limit	mempool_limit.py:212	AssertionError: Expected substring not found in error message:
+FAIL	mempool_package_limits	mempool_package_limits.py:29	KeyError: 'package-error'
+FAIL	mempool_package_rbf	mempool_package_rbf.py:110	AssertionError: not(min relay fee not met == bip125-replacement-disallowed)
+FAIL	mempool_packages	mempool_packages.py:108	AssertionError: not(None == [])
+FAIL	mempool_persist	mempool_persist.py:194	AssertionError: No exception raised
+FAIL	mempool_reorg	mempool_reorg.py:47	AssertionError: not(0ba9e738b93cfa1182dbaeb7359242a985b2e6ad39857933a8eeb408902fbf8e == 3297cab40892
+FAIL	mempool_resurrect	mempool_resurrect.py:20	AssertionError: not(4ff90a0647a71c345a2783e0ce4309f54577e3677e16cd91011bfd43e59e3cbf == 11130cf79061
+FAIL	mempool_sigoplimit	mempool_sigoplimit.py:175	KeyError: 'package-error'
+PASS	mempool_spend_coinbase	-	PASS
+FAIL	mempool_truc	mempool_truc.py:69	AssertionError: Expected substring not found in error message:
+FAIL	mempool_unbroadcast	mempool_unbroadcast.py:70	AssertionError: Mempool sync timed out after 30s:
+FAIL	mempool_updatefromblock	mempool_updatefromblock.py:105	AssertionError: not(14 == 64)
+TIMEOUT	mining_basic	-	TIMEOUT
+FAIL	mining_getblocktemplate_longpoll	mining_getblocktemplate_longpoll.py:26	AssertionError: [node 0] Expected message(s) ['ThreadRPCServer method=getblocktemplate'] not found i
+FAIL	mining_mainnet	-	test_framework.test_node.FailedToStartError: [node 0] bitcoind exited with status 1 during initializ
+FAIL	mining_prioritisetransaction	mining_prioritisetransaction.py:364	AssertionError: Both values are {'capabilities': ['proposal'], 'version': 805306368, 'previousblockh
+FAIL	mining_template_verification	mining_template_verification.py:44	AssertionError: not(first-tx-not-coinbase == bad-cb-missing)
+TIMEOUT	p2p_1p1c_network	-	TIMEOUT
+TIMEOUT	p2p_add_connections	-	TIMEOUT
+TIMEOUT	p2p_addr_relay	-	TIMEOUT
+FAIL	p2p_addr_selfannouncement	p2p_addr_selfannouncement.py:103	IndexError: list index out of range
+FAIL	p2p_addrfetch	p2p_addrfetch.py:40	AssertionError: not(1 == 0)
+FAIL	p2p_addrv2_relay	p2p_addrv2_relay.py:81	AssertionError: [node 0] Expected message(s) ['sendaddrv2 received after verack, disconnecting peer=
+PASS	p2p_block_sync	-	PASS
+FAIL	p2p_blockfilters	p2p_blockfilters.py:85	OSError: Not connected
+FAIL	p2p_blocksonly	p2p_blocksonly.py:118	AssertionError: [node 0] Expected message(s) ['transaction sent in violation of protocol, disconnect
+FAIL	p2p_compactblocks	p2p_compactblocks.py:162	AssertionError: not(0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 == 3071b2993231
+FAIL	p2p_compactblocks_blocksonly	p2p_compactblocks_blocksonly.py:75	AssertionError: not(06de71ddb62163527f99813ee535fb7d7bd73775f7eb2c0571003c2f7eddb025 == 5edba0f17a87
+TIMEOUT	p2p_compactblocks_hb	-	TIMEOUT
+FAIL	p2p_disconnect_ban	-	AssertionError: Predicate ''''
+FAIL	p2p_dns_seeds	p2p_dns_seeds.py:36	AssertionError: [node 0] Expected message(s) ['Loading addresses from DNS seed'] not found in log:
+TIMEOUT	p2p_eviction	-	TIMEOUT
+FAIL	p2p_feefilter	p2p_feefilter.py:24	AssertionError: not(False == True)
+FAIL	p2p_filter	p2p_filter.py:109	AssertionError: [node 0] Expected message(s) ['Misbehaving'] not found in log:
+FAIL	p2p_fingerprint	p2p_fingerprint.py:82	AssertionError: Predicate ''''
+FAIL	p2p_getaddr_caching	p2p_getaddr_caching.py:74	AssertionError: Predicate ''''
+PASS	p2p_getdata	-	PASS
+FAIL	p2p_handshake	p2p_handshake.py:38	AssertionError: Predicate ''''
+FAIL	p2p_headers_sync_with_minchainwork	p2p_headers_sync_with_minchainwork.py:62	AssertionError: [node 3] Expected message(s) ['Synchronizing blockheaders, height: 14'] not found in
+FAIL	p2p_i2p_ports	p2p_i2p_ports.py:26	AssertionError: [node 0] Expected message(s) ['Error connecting to zsxwyo6qcn3chqzwxnseusqgsnuw3maqn
+FAIL	p2p_i2p_sessions	p2p_i2p_sessions.py:26	AssertionError: [node 0] Expected message(s) ['Creating persistent I2P SAM session'] not found in lo
+FAIL	p2p_ibd_stalling	p2p_ibd_stalling.py:152	AssertionError: Predicate ''''
+FAIL	p2p_ibd_txrelay	p2p_ibd_txrelay.py:48	AssertionError
+FAIL	p2p_initial_headers_sync	p2p_initial_headers_sync.py:94	AssertionError
+FAIL	p2p_invalid_block	p2p_invalid_block.py:89	AssertionError: [node 0] Expected message(s) ['bad-txns-duplicate'] not found in log:
+PASS	p2p_invalid_locator	-	PASS
+FAIL	p2p_invalid_messages	p2p_invalid_messages.py:98	AssertionError: not(359 == 347)
+FAIL	p2p_invalid_tx	p2p_invalid_tx.py:74	AssertionError: [node 0] Expected message(s) ['bad-txns-vout-empty'] not found in log:
+FAIL	p2p_leak	p2p_leak.py:131	AssertionError
+PASS	p2p_leak_tx	-	PASS
+FAIL	p2p_message_capture	p2p_message_capture.py:65	IndexError: list index out of range
+FAIL	p2p_mutated_blocks	p2p_mutated_blocks.py:77	AssertionError: not(1 == 0)
+PASS	p2p_net_deadlock	-	PASS
+FAIL	p2p_nobloomfilter_messages	p2p_nobloomfilter_messages.py:31	AssertionError: not(1 == 0)
+TIMEOUT	p2p_node_network_limited	-	TIMEOUT
+TIMEOUT	p2p_opportunistic_1p1c	-	TIMEOUT
+FAIL	p2p_orphan_handling	p2p_orphan_handling.py:271	RPC -1 reorg-failed
+FAIL	p2p_outbound_eviction	p2p_outbound_eviction.py:56	AssertionError: Predicate ''''
+FAIL	p2p_permissions	p2p_permissions.py:123	AssertionError: Predicate ''''
+FAIL	p2p_ping	p2p_ping.py:56	KeyError: 'ping'
+FAIL	p2p_private_broadcast	p2p_private_broadcast.py:293	test_framework.test_node.FailedToStartError: [node 0] bitcoind exited with status 1 during initializ
+FAIL	p2p_seednode	p2p_seednode.py:33	AssertionError: [node 0] Expected message(s) ['Empty addrman, adding seednode (25.0.0.1) to addrfetc
+TIMEOUT	p2p_segwit	-	TIMEOUT
+FAIL	p2p_sendheaders	p2p_sendheaders.py:181	AssertionError: Predicate ''''
+FAIL	p2p_sendtxrcncl	p2p_sendtxrcncl.py:125	AssertionError: Both values are 0
+FAIL	p2p_timeouts	p2p_timeouts.py:52	AssertionError: [node 0] Expected message(s) ['Added connection peer=0'] not found in log:
+FAIL	p2p_tx_download	p2p_tx_download.py:176	AssertionError: Predicate ''''
+PASS	p2p_tx_privacy	-	PASS
+FAIL	p2p_unrequested_blocks	p2p_unrequested_blocks.py:100	AssertionError: [node 1] Expected message(s) ['AcceptBlockHeader: not adding new block header 2a0d8c
+FAIL	p2p_v2_encrypted	p2p_v2_encrypted.py:67	AssertionError
+FAIL	p2p_v2_misbehaving	p2p_v2_misbehaving.py:143	AssertionError: Predicate ''''
+FAIL	p2p_v2_transport	p2p_v2_transport.py:45	AssertionError: [node 0] Expected message(s) ['start sending v2 handshake to peer'] not found in log
+FAIL	rpc_bind	rpc_bind.py:46	AssertionError: not({('7f000001', 16653)} == {('00000000000000000000000000000001', 16653), ('7f00000
+FAIL	rpc_blockchain	rpc_blockchain.py:125	AssertionError: [node 0] bitcoind should have exited within 60s with expected error The block databa
+FAIL	rpc_createmultisig	rpc_createmultisig.py:150	AssertionError: Expected substring not found in error message:
+FAIL	rpc_decodescript	rpc_decodescript.py:281	AssertionError
+PASS	rpc_deprecated	-	PASS
+PASS	rpc_deriveaddresses	-	PASS
+FAIL	rpc_dumptxoutset	rpc_dumptxoutset.py:44	AssertionError
+PASS	rpc_estimatefee	-	PASS
+FAIL	rpc_generate	rpc_generate.py:129	AssertionError: Expected substring not found in error message:
+PASS	rpc_getblockfilter	-	PASS
+FAIL	rpc_getblockfrompeer	rpc_getblockfrompeer.py:61	AssertionError: Expected substring not found in error message:
+FAIL	rpc_getblockstats	rpc_getblockstats.py:188	AssertionError: Expected substring not found in error message:
+FAIL	rpc_getchaintips	rpc_getchaintips.py:60	AssertionError: not(valid-headers == valid-fork)
+FAIL	rpc_getdescriptoractivity	rpc_getdescriptoractivity.py:40	TypeError: object of type 'NoneType' has no len()
+FAIL	rpc_getdescriptorinfo	rpc_getdescriptorinfo.py:41	AssertionError: Expected substring not found in error message:
+FAIL	rpc_gettxspendingprevout	rpc_gettxspendingprevout.py:111	AssertionError: No exception raised
+FAIL	rpc_help	rpc_help.py:80	AssertionError: RPC client conversion table (/workspace/refs/bitcoin/src/rpc/client.cpp) and RPC ser
+FAIL	rpc_invalid_address_message	rpc_invalid_address_message.py:57	AssertionError: not(Invalid or unsupported Segwit (Bech32) or Base58 encoding. == Invalid Bech32 add
+FAIL	rpc_invalidateblock	rpc_invalidateblock.py:55	AssertionError: not(1 == 4)
+FAIL	rpc_misc	rpc_misc.py:34	AssertionError
+FAIL	rpc_named_arguments	rpc_named_arguments.py:21	AssertionError
+FAIL	rpc_net	rpc_net.py:131	AssertionError
+FAIL	rpc_orphans	rpc_orphans.py:152	AssertionError
+FAIL	rpc_packages	rpc_packages.py:526	AssertionError: No exception raised
+FAIL	rpc_preciousblock	rpc_preciousblock.py:26	AssertionError
+FAIL	rpc_psbt	rpc_psbt.py:481	AssertionError
+FAIL	rpc_rawtransaction	rpc_rawtransaction.py:267	AssertionError: Expected substring not found in error message:
+FAIL	rpc_scanblocks	rpc_scanblocks.py:60	TypeError: argument of type 'NoneType' is not iterable
+FAIL	rpc_scantxoutset	rpc_scantxoutset.py:66	AssertionError: not(216 == 32)
+FAIL	rpc_setban	rpc_setban.py:45	AssertionError: Predicate ''''
+SKIP	rpc_signer	-	SKIP
+FAIL	rpc_signmessagewithprivkey	rpc_signmessagewithprivkey.py:44	AssertionError: No exception raised
+FAIL	rpc_signrawtransactionwithkey	rpc_signrawtransactionwithkey.py:57	AssertionError
+FAIL	rpc_txoutproof	rpc_txoutproof.py:37	AssertionError: Expected substring not found in error message:
+PASS	rpc_uptime	-	PASS
+FAIL	rpc_users	rpc_users.py:160	AssertionError: [node 0] bitcoind should have exited within 60s with expected error Error: Unable to
+FAIL	rpc_validateaddress	-	test_framework.test_node.FailedToStartError: [node 0] bitcoind exited with status 1 during initializ
+PASS	rpc_whitelist	-	PASS
+SKIP	tool_bench_sanity_check	-	SKIP
+FAIL	tool_bitcoin	tool_bitcoin.py:54	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/bin/bitcoin'
+SKIP	tool_bitcoin_chainstate	-	SKIP
+PASS	tool_rpcauth	-	PASS
+SKIP	tool_signet_miner	-	SKIP
+SKIP	tool_utils	-	SKIP
+PASS	tool_utxo_to_sqlite	-	PASS
+SKIP	tool_wallet	-	SKIP
+FAIL	wallet_abandonconflict	wallet_abandonconflict.py:242	AssertionError: not(2514.99986860 == 2494.99986860)
+FAIL	wallet_address_types	wallet_address_types.py:91	AssertionError: Predicate ''''
+FAIL	wallet_anchor	wallet_anchor.py:80	AssertionError: not([{'txid': '02adb745d7723456fb64ba2331abc77ba36133dc5a62a07a48ef34f72663114f', 'v
+FAIL	wallet_assumeutxo	wallet_assumeutxo.py:173	AssertionError: not(2f7f08933c06fe9208ec41a63ddea35c0b1ba4beac8d84bd63177a5cef327f8a == d2b051ff5e8e
+PASS	wallet_avoid_mixing_output_types	-	PASS
+PASS	wallet_avoidreuse	-	PASS
+TIMEOUT	wallet_backup	-	TIMEOUT
+SKIP	wallet_backwards_compatibility	-	SKIP
+PASS	wallet_balance	-	PASS
+TIMEOUT	wallet_basic	-	TIMEOUT
+PASS	wallet_blank	-	PASS
+FAIL	wallet_bumpfee	wallet_bumpfee.py:345	AssertionError
+PASS	wallet_change_address	-	PASS
+PASS	wallet_coinbase_category	-	PASS
+TIMEOUT	wallet_conflicts	-	TIMEOUT
+PASS	wallet_create_tx	-	PASS
+PASS	wallet_createwallet	-	PASS
+FAIL	wallet_createwalletdescriptor	wallet_createwalletdescriptor.py:34	RPC -32603 Internal error: The value\n                  NIL\n                is n
+FAIL	wallet_crosschain	wallet_crosschain.py:32	RPC -8 Invalid wallet name "/workspace/build/conformance-tmp/20260913T102845-
+FAIL	wallet_descriptor	wallet_descriptor.py:93	AssertionError: not(leveldb == sqlite)
+PASS	wallet_disable	-	PASS
+PASS	wallet_encryption	-	PASS
+PASS	wallet_fallbackfee	-	PASS
+PASS	wallet_fast_rescan	-	PASS
+FAIL	wallet_fundrawtransaction	wallet_fundrawtransaction.py:1121	RPC -3 Invalid amount
+FAIL	wallet_gethdkeys	wallet_gethdkeys.py:62	AssertionError: not(False == True)
+FAIL	wallet_groups	wallet_groups.py:42	AssertionError: Block sync timed out after 60s:
+FAIL	wallet_hd	-	test_framework.test_node.FailedToStartError: [node 1] bitcoind exited with status 1 during initializ
+FAIL	wallet_importdescriptors	wallet_importdescriptors.py:583	AssertionError: not(False == True)
+FAIL	wallet_importprunedfunds	wallet_importprunedfunds.py:68	RPC -8 Need a blockhash (no txindex on this node)
+FAIL	wallet_keypool	wallet_keypool.py:165	AssertionError: Expected substring not found in error message:
+FAIL	wallet_keypool_topup	-	AssertionError: Predicate ''''
+FAIL	wallet_labels	wallet_labels.py:47	AssertionError: not(-5 == -11)
+FAIL	wallet_listdescriptors	wallet_listdescriptors.py:147	AssertionError: not({'wallet_name': 'w5', 'descriptors': [{'active': False, 'desc': 'tr([1dce71b2/48
+SKIP	wallet_listreceivedby	-	SKIP
+TIMEOUT	wallet_listsinceblock	-	TIMEOUT
+TIMEOUT	wallet_listtransactions	-	TIMEOUT
+SKIP	wallet_migration	-	SKIP
+FAIL	wallet_miniscript	wallet_miniscript.py:302	KeyError: 'partial_signatures'
+FAIL	wallet_miniscript_decaying_multisig_descriptor_psbt	wallet_miniscript_decaying_multisig_descriptor_psbt.py:96	RPC -8 Unknown named parameter feeRate
+FAIL	wallet_multisig_descriptor_psbt	wallet_multisig_descriptor_psbt.py:109	RPC -8 Unknown named parameter feeRate
+FAIL	wallet_multiwallet	wallet_multiwallet.py:78	AssertionError: not(False == True)
+FAIL	wallet_musig	wallet_musig.py:89	AssertionError: not(False == True)
+FAIL	wallet_orphanedreward	wallet_orphanedreward.py:42	AssertionError
+FAIL	wallet_reindex	wallet_reindex.py:64	AssertionError: [node 0] Expected message(s) ['initload thread exit'] not found in log:
+FAIL	wallet_reorgsrestore	wallet_reorgsrestore.py:203	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260913T1
+FAIL	wallet_rescan_unconfirmed	wallet_rescan_unconfirmed.py:77	RPC -5 Invalid or non-wallet transaction id
+FAIL	wallet_resendwallettransactions	wallet_resendwallettransactions.py:72	AssertionError: [node 0] Expected message(s) ['resubmit 1 unconfirmed transactions'] not found in lo
+FAIL	wallet_send	wallet_send.py:286	AssertionError: not(0.00004380 == 0.00000219)
+FAIL	wallet_sendall	wallet_sendall.py:254	AssertionError: Expected substring not found in error message:
+FAIL	wallet_sendmany	wallet_sendmany.py:33	AssertionError: Expected substring not found in error message:
+SKIP	wallet_signer	-	SKIP
+PASS	wallet_signmessagewithaddress	-	PASS
+FAIL	wallet_signrawtransactionwithwallet	wallet_signrawtransactionwithwallet.py:110	AssertionError
+FAIL	wallet_simulaterawtx	wallet_simulaterawtx.py:93	AssertionError: No exception raised
+FAIL	wallet_spend_unconfirmed	wallet_spend_unconfirmed.py:107	AssertionError: 15.50000 < 30
+FAIL	wallet_startup	wallet_startup.py:38	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260913T1
+FAIL	wallet_taproot	wallet_taproot.py:358	AssertionError
+PASS	wallet_timelock	-	PASS
+TIMEOUT	wallet_transactiontime_rescan	-	TIMEOUT
+PASS	wallet_txn_clone	-	PASS
+PASS	wallet_txn_doublespend	-	PASS
+FAIL	wallet_v3_txs	wallet_v3_txs.py:450	RPC -8 Invalid outputs
