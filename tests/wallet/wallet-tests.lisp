@@ -1381,14 +1381,20 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
 
 (test wallet-simulaterawtransaction-balance-change
   "simulaterawtransaction reports +owned-output and -owned-input deltas, and
-rejects a double-spend across the array."
+rejects a double-spend across the array.
+
+The node carries a UTXO set holding the coins these transactions spend,
+because simulaterawtransaction runs Core's findCoins over every input and
+refuses one the chain does not have."
   (with-wallet-test-node (node :keypool 4)
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("sim")))
     (let* ((manager (%node-manager node))
            (wallet (loaded-wallet manager "sim"))
+           (utxo-set (bl.store:make-utxo-set))
            (bl.wallet::*rpc-wallet-name* "sim"))
-      (setf (bl.wallet::wallet-last-block-height wallet) 100)
+      (setf (bl.wallet::wallet-last-block-height wallet) 100
+            (bl:node-utxo-set node) utxo-set)
       (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "bech32")))
              (script (%address-script addr :testnet4))
              (foreign (%address-script
@@ -1398,6 +1404,8 @@ rejects a double-spend across the array."
                         :testnet4)
                        :testnet4)))
         ;; A pure receive to an owned script: +0.007.
+        (bl.store:add-utxo utxo-set (%wt-dummy-txid 5) 0 900000 foreign 100
+                           :coinbase nil)
         (let ((result (bl.wallet::rpc-simulaterawtransaction
                        node (list (list (%wt-raw-tx-hex
                                          (list (cons (%wt-dummy-txid 5) 0))
@@ -1407,6 +1415,8 @@ rejects a double-spend across the array."
         (let ((funded (%wt-add-confirmed-tx
                        wallet (list (cons (%wt-dummy-txid 6) 0))
                        (list (cons script 1000000)))))
+          (bl.store:add-utxo utxo-set funded 0 1000000 script 100
+                             :coinbase nil)
           (let ((result (bl.wallet::rpc-simulaterawtransaction
                          node (list (list (%wt-raw-tx-hex
                                            (list (cons funded 0))
@@ -1421,6 +1431,65 @@ rejects a double-spend across the array."
                                                       (list (cons foreign 900000)))
                                       (%wt-raw-tx-hex (list (cons funded 0))
                                                       (list (cons foreign 800000)))))))))))))))
+
+(test wallet-simulaterawtransaction-refuses-an-input-nothing-holds
+  "simulaterawtransaction refuses an input that neither the chain nor an
+earlier transaction in the array provides, with Core's -8 `One or more
+transaction inputs are missing or have been spent already'. Core runs
+chain().findCoins over each transaction's inputs and throws on an outpoint
+whose coin IsSpent -- which includes one nothing knows at all
+(wallet/rpc/wallet.cpp, simulaterawtransaction).
+
+Ours computed the delta from the wallet's own view alone and answered a
+NUMBER for a transaction spending an output that does not exist; the same
+call with the creating transaction prepended has to keep working, which is
+the whole point of the in-array new_utxos map (wallet_simulaterawtx.py:93)."
+  (with-wallet-test-node (node :keypool 4)
+    (with-rpc-wallet (nil)
+      (bl.wallet::rpc-createwallet node '("simmiss")))
+    (let* ((manager (%node-manager node))
+           (wallet (loaded-wallet manager "simmiss"))
+           (utxo-set (bl.store:make-utxo-set))
+           (bl.wallet::*rpc-wallet-name* "simmiss"))
+      (setf (bl.wallet::wallet-last-block-height wallet) 100
+            (bl:node-utxo-set node) utxo-set)
+      (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "bech32")))
+             (script (%address-script addr :testnet4))
+             (foreign (%address-script
+                       (bl.crypto:encode-p2wpkh-address
+                        (make-array 20 :element-type '(unsigned-byte 8)
+                                       :initial-element 7)
+                        :testnet4)
+                       :testnet4))
+             ;; tx1 spends a real chain coin and pays the wallet.
+             (chain-coin (%wt-dummy-txid 11)))
+        (bl.store:add-utxo utxo-set chain-coin 0 1000000 foreign 100
+                           :coinbase nil)
+        (let* ((tx1-hex (%wt-raw-tx-hex (list (cons chain-coin 0))
+                                        (list (cons script 900000))))
+               (tx1-id (bl.ser:transaction-hash
+                        (bl.rpc:decode-hex-tx tx1-hex)))
+               ;; tx2 spends tx1's output, which is not on chain yet.
+               (tx2-hex (%wt-raw-tx-hex (list (cons tx1-id 0))
+                                        (list (cons foreign 800000)))))
+          ;; Control: tx1 alone is fine -- its input IS on chain.
+          (is (%wt= 0.009d0
+                    (%aval "balance_change"
+                           (bl.rpc:dispatch-rpc-method
+                            node "simulaterawtransaction" (list (list tx1-hex))))))
+          ;; tx2 on its own spends an output nothing holds.
+          (signals-rpc-error
+              (:code -8 :exact-message
+               "One or more transaction inputs are missing or have been spent already")
+            (bl.rpc:dispatch-rpc-method node "simulaterawtransaction"
+                                        (list (list tx2-hex))))
+          ;; With tx1 in front of it the output exists inside the array, and
+          ;; the pair is accepted: 0.009 in, then 0.009 back out.
+          (is (%wt= 0.0d0
+                    (%aval "balance_change"
+                           (bl.rpc:dispatch-rpc-method
+                            node "simulaterawtransaction"
+                            (list (list tx1-hex tx2-hex)))))))))))
 
 (test wallet-listaddressgroupings-clusters
   "listaddressgroupings clusters addresses co-spent as inputs of one tx and

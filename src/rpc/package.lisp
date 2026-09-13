@@ -180,6 +180,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:default-input-sequence
    #:decode-hex-tx
    #:decode-hex-tx-or-error
+   #:find-coins
    #:parse-prevouts
    #:decode-tx
    #:iswitness-flags

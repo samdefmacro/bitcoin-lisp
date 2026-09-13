@@ -892,7 +892,7 @@ null (or an empty array), not an object -- Core's isObject."
       (and (consp value)
            (every (lambda (cell) (and (consp cell) (stringp (car cell)))) value))))
 
-(defun %find-coins (node tx)
+(defun find-coins (node tx)
   "Core FindCoins (node/coin.cpp:12-27) for TX's inputs: the coin each input
 spends, from the mempool view first (an unconfirmed parent's output) and the
 chainstate's coins otherwise, as an EQUALP hash (txid . vout) ->
@@ -1045,7 +1045,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
            (tr-keymap (make-hash-table :test 'equalp)) ; tweaked taproot output key (32B) -> privkey
            ;; (txid . vout) -> (spk amount-sats redeem witness-script), seeded
            ;; with what the node itself knows about the inputs.
-           (prevmap (%find-coins node tx)))
+           (prevmap (find-coins node tx)))
       ;; Key map: derive each WIF's pubkey (per its compression flag) -> key-id.
       (dolist (wif wifs)
         (multiple-value-bind (sk compressed) (bl.crypto:wif-to-private-key wif)

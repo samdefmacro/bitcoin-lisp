@@ -1302,10 +1302,16 @@ keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
 (bl.rpc:define-rpc "simulaterawtransaction" (node params)
   "Wallet balance change from signing+broadcasting the given raw txs (Bitcoin
 Core simulaterawtransaction). PARAMS: (rawtxs options). Returns
-{\"balance_change\": <btc>}. DIVERGENCE: Core also runs chain findCoins to
-reject inputs that are missing or already spent on-chain; here the delta is
-computed from wallet-owned prevouts (GetDebit) and the in-array new_utxos,
-which yields the same balance_change without touching the chain UTXO set."
+{\"balance_change\": <btc>}.
+
+An input that neither an earlier transaction in the array creates nor the
+chain (or the mempool) still holds is -8 \"One or more transaction inputs are
+missing or have been spent already\", as Core reports it: it runs
+chain().findCoins over each transaction's inputs and refuses an outpoint whose
+coin IsSpent -- which includes one nothing knows at all (wallet/rpc/wallet.cpp,
+simulaterawtransaction). Without that check the balance change of a
+transaction spending an output that does not exist was reported as a number
+rather than refused."
   (let ((wallet (wallet-for-request node))
         (rawtxs (bl.rpc:positional-array (first params))))
     (unless (or (null rawtxs) (listp rawtxs))
@@ -1315,15 +1321,19 @@ which yields the same balance_change without touching the chain UTXO set."
             (new-utxos (make-hash-table :test 'equalp))  ; outpoint-key -> value
             (spent (make-hash-table :test 'equalp)))
         (dolist (raw rawtxs)
-          (let ((tx (bl.rpc:decode-hex-tx-or-error
-                     raw "Transaction hex string decoding failure.")))
+          (let* ((tx (bl.rpc:decode-hex-tx-or-error
+                      raw "Transaction hex string decoding failure."))
+                 ;; Core fetches this transaction's input coins before the
+                 ;; debit loop, once per transaction; an outpoint missing from
+                 ;; the map is its cleared, IsSpent coin.
+                 (coins (bl.rpc:find-coins node tx)))
             ;; Debit: these inputs are spent when the tx is broadcast.
             (bl.ser:dovector
                 (input (bl.ser:transaction-inputs tx))
               (let* ((prevout (bl.ser:tx-in-previous-output input))
-                     (key (%wtx-outpoint-key
-                           (bl.ser:outpoint-hash prevout)
-                           (bl.ser:outpoint-index prevout))))
+                     (txid (bl.ser:outpoint-hash prevout))
+                     (vout (bl.ser:outpoint-index prevout))
+                     (key (%wtx-outpoint-key txid vout)))
                 (when (gethash key spent)
                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "Transaction(s) are spending the same output more than once"))
@@ -1331,7 +1341,14 @@ which yields the same balance_change without touching the chain UTXO set."
                   (if present
                       (progn (decf changes utxo-value)
                              (remhash key new-utxos))
-                      (decf changes (%wallet-input-debit wallet input))))
+                      (progn
+                        ;; Core's order: the same-output check, then the
+                        ;; in-array outputs, and only then the chain.
+                        (unless (gethash (cons txid vout) coins)
+                          (error 'bl.rpc:rpc-error
+                                 :code bl.rpc:+rpc-invalid-parameter+
+                                 :message "One or more transaction inputs are missing or have been spent already"))
+                        (decf changes (%wallet-input-debit wallet input)))))
                 (setf (gethash key spent) t)))
             ;; Credit: outputs the wallet considers mine, also feeding new_utxos.
             (let ((hash (bl.ser:transaction-hash tx)))
