@@ -65,9 +65,13 @@
   (%shp-tx (list (cons (%shp-outpoint-hash n) 0)) :value value))
 
 (defun %shp-add (mempool tx &key (fee 10000))
+  ;; A current entry time, as a real acceptance stamps: ACCEPT-VALIDATED-TX
+  ;; runs Core LimitMempoolSize, so an entry dated at the epoch is expired the
+  ;; moment anything else is accepted -- including the mempool.dat replay
+  ;; below, which carries the SAVED time.
   (bl.mp:mempool-add
    mempool (%shp-hash tx)
-   (bl.mp:make-entry-from-tx tx fee 0 :entry-time 1000000)))
+   (bl.mp:make-entry-from-tx tx fee 0 :entry-time (bl.ser:get-unix-time))))
 
 (defun %shp-block (txs)
   "A block containing TXS, sufficient for mempool-remove-for-block."

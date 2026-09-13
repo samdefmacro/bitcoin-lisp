@@ -7301,10 +7301,14 @@ address, and a malformed signature all fail. The signature is deterministic."
                    (bl.crypto:hash160 (bl.crypto:derive-public-key k2))
                    :testnet3)))
       (is (eq 'yason:false (bl.rpc::rpc-verifymessage node (list addr2 sig msg)))))
-    ;; Malformed base64 is an ERROR in Core (-5 "Malformed base64 encoding"),
-    ;; not a false result (rpc/signmessage.cpp ERR_MALFORMED_SIGNATURE).
-    (signals-rpc-error (:code -5)
-      (bl.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg)))))
+    ;; Malformed base64 is an ERROR in Core, not a false result, and its code
+    ;; is RPC_TYPE_ERROR: ERR_MALFORMED_SIGNATURE is grouped with
+    ;; ERR_ADDRESS_NO_KEY and not with the undecodable address
+    ;; (rpc/signmessage.cpp:41-57). We answered -5
+    ;; (rpc_signmessagewithprivkey.py:59).
+    (signals-rpc-error (:code -3 :exact-message "Malformed base64 encoding")
+      (bl.rpc:dispatch-rpc-method node "verifymessage"
+                                  (list addr "not-a-valid-sig" msg)))))
 
 (test rpc-verifymessage-p2sh-address-is-not-a-key
   "verifymessage refuses a P2SH address with Core's -3 `Address does not refer
