@@ -60,7 +60,7 @@ default reachability)."
              bl.net:*onlynet-networks* old-onlynet)
        ;; old-locals is already a private snapshot (local-addresses copies).
        (bt:with-lock-held (bl.net::*local-addresses-lock*)
-         (setf bl.net::*local-addresses* old-locals)))))
+         (setf bl.net:*local-addresses* old-locals)))))
 
 (defun %fake-tor-server (handler)
   "One-shot fake Tor control server on 127.0.0.1: accept a single client,
