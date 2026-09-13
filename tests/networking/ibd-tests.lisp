@@ -1955,6 +1955,20 @@ NODE_BLOOM, matching Core's no-bloom path (net_processing.cpp:4940-4951)."
     (is-true (bl.net:handle-message peer "mempool" #() (bl.ctx:make-node-context)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
+(test bip37-filter-messages-disconnect
+  "filterload, filteradd and filterclear get a disconnect: we never advertise
+NODE_BLOOM, and Core drops the peer for each of them when it does not
+(net_processing.cpp:5051-5056, :5076-5081, :5104-5109). There was no handler
+for any of the three, so they were silently ignored and the peer stayed --
+p2p_nobloomfilter_messages.py:30 waits for the close on each."
+  (dolist (command (list "filterload" "filteradd" "filterclear"))
+    (let ((peer (bl.net:make-peer :state :ready)))
+      (is-true (bl.net:handle-message peer command #()
+                                      (bl.ctx:make-node-context))
+               "~A is dispatched" command)
+      (is (eq :disconnected (bl.net:peer-state peer))
+          "~A leaves the peer disconnected" command))))
+
 (test getaddr-message-format
   "getaddr serializes as a bare 24-byte v1 header with empty payload."
   (let ((bytes (bl.ser:make-getaddr-message)))

@@ -79,8 +79,10 @@ run on a loaded machine (2026-09-05)."
     "getblocks" "getaddr" "mempool" "notfound" "addr" "addrv2" "getcfilters"
     "getcfheaders" "getcfcheckpt" "verack" "sendaddrv2" "wtxidrelay"
     "sendtxrcncl" "reqrecon" "sketch" "reqsketchext" "reconcildiff"
-    "sendheaders" "feefilter" "sendcmpct" "cmpctblock" "blocktxn" "getblocktxn")
-  "The 31 commands HANDLE-MESSAGE dispatched as a COND before the table
+    "sendheaders" "feefilter" "sendcmpct" "cmpctblock" "blocktxn" "getblocktxn"
+    ;; BIP37, refused rather than served: this node advertises no NODE_BLOOM.
+    "filterload" "filteradd" "filterclear")
+  "The commands HANDLE-MESSAGE dispatched as a COND before the table
 (second-round review wave C). A handler that exists but is not in the table
 is the failure the table was built against, so the list is pinned here;
 extend it when a message type is added.")
