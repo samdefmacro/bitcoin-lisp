@@ -66,16 +66,26 @@
                    ("warnings" . ,(bl.log:warnings-for-rpc)))))
     ;; Add pruning-specific fields when pruning is enabled
     (when (bl:pruning-enabled-p)
-      (let ((pruned-height (bl.store:chain-state-pruned-height chain-state)))
+      (let ((pruned-height (bl.store:chain-state-pruned-height chain-state))
+            (automatic (bl:automatic-pruning-p)))
         (setf result
               (append result
                       ;; pruneheight = first UNpruned block (Bitcoin Core convention).
                       ;; Note: pruneblockchain RPC returns pruned-height (last pruned).
                       `(("pruneheight" . ,(1+ pruned-height))
-                        ("automatic_pruning" . ,(json-bool (bl:automatic-pruning-p)))
-                        ("prune_target_size" . ,(if (bl:automatic-pruning-p)
-                                                    (* bl:*prune-target-mib* 1048576)
-                                                    0)))))))
+                        ("automatic_pruning" . ,(json-bool automatic)))
+                      ;; prune_target_size is OPTIONAL and Core writes it only
+                      ;; inside `if (automatic_pruning)' (rpc/blockchain.cpp:
+                      ;; 1432-1434, declared /*optional=*/true at :1388). A
+                      ;; manually pruned node (-prune=1) has no target, and
+                      ;; answering 0 is not the same as answering nothing:
+                      ;; rpc_blockchain.py:161 compares the WHOLE key set of a
+                      ;; -prune=1 node against ['pruneheight',
+                      ;; 'automatic_pruning'] + the always-present keys, and
+                      ;; the extra key fails it.
+                      (when automatic
+                        `(("prune_target_size"
+                           . ,(* bl:*prune-target-mib* 1048576))))))))
     ;; Core reports the signet challenge here too, on a signet chain and
     ;; nowhere else (rpc/blockchain.cpp:1436-1440); feature_signet.py asserts
     ;; it. This is the third place the challenge belongs — getmininginfo had

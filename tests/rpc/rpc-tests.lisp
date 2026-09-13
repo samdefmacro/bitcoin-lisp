@@ -9726,3 +9726,37 @@ the storage clause formats its TYPE. A blanket handler would print neither."
         (is (eql 42 (and (hash-table-p reply) (gethash "result" reply)))
             "the server stopped serving after the storage condition: ~S"
             json)))))
+
+;;; --- getblockchaininfo's pruning fields ------------------------------------
+
+(test getblockchaininfo-names-a-prune-target-only-when-pruning-is-automatic
+  "Core's getblockchaininfo adds pruneheight and automatic_pruning whenever
+pruning is on, and prune_target_size ONLY inside `if (automatic_pruning)'
+(rpc/blockchain.cpp:1426-1434; the field is declared /*optional=*/true at
+:1388). A manually pruned node (-prune=1) has no target at all, so answering
+0 is not the same as answering nothing: rpc_blockchain.py:161 compares the
+whole key set of such a node against ['pruneheight', 'automatic_pruning']
+plus the always-present keys."
+  (let ((node (make-test-node)))
+    (flet ((chain-info ()
+             (bl.rpc:dispatch-rpc-method node "getblockchaininfo" (wire-params '()))))
+      (flet ((info-keys () (mapcar #'car (chain-info)))
+             (info-value (key) (cdr (assoc key (chain-info) :test #'string=))))
+      ;; -prune=1 is Core's PRUNE_TARGET_MANUAL.
+      (let ((bl:*prune-target-mib* 1))
+        (let ((keys (info-keys)))
+          (is-true (member "pruneheight" keys :test #'string=))
+          (is-true (member "automatic_pruning" keys :test #'string=))
+          (is-false (member "prune_target_size" keys :test #'string=)
+                    "manual pruning must report no prune_target_size; keys were ~S"
+                    keys)))
+      ;; An automatic target IS reported, in bytes.
+      (let ((bl:*prune-target-mib* 550))
+        (is-true (member "prune_target_size" (info-keys) :test #'string=))
+        (is (= (* 550 1048576) (info-value "prune_target_size"))))
+      ;; Pruning off: none of the three keys.
+      (let ((bl:*prune-target-mib* nil))
+        (let ((keys (info-keys)))
+          (is-false (member "pruneheight" keys :test #'string=))
+          (is-false (member "automatic_pruning" keys :test #'string=))
+          (is-false (member "prune_target_size" keys :test #'string=))))))))
