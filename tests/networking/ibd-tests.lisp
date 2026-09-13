@@ -4458,3 +4458,25 @@ Control: a cleared window buys one more."
                    (bl.net:disconnect-peer peer)
                    (bl.net:disconnect-peer client))))
           (bl.net:close-listener srv))))))
+
+(test the-drains-block-rejection-is-logged-in-cores-words
+  "Core logs a refused block with BlockValidationState::ToString() -- the reject
+reason in LOWER CASE (consensus/validation.h:110-121) -- from ProcessNewBlock's
+`AcceptBlock FAILED (%s)' (validation.cpp:4457). An unsolicited block the
+block-download drain refuses is logged by HANDLE-VALIDATION-FAILURE, and that
+line printed the verdict keyword with ~A, i.e. UPPER CASE: p2p_segwit.py:145
+waits for `unexpected-witness' in debug.log after a witness block below
+activation and the log said UNEXPECTED-WITNESS."
+  (with-network (:regtest)
+    (with-ibd-context
+      (let* ((blk (bl.ser:make-bitcoin-block
+                   :header (%mtp-header (%bd-hash 101) 1700000000 :grind nil)
+                   :transactions '()))
+             (lines (capture-log-lines
+                     (lambda ()
+                       (bl.net::handle-validation-failure
+                        blk 102 :unexpected-witness nil)))))
+        (is-true (find "unexpected-witness" lines :test #'search)
+                 "the line carries Core's lower-case reason")
+        (is-false (find "UNEXPECTED-WITNESS" lines :test #'search)
+                  "and not the keyword's upper-case name")))))
