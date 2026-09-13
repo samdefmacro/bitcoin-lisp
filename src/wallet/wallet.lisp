@@ -418,6 +418,18 @@ GetKeys does when it discards DecryptKey's return value
             (when (and master entry)
               (decrypt-key master (car entry) (cdr entry))))))))
 
+(defun spkm-has-priv-key-p (spkm keyid)
+  "Core DescriptorScriptPubKeyMan::HasPrivKey (scriptpubkeyman.cpp:962-966):
+does this SPKM hold the private key for KEYID -- plaintext or encrypted?
+
+TRUE on a LOCKED wallet. The key is there; it merely cannot be read right
+now, and that is a different question from whether it exists. Asking whether
+the secret can be PRODUCED (SPKM-PRIVKEY-PROVIDER) answers NIL for every key
+of a locked wallet, which is the wrong answer to `does the wallet have it'."
+  (and (or (gethash keyid (desc-spkm-keys spkm))
+           (gethash keyid (desc-spkm-crypted-keys spkm)))
+       t))
+
 (defun spkm-have-private-keys-p (spkm)
   "Core HavePrivateKeys. TRUE on a locked encrypted wallet — the keys exist,
 they are merely unreadable right now. Reporting NIL here would make
@@ -2248,19 +2260,30 @@ which is the whole point of the RPC."
                           (xpub-key (or (bl.rpc:desc-key-extkey key)
                                         (and xprv (bl.crypto:bip32-neuter xprv)))))
                      (when xpub-key
-                       (let ((xpub (bl.crypto:bip32-serialize xpub-key)))
+                       (let* ((xpub (bl.crypto:bip32-serialize xpub-key))
+                              ;; Core's has_private is HasPrivKey(
+                              ;; xpub.pubkey.GetID()) -- does the SPKM HOLD the
+                              ;; key, encrypted or not -- not whether the
+                              ;; secret can be read right now
+                              ;; (wallet/rpc/wallet.cpp:711,731).
+                              (keyid (bl.crypto:hash160
+                                      (bl.crypto:ext-key-public-bytes xpub-key)))
+                              (has-priv (or (spkm-has-priv-key-p spkm keyid)
+                                            (and (bl.rpc:desc-key-ext-privkey key) t))))
                          (unless (gethash xpub by-xpub)
-                           (setf (gethash xpub by-xpub) (list nil nil))
+                           (setf (gethash xpub by-xpub) (list nil nil nil))
                            (push xpub order))
                          (let ((entry (gethash xpub by-xpub)))
                            (when xprv (setf (first entry) xprv))
+                           (when has-priv (setf (third entry) t))
                            (push (cons spkm active) (second entry))))))))))
     (loop for xpub in (nreverse order)
           for entry = (gethash xpub by-xpub)
           collect (let ((xprv (first entry))
-                        (descs (reverse (second entry))))
+                        (descs (reverse (second entry)))
+                        (has-priv (third entry)))
                     `(("xpub" . ,xpub)
-                      ("has_private" . ,(bl.rpc:json-bool (and xprv t)))
+                      ("has_private" . ,(bl.rpc:json-bool has-priv))
                       ,@(when (and private xprv)
                           `(("xprv" . ,(bl.crypto:bip32-serialize xprv))))
                       ("descriptors"

@@ -381,6 +381,43 @@ carries hash256(pubkey||der))."
 ;;; Encryption lifecycle
 ;;; ============================================================
 
+(test wenc-gethdkeys-has-private-survives-encryption
+  "gethdkeys's has_private is Core's HasPrivKey(xpub.pubkey.GetID())
+(wallet/rpc/wallet.cpp:711,731 -> scriptpubkeyman.cpp:962-966): does the SPKM
+HOLD the private key, plaintext OR encrypted. It is TRUE on a locked wallet --
+the key is there, it merely cannot be read right now.
+
+Ours answered it by asking whether the secret could be PRODUCED, through the
+SPKM's signing provider, which yields NIL for every key of a locked wallet. So
+every root of an encrypted wallet reported has_private false, including the
+one encryptwallet had just generated (wallet_gethdkeys.py:62)."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("w")
+      (let ((wallet (%wenc-fresh-wallet node "w")))
+        ;; Control: before encryption the single root reports has_private.
+        (let ((rows (bl.rpc:dispatch-rpc-method node "gethdkeys" nil)))
+          (is (= 1 (length rows)))
+          (is (eq t (cdr (assoc "has_private" (first rows) :test #'string=)))))
+        (%wenc-encrypt node)
+        (is-true (bl.wallet::wallet-is-locked-p wallet)
+                 "control: encryptwallet leaves the wallet LOCKED, which is the
+                  state this test is about")
+        ;; Encryption rotates the HD key, so there are two roots now, and the
+        ;; wallet holds the private key of both.
+        (let ((rows (bl.rpc:dispatch-rpc-method node "gethdkeys" nil)))
+          (is (= 2 (length rows)))
+          (dolist (row rows)
+            (is (eq t (cdr (assoc "has_private" row :test #'string=)))))
+          ;; And no xprv leaks out of a locked wallet by this route.
+          (dolist (row rows)
+            (is-false (assoc "xprv" row :test #'string=))))
+        ;; The active root alone, still has_private.
+        (let* ((opts (let ((h (make-hash-table :test 'equal)))
+                       (setf (gethash "active_only" h) t) h))
+               (rows (bl.rpc:dispatch-rpc-method node "gethdkeys" (list opts))))
+          (is (= 1 (length rows)))
+          (is (eq t (cdr (assoc "has_private" (first rows) :test #'string=)))))))))
+
 (test wenc-encryptwallet-lifecycle
   "encryptwallet: returns Core's instruction string, leaves the wallet locked,
 moves every key from plaintext to ciphertext records on disk AND in memory,
