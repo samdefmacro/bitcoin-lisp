@@ -888,17 +888,24 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
 (bl.rpc:define-rpc "combinerawtransaction" (node params)
   "Combine partially-signed raw transactions, taking the most-complete scriptSig
 and witness per input (prevout script types come from the UTXO set / mempool).
-PARAMS: (txs). Mirrors Core combinerawtransaction."
+PARAMS: (txs). Mirrors Core combinerawtransaction.
+
+Core decodes every element FIRST and only then refuses an empty list, so a
+malformed element is named by index and an empty array is the -22 \"Missing
+transactions\" rpc_createmultisig.py:150 asks for (rpc/rawtransaction.cpp:
+608-619). A non-array never reaches here: `txs' is declared RPCArg::Type::ARR,
+which is the dispatcher's own -3 (core-tables.lisp, Core's params[0]
+.get_array())."
   (declare (ignore node))
   (let ((hexes (bl.rpc:positional-array (first params))))
-    (unless (and (listp hexes) (>= (length hexes) 1))
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                        :message "txs must be a non-empty array of hex transactions"))
     (let ((txs (loop for h in hexes
                      for idx from 0
                      collect (bl.rpc:decode-hex-tx-or-error
                               h (format nil "TX decode failed for tx ~D. Make ~
 sure the tx has at least one input." idx)))))
+      (unless txs
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
+                                 :message "Missing transactions"))
       (let* ((base (first txs))
              (nin (length (bl.ser:transaction-inputs base)))
              (merged-ins (make-array nin))
