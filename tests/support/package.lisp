@@ -28,6 +28,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:rpc-error-code-of
    #:capture-log-lines
    #:next-message-within
+   #:clear-recent-block-txs
    #:rpc-error-of
    #:wire-params
    #:one-input-tx-hex
