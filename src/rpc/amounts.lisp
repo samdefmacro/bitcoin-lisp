@@ -186,8 +186,9 @@ for 10000000000 and 92233720368.54775808."
         (return-from parse-fixed-point nil))
       mantissa)))
 
-(defun %json-number-text (value)
-  "The text Core's UniValue holds for the JSON number VALUE.
+(defun %json-number-text (value &optional (decimals 8))
+  "The text Core's UniValue holds for the JSON number VALUE, at DECIMALS
+fraction digits.
 
 UniValue keeps a number's SOURCE TEXT and getValStr() hands it back, so in
 Core AmountFromValue's number path IS its string path: 1e-8 and 0.00000001
@@ -197,21 +198,26 @@ rebuilt -- an integer prints exactly, and a float prints with SBCL's shortest
 round-tripping digits, whose exponent marker (d/f/s/l) becomes the e
 ParseFixedPoint reads. A RATIO never arrives over the wire; a Lisp caller's
 1/2 is rendered exactly when it is a whole number of units and left to fail
-otherwise."
+otherwise. DECIMALS is the scale that decides what \"a whole number of
+units\" means -- 8 for a BTC amount, 3 for a sat/vB fee rate."
   (etypecase value
     (integer (format nil "~D" value))
     (float (map 'string
                 (lambda (c) (if (member c '(#\d #\D #\f #\F #\s #\S #\l #\L)) #\e c))
                 (princ-to-string value)))
-    (ratio (let ((units (* value (expt 10 8))))
+    (ratio (let ((units (* value (expt 10 decimals))))
              (if (integerp units)
-                 (multiple-value-bind (whole rest) (truncate (abs units) (expt 10 8))
-                   (format nil "~:[~;-~]~D.~8,'0D" (minusp units) whole rest))
+                 (multiple-value-bind (whole rest) (truncate (abs units) (expt 10 decimals))
+                   (format nil "~:[~;-~]~D.~V,'0D" (minusp units) whole decimals rest))
                  (princ-to-string value))))))
 
-(defun amount-from-value (value)
-  "Core AmountFromValue (rpc/util.cpp:98-108): a JSON number or decimal string
-in BTC to satoshis.
+(defun amount-from-value (value &optional (decimals 8))
+  "Core AmountFromValue (rpc/util.cpp:98-108, declared with
+`int decimals = 8\' in rpc/util.h:125): a JSON number or decimal string to
+an integer count of 10^-DECIMALS units -- BTC to satoshis at the default,
+and sat/vB to sat/kvB at DECIMALS 3, which is the only other scale Core
+asks for (wallet/rpc/spend.cpp:224, `Fee rates in sat/vB cannot represent
+more than 3 significant digits\').
 
 Three lines, because Core is three lines: a value that is neither a number nor
 a string is \"Amount is not a number or string\"; text ParseFixedPoint refuses
@@ -231,8 +237,8 @@ accepted."
                       :message "Amount is not a number or string"))
   (let ((satoshis (parse-fixed-point (if (stringp value)
                                          value
-                                         (%json-number-text value))
-                                     8)))
+                                         (%json-number-text value decimals))
+                                     decimals)))
     (unless satoshis
       (error 'rpc-error :code +rpc-type-error+ :message "Invalid amount"))
     (unless (bl.val:money-range-p satoshis)

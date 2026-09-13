@@ -221,45 +221,23 @@ too small to pay the fee\" error instead of committing a broken tx."
     (format nil "~D.~3,'0D sat/vB" whole frac)))
 
 (defun %feerate-from-value (value)
-  "Core AmountFromValue(fee_rate, /*decimals=*/3): a sat/vB number or
-decimal string with at most 3 fraction digits, to integer sat/kvB."
-  (let ((milli
-          (cond
-            ((integerp value) (* value 1000))
-            ((rationalp value) (let ((m (* value 1000)))
-                                 (unless (integerp m)
-                                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
-                                                     :message "Invalid amount"))
-                                 m))
-            ((floatp value)
-             (let ((m (rational value)))
-               (setf m (* m 1000))
-               ;; JSON doubles: accept values that are integral to within
-               ;; double noise, exactly like UniValue's decimal parse.
-               (unless (< (abs (- m (round m))) 1/1000)
-                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
-                                   :message "Invalid amount"))
-               (round m)))
-            ((stringp value)
-             (let* ((dot (position #\. value))
-                    (whole (if dot (subseq value 0 dot) value))
-                    (frac (if dot (subseq value (1+ dot)) "")))
-               (unless (and (plusp (length whole))
-                            (every #'digit-char-p whole)
-                            (<= (length frac) 3)
-                            (or (null dot) (plusp (length frac)))
-                            (every #'digit-char-p frac))
-                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
-                                   :message "Invalid amount"))
-               (+ (* (parse-integer whole) 1000)
-                  (if (plusp (length frac))
-                      (* (parse-integer frac) (expt 10 (- 3 (length frac))))
-                      0))))
-            (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
-                                 :message "Amount is not a number or string")))))
-    (when (minusp milli)
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "Amount out of range"))
-    milli))
+  "Core wallet/rpc/spend.cpp:224 SetFeeEstimateMode:
+`CFeeRate{AmountFromValue(fee_rate, /*decimals=*/3)}\' -- the fee_rate
+argument, given in sat/vB, as the integer sat/kvB a CFeeRate holds.
+
+The parse is Core's ParseFixedPoint at three decimals and nothing narrower.
+This used to hand-parse the string as whole-plus-fraction and refuse any
+text with more than three characters after the point, which refuses the
+spelling Core's own functional tests send: Python's Decimal reaches the node
+as a decimal STRING (test/functional/test_framework/authproxy.py:59-64), and
+a Decimal division keeps its trailing zeros, so wallet_basic.py:242-244 sends
+\"100.000000\" and wallet_fundrawtransaction.py:103 sends \"1.00000\".
+ParseFixedPoint counts a trailing zero rather than refusing it
+(util/strencodings.cpp:255-269 ProcessMantissaDigit), so both are 100 and 1
+sat/vB; only a SIGNIFICANT digit past the third makes the exponent negative
+and fails. It also takes the exponent form and the leading-zero rule, and
+leaves the range to MoneyRange, which is where a negative rate is refused."
+  (bl.rpc:amount-from-value value 3))
 
 ;;; --- Coin control (Core CCoinControl, the subset the P4 RPCs drive) ---
 

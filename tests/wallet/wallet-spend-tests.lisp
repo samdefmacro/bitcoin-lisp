@@ -148,6 +148,38 @@ fixed-rate version at the 3000 sat/kvB dust relay rate."
   (signals bl.rpc:rpc-error
     (bl.wallet::%feerate-from-value "1.0001")))
 
+(test ws-feerate-is-parse-fixed-point-at-three-decimals
+  "Core wallet/rpc/spend.cpp:224 parses fee_rate with AmountFromValue(v, 3),
+which is ParseFixedPoint(util/strencodings.cpp:271-359) -- so a TRAILING
+ZERO past the third decimal is counted, not refused, and the exponent form
+parses. Python's Decimal reaches the node as a decimal STRING
+(test_framework/authproxy.py:59-64), and the two spellings below are the
+ones Core's own suite sends: wallet_basic.py:242-244 computes
+Decimal('0.001')/1000*Decimal(1e8) => \"100.000000\" and
+wallet_fundrawtransaction.py:103 computes
+min_relay_tx_fee*Decimal(1e8)/1000 => \"1.00000\"."
+  (is (= 100000 (bl.wallet::%feerate-from-value "100.000000")))
+  (is (= 1000 (bl.wallet::%feerate-from-value "1.00000")))
+  (is (= 1000 (bl.wallet::%feerate-from-value "1.000")))
+  (is (= 2000 (bl.wallet::%feerate-from-value 2)))
+  ;; ParseFixedPoint's own grammar, at three decimals.
+  (is (= 1000000 (bl.wallet::%feerate-from-value "1e3")))
+  (is (= 1 (bl.wallet::%feerate-from-value "0.001")))
+  ;; A SIGNIFICANT fourth decimal is still finer than one unit: exponent < 0.
+  (is (string= "Invalid amount"
+               (bl.rpc:rpc-error-message
+                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value "1.0001"))))))
+  (is (string= "Invalid amount"
+               (bl.rpc:rpc-error-message
+                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value "01"))))))
+  ;; A parsed value outside MoneyRange is Core's other message.
+  (is (string= "Amount out of range"
+               (bl.rpc:rpc-error-message
+                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value "-1"))))))
+  (is (string= "Amount is not a number or string"
+               (bl.rpc:rpc-error-message
+                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value (list 1))))))))
+
 (test ws-amount-sub-satoshi-rejected
   "AmountFromValue rejects sub-satoshi precision (Core parses the decimal
 text exactly and errors on >8 fraction digits); legit amounts still parse."
