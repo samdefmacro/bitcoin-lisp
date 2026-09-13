@@ -116,6 +116,19 @@ JSON-RPC 1.x) or a hash-table (from yason)."
   (cond ((hash-table-p obj) (gethash key obj))
         ((listp obj) (cdr (assoc key obj :test #'string=)))))
 
+(defun obj-keys (obj)
+  "The key names of a JSON object that arrived as either an alist or a
+hash-table -- Core's UniValue::getKeys, which RPCTypeCheckObj's strict mode
+walks to find a key nobody asked for.
+
+Sorted, because a hash-table from the wire has no insertion order to report
+and an unexpected-key message that names a different key on each call is not
+a message anyone can test."
+  (sort (cond ((hash-table-p obj)
+               (loop for k being the hash-keys of obj collect k))
+              ((listp obj) (mapcar #'car obj)))
+        #'string<))
+
 ;;; --- Numbers Core spells itself (UniValue::setFloat) ---
 
 (defstruct (json-number (:constructor make-json-number (text))
