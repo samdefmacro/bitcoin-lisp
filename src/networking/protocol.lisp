@@ -414,13 +414,29 @@ net_processing.cpp:6064-6066). Its hash is %PEER-INV-HASH."
 ;;; per SendMessages pass.
 
 (defvar *tx-in-flight* (make-hash-table :test 'equalp)
-  "txid -> (peer . request-internal-real-time); at most one per txid.")
+  "txid -> (peer . request-time in %TX-REQUEST-NOW seconds); at most one per
+txid.")
+
+(defun %tx-request-now ()
+  "The tx-request tracker's clock, and it is Core's MOCKABLE one. SendMessages
+hands `GetTime<std::chrono::microseconds>()' to GetRequestable
+(net_processing.cpp:6162) and AddTxAnnouncement stamps each announcement's
+reqtime from the same call (txdownloadman_impl.cpp:210-219), so setmocktime
+moves every request delay and the sixty-second expiry with it.
+
+Ours read GET-INTERNAL-REAL-TIME -- a process-relative clock nothing can move
+-- for both. That put the whole tracker out of reach of the functional suite,
+which drives it with mocktime and then waits seconds, not minutes:
+p2p_tx_download.py:175-176 jumps the clock past GETDATA_TX_INTERVAL and gives
+the fallback peer ONE second to be asked, and p2p_ibd_txrelay.py:95-96 bumps
+it by NONPREF_PEER_TX_DELAY and waits for the getdata."
+  (bl.ser:get-unix-time))
 
 (defstruct (tx-announcement
             (:constructor %make-tx-announcement (peer ready priority))
             (:conc-name tx-ann-))
   "One peer's announcement of one txhash — Core's txrequest Announcement
-(txrequest.cpp:52-100). READY is the internal-real-time at which it becomes
+(txrequest.cpp:52-100). READY is the %TX-REQUEST-NOW time at which it becomes
 requestable (Core m_time as a reqtime: CANDIDATE_DELAYED until then,
 CANDIDATE_READY after). COMPLETED is Core's State::COMPLETED: the peer
 answered notfound, let its request expire, or delivered something for this
@@ -506,16 +522,15 @@ delay: outbound connections (Core's fPreferredDownload — outbound or NoBan
 permission; we have no permission flags)."
   (not (peer-inbound peer)))
 
-(defun %tx-announcement-delay-ticks (peer wtxidp num-wtxid-peers)
-  "The announcement's request delay in internal-time ticks — the sum Core
+(defun %tx-announcement-delay-seconds (peer wtxidp num-wtxid-peers)
+  "The announcement's request delay in %TX-REQUEST-NOW seconds — the sum Core
 computes in AddTxAnnouncement (txdownloadman_impl.cpp:210-219)."
-  (* internal-time-units-per-second
-     (+ (if (tx-request-preferred-p peer) 0 +nonpref-peer-tx-delay-seconds+)
-        (if (and (not wtxidp) (plusp num-wtxid-peers))
-            +txid-relay-delay-seconds+ 0)
-        (if (>= (gethash peer *tx-peer-in-flight* 0)
-                +max-peer-tx-request-in-flight+)
-            +overloaded-peer-tx-delay-seconds+ 0))))
+  (+ (if (tx-request-preferred-p peer) 0 +nonpref-peer-tx-delay-seconds+)
+     (if (and (not wtxidp) (plusp num-wtxid-peers))
+         +txid-relay-delay-seconds+ 0)
+     (if (>= (gethash peer *tx-peer-in-flight* 0)
+             +max-peer-tx-request-in-flight+)
+         +overloaded-peer-tx-delay-seconds+ 0)))
 
 (defun %tx-request-mark-in-flight (hash peer now)
   "Lock held: record an outstanding getdata for HASH to PEER."
@@ -653,9 +668,9 @@ count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
     (when (>= (gethash peer *tx-peer-announcements* 0)
               +max-peer-tx-announcements+)
       (return-from tx-request-wanted-p nil))
-    (let* ((now (get-internal-real-time))
-           (ready (+ now (%tx-announcement-delay-ticks peer wtxidp
-                                                       num-wtxid-peers))))
+    (let* ((now (%tx-request-now))
+           (ready (+ now (%tx-announcement-delay-seconds peer wtxidp
+                                                         num-wtxid-peers))))
       (push (%make-tx-announcement peer ready (%tx-request-priority hash peer))
             (gethash hash *tx-announcers*))
       (incf (gethash peer *tx-peer-announcements* 0))
@@ -831,7 +846,7 @@ hash goes to its best candidate. Returns the number of requests sent.
 CTX, the node-context, is optional and enables Core's belt-and-suspenders
 re-check: a hash we have acquired since its announcement is forgotten rather
 than requested (%DROP-ALREADY-HAVE-REQUESTS)."
-  (let ((now (get-internal-real-time))
+  (let ((now (%tx-request-now))
         (to-send '()))                  ; (peer . list-of-invs)
     (bt:with-lock-held (*tx-request-lock*)
       (maphash (lambda (hash anns)
@@ -852,7 +867,7 @@ per peer per pass, unauthenticated and uncharged. Core does not re-issue from
 the NOTFOUND branch at all -- ReceivedNotFound is one indexed ReceivedResponse
 per item (txdownloadman_impl.cpp:288-294) and SendMessages re-issues from a
 per-peer index of CANDIDATE_BEST announcements (txrequest.cpp:595-624)."
-  (let ((now (get-internal-real-time))
+  (let ((now (%tx-request-now))
         (to-send '()))
     (bt:with-lock-held (*tx-request-lock*)
       (dolist (hash hashes)
@@ -915,13 +930,12 @@ passed (txrequest.cpp:485-500) — the peer keeps the slot it burned, so it may
 not re-announce its way into a second GETDATA_TX_INTERVAL window on the same
 transaction. Returns the number re-requested. CTX enables the same
 belt-and-suspenders re-check PROCESS-TX-REQUESTS takes it for."
-  (let ((now (get-internal-real-time))
-        (timeout-ticks (* +tx-request-timeout-seconds+ internal-time-units-per-second))
+  (let ((now (%tx-request-now))
         (to-send '()))
     (bt:with-lock-held (*tx-request-lock*)
       (let ((timed-out '()))
         (maphash (lambda (txid entry)
-                   (when (> (- now (cdr entry)) timeout-ticks)
+                   (when (> (- now (cdr entry)) +tx-request-timeout-seconds+)
                      (push (cons txid (car entry)) timed-out)))
                  *tx-in-flight*)
         (dolist (item timed-out)

@@ -358,8 +358,9 @@ delay had elapsed SECONDS ago, so the next scheduler pass may grant it. Every
 announcement gets the SAME ready time, which is what lets a test ask which
 one the tracker picks without announcement time deciding it. Returns the
 number of announcements moved."
-  (let ((ready (- (get-internal-real-time)
-                  (max 1 (* seconds internal-time-units-per-second))))
+  ;; The tracker's clock is %TX-REQUEST-NOW, Core's mockable NodeClock in
+  ;; seconds, not the process-relative internal-real-time.
+  (let ((ready (- (bl.ser:get-unix-time) (max 1 seconds)))
         (n 0))
     (dolist (ann (gethash hash bl.net::*tx-announcers*) n)
       (incf n)
@@ -371,8 +372,7 @@ RETRY-TIMED-OUT-TX-REQUESTS sees it past GETDATA_TX_INTERVAL. Returns the
 peer whose request was backdated, or NIL if nothing was in flight."
   (let ((entry (gethash hash bl.net::*tx-in-flight*)))
     (when entry
-      (setf (cdr entry) (- (get-internal-real-time)
-                           (* seconds internal-time-units-per-second)))
+      (setf (cdr entry) (- (bl.ser:get-unix-time) seconds))
       (car entry))))
 
 (defun (setf tx-request-peer-count) (n peer)

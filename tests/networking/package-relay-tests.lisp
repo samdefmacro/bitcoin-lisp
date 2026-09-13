@@ -1036,3 +1036,50 @@ Nothing was announced and nothing was logged."
               "a forcerelay peer's duplicate is announced to everyone else")
           (is (equalp txid (first (first (bl.net:peer-tx-inv-queue downstream))))
               "and it is that transaction")))))))
+
+(test the-tx-request-tracker-runs-on-the-mockable-clock
+  "Core's tx-request tracker is driven by the MOCKABLE clock: SendMessages
+passes `GetTime<std::chrono::microseconds>()' to GetRequestable
+(net_processing.cpp:6162) and AddTxAnnouncement stamps each announcement's
+reqtime from the same call (txdownloadman_impl.cpp:210-219), so setmocktime
+moves the NONPREF/TXID/OVERLOADED delays and the sixty-second
+GETDATA_TX_INTERVAL expiry with it.
+
+Ours read GET-INTERNAL-REAL-TIME for both, a process-relative clock nothing
+can move, which put the entire tracker out of reach of the tests that drive
+it: p2p_tx_download.py:175-176 jumps the clock past GETDATA_TX_INTERVAL and
+gives the fallback peer ONE second to be asked, and p2p_ibd_txrelay.py:95-96
+bumps it by NONPREF_PEER_TX_DELAY and then waits for the getdata."
+  (bl.net:reset-tx-requests)
+  (unwind-protect
+       (let* ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 211))
+              (first-peer (bl.net:make-peer :state :ready :inbound t))
+              (fallback (bl.net:make-peer :state :ready :inbound t))
+              (t0 (bl.ser:get-unix-time))
+              (bl.ser:*mock-time* t0))
+         ;; Two inbound announcers: both carry NONPREF_PEER_TX_DELAY, so
+         ;; nothing is asked for while the clock stands still.
+         (is-false (bl.net:tx-request-wanted-p hash first-peer))
+         (is-false (bl.net:tx-request-wanted-p hash fallback))
+         (is (= 0 (bl.net:process-tx-requests))
+             "the delay has not elapsed on the mocked clock")
+         ;; Bump the mocked clock by the delay, as bumpmocktime does: the
+         ;; scheduler asks one of them now.
+         (setf bl.ser:*mock-time* (+ t0 2))
+         (is (= 1 (bl.net:process-tx-requests))
+             "a mocked clock past NONPREF_PEER_TX_DELAY releases the request")
+         (let ((asked (tx-request-in-flight-peer hash)))
+           (is-true asked)
+           ;; Nothing expires until the mocked clock passes
+           ;; GETDATA_TX_INTERVAL, and then the other announcer is asked.
+           (setf bl.ser:*mock-time* (+ t0 2 59))
+           (is (= 0 (bl.net:retry-timed-out-tx-requests))
+               "and nothing expires one second before the interval")
+           (setf bl.ser:*mock-time* (+ t0 2 61))
+           (is (= 1 (bl.net:retry-timed-out-tx-requests))
+               "a mocked clock past GETDATA_TX_INTERVAL expires the request")
+           (is-true (tx-request-in-flight-peer hash))
+           (is (not (eq asked (tx-request-in-flight-peer hash)))
+               "and the fallback announcer is the one now asked")))
+    (bl.net:reset-tx-requests)))
