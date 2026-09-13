@@ -423,6 +423,15 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   (by-wtxid (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; outpoint-key (byte vector) -> txid that spends it
   (spent-outpoints (bl.bytes:make-octets-hash-table) :type hash-table)
+  ;; A LOWER BOUND on the entry-time of everything in ENTRIES -- no entry is
+  ;; older than this, and 0 means "unknown, sweep to find out". Core reads the
+  ;; first element of its entry_time index and stops there (CTxMemPool::Expire,
+  ;; txmempool.cpp:811-827), so its expiry sweep costs nothing when nothing has
+  ;; expired; ours walks a hash table, and LimitMempoolSize runs it after EVERY
+  ;; accepted transaction, which would make each acceptance O(mempool).
+  ;; A removal never invalidates the bound: taking entries out can only raise
+  ;; the true minimum.
+  (oldest-entry-time 0 :type integer)
   ;; Sum of the entries' sigop-adjusted virtual sizes (Core totalTxSize,
   ;; txmempool.h:191 "sum of all mempool tx's virtual sizes" —
   ;; getmempoolinfo's "bytes").
@@ -1022,6 +1031,19 @@ at hand."
   (let ((entry (make-entry-from-tx tx (or fee 0) height
                                    :sigops sigops :entry-time entry-time)))
     (let ((result (mempool-add mempool txid entry :defer-trim defer-trim)))
+      ;; Core LimitMempoolSize after a successful acceptance
+      ;; (validation.cpp:1392-1394), under Core's own guard
+      ;; `!package_submission && !bypass_limits'. Expiry lives here and
+      ;; nowhere else on this path: Core checks it only when something is
+      ;; accepted, which is why mempool_expiry.py broadcasts an unrelated
+      ;; transaction to make the node look at a pool it has been ignoring.
+      ;; A tx that the sweep or the trim then removes -- its own parent could
+      ;; have expired underneath it -- is Core's `mempool full', which is
+      ;; how it reads the pool after LimitMempoolSize (validation.cpp:1398).
+      (when (and (eq result :ok) (not defer-trim) (not bypass-limits))
+        (mempool-limit-size mempool)
+        (unless (mempool-has mempool txid)
+          (setf result :mempool-full)))
       ;; Fee estimation tracks a transaction from mempool ENTRY, so it can
       ;; later say how long that feerate waited (Core's validation interface
       ;; delivers TransactionAddedToMempool for the same purpose). Only a tx
@@ -1143,6 +1165,10 @@ runs unconditionally (validation.cpp:1338-1342)."
   ;; totalTxSize += GetTxSize(), cachedInnerUsage += DynamicMemoryUsage()).
   (incf (mempool-total-size mempool) (mempool-entry-vsize entry))
   (incf (mempool-total-usage mempool) (mempool-entry-usage entry))
+  (let ((bound (mempool-oldest-entry-time mempool))
+        (entered (mempool-entry-entry-time entry)))
+    (setf (mempool-oldest-entry-time mempool)
+          (if (zerop bound) entered (min bound entered))))
   (%mempool-graph-verify mempool)
 
   ;; Trim back to the memory cap now that the tx is in (Core
@@ -1151,7 +1177,10 @@ runs unconditionally (validation.cpp:1338-1342)."
   ;; the worst it evicts itself - that is the "mempool full" outcome, and the
   ;; rolling minimum fee has been raised past its feerate either way. The cap
   ;; is Core's: modeled DYNAMIC MEMORY USAGE against -maxmempool, not wire
-  ;; bytes. Skipped under DEFER-TRIM (see docstring).
+  ;; bytes. Skipped under DEFER-TRIM (see docstring). LimitMempoolSize's OTHER
+  ;; half, the expiry, belongs to the acceptance path and runs in
+  ;; ACCEPT-VALIDATED-TX: this function is Core's addUnchecked, which every
+  ;; test that plants an entry by hand calls directly.
   (when (and (not defer-trim)
              (> (mempool-dynamic-usage mempool) (mempool-max-size mempool)))
     (mempool-trim-to-size mempool)
@@ -1975,20 +2004,48 @@ connects. Returns the number of transactions removed."
 ;;;; Expiry and periodic trim
 
 (defun mempool-expire (mempool &optional (now (bl.ser:get-unix-time)))
-  "Remove transactions (and their descendants) older than the expiry window.
-Returns the number of transactions removed."
+  "Remove transactions (and their descendants) older than the expiry window
+(Core CTxMemPool::Expire, txmempool.cpp:811-827). Returns the number of
+transactions removed.
+
+MEMPOOL-OLDEST-ENTRY-TIME stands in for Core's entry_time index: when the
+oldest entry there can be is already inside the window there is nothing to
+find, and the sweep returns without walking the pool. That matters because
+this now runs after every accepted transaction, where Core runs it."
   (let ((cutoff (- now (* *mempool-expiry-hours* 3600)))
+        (bound (mempool-oldest-entry-time mempool))
         (stale '())
         (removed 0)
         (*mempool-removal-reason* :expiry))
+    (when (and (plusp bound) (>= bound cutoff))
+      (return-from mempool-expire 0))
     (maphash (lambda (txid entry)
                (when (< (mempool-entry-entry-time entry) cutoff)
                  (push txid stale)))
              (mempool-entries mempool))
-    (dolist (txid stale removed)
+    ;; Everything older than CUTOFF is about to go, so CUTOFF is the new bound
+    ;; -- or nothing is left and the bound is unknown again.
+    (dolist (txid stale)
       ;; A stale tx may already be gone (removed as a descendant of another).
       (when (mempool-has mempool txid)
-        (incf removed (mempool-remove-recursive mempool txid))))))
+        (incf removed (mempool-remove-recursive mempool txid))))
+    (setf (mempool-oldest-entry-time mempool)
+          (if (zerop (mempool-count mempool)) 0 (max bound cutoff)))
+    removed))
+
+(defun mempool-limit-size (mempool &optional (now (bl.ser:get-unix-time)))
+  "Core LimitMempoolSize (validation.cpp:264-275): expire everything older
+than -mempoolexpiry, then trim back to -maxmempool. Returns the number of
+transactions the expiry removed.
+
+Core calls this after every accepted transaction that is neither part of a
+package submission nor bypassing limits (validation.cpp:1392-1394), once at
+the end of a package (:1728), and once after a reorg re-adds the disconnected
+block's transactions (:387). Expiry is therefore only ever noticed when
+something else happens to the pool, which is what mempool_expiry.py relies on:
+it broadcasts an unrelated transaction to make the node look."
+  (prog1 (mempool-expire mempool now)
+    (mempool-trim-to-size mempool)))
 
 ;;;; Block interaction
 

@@ -730,7 +730,7 @@ mempool, exactly as in Core's early return.
       ;; the pool — may be evicted by the trim; flip its result to
       ;; :mempool-full, as Core does by re-checking existence
       ;; (validation.cpp:1736-1760).
-      (bl.mp:mempool-trim-to-size mempool)
+      (bl.mp:mempool-limit-size mempool)
       (loop for res being the hash-values of results
             when (and (member (package-tx-result-status res)
                               '(:valid :mempool-entry :different-witness))
