@@ -1781,3 +1781,34 @@ whole mandatory path would be untested code that reads as covered."
            (r (%gbt node (%gbt-params "rules"
                                       (vector "segwit" "taproot" "testdummy")))))
       (is (= #x30000000 (cdr (assoc "version" r :test #'string=)))))))
+
+(test generate-states-its-deprecation-in-core-s-own-lines
+  "Core keeps `generate' registered only to state its own deprecation, and
+rpc_generate.py reads that text TWICE: from the -32601 the call throws
+(rpc/mining.cpp:259-261, :129) and from `help generate' (:132). Both are
+RPCHelpMan::ToString(): the method name, a blank line, the one-line
+description, and a closing newline.
+
+A Common Lisp string literal has no \\n escape -- \"a\\nb\" reads as \"anb\" --
+so the notice went out as a single line carrying the letter `n' wherever Core
+writes a newline, and neither read could match it."
+  (let ((node (make-test-node))
+        (expected (concatenate 'string
+                               "generate"
+                               (string #\Newline) (string #\Newline)
+                               "has been replaced by the -generate cli option. "
+                               "Refer to -help for more information."
+                               (string #\Newline))))
+    (signals-rpc-error (:code -32601 :exact-message expected)
+      (bl.rpc:dispatch-rpc-method node "generate" nil))
+    (is (string= expected
+                 (bl.rpc:dispatch-rpc-method node "help"
+                                             (wire-params (list "generate")))))
+    ;; Control: a method that registers no help text still answers with its
+    ;; own name, and an unknown one still says so.
+    (is (string= "getblockcount"
+                 (bl.rpc:dispatch-rpc-method node "help"
+                                             (wire-params (list "getblockcount")))))
+    (is (string= "help: unknown command: nosuchrpc"
+                 (bl.rpc:dispatch-rpc-method node "help"
+                                             (wire-params (list "nosuchrpc")))))))

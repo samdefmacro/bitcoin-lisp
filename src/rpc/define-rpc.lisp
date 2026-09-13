@@ -45,6 +45,18 @@ DISPATCH-RPC-METHOD runs before CHECK-RPC-ARG-TYPES -- and by RPC-USAGE-LINE.")
 OBJ_NAMED_PARAMS options object, which a named-parameter call may pass at
 top level (Core rpc/server.cpp:408-415).")
 
+(defvar *rpc-help-texts* (make-hash-table :test 'equal)
+  "method name -> the text Core's `help <method>' prints for it, which is that
+method's RPCHelpMan::ToString() (rpc/util.cpp). Ours carries only the methods
+whose help text is part of their OBSERVABLE behaviour rather than
+documentation -- today `generate' alone, whose whole purpose is to state its
+deprecation both when called and when asked for (rpc/mining.cpp:257-262,
+rpc_generate.py:129-132). A method with no entry answers as it always did.")
+
+(defun register-rpc-help (name text)
+  "Record TEXT as the answer of `help NAME'."
+  (setf (gethash name *rpc-help-texts*) text))
+
 (defun register-rpc-method (name handler)
   "Install HANDLER (a function of NODE and PARAMS) as method NAME."
   (setf (gethash name *rpc-methods*) handler))

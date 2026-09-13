@@ -980,16 +980,29 @@ getnetworkhashps)."
                     (%number-arg nblocks 120)
                     (%number-arg height -1)))
 
+(defparameter *generate-deprecation-notice*
+  (format nil "generate~2%has been replaced by the -generate cli option. ~
+Refer to -help for more information.~%")
+  "What Core's `generate' RPCHelpMan renders as ToString(): the method name, a
+blank line, the one-line description, and a closing newline
+(rpc/mining.cpp:257-262). Written with FORMAT directives because Common Lisp
+string literals have NO \\n escape -- the literal spelling read as the letter
+`n', so the message went out as `generatennhas been replaced ... information.n'
+and rpc_generate.py:129 saw no newline where it asks for three.")
+
+(register-rpc-help "generate" *generate-deprecation-notice*)
+
 (define-rpc "generate" (node params)
   "Core keeps `generate' registered ONLY so that calling it explains itself
 (rpc/mining.cpp:258-261): it throws RPC_METHOD_NOT_FOUND with the help text.
 
 An unregistered method would answer `Method not found' with no explanation, and
 rpc_generate.py asserts on the message — it is a deprecation notice, not an
-absence."
+absence. `help generate' prints the same text (rpc_generate.py:132), which is
+why it is registered in *RPC-HELP-TEXTS* as well."
   (declare (ignore node params))
   (error 'rpc-error :code +rpc-method-not-found+
-                    :message "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"))
+                    :message *generate-deprecation-notice*))
 
 ;;; --- Transaction prioritisation (Bitcoin Core prioritisetransaction) ---
 
