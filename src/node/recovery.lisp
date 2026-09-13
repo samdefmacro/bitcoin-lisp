@@ -58,7 +58,17 @@ wipe is that case wearing a hash."
         ((null recorded)
          (log-info "Coins DB has no best-block pointer yet; it will be written on the next flush")
          :unrecorded)
-        ((and tip (equalp recorded tip))
+        ;; Core's early return in LoadChainTip is `tip && tip->GetBlockHash()
+        ;; == coins_cache.GetBestBlock()' (validation.cpp:4835-4838), and its
+        ;; tip is a CBlockIndex* -- a block it HAS. Ours is a hash and a height
+        ;; in chainstate.dat, which can name a block the index does not hold,
+        ;; and then agreeing with the coins pointer proved nothing: with
+        ;; blocks/index removed the node came up claiming height 200 over an
+        ;; empty index, where Core reports `Error initializing block database'
+        ;; and offers a reindex (node/chainstate.cpp:122-124,
+        ;; feature_reindex_init.py:23). So the record must name a block we have.
+        ((and tip (equalp recorded tip)
+              (bl.store:get-block-index-entry chainstate tip))
          :match)
         ;; Core's is_coinsview_empty gate. The genesis pointer is exempt: an
         ;; empty set AT genesis is the correct, ordinary state of a node that

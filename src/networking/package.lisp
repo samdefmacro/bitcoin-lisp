@@ -158,6 +158,9 @@ headerssync.cpp. src/networking/.")
    ;; Protocol
    #:handle-message
    #:ingest-headers-from-peer
+   #:header-sync-candidate-p
+   #:broadcast-initial-getheaders
+   #:handle-validation-failure
    #:peer-last-getheaders-time
    #:request-headers
    #:relay-transaction

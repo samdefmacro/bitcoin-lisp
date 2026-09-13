@@ -201,21 +201,33 @@ log line of the node itself."
       (log-info "Debug logging categories: ~{~A~^ ~}" enabled))))
 
 
-(alexandria:define-constant +test-options+ '("bip94")
+(alexandria:define-constant +test-options+
+    '("bip94" "reindex_after_failure_noninteractive_yes")
   :test #'equal
   :documentation "The values -test=<option> is honoured for, a subset of Core's
-TEST_OPTIONS_DOC (common/args.cpp:743-747). Core's other two -- `addrman' (a
-deterministic addrman) and `reindex_after_failure_noninteractive_yes' -- are
-deliberately absent: an option we cannot honour must warn like any other
-unrecognised one rather than be accepted and silently ignored, which is what
-makes -test=bip94 mean something.")
+TEST_OPTIONS_DOC (common/args.cpp:743-747). Core's remaining one -- `addrman'
+ (a deterministic addrman) -- is deliberately absent: an option we cannot honour
+must warn like any other unrecognised one rather than be accepted and silently
+ignored, which is what makes -test=bip94 mean something.")
+
+(defvar *test-options* '()
+  "The -test=<option> values this run was given (Core's ArgsManager -test list,
+read back by HasTestOption, common/args.cpp:749-754). Set by
+%APPLY-TEST-OPTIONS; the chainstate-load retry asks it whether the operator has
+pre-answered the rebuild question.")
+
+(defun test-option-set-p (option)
+  "Core's HasTestOption (common/args.cpp:749-754): OPTION is among -test's
+values. Regtest-only, because -test itself is."
+  (member option *test-options* :test #'string=))
 
 (defun %apply-test-options (network options)
   "Apply -test=<option> (Core init.cpp:1107-1121 plus chainparams.cpp
 ReadRegTestArgs). Core reads -test with GetArgs, so it is a LIST and every
 value is a separate switch; it is an ERROR off regtest and a WARNING for a
 value the node does not know."
-  (setf bl.chain:*enforce-bip94-on-regtest* nil)
+  (setf bl.chain:*enforce-bip94-on-regtest* nil
+        *test-options* options)
   (when options
     (unless (eq network :regtest)
       (config-error "-test=<option> can only be used with regtest"))
@@ -594,6 +606,28 @@ pruning mode announcement (Step 3)."
         (log-info "Transaction relay: DISABLED (safety default)"))))
 
 
+(defun %rebuild-block-index-from-block-files ()
+  "The -reindex step: rebuild the block index from the block files already on
+disk. Additive -- an intact index is extended, never discarded.
+
+Extracted so the chainstate-load retry can run it too: Core's AppInitMain
+re-enters InitAndLoadChainstate with do_reindex true after a FAILURE the
+operator agreed to rebuild from (init.cpp:1860-1879), which wipes the block
+tree db and rebuilds it from the same files. Ours keeps what the index already
+holds, which reaches the same place from a deleted blocks/index without
+re-deciding anything that is still on disk."
+  (when (node-block-store *node*)
+    (log-info "Reindex: rebuilding the block index from the block files...")
+    (multiple-value-bind (added orphans)
+        (bl.store:reindex-block-index
+         (node-block-store *node*) (node-chain-state *node*))
+      (log-info "Reindex: added ~D block index entries~@[, ~D record~:P had no parent~]"
+                added (and (plusp orphans) orphans))
+      (when (plusp added)
+        (bl.store:save-header-index (node-chain-state *node*)
+                                    :force-full t))
+      added)))
+
 (defun %init-load-chain (network reindex blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
 index, -reindex, and the block-store <-> header-index position map.
@@ -725,16 +759,8 @@ startup refusal rather than a directory we create somewhere else."
   ;; extended rather than discarded — reindexing is additive, and a node that
   ;; threw away a good index to rebuild it would be strictly worse off if the
   ;; files turned out to be incomplete.
-  (when (and reindex (node-block-store *node*))
-    (log-info "Reindex: rebuilding the block index from the block files...")
-    (multiple-value-bind (added orphans)
-        (bl.store:reindex-block-index
-         (node-block-store *node*) (node-chain-state *node*))
-      (log-info "Reindex: added ~D block index entries~@[, ~D record~:P had no parent~]"
-                added (and (plusp orphans) orphans))
-      (when (plusp added)
-        (bl.store:save-header-index (node-chain-state *node*)
-                                                :force-full t))))
+  (when reindex
+    (%rebuild-block-index-from-block-files))
 
   ;; Per-file accounting for the flat block files, recovered by joining the
   ;; store's hash -> position map with the header index's hash -> height. It
@@ -838,6 +864,73 @@ connect."
     (do-reindex-chainstate)))
 
 
+(defun %init-chain-tip (reindex)
+  "Core's LoadChainTip, the last step of CompleteChainstateInitialization
+ (node/chainstate.cpp:120-126): with a non-empty coins view, the chain tip is
+placed on the block the coins pointer names, and a pointer naming a block the
+index does not hold is `Error initializing block database'.
+
+Our RECONCILE-COINS-DB-BEST-BLOCK is that step -- the coins pointer is the
+fact, the tip record is the copy -- and it has always refused an unplaceable
+pointer. Two things are new here. It is reported as Core reports it, a
+CHAINSTATE-LOAD-ERROR carrying Core's own sentence, because the framework
+compares the whole of stderr against it (feature_reindex_init.py:23). And it
+happens HERE, where Core has it: before the mempool replay and the RPC server,
+so nothing downstream reads a tip that was never settled.
+
+The retry is Core's too. A FAILURE from the chainstate load is the one class of
+startup failure Core offers to rebuild from: it asks the operator, and the
+functional tests pre-answer yes with
+-test=reindex_after_failure_noninteractive_yes (init.cpp:1860-1879,
+HasTestOption). noui answers NO (noui.cpp:49-52), so an operator who was not
+asked gets the refusal and the advice. REINDEX is whether this run was already
+a -reindex, which is Core's `!do_reindex' guard: one retry, never a loop."
+  (flet ((verdict () (reconcile-coins-db-best-block *node*)))
+    (let ((result (verdict)))
+      (when (eq result :unresolvable)
+        (cond
+          ((or reindex
+               (not (test-option-set-p "reindex_after_failure_noninteractive_yes")))
+           (log-error "Refusing to start: the UTXO set names a block this node cannot place.")
+           (log-error "Recover by reindexing from the block files, or restore a backup.")
+           (chainstate-load-error "Error initializing block database"))
+          (t
+           (log-warn "Block database load failed; rebuilding the block index from the block files (-test=reindex_after_failure_noninteractive_yes)")
+           (%rebuild-block-index-from-block-files)
+           (when (node-block-store *node*)
+             (bl.store:rebuild-block-file-info
+              (node-block-store *node*) (node-chain-state *node*)))
+           (setf result (verdict))
+           (when (eq result :unresolvable)
+             (log-error "Refusing to start: the rebuilt block index still cannot place the UTXO set.")
+             (chainstate-load-error "Error initializing block database")))))
+      result)))
+
+(defun %refuse-a-tip-from-the-future (chainstate)
+  "Core VerifyLoadedChainstate's first test, before VerifyDB itself: a tip more
+than MAX_FUTURE_BLOCK_TIME ahead of the node's clock is refused, and the
+refusal names the CLOCK rather than the database, because a wrong system time
+is the likelier cause (node/chainstate.cpp:250-255).
+
+Core's GetTime() honours -mocktime and so does GET-UNIX-TIME, which is what
+makes the test drivable: rpc_blockchain.py:125 restarts the node with a
+mocktime one second below the tip's own timestamp minus the window, and
+compares the whole of stderr against this sentence. Returns NIL when the tip is
+acceptable."
+  (let* ((tip-hash (bl.store:best-block-hash chainstate))
+         (tip (and tip-hash
+                   (bl.store:get-block-index-entry chainstate tip-hash)))
+         (header (and tip (bl.store:block-index-entry-header tip)))
+         (tip-time (and header (bl.ser:block-header-timestamp header))))
+    (when (and tip-time
+               (> tip-time (+ (bl.ser:get-unix-time)
+                              bl.val:+max-future-block-time+)))
+      (chainstate-load-error
+       "The block database contains a block which appears to be from the ~
+future. This may be due to your computer's date and time being set ~
+incorrectly. Only rebuild the block database if you are sure that your ~
+computer's date and time are correct"))))
+
 (defun %verify-loaded-chainstates (check-blocks check-level
                                    require-full-verification reindex-chainstate)
   "Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276): run VerifyDB
@@ -856,6 +949,7 @@ given explicitly, Core's require_full_verification (init.cpp:1390)."
     (dolist (cs (node-chainstates *node*))
       (let ((view (bl.store:chain-state-coins-view cs)))
         (unless (or (null view) (null (bl.store:coins-view-best-block view)))
+          (%refuse-a-tip-from-the-future cs)
           (let ((result (bl.val:verify-db
                          cs (node-block-store *node*)
                          :check-level (or check-level bl.val:+default-checklevel+)
@@ -965,23 +1059,8 @@ it; the indexes (Step 8) and -forcecompactdb."
   ;; Load reconnection anchors (tried first, before DNS seeds — anti-eclipse).
   (load-anchors *node*)
 
-  ;; Reconcile chainstate.dat with where the coins actually are.
-  ;;
-  ;; These are two records of one fact and every corruption story here is them
-  ;; disagreeing: an interrupted reorg rewinds coins while chainstate.dat still
-  ;; names the old tip. The coins DB's pointer moves WITH the coins, so it is
-  ;; the fact and the tip record is the stale copy — move the record, then let
-  ;; normal sync re-validate the gap. This runs unconditionally, unlike the
-  ;; older in-transition recovery, because the case that motivated it leaves no
-  ;; marker at all: an interrupted reorg whose cache is then flushed cleanly.
-  (when (eq :unresolvable (reconcile-coins-db-best-block *node*))
-    (log-error "Refusing to start: the UTXO set names a block this node cannot place.")
-    (log-error "Recover by reindexing from the block files, or restore a backup.")
-    (init-error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
-
-  ;; Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276), placed as Core
-  ;; places it: right after the reconciliation above, which is our LoadChainTip,
-  ;; and so the first moment every chainstate's tip agrees with its coins.
+  ;; Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276). Its input is
+  ;; the settled tip %INIT-CHAIN-TIP produced before the RPC server came up.
   (%verify-loaded-chainstates check-blocks check-level require-full-verification
                               reindex-chainstate)
 
@@ -1656,6 +1735,10 @@ Returns the node instance."
   (init-message "Loading block index…")          ; init.cpp:1396
   (%init-load-chain network reindex blocks-directory)
   (%init-recover-chain reindex-chainstate)
+  ;; LoadChainTip, where Core has it: the tip is settled before the mempool
+  ;; replay and the RPC server, and a coins pointer this node cannot place is
+  ;; the chainstate-load failure Core offers a reindex for.
+  (%init-chain-tip reindex)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
@@ -1941,6 +2024,22 @@ startup.~%"
            ;; run-node-watchdog exits by itself; reaching here means it was
            ;; told not to, so report a clean stop.
            (sb-ext:exit :code 0)))
+      ;; A chainstate load Core would offer to rebuild from is reported
+      ;; differently from every other startup refusal, so it is caught FIRST.
+      ;; AppInitMain hands such a FAILURE to uiInterface.ThreadSafeQuestion
+      ;; (init.cpp:1860-1871) whose non-interactive text is the message, a
+      ;; period, a newline, and the advice below; its style MSG_ERROR|BTN_ABORT
+      ;; matches none of noui's captioned cases, so no "Error: " is prepended
+      ;; (noui.cpp:28-46). feature_reindex_init.py:23,
+      ;; feature_presegwit_node_upgrade.py:39 and rpc_blockchain.py:125 each
+      ;; compare the WHOLE of stderr against exactly that.
+      (chainstate-load-error (e)
+        (ignore-errors
+         (format *error-output*
+                 "~A.~%Please restart with -reindex or -reindex-chainstate to recover.~%"
+                 e)
+         (finish-output *error-output*))
+        (sb-ext:exit :code 1 :abort t))
       (error (e)
         ;; A startup failure is what Core prints to stderr and exits 1 for.
         (ignore-errors

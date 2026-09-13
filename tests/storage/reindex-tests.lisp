@@ -188,3 +188,97 @@ chainstate.dat where the recovery put it and says a rebuild is needed."
           (let ((bl::*chainstates-reset-to-genesis* (list cs)))
             (is (eq :reset (bl::reconcile-coins-db-best-block node))))
           (is (= 0 (bl.store:current-height cs))))))))
+
+(test a-tip-record-the-block-index-cannot-place-is-a-load-failure
+  "Core's LoadChainTip returns early only when m_chain.Tip() -- a block it HAS
+-- carries the coins pointer's hash (validation.cpp:4835-4838); otherwise it
+looks the pointer up in the block index and returns false when it is not there,
+which CompleteChainstateInitialization reports as `Error initializing block
+database' (node/chainstate.cpp:122-124). Our tip is a hash in chainstate.dat,
+which can name a block the index does not hold, and a pointer that agreed with
+it was taken as :match -- so removing blocks/ index left the node coming up at
+height 5 over an index holding only genesis. feature_reindex_init.py:23 removes
+exactly that directory and compares the whole of stderr against Core's
+sentence.
+
+The retry is Core's too: a chainstate-load FAILURE is the one startup failure
+it offers to rebuild from, and the functional tests pre-answer yes with
+-test=reindex_after_failure_noninteractive_yes (init.cpp:1860-1879)."
+  (with-network (:regtest)
+    (let* ((tag (format nil "loadtip~D" (get-internal-real-time)))
+           (node (coins-db-node-fixture tag)))
+      (let ((bl:*node* node))
+        (generate-regtest-blocks node 5)
+        (let* ((cs (bl:node-chain-state node))
+               (utxo (bl:node-utxo-set node))
+               (tip (bl.store:best-block-hash cs))
+               (genesis (bl.store:get-block-index-entry
+                         cs (bl.store:chain-state-genesis-hash cs))))
+          (bl.store:coins-view-cache-flush utxo :sync t :best-block tip)
+          (flet ((verdict () (bl::reconcile-coins-db-best-block node))
+                 (load-tip (options)
+                   (let ((bl::*test-options* options))
+                     (handler-case (bl::%init-chain-tip nil)
+                       (bl.err:chainstate-load-error (e) (princ-to-string e))))))
+            (is (eq :match (verdict))
+                "control: with the index intact the two records agree")
+            ;; blocks/index removed: only genesis is left, while chainstate.dat
+            ;; and the coins pointer both still name block 5.
+            (clrhash (bl.store:chain-state-block-index cs))
+            (bl.store:add-block-index-entry cs genesis)
+            (is (eq :unresolvable (verdict))
+                "a tip record the index cannot place is not a match")
+            ;; Without the operator's yes, that is Core's refusal, in its words.
+            (is (equal "Error initializing block database" (load-tip '())))
+            ;; With it, the block index is rebuilt from the block files and the
+            ;; pointer is placed again.
+            (is (member (load-tip (list "reindex_after_failure_noninteractive_yes"))
+                        '(:match :reconciled))
+                "the retry rebuilds the index and places the UTXO set")
+            (is (equalp tip (bl.store:best-block-hash cs))
+                "and the tip record still names block 5")))))))
+
+(test a-tip-timestamped-in-the-future-is-a-load-failure
+  "Core's VerifyLoadedChainstate refuses a tip more than MAX_FUTURE_BLOCK_TIME
+ahead of the node's clock before it runs VerifyDB at all, and the refusal names
+the CLOCK rather than the database (node/chainstate.cpp:250-255). GetTime()
+honours -mocktime and so does ours, which is what makes rpc_blockchain.py:125
+drivable: it restarts the node with a mocktime one second below the tip's
+timestamp minus the window and compares the whole of stderr against this
+sentence."
+  (with-network (:regtest)
+    (let* ((cs (bl.store:make-chain-state))
+           (now (bl.ser:get-unix-time))
+           (hash (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element #xB7)))
+      (flet ((tip-at (timestamp)
+               (clrhash (bl.store:chain-state-block-index cs))
+               (bl.store:add-block-index-entry
+                cs (bl.store:make-block-index-entry
+                    :hash hash :height 1 :chain-work 2 :status :valid
+                    :header (bl.ser:make-block-header
+                             :version 4
+                             :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)
+                             :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 0)
+                             :timestamp timestamp :bits #x207fffff :nonce 0)))
+               (bl.store:update-chain-tip cs hash 1)))
+        (flet ((refusal ()
+                 (handler-case (bl::%refuse-a-tip-from-the-future cs)
+                   (bl.err:chainstate-load-error (e) (princ-to-string e)))))
+        ;; Exactly at the window: accepted, as Core's strict > accepts it.
+        (tip-at (+ now bl.val:+max-future-block-time+))
+        (is (null (refusal))
+            "a tip exactly MAX_FUTURE_BLOCK_TIME ahead is still fine")
+        ;; One second past it: refused, in Core's words.
+        (tip-at (+ now bl.val:+max-future-block-time+ 1))
+        (let ((refusal (refusal)))
+          ;; FORMAT, not a bare literal: the message is built from a control
+          ;; string whose tilde-newlines fold the source lines away, so the
+          ;; expectation has to be folded the same way to compare equal.
+          (is (equal (format nil "The block database contains a block which ~
+appears to be from the future. This may be due to your computer's date and ~
+time being set incorrectly. Only rebuild the block database if you are sure ~
+that your computer's date and time are correct")
+                     refusal))))))))
