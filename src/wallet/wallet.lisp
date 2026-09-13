@@ -2535,7 +2535,18 @@ export looks like."
             (unless (stringp desc-str)
               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                 :message "desc must be a string"))
-            (let* ((descs (bl.rpc:parse-descriptors desc-str (wallet-network wallet)
+            (let* (;; Core reads the request's own fields BEFORE it parses the
+                   ;; descriptor (wallet/rpc/backup.cpp:151-157): the desc
+                   ;; string, then active, then LabelFromValue, and only then
+                   ;; Parse(..., require_checksum=true). The order decides
+                   ;; which error a doubly-invalid request gets, and
+                   ;; wallet_labels.py:40-48 asserts that pair -- a "*" label
+                   ;; on an unchecksummed descriptor is -11 "Invalid label
+                   ;; name", not the parse error. Parsing first answered -5.
+                   (active (and (gethash "active" data) t))
+                   (label-present (nth-value 1 (gethash "label" data)))
+                   (label (%label-from-value (gethash "label" data)))
+                   (descs (bl.rpc:parse-descriptors desc-str (wallet-network wallet)
                                                     :require-checksum t))
                    ;; Every flag below is read off descs.at(0), as Core reads
                    ;; them: the branches of one string differ only in a path
@@ -2543,9 +2554,6 @@ export looks like."
                    ;; together.
                    (desc (first descs))
                    (multipath (and (rest descs) t))
-                   (active (and (gethash "active" data) t))
-                   (label-present (nth-value 1 (gethash "label" data)))
-                   (label (%label-from-value (gethash "label" data)))
                    (internal-present (nth-value 1 (gethash "internal" data)))
                    (internal (and (gethash "internal" data) t))
                    (ranged (bl.rpc:out-desc-ranged-p desc))
