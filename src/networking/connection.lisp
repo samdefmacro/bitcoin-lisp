@@ -495,7 +495,11 @@ full write through the stream."
     (if raw
         (handler-case
             (or (sb-bsd-sockets:socket-send raw bytes (length bytes)) 0)
-          (error () :error))
+          ;; Core: `socket send error for peer=%d: %s` (net.cpp SocketSendData);
+          ;; without the condition text a send failure was unexplainable.
+          (error (e)
+            (bl.log:log-cat "net" "socket send error: ~A" e)
+            :error))
         :error))
   #-sbcl
   (handler-case
@@ -619,7 +623,8 @@ the peer instead, which stops us reading its input."
                 (when (< n (length bytes))
                   (%enqueue-send-bytes conn (if (zerop n) bytes (subseq bytes n))))
                 (length bytes)))))))
-    (error ()
+    (error (e)
+      (bl.log:log-cat "net" "socket send error: ~A" e)
       (%connection-failed conn :send-error))))
 
 (defun drain-available-bytes (stream buffer start end)

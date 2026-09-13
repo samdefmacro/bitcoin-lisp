@@ -158,6 +158,7 @@ headerssync.cpp. src/networking/.")
    ;; Protocol
    #:handle-message
    #:ingest-headers-from-peer
+   #:peer-last-getheaders-time
    #:request-headers
    #:relay-transaction
    #:peer-announced-txs

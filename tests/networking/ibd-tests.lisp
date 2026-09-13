@@ -4356,3 +4356,59 @@ hook. Control: the same delivery with the IBD latch on announces nothing."
                    (bl.net:disconnect-peer listener-peer)
                    (bl.net:disconnect-peer client))))
           (bl.net:close-listener srv))))))
+
+;;;; Unconnecting announcements buy one getheaders per response window
+
+(test unconnecting-headers-send-one-throttled-getheaders
+  "Core's HandleUnconnectingHeaders asks for the missing chain through
+MaybeSendGetHeaders (net_processing.cpp:2659), which sends at most one
+getheaders per HEADERS_RESPONSE_TIME to a peer (:2825-2837). Ours sent one
+per unconnecting message: a peer that had just mined ninety-nine blocks
+announced them one header at a time, node1 answered thirty of them with a
+getheaders each within a millisecond, and node0 disconnected it for exceeding
+the getheaders rate limit (p2p_segwit.py, 2026-09-13). Control: once the
+throttle window is cleared, the next unconnecting message asks again."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "unconnecting-throttle"))
+           (cs (bl:node-chain-state node))
+           (srv (bl.net:open-listener "127.0.0.1" 0)))
+      (is-true srv)
+      (when srv
+        (unwind-protect
+             (let* ((port (usocket:get-local-port srv))
+                    (client (bl.net:connect-peer "127.0.0.1" port))
+                    (conn (and client (bl.net:accept-connection srv :timeout 10)))
+                    (peer (and conn (bl.net:make-inbound-peer conn "127.0.0.1"))))
+               (is-true peer)
+               (when peer
+                 (unwind-protect
+                      (flet ((orphan-header (seed)
+                               (bl.ser:make-block-header
+                                :version 1
+                                :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element seed)
+                                :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element 1)
+                                :timestamp 1 :bits #x207fffff :nonce 0))
+                             (getheaders-bytes ()
+                               ;; The per-command counter is BYTES (Core
+                               ;; mapSendBytesPerMsgType); one getheaders is one
+                               ;; fixed size, so bytes count messages here.
+                               (gethash "getheaders" (bl.net:peer-sent-per-msg peer) 0)))
+                        (setf (bl.net:peer-state peer) :ready)
+                        (is (= 0 (getheaders-bytes)) "control: nothing sent yet")
+                        (bl.net:ingest-headers-from-peer peer (list (orphan-header #xA1)) cs)
+                        (let ((one (getheaders-bytes)))
+                          (is (plusp one) "the first unconnecting header asks for the chain")
+                          (bl.net:ingest-headers-from-peer peer (list (orphan-header #xA2)) cs)
+                          (bl.net:ingest-headers-from-peer peer (list (orphan-header #xA3)) cs)
+                          (is (= one (getheaders-bytes))
+                              "further unconnecting headers inside the window ask nothing more")
+                          ;; Control: the window cleared, the next one asks again.
+                          (setf (bl.net:peer-last-getheaders-time peer) 0)
+                          (bl.net:ingest-headers-from-peer peer (list (orphan-header #xA4)) cs)
+                          (is (= (* 2 one) (getheaders-bytes))
+                              "control: a cleared window buys one more")))
+                   (bl.net:disconnect-peer peer)
+                   (bl.net:disconnect-peer client))))
+          (bl.net:close-listener srv))))))
