@@ -1067,8 +1067,8 @@ trickle tx and addr announcements, rebroadcasts, the wallet resend timer,
 local-address adverts, feefilter and reconciliation rounds, and the at-tip
 liveness signal; SECOND is the whole second (1..30) this tick falls in, and
 only gates the behind-known-work exit. Returns T when the wait should end
-now: new headers arrived, or the node is behind known work and
-+BEHIND-RETRY-SECONDS+ have passed."
+now: new headers arrived, a peer was admitted or dialed this tick, or the
+node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
   ;; Admit the peers that arrived during
   ;; the wait BEFORE the pump reads, or
   ;; they sit in the hand-off list until
@@ -1083,8 +1083,11 @@ now: new headers arrived, or the node is behind known work and
   ;; python peer waited up to 30 s for its
   ;; first reply, and each addconnection
   ;; took a whole cycle.
-  (merge-inbound-peers *node*)
-  (dial-queued-nodes *node*)
+  (let* ((peers-before (length (node-peers *node*)))
+         (admitted (progn
+                     (merge-inbound-peers *node*)
+                     (dial-queued-nodes *node*)
+                     (> (length (node-peers *node*)) peers-before))))
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the
   ;; periodic half of Core's
@@ -1228,7 +1231,13 @@ now: new headers arrived, or the node is behind known work and
                (> bl.net:*highest-header-seen*
                   (bl.store:current-height cs)))
       (return-from %sync-idle-tick t)))
-  nil)
+  ;; A peer admitted or dialed this tick:
+  ;; end the wait so the sync pass asks it
+  ;; for headers now. The cycle-start merge
+  ;; used to be followed by the pass at
+  ;; once; admitting mid-wait must not
+  ;; push that request up to 30 s out.
+  admitted))
 
 (defun %sync-pass ()
   "One sync pass with peers connected: IBD or follow-tip (SYNC-BLOCKCHAIN),
