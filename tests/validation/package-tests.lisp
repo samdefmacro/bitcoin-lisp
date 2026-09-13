@@ -345,6 +345,51 @@ either. IsWellFormedPackage maps that to the package-level \"conflict-in-package
         ;; each entry is (wtxid-hex . field-alist) carrying at least a txid
         (is-true (every (lambda (e) (assoc "txid" (cdr e) :test #'string=)) tx-results))))))
 
+(test rpc-submitpackage-refuses-a-topology-core-refuses
+  "submitpackage RAISES on a package that is not a child with its parents.
+The gate is the RPC's, before any validation runs (rpc/mempool.cpp:1385-1387),
+and Core throws TransactionError::INVALID_PACKAGE, which
+RPCErrorFromTransactionError maps to RPC_TRANSACTION_ERROR = -25
+(rpc/util.cpp:391-401, protocol.h:47,54).
+
+VALIDATE-PACKAGE-FOR-MEMPOOL runs the same check for the P2P 1p1c path and
+reports it as a package_msg; submitpackage was answering with that -- a result
+object saying `package-not-child-with-parents', not an error -- so a
+four-transaction chain came back as an ordinary reply
+(rpc_packages.py:526)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((node (bl:make-node :network :testnet3))
+           (parent (%pkg-tx funding-txid 0 (- 100000000 50)))
+           (pid (bl.ser:transaction-hash parent))
+           (child (%pkg-tx pid 0 (- 100000000 100)))
+           (cid (bl.ser:transaction-hash child))
+           (grandchild (%pkg-tx cid 0 (- 100000000 150)))
+           (gid (bl.ser:transaction-hash grandchild))
+           (ggrandchild (%pkg-tx gid 0 (- 100000000 200)))
+           (hex (lambda (tx) (bl.crypto:bytes-to-hex
+                              (bl.ser:serialize-transaction tx)))))
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool)
+      ;; A four-generation chain: the last transaction does not spend the
+      ;; first, so the package is not child-with-parents.
+      (signals-rpc-error (:code -25 :message "package topology disallowed")
+        (bl.rpc::rpc-submitpackage
+         node (list (mapcar hex (list parent child grandchild ggrandchild)))))
+      ;; Two parents where one spends the other: child-with-parents holds, the
+      ;; parents-are-independent half does not.
+      (signals-rpc-error (:code -25 :message "package topology disallowed")
+        (bl.rpc::rpc-submitpackage
+         node (list (mapcar hex (list parent child grandchild)))))
+      ;; Nothing entered the mempool on either refusal.
+      (is (= 0 (bl.mp:mempool-count mempool)))
+      ;; Control: the 1p1c package the gate exists to let through still does.
+      (let ((result (bl.rpc::rpc-submitpackage
+                     node (list (mapcar hex (list parent child))))))
+        (is (string= "success"
+                     (cdr (assoc "package_msg" result :test #'string=)))))
+      (is (= 2 (bl.mp:mempool-count mempool))))))
+
 (test rpc-submitpackage-broadcasts-accepted-members
   "submitpackage queues an announcement for every package member that made
 it into the mempool (Core rpc/mempool.cpp:1423-1444 runs

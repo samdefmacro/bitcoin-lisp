@@ -803,6 +803,20 @@ member may send to a script that can never spend it."
       ;; (rpc/mempool.cpp:1374-1380).
       (dolist (tx package)
         (%check-max-burn tx max-burn))
+      ;; The topology gate is the RPC's, not the package validator's
+      ;; (rpc/mempool.cpp:1385-1387): more than one transaction must be a
+      ;; child with its parents, and no parent may spend another parent.
+      ;; Core throws TransactionError::INVALID_PACKAGE, which
+      ;; RPCErrorFromTransactionError maps to RPC_TRANSACTION_ERROR = -25
+      ;; (rpc/util.cpp:391-401, protocol.h:47,54) -- an ERROR, not a result
+      ;; object. VALIDATE-PACKAGE-FOR-MEMPOOL runs the same check for the P2P
+      ;; 1p1c path and reports it as a package_msg, and that is what
+      ;; submitpackage answered for a four-transaction chain: HTTP 200 with
+      ;; "package-not-child-with-parents" in the body, where Core raises.
+      (when (and (> (length package) 1)
+                 (not (bl.val:package-child-with-parents-tree-p package)))
+        (error 'rpc-error :code +rpc-verify-error+
+                          :message "package topology disallowed. not child-with-parents or parents depend on each other."))
       ;; Node lock across validate-package -> mempool submission ->
       ;; broadcast: package acceptance mutates the mempool tx-by-tx and
       ;; must not interleave with the sync thread (Core AcceptPackage runs
