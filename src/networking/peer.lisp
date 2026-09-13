@@ -11,10 +11,19 @@
 ;;; creation. Exposed via getpeerinfo "id" and used by getblockfrompeer to name a
 ;;; peer. Lock-guarded because outbound (sync thread) and inbound (listener
 ;;; thread) peers are created concurrently.
+;;;
+;;; The FIRST id is 0. Core's CConnman::GetNewNodeId is
+;;; `nLastNodeId.fetch_add(1)' over a counter initialised to 0
+;;; (net.cpp:3390-3393, net.h:1609), so it hands out the value BEFORE the
+;;; increment; ours handed out the value after it and every peer id in this
+;;; node was one too high. The framework asserts the absolute id of a node's
+;;; first peer -- p2p_addrfetch.py:40 and p2p_mutated_blocks.py:77 both read
+;;; `info[0]['id'] == 0'.
 (defvar *peer-id-counter* 0)
 (defvar *peer-id-lock* (bt:make-lock "peer-id"))
 (defun next-peer-id ()
-  (bt:with-lock-held (*peer-id-lock*) (incf *peer-id-counter*)))
+  (bt:with-lock-held (*peer-id-lock*)
+    (prog1 *peer-id-counter* (incf *peer-id-counter*))))
 
 ;;; Per-address addr/addrv2 intake rate limit (Bitcoin Core
 ;;; net_processing.cpp:190-197): the units are ADDRESSES, not messages.

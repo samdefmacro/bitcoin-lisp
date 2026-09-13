@@ -6,6 +6,17 @@
 
 (in-suite :conn-type-tests)
 
+(test peer-ids-start-at-zero
+  "Core's CConnman::GetNewNodeId is `nLastNodeId.fetch_add(1)' over a counter
+initialised to 0 (net.cpp:3390-3393, net.h:1609): it hands out the value BEFORE
+the increment, so a node's FIRST peer is id 0. Ours incremented first and every
+id was one too high -- p2p_addrfetch.py:40 and p2p_mutated_blocks.py:77 both
+assert `info[0]['id'] == 0' on a node's first peer."
+  (let ((bl.net::*peer-id-counter* 0))
+    (is (= 0 (bl.net:peer-id (bl.net:make-peer))) "the first peer is id 0")
+    (is (= 1 (bl.net:peer-id (bl.net:make-peer))) "the second is id 1")
+    (is (= 2 (bl.net:peer-id (bl.net:make-peer))))))
+
 (test peer-conn-type-defaults
   "A freshly-made peer defaults to :inbound; make-inbound-peer keeps it."
   (let ((p (bl.net:make-peer)))
