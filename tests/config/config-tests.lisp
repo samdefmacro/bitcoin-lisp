@@ -564,6 +564,13 @@ tests cannot leak reachability or seed state into each other."
     (apply-config-globals (bl.cfg:parse-cli-args cli))
     bl::*force-dns-seed*))
 
+(defun %reachable-seeds (addresses)
+  "The seed ADDRESSES the dial loop may actually use under the -onlynet and
+proxy settings in force. One reach for the whole file: the filter is internal
+to BL -- its src caller is the seed half of the outbound refill -- and fourteen
+assertions in the -onlynet tests below read it."
+  (bl::%reachable-seed-addresses addresses))
+
 (defun %config-globals-refusal (&rest cli)
   "The message APPLY-CONFIG-GLOBALS refuses CLI with, or NIL when it accepts
 CLI."
@@ -622,20 +629,20 @@ filter, where discover-peers only ever produces IP literals."
          (bl.net:*proxy* nil))
     ;; Default reachable set: clearnet seeds pass through untouched.
     (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6)))
-      (is (equal clearnet (bl::%reachable-seed-addresses clearnet))))
+      (is (equal clearnet (%reachable-seeds clearnet))))
     ;; Onion-only: every clearnet seed is dropped rather than dialed.
     (let ((bl.net:*reachable-networks* '(:torv3)))
-      (is (null (bl::%reachable-seed-addresses clearnet)))
-      (is (equal onion (bl::%reachable-seed-addresses onion))))
+      (is (null (%reachable-seeds clearnet)))
+      (is (equal onion (%reachable-seeds onion))))
     ;; IPv4-only drops IPv6 seeds and keeps IPv4.
     (let ((bl.net:*reachable-networks* '(:ipv4)))
       (is (equal '("203.0.113.7")
-                 (bl::%reachable-seed-addresses clearnet))))
+                 (%reachable-seeds clearnet))))
     ;; With NO proxy an address whose network cannot be determined is dropped,
     ;; not dialed: nothing can resolve it inside a tunnel, and under an active
     ;; restriction an unclassifiable candidate is exactly what must not leak.
     (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6)))
-      (is (null (bl::%reachable-seed-addresses
+      (is (null (%reachable-seeds
                  '("seed.example.invalid" "not an address")))))))
 
 ;;; --- GA8: proxied DNS seeding (bootstrap regression, GA7 G7-03) --------------
@@ -663,12 +670,12 @@ discarded every DNS seed of a proxied node."
        (bl.cfg:parse-cli-args '("-proxy=127.0.0.1:9050")))
       (let ((dns (bl.net:discover-peers seeds)))
         (is (equal seeds dns))
-        (is (equal seeds (bl::%reachable-seed-addresses dns))))
+        (is (equal seeds (%reachable-seeds dns))))
       ;; The literal branch is untouched by the proxy: still -onlynet-filtered.
       (is (equal '("203.0.113.7")
-                 (bl::%reachable-seed-addresses '("203.0.113.7"))))
+                 (%reachable-seeds '("203.0.113.7"))))
       (let ((bl.net:*reachable-networks* '(:ipv4)))
-        (is (null (bl::%reachable-seed-addresses '("2001:db8::1"))))))
+        (is (null (%reachable-seeds '("2001:db8::1"))))))
     ;; -proxy together with a clearnet-containing -onlynet: seeding stays on
     ;; (soft-set does not fire) and the hostnames stay dialable.
     (%with-net-config-globals
@@ -676,7 +683,7 @@ discarded every DNS seed of a proxied node."
        (bl.cfg:parse-cli-args '("-onlynet=onion" "-onlynet=ipv6"
                                        "-proxy=127.0.0.1:9050")))
       (is-true bl:*dns-seed-enabled*)
-      (is (equal seeds (bl::%reachable-seed-addresses seeds))))))
+      (is (equal seeds (%reachable-seeds seeds))))))
 
 (test reachable-seed-addresses-onion-only-no-clearnet-dial
   "G7-03 control for the change above: -onlynet=onion still yields no clearnet
@@ -694,20 +701,20 @@ is dropped along with every clearnet literal."
       ;; Layer 1.
       (is-false bl:*dns-seed-enabled*)
       ;; Layer 2: hostnames, clearnet literals and the fixed-seed list alike.
-      (is (null (bl::%reachable-seed-addresses seeds)))
-      (is (null (bl::%reachable-seed-addresses
+      (is (null (%reachable-seeds seeds)))
+      (is (null (%reachable-seeds
                  '("203.0.113.7" "2001:db8::1"))))
-      (is (null (bl::%reachable-seed-addresses
+      (is (null (%reachable-seeds
                  (bl.chain:chain-params-fixed-seeds (bl.chain:find-chain-params :testnet4)))))
       ;; An onion literal is of course still dialable.
-      (is (equal onion (bl::%reachable-seed-addresses onion))))
+      (is (equal onion (%reachable-seeds onion))))
     ;; cjdns-only is equally clearnet-free with a proxy configured.
     (%with-net-config-globals
       (apply-config-globals
        (bl.cfg:parse-cli-args '("-onlynet=cjdns" "-cjdnsreachable=1"
                                        "-proxy=127.0.0.1:9050")))
       (is-false bl:*dns-seed-enabled*)
-      (is (null (bl::%reachable-seed-addresses seeds))))))
+      (is (null (%reachable-seeds seeds))))))
 
 ;;; --- datadir layout and lifecycle (Core chainparamsbase.cpp, args.cpp:789) ---
 
