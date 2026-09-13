@@ -738,6 +738,68 @@ not active; contextual validation rejects that block as :unexpected-witness")
        (is (= 1 (bl.store:current-height cs)))))))
 
 
+(defvar *submitblock-fork-runs* 0
+  "Counter behind the per-run datadir suffix of
+SUBMITBLOCK-INDEXES-AN-UNSEEN-HEADER-SO-THE-NEXT-FORK-BLOCK-CONNECTS, whose
+two nodes must start at genesis every time the test runs in one image
+(REGTEST-NODE-FIXTURE reopens the on-disk state of a repeated suffix).")
+
+(test submitblock-indexes-an-unseen-header-so-the-next-fork-block-connects
+  "Core's submitblock calls ProcessNewBlock, which calls AcceptBlock, which
+calls AcceptBlockHeader FIRST (validation.cpp:4340): the header is indexed
+before the body is judged, and AcceptBlock then records the body against
+that entry even when the block never becomes the tip.
+
+Ours went straight to ACTIVATE-BLOCK, whose store-without-activating arm
+looks the index entry up and found none, so a competing-chain block was
+answered `inconclusive' -- Core's own word -- while nothing was kept. The
+block ABOVE it then had no known parent.
+
+rpc_preciousblock.py copies a competing chain over RPC, oldest first, and
+asserts every answer (:13-26):
+
+    assert node_dest.submitblock(blockdata) in (None, 'inconclusive')
+
+The first block was inconclusive and the second answered `unknown-parent'.
+Reproduced here with two regtest nodes on their own chains from the same
+genesis."
+  (with-network (:regtest)
+   (let* ((tag (incf *submitblock-fork-runs*))
+          (src (regtest-node-fixture (format nil "submitfork-src-~D" tag)))
+          (dst (regtest-node-fixture (format nil "submitfork-dst-~D" tag))))
+     (flet ((call (node method &rest params)
+              (bl.rpc:dispatch-rpc-method node method (wire-params params))))
+       ;; Different coinbase scripts, or the two nodes would mine the SAME
+       ;; block from the same genesis and the copy would be a duplicate.
+       (let ((fork (call src "generatetodescriptor" 2 "raw(51)")))
+         (call dst "generatetodescriptor" 1 "raw(52)")
+         (is (= 2 (bl.store:current-height (bl:node-chain-state src))))
+         (is (= 1 (bl.store:current-height (bl:node-chain-state dst))))
+         (let* ((h1 (first fork))
+                (h2 (second fork))
+                (hex1 (call src "getblock" h1 0))
+                (hex2 (call src "getblock" h2 0))
+                (first-answer (call dst "submitblock" hex1)))
+           ;; A sibling of dst's own height-1 block: stored, never connected.
+           (is (equal "inconclusive" first-answer)
+               "the first fork block answered ~S" first-answer)
+           ;; Core keeps it: the header is in the index and the body on disk.
+           ;; Asked through RPC errors rather than by signalling, so the
+           ;; child assertion below still runs on a node that kept neither.
+           (is-false (rpc-error-of (lambda () (call dst "getblockheader" h1)))
+                     "the fork block's header was not indexed")
+           (is (equal hex1 (ignore-errors (call dst "getblock" h1 0)))
+               "the fork block's body was not stored")
+           ;; ... which is the whole point: its CHILD has a known parent.
+           (let ((second-answer (call dst "submitblock" hex2)))
+             (is (or (null second-answer) (equal "inconclusive" second-answer))
+                 "the second fork block answered ~S; Core answers null or ~
+'inconclusive' (rpc_preciousblock.py:26)"
+                 second-answer))
+           ;; Two blocks of work beat dst's one, so dst is on the fork now.
+           (is (= 2 (bl.store:current-height (bl:node-chain-state dst))))
+           (is (string= h2 (call dst "getbestblockhash")))))))))
+
 (test submitblock-header-only-entry-proceeds
   ;; Standard pool flow: submitheader, then submitblock. The header-only index
   ;; entry must NOT short-circuit as "duplicate" (Core returns "duplicate" only
