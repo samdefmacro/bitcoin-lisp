@@ -11,15 +11,6 @@
 between two sync cycles. The one internal reach of this file."
   (bl::%sync-idle-tick 1))
 
-(defun %next-message (peer seconds)
-  "Poll PEER's resumable reader for up to SECONDS; (VALUES COMMAND PAYLOAD)
-of the first complete message, or NIL."
-  (loop repeat (ceiling (* seconds 20))
-        do (multiple-value-bind (command payload) (bl.net:receive-message peer)
-             (when command
-               (return (values command payload))))
-           (sleep 0.05)))
-
 (test idle-tick-admits-a-pending-inbound-peer-and-answers-it
   "An inbound peer the listener hands over during the sync thread's 30-second
 wait must be admitted and read by the NEXT idle tick, not by the next cycle.
@@ -59,7 +50,7 @@ peer placed in node-peers directly was answered by one tick."
                       (is-true (member server-peer (bl:node-peers node))
                                "the tick must admit the pending inbound peer")
                       (is (null (bl:node-pending-inbound-peers node)))
-                      (is (equal "pong" (%next-message client 3))
+                      (is (equal "pong" (next-message-within client 3))
                           "the same tick must read and answer the peer's ping"))
                  (setf (bl:node-running node) nil)
                  (bl.net:disconnect-peer server-peer)

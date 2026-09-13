@@ -574,21 +574,10 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                      (rpc-get-block-store node)
                      (rpc-get-utxo-set node)
                      :mempool (rpc-get-mempool node)))))
-      (when (first result)
-        (let ((header (bl.ser:bitcoin-block-header block))
-              (peers (bl:node-peers node)))
-          ;; Only when it is the ACTIVE tip, which is the same condition the
-          ;; P2P path applies (protocol.lisp): a stored side block announces
-          ;; nothing.
-          (when (and peers
-                     (equalp (bl.store:best-block-hash chain-state)
-                             (bl.ser:block-header-hash header)))
-            (handler-case
-                (bl.net:relay-block header nil peers)
-              ;; A send failure must not turn an accepted block into a
-              ;; submitblock error: the block IS connected either way.
-              (error (e)
-                (bl:log-warn "Announcing submitted block failed: ~A" e))))))
+      ;; A block that became the tip is announced by the :updated-block-tip
+      ;; hook (announce-block-tip, Core UpdatedBlockTip), the one path every
+      ;; connect shares; a stored side block moves no tip and announces
+      ;; nothing, as before.
       (values-list result))))
 
 (define-rpc "submitblock" (node (hex))

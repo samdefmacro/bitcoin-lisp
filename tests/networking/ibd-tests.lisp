@@ -4280,3 +4280,79 @@ still be refused, and must not grow the index."
         (is (null (bl.store:get-block-index-entry cs orphan-hash))
             "a body on an unknown parent must not be indexed")
         (is (= entries-before (hash-table-count (bl.store:chain-state-block-index cs))))))))
+
+;;;; Every new tip is announced (Core UpdatedBlockTip), whichever path connected it
+
+(test a-block-connected-by-the-drain-is-announced-to-peers
+  "Core queues every new tip for announcement to every peer from
+PeerManagerImpl::UpdatedBlockTip (net_processing.cpp:2160-2189), whatever
+connected it, except during IBD (:2165). Ours announced from two call sites
+only -- the P2P block handler and submitblock -- so a block connected by the
+block-download drain, which is every block fetched after a headers
+announcement and every unsolicited block read mid-pass, was never announced
+onward: in the 2026-09-13 sweep example_test.py's node1 heard about one of the
+ten blocks node0 connected. The announcement is now the :updated-block-tip
+hook. Control: the same delivery with the IBD latch on announces nothing."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "announce-drain"))
+           (cs (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
+           (store (bl:node-block-store node))
+           (bl:*node* node)
+           (bl.net:*cached-is-ibd* nil)
+           (spk (p2sh-optrue-script-pubkey))
+           (srv (bl.net:open-listener "127.0.0.1" 0)))
+      (is-true srv)
+      (when srv
+        (unwind-protect
+             (let* ((port (usocket:get-local-port srv))
+                    (client (bl.net:connect-peer "127.0.0.1" port))
+                    (conn (and client (bl.net:accept-connection srv :timeout 10)))
+                    (listener-peer (and conn (bl.net:make-inbound-peer conn "127.0.0.1")))
+                    (deliverer (bl.net:make-peer :address "198.51.100.42" :state :ready))
+                    (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                                   :block-store store)))
+               (is-true listener-peer)
+               (when listener-peer
+                 (unwind-protect
+                      (flet ((mine ()
+                               (let ((blk (bl.mining:assemble-full-block
+                                           cs (bl:node-mempool node)
+                                           :coinbase-script-pubkey spk)))
+                                 (bl.mining:mine-block blk)
+                                 blk))
+                             (deliver (blk)
+                               (with-ibd-context
+                                 (deliver-ibd-message
+                                  deliverer "block"
+                                  (subseq (bl.ser:make-block-message blk :witness t) 24)
+                                  ctx))))
+                        (setf (bl.net:peer-state listener-peer) :ready
+                              (bl.net:peer-prefers-headers listener-peer) t
+                              (bl.net:peer-state client) :ready)
+                        (push listener-peer (bl:node-peers node))
+                        (let ((b1 (mine)))
+                          (deliver b1)
+                          (is (= 1 (bl.store:current-height cs)) "the block connected")
+                          (multiple-value-bind (command payload) (next-message-within client 3)
+                            (is (equal "headers" command)
+                                "a block the drain connected is announced onward")
+                            (when payload
+                              (is (equalp (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1))
+                                          (bl.ser:block-header-hash
+                                           (first (bl.ser:parse-headers-payload payload))))
+                                  "the announced header is the new tip's"))))
+                        ;; Control: a peer whose best-known block IS the new tip
+                        ;; already has it (Core PeerHasHeader, :1352, :5877) and
+                        ;; is not told again. (The IBD gate cannot be shown here:
+                        ;; a fresh regtest tip latches the node OUT of IBD.)
+                        (let ((b2 (mine)))
+                          (setf (bl.net:peer-best-known-block-hash listener-peer)
+                                (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b2)))
+                          (deliver b2)
+                          (is (= 2 (bl.store:current-height cs)))
+                          (is (null (next-message-within client 1))
+                              "control: a peer that already has the tip is not told")))
+                   (bl.net:disconnect-peer listener-peer)
+                   (bl.net:disconnect-peer client))))
+          (bl.net:close-listener srv))))))

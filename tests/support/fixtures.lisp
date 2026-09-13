@@ -484,3 +484,15 @@ payload field alike."
 (defun message-command (bytes)
   "The command a v1-framed message BYTES carries (bytes 4-15 of the header)."
   (bl.ser:bytes-to-command (subseq bytes 4 16)))
+
+;;;; Reading a peer's next message in a test
+
+(defun next-message-within (peer seconds)
+  "Poll PEER's resumable reader for up to SECONDS; (VALUES COMMAND PAYLOAD) of
+the first complete message, or NIL. Two test files wait on a loopback peer's
+reply this way (the sync thread's idle tick, the new-tip announcement)."
+  (loop repeat (ceiling (* seconds 20))
+        do (multiple-value-bind (command payload) (bl.net:receive-message peer)
+             (when command
+               (return (values command payload))))
+           (sleep 0.05)))
