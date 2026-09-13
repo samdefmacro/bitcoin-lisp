@@ -598,14 +598,20 @@ re-frames it as an encrypted BIP324 packet. Returns T on success, NIL on
 failure."
   (when (and (peer-connection peer)
              (connection-connected (peer-connection peer)))
-    (let ((conn (peer-connection peer)))
+    (let ((conn (peer-connection peer))
+          (command (bl.ser:bytes-to-command (subseq message-bytes 4 16))))
+      ;; Core logs every send under net (PushMessage, net.cpp:4075:
+      ;; `sending %s (%d bytes) peer=%d`). The receive side is logged the
+      ;; same way, so a reply that never reached the wire is otherwise the
+      ;; one thing a debug.log cannot show.
+      (bl:log-cat "net" "sending ~A (~D bytes) peer=~A"
+                  command (- (length message-bytes) 24) (peer-id peer))
       ;; Per-command send accounting (Core CConnman::PushMessage's
       ;; mapSendBytesPerMsgType, counted when the message is handed to the
       ;; transport). The command sits at bytes 4-15 of the v1 frame.
       (%account-message (peer-sent-per-msg peer)
                         (connection-transport conn)
-                        (bl.ser:bytes-to-command
-                         (subseq message-bytes 4 16))
+                        command
                         (- (length message-bytes) 24))
       (if (connection-transport conn)
           (v2-send-message conn (connection-transport conn) message-bytes)
