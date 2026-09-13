@@ -325,7 +325,7 @@ alone is accepted, so the fixture's inputs are genuinely spendable."
            (%ib-validate (%ib-block (list tx-x tx-y) prev bits now (+ subsidy 30000000))
                          cs utxo now)
          (is (null valid))
-         (is (eq :missing-input error)))
+         (is (eq :missing-input (if (consp error) (first error) error))))
        ;; CONTROL: one spender only.
        (multiple-value-bind (valid error fees)
            (%ib-validate (%ib-block (list tx-x) prev bits now (+ subsidy 10000000))
@@ -348,7 +348,7 @@ without the second spender is accepted."
            (%ib-validate (%ib-block (list tx-a tx-b tx-c) prev bits now (+ subsidy 30000000))
                          cs utxo now)
          (is (null valid))
-         (is (eq :missing-input error)))
+         (is (eq :missing-input (if (consp error) (first error) error))))
        ;; CONTROL: the honest chain of two.
        (multiple-value-bind (valid error fees)
            (%ib-validate (%ib-block (list tx-a tx-b) prev bits now (+ subsidy 20000000))
@@ -373,7 +373,9 @@ legitimate single spend must still report exactly its own fee."
              (%ib-validate (%ib-block (list tx-x tx-y) prev bits now claimed)
                            cs utxo now)
            (is (null valid))
-           (is (eq :missing-input error))
+           ;; Core's (REASON DETAIL) pair: the reject reason, then the debug
+           ;; message naming the transaction ConnectBlock refused.
+           (is (eq :missing-input (if (consp error) (first error) error)))
            (is (null fees))))
        ;; Unchanged for the honest block: fees are the single spend's 10M, and
        ;; one satoshi above subsidy + that is still too large.
@@ -421,8 +423,14 @@ both modes, so the rejection is attributable to unspendability alone."
                                     (list (list 80000000 (p2sh-optrue-script-pubkey)))))
                       (blk (%ib-block (list tx-a tx-b) prev bits now
                                       (+ subsidy 20000000))))
-                 (multiple-value-list
-                  (%ib-validate blk cs utxo now :skip-scripts skip))))))
+                 ;; The verdict a relayed TRANSACTION failure carries is Core's
+                 ;; (REASON DETAIL) pair -- the reject reason plus the debug
+                 ;; message naming the offending txid. The question here is the
+                 ;; REASON, so the detail is read past.
+                 (destructuring-bind (valid error &optional fees)
+                     (multiple-value-list
+                      (%ib-validate blk cs utxo now :skip-scripts skip))
+                   (list valid (if (consp error) (first error) error) fees))))))
       (let ((op-return (%ib-bytes #x6a #x04 1 2 3 4))
             ;; MAX_SCRIPT_SIZE is 10000; one byte past it is unspendable.
             (oversize (make-array 10001 :element-type '(unsigned-byte 8)
