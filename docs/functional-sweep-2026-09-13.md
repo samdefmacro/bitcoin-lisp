@@ -145,7 +145,11 @@ not a node without RPC" (`start-rpc-early` signals `init-error` when
   `rpc_validateaddress.py` write a config with no chain selector and expect
   mainnet; our CLI defaulted to testnet3, so the default-section options were
   refused as testnet-unsuitable. Decided 2026-09-13: mainnet is the default,
-  as in Core ("Config: the default chain is mainnet, as Core's is").
+  as in Core ("Config: the default chain is mainnet, as Core's is"). Run alone
+  against that commit, `mining_mainnet.py` passes and `rpc_validateaddress.py`
+  reaches its first real assertion: for one malformed address Core answers
+  `Invalid Bech32 checksum` where we answer the generic `Invalid or
+  unsupported Segwit (Bech32) or Base58 encoding.`
 - **`tool_bitcoin.py`** wants a `bitcoin` multiplexer binary; declared absent
   in `scripts/conformance-config.sh` like `bitcoin-cli`.
 - **Three init-error texts** the framework waits 60 s for and never sees:
