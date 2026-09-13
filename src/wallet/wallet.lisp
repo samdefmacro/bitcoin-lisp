@@ -2052,6 +2052,20 @@ backend (leveldb, where Core says sqlite)."
              (flags (wallet-flags wallet)))
         `(("walletname" . ,(wallet-name wallet))
           ("walletversion" . ,+wallet-legacy-version+)
+          ;; Core: obj.pushKV("format", wallet.GetDatabase().Format()), a
+          ;; closed vocabulary of Core's own backends -- "sqlite" for every
+          ;; descriptor wallet at d3056bc (wallet/sqlite.h:78), "bdb" for the
+          ;; legacy ones. DELIBERATE DIVERGENCE: our wallet database is a
+          ;; LevelDB DIRECTORY, not a single wallet.dat SQLite file, and
+          ;; Core's wallet.dat file-format interop is out of scope by
+          ;; docs/wallet-plan.md §1 ("Out of scope for this plan"). This
+          ;; field names the database a caller would actually have to open,
+          ;; so it says leveldb: answering "sqlite" would send a tool to a
+          ;; wallets/<name>/wallet.dat that does not exist, which is a worse
+          ;; answer than one outside Core's vocabulary. The cost is that
+          ;; wallet_descriptor.py:93 (format == sqlite) and
+          ;; wallet_multiwallet.py:78 (wallet.dat is a FILE, and :116-123
+          ;; renames it about) cannot pass until that plan item is done.
           ("format" . "leveldb")
           ("txcount" . ,(hash-table-count (wallet-map-wallet wallet)))
           ("keypoolsize" . ,external-count)
