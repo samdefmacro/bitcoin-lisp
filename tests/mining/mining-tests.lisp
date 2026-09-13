@@ -115,6 +115,24 @@ Returns the txid."
   (%mine-add-entry mempool tx fee)
   (bl.ser:transaction-hash tx))
 
+(defun %gbt-transactions-of (template pre-segwit-p)
+  "The getblocktemplate `transactions' array for TEMPLATE. One reach for the
+whole file: the renderer is internal to BL.RPC and two tests read it."
+  (bl.rpc::%gbt-transactions template pre-segwit-p))
+
+(defun %gbt-template-of (&rest entries)
+  "A block template already holding ENTRIES, each a (TX . SIGOPS) pair (a bare
+list of one TX means no sigops). For the getblocktemplate reply-shape tests,
+which are about how a SELECTED transaction is rendered and not about which
+transactions the assembler picks — going through the assembler would need a
+UTXO set for every input, and its TestBlockValidity dry run refuses a template
+whose inputs are not there."
+  (bl.mining::make-block-template
+   :transactions (loop for entry in entries
+                       for tx = (if (consp entry) (car entry) entry)
+                       for sigops = (if (consp entry) (or (cdr entry) 0) 0)
+                       collect (bl.mp:make-entry-from-tx tx 1000 0 :sigops sigops))))
+
 (test assembler-empty-mempool
   (let ((bl:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
@@ -405,6 +423,64 @@ chunk feerate diagram, not boundary knapsack optimality."
             (is (member "taproot" rules :test #'string=)))
           (is (= 0 (cdr (assoc "vbrequired" r :test #'string=))))
           (is (stringp (cdr (assoc "longpollid" r :test #'string=)))))))))
+
+(test gbt-states-its-limits-in-pre-bip141-units-before-segwit
+  "Core's getblocktemplate states sigoplimit and sizelimit in the units the
+block being templated is judged in: MAX_BLOCK_SIGOPS_COST and
+MAX_BLOCK_SERIALIZED_SIZE as they stand once segwit is active, and each divided
+by WITNESS_SCALE_FACTOR before that -- 20,000 sigops and 1,000,000 bytes -- with
+weightlimit omitted entirely, because a block weight is not yet a rule
+ (rpc/mining.cpp:1000-1012, fPreSegWit at :892). The per-transaction sigops
+count gets the same division (:925-930).
+
+This node emitted the post-BIP141 numbers at every height, so a miner reading a
+template for a pre-segwit chain was told it could fill four times the block that
+chain will accept, and was handed a weightlimit for a rule that does not exist
+there. feature_segwit.py:120 asserts the 1,000,000."
+  (with-network (:regtest)
+    (let ((bl.rpc::*gbt-cache* nil)
+          (bl.val:*test-activation-heights* (make-hash-table :test 'equal)))
+      (bl.val:apply-test-activation-heights '("segwit@5"))
+      (is-false (bl.val:segwit-active-at-height-p 1))
+      (multiple-value-bind (cs mp) (%mining-fixture)
+        (let ((node (bl:make-node :network :regtest)))
+          (setf (bl:node-chain-state node) cs
+                (bl:node-mempool node) mp
+                (bl:node-utxo-set node) (bl.store:make-utxo-set))
+          (let ((r (%gbt node (%gbt-params))))
+            (is (= 1 (cdr (assoc "height" r :test #'string=))))
+            (is (= 1000000 (cdr (assoc "sizelimit" r :test #'string=))))
+            (is (= 20000 (cdr (assoc "sigoplimit" r :test #'string=))))
+            (is-false (assoc "weightlimit" r :test #'string=)
+                      "a pre-segwit template must not offer a weightlimit")
+            ;; "!segwit" is the companion statement in the same reply: Core
+            ;; pushes it only when the fork is active (rpc/mining.cpp:951).
+            (is-false (member "!segwit" (cdr (assoc "rules" r :test #'string=))
+                              :test #'string=)))))
+      ;; Control: the same chain with segwit active (regtest's own height 0)
+      ;; keeps Core's post-BIP141 numbers. A SECOND node, because the template
+      ;; cache is keyed on the node object and the tip, and both would match.
+      (clrhash bl.val:*test-activation-heights*)
+      (is-true (bl.val:segwit-active-at-height-p 1))
+      (multiple-value-bind (cs mp) (%mining-fixture)
+        (let ((node (bl:make-node :network :regtest)))
+          (setf (bl:node-chain-state node) cs
+                (bl:node-mempool node) mp
+                (bl:node-utxo-set node) (bl.store:make-utxo-set))
+          (let ((r (%gbt node (%gbt-params))))
+            (is (= 4000000 (cdr (assoc "sizelimit" r :test #'string=))))
+            (is (= 80000 (cdr (assoc "sigoplimit" r :test #'string=))))
+            (is (= 4000000 (cdr (assoc "weightlimit" r :test #'string=)))))))
+      ;; And the per-transaction sigops count follows the same division: a
+      ;; selected entry whose weighted cost is 8 is reported as 2 before
+      ;; segwit and as 8 after it.
+      (let ((template (%gbt-template-of (cons (make-mempool-test-tx) 8))))
+        (flet ((sigops (pre-segwit-p)
+                 (cdr (assoc "sigops"
+                             (first (%gbt-transactions-of template pre-segwit-p))
+                             :test #'string=))))
+          (is (= 8 (sigops nil)))
+          (is (= 2 (sigops t))))))))
 
 (test gbt-longpollid-carries-the-mempool-counter
   "Core's longpollid is <best chain hash><nTransactionsUpdatedLast>
@@ -891,11 +967,7 @@ genesis."
          (witness-raw (make-witness-test-tx-bytes))
          (witness-tx (flexi-streams:with-input-from-sequence (s witness-raw)
                        (bl.ser:read-transaction s)))
-         (template (bl.mining::make-block-template
-                    :transactions
-                    (list (bl.mp:make-entry-from-tx legacy-tx 1000 0)
-                          (bl.mp:make-entry-from-tx witness-tx 1000 0))))
-         (txs (bl.rpc::%gbt-transactions template)))
+         (txs (%gbt-transactions-of (%gbt-template-of legacy-tx witness-tx) nil)))
     (let ((legacy-data (bl.crypto:hex-to-bytes
                         (cdr (assoc "data" (first txs) :test #'string=)))))
       (is (equalp (bl.ser:serialize-transaction legacy-tx)
