@@ -1645,7 +1645,18 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
       (when (zerop requests-made)
         (return-from request-blocks-from-peers 0))
 
-      ;; Send batch request to each peer
+      ;; Send batch request to each peer.
+      ;;
+      ;; OLDEST FIRST. Core's SendMessages walks vToDownload -- which
+      ;; FindNextBlocksToDownload fills in ASCENDING height -- and emplaces each
+      ;; hash into vGetData in that order (net_processing.cpp:6180-6190), so the
+      ;; peer answers a batch from its oldest block to its newest and the tip of
+      ;; the batch arrives LAST. The walk above already yields ascending height;
+      ;; PUSH then reversed it, so every getdata we sent asked for the newest
+      ;; block first. That is not merely cosmetic: a caller that waits for the
+      ;; TIP to be available and then reads the blocks below it finds them
+      ;; missing, because the tip is the FIRST thing the peer sends.
+      ;; p2p_node_network_limited.py:105-110 is exactly that caller.
       (maphash (lambda (peer hashes)
                    (when hashes
                      (handler-case
@@ -1653,7 +1664,7 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                                                       (bl.ser:make-inv-vector
                                                        :type bl.ser:+inv-type-witness-block+
                                                        :hash h))
-                                                    hashes)))
+                                                    (nreverse hashes))))
                            (send-message peer
                                          (bl.ser:make-getdata-message
                                           inv-vectors)))
