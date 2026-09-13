@@ -1295,9 +1295,12 @@ of them needed the same fix."
 order and rotates past any that STALL, stopping at the first that answers."
   (let* ((ctx (%ibd-ctx))
          ;; Three ready peers; the two highest-start-height ones stall.
-         (p-hi  (bl.net:make-peer :state :ready :start-height 900))
-         (p-mid (bl.net:make-peer :state :ready :start-height 800))
-         (p-lo  (bl.net:make-peer :state :ready :start-height 700))
+         (p-hi  (bl.net:make-peer :state :ready :start-height 900
+                                  :services bl.ser:+node-network+))
+         (p-mid (bl.net:make-peer :state :ready :start-height 800
+                                  :services bl.ser:+node-network+))
+         (p-lo  (bl.net:make-peer :state :ready :start-height 700
+                                  :services bl.ser:+node-network+))
          (tried '())
          ;; Stub: p-hi and p-mid stall (values 0 t); p-lo answers (values 3 nil).
          (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
@@ -1316,8 +1319,10 @@ order and rotates past any that STALL, stopping at the first that answers."
 (test header-sync-failover-first-peer-answers
   "When the highest-start-height peer answers, no rotation happens."
   (let* ((ctx (%ibd-ctx))
-         (p-hi (bl.net:make-peer :state :ready :start-height 900))
-         (p-lo (bl.net:make-peer :state :ready :start-height 700))
+         (p-hi (bl.net:make-peer :state :ready :start-height 900
+                                 :services bl.ser:+node-network+))
+         (p-lo (bl.net:make-peer :state :ready :start-height 700
+                                 :services bl.ser:+node-network+))
          (calls 0)
          (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
                     (declare (ignore peer chain-state recent-rejects))
@@ -1329,8 +1334,10 @@ order and rotates past any that STALL, stopping at the first that answers."
 (test header-sync-failover-all-stalled-and-skips-nonready
   "All-stalled returns NIL; non-:ready peers are skipped entirely."
   (let* ((ctx (%ibd-ctx))
-         (ready (bl.net:make-peer :state :ready :start-height 500))
-         (dead  (bl.net:make-peer :state :disconnected :start-height 999))
+         (ready (bl.net:make-peer :state :ready :start-height 500
+                                  :services bl.ser:+node-network+))
+         (dead  (bl.net:make-peer :state :disconnected :start-height 999
+                                  :services bl.ser:+node-network+))
          (tried '())
          (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
                     (declare (ignore chain-state recent-rejects))
@@ -1354,7 +1361,8 @@ order and rotates past any that STALL, stopping at the first that answers."
 (test header-sync-failover-honors-stop-request
   "With a stop requested, the rotation exits before trying any peer."
   (let* ((ctx (%ibd-ctx))
-         (ready (bl.net:make-peer :state :ready :start-height 500))
+         (ready (bl.net:make-peer :state :ready :start-height 500
+                                  :services bl.ser:+node-network+))
          (calls 0)
          (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
                     (declare (ignore peer chain-state recent-rejects))
@@ -4549,8 +4557,10 @@ follows; the next pass's broadcast failed it."
               :hash (%bd-hash 1) :height 1 :chain-work 2
               :prev-entry genesis :status :valid))
       (bl.store:update-chain-tip state (%bd-hash 1) 1)
-      (let ((peer (bl.net:make-peer :address "198.51.100.4" :state :ready))
-            (other (bl.net:make-peer :address "198.51.100.5" :state :ready)))
+      (let ((peer (bl.net:make-peer :address "198.51.100.4" :state :ready
+                                    :services bl.ser:+node-network+))
+            (other (bl.net:make-peer :address "198.51.100.5" :state :ready
+                                     :services bl.ser:+node-network+)))
         (flet ((broadcast (&rest peers)
                  (length (captured-sends
                           (lambda ()
@@ -4560,3 +4570,40 @@ follows; the next pass's broadcast failed it."
           (is (= 0 (broadcast peer)) "a later pass does not ask it again")
           (is (= 1 (broadcast peer other))
               "control: a peer we have not opened header sync with still gets one"))))))
+
+(test an-addr-fetch-peer-is-never-header-synced
+  "Core's SendMessages opens header sync only with a peer that CanServeBlocks
+and is not an addr-fetch connection (net_processing.cpp:5782-5797, :1153-1156):
+an addr-fetch peer exists to answer one getaddr and is then closed.
+p2p_addrfetch.py:54 asserts it is sent a getaddr and NO getheaders; ours asked
+every ready peer, and the Phase-1 header sync picked the only one there was."
+  (let ((full (bl.net:make-peer :address "198.51.100.6" :state :ready
+                                :conn-type :outbound-full-relay
+                                :services bl.ser:+node-network+))
+        (fetch (bl.net:make-peer :address "198.51.100.7" :state :ready
+                                 :conn-type :addr-fetch
+                                 :services bl.ser:+node-network+))
+        (mute (bl.net:make-peer :address "198.51.100.8" :state :ready
+                                :conn-type :outbound-full-relay
+                                :services 0)))
+    ;; The behavioural assertions first, so the control run reports THEM and
+    ;; not an undefined new symbol.
+    (let ((ctx (%ibd-ctx)))
+      (flet ((tried (peers)
+               (let ((seen '()))
+                 (bl.net::sync-headers-with-failover
+                  peers nil ctx
+                  :sync-fn (lambda (peer chain-state &key &allow-other-keys)
+                             (declare (ignore chain-state))
+                             (push peer seen)
+                             (values 1 nil)))
+                 (nreverse seen))))
+        (is (null (tried (list fetch)))
+            "Phase 1 never opens a header sync with an addr-fetch peer")
+        (is (null (tried (list mute)))
+            "nor with a peer advertising neither NODE_NETWORK nor _LIMITED")
+        (is (equal (list full) (tried (list fetch full)))
+            "control: the full-relay peer beside them is still asked")))
+    (is-true (bl.net::header-sync-candidate-p full))
+    (is-false (bl.net::header-sync-candidate-p fetch))
+    (is-false (bl.net::header-sync-candidate-p mute))))
