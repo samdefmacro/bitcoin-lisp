@@ -621,6 +621,32 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
         (let ((store (rpc-get-block-store node)))
           (when (and store (bl.store:block-exists-p store hash))
             (return-from rpc-submitblock "duplicate"))))
+      ;; A body whose header we have never seen: Core's ProcessNewBlock runs
+      ;; AcceptBlock, which runs AcceptBlockHeader FIRST
+      ;; (validation.cpp:4340), so the header is indexed before the body is
+      ;; judged -- and then AcceptBlock's write step records the body against
+      ;; that entry even when the block does not become the tip.
+      ;;
+      ;; Ours went straight to ACTIVATE-BLOCK, whose store-without-activating
+      ;; arm asks for the index entry (%STORE-ACCEPTED-BLOCK-BODY) and finds
+      ;; none, so a side-chain block was answered "inconclusive" -- Core's own
+      ;; word for it -- while leaving nothing behind. The block after it then
+      ;; had no known parent. That is rpc_preciousblock.py's
+      ;; unidirectional_node_sync_via_rpc (:13-26), which copies a competing
+      ;; chain block by block and asserts every submitblock answers None or
+      ;; 'inconclusive': the first block of the fork was inconclusive, the
+      ;; second answered "unknown-parent".
+      ;;
+      ;; The same path submitheader takes, with the same min_pow_checked=true
+      ;; that submitblock passes ProcessNewBlock (rpc/mining.cpp:1084): a
+      ;; header whose parent we do not have is still refused, and the body is
+      ;; then judged exactly as before.
+      (unless entry
+        (let ((headers (bl.net:validate-header-chain
+                        (list (bl.ser:bitcoin-block-header block))
+                        chain-state)))
+          (when headers
+            (bl.net:process-headers headers chain-state))))
       (bl.val:update-uncommitted-block-structures block chain-state)
       (multiple-value-bind (ok reason) (activate-submitted-block node block)
         (cond
