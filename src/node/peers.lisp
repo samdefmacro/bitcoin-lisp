@@ -1118,10 +1118,17 @@ Core's min(8, total): it is an operator knob here (run-node.sh sets 16)."
   "GET-NODE-TIME of the last feeler attempt, for rate-limiting.")
 
 (defun peers-of-conn-type (node type)
-  "Count current peers whose connection type is TYPE."
+  "Count the LIVE peers whose connection type is TYPE. Core counts m_nodes
+(CConnman::AddConnection, net.cpp:1894-1897), from which DisconnectNodes has
+already erased a closed connection (:1909-1939); ours keeps a :disconnected
+peer in node-peers until the sync cycle reaps it, and counting those told
+addconnection the outbound slots were full for a whole cycle after the test
+framework closed every one of them (p2p_add_connections.py:78, 2026-09-13)."
   (bt:with-recursive-lock-held ((node-lock node))
-    (count type (node-peers node)
-           :key #'bl.net:peer-conn-type)))
+    (count-if (lambda (p)
+                (and (eq (bl.net:peer-conn-type p) type)
+                     (not (eq (bl.net:peer-state p) :disconnected))))
+              (node-peers node))))
 
 (defun %addrman-pick-unconnected (node &key new-only)
   "Pick an addrman address, as (values HOST PORT LAST-ATTEMPT), that we are not

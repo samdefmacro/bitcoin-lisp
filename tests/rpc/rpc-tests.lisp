@@ -4021,6 +4021,35 @@ The KEY SET is what is asserted, in order, because that is the whole finding."
          (pass (cdr (assoc "pass" object :test #'string=))))
     (is (string= "1e+99" (%json-token (cdr (assoc "endrange" pass :test #'string=)))))))
 
+
+(test addconnection-capacity-ignores-disconnected-peers
+  "Core's AddConnection counts m_nodes (net.cpp:1894-1897), from which a closed
+connection has already been erased (DisconnectNodes, :1909-1939). Ours kept a
+:disconnected peer in node-peers until the sync cycle reaped it and counted it
+toward the outbound cap, so after the framework closed all of node0's
+connections the next addconnection was refused as `Already at capacity` for
+a whole cycle (p2p_add_connections.py:78). Control: a live peer still counts."
+  (let* ((bl:*network* :regtest)
+         (node (bl:make-node :network :regtest))
+         (bl:*pending-test-connections* '()))
+    (setf (bl:node-max-peers node) 1)
+    (push (bl.net:make-peer :address "10.0.0.5" :state :disconnected
+                            :conn-type :outbound-full-relay)
+          (bl:node-peers node))
+    (is (= 0 (bl:peers-of-conn-type node :outbound-full-relay))
+        "a closed connection is not a connection")
+    (is-true (bl.rpc:dispatch-rpc-method node "addconnection"
+                                         (list "1.2.3.4:1" "outbound-full-relay" nil))
+             "the slot the closed connection held is free")
+    (push (bl.net:make-peer :address "10.0.0.6" :state :ready
+                            :conn-type :outbound-full-relay)
+          (bl:node-peers node))
+    (is (= 1 (bl:peers-of-conn-type node :outbound-full-relay)) "control: a live peer counts")
+    (is (= bl.rpc::+rpc-client-node-capacity-reached+
+           (rpc-error-code-of
+            (lambda () (bl.rpc:dispatch-rpc-method
+                        node "addconnection" (list "1.2.3.4:2" "outbound-full-relay" nil)))))
+        "control: a live peer fills the one slot")))
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
 its own P2P connections of a CHOSEN type — a block-relay or feeler slot a test
