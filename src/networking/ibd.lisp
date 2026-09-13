@@ -1787,6 +1787,11 @@ this line is only ever a socket-level reap."
   "Process one wire message from PEER during IBD: connect a received
 block, ingest announced headers, or hand anything else to the generic
 handler. Shared by the block-download drain and the at-tip reap pass."
+  ;; Core logs every received message (net_processing.cpp:3582); the two arms
+  ;; handled here do not pass through handle-message, which logs the rest.
+  (when (or (string= command "block") (string= command "headers"))
+    (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
+                command (length payload) (peer-id peer)))
   (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects) node-ctx
   (cond
     ((string= command "block")
@@ -3327,7 +3332,19 @@ of headers added to the index."
               chain-state
               (bl.ser:block-header-prev-block (first headers))))
        (when peer
-         (request-headers-for-ibd peer chain-state)
+         ;; Core: `received header %s: missing prev block %s, sending
+         ;; getheaders (%d) to end (peer=%d)` (net_processing.cpp:2660).
+         ;; Throttled, as Core's MaybeSendGetHeaders is (:2659): a burst of
+         ;; announcements whose parents we lack -- a peer that just mined
+         ;; ninety-nine blocks -- buys ONE getheaders per HEADERS_RESPONSE_TIME,
+         ;; not one each. Unthrottled, node1 in p2p_segwit.py sent thirty in a
+         ;; millisecond and node0 disconnected it for exceeding the getheaders
+         ;; rate limit (2026-09-13).
+         (when (%maybe-send-getheaders peer (build-header-locator chain-state))
+           (bl:log-cat "net" "received header ~A: missing prev block ~A, sending getheaders to end (~A)"
+                       (bl.crypto:bytes-to-hex (bl.ser:block-header-hash (first headers)))
+                       (bl.crypto:bytes-to-hex (bl.ser:block-header-prev-block (first headers)))
+                       (peer-log-name peer)))
          (update-block-availability
           peer chain-state
           (bl.ser:block-header-hash (car (last headers)))))
@@ -3352,7 +3369,12 @@ of headers added to the index."
           (send-message peer (bl.ser:make-getheaders-message
                               (hss-locator-hashes (peer-headers-sync peer))))
           0)
-         (:ignore 0)
+         (:ignore
+          ;; Core: `Ignoring low-work chain (height=%u) from peer=%d`
+          ;; (net_processing.cpp:2767).
+          (bl:log-cat "net" "Ignoring low-work chain (~D headers) from ~A"
+                      (length headers) (if peer (peer-log-name peer) "no peer"))
+          0)
          (:store
           (multiple-value-bind (added last-entry)
               (%store-validated-headers peer chain-state headers full-batch
@@ -3959,7 +3981,7 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
         ;; every reorg attempt — exactly what wedged testnet4. Drop this copy; a
         ;; witness-complete copy arrives via v2 compact blocks / full witness
         ;; downloads if the fork ever becomes relevant.
-        (when (bl.val:block-witness-stripped-p block)
+        (when (bl.val:block-witness-stripped-p block height)
           (bl:log-debug
            "Competing-fork block ~D arrived witness-stripped; not storing" height)
           (return-from process-received-block nil))
@@ -4052,7 +4074,7 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
           ;; wedge. Drop it; a witness-complete copy arrives via the normal
           ;; download / compact-block path. (Mirrors the competing-fork guard
           ;; below and the out-of-order guard further down.)
-          (if (bl.val:block-witness-stripped-p block)
+          (if (bl.val:block-witness-stripped-p block height)
               (progn
                 (bl:log-debug
                  "Tip+1 block ~D arrived witness-stripped; dropping (await complete copy)"
@@ -4150,7 +4172,7 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
           (progn
             (bl:log-debug "Block ~D received out of order (current: ~D)"
                                     height current-height)
-            (let* ((stripped (bl.val:block-witness-stripped-p block))
+            (let* ((stripped (bl.val:block-witness-stripped-p block height))
                    (accept (and (not stripped)
                                 (%out-of-order-block-acceptable-p
                                  entry current-height requested chain-state)))
