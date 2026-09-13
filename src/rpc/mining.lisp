@@ -620,6 +620,20 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
       ;; nothing, as before.
       (values-list result))))
 
+(defun %submitted-block-height (chain-state block)
+  "The height BLOCK claims, from its own index entry or one above its parent's,
+or NIL when neither is known. Only the contextual header checks read it, and
+with no parent in the index there is no chain to place the block on -- which is
+exactly the case Core's CheckBlock answers without a height at all."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (entry (bl.store:get-block-index-entry
+                 chain-state (bl.ser:block-header-hash header))))
+    (if entry
+        (bl.store:block-index-entry-height entry)
+        (let ((prev (bl.store:get-block-index-entry
+                     chain-state (bl.ser:block-header-prev-block header))))
+          (and prev (1+ (bl.store:block-index-entry-height prev)))))))
+
 (define-rpc "submitblock" (node (hex))
   "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
 JSON null on acceptance, \"duplicate\" if already known, \"duplicate-invalid\"
@@ -685,6 +699,21 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
           (when headers
             (bl.net:process-headers headers chain-state))))
       (bl.val:update-uncommitted-block-structures block chain-state)
+      ;; Core's ProcessNewBlock runs CheckBlock BEFORE AcceptBlock
+      ;; (validation.cpp:4340-4360, reached from rpc/mining.cpp:1088), so a
+      ;; block that is not a block at all is judged on its own bytes and never
+      ;; on where it claims to sit. Ours dispatched on the parent first, so
+      ;; every malformed submission whose prev hash we do not hold came back
+      ;; `unknown-parent': mining_basic.py:443 submits an empty CBlock -- no
+      ;; transactions, zero nBits, zero prev -- and Core answers `high-hash',
+      ;; the proof-of-work verdict, because the parent is never looked at.
+      (multiple-value-bind (checked check-reason)
+          (bl.val:validate-block block chain-state nil
+                                 (%submitted-block-height chain-state block)
+                                 (bl.ser:get-unix-time)
+                                 :context-free-only t)
+        (unless checked
+          (return-from rpc-submitblock (bl.val:block-reject-reason check-reason))))
       (multiple-value-bind (ok reason) (activate-submitted-block node block)
         (cond
           (ok nil)                        ; accepted → JSON null (BIP22 success)

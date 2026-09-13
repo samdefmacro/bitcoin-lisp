@@ -876,6 +876,43 @@ genesis."
            (is (= 2 (bl.store:current-height (bl:node-chain-state dst))))
            (is (string= h2 (call dst "getbestblockhash")))))))))
 
+(test submitblock-judges-the-block-before-it-judges-its-parent
+  "Core's ProcessNewBlock runs CheckBlock and only then AcceptBlock
+(validation.cpp:4340-4360, reached from rpc/mining.cpp:1088), so a submission
+that is not a block at all is judged on its own bytes: an EMPTY block -- no
+transactions, nBits 0, prev hash 0 -- fails CheckBlockHeader's proof-of-work
+test and Core answers `high-hash' (validation.cpp:3864). The parent is never
+looked at.
+
+Ours dispatched on the parent first, so every malformed submission whose prev
+hash we do not hold came back `unknown-parent', which is neither Core's answer
+nor a useful one for the miner: it names the one thing that was not wrong.
+mining_basic.py:443 asserts the `high-hash'. The verdict keyword is one of the
+few whose Core reject reason is spelled differently, so it is rendered through
+*BLOCK-REJECT-REASONS* rather than by lower-casing the symbol."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "submit-empty"))
+           (empty (bl.ser:make-bitcoin-block
+                   :header (bl.ser:make-block-header :version 0 :bits 0 :nonce 0
+                                                     :timestamp 0)
+                   :transactions nil))
+           (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-witness-block empty))))
+      ;; The parent really is unknown -- that is what used to be reported.
+      (is-false (bl.store:get-block-index-entry
+                 (bl:node-chain-state node)
+                 (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header empty))))
+      (is (string= "high-hash" (bl.rpc::rpc-submitblock node (list hex))))
+      ;; And a well-formed block on this chain is still accepted, so the new
+      ;; gate is not refusing everything.
+      (let ((good (bl.mining:assemble-full-block
+                   (bl:node-chain-state node) (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+        (bl.mining:mine-block good)
+        (is (null (bl.rpc::rpc-submitblock
+                   node (list (bl.crypto:bytes-to-hex
+                               (bl.ser:serialize-witness-block good))))))
+        (is (= 1 (bl.store:current-height (bl:node-chain-state node))))))))
+
 (test submitblock-header-only-entry-proceeds
   ;; Standard pool flow: submitheader, then submitblock. The header-only index
   ;; entry must NOT short-circuit as "duplicate" (Core returns "duplicate" only
