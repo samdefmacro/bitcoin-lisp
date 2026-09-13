@@ -871,3 +871,44 @@ verification gate on a fresh node."
              (is (= 4 (bl.store:current-height cs))))
            (setf (bl:node-network-active node) t))
          (clear-undo-cache))))))
+
+(test snapshot-path-arguments-hang-off-the-network-data-directory
+  "Core joins dumptxoutset's `path' onto GetDataDirNet
+(rpc/blockchain.cpp:3111) and runs loadtxoutset's through
+AbsPathForConfigVal, whose net_specific default is the same directory
+(:3383, common/config.cpp:226-232). A relative argument therefore names a
+file in the CHAIN directory, and never one in whatever working directory
+the node process happens to have been started from. rpc_dumptxoutset.py:44
+is that assertion: `assert (node.chain_path / 'txoutset.dat').is_file()'.
+An absolute argument is taken as given, and the reported `path' is the
+joined one Core reports."
+  (with-temp-directory (dir)
+    (let* ((h1 (%snap-fill 32 #x11))
+           (node (%snap-node dir h1 1))
+           (in-datadir (merge-pathnames "relative-utxos.dat" dir))
+           (result (bl.rpc:dispatch-rpc-method
+                    node "dumptxoutset"
+                    (wire-params (list "relative-utxos.dat" "latest")))))
+      (is-true (probe-file in-datadir)
+               "a relative dumptxoutset path must land in the data directory ~A"
+               (namestring dir))
+      (is (string= (namestring in-datadir)
+                   (cdr (assoc "path" result :test #'string=))))
+      ;; loadtxoutset resolves the same way: the dump above is found by the
+      ;; name it was written under. It is not a loadable snapshot for this
+      ;; chain, so the call fails -- but on its CONTENT, not on the file
+      ;; being missing, which is the "Couldn't open file" arm.
+      (let ((err (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method
+                     node "loadtxoutset"
+                     (wire-params (list "relative-utxos.dat")))))))
+        (is-true err)
+        (is-false (and err (search "Couldn't open file" (cdr err)))
+                  "loadtxoutset did not find the file the dump wrote: ~S" err))
+      ;; An absolute path is used unchanged.
+      (let* ((abs (namestring (merge-pathnames "absolute-utxos.dat" dir)))
+             (r2 (bl.rpc:dispatch-rpc-method
+                  node "dumptxoutset" (wire-params (list abs "latest")))))
+        (is (string= abs (cdr (assoc "path" r2 :test #'string=))))
+        (is-true (probe-file abs))))))
