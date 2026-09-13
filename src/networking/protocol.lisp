@@ -1201,11 +1201,15 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                     ;; "gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags)"
                     ;; (net_processing.cpp:6207).
                     (push (tx-request-inv hash wtxidp peer) wanted))))))))))
-    (when unknown-block-hash
+    ;; Throttled, as Core's is (MaybeSendGetHeaders at :4198, one per
+    ;; HEADERS_RESPONSE_TIME per peer): a peer announcing block after block by
+    ;; inv buys one getheaders per window, not one per inv -- p2p_sendheaders.py
+    ;; :334 asserts exactly that no second getheaders follows the second inv.
+    (when (and unknown-block-hash
+               (%maybe-send-getheaders peer (build-header-locator chain-state)))
       (bl:log-cat "net" "inv: unknown block ~A from ~A — sending getheaders"
                   (bl.crypto:bytes-to-hex unknown-block-hash)
-                  (peer-log-name peer))
-      (request-headers-for-ibd peer chain-state))
+                  (peer-log-name peer)))
     (when wanted
       (send-message peer
                     (bl.ser:make-getdata-message

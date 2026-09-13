@@ -4412,3 +4412,49 @@ throttle window is cleared, the next unconnecting message asks again."
                    (bl.net:disconnect-peer peer)
                    (bl.net:disconnect-peer client))))
           (bl.net:close-listener srv))))))
+
+(test inv-of-unknown-blocks-sends-one-throttled-getheaders
+  "Core answers an inv naming a block it does not have with a getheaders through
+MaybeSendGetHeaders (net_processing.cpp:4198): one per HEADERS_RESPONSE_TIME
+per peer. Ours sent one per inv, so p2p_sendheaders.py:334 -- which announces
+a second block by inv and asserts no second getheaders follows -- failed.
+Control: a cleared window buys one more."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "inv-throttle"))
+           (cs (bl:node-chain-state node))
+           (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set (bl:node-utxo-set node)
+                                          :block-store (bl:node-block-store node)
+                                          :mempool (bl:node-mempool node)))
+           (srv (bl.net:open-listener "127.0.0.1" 0)))
+      (is-true srv)
+      (when srv
+        (unwind-protect
+             (let* ((port (usocket:get-local-port srv))
+                    (client (bl.net:connect-peer "127.0.0.1" port))
+                    (conn (and client (bl.net:accept-connection srv :timeout 10)))
+                    (peer (and conn (bl.net:make-inbound-peer conn "127.0.0.1"))))
+               (is-true peer)
+               (when peer
+                 (unwind-protect
+                      (flet ((block-inv (seed)
+                               (subseq (bl.ser:make-inv-message
+                                        (list (bl.ser:make-inv-vector
+                                               :type bl.ser:+inv-type-block+
+                                               :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                    :initial-element seed))))
+                                       24))
+                             (getheaders-bytes ()
+                               (gethash "getheaders" (bl.net:peer-sent-per-msg peer) 0)))
+                        (setf (bl.net:peer-state peer) :ready)
+                        (deliver-inv peer (block-inv #xB1) ctx)
+                        (let ((one (getheaders-bytes)))
+                          (is (plusp one) "the first unknown block asks for headers")
+                          (deliver-inv peer (block-inv #xB2) ctx)
+                          (is (= one (getheaders-bytes))
+                              "a second inv inside the window asks nothing more")
+                          (setf (bl.net:peer-last-getheaders-time peer) 0)
+                          (deliver-inv peer (block-inv #xB3) ctx)
+                          (is (= (* 2 one) (getheaders-bytes)) "control: a cleared window buys one more")))
+                   (bl.net:disconnect-peer peer)
+                   (bl.net:disconnect-peer client))))
+          (bl.net:close-listener srv))))))
