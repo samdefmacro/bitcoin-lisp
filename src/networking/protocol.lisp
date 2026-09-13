@@ -1414,12 +1414,10 @@ ones, so promotion must not be a compact-block-only privilege."
                                                :recent-rejects recent-rejects)
                     (cond
                       (valid
-                       ;; Announce onward only if this block is now the active
-                       ;; tip (accept may have stored a side block or reorged).
-                       (when (and peers
-                                  (equalp (bl.store:best-block-hash chain-state)
-                                          hash))
-                         (relay-block header peer peers))
+                       ;; Announcing the new tip is the :updated-block-tip
+                       ;; hook's job (announce-block-tip, Core UpdatedBlockTip):
+                       ;; it fires for THIS path, the block-download drain and
+                       ;; a reorg alike, so no path is a block sink.
                        ;; Promotion needs strictly more than acceptance: the
                        ;; block must have CONNECTED (see %block-newly-connected-p).
                        (%block-newly-connected-p chain-state hash tip-before))

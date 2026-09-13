@@ -3503,12 +3503,14 @@ the submitblock path actually makes the call."
     (is (equal (list peer)
                (bl.net::block-relay-targets nil (list peer)))
         "a NIL source peer must not exclude anybody — a locally mined block has no source")
-    ;; And the production call site passes NIL, rather than only the P2P one
-    ;; having a call at all. This is the half that was missing, so it is the
-    ;; half the test pins.
-    (let ((src (%rpc-source-text)))
-      (is (search "relay-block header nil peers" src)
-          "the submitblock path no longer announces the block it just connected"))))
+    ;; And the production announcement is the :updated-block-tip hook, the one
+    ;; path every connect shares -- submitblock, the P2P handler and the
+    ;; block-download drain alike -- passing a NIL source.
+    (let ((src (project-source-text "src/node/peers.lisp")))
+      (is (search "define-validation-hook :updated-block-tip announce-block-tip" src)
+          "the new-tip announcement hook is gone")
+      (is (search "(bl.net:relay-block (bl.store:block-index-entry-header entry) nil peers)" src)
+          "the hook must announce with a NIL source"))))
 
 (test getpeerinfo-rows-are-in-peer-id-order
   "Core's getpeerinfo comes out in ascending peer id: m_nodes is a vector
