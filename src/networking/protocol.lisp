@@ -1423,7 +1423,8 @@ ones, so promotion must not be a compact-block-only privilege."
                        (%block-newly-connected-p chain-state hash tip-before))
                       (t
                        (bl:log-warn "Block ~A rejected: ~A"
-                                              (bl.crypto:bytes-to-hex hash) error)
+                                    (bl.crypto:bytes-to-hex hash)
+                                    (bl.val:block-reject-reason-string error))
                        (record-misbehavior peer "invalid block")
                        nil)))))))
         ;; Outside the node lock: promotion writes sendcmpct to up to two peers.
