@@ -1432,6 +1432,56 @@ refuses one the chain does not have."
                                       (%wt-raw-tx-hex (list (cons funded 0))
                                                       (list (cons foreign 800000)))))))))))))))
 
+(test importdescriptors-sees-the-private-key-inside-a-musig
+  "importdescriptors accepts a musig() descriptor one of whose PARTICIPANTS is
+an xprv. A musig() key expression carries no secret of its own; Core parses
+each participant with the SAME FlatSigningProvider the enclosing expression
+was given (ParseMuSig -> ParsePubkey, descriptor.cpp), so the participant's
+key lands in `keys' like any other and ProcessDescriptorImport's
+`keys.keys.empty()' test passes (wallet/rpc/backup.cpp:259-262).
+
+We collected the key material from the top-level key expressions alone, found
+none inside a musig(), and answered -4 `Cannot import descriptor without
+private keys to a wallet with private keys enabled' for every musig descriptor
+a wallet could own (wallet_musig.py:89)."
+  (with-wallet-test-node (node :keypool 4)
+    (with-rpc-wallet (nil)
+      (bl.rpc:dispatch-rpc-method node "createwallet" '("musig")))
+    (with-rpc-wallet ("musig")
+      (let* ((tprv "tprv8ZgxMBicQKsPeZSeYx7VXDDTs3XrTcmZQpRLbAeSQFCQGgKwR4gKpcxHaKdoTNHniv4EPDJNdzA3KxRrrBHcAgth8fU5X4oCndkkxk39iAt")
+             (tpub "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B")
+             (desc (bl.rpc:descriptor-add-checksum
+                    (format nil "rawtr(musig(~A/86h/1h/0h/0/*,[00000000/86h/1h/0h]~A/0/*))"
+                            tprv tpub)))
+             ;; Control: the same shape with BOTH participants public. Core
+             ;; refuses that one, and for the same reason we used to refuse
+             ;; both -- so it says the -4 arm still works.
+             (watch (bl.rpc:descriptor-add-checksum
+                     (format nil "rawtr(musig([00000000/86h/1h/0h]~A/0/*,[00000000/86h/1h/0h]~A/0/*))"
+                             tpub tpub)))
+             (result (first (bl.rpc:dispatch-rpc-method
+                             node "importdescriptors"
+                             (list (list (%ht "desc" desc
+                                                   "timestamp" "now"
+                                                   "active" nil
+                                                   "range" 2)))))))
+        (is (eq t (cdr (assoc "success" result :test #'string=)))
+            "musig with an xprv participant: ~S"
+            (cdr (assoc "error" result :test #'string=)))
+        (let ((watch-result
+                (first (bl.rpc:dispatch-rpc-method
+                        node "importdescriptors"
+                        (list (list (%ht "desc" watch
+                                              "timestamp" "now"
+                                              "active" nil
+                                              "range" 2)))))))
+          (is (eq 'yason:false
+                  (cdr (assoc "success" watch-result :test #'string=)))
+              "a musig with no private participant must still be refused")
+          (is (= -4 (cdr (assoc "code"
+                                (cdr (assoc "error" watch-result :test #'string=))
+                                :test #'string=)))))))))
+
 (test wallet-simulaterawtransaction-refuses-an-input-nothing-holds
   "simulaterawtransaction refuses an input that neither the chain nor an
 earlier transaction in the array provides, with Core's -8 `One or more

@@ -2378,21 +2378,33 @@ avoid_reuse means silently resuming address reuse."
 
 (defun %out-desc-embedded-keys (desc)
   "The private keys carried by a parsed descriptor, as a list of
- (pubkey priv32 compressed-p) — Core Parse's FlatSigningProvider keys."
+ (pubkey priv32 compressed-p) — Core Parse's FlatSigningProvider keys.
+
+A musig() key expression holds no secret of its own; its PARTICIPANTS do, and
+Core parses each of them with the same `out' provider (ParseMuSig hands
+ParsePubkey the caller's FlatSigningProvider, descriptor.cpp), so a musig
+descriptor written with one of its participants as an xprv carries that key
+like any other. Walking the top-level key expressions alone found nothing in
+one, and importdescriptors answered `Cannot import descriptor without private
+keys to a wallet with private keys enabled' for every musig() descriptor a
+wallet could own."
   (let ((out '()))
-    (dolist (key (bl.rpc:out-desc-ordered-keys desc) (nreverse out))
-      (cond
-        ((bl.rpc:desc-key-ext-privkey key)
-         (let ((xprv (bl.rpc:desc-key-ext-privkey key)))
-           (push (list (bl.crypto:ext-key-public-bytes xprv)
-                       (subseq (bl.crypto:ext-key-key xprv) 1 33)
-                       t)
-                 out)))
-        ((bl.rpc:desc-key-privkey key)
-         (push (list (bl.rpc:desc-key-pubkey key)
-                     (bl.rpc:desc-key-privkey key)
-                     (bl.rpc:desc-key-compressed-p key))
-               out))))))
+    (labels ((collect (key)
+               (cond
+                 ((bl.rpc:desc-key-ext-privkey key)
+                  (let ((xprv (bl.rpc:desc-key-ext-privkey key)))
+                    (push (list (bl.crypto:ext-key-public-bytes xprv)
+                                (subseq (bl.crypto:ext-key-key xprv) 1 33)
+                                t)
+                          out)))
+                 ((bl.rpc:desc-key-privkey key)
+                  (push (list (bl.rpc:desc-key-pubkey key)
+                              (bl.rpc:desc-key-privkey key)
+                              (bl.rpc:desc-key-compressed-p key))
+                        out)))
+               (mapc #'collect (bl.rpc:desc-key-musig-participants key))))
+      (mapc #'collect (bl.rpc:out-desc-ordered-keys desc)))
+    (nreverse out)))
 
 (defun wallet-add-descriptor (wallet desc timestamp range-start range-end
                               next-index keys label internal)
