@@ -206,7 +206,20 @@ not available (not fully downloaded)` for a header the index holds whose body
 never arrived -- a headers-only chain tip, which rpc_getblockfrompeer.py and
 rpc_getblockstats.py both ask about. Every RPC that reads a body by hash
 answers through this one; getblock, getblockstats and gettxoutproof used to
-call a missing body `Block not found` (-5), the answer for an unknown hash."
+call a missing body `Block not found` (-5), the answer for an unknown hash.
+
+Core has a FOURTH answer, and it is the one the index cannot predict: when
+CheckBlockDataAvailability passes -- BLOCK_HAVE_DATA is set -- and ReadBlock
+then fails anyway, the block is -1 `Block not found on disk`
+(blockchain.cpp:686-698). Core reaches it when a prune races the read;
+rpc_getblockstats.py:192 reaches it by renaming blk00000.dat away, which is
+also how an operator meets a damaged or half-restored blocks directory. Asked
+in Core's order the availability question would have to be answered from the
+index alone, and our entry records the flat-file position rather than a
+HAVE_DATA bit -- NIL there also means a legacy per-block file or a pruned
+body. So the read is attempted first and only its FAILURE is classified: a
+recorded position that did not read back is `not found on disk', and no
+recorded position is the pruned / not-downloaded pair as before."
   (let ((entry (bl.store:get-block-index-entry chain-state hash)))
     (unless entry
       (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -214,11 +227,13 @@ call a missing body `Block not found` (-5), the answer for an unknown hash."
     (or (and block-store (bl.store:get-block block-store hash))
         (error 'rpc-error
                :code +rpc-misc-error+
-               :message (if (and (bl:pruning-enabled-p)
-                                 (<= (bl.store:block-index-entry-height entry)
-                                     (bl.store:chain-state-pruned-height chain-state)))
-                            "Block not available (pruned data)"
-                            "Block not available (not fully downloaded)")))))
+               :message (cond ((bl.store:block-index-entry-data-pos entry)
+                               "Block not found on disk")
+                              ((and (bl:pruning-enabled-p)
+                                    (<= (bl.store:block-index-entry-height entry)
+                                        (bl.store:chain-state-pruned-height chain-state)))
+                               "Block not available (pruned data)")
+                              (t "Block not available (not fully downloaded)"))))))
 
 (define-rpc "getblock" (node (hash-str))
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
