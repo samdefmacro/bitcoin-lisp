@@ -1525,8 +1525,11 @@ index or destination string."
                           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                             :message (format nil "Invalid parameter 'subtract fee from output', destination ~A not found in tx outputs" sffo))))
                      ((integerp sffo) sffo)
+                     ;; Core names the type it got, uvTypeName and all
+                     ;; (spend.cpp:82, wallet_sendmany.py:33).
                      (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                          :message "Invalid parameter 'subtract fee from output', invalid value type")))))
+                                          :message (format nil "Invalid parameter 'subtract fee from output', invalid value type: ~A"
+                                                           (bl.rpc:json-type-name sffo)))))))
           (when (gethash pos seen)
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message (format nil "Invalid parameter 'subtract fee from output', duplicated position: ~D" pos)))
@@ -3353,10 +3356,10 @@ estimate_mode fee_rate options)."
           (%prevent-outdated-options options)
           (let ((addresses-without-amount (make-hash-table :test 'equal))
                 (pairs '()))
-            (unless (and (listp (first params)) (first params))
-              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
-                                :message "recipients must be a non-empty array"))
-            (dolist (entry (first params))
+            ;; Core has no emptiness check here: the loop runs zero times and
+            ;; the addresses_without_amount test below is what refuses an
+            ;; empty array (spend.cpp:1384-1397, wallet_sendall.py:254).
+            (dolist (entry (bl.rpc:positional-array (first params)))
               (cond
                 ((stringp entry)
                  (push (cons entry 0) pairs)

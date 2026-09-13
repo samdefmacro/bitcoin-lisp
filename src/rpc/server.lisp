@@ -212,7 +212,7 @@ AMOUNT, RANGE, skip_type_check -- is not gated here either."
           for value = (car tail)
           for expected = (%rpc-expected-json-type type)
           do (when (and expected value)
-               (let ((actual (%json-type-name value)))
+               (let ((actual (json-type-name value)))
                  (unless (string= expected actual)
                    (push (cons (format nil "Position ~D (~A)" position
                                        (%rpc-arg-name method position))
@@ -262,17 +262,26 @@ cleared or a server started after one."
 
 ;;; --- JSON-RPC Request/Response Handling ---
 
-(defun %normalize-json-value (value top-level)
+(defun %normalize-json-value (value top-level &optional in-array)
   "Boolean normalization of a parsed request value (booleans arrive as
 'yason:true / 'yason:false from the symbols parse mode): true -> T
 everywhere; false -> the +json-false+ sentinel when TOP-LEVEL (a direct
 positional parameter — handlers read those through positional-bool so
 explicit false, null, and omitted are distinguishable, Core's isNull
-semantics), NIL inside nested arrays/objects (the historical folding —
-object readers distinguish absence via present-p). Hash tables are
-normalized in place; lists are rebuilt."
+semantics) and when IN-ARRAY, NIL inside an OBJECT (the historical folding —
+object readers distinguish absence via present-p, and a member that folded to
+the truthy sentinel would read as present-and-true). Hash tables are
+normalized in place; lists are rebuilt.
+
+An array ELEMENT keeps the sentinel because nothing reads an array by
+presence: Core's own UniValue keeps VBOOL false distinct from VNULL
+everywhere, and a handler that reports the TYPE of an element it refuses --
+`Invalid parameter 'subtract fee from output', invalid value type: bool',
+wallet_sendmany.py:33 -- can say `bool' only if the element still is one. A
+nested EMPTY ARRAY still folds to NIL: that is a shape question, not a
+boolean one, and no handler reads an inner array by identity."
   (cond ((eq value 'yason:true) t)
-        ((eq value 'yason:false) (if top-level +json-false+ nil))
+        ((eq value 'yason:false) (if (or top-level in-array) +json-false+ nil))
         ((hash-table-p value)
          (maphash (lambda (key v)
                     (setf (gethash key value) (%normalize-json-value v nil)))
@@ -291,9 +300,9 @@ normalized in place; lists are rebuilt."
         ((and (vectorp value) (not (stringp value)))
          (if (zerop (length value))
              (if top-level +json-empty-array+ nil)
-             (map 'list (lambda (v) (%normalize-json-value v nil)) value)))
+             (map 'list (lambda (v) (%normalize-json-value v nil t)) value)))
         ((and (consp value) (rpc-proper-list-p value))
-         (mapcar (lambda (v) (%normalize-json-value v nil)) value))
+         (mapcar (lambda (v) (%normalize-json-value v nil t)) value))
         (t value)))
 
 (defun %normalize-rpc-params (params)

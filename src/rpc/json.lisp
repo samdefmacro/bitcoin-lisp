@@ -224,7 +224,7 @@ each spell at least one of those differently."
 ;;; every handler above them signal this one type error, so it has to be
 ;;; defined below all of them.
 
-(defun %json-type-name (value)
+(defun json-type-name (value)
   "Core's uvTypeName (univalue.cpp:217-226) for VALUE as our decoder represents
 it: null, bool, object, array, string, number.
 
@@ -255,4 +255,4 @@ array of tx hex\", \"JSON value is not an integer as expected\") was a
 different sentence saying the same thing, so no caller could match any of them."
   (error 'rpc-error :code +rpc-type-error+
                     :message (format nil "JSON value of type ~A is not of expected type ~A"
-                                     (%json-type-name value) expected)))
+                                     (json-type-name value) expected)))

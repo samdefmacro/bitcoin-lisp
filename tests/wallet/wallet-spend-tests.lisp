@@ -715,6 +715,79 @@ tx gets no change output and overpays exactly the remainder."
         (is (= 900 (%ws-tx-fee node wallet tx)))
         (is (%ws-verify-ok-p node wallet tx))))))
 
+(test ws-sffo-instruction-names-the-type-core-names
+  "Core's InterpretSubtractFeeFromOutputInstructions refuses an instruction
+that is neither a string nor a number by NAMING its JSON type -- `Invalid
+parameter 'subtract fee from output', invalid value type: bool'
+(wallet/rpc/spend.cpp:82, uvTypeName). wallet_sendmany.py:33 sends [False] and
+asserts the whole sentence including the word `bool'; ours stopped at `invalid
+value type'.
+
+Saying which type requires the element to still HAVE one: the request
+normalizer folded an explicit false anywhere below the top level to NIL, so
+[False] and [null] arrived identically and both could only be called `null'.
+An array element now keeps the false sentinel (an object MEMBER still folds,
+where presence is what readers ask). The last two rows are the controls that
+the string and number arms are untouched."
+  (with-wallet-chain-node (node "ws-sffo-type" :wallet "sffo")
+    (let* ((dest (%wc-optrue-address))
+           (amounts (let ((h (make-hash-table :test 'equal)))
+                      (setf (gethash dest h) 1)
+                      h)))
+      (flet ((sffo (value)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "sendmany"
+                   (wire-params (list "" amounts nil nil value)))))))
+        (is (equal (cons -8 "Invalid parameter 'subtract fee from output', invalid value type: bool")
+                   (sffo (vector 'yason:false))))
+        (is (equal (cons -8 "Invalid parameter 'subtract fee from output', invalid value type: bool")
+                   (sffo (vector 'yason:true))))
+        (is (equal (cons -8 "Invalid parameter 'subtract fee from output', invalid value type: null")
+                   (sffo (vector nil))))
+        (is (equal (cons -8 "Invalid parameter 'subtract fee from output', invalid value type: object")
+                   (sffo (vector (make-hash-table :test 'equal)))))
+        (is (equal (cons -8 "Invalid parameter 'subtract fee from output', duplicated position: 0")
+                   (sffo (vector 0 0))))
+        (let ((elsewhere (bl.crypto:encode-p2sh-address
+                          (bl.crypto:hash160
+                           (coerce #(#x51 #x51) '(vector (unsigned-byte 8))))
+                          :regtest)))
+          (is (equal (cons -8 (format nil "Invalid parameter 'subtract fee from output', destination ~A not found in tx outputs"
+                                      elsewhere))
+                     (sffo (vector elsewhere)))))))))
+
+(test ws-sendall-empty-recipients-is-cores-own-sentence
+  "Core's sendall has no emptiness check of its own: the loop over
+`recipients' runs zero times for an empty array and the
+addresses_without_amount test is what refuses it, -8 \"Must provide at least
+one address without a specified amount\" (wallet/rpc/spend.cpp:1384-1397).
+wallet_sendall.py:254 asserts that sentence.
+
+Ours refused the empty array first, with -3 and a sentence of our own
+(\"recipients must be a non-empty array\"), so Core's -- which the handler
+already carried, one branch further down -- was unreachable. The second row is
+the same rejection reached the way Core reaches it, from a recipient list that
+names only amounts."
+  (with-wallet-chain-node (node "ws-sendall-empty")
+    (%ws-fund-wallet node :blocks 2)
+    (let ((dest (%wc-optrue-address)))
+      (is (equal (cons -8 "Must provide at least one address without a specified amount")
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method node "sendall"
+                                                (wire-params (list (vector))))))))
+      (is (equal (cons -8 "Must provide at least one address without a specified amount")
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method
+                     node "sendall"
+                     (wire-params (list (vector (list (cons dest 0.001))))))))))
+      ;; Control: one bare address is the form sendall exists for.
+      (is (eq t (%aval "complete"
+                       (bl.wallet::rpc-sendall node (list (list dest) nil nil 10))))))))
+
 (test ws-sendall-sweep
   "sendall sweeps every coin: fee = feerate x estimated size, single
 output of total - fee, wallet empty afterwards."
