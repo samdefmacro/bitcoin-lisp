@@ -1339,10 +1339,14 @@
   `script-to-json\', Core's ScriptToUniv, in Core's key order (asm, desc,
   hex, address, type) -- there is no second copy to drift, and the
   verbosity-3 prevout object is the same helper as the vout. Its `desc'
-  is Core's InferScript with no signing provider, so the TYPED arms come
+  is Core's InferScript, whose TYPED arms come
   first -- pk() for a bare pubkey, multi() for a bare multisig, rawtr()
   for a taproot output whose program is a valid x-only key -- and only
-  then addr(), with raw() last. `decodescript\'
+  then addr(), with raw() last. The signing provider Core threads through
+  it is empty at every call site but one: decodescript files the script it
+  was handed under the P2WSH program it derives from it, so the SEGWIT
+  object's desc recurses into that program and answers wsh(<miniscript>)
+  wherever the inner script is a sane miniscript. `decodescript\'
   is that object plus Core's can_wrap and can_wrap_P2WSH gates: a P2SH
   wrapper is offered only for a script that may be wrapped, which is why
   a NULL_DATA, a SCRIPTHASH, a taproot output, an ANCHOR, an unknown
