@@ -997,26 +997,7 @@ null (or an empty array), not an object -- Core's isObject."
       (and (consp value)
            (every (lambda (cell) (and (consp cell) (stringp (car cell)))) value))))
 
-(defun rpc-type-check-obj (obj expected &key allow-null)
-  "Core RPCTypeCheckObj (rpc/util.cpp:56-68) without fStrict: EXPECTED is
-((key . uvTypeName) ...) in the order Core's std::map visits the keys --
-SORTED by key, which decides which of two missing keys is named. A missing
-key is -3 \"Missing <key>\"; a present key of another type is -3 \"JSON
-value of type <actual> for field <key> is not of expected type <type>\".
-ALLOW-NULL is fAllowNull: a missing key passes and only a present one is
-typed. Absent and null are one thing here, as find_value's null makes them
-in Core; a nested false or [] has folded to NIL too and reads as missing."
-  (loop for (key . type) in expected
-        for value = (obj-get obj key)
-        do (cond ((null value)
-                  (unless allow-null
-                    (error 'rpc-error :code +rpc-type-error+
-                                      :message (format nil "Missing ~A" key))))
-                 ((string/= (json-type-name value) type)
-                  (error 'rpc-error
-                         :code +rpc-type-error+
-                         :message (format nil "JSON value of type ~A for field ~A ~
-is not of expected type ~A" (json-type-name value) key type))))))
+;; rpc-type-check-obj lives in amounts.lisp (Core RPCTypeCheckObj, with fStrict).
 
 (defun find-coins (node tx)
   "Core FindCoins (node/coin.cpp:12-27) for TX's inputs: the coin each input

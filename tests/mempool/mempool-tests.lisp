@@ -505,7 +505,7 @@ without bound (the old hash-table leaked per-peer memory forever)."
     (setf (aref script 2) #x14)   ; push 20 bytes
     (setf (aref script 23) #x88)  ; OP_EQUALVERIFY
     (setf (aref script 24) #xac)  ; OP_CHECKSIG
-    (is (bl.val::standard-output-script-p script))))
+    (is (bl.val:standard-output-script-p script))))
 
 (test standard-output-script-p2sh
   "P2SH scripts are standard."
@@ -513,21 +513,21 @@ without bound (the old hash-table leaked per-peer memory forever)."
     (setf (aref script 0) #xa9)   ; OP_HASH160
     (setf (aref script 1) #x14)   ; push 20 bytes
     (setf (aref script 22) #x87)  ; OP_EQUAL
-    (is (bl.val::standard-output-script-p script))))
+    (is (bl.val:standard-output-script-p script))))
 
 (test standard-output-script-p2wpkh
   "P2WPKH scripts are standard."
   (let ((script (make-array 22 :element-type '(unsigned-byte 8) :initial-element 0)))
     (setf (aref script 0) #x00)   ; OP_0
     (setf (aref script 1) #x14)   ; push 20 bytes
-    (is (bl.val::standard-output-script-p script))))
+    (is (bl.val:standard-output-script-p script))))
 
 (test standard-output-script-p2tr
   "P2TR scripts are standard."
   (let ((script (make-array 34 :element-type '(unsigned-byte 8) :initial-element 0)))
     (setf (aref script 0) #x51)   ; OP_1
     (setf (aref script 1) #x20)   ; push 32 bytes
-    (is (bl.val::standard-output-script-p script))))
+    (is (bl.val:standard-output-script-p script))))
 
 (test acceptnonstdtxn-is-one-gate-over-corecs-set
   "-acceptnonstdtxn (Core mempool_args.cpp:101 -> require_standard). Core gates
@@ -633,7 +633,7 @@ rules the operator never asked about."
 (test non-standard-output-script
   "Arbitrary scripts are non-standard."
   (let ((script (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xFF)))
-    (is (not (bl.val::standard-output-script-p script)))))
+    (is (not (bl.val:standard-output-script-p script)))))
 
 (defun %op-return-script (data-len)
   "An OP_RETURN scriptPubKey carrying DATA-LEN data bytes: OP_RETURN + a
@@ -681,7 +681,7 @@ the default budget is MAX_OP_RETURN_RELAY = 100,000."
   ;; Default budget is Core's MAX_OP_RETURN_RELAY.
   (is (= 100000 bl:*max-datacarrier-bytes*))
   ;; Per-output classification no longer size-caps OP_RETURN.
-  (is-true (bl.val::standard-output-script-p
+  (is-true (bl.val:standard-output-script-p
             (%op-return-script 200)))
   (let ((bl:*max-datacarrier-bytes* 168))
     ;; Two 84-byte scripts (OP_RETURN + PUSHDATA1 + len + 81 data) total
@@ -703,7 +703,7 @@ max_datacarrier_bytes = nullopt -> value_or(0)); classification itself stays
 NULL_DATA (standard)."
   (let ((bl:*accept-datacarrier* nil))
     ;; Still classified a standard script type...
-    (is-true (bl.val::standard-output-script-p
+    (is-true (bl.val:standard-output-script-p
               (%op-return-script 3)))
     ;; ...but any NULL_DATA output overdraws the zero budget.
     (is (eq :datacarrier (%datacarrier-validate '(3))))))
@@ -769,14 +769,14 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
     ;; -permitbaremultisig: that gate lives in IsStandardTx (policy.cpp:151-153)
     ;; so the two can report different reasons. The knob is asserted through
     ;; the battery below; here the shape cap is what IsStandard owns.
-    (is (bl.val::standard-output-script-p ms))
+    (is (bl.val:standard-output-script-p ms))
     (let ((bl:*permit-bare-multisig* nil))
-      (is (bl.val::standard-output-script-p ms)))
+      (is (bl.val:standard-output-script-p ms)))
     (let ((bl:*permit-bare-multisig* t))
-      (is (bl.val::standard-output-script-p ms))
-      (is (not (bl.val::standard-output-script-p ms4)))
+      (is (bl.val:standard-output-script-p ms))
+      (is (not (bl.val:standard-output-script-p ms4)))
       ;; a truncated/garbage multisig is rejected even when permitted
-      (is (not (bl.val::standard-output-script-p
+      (is (not (bl.val:standard-output-script-p
                 (coerce #(#x51 #xae) '(vector (unsigned-byte 8)))))))
     ;; The knob, through the battery, with Core's two distinct reasons:
     ;; :bare-multisig for a permitted SHAPE refused by the knob, and
@@ -2649,10 +2649,10 @@ relay floor of 100, 200 vB need 20 sat; a rolling floor of 5,000 needs 1,000."
   (let ((bl:*accept-datacarrier* t)
         (bl:*max-datacarrier-bytes* 83))
     ;; OP_RETURN <push 3 bytes> -> standard
-    (is-true (bl.val::standard-output-script-p
+    (is-true (bl.val:standard-output-script-p
               (%policy-bytes #x6a #x03 #xaa #xbb #xcc)))
     ;; OP_RETURN OP_ADD (0x93, a non-push opcode) -> nonstandard
-    (is-false (bl.val::standard-output-script-p
+    (is-false (bl.val:standard-output-script-p
                (%policy-bytes #x6a #x93)))
     ;; the helper directly
     (is-true (bl.val::%op-return-push-only-p
@@ -2671,7 +2671,7 @@ relay floor of 100, 200 vB need 20 sat; a rolling floor of 5,000 needs 1,000."
   (let* ((pk (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
          (script (concatenate '(vector (unsigned-byte 8))
                               (%policy-bytes #x51 #x21) pk (%policy-bytes #x51 #xae))))
-    (is-true (bl.val::standard-output-script-p script))))
+    (is-true (bl.val:standard-output-script-p script))))
 
 (test mempool-entry-fields-spentby-rbf
   "%mempool-entry-fields reports spentby (in-mempool children), bip125-replaceable,
@@ -2700,21 +2700,21 @@ irregular version-0 programs stay nonstandard."
                         (vector ver-op (length prog))
                         (coerce prog '(vector (unsigned-byte 8))))))
     ;; P2A: OP_1 push2 0x4e73
-    (is-true (bl.val::standard-output-script-p (wp #x51 #x4e #x73)))
+    (is-true (bl.val:standard-output-script-p (wp #x51 #x4e #x73)))
     ;; v2 (OP_2) 32-byte program
-    (is-true (bl.val::standard-output-script-p
+    (is-true (bl.val:standard-output-script-p
               (concatenate '(vector (unsigned-byte 8)) (vector #x52 #x20)
                            (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))))
     ;; v16 (OP_16) 40-byte program (max)
-    (is-true (bl.val::standard-output-script-p
+    (is-true (bl.val:standard-output-script-p
               (concatenate '(vector (unsigned-byte 8)) (vector #x60 #x28)
                            (make-array 40 :element-type '(unsigned-byte 8) :initial-element 1))))
     ;; 41-byte program: not a witness program -> nonstandard
-    (is-false (bl.val::standard-output-script-p
+    (is-false (bl.val:standard-output-script-p
                (concatenate '(vector (unsigned-byte 8)) (vector #x52 #x29)
                             (make-array 41 :element-type '(unsigned-byte 8) :initial-element 1))))
     ;; irregular v0 (OP_0 push2): stays nonstandard
-    (is-false (bl.val::standard-output-script-p (wp #x00 #xaa #xbb)))
+    (is-false (bl.val:standard-output-script-p (wp #x00 #xaa #xbb)))
     ;; RPC type names
     (is (string= "anchor" (bl.val:script-type-name (wp #x51 #x4e #x73))))
     (is (string= "witness_unknown" (bl.val:script-type-name (wp #x52 #xaa #xbb))))))
@@ -3431,12 +3431,12 @@ including the order in which the forms are matched."
   "G7-13: Core's IsStandard accepts TxoutType::PUBKEY unconditionally
 (solver.cpp:190-192, policy.cpp:79-97). We classified bare P2PK NONSTANDARD
 and so refused to relay transactions the whole network relays."
-  (is-true (bl.val::standard-output-script-p
+  (is-true (bl.val:standard-output-script-p
             (%push-script 33 #x02 #xac)))
-  (is-true (bl.val::standard-output-script-p
+  (is-true (bl.val:standard-output-script-p
             (%push-script 65 #x04 #xac)))
   ;; A malformed pubkey script stays nonstandard.
-  (is-false (bl.val::standard-output-script-p
+  (is-false (bl.val:standard-output-script-p
              (%push-script 33 #x04 #xac))))
 
 (test g7-12-multisig-shape-vs-output-standardness
@@ -3462,15 +3462,15 @@ is still standard, so the two must not share one predicate."
     (is (eq :multisig (bl.val:classify-script (ms 15 15))))
     ;; But only n<=3 is a standard OUTPUT.
     (let ((bl:*permit-bare-multisig* t))
-      (is-true (bl.val::standard-output-script-p (ms 2 3)))
-      (is-false (bl.val::standard-output-script-p (ms 4 4))))
+      (is-true (bl.val:standard-output-script-p (ms 2 3)))
+      (is-false (bl.val:standard-output-script-p (ms 4 4))))
     ;; -permitbaremultisig=0 rejects even the small ones — but through
     ;; IsStandardTx, not IsStandard: Core applies that gate in the output loop
     ;; (policy.cpp:151-153) so it can report "bare-multisig" rather than
     ;; "scriptpubkey". STANDARD-OUTPUT-SCRIPT-P is IsStandard alone and so
     ;; keeps answering for the SHAPE regardless of the knob.
     (let ((bl:*permit-bare-multisig* nil))
-      (is-true (bl.val::standard-output-script-p (ms 2 3)))
+      (is-true (bl.val:standard-output-script-p (ms 2 3)))
       (is (eq :bare-multisig
               (nth-value 1 (bl.val::%is-standard-tx
                             (%tx-with-output-script (ms 2 3)))))))))
