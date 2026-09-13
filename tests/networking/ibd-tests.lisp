@@ -4496,7 +4496,7 @@ activation and the log said UNEXPECTED-WITNESS."
                    :transactions '()))
              (lines (capture-log-lines
                      (lambda ()
-                       (bl.net::handle-validation-failure
+                       (bl.net:handle-validation-failure
                         blk 102 :unexpected-witness nil)))))
         (is-true (find "unexpected-witness" lines :test #'search)
                  "the line carries Core's lower-case reason")
@@ -4578,7 +4578,7 @@ follows; the next pass's broadcast failed it."
         (flet ((broadcast (&rest peers)
                  (length (captured-sends
                           (lambda ()
-                            (bl.net::broadcast-initial-getheaders
+                            (bl.net:broadcast-initial-getheaders
                              peers state))))))
           (is (= 1 (broadcast peer)) "the first pass asks the peer")
           (is (= 0 (broadcast peer)) "a later pass does not ask it again")
@@ -4618,9 +4618,9 @@ every ready peer, and the Phase-1 header sync picked the only one there was."
             "nor with a peer advertising neither NODE_NETWORK nor _LIMITED")
         (is (equal (list full) (tried (list fetch full)))
             "control: the full-relay peer beside them is still asked")))
-    (is-true (bl.net::header-sync-candidate-p full))
-    (is-false (bl.net::header-sync-candidate-p fetch))
-    (is-false (bl.net::header-sync-candidate-p mute))))
+    (is-true (bl.net:header-sync-candidate-p full))
+    (is-false (bl.net:header-sync-candidate-p fetch))
+    (is-false (bl.net:header-sync-candidate-p mute))))
 
 (test an-empty-headers-answer-re-arms-the-getheaders-throttle
   "Core's ProcessHeadersMessage clears m_last_getheaders_timestamp on a headers

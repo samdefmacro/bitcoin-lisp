@@ -40,6 +40,28 @@ function NAME (control &rest args) that signals it with that message."
   "Startup refused for a reason other than the configuration: a datadir
 that cannot be locked or migrated, a corrupt on-disk state, a log file that
 cannot be opened.")
+(define-condition chainstate-load-error (init-error) ()
+  (:documentation "A chainstate load that failed where Core's LoadChainstate /
+VerifyLoadedChainstate return ChainstateLoadStatus::FAILURE
+ (node/chainstate.cpp), the class of failure Core OFFERS A REINDEX for rather
+than simply reporting.
+
+It is reported differently from every other startup refusal, which is why it
+has its own type. An InitError prints the message under an Error: caption
+ (noui.cpp:29-31); a FAILURE here goes to uiInterface.ThreadSafeQuestion, whose
+non-interactive text is the message, a period, a newline, and the line Please
+restart with -reindex or -reindex-chainstate to recover (init.cpp:1860-1871).
+Its style MSG_ERROR|BTN_ABORT matches none of noui's captioned cases, so it is
+printed with no caption at all (noui.cpp:28-46). Three functional tests compare
+the WHOLE of stderr against exactly that text: feature_reindex_init.py:23,
+feature_presegwit_node_upgrade.py:39 and rpc_blockchain.py:125."))
+
+(declaim (ftype (function (t &rest t) nil) chainstate-load-error))
+
+(defun chainstate-load-error (control &rest args)
+  "Signal a CHAINSTATE-LOAD-ERROR whose message is CONTROL formatted with ARGS."
+  (error 'chainstate-load-error :format-control control :format-arguments args))
+
 (define-simple-error serialization-error
   "Bytes that are not a valid encoding of what they claim to be: a
 non-canonical CompactSize, a truncated message, a PSBT with the wrong shape.

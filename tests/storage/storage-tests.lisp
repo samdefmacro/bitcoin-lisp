@@ -121,11 +121,14 @@ asserts nothing about the root")
               (bl.store:chain-state-block-index seeded))))
     ;; And the node seeds genesis BEFORE it reindexes — the ordering is the
     ;; whole fix, so assert it structurally rather than trusting the diff.
+    ;; The two CALL sites, not the log line: the rebuild moved into its own
+    ;; function (the chainstate-load retry runs it too), which put its log
+    ;; string earlier in the file than the seeding it still follows.
     (let ((src (%node-source-text)))
       (let ((genesis-at (search "(%ensure-genesis-index-entry network)" src))
-            (reindex-at (search "Reindex: rebuilding the block index" src)))
+            (reindex-at (search "(%rebuild-block-index-from-block-files))" src)))
         (is-true genesis-at "the genesis seeding call is gone")
-        (is-true reindex-at "the reindex call is gone")
+        (is-true reindex-at "the -reindex rebuild call is gone")
         (is (< genesis-at reindex-at)
             "genesis is seeded AFTER the reindex again; every record will orphan")))))
 
