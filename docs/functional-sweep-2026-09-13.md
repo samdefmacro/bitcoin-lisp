@@ -189,3 +189,54 @@ rpc_packages.py:526, rpc_signmessagewithprivkey.py:44, wallet_simulaterawtx.py:9
 **A boolean the other way** (`not(False == True)`, 6): feature_maxtipage.py:39,
 p2p_feefilter.py:24, wallet_gethdkeys.py:62, wallet_importdescriptors.py:583,
 wallet_multiwallet.py:78, wallet_musig.py:89.
+
+## Round 2
+
+Same oracle, same recipe, run the same day after the round-1 fixes. Each item
+below is one commit on `main` with a pre-fix-red test and the Core lines in
+its message; the cold battery ran on every branch and on the merged `main`
+before each push (38,510 → 38,563 checks).
+
+| root cause | Core | fix |
+|---|---|---|
+| 7. At the tip, header sync waited ~10 s per silent peer on the sync thread, so every peer the idle tick admitted cost a 20-second pass (`p2p_add_connections`: one connection per pass) | SendMessages sends the initial getheaders and moves on, net_processing.cpp:5797-5810 | "Net: at the tip, header sync sends its getheaders and does not wait" |
+| 8. `init message:` lines never logged; `-norpccookiefile` read as a cookie file named `0` | noui.cpp:56; rpc/request.cpp:115, httprpc.cpp:261 | "Init: Core's `init message:` log lines, and -norpccookiefile means no cookie file" |
+| 9. Blocks connected by the block-download drain (every block fetched after an announcement) were never announced onward; `example_test` node1 heard about 1 of 10 | UpdatedBlockTip queues every new tip for every peer, net_processing.cpp:2160-2189 | "Net: every new tip is announced from the tip hook" (the `:updated-block-tip` hook replaces the two ad-hoc call sites) |
+| 10. A header-only block was `Block not found` (-5); `gettxoutproof` demanded a blockhash or txindex | CheckBlockDataAvailability, rpc/blockchain.cpp:671-700; txoutproof.cpp:71-91 | "RPC: a known header without its body is `Block not available`, and gettxoutproof finds the block through an unspent output" |
+| 11. One fee-floor reason where Core has two | CheckFeeRate, validation.cpp:699-712 | "Mempool: the two fee-floor reasons, in Core's order" |
+| 12. A closed connection still counted toward the addconnection cap for a whole cycle | AddConnection counts m_nodes, net.cpp:1894; DisconnectNodes erases, :1909-1939 | "Net: a closed connection no longer counts toward addconnection's outbound cap" |
+| 13. A commitment without witness was "stripped" at any height; with `-testactivationheight=segwit@120` node1 refused every block node0 mined below 120 and re-requested them forever (4,500 getdata in a minute) | ContextualCheckBlock judges the commitment only where segwit is active, validation.cpp:4021 | "Validation: a witness commitment is judged only where BIP141 is active" |
+| 14. One getheaders per unconnecting announcement (thirty in a millisecond after a 99-block mine), and node0 disconnected node1 for it; the same per inv | MaybeSendGetHeaders throttles both, net_processing.cpp:2659, :4198 | "Net: unconnecting headers ask once per response window…", "Net: an inv naming an unknown block asks for headers once per response window" |
+| 15. Block rejections logged as upper-case keywords; the framework greps for Core's lower-case reasons (`unexpected-witness`) | BlockValidationState::ToString, consensus/validation.h:110-121 | "Validation: a rejected block is logged in Core's words" |
+
+Three log lines Core writes and ours did not were added along the way, and
+they were what it took to see 13 and 14: the condition text of a send
+failure, `received: block|headers` for the drain's own two arms, and the
+ingest decisions (`missing prev block`, `Ignoring low-work chain`); plus
+`sending <command> (<bytes>) peer=<id>` for every send (net.cpp:4075).
+
+### Round-2 sweep
+
+Binary `580627ba` (every round-2 fix but the inv throttle, which landed
+during the run), classification in `docs/functional-sweep-2026-09-13/after-580627ba.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `6011851b` baseline | 48 | 171 | 21 | 23 |
+| `f662c475` round 1 | 49 | 181 | 10 | 23 |
+| `580627ba` round 2 | **58** | **176** | **6** | 23 |
+
+Against round 1: nine tests now pass (`example_test`, `mining_mainnet`,
+`p2p_add_connections`, `p2p_compactblocks_hb`, `rpc_users`,
+`wallet_importprunedfunds`, `wallet_listsinceblock`, `wallet_orphanedreward`,
+`wallet_transactiontime_rescan`); thirteen failure points advanced
+(`p2p_segwit` 309 → 145, `p2p_sendheaders` 181 → 340, `rpc_txoutproof` 37 → 84,
+`wallet_groups` 42 → 137, `mining_basic`, `mempool_limit`, `rpc_getblockfrompeer`,
+`rpc_getblockstats`, ...); three timeouts became ordinary failures; no test
+lost status. `feature_pruning` and `wallet_address_types` timed out this run
+(both have alternated before). The "Block sync timed out" cluster is gone.
+
+Next round, from this sweep: the 13 RPC error texts still open (table above),
+8 "accepted what Core rejects", the 5 wallet-file (`wallet.dat`) failures,
+`p2p_node_network_limited.py:110` (a `getblockfrompeer` on a header-only
+block should be allowed), and the two remaining init-error texts.
