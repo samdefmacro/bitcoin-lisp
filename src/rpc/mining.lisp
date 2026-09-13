@@ -5,6 +5,13 @@
 
 ;;; --- Mining RPCs ---
 
+(defconstant +max-block-serialized-size+ 4000000
+  "Core's MAX_BLOCK_SERIALIZED_SIZE (consensus/consensus.h): the largest block
+that may be relayed or stored, in serialized bytes. Numerically equal to
+MAX_BLOCK_WEIGHT and deliberately kept a separate name, because
+getblocktemplate divides THIS one -- and not the weight -- by
+WITNESS_SCALE_FACTOR to state its pre-segwit sizelimit.")
+
 (defun %bits-to-target-hex (bits)
   "The 256-bit target for BITS as 64 lowercase hex chars (Core hashTarget.GetHex)."
   (format nil "~(~64,'0x~)" (bl.store:bits-to-target bits)))
@@ -25,10 +32,17 @@ GetDifficulty."
 testnet4, signet, regtest."
   (bl.chain:chain-params-core-name (bl.chain:find-chain-params network)))
 
-(defun %gbt-transactions (template)
+(defun %gbt-transactions (template pre-segwit-p)
   "The getblocktemplate `transactions` array for TEMPLATE: one object per
 selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
-1-based indices of the in-template txs each tx spends from."
+1-based indices of the in-template txs each tx spends from.
+
+PRE-SEGWIT-P is Core's fPreSegWit for the block being templated. Every sigop
+count in this reply is BIP141's weighted cost, and before segwit activates Core
+reports the pre-BIP141 number instead by dividing it by WITNESS_SCALE_FACTOR
+(rpc/mining.cpp:925-930) -- the same conversion its sigoplimit gets. A miner
+reading a post-BIP141 cost against a pre-BIP141 limit would leave three
+quarters of the block's sigop budget unused."
   (let ((entries (bl.mining:block-template-transactions template))
         (index-of (make-hash-table :test 'equalp)))
     ;; 1-based index of each selected txid (they are in parents-first order).
@@ -56,7 +70,10 @@ selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
                     ("hash" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
                     ("depends" . ,depends)
                     ("fee" . ,(bl.mp:mempool-entry-fee e))
-                    ("sigops" . ,(bl.mp:mempool-entry-sigops e))
+                    ("sigops" . ,(let ((cost (bl.mp:mempool-entry-sigops e)))
+                                   (if pre-segwit-p
+                                       (floor cost bl.val:+witness-scale-factor+)
+                                       cost)))
                     ("weight" . ,(bl.ser:transaction-weight tx))))))
 
 (defun %gbt-rules (network height active-deployments)
@@ -446,23 +463,43 @@ cache above wraps exactly the expensive part and nothing else."
          ;; recorded -- not a fresh read of the tip, which can already have
          ;; moved by the time the assembly returns.
          (prev-entry (bl.store:get-block-index-entry
-                      chain-state (bl.mining:block-template-prev-hash template))))
+                      chain-state (bl.mining:block-template-prev-hash template)))
+         ;; Core's fPreSegWit: segwit is judged for the block AFTER pindexPrev,
+         ;; which is the template's own height (DeploymentActiveAfter,
+         ;; rpc/mining.cpp:892).
+         (pre-segwit-p (not (bl.val:segwit-active-at-height-p
+                             (bl.mining:block-template-height template)
+                             (bl:node-network node)))))
     (multiple-value-bind (version vbavailable active-deployments)
         (%gbt-versionbits (bl:node-network node) chain-state prev-entry
                           (bl.mining:block-template-version template) rules)
       `(("capabilities" . ("proposal"))
         ("version" . ,version)
         ("previousblockhash" . ,(hash-to-hex (bl.mining:block-template-prev-hash template)))
-        ("transactions" . ,(%gbt-transactions template))
+        ("transactions" . ,(%gbt-transactions template pre-segwit-p))
         ("coinbaseaux" . ,(make-hash-table :test 'equal))
         ("coinbasevalue" . ,(bl.mining:block-template-coinbase-value template))
         ("target" . ,(%bits-to-target-hex bits))
         ("mintime" . ,(bl.mining:block-template-mintime template))
         ("mutable" . ("time" "transactions" "prevblock"))
         ("noncerange" . "00000000ffffffff")
-        ("sigoplimit" . ,bl.val:+max-block-sigops-cost+)
-        ("sizelimit" . 4000000)          ; MAX_BLOCK_SERIALIZED_SIZE
-        ("weightlimit" . ,bl.val:+max-block-weight+)
+        ;; sigoplimit / sizelimit / weightlimit (rpc/mining.cpp:1000-1012).
+        ;; Before segwit activates Core states both limits in PRE-BIP141 units
+        ;; -- MAX_BLOCK_SIGOPS_COST and MAX_BLOCK_SERIALIZED_SIZE each divided
+        ;; by WITNESS_SCALE_FACTOR, so 20,000 sigops and 1,000,000 bytes -- and
+        ;; omits weightlimit entirely, because a block weight is not a rule yet.
+        ;; Reporting the post-BIP141 numbers told a miner it could fill four
+        ;; times the block a pre-segwit chain will accept.
+        ("sigoplimit" . ,(if pre-segwit-p
+                             (floor bl.val:+max-block-sigops-cost+
+                                    bl.val:+witness-scale-factor+)
+                             bl.val:+max-block-sigops-cost+))
+        ("sizelimit" . ,(if pre-segwit-p
+                            (floor +max-block-serialized-size+
+                                   bl.val:+witness-scale-factor+)
+                            +max-block-serialized-size+))
+        ,@(unless pre-segwit-p
+            (list (cons "weightlimit" bl.val:+max-block-weight+)))
         ("curtime" . ,(bl.mining:block-template-curtime template))
         ("bits" . ,(%bits-hex bits))
         ("height" . ,(bl.mining:block-template-height template))
