@@ -131,12 +131,56 @@ the unbroadcast re-announce interval and then asserts the re-announce happened).
           (+ (bl.ser:get-unix-time) delta))
     :null))
 
+(defparameter *client-bug-report-url*
+  "https://github.com/samdefmacro/bitcoin-lisp/issues"
+  "Where a caller is asked to report an internal bug (Core CLIENT_BUGREPORT,
+the last line StrFormatInternalBug prints).")
+
+(defun str-format-internal-bug (assertion where)
+  "Core StrFormatInternalBug (util/check.cpp:18-25): the report text a failed
+CHECK_NONFATAL carries out of an RPC handler.
+
+    Internal bug detected: <assertion>
+    <file>:<line> (<function>)
+    <client name> <version>
+    Please report this issue here: <bug report URL>
+
+WHERE stands in for Core's std::source_location, which SBCL has no equivalent
+of, so the caller names its own file and function. The FIRST line is the
+contract: Core's rpc_misc.py:45 asserts `Internal bug detected: ' followed by
+the condition's own SOURCE TEXT is a substring of the error message, so
+ASSERTION is quoted exactly as Core's `#condition' stringification renders it."
+  (format nil "Internal bug detected: ~A~%~A~%bitcoin-lisp ~A~%Please report this issue here: ~A~%"
+          assertion where (bl.ser:client-version-string) *client-bug-report-url*))
+
+(defun %echo-arguments (params)
+  "Core's echo/echojson body (rpc/node.cpp:299-306): the arguments, unchanged
+-- except that arg9 = \"trigger_internal_bug\" trips a CHECK_NONFATAL (:301-303)
+whose NonFatalCheckError the RPC server turns into an RPC_MISC_ERROR (-1)
+carrying the report text (rpc/server.cpp:514-516).
+
+That branch is not decoration: it is the only way a test can exercise the
+internal-bug path end to end, and rpc_misc.py:32-45 requires the call either to
+kill the node or to answer with that error. A node that echoed the string back
+answered neither, and the test's `assert False' fired on the line after the
+call. Both names share this body because Core builds them from one
+RPCHelpMan (`static RPCHelpMan echo(const std::string& name)', :277)."
+  (let ((arg9 (nth 9 params)))
+    (when (and (stringp arg9) (string= arg9 "trigger_internal_bug"))
+      (error 'rpc-error
+             :code +rpc-misc-error+
+             :message (str-format-internal-bug
+                       "request.params[9].get_str() != \"trigger_internal_bug\""
+                       "src/rpc/node.lisp (%ECHO-ARGUMENTS)"))))
+  (or params '()))
+
 (define-rpc "echo" (node params)
   "Return the arguments unchanged (Core echo, rpc/node.cpp:279). It exists for
 the test framework to check argument marshalling end to end, which is exactly
-what rpc_misc.py uses it for."
+what rpc_misc.py uses it for -- including arg9 = \"trigger_internal_bug\",
+which Core answers with its internal-bug report (see %ECHO-ARGUMENTS)."
   (declare (ignore node))
-  (or params '()))
+  (%echo-arguments params))
 
 (define-rpc "getrpcinfo" (node params)
   "Report RPC server state (Bitcoin Core getrpcinfo): the commands currently
@@ -156,11 +200,13 @@ shutdown, so a node reporting none hangs that test forever."
                       ""))))
 
 (define-rpc "echojson" (node params)
-  "Return the arguments unchanged (Core echojson, rpc/misc.cpp). For testing
+  "Return the arguments unchanged (Core echojson, rpc/node.cpp:311). For testing
 only; it exists so a test can check the JSON round-trip of every argument type
-without depending on what any real method does with them."
+without depending on what any real method does with them. Core builds echo and
+echojson from ONE RPCHelpMan (rpc/node.cpp:277-311), so the arg9 internal-bug
+trigger is this method's too."
   (declare (ignore node))
-  (coerce params 'vector))
+  (coerce (%echo-arguments params) 'vector))
 
 (defun %dump-all-command-conversions ()
   "Core CRPCTable::dumpArgMap / RPCHelpMan::GetArgMap (rpc/util.cpp:833-863):

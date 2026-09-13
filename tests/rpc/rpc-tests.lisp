@@ -9760,3 +9760,46 @@ plus the always-present keys."
           (is-false (member "pruneheight" keys :test #'string=))
           (is-false (member "automatic_pruning" keys :test #'string=))
           (is-false (member "prune_target_size" keys :test #'string=))))))))
+
+;;; --- echo's internal-bug trigger -------------------------------------------
+
+(test echo-answers-cores-internal-bug-report-for-the-arg9-trigger
+  "Core's echo and echojson are one RPCHelpMan (rpc/node.cpp:277-311) whose
+body opens with
+
+    if (request.params[9].isStr()) {
+        CHECK_NONFATAL(request.params[9].get_str() != \"trigger_internal_bug\");
+    }
+
+The NonFatalCheckError that raises becomes an RPC_MISC_ERROR (-1) carrying
+StrFormatInternalBug's text (rpc/server.cpp:514-516, util/check.cpp:18-25).
+rpc_misc.py:32-45 calls echo(arg9=\"trigger_internal_bug\") and accepts only
+two answers: the node dies, or the error arrives with code -1 and
+`Internal bug detected: <the condition's source text>' in its message. A node
+that echoed the string back gave neither, and the test's next line is
+`assert False'."
+  (let ((node (make-test-node)))
+    (flet ((args (arg9)
+             (wire-params (list nil nil nil nil nil nil nil nil nil arg9))))
+      ;; Every other argument, arg9 included, is still echoed unchanged.
+      (is (equal (list nil nil nil nil nil nil nil nil nil "harmless")
+                 (bl.rpc:dispatch-rpc-method node "echo" (args "harmless"))))
+      (is (equalp (coerce (list nil nil nil nil nil nil nil nil nil "harmless")
+                          'vector)
+                  (bl.rpc:dispatch-rpc-method node "echojson" (args "harmless"))))
+      ;; Both names carry the trigger, because Core builds both from one body.
+      (dolist (method '("echo" "echojson"))
+        (let ((err (rpc-error-of
+                    (lambda ()
+                      (bl.rpc:dispatch-rpc-method
+                       node method (args "trigger_internal_bug"))))))
+          (is-true err "~A echoed the trigger back instead of reporting a bug"
+                   method)
+          (when err
+            (is (= bl.rpc:+rpc-misc-error+ (car err))
+                "~A reported code ~D, Core reports RPC_MISC_ERROR" method (car err))
+            (is-true
+             (search "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\""
+                     (cdr err))
+             "~A's message was ~S" method (cdr err))
+            (is-true (search "Please report this issue here:" (cdr err)))))))))
