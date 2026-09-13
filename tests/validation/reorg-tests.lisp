@@ -657,7 +657,7 @@ output and NO coinbase witness — a witness-stripped block (block-witness-strip
 from the old v1-compact :weaker-chain path) is pruned during the reorg precondition
 and returned as MISSING so it gets re-downloaded witness-complete — instead of
 failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behind)."
-  (with-network (:mainnet)
+  (with-network (:regtest)   ; BIP141 active from genesis: only there is a commitment without witness "stripped" (Core validation.cpp:4021)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "prune-stripped")
      ;; Active chain A: genesis -> A1 -> A2.
@@ -2272,7 +2272,7 @@ stripped body on disk fails every later reorg (the original testnet4 wedge).
 block-exists-p stays NIL for the stripped copy in all three cases. An above-tip
 stripped copy of a REQUESTED block re-enters pending so a witness-complete copy is
 re-fetched; an unsolicited stripped copy does not."
-  (with-network (:mainnet)
+  (with-network (:regtest)   ; BIP141 active from genesis: only there is a commitment without witness "stripped" (Core validation.cpp:4021)
    (multiple-value-bind (cs utxo store genesis-hash)
        (make-activate-block-fixture "l5-stripped")
      ;; Active chain A: two blocks, tip A2 at height 2.
