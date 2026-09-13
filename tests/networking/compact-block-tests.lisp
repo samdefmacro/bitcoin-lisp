@@ -1810,3 +1810,62 @@ valid-yet-unconnected case, not a rejection")
               "a stored-but-unconnected block must not earn high bandwidth")
           (is (null (bl.net:peer-compact-block-high-bandwidth-to
                      b)))))))))
+
+;;;; The getblocktxn round trip is a block download (p2p_mutated_blocks.py:78)
+
+(test a-compact-block-awaiting-getblocktxn-is-in-flight
+  "Core marks the block IN FLIGHT against the peer before it even builds the
+getblocktxn (BlockRequested, net_processing.cpp:4668): the round trip is a
+block download like any other. mapBlocksInFlight is what stops the scheduler
+asking a second peer for the same block, and it is where getpeerinfo's
+`inflight' array comes from (rpc/net.cpp:275-281).
+
+p2p_mutated_blocks.py:73-78 reads it in exactly that window -- after the
+getblocktxn goes out and before the answer:
+
+    honest_relayer.wait_until(self_transfer_requested, timeout=5)
+    peer_info_prior_to_attack = self.nodes[0].getpeerinfo()
+    assert_equal([101], peer_info_prior_to_attack[0][\"inflight\"])
+
+Ours tracked the reconstruction in the per-peer pending slot alone, so the
+array was empty. Every path that gives a reconstruction up now clears the
+in-flight entry with it (CLEAR-PENDING-COMPACT-BLOCK), which is Core's
+BlockRequested/RemoveBlockRequest pairing: without it a peer would hold a
+block forever that nothing would ask anyone else for."
+  (with-network (:regtest)
+   (with-ibd-context
+     (let* ((bl.net:*cached-is-ibd* nil)
+            (peer (%cbp-peer "203.0.113.68"))
+            (parent (%cbp-hash #xB8))
+            (state (%cbp-state-with-parent parent 1296688600))
+            (utxo (bl.store:make-utxo-set))
+            (mempool (bl.mp:make-mempool))
+            (hdr (%cbp-grind (%cbp-header parent 1296688700)))
+            (cb (%cbp-compact-block-missing-one hdr (make-simple-tx #x58)))
+            (block-hash (bl.ser:block-header-hash hdr))
+            (sent (%cbp-capture-sends
+                   (lambda ()
+                     (%cbp-deliver peer (%cbp-payload cb) state utxo mempool)))))
+       ;; Controls: the handler really did take the missing-transactions arm.
+       (is (equal '("getblocktxn") sent)
+           "the handler must ask for the missing transaction, sent: ~S" sent)
+       (is-true (bl.net:peer-pending-compact-block peer))
+       (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes peer))
+           "a compact block awaiting getblocktxn must be in flight from its peer")
+       ;; And getpeerinfo reports its HEIGHT, which is what the framework reads.
+       (let ((node (bl:make-node :network :regtest)))
+         (setf (bl:node-chain-state node) state
+               (bl:node-utxo-set node) utxo
+               (bl:node-mempool node) mempool
+               (bl:node-peers node) (list peer))
+         (let* ((rows (coerce (bl.rpc:dispatch-rpc-method
+                               node "getpeerinfo" (wire-params (list)))
+                              'list))
+                (inflight (cdr (assoc "inflight" (first rows) :test #'string=))))
+           (is (equalp #(1) inflight)
+               "getpeerinfo must report the in-flight block's height; got ~S"
+               inflight)))
+       ;; Giving the reconstruction up releases the block again.
+       (bl.net:clear-pending-compact-block peer)
+       (is (null (bl.net:peer-inflight-block-hashes peer))
+           "an abandoned reconstruction must not leave the block in flight")))))
