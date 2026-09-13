@@ -3430,6 +3430,18 @@ keeping. Core has no header-sync loop at all for the same reason."
         ;; ask. Reporting a stall here would rotate header sync away from a
         ;; perfectly healthy peer on a timer.
         (return-from sync-headers (values 0 nil))))
+    ;; Out of IBD there is nothing to wait for: Core's SendMessages sends a
+    ;; new peer its initial getheaders and moves on (net_processing.cpp:
+    ;; 5797-5810); the reply, if any, is ingested by the pump and ends the
+    ;; idle wait, and a peer that never answers is nobody's problem. Waiting
+    ;; out the silent budget here cost every sync pass at the tip ~10 s per
+    ;; silent peer, on the sync thread, with no inbound admitted and no dial
+    ;; made meanwhile: p2p_add_connections.py added one connection per
+    ;; 20-second pass, because its peers never answer a getheaders at all.
+    (unless *cached-is-ibd*
+      (bl:log-debug "Header sync kicked ~A at the tip; the reply arrives through the pump"
+                    (peer-log-name peer))
+      (return-from sync-headers (values 0 nil)))
     (loop
       (when (or *ibd-stop-requested*
                 (not (eq (peer-state peer) :ready))

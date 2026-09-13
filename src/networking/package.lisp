@@ -329,6 +329,7 @@ headerssync.cpp. src/networking/.")
   (:export
    #:*asmap*
    #:*cached-is-ibd*
+   #:sync-headers
    #:*ibd-context*
    #:*max-upload-target*
    #:*whitebind-flags*
