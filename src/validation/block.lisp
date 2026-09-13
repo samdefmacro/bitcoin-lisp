@@ -3345,10 +3345,11 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     (:too-many-sigops            . "bad-blk-sigops")                     ; :2567
     (:coinbase-too-large         . "bad-cb-amount")                      ; :2609
     (:bad-proof-of-work          . "high-hash")                          ; :3864 CheckBlockHeader
+    (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot
     (:non-final-tx               . "bad-txns-nonfinal"))                 ; :4179 ContextualCheckBlock
   "Block verdicts in Core's reject-reason vocabulary. A keyword with no entry
 is its own downcased name, which is what most of ours already are
-(bad-txnmrklroot, unexpected-witness, ...).")
+(unexpected-witness, time-too-old, bad-txns-duplicate, ...).")
 
 (defun block-reject-reason (error)
   "ERROR's Core reject reason alone -- state.GetRejectReason(). This is what
