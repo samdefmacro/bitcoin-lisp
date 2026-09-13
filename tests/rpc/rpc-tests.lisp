@@ -8146,8 +8146,11 @@ missing file or non-string path errors."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex 999999)))
     ;; connected peer by id → returns {} (empty hash-table); send is a no-op on
-    ;; the fake peer's nil connection.
+    ;; the fake peer's nil connection. The peer advertises NODE_WITNESS, as a
+    ;; peer that handshook with a segwit node does -- Core's FetchBlock refuses
+    ;; one that does not (net_processing.cpp:1971).
     (let ((peer (%rpc-fake-peer "1.2.3.4")))
+      (setf (bl.net:peer-services peer) bl.ser:+node-witness+)
       (push peer (bl:node-peers node))
       (let ((r (bl.rpc::rpc-getblockfrompeer
                 node (list hash-hex (bl.net:peer-id peer)))))
@@ -8156,6 +8159,43 @@ missing file or non-string path errors."
     ;; bad peer_id type → error
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))
+
+(test rpc-getblockfrompeer-refuses-a-pre-segwit-peer
+  "getblockfrompeer refuses a peer that does not advertise NODE_WITNESS with
+Core's -1 `Pre-SegWit peer'. FetchBlock tests CanServeWitnesses right after the
+peer lookup (net_processing.cpp:1970-1971) because the getdata it would send
+asks for MSG_WITNESS_BLOCK, which such a peer does not answer, and the bare
+MSG_BLOCK it could answer returns the witness-stripped serialization -- a block
+that can never pass script validation. We sent the request anyway
+(rpc_getblockfrompeer.py:88)."
+  (let* ((bl:*prune-target-mib* nil)
+         (node (make-test-node))
+         (cs (bl:node-chain-state node))
+         (hdr (bl.ser:make-block-header
+               :version 1
+               :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+               :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+               :timestamp 1 :bits #x1d00ffff :nonce 0))
+         (hash (bl.ser:block-header-hash hdr))
+         (hash-hex (bl.rpc:hash-to-hex hash))
+         (witness-peer (%rpc-fake-peer "1.2.3.4"))
+         (legacy-peer (%rpc-fake-peer "5.6.7.8")))
+    (bl.store:add-block-index-entry
+     cs (bl.store:make-block-index-entry
+         :hash hash :height 1 :header hdr :status :header-valid :chain-work 1))
+    (setf (bl.net:peer-services witness-peer)
+          (logior bl.ser:+node-network+ bl.ser:+node-witness+))
+    ;; Core's NODE_WITNESS bit is the only one that matters here: a peer
+    ;; advertising NODE_NETWORK alone is pre-segwit.
+    (setf (bl.net:peer-services legacy-peer) bl.ser:+node-network+)
+    (push witness-peer (bl:node-peers node))
+    (push legacy-peer (bl:node-peers node))
+    ;; Control: the witness peer is served.
+    (is (hash-table-p (bl.rpc::rpc-getblockfrompeer
+                       node (list hash-hex (bl.net:peer-id witness-peer)))))
+    (signals-rpc-error (:code -1 :exact-message "Pre-SegWit peer")
+      (bl.rpc::rpc-getblockfrompeer
+       node (list hash-hex (bl.net:peer-id legacy-peer))))))
 
 ;;; --- logging (Bitcoin Core logging) ---
 

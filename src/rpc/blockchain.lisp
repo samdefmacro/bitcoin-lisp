@@ -2514,6 +2514,15 @@ the cross-thread send safe."
                         :key #'bl.net:peer-id))))
       (unless peer
         (error 'rpc-error :code +rpc-misc-error+ :message "Peer does not exist"))
+      ;; Core FetchBlock's next line: a peer that cannot serve witnesses is
+      ;; refused outright (net_processing.cpp:1970-1971, CanServeWitnesses =
+      ;; NODE_WITNESS among the peer's advertised services). The getdata below
+      ;; asks for MSG_WITNESS_BLOCK, which such a peer does not understand; a
+      ;; bare MSG_BLOCK would get the witness-stripped serialization back, and
+      ;; that can never pass script validation. Either way there is no useful
+      ;; request to make, so Core says so instead of sending one.
+      (unless (logtest (bl.net:peer-services peer) bl.ser:+node-witness+)
+        (error 'rpc-error :code +rpc-misc-error+ :message "Pre-SegWit peer"))
       (bl.net:send-message
        peer
        (bl.ser:make-getdata-message
