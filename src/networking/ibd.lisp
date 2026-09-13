@@ -2601,20 +2601,34 @@ transferring nothing. Falls back to the header-tip locator at genesis."
      (bl.ser:make-getheaders-message locator))))
 
 (defun broadcast-initial-getheaders (peers chain-state)
-  "At the start of block download, send one getheaders — locator one block back
-from our header tip — to every ready peer. Phase 1 learned only the bulk
-header-sync peer's tip; every other peer has an empty best-known-block, so the
-per-peer download walk (find-blocks-to-download-for-peer) cannot yet tell which
-of them serve the tip. A caught-up peer replies with our own best header
-(already-known fast path -> update-block-availability), setting its best-known
-without any block transfer; a peer slightly ahead sends the few new headers it
-has. Core sends this pprev-locator getheaders on peer/sync events; here it
-primes availability for the whole ready set as Phase 2 begins. Errors are
-isolated per peer so one dead socket cannot abort the sweep."
+  "Send the INITIAL getheaders — locator one block back from our header tip —
+to every ready peer we have not opened header sync with yet. Phase 1 learned
+only the bulk header-sync peer's tip; every other peer has an empty
+best-known-block, so the per-peer download walk
+(find-blocks-to-download-for-peer) cannot yet tell which of them serve the tip.
+A caught-up peer replies with our own best header (already-known fast path ->
+update-block-availability), setting its best-known without any block transfer;
+a peer slightly ahead sends the few new headers it has. Errors are isolated per
+peer so one dead socket cannot abort the sweep.
+
+ONCE PER PEER. Core's SendMessages guards its initial getheaders with
+`!state.fSyncStarted' and sets the flag when one goes out
+(net_processing.cpp:5797-5821); after that a peer is only asked again by a
+specific trigger -- an unconnecting announcement, an inv naming a block we lack,
+a maximally-sized headers batch -- each of them throttled by
+MaybeSendGetHeaders. Ours had no latch, so this ran on EVERY sync pass and every
+peer got a fresh getheaders per cycle. The throttle cannot stand in for the
+latch: Core clears m_last_getheaders_timestamp whenever connecting headers
+arrive (net_processing.cpp:3043), which a peer announcing blocks does
+constantly. p2p_sendheaders.py:334 announces a block by inv and asserts that NO
+getheaders follows, having popped the one it expected earlier; the sync pass's
+next broadcast failed it."
   (let ((locator (build-header-locator-pprev chain-state)))
     (when locator
       (dolist (peer peers)
-        (when (eq (peer-state peer) :ready)
+        (when (and (eq (peer-state peer) :ready)
+                   (not (peer-headers-sync-started peer)))
+          (setf (peer-headers-sync-started peer) t)
           (ignore-errors
            (send-message
             peer

@@ -243,6 +243,13 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; Peer::m_last_getheaders_timestamp). Throttles our own requests; cleared
   ;; when a connecting headers message arrives, so the answer re-arms it.
   (last-getheaders-time 0 :type integer)
+  ;; T once this node has opened header sync with the peer (Core
+  ;; CNodeState::fSyncStarted, net_processing.cpp:453). Core's SendMessages
+  ;; sends its initial getheaders only `if (!state.fSyncStarted)'
+  ;; (net_processing.cpp:5797), so a peer is asked ONCE and everything after
+  ;; that is announcement-driven. Nothing clears it while the connection
+  ;; lives: a fresh peer object is how a reconnect starts over.
+  (headers-sync-started nil :type boolean)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; Peer selected US as high-bandwidth (Core m_bip152_highbandwidth_from)
