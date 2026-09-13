@@ -293,6 +293,44 @@ transaction that is in that block."
            (is (not (null (probe-file (bl.mp:mempool-dat-path dir))))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
+(test rpc-savemempool-reports-a-dump-it-could-not-write
+  "savemempool answers -1 `Unable to dump mempool to disk' when the dump
+cannot be written, and the temp file it writes through is Core's own
+`<mempool.dat>.new'.
+
+Core's DumpMempool opens dump_path + \".new\" and returns false if it cannot
+(node/mempool_persist.cpp:175-179), catching every later failure the same way
+(:225-229); savemempool turns that false into RPC_MISC_ERROR `Unable to dump
+mempool to disk'. mempool_persist.py:194 drives exactly this by making a
+DIRECTORY at mempool.dat.new -- which only blocks the dump if our temp file
+carries Core's name, so the name is part of the contract and not an internal
+detail. Ours wrote through a .tmp of its own and let the error escape."
+  (with-temp-directory (dir "bl-savemempool")
+    (let ((node (make-test-node))
+          (dat (bl.mp:mempool-dat-path dir)))
+      (setf (bl:node-data-directory node) dir)
+      ;; Control: with nothing in the way the dump succeeds and leaves the
+      ;; temp file renamed away.
+      (let ((r (bl.rpc:dispatch-rpc-method node "savemempool" nil)))
+        (is (stringp (cdr (assoc "filename" r :test #'string=)))))
+      (is (not (null (probe-file dat))))
+      ;; Core's name, built the way Core builds it -- MAKE-PATHNAME with a
+      ;; :type carrying a dot escapes it and names a different file.
+      (let ((dotnew (pathname (concatenate 'string (namestring dat) ".new"))))
+        (is (null (probe-file dotnew))
+            "the temp file is renamed over the target, not left behind")
+        ;; And nothing ELSE is left behind either -- the rename is the only
+        ;; thing that puts the dump in place.
+        (is (equal (list (file-namestring dat))
+                   (mapcar #'file-namestring (directory (merge-pathnames "*.*" dir))))
+            "the data directory holds mempool.dat and nothing else")
+        ;; A directory at Core's temp path blocks the dump.
+        (ensure-directories-exist
+         (make-pathname :directory (append (pathname-directory dotnew)
+                                           (list (file-namestring dotnew)))))
+        (signals-rpc-error (:code -1 :exact-message "Unable to dump mempool to disk")
+          (bl.rpc:dispatch-rpc-method node "savemempool" nil))))))
+
 (test rpc-getdescriptorinfo
   "getdescriptorinfo validates + reports canonical form/checksum; flags are
 the no-wallet/no-range constants; bad descriptors error."
