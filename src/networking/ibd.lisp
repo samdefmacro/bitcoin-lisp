@@ -1811,6 +1811,24 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                                        :if-exists :supersede
                                        :element-type '(unsigned-byte 8))
                  (write-sequence payload s))))))
+       ;; A body whose header we have never seen: Core's ProcessNewBlock
+       ;; runs AcceptBlock, which runs AcceptBlockHeader FIRST
+       ;; (validation.cpp:4340), so an unsolicited block that connects to a
+       ;; known parent is indexed and then judged by the unrequested-block
+       ;; gates (:4368-4372). process-received-block below requires the
+       ;; index entry, so without this step every such block was dropped as
+       ;; `Received unknown block' -- the ten blocks example_test.py's peer
+       ;; pushed while the drain owned the socket never reached the chain.
+       ;; The header goes through the same ingest as a headers message
+       ;; (anti-DoS work floor included); a header on an unknown parent is
+       ;; not added, and the body is then dropped as before.
+       (unless (bl.store:get-block-index-entry chain-state hash)
+         (with-current-node-lock
+           (ingest-headers-from-peer
+            peer (list header) chain-state
+            :count-fn (and ctx
+                           (lambda (n)
+                             (incf (ibd-context-headers-received ctx) n))))))
        ;; Per-peer availability: receiving a block proves peer had it.
        (update-block-availability peer chain-state hash)
        ;; Assumeutxo routing (Core ProcessNewBlock runs ABC on the current

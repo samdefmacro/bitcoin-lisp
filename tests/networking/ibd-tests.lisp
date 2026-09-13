@@ -4179,3 +4179,63 @@ authenticates -- poison the entry and its indexed descendants."
                     (bl.store:block-index-entry-status
                      (bl.store:get-block-index-entry cs child-h)))
                 "the doomed subtree was not marked (Core BLOCK_FAILED_CHILD)")))))))
+
+;;;; The block-download drain indexes an unseen header before judging the body
+
+(test drain-accepts-an-unsolicited-block-whose-header-it-has-never-seen
+  "Core's ProcessNewBlock runs AcceptBlock, which runs AcceptBlockHeader first
+(validation.cpp:4340), so an unrequested block on a known parent is indexed
+and then judged by the unrequested-block gates (:4368-4372). Our
+dispatch-ibd-message `block' arm handed the body straight to
+process-received-block, which requires the index entry, so every block whose
+header had not arrived separately was dropped as `Received unknown block':
+observed in the 2026-09-13 functional sweep, where the ten blocks
+example_test.py's peer pushed never reached node0's chain. Control: the same
+delivery with the header pre-indexed connected before the fix (the compact-
+block promotion test drives that shape); a block on an UNKNOWN parent must
+still be refused, and must not grow the index."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "drain-unseen-header"))
+           (cs (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
+           (store (bl:node-block-store node))
+           (spk (p2sh-optrue-script-pubkey))
+           (b1 (let ((blk (bl.mining:assemble-full-block
+                           cs (bl:node-mempool node)
+                           :coinbase-script-pubkey spk)))
+                 (bl.mining:mine-block blk)
+                 blk))
+           (b1-hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1)))
+           (peer (bl.net:make-peer :address "198.51.100.41" :state :ready))
+           (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                          :block-store store)))
+      (is (null (bl.store:get-block-index-entry cs b1-hash))
+          "control: the header is not in the index before delivery")
+      (with-ibd-context
+        (deliver-ibd-message
+         peer "block" (subseq (bl.ser:make-block-message b1 :witness t) 24) ctx))
+      (is (= 1 (bl.store:current-height cs))
+          "an unsolicited block on the tip connects, header and body together")
+      (is (eq :valid (bl.store:block-index-entry-status
+                      (bl.store:get-block-index-entry cs b1-hash))))
+      ;; An orphan body (unknown parent) is refused and leaves no index entry.
+      (let* ((orphan (bl.ser:make-bitcoin-block
+                      :header (bl.ser:make-block-header
+                               :version 1
+                               :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element #xEE)
+                               :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 0)
+                               :timestamp 1
+                               :bits #x207fffff
+                               :nonce 0)
+                      :transactions (bl.ser:bitcoin-block-transactions b1)))
+             (orphan-hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header orphan)))
+             (entries-before (hash-table-count (bl.store:chain-state-block-index cs))))
+        (with-ibd-context
+          (deliver-ibd-message
+           peer "block" (subseq (bl.ser:make-block-message orphan :witness t) 24) ctx))
+        (is (= 1 (bl.store:current-height cs)))
+        (is (null (bl.store:get-block-index-entry cs orphan-hash))
+            "a body on an unknown parent must not be indexed")
+        (is (= entries-before (hash-table-count (bl.store:chain-state-block-index cs))))))))
