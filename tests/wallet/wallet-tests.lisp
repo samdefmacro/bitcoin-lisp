@@ -1239,6 +1239,48 @@ is what tells an operator which key their wallet actually depends on."
                (active (bl.wallet::rpc-gethdkeys node (list opts))))
           (is (= 1 (length active))))))))
 
+(test importdescriptors-reads-the-label-before-it-parses-the-descriptor
+  "Core wallet/rpc/backup.cpp:147-157 ProcessDescriptorImport reads the desc
+STRING, then active, then LabelFromValue(data[\"label\"]), and only then
+calls Parse(descriptor, keys, error, /*require_checksum=*/true). The order
+decides which error a doubly-invalid request is given, and
+wallet_labels.py:40-48 asserts exactly that pair: a request whose label is
+\"*\" AND whose descriptor carries no checksum answers -11 \"Invalid label
+name\", not the parse error.
+
+Ours bound the parsed descriptor first, so the same request answered -5
+\"Missing checksum\". Both single faults keep their own answer."
+  (with-wallet-test-node (node :keypool 3)
+    (with-rpc-wallet (nil)
+      (bl.wallet::rpc-createwallet node '("lbl")))
+    (with-rpc-wallet ("lbl")
+      (let ((bare "pkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"))
+        ;; wallet_labels.py:40-48: no checksum AND label "*".
+        (let ((err (%aval "error"
+                          (first (bl.wallet::rpc-importdescriptors
+                                  node (list (list (%ht "desc" bare
+                                                        "label" "*"
+                                                        "timestamp" "now"))))))))
+          (is (= -11 (%aval "code" err))
+              "a \"*\" label with an unchecksummed descriptor answered ~D"
+              (%aval "code" err))
+          (is (string= "Invalid label name" (%aval "message" err))))
+        ;; A well-formed descriptor with the same label: still -11.
+        (let ((err (%aval "error"
+                          (first (bl.wallet::rpc-importdescriptors
+                                  node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum bare)
+                                                        "label" "*"
+                                                        "timestamp" "now"))))))))
+          (is (= -11 (%aval "code" err)))
+          (is (string= "Invalid label name" (%aval "message" err))))
+        ;; No label, no checksum: the parse error is still the answer.
+        (let ((err (%aval "error"
+                          (first (bl.wallet::rpc-importdescriptors
+                                  node (list (list (%ht "desc" bare
+                                                        "timestamp" "now"))))))))
+          (is (= bl.rpc:+rpc-invalid-address-or-key+ (%aval "code" err)))
+          (is (string= "Missing checksum" (%aval "message" err))))))))
+
 (test gethdkeys-ignores-a-key-expression-with-no-extended-key
   "Core wallet/rpc/wallet.cpp:701-704: gethdkeys asks the descriptor for
 GetPubKeys(desc_pubkeys, desc_xpubs) and then iterates the XPUBS only, so a
