@@ -9881,3 +9881,57 @@ appear in one and not the other."
                  "getaddrmaninfo reports no ~A row" name))
       ;; not_publicly_routable is documented but never counted, as in Core.
       (is-false (assoc "not_publicly_routable" counts :test #'string=)))))
+
+;;; --- signrawtransactionwithkey over a pay-to-anchor input -------------------
+
+(test signrawtransactionwithkey-signs-a-pay-to-anchor-input-with-nothing
+  "A pay-to-anchor output (OP_1 <0x4e73>) is spent with an empty scriptSig and
+an empty witness: Core's SignStep answers it `return true;' with an EMPTY
+result (sign.cpp:706-707), ProduceSignature reaches none of its witness
+branches for TxoutType::ANCHOR so the stack is cleared and PushAll({}) is the
+scriptSig (:782-796), and VerifyScript passes on the interpreter's own anchor
+carve-out (interpreter.cpp:1990-1991). SIGNING ONE SUCCEEDS AND CHANGES
+NOTHING -- it takes no key and needs none, which is the point of the output
+type.
+
+Ours fell through to the unsupported-scriptPubKey-type arm and reported an
+error for an input nothing was wrong with:
+
+    spending_tx_signed = self.nodes[0].signrawtransactionwithkey(spending_tx, [], [])
+    assert 'errors' not in signed_tx                       (rpc_signrawtransactionwithkey.py:57)
+    assert_equal(spending_tx, spending_tx_signed[\"hex\"])   (:108)
+
+both reached with NO keys and NO prevtxs at all (:98-108)."
+  (let* ((node (make-test-node))
+         (anchor-spk (coerce #(#x51 #x02 #x4e #x73)
+                             '(simple-array (unsigned-byte 8) (*))))
+         (prev-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #x11))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
+                                                 :hash prev-hash :index 0)
+                               :script-sig (make-array 0 :element-type
+                                                       '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out
+                                :value 99000 :script-pubkey anchor-spk))
+              :lock-time 0))
+         (hex (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx)))
+         (prevtx (list (cons "txid" (bl.rpc:hash-to-hex prev-hash))
+                       (cons "vout" 0)
+                       (cons "scriptPubKey" (bl.crypto:bytes-to-hex anchor-spk))
+                       ;; The amount as a client sends one, in BTC.
+                       (cons "amount" "0.00100000")))
+         (result (bl.rpc:dispatch-rpc-method
+                  node "signrawtransactionwithkey"
+                  (wire-params (list hex '() (list prevtx))))))
+    (flet ((field (name) (cdr (assoc name result :test #'string=))))
+      (is (eq t (field "complete"))
+          "a P2A input needs no key, so signing it is complete")
+      (is-false (assoc "errors" result :test #'string=)
+                "Core omits `errors' entirely when there are none; got ~S"
+                (field "errors"))
+      ;; Signing a P2A prevout is a no-op, so the bytes are unchanged.
+      (is (string= hex (field "hex"))))))

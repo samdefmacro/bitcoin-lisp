@@ -751,6 +751,19 @@ must be bound by the caller."
           ((string= type "witness_v1_taproot")
            (%p2tr-input spk amount tap-sighash-type tr-keymap tr-scripts
                         pubmap spent-utxos))
+          ;; Pay-to-anchor (OP_1 <0x4e73>): Core's SignStep ANCHOR case is
+          ;; `return true;' with an EMPTY result (sign.cpp:706-707), so
+          ;; ProduceSignature leaves both the scriptSig and the witness empty
+          ;; and VerifyScript passes on the interpreter's own anchor carve-out
+          ;; (interpreter.cpp:1990-1991). Signing a P2A input is a no-op that
+          ;; SUCCEEDS -- it takes no key and needs none, which is the whole
+          ;; point of the output type. Falling through to the unsupported-type
+          ;; arm reported an error for an input nothing was wrong with, and
+          ;; rpc_signrawtransactionwithkey.py:98-108 signs one with NO keys and
+          ;; NO prevtxs at all, then asserts `errors' is absent (:57) and that
+          ;; the signed hex equals the unsigned one (:108).
+          ((string= type "anchor")
+           (values (%make-input-sig :kind :anchor :needed 0)))
           ((string= type "scripthash")   ; P2SH (wrapped)
            (cond
              ((null redeem) (fail "P2SH requires redeemScript"))
@@ -847,6 +860,12 @@ the second one saw."
         (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                    (values nil (list (cdr s) (car s)) nil)))
         (:p2tr (values nil (list (input-sig-tap sig)) nil))
+        ;; Pay-to-anchor: no scriptSig, no witness, no error. Core's
+        ;; ProduceSignature reaches none of its witness branches for
+        ;; TxoutType::ANCHOR, so sigdata.witness stays false, the witness
+        ;; stack is cleared and PushAll({}) is the empty scriptSig
+        ;; (sign.cpp:782-796).
+        (:anchor (values nil nil nil))
         ;; A script-path spend: the satisfaction, then the leaf script, then
         ;; the control block (BIP341). %TR-SCRIPT-PATH-WITNESS already appended
         ;; the last two, so there is nothing to assemble here.
