@@ -158,6 +158,27 @@ vBits serialization)."
 
 ;;; --- RPCs ---
 
+(defconstant +max-outputs-per-block+ (floor 4000000 36)
+  "Core MAX_OUTPUTS_PER_BLOCK (coins.cpp:384): MAX_BLOCK_WEIGHT over the
+weight of the smallest serializable output, the bound AccessByTxid walks
+when it looks for any unspent output of a txid.")
+
+(defun %block-hash-of-unspent-output (node chain-state txids)
+  "The hash of the block holding the first of TXIDS that still has an unspent
+output, or NIL: Core's gettxoutproof without a blockhash (txoutproof.cpp:
+71-80) walks each txid's outputs through AccessByTxid (coins.cpp:386-394) and
+takes the active chain's block at the coin's height."
+  (let ((view (rpc-get-utxo-set node)))
+    (when view
+      (dolist (txid txids)
+        (loop for n from 0 below +max-outputs-per-block+
+              for coin = (bl.store:get-utxo view txid n)
+              when coin
+                do (let ((entry (bl.store:get-block-at-height
+                                 chain-state (bl.store:utxo-entry-height coin))))
+                     (return-from %block-hash-of-unspent-output
+                       (and entry (bl.store:block-index-entry-hash entry)))))))))
+
 (define-rpc "gettxoutproof" (node ((txids :array) blockhash-hex))
   "Build a merkle proof that the given TXIDs are in a block (Bitcoin Core
 gettxoutproof). PARAMS: (txids [blockhash]). On this pruned node the block
@@ -172,20 +193,19 @@ hex-encoded CMerkleBlock."
     (let* ((block-hash
              (cond
                (blockhash-hex (parse-hash-v blockhash-hex "blockhash"))
+               ;; No blockhash: Core looks for an UNSPENT output of any of the
+               ;; txids in the coins view and takes the block at its height
+               ;; (txoutproof.cpp:71-80, AccessByTxid), then asks the txindex,
+               ;; and only then says `Transaction not yet in block` (:88-91).
+               ((%block-hash-of-unspent-output node chain-state wanted))
                ((let ((ti (rpc-get-tx-index node)))
-                  (and ti (bl.store:tx-index-enabled ti)))
-                (let ((loc (bl.store:txindex-lookup
-                            (rpc-get-tx-index node) (first wanted))))
-                  (unless loc
-                    (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                      :message "Transaction not in txindex; pass a blockhash"))
-                  (bl.store:tx-location-block-hash loc)))
-               (t (error 'rpc-error :code +rpc-invalid-parameter+
-                                    :message "Need a blockhash (no txindex on this node)"))))
-           (block (bl.store:get-block block-store block-hash)))
-      (unless block
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
-                          :message "Block not found (pruned?)"))
+                  (and ti (bl.store:tx-index-enabled ti)
+                       (let ((loc (bl.store:txindex-lookup ti (first wanted))))
+                         (and loc (bl.store:tx-location-block-hash loc))))))
+               (t (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                    :message "Transaction not yet in block"))))
+           ;; CheckBlockDataAvailability + ReadBlock (txoutproof.cpp:101-107).
+           (block (block-body-checked chain-state block-store block-hash)))
       (let* ((txs (bl.ser:bitcoin-block-transactions block))
              (txids-vec (map 'vector #'bl.ser:transaction-hash txs))
              (match (make-array (length txids-vec) :initial-element nil)))

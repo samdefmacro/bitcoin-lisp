@@ -2559,6 +2559,14 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
                 (hash (bl.ser:block-header-hash
                        (bl.ser:bitcoin-block-header blk))))
            (bl.store:store-block store blk)
+           ;; getblock reads bodies through the index (Core LookupBlockIndex
+           ;; before GetRawBlockChecked): a body the index does not know is
+           ;; -5 Block not found, so the header goes in as a real block's would.
+           (bl.store:add-block-index-entry
+            (bl:node-chain-state node)
+            (bl.store:make-block-index-entry :hash hash :height 1 :chain-work 2
+                                             :status :valid
+                                             :header (bl.ser:bitcoin-block-header blk)))
            (let ((cb (cdr (assoc "coinbase_tx"
                                  (bl.rpc::rpc-getblock
                                   node (list (bl.rpc:hash-to-hex hash) 1))
@@ -2679,6 +2687,57 @@ with -norpccookiefile is up). Ours logged none of them."
     (is-true (find "init message: Done loading" lines :test #'search)
              "the line reads exactly as Core's"))
   (is-true (fboundp 'bl:init-message)))
+
+(test a-header-only-block-is-not-available-not-not-found
+  "Core answers a body request for a header the index holds but never got the
+body of with -1 `Block not available (not fully downloaded)` (GetBlockChecked
+over CheckBlockDataAvailability, rpc/blockchain.cpp:671-700), and keeps -5
+`Block not found` for a hash the index does not know. Ours said -5 for both,
+so rpc_getblockfrompeer.py:61 and rpc_getblockstats.py:188, which ask about a
+headers-only tip, read the wrong code and text. gettxoutproof reads a body the
+same way (txoutproof.cpp:103)."
+  (with-network (:regtest)
+   (let* ((node (regtest-node-fixture "header-only"))
+         (cs (bl:node-chain-state node))
+         (header (bl.ser:make-block-header
+                  :version 1
+                  :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)
+                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)
+                  :timestamp 1 :bits #x207fffff :nonce 0))
+         (hash (bl.ser:block-header-hash header))
+         (hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))
+         (unknown (make-string 64 :initial-element #\1))
+         (not-available (cons -1 "Block not available (not fully downloaded)")))
+    (bl.store:add-block-index-entry
+     cs (bl.store:make-block-index-entry :hash hash :height 1 :header header
+                                         :chain-work 2 :status :header-valid))
+    (is (equal not-available (%rpc-wire-error node "getblock" (list hex))))
+    (is (equal not-available (%rpc-wire-error node "getblockstats" (list hex))))
+    (is (equal not-available
+               (%rpc-wire-error node "gettxoutproof" (list (list unknown) hex))))
+    ;; Control: an unknown hash is still -5 Block not found.
+    (is (equal (cons -5 "Block not found") (%rpc-wire-error node "getblock" (list unknown))))
+    (is (equal (cons -5 "Block not found") (%rpc-wire-error node "getblockstats" (list unknown)))))))
+
+(test gettxoutproof-finds-the-block-through-an-unspent-output
+  "Without a blockhash Core looks for an unspent output of any given txid in
+the coins view and takes the block at that coin's height (txoutproof.cpp:
+71-80, AccessByTxid), then the txindex, and only then answers -5
+`Transaction not yet in block` (:88-91). Ours demanded a blockhash or a txindex
+(-8 `Need a blockhash`), so rpc_txoutproof.py:37 never got Core's answer. The
+coinbase of a freshly mined block has an unspent output, so its proof comes
+back with no blockhash and no txindex; a txid with no coin gets Core's text."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "txoutproof-utxo"))
+           (hashes (generate-regtest-blocks node 1))
+           (block (bl.rpc:dispatch-rpc-method node "getblock" (list (first hashes))))
+           (coinbase (first (cdr (assoc "tx" block :test #'string=)))))
+      (is (stringp coinbase) "control: the mined block reports its coinbase txid")
+      (is (stringp (bl.rpc:dispatch-rpc-method node "gettxoutproof" (list (list coinbase))))
+          "the proof is found through the coinbase's unspent output, no blockhash given")
+      (is (equal (cons -5 "Transaction not yet in block")
+                 (%rpc-wire-error node "gettxoutproof"
+                                  (list (list (make-string 64 :initial-element #\2)))))))))
 (test rpc-start-failure-is-an-init-error
   "Core's AppInitMain turns a false from AppInitServers into
 InitError(\"Unable to start HTTP server. See debug log for details.\")
