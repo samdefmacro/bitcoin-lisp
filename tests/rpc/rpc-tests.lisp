@@ -2640,6 +2640,45 @@ constant-time but wrong would hand out access."
 ;;; --- -rpcauth / -rpcallowip (7.4b) ---
 
 
+
+(test rpc-server-with-the-cookie-file-disabled
+  "With *rpc-cookie-file* :disabled (-norpccookiefile) the server starts on the
+-rpcauth users alone, writes no .cookie, and logs Core's line (httprpc.cpp:
+261-262, rpc/request.cpp:115). Control: the default writes the cookie."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19989)
+          (rpcauth (mapcar #'third *core-whitelist-users*)))
+      (setf (bl:node-data-directory node) dir)
+      (let ((lines (capture-log-lines
+                    (lambda ()
+                      (let ((bl.rpc:*rpc-cookie-file* :disabled))
+                        (is-true (bl.rpc:start-rpc-server node :port port :rpc-auth rpcauth)
+                                 "the server starts without a cookie file"))))))
+        (is (null (probe-file (merge-pathnames ".cookie" dir)))
+            "no cookie file is written when it is disabled")
+        (is-true (find "RPC authentication cookie file generation is disabled."
+                       lines :test #'search)
+                 "Core's log line for the disabled cookie"))
+      (bl.rpc:stop-rpc-server)
+      ;; Control: the default writes the cookie.
+      (let ((bl.rpc:*rpc-cookie-file* nil))
+        (is-true (bl.rpc:start-rpc-server node :port port :rpc-auth rpcauth))
+        (is-true (probe-file (merge-pathnames ".cookie" dir))
+                 "control: with the default, the cookie is written"))
+      (bl.rpc:stop-rpc-server))))
+
+(test init-message-lines-are-cores
+  "Core's non-GUI build logs every uiInterface.InitMessage as `init message:
+<text>` (noui.cpp:56) and the functional framework waits on those lines
+(feature_init.py: `Verifying blocks`, `Starting network threads`;
+rpc_users.py:127: `Done loading`, which is also how it knows a node started
+with -norpccookiefile is up). Ours logged none of them."
+  (let ((lines (capture-log-lines (lambda () (bl:init-message "Done loading")))))
+    (is-true (find "init message: Done loading" lines :test #'search)
+             "the line reads exactly as Core's"))
+  (is-true (fboundp 'bl:init-message)))
 (test rpc-start-failure-is-an-init-error
   "Core's AppInitMain turns a false from AppInitServers into
 InitError(\"Unable to start HTTP server. See debug log for details.\")

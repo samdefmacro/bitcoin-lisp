@@ -785,7 +785,8 @@ the ambient umask. See %WRITE-COOKIE-FILE for why that distinction matters.")
 
 (defun rpc-cookie-path (data-directory)
   "Where the cookie goes for DATA-DIRECTORY, honouring -rpccookiefile."
-  (cond ((null *rpc-cookie-file*) (merge-pathnames ".cookie" data-directory))
+  (cond ((eq *rpc-cookie-file* :disabled) nil)   ; -norpccookiefile: no file at all
+        ((null *rpc-cookie-file*) (merge-pathnames ".cookie" data-directory))
         ;; An absolute path is used as given; a relative one hangs off the data
         ;; directory, which is what Core means by "prefixed by a net-specific
         ;; datadir location".
@@ -1516,8 +1517,16 @@ Callers must have bound the listening socket first — this writes .cookie, and
            (setf *rpc-credentials* (append pair rpcauth-credentials)
                  *rpc-cookie-path* cookie-path)
            t))
-    (if (and user password)
-        (install (list (hash-rpc-credential user password)) nil)
+    (cond
+      ((and user password)
+       (install (list (hash-rpc-credential user password)) nil))
+      ;; -norpccookiefile: Core's GenerateAuthCookie answers DISABLED
+      ;; (rpc/request.cpp:115) and InitRPCAuthentication logs it and carries
+      ;; on (httprpc.cpp:261-262) -- only -rpcauth users can authenticate.
+      ((eq *rpc-cookie-file* :disabled)
+       (bl.log:node-log :info "RPC authentication cookie file generation is disabled.")
+       (install '() nil))
+      (t
         (multiple-value-bind (path secret)
             (let ((data-directory (rpc-server-data-directory node)))
               (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
@@ -1527,7 +1536,7 @@ Callers must have bound the listening socket first — this writes .cookie, and
                  (bl.log:node-log
                   :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
 .cookie file could not be written, so no request could be authorized")
-                 nil))))))
+                 nil)))))))
 
 (defun start-rpc-server (node &rest options
                          &key port (bind "127.0.0.1") (bind-supplied-p nil)
