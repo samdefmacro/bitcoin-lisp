@@ -228,11 +228,50 @@ reason the method exists — it is undocumented and for testing only."
               (push (vector method position name (json-bool string-p)) rows))))))
     (coerce (nreverse rows) 'vector)))
 
+(defun %method-help-text (method)
+  "The help document for one METHOD, the shape Core's RPCHelpMan::ToString
+builds (rpc/util.cpp:773-793): the ONE-LINE summary -- the method name and
+its declared arguments, a run of optional ones wrapped in `( )' -- then a
+blank line, then the description.
+
+    getblockchaininfo
+
+    Returns an object containing various state info regarding blockchain
+    processing.
+
+The name-then-newline opening is the part clients rely on: Core's
+rpc_named_arguments.py:21 asserts `node.help(command='getblockchaininfo')
+.startswith('getblockchaininfo\\n')', and the web console reads the first
+word of each line. Answering the bare method name, as this did, has no
+newline at all.
+
+DIVERGENCE, unchanged from before: no method here carries Core's Arguments,
+Result or Examples sections, so the document stops after the description."
+  (let ((description (rpc-method-description method)))
+    (if description
+        (format nil "~A~%~%~A~%" (rpc-usage-line method)
+                (string-trim '(#\Space #\Tab #\Newline #\Return) description))
+        (format nil "~A~%" (rpc-usage-line method)))))
+
 (define-rpc "help" (node params)
-  "List available RPC methods, or echo the name of a known one (Bitcoin Core
-help). A full per-method help text is out of scope, except for the methods
-whose help text IS their behaviour: those register it in *RPC-HELP-TEXTS* and
-are answered from there, as Core answers every method from its own RPCHelpMan.
+  "List available RPC methods, or answer with one method's help document
+(Bitcoin Core help / CRPCTable::help, rpc/server.cpp:295-330).
+
+A bare call lists every method Core would list: the ones it files under the
+category \"hidden\" -- generate*, invalidateblock, setmocktime, echo,
+addconnection, getorphantxs -- are left out (:310-311, *RPC-HIDDEN-METHODS*),
+because they are test and debugging entry points rather than part of the
+node's interface. `help <name>' still answers for a hidden method, which is
+how rpc_orphans.py:152-153 tells the two apart: getorphantxs must be absent
+from the listing AND must not be an \"unknown command\".
+
+DIVERGENCE: the listing is one bare method name per line rather than Core's
+usage lines under `== Category ==' headings; this node carries no category
+for its methods (rpc_help.py's test_categories is what wants them).
+
+A method whose help text IS its behaviour registers it in *RPC-HELP-TEXTS*
+(register-rpc-help) and is answered from there first -- today `generate'
+alone, whose deprecation notice is what rpc_generate.py:129-132 asks for.
 
 The undocumented \"dump_all_command_conversions\" argument returns the
 argument-conversion table instead (Core rpc/server.cpp:135-138); it is what
@@ -244,11 +283,14 @@ rpc_help.py uses to check this node against Core's client.cpp."
        (%dump-all-command-conversions))
       ((and method (stringp method))
        (cond ((gethash method *rpc-help-texts*))
-             ((gethash method *rpc-methods*) method)
+             ((gethash method *rpc-methods*) (%method-help-text method))
              (t (format nil "help: unknown command: ~A" method))))
       (t
        (let ((names '()))
-         (maphash (lambda (k v) (declare (ignore v)) (push k names)) *rpc-methods*)
+         (maphash (lambda (k v)
+                    (declare (ignore v))
+                    (unless (rpc-method-hidden-p k) (push k names)))
+                  *rpc-methods*)
          (format nil "~{~A~^~%~}" (sort names #'string<)))))))
 
 (define-rpc "getindexinfo" (node params)

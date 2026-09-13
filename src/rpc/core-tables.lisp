@@ -712,3 +712,23 @@ quietly.")
     ("walletpassphrasechange" t t)
     ("walletprocesspsbt" t nil nil nil nil)
     ))
+
+;;; --- The "hidden" category (Core's RegisterRPCCommands tables) ---
+;;;
+;;; Core's command table pairs every method with a CATEGORY, and one of them
+;;; is literally "hidden": CRPCTable::help skips such a method when listing
+;;; ALL commands (`if ((strCommand != "" || pcmd->category == "hidden") &&
+;;; strMethod != strCommand) continue;', rpc/server.cpp:310-311) while
+;;; `help <name>' still answers for it. These are the test and debugging
+;;; entry points -- generate*, invalidateblock, setmocktime, echo,
+;;; addconnection, getorphantxs -- which the framework calls by name and
+;;; which Core deliberately keeps out of a user's command list.
+;;;
+;;; GENERATED from the {"hidden", &name} rows of Core's RegisterRPCCommands
+;;; tables. Do not hand-edit.
+(setf *rpc-hidden-methods*
+  '("addconnection" "addpeeraddress" "echo" "echoipc" "echojson"
+    "estimaterawfee" "generate" "generateblock" "generatetoaddress"
+    "generatetodescriptor" "getmempoolfeeratediagram" "getorphantxs"
+    "getrawaddrman" "invalidateblock" "mockscheduler" "reconsiderblock"
+    "sendmsgtopeer" "setmocktime" "syncwithvalidationinterfacequeue"))
