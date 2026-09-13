@@ -309,6 +309,26 @@ vector."
     (is (= 5 (length (bl.ser:tx-in-script-sig
                       (aref (bl.ser:transaction-inputs tx) 0)))))))
 
+(test combinerawtransaction-refuses-an-empty-array-the-way-core-does
+  "Core builds one CMutableTransaction per element and only THEN refuses an
+empty list, with RPC_DESERIALIZATION_ERROR \"Missing transactions\"
+(rpc/rawtransaction.cpp:608-619) -- rpc_createmultisig.py:150, one line after
+the -22 \"TX decode failed\" it also asks for. Ours answered -8 with a sentence
+of its own making, which no client can match."
+  (let ((node (bl:make-node :network :regtest)))
+    (is (equal (cons -22 "Missing transactions")
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method node "combinerawtransaction"
+                                              (wire-params (list (vector))))))))
+    ;; :149's row is the control that the decode loop still runs first and
+    ;; names the offending index.
+    (is (equal (cons -22 "TX decode failed for tx 0. Make sure the tx has at least one input.")
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method node "combinerawtransaction"
+                                              (wire-params (list (vector "00"))))))))))
+
 ;;; --- Wallet P5 SIGNER role -----------------------------------------------
 
 (defun %psbt-partial-sigs (psbt)
