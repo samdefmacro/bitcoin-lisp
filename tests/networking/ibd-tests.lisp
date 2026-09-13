@@ -4607,3 +4607,38 @@ every ready peer, and the Phase-1 header sync picked the only one there was."
     (is-true (bl.net::header-sync-candidate-p full))
     (is-false (bl.net::header-sync-candidate-p fetch))
     (is-false (bl.net::header-sync-candidate-p mute))))
+
+(test an-empty-headers-answer-re-arms-the-getheaders-throttle
+  "Core's ProcessHeadersMessage clears m_last_getheaders_timestamp on a headers
+message with NO headers -- it cannot be an announcement, so it is taken as the
+response to our last getheaders (net_processing.cpp:2977-2979) -- as well as on
+a connecting batch (:3040-3043). Ours cleared it only for the connecting batch,
+so a peer that answered our getheaders with nothing held the two-minute
+throttle shut: every header it then announced was UNCONNECTING, and the
+unconnecting path is the one that would have asked for the chain to connect
+them. p2p_segwit.py:309 timed out there, node1 sitting at height 0 after a
+hundred single-header announcements."
+  (with-network (:regtest)
+    (let* ((state (bl.store:make-chain-state))
+           (genesis (bl.store:make-block-index-entry
+                     :hash (%bd-hash 0) :height 0 :chain-work 1
+                     :status :valid))
+           (orphan (%mtp-header (%bd-hash 900) 1700000000 :grind nil))
+           (peer (bl.net:make-peer :address "198.51.100.11" :state :ready
+                                   :services bl.ser:+node-network+)))
+      (bl.store:add-block-index-entry state genesis)
+      (bl.store:update-chain-tip state (%bd-hash 0) 0)
+      (let ((armed (bl.ser:get-node-time)))
+        (setf (bl.net:peer-last-getheaders-time peer) armed)
+        (captured-sends
+         (lambda () (bl.net:ingest-headers-from-peer peer '() state)))
+        (is (= 0 (bl.net:peer-last-getheaders-time peer))
+            "an empty answer re-arms the throttle")
+        ;; Control: an announcement we cannot connect is NOT an answer, so it
+        ;; leaves the throttle where it was (Core asks through the throttled
+        ;; HandleUnconnectingHeaders instead).
+        (setf (bl.net:peer-last-getheaders-time peer) armed)
+        (captured-sends
+         (lambda () (bl.net:ingest-headers-from-peer peer (list orphan) state)))
+        (is (= armed (bl.net:peer-last-getheaders-time peer))
+            "control: an unconnecting announcement does not re-arm it")))))
