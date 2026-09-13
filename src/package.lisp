@@ -72,6 +72,7 @@ init.cpp, node/. src/node/.")
    #:unknown-config-file-keys
    #:known-config-option-p
    #:asmap-file-path
+   #:start-rpc-early
    #:defer-log
    #:*category-log-levels*
    #:category-log-level

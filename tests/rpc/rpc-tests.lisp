@@ -2639,6 +2639,31 @@ constant-time but wrong would hand out access."
 
 ;;; --- -rpcauth / -rpcallowip (7.4b) ---
 
+
+(test rpc-start-failure-is-an-init-error
+  "Core's AppInitMain turns a false from AppInitServers into
+InitError(\"Unable to start HTTP server. See debug log for details.\")
+(init.cpp:1559-1561): a malformed -rpcauth, a bad -rpcallowip or a port in use
+ends the process with that line on stderr and exit status 1, which is what the
+functional framework's assert_start_raises_init_error waits sixty seconds for.
+Ours logged the cause and carried on without an RPC server. Control: the same
+start with a well-formed -rpcauth returns the acceptor."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19991))
+      (setf (bl:node-data-directory node) dir)
+      (flet ((start (rpc-auth)
+               (apply #'bl:start-rpc-early node port "127.0.0.1" t nil nil rpc-auth
+                      (list nil nil nil nil :regtest nil t nil nil))))
+        (handler-case
+            (progn (start '("foo")) (fail "a malformed -rpcauth must refuse to start"))
+          (bl.err:init-error (e)
+            (is (string= "Unable to start HTTP server. See debug log for details."
+                         (princ-to-string e)))))
+        (let ((server (start (mapcar #'third *core-whitelist-users*))))
+          (is-true server "control: a well-formed -rpcauth starts the server")
+          (bl.rpc:stop-rpc-server))))))
 (test rpc-auth-rpcauth-parsing
   "-rpcauth is USERNAME:SALT$HMAC and nothing else. Core splits on #\\: demanding
 exactly two fields and splits the second on #\\$ demanding exactly two more

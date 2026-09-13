@@ -921,7 +921,7 @@ it; the indexes (Step 8) and -forcecompactdb."
   ;; monitoring saw a dead node. It now gets "-28 Replaying mempool...", which
   ;; is retryable and true.
   (when rpc-port
-    (%start-rpc-early *node* rpc-port rpc-bind rpc-bind-supplied-p
+    (start-rpc-early *node* rpc-port rpc-bind rpc-bind-supplied-p
                       rpc-user rpc-password rpc-auth rpc-allow-ip
                       rpc-whitelist rpc-whitelist-default
                       rest-enabled network webui webui-supplied-p
@@ -1440,7 +1440,7 @@ listener, the onion listener with its Tor control connection, and
 per-process sync state and the at-tip liveness signal reset for this run."
   (setf (node-running *node*) t)
 
-  ;; The RPC server is UP by now (%start-rpc-early, from %INIT-SERVICES); the node is
+  ;; The RPC server is UP by now (start-rpc-early, from %INIT-SERVICES); the node is
   ;; ready, so stop answering -28.
   (bl.rpc:finish-rpc-warmup)
   (when rpc-port
