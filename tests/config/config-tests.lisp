@@ -1627,15 +1627,34 @@ option this repo keeps finding."
          (progn
            (ensure-directories-exist dir)
            ;; A relative -pid hangs off the datadir; the default name applies
-           ;; when -pid is absent; an absolute path wins outright.
-           (is (equal (merge-pathnames "node.pid" dir)
-                      (bl::pid-file-path "node.pid" dir)))
-           (is (equal (merge-pathnames "bitcoin-lisp.pid" dir)
-                      (bl::pid-file-path nil dir)))
-           (is (equal #p"/var/run/x.pid"
-                      (bl::pid-file-path "/var/run/x.pid" dir)))
-           ;; -nopid parses to "0", which Core reads as IsArgNegated.
-           (is-false (bl::pid-file-path "0" dir))
+           ;; when -pid is absent; an absolute path wins outright; -nopid
+           ;; parses to "0", which Core reads as IsArgNegated.
+           ;;
+           ;; And a relative one is NETWORK-specific: GetPidFile takes
+           ;; AbsPathForConfigVal's default net_specific=true
+           ;; (common/args.h:42, init.cpp:180), so on regtest the file lands in
+           ;; <datadir>/regtest/ -- which is where feature_init.py:256 looks
+           ;; for it (node.chain_path). Mainnet's network directory IS the
+           ;; datadir root, so that spelling is unchanged, and an absolute path
+           ;; is taken as given on every network.
+           (loop for (arg net expected)
+                   in (list (list "node.pid" nil (merge-pathnames "node.pid" dir))
+                            (list nil nil (merge-pathnames "bitcoin-lisp.pid" dir))
+                            (list "/var/run/x.pid" nil #p"/var/run/x.pid")
+                            (list "0" nil nil)
+                            (list "node.pid" :regtest
+                                  (merge-pathnames "regtest/node.pid" dir))
+                            (list nil :regtest
+                                  (merge-pathnames "regtest/bitcoin-lisp.pid" dir))
+                            (list "node.pid" :mainnet (merge-pathnames "node.pid" dir))
+                            (list "/var/run/x.pid" :regtest #p"/var/run/x.pid"))
+                 do (is (equal expected (bl::pid-file-path arg dir net))
+                        "-pid=~A on ~A resolved wrongly" arg net))
+           (ensure-directories-exist (merge-pathnames "regtest/" dir))
+           (let ((path (bl::write-pid-file "net.pid" dir :regtest)))
+             (is (equal (merge-pathnames "regtest/net.pid" dir) path))
+             (is-true (probe-file path) "the network-directory pid file is missing"))
+           (bl::remove-pid-file)
            (let ((path (bl::write-pid-file "node.pid" dir)))
              (is-true (probe-file path) "no pid file was written")
              (is (= (sb-posix:getpid)
