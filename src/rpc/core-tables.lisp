@@ -150,23 +150,35 @@ quietly.")
 ;;; bumpfee and psbtbumpfee are declared that way (wallet/rpc/spend.cpp:960,
 ;;; 1166-1167), so both were absent and wallet_bumpfee.py died on fee_rate.
 ;;;
+;;; ⚠️ The rows are the DIRECT members of the OBJ_NAMED_PARAMS argument, and
+;;; every one of them. GetArgNames walks `arg.m_inner' and goes no deeper, so a
+;;; member of a member (subtractFeeFromOutputs' vout_index, input_weights'
+;;; txid/vout/weight) is NOT a named-only argument; and the members Core
+;;; appends from a helper (FundTxDoc's conf_target, estimate_mode, replaceable,
+;;; solving_data, spliced in with Cat<>) are. An earlier reading of this table
+;;; had both errors at once: it listed the nested names and dropped every
+;;; camelCase one — changeAddress, changePosition, includeWatching,
+;;; lockUnspents, feeRate, subtractFeeFromOutputs — so wallet_keypool.py:165,
+;;; which calls walletcreatefundedpsbt(feeRate=..., subtractFeeFromOutputs=...),
+;;; got "Unknown named parameter feeRate".
+;;;
 ;;; GENERATED from Core's RPCHelpMan declarations. Do not hand-edit.
 (setf *rpc-named-only-args*
   '(
     ("bumpfee" "conf_target" "fee_rate" "replaceable" "estimate_mode" "outputs" "original_change_index")
     ("createwalletdescriptor" "internal" "hdkey")
     ("dumptxoutset" "rollback")
-    ("fundrawtransaction" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "input_weights" "txid" "vout" "weight" "max_tx_weight")
+    ("fundrawtransaction" "add_inputs" "include_unsafe" "minconf" "maxconf" "changeAddress" "changePosition" "change_type" "includeWatching" "lockUnspents" "fee_rate" "feeRate" "subtractFeeFromOutputs" "input_weights" "max_tx_weight" "conf_target" "estimate_mode" "replaceable" "solving_data")
     ("gethdkeys" "active_only" "private")
     ("gettxspendingprevout" "mempool_only" "return_spending_tx")
     ("importmempool" "use_current_time" "apply_fee_delta_priority" "apply_unbroadcast_set")
-    ("listunspent" "include_immature_coinbase")
+    ("listunspent" "minimumAmount" "maximumAmount" "maximumCount" "minimumSumAmount" "include_immature_coinbase")
     ("psbtbumpfee" "conf_target" "fee_rate" "replaceable" "estimate_mode" "outputs" "original_change_index")
     ("scanblocks" "filter_false_positives")
-    ("send" "add_inputs" "include_unsafe" "minconf" "maxconf" "add_to_wallet" "change_address" "change_position" "change_type" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "weight" "locktime" "lock_unspents" "psbt" "subtract_fee_from_outputs" "vout_index" "max_tx_weight")
-    ("sendall" "add_to_wallet" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "locktime" "lock_unspents" "psbt" "send_max" "minconf" "maxconf" "version")
+    ("send" "add_inputs" "include_unsafe" "minconf" "maxconf" "add_to_wallet" "change_address" "change_position" "change_type" "fee_rate" "include_watching" "inputs" "locktime" "lock_unspents" "psbt" "subtract_fee_from_outputs" "max_tx_weight" "conf_target" "estimate_mode" "replaceable" "solving_data")
+    ("sendall" "add_to_wallet" "fee_rate" "include_watching" "inputs" "locktime" "lock_unspents" "psbt" "send_max" "minconf" "maxconf" "version" "conf_target" "estimate_mode" "replaceable" "solving_data")
     ("simulaterawtransaction" "include_watchonly")
-    ("walletcreatefundedpsbt" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "max_tx_weight")))
+    ("walletcreatefundedpsbt" "add_inputs" "include_unsafe" "minconf" "maxconf" "changeAddress" "changePosition" "change_type" "includeWatching" "lockUnspents" "fee_rate" "feeRate" "subtractFeeFromOutputs" "max_tx_weight" "conf_target" "estimate_mode" "replaceable" "solving_data")))
 
 ;;; Positional argument names for every RPC method Core declares, in declaration
 ;;; order — what transformNamedArguments (rpc/server.cpp:396) matches an incoming

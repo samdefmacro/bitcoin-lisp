@@ -9557,14 +9557,18 @@ approximation."
            (let ((h (make-hash-table :test 'equal)))
              (loop for (k v) on kvs by #'cddr do (setf (gethash k h) v))
              (bl.rpc::%named-params-to-positional method h))))
-    ;; send: outputs is positional 0, options is positional 4.
+    ;; send: outputs is positional 0, options is positional 4. `fee_rate' is
+    ;; BOTH a member and positional 3, and Core's GetArgNames reaches the
+    ;; positional one first, so it fills that slot; Core's own handler is what
+    ;; then pushes it into the options object
+    ;; (InterpretFeeEstimationInstructions, wallet/rpc/spend.cpp:44-62).
     (let ((out (call "send" "outputs" 1 "fee_rate" 2 "add_to_wallet" 3)))
       (is (= 5 (length out)) "send produced ~D slots, wanted 5" (length out))
       (is (eql 1 (first out)))
+      (is (eql 2 (fourth out)) "fee_rate belongs in its positional slot: ~S" out)
       (let ((options (fifth out)))
         (is-true (hash-table-p options) "the options slot is ~S" options)
         (when (hash-table-p options)
-          (is (eql 2 (gethash "fee_rate" options)))
           (is (eql 3 (gethash "add_to_wallet" options))))))
     ;; gettxspendingprevout's member, which is not a wallet RPC.
     (let ((out (call "gettxspendingprevout" "outputs" 1 "mempool_only" t)))
@@ -9572,6 +9576,65 @@ approximation."
                "mempool_only did not reach the options slot: ~S" out))
     ;; A name that is neither positional nor a member is still unknown.
     (signals bl.rpc:rpc-error (call "send" "outputs" 1 "nonesuch" 2))))
+
+(test named-only-members-are-cores-direct-inner-arguments
+  "GetArgNames walks the OBJ_NAMED_PARAMS argument's OWN m_inner and goes no
+deeper (rpc/util.cpp:745-757), so the named-only set is exactly its direct
+members -- every one of them, including those Core splices in from a helper
+with Cat<> (FundTxDoc's conf_target, estimate_mode, replaceable,
+solving_data), and none of the members OF a member (subtractFeeFromOutputs'
+vout_index, input_weights' txid/vout/weight).
+
+Our table had both errors at once: it carried the nested names and dropped
+every camelCase one, so walletcreatefundedpsbt(feeRate=..., subtractFeeFrom
+Outputs=[0]) -- wallet_keypool.py:165 -- answered `Unknown named parameter
+feeRate' while fundrawtransaction(txid=...) was quietly swallowed.
+
+Two ordering rules come with it, and both were wrong before:
+
+  - a name that is BOTH a member and a positional argument belongs to
+    whichever comes first in GetArgNames. send and sendall declare
+    conf_target, estimate_mode and fee_rate in both places (Core marks the
+    members .also_positional) and the positional slot is earlier, so
+    sendall(conf_target=6) fills the slot rather than the options object.
+  - the options object is pushed at the OBJ_NAMED_PARAMS slot, which is not
+    always called \"options\": listunspent's is \"query_options\", so a
+    lookup by name found no slot and dropped the collected members in
+    silence."
+  (flet ((call (method &rest kvs)
+           (let ((h (make-hash-table :test 'equal)))
+             (loop for (k v) on kvs by #'cddr do (setf (gethash k h) v))
+             (bl.rpc::%named-params-to-positional method h))))
+    ;; wallet_keypool.py:165's call: both camelCase members reach the options
+    ;; slot, which is positional 3.
+    (let* ((out (call "walletcreatefundedpsbt" "inputs" (vector) "outputs" (vector)
+                      "feeRate" 1/10000 "subtractFeeFromOutputs" (vector 0)))
+           (options (nth 3 out)))
+      (is (= 4 (length out)))
+      (is-true (hash-table-p options) "the options slot is ~S" options)
+      (when (hash-table-p options)
+        (is (eql 1/10000 (gethash "feeRate" options)))
+        (is (equalp (vector 0) (gethash "subtractFeeFromOutputs" options)))))
+    ;; A member Core splices in from FundTxDoc.
+    (let ((out (call "walletcreatefundedpsbt" "inputs" (vector) "outputs" (vector)
+                     "solving_data" 7)))
+      (is (eql 7 (and (hash-table-p (nth 3 out))
+                      (gethash "solving_data" (nth 3 out))))))
+    ;; Positional beats member where Core's order puts it first.
+    (let ((out (call "sendall" "recipients" (vector "x") "conf_target" 6 "send_max" t)))
+      (is (eql 6 (second out)) "conf_target belongs in its positional slot: ~S" out)
+      (is-true (and (hash-table-p (fifth out))
+                    (gethash "send_max" (fifth out)))))
+    ;; listunspent's options slot is query_options, positional 4.
+    (let ((out (call "listunspent" "minconf" 1 "minimumAmount" 5)))
+      (is (eql 1 (first out)))
+      (is (eql 5 (and (hash-table-p (nth 4 out))
+                      (gethash "minimumAmount" (nth 4 out))))))
+    ;; A member OF a member is not a named-only argument.
+    (signals bl.rpc:rpc-error
+      (call "walletcreatefundedpsbt" "inputs" (vector) "vout_index" 0))
+    (signals bl.rpc:rpc-error
+      (call "fundrawtransaction" "hexstring" "00" "txid" "ff"))))
 
 ;;;; --- The request boundary against an attacker-chosen tree depth ----------
 

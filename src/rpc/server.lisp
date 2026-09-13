@@ -372,28 +372,40 @@ argument already reaches every handler."
                                 :message "Parameter args must be an array"))
             (setf positional (coerce args 'list))))
         ;; Named-only members of the method's options object, collected out
-        ;; before the positional slots are matched. Core does this inline in
-        ;; the same loop (rpc/server.cpp:408); pulling it out first is the same
-        ;; thing, because a named-only name can never also be a positional one.
-        (let ((options '())
-              (option-names (cdr (assoc method *rpc-named-only-args*
-                                        :test #'string=))))
+        ;; before the positional slots are matched. Core does it inline in one
+        ;; loop over GetArgNames (rpc/server.cpp:408-415), where the members
+        ;; sit at the OBJ_NAMED_PARAMS argument's own position, so a name that
+        ;; is BOTH a member and a positional argument goes to whichever comes
+        ;; first. That is not hypothetical: send and sendall declare
+        ;; conf_target, estimate_mode and fee_rate positionally AND inside
+        ;; options (Core marks those members .also_positional) and the
+        ;; positional slot is earlier, so it wins. Collecting the members
+        ;; first without that rule would bury a positional argument in the
+        ;; options object.
+        (let* ((options '())
+               (option-names (cdr (assoc method *rpc-named-only-args*
+                                         :test #'string=)))
+               ;; The OBJ_NAMED_PARAMS slot, found by TYPE rather than by the
+               ;; name "options": listunspent calls its own "query_options",
+               ;; so a name lookup found no slot and silently dropped every
+               ;; option it had just collected.
+               (types (cdr (assoc method *rpc-arg-types* :test #'string=)))
+               (opt-slot (or (position :obj-named-params types)
+                             (position-if (lambda (n) (%named-arg-slot n "options"))
+                                          names))))
           (dolist (opt option-names)
-            (multiple-value-bind (v present) (gethash opt remaining)
-              (when present
-                (remhash opt remaining)
-                (push (cons opt v) options))))
+            (let ((positional-slot
+                    (position-if (lambda (n) (%named-arg-slot n opt)) names)))
+              (unless (and positional-slot opt-slot (< positional-slot opt-slot))
+                (multiple-value-bind (v present) (gethash opt remaining)
+                  (when present
+                    (remhash opt remaining)
+                    (push (cons opt v) options))))))
           (setf options (nreverse options))
           (when options
-            ;; Core pushes the accumulated object at the OPTIONS slot, which is
-            ;; the one positional argument of type OBJ_NAMED_PARAMS. Finding it
-            ;; by name is enough: every method that has one calls it "options",
-            ;; except send/sendall/walletcreatefundedpsbt, where Core's own
-            ;; help calls it "options" too.
-            (let ((slot (position-if (lambda (n) (%named-arg-slot n "options"))
-                                     names)))
-              (when (and slot (not (gethash "options" remaining)))
-                (setf (gethash "options" remaining)
+            (let ((slot-name (and opt-slot (nth opt-slot names))))
+              (when (and slot-name (not (gethash slot-name remaining)))
+                (setf (gethash slot-name remaining)
                       (let ((h (make-hash-table :test 'equal)))
                         (dolist (kv options h)
                           (setf (gethash (car kv) h) (cdr kv)))))))))
