@@ -87,8 +87,17 @@ or NIL if STRING contains a character outside the descriptor charset."
 (defun %check-descriptor-checksum (string require-checksum)
   "Validate and strip an optional trailing '#checksum' (Core's CheckChecksum).
 Returns (values body computed-checksum). Signals rpc-error with Core's exact
-messages on any checksum problem."
-  (let ((parts (uiop:split-string string :separator "#")))
+messages on any checksum problem.
+
+Core's Split(sp, '#') of an EMPTY descriptor yields one empty span, so \"\" is
+a body like any other: it carries no checksum (`Missing checksum' where one is
+required) and otherwise reaches ParseScript, which names it -- `'' is not a
+valid descriptor function', rpc_getdescriptorinfo.py:41. UIOP:SPLIT-STRING
+answers NIL for the empty string rather than one empty part, so BODY was NIL,
+DESCRIPTOR-CHECKSUM ran LOOP ACROSS over it, and the TYPE-ERROR left the RPC
+boundary as -32603 Internal error -- the node reporting itself broken for a
+caller's empty string."
+  (let ((parts (or (uiop:split-string string :separator "#") (list ""))))
     (when (> (length parts) 2)
       (%desc-error "Multiple '#' symbols"))
     (when (and (= (length parts) 1) require-checksum)
