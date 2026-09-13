@@ -62,11 +62,96 @@ the services gate (CNode::ExpectServicesFromConn)."
     ;; A limited peer is desirable only near the tip.
     (is-false (bl.net::has-all-desirable-service-flags-p limited nil))
     (is-true (bl.net::has-all-desirable-service-flags-p limited t))
+    ;; The gate's guard is Core's ExpectServicesFromConn (net.h:833-847),
+    ;; whose switch answers false for INBOUND, MANUAL and FEELER and true for
+    ;; OUTBOUND_FULL_RELAY, BLOCK_RELAY and ADDR_FETCH. It is asked at
+    ;; net_processing.cpp:3613.
     (flet ((expects (&rest args)
-             (bl.net:peer-outbound-or-block-relay-p
+             (bl.net:peer-expects-services-p
               (apply #'bl.net:make-peer args))))
       (is-true (expects :conn-type :outbound-full-relay))
       (is-true (expects :conn-type :block-relay))
+      (is-true (expects :conn-type :addr-fetch)
+               "an addr-fetch dial is held to the desirable services too")
       (is-false (expects :conn-type :manual))
       (is-false (expects :conn-type :feeler))
-      (is-false (expects :conn-type :inbound)))))
+      (is-false (expects :conn-type :inbound))
+      (is-false (expects :conn-type :outbound-full-relay :inbound t)
+                "an inbound connection is exempt whatever its type says"))
+    ;; And the eviction predicate stays a DIFFERENT set: Core's
+    ;; IsOutboundOrBlockRelayConn (net.h:771-785) is the two automatic
+    ;; outbound types only, and reading it as the services guard is what let
+    ;; an addr-fetch peer through.
+    (flet ((evictable (type)
+             (bl.net:peer-outbound-or-block-relay-p
+              (bl.net:make-peer :conn-type type))))
+      (is-true (evictable :outbound-full-relay))
+      (is-true (evictable :block-relay))
+      (is-false (evictable :addr-fetch)
+                "the two predicates differ exactly here"))))
+
+(test an-addr-fetch-dial-is-refused-for-undesirable-services
+  "Core guards the VERSION-time services gate with CNode::ExpectServicesFromConn
+(net_processing.cpp:3613), and that switch (net.h:833-847) covers ADDR_FETCH
+alongside OUTBOUND_FULL_RELAY and BLOCK_RELAY, exempting only INBOUND, MANUAL
+and FEELER. Ours guarded it with IsOutboundOrBlockRelayConn -- the eviction
+predicate, which is the two automatic outbound types and nothing else -- so an
+addr-fetch dial to a peer offering NODE_WITNESS alone completed its handshake.
+
+p2p_handshake.py:53-64 walks all three connection types against the same three
+undesirable service sets and asserts a disconnect for each; the addr-fetch row
+was the first one our node failed, and the node's log shows six `does not
+offer the expected services' lines where Core writes nine."
+  (flet ((handshake (conn-type services)
+           ;; A real loopback dial whose far end answers with a version
+           ;; offering SERVICES and nothing more.
+           (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+             (when srv
+               (unwind-protect
+                    (let* ((port (usocket:get-local-port srv))
+                           (done nil)
+                           (server
+                             (bt:make-thread
+                              (lambda ()
+                                (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                                  (when conn
+                                    (bl.net:send-bytes
+                                     conn
+                                     (bl.ser:serialize-message
+                                      "version"
+                                      (bl.ser:make-version-message-bytes
+                                       :services services)))
+                                    (bl.net:send-bytes conn (bl.ser:make-verack-message))
+                                    (loop repeat 100 until done do (sleep 0.05))
+                                    (bl.net:close-connection conn))))
+                              :name "test-services-peer")))
+                      (sleep 0.2)
+                      (let ((peer (bl.net:connect-peer "127.0.0.1" port)))
+                        (unwind-protect
+                             (when peer
+                               ;; PERFORM-HANDSHAKE sets the type itself, and
+                               ;; its default would overwrite any set here.
+                               (and (bl.net:perform-handshake
+                                     peer :conn-type conn-type)
+                                    t))
+                          (setf done t)
+                          (when peer (ignore-errors (bl.net:disconnect-peer peer)))
+                          (ignore-errors (bt:join-thread server)))))
+                 (bl.net:close-listener srv))))))
+    (let ((witness-only bl.ser:+node-witness+)
+          (full (logior bl.ser:+node-network+ bl.ser:+node-witness+)))
+      ;; The behavioural rows, in the order p2p_handshake.py walks them.
+      (is-false (handshake :outbound-full-relay witness-only)
+                "an outbound-full-relay dial lacking NODE_NETWORK is refused")
+      (is-false (handshake :block-relay witness-only)
+                "so is a block-relay-only dial")
+      (is-false (handshake :addr-fetch witness-only)
+                "and so is an addr-fetch dial -- Core expects services there too")
+      ;; The exemptions, and the control that the gate is not simply refusing
+      ;; every handshake.
+      (is-true (handshake :manual witness-only)
+               "a manual (-addnode) peer is exempt")
+      (is-true (handshake :feeler witness-only)
+               "and so is a feeler")
+      (is-true (handshake :addr-fetch full)
+               "control: an addr-fetch peer that does offer the services connects"))))

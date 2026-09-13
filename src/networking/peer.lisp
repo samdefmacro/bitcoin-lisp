@@ -798,6 +798,23 @@ a peer the operator explicitly pinned. Feelers and inbound are excluded too."
        (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
        t))
 
+(defun peer-expects-services-p (peer)
+  "T when PEER's connection type makes the DESIRABLE-SERVICES gate apply --
+Core CNode::ExpectServicesFromConn (net.h:833-847), whose switch says false
+for INBOUND, MANUAL and FEELER and true for OUTBOUND_FULL_RELAY, BLOCK_RELAY,
+ADDR_FETCH and PRIVATE_BROADCAST.
+
+This is NOT PEER-OUTBOUND-OR-BLOCK-RELAY-P, which is Core's
+IsOutboundOrBlockRelayConn and governs chain-quality eviction; the two sets
+differ by ADDR_FETCH, and using the eviction predicate here was the bug.
+p2p_handshake.py exercises all three of outbound-full-relay, block-relay-only
+and addr-fetch with services Core refuses, and asserts a disconnect for each
+(p2p_handshake.py:53-64); ours handshaked the addr-fetch peer, so the fifth
+of nine cases hung."
+  (and (not (peer-inbound peer))
+       (not (member (peer-conn-type peer) '(:inbound :manual :feeler)))
+       t))
+
 (defun peer-manual-p (peer)
   "Core CNode::IsManualConn (net.h:791): PEER is an operator-named connection
 (-addnode, -connect, the addnode RPC). Such a peer is typed :manual by the
@@ -1190,10 +1207,11 @@ desirable set to limited peers, as in Core."
                 (- (bl.ser:version-message-timestamp version-msg)
                    (bl.ser:get-unix-time)))
           ;; Core's two VERSION-time disconnects (net_processing.cpp:3611-3627).
-          ;; The services gate applies to automatic outbounds only — Core
-          ;; CNode::ExpectServicesFromConn, which peer-outbound-or-block-relay-p
-          ;; already spells out (manual and feeler peers exempt).
-          (cond ((and (peer-outbound-or-block-relay-p peer)
+          ;; The services gate is guarded by CNode::ExpectServicesFromConn
+          ;; (net_processing.cpp:3613), which exempts inbound, manual and
+          ;; feeler connections and covers ADDR-FETCH along with the two
+          ;; automatic outbound types.
+          (cond ((and (peer-expects-services-p peer)
                       (not (has-all-desirable-service-flags-p services near-tip)))
                  (bl:log-cat "net"
                              "peer does not offer the expected services ~
