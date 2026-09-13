@@ -1108,15 +1108,18 @@ decide (Core PreChecks, validation.cpp:950-970)."
     ;; (:892). Evaluated as if the tx were in the NEXT block (tip+1) with the
     ;; tip's median-time-past (BIP113); same helpers the block connect path
     ;; uses, gated on CHAIN-STATE being supplied.
+    ;; UNCONDITIONAL, whatever the chain says about CSV: PreChecks always
+    ;; evaluates the locks with LOCKTIME_VERIFY_SEQUENCE (policy/policy.h:137,
+    ;; validation.cpp:218) and only ConnectBlock gates the rule on the
+    ;; deployment (:2475-2479) -- BIP68 is relay policy, then consensus.
     (when chain-state
       (multiple-value-bind (eval-height locktime-time mtp csv-active)
           (%mempool-lock-context chain-state current-height)
-        (declare (ignore locktime-time))
-        (when csv-active
-          (unless (check-sequence-locks tx utxo-set eval-height mtp chain-state
-                                        :pending-utxos extra-coins)
-            (return-from validate-transaction-for-mempool
-              (values nil :non-bip68-final nil))))))
+        (declare (ignore locktime-time csv-active))
+        (unless (check-sequence-locks tx utxo-set eval-height mtp chain-state
+                                      :pending-utxos extra-coins)
+          (return-from validate-transaction-for-mempool
+            (values nil :non-bip68-final nil)))))
 
     ;; Consensus: Core's Consensus::CheckTxInputs (validation.cpp:892-895) —
     ;; coinbase maturity, input-value range, fee. It runs FIRST of the checks

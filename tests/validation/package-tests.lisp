@@ -703,6 +703,62 @@ validation.cpp:185-192) — so any nonzero relative lock on it is non-final."
                           (%result-for results child)))))
       (is (not (bl.mp:mempool-has mempool pid))))))
 
+(test bip68-is-mempool-policy-before-csv-activates
+  "BIP68 relative locks are enforced on every mempool transaction whatever the
+chain says about CSV. Core's PreChecks evaluates them with
+STANDARD_LOCKTIME_VERIFY_FLAGS (validation.cpp:218), which is
+LOCKTIME_VERIFY_SEQUENCE and nothing else (policy/policy.h:137), and rejects
+with `non-BIP68-final' at validation.cpp:886-889; only ConnectBlock gates the
+same rule on the deployment (validation.cpp:2475-2479). So the rule is relay
+policy before activation and consensus after -- which is what
+feature_bip68_sequence.py's `BIP68 not consensus before activation' case
+asserts: the node refuses the transaction and then accepts a block holding it.
+
+Ours skipped the check whenever CSV was not yet active on the chain, so on the
+test's own chain (-testactivationheight=csv@432, height ~200) every premature
+relative lock relayed (feature_bip68_sequence.py:114)."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
+    ;; The test's own chain: -testactivationheight=csv@432 over a chain at
+    ;; height 200, exactly as feature_bip68_sequence.py sets it up. CSV being
+    ;; INACTIVE is the whole premise -- where it is active, both versions of
+    ;; this code agree.
+    (let ((bl.val:*test-activation-heights* (make-hash-table :test 'equal)))
+      (setf (gethash "csv" bl.val:*test-activation-heights*) 432)
+      (is (< (bl.store:current-height chain-state)
+             (bl.val:get-csv-activation-height bl:*network*))
+          "control: the fixture's chain must be BELOW the CSV activation height")
+    (let* ((parent (%pkg-tx funding 0 99000000))
+           (pid (bl.ser:transaction-hash parent)))
+      ;; The parent is in the mempool, so the child spends an UNCONFIRMED
+      ;; output; Core assumes it confirms in the next block (prev height =
+      ;; tip+1, validation.cpp:185-192), which makes any nonzero relative
+      ;; height lock on it non-final.
+      (bl.mp:mempool-add mempool pid
+                         (bl.mp:make-entry-from-tx
+                          parent 1000 200
+                          :entry-time (bl.ser:get-unix-time)))
+      ;; A one-block relative lock on that parent: rejected.
+      (is (eq :non-bip68-final
+              (nth-value 1 (bl.val:validate-transaction-for-mempool
+                            (%pkg-tx pid 0 98000000 :sequence 1)
+                            utxo-set mempool
+                            (bl.store:current-height chain-state)
+                            :chain-state chain-state))))
+      ;; Control 1: the SAME spend with the disable flag set is accepted --
+      ;; the rejection is the sequence lock and not the chained spend.
+      (is (null (nth-value 1 (bl.val:validate-transaction-for-mempool
+                              (%pkg-tx pid 0 98000000 :sequence #x80000001)
+                              utxo-set mempool
+                              (bl.store:current-height chain-state)
+                              :chain-state chain-state))))
+      ;; Control 2: version 1 disables BIP68 entirely (tx_verify.cpp:51), so
+      ;; the same nSequence is fine there.
+      (is (null (nth-value 1 (bl.val:validate-transaction-for-mempool
+                              (%pkg-tx pid 0 98000000 :sequence 1 :version 1)
+                              utxo-set mempool
+                              (bl.store:current-height chain-state)
+                              :chain-state chain-state))))))))
+
 (test fee-floor-uses-sigop-adjusted-vsize
   "The relay fee floor prices sigop-dense txs on the ADJUSTED virtual size
 (Core CheckFeeRate runs on ws.m_vsize = the entry's GetTxSize,

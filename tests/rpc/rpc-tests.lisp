@@ -6333,27 +6333,27 @@ is why the type error is the one reported. We accepted both silently
                h)))
       ;; Control: the well-formed call answers, so a rejection below is the
       ;; strict check and not a broken fixture.
-      (is (= 1 (length (bl.rpc::rpc-gettxspendingprevout
-                        node (list (list (obj "txid" txid-hex "vout" 0)))))))
+      (is (= 1 (length (bl.rpc:dispatch-rpc-method
+                        node "gettxspendingprevout" (list (list (obj "txid" txid-hex "vout" 0)))))))
       (signals-rpc-error (:code -3 :exact-message "Unexpected key unknown")
-        (bl.rpc::rpc-gettxspendingprevout
-         node (list (list (obj "txid" txid-hex "vout" 1 "unknown" 42)))))
+        (bl.rpc:dispatch-rpc-method
+         node "gettxspendingprevout" (list (list (obj "txid" txid-hex "vout" 1 "unknown" 42)))))
       (signals-rpc-error
           (:code -3 :exact-message
            "JSON value of type number for field txid is not of expected type string")
-        (bl.rpc::rpc-gettxspendingprevout
-         node (list (list (obj "txid" 42 "vout" 0)))))
+        (bl.rpc:dispatch-rpc-method
+         node "gettxspendingprevout" (list (list (obj "txid" 42 "vout" 0)))))
       (signals-rpc-error (:code -3 :exact-message "Missing vout")
-        (bl.rpc::rpc-gettxspendingprevout
-         node (list (list (obj "txid" txid-hex)))))
+        (bl.rpc:dispatch-rpc-method
+         node "gettxspendingprevout" (list (list (obj "txid" txid-hex)))))
       ;; The options object is strict too, and null-tolerant: an absent
       ;; mempool_only is fine, an unknown one is not.
-      (is (= 1 (length (bl.rpc::rpc-gettxspendingprevout
-                        node (list (list (obj "txid" txid-hex "vout" 0))
+      (is (= 1 (length (bl.rpc:dispatch-rpc-method
+                        node "gettxspendingprevout" (list (list (obj "txid" txid-hex "vout" 0))
                                    (obj "mempool_only" t))))))
       (signals-rpc-error (:code -3 :exact-message "Unexpected key mempoolonly")
-        (bl.rpc::rpc-gettxspendingprevout
-         node (list (list (obj "txid" txid-hex "vout" 0))
+        (bl.rpc:dispatch-rpc-method
+         node "gettxspendingprevout" (list (list (obj "txid" txid-hex "vout" 0))
                     (obj "mempoolonly" t)))))))
 
 ;;; --- Node / chain info RPCs ---
@@ -7278,9 +7278,9 @@ compare the script hash against the recovered key's hash160
          (p2sh (bl.crypto:encode-p2sh-address (bl.crypto:hash160 redeem) :testnet3))
          (sig (bl.rpc:rpc-signmessagewithprivkey node (list wif msg))))
     ;; Control: the SAME key's P2PKH address still verifies true.
-    (is (eq t (bl.rpc::rpc-verifymessage node (list p2pkh sig msg))))
+    (is (eq t (bl.rpc:dispatch-rpc-method node "verifymessage" (list p2pkh sig msg))))
     (signals-rpc-error (:code -3 :exact-message "Address does not refer to key")
-      (bl.rpc::rpc-verifymessage node (list p2sh sig msg)))))
+      (bl.rpc:dispatch-rpc-method node "verifymessage" (list p2sh sig msg)))))
 
 (test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
   "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input
@@ -8191,7 +8191,7 @@ that could be observed (feature_maxtipage.py:39)."
                      (bl.store:chain-state-best-height cs) 1)))
            (ibd ()
              (cdr (assoc "initialblockdownload"
-                         (bl.rpc::rpc-getblockchaininfo node nil)
+                         (bl.rpc:dispatch-rpc-method node "getblockchaininfo" nil)
                          :test #'string=))))
       ;; A tip older than -maxtipage keeps the node in IBD.
       (set-tip (+ (* 24 60 60) 5))
@@ -8238,11 +8238,12 @@ that can never pass script validation. We sent the request anyway
     (push witness-peer (bl:node-peers node))
     (push legacy-peer (bl:node-peers node))
     ;; Control: the witness peer is served.
-    (is (hash-table-p (bl.rpc::rpc-getblockfrompeer
-                       node (list hash-hex (bl.net:peer-id witness-peer)))))
+    (is (hash-table-p (bl.rpc:dispatch-rpc-method
+                       node "getblockfrompeer"
+                       (list hash-hex (bl.net:peer-id witness-peer)))))
     (signals-rpc-error (:code -1 :exact-message "Pre-SegWit peer")
-      (bl.rpc::rpc-getblockfrompeer
-       node (list hash-hex (bl.net:peer-id legacy-peer))))))
+      (bl.rpc:dispatch-rpc-method
+       node "getblockfrompeer" (list hash-hex (bl.net:peer-id legacy-peer))))))
 
 ;;; --- logging (Bitcoin Core logging) ---
 
