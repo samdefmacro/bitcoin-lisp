@@ -6316,6 +6316,46 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       (bl.rpc::rpc-getmempoolentry
        node (list (bl.rpc:hash-to-hex (%txid-array 201)))))))
 
+(test rpc-gettxspendingprevout-objects-are-closed-sets
+  "gettxspendingprevout refuses a key nobody asked for, in both of its object
+arguments. Core runs RPCTypeCheckObj with fStrict over the options object
+(rpc/mempool.cpp:944-949) and over EACH {txid, vout} entry
+(rpc/mempool.cpp:964-968), so an unexpected key is -3 `Unexpected key <k>' and
+a txid given as a number is -3 `JSON value of type number for field txid is
+not of expected type string' -- the entry check runs before ParseHashO, which
+is why the type error is the one reported. We accepted both silently
+(rpc_gettxspendingprevout.py:111)."
+  (let* ((node (make-test-node))
+         (txid-hex (bl.rpc:hash-to-hex (%txid-array 99))))
+    (flet ((obj (&rest kvs)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kvs by #'cddr do (setf (gethash k h) v))
+               h)))
+      ;; Control: the well-formed call answers, so a rejection below is the
+      ;; strict check and not a broken fixture.
+      (is (= 1 (length (bl.rpc::rpc-gettxspendingprevout
+                        node (list (list (obj "txid" txid-hex "vout" 0)))))))
+      (signals-rpc-error (:code -3 :exact-message "Unexpected key unknown")
+        (bl.rpc::rpc-gettxspendingprevout
+         node (list (list (obj "txid" txid-hex "vout" 1 "unknown" 42)))))
+      (signals-rpc-error
+          (:code -3 :exact-message
+           "JSON value of type number for field txid is not of expected type string")
+        (bl.rpc::rpc-gettxspendingprevout
+         node (list (list (obj "txid" 42 "vout" 0)))))
+      (signals-rpc-error (:code -3 :exact-message "Missing vout")
+        (bl.rpc::rpc-gettxspendingprevout
+         node (list (list (obj "txid" txid-hex)))))
+      ;; The options object is strict too, and null-tolerant: an absent
+      ;; mempool_only is fine, an unknown one is not.
+      (is (= 1 (length (bl.rpc::rpc-gettxspendingprevout
+                        node (list (list (obj "txid" txid-hex "vout" 0))
+                                   (obj "mempool_only" t))))))
+      (signals-rpc-error (:code -3 :exact-message "Unexpected key mempoolonly")
+        (bl.rpc::rpc-gettxspendingprevout
+         node (list (list (obj "txid" txid-hex "vout" 0))
+                    (obj "mempoolonly" t)))))))
+
 ;;; --- Node / chain info RPCs ---
 
 (test rpc-node-info

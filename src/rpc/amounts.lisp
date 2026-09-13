@@ -364,3 +364,36 @@ send/walletcreatefundedpsbt docstrings."
 (defun %op-return-script (data)
   "CScript() << OP_RETURN << data."
   (concatenate '(vector (unsigned-byte 8)) (vector #x6a) (bl.ser:script-push-data data)))
+
+;;; --- Core RPCTypeCheckObj (rpc/util.cpp:56-80) ---
+
+(defun rpc-type-check-obj (obj expected &key allow-null strict)
+  "Core RPCTypeCheckObj (rpc/util.cpp:56-80): EXPECTED is
+((key . uvTypeName) ...) in the order Core's std::map visits the keys --
+SORTED by key, which decides which of two missing keys is named. A missing
+key is -3 \"Missing <key>\"; a present key of another type is -3 \"JSON
+value of type <actual> for field <key> is not of expected type <type>\".
+ALLOW-NULL is fAllowNull: a missing key passes and only a present one is
+typed. Absent and null are one thing here, as find_value's null makes them
+in Core; a nested false or [] has folded to NIL too and reads as missing.
+
+STRICT is fStrict (rpc/util.cpp:69-79): after the expected keys are checked,
+every key of OBJ that EXPECTED does not name is -3 \"Unexpected key <k>\".
+Core passes it wherever an object argument is a closed set of options, so a
+typo in a caller's key is an error rather than a silently ignored field."
+  (loop for (key . type) in expected
+        for value = (obj-get obj key)
+        do (cond ((null value)
+                  (unless allow-null
+                    (error 'rpc-error :code +rpc-type-error+
+                                      :message (format nil "Missing ~A" key))))
+                 ((string/= (%json-type-name value) type)
+                  (error 'rpc-error
+                         :code +rpc-type-error+
+                         :message (format nil "JSON value of type ~A for field ~A ~
+is not of expected type ~A" (%json-type-name value) key type)))))
+  (when strict
+    (dolist (k (obj-keys obj))
+      (unless (assoc k expected :test #'string=)
+        (error 'rpc-error :code +rpc-type-error+
+                          :message (format nil "Unexpected key ~A" k))))))

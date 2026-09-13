@@ -352,6 +352,17 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
                       false when it is — so the answer improves by enabling the
                       index rather than by changing the call.
   return_spending_tx  default false; adds the full spending transaction as hex."
+  (unless (and (listp outpoints) outpoints)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid parameter, outputs are missing"))
+  ;; The options object is a CLOSED set (rpc/mempool.cpp:944-949: fAllowNull
+  ;; true, fStrict true), so an unknown key is -3 rather than a field silently
+  ;; ignored -- a caller who misspells mempool_only gets the index answer it
+  ;; meant to suppress otherwise.
+  (when options
+    (rpc-type-check-obj options '(("mempool_only" . "bool")
+                                  ("return_spending_tx" . "bool"))
+                        :allow-null t :strict t))
   (let* ((mempool (rpc-get-mempool node))
          (index (bl:node-txospenderindex node))
          (index-live (and index (bl.store:txospender-index-enabled index)))
@@ -362,20 +373,20 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
          (return-tx (and (hash-table-p options)
                          (gethash "return_spending_tx" options)
                          t)))
-    (unless (and (listp outpoints) outpoints)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid parameter, outputs are missing"))
     ;; Node lock: one consistent spent-map snapshot across all queried
     ;; outpoints (Core gettxspendingprevout takes pool.cs once).
     (with-node-lock (node)
      (mapcar
       (lambda (op)
+        ;; Each outpoint is a closed {txid, vout} object too (fAllowNull
+        ;; false, fStrict true, rpc/mempool.cpp:964-968), and it runs BEFORE
+        ;; ParseHashO so a numeric txid is the type error Core reports rather
+        ;; than a hash-parse complaint.
+        (rpc-type-check-obj op '(("txid" . "string") ("vout" . "number"))
+                            :strict t)
         (let* ((txid-hex (obj-get op "txid"))
                (txid (parse-hash-v txid-hex "txid"))
                (vout (obj-get op "vout")))
-          (unless (integerp vout)
-            (error 'rpc-error :code +rpc-invalid-parameter+
-                              :message "Invalid parameter, outputs are missing"))
           (when (minusp vout)
             (error 'rpc-error :code +rpc-invalid-parameter+
                               :message "Invalid parameter, vout cannot be negative"))
