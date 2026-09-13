@@ -377,7 +377,10 @@ at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
 in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
 connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
 751 sockets in CLOSE-WAIT this way. Counting the queue bounds the damage at
-twice the inbound cap no matter what the rest of the node is doing."
+twice the inbound cap no matter what the rest of the node is doing. It counts
+the handshakes still in flight for the same reason: since the accept loop
+stopped running them inline, each one is a thread and a socket that has not
+reached the queue yet."
   ;; Ban check first and lock-free: a connect flood is exactly when the listener
   ;; must not contend with the sync thread and RPC readers for the node lock.
   (let ((noban (bl.net:permission-flag-set-p
@@ -386,8 +389,13 @@ twice the inbound cap no matter what the rest of the node is doing."
     (cond
       ((and (not noban) (bl.net:peer-banned-p host))
        (values nil :banned))
-      ((>= (bt:with-recursive-lock-held ((node-lock node))
-             (length (node-pending-inbound-peers node)))
+      ((>= (+ (bt:with-recursive-lock-held ((node-lock node))
+                (length (node-pending-inbound-peers node)))
+              ;; Handshakes still running on their own threads have not
+              ;; reached the queue yet; they hold a socket and a thread all
+              ;; the same, so they count here or the bound this arm exists to
+              ;; enforce would be a bound on nothing.
+              (inbound-handshakes-in-flight))
            *max-inbound-connections*)
        (values nil :backlog))
       ((and (not noban)

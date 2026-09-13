@@ -31,8 +31,7 @@
                       ;; thread-local, so this cannot affect the dialing side.
                       ;; The refusal itself is asserted by
                       ;; inbound-handshake-refuses-self-connection below.
-                      (let ((bl.net::*outbound-nonces*
-                              (make-hash-table :test 'eql)))
+                      (with-private-outbound-nonces
                         (let ((conn (bl.net:accept-connection srv :timeout 10)))
                           (when conn
                             (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
@@ -74,7 +73,7 @@ we send VERSION, released when the handshake ends — SUCCESS OR FAILURE. Core
 matches only against !fSuccessfullyConnected nodes; a leaked entry would stay
 armed forever and refuse an unrelated future peer that happened to reuse the
 value."
-  (let ((bl.net::*outbound-nonces* (make-hash-table :test 'eql)))
+  (with-private-outbound-nonces
     (let ((n (bl.net::%fresh-local-nonce)))
       (is-false (bl.net::self-connection-nonce-p n))
       (bl.net::%register-outbound-nonce n)
@@ -181,7 +180,7 @@ must hold the filtered one."
                        ;; A registry of its own: this stands in for a distinct
                        ;; node, so our own nonce must not look like a
                        ;; self-connection.
-                       (let ((bl.net::*outbound-nonces* (make-hash-table :test 'eql)))
+                       (with-private-outbound-nonces
                          (let ((conn (bl.net:accept-connection srv :timeout 10)))
                            (when conn
                              (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
@@ -254,3 +253,78 @@ stand in for a distinct node."
                  ;; lingering connection.
                  (ignore-errors (bl.net:disconnect-peer client)))))
         (bl.net:close-listener srv)))))
+
+(test the-accept-loop-does-not-wait-for-a-silent-peer
+  "Core adds an accepted socket to m_nodes AT ONCE (net.cpp:1854-1858) and lets
+ThreadMessageHandler run the version exchange, so its accept loop never waits
+on a peer. Ours ran PERFORM-INBOUND-HANDSHAKE inline on the listener thread,
+which serialised every inbound connection behind the slowest handshake: with
+p2p_leak.py's first peer -- a LazyPeer that sends nothing at all -- the node's
+own log shows the second connection accepted 15 s after it and the third 30 s
+after it, and by then the first had been dropped, which is exactly what
+p2p_leak.py:131 asserts against. p2p_eviction.py:90, p2p_getaddr_caching.py:74
+and p2p_ibd_stalling.py connect peers in bulk and pay the same toll each.
+
+A client dials and then says nothing; a second client dials while the first is
+still being waited on and must complete its whole handshake. The second client
+runs with its own outbound-nonce registry so the inbound side does not
+(correctly) refuse a loopback dial as a self-connection."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (let* ((node (bl:make-node))
+             (port (usocket:get-local-port srv))
+             (silent nil)
+             (listener nil)
+             (client-thread nil)
+             (good nil))
+        (setf (bl:node-running node) t)
+        (unwind-protect
+             (progn
+               (setf listener
+                     (bt:make-thread (lambda () (bl:run-inbound-listener node :socket srv))
+                                     :name "test-inbound-listener"))
+               (sleep 0.3)
+               ;; p2p_leak.py's LazyPeer: connect, send nothing, ever.
+               (setf silent (usocket:socket-connect
+                             "127.0.0.1" port
+                             :element-type '(unsigned-byte 8)))
+               (sleep 0.5)
+               (setf client-thread
+                     (bt:make-thread
+                      (lambda ()
+                        (with-private-outbound-nonces
+                          (let ((c (bl.net:connect-peer "127.0.0.1" port)))
+                            (when (and c (bl.net:perform-handshake c))
+                              (setf good c)))))
+                      :name "test-inbound-client"))
+               ;; TIMING-SENSITIVE, with a wide margin on purpose: the whole
+               ;; question is latency, and the two answers are ~0.05 s (the
+               ;; handshake runs on its own thread) against 15 s (the accept
+               ;; loop waits out PERFORM-INBOUND-HANDSHAKE's timeout on the
+               ;; silent peer first, measured in this image). Five seconds sits
+               ;; two orders of magnitude from one and three times clear of the
+               ;; other.
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* 5 internal-time-units-per-second))))
+                 (loop until (or (and good (bl:node-pending-inbound-peers node))
+                                 (> (get-internal-real-time) deadline))
+                       do (sleep 0.02)))
+               ;; The behavioural assertions, in pre-existing names only.
+               (is-true good
+                        "a second peer handshakes within five seconds while the first stays silent")
+               (when good
+                 (is (eq :ready (bl.net:peer-state good))))
+               (is (= 1 (length (bl:node-pending-inbound-peers node)))
+                   "and the node queued it for the sync thread, not the silent one")
+               ;; The silent peer is still being waited on, on its own thread.
+               (is (plusp (bl:inbound-handshakes-in-flight))
+                   "the silent peer's handshake is still in flight"))
+          (setf (bl:node-running node) nil)
+          (when client-thread (ignore-errors (bt:join-thread client-thread)))
+          (when good (ignore-errors (bl.net:disconnect-peer good)))
+          (when silent (ignore-errors (usocket:socket-close silent)))
+          (when listener (ignore-errors (bt:join-thread listener)))
+          (dolist (p (bl:node-pending-inbound-peers node))
+            (ignore-errors (bl.net:disconnect-peer p)))
+          (bl.net:close-listener srv))))))

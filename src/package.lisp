@@ -243,6 +243,8 @@ init.cpp, node/. src/node/.")
    #:node-pending-inbound-peers
    #:node-pending-onetry
    #:node-running
+   #:run-inbound-listener
+   #:inbound-handshakes-in-flight
    #:node-syncing
    #:node-tip-liveness
    #:node-tx-index
