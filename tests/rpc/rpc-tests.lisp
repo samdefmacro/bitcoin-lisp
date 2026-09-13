@@ -2788,6 +2788,59 @@ same way (txoutproof.cpp:103)."
     (is (equal (cons -5 "Block not found") (%rpc-wire-error node "getblock" (list unknown))))
     (is (equal (cons -5 "Block not found") (%rpc-wire-error node "getblockstats" (list unknown)))))))
 
+(test a-block-the-index-placed-but-cannot-read-is-not-found-on-disk
+  "Core's GetBlockChecked asks two questions in order: CheckBlockDataAvailability
+reads BLOCK_HAVE_DATA off the index, and only when that PASSES does ReadBlock
+run -- a read that fails there is -1 `Block not found on disk'
+(rpc/blockchain.cpp:686-698), a different answer from the two availability
+ones. Core reaches it when a prune races the read; rpc_getblockstats.py:192
+reaches it by renaming blk00000.dat away, and an operator reaches it with a
+damaged or half-restored blocks directory. Ours had no such answer: every
+unreadable body was `Block not available (not fully downloaded)', which says
+the node never had it.
+
+Our index entry records the flat-file POSITION rather than a HAVE_DATA bit, so
+the read runs first and its failure is classified by whether a position was
+recorded. The two entries below differ in exactly that."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "no-body-on-disk"))
+           (cs (bl:node-chain-state node))
+           (mk (lambda (fill height)
+                 (let* ((header (bl.ser:make-block-header
+                                 :version 1
+                                 :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element fill)
+                                 :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                             :initial-element fill)
+                                 :timestamp 1 :bits #x207fffff :nonce 0))
+                        (hash (bl.ser:block-header-hash header)))
+                   (values header hash
+                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
+                           height)))))
+      (multiple-value-bind (placed-header placed-hash placed-hex) (funcall mk 21 1)
+        (multiple-value-bind (bare-header bare-hash bare-hex) (funcall mk 22 1)
+          (declare (ignore bare-hash))
+          ;; Placed: the index says where the body is, and it is not there.
+          (bl.store:add-block-index-entry
+           cs (bl.store:make-block-index-entry
+               :hash placed-hash :height 1 :header placed-header :chain-work 2
+               :status :valid :file 0 :data-pos 8))
+          (is (equal (cons -1 "Block not found on disk")
+                     (%rpc-wire-error node "getblock" (list placed-hex))))
+          (is (equal (cons -1 "Block not found on disk")
+                     (%rpc-wire-error node "getblockstats" (list placed-hex))))
+          ;; Control: an entry with no recorded position is still the
+          ;; headers-only answer, and an unknown hash still -5.
+          (bl.store:add-block-index-entry
+           cs (bl.store:make-block-index-entry
+               :hash (bl.ser:block-header-hash bare-header) :height 1
+               :header bare-header :chain-work 2 :status :header-valid))
+          (is (equal (cons -1 "Block not available (not fully downloaded)")
+                     (%rpc-wire-error node "getblock" (list bare-hex))))
+          (is (equal (cons -5 "Block not found")
+                     (%rpc-wire-error node "getblock"
+                                      (list (make-string 64 :initial-element #\3))))))))))
+
 (test gettxoutproof-finds-the-block-through-an-unspent-output
   "Without a blockhash Core looks for an unspent output of any given txid in
 the coins view and takes the block at that coin's height (txoutproof.cpp:
