@@ -855,6 +855,31 @@ indefinitely. Returns the tip on reaching the height, timeout, or node shutdown.
 ;;;             CompactSize(vout) + Coin (VARINT(2*height+coinbase) +
 ;;;             compressed TxOut) — the compressor module's codec.
 
+(defun abs-path-for-config-val (node path)
+  "PATH as Core resolves a net-specific configuration path: an absolute (or
+empty) one as given, a relative one joined onto the NETWORK data directory
+(common/config.cpp:226-232 AbsPathForConfigVal, net_specific defaulting to
+true; fsbridge::AbsPathJoin then makes the result absolute). Returns a
+namestring.
+
+dumptxoutset joins against GetDataDirNet explicitly
+(rpc/blockchain.cpp:3111) and loadtxoutset goes through
+AbsPathForConfigVal (:3383), so both name a file inside the chain
+directory. Reading the argument as a bare pathname instead anchors it at
+the PROCESS's working directory, which is wherever the node happens to have
+been started from: `dumptxoutset utxos.dat' then writes a file the caller
+cannot find, and rpc_dumptxoutset.py:44 -- `assert (node.chain_path /
+FILENAME).is_file()' -- is exactly that check."
+  (let* ((given (pathname path))
+         (base (uiop:ensure-directory-pathname
+                (or (bl:node-data-directory node) (uiop:getcwd))))
+         (joined (if (uiop:absolute-pathname-p given)
+                     given
+                     (merge-pathnames given base))))
+    (namestring (if (uiop:absolute-pathname-p joined)
+                    joined
+                    (merge-pathnames joined (uiop:getcwd))))))
+
 (alexandria:define-constant +snapshot-magic-bytes+ (coerce #(#x75 #x74 #x78 #x6F #xFF) '(simple-array (unsigned-byte 8) (*)))
   :test #'equalp :documentation "SNAPSHOT_MAGIC_BYTES {'u','t','x','o',0xff} (node/utxo_snapshot.h:28).")
 
@@ -1030,9 +1055,13 @@ chainparams assumeutxo snapshot height. Like gettxoutsetinfo this forces a
 coins-cache flush, then streams coins in cursor order while accumulating
 hash_serialized_3 over the same pass. Writes to PATH.incomplete and renames
 on completion. nchaintx is omitted when some block's tx count is unknown
-(header-only/pruned ancestors; Core reports its cached nChainTx)."
+(header-only/pruned ancestors; Core reports its cached nChainTx).
+
+A relative PATH hangs off the NETWORK data directory, never the process's
+working directory (ABS-PATH-FOR-CONFIG-VAL; Core rpc/blockchain.cpp:3111)."
   (unless (and (stringp path) (plusp (length path)))
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
+  (setf path (abs-path-for-config-val node path))
   (let* ((chain-state (rpc-get-chain-state node))
          (tip-hash (or (bl.store:best-block-hash chain-state)
                        (error 'rpc-error :code +rpc-misc-error+
@@ -1117,7 +1146,11 @@ blockchain.cpp:3208-3323) and return dumptxoutset's result alist."
       `(("coins_written" . ,count)
         ("base_hash" . ,(hash-to-hex base-hash))
         ("base_height" . ,base-height)
-        ("path" . ,(namestring (truename path)))
+        ;; Core reports the JOINED path (fs::PathToString of the
+        ;; AbsPathJoin result, rpc/blockchain.cpp:3322), not the resolved
+        ;; realpath: rpc_dumptxoutset.py:48 compares it with the framework's
+        ;; own `node.chain_path / FILENAME'.
+        ("path" . ,(namestring (pathname path)))
         ("txoutset_hash" . ,(hash-to-hex hash))
         ,@(when nchaintx `(("nchaintx" . ,nchaintx)))))))
 
@@ -1295,9 +1328,14 @@ Pruned nodes are supported (P6): the snapshot chainstate's per-chainstate
 prune floor (chain-state-prune-floor — Core Chainstate::GetPruneRange) keeps
 every block at or below the base on disk until background validation
 completes, and the automatic prune target is halved while the historical
-chainstate exists (effective-prune-target-bytes)."
+chainstate exists (effective-prune-target-bytes).
+
+A relative PATH hangs off the NETWORK data directory, the same resolution
+dumptxoutset uses (ABS-PATH-FOR-CONFIG-VAL; Core rpc/blockchain.cpp:3383
+AbsPathForConfigVal), so a snapshot named the way it was dumped is found."
   (unless (and (stringp path) (plusp (length path)))
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
+  (setf path (abs-path-for-config-val node path))
   (unless (probe-file path)
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message (format nil "Couldn't open file ~A for reading." path)))
@@ -1397,7 +1435,8 @@ chainstate exists (effective-prune-target-bytes)."
               `(("coins_loaded" . ,coins-count)
                 ("tip_hash" . ,(hash-to-hex base-hash))
                 ("base_height" . ,base-height)
-                ("path" . ,(namestring (truename path)))))))))))
+                ;; The joined path, as Core reports it (:3418).
+                ("path" . ,(namestring (pathname path)))))))))))
 
 ;;; --- UTXO set scanning (Bitcoin Core scantxoutset) ---
 
