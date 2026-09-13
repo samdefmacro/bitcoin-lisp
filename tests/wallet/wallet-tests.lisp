@@ -771,6 +771,13 @@ getwalletinfo reports Core's fields."
         (is (eq t (%aval "descriptors" info)))
         (is (= 0 (%aval "txcount" info)))
         (is (= 0 (%aval "keypoolsize" info)))
+        ;; DELIBERATE DIVERGENCE, pinned so a change to it is a decision:
+        ;; Core answers "sqlite" here for every descriptor wallet
+        ;; (wallet/rpc/wallet.cpp getwalletinfo, GetDatabase().Format()), and
+        ;; wallet_descriptor.py:93 asserts it. Our store is a LevelDB
+        ;; directory and Core's wallet.dat file format is out of scope by
+        ;; docs/wallet-plan.md §1, so the field names the database a caller
+        ;; would really have to open. See the getwalletinfo comment.
         (is (string= "leveldb" (%aval "format" info)))
         (let ((flags (%aval "flags" info)))
           (is (member "avoid_reuse" flags :test #'string=))

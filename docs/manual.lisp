@@ -1423,6 +1423,17 @@
   mapTxSpends unwound per transaction so an outpoint a surviving
   conflicting spend also names stays spent.
 
+  DELIBERATE DIVERGENCE, the one an operator sees first: a wallet is a
+  LevelDB DIRECTORY under `wallets/<name>/`, not Core's single
+  `wallet.dat` SQLite file, and `getwalletinfo`'s `format` says `leveldb`
+  where Core says `sqlite`. Core's wallet.dat file-format interop is out
+  of scope by docs/wallet-plan.md §1. The field names the database a
+  caller would actually have to open, so it is not dressed up as sqlite:
+  a tool told `sqlite` would go looking for a file that does not exist.
+  Two of Core's functional tests are unreachable until that plan item is
+  taken up -- wallet_descriptor.py:93 reads the field, and
+  wallet_multiwallet.py:78 onwards renames the wallet FILE about.
+
   Traps: a locked wallet could once still sign because a parsed
   descriptor kept its embedded xprv; the key-provider is the only source
   now. RENAME-FILE merges a target pathname with the source, so a backup
