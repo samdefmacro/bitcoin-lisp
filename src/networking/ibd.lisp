@@ -2658,6 +2658,18 @@ a getaddr and NO getheaders. Ours asked every ready peer."
                 (logior bl.ser:+node-network+ bl.ser:+node-network-limited+))
        t))
 
+(defun %best-header-is-recent-p (chain-state)
+  "Core's `m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
+(net_processing.cpp:5799): the escape hatch that lets a node whose HEADER chain
+is already at today's tip open header sync with every peer at once, instead of
+one at a time. A header-less synthetic index entry is not recent."
+  (let* ((best (%best-header-entry chain-state))
+         (header (and best (bl.store:block-index-entry-header best))))
+    (and header
+         (> (bl.ser:block-header-timestamp header)
+            (- (bl.ser:get-unix-time) (* 24 60 60)))
+         t)))
+
 (defun broadcast-initial-getheaders (peers chain-state)
   "Send the INITIAL getheaders — locator one block back from our header tip —
 to every ready peer we have not opened header sync with yet. Phase 1 learned
@@ -2680,13 +2692,41 @@ latch: Core clears m_last_getheaders_timestamp whenever connecting headers
 arrive (net_processing.cpp:3043), which a peer announcing blocks does
 constantly. p2p_sendheaders.py:334 announces a block by inv and asserts that NO
 getheaders follows, having popped the one it expected earlier; the sync pass's
-next broadcast failed it."
-  (let ((locator (build-header-locator-pprev chain-state)))
+next broadcast failed it.
+
+ONE PEER AT A TIME while our header chain is old. Core's guard is
+`(nSyncStarted == 0 && sync_blocks_and_headers_from_peer) ||
+m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
+(net_processing.cpp:5799): until the header chain is within a day of now,
+exactly one peer is actively asked, and the next one is asked only once that
+peer has gone. p2p_initial_headers_sync.py:90-95 connects two more peers and
+asserts neither sees a getheaders. Ours asked every candidate at once. The
+`sync_blocks_and_headers_from_peer' half (net_processing.cpp:5779-5795, which
+also declines an inbound peer while preferred outbound peers have blocks in
+flight) is NOT ported: leaving it out can only make us ask a peer Core would
+skip, never the reverse, and it needs fPreferredDownload and mapBlocksInFlight
+which this layer does not have.
+
+At the tip the 24h clause is true, so a live node still primes every peer on
+the pass -- which is the behaviour p2p_add_connections.py needs and the reason
+the gate cannot simply be `one peer, always'. In IBD the rotation away from a
+silent peer is SYNC-HEADERS-WITH-FAILOVER's, not this function's; Core's own
+rotation is the headers-download timeout (net_processing.cpp:6125-6146), which
+this tree does not have."
+  (let ((locator (build-header-locator-pprev chain-state))
+        ;; Core's nSyncStarted: the number of peers whose fSyncStarted is set
+        ;; (net_processing.cpp:826-827). Ours is the same count taken over the
+        ;; LIVE peer list -- a peer that left took its latch with it, which is
+        ;; what Core's FinalizeNode decrement does (net_processing.cpp:1695).
+        (sync-started (count-if #'peer-headers-sync-started peers))
+        (best-header-recent (%best-header-is-recent-p chain-state)))
     (when locator
       (dolist (peer peers)
         (when (and (header-sync-candidate-p peer)
-                   (not (peer-headers-sync-started peer)))
+                   (not (peer-headers-sync-started peer))
+                   (or best-header-recent (zerop sync-started)))
           (setf (peer-headers-sync-started peer) t)
+          (incf sync-started)
           (ignore-errors
            (send-message
             peer

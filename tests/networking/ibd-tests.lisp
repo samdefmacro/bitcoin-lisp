@@ -4644,8 +4644,69 @@ follows; the next pass's broadcast failed it."
                              peers state))))))
           (is (= 1 (broadcast peer)) "the first pass asks the peer")
           (is (= 0 (broadcast peer)) "a later pass does not ask it again")
-          (is (= 1 (broadcast peer other))
+          ;; Control: the broadcast is not simply inert once anything has been
+          ;; latched -- a peer nobody has opened header sync with still gets
+          ;; one, as long as no live peer is holding Core's nSyncStarted slot.
+          (is (= 1 (broadcast other))
               "control: a peer we have not opened header sync with still gets one"))))))
+
+(test the-initial-getheaders-goes-to-one-peer-while-the-header-chain-is-old
+  "Core asks for headers from a SINGLE peer until its header chain is close to
+today: `(nSyncStarted == 0 && sync_blocks_and_headers_from_peer) ||
+m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
+(net_processing.cpp:5797-5799), where nSyncStarted counts the peers whose
+fSyncStarted is set (net_processing.cpp:826-827). Ours asked every candidate on
+the same pass, so p2p_initial_headers_sync.py:94 -- which connects two more
+peers after the first and asserts `getheaders' is in neither's last_message --
+failed on the second peer. The 24-hour clause is what keeps a node AT ITS TIP
+priming every peer it admits."
+  (with-network (:regtest)
+    (flet ((%state (header-time)
+             ;; One entry above genesis, carrying a real header so the 24-hour
+             ;; clause has a timestamp to read.
+             (let* ((state (bl.store:make-chain-state))
+                    (genesis (bl.store:make-block-index-entry
+                              :hash (%bd-hash 0) :height 0 :chain-work 1
+                              :status :valid))
+                    (top (bl.store:make-block-index-entry
+                          :hash (%bd-hash 1) :height 1 :chain-work 2
+                          :prev-entry genesis :status :valid
+                          :header (bl.ser:make-block-header
+                                   :version 1
+                                   :prev-block (%bd-hash 0)
+                                   :merkle-root (%bd-hash 0)
+                                   :timestamp header-time
+                                   :bits #x207fffff
+                                   :nonce 0))))
+               (bl.store:add-block-index-entry state genesis)
+               (bl.store:add-block-index-entry state top)
+               (bl.store:update-chain-tip state (%bd-hash 1) 1)
+               state))
+           (%peer (addr)
+             (bl.net:make-peer :address addr :state :ready
+                               :services bl.ser:+node-network+)))
+      (let ((old (%state (- (bl.ser:get-unix-time) (* 3 24 60 60))))
+            (recent (%state (- (bl.ser:get-unix-time) 600)))
+            (a (%peer "198.51.100.11"))
+            (b (%peer "198.51.100.12"))
+            (c (%peer "198.51.100.13"))
+            (d (%peer "198.51.100.14")))
+        (flet ((broadcast (state &rest peers)
+                 (length (captured-sends
+                          (lambda ()
+                            (bl.net:broadcast-initial-getheaders peers state))))))
+          ;; A header chain three days old: one peer of the three, not three.
+          (is (= 1 (broadcast old a b))
+              "only one of two new peers is asked while the header chain is old")
+          (is (= 0 (broadcast old a b))
+              "and the second peer is still not asked on the next pass")
+          ;; The peer holding the slot leaves: the next pass asks another one.
+          (is (= 1 (broadcast old b))
+              "once the syncing peer is gone the next peer is asked")
+          ;; A header chain within 24 hours: every candidate is primed at once,
+          ;; which is what a node at its tip does.
+          (is (= 2 (broadcast recent c d))
+              "at the tip both new peers are asked on the same pass"))))))
 
 (test an-addr-fetch-peer-is-never-header-synced
   "Core's SendMessages opens header sync only with a peer that CanServeBlocks
