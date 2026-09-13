@@ -295,7 +295,6 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (rate-limit-inv nil)
   (rate-limit-tx nil)
   (rate-limit-addr nil)
-  (rate-limit-getdata nil)
   (rate-limit-headers nil)
   ;; Shared bucket for serve requests: getheaders/getblocks/getaddr.
   (rate-limit-serve nil)
@@ -363,7 +362,6 @@ PEER-LOG-NAME. A caller with a reason of its own writes it as Core does,
     (setf (peer-rate-limit-inv peer) (rl bl:*rate-limit-inv*))
     (setf (peer-rate-limit-tx peer) (rl bl:*rate-limit-tx*))
     (setf (peer-rate-limit-addr peer) (rl bl:*rate-limit-addr*))
-    (setf (peer-rate-limit-getdata peer) (rl bl:*rate-limit-getdata*))
     (setf (peer-rate-limit-headers peer) (rl bl:*rate-limit-headers*))
     (setf (peer-rate-limit-serve peer) (rl bl:*rate-limit-serve*)))
   peer)
