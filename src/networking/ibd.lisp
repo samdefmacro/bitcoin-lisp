@@ -3344,14 +3344,26 @@ of headers added to the index."
                          (= (length headers)
                             bl.ser:+max-headers-count+)))
         (count-fn (or count-fn (lambda (n) (declare (ignore n))))))
-    ;; A CONNECTING headers message is the answer to any getheaders we had
-    ;; outstanding, so re-arm the throttle (Core net_processing.cpp:3040-3043 —
-    ;; deliberately NOT for unconnecting batches, which are announcements and
-    ;; must not buy an unthrottled request from us).
-    (when (and peer headers
-               (bl.store:get-block-index-entry
-                chain-state
-                (bl.ser:block-header-prev-block (first headers))))
+    ;; A headers message that CONNECTS, and an EMPTY one, are both the answer
+    ;; to a getheaders we had outstanding, so either re-arms the throttle. Core
+    ;; clears m_last_getheaders_timestamp in both places: at :2977-2979, "a
+    ;; headers message with no headers cannot be an announcement, so assume it
+    ;; is a response to our last getheaders request", and at :3040-3043 for a
+    ;; connecting batch. Deliberately NOT for an unconnecting batch, which IS
+    ;; an announcement and must not buy an unthrottled request from us.
+    ;;
+    ;; The empty case was missing, and it wedges a node that asked too early:
+    ;; ask a peer that has nothing, get an empty answer, and the two-minute
+    ;; throttle stays shut. Every header that peer then announces is
+    ;; unconnecting -- it mined a hundred blocks meanwhile -- and the
+    ;; unconnecting path is the one that would have asked for the chain to
+    ;; connect them. p2p_segwit.py:309 timed out there with node1 at height 0
+    ;; after a hundred single-header announcements (2026-09-13).
+    (when (and peer
+               (or (null headers)
+                   (bl.store:get-block-index-entry
+                    chain-state
+                    (bl.ser:block-header-prev-block (first headers)))))
       (setf (peer-last-getheaders-time peer) 0))
     (cond
       ;; Empty message: cannot be an announcement; a peer mid-low-work-sync
