@@ -41,7 +41,17 @@
                                               chain-state best-hash))
                                         0))
                    ("verificationprogress" . ,(if syncing 0.0 1.0))
-                   ("initialblockdownload" . ,(json-bool syncing))
+                   ;; Core reports chainman.IsInitialBlockDownload()
+                   ;; (rpc/blockchain.cpp:1422) -- the LATCHED verdict of
+                   ;; UpdateIBDStatus, "the tip has minimum chain work and is
+                   ;; younger than -maxtipage" (validation.cpp:3314-3320,
+                   ;; CChain::IsTipRecent, chain.h:431-437). NODE-SYNCING,
+                   ;; which this used to report, is true only WHILE a sync
+                   ;; pass is running, so a node whose tip is a week old
+                   ;; answered false between passes and -maxtipage had no
+                   ;; observable effect at all (feature_maxtipage.py:39).
+                   ("initialblockdownload"
+                    . ,(json-bool (bl.net:initial-block-download-p chain-state)))
                    ("chainwork" . ,(string-downcase
                                     (format nil "~64,'0x"
                                             (if tip (bl.store:block-index-entry-chain-work tip) 0))))

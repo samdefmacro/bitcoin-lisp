@@ -8160,6 +8160,53 @@ missing file or non-string path errors."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))
 
+(test rpc-getblockchaininfo-initialblockdownload-is-the-tip-age-verdict
+  "getblockchaininfo's initialblockdownload is Core's
+chainman.IsInitialBlockDownload() (rpc/blockchain.cpp:1422), the latched verdict
+of UpdateIBDStatus: true while the tip has less than the network's minimum
+chain work OR is older than -maxtipage (validation.cpp:3314-3320,
+CChain::IsTipRecent, chain.h:431-437). It used to report NODE-SYNCING, a flag
+that is true only WHILE a sync pass is running, so a node whose tip was a week
+old answered false the moment the pass ended and -maxtipage changed nothing
+that could be observed (feature_maxtipage.py:39)."
+  (let* ((bl:*network* :regtest)        ; minimum chain work 0
+         (bl.net:*cached-is-ibd* t)     ; bound: the latch is process-global
+         (bl.net:*max-tip-age-seconds* (* 24 60 60))
+         (node (make-test-node))
+         (cs (bl:node-chain-state node)))
+    (flet ((set-tip (age-seconds)
+             (let* ((hdr (bl.ser:make-block-header
+                          :version 1
+                          :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0)
+                          :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                      :initial-element 0)
+                          :timestamp (- (bl.ser:get-unix-time) age-seconds)
+                          :bits #x207fffff :nonce 0))
+                    (hash (bl.ser:block-header-hash hdr)))
+               (bl.store:add-block-index-entry
+                cs (bl.store:make-block-index-entry
+                    :hash hash :height 1 :header hdr :status :valid :chain-work 1))
+               (setf (bl.store:chain-state-best-block-hash cs) hash
+                     (bl.store:chain-state-best-height cs) 1)))
+           (ibd ()
+             (cdr (assoc "initialblockdownload"
+                         (bl.rpc::rpc-getblockchaininfo node nil)
+                         :test #'string=))))
+      ;; A tip older than -maxtipage keeps the node in IBD.
+      (set-tip (+ (* 24 60 60) 5))
+      (is (eq t (ibd)))
+      ;; And it stays in IBD however many times it is asked -- the latch only
+      ;; falls, it is not re-derived per call.
+      (is (eq t (ibd)))
+      ;; A tip inside the window leaves IBD.
+      (set-tip (- (* 24 60 60) 60))
+      (is (eq 'yason:false (ibd)))
+      ;; Latched: an old tip after the flip does NOT put the node back in IBD
+      ;; (Core's m_cached_is_ibd never flips back, validation.cpp:3316).
+      (set-tip (* 7 24 60 60))
+      (is (eq 'yason:false (ibd))))))
+
 (test rpc-getblockfrompeer-refuses-a-pre-segwit-peer
   "getblockfrompeer refuses a peer that does not advertise NODE_WITNESS with
 Core's -1 `Pre-SegWit peer'. FetchBlock tests CanServeWitnesses right after the
