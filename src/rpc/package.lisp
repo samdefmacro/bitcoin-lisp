@@ -67,6 +67,8 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    ;; JSON boolean helpers (Core booleans are true/false, never null)
    #:+json-false+
    #:json-bool
+   ;; Core's uvTypeName: the word a diagnostic names a value's type with
+   #:json-type-name
 
    ;; Empty-collection helpers (Core renders [] / {}, never null)
    #:json-array
