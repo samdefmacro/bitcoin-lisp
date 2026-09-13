@@ -75,7 +75,6 @@
     "bitcoin-lisp.mempool:txgraph-get-ancestors-union"
     "bitcoin-lisp.mempool:txgraph-get-descendants-union"
     "bitcoin-lisp.networking:clear-discouraged"
-    "bitcoin-lisp.networking:clear-pending-compact-block"
     "bitcoin-lisp.networking:compact-block-stats"
     "bitcoin-lisp.networking:last-checkpoint-height"
     "bitcoin-lisp.networking:local-addresses"
