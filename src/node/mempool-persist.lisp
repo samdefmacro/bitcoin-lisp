@@ -57,8 +57,12 @@ only ever read part of it."
 existing ~A is the better copy" (file-namestring path))
        nil)
       (t
+       ;; NIL means the dump failed and SAVE-MEMPOOL-FILE has already said
+       ;; so, the way Core's DumpMempool does; a shutdown carries on
+       ;; regardless (node/mempool_persist.cpp:225-229).
        (let ((count (bl.mp:save-mempool-file (node-mempool node) path)))
-         (log-info "Saving mempool (~D entries)..." count)
+         (when count
+           (log-info "Saving mempool (~D entries)..." count))
          count)))))
 
 (defun broadcast-transaction-to-peers (node txid)

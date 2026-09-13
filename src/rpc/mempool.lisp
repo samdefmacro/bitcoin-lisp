@@ -847,8 +847,15 @@ The same dump runs automatically on graceful shutdown."
     ;; Node lock: the dump iterates entries, deltas, and the unbroadcast
     ;; set; a concurrent sync-thread mutation would tear the snapshot
     ;; (Core DumpMempool snapshots under pool.cs).
-    (with-node-lock (node)
-      (bl.mp:save-mempool-file (rpc-get-mempool node) path))
+    ;;
+    ;; A dump that could not be written is Core's -1 "Unable to dump mempool
+    ;; to disk" (rpc/mempool.cpp, savemempool: `if (!DumpMempool(...)) throw
+    ;; JSONRPCError(RPC_MISC_ERROR, ...)'). DumpMempool itself never throws,
+    ;; so the RPC is the only place the failure is reported.
+    (unless (with-node-lock (node)
+              (bl.mp:save-mempool-file (rpc-get-mempool node) path))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Unable to dump mempool to disk"))
     `(("filename" . ,(namestring path)))))
 
 (define-rpc "importmempool" (node (filepath options))

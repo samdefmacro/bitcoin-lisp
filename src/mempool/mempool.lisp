@@ -1783,12 +1783,20 @@ and starts with an empty mempool; so do we."
 (defun %save-bytes-atomically (path bytes)
   "Write BYTES to PATH via a temp file, fsync and rename — the same crash-safe
 shape SAVE-FILE-WITH-CRC32 uses, without appending a checksum Core would not
-understand."
+understand.
+
+The temp file is Core's own name, `<path>.new' (node/mempool_persist.cpp:175
+and :216), not a .tmp of our choosing. It is an implementation detail Core's
+own suite reaches into: mempool_persist.py makes a DIRECTORY at that path to
+prove savemempool reports a failed dump, and it can only do that if the name
+matches.
+
+Built by appending to the NAMESTRING, as Core appends to its path. Asking
+MAKE-PATHNAME for a :type of `dat.new' does not produce mempool.dat.new: a
+dot inside a pathname component is escaped, and the file that reached the
+disk was named with a backslash before the second dot."
   (ensure-directories-exist path)
-  (let ((tmp (make-pathname :defaults path
-                            :type (concatenate 'string
-                                               (or (pathname-type path) "dat")
-                                               ".tmp"))))
+  (let ((tmp (pathname (concatenate 'string (namestring path) ".new"))))
     (with-open-file (out tmp :direction :output :if-exists :supersede
                              :element-type '(unsigned-byte 8))
       (write-sequence bytes out)
@@ -1806,10 +1814,20 @@ This used to write a format of our own, which meant importmempool — an RPC
 whose entire purpose is moving a mempool between nodes — could not read a Core
 dump or produce one Core could read. READ-MEMPOOL-FILE still accepts the old
 format, so an existing on-disk mempool survives the upgrade and is rewritten in
-Core's format on the next save."
-  (multiple-value-bind (bytes count) (core-mempool-file-bytes mempool)
-    (%save-bytes-atomically path bytes)
-    count))
+Core's format on the next save.
+
+Returns NIL, having logged, when the dump could not be written: Core's
+DumpMempool catches every exception on that path, logs `Failed to dump
+mempool: <reason>. Continuing anyway.' and returns false
+(node/mempool_persist.cpp:225-229). A shutdown must not be turned into a
+crash by a full disk, and savemempool has an error of its own to report."
+  (handler-case
+      (multiple-value-bind (bytes count) (core-mempool-file-bytes mempool)
+        (%save-bytes-atomically path bytes)
+        count)
+    (error (e)
+      (bl:log-warn "Failed to dump mempool: ~A. Continuing anyway." e)
+      nil)))
 
 (defun %read-file-bytes (path &optional limit)
   "The file at PATH as a byte vector — the whole of it, or its first LIMIT
