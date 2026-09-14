@@ -72,7 +72,7 @@ used only as the comparator's tiebreak."
   "The mempool transactions connected to TXIDS through parent or child links
 -- Core CTxMemPool::GatherClusters, which MiniMiner uses to bound the work to
 one cluster (node/mini_miner.cpp:64-66). Returns a hash-set of txids."
-  (let ((seen (make-hash-table :test 'equalp))
+  (let ((seen (bl.bytes:make-octets-hash-table))
         (queue (copy-list txids)))
     (loop while queue
           do (let ((txid (pop queue)))
@@ -93,17 +93,17 @@ BUMP-FEES already-decided zeros keyed by outpoint key, REQUESTED the requested
 outpoints grouped by txid, ENTRIES the mock-mempool entries by txid,
 DESCENDANTS each entry's descendant txids (itself included), READY-P Core's
 m_ready_to_calculate."
-  (bump-fees (make-hash-table :test 'equalp) :type hash-table)
-  (requested (make-hash-table :test 'equalp) :type hash-table)
-  (entries (make-hash-table :test 'equalp) :type hash-table)
-  (descendants (make-hash-table :test 'equalp) :type hash-table)
+  (bump-fees (bl.bytes:make-octets-hash-table) :type hash-table)
+  (requested (bl.bytes:make-octets-hash-table) :type hash-table)
+  (entries (bl.bytes:make-octets-hash-table) :type hash-table)
+  (descendants (bl.bytes:make-octets-hash-table) :type hash-table)
   (ready-p t))
 
 (defun %mm-make (mempool outpoints)
   "Core's MiniMiner(mempool, outpoints) constructor. OUTPOINTS is a list of
 (txid . index)."
   (let ((state (make-mm-state))
-        (to-be-replaced (make-hash-table :test 'equalp)))
+        (to-be-replaced (bl.bytes:make-octets-hash-table)))
     (let ((bump-fees (mms-bump-fees state))
           (requested (mms-requested state)))
       (dolist (op outpoints)
@@ -177,7 +177,7 @@ consumed, so what is left is exactly what did NOT make it into the block, with
 its ancestor state reduced to the ancestors that are still outside."
   (let ((entries (mms-entries state))
         (descendants (mms-descendants state))
-        (in-block (make-hash-table :test 'equalp)))
+        (in-block (bl.bytes:make-octets-hash-table)))
     (loop
       (when (zerop (hash-table-count entries)) (return))
       (let ((best nil))
@@ -188,7 +188,7 @@ its ancestor state reduced to the ancestors that are still outside."
                    (< (mm-anc-fee best)
                       (bl.rpc:feerate-fee target-feerate (mm-anc-vsize best))))
           (return))
-        (let ((ancestors (make-hash-table :test 'equalp))
+        (let ((ancestors (bl.bytes:make-octets-hash-table))
               (queue (list best)))
           (loop while queue
                 do (let ((e (pop queue)))
@@ -229,7 +229,7 @@ Per outpoint the answer is the LARGER of the two bumps -- the one that lifts
 the ancestor set to the target and the one that lifts the transaction itself --
 because a transaction is only mined when both its own feerate and its ancestor
 set's reach it (the worked example at :330-360)."
-  (let ((answers (make-hash-table :test 'equalp)))
+  (let ((answers (bl.bytes:make-octets-hash-table)))
     (cond
       ((null mempool)
        (dolist (op outpoints answers)
@@ -281,7 +281,7 @@ ancestors, and adding their bumps would pay for the same parent several times."
     (unless (mms-ready-p state) (return-from mini-miner-total-bump-fee nil))
     (let* ((in-block (%mm-build-template state target-feerate))
            (entries (mms-entries state))
-           (ancestors (make-hash-table :test 'equalp))
+           (ancestors (bl.bytes:make-octets-hash-table))
            (queue '()))
       (loop for txid being the hash-keys of (mms-requested state)
             do (unless (gethash txid in-block)

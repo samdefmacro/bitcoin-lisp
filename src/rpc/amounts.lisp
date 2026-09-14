@@ -409,6 +409,10 @@ ALLOW-NULL is fAllowNull: a missing key passes and only a present one is
 typed. Absent and null are one thing here, as find_value's null makes them
 in Core; a nested false or [] has folded to NIL too and reads as missing.
 
+A NIL type is Core's bare UniValueType(), its typeAny: the key is accepted
+whatever it holds, because something later reads it with its own parser (the
+fee options do, through AmountFromValue).
+
 STRICT is fStrict (rpc/util.cpp:69-79): after the expected keys are checked,
 every key of OBJ that EXPECTED does not name is -3 \"Unexpected key <k>\".
 Core passes it wherever an object argument is a closed set of options, so a
@@ -419,6 +423,7 @@ typo in a caller's key is an error rather than a silently ignored field."
                   (unless allow-null
                     (error 'rpc-error :code +rpc-type-error+
                                       :message (format nil "Missing ~A" key))))
+                 ((null type))           ; UniValueType(): typeAny
                  ((string/= (json-type-name value) type)
                   (error 'rpc-error
                          :code +rpc-type-error+

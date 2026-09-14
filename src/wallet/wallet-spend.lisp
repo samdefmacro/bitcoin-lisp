@@ -2816,6 +2816,49 @@ fundrawtransaction option names)."
         do (when (%opt-present-p options old)
              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message new))))
 
+(defun %check-fund-options (options)
+  "Core's RPCTypeCheckObj over the fund-option block (rpc/spend.cpp:485-515),
+in the order std::map visits the keys: fAllowNull, so a member given as null
+passes here and is caught by the getter that reads it, and fSTRICT, so a key
+nobody asked for is -3 rather than a silently ignored typo. feeRate and
+fee_rate are Core's bare UniValueType() -- AmountFromValue checks them later.
+
+Without it a member of the wrong type reached the parser that reads it and
+came back as whatever that parser did with it: estimate_mode=42 walked into
+STRING-EQUAL and left through the RPC boundary as -32603 Internal error, where
+Core answers -3 with its own sentence, the one naming the FIELD as well as the
+two types (rpc_psbt.py:628)."
+  (bl.rpc:rpc-type-check-obj
+   options
+   '(("add_inputs" . "bool")
+     ("add_to_wallet" . "bool")
+     ("changeAddress" . "string")
+     ("changePosition" . "number")
+     ("change_address" . "string")
+     ("change_position" . "number")
+     ("change_type" . "string")
+     ("conf_target" . "number")
+     ("estimate_mode" . "string")
+     ("feeRate" . nil)
+     ("fee_rate" . nil)
+     ("includeWatching" . "bool")
+     ("include_unsafe" . "bool")
+     ("include_watching" . "bool")
+     ("input_weights" . "array")
+     ("inputs" . "array")
+     ("lockUnspents" . "bool")
+     ("lock_unspents" . "bool")
+     ("locktime" . "number")
+     ("max_tx_weight" . "number")
+     ("maxconf" . "number")
+     ("minconf" . "number")
+     ("psbt" . "bool")
+     ("replaceable" . "bool")
+     ("solving_data" . "object")
+     ("subtractFeeFromOutputs" . "array")
+     ("subtract_fee_from_outputs" . "array"))
+   :allow-null t :strict t))
+
 (defun %parse-fund-options (node wallet cc options recipients override-min-fee)
   "The shared option block of fundrawtransaction / send /
 walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
@@ -2824,6 +2867,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
   (let ((change-position nil)
         (lock-unspents nil)
         (network (wallet-network wallet)))
+    (%check-fund-options options)
     (when (%opt-present-p options "add_inputs")
       (setf (wcc-allow-other-inputs cc) (and (%opt options "add_inputs") t)))
     (multiple-value-bind (change-address present)
@@ -3353,6 +3397,47 @@ form when output order matters."
                                       :message "send failed"))
                   (%finish-transaction node wallet options funded))))))))))
 
+(defun %sendall-assign-remainder (tx recipients addresses-without-amount remainder)
+  "Spread REMAINDER over sendall's amount-less recipients (Core
+rpc/spend.cpp:1522-1553): an equal share each, the rounding remainder to the
+first, and every output held to the dust threshold afterwards -- Core words
+the refusal differently for an output it sized itself and one the caller
+sized."
+  (let ((share (floor remainder (hash-table-count addresses-without-amount)))
+        (gave-remaining nil))
+    (loop for output across (bl.ser:transaction-outputs tx)
+          for recipient in recipients
+          do (let ((address (bl.rpc:recipient-address recipient)))
+               (cond
+                 ((and address (gethash address addresses-without-amount))
+                  (setf (bl.ser:tx-out-value output) share)
+                  (unless gave-remaining
+                    (incf (bl.ser:tx-out-value output)
+                          (mod remainder (hash-table-count addresses-without-amount)))
+                    (setf gave-remaining t))
+                  (when (%output-dust-p (bl.ser:tx-out-value output)
+                                        (bl.ser:tx-out-script-pubkey output))
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
+                                      :message "Dynamically assigned remainder results in dust output.")))
+                 ((%output-dust-p (bl.ser:tx-out-value output)
+                                  (bl.ser:tx-out-script-pubkey output))
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                    :message (format nil "Specified output amount to ~A is below dust threshold."
+                                                     address))))))))
+
+(defun %sendall-bump-fee (node outpoints fee-rate)
+  "sendall's budget for the unconfirmed ancestors of everything it sweeps
+(Core rpc/spend.cpp:1489-1503): ONE combined bump fee over all the spent
+outpoints, so a shared ancestor is paid for once rather than once per input.
+
+Without it a sweep paid FEE-RATE on its own vsize and its parents kept theirs,
+so sweeping a low-feerate parent sent out exactly as much as sweeping a
+high-feerate one -- wallet_sendall.py:433 compares those two amounts. Core
+treats an unanswerable calculation as 0 here (value_or(0))."
+  (or (mini-miner-total-bump-fee (bl.rpc:rpc-get-mempool node)
+                                 outpoints fee-rate)
+      0))
+
 (defun %fund-transaction-for-send (node wallet recipients change-position
                                    lock-unspents cc)
   "The FundTransaction step of send/sendall's ConstructTransaction path:
@@ -3603,21 +3688,9 @@ estimate_mode fee_rate options)."
                             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                               :message "Unable to determine the size of the transaction, the wallet contains unsolvable descriptors"))
                           (let* ((fee-from-size (bl.rpc:feerate-fee fee-rate vsize))
-                                 ;; Core sendall budgets for the unconfirmed
-                                 ;; ancestors of everything it sweeps
-                                 ;; (rpc/spend.cpp:1489-1503): ONE combined
-                                 ;; bump fee over all the spent outpoints, so a
-                                 ;; shared ancestor is paid for once. Without
-                                 ;; it the sweep's own feerate was the target
-                                 ;; and its parents kept theirs, so a sweep of
-                                 ;; a low-feerate parent sent the same amount
-                                 ;; as a sweep of a high-feerate one
-                                 ;; (wallet_sendall.py:433).
                                  (total-bump-fees
-                                   (or (mini-miner-total-bump-fee
-                                        (bl.rpc:rpc-get-mempool node)
-                                        (reverse outpoints) fee-rate)
-                                       0))
+                                   (%sendall-bump-fee node (reverse outpoints)
+                                                      fee-rate))
                                  (effective-value (- total-input-value
                                                      fee-from-size
                                                      total-bump-fees)))
@@ -3643,33 +3716,9 @@ estimate_mode fee_rate options)."
                                 (when (minusp remainder)
                                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
                                                     :message "Insufficient funds for fees after creating specified outputs."))
-                                (let ((per-output (floor remainder
-                                                         (hash-table-count addresses-without-amount)))
-                                      (gave-remaining nil))
-                                  (loop for output across (bl.ser:transaction-outputs tx)
-                                        for recipient in recipients
-                                        do (let ((address (bl.rpc:recipient-address recipient)))
-                                             (if (and address
-                                                      (gethash address addresses-without-amount))
-                                                 (progn
-                                                   (setf (bl.ser:tx-out-value output)
-                                                         per-output)
-                                                   (unless gave-remaining
-                                                     (incf (bl.ser:tx-out-value output)
-                                                           (mod remainder
-                                                                (hash-table-count addresses-without-amount)))
-                                                     (setf gave-remaining t))
-                                                   (when (%output-dust-p
-                                                          (bl.ser:tx-out-value output)
-                                                          (bl.ser:tx-out-script-pubkey output))
-                                                     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
-                                                                       :message "Dynamically assigned remainder results in dust output.")))
-                                                 (when (%output-dust-p
-                                                        (bl.ser:tx-out-value output)
-                                                        (bl.ser:tx-out-script-pubkey output))
-                                                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                                                     :message (format nil "Specified output amount to ~A is below dust threshold."
-                                                                                      address))))))
+                                (%sendall-assign-remainder
+                                 tx recipients addresses-without-amount remainder)
+                                (progn
                                   (when (and (%opt options "lock_unspents"))
                                     (bl.ser:dovector
                                         (input (bl.ser:transaction-inputs tx))

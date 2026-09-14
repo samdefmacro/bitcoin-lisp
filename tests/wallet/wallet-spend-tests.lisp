@@ -1662,10 +1662,16 @@ ParseOutputType and Core's own -5 (:547)."
         ;; change_type=None: present, not a string.
         (is (equal (cons -3 "JSON value of type null is not of expected type string")
                    (answer '(("change_type" . nil)))))
-        ;; The same member as a number, to show the sentence names the type it
-        ;; found rather than the word "null".
-        (is (equal (cons -3 "JSON value of type number is not of expected type string")
+        ;; A member of the wrong NON-null type never reaches get_str: Core's
+        ;; RPCTypeCheckObj runs first over the whole block (rpc/spend.cpp:
+        ;; 485-515) and its sentence names the FIELD as well as the two types.
+        ;; Both sentences exist in Core and this is the pair that tells them
+        ;; apart.
+        (is (equal (cons -3 "JSON value of type number for field change_type is not of expected type string")
                    (answer '(("change_type" . 3)))))
+        ;; And a key nobody asked for is refused rather than ignored (fStrict).
+        (is (equal (cons -3 "Unexpected key chnge_type")
+                   (answer '(("chnge_type" . "bech32")))))
         ;; changeAddress is Core's other get_str member of this block (:523).
         (is (equal (cons -3 "JSON value of type null is not of expected type string")
                    (answer '(("changeAddress" . nil)))))
