@@ -473,22 +473,25 @@ before it is believed — Core does the same for the same reason
 (index/txospenderindex.cpp:141-156). A candidate that does not really spend the
 outpoint is a hash collision; one whose block is no longer on the active chain
 is a reorg the index has not been told about, and both are skipped."
-  (let ((chain-state (rpc-get-chain-state node))
-        (block-store (bl:node-block-store node)))
+  (let ((block-store (bl:node-block-store node)))
     (dolist (locator (bl.store:txospenderindex-locators index txid vout))
       (destructuring-bind (block-hash . position) locator
         (let ((block (and block-store
                           (bl.store:get-block block-store block-hash))))
-          ;; ⚠️ ACTIVE chain, not merely known. An index entry left behind by
-          ;; a reorg names a block that is still on disk and still spends the
-          ;; outpoint, so believing it would answer with a spender from an
-          ;; abandoned chain. The disconnect hook erases those entries; this is
-          ;; the belt to its braces. Reuses the %BLOCK-ON-ACTIVE-CHAIN-P this
-          ;; file already had rather than adding a second one.
-          (when (and block
-                     (let ((entry (bl.store:get-block-index-entry
-                                   chain-state block-hash)))
-                       (and entry (%block-on-active-chain-p entry chain-state))))
+          ;; KNOWN, not necessarily on the ACTIVE chain. Core's FindSpender
+          ;; reads the transaction at the indexed position and returns it as
+          ;; soon as one of its inputs is the outpoint
+          ;; (index/txospenderindex.cpp:160-176); it asks nothing about the
+          ;; chain, so an entry a reorg has left behind is answered until the
+          ;; index is rewound, and the block hash it reports is that block's.
+          ;; rpc_gettxspendingprevout.py:200 pins exactly that: after an
+          ;; invalidateblock the RPC still names the spend from the abandoned
+          ;; block, "still in txospender index which has not been rewound yet".
+          ;; An active-chain gate here answered "unspent" instead, which is
+          ;; Core's shape for "nothing spent it" and so indistinguishable from
+          ;; a real answer -- the same confusion the index's own rewind test
+          ;; was written about.
+          (when block
             (let ((tx (%tx-at-block-position block position)))
               (when (and tx (%tx-spends-outpoint-p tx txid vout))
                 (return-from %txospender-confirmed-spender
@@ -774,18 +777,18 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                   (max-fee (feerate-fee
                             (%parse-max-fee-rate params 1)
                             (bl.ser:transaction-vsize tx))))
+            ;; Core checks the mempool by TXID before validating at all
+            ;; (node/transaction.cpp:63-72), skips submission and only
+            ;; re-announces, with the POOL entry's wtxid. Asking VALIDATE
+            ;; instead threw -26 txn-same-nonwitness-data-in-mempool where
+            ;; Core answers the txid (mempool_accept_wtxid.py:82).
+            (when (bl.mp:mempool-has mempool txid)
+              (bl:broadcast-transaction-to-peers node txid)
+              (return-from rpc-sendrawtransaction (hash-to-hex txid)))
             ;; Validate transaction for mempool
             (multiple-value-bind (valid error fee replaced sigops)
                 (bl.val:validate-transaction-for-mempool
                  tx utxo-set mempool current-height :chain-state chain-state)
-              (when (and (not valid) (eq error :already-in-mempool))
-                ;; Core doesn't reject a same-txid resubmission: it skips the
-                ;; mempool submission but still relays, announcing the POOL
-                ;; entry's wtxid (a same-txid/different-witness submission must
-                ;; advertise the witness we can actually serve). No unbroadcast
-                ;; add — Core's already-in-mempool branch skips it too.
-                (bl:broadcast-transaction-to-peers node txid)
-                (return-from rpc-sendrawtransaction (hash-to-hex txid)))
               (unless valid
                 ;; Core reports the state's own reject reason, with no prefix
                 ;; of its own: BroadcastTransaction sets err_string to

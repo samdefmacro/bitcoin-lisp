@@ -633,6 +633,16 @@ see %MAKE-RPC-REPLY for the version-dependent shape."
 (defun handle-single-request (node method params id version &key (id-present t))
   "Handle a single RPC request. VERSION and ID-PRESENT come from the parsed
 request and shape the reply (see MAKE-RPC-RESPONSE)."
+  ;; One line per call under the `rpc\' category, exactly where Core writes it
+  ;; -- JSONRPCRequest::parse, immediately after the method name is read and
+  ;; before the parameters are (rpc/request.cpp:240-243), so a call that
+  ;; BLOCKS is logged when it arrives rather than when it returns. That is the
+  ;; whole point of the line for mining_getblocktemplate_longpoll.py:26, which
+  ;; waits for it while a longpoll getblocktemplate is parked. A batch logs
+  ;; one line per member, as Core does, because each member is parsed on its
+  ;; own. Core prints peeraddr too, but only under -logips.
+  (bl.log:log-cat "rpc" "ThreadRPCServer method=~A user=~A"
+                  (bl.bytes:sanitize-string method) *rpc-auth-user*)
   (handler-case
       (let ((result (dispatch-rpc-method node method params)))
         (make-rpc-response result id version :id-present id-present))
@@ -709,6 +719,12 @@ handler-case around it does."
   "The path of the HTTP request being served, bound by RPC-HANDLER for the
 duration of the call (Core JSONRPCRequest::URI). The wallet reads its
 /wallet/<name> endpoint from it; NIL outside a request.")
+
+(defvar *rpc-auth-user* ""
+  "The authenticated user name of the request being served (Core
+JSONRPCRequest::authUser, set by RPCAuthorized, httprpc.cpp:84,121). Read by
+the per-request log line below; the empty string outside a request, which is
+also what Core prints for the cookie user.")
 
 (defvar *rpc-credentials* '()
   "Every credential the RPC server authorizes against, each an RPC-CREDENTIAL:
@@ -1289,7 +1305,8 @@ must stay a value test (NIL = success), not a key-presence test."
         (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
         (setf (hunchentoot:header-out :www-authenticate) "Basic realm=\"bitcoin-lisp\"")
         (return-from rpc-handler ""))
-      (%rpc-handle-authorized request user))))
+      (let ((*rpc-auth-user* (or user "")))
+        (%rpc-handle-authorized request user)))))
 
 (defun %rpc-handle-authorized (request user)
   "Answer REQUEST, which USER has already authenticated for. Everything from

@@ -392,8 +392,9 @@ index lookup rather than from a hand-built result."
                              (setf (gethash "txid" h)
                                    (bl.rpc:hash-to-hex (bl.ser:outpoint-hash op))
                                    (gethash "vout" h) (bl.ser:outpoint-index op))
-                             (first (bl.rpc::rpc-gettxspendingprevout
-                                     node (list (list h)))))))
+                             (first (bl.rpc:dispatch-rpc-method
+                                     node "gettxspendingprevout"
+                                     (wire-params (list (vector h))))))))
                     (let ((r (query spent)))
                       (is-true (assoc "spendingtxid" r :test #'string=)
                                "the fixture's confirmed spend was not found")
@@ -403,6 +404,21 @@ index lookup rather than from a hand-built result."
                     ;; blockhash really comes from the index hit.
                     (let ((r (query unspent)))
                       (is-false (assoc "spendingtxid" r :test #'string=))
-                      (is-false (assoc "blockhash" r :test #'string=)))))
+                      (is-false (assoc "blockhash" r :test #'string=)))
+                    ;; And the index is answered whether or not its block is
+                    ;; still on the ACTIVE chain. Core's FindSpender asks
+                    ;; nothing about the chain (index/txospenderindex.cpp:
+                    ;; 160-176), so a row a reorg has left behind is still
+                    ;; reported until the index is rewound --
+                    ;; rpc_gettxspendingprevout.py:200 invalidates the block
+                    ;; and still expects the spend. An active-chain gate here
+                    ;; answered "unspent" instead, which is Core's shape for
+                    ;; "nothing spent it".
+                    (bl.store:update-chain-tip cs genesis-hash 0)
+                    (let ((r (query spent)))
+                      (is-true (assoc "spendingtxid" r :test #'string=)
+                               "the spend went missing once its block left the active chain")
+                      (is (string= (bl.rpc:hash-to-hex block-hash)
+                                   (cdr (assoc "blockhash" r :test #'string=)))))))
              (bl.store:close-txospender-index idx)))
       (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
