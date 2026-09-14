@@ -1684,13 +1684,16 @@ option this repo keeps finding."
            ;; is taken as given on every network.
            (loop for (arg net expected)
                    in (list (list "node.pid" nil (merge-pathnames "node.pid" dir))
-                            (list nil nil (merge-pathnames "bitcoin-lisp.pid" dir))
+                            ;; Core's BITCOIN_PID_FILENAME (init.cpp:171) is
+                            ;; the default, and the functional framework looks
+                            ;; for that exact name (test_node.py:61).
+                            (list nil nil (merge-pathnames "bitcoind.pid" dir))
                             (list "/var/run/x.pid" nil #p"/var/run/x.pid")
                             (list "0" nil nil)
                             (list "node.pid" :regtest
                                   (merge-pathnames "regtest/node.pid" dir))
                             (list nil :regtest
-                                  (merge-pathnames "regtest/bitcoin-lisp.pid" dir))
+                                  (merge-pathnames "regtest/bitcoind.pid" dir))
                             (list "node.pid" :mainnet (merge-pathnames "node.pid" dir))
                             (list "/var/run/x.pid" :regtest #p"/var/run/x.pid"))
                  do (is (equal expected (bl::pid-file-path arg dir net))

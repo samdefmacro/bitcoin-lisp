@@ -18,6 +18,16 @@ Ours used the -conf value verbatim, so `-conf=bitcoin.conf` alongside
       (pathname path)
       (merge-pathnames path (uiop:ensure-directory-pathname datadir))))
 
+(alexandria:define-constant +pid-filename+ "bitcoind.pid"
+  :test #'equal
+  :documentation "Core BITCOIN_PID_FILENAME (init.cpp:171), the default -pid
+value.
+
+Core's name, not a name of our own: the pid file is part of the datadir
+layout every supervisor and packaging script already knows, and
+feature_filelock.py:43 and feature_init.py:255 look for it by that name.
+An operator who wants another one passes -pid.")
+
 (defun pid-file-path (pid-arg data-directory &optional network)
   "Where -pid points: PID-ARG, prefixed by NETWORK's directory under
 DATA-DIRECTORY when relative (Core GetPidFile -> AbsPathForConfigVal,
@@ -32,7 +42,7 @@ feature_init.py:256 looks for `-pid=<relative>` under `node.chain_path`; a pid
 file one directory up is one a supervisor pointed at the chain directory never
 finds. Passing no NETWORK keeps the base directory, which is what mainnet and
 the pre-Core callers want."
-  (let ((arg (cond ((null pid-arg) "bitcoin-lisp.pid")
+  (let ((arg (cond ((null pid-arg) +pid-filename+)
                    ((not (stringp pid-arg)) pid-arg)
                    ((or (string= pid-arg "0") (string= pid-arg "")) nil)
                    (t pid-arg))))
