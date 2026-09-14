@@ -873,7 +873,15 @@ size fails the floor."
 ;;;; Wave 9C: PackageTRUCChecks (Core policy/truc_policy.cpp:58-170)
 
 (defun %pkg-truc (mempool tx vsize txns)
-  (bl.val:package-truc-checks mempool tx vsize txns))
+  "The VERDICT KEYWORD of PACKAGE-TRUC-CHECKS: the call answers (KEYWORD
+DETAIL), Core's sentence beside the rule it broke."
+  (bl.val:tx-reject-keyword
+   (bl.val:package-truc-checks mempool tx vsize txns)))
+
+(defun %pkg-truc-message (mempool tx vsize txns)
+  "PACKAGE-TRUC-CHECKS' verdict as the package state prints it."
+  (bl.val:tx-reject-reason-string
+   (bl.val:package-truc-checks mempool tx vsize txns)))
 
 (test package-truc-checks-inheritance
   "In-package v3<->v2 inheritance: a v3 member cannot spend an in-package v2
@@ -941,6 +949,74 @@ descendant is likewise at its limit."
     (is (eq :ok (%add-tx mempool c1 :fee 20000 :height 200)))
     (is (eq :truc-descendant-limit (%pkg-truc mempool c2 100 (list c2))))))
 
+(test package-truc-checks-carry-cores-sentence
+  "Core's PackageTRUCChecks returns a SENTENCE, not a verdict: every one of
+its rules is the same reject reason, \"TRUC-violation\", and what tells the
+rules apart is the strprintf beside it (policy/truc_policy.cpp:58-170). That
+sentence is what the package state prints, and what submitpackage reports as
+package_msg and testmempoolaccept as package-error -- mempool_truc.py:284,
+:290, :297, :326 and :421 compare the whole string.
+
+It also says WHICH transaction is at fault, and that is not always the member
+being checked: a descendant-count failure names the PARENT whose limit would
+be exceeded, and the both-a-parent-and-an-in-package-child failure names the
+CHILD that would be the ancestor too many.
+
+We answered with one bare keyword for all six rules, so every package TRUC
+rejection read \"TRUC-violation\" and named nothing."
+  (let* ((mempool (bl.mp:make-mempool))
+         (funding (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 24))
+         (p3 (%pkg-tx funding 0 99990000 :version 3))
+         (p3id (bl.ser:transaction-hash p3))
+         (c3 (%pkg-tx p3id 0 99980000 :version 3))
+         (c3id (bl.ser:transaction-hash c3))
+         (g3 (%pkg-tx c3id 0 99970000 :version 3))
+         (p2 (%pkg-tx funding 0 99990000 :version 2))
+         (p2id (bl.ser:transaction-hash p2))
+         (c3-of-v2 (%pkg-tx p2id 0 99980000 :version 3))
+         (c2-of-v3 (%pkg-tx p3id 0 99980000 :version 2))
+         (two-out (%truc-2out-parent funding))
+         (two-out-id (bl.ser:transaction-hash two-out))
+         (s1 (%pkg-tx two-out-id 0 49980000 :version 3))
+         (s2 (%pkg-tx two-out-id 1 49980000 :version 3)))
+    (flet ((names (tx)
+             (format nil "~A (wtxid=~A)"
+                     (bl.crypto:bytes-to-hex
+                      (bl.crypto:reverse-bytes (bl.ser:transaction-hash tx)))
+                     (bl.crypto:bytes-to-hex
+                      (bl.crypto:reverse-bytes (bl.ser:transaction-wtxid tx))))))
+      ;; Inheritance, both directions, naming both transactions.
+      (is (string= (format nil "TRUC-violation, version=3 tx ~A cannot spend from non-version=3 tx ~A"
+                           (names c3-of-v2) (names p2))
+                   (%pkg-truc-message mempool c3-of-v2 100 (list p2 c3-of-v2))))
+      (is (string= (format nil "TRUC-violation, non-version=3 tx ~A cannot spend from version=3 tx ~A"
+                           (names c2-of-v3) (names p3))
+                   (%pkg-truc-message mempool c2-of-v3 100 (list p3 c2-of-v3))))
+      ;; The two size caps carry the numbers that decided them.
+      (is (string= (format nil "TRUC-violation, version=3 tx ~A is too big: 10001 > 10000 virtual bytes"
+                           (names p3))
+                   (%pkg-truc-message mempool p3 10001 (list p3 c3))))
+      (is (string= (format nil "TRUC-violation, version=3 child tx ~A is too big: 1001 > 1000 virtual bytes"
+                           (names c3))
+                   (%pkg-truc-message mempool c3 1001 (list p3 c3))))
+      ;; A member with a parent AND an in-package child: the sentence names
+      ;; the CHILD (truc_policy.cpp:135-140).
+      (is (string= (format nil "TRUC-violation, tx ~A would have too many ancestors"
+                           (names g3))
+                   (%pkg-truc-message mempool c3 100 (list p3 c3 g3))))
+      ;; Two siblings on one parent: the sentence names the PARENT
+      ;; (truc_policy.cpp:127-133).
+      (is (string= (format nil "TRUC-violation, tx ~A would exceed descendant count limit"
+                           (names two-out))
+                   (%pkg-truc-message mempool s1 100 (list two-out s1 s2))))
+      ;; A mempool parent that already has a child: still the parent's name.
+      (is (eq :ok (%add-tx mempool two-out :fee 20000 :height 200)))
+      (is (eq :ok (%add-tx mempool s1 :fee 20000 :height 200)))
+      (is (string= (format nil "TRUC-violation, tx ~A would exceed descendant count limit"
+                           (names two-out))
+                   (%pkg-truc-message mempool s2 100 (list s2)))))))
+
 (test package-truc-enforced-end-to-end
   "The in-package TRUC topology is enforced on the CPFP path: a v2 child
 CPFPing a 0-fee v3 parent — invisible to the per-tx single checks because
@@ -954,7 +1030,7 @@ PackageTRUCChecks port was a stub)."
       (multiple-value-bind (msg results)
           (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state)
-        (is (eq :truc-nonv3-spends-v3 msg))
+        (is (eq :truc-nonv3-spends-v3 (bl.val:tx-reject-keyword msg)))
         ;; package-level failure: members keep their phase-1 nonfinal results
         (is (eq :invalid (bl.val:package-tx-result-status
                           (%result-for results parent)))))
@@ -998,7 +1074,7 @@ fails the package."
           (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state)
         (declare (ignore results))
-        (is (eq :truc-child-too-big msg)))
+        (is (eq :truc-child-too-big (bl.val:tx-reject-keyword msg))))
       (is (= 0 (bl.mp:mempool-count mempool))))))
 
 ;;;; Wave 9C: atomic package acceptance + Core result semantics
