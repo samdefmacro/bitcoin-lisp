@@ -2428,10 +2428,17 @@ risk a false negative."
 
 ;;; getdescriptoractivity — spend/receive activity for descriptors in blocks.
 
-(defun %spk-object (script needles)
-  "A scriptPubKey JSON object (hex, plus the matched descriptor when known)."
-  `(("hex" . ,(bl.crypto:bytes-to-hex script))
-    ,@(let ((desc (gethash script needles))) (when desc `(("desc" . ,desc))))))
+(defun %spk-object (script network)
+  "The scriptPubKey object an activity entry carries. Core builds it with
+ScriptToUniv(include_hex, include_address), like every other scriptPubKey
+field in the RPC surfaces (rpc/blockchain.cpp:2799, :2820), so it has asm,
+the INFERRED descriptor, hex, the address when the script has one, and type.
+
+Ours carried hex and the REQUEST's descriptor -- the needle that matched --
+so rpc_getdescriptoractivity.py:65 died on a KeyError for `asm', and `desc'
+named the scanobject the caller had just sent rather than what Core infers
+from the script itself (`rawtr(...)' for the taproot output at :66)."
+  (script-to-json script :network network))
 
 (defun outpoint-key (txid index)
   (let ((k (make-array 36 :element-type '(unsigned-byte 8))))
@@ -2445,7 +2452,7 @@ risk a false negative."
     (dolist (e undo table)
       (setf (gethash (outpoint-key (first e) (second e)) table) (third e)))))
 
-(defun %tx-activity (tx needles prevout-fn base-fields)
+(defun %tx-activity (tx needles prevout-fn base-fields network)
   "Collect spend+receive activity entries for TX. NEEDLES maps script->desc;
 PREVOUT-FN maps (txid index) -> utxo-entry (or NIL); BASE-FIELDS is an alist of
 common fields (blockhash/height, or nil for mempool). Returns a list of entries."
@@ -2470,7 +2477,7 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
                                ("spend_vin" . ,vin)
                                ("prevout_txid" . ,(hash-to-hex phash))
                                ("prevout_vout" . ,pindex)
-                               ("prevout_spk" . ,(%spk-object spk needles)))
+                               ("prevout_spk" . ,(%spk-object spk network)))
                              acc))))))
     ;; Receives: each output whose script matches.
     (loop for out across (bl.ser:transaction-outputs tx)
@@ -2482,7 +2489,7 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
                        ,@base-fields
                        ("txid" . ,(hash-to-hex txid))
                        ("vout" . ,vout)
-                       ("output_spk" . ,(%spk-object spk needles)))
+                       ("output_spk" . ,(%spk-object spk network)))
                      acc))
     (nreverse acc)))
 
@@ -2532,7 +2539,7 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
               (dolist (tx (bl.ser:bitcoin-block-transactions block))
                 (push (%tx-activity tx needles
                                     (lambda (th ti) (gethash (outpoint-key th ti) prevouts))
-                                    base)
+                                    base network)
                       chunks))))))
       ;; Mempool (blockhash/height omitted).
       (when include-mempool
@@ -2558,7 +2565,7 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
                                     (bl.store:make-utxo-entry
                                      :value (bl.ser:tx-out-value o)
                                      :script-pubkey (bl.ser:tx-out-script-pubkey o)))))))
-                        nil)
+                        nil network)
                        chunks)))))))
       ;; chunks is reverse-order lists of entries; flatten once (O(total)).
       ;; Core builds `activity' as a VARR (rpc/blockchain.cpp,

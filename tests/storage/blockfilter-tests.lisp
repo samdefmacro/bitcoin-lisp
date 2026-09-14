@@ -427,6 +427,38 @@ from the zero header, and filling the gap in order is then accepted."
             node (list (list (bl.rpc:hash-to-hex (%bfi-zeros32)))
                        (list "raw(51)") nil))))))))
 
+(test getdescriptoractivity-carries-cores-whole-script-object
+  "Every scriptPubKey Core prints goes through ScriptToUniv, and an activity
+entry's is no exception: AddSpend and AddReceive build prevout_spk and
+output_spk with ScriptToUniv(include_hex, include_address)
+(rpc/blockchain.cpp:2799, :2820), so the object carries asm, desc, hex, the
+address when the script has one, and type -- in that order
+(core_io.cpp:409-428).
+
+Ours carried hex and, as `desc', the SCANOBJECT that matched. So
+rpc_getdescriptoractivity.py:65 died on a KeyError for `asm', and a caller
+that read `desc' got back the descriptor it had just sent instead of the one
+Core infers from the script (`rawtr(...)' for the taproot output at :66).
+SCRIPT-TO-JSON is ScriptToUniv here and had every other scriptPubKey field in
+the tree already; this one was not using it."
+  (with-network (:regtest)
+    (let ((node (%bfi-regtest-node)))
+      (let ((bl:*node* node))
+        (let* ((hashes (generate-regtest-blocks node 2))
+               (res (bl.rpc:dispatch-rpc-method
+                     node "getdescriptoractivity"
+                     (list hashes (list "raw(51)") nil)))
+               (activity (cdr (assoc "activity" res :test #'equal)))
+               (spk (cdr (assoc "output_spk" (first activity) :test #'equal))))
+          (is (equal '("asm" "desc" "hex" "type") (mapcar #'car spk))
+              "the scriptPubKey object is not ScriptToUniv's")
+          (is (string= "1" (cdr (assoc "asm" spk :test #'equal))))
+          (is (string= "51" (cdr (assoc "hex" spk :test #'equal))))
+          (is (string= "nonstandard" (cdr (assoc "type" spk :test #'equal))))
+          ;; The INFERRED descriptor, checksum and all -- not the scanobject,
+          ;; which was spelled without one.
+          (is (string= "raw(51)#8lvh9jxk" (cdr (assoc "desc" spk :test #'equal)))))))))
+
 (test bip157-serving-request-validation-and-messages
   "BIP157 serving: %cf-request-stop-height enforces active-chain stop hash +
 range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
