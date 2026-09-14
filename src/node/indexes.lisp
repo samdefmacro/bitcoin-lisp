@@ -398,7 +398,11 @@ in the header index; rebuilding from genesis")
 is unavailable; rebuilding from genesis" (bl.crypto:bytes-to-hex hash))
                        (bl.store:index-clear-best idx)
                        (return-from %rewind-txospenderindex -1))
-                     (bl.store:txospenderindex-remove-block idx block hash))))
+                     ;; Core's CustomRemove, reached the one way it is ever
+                     ;; reached: from a rewind (index/base.cpp:313).
+                     (bl.store:index-rewind-block
+                      idx cs block hash
+                      (bl.store:block-index-entry-height e)))))
         (let ((height (bl.store:block-index-entry-height fork)))
           (log-warn "Spender index rewound to height ~D (~D block~:P of the abandoned branch erased)"
                     height (- best-height height))
@@ -422,6 +426,24 @@ bugs, all of them the txindex)."
                                    (node-coinstatsindex node)
                                    (node-txospenderindex node)))))
 
+(defun %index-rewind-if-not-parent (index chainstate block)
+  "Core BaseIndex::BlockConnected's rewind step (index/base.cpp:363-367): a
+block whose parent is not the index's best block means the chain moved under
+the index, so rewind it to the active chain BEFORE writing.
+
+This is the only place an index removes anything: Core is never told about a
+disconnected block (there is no BlockDisconnected handler), so the removal
+happens here, when a replacement has arrived. INDEX-PREPARE-SYNC is the same
+rewind the startup catch-up runs -- walk the best marker back to the last
+block it shares with the active chain, removing what the abandoned branch
+wrote on the way. It runs only on the rare connect that is not a
+continuation."
+  (let ((best (bl.store:index-best-block index)))
+    (when (and best
+               (not (equalp best (bl.ser:block-header-prev-block
+                                  (bl.ser:bitcoin-block-header block)))))
+      (bl.store:index-prepare-sync index chainstate (node-block-store *node*)))))
+
 (bl.vi:define-validation-hook :block-connected index-block-connected (chainstate block block-hash height spent-utxos)
   "Connect-time hook (Core BaseIndex::BlockConnected): fold BLOCK, connected
 at HEIGHT with SPENT-UTXOS as its undo list, into every enabled index.
@@ -436,7 +458,9 @@ connect, so consensus is unaffected whether an index is on or off."
       (let ((name (bl.store:index-name index)))
         (handler-case
             (multiple-value-bind (result status)
-                (bl.store:index-write-block index chainstate block block-hash height spent-utxos)
+                (progn
+                  (%index-rewind-if-not-parent index chainstate block)
+                  (bl.store:index-write-block index chainstate block block-hash height spent-utxos))
               (declare (ignore result))
               (when (and (eq status :noncontiguous)
                          (not (member name *index-stall-logged* :test #'string=)))
@@ -448,16 +472,24 @@ the startup backfill will heal it on next restart"
             (log-warn "~A failed at height ~D: ~A" name height e)))))))
 
 (bl.vi:define-validation-hook :block-disconnected index-block-disconnected (chainstate block block-hash height)
-  "Disconnect-time hook (Core BaseIndex's rewind): erase what
-INDEX-BLOCK-CONNECTED wrote for BLOCK (at HEIGHT) in every enabled index.
-Same chainstate rule and same never-signals rule as the connect hook."
-  (when (and *node* (eq chainstate (node-validated-chainstate *node*)))
-    (dolist (index (node-indexes *node*))
-      (handler-case
-          (bl.store:index-rewind-block index chainstate block block-hash height)
-        (error (e)
-          (log-warn "~A failed to rewind ~A: ~A"
-                    (bl.store:index-name index) (bl.crypto:bytes-to-hex block-hash) e))))))
+  "Disconnect-time hook: the indexes are NOT told, and that is Core's shape.
+
+BaseIndex has no BlockDisconnected handler at all. Its rewind is driven from
+the next BlockConnected, which notices the stored best block is not the
+arriving block's parent and only then walks pprev calling CustomRemove
+(index/base.cpp:363-367, :290-320) -- see %INDEX-REWIND-IF-NOT-PARENT. So a
+disconnected block's rows stay readable until a block replaces it, which is
+what rpc_gettxspendingprevout.py:198-200 asserts across an invalidateblock:
+`tx2 is not in the mempool anymore, but still in txospender index which has
+not been rewound yet'.
+
+Erasing here answered UNSPENT in that window -- Core's shape for `nothing ever
+spent it', and so indistinguishable from a real answer -- and made a reorg
+that re-connects the same block rebuild what it had just thrown away. The hook
+stays declared because the disconnect signal is part of the interface and a
+reader looking for the index's half of it should find this."
+  (declare (ignore chainstate block block-hash height))
+  nil)
 
 (defmethod bl.store:index-write-block ((csi bl.store:coinstatsindex) chainstate block block-hash height spent-utxos)
   "The coinstats fold needs the block subsidy, which is consensus; that is
