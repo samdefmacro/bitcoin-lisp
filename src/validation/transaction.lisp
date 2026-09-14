@@ -1380,12 +1380,6 @@ decide (Core PreChecks, validation.cpp:950-970)."
             (return-from validate-transaction-for-mempool
               (values nil :too-many-sigops nil)))
 
-          ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends,
-          ;; validation.cpp:1370-1372) -- see %SINGLE-EPHEMERAL-SPEND-VERDICT.
-          (let ((dust (%single-ephemeral-spend-verdict tx mempool bypass-limits)))
-            (when dust
-              (return-from validate-transaction-for-mempool (values nil dust nil))))
-
           ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
           ;; dynamic minimum when the mempool has been trimming). The rate is
           ;; sat/kvB (Core CFeeRate), so compare fee*1000 against rate*vsize --
@@ -1428,6 +1422,17 @@ decide (Core PreChecks, validation.cpp:950-970)."
               (unless ok
                 (return-from validate-transaction-for-mempool (values nil reason nil)))
               (setf replaced-set rset)))
+
+          ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends,
+          ;; validation.cpp:1370-1374) -- see %SINGLE-EPHEMERAL-SPEND-VERDICT.
+          ;; Core runs it after ALL of PreChecks and immediately before the
+          ;; script passes, so the fee floor, the TRUC topology and the RBF
+          ;; economics all answer first: mempool_ephemeral_dust.py:347 sends a
+          ;; sweep that both underpays AND strands dust, and reads "min relay
+          ;; fee not met".
+          (let ((dust (%single-ephemeral-spend-verdict tx mempool bypass-limits)))
+            (when dust
+              (return-from validate-transaction-for-mempool (values nil dust nil))))
 
           ;; The two script passes, Core's names (defined above this
           ;; function): STANDARD flags first, then the tip's consensus
