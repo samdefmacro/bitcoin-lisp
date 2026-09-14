@@ -1055,7 +1055,7 @@ an exiled honest peer."
     ;; cannot reach that arm from a compact block, and it was one of the two
     ;; false positives that exiled honest peers.
     (dolist (reason '(:orphan-block :bad-merkle-root :bad-txns-duplicate
-                      :first-tx-not-coinbase :bad-signet-solution :script-failed
+                      :first-tx-not-coinbase :bad-signet-solution :block-script-verify-flag-failed
                       :bad-witness-merkle-match :block-too-heavy))
       (is (eq :refetch (action reason))
           "~S is BLOCK_CONSENSUS/BLOCK_MUTATED and must not punish, got ~S"

@@ -2571,7 +2571,7 @@ CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons)."
   ;; witness-byte-dependent verdicts (script / witness-commitment / contextual
   ;; sigops), corrupt-body signals (merkle), CheckBlock/structural failures,
   ;; header keywords, the reorg control keywords, an unknown keyword, and NIL.
-  (dolist (k '(:script-failed :bad-witness-merkle-match :bad-witness-nonce-size
+  (dolist (k '(:block-script-verify-flag-failed :bad-witness-merkle-match :bad-witness-nonce-size
                :unexpected-witness :too-many-sigops
                :bad-merkle-root :bad-txns-duplicate :no-transactions
                :first-tx-not-coinbase :multiple-coinbase :block-too-heavy

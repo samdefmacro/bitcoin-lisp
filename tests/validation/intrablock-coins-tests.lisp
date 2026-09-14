@@ -199,7 +199,8 @@ signature really is invalid."
        (bl.store:add-utxo utxo confirmed 0 90000000 p2pkh 0 :coinbase nil)
        (multiple-value-bind (valid error) (%ib-validate blk cs utxo now)
          (is (null valid))
-         (is (eq :script-failed error)))
+         (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error)))))
        ;; CONTROL: identical shape, but the parent coin is confirmed.
        (let* ((unsigned-c (%ib-tx (list (list confirmed 0 (%ib-empty)))
                                   (list (list 80000000 (p2sh-optrue-script-pubkey)))))
@@ -209,7 +210,8 @@ signature really is invalid."
               (blk-c (%ib-block (list tx-c) prev bits now (+ subsidy 10000000))))
          (multiple-value-bind (valid error) (%ib-validate blk-c cs utxo now)
            (is (null valid))
-           (is (eq :script-failed error))))))))
+           (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error))))))))))
 
 (test intrablock-chained-valid-signature-accepted
   "The other half of the fix: an honestly signed chained spend must still be
@@ -260,7 +262,8 @@ accepted, so the rejection is attributable to the bad one."
                   (%ib-block (list tx-a tx-b) prev bits now (+ subsidy 20000000)))))
          (multiple-value-bind (valid error) (%ib-validate (build t) cs utxo now)
            (is (null valid))
-           (is (eq :script-failed error)))
+           (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error)))))
          ;; CONTROL: both inputs correctly signed.
          (multiple-value-bind (valid error) (%ib-validate (build nil) cs utxo now)
            (is (eq t valid))
@@ -293,7 +296,8 @@ The honest spend must validate and a corrupted one must not."
            (is (null error)))
          (multiple-value-bind (valid error) (%ib-validate (spend t) cs utxo now)
            (is (null valid))
-           (is (eq :script-failed error))))
+           (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error))))))
        ;; The mechanism underneath: without the overlay the vector is NIL and
        ;; the BIP341 fields cannot be precomputed; with it they are present.
        (let ((extra (make-hash-table :test 'equalp))
