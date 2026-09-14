@@ -935,8 +935,9 @@ standard (TRUC/BIP431 enforced) -- see +max-standard-tx-version+."
    :outputs (coerce outputs 'vector)
    :lock-time 0))
 
-(defun %eph-spend (parent-tx indices)
-  "A transaction spending PARENT-TX's outputs at INDICES."
+(defun %eph-spend (parent-tx indices &key (out-value 10000))
+  "A transaction spending PARENT-TX's outputs at INDICES, paying OUT-VALUE to
+one output -- so the caller can choose whether it leaves a fee."
   (let ((txid (bl.ser:transaction-hash parent-tx)))
     (bl.ser:make-transaction
      :version 1
@@ -950,7 +951,7 @@ standard (TRUC/BIP431 enforced) -- see +max-standard-tx-version+."
                      :sequence #xFFFFFFFF))
                   indices)
      :outputs (vector (bl.ser:make-tx-out
-                       :value 10000
+                       :value out-value
                        :script-pubkey (bl.ser:tx-out-script-pubkey
                                        (elt (bl.ser:transaction-outputs
                                              parent-tx) 0))))
@@ -1068,6 +1069,46 @@ nothing tested it."
                                           :value 60000 :script-pubkey spk)))))
       (is-true (bl.val::check-ephemeral-spends
                 (list clean (%eph-spend clean '(0))) nil)))))
+
+(test ephemeral-spends-are-checked-after-every-precheck
+  "Core runs CheckEphemeralSpends after ALL of PreChecks and immediately
+before the script passes (validation.cpp:1370-1374), so the fee floor
+(:945), the TRUC topology (:951) and the RBF economics all answer first --
+the order decides WHICH reason a transaction that breaks two rules is given.
+
+This node ran it right after the sigop cap, before the fee floor, so a sweep
+that both underpays and strands its parent's dust was told
+missing-ephemeral-spends where mempool_ephemeral_dust.py:347 reads `min
+relay fee not met'."
+  (let* ((mempool (bl.mp:make-mempool))
+         (utxo (bl.store:make-utxo-set))
+         (spk (bl.ser:tx-out-script-pubkey
+               (elt (bl.ser:transaction-outputs
+                     (make-mempool-test-tx :input-id 93)) 0)))
+         (parent (%eph-tx :input-id 93
+                          :outputs (list (bl.ser:make-tx-out
+                                          :value 50000 :script-pubkey spk)
+                                         (bl.ser:make-tx-out
+                                          :value 1 :script-pubkey spk))))
+         (pid (bl.ser:transaction-hash parent)))
+    ;; The dust-carrying parent is in the pool, so the sweep's failure to
+    ;; take output 1 is visible.
+    (bl.store:add-utxo utxo (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element 93)
+                       0 100000 spk 0)
+    (bl.mp:mempool-add mempool pid
+                       (bl.mp:make-entry-from-tx parent 0 1
+                                                 :entry-time (bl.ser:get-unix-time)))
+    (bl.store:add-utxo utxo pid 0 50000 spk 1)
+    (bl.store:add-utxo utxo pid 1 1 spk 1)
+    ;; A sweep that takes only the non-dust output AND pays no fee breaks two
+    ;; rules at once; Core's order names the fee one.
+    (let ((sweep (%eph-spend parent '(0) :out-value 50000)))
+      (multiple-value-bind (valid err)
+          (bl.val:validate-transaction-for-mempool sweep utxo mempool 100)
+        (is (null valid))
+        (is (eq :insufficient-fee (bl.val:tx-reject-keyword err))
+            "the ephemeral-dust check answered before the fee floor: ~S" err)))))
 
 (test check-ephemeral-spends-sees-mempool-parents-too
   "A parent already IN the mempool imposes the same sweep requirement as one
