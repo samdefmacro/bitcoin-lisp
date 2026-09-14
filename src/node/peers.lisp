@@ -1246,29 +1246,42 @@ timestamp would reset each pass and the cadence would be meaningless.")
   "Core EXTRA_PEER_CHECK_INTERVAL — cadence of the chain-sync sweep.")
 
 (defun consider-outbound-evictions (node)
-  "Core's CheckForStaleTipAndEvictPeers tick (net_processing.cpp:5460), on the
-45s EXTRA_PEER_CHECK_INTERVAL cadence. Driven from here rather than from
-run-ibd's block-download loop, which does not run at tip — exactly where
-eclipse resistance matters.
+  "Core's two outbound-eviction sweeps, on Core's two cadences.
 
-Two sweeps, in Core's order: the per-peer chain-sync eviction, then the
-whole-set extra-outbound eviction."
+The per-peer chain-sync eviction runs EVERY pass. Core calls ConsiderEviction
+from SendMessages itself, once per peer per message-handler iteration
+(net_processing.cpp:6159); only CheckForStaleTipAndEvictPeers -- the
+extra-outbound sweep and the stale-tip check -- is on the 45-second
+EXTRA_PEER_CHECK_INTERVAL scheduler (:2034). Ours had BOTH behind the
+interval, and behind it measured on the MOCKABLE clock, which is worse than
+slow: a test that moves mocktime BACKWARDS leaves now - *last-chain-sync-check*
+negative for good and the sweep never runs again.
+p2p_outbound_eviction.py:46-56 connects an outbound peer, jumps the clock past
+CHAIN_SYNC_TIMEOUT and then past HEADERS_RESPONSE_TIME, and waits for the
+disconnect; node0's log shows the ladder never being walked at all.
+
+Driven from here rather than from run-ibd's block-download loop, which does not
+run at tip — exactly where eclipse resistance matters."
   (let ((now (bl.ser:get-unix-time)))
-    (when (>= (- now *last-chain-sync-check*) +extra-peer-check-interval-seconds+)
+    (let ((chain-state (node-current-chainstate node)))
+      (when chain-state
+        (dolist (peer (node-peers node))
+          (handler-case
+              (bl.net:consider-chain-sync-eviction
+               peer chain-state now)
+            (error (e)
+              ;; Per-peer, so one unhappy peer cannot stop the sweep — but
+              ;; LOGGED, not swallowed. A silent error here exempts that peer
+              ;; from eviction forever, which is indistinguishable from the
+              ;; eclipse this code exists to prevent.
+              (log-warn "Chain-sync eviction failed for ~A: ~A"
+                        (bl.net:peer-log-name peer) e))))))
+    ;; The 45-second half. A clock that moved BACKWARDS (setmocktime) re-arms
+    ;; the cadence instead of stalling it forever.
+    (when (or (>= (- now *last-chain-sync-check*)
+                  +extra-peer-check-interval-seconds+)
+              (< now *last-chain-sync-check*))
       (setf *last-chain-sync-check* now)
-      (let ((chain-state (node-current-chainstate node)))
-        (when chain-state
-          (dolist (peer (node-peers node))
-            (handler-case
-                (bl.net:consider-chain-sync-eviction
-                 peer chain-state now)
-              (error (e)
-                ;; Per-peer, so one unhappy peer cannot stop the sweep — but
-                ;; LOGGED, not swallowed. A silent error here exempts that peer
-                ;; from eviction forever, which is indistinguishable from the
-                ;; eclipse this code exists to prevent.
-                (log-warn "Chain-sync eviction failed for ~A: ~A"
-                          (bl.net:peer-log-name peer) e))))))
       ;; Core runs EvictExtraOutboundPeers from this same tick (:5466), and
       ;; BEFORE the stale-tip check rather than after: the peer we are about to
       ;; decide we need is not one we should have dropped on the way in.
