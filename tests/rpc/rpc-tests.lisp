@@ -3094,6 +3094,149 @@ framework reported `Unable to connect to bitcoind after 60s'."
                    "Core's line for the password branch"))
         (bl.rpc:stop-rpc-server)))))
 
+(test rpcthreads-bounds-running-requests-not-open-connections
+  "Core's -rpcthreads sizes the HTTP WORKER POOL (httpserver.cpp:411-421): one
+event loop accepts, and an idle keep-alive connection costs no worker. Handing
+the number to hunchentoot's taskmaster as :max-thread-count bounded
+CONNECTIONS instead, and that taskmaster -- with no :max-accept-count -- stops
+accepting once they are all held.
+
+Core's own framework writes `rpcthreads=2' into every node's bitcoin.conf
+(test_framework/util.py:562), so the framework's persistent JSON-RPC
+connection plus ONE response whose body a test had not read yet wedged the
+whole HTTP port until the idle timeout. interface_rest.py hung on its third
+request (`GET /rest/tx/abc.json') and timed out the test.
+
+So: the acceptor must carry no connection cap, and the bound must be a
+semaphore taken around request execution."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19993))
+      (setf (bl:node-data-directory node) dir)
+      (let ((bl.rpc::*rpc-threads* 2)
+            (bl.rpc::*rpc-worker-semaphore* nil)
+            (bl.rpc::*rpc-worker-permits* nil))
+        (unwind-protect
+             (progn
+               (is-true (bl.rpc:start-rpc-server node :port port))
+               (let* ((taskmaster (hunchentoot::acceptor-taskmaster
+                                   bl.rpc::*rpc-server*))
+                      (threads (hunchentoot::taskmaster-max-thread-count taskmaster))
+                      (accepts (hunchentoot::taskmaster-max-accept-count taskmaster)))
+                 (is (or (null threads) (> threads bl.rpc::*rpc-threads*))
+                     "the accept loop must not be capped at -rpcthreads (~S)" threads)
+                 (is (or (null threads) accepts)
+                     "a capped taskmaster must REFUSE, not block: ~S/~S"
+                     threads accepts)))
+          (bl.rpc:stop-rpc-server)))
+      ;; The bound itself is real: two permits, and the third caller waits.
+      (let ((bl.rpc::*rpc-threads* 2)
+            (bl.rpc::*rpc-worker-semaphore* nil)
+            (bl.rpc::*rpc-worker-permits* nil))
+        (let ((semaphore (bl.rpc::rpc-worker-semaphore)))
+          (is-true semaphore "a semaphore exists when -rpcthreads is set")
+          (is-true (bt:wait-on-semaphore semaphore :timeout 1))
+          (is-true (bt:wait-on-semaphore semaphore :timeout 1))
+          (is (null (bt:wait-on-semaphore semaphore :timeout 0.2))
+              "the third request waits, as Core's third worker request does")
+          (bt:signal-semaphore semaphore)
+          (bt:signal-semaphore semaphore)))
+      ;; Unset means unbounded, as before.
+      (let ((bl.rpc::*rpc-threads* nil)
+            (bl.rpc::*rpc-worker-semaphore* nil)
+            (bl.rpc::*rpc-worker-permits* nil))
+        (is (null (bl.rpc::rpc-worker-semaphore))
+            "no -rpcthreads, no bound")))))
+
+(test json-rpc-claims-only-the-paths-core-registers
+  "Core registers the JSON-RPC handler at the EXACT path `/' and at the prefix
+`/wallet/' (httprpc.cpp:338-341). A path no handler claims gets 404
+(httpserver.cpp:287); 405 is reserved for an unknown HTTP METHOD (:225-230).
+
+Ours was a bare prefix dispatcher on `/', which matches every path there is,
+so `GET /xxxx' reached the JSON-RPC handler and came back 405 --
+interface_http.py:100 asserts 404."
+  (flet ((claimed (path)
+           (let ((hunchentoot:*acceptor* (make-instance 'hunchentoot:acceptor)))
+             (and (funcall (bl.rpc::make-json-rpc-dispatcher)
+                           (make-instance 'hunchentoot:request
+                                          :uri path
+                                          :acceptor hunchentoot:*acceptor*
+                                          :headers-in nil
+                                          :method :get
+                                          :server-protocol :http/1.1))
+                  t))))
+    (is-true (claimed "/") "Core's exact `/'")
+    (is-true (claimed "/wallet/w1") "Core's `/wallet/' prefix")
+    (is (null (claimed "/xxxxxxxxxx"))
+        "an unclaimed path must fall through to 404")
+    (is (null (claimed "/rest/tx/abc.json"))
+        "the REST surface is not the JSON-RPC one")
+    (is (null (claimed "/walletfoo"))
+        "`/wallet' without the separator is not the wallet endpoint")))
+
+(test oversized-request-headers-are-refused-as-core-refuses-them
+  "Core hands libevent MAX_HEADERS_SIZE = 8192 (httpserver.cpp:51, :409), so a
+request whose start line and headers exceed it is answered 400 before any
+handler sees it. interface_http.py sends a 1,000-character URI (404, no
+handler claims it) and then a 10,000-character one (400). With no cap the
+second was a 404 too, and nothing bounded how much one unauthenticated
+request could make this process buffer."
+  (flet ((size (uri &optional (headers '((:authorization . "Basic abc"))))
+           (let ((hunchentoot:*acceptor* (make-instance 'hunchentoot:acceptor)))
+             (bl.rpc::%request-headers-size
+              (make-instance 'hunchentoot:request
+                             :uri uri
+                             :acceptor hunchentoot:*acceptor*
+                             :headers-in headers
+                             :method :get
+                             :server-protocol :http/1.1)))))
+    (is (<= (size (format nil "/~A" (make-string 1000 :initial-element #\x)))
+            bl.rpc::+max-http-headers-size+)
+        "a 1,000-character URI is under Core's cap")
+    (is (> (size (format nil "/~A" (make-string 10000 :initial-element #\x)))
+           bl.rpc::+max-http-headers-size+)
+        "a 10,000-character URI is over it")
+    ;; The headers count too, not only the URI.
+    (is (> (size "/" (list (cons :authorization (make-string 9000 :initial-element #\a))))
+           bl.rpc::+max-http-headers-size+)
+        "one huge header is over it as well")
+    (is (= 8192 bl.rpc::+max-http-headers-size+) "Core's MAX_HEADERS_SIZE")))
+
+(test the-jsonrpc-version-field-is-validated-as-core-validates-it
+  "Core accepts an absent/null `jsonrpc', the string \"1.0\" (V1_LEGACY) and
+\"2.0\" (V2), and refuses everything else with -32600: `jsonrpc field must be
+a string' for a non-string, `JSON-RPC version not supported' for another
+version (rpc/request.cpp:215-230). We called every unrecognised value :V1 and
+answered it, so a client asking for a protocol this server does not speak got
+a reply shaped like a different one. interface_rpc.py:177, :204 and :207 send
+\"2.1\", 2 and \"3.0\" and compare the whole error object."
+  (flet ((version-of (marker &optional (present t))
+           (let ((req (make-hash-table :test 'equal)))
+             (when present (setf (gethash "jsonrpc" req) marker))
+             (handler-case (bl.rpc::request-json-version req)
+               (bl.rpc:rpc-error (e)
+                 (list (bl.rpc:rpc-error-code e) (bl.rpc:rpc-error-message e)))))))
+    (is (eq :v1 (version-of nil nil)) "absent is V1_LEGACY")
+    (is (eq :v1 (version-of nil)) "null is V1_LEGACY")
+    (is (eq :v1 (version-of "1.0")) "\"1.0\" is V1_LEGACY")
+    (is (eq :v2 (version-of "2.0")) "\"2.0\" is V2")
+    (is (equal (list bl.rpc:+rpc-invalid-request+ "jsonrpc field must be a string")
+               (version-of 2))
+        "a non-string jsonrpc")
+    (is (equal (list bl.rpc:+rpc-invalid-request+ "JSON-RPC version not supported")
+               (version-of "2.1"))
+        "an unrecognised version")
+    (is (equal (list bl.rpc:+rpc-invalid-request+ "JSON-RPC version not supported")
+               (version-of "3.0"))
+        "another unrecognised version")
+    ;; \"1.1\" is NOT a jsonrpc marker Core knows; the framework sends it in a
+    ;; \"version\" member, which this function never reads.
+    (is (equal (list bl.rpc:+rpc-invalid-request+ "JSON-RPC version not supported")
+               (version-of "1.1"))
+        "\"1.1\" as a jsonrpc marker is refused, as Core refuses it")))
+
 (test init-message-lines-are-cores
   "Core's non-GUI build logs every uiInterface.InitMessage as `init message:
 <text>` (noui.cpp:56) and the functional framework waits on those lines
@@ -9719,7 +9862,13 @@ content-type guard in that chain; see the last case."
     (jsonrpc-handler-check
      "{\"jsonrpc\":\"2.0\",\"id\":1}" 400
      (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
-                                "Missing or invalid method"))
+                                "Missing method"))
+    ;; A "method" that is present but not a string is Core's OTHER sentence
+    ;; (rpc/request.cpp:236-237).
+    (jsonrpc-handler-check
+     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":7}" 400
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
+                                "Method must be a string"))
     ;; A result yason cannot encode reaches the handler's outermost clause.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-handler-dotted-method*)

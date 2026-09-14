@@ -321,12 +321,37 @@ stops being applied."
          (mapcar (lambda (v) (%normalize-json-value v t)) params))
         (t (%normalize-json-value params nil))))
 
+(defun missing-method-message (method)
+  "Core's wording for a request whose \"method\" is unusable
+(rpc/request.cpp:233-237): absent or null is `Missing method', anything
+present that is not a string is `Method must be a string'. One sentence for
+both said neither, and interface_rpc.py compares the whole error object."
+  (if (null method) "Missing method" "Method must be a string"))
+
 (defun request-json-version (request)
-  "The JSON-RPC version of one parsed request object REQUEST (a hash-table):
-:V2 only for the exact marker jsonrpc:\"2.0\", else :V1 — an absent member,
-\"1.0\" or \"1.1\" all mean legacy 1.x, which is Core's V1_LEGACY default
-(JSONRPCRequest::parse, rpc/request.cpp:212-227)."
-  (if (equal (gethash "jsonrpc" request) "2.0") :v2 :v1))
+  "The JSON-RPC version of one parsed request object REQUEST (a hash-table),
+validated as Core validates it (JSONRPCRequest::parse, rpc/request.cpp:215-230).
+
+An ABSENT or null \"jsonrpc\" member is V1_LEGACY, the string \"1.0\" is
+V1_LEGACY (kept for the old documentation that told clients to send it) and
+\"2.0\" is V2. Anything else is refused: a non-string with `jsonrpc field
+must be a string\', another version string with `JSON-RPC version not
+supported\', both -32600.
+
+Accepting every version silently and calling it :V1 let a client ask for a
+protocol this server does not speak and get an answer shaped like a different
+one -- interface_rpc.py:177 and :207 send \"2.1\" and \"3.0\" and compare
+the whole error object."
+  (let ((marker (gethash "jsonrpc" request)))
+    (cond
+      ((null marker) :v1)
+      ((not (stringp marker))
+       (error 'rpc-error :code +rpc-invalid-request+
+                         :message "jsonrpc field must be a string"))
+      ((string= marker "1.0") :v1)
+      ((string= marker "2.0") :v2)
+      (t (error 'rpc-error :code +rpc-invalid-request+
+                           :message "JSON-RPC version not supported")))))
 
 (defun %named-arg-slot (name-spec key)
   "T when KEY names the slot NAME-SPEC, which may list aliases separated by
@@ -520,9 +545,13 @@ argument was `[]`."
              ;; Accept any/absent "jsonrpc" version: bitcoin-cli sends 1.0 (or
              ;; omits it) on older builds and 2.0 on newer; Core doesn't
              ;; validate it. Rejecting non-2.0 made stock bitcoin-cli unusable.
+             ;; Core tells the two apart (rpc/request.cpp:233-237): an absent
+             ;; or null "method" is `Missing method', a present non-string one
+             ;; is `Method must be a string'. interface_rpc.py's batch sends
+             ;; `{"pizza":"sausage"}' and compares the whole error object.
              (unless (stringp method)
                (error 'rpc-error :code +rpc-invalid-request+
-                                 :message "Missing or invalid method"))
+                                 :message (missing-method-message method)))
              (multiple-value-bind (id id-present) (gethash "id" json)
                (values :single method
                        (%request-params method (or params '()))
@@ -682,24 +711,35 @@ handler-case around it does."
   (let ((responses '()))
     (dolist (req requests (nreverse responses))
       (if (hash-table-p req)
-          (let ((method (gethash "method" req))
-                (version (request-json-version req)))
-            (multiple-value-bind (id id-present) (gethash "id" req)
-              (let ((response
-                      (handler-case
-                          (if (stringp method)
-                              (handle-single-request
-                               node method
-                               (%request-params method (or (gethash "params" req) '()))
-                               id version :id-present id-present)
-                              (make-rpc-error-response +rpc-invalid-request+
-                                                       "Missing or invalid method"
-                                                       id version
-                                                       :id-present id-present))
-                        (rpc-error (e)
-                          (rpc-error-response e id version :id-present id-present)))))
-                (unless (and (eq version :v2) (not id-present))
-                  (push response responses)))))
+          (multiple-value-bind (id id-present) (gethash "id" req)
+            ;; A member whose "jsonrpc" is unusable is ONE failed member, not a
+            ;; failed batch, and its answer carries the legacy shape because
+            ;; Core throws before m_json_version leaves V1_LEGACY
+            ;; (rpc/request.cpp:215-230).
+            (let* ((version-error nil)
+                   (version (handler-case (request-json-version req)
+                              (rpc-error (e) (setf version-error e) :v1)))
+                   (method (gethash "method" req))
+                   (response
+                     (cond
+                       (version-error
+                        (rpc-error-response version-error id version
+                                            :id-present id-present))
+                       (t
+                        (handler-case
+                            (if (stringp method)
+                                (handle-single-request
+                                 node method
+                                 (%request-params method (or (gethash "params" req) '()))
+                                 id version :id-present id-present)
+                                (make-rpc-error-response +rpc-invalid-request+
+                                                         (missing-method-message method)
+                                                         id version
+                                                         :id-present id-present))
+                          (rpc-error (e)
+                            (rpc-error-response e id version :id-present id-present)))))))
+              (unless (and (eq version :v2) (not id-present))
+                (push response responses))))
           ;; A non-object member has no version of its own; Core's default is
           ;; V1_LEGACY with a null id.
           (push (make-rpc-error-response +rpc-invalid-request+
@@ -782,11 +822,39 @@ written through and then renamed target-and-all over .cookie."
       (if stream (close stream) (sb-posix:close fd)))))
 
 (defvar *rpc-threads* nil
-  "Maximum concurrent RPC handler threads, or NIL for hunchentoot's default
-(Core -rpcthreads, DEFAULT_HTTP_THREADS = 16). Core services requests from a
-fixed pool; hunchentoot is thread-per-connection, so this caps the pool rather
-than sizing it — the observable behaviour, a bound on concurrent work, is the
-same.")
+  "Maximum requests this server EXECUTES at once, or NIL for no bound (Core
+-rpcthreads, DEFAULT_HTTP_THREADS = 16).
+
+Core services requests from a fixed worker pool while one event loop accepts
+connections, so an idle keep-alive connection costs no worker. Hunchentoot is
+thread-per-connection, so handing this number to the taskmaster as
+:max-thread-count bounded CONNECTIONS instead — and the taskmaster, with no
+:max-accept-count, then BLOCKS the accept loop once they are all held.
+
+Core's own functional framework writes `rpcthreads=2' into every node's
+bitcoin.conf (test_framework/util.py:562). Two held connections — the
+framework's own persistent JSON-RPC connection plus one HTTP response whose
+body a test had not read yet — wedged the whole HTTP port until the idle
+timeout: interface_rest.py hung on its third request and timed out the test,
+and no log line said why. So the bound belongs around request EXECUTION, where
+Core has it, and accepting stays unbounded.")
+
+(defvar *rpc-worker-semaphore* nil
+  "Semaphore of *RPC-THREADS* permits, held for the duration of one request —
+Core's HTTP worker pool (httpserver.cpp:411-421), which services every path
+handler, not the JSON-RPC one alone. NIL when unbounded.")
+
+(defvar *rpc-worker-permits* nil
+  "The permit count *RPC-WORKER-SEMAPHORE* was made with, so a changed
+-rpcthreads rebuilds it.")
+
+(defun rpc-worker-semaphore ()
+  "The worker semaphore for the current -rpcthreads, rebuilt when it changes."
+  (let ((n *rpc-threads*))
+    (cond ((null n) (setf *rpc-worker-semaphore* nil *rpc-worker-permits* nil))
+          ((eql n *rpc-worker-permits*) *rpc-worker-semaphore*)
+          (t (setf *rpc-worker-permits* n
+                   *rpc-worker-semaphore* (bt:make-semaphore :count n))))))
 
 (defvar *rpc-server-timeout* 30
   "Seconds an idle RPC connection is held before it is closed (Core
@@ -1435,13 +1503,73 @@ pathHandlers lookup (:235-250), so /rest/ (rest.cpp:1160-1164) inherits the ACL
 without doing anything itself. Putting the check in one handler would leave
 /rest/ and /ui/ reachable from any address the moment -rpcbind is honoured."))
 
+(defconstant +max-http-headers-size+ 8192
+  "Core MAX_HEADERS_SIZE (httpserver.cpp:51), handed to libevent as
+evhttp_set_max_headers_size (:409): a request whose start line and headers
+exceed this is answered 400 and never reaches a handler.
+
+interface_http.py:106 sends a 10,000-character URI and expects 400; without a
+cap it was merely a path no handler claimed, i.e. 404. The cap is also the
+only bound on how much a single unauthenticated request can make this process
+buffer.")
+
+(defun %request-headers-size (request)
+  "Bytes of REQUEST's start line and headers, as libevent counts them for
+evhttp_set_max_headers_size: `METHOD URI PROTOCOL\\r\\n', one
+`Name: Value\\r\\n' per header, and the blank line that ends them."
+  (let ((total (+ (length (string (hunchentoot:request-method request)))
+                  1
+                  (length (or (hunchentoot:request-uri request) ""))
+                  1
+                  (length (string (hunchentoot:server-protocol request)))
+                  2
+                  2)))
+    (loop for (name . value) in (hunchentoot:headers-in request)
+          do (incf total (+ (length (string name)) 2
+                            (length (princ-to-string value)) 2)))
+    total))
+
 (defmethod hunchentoot:acceptor-dispatch-request ((acceptor rpc-acceptor) request)
+  ;; Core's header-size cap is enforced by libevent before http_request_cb
+  ;; runs, so it comes before the address ACL and before any routing.
+  (when (> (%request-headers-size request) +max-http-headers-size+)
+    (setf (hunchentoot:return-code*) hunchentoot:+http-bad-request+
+          (hunchentoot:content-type*) "text/plain")
+    (return-from hunchentoot:acceptor-dispatch-request ""))
   (if (rpc-client-allowed-p (hunchentoot:remote-addr request))
-      (call-next-method)
+      ;; -rpcthreads bounds how many requests RUN at once, not how many
+      ;; connections exist (Core's worker pool, httpserver.cpp:411-421). Taken
+      ;; here because this one acceptor serves all three surfaces, exactly as
+      ;; Core's pool services every registered path handler.
+      (let ((semaphore (rpc-worker-semaphore)))
+        (if semaphore
+            (progn
+              (bt:wait-on-semaphore semaphore)
+              (unwind-protect (call-next-method)
+                (bt:signal-semaphore semaphore)))
+            (call-next-method)))
       ;; Core answers a bare 403 and reveals nothing else — not the method it
       ;; would have refused, not whether a handler exists at this path.
       (rpc-json-error hunchentoot:+http-forbidden+ +rpc-misc-error+
                       "Client network is not allowed RPC access")))
+
+(defun make-json-rpc-dispatcher ()
+  "Dispatch-table entry matching exactly what Core registers for JSON-RPC:
+the path \"/\" as an EXACT match, and \"/wallet/\" as a prefix
+(httprpc.cpp:338-341).
+
+A bare prefix dispatcher on \"/\" matches every path there is, so an
+unregistered URI reached RPC-DISPATCH-HANDLER, which answers 405 to anything
+that is not a POST. Core answers 405 only for an unknown HTTP METHOD
+(httpserver.cpp:225-230) and 404 for a known method at a path no handler
+claims (:287) -- which is what interface_http.py:100 asserts for
+`GET /xxxx...\'. Falling through to no dispatcher at all gives hunchentoot's
+own 404, so the two agree without a handler of our own."
+  (lambda (request)
+    (let ((script-name (hunchentoot:script-name request)))
+      (when (or (string= script-name "/")
+                (alexandria:starts-with-subseq "/wallet/" script-name))
+        'rpc-dispatch-handler))))
 
 (defun rpc-dispatch-handler ()
   "Dispatch handler for hunchentoot. Only handles POST requests."
@@ -1694,15 +1822,11 @@ its own from OPTIONS; an option nobody reads is an error."
                     (apply #'make-instance 'rpc-acceptor
                            :port port
                            :address bind
-                           ;; -rpcthreads caps concurrent handler threads. The
-                           ;; initarg is passed only when configured, so
-                           ;; hunchentoot's own default stands otherwise.
+                           ;; -rpcthreads is NOT a taskmaster cap: see
+                           ;; *RPC-THREADS*. Accepting stays unbounded, as it
+                           ;; is in Core, and the bound is taken around request
+                           ;; execution in ACCEPTOR-DISPATCH-REQUEST below.
                            (append
-                            (when *rpc-threads*
-                              (list :taskmaster
-                                    (make-instance
-                                     'hunchentoot:one-thread-per-connection-taskmaster
-                                     :max-thread-count *rpc-threads*)))
                             ;; -rpcservertimeout, as INITARGS. This used to
                             ;; SETF hunchentoot:*default-connection-timeout*
                             ;; after the acceptor existed, and the special is
@@ -1757,7 +1881,7 @@ its own from OPTIONS; an option nobody reads is an error."
               ;; hunchentoot:*dispatch-table* is the step that makes requests
               ;; reachable, and a failed start must not leak them (it used to
               ;; leave *rpc-dispatcher* in the table when the bind threw).
-              (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
+              (let ((dispatcher (make-json-rpc-dispatcher)))
                 (setf *rpc-dispatcher* dispatcher)
                 (push dispatcher pushed)
                 (push dispatcher hunchentoot:*dispatch-table*))
