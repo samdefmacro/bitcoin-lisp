@@ -12,13 +12,24 @@
 
 (defun build-coinbase-transaction (height value &key script-pubkey
                                                      witness-commitment-script
-                                                     (segwit-active t)
-                                                     (extranonce 0))
+                                                     (segwit-active t))
   "Build the coinbase for a block at HEIGHT paying VALUE to SCRIPT-PUBKEY. The
-scriptSig is the BIP34 height push followed by a 4-byte EXTRANONCE (so it is
-always >= 2 bytes). When WITNESS-COMMITMENT-SCRIPT is given, a zero-value output
-carrying it is appended; the BIP141 reserved witness value (a single 32-byte
-zero item) is added only when SEGWIT-ACTIVE.
+scriptSig is the BIP34 height push followed by a single OP_0 -- Core's
+`include_dummy_extranonce\' scriptSig, which every mining RPC asks for
+(node/miner.cpp:182-192; rpc/mining.cpp:168, :379, :877), and which exists so
+that a height of 16 or less, whose BIP34 push is one byte, still clears the
+two-byte `bad-cb-length\' minimum. When WITNESS-COMMITMENT-SCRIPT is given, a
+zero-value output carrying it is appended; the BIP141 reserved witness value (a
+single 32-byte zero item) is added only when SEGWIT-ACTIVE.
+
+Every byte here is part of the coinbase TXID, so it is part of the block hash
+and of the UTXO set: a coinbase that is not Core\'s byte for byte gives a
+different chain from the same instructions. Ours wrote a 4-byte extranonce
+field (5 scriptSig bytes at height 1 where Core writes 2) and transaction
+version 1 where Core writes 2 (CTransaction::CURRENT_VERSION,
+primitives/transaction.h:284), so feature_utxo_set_hash.py:70 and
+rpc_dumptxoutset.py:50 -- both of which pin a constant computed from Core\'s
+own regtest chain -- could not match whatever else was right.
 
 Those two are gated SEPARATELY, and that is Core's split rather than a
 refinement of it. GenerateCoinbaseCommitment appends the commitment output with
@@ -34,10 +45,9 @@ a block it was right to refuse, so the node could not mine at all under
 `-testactivationheight=segwit@N`. Invisible whenever segwit is active from
 genesis, which is every default network this node runs on."
   (let* ((bip34 (bl.val:encode-bip34-height height))
-         (extra (let ((b (make-array 4 :element-type '(unsigned-byte 8))))
-                  (dotimes (i 4) (setf (aref b i) (logand (ash extranonce (* -8 i)) #xff)))
-                  b))
-         (script-sig (concatenate '(vector (unsigned-byte 8)) bip34 extra))
+         ;; CScript() << nHeight << OP_0 (node/miner.cpp:186-192): OP_0 is one
+         ;; zero byte, not a four-byte field.
+         (script-sig (concatenate '(vector (unsigned-byte 8)) bip34 #(0)))
          (in (bl.ser:make-tx-in
               :previous-output (bl.ser:make-outpoint
                                 :hash (%zeros32) :index #xffffffff)
@@ -56,7 +66,9 @@ genesis, which is every default network this node runs on."
                                    :value 0
                                    :script-pubkey witness-commitment-script)))))
     (bl.ser:make-transaction
-     :version 1
+     ;; CMutableTransaction's default, CTransaction::CURRENT_VERSION = 2
+     ;; (primitives/transaction.h:284); node/miner.cpp never overrides it.
+     :version 2
      :inputs (vector in)
      :outputs (coerce outputs 'simple-vector)
      ;; BIP141 reserved witness value (one 32-byte zero item) — only once

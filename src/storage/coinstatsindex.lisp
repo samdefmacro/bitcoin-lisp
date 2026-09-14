@@ -221,7 +221,8 @@ STATS."
                                        (incf (coinstats-total-new-outputs-ex-coinbase stats) value))
                                    (incf (coinstats-txout-count stats))
                                    (incf (coinstats-total-amount stats) value)
-                                   (incf (coinstats-bogo-size stats) (+ 44 (length spk))))))))
+                                   (incf (coinstats-bogo-size stats)
+                                         (+ +bogo-size-overhead+ (length spk))))))))
           ;; Spent prevouts (from undo data).
           (dolist (entry spent-utxos)
             (destructuring-bind (ptxid pidx putxo) entry
@@ -236,7 +237,8 @@ STATS."
                 (incf (coinstats-total-prevout-spent stats) value)
                 (decf (coinstats-txout-count stats))
                 (decf (coinstats-total-amount stats) value)
-                (decf (coinstats-bogo-size stats) (+ 44 (length spk))))))))
+                (decf (coinstats-bogo-size stats)
+                      (+ +bogo-size-overhead+ (length spk))))))))
     ;; Unclaimed reward (miner took less than subsidy + fees) is unspendable.
     (let* ((unspendable-total (+ (coinstats-unspendable-genesis stats)
                                  (coinstats-unspendable-bip30 stats)

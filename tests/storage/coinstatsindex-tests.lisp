@@ -54,6 +54,15 @@ set's txout count and total amount."
                   (bl.store:coinstats-txout-count stats)))
            (is (= (bl.store:utxo-set-total-amount utxo)
                   (bl.store:coinstats-total-amount stats)))
+           ;; Core's GetBogoSize is 50 + scriptPubKey (kernel/coinstats.cpp:
+           ;; 36-44): 32 txid + 4 vout + 4 height/coinbase + 8 amount + 2
+           ;; scriptPubKey length. The index counted 44, six short per coin,
+           ;; so feature_coinstatsindex.py:91 -- which compares the index's
+           ;; answer with the coins view's, field by field -- saw the two
+           ;; differ by 6 times the coin count.
+           (is (= (nth-value 1 (bl.store:utxo-set-total-amount utxo))
+                  (bl.store:coinstats-bogo-size stats))
+               "the index's bogosize must be the whole-set walk's")
            ;; Every regtest block subsidy summed (genesis..tip).
            (is (= (loop for h from 0 to tip
                         sum (bl.val:calculate-block-subsidy h))

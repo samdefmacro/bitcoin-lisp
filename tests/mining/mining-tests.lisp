@@ -748,6 +748,38 @@ not active; contextual validation rejects that block as :unexpected-witness")
        (is-true (bl.val:check-proof-of-work
                  (bl.ser:bitcoin-block-header block)))))))
 
+(test the-coinbase-is-cores-coinbase-byte-for-byte
+  "Every byte of the coinbase is part of its txid, so it is part of the block
+hash and of the UTXO set: a coinbase that is not Core's byte for byte gives a
+different chain from the same instructions, and two functional tests pin
+constants computed from Core's own regtest chain --
+feature_utxo_set_hash.py:70 (hash_serialized_3) and rpc_dumptxoutset.py:50
+(the snapshot's base_hash).
+
+Core's is transaction version 2 (CTransaction::CURRENT_VERSION,
+primitives/transaction.h:284), a null prevout, scriptSig
+`CScript() << nHeight << OP_0' -- the dummy extranonce every mining RPC asks
+for (node/miner.cpp:182-192; rpc/mining.cpp:168, :379, :877), whose OP_0 is
+ONE zero byte and exists so a height of 16 or less still clears the two-byte
+bad-cb-length minimum -- nSequence MAX_SEQUENCE_NONFINAL and
+nLockTime = nHeight - 1 (:195-196).
+
+Ours wrote version 1 and a four-byte extranonce field: five scriptSig bytes at
+height 1 where Core writes two."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "cb-bytes"))
+           (block (bl.mining:assemble-full-block
+                   (bl:node-chain-state node) (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+           (cb (first (bl.ser:bitcoin-block-transactions block)))
+           (in0 (aref (bl.ser:transaction-inputs cb) 0)))
+      (is (equalp #(#x51 #x00) (bl.ser:tx-in-script-sig in0))
+          "height 1: OP_1 then the OP_0 dummy extranonce, and nothing else")
+      (is (= 2 (bl.ser:transaction-version cb)))
+      (is (= #xfffffffe (bl.ser:tx-in-sequence in0)))
+      (is (= 0 (bl.ser:transaction-lock-time cb)) "nLockTime is nHeight - 1")
+      (is (= #xffffffff (bl.ser:outpoint-index (bl.ser:tx-in-previous-output in0)))))))
+
 (test submitblock-round-trip
   ;; Build + mine a regtest block at the genesis tip, serialize it, submit the
   ;; hex via the RPC — accepted (null), tip advances, resubmit → "duplicate".

@@ -1072,19 +1072,33 @@ reports as `bogosize', which is deliberately NOT the on-disk size.")
   "Sum of all utxo-entry-value across the set.
 
 The SECOND value is the set\'s `bogosize\' (Core nBogoSize, the sum of
-GetBogoSize over every coin, kernel/coinstats.cpp:106). It rides along here
-because gettxoutsetinfo already walks this set three times and a fourth full
-walk for one accumulator would be the most expensive way to add a field."
+GetBogoSize over every coin, kernel/coinstats.cpp:106) and the THIRD is the
+number of coins (nTransactionOutputs, :103). Both ride along here because
+gettxoutsetinfo already walks this set three times and a fourth full walk for
+one accumulator would be the most expensive way to add a field -- Core fills
+all four of its counters in ONE pass over the view (ComputeUTXOStats ->
+ApplyStats, :96-107).
+
+The count in particular MUST come from this walk. UTXO-COUNT answers from the
+in-memory table alone, which for a LevelDB-backed view is neither the whole
+set nor only the live part of it: it misses every coin that has been flushed
+to disk and it counts the spent-coin tombstones the cache is still holding.
+Both errors were visible from the RPC -- feature_coinstatsindex.py:91 read one
+coin too many on a freshly built chain (the tombstone of the one output its
+transaction had spent), and rpc_scantxoutset.py:66 read 32 where scantxoutset,
+which walks the view properly, counted 216."
   (let ((total 0)
-        (bogo-size 0))
+        (bogo-size 0)
+        (count 0))
     (utxo-set-iterate view
                       (lambda (txid vout entry)
                         (declare (ignore txid vout))
+                        (incf count)
                         (incf total (utxo-entry-value entry))
                         (incf bogo-size
                               (+ +bogo-size-overhead+
                                  (length (utxo-entry-script-pubkey entry))))))
-    (values total bogo-size)))
+    (values total bogo-size count)))
 
 (defun utxo-set-distinct-txids (view)
   "Count distinct transaction IDs with at least one unspent output.

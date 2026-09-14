@@ -1947,9 +1947,12 @@ and feature_coinstatsindex.py:87 found no block_info in it."
              ;; differ partway through a reorg's disconnect phase.
              (best-hash (or (bl.store:coins-view-best-block utxo-set)
                             (bl.store:best-block-hash chain-state)))
-             (txout-count (bl.store:utxo-count utxo-set))
              (tx-count (bl.store:utxo-set-distinct-txids utxo-set)))
-        (multiple-value-bind (total-satoshis bogo-size)
+        (multiple-value-bind (total-satoshis bogo-size txout-count)
+            ;; The coin COUNT comes from the same walk as the amount and the
+            ;; bogosize, never from UTXO-COUNT: that one answers from the
+            ;; in-memory table, which misses every flushed coin and counts the
+            ;; cache's spent-coin tombstones (see UTXO-SET-TOTAL-AMOUNT).
             (bl.store:utxo-set-total-amount utxo-set)
          (let* ((total-btc (satoshi->btc total-satoshis))
              ;; Core's key order and its two index-absent fields
