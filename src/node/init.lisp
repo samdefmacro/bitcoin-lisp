@@ -628,6 +628,20 @@ re-deciding anything that is still on disk."
                                     :force-full t))
       added)))
 
+(defun log-assumevalid-decision (network)
+  "Say which signatures this node intends to check (Core LoadChainstate,
+node/chainstate.cpp:154-158).
+
+Core writes one of these two sentences before it opens the chainstate, and
+feature_init.py:67 waits for the second of them. It is also the line an
+operator reading a slow IBD wants: whether every signature is being verified
+or the node is riding an assumevalid point, and which one."
+  (let ((av (network-assumevalid network)))
+    (if av
+        (log-info "Assuming ancestors of block ~A have valid signatures."
+                  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes av)))
+        (log-info "Validating signatures for all blocks."))))
+
 (defun %init-load-chain (network reindex blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
 index, -reindex, and the block-store <-> header-index position map.
@@ -639,6 +653,7 @@ startup refusal rather than a directory we create somewhere else."
   ;; chainstate (empty storage suffix, so it loads exactly the files a
   ;; single-chainstate node wrote). A persisted snapshot chainstate would be
   ;; detected and appended here (Core LoadAssumeutxoChainstate) — future work.
+  (log-assumevalid-decision network)
   (log-info "Loading chain state...")
   (setf (node-chainstates *node*)
         (list (bl.store:init-chain-state (node-data-directory *node*))))
