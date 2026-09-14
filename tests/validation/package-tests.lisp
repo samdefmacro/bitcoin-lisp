@@ -223,6 +223,35 @@ either. IsWellFormedPackage maps that to the package-level \"conflict-in-package
         (is-true (bl.mp:mempool-has
                   mempool (bl.ser:transaction-hash tx)))))))
 
+(test package-single-tx-effective-feerate-is-the-modified-fee
+  "Core builds an individually-accepted member's effective feerate from
+ws.m_modified_fees, and reports ws.m_base_fees as the base fee
+(validation.cpp:1295-1296). Ours divided the BASE fee by the vsize, so a
+transaction that prioritisetransaction had lifted over the floor answered the
+feerate at which it would have been refused -- zero, for a zero-fee parent.
+mempool_limit.py:220-238 submits exactly that: a zero-fee parent given a
+DEFAULT_FEE delta, which enters on its own and must then report DEFAULT_FEE
+over its own vsize, covering its own wtxid alone."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((tx (pkg-tx funding-txid 0 100000000))     ; pays no fee at all
+           (txid (bl.ser:transaction-hash tx))
+           (delta 10000))
+      (bl.mp:mempool-prioritise mempool txid delta)
+      (multiple-value-bind (msg results)
+          (bl.val:validate-package-for-mempool
+           (list tx) utxo-set mempool chain-state)
+        (is (eq :success msg) "the delta alone must carry it over the floor")
+        (let* ((res (%result-for results tx))
+               (vsize (bl.val:package-tx-result-vsize res)))
+          (is (plusp vsize))
+          (is (= 0 (bl.val:package-tx-result-fee res))
+              "the reported base fee is the transaction's own, which is zero")
+          (is (= 1 (length (bl.val:package-tx-result-effective-includes res)))
+              "a member accepted on its own covers only its own wtxid")
+          (is (= (/ delta vsize)
+                 (bl.val:package-tx-result-effective-feerate res))
+              "the effective feerate is the MODIFIED fee over the vsize"))))))
+
 (test package-single-low-fee-tx-rejected
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let ((tx (pkg-tx funding-txid 0 (- 100000000 5))))
