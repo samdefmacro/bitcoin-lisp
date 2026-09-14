@@ -504,6 +504,60 @@ reconsider-block clears the flags and reorgs back to the best valid chain."
        (is (null ok)) (is (eq :cannot-invalidate-genesis reason)))
      (clear-undo-cache))))
 
+(test invalidate-block-activates-the-best-chain-that-is-still-valid
+  "Core's invalidateblock is TWO steps: InvalidateBlock, which disconnects back
+to the invalidated block's parent and marks the branch failed, and then
+ActivateBestChain, which moves the node on to the most-work chain that is
+still valid (rpc/blockchain.cpp:1705-1709). Ours stopped after the first, so a
+node that had reorged onto a competing chain and then invalidated it sat on
+that chain's early ancestry instead of returning to its own.
+
+rpc_invalidateblock.py:52-56 is exactly that: node 0 mines four blocks, reorgs
+onto node 1's six, invalidates node 1's block 2, and must be back on its own
+four-block tip. We answered height 1."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture "invalidate-best")
+      ;; Chain A: genesis -> A1..A4, the node's own.
+      (let* ((a-hashes (make-test-chain-hashes #xA0 4))
+             (b-hashes (make-test-chain-hashes #xB0 6)))
+        (build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
+        (is (= 4 (bl.store:current-height chain-state)))
+        (let ((a-tip (bl.store:best-block-hash chain-state)))
+          ;; Chain B: genesis -> B1..B6, indexed and stored the way the
+          ;; sibling fork tests build one; the last block is delivered through
+          ;; ACTIVATE-BLOCK, whose pre-reorg is what moves the tip onto it.
+          (let ((prev genesis-hash))
+            (loop for h from 1 to 5
+                  for block-hash in b-hashes
+                  do (let ((block (make-reorg-test-block prev block-hash h)))
+                       (bl.store:store-block block-store block)
+                       (bl.val:connect-block block chain-state block-store utxo-set)
+                       (setf prev block-hash)))
+            (let ((block (make-reorg-test-block prev (sixth b-hashes) 6)))
+              (bl.store:store-block block-store block)
+              (bl.val:activate-block block chain-state block-store utxo-set
+                                     :skip-scripts t)))
+          (is (= 6 (bl.store:current-height chain-state))
+              "the six-block chain wins")
+          ;; Invalidate B2: the branch B2..B6 is gone, and the node must land
+          ;; on A4 -- not on B1, which is where the disconnect alone stops.
+          (multiple-value-bind (ok reason)
+              (bl.val:invalidate-block chain-state block-store utxo-set
+                                       (second b-hashes))
+            (is (eq t ok))
+            (is (null reason)))
+          (is (= 4 (bl.store:current-height chain-state))
+              "the node returns to the best chain that is still valid")
+          (is (equalp a-tip (bl.store:best-block-hash chain-state)))
+          (is (eq :invalid (bl.store:block-index-entry-status
+                            (bl.store:get-block-index-entry chain-state
+                                                            (second b-hashes)))))
+          (is (eq :invalid (bl.store:block-index-entry-status
+                            (bl.store:get-block-index-entry chain-state
+                                                            (sixth b-hashes)))))))
+      (clear-undo-cache))))
+
 (test precious-block
   "preciousblock reorgs to a chosen block of >= the tip's work; equal-work
 competitors don't displace it (strict-> fork choice), and it can flip between
