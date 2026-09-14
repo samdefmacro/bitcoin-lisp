@@ -1135,15 +1135,37 @@ getreceivedbylabel). PARAMS: (label minconf include_immature_coinbase)."
   (conf most-positive-fixnum :type integer)  ; numeric_limits<int>::max sentinel
   (txids '()))                               ; wtx txids, reversed
 
+(defun %map-wallet-in-txid-order (wallet)
+  "The wallet's transactions as a list of wtx, ordered by TXID.
+
+Core's mapWallet is std::unordered_map<Txid, CWalletTx, SaltedTxidHasher>
+(wallet/wallet.h:498) and the RPCs that walk it take it as it stands, so the
+order a caller sees is derived from the TXID and a per-process salt -- it is
+not the order the transactions arrived in, and Core's own tests rely on
+that. A hash table walked with MAPHASH here gives ARRIVAL order instead, and
+the difference is observable: wallet_resendwallettransactions.py:97-117
+bumps a child transaction until listreceivedbyaddress reports it BEFORE its
+parent, which under arrival order can never happen, because the newest child
+is always last. That loop ran 1,470 times before a replacement finally
+failed for an unrelated reason.
+
+Ordered by the txid as a client SEES it (the reversed hex the RPCs print)
+rather than by a salted hash: deterministic where Core's is not, which a
+test can rely on, and it varies with the transaction rather than with when
+it was seen, which is the property the order has to have."
+  (let ((rows '()))
+    (maphash (lambda (txid wtx)
+               (push (cons (bl.rpc:hash-to-hex txid) wtx) rows))
+             (wallet-map-wallet wallet))
+    (mapcar #'cdr (sort rows #'string< :key #'car))))
+
 (defun %wallet-received-map-tally (wallet min-depth include-immature filter-address)
   "Core ListReceived's mapTally: address-string -> received-tally over
 mapWallet outputs that are IsMine (and, when FILTER-ADDRESS, equal to it).
 Caller holds the wallet lock."
   (let ((tally (make-hash-table :test 'equal)))
-    (maphash
-     (lambda (txid wtx)
-       (declare (ignore txid))
-       (let ((depth (wallet-tx-depth wallet wtx)))
+    (dolist (wtx (%map-wallet-in-txid-order wallet))
+      (let ((depth (wallet-tx-depth wallet wtx)))
          (unless (or (< depth min-depth)
                      (and (%wtx-coinbase-p wtx) (< depth 1))
                      (and (wallet-tx-immature-coinbase-p wallet wtx)
@@ -1165,7 +1187,6 @@ Caller holds the wallet lock."
                         (setf (received-tally-conf item)
                               (min (received-tally-conf item) depth))
                         (push (wallet-tx-txid wtx) (received-tally-txids item))))))))
-     (wallet-map-wallet wallet))
     tally))
 
 (defun %listreceived-address-obj (address label item)
