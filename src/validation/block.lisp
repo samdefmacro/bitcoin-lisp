@@ -3175,6 +3175,12 @@ Side effects (indexes / fee-estimator / mempool) are deferred to
 perform-reorg's success phase, so there is nothing to undo here."
   ;; 1. Disconnect the fork blocks we applied, newest-first (reverse of the
   ;;    application order). spent-utxos is the undo data apply returned.
+  ;;
+  ;;    The entry's STATUS is left alone, as Core leaves nStatus alone in
+  ;;    DisconnectTip (validation.cpp:2960-2990): block validity is a
+  ;;    MONOTONE property of the block, not a statement about where the
+  ;;    active chain currently is. These blocks really were fully validated;
+  ;;    the reorg failed on a LATER one.
   (dolist (item connected)
     (destructuring-bind (entry block height spent-utxos) item
       ;; HEIGHT enables Core's per-output height comparison in the disconnect
@@ -3689,6 +3695,16 @@ deferred to %REORG-COMMIT so a rolled-back reorg leaves nothing behind."
               (setf (reorg-disconnected-block-txs r) kept
                     (reorg-disconnected-bytes r) left)
               (incf (reorg-disconnected-dropped r) dropped))))
+        ;; The entry keeps its :VALID status. Bitcoin Core's DisconnectTip
+        ;; never lowers nStatus -- validity is monotone, and "is this block on
+        ;; the active chain" is a question for CChain::Contains
+        ;; (ENTRY-ON-ACTIVE-CHAIN-P), not for the status field. Downgrading to
+        ;; :header-valid here made a reorged-off block unservable: Core's
+        ;; BlockRequestAllowed (net_processing.cpp:1953-1960) asks
+        ;; IsValid(BLOCK_VALID_SCRIPTS) for a stale block, so
+        ;; p2p_fingerprint.py:93 -- which reorgs a block off and then asks for
+        ;; it by getdata -- got "ignoring request for an old block that is not
+        ;; on the main chain" and timed out.
         (push (cons block (bl.store:block-index-entry-height entry))
               (reorg-disconnected-blocks r))
         ;; ENTRY's status is NOT lowered: Core's DisconnectTip touches

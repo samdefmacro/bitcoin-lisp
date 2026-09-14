@@ -160,6 +160,91 @@ Returns (VALUES chain-state entries) with ENTRIES ascending (genesis first)."
       (is (equalp (%entry-hash entries 3)
                   (bl.ser:block-header-hash (first headers)))))))
 
+(defun %fork-off-the-tip (cs entries)
+  "Reorg CS one block back: the old tip entry stays in the index with the
+:VALID it earned, and a sibling of equal height becomes the active tip. Returns
+the now-stale entry.
+
+Built the way a real reorg leaves the index -- Core's DisconnectTip does not
+lower nStatus -- so the serving rules below are asked the question they are
+actually asked in the field."
+  (let* ((stale (car (last entries)))
+         (parent (nth (- (length entries) 2) entries))
+         (header (bl.ser:make-block-header
+                  :version 1
+                  :prev-block (bl.store:block-index-entry-hash parent)
+                  :merkle-root (%uniq-hash 9999)
+                  :timestamp (bl.ser:block-header-timestamp
+                              (bl.store:block-index-entry-header stale))
+                  :bits #x1d00ffff :nonce #xbeef))
+         (hash (bl.ser:block-header-hash header))
+         (sibling (bl.store:make-block-index-entry
+                   :hash hash
+                   :height (bl.store:block-index-entry-height stale)
+                   :header header :prev-entry parent
+                   :chain-work (1+ (bl.store:block-index-entry-chain-work stale))
+                   :status :valid)))
+    (bl.store:add-block-index-entry cs sibling)
+    (bl.store:update-chain-tip cs hash (bl.store:block-index-entry-height sibling))
+    stale))
+
+(test getheaders-null-locator-serves-a-recent-stale-header
+  "Core's GETHEADERS null-locator branch gates the stop block on
+BlockRequestAllowed (net_processing.cpp:4429-4436), the same rule the getdata
+path uses -- so a block RECENTLY reorged off the chain is still served, and an
+old one is not. Ours asked only whether the block was on the active chain, so
+p2p_fingerprint.py:97 waited out its three seconds for the header of a block
+the node had just reorged away from.
+
+The refusal sends NOTHING, as Core's `return' does -- not an empty headers
+message."
+  (multiple-value-bind (cs entries) (%make-served-chain 5)
+    (let* ((stale (%fork-off-the-tip cs entries))
+           (stale-hash (bl.store:block-index-entry-hash stale)))
+      (is-false (bl.store:entry-on-active-chain-p cs stale)
+                "the block really is off the active chain now")
+      (let* ((msg (bl.net::getheaders-response-message
+                   (%getheaders-payload '() stale-hash) cs)))
+        (is-true msg "a recent stale header is still served")
+        (when msg
+          (let ((headers (bl.ser:parse-headers-payload (%message-payload msg))))
+            (is (= 1 (length headers)))
+            (is (equalp stale-hash
+                        (bl.ser:block-header-hash (first headers)))))))
+      ;; Control: a block we do not know at all gets no message whatsoever.
+      (is-false (bl.net::getheaders-response-message
+                 (%getheaders-payload '() (%uniq-hash 4242)) cs)
+                "and an unknown stop hash is answered with nothing at all"))))
+
+(test stale-block-stays-servable-after-a-reorg
+  "Core's BlockRequestAllowed asks IsValid(BLOCK_VALID_SCRIPTS) for a block off
+the active chain (net_processing.cpp:1953-1960), and that validity is MONOTONE
+-- DisconnectTip never lowers nStatus. Ours downgraded a disconnected block to
+:header-valid inside perform-reorg, so the gate refused a block this node had
+itself validated and p2p_fingerprint.py:93 timed out waiting for it.
+
+The age half of the rule is the control: the same entry, aged past
+STALE_RELAY_AGE_LIMIT relative to the best header, is refused."
+  (multiple-value-bind (cs entries) (%make-served-chain 5)
+    (let* ((stale (%fork-off-the-tip cs entries))
+           (best (bl.store:best-header-entry cs)))
+      (is (eq :valid (bl.store:block-index-entry-status stale))
+          "a reorged-off block keeps the validity it earned")
+      (is-true (bl.net::%block-request-allowed-p cs stale best)
+               "so a recent stale block is servable")
+      ;; Control 1: never fully validated => refused.
+      (setf (bl.store:block-index-entry-status stale) :header-valid)
+      (is-false (bl.net::%block-request-allowed-p cs stale best))
+      (setf (bl.store:block-index-entry-status stale) :valid)
+      ;; Control 2: valid, but older than a month relative to the best header.
+      (setf (bl.ser:block-header-timestamp
+             (bl.store:block-index-entry-header stale))
+            (- (bl.ser:block-header-timestamp
+                (bl.store:block-index-entry-header best))
+               (* 31 24 60 60)))
+      (is-false (bl.net::%block-request-allowed-p cs stale best)
+                "an old stale block is a fingerprint, not a service"))))
+
 ;;;; getblocks-response-message
 
 (test getblocks-from-genesis-returns-inv
