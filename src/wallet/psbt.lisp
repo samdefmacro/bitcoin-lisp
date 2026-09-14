@@ -1438,6 +1438,49 @@ A caller that wants the network transaction calls finalizepsbt, which is what
 
 ;;; --- walletprocesspsbt (wallet/rpc/spend.cpp:1573) ---
 
+(defun %psbt-input-listed-pubkeys (map spk)
+  "The pubkeys one PSBT input LISTS, in Core's order (scriptpubkeyman.cpp:
+1342-1367): every PSBT_IN_BIP32_DERIVATION key, then -- for a taproot output --
+the output key lifted to both parities, then every PSBT_IN_TAP_BIP32_DERIVATION
+x-only key lifted the same way. Core builds this list only to ask the wallet
+whether it derives any of them."
+  (let ((out '()))
+    (flet ((lift (xonly)
+             (dolist (prefix '(2 3))
+               (push (concatenate '(simple-array (unsigned-byte 8) (*))
+                                  (vector prefix) xonly)
+                     out))))
+      (dolist (pair (bl.ser:psbt-map-collect map bl.ser:+psbt-in-bip32+))
+        (push (car pair) out))
+      (when (eq (bl.val:classify-script spk) :witness-v1-taproot)
+        (lift (subseq spk 2 34)))
+      (dolist (pair (bl.ser:psbt-map-collect map bl.ser:+psbt-in-tap-bip32+))
+        (lift (car pair))))
+    (nreverse out)))
+
+(defun %psbt-add-foreign-pubkey-keys (psbt wallet coins keymap pubmap tr-keymap)
+  "Core DescriptorScriptPubKeyMan::FillPSBT's else branch
+(scriptpubkeyman.cpp:1340-1377): for every input whose scriptPubKey NO SPKM
+owns, the wallet is asked whether it derives any pubkey the input lists, and
+the provider for that index joins the signing maps.
+
+Without it a cosigner signed nothing: it holds the key and never the multisig
+script, so the script lookup found no SPKM and the signing maps came back
+empty -- walletprocesspsbt answered complete false with no `hex'
+(wallet_fundrawtransaction.py:591, wallet_multisig_descriptor_psbt.py:123)."
+  (let ((tx (bl.ser:psbt-tx psbt)))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
+          for entry = (gethash (cons (bl.ser:outpoint-hash op)
+                                     (bl.ser:outpoint-index op))
+                               coins)
+          for spk = (and entry (first entry))
+          do (when (and spk (null (%wallet-owning-spkm wallet spk)))
+               (%wallet-add-keys-for-pubkeys
+                wallet (%psbt-input-listed-pubkeys map spk)
+                keymap pubmap tr-keymap)))))
+
 (bl.rpc:define-rpc "walletprocesspsbt" (node params)
   "Update a PSBT with wallet input info and sign the inputs we can (Bitcoin Core
 walletprocesspsbt). PARAMS: (psbt [sign] [sighashtype] [bip32derivs] [finalize]).
@@ -1464,6 +1507,8 @@ Returns {psbt, complete, hex?}."
             (when sign
               (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
                   (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
+                (%psbt-add-foreign-pubkey-keys psbt wallet coins
+                                               keymap pubmap tr-keymap)
                 (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
                                          tr-scripts)))
             (%psbt-signer-result psbt finalize t)))))))
