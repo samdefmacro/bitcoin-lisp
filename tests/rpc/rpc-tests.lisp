@@ -10813,6 +10813,58 @@ the storage clause formats its TYPE. A blanket handler would print neither."
 
 ;;; --- getblockchaininfo's pruning fields ------------------------------------
 
+(test sighash-strings-are-cores-seven-and-nothing-else
+  "Core's SighashFromStr is a MAP of seven strings, not a search
+(core_io.cpp:265-281): the match is case-sensitive and admits no substring,
+and the refusal quotes the offending string. Ours upcased the argument and
+looked for ALL / NONE / SINGLE / ANYONECANPAY as substrings, so it accepted
+`all', `sighash_all' and anything else that happened to contain one of the
+four words -- and said `Invalid sighashtype' instead of Core's sentence.
+rpc_signrawtransactionwithkey.py:132 passes sighashtype=\"all\" and asks for
+-8 with that sentence."
+  (is (= 1 (bl.rpc:parse-sighash-type nil)) "absent means ALL")
+  (dolist (row '(("DEFAULT" . 0) ("ALL" . 1) ("ALL|ANYONECANPAY" . #x81)
+                 ("NONE" . 2) ("NONE|ANYONECANPAY" . #x82)
+                 ("SINGLE" . 3) ("SINGLE|ANYONECANPAY" . #x83)))
+    (is (= (cdr row) (bl.rpc:parse-sighash-type (car row)))
+        "~A must be ~2,'0X" (car row) (cdr row)))
+  (dolist (bad '("all" "None" "SIGHASH_ALL" "ALL|anyonecanpay" "" "ALLX"))
+    (is (equal (cons -8 (format nil "'~A' is not a valid sighash parameter." bad))
+               (rpc-error-of (lambda () (bl.rpc:parse-sighash-type bad))))
+        "~S must be refused by name" bad)))
+
+(test gettxoutsetinfo-by-height-needs-the-index-in-cores-words
+  "Without -coinstatsindex, asking gettxoutsetinfo for a specific height is
+-8 \"Querying specific block heights requires coinstatsindex\"
+(rpc/blockchain.cpp:1088). Ours said \"Querying by block height/hash requires
+-coinstatsindex\" -- the same refusal in different words, which
+feature_coinstatsindex.py:112 reads back verbatim."
+  (with-network (:regtest)
+    (let ((node (regtest-node-fixture "gettxoutsetinfo-height")))
+      (generate-regtest-blocks node 2)
+      (is (equal '(-8 . "Querying specific block heights requires coinstatsindex")
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method node "gettxoutsetinfo"
+                                                (wire-params (list "muhash" 1))))))))))
+
+(test dumptxoutset-names-the-file-it-could-not-open
+  "Core opens PATH.incomplete immediately after the already-exists check and
+BEFORE the temporary rollback, and reports a failure as -8 \"Couldn't open
+file <temppath> for writing.\" (rpc/blockchain.cpp:3123-3129). Ours first
+opened it inside the streaming pass, so a path whose directory does not exist
+escaped the RPC layer as an internal error -- and only after the chain had
+been rolled back. rpc_dumptxoutset.py:66-68 asks for that sentence."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "dumptxoutset-open"))
+           (bad (namestring (merge-pathnames "no-such-directory-zz/snapshot.dat"
+                                             (uiop:temporary-directory)))))
+      (is (equal (cons -8 (format nil "Couldn't open file ~A.incomplete for writing." bad))
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method node "dumptxoutset"
+                                                (wire-params (list bad "latest"))))))))))
+
 (test getchaintips-always-reports-the-active-tip
   "Core's getchaintips is not `every index entry with no child': a candidate
 tip is a block NOT on the active chain that no other off-chain block builds

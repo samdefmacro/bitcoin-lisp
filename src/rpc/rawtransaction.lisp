@@ -265,17 +265,35 @@ all of them silently:
 
 ;;; --- signrawtransactionwithkey (non-wallet, P2PKH + P2WPKH) ---
 
+(defparameter +sighash-strings+
+  '(("DEFAULT"            . #x00)
+    ("ALL"                . #x01)
+    ("ALL|ANYONECANPAY"   . #x81)
+    ("NONE"               . #x02)
+    ("NONE|ANYONECANPAY"  . #x82)
+    ("SINGLE"             . #x03)
+    ("SINGLE|ANYONECANPAY" . #x83))
+  "Core SighashFromStr's map, spelled exactly as Core spells it
+(core_io.cpp:265-275). These SEVEN strings are the whole vocabulary: the
+lookup is a map, not a search, so the match is case-sensitive and admits no
+substring.")
+
 (defun parse-sighash-type (s)
-  "Map a sighashtype string (default \"ALL\") to its byte: ALL=1 NONE=2 SINGLE=3,
-with |ANYONECANPAY setting 0x80."
-  (let* ((str (string-upcase (or s "ALL")))
-         (acp (search "ANYONECANPAY" str))
-         (base (cond ((search "ALL" str) 1)
-                     ((search "NONE" str) 2)
-                     ((search "SINGLE" str) 3)
-                     (t (error 'rpc-error :code +rpc-invalid-parameter+
-                                          :message "Invalid sighashtype")))))
-    (logior base (if acp #x80 0))))
+  "The sighash byte named by the string S, defaulting to ALL when S is absent
+-- Core SighashFromStr (core_io.cpp:265-281).
+
+Ours upcased the argument and looked for ALL / NONE / SINGLE / ANYONECANPAY as
+SUBSTRINGS, so it accepted `all', `sighash_all' and anything else containing
+one of the four words, and its refusal said `Invalid sighashtype' where Core
+names the offending string. rpc_signrawtransactionwithkey.py:132 passes
+sighashtype=\"all\" and asks for -8 with Core's own sentence."
+  (let* ((str (or s "ALL"))
+         (hit (and (stringp str) (assoc str +sighash-strings+ :test #'string=))))
+    (unless hit
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "'~A' is not a valid sighash parameter."
+                                         (if (stringp str) str s))))
+    (cdr hit)))
 
 (defun parse-multisig (script)
   "If SCRIPT is a bare multisig (OP_m <pubkey>...<pubkey> OP_n OP_CHECKMULTISIG),

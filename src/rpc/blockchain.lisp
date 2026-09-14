@@ -1212,6 +1212,23 @@ working directory (ABS-PATH-FOR-CONFIG-VAL; Core rpc/blockchain.cpp:3111)."
     (when (probe-file path)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message (format nil "~A already exists. If you are sure this is what you want, move it out of the way first" path)))
+    ;; Core opens PATH.incomplete HERE, immediately after the exists check and
+    ;; before the temporary rollback, and reports a failure as -8
+    ;; "Couldn't open file <temppath> for writing." (rpc/blockchain.cpp:
+    ;; 3123-3129). Ours first opened it inside the streaming pass, so a path
+    ;; whose directory does not exist escaped the RPC layer as an internal
+    ;; error -- and, worse, only after the chain had been rolled back.
+    ;; rpc_dumptxoutset.py:66-68 asks for that sentence with a
+    ;; <datadir>/invalid/path.
+    (let ((temppath (concatenate 'string path ".incomplete")))
+      (unless (ignore-errors
+                (with-open-file (out temppath :direction :output
+                                              :if-exists :supersede
+                                              :element-type '(unsigned-byte 8))
+                  (and out t)))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Couldn't open file ~A for writing."
+                                           temppath))))
     ;; Dumping at the current tip needs no rollback at all (Core
     ;; rpc/blockchain.cpp:3136-3138).
     (if (eq target-entry tip-entry)
@@ -1833,8 +1850,10 @@ that block's deltas. Only the muhash hash_type is index-backed."
   (let* ((csi (rpc-get-coinstatsindex node))
          (chain-state (rpc-get-chain-state node)))
     (unless (and csi (bl.store:coinstatsindex-enabled csi))
-      (error 'rpc-error :code +rpc-misc-error+
-                        :message "Querying by block height/hash requires -coinstatsindex"))
+      ;; Core RPC_INVALID_PARAMETER, not a misc error (rpc/blockchain.cpp:1088):
+      ;; feature_coinstatsindex.py:112 asks for -8 and the sentence.
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Querying specific block heights requires coinstatsindex"))
     (when (string= hash-type "hash_serialized_3")
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "hash_serialized_3 is not available for historical heights; use 'muhash'"))
