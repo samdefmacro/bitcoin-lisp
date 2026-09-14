@@ -1137,13 +1137,12 @@ accumulating score); discouragement is NOT a hard ban."
   "peer-banned-p should return T for banned addresses, NIL for others."
   (bl.net:clear-ban-list)
   (is (not (bl.net:peer-banned-p "192.0.2.1")))
-  ;; Manually ban an address
-  (setf (gethash "192.0.2.1" bl.net:*banned-peers*)
-        (+ (get-universal-time) 3600))  ; 1 hour from now
+  ;; Ban through the shipped entry point: the list is keyed by CSubNet and
+  ;; carries a BAN-ENTRY, so a raw hash write would build the wrong shape.
+  (bl.net:ban-address "192.0.2.1" 3600)
   (is (bl.net:peer-banned-p "192.0.2.1"))
-  ;; Expired ban
-  (setf (gethash "192.0.2.2" bl.net:*banned-peers*)
-        (- (get-universal-time) 1))  ; 1 second ago
+  ;; Expired ban: still on the list, but past its time.
+  (bl.net:ban-address "192.0.2.2" -1)
   (is (not (bl.net:peer-banned-p "192.0.2.2")))
   (bl.net:clear-ban-list))
 

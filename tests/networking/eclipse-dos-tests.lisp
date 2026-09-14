@@ -854,6 +854,63 @@ two gates."
               do (return hdr)
             finally (return hdr)))))
 
+(test genesis-carries-its-own-proof-of-work
+  "Core's genesis CBlockIndex has nChainWork = GetBlockProof(genesis) -- the
+same prev_work + proof sum every other entry gets, with prev_work 0. Ours
+started the chain at 0, so EVERY chain-work in the index was short by exactly
+one block's proof.
+
+A uniform offset is invisible to relative comparisons, which is why it lasted.
+The comparison that is ABSOLUTE is -minimumchainwork: feature_minchainwork.py
+sets 0x65 = 101 and mines the 50 regtest blocks (proof 2 apiece) that put the
+chain at 102, and the node computed 100 -- refusing the peer's headers as a
+low-work chain and never syncing at all.
+
+Second arm: an index PERSISTED before the fix starts at 0 and every descendant
+inherits the shortfall, so start-up adds the genesis proof to the whole index
+rather than to genesis alone, which would leave genesis heavier than its own
+child."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-genesis-work")
+      (let* ((cs (bl.store:init-chain-state (namestring dir) :network :regtest))
+             (node (bl:make-node :network :regtest))
+             (bl:*node* node)
+             (ghash (bl.store:network-genesis-hash :regtest))
+             (expected (bl.store:calculate-chain-work
+                        (bl.ser:block-header-bits (bl::make-genesis-header :regtest))
+                        0)))
+        (setf (bl:node-chain-state node) cs)
+        (is (= 2 expected) "a regtest block is worth 2 (the test's own constant)")
+        ;; Fresh index: genesis is created carrying its own proof.
+        (bl::%ensure-genesis-index-entry :regtest)
+        (let ((genesis (bl.store:get-block-index-entry cs ghash)))
+          (is-true genesis)
+          (is (= expected (bl.store:block-index-entry-chain-work genesis))
+              "genesis carries GetBlockProof(genesis), not 0"))
+        ;; Second arm: an index written before the fix. Put genesis back to 0
+        ;; with a child above it, as the old code would have left them.
+        (let* ((genesis (bl.store:get-block-index-entry cs ghash))
+               (child-header (bl.ser:make-block-header
+                              :version 1 :prev-block ghash
+                              :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element 7)
+                              :timestamp 1700000000 :bits #x207fffff :nonce 1))
+               (child (bl.store:make-block-index-entry
+                       :hash (bl.ser:block-header-hash child-header)
+                       :height 1 :header child-header :prev-entry genesis
+                       :chain-work expected :status :valid)))
+          (setf (bl.store:block-index-entry-chain-work genesis) 0)
+          (bl.store:add-block-index-entry cs child)
+          (bl::%ensure-genesis-index-entry :regtest)
+          (is (= expected (bl.store:block-index-entry-chain-work genesis))
+              "the stale genesis is corrected on start-up")
+          (is (= (* 2 expected) (bl.store:block-index-entry-chain-work child))
+              "and so is every descendant, so the chain stays monotone")
+          ;; Idempotent: a second start-up must not add the proof twice.
+          (bl::%ensure-genesis-index-entry :regtest)
+          (is (= (* 2 expected) (bl.store:block-index-entry-chain-work child))
+              "and the correction does not run twice"))))))
+
 (test maybe-start-presync-reports-low-work
   "maybe-start-presync's second value flags a connecting sub-threshold chain
 even when no sync starts (a non-full batch): the caller must then IGNORE the

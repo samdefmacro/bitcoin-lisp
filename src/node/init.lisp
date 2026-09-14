@@ -86,7 +86,21 @@ case ever exercised) has genesis for a root."
   (let* ((genesis-hash (bl.store:network-genesis-hash network))
          (genesis-entry (bl.store:get-block-index-entry
                          (node-chain-state *node*) genesis-hash))
-         (genesis-header (make-genesis-header network)))
+         (genesis-header (make-genesis-header network))
+         ;; Core's genesis CBlockIndex carries nChainWork = GetBlockProof of
+         ;; itself (CChainState::LoadGenesisBlock -> AddToBlockIndex, which
+         ;; runs the same prev_work + proof sum with prev_work 0); ours started
+         ;; the chain at 0 instead, so EVERY chain-work in the index was short
+         ;; by exactly one block's proof.
+         ;;
+         ;; Relative comparisons do not notice a uniform offset, which is why
+         ;; this survived. The one comparison that is ABSOLUTE does:
+         ;; -minimumchainwork. feature_minchainwork.py sets 0x65 = 101 and
+         ;; mines the 50 regtest blocks (proof 2 each) that put the chain at
+         ;; 102; ours computed 100, refused the headers as a low-work chain,
+         ;; and the node never synced.
+         (genesis-work (bl.store:calculate-chain-work
+                        (bl.ser:block-header-bits genesis-header) 0)))
     (if genesis-entry
         ;; Fix existing entry if it has a missing or zeroed header, or a
         ;; persisted header with the wrong merkle root (the old shared-constant
@@ -105,6 +119,21 @@ case ever exercised) has genesis for a root."
             ;; index delta log cannot see (it tracks presence, not identity).
             ;; Force a full snapshot so the corrected genesis actually lands.
             (bl.store:save-header-index
+             (node-chain-state *node*) :force-full t))
+          ;; An index written before the genesis-work fix above starts at 0 and
+          ;; every descendant's stored chain-work inherits that shortfall.
+          ;; Correct the whole index in one pass rather than genesis alone,
+          ;; which would leave genesis heavier than its own child. Idempotent:
+          ;; after this genesis is never 0 again.
+          (when (zerop (bl.store:block-index-entry-chain-work genesis-entry))
+            (log-info "Correcting chain work: genesis carried 0, adding its own proof (~D) to every index entry"
+                      genesis-work)
+            (maphash (lambda (hash entry)
+                       (declare (ignore hash))
+                       (incf (bl.store:block-index-entry-chain-work entry)
+                             genesis-work))
+                     (bl.store:chain-state-block-index (node-chain-state *node*)))
+            (bl.store:save-header-index
              (node-chain-state *node*) :force-full t)))
         ;; Create new genesis entry
         (bl.store:add-block-index-entry
@@ -114,7 +143,7 @@ case ever exercised) has genesis for a root."
           :height 0
           :header genesis-header
           :prev-entry nil
-          :chain-work 0
+          :chain-work genesis-work
           :status :valid
           :tx-count 1)))))   ; genesis carries exactly its coinbase
 
