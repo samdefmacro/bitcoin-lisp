@@ -1823,8 +1823,24 @@ banman.h:19).")
 gets no explicit time (Core -bantime, banman.cpp:130-140: a non-positive
 ban_time_offset falls back to m_default_ban_time). Set from config at startup.")
 
+(defstruct (ban-entry (:constructor %make-ban-entry (created until subnet)))
+  "One manual ban: Core's CBanEntry (nCreateTime / nBanUntil, banman.h:20-40)
+plus the CSubNet it is keyed by.
+
+CREATED and UNTIL are universal times. SUBNET is the parsed range, or NIL for
+an address on a network Core compares by equality rather than by mask (onion,
+I2P) -- there the key string IS the match."
+  (created 0 :type integer)
+  (until 0 :type integer)
+  (subnet nil))
+
 (defvar *banned-peers* (make-hash-table :test 'equal)
-  "Hash table mapping peer address (string) -> ban-expiry-time (universal-time).")
+  "Core's BanMan::m_banned (banman.h:60): canonical subnet string -> BAN-ENTRY.
+
+The KEY is Core's CSubNet::ToString of the banned range, so `127.0.0.1' and
+`127.0.0.1/32' are one entry and `127.0.0.0/24' is a different one -- which is
+what makes Unban an exact erase (banman.cpp:144-152) while IsBanned(CNetAddr)
+walks every range (:89-102).")
 
 (defvar *banlist-path* nil
   "Pathname of the banlist.json persistence file (Core BanMan's
@@ -1992,18 +2008,66 @@ independently."
   (disconnect-peer peer)
   t)
 
+(defun ban-key (string)
+  "The canonical ban-list key for STRING, as (VALUES key subnet), or NIL when
+it names neither an address nor a subnet.
+
+An IP or CIDR range becomes Core's CSubNet::ToString of it (a bare address is
+the /32 or /128 containing it, exactly as CSubNet(CNetAddr) makes one,
+banman.cpp:118-122). An onion or I2P address keeps its own string and carries
+no subnet: Core's CSubNet compares those by equality."
+  (when (and (stringp string) (plusp (length string)))
+    (let ((subnet (parse-subnet string)))
+      (if subnet
+          (values (subnet-string subnet) subnet)
+          (multiple-value-bind (network address) (parse-network-address string)
+            (when address
+              (values (network-address-to-string network address) nil)))))))
+
+(defun %ban-entry-live-p (entry now)
+  (< now (ban-entry-until entry)))
+
 (defun peer-banned-p (address)
-  "Check if ADDRESS is currently banned.
+  "Check if ADDRESS is currently banned -- Core BanMan::IsBanned(CNetAddr)
+(banman.cpp:89-102), which walks EVERY banned range rather than looking the
+address up: a ban on 127.0.0.0/24 covers 127.0.0.1, and that is what
+p2p_disconnect_ban.py:52 asserts by re-banning the covered address and
+expecting `IP/Subnet already banned'.
+
 Returns T if banned, NIL otherwise. Expired bans are cleaned up."
-  (bt:with-lock-held (*ban-lock*)
-    (let ((expiry (gethash address *banned-peers*)))
-      (cond
-        ((null expiry) nil)
-        ((> (bl.ser:get-node-time) expiry)
-         ;; Ban expired, remove it
-         (remhash address *banned-peers*)
-         nil)
-        (t t)))))
+  (let ((now (bl.ser:get-node-time)))
+    (multiple-value-bind (key) (ban-key address)
+      (bt:with-lock-held (*ban-lock*)
+        ;; The exact key first: it is the common case, and it is the only one
+        ;; an onion or I2P ban can hit.
+        (let ((entry (and key (gethash key *banned-peers*))))
+          (when entry
+            (cond ((%ban-entry-live-p entry now) (return-from peer-banned-p t))
+                  (t (remhash key *banned-peers*)))))
+        ;; Otherwise ask every live range whether it covers this address.
+        (let ((expired '())
+              (hit nil))
+          (maphash (lambda (k entry)
+                     (cond ((not (%ban-entry-live-p entry now)) (push k expired))
+                           ((and (ban-entry-subnet entry)
+                                 (address-in-subnets-p
+                                  address (list (ban-entry-subnet entry))))
+                            (setf hit t))))
+                   *banned-peers*)
+          (dolist (k expired) (remhash k *banned-peers*))
+          hit)))))
+
+(defun subnet-exactly-banned-p (string)
+  "T when STRING names a range that is itself on the ban list -- Core
+BanMan::IsBanned(CSubNet) (banman.cpp:104-116), an exact lookup rather than a
+walk. This is the question setban asks for an argument carrying a `/', and it
+is why banning 127.0.0.0/24 twice is refused while banning 127.0.0.0/25 after
+it is not."
+  (let ((key (ban-key string)))
+    (when key
+      (bt:with-lock-held (*ban-lock*)
+        (let ((entry (gethash key *banned-peers*)))
+          (and entry (%ban-entry-live-p entry (bl.ser:get-node-time))))))))
 
 (defun clear-ban-list ()
   "Clear all bans."
@@ -2012,37 +2076,85 @@ Returns T if banned, NIL otherwise. Expired bans are cleaned up."
   (save-banlist))
 
 (defun ban-address (address &optional (seconds *default-ban-time-seconds*))
-  "Manually ban ADDRESS (string) for SECONDS from now (Bitcoin Core setban add;
-SECONDS defaults to -bantime). Returns T, NIL for an empty address."
-  (when (and (stringp address) (plusp (length address)))
-    (bt:with-lock-held (*ban-lock*)
-      (setf (gethash address *banned-peers*)
-            (+ (bl.ser:get-node-time) seconds)))
-    (save-banlist)
-    t))
+  "Manually ban ADDRESS -- an IP, a CIDR subnet, or an onion/I2P address --
+for SECONDS from now (Core BanMan::Ban, banman.cpp:130-142; SECONDS defaults
+to -bantime). Records the creation time as Core's CBanEntry does, so
+listbanned can report ban_duration. Returns T, NIL when ADDRESS names no
+address or range."
+  (multiple-value-bind (key subnet) (ban-key address)
+    (when key
+      (let ((now (bl.ser:get-node-time)))
+        (bt:with-lock-held (*ban-lock*)
+          (setf (gethash key *banned-peers*)
+                (%make-ban-entry now (+ now seconds) subnet))))
+      (save-banlist)
+      t)))
 
 (defun unban-address (address)
-  "Remove ADDRESS from the ban list (Bitcoin Core setban remove). Returns T if it
+  "Remove ADDRESS from the ban list (Core BanMan::Unban, banman.cpp:144-152).
+An EXACT erase of that range, not \"whatever covers it\": with 127.0.0.0/24
+banned, unbanning 127.0.0.1 fails, as it does in Core. Returns T if the range
 was banned, NIL otherwise."
-  (let ((removed (bt:with-lock-held (*ban-lock*)
-                   (remhash address *banned-peers*))))
+  (let* ((key (ban-key address))
+         (removed (and key
+                       (bt:with-lock-held (*ban-lock*)
+                         (remhash key *banned-peers*)))))
     (when removed (save-banlist))
     removed))
 
+(defun %ban-network-rank (network)
+  "Core's Network enum order (netaddress.h:33-51), which is the first term of
+CNetAddr::operator< and so of CSubNet::operator<."
+  (case network (:ipv4 1) (:ipv6 2) (:torv3 3) (:i2p 4) (:cjdns 5) (t 9)))
+
+(defun %ban-order (a b)
+  "Core's CSubNet::operator< (netaddress.cpp:1090-1093): the network address
+first (itself network tag then bytes, :608-611), then the netmask.
+
+The order is not cosmetic. Core's m_banned is a std::map keyed by CSubNet, so
+listbanned comes out sorted and p2p_disconnect_ban.py:83 reads a row BY INDEX
+-- listBeforeShutdown[2] must be the ban it inserted fourth."
+  (flet ((key (ban)
+           (let ((subnet (ban-entry-subnet (cdr ban))))
+             (if subnet
+                 (list (%ban-network-rank (subnet-network subnet))
+                       (subnet-address subnet)
+                       (subnet-netmask subnet))
+                 ;; No subnet: an onion or I2P ban, keyed by its own string.
+                 (multiple-value-bind (network address)
+                     (parse-network-address (car ban))
+                   (list (%ban-network-rank network)
+                         (or address #())
+                         #()))))))
+    (destructuring-bind (rank-a addr-a mask-a) (key a)
+      (destructuring-bind (rank-b addr-b mask-b) (key b)
+        (cond ((/= rank-a rank-b) (< rank-a rank-b))
+              ((mismatch addr-a addr-b)
+               (let ((i (mismatch addr-a addr-b)))
+                 (cond ((>= i (length addr-a)) t)
+                       ((>= i (length addr-b)) nil)
+                       (t (< (aref addr-a i) (aref addr-b i))))))
+              (t (let ((i (mismatch mask-a mask-b)))
+                   (and i
+                        (cond ((>= i (length mask-a)) t)
+                              ((>= i (length mask-b)) nil)
+                              (t (< (aref mask-a i) (aref mask-b i))))))))))))
+
 (defun list-bans ()
-  "Return a list of (address . banned-until-universal-time) for active bans,
-pruning any that have expired (Bitcoin Core listbanned)."
+  "Return a list of (address . BAN-ENTRY) for active bans, pruning any that
+have expired (Bitcoin Core listbanned), in Core's CSubNet order. ADDRESS is
+the canonical range string the ban is keyed by."
   (let ((now (bl.ser:get-node-time))
         (result '())
         (expired '()))
     (bt:with-lock-held (*ban-lock*)
-      (maphash (lambda (addr expiry)
-                 (if (> now expiry)
-                     (push addr expired)
-                     (push (cons addr expiry) result)))
+      (maphash (lambda (addr entry)
+                 (if (%ban-entry-live-p entry now)
+                     (push (cons addr entry) result)
+                     (push addr expired)))
                *banned-peers*)
       (dolist (addr expired) (remhash addr *banned-peers*)))
-    result))
+    (sort result #'%ban-order)))
 
 ;;; Banlist persistence (Core BanMan <datadir>/banlist.json, banman.cpp).
 ;;; Core dumps immediately on every Ban/Unban/ClearBanned plus a 15-minute
@@ -2059,13 +2171,14 @@ a failed dump only logs (Core LogError in DumpBanlist)."
         (let* ((bans (list-bans))
                (entries
                  (mapcar (lambda (ban)
-                           (let ((ht (make-hash-table :test 'equal)))
+                           (let ((ht (make-hash-table :test 'equal))
+                                 (entry (cdr ban)))
                              (setf (gethash "version" ht) 1
-                                   ;; Creation time is not tracked; 0 keeps the
-                                   ;; field present for Core-shaped consumers.
-                                   (gethash "ban_created" ht) 0
+                                   (gethash "ban_created" ht)
+                                   (- (ban-entry-created entry)
+                                      bl.ser:+universal-unix-epoch-offset+)
                                    (gethash "banned_until" ht)
-                                   (- (cdr ban)
+                                   (- (ban-entry-until entry)
                                       bl.ser:+universal-unix-epoch-offset+)
                                    (gethash "address" ht) (car ban))
                              ht))
@@ -2116,12 +2229,24 @@ RECREATED before this returns."
             (dolist (entry nets)
               (when (hash-table-p entry)
                 (let ((addr (gethash "address" entry))
-                      (until (gethash "banned_until" entry)))
+                      (until (gethash "banned_until" entry))
+                      (created (gethash "ban_created" entry)))
                   (when (and (stringp addr) (integerp until))
                     (let ((expiry (+ until bl.ser:+universal-unix-epoch-offset+)))
                       (when (> expiry now)
-                        (setf (gethash addr *banned-peers*) expiry)
-                        (incf count))))))))
+                        ;; Re-key through BAN-KEY: the stored string is already
+                        ;; canonical, but a file written by Core (or by an
+                        ;; older build of this node) need not be, and the
+                        ;; subnet has to be re-parsed for matching either way.
+                        (multiple-value-bind (key subnet) (ban-key addr)
+                          (when key
+                            (setf (gethash key *banned-peers*)
+                                  (%make-ban-entry
+                                   (if (integerp created)
+                                       (+ created bl.ser:+universal-unix-epoch-offset+)
+                                       expiry)
+                                   expiry subnet))
+                            (incf count))))))))))
           count)
       (error (e)
         ;; Core logs this exact line and starts from an empty list rather than

@@ -1633,7 +1633,7 @@ fix: listbanned and getaddednodeinfo answered result:null."
     (is (string= "null" (%encode-rpc-result nil)))
     ;; Arrays (Core VARR).
     (dolist (site (list (cons "getpeerinfo" (bl.rpc::rpc-getpeerinfo node nil))
-                        (cons "listbanned" (bl.rpc::rpc-listbanned node nil))
+                        (cons "listbanned" (call-listbanned node))
                         (cons "getorphantxs" (bl.rpc::rpc-getorphantxs node nil))
                         (cons "getnodeaddresses"
                               (bl.rpc::rpc-getnodeaddresses node (list 0)))
@@ -1677,13 +1677,15 @@ fix: listbanned and getaddednodeinfo answered result:null."
     (setf (bl:node-peers node)
           (list (bl.net:make-peer :address "1.2.3.4:48333" :user-agent "/t/" :state :ready)))
     (bl.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
-    (bl.rpc::rpc-setban node (list "1.2.3.4" "add"))
+    (call-setban node (list "1.2.3.4" "add"))
     (let ((peers (%encode-rpc-result (bl.rpc::rpc-getpeerinfo node nil)))
-          (bans (%encode-rpc-result (bl.rpc::rpc-listbanned node nil)))
+          (bans (%encode-rpc-result (call-listbanned node)))
           (added (%encode-rpc-result (bl.rpc::rpc-getaddednodeinfo node nil))))
       (is (eql 0 (search "[{" peers)))
       (is (eql 0 (search "[{" bans)))
-      (is (search "\"address\":\"1.2.3.4\"" bans))
+      ;; Core keys the ban list by CSubNet, so a bare address is listed as the
+      ;; /32 containing it (CSubNet::ToString, netaddress.cpp:1047-1080).
+      (is (search "\"address\":\"1.2.3.4/32\"" bans))
       (is (eql 0 (search "[{" added)))
       ;; ... and a populated row's own empty nested array is [] too.
       (is (search "\"addresses\":[]" added)))
@@ -7539,31 +7541,124 @@ is why the type error is the one reported. We accepted both silently
   "setban add/remove + listbanned + clearbanned manage the manual ban list."
   (bl.net:clear-ban-list)
   (let ((node (make-test-node)))
-    (is (null (bl.rpc::rpc-setban node (list "1.2.3.4" "add"))))
+    (is (null (call-setban node (list "1.2.3.4" "add"))))
     (is-true (bl.net:peer-banned-p "1.2.3.4"))
-    (let ((banned (bl.rpc::rpc-listbanned node nil)))
+    (let ((banned (call-listbanned node)))
       (is (= 1 (length banned)))
-      (is (string= "1.2.3.4" (cdr (assoc "address" (first banned) :test #'string=))))
+      ;; Core lists the CSubNet, so a bare address appears as its /32.
+      (is (string= "1.2.3.4/32" (cdr (assoc "address" (first banned) :test #'string=))))
       (is (integerp (cdr (assoc "banned_until" (first banned) :test #'string=)))))
-    (is (null (bl.rpc::rpc-setban node (list "1.2.3.4" "remove"))))
+    (is (null (call-setban node (list "1.2.3.4" "remove"))))
     (is (not (bl.net:peer-banned-p "1.2.3.4")))
     ;; remove a non-existent ban / bad command -> error
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-setban node (list "9.9.9.9" "remove")))
+      (call-setban node (list "9.9.9.9" "remove")))
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-setban node (list "1.2.3.4" "bogus")))
+      (call-setban node (list "1.2.3.4" "bogus")))
     ;; clearbanned empties the list
-    (bl.rpc::rpc-setban node (list "5.6.7.8" "add"))
-    (is (null (bl.rpc::rpc-clearbanned node nil)))
-    (is (= 0 (length (bl.rpc::rpc-listbanned node nil))))))
+    (call-setban node (list "5.6.7.8" "add"))
+    (is (null (call-clearbanned node)))
+    (is (= 0 (length (call-listbanned node))))))
+
+(test disconnectnode-matches-the-address-getpeerinfo-printed
+  "Core's DisconnectNode(string) matches CNode::m_addr_name
+(net.cpp:3809-3820), which for an accepted connection is the same
+\"ip:port\" getpeerinfo reports as `addr'. That round trip is the whole API:
+p2p_disconnect_ban.py:131-133 reads getpeerinfo()[0]['addr'] and hands it
+straight back to disconnectnode. Ours compared the bare HOST, so the address
+it had just printed came back -29 `Node not found in connected nodes'.
+
+The bare host keeps working -- it is what this node's own UI passes -- and
+the control is that a string matching neither is still -29."
+  (let* ((node (make-test-node))
+         (srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (unwind-protect
+           (let* ((port (usocket:get-local-port srv))
+                  (client (usocket:socket-connect "127.0.0.1" port
+                                                  :element-type '(unsigned-byte 8)))
+                  (conn (bl.net::make-connection
+                         :socket client :host "127.0.0.1" :port port :connected t))
+                  (peer (bl.net:make-peer :address "127.0.0.1" :state :ready
+                                          :connection conn)))
+             (setf (bl:node-peers node) (list peer))
+             (let ((printed (cdr (assoc "addr" (first (bl.rpc::rpc-getpeerinfo node nil))
+                                        :test #'string=))))
+               (is-true (search ":" printed)
+                        "getpeerinfo prints ip:port, as Core's does")
+               ;; A string matching neither form is Core's -29.
+               (signals bl.rpc:rpc-error
+                 (bl.rpc::rpc-disconnectnode node (list "221B Baker Street" nil)))
+               ;; The printed address finds the peer.
+               (is (null (bl.rpc::rpc-disconnectnode node (list printed nil))))
+               (is (eq :disconnected (bl.net:peer-state peer))))
+             (ignore-errors (usocket:socket-close client)))
+        (bl.net:close-listener srv)))))
+
+(test rpc-setban-bans-a-subnet-and-reports-its-duration
+  "Two things rpc_setban.py and p2p_disconnect_ban.py ask for that the ban list
+could not answer while it was a flat address -> expiry map.
+
+SUBNETS: Core's ban list is keyed by CSubNet (banman.h:60), so `-setban
+127.0.0.0/24' is one entry that COVERS 127.0.0.1 -- IsBanned(CNetAddr) walks
+every range (banman.cpp:89-102) -- while Unban is an exact erase of the range
+(:144-152) and re-banning a covered ADDRESS is refused with -23
+(p2p_disconnect_ban.py:52). Ours refused subnet syntax outright.
+
+BAN_DURATION: Core's CBanEntry keeps the CREATION time and listbanned reports
+banned_until - created (rpc/net.cpp:854-858). Ours wrote a hardcoded 0 for the
+creation time, so the field could not exist; rpc_setban.py:75 restarts with
+-bantime=1234 and reads it back."
+  (bl.net:clear-ban-list)
+  (let ((node (make-test-node)))
+    (is (null (call-setban node (list "127.0.0.0/24" "add" 1234))))
+    (let ((banned (call-listbanned node)))
+      (is (= 1 (length banned)))
+      (is (string= "127.0.0.0/24"
+                   (cdr (assoc "address" (first banned) :test #'string=))))
+      (is (= 1234 (cdr (assoc "ban_duration" (first banned) :test #'string=))))
+      (is (<= 0 (cdr (assoc "time_remaining" (first banned) :test #'string=)) 1234)))
+    ;; The range covers every address in it...
+    (is-true (bl.net:peer-banned-p "127.0.0.1"))
+    (is-true (bl.net:peer-banned-p "127.0.0.255"))
+    ;; ...and nothing outside it (the control: /24, not /16).
+    (is-false (bl.net:peer-banned-p "127.0.1.1"))
+    ;; Re-banning a COVERED address is Core's -23, because setban asks
+    ;; IsBanned(CNetAddr) for an argument with no slash.
+    (signals bl.rpc:rpc-error (call-setban node (list "127.0.0.1" "add")))
+    ;; A narrower range is a DIFFERENT entry, so it is not already banned.
+    (is (null (call-setban node (list "127.0.0.0/25" "add"))))
+    (is (= 2 (length (call-listbanned node))))
+    ;; Unban is exact: the covered address was never its own entry.
+    (signals bl.rpc:rpc-error (call-setban node (list "127.0.0.1" "remove")))
+    (is (null (call-setban node (list "127.0.0.0/24" "remove"))))
+    (is (= 1 (length (call-listbanned node))))
+    ;; An unparseable range is still -30.
+    (signals bl.rpc:rpc-error (call-setban node (list "127.0.0.0/33" "add")))
+    ;; Core's m_banned is a std::map keyed by CSubNet, so listbanned comes out
+    ;; in CSubNet order -- network first, then address, then netmask
+    ;; (netaddress.cpp:1090-1093, :608-611). p2p_disconnect_ban.py:83 reads a
+    ;; row BY INDEX, so an unordered list fails on the wrong entry.
+    (bl.net:clear-ban-list)
+    (dolist (spec '("127.0.0.0/32" "127.0.0.0/24"
+                    "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+                    "192.168.0.1"))
+      (call-setban node (list spec "add")))
+    (is (equal '("127.0.0.0/24" "127.0.0.0/32" "192.168.0.1/32"
+                 "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion")
+               (mapcar (lambda (row) (cdr (assoc "address" row :test #'string=)))
+                       (call-listbanned node)))
+        "IPv4 before onion, and the wider netmask before the narrower")
+    (bl.net:clear-ban-list)))
 
 (test rpc-setban-absolute-bantime
   "setban add with absolute=true sets banned_until to the given Unix time."
   (bl.net:clear-ban-list)
   (let ((node (make-test-node))
         (future (+ (bl.ser:get-unix-time) 3600)))
-    (bl.rpc::rpc-setban node (list "10.0.0.1" "add" future t))
-    (let ((banned (bl.rpc::rpc-listbanned node nil)))
+    (call-setban node (list "10.0.0.1" "add" future t))
+    (let ((banned (call-listbanned node)))
       (is (<= (abs (- future (cdr (assoc "banned_until" (first banned) :test #'string=)))) 2)))
     (bl.net:clear-ban-list)))
 
@@ -7579,7 +7674,7 @@ longer needs to chain a disconnectnode. Other peers are untouched."
                                           :connection conn))
          (other (bl.net:make-peer :address "198.51.100.3" :state :ready)))
     (setf (bl:node-peers node) (list target other))
-    (is (null (bl.rpc::rpc-setban node (list "203.0.113.9" "add"))))
+    (is (null (call-setban node (list "203.0.113.9" "add"))))
     (is-true (bl.net:peer-banned-p "203.0.113.9"))
     (is (eq :disconnected (bl.net:peer-state target)))
     (is (null (bl.net:peer-connection target)))

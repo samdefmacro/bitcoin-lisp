@@ -302,6 +302,19 @@ a wtxidrelay peer, MSG_TX / MSG_WITNESS_TX otherwise."
            (list (bl.ser:make-inv-vector :type type :hash hash)))
           24))
 
+(defun call-setban (node params)
+  "Drive the shipped setban RPC (Core rpc/net.cpp:766-820). Two test files ask
+for it, and each reach used to spell the internal out."
+  (bl.rpc::rpc-setban node params))
+
+(defun call-listbanned (node)
+  "The shipped listbanned RPC's rows (Core rpc/net.cpp:840-864)."
+  (bl.rpc::rpc-listbanned node nil))
+
+(defun call-clearbanned (node)
+  "The shipped clearbanned RPC (Core rpc/net.cpp:866-886)."
+  (bl.rpc::rpc-clearbanned node nil))
+
 (defun block-request-allowed-p (chain-state entry best-header)
   "Whether the shipped serving rule will hand ENTRY to a peer that asks for it
 (Core PeerManagerImpl::BlockRequestAllowed, net_processing.cpp:1953-1960): on

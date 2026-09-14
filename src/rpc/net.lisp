@@ -641,9 +641,22 @@ parameter the caller never sent."
       (let ((target
               (cond
                 ((and have-address (not have-nodeid))
-                 (find address (bl:node-peers node)
-                       :key (lambda (p) (bl.net:peer-address p))
-                       :test #'string=))
+                 ;; Core matches CNode::m_addr_name (net.cpp:3809-3820), which
+                 ;; is the connection's "ip:port" -- the same string
+                 ;; getpeerinfo reports as `addr', which is where a caller gets
+                 ;; it from (p2p_disconnect_ban.py:131-133 reads
+                 ;; getpeerinfo()[0]['addr'] and hands it straight back). Ours
+                 ;; compared the bare HOST, so the address getpeerinfo had just
+                 ;; printed was "not found in connected nodes".
+                 ;;
+                 ;; The bare host still matches: it is what this node's own web
+                 ;; UI and RPC callers have always passed, and Core's
+                 ;; m_addr_name for a peer dialled by name is whatever the
+                 ;; operator wrote.
+                 (find-if (lambda (p)
+                            (or (string= address (%peer-addr p))
+                                (string= address (bl.net:peer-address p))))
+                          (bl:node-peers node)))
                 ((and have-nodeid (or (null address)
                                       (and (stringp address) (zerop (length address)))))
                  (find nodeid (bl:node-peers node)
@@ -675,27 +688,34 @@ parameter the caller never sent."
 
 (define-rpc "setban" (node (address command bantime (absolute :bool)))
   "Add or remove a manual ban (Bitcoin Core setban). PARAMS:
-(address command [bantime] [absolute]). COMMAND is \"add\" or \"remove\". For add,
+(address command [bantime] [absolute]). ADDRESS is an IP, a CIDR subnet, or an
+onion/I2P address. COMMAND is \"add\" or \"remove\". For add,
 BANTIME is seconds from now (default -bantime, 24h), or an absolute Unix time
-when ABSOLUTE is true, and every connected peer with that address is
-disconnected (Core net.cpp:803-810 -> CConnman::DisconnectNode). Error codes
+when ABSOLUTE is true, and every connected peer the ban covers is
+disconnected (Core net.cpp:799-808 -> CConnman::DisconnectNode). Error codes
 mirror Core (net.cpp:766-812): a non-address (-30
 RPC_CLIENT_INVALID_IP_OR_SUBNET), re-banning (-23), a failed unban (-30).
-Subnet (CIDR) bans are not supported — bans match exact addresses — so
-subnet syntax is rejected as invalid. Returns null."
+
+Core decides SUBNET-ness by the presence of a `/' and asks a different
+question for each (net.cpp:770-786): an ADDRESS is already-banned when ANY
+live range covers it, a SUBNET only when that exact range is on the list.
+REMOVE is always the exact range. Returns null."
   (unless (and (stringp address) (plusp (length address)))
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "address required"))
   ;; Core: unparseable IP/subnet -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30),
-  ;; net.cpp:781. parse-network-address accepts IPv4/IPv6/onion/i2p
-  ;; literals; hostnames and CIDR subnets are rejected.
-  (unless (bl.net:parse-network-address address)
+  ;; net.cpp:781. BAN-KEY accepts IPv4/IPv6 literals, CIDR subnets and
+  ;; onion/i2p addresses; a hostname resolves to none of them.
+  (unless (bl.net:ban-key address)
     (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
                       :message "Error: Invalid IP/Subnet"))
   (cond
     ((equal command "add")
      ;; Core: already banned -> RPC_CLIENT_NODE_ALREADY_ADDED (-23),
-     ;; net.cpp:786.
-     (when (bl.net:peer-banned-p address)
+     ;; net.cpp:786 -- IsBanned(CSubNet) for a `/' argument (exact), and
+     ;; IsBanned(CNetAddr) for a bare one (any covering range).
+     (when (if (find #\/ address)
+               (bl.net:subnet-exactly-banned-p address)
+               (bl.net:peer-banned-p address))
        (error 'rpc-error :code +rpc-client-node-already-added+
                          :message "Error: IP/Subnet already banned"))
      (cond
@@ -717,9 +737,12 @@ subnet syntax is rejected as invalid. Returns null."
      ;; that address). Same node-lock discipline as rpc-disconnectnode:
      ;; hold it across the scan + disconnects so we never act on a peer
      ;; mid-removal by the sync thread.
+     ;; Core's DisconnectNode takes the CSubNet or the CNetAddr it just
+     ;; banned and drops every node it covers (net.cpp:799-808), so a /24 ban
+     ;; disconnects the whole range rather than one exact string match.
      (bt:with-recursive-lock-held ((bl:node-lock node))
        (dolist (peer (bl:node-peers node))
-         (when (string= address (bl.net:peer-address peer))
+         (when (bl.net:peer-banned-p (bl.net:peer-address peer))
            (bl.net:disconnect-peer peer))))
      nil)
     ((equal command "remove")
@@ -735,12 +758,25 @@ subnet syntax is rejected as invalid. Returns null."
   "List active manual bans (Bitcoin Core listbanned)."
   (declare (ignore node params))
   ;; Core pushes a VARR: no bans is [], not null.
-  (json-array
-   (mapcar (lambda (ban)
-             `(("address" . ,(car ban))
-               ("banned_until" . ,(- (cdr ban)
-                                     bl.ser:+universal-unix-epoch-offset+))))
-           (bl.net:list-bans))))
+  (let ((now (bl.ser:get-unix-time)))
+    (json-array
+     (mapcar (lambda (ban)
+               ;; Core's five fields, in Core's order (rpc/net.cpp:854-858).
+               ;; BAN_DURATION and TIME_REMAINING are derived, not stored --
+               ;; rpc_setban.py:75 restarts with -bantime=1234 and reads the
+               ;; duration back, which needs the CREATION time Core's CBanEntry
+               ;; keeps and ours had been writing as a hardcoded 0.
+               (let* ((entry (cdr ban))
+                      (created (- (bl.net:ban-entry-created entry)
+                                  bl.ser:+universal-unix-epoch-offset+))
+                      (until (- (bl.net:ban-entry-until entry)
+                                bl.ser:+universal-unix-epoch-offset+)))
+                 `(("address" . ,(car ban))
+                   ("ban_created" . ,created)
+                   ("banned_until" . ,until)
+                   ("ban_duration" . ,(- until created))
+                   ("time_remaining" . ,(- until now)))))
+             (bl.net:list-bans)))))
 
 (define-rpc "clearbanned" (node params)
   "Clear all manual bans (Bitcoin Core clearbanned). Returns null."
