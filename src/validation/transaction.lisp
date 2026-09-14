@@ -844,31 +844,106 @@ transaction is refused even on a node told to relay non-standard ones."
   (cdr (assoc (if (consp reason) (first reason) reason)
               *tx-reject-debug-messages*)))
 
+(defun tx-reject-keyword (reason)
+  "The verdict KEYWORD inside REASON, whichever shape carries it.
+A verdict travels as a bare keyword, or as a list whose first element is the
+keyword and whose remaining elements are the detail Core's ValidationState
+keeps beside it. A caller that switches on the verdict asks this rather than
+EQ, so a site that gains a detail does not silently change its class."
+  (if (consp reason) (first reason) reason))
+
+(defun tx-reject-reason-only (reason)
+  "REASON as Core's state.GetRejectReason() spells it -- the SHORT half.
+Core keeps the reject reason and the debug message in two fields and joins
+them only in ToString() (consensus/validation.h:112-121); testmempoolaccept
+reports them separately as `reject-reason' and `reject-details'
+(rpc/mempool.cpp:396-402), so a client matching on the reason never has to
+parse a sentence built from the values of one particular rejection.
+
+The two script passes are the exception Core builds INTO the reason: their
+reject reason is `<prefix> (<ScriptErrorString>)' (validation.cpp:2117-2119),
+with the failing input in the debug message.
+
+REASON is a keyword, (KEYWORD DEBUG-STRING), (KEYWORD SCRIPT-ERROR) or
+(KEYWORD SCRIPT-ERROR DEBUG-STRING); a STRING second element is a debug
+message, anything else is a script error. An unmapped keyword falls back to
+its downcased name and is caught by test rather than by a client: see
+TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
+  (let ((keyword (tx-reject-keyword reason)))
+    (flet ((base ()
+             (or (cdr (assoc keyword *tx-reject-reasons*))
+                 (string-downcase (symbol-name keyword)))))
+      ;; A cons whose second element is a STRING is (KEYWORD DEBUG-STRING) and
+      ;; keeps the plain reason; anything else in that position is a script
+      ;; error, NIL included -- Core builds the parenthetical unconditionally
+      ;; at both script sites and ScriptErrorString's own fallback for an
+      ;; error it does not know is "unknown error".
+      (if (and (consp reason) (not (stringp (second reason))))
+          (format nil "~A (~A)" (base)
+                  (bl.interop:script-error-message (second reason)))
+          (base)))))
+
+(defun tx-reject-debug-string (reason)
+  "REASON as Core's state.GetDebugMessage() spells it, or NIL where Core
+writes none. It is the second element of (KEYWORD DEBUG-STRING) and the THIRD
+of (KEYWORD SCRIPT-ERROR DEBUG-STRING) -- a script pass carries both halves,
+the ScriptErrorString inside the reason and the failing input here."
+  (cond ((and (consp reason) (stringp (second reason))) (second reason))
+        ((and (consp reason) (stringp (third reason))) (third reason))))
+
 (defun tx-reject-reason-string (reason)
-  "REASON as Core's state.ToString() spells it.
-REASON is a keyword, the list (KEYWORD SCRIPT-ERROR) the two script passes
-return -- Core renders those as `<prefix> (<ScriptErrorString>)'
-(validation.cpp:2117-2119), and BL.INTEROP:SCRIPT-ERROR-MESSAGE is that string
-verbatim for every error our interpreter reports -- or the list (KEYWORD
-DEBUG-STRING), which is Core's reject reason and debug message and renders as
-`<reason>, <debug>' (consensus/validation.h:112-121). A STRING second element
-is the debug message; anything else is a script error.
-An unmapped keyword falls back to its downcased name and is caught by test
-rather than by a client: see TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
-  (cond ((and (consp reason) (stringp (second reason)))
-         (format nil "~A, ~A"
-                 (tx-reject-reason-string (first reason)) (second reason)))
-        ((consp reason)
-         (format nil "~A (~A)"
-                 (tx-reject-reason-string (first reason))
-                 (bl.interop:script-error-message (second reason))))
-        (t (or (cdr (assoc reason *tx-reject-reasons*))
-               (string-downcase (symbol-name reason))))))
+  "REASON as Core's state.ToString() spells it: the reject reason, then the
+debug message after `, ' when there is one (consensus/validation.h:112-121).
+This is the string sendrawtransaction throws and the string
+testmempoolaccept reports as `reject-details'."
+  (let ((base (tx-reject-reason-only reason))
+        (debug (tx-reject-debug-string reason)))
+    (if debug (format nil "~A, ~A" base debug) base)))
+
+(defun %tx-hash-hex (hash)
+  "HASH as Core's uint256::ToString() writes it into a message: big-endian hex."
+  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))
+
+(defun %script-check-debug-string (tx input-index)
+  "Core CScriptCheck::operator()'s debug message (validation.cpp:2018):
+`input %i of %s (wtxid %s), spending %s:%i'. CheckInputScripts hands it to
+state.Invalid as the DEBUG half of the rejection (:2117-2119), so the reject
+reason stays the short `<prefix> (<ScriptErrorString>)' a client matches on
+while the detail that names this input travels beside it.
+
+Returns NIL when INPUT-INDEX names no input, so a script pass that failed
+without reporting an index still produces Core's reason."
+  (let ((inputs (bl.ser:transaction-inputs tx)))
+    (when (and input-index (< -1 input-index (length inputs)))
+      (let ((prevout (bl.ser:tx-in-previous-output (aref inputs input-index))))
+        (format nil "input ~D of ~A (wtxid ~A), spending ~A:~D"
+                input-index
+                (%tx-hash-hex (bl.ser:transaction-hash tx))
+                (%tx-hash-hex (bl.ser:transaction-wtxid tx))
+                (%tx-hash-hex (bl.ser:outpoint-hash prevout))
+                (bl.ser:outpoint-index prevout))))))
 
 (defun %policy-script-checks (tx utxo-set extra-coins)
   "Core MemPoolAccept::PolicyScriptChecks (validation.cpp:1132-1153).
-Returns (VALUES T NIL), or (VALUES NIL (KEYWORD SCRIPT-ERROR)) -- the reason
-carries the script error so it can be rendered with Core's parenthetical."
+Returns (VALUES T NIL), or (VALUES NIL (KEYWORD SCRIPT-ERROR DEBUG)) -- the
+reason carries the script error so it can be rendered with Core's
+parenthetical, and the debug string that names the failing input.
+
+Witness-stripped reclassification: a tx with NO witness data spending a
+(non-anchor) witness program can never satisfy its scripts -- the witness is
+simply missing. Core runs the pass anyway and, on failure, RE-STATES the
+verdict as TX_WITNESS_STRIPPED while keeping the reject reason and the debug
+message the pass produced (validation.cpp:1143-1148,
+SpendsNonAnchorWitnessProg). Only the CLASS moves, and it moves for one
+reason: the P2P layer must not cache such a failure in recent-rejects,
+because a stripped tx's wtxid equals its txid, so caching would poison the
+real witnessed transaction's txid and block its relay permanently. A gate
+that returned a bare :WITNESS-STRIPPED BEFORE the pass got the class right
+and threw the answer away -- mempool_accept.py:78 reads
+\"mempool-script-verify-flag-failed (Witness version reserved for soft-fork
+upgrades)\" off a nested sh(P2A) spend, which is what this pass reports and
+what a pre-gate cannot know. Anchor (P2A) spends are exempt: they
+legitimately carry no witness."
   ;; Script pass 1 — PolicyScriptChecks (Core MemPoolAccept::
   ;; PolicyScriptChecks, validation.cpp:1132-1153): run the input
   ;; scripts under the full STANDARD flag set (a constant in Core,
@@ -880,10 +955,15 @@ carries the script error so it can be rendered with Core's parenthetical."
       (validate-transaction-scripts tx utxo-set
                                     :flags +standard-script-verify-flags+
                                     :extra-coins extra-coins)
-    (declare (ignore failed-input))
     (unless scripts-valid
       (return-from %policy-script-checks
-        (values nil (list :mempool-script-verify-flag-failed script-error)))))
+        (values nil (list (if (and (not (bl.ser:transaction-has-witness-p tx))
+                                   (spends-non-anchor-witness-program-p
+                                    tx utxo-set extra-coins))
+                              :witness-stripped
+                              :mempool-script-verify-flag-failed)
+                          script-error
+                          (%script-check-debug-string tx failed-input))))))
   (values t nil))
 
 (defun %consensus-script-checks (tx utxo-set current-height extra-coins)
@@ -913,7 +993,8 @@ carries the script error so it can be rendered with Core's parenthetical."
         (bl.ser:transaction-hash tx))
        failed-input)
       (return-from %consensus-script-checks
-        (values nil (list :block-script-verify-flag-failed script-error)))))
+        (values nil (list :block-script-verify-flag-failed script-error
+                          (%script-check-debug-string tx failed-input))))))
   (values t nil))
 
 (defun %mempool-precheck-context-free (tx)
@@ -1308,31 +1389,10 @@ decide (Core PreChecks, validation.cpp:950-970)."
                 (return-from validate-transaction-for-mempool (values nil reason nil)))
               (setf replaced-set rset)))
 
-          ;; Witness-stripped gate: a tx with NO witness data spending a
-          ;; (non-anchor) witness program can never satisfy its scripts —
-          ;; the witness is simply missing. Core fails these inside
-          ;; CheckInputScripts and PolicyScriptChecks then reclassifies the
-          ;; failure TX_WITNESS_STRIPPED (validation.cpp:1143-1148,
-          ;; SpendsNonAnchorWitnessProg) so the P2P layer never caches it in
-          ;; recent-rejects: a stripped tx's wtxid equals its txid, so
-          ;; caching would poison the real witnessed tx's txid and block its
-          ;; relay permanently. Running the gate BEFORE the script passes is
-          ;; equivalent to Core's fail-then-reclassify: under the STANDARD
-          ;; flags of the policy pass below, every witnessless non-anchor
-          ;; witness-program spend fails (v0/v1 on the empty witness stack,
-          ;; unknown versions on DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM), so
-          ;; the reclassification would always fire anyway — pre-gating just
-          ;; skips the doomed execution and keeps the :witness-stripped
-          ;; classification. Anchor (P2A) spends are exempt: they
-          ;; legitimately carry no witness.
-          (when (and (not (bl.ser:transaction-has-witness-p tx))
-                     (spends-non-anchor-witness-program-p tx utxo-set extra-coins))
-            (return-from validate-transaction-for-mempool
-              (values nil :witness-stripped nil)))
-
           ;; The two script passes, Core's names (defined above this
           ;; function): STANDARD flags first, then the tip's consensus
-          ;; flags to warm the cache block connection will hit.
+          ;; flags to warm the cache block connection will hit. The policy
+          ;; pass carries Core's witness-stripped reclassification.
           (multiple-value-bind (ok error)
               (%policy-script-checks tx utxo-set extra-coins)
             (unless ok

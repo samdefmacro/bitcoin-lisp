@@ -447,6 +447,44 @@ The sentences below are ScriptErrorString's own (script/script_error.cpp)."
     (is (string= "mempool-script-verify-flag-failed"
                  (r :mempool-script-verify-flag-failed)))))
 
+(test reject-reason-and-details-are-cores-two-fields
+  "Core keeps GetRejectReason() and GetDebugMessage() apart, and ToString()
+is the pair joined with `, ' (consensus/validation.h:112-121). A rejection
+that builds a sentence from its own values -- the RBF anti-DoS arithmetic,
+validation.cpp:1009-1011 -- puts the SENTENCE in the debug message and leaves
+the reason the token `insufficient fee', which is what feature_rbf.py:112
+compares against `reject-reason' while comparing the sentence against
+`reject-details'."
+  (let ((rbf (list :rbf-insufficient-fee
+                   "rejecting replacement ab, not enough additional fees to relay; 0.00 < 0.00000011")))
+    (is (string= "insufficient fee" (bl.val:tx-reject-reason-only rbf)))
+    (is (string= "rejecting replacement ab, not enough additional fees to relay; 0.00 < 0.00000011"
+                 (bl.val:tx-reject-debug-string rbf)))
+    (is (string= "insufficient fee, rejecting replacement ab, not enough additional fees to relay; 0.00 < 0.00000011"
+                 (bl.val:tx-reject-reason-string rbf))))
+  ;; A verdict with no debug message reports the reason for both, which is
+  ;; what mempool_accept_wtxid.py:59 reads back as reject-details.
+  (is (string= "txn-already-in-mempool" (bl.val:tx-reject-reason-only :already-in-mempool)))
+  (is (null (bl.val:tx-reject-debug-string :already-in-mempool)))
+  (is (string= "txn-already-in-mempool" (bl.val:tx-reject-reason-string :already-in-mempool)))
+  ;; A script pass carries BOTH halves: the ScriptErrorString inside the
+  ;; reason (validation.cpp:2117) and CScriptCheck's own per-input sentence
+  ;; (:2018) as the debug message.
+  (let ((script (list :mempool-script-verify-flag-failed :invalid-stack-operation
+                      "input 0 of aa (wtxid bb), spending cc:0")))
+    (is (string= "mempool-script-verify-flag-failed (Operation not valid with the current stack size)"
+                 (bl.val:tx-reject-reason-only script)))
+    (is (string= "input 0 of aa (wtxid bb), spending cc:0"
+                 (bl.val:tx-reject-debug-string script)))
+    (is (string= "mempool-script-verify-flag-failed (Operation not valid with the current stack size), input 0 of aa (wtxid bb), spending cc:0"
+                 (bl.val:tx-reject-reason-string script))))
+  ;; The verdict CLASS survives every shape, which is what the reject cache
+  ;; and this RPC switch on.
+  (is (eq :witness-stripped
+          (bl.val:tx-reject-keyword
+           (list :witness-stripped :discourage-upgradable-witness-program "input 0 of aa"))))
+  (is (eq :already-in-mempool (bl.val:tx-reject-keyword :already-in-mempool))))
+
 (test transaction-no-outputs
   "Transaction without outputs should fail validation."
   (let ((tx (bl.ser:make-transaction

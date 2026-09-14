@@ -719,7 +719,7 @@ to make on purpose, so the set is pinned."
     ;; VALIDATE-TRANSACTION-SCRIPTS and now carry Core's own names, so what
     ;; remains is PreChecks alone -- 330 lines against Core's 198. Closing
     ;; that gap means shortening OUR PreChecks, not extracting a phase.
-    ("validate-transaction-for-mempool" . 330)   ; validation/transaction.lisp
+    ("validate-transaction-for-mempool" . 309)   ; validation/transaction.lisp
                                                  ; Core PreChecks 198.
                                                  ; NOT a three-phase fusion:
                                                  ; the script passes were

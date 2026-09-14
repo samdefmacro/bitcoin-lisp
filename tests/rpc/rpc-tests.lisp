@@ -1997,10 +1997,78 @@ CheckInputScripts, validation.cpp:2117."
                  (bl.net:make-peer :state :ready)))
           (hex (bl.crypto:bytes-to-hex
                 (bl.ser:serialize-transaction tx))))
-      (let ((r (first (%testmempoolaccept node (list hex)))))
+      (let* ((r (first (%testmempoolaccept node (list hex))))
+             (details (cdr (assoc "reject-details" r :test #'string=))))
         (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
         (is (string= "mempool-script-verify-flag-failed (Stack size must be exactly one after execution)"
-                     (cdr (assoc "reject-reason" r :test #'string=))))))))
+                     (cdr (assoc "reject-reason" r :test #'string=))))
+        ;; reject-details is state.ToString(): the reason, then the debug
+        ;; message CScriptCheck built for the failing input
+        ;; (rpc/mempool.cpp:400-401, validation.cpp:2018). rpc_packages.py:123
+        ;; compares the whole sentence, input index and outpoint included.
+        (is-true (stringp details))
+        (is (eql 0 (search "mempool-script-verify-flag-failed (Stack size must be exactly one after execution), "
+                           (or details ""))))
+        (is (search (format nil "input 0 of ~A (wtxid ~A), spending "
+                            (bl.rpc::hash-to-hex (bl.ser:transaction-hash tx))
+                            (bl.rpc::hash-to-hex (bl.ser:transaction-wtxid tx)))
+                    (or details "")))))))
+
+(test rpc-testmempoolaccept-reject-details-is-cores-second-field
+  "Core reports the rejection TWICE and differently: `reject-reason' is
+state.GetRejectReason(), the token, and `reject-details' is state.ToString(),
+the token plus whatever debug message this particular rejection built
+(rpc/mempool.cpp:396-402). feature_rbf.py:112 reads both off one RBF
+rejection: the reason must be exactly "insufficient fee" while the details
+carry the amounts. A verdict with no debug message reports the token for
+both, which is what mempool_accept_wtxid.py:59 asserts.
+
+A missing input is the one case with NEITHER field pair: Core substitutes its
+own "missing-inputs" for the reason and emits no details at all (:398-399)."
+  (let ((rbf (list :rbf-insufficient-fee
+                   "rejecting replacement ab, not enough additional fees to relay; 0.00 < 0.00000011")))
+    (is (string= "insufficient fee" (bl.val:tx-reject-reason-only rbf)))
+    (is (string= "insufficient fee, rejecting replacement ab, not enough additional fees to relay; 0.00 < 0.00000011"
+                 (bl.val:tx-reject-reason-string rbf))))
+  (multiple-value-bind (tx utxo mempool)
+      (%cleanstack-violation-fixture
+       (make-array 4 :element-type '(unsigned-byte 8)
+                     :initial-contents '(#x01 #x51 #x01 #x51))
+       :input-id 141)
+    (declare (ignore tx))
+    (let* ((node (%broadcast-test-node
+                  utxo mempool
+                  (bl.store:make-chain-state :best-height 100)
+                  (bl.net:make-peer :state :ready)))
+           ;; A transaction whose input nothing funds: missing-inputs, the one
+           ;; rejection Core answers with a reason and NO details.
+           (orphan (bl.ser:make-transaction
+                    :version 2
+                    :inputs (vector (bl.ser:make-tx-in
+                                     :previous-output
+                                     (bl.ser:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 199)
+                                      :index 0)
+                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                     :sequence #xffffffff))
+                    :outputs (vector (bl.ser:make-tx-out
+                                      :value 1000
+                                      :script-pubkey
+                                      ;; OP_RETURN with an 8-byte payload, so
+                                      ;; the transaction clears Core's 65-byte
+                                      ;; non-witness minimum and the rejection
+                                      ;; under test is the missing input.
+                                      (make-array 10 :element-type '(unsigned-byte 8)
+                                                     :initial-contents
+                                                     '(#x6a #x08 1 2 3 4 5 6 7 8))))
+                    :lock-time 0))
+           (r (first (%testmempoolaccept
+                      node
+                      (list (bl.crypto:bytes-to-hex
+                             (bl.ser:serialize-transaction orphan)))))))
+      (is (string= "missing-inputs" (cdr (assoc "reject-reason" r :test #'string=))))
+      (is-false (assoc "reject-details" r :test #'string=)))))
 
 
 ;;; --- Raw-transaction safety rails (Core node/transaction.h:28-34) ---

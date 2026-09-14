@@ -674,15 +674,26 @@ anything to the mempool. Each tx is checked independently against current state
                                    (append ids
                                            `(("allowed" . ,+json-false+)
                                              ;; This RPC substitutes its own string for the
-                                             ;; missing-inputs result and prints the state's
-                                             ;; reason for everything else (rpc/mempool.cpp:
-                                             ;; 399-402). Note the plural: it is this surface
-                                             ;; only — sendrawtransaction reports the state's
-                                             ;; "bad-txns-inputs-missingorspent" instead.
-                                             ("reject-reason"
-                                              . ,(if (eq error :missing-input)
-                                                     "missing-inputs"
-                                                     (bl.val:tx-reject-reason-string error)))))))))))
+                                             ;; missing-inputs result and reports the state's
+                                             ;; TWO fields for everything else (rpc/mempool.cpp:
+                                             ;; 396-402): reject-reason is GetRejectReason(),
+                                             ;; the short verdict a client matches on, and
+                                             ;; reject-details is ToString(), the verdict plus
+                                             ;; the debug message this rejection built from its
+                                             ;; own values ("insufficient fee" vs "insufficient
+                                             ;; fee, rejecting replacement <txid>, ...").
+                                             ;; Reporting ToString() as the reason gave a client
+                                             ;; a sentence to parse where Core gives it a token.
+                                             ;; Note the plural in missing-inputS: it is this
+                                             ;; surface only — sendrawtransaction reports the
+                                             ;; state's "bad-txns-inputs-missingorspent".
+                                             ,@(if (eq (bl.val:tx-reject-keyword error)
+                                                       :missing-input)
+                                                   `(("reject-reason" . "missing-inputs"))
+                                                   `(("reject-reason"
+                                                      . ,(bl.val:tx-reject-reason-only error))
+                                                     ("reject-details"
+                                                      . ,(bl.val:tx-reject-reason-string error))))))))))))
           (%package-test-rows
            (mapcar (lambda (tx)
                      `(("txid" . ,(hash-to-hex (bl.ser:transaction-hash tx)))
