@@ -1521,7 +1521,7 @@ thread."
     (error () nil)))
 
 
-(defun %start-network-services (network sync listen listen-bind listen-onion tor-control tor-password)
+(defun %start-network-services (network sync listen listen-bind listen-bind-supplied-p listen-onion tor-control tor-password)
   "Core Step 12, start node: DNS seeding into the address book, the inbound
 listener, the onion listener with its Tor control connection, and
 -externalip's AddLocal entries."
@@ -1549,23 +1549,29 @@ listener, the onion listener with its Tor control connection, and
   (when (and sync listen)
     (start-inbound-listener *node* listen-bind))
 
-  ;; The onion-service TARGET is bound whenever this node listens, whether or
-  ;; not an onion service will exist: Core pushes DefaultOnionServiceTarget
-  ;; into onion_binds when no -bind=...=onion was given (init.cpp:2174-2182)
-  ;; and CConnman::InitBinds binds every one of them (net.cpp:3437-3441),
-  ;; independently of -listenonion, which only decides whether StartTorControl
-  ;; runs (:2184-2191). We gated the BIND on -listenonion too, and Core's own
-  ;; framework writes `listenonion=0' into every node's config -- so
-  ;; feature_port.py, which reads `Bound to 127.0.0.1:<port+1>' out of
-  ;; debug.log, saw no such line under any configuration.
-  (when (and sync listen)
-    (bl.net:clear-local-addresses)
+  ;; The DEFAULT onion-service target is bound whenever this node listens on a
+  ;; default bind, whether or not an onion service will exist: Core pushes
+  ;; DefaultOnionServiceTarget into onion_binds ONLY when neither
+  ;; -bind=...=onion NOR a plain -bind was given (init.cpp:2174-2182 -- with a
+  ;; -bind present the target is vBinds.front() and nothing extra is pushed),
+  ;; and CConnman::InitBinds binds every entry of onion_binds
+  ;; (net.cpp:3437-3441) independently of -listenonion, which only decides
+  ;; whether StartTorControl runs (:2184-2191).
+  ;;
+  ;; We gated the BIND on -listenonion -- and Core's own framework writes
+  ;; `listenonion=0' into every node's config, so feature_port.py, which reads
+  ;; `Bound to 127.0.0.1:<port+1>' out of debug.log, saw no such line under any
+  ;; configuration. Binding it unconditionally is the other error: with an
+  ;; explicit -bind Core binds nothing extra, and the framework's consecutive
+  ;; per-node ports make <port>+1 the NEXT node's p2p port.
+  (when (and sync listen (not listen-bind-supplied-p))
     (start-onion-listener *node*))
   ;; The torcontrol client that registers the v3 onion service and AddLocal()s
   ;; the .onion address is what -listenonion actually governs. Gated on LISTEN
   ;; as well (Core: -listen=0 soft-disables -listenonion; the config layer
   ;; errors on the explicit combination).
   (when (and sync listen listen-onion)
+    (bl.net:clear-local-addresses)
     (setf (node-tor-controller *node*)
           (bl.net:start-tor-control
            :control-spec tor-control
@@ -1651,7 +1657,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (rpc-whitelist nil)
                         (rpc-whitelist-default :unset)
                         (listen t)
-                        (listen-bind "0.0.0.0")
+                        (listen-bind "0.0.0.0" listen-bind-supplied-p)
                         (listen-onion t)
                         (tor-control nil)
                         (tor-password nil)
@@ -1808,7 +1814,7 @@ Returns the node instance."
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 
-  (%start-network-services network sync listen listen-bind listen-onion tor-control tor-password)
+  (%start-network-services network sync listen listen-bind listen-bind-supplied-p listen-onion tor-control tor-password)
   ;; -loadblock=<file>: import external block files before declaring the node
   ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
   ;; on it). A file that cannot be opened warns and the rest still run.
