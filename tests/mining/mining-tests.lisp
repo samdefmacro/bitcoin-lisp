@@ -2051,3 +2051,57 @@ writes a newline, and neither read could match it."
     (is (string= "help: unknown command: nosuchrpc"
                  (bl.rpc:dispatch-rpc-method node "help"
                                              (wire-params (list "nosuchrpc")))))))
+
+(test prioritisation-advances-the-counter-a-template-is-cached-against
+  "Core bumps nTransactionsUpdated when a transaction IN the pool is
+prioritised (txmempool.cpp:640-642), and that counter is what getblocktemplate
+caches against: it rebuilds when the tip moved, or when the counter moved AND
+the cached template is older than five seconds (rpc/mining.cpp). A
+prioritisation changes no membership at all -- same transactions, same count --
+so without the bump nothing downstream can tell that the answer would differ,
+and a miner is handed the template assembled before it.
+
+mining_prioritisetransaction.py:352-364 is exactly that sequence: template,
+prioritise, advance the clock past the cache window, template again, and the
+two must differ.
+
+Ours derived the counter from admissions and removals alone, so it could not
+move here; the second getblocktemplate returned the FIRST one, byte for byte."
+  (let ((bl:*network* :regtest)
+        (bl.rpc::*gbt-cache* nil))
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let* ((node (bl:make-node :network :regtest))
+             (utxos (bl.store:make-utxo-set))
+             (funding (make-array 32 :element-type (quote (unsigned-byte 8))
+                                     :initial-element 57))
+             (tx (%pkg-tx funding 0 99990000)))
+        (bl.store:add-utxo utxos funding 0 100000000
+                           (p2sh-optrue-script-pubkey) 0 :coinbase nil)
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp
+              (bl:node-utxo-set node) utxos)
+        (let ((txid (%mine-add mp tx 1000)))
+          (let ((before (bl.mp:mempool-transactions-updated mp)))
+            ;; A delta on a transaction that is NOT in the pool changes nothing
+            ;; a miner would build differently, and Core does not bump for it.
+            (bl.mp:mempool-prioritise mp (make-array 32 :element-type '(unsigned-byte 8)
+                                                       :initial-element 3)
+                                      500)
+            (is (= before (bl.mp:mempool-transactions-updated mp))
+                "a delta against an absent transaction moved the counter")
+            ;; One that IS in the pool does.
+            (bl.mp:mempool-prioritise mp txid 500)
+            (is (= (1+ before) (bl.mp:mempool-transactions-updated mp))
+                "prioritising a pooled transaction did not move the counter"))
+          ;; And the counter is what the template cache turns on. The clock is
+          ;; mocked because Core's cache holds for five seconds whatever the
+          ;; counter says, which is why the functional test advances it by ten.
+          (let ((bl.ser:*mock-time* 1700000000))
+            (let ((first-template (%gbt node)))
+              (bl.mp:mempool-prioritise mp txid 100000)
+              ;; Within the window, Core still answers from the cache.
+              (is (equal first-template (%gbt node))
+                  "the cache was dropped before its five seconds were up")
+              (let ((bl.ser:*mock-time* 1700000010))
+                (is (not (equal first-template (%gbt node)))
+                    "the template did not change after a prioritisation")))))))))
