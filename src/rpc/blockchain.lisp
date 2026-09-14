@@ -691,55 +691,79 @@ count on the entry."
                 "headers-only"))))))
 
 (define-rpc "getchaintips" (node params)
-  "Return information about all known chain tips (active and side branches)."
+  "Return information about all known chain tips (active and side branches).
+
+Core's algorithm, and it is not the obvious one (rpc/blockchain.cpp:
+1587-1612): a candidate tip is a block NOT on the active chain that no other
+off-chain block builds on, and the ACTIVE TIP IS THEN ADDED unconditionally --
+\"Always report the currently active tip\" (:1611-1612).
+
+Ours listed every index entry with no child, which drops the active tip the
+moment a header extends it. rpc_getchaintips.py:79-83 submits a two-header
+chain on top of the active tip and asserts three tips -- the headers-only
+branch, the valid-fork from earlier in the test, and the active tip, which
+now has a child. We answered two.
+
+The order is Core's CompareBlocksByHeight (:1576-1580): height DESCENDING,
+with no special place for the active tip. That matters in the same test: at
+:84 the headers-only branch is two blocks above the active tip and must come
+first."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
          (index (bl.store:chain-state-block-index chain-state))
          (best-hash (bl.store:best-block-hash chain-state))
-         (has-child (make-hash-table :test 'equalp))
+         (prevs (make-hash-table :test 'equalp))
          (active (make-hash-table :test 'equalp))
+         (off-chain '())
          (tips '()))
-    ;; Any block referenced as a parent has a child, so it is not a tip.
-    (maphash (lambda (h entry)
-               (declare (ignore h))
-               (let ((prev (bl.store:block-index-entry-prev-entry entry)))
-                 (when prev
-                   (setf (gethash (bl.store:block-index-entry-hash prev)
-                                  has-child)
-                         t))))
-             index)
     ;; Active-chain hash set (tip back to genesis) for O(1) membership tests.
     (loop for e = (and best-hash
                        (bl.store:get-block-index-entry chain-state best-hash))
             then (bl.store:block-index-entry-prev-entry e)
           while e
           do (setf (gethash (bl.store:block-index-entry-hash e) active) t))
-    (maphash
-     (lambda (h entry)
-       (unless (gethash h has-child)
-         (let ((on-active (gethash h active))
-               (branchlen 0))
-           ;; branchlen = blocks from this tip back to the active chain.
-           (unless on-active
-             (loop for e = entry
-                     then (bl.store:block-index-entry-prev-entry e)
-                   while (and e (not (gethash (bl.store:block-index-entry-hash e)
-                                              active)))
-                   do (incf branchlen)))
-           (push `(("height" . ,(bl.store:block-index-entry-height entry))
+    ;; Core's setOrphans / setPrevs pass (:1598-1603): only OFF-CHAIN blocks
+    ;; are candidates, and only an off-chain block's parent is disqualified.
+    (maphash (lambda (h entry)
+               (unless (gethash h active)
+                 (push entry off-chain)
+                 (let ((prev (bl.store:block-index-entry-prev-entry entry)))
+                   (when prev
+                     (setf (gethash (bl.store:block-index-entry-hash prev) prevs)
+                           t)))))
+             index)
+    (dolist (entry off-chain)
+      (let ((h (bl.store:block-index-entry-hash entry)))
+        (unless (gethash h prevs)
+          (push (cons h entry) tips))))
+    ;; "Always report the currently active tip" (:1611-1612).
+    (let ((tip (and best-hash
+                    (bl.store:get-block-index-entry chain-state best-hash))))
+      (when tip (push (cons best-hash tip) tips)))
+    (setf tips
+          (mapcar
+           (lambda (pair)
+             (destructuring-bind (h . entry) pair
+               (let ((on-active (gethash h active))
+                     (branchlen 0))
+                 ;; branchlen = blocks from this tip back to the active chain
+                 ;; (Core: nHeight - FindFork(block)->nHeight).
+                 (unless on-active
+                   (loop for e = entry
+                           then (bl.store:block-index-entry-prev-entry e)
+                         while (and e (not (gethash (bl.store:block-index-entry-hash e)
+                                                    active)))
+                         do (incf branchlen)))
+                 `(("height" . ,(bl.store:block-index-entry-height entry))
                    ("hash" . ,(hash-to-hex h))
                    ("branchlen" . ,branchlen)
-                   ("status" . ,(chaintip-status entry on-active best-hash h block-store)))
-                 tips))))
-     index)
-    ;; Active tip first, then by descending height. A numeric sort key keeps
-    ;; this a total order (the active tip gets the maximum key).
+                   ("status" . ,(chaintip-status entry on-active best-hash h
+                                                 block-store))))))
+           tips))
+    ;; Core CompareBlocksByHeight: height descending, the active tip included.
     (stable-sort tips #'>
-                 :key (lambda (tip)
-                        (if (string= (cdr (assoc "status" tip :test #'string=)) "active")
-                            most-positive-fixnum
-                            (cdr (assoc "height" tip :test #'string=)))))))
+                 :key (lambda (tip) (cdr (assoc "height" tip :test #'string=))))))
 
 ;;; --- UTXO Query Methods ---
 

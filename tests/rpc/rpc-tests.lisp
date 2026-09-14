@@ -10813,6 +10813,58 @@ the storage clause formats its TYPE. A blanket handler would print neither."
 
 ;;; --- getblockchaininfo's pruning fields ------------------------------------
 
+(test getchaintips-always-reports-the-active-tip
+  "Core's getchaintips is not `every index entry with no child': a candidate
+tip is a block NOT on the active chain that no other off-chain block builds
+on, and the active tip is then added unconditionally -- \"Always report the
+currently active tip\" (rpc/blockchain.cpp:1587-1612). Ours dropped the
+active tip the moment a submitted header extended it.
+
+The order is Core's CompareBlocksByHeight (:1576-1580), height DESCENDING
+with no special place for the active tip -- so a headers-only branch above
+the tip comes first. rpc_getchaintips.py:79-84 asserts both: three tips after
+a two-header chain is submitted on top of the active tip, and tips[0] being
+the headers-only one."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "chaintips-active"))
+           (cs (bl:node-chain-state node)))
+      (generate-regtest-blocks node 3)
+      (flet ((header-hex (b)
+               (bl.crypto:bytes-to-hex
+                (bl.ser:serialize-block-header (bl.ser:bitcoin-block-header b))))
+             (tips ()
+               (bl.rpc:dispatch-rpc-method node "getchaintips" (wire-params '())))
+             (field (row name) (cdr (assoc name row :test #'string=))))
+        (is (= 1 (length (tips))) "one tip before anything is submitted")
+        ;; Two headers extending the active tip, neither with a body.
+        (let ((b1 (bl.mining:assemble-full-block
+                   cs (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+          (bl.mining:mine-block b1)
+          (bl.rpc:dispatch-rpc-method node "submitheader" (list (header-hex b1)))
+          (let ((b2 (bl.mining:assemble-full-block
+                     cs (bl:node-mempool node)
+                     :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+            (setf (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header b2))
+                  (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1))
+                  (bl.ser:block-header-timestamp (bl.ser:bitcoin-block-header b2))
+                  (1+ (bl.ser:block-header-timestamp (bl.ser:bitcoin-block-header b1)))
+                  (bl.ser:block-header-cached-hash (bl.ser:bitcoin-block-header b2)) nil)
+            (bl.mining:mine-block b2)
+            (bl.rpc:dispatch-rpc-method node "submitheader" (list (header-hex b2))))
+          (let ((rows (tips)))
+            (is (= 2 (length rows))
+                "the active tip is still reported although a header extends it")
+            (is (equal '(5 "headers-only" 2)
+                       (list (field (first rows) "height")
+                             (field (first rows) "status")
+                             (field (first rows) "branchlen")))
+                "height descending: the headers-only branch comes first")
+            (is (equal '(3 "active" 0)
+                       (list (field (second rows) "height")
+                             (field (second rows) "status")
+                             (field (second rows) "branchlen"))))))))))
+
 (test pruneheight-is-the-lowest-block-still-on-disk
   "Core's `pruneheight' -- and the value pruneblockchain returns -- is
 GetFirstStoredBlock(tip)->nHeight, the height of the lowest block whose body
