@@ -571,57 +571,137 @@ allowed=false row."
    hex (format nil "TX decode failed: ~A Make sure the tx has at least one input."
                (if (stringp hex) hex ""))))
 
-(alexandria:define-constant +script-check-verdicts+
-  '(:mempool-script-verify-flag-failed :block-script-verify-flag-failed
-    :witness-stripped)
-  :test #'equal
-  :documentation "Mempool verdicts that come from Core's script pass, not its PreChecks.
+(defun %testmempoolaccept-single (tx utxo-set mempool chain-state height)
+  "One transaction is NOT a package: testmempoolaccept sends it through plain
+single-transaction acceptance instead (Core rpc/mempool.cpp:343-346 ->
+ChainstateManager::ProcessTransaction with test_accept), where replacement IS
+allowed and sibling eviction IS on. That is why a lone BIP125 replacement is
+reported as acceptable while the very same transaction inside a package is
+`bip125-replacement-disallowed' (rpc_packages.py:318-326).
 
-MemPoolAccept::AcceptMultipleTransactionsInternal runs every member through
-PreChecks first and only then through PolicyScriptChecks (validation.cpp:
-1444-1474, :1533-1551), and WHERE a member failed decides what the caller is
-told about the OTHERS -- see %PACKAGE-TEST-ROWS.")
+Returns the PACKAGE-TX-RESULT for TX, so both arms of the RPC render through
+the same loop."
+  (multiple-value-bind (valid error fee replaced sigops modified-fee)
+      (bl.val:validate-transaction-for-mempool tx utxo-set mempool height
+                                               :chain-state chain-state)
+    (declare (ignore replaced))
+    (let ((res (bl.val:make-package-tx-result
+                :txid (bl.ser:transaction-hash tx)
+                :wtxid (bl.ser:transaction-wtxid tx))))
+      (if valid
+          ;; Core reports ws.m_vsize — the sigop-adjusted size, not the raw
+          ;; BIP141 vsize (validation.cpp:1383-1387) — and the effective
+          ;; feerate is the MODIFIED fee (base plus any prioritisetransaction
+          ;; delta) over that same vsize, covering this wtxid alone.
+          (let ((vsize (bl.mp:sigop-adjusted-vsize
+                        (bl.ser:transaction-weight tx) sigops)))
+            (setf (bl.val:package-tx-result-status res) :valid
+                  (bl.val:package-tx-result-vsize res) vsize
+                  (bl.val:package-tx-result-fee res) (or fee 0)
+                  (bl.val:package-tx-result-effective-feerate res)
+                  (if (plusp vsize) (/ (or modified-fee fee 0) vsize) 0)
+                  (bl.val:package-tx-result-effective-includes res)
+                  (list (bl.ser:transaction-wtxid tx))))
+          (setf (bl.val:package-tx-result-status res) :invalid
+                (bl.val:package-tx-result-error res) error))
+      res)))
 
-(defun %package-test-rows (all-ids rows failure-index failure-row failure-reason)
-  "The testmempoolaccept array for a package: which members get a verdict and
-which get only their txid and wtxid (Core rpc/mempool.cpp:352-395).
+(defun %testmempoolaccept-rows (results max-fee-rate package-error)
+  "Core's testmempoolaccept output loop (rpc/mempool.cpp:352-402) over RESULTS,
+one PACKAGE-TX-RESULT per member in the order they were submitted.
 
-Core fills `results' for a member only once that member has passed
-PolicyScriptChecks, and it returns at the FIRST failure of either pass
-(validation.cpp:1446-1450, 1535-1539); rpc/mempool.cpp then emits txid and
-wtxid alone for every member with no result. So the answer depends on which
-pass failed:
+Three shapes come out of it:
 
-  PreChecks -- missing inputs, fees, standardness, topology. No member has a
-  result yet, so ONLY the failing one is reported. `Package validation is
-  atomic: if the node cannot find a UTXO for any single tx in the package, it
-  terminates immediately to avoid unnecessary, expensive signature
-  verification' (rpc_packages.py:106-111).
+  a member Core finished and accepted — allowed, its vsize, and the fees
+  object; a member it rejected — allowed=false with the reject reason, plus
+  the details for everything except missing inputs, whose reason this RPC
+  spells `missing-inputs' where the state says
+  `bad-txns-inputs-missingorspent'; and a member it never finished — txid and
+  wtxid ALONE, which is how a caller can tell that the answer it did not get
+  was never computed rather than lost.
 
-  PolicyScriptChecks -- every member BEFORE the failing one already has its
-  Success result, so all of those are reported in full; the members after it
-  are not (rpc_packages.py:118-120).
+MAX-FEE-RATE is the caller's fat-finger rail, in satoshis per kvB, and it is
+applied HERE rather than inside validation (:376-381): a member over the rail
+is reported as `max-fee-exceeded' and every member after it goes blank, because
+a descendant's verdict is meaningless once an ancestor would not be submitted.
 
-ALL-IDS is the (txid . wtxid) alist of every member, in order -- the blank row.
-ROWS are the full rows of the members validated before the failure, also in
-order. A NIL FAILURE-INDEX means every member passed."
-  (if (null failure-index)
-      rows
-      (let ((keep (if (member (if (consp failure-reason)
-                                  (first failure-reason)
-                                  failure-reason)
-                              +script-check-verdicts+)
-                      rows
-                      (subseq all-ids 0 failure-index))))
-        (append keep
-                (list failure-row)
-                (nthcdr (1+ failure-index) all-ids)))))
+PACKAGE-ERROR, when the package validator gave one, is printed on EVERY row
+(:360-362) — it is a statement about the package, not about any member."
+  (let ((exit-early nil))
+    (loop for res in results
+          collect
+          (let ((ids `(("txid" . ,(hash-to-hex (bl.val:package-tx-result-txid res)))
+                       ("wtxid" . ,(hash-to-hex (bl.val:package-tx-result-wtxid res)))
+                       ,@(when package-error
+                           `(("package-error"
+                              . ,(bl.val:tx-reject-reason-string package-error)))))))
+            (case (if exit-early :not-validated (bl.val:package-tx-result-status res))
+              (:valid
+               (let* ((vsize (bl.val:package-tx-result-vsize res))
+                      (fee (or (bl.val:package-tx-result-fee res) 0))
+                      (max-fee (feerate-fee max-fee-rate vsize)))
+                 (if (and (plusp max-fee) (> fee max-fee))
+                     (progn
+                       (setf exit-early t)
+                       (append ids `(("allowed" . ,+json-false+)
+                                     ("reject-reason" . "max-fee-exceeded"))))
+                     (append ids
+                             `(("allowed" . t)
+                               ("vsize" . ,vsize)
+                               ("fees"
+                                . (("base" . ,(satoshi->btc fee))
+                                   ;; CFeeRate(m_modified_fees, m_vsize).GetFeePerK():
+                                   ;; satoshis per kvB truncated toward zero, then
+                                   ;; rendered in BTC.
+                                   ("effective-feerate"
+                                    . ,(satoshi->btc
+                                        (truncate
+                                         (* (or (bl.val:package-tx-result-effective-feerate res) 0)
+                                            1000))))
+                                   ;; Whose fees that rate covers: for a single
+                                   ;; transaction its own wtxid and nothing else.
+                                   ("effective-includes"
+                                    . ,(map 'vector #'hash-to-hex
+                                            (bl.val:package-tx-result-effective-includes res))))))))))
+              ((:invalid :mempool-entry :different-witness)
+               (let ((error (bl.val:package-tx-result-error res)))
+                 (append ids
+                         `(("allowed" . ,+json-false+)
+                           ;; The state's TWO fields, reported apart
+                           ;; (:396-402): reject-reason is GetRejectReason(),
+                           ;; the short verdict a client matches on, and
+                           ;; reject-details is ToString(), that verdict plus
+                           ;; the debug message the rejection built from its own
+                           ;; values ("insufficient fee" vs "insufficient fee,
+                           ;; rejecting replacement <txid>, ..."). Reporting
+                           ;; ToString() as the reason gave a client a sentence
+                           ;; to parse where Core gives it a token. Note the
+                           ;; plural in missing-inputS: it is this surface only
+                           ;; — sendrawtransaction reports the state's
+                           ;; "bad-txns-inputs-missingorspent".
+                           ,@(if (eq (bl.val:tx-reject-keyword error) :missing-input)
+                                 `(("reject-reason" . "missing-inputs"))
+                                 `(("reject-reason"
+                                    . ,(bl.val:tx-reject-reason-only error))
+                                   ("reject-details"
+                                    . ,(bl.val:tx-reject-reason-string error))))))))
+              (t ids))))))
 
 (define-rpc "testmempoolaccept" (node ((txs :array)))
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
-array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
-anything to the mempool. Each tx is checked independently against current state
-(package interdependence is not modeled — that needs submitpackage)."
+array of {txid, wtxid, allowed, reject-reason?, reject-details?, vsize,
+fees{base, effective-feerate, effective-includes}} without adding anything to
+the mempool.
+
+More than one transaction is validated AS A PACKAGE (Core
+MemPoolAccept::AcceptMultipleTransactions under ATMPArgs::PackageTestAccept,
+validation.cpp:1429-1553): the members share one coin view, so a child spending
+an in-package parent is judged on its merits, the context-free package rules
+(sorted, no duplicates, no internal conflicts) get their own `package-error'
+verdict on every row, and replacement is disallowed — a member conflicting with
+a mempool transaction is `bip125-replacement-disallowed' however good a
+replacement it would be alone. Fee policy stays individual, so a package answer
+equals the members' individual answers (rpc_packages.py:100)."
   (let ((utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
@@ -644,103 +724,15 @@ anything to the mempool. Each tx is checked independently against current state
       ;; requires cs_main even for test_accept).
       (with-node-lock (node)
         (let ((height (bl.store:current-height chain-state))
-              (max-fee-rate (%parse-max-fee-rate params 1))
-              (rows '())                ; full rows, newest first
-              (failure-index nil)
-              (failure-row nil)
-              (failure-reason nil))
-          (loop for tx in decoded
-                for index from 0
-                until failure-index
-                do (let* ((txid (bl.ser:transaction-hash tx))
-                          (wtxid (bl.ser:transaction-wtxid tx))
-                          (ids `(("txid" . ,(hash-to-hex txid))
-                                 ("wtxid" . ,(hash-to-hex wtxid)))))
-                     (flet ((fail (reason row)
-                              (setf failure-index index
-                                    failure-reason reason
-                                    failure-row row)))
-                       (multiple-value-bind (valid error fee replaced sigops)
-                           (bl.val:validate-transaction-for-mempool
-                            tx utxo-set mempool height :chain-state chain-state)
-                         (declare (ignore replaced))
-                         (if valid
-                             ;; Core reports ws.m_vsize here — the sigop-adjusted
-                             ;; size, not the raw BIP141 vsize (rpc/mempool.cpp:375)
-                             ;; — and caps the fee against that same vsize (:376).
-                             (let* ((vsize (bl.mp:sigop-adjusted-vsize
-                                            (bl.ser:transaction-weight tx)
-                                            sigops))
-                                    (max-fee (feerate-fee max-fee-rate vsize)))
-                               (if (and (plusp max-fee) (> (or fee 0) max-fee))
-                                   ;; Core checks client_maxfeerate inside the
-                                   ;; PreChecks loop (validation.cpp:1455-1461),
-                                   ;; so it is a PreChecks-class failure.
-                                   (fail :max-fee-exceeded
-                                         (append ids
-                                                 `(("allowed" . ,+json-false+)
-                                                   ("reject-reason" . "max-fee-exceeded"))))
-                                   (push
-                                    (append ids
-                                            `(("allowed" . t)
-                                              ("vsize" . ,vsize)
-                                              ("fees"
-                                               . (("base" . ,(satoshi->btc (or fee 0)))
-                                                  ;; The feerate the acceptance decision
-                                                  ;; actually used: CFeeRate(m_modified_fees,
-                                                  ;; m_vsize).GetFeePerK() for a single
-                                                  ;; transaction (validation.cpp:1383,1387),
-                                                  ;; i.e. MODIFIED fees — base plus any
-                                                  ;; prioritisetransaction delta — over the
-                                                  ;; sigop-adjusted vsize, truncated to
-                                                  ;; satoshis per kvB (feerate.cpp) and
-                                                  ;; rendered in BTC.
-                                                  ("effective-feerate"
-                                                   . ,(satoshi->btc
-                                                       (let ((modified
-                                                               (+ (or fee 0)
-                                                                  (gethash txid (bl.mp:mempool-deltas mempool) 0))))
-                                                         (if (plusp vsize)
-                                                             (truncate (* modified 1000) vsize)
-                                                             0))))
-                                                  ;; Which transactions' fees that rate
-                                                  ;; covers. For a single transaction it is
-                                                  ;; its own wtxid and nothing else
-                                                  ;; (validation.cpp:1320,1387); a package
-                                                  ;; feerate would list every member.
-                                                  ("effective-includes"
-                                                   . ,(vector (hash-to-hex wtxid))))))) 
-                                    rows)))
-                             (fail error
-                                   (append ids
-                                           `(("allowed" . ,+json-false+)
-                                             ;; This RPC substitutes its own string for the
-                                             ;; missing-inputs result and reports the state's
-                                             ;; TWO fields for everything else (rpc/mempool.cpp:
-                                             ;; 396-402): reject-reason is GetRejectReason(),
-                                             ;; the short verdict a client matches on, and
-                                             ;; reject-details is ToString(), the verdict plus
-                                             ;; the debug message this rejection built from its
-                                             ;; own values ("insufficient fee" vs "insufficient
-                                             ;; fee, rejecting replacement <txid>, ...").
-                                             ;; Reporting ToString() as the reason gave a client
-                                             ;; a sentence to parse where Core gives it a token.
-                                             ;; Note the plural in missing-inputS: it is this
-                                             ;; surface only — sendrawtransaction reports the
-                                             ;; state's "bad-txns-inputs-missingorspent".
-                                             ,@(if (eq (bl.val:tx-reject-keyword error)
-                                                       :missing-input)
-                                                   `(("reject-reason" . "missing-inputs"))
-                                                   `(("reject-reason"
-                                                      . ,(bl.val:tx-reject-reason-only error))
-                                                     ("reject-details"
-                                                      . ,(bl.val:tx-reject-reason-string error))))))))))))
-          (%package-test-rows
-           (mapcar (lambda (tx)
-                     `(("txid" . ,(hash-to-hex (bl.ser:transaction-hash tx)))
-                       ("wtxid" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))))
-                   decoded)
-           (nreverse rows) failure-index failure-row failure-reason))))))
+              (max-fee-rate (%parse-max-fee-rate params 1)))
+          (multiple-value-bind (package-error results)
+              (if (> (length decoded) 1)
+                  (bl.val:test-package-acceptance decoded utxo-set mempool
+                                                  chain-state)
+                  (values nil (list (%testmempoolaccept-single
+                                     (first decoded) utxo-set mempool
+                                     chain-state height))))
+            (%testmempoolaccept-rows results max-fee-rate package-error)))))))
 
 (define-rpc "sendrawtransaction" (node (hex-str))
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
