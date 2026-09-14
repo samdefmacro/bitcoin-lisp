@@ -1000,6 +1000,11 @@ throws out of the whole call."
 TOKEN as an RPC emits it (BTC-AMOUNT decodes it) or a plain number."
   (< (abs (- (btc-amount a) (btc-amount b))) 1d-6))
 
+(defun %wt-at-height (wallet height)
+  "Put WALLET's chain view at HEIGHT, so a transaction confirmed at HEIGHT has
+depth 1. Six tests in this file set the same slot; one reach between them."
+  (setf (bl.wallet::wallet-last-block-height wallet) height))
+
 (defun %wt-dummy-txid (n)
   "A distinct non-zero 32-byte outpoint hash (so it never reads as coinbase)."
   (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element n)))
@@ -1009,6 +1014,21 @@ TOKEN as an RPC emits it (BTC-AMOUNT decodes it) or a plain number."
 (defun %wt-add-confirmed-tx (wallet inputs outputs &key (height 100))
   "Build and AddToWallet a confirmed tx. INPUTS: ((hash . vout) ...) prevouts;
 OUTPUTS: ((script . value-sats) ...). Returns the tx's txid."
+  (%wt-add-confirmed-tx-object wallet (%wt-confirmed-tx inputs outputs)
+                              :height height))
+
+(defun %wt-add-confirmed-tx-object (wallet tx &key (height 100))
+  "AddToWallet TX as confirmed at HEIGHT. Returns its txid. Split out of
+%WT-ADD-CONFIRMED-TX so a test that cares about the ORDER transactions reach
+the wallet in can build them first and choose."
+  (let ((block-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 9)))
+    (bl.wallet::wallet-add-to-wallet
+     wallet tx (list :confirmed block-hash height 0))
+    (bl.ser:transaction-hash tx)))
+
+(defun %wt-confirmed-tx (inputs outputs)
+  "The v2 transaction %WT-ADD-CONFIRMED-TX would add, unadded."
   (let* ((tx (bl.ser:make-transaction
               :version 2
               :inputs (coerce
@@ -1028,13 +1048,8 @@ OUTPUTS: ((script . value-sats) ...). Returns the tx's txid."
                                    :value (cdr out) :script-pubkey (car out)))
                                 outputs)
                         'simple-vector)
-              :lock-time 0))
-         (txid (bl.ser:transaction-hash tx))
-         (block-hash (make-array 32 :element-type '(unsigned-byte 8)
-                                    :initial-element 9)))
-    (bl.wallet::wallet-add-to-wallet
-     wallet tx (list :confirmed block-hash height 0))
-    txid))
+              :lock-time 0)))
+    tx))
 
 (defun %wt-raw-tx-hex (inputs outputs)
   "Wire hex of a v2 tx over INPUTS ((hash . vout) ...) and OUTPUTS
@@ -1361,7 +1376,7 @@ hook wired inside the branch."
                       ;; command line; %b would be the block hash, which is
                       ;; the file name below.
                       (format nil "touch ~A%w-%h-%b" (namestring dir))))
-               (setf (bl.wallet::wallet-last-block-height wallet) 100)
+               (%wt-at-height wallet 100)
                (let* ((addr (bl.wallet::rpc-getnewaddress
                              node '("" "legacy")))
                       (script (%address-script addr :testnet4))
@@ -1400,6 +1415,59 @@ hook wired inside the branch."
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
+(test listreceivedbyaddress-orders-its-txids-by-txid-not-by-arrival
+  "Core's mapWallet is std::unordered_map<Txid, CWalletTx, SaltedTxidHasher>
+(wallet/wallet.h:498) and ListReceived walks it as it stands
+(wallet/rpc/coins.cpp:58, `for (const auto& [_, wtx] : wallet.mapWallet)'),
+so the txids of one address come back in an order derived from the TXID and
+a per-process salt -- never in the order the transactions arrived.
+
+wallet_resendwallettransactions.py:97-117 depends on exactly that. It bumps
+a child transaction in a loop until listreceivedbyaddress reports the child
+BEFORE its parent, saying so at :82-89 (\"We cannot predict the position in
+mapWallet, but we can observe it\"), and each bump gives the child a fresh
+txid, so Core converges in a couple of rounds. Ours walked the table in
+ARRIVAL order, where the newest child is always last, so the loop could
+never converge: it ground on for 1,470 bumps until one replacement finally
+failed the feerate-diagram test, and the -26 the test then saw
+(\"replacement-failed\") was not the one it was written to tolerate.
+
+Ours orders by the txid itself, which is deterministic where Core's salt is
+not -- what matters is that it varies with the transaction rather than with
+when it was seen. The two transactions below are added in DESCENDING txid
+order, so arrival order and txid order cannot agree by luck."
+  (with-wallet-test-node (node :keypool 4)
+    (with-rpc-wallet (nil)
+      (bl.rpc:dispatch-rpc-method node "createwallet" '("ord")))
+    (let* ((manager (%node-manager node))
+           (wallet (loaded-wallet manager "ord")))
+      (%wt-at-height wallet 100)
+      (with-rpc-wallet ("ord")
+        (let* ((addr (bl.rpc:dispatch-rpc-method node "getnewaddress" '("" "legacy")))
+               (script (%address-script addr :testnet4))
+               (one (%wt-confirmed-tx (list (cons (%wt-dummy-txid 1) 0))
+                                      (list (cons script 500000))))
+               (two (%wt-confirmed-tx (list (cons (%wt-dummy-txid 2) 0))
+                                      (list (cons script 300000))))
+               (by-txid (sort (list one two) #'string<
+                              :key (lambda (tx) (bl.rpc:hash-to-hex
+                                                 (bl.ser:transaction-hash tx))))))
+          ;; Newest-first arrival: the LAST transaction by txid arrives first.
+          (dolist (tx (reverse by-txid))
+            (%wt-add-confirmed-tx-object wallet tx))
+          (let ((txids (%aval "txids"
+                              (find addr (bl.rpc:dispatch-rpc-method
+                                          node "listreceivedbyaddress" nil)
+                                    :key (lambda (r) (%aval "address" r))
+                                    :test #'string=))))
+            (is (= 2 (length txids)))
+            (is (equal txids (mapcar (lambda (tx)
+                                       (bl.rpc:hash-to-hex
+                                        (bl.ser:transaction-hash tx)))
+                                     by-txid))
+                "the txids came back in arrival order, not txid order: ~S"
+                txids)))))))
+
 (test wallet-received-by-rpcs
   "getreceivedbyaddress/bylabel and listreceivedbyaddress/bylabel tally owned
 outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
@@ -1410,7 +1478,7 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
     (let* ((manager (%node-manager node))
            (wallet (loaded-wallet manager "recv"))
            (bl.wallet::*rpc-wallet-name* "recv"))
-      (setf (bl.wallet::wallet-last-block-height wallet) 100)
+      (%wt-at-height wallet 100)
       (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "legacy")))
              (script (%address-script addr :testnet4)))
         (bl.wallet::rpc-setlabel node (list addr "L1"))
@@ -1493,8 +1561,8 @@ refuses one the chain does not have."
            (wallet (loaded-wallet manager "sim"))
            (utxo-set (bl.store:make-utxo-set))
            (bl.wallet::*rpc-wallet-name* "sim"))
-      (setf (bl.wallet::wallet-last-block-height wallet) 100
-            (bl:node-utxo-set node) utxo-set)
+      (%wt-at-height wallet 100)
+      (setf (bl:node-utxo-set node) utxo-set)
       (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "bech32")))
              (script (%address-script addr :testnet4))
              (foreign (%address-script
@@ -1601,8 +1669,8 @@ the whole point of the in-array new_utxos map (wallet_simulaterawtx.py:93)."
            (wallet (loaded-wallet manager "simmiss"))
            (utxo-set (bl.store:make-utxo-set))
            (bl.wallet::*rpc-wallet-name* "simmiss"))
-      (setf (bl.wallet::wallet-last-block-height wallet) 100
-            (bl:node-utxo-set node) utxo-set)
+      (%wt-at-height wallet 100)
+      (setf (bl:node-utxo-set node) utxo-set)
       (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "bech32")))
              (script (%address-script addr :testnet4))
              (foreign (%address-script
@@ -1650,7 +1718,7 @@ keeps an unrelated lone address in its own group."
     (let* ((manager (%node-manager node))
            (wallet (loaded-wallet manager "grp"))
            (bl.wallet::*rpc-wallet-name* "grp"))
-      (setf (bl.wallet::wallet-last-block-height wallet) 100)
+      (%wt-at-height wallet 100)
       (let* ((addr1 (bl.wallet::rpc-getnewaddress node '("" "legacy")))
              (addr2 (bl.wallet::rpc-getnewaddress node '("" "legacy")))
              (addr3 (bl.wallet::rpc-getnewaddress node '("" "legacy")))
