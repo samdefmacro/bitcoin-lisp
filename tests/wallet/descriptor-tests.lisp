@@ -1851,3 +1851,35 @@ the same split that produced a wrong address twice in the tr() work."
         "leaf pushes ~D bytes, wanted 32 (x-only)" (aref script 0))
     (is-false (search (bl.crypto:hex-to-bytes a) script)
               "the 33-byte key appears verbatim in a tapscript leaf")))
+
+(test listdescriptors-prints-an-origin-path-once
+  "Core's ToNormalizedString merges the OriginPubkeyProvider's own origin with
+whatever the INNER provider returned (descriptor.cpp:273-285): when the inner
+string starts with `[' its fingerprint is dropped and its path appended to the
+outer origin's, otherwise the outer origin is simply prefixed. The inner
+provider here is a BIP32PubkeyProvider whose own path holds no hardened step,
+so it returns a bare xpub with no origin at all (:530-532).
+
+Ours passed the ORIGIN-CARRYING form of the key into that merge, so the merge
+took the strip-and-append branch and printed the origin path twice -- once
+normalized to `h' and once again with apostrophes:
+
+  tr([1dce71b2/48h/1h/0h/2h/48'/1'/0'/2']tpub.../0/*,...)
+
+Vector and expected string from wallet_listdescriptors.py:133-147, checksum
+included: a re-printed descriptor's checksum is computed over the printed
+string, so a wrong path is a wrong checksum too."
+  (let* ((inner "tpubDEeP3GefjqbaDTTaVAF5JkXWhoFxFDXQ9KuhVrMBViFXXNR2B3Lvme2d2AoyiKfzRFZChq2AGMNbU1qTbkBMfNv7WGVXLt2pnYXY87gXqcs")
+         (leaf "tpubDFL5wzgPBYK5pZ2Kh1T8qrxnp43kjE5CXfguZHHBrZSWpkfASy5rVfj7prh11XdqkC1P3kRwUPBeX7AHN8XBNx8UwiprnFnEm5jyswiRD4p")
+         (written (format nil "tr([1dce71b2/48'/1'/0'/2']~A/0/*,and_v(v:pk([c658b283/48'/1'/0'/2']~A/0/*),older(65535)))"
+                          inner leaf))
+         (expected (format nil "tr([1dce71b2/48h/1h/0h/2h]~A/0/*,and_v(v:pk([c658b283/48h/1h/0h/2h]~A/0/*),older(65535)))#m4uznndk"
+                           inner leaf))
+         (desc (%desc-parse written :testnet3)))
+    (multiple-value-bind (body ok)
+        (bl.rpc:out-desc-string-normalized desc nil (constantly nil))
+      (is-true ok "the normalized form reported it could not be produced")
+      (is (string= expected (bl.rpc:descriptor-add-checksum body))))
+    ;; The written form is unchanged: normalizing is a second rendering, not a
+    ;; rewrite of the descriptor the wallet stored.
+    (is (string= written (bl.rpc:out-desc-string desc)))))

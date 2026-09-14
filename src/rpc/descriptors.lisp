@@ -593,17 +593,19 @@ Returns a LIST of desc-keys, one per BIP389 multipath branch."
       (when (logbitp 31 i)
         (write-char (if apostrophe #\' #\h) s)))))
 
-(defun desc-key-string (key &optional (style :public))
-  "The canonical public string form of KEY: origins preserved, xprv shown as
-xpub, WIF as its hex pubkey, hardened markers in the style used on input.
-STYLE :compat forces apostrophe hardened markers (Core's StringType::COMPAT,
-used only for DescriptorID stability across versions)."
+(defun %desc-key-body-string (key &optional (style :public))
+  "KEY WITHOUT its origin prefix -- the string Core's INNER PubkeyProvider
+prints, the [fingerprint/path] being supplied by the OriginPubkeyProvider that
+wraps it (descriptor.cpp:265). We keep origin and key in one struct, so the two
+halves have to be nameable apart: the normalized form merges its own origin
+with whatever the inner form produced, and handing it a string that already
+carried the origin printed the origin path TWICE."
   ;; musig() prints its participants in the order they were WRITTEN, not the
   ;; sorted order aggregation uses (Core MuSigPubkeyProvider::ToString,
   ;; descriptor.cpp:700). A descriptor that came back re-sorted would not
   ;; round-trip to the string the user handed in.
   (when (desc-key-musig-participants key)
-    (return-from desc-key-string
+    (return-from %desc-key-body-string
       (format nil "musig(~{~A~^,~})~A~A"
               (mapcar (lambda (p) (desc-key-string p style))
                       (desc-key-musig-participants key))
@@ -616,11 +618,6 @@ used only for DescriptorID stability across versions)."
   (let ((apostrophe (if (eq style :compat) t (desc-key-apostrophe key))))
     (concatenate
      'string
-     (if (desc-key-origin-fingerprint key)
-         (format nil "[~A~A]"
-                 (bl.crypto:bytes-to-hex (desc-key-origin-fingerprint key))
-                 (format-key-path (desc-key-origin-path key) apostrophe))
-         "")
      (if (desc-key-pubkey key)
          (bl.crypto:bytes-to-hex
           (if (desc-key-xonly-p key)
@@ -634,6 +631,24 @@ used only for DescriptorID stability across versions)."
        (:none "")
        (:unhardened "/*")
        (:hardened (if apostrophe "/*'" "/*h"))))))
+
+(defun desc-key-string (key &optional (style :public))
+  "The canonical public string form of KEY: origins preserved, xprv shown as
+xpub, WIF as its hex pubkey, hardened markers in the style used on input.
+STYLE :compat forces apostrophe hardened markers (Core's StringType::COMPAT,
+used only for DescriptorID stability across versions)."
+  (let ((apostrophe (if (eq style :compat) t (desc-key-apostrophe key))))
+    (concatenate
+     'string
+     ;; A musig() expression's own origin is not printed here (and never was):
+     ;; the body's early return prints the participants' origins instead.
+     (if (and (desc-key-origin-fingerprint key)
+              (null (desc-key-musig-participants key)))
+         (format nil "[~A~A]"
+                 (bl.crypto:bytes-to-hex (desc-key-origin-fingerprint key))
+                 (format-key-path (desc-key-origin-path key) apostrophe))
+         "")
+     (%desc-key-body-string key style))))
 
 ;;; --- Key expression expansion ---
 
@@ -2126,7 +2141,7 @@ entry and no private key)."
     (cond
       ;; Const pubkeys normalize to their public form.
       ((desc-key-pubkey key)
-       (values (wrap-origin (desc-key-string key)) t))
+       (values (wrap-origin (%desc-key-body-string key)) t))
       ;; Hardened-ranged: print public as-is with normalized markers.
       ((eq (desc-key-derive key) :hardened)
        (values (wrap-origin
@@ -2140,8 +2155,15 @@ entry and no private key)."
               (last-hardened-pos (position-if (lambda (i) (logbitp 31 i)) path
                                               :from-end t)))
          (if (null last-hardened-pos)
-             ;; No hardened derivation: the plain public form.
-             (values (wrap-origin (desc-key-string key)) t)
+             ;; No hardened derivation: the plain public form. The BODY, never
+             ;; DESC-KEY-STRING: Core's inner BIP32PubkeyProvider returns a
+             ;; string with no origin here (descriptor.cpp:530-532), and
+             ;; WRAP-ORIGIN below is the OriginPubkeyProvider that adds ours.
+             ;; Passing the origin-carrying form made the merge see a leading
+             ;; `[', strip the fingerprint and keep the path, so the origin path
+             ;; was printed twice -- once normalized and once with apostrophes
+             ;; (wallet_listdescriptors.py:147).
+             (values (wrap-origin (%desc-key-body-string key)) t)
              (let* ((origin-path (subseq path 0 (1+ last-hardened-pos)))
                     (end-path (subseq path (1+ last-hardened-pos)))
                     (fingerprint (subseq (%desc-key-root-keyid key) 0 4))
