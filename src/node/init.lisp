@@ -118,11 +118,12 @@ case ever exercised) has genesis for a root."
           :status :valid
           :tx-count 1)))))   ; genesis carries exactly its coinbase
 
-(defun %init-logging (data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
+(defun %init-logging (data-directory network log-level log-file console-log block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
   "Core AppInitMain Step 4a, application initialization: the log file and level,
-per-category thresholds, the deferred config lines, the operator hooks, the pid
-file and -debug / -debugexclude -- everything that must exist before the first
-log line of the node itself."
+per-category thresholds, the deferred config lines, the operator hooks and
+-debug / -debugexclude -- everything that must exist before the first log line
+of the node itself. The pid file is NOT here: Core writes it after the
+directory lock (see %INIT-LOCK-AND-BANNER)."
   ;; Real time, not the mockable clock: uptime must keep measuring real elapsed
   ;; seconds while a functional test drives setmocktime, exactly as Core's
   ;; GetUptime uses SteadyClock rather than GetTime (common/system.cpp:134).
@@ -186,12 +187,6 @@ log line of the node itself."
   ;; can fire them.
   (setf *block-notify-command* block-notify
         *shutdown-notify-commands* shutdown-notify)
-
-  ;; -pid: written once the log exists, so a failure is on the record, and
-  ;; before any long-running startup work, so a supervisor watching for the
-  ;; file does not have to wait out a reindex to learn our PID.
-  (let ((path (write-pid-file pid-file data-directory network)))
-    (when path (log-info "PID file: ~A" path)))
 
   ;; -debug=<category> / -debugexclude=<category> (Core init/common.cpp).
   ;; Applied before init-node so startup's own category lines are subject to
@@ -575,7 +570,7 @@ previous node's state."
     (defer-log :info "Wallet transactions will not be broadcast (-walletbroadcast=0)")))
 
 
-(defun %init-lock-and-banner (network blocks-directory)
+(defun %init-lock-and-banner (network blocks-directory pid-file data-directory)
   "The startup banner (Core InitLogging), the datadir lock
 (AppInitLockDirectories), SIGHUP log reopening, ZMQ publishers and the
 pruning mode announcement (Step 3)."
@@ -594,6 +589,17 @@ pruning mode announcement (Step 3)."
                          (blocks-dir-path blocks-directory
                                           (node-data-directory *node*)
                                           network))
+
+  ;; -pid, AFTER the lock. Core's bitcoind locks the directories in
+  ;; AppInitLockDataDirectory and only then reaches CreatePidFile, the first
+  ;; step of AppInitMain (init.cpp:1431-1435). Written before it, a SECOND node
+  ;; starting on a running node's datadir overwrote the running node's pid file
+  ;; with its own pid and then deleted it on its way out -- leaving the
+  ;; supervisor of a perfectly healthy node with no pid file at all.
+  ;; feature_filelock.py:40-44 checks exactly that, and so would any operator
+  ;; who ever typed the wrong -datadir.
+  (let ((path (write-pid-file pid-file data-directory network)))
+    (when path (log-info "PID file: ~A" path)))
 
   ;; SIGHUP reopens the log file, so an external logrotate can move it.
   (install-sighup-log-reopen)
@@ -1780,7 +1786,7 @@ Returns the node instance."
   ;; the rest.
   (%ensure-wallets-subdirectory data-directory network)
 
-  (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
+  (%init-logging data-directory network log-level log-file console-log block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
   (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   (%init-datadir-layout data-directory network migrate-datadir)
   ;; Initialize node: the node struct and its databases; the chain itself is
@@ -1790,7 +1796,7 @@ Returns the node instance."
   (%init-connection-options data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly)
   (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1
                           wallet-broadcast)
-  (%init-lock-and-banner network blocks-directory)
+  (%init-lock-and-banner network blocks-directory pid-file data-directory)
   (init-message "Loading block index…")          ; init.cpp:1396
   (%init-load-chain network reindex blocks-directory)
   (%init-recover-chain reindex-chainstate)

@@ -1712,6 +1712,20 @@ option this repo keeps finding."
              (bl::remove-pid-file))
            ;; A negated -pid writes nothing at all.
            (is-false (bl::write-pid-file "0" dir))
+           ;; And the WRITE happens after the directory lock, where Core's
+           ;; does: bitcoind locks in AppInitLockDataDirectory and only then
+           ;; reaches CreatePidFile, the first step of AppInitMain
+           ;; (init.cpp:1431-1435). Written before it, a second node starting
+           ;; on a running node's datadir overwrote the running node's pid
+           ;; file with its own pid and deleted it on the way out
+           ;; (feature_filelock.py:40-44).
+           (let* ((src (%node-source-text))
+                  (lock-at (search "(lock-data-directories (node-data-directory *node*)" src))
+                  (pid-at (search "(let ((path (write-pid-file pid-file data-directory network)))" src)))
+             (is-true lock-at "the directory-lock call is gone")
+             (is-true pid-at "the pid-file write call is gone")
+             (is (< lock-at pid-at)
+                 "the pid file is written before the datadir lock again"))
            ;; An unwritable path is fatal, as Core's InitError is: an operator
            ;; who asked for a pid file and silently did not get one has a
            ;; supervisor that will never find this process.
