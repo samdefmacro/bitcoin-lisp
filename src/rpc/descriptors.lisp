@@ -2093,6 +2093,33 @@ returned with HAS-PRIV-P nil."
                             (format-key-path (desc-key-origin-path key)
                                               (desc-key-apostrophe key)))
                     "")))
+    ;; musig(): Core's MuSigPubkeyProvider::ToPrivateString (descriptor.cpp:
+    ;; 715-732) recurses into the PARTICIPANTS and reports has-priv as the OR
+    ;; over them, each participant falling back to its own public form. Without
+    ;; this arm a musig() key expression had no private form at all: it fell
+    ;; through to the extended-key branch, found no root xprv of its own, and
+    ;; answered the public string with has-priv NIL -- which makes the whole
+    ;; descriptor's private string report failure, and listdescriptors(true)
+    ;; answer -4 "Unable to produce descriptor string" for a wallet holding one
+    ;; (wallet_listdescriptors.py:170).
+    (when (desc-key-musig-participants key)
+      (let ((any nil)
+            (parts '()))
+        (dolist (participant (desc-key-musig-participants key))
+          (multiple-value-bind (text ok)
+              (desc-key-private-string participant network privkey-provider)
+            (when ok (setf any t))
+            (push text parts)))
+        (return-from desc-key-private-string
+          (values (format nil "musig(~{~A~^,~})~A~A"
+                          (nreverse parts)
+                          (format-key-path (desc-key-path key)
+                                            (desc-key-apostrophe key))
+                          (ecase (desc-key-derive key)
+                            (:none "")
+                            (:unhardened "/*")
+                            (:hardened "/*h")))
+                  any))))
     (if (desc-key-pubkey key)
         (multiple-value-bind (priv compressed)
             (desc-key-privkey-for key privkey-provider)
