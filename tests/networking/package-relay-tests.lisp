@@ -856,7 +856,7 @@ TXID on both sides -- an orphan's parents are known only by txid."
           ;; Which is what stops the parent being announced back to A when we
           ;; do accept it.
           (with-network (:regtest)
-            (bl.net:relay-transaction parent-id nil (list a b) :fee-rate 2))
+            (bl.net:relay-transaction parent-id nil (list a b) :fee-rate-per-kvb 2))
           (is (null (bl.net:peer-tx-inv-queue a)))
           (is (= 1 (length (bl.net:peer-tx-inv-queue b)))))))))
 
@@ -1130,3 +1130,38 @@ greps for the forcerelay line that follows it."
                                        (bl.net:peer-id peer))
                                log)
                        "and Core's rejection line names it, in Core's words"))))))))
+
+(test a-sub-one-sat-per-vbyte-transaction-clears-a-feefilter-under-it
+  "End to end through the shipped announce path: a transaction whose real fee
+rate is a few hundred satoshis per KVB -- and therefore ZERO satoshis per
+vbyte once truncated -- must still be announced to a peer whose BIP133 filter
+sits below it. Core never forms an intermediate rate at all: it compares the
+fee against filterrate.GetFee(vsize) (net_processing.cpp:6072).
+
+Every relay site here computed (floor fee vsize) and the queue multiplied it
+by 1000, so the whole sub-1-sat/vB band was queued at rate 0 and withheld from
+every peer that had ever sent a feefilter. p2p_feefilter.py:87 sets a filter of
+150 and expects three transactions paying exactly 0.15 sat/vB; all three were
+dropped and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
+  (with-network (:regtest)
+    (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+      (declare (ignore utxo state))
+      (let* ((tx (%pkg-tx funding 0 (- 100000000 23)))
+             (txid (bl.ser:transaction-hash tx)))
+        (bl.mp:accept-validated-tx mempool txid tx 23 200)
+        (let* ((entry (bl.mp:mempool-get mempool txid))
+               (vsize (and entry (bl.mp:mempool-entry-vsize entry)))
+               (peer (%pr-peer)))
+          (is-true entry "the transaction is in the mempool to announce")
+          (when entry
+            (let ((per-kvb (floor (* 1000 23) vsize)))
+              (is (plusp per-kvb)
+                  "its real rate is a positive number of satoshis per kvB")
+              (is (zerop (floor 23 vsize))
+                  "and zero once truncated to satoshis per vbyte")
+              ;; A filter one satoshi per kvB UNDER the transaction's rate.
+              (setf (bl.net:peer-feefilter-rate peer) (1- per-kvb))
+              (bl.net:announce-mempool-tx (list peer) mempool txid)
+              (flush-peer-invs peer mempool)
+              (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) txid)
+                       "the transaction clears a filter below its real rate"))))))))
