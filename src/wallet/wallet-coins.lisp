@@ -376,8 +376,38 @@ CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
         (dolist (entry truc-coins)
           (when (equalp (wallet-coin-txid (cdr entry)) best-txid)
             (push (cdr entry) (gethash (car entry) buckets))))))
-    (loop for type in +output-type-order+
-          nconc (nreverse (gethash type buckets)))))
+    (let ((coins (loop for type in +output-type-order+
+                       nconc (nreverse (gethash type buckets)))))
+      ;; Core AvailableCoins' last step (spend.cpp:515-522): with a feerate in
+      ;; hand, every candidate's effective value drops by what its unconfirmed
+      ;; ancestors would cost to bump to that feerate, so coin selection sees
+      ;; the real price of spending it. Without a mempool there is no
+      ;; information and every bump is 0, which is Core's own no-mempool branch
+      ;; (node/interfaces.cpp:691-697).
+      (when (and feerate mempool)
+        (let ((bumps (mini-miner-bump-fees
+                      mempool
+                      (mapcar (lambda (coin)
+                                (cons (wallet-coin-txid coin)
+                                      (wallet-coin-index coin)))
+                              coins)
+                      feerate)))
+          (dolist (coin coins)
+            (let ((bump (gethash (%wtx-outpoint-key (wallet-coin-txid coin)
+                                                    (wallet-coin-index coin))
+                                 bumps 0)))
+              (when (plusp bump)
+                (%apply-bump-fee coin bump))))))
+      coins)))
+
+(defun %apply-bump-fee (coin bump)
+  "Core COutput::ApplyBumpFee (coinselection.h:108-116): the bump joins the
+coin's spending fee, and its effective value falls by the same amount."
+  (setf (wallet-coin-bump-fee coin) bump
+        (wallet-coin-fee coin) (+ (or (wallet-coin-fee coin) 0) bump)
+        (wallet-coin-effective-value coin)
+        (- (bl.ser:tx-out-value (wallet-coin-output coin))
+           (wallet-coin-fee coin))))
 
 ;;; --- Inferred descriptors (script/descriptor.cpp InferDescriptor) ---
 

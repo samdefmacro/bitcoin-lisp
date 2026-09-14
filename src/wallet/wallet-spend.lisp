@@ -47,11 +47,12 @@
 ;;;
 ;;; Known divergences from Core (each justified inline at its site):
 ;;;  1. CoinGrinder deferred (above).
-;;;  2. No unconfirmed-ancestor bump fees (Core calculateIndividualBumpFees/
-;;;     calculateCombinedBumpFee): our node has no bump-fee calculator, so
-;;;     bump fees are 0. Spending unconfirmed inputs pays the target feerate
-;;;     on the new tx itself but does not additionally bump its ancestors
-;;;     (slower confirmation possible; never overpays).
+;;;  2. Bump fees are computed per outpoint but the COMBINED-bump discount
+;;;     Core applies to a finished selection (spend.cpp:788-807,
+;;;     SetBumpFeeDiscount) is not: two selected inputs sharing an unconfirmed
+;;;     ancestor are each charged for it, so such a selection overpays. Never
+;;;     underpays, and MINI-MINER-TOTAL-BUMP-FEE -- which is what that
+;;;     discount is computed from -- is already here for sendall.
 ;;;  3. -walletrejectlongchains' pre-commit checkChainLimits simulation is
 ;;;     not run; the mempool applies the real cluster limits at broadcast,
 ;;;     and a rejected tx stays in the wallet as unbroadcast (Core commits
@@ -1680,8 +1681,12 @@ as hard internal-bug errors (funds-critical invariants)."
 (defun %fetch-selected-inputs (node wallet cc params)
   "(values wallet-coin-list error-message) for the coin control's preset
 inputs, in selection order. Caller holds node + wallet locks."
-  (declare (ignorable node))
-  (let ((coins '()))
+  (let ((coins '())
+        ;; Core computes the preset inputs' bump fees up front, over the whole
+        ;; selected list, and applies each to its COutput (spend.cpp:274, :313).
+        (bumps (mini-miner-bump-fees (bl.rpc:rpc-get-mempool node)
+                                     (wcc-selected cc)
+                                     (csel-params-effective-feerate params))))
     (dolist (outpoint (wcc-selected cc))
       (destructuring-bind (txid . vout) outpoint
         (let* ((preset (gethash outpoint (wcc-presets cc)))
@@ -1735,18 +1740,20 @@ inputs, in selection order. Caller holds node + wallet locks."
               (return-from %fetch-selected-inputs
                 (values nil (format nil "Not solvable pre-selected input ~A"
                                     (%outpoint-string txid vout)))))
-            (let ((fee (bl.rpc:feerate-fee (csel-params-effective-feerate params)
-                                     input-bytes)))
-              (push (make-wallet-coin
-                     :txid txid :index vout :output txout :wtx nil
-                     :depth 0 :solvable t :safe t :time 0 :from-me nil
-                     :input-bytes input-bytes
-                     :fee fee
-                     :effective-value (- (bl.ser:tx-out-value
-                                          txout)
-                                         fee)
-                     :output-type :unknown)
-                    coins))))))
+            (let* ((fee (bl.rpc:feerate-fee (csel-params-effective-feerate params)
+                                     input-bytes))
+                   (coin (make-wallet-coin
+                          :txid txid :index vout :output txout :wtx nil
+                          :depth 0 :solvable t :safe t :time 0 :from-me nil
+                          :input-bytes input-bytes
+                          :fee fee
+                          :effective-value (- (bl.ser:tx-out-value
+                                               txout)
+                                              fee)
+                          :output-type :unknown))
+                   (bump (gethash (%wtx-outpoint-key txid vout) bumps 0)))
+              (when (plusp bump) (%apply-bump-fee coin bump))
+              (push coin coins))))))
     (values (nreverse coins) nil)))
 
 ;;; --- Wallet signing (CWallet::SignTransaction over the SPKMs' keys) ---
@@ -3596,7 +3603,24 @@ estimate_mode fee_rate options)."
                             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                               :message "Unable to determine the size of the transaction, the wallet contains unsolvable descriptors"))
                           (let* ((fee-from-size (bl.rpc:feerate-fee fee-rate vsize))
-                                 (effective-value (- total-input-value fee-from-size)))
+                                 ;; Core sendall budgets for the unconfirmed
+                                 ;; ancestors of everything it sweeps
+                                 ;; (rpc/spend.cpp:1489-1503): ONE combined
+                                 ;; bump fee over all the spent outpoints, so a
+                                 ;; shared ancestor is paid for once. Without
+                                 ;; it the sweep's own feerate was the target
+                                 ;; and its parents kept theirs, so a sweep of
+                                 ;; a low-feerate parent sent the same amount
+                                 ;; as a sweep of a high-feerate one
+                                 ;; (wallet_sendall.py:433).
+                                 (total-bump-fees
+                                   (or (mini-miner-total-bump-fee
+                                        (bl.rpc:rpc-get-mempool node)
+                                        (reverse outpoints) fee-rate)
+                                       0))
+                                 (effective-value (- total-input-value
+                                                     fee-from-size
+                                                     total-bump-fees)))
                             (when (> fee-from-size bl:*wallet-max-tx-fee*)
                               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                                 :message +max-fee-exceeded-message+))

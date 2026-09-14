@@ -1716,3 +1716,60 @@ limit refuses the fourth, not every send."
           (is (equal (cons bl.rpc:+rpc-wallet-insufficient-funds+
                            "Unconfirmed UTXOs are available, but spending them creates a chain of transactions that will be rejected by the mempool")
                      (send))))))))
+
+(test spending-an-unconfirmed-parent-bumps-it-to-the-target-feerate
+  "Core prices an unconfirmed candidate by what its ancestors would cost to
+bring to the target feerate: AvailableCoins asks
+chain.calculateIndividualBumpFees (wallet/spend.cpp:515-522) and every
+COutput's effective value falls by its answer (coinselection.h:108-116), so
+the selection has to find that much more and the change is that much smaller.
+The answer comes from node::MiniMiner, a BlockAssembler run over the
+outpoint's mempool cluster (node/mini_miner.cpp).
+
+We had no bump-fee calculator at all, so spending a 1 sat/vB parent at a
+30 sat/vB target confirmed the PAIR at about half the target --
+wallet_spend_unconfirmed.py:107 measured 15.5 for a target of 30, and :108
+asserts the other side: no more than 1% over, so the bump is priced and not
+merely over-shot.
+
+The parent's own feerate is asserted BELOW the target first: that is the
+control, since a parent that already beat the target would make the pair beat
+it with no bump at all."
+  (with-wallet-chain-node (node "ws-bumpfee")
+    (multiple-value-bind (wallet address) (%ws-fund-wallet node)
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 4242))
+            (target 30))
+        (flet ((send-tx (dest amount rate)
+                 (let ((txid (bl.rpc:parse-hex-hash
+                              (%ws-sendtoaddress
+                               node (list dest amount nil nil nil nil nil nil nil rate)))))
+                   (%ws-mempool-tx node txid)))
+               (feerate-of (txs)
+                 ;; The functional test's calc_set_fee_rate: total fees over
+                 ;; total vsize, in sat/vB.
+                 (let ((fee 0) (vsize 0))
+                   (dolist (tx txs (/ fee vsize))
+                     (incf fee (%ws-tx-fee node wallet tx))
+                     (incf vsize (bl.ser:transaction-vsize tx))))))
+          ;; A deliberately cheap parent, paying to ourselves so its output is
+          ;; a candidate for the next send.
+          (let ((parent (send-tx address 1 1)))
+            (is (not (null parent)) "the low-feerate parent never reached the mempool")
+            (is (< (feerate-of (list parent)) target)
+                "fixture: the parent already beats the target at ~A sat/vB"
+                (feerate-of (list parent)))
+            (let ((child (send-tx (%wc-optrue-address) 1/2 target)))
+              (is (not (null child)) "the child never reached the mempool")
+              ;; The child alone beats the target, and so does the PAIR: that
+              ;; second half is the bump fee.
+              (is (>= (feerate-of (list child)) target)
+                  "the child pays ~A sat/vB, under the ~A target"
+                  (feerate-of (list child)) target)
+              (is (>= (feerate-of (list parent child)) target)
+                  "parent+child pay ~A sat/vB, under the ~A target -- the ~
+parent was not bumped" (feerate-of (list parent child)) target)
+              ;; ...and not by much: a bump that is computed rather than
+              ;; guessed lands within a percent of the target.
+              (is (<= (feerate-of (list parent child)) (* 101/100 target))
+                  "parent+child pay ~A sat/vB, over the ~A target by more ~
+than 1%" (feerate-of (list parent child)) target))))))))
