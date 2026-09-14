@@ -1560,8 +1560,17 @@ Callers must have bound the listening socket first — this writes .cookie, and
                  *rpc-cookie-path* cookie-path)
            t))
     (cond
-      ((and user password)
-       (install (list (hash-rpc-credential user password)) nil))
+      ;; Core asks ONE question: is -rpcpassword non-empty
+      ;; (InitRPCAuthentication, httprpc.cpp:245)? -rpcuser alone does not
+      ;; choose this branch, and an EMPTY -rpcpassword chooses the cookie --
+      ;; which is what feature_config_args.py:255 starts a node with
+      ;; (`-rpcpassword=' beside `-rpcuser=secret-rpcuser'). Asking whether
+      ;; both were merely SUPPLIED gave that node no cookie and no usable
+      ;; password, so the framework never authenticated and the test read
+      ;; "Unable to connect to bitcoind after 60s".
+      ((and password (plusp (length password)))
+       (bl.log:node-log :info "Using rpcuser/rpcpassword authentication.")
+       (install (list (hash-rpc-credential (or user "") password)) nil))
       ;; -norpccookiefile: Core's GenerateAuthCookie answers DISABLED
       ;; (rpc/request.cpp:115) and InitRPCAuthentication logs it and carries
       ;; on (httprpc.cpp:261-262) -- only -rpcauth users can authenticate.
@@ -1573,6 +1582,7 @@ Callers must have bound the listening socket first — this writes .cookie, and
             (let ((data-directory (rpc-server-data-directory node)))
               (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
           (cond (path
+                 (bl.log:node-log :info "Using random cookie authentication.")
                  (install (list (hash-rpc-credential +rpc-cookie-user+ secret)) path))
                 (t
                  (bl.log:node-log

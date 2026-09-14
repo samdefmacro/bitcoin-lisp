@@ -3058,6 +3058,42 @@ constant-time but wrong would hand out access."
                  "control: with the default, the cookie is written"))
       (bl.rpc:stop-rpc-server))))
 
+(test an-empty-rpcpassword-still-gets-a-cookie
+  "Core's InitRPCAuthentication asks one question -- is -rpcpassword non-empty
+(httprpc.cpp:245)? -rpcuser alone does not answer it, so a node started with
+`-rpcuser=x -rpcpassword=' generates the .cookie and logs `Using random cookie
+authentication.'. Asking instead whether both were SUPPLIED left
+feature_config_args.py:255's node with no cookie and an empty password, and the
+framework reported `Unable to connect to bitcoind after 60s'."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19991))
+      (setf (bl:node-data-directory node) dir)
+      (let ((bl.rpc:*rpc-cookie-file* nil))
+        (let ((lines (capture-log-lines
+                      (lambda ()
+                        (is-true (bl.rpc:start-rpc-server
+                                  node :port port
+                                       :user "secret-rpcuser" :password ""))))))
+          (is-true (probe-file (merge-pathnames ".cookie" dir))
+                   "an empty -rpcpassword means cookie authentication")
+          (is-true (find "Using random cookie authentication." lines :test #'search)
+                   "Core's line for the cookie branch"))
+        (bl.rpc:stop-rpc-server)
+        (ignore-errors (delete-file (merge-pathnames ".cookie" dir)))
+        ;; Control: a real password takes Core's other branch and writes none.
+        (let ((lines (capture-log-lines
+                      (lambda ()
+                        (is-true (bl.rpc:start-rpc-server
+                                  node :port port
+                                       :user "u" :password "p"))))))
+          (is (null (probe-file (merge-pathnames ".cookie" dir)))
+              "control: a non-empty -rpcpassword writes no cookie")
+          (is-true (find "Using rpcuser/rpcpassword authentication." lines :test #'search)
+                   "Core's line for the password branch"))
+        (bl.rpc:stop-rpc-server)))))
+
 (test init-message-lines-are-cores
   "Core's non-GUI build logs every uiInterface.InitMessage as `init message:
 <text>` (noui.cpp:56) and the functional framework waits on those lines
@@ -7244,7 +7280,7 @@ EXISTING inode with O_TRUNC, and follows a symlink to do it."
                 "the secret was written into a pre-existing inode the attacker ~
 still holds open: ~S" seen))))
       (when (probe-file (merge-pathnames ".cookie" dir))
-        (delete-file (merge-pathnames ".cookie" dir)))
+        (ignore-errors (delete-file (merge-pathnames ".cookie" dir))))
       ;; (b) a planted symlink: written through, and then RENAME moves the
       ;; resolved target over .cookie
       (let ((target (merge-pathnames "attacker-target" dir)))
