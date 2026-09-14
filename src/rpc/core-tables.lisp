@@ -34,7 +34,12 @@
     ("descriptorprocesspsbt" (0 "psbt" . t) (1 "descriptors" . nil) (2 "sighashtype" . t) (3 "bip32derivs" . nil) (4 "finalize" . nil))
     ("disconnectnode" (1 "nodeid" . nil))
     ("dumptxoutset" (0 "path" . t) (1 "type" . t) (2 "options" . nil) (2 "rollback" . nil))
-    ("echojson" (0 "arg0" . nil) (1 "arg1" . nil) (2 "arg2" . nil) (3 "arg3" . nil) (4 "arg4" . nil) (5 "arg5" . nil) (6 "arg6" . nil) (7 "arg7" . nil) (8 "arg8" . nil) (9 "arg9" . nil))
+    ;; echojson's arguments are declared STR in Core's RPCHelpMan (with
+    ;; skip_type_check, rpc/node.cpp:286-295), so dumpArgMap reports them as
+    ;; string-typed even though client.cpp lists them as convertible -- the one
+    ;; row where the two Core tables deliberately disagree, which is why
+    ;; rpc_help.py:72 drops echojson from the CLIENT side and compares the rest.
+    ("echojson" (0 "arg0" . t) (1 "arg1" . t) (2 "arg2" . t) (3 "arg3" . t) (4 "arg4" . t) (5 "arg5" . t) (6 "arg6" . t) (7 "arg7" . t) (8 "arg8" . t) (9 "arg9" . t))
     ("encryptwallet" (0 "passphrase" . t))
     ("estimaterawfee" (0 "conf_target" . nil) (1 "threshold" . nil))
     ("estimatesmartfee" (0 "conf_target" . nil))

@@ -3237,6 +3237,47 @@ a reply shaped like a different one. interface_rpc.py:177, :204 and :207 send
                (version-of "1.1"))
         "\"1.1\" as a jsonrpc marker is refused, as Core refuses it")))
 
+(test getmemoryinfo-reports-chunks-of-the-heap-it-has
+  "Core's `locked' object describes its mlock()ed LockedPool
+(support/lockedpool.h:57-64) and rpc_misc.py:61-62 asserts chunks_used and
+chunks_free are both above zero. This node has no locked pool -- the same
+secrets live in the ordinary heap -- so it reports that heap counted in the
+units the field names mean: allocation granules, which is what a chunk IS for
+Core's arena. Reporting a constant 0 failed the assertion AND told a caller
+watching for allocator pressure nothing."
+  (let* ((info (bl.rpc::rpc-getmemoryinfo nil nil))
+         (locked (cdr (assoc "locked" info :test #'string=)))
+         (used (cdr (assoc "used" locked :test #'string=)))
+         (free (cdr (assoc "free" locked :test #'string=)))
+         (total (cdr (assoc "total" locked :test #'string=)))
+         (chunks-used (cdr (assoc "chunks_used" locked :test #'string=)))
+         (chunks-free (cdr (assoc "chunks_free" locked :test #'string=))))
+    (is (= total (+ used free)) "used + free = total, as rpc_misc.py:63 asserts")
+    (is (plusp chunks-used) "chunks_used must be above zero")
+    (is (plusp chunks-free) "chunks_free must be above zero")
+    ;; They are the heap in granules, not decoration: derived from the same
+    ;; byte counts the object already reports.
+    (is (= chunks-used (ceiling used bl.rpc::+heap-chunk-bytes+)))
+    (is (= chunks-free (floor free bl.rpc::+heap-chunk-bytes+)))
+    ;; `locked' stays 0: nothing here is mlock()ed and saying otherwise would
+    ;; be a security claim this node cannot make.
+    (is (zerop (cdr (assoc "locked" locked :test #'string=))))))
+
+(test echojson-is-string-typed-where-cores-helpman-declares-it
+  "Core's two argument tables disagree about exactly one method: client.cpp
+lists echojson's arg0..arg9 as convertible, while the RPCHelpMan declares them
+STR with skip_type_check (rpc/node.cpp:286-295), so dumpArgMap -- which is what
+`help dump_all_command_conversions' answers -- reports them string-typed.
+rpc_help.py:72 drops echojson from the CLIENT side and compares the rest, so a
+node that answers from the client side alone fails on those ten rows and
+nothing else."
+  (let ((rows (loop for row across (bl.rpc::%dump-all-command-conversions)
+                    when (string= (aref row 0) "echojson") collect row)))
+    (is (= 10 (length rows)) "all ten arguments are reported")
+    (dolist (row rows)
+      (is (eq t (aref row 3))
+          "~A arg ~D must be reported string-typed" (aref row 0) (aref row 1)))))
+
 (test init-message-lines-are-cores
   "Core's non-GUI build logs every uiInterface.InitMessage as `init message:
 <text>` (noui.cpp:56) and the functional framework waits on those lines
@@ -4545,15 +4586,24 @@ rpc_help.py passing."
                                          (setf (gethash k h) t))
                                        bl.rpc::*rpc-methods*)
                               h))
-               ;; Core's rows, restricted to what we serve.
-               (want-json (remove-if-not (lambda (r) (gethash (first r) our-methods))
-                                         core-json))
-               (want-strings (remove-if-not (lambda (r) (gethash (first r) our-methods))
-                                            core-strings))
-               (got-json (loop for r in ours unless (fourth r)
-                               collect (subseq r 0 3)))
-               (got-strings (loop for r in ours when (fourth r)
-                                  collect (subseq r 0 3))))
+               ;; Core's rows, restricted to what we serve -- and without
+               ;; echojson, the one method where Core's own two tables
+               ;; disagree: client.cpp lists its arguments as convertible while
+               ;; the RPCHelpMan declares them STR (rpc/node.cpp:286-295), so
+               ;; dumpArgMap reports them string-typed. rpc_help.py:72 drops it
+               ;; from the client side for exactly this reason; keeping it here
+               ;; would pin our table to the side Core's own test ignores.
+               (comparable (lambda (r) (and (gethash (first r) our-methods)
+                                            (not (string= (first r) "echojson")))))
+               (want-json (remove-if-not comparable core-json))
+               (want-strings (remove-if-not comparable core-strings))
+               (got-json (loop for r in ours
+                               unless (or (fourth r) (string= (first r) "echojson"))
+                                 collect (subseq r 0 3)))
+               (got-strings (loop for r in ours
+                                  when (and (fourth r)
+                                            (not (string= (first r) "echojson")))
+                                    collect (subseq r 0 3))))
           (flet ((sorted (rows)
                    (sort (copy-list rows)
                          (lambda (a b)
