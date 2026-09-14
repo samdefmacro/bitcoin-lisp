@@ -1993,6 +1993,63 @@ code, carrying an uppercased Lisp keyword no client can match on."
           (bl:node-peers node) (list peer))
     node))
 
+(test rpc-sendrawtransaction-resubmits-nothing-that-is-already-there
+  "Core looks the transaction up by TXID before validating anything
+(node/transaction.cpp:63-72). Finding it, BroadcastTransaction does not
+resubmit -- it only re-announces, and with the POOL entry's wtxid, because
+that is the witness this node can serve. The lookup is by txid on purpose, so
+a submission whose witness differs from the pooled one takes the same branch:
+mempool_accept_wtxid.py:82 sends exactly that and expects the txid back, not
+an error.
+
+This node asked VALIDATE-TRANSACTION-FOR-MEMPOOL instead and took the branch
+only for its :already-in-mempool verdict, so the different-witness case fell
+through to the generic rejection and threw -26
+txn-same-nonwitness-data-in-mempool."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((peer (bl.net:make-peer :state :ready))
+           (node (%broadcast-test-node utxo-set mempool chain-state peer))
+           (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
+           (txid (bl.ser:transaction-hash tx))
+           (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))))
+      (flet ((send (h) (bl.rpc:dispatch-rpc-method
+                        node "sendrawtransaction" (wire-params (list h)))))
+        (is (string= (bl.rpc:hash-to-hex txid) (send hex)))
+        (is-true (bl.mp:mempool-has mempool txid))
+        ;; The same transaction again: the txid, not an error, and the pool is
+        ;; untouched.
+        (is (string= (bl.rpc:hash-to-hex txid) (send hex)))
+      (is (= 1 (bl.mp:mempool-count mempool)))
+      ;; A DIFFERENT witness over the same non-witness data. The pooled entry
+      ;; is the one that stays; the caller still gets the txid.
+      ;; The hex must carry the witness, so TRANSACTION-WIRE-BYTES rather
+      ;; than SERIALIZE-TRANSACTION, which writes the legacy form and would
+      ;; hand the RPC the SAME transaction back.
+      (let* ((other (bl.ser:make-transaction
+                     :version (bl.ser:transaction-version tx)
+                     :inputs (bl.ser:transaction-inputs tx)
+                     :outputs (bl.ser:transaction-outputs tx)
+                     :witness (vector (list (make-array 3 :element-type '(unsigned-byte 8)
+                                                          :initial-element 7)))
+                     :lock-time (bl.ser:transaction-lock-time tx)))
+             (other-hex (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes other)))
+             ;; The control is about what the RPC DECODES, not about the
+             ;; object built here.
+             (decoded (bl.bytes:with-byte-reader
+                          (r (bl.crypto:hex-to-bytes other-hex))
+                        (bl.ser:br-read-transaction r))))
+        (is (equalp txid (bl.ser:transaction-hash decoded))
+            "control: the second submission must share the pooled txid")
+        (is-false (equalp (bl.ser:transaction-wtxid tx)
+                          (bl.ser:transaction-wtxid decoded))
+                  "control: and differ in wtxid")
+        (is (string= (bl.rpc:hash-to-hex txid) (send other-hex)))
+        (is (= 1 (bl.mp:mempool-count mempool)))
+        ;; The pooled entry is untouched: it is still the witness this node
+        ;; can serve.
+        (is (equalp (bl.ser:transaction-wtxid tx)
+                    (bl.mp:mempool-entry-wtxid (bl.mp:mempool-get mempool txid)))))))))
+
 (test rpc-sendrawtransaction-rejection-speaks-cores-vocabulary
   "A rejection raised by the INSERTION step -- after every check passed --
 must report Core's own reject reason like any other. BroadcastTransaction
@@ -9085,6 +9142,32 @@ rpc-handler answers with HTTP 204 and no body."
 to splice in (\"\" for absent)."
   (format nil "{~@[~A,~]\"method\":\"~A\",\"params\":[]~@[,~A~]}"
           version-member method id-member))
+
+(test every-rpc-call-is-logged-under-cores-rpc-category
+  "Core writes one debug line per call, in JSONRPCRequest::parse the moment
+the method name is read and BEFORE the parameters are
+(rpc/request.cpp:240-243): ThreadRPCServer method=<m> user=<u>, under the rpc
+category. Writing it at parse time rather than at return time is the whole
+point of the line for mining_getblocktemplate_longpoll.py:26, which waits for
+it while a longpoll getblocktemplate is still parked. We logged nothing at
+all.
+
+Core sanitizes the method name (SanitizeString), which matters because the
+name is caller-supplied and a newline in it would write a debug.log line of
+the caller's choosing."
+  (let ((bl.log:*current-log-level* :debug))
+    (bl.log:enable-log-category "rpc")
+    (unwind-protect
+         (let ((lines (capture-log-lines
+                       (lambda ()
+                         (ignore-errors
+                          (jsonrpc-shape-reply
+                           (jsonrpc-shape-body nil "uptime" "\"id\":1")))))))
+           (is-true (find "ThreadRPCServer method=uptime" lines :test #'search)
+                    "no per-call rpc log line: ~S" lines)
+           ;; The category tag Core prints for a categorized debug line.
+           (is-true (find "[rpc]" lines :test #'search)))
+      (bl.log:disable-log-category "rpc"))))
 
 (test jsonrpc-v1-success-reply-has-both-result-and-null-error
   "A jsonrpc:\"1.0\" request — and one with no jsonrpc member at all, which
