@@ -642,6 +642,13 @@ re-deciding anything that is still on disk."
       (when (plusp added)
         (bl.store:save-header-index (node-chain-state *node*)
                                     :force-full t))
+      ;; Core's own sentence for the end of the reindex
+      ;; (ImportBlocks, node/blockstorage.cpp:1291). It is what says the block
+      ;; files were all read rather than the node having given up partway:
+      ;; feature_reindex_readonly.py:78 waits for it after making a block file
+      ;; unwritable, precisely to check that a read-only file is read and not
+      ;; an abort.
+      (log-info "Reindexing finished")
       added)))
 
 (defun log-assumevalid-decision (network)
