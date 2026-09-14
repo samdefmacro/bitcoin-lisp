@@ -1488,12 +1488,22 @@ Returns (values sel-result error-message)."
           ; subtract fee from this output
 
 (defun %interpret-sffo (sffo-param keys recipients)
-  "Core InterpretSubtractFeeFromOutputInstructions: mark recipients by
-index or destination string."
-  (when sffo-param
-    (unless (listp sffo-param)
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
-                        :message "subtractfeefrom must be an array"))
+  "Core InterpretSubtractFeeFromOutputInstructions (wallet/rpc/spend.cpp:
+68-94): mark recipients by index or destination string.
+
+Core returns an empty set for a null argument and otherwise iterates the
+values, so an EMPTY array contributes nothing and is as good as omitting the
+argument; there is no `must be an array' check in it at all. A top-level
+empty array reaches a handler here as the empty-array SENTINEL, which is
+truthy and is not a list, so POSITIONAL-ARRAY has to fold it before the
+guard below sees it -- wallet_basic.py:259 sends
+sendmany with an empty comment and an empty subtractfeefrom array, and was
+answered -3, the message below."
+  (let ((sffo-param (bl.rpc:positional-array sffo-param)))
+    (when sffo-param
+      (unless (listp sffo-param)
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
+                          :message "subtractfeefrom must be an array"))
     (let ((seen (make-hash-table :test 'eql))
           (n (length recipients)))
       (dolist (sffo sffo-param)
@@ -1518,7 +1528,7 @@ index or destination string."
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message (format nil "Invalid parameter 'subtract fee from output', position too large: ~D" pos)))
           (setf (gethash pos seen) t)
-          (setf (bl.rpc:recipient-sffo (nth pos recipients)) t)))))
+          (setf (bl.rpc:recipient-sffo (nth pos recipients)) t))))))
   recipients)
 
 ;;; --- Change type + change address reservation ---
