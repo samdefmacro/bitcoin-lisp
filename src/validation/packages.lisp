@@ -580,6 +580,51 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
                   (setf failure (or failure add-result))))))
         (or failure :success)))))
 
+(defparameter *package-level-reject-reasons*
+  '(;; policy/packages.cpp IsWellFormedPackage
+    :package-empty
+    :package-too-many-transactions                ; packages.cpp:84
+    :package-too-large                            ; :91
+    :package-contains-duplicates                  ; :101
+    :package-not-sorted                           ; :109
+    :conflict-in-package                          ; :114
+    ;; The topology gate (validation.cpp:1640) and our second half of it.
+    :package-not-child-with-parents
+    :package-parent-depends-on-parent
+    ;; PackageTRUCChecks (validation.cpp:1480), one reason for all six.
+    :truc-tx-too-big :truc-child-too-big :truc-too-many-ancestors
+    :truc-descendant-limit :truc-nonv3-spends-v3 :truc-v3-spends-nonv3
+    ;; PackageRBFChecks (validation.cpp:1049-1119).
+    :package-rbf-not-1p1c :package-rbf-mempool-ancestors
+    :package-rbf-insufficient-fee
+    ;; The changeset's cluster limits (:1518) and the package dust sweep
+    ;; (:1527), both judged over the whole subset.
+    :too-large-cluster :unspent-dust)
+  "The verdicts Core states about the PACKAGE rather than about one member.
+
+Core keeps two states side by side: a TxValidationState per transaction and
+one PackageValidationState for the package. A per-transaction failure sets
+the package state to PCKG_TX \"transaction failed\" and nothing else -- the
+member's own reason stays in its own result -- while the checks in this list
+are the package's own verdict and keep their word (PCKG_POLICY, plus
+unspent-dust at PCKG_TX). testmempoolaccept reports the PCKG_POLICY ones as
+`package-error' and submitpackage reports every one of them as package_msg
+(rpc/mempool.cpp:368-370, :1395-1400).")
+
+(defun %package-level-reject-p (reason)
+  "T when REASON is one of *PACKAGE-LEVEL-REJECT-REASONS*."
+  (and (member (tx-reject-keyword reason) *package-level-reject-reasons*) t))
+
+(defun %package-msg (reason)
+  "Core's package_msg for REASON: the package state's own ToString().
+A verdict about one member is `transaction failed' at package level, however
+the member itself was rejected -- mempool_ephemeral_dust.py:160 submits a
+dusty parent and reads package_msg \"transaction failed\" while the parent's
+own result carries \"dust, tx with dust output must be 0-fee\"."
+  (if (%package-level-reject-p reason)
+      (tx-reject-reason-string reason)
+      "transaction failed"))
+
 (defun validate-package-for-mempool (package utxo-set mempool chain-state
                                     &key client-maxfeerate)
   "Validate and submit a transaction PACKAGE (a topologically-sorted list of
@@ -607,18 +652,22 @@ mempool, exactly as in Core's early return.
 
   MSG       — :success, or a package-/tx-level failure reason keyword
   RESULTS   — a list of PACKAGE-TX-RESULT, one per package tx, in package order
-  REPLACED  — list of txids (byte vectors) evicted by RBF during acceptance."
+  REPLACED  — list of txids (byte vectors) evicted by RBF during acceptance
+  PACKAGE-MSG — Core's package_msg for MSG (see %PACKAGE-MSG), which
+              submitpackage reports verbatim."
   (let ((height (bl.store:current-height chain-state)))
     ;; 0. Context-free package checks.
     (multiple-value-bind (ok reason) (package-well-formed package)
       (unless ok
         (return-from validate-package-for-mempool
-          (values reason (%results-not-validated package reason) nil))))
+          (values reason (%results-not-validated package reason) nil
+                  (%package-msg reason)))))
     (when (> (length package) 1)
       (multiple-value-bind (ok reason) (package-child-with-parents-tree-p package)
         (unless ok
           (return-from validate-package-for-mempool
-            (values reason (%results-not-validated package reason) nil)))))
+            (values reason (%results-not-validated package reason) nil
+                    (%package-msg reason))))))
     ;; 1. Per-tx individual acceptance. No package coins — each tx must stand on
     ;;    its own against confirmed UTXOs + the current mempool. Txs that fail
     ;;    only for low feerate or a missing (in-package) input are deferred to
@@ -632,7 +681,13 @@ mempool, exactly as in Core's early return.
           (replaced (make-hash-table :test 'equalp))   ; txid -> t
           (deferred '())
           (quit-early nil)
-          (fail-reason nil))
+          (fail-reason nil)
+          ;; Whether FAIL-REASON is a verdict on the PACKAGE (Core's
+          ;; PCKG_POLICY word, or unspent-dust) rather than on one member.
+          ;; Decided by the SITE that set it -- too-large-cluster is both a
+          ;; per-transaction insertion verdict (validation.cpp:1021) and a
+          ;; package one (:1518), so the keyword alone cannot say.
+          (package-level-failure nil))
       (dolist (tx package)
         (let* ((txid (bl.ser:transaction-hash tx))
                (wtxid (bl.ser:transaction-wtxid tx))
@@ -676,7 +731,8 @@ mempool, exactly as in Core's early return.
                                (%finalize-package-results package results
                                                           :max-feerate-exceeded)
                                (loop for k being the hash-keys of replaced
-                                     collect k))))))
+                                     collect k)
+                               "transaction failed")))))
                (cond
                  (valid
                   (let ((add-result (%accept-into-mempool tx txid fee sigops
@@ -727,6 +783,8 @@ mempool, exactly as in Core's early return.
                                            (%build-package-coins package (1+ height))
                                            now results replaced)))
           (unless (eq msg :success)
+            (when (null fail-reason)
+              (setf package-level-failure (%package-level-reject-p msg)))
             (setf fail-reason (or fail-reason msg)))))
       ;; Re-limit ONCE (Core AcceptPackage -> LimitMempoolSize,
       ;; validation.cpp:1728): every package submission above deferred its
@@ -745,4 +803,10 @@ mempool, exactly as in Core's early return.
       (values (or fail-reason :success)
               (loop for tx in package
                     collect (gethash (bl.ser:transaction-wtxid tx) results))
-              (loop for k being the hash-keys of replaced collect k)))))
+              (loop for k being the hash-keys of replaced collect k)
+              (if fail-reason
+                  ;; The PACKAGE phase's own verdicts keep their word; every
+                  ;; other failure here is a per-transaction one, which Core
+                  ;; states at package level as "transaction failed".
+                  (if package-level-failure (%package-msg fail-reason) "transaction failed")
+                  "success")))))

@@ -836,7 +836,12 @@ transaction is refused even on a node told to relay non-standard ones."
     (:mempool-full             . "mempool full")              ; :1401
     (:duplicate                . "txn-already-in-mempool")    ; :825
     (:conflict                 . "bip125-replacement-disallowed") ; :839
-    (:max-feerate-exceeded     . "max feerate exceeded"))     ; :1455
+    (:max-feerate-exceeded     . "max feerate exceeded")      ; :1455
+    ;; PackageRBFChecks' two topology sentences (validation.cpp:1049,1062);
+    ;; the rest of its reasons are named by their own keyword.
+    (:package-rbf-not-1p1c . "package RBF failed: package must be 1-parent-1-child")
+    (:package-rbf-mempool-ancestors
+     . "package RBF failed: new transaction cannot have mempool ancestors"))
   "Our validation keywords in Core's reject-reason vocabulary.")
 
 (defparameter *tx-reject-debug-messages*

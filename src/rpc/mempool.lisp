@@ -928,7 +928,7 @@ member may send to a script that can never spend it."
       ;; broadcast: package acceptance mutates the mempool tx-by-tx and
       ;; must not interleave with the sync thread (Core AcceptPackage runs
       ;; entirely under cs_main + pool.cs).
-      (multiple-value-bind (msg results replaced)
+      (multiple-value-bind (msg results replaced package-msg)
           (with-node-lock (node)
             (multiple-value-prog1
                 (bl.val:validate-package-for-mempool
@@ -944,8 +944,14 @@ member may send to a script that can never spend it."
                 (let ((txid (bl.ser:transaction-hash tx)))
                   (when (bl.mp:mempool-has mempool txid)
                     (bl:broadcast-transaction-to-peers node txid))))))
-        `(("package_msg" . ,(if (eq msg :success) "success"
-                                (string-downcase (symbol-name msg))))
+        (declare (ignore msg))
+        `(;; Core's package_msg is the PACKAGE state's ToString(), which for a
+          ;; per-member failure is the fixed "transaction failed"
+          ;; (rpc/mempool.cpp:1395-1400, validation.cpp:1447 and the other
+          ;; PCKG_TX sites); only a verdict about the package itself keeps its
+          ;; own word. Downcasing the member's keyword answered "dust" where
+          ;; mempool_ephemeral_dust.py:160 reads "transaction failed".
+          ("package_msg" . ,package-msg)
           ("tx-results"
            . ,(mapcar (lambda (r)
                         (cons (hash-to-hex (bl.val:package-tx-result-wtxid r))
