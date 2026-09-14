@@ -59,9 +59,14 @@
 where implementations diverge — the 0xFFFFFFFF/0xFFFFFFFE child indices, a
 chain code with a leading zero, and BIP32's own vector 4, added for
 implementations that mishandle a leading zero byte in a derived private key."
-  (let ((vectors (%load-core-vectors "bip32_vectors.json")))
-    (dolist (name '("test1" "test2" "test3" "test4"))
-      (%run-bip32-vector (gethash name vectors) name))))
+  ;; Core's bip32_tests runs under BasicTestingSetup, whose default chain is
+  ;; ChainType::MAIN (test/util/setup_common.h:76): DecodeExtKey reads only the
+  ;; running chain's prefix (key_io.cpp:272-275), so these xprv strings parse
+  ;; on mainnet and nowhere else.
+  (with-network (:mainnet)
+    (let ((vectors (%load-core-vectors "bip32_vectors.json")))
+      (dolist (name '("test1" "test2" "test3" "test4"))
+        (%run-bip32-vector (gethash name vectors) name)))))
 
 (test bip32-invalid-extended-keys-are-rejected
   "BIP32 test vector 5 (Core bip32_tests.cpp:104-122): sixteen extended keys
@@ -72,11 +77,12 @@ a private key of zero or >= n, an invalid public key, and a bad checksum.
 A reject corpus is the half that catches a permissive parser, and a permissive
 xprv parser accepts keys that derive to something other than what the writer
 intended."
-  (let ((invalid (gethash "invalid" (%load-core-vectors "bip32_vectors.json"))))
-    (is (= 16 (length invalid)) "expected Core's sixteen invalid keys")
-    (dolist (str (coerce invalid 'list))
-      (is-false (ignore-errors (bl.crypto:bip32-parse str))
-                "accepted an extended key Core rejects: ~A" str))))
+  (with-network (:mainnet)
+    (let ((invalid (gethash "invalid" (%load-core-vectors "bip32_vectors.json"))))
+      (is (= 16 (length invalid)) "expected Core's sixteen invalid keys")
+      (dolist (str (coerce invalid 'list))
+        (is-false (ignore-errors (bl.crypto:bip32-parse str))
+                  "accepted an extended key Core rejects: ~A" str)))))
 
 ;;; --- SipHash (G7-69): Core hash_tests.cpp:62-79 ----------------------------
 

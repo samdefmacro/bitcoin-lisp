@@ -1695,8 +1695,7 @@ fractional conf_target it was -8 \"Invalid conf_target, must be between 1 and
 The two positive controls are the modes that ARE in Core's map: with them the
 same fractional conf_target still reaches ParseConfirmTarget, so a change that
 simply refused every conf_target-bearing call would fail here."
-  (with-wallet-chain-node (node "ws-emptymode")
-    (bl.wallet::rpc-createwallet node '("w"))
+  (with-wallet-chain-node (node "ws-emptymode" :wallet "w")
     (let ((raw (one-input-tx-hex (format nil "~64,\'0D" 1) 0
                                  (p2sh-optrue-script-pubkey))))
       (flet ((answer (options)

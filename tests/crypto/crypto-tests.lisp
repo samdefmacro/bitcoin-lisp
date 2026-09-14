@@ -304,11 +304,15 @@ public key (and rejects under a different key); RFC6979 makes it deterministic."
   "BIP32 test vector 1 (seed 000102...0f): master + m/0' + m/0'/1 xprv/xpub all
 match the canonical strings; CKDpub (derive the normal child m/0'/1 from the
 neutered m/0' xpub) matches the private path; derive-path and parse round-trip."
-  (let* ((seed (bl.crypto:hex-to-bytes "000102030405060708090a0b0c0d0e0f"))
-         (m (bl.crypto:bip32-master-key seed :network :mainnet))
-         (m0h (bl.crypto:bip32-derive-child
-               m (+ 0 bl.crypto:+bip32-hardened+)))
-         (m0h1 (bl.crypto:bip32-derive-child m0h 1)))
+  ;; Core's bip32_tests runs under BasicTestingSetup, whose default chain is
+  ;; ChainType::MAIN (test/util/setup_common.h:76) -- which is what makes
+  ;; DecodeExtKey read these xprv strings at all (key_io.cpp:272-275).
+  (with-network (:mainnet)
+   (let* ((seed (bl.crypto:hex-to-bytes "000102030405060708090a0b0c0d0e0f"))
+          (m (bl.crypto:bip32-master-key seed :network :mainnet))
+          (m0h (bl.crypto:bip32-derive-child
+                m (+ 0 bl.crypto:+bip32-hardened+)))
+          (m0h1 (bl.crypto:bip32-derive-child m0h 1)))
     ;; master
     (is (string= "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
                  (bl.crypto:bip32-serialize m)))
@@ -339,7 +343,49 @@ neutered m/0' xpub) matches the private path; derive-path and parse round-trip."
       (is (bl.crypto:ext-key-privatep parsed))
       (is (string= (bl.crypto:bip32-serialize m0h)
                    (bl.crypto:bip32-serialize parsed))))
-    (is (null (bl.crypto:bip32-parse "not-an-xkey")))))
+    (is (null (bl.crypto:bip32-parse "not-an-xkey"))))))
+
+(test bip32-parse-reads-only-the-running-chains-prefix
+  "Core's DecodeExtPubKey and DecodeExtKey (key_io.cpp:244-255, :267-281) compare
+the decoded four-byte prefix with Params().Base58Prefix(EXT_PUBLIC_KEY /
+EXT_SECRET_KEY) -- the RUNNING chain's, and only that one -- and hand back an
+invalid key when it does not match. There is no such thing as decoding an
+extended key without naming a chain: both callers, the descriptor parser
+(descriptor.cpp:1934-1938) and createwalletdescriptor (wallet/rpc/wallet.cpp:
+803), go through them.
+
+Ours accepted ANY chain's prefix, so a tpub was a perfectly good answer on
+mainnet; the descriptor parser carried its own network check and the wallet's
+hdkey argument did not, which is what let createwalletdescriptor take a key
+belonging to another chain.
+
+Each key on its OWN network is the positive control: a change that simply
+refused extended keys would fail there."
+  (let* ((seed (bl.crypto:hex-to-bytes "000102030405060708090a0b0c0d0e0f"))
+         (main-prv (bl.crypto:bip32-master-key seed :network :mainnet))
+         (test-prv (bl.crypto:bip32-master-key seed :network :testnet4))
+         (xprv (bl.crypto:bip32-serialize main-prv))
+         (xpub (bl.crypto:bip32-serialize (bl.crypto:bip32-neuter main-prv)))
+         (tprv (bl.crypto:bip32-serialize test-prv))
+         (tpub (bl.crypto:bip32-serialize (bl.crypto:bip32-neuter test-prv))))
+    ;; The strings really are the two chains' spellings.
+    (is (string= "xprv" (subseq xprv 0 4)))
+    (is (string= "tprv" (subseq tprv 0 4)))
+    (with-network (:mainnet)
+      (is-true (bl.crypto:bip32-parse xprv) "a mainnet xprv on mainnet")
+      (is-true (bl.crypto:bip32-parse xpub) "a mainnet xpub on mainnet")
+      (is-false (bl.crypto:bip32-parse tprv) "a tprv is not a mainnet extended key")
+      (is-false (bl.crypto:bip32-parse tpub) "a tpub is not a mainnet extended key"))
+    (with-network (:testnet4)
+      (is-true (bl.crypto:bip32-parse tprv) "a tprv on testnet4")
+      (is-true (bl.crypto:bip32-parse tpub) "a tpub on testnet4")
+      (is-false (bl.crypto:bip32-parse xprv) "an xprv is not a testnet extended key")
+      (is-false (bl.crypto:bip32-parse xpub) "an xpub is not a testnet extended key"))
+    ;; And named explicitly, which is how the descriptor parser asks -- it
+    ;; carries the network of the wallet whose descriptor it is reading.
+    (is-true (bl.crypto:bip32-parse tpub :testnet3)
+             "the test chains share one prefix pair")
+    (is-false (bl.crypto:bip32-parse tpub :mainnet))))
 
 (test schnorr-sign-bip340-vector-0
   "BIP340 test vector 0: secret key 3, message 0, aux 0 -> the canonical x-only

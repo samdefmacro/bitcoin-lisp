@@ -1240,7 +1240,9 @@ follow from that and all three are Core's own:
     it is -5 \"Unable to parse HD key. Please provide a valid xpub\" (:94);
   - an xpub whose secret the wallet does not hold keeps -5 \"Private key for
     <xpub> is not known\" (:42), the control that the message did not merely
-    move."
+    move. It has to be an xpub of THIS chain: DecodeExtPubKey compares the
+    prefix with Params()'s (key_io.cpp:249-252), so another chain's key never
+    reaches CWallet::GetKey at all and is the parse refusal above."
   (with-wallet-test-node (node :keypool 4)
     (with-rpc-wallet (nil)
       (bl.rpc:dispatch-rpc-method node "createwallet" (wire-params '("cwd-hdkey"))))
@@ -1269,12 +1271,24 @@ follow from that and all three are Core's own:
           (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
                            "Unable to parse HD key. Please provide a valid xpub")
                      (answer "bech32m" own-xprv)))
-          ;; A well-formed xpub the wallet holds no secret for. BIP32's own
-          ;; test-vector-1 master xpub, so nothing in the fixture can have it.
-          (let ((foreign "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"))
+          ;; A well-formed xpub of THIS chain that the wallet holds no secret
+          ;; for: BIP32's own test-vector-1 seed, so nothing in the fixture
+          ;; (whose keys come from the wallet's RNG) can have it.
+          (let ((foreign (bl.crypto:bip32-serialize
+                          (bl.crypto:bip32-neuter
+                           (bl.crypto:bip32-master-key
+                            (bl.crypto:hex-to-bytes "000102030405060708090a0b0c0d0e0f")
+                            :network :testnet4)))))
             (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
                              (format nil "Private key for ~A is not known" foreign))
-                       (answer "bech32m" foreign)))))))))
+                       (answer "bech32m" foreign))))
+          ;; ANOTHER chain's xpub -- BIP32 vector 1's mainnet master, on a
+          ;; testnet4 wallet -- is not an extended key here at all, so it is
+          ;; the parse refusal and never reaches CWallet::GetKey.
+          (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
+                           "Unable to parse HD key. Please provide a valid xpub")
+                     (answer "bech32m"
+                             "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"))))))))
 
 (test gethdkeys-groups-descriptors-under-their-root-key
   "Core gethdkeys. The grouping is the point: two descriptors derived from one

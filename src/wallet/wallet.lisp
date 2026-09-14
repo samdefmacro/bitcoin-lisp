@@ -1009,9 +1009,12 @@ result is an array."
           ;; answers -4 "Descriptor already exists".
           (let* ((xpub (if hdkey
                            (let ((parsed (and (stringp hdkey)
-                                              (ignore-errors (bl.crypto:bip32-parse hdkey)))))
-                             ;; DecodeExtPubKey reads the xpub prefix alone, so
-                             ;; an xprv is not a valid argument here.
+                                              (ignore-errors
+                                               (bl.crypto:bip32-parse
+                                                hdkey (wallet-network wallet))))))
+                             ;; DecodeExtPubKey reads THIS chain's xpub prefix
+                             ;; alone, so neither an xprv nor another chain's
+                             ;; tpub is a valid argument here.
                              (when (or (null parsed) (bl.crypto:ext-key-privatep parsed))
                                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                                  :message "Unable to parse HD key. Please provide a valid xpub"))
