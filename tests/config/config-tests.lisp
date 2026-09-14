@@ -2221,12 +2221,25 @@ keypool size is read as a struct slot DEFAULT and a test on the variable alone
 would pass even if no struct ever consulted it."
   (let ((saved-keypool bl.wallet:*default-keypool-size*)
         (saved-dir bl.wallet:*wallet-directory*))
+    (flet ((manager-keypool ()
+             (bl.wallet::wallet-manager-keypool-size
+              (bl.wallet::make-wallet-manager :data-directory #p"/tmp/kp/"))))
     (unwind-protect
          (progn
            (bl:apply-rpc-config-globals '(("keypool" . "37")))
-           (is (= 37 (bl.wallet::wallet-manager-keypool-size
-                      (bl.wallet::make-wallet-manager
-                       :data-directory #p"/tmp/kp/"))))
+           (is (= 37 (manager-keypool)))
+           ;; CLAMPED, never refused. Core reads the option as
+           ;; std::max(args.GetIntArg("-keypool", DEFAULT_KEYPOOL_SIZE),
+           ;; int64_t{1}) (wallet/wallet.cpp:3066), and GetIntArg answers 0 for
+           ;; a value it cannot read, so 0, a negative and a garbage string all
+           ;; become 1. This test used to assert the OPPOSITE -- that we refuse
+           ;; all three -- and refusing 0 stopped the node from STARTING, where
+           ;; wallet_hd.py:21 runs its second node with -keypool=0 so that no
+           ;; address is handed out before the test asks for one.
+           (dolist (v '("0" "-1" "x"))
+             (bl:apply-rpc-config-globals (list (cons "keypool" v)))
+             (is (= 1 (manager-keypool))
+                 "-keypool=~A did not clamp to 1" v))
            ;; Relative -walletdir hangs off the data directory, absolute wins
            ;; outright, and NIL restores <datadir>/wallets/.
            (let ((manager (bl.wallet::make-wallet-manager
@@ -2242,10 +2255,7 @@ would pass even if no struct ever consulted it."
              (is (equal #p"/srv/keys/"
                         (bl.wallet::wallets-directory manager)))))
       (setf bl.wallet:*default-keypool-size* saved-keypool
-            bl.wallet:*wallet-directory* saved-dir)))
-  ;; Core rejects -keypool=0; so do we, rather than making an unusable wallet.
-  (dolist (bad '((("keypool" . "0")) (("keypool" . "-1")) (("keypool" . "x"))))
-    (signals error (bl:apply-rpc-config-globals bad)))
+            bl.wallet:*wallet-directory* saved-dir))))
   (dolist (name '("keypool" "walletdir"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))

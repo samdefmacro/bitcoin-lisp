@@ -1068,3 +1068,31 @@ stays ASCII."
                          bytes)
                  "the CJK comment is not on disk as its UTF-8 bytes")
         (is (equal cjk (comment-of bytes)))))))
+
+(test rescan-logs-cores-start-line-naming-the-block
+  "Core opens every rescan with
+\"Rescan started from block %s... (%s)\" (wallet/wallet.cpp:1871), the block
+being the uint256 the scan starts at and the parenthesis saying which of the
+two variants is running. Ours named the start HEIGHT instead, which reads more
+easily and is not what a caller can wait for: an importdescriptors rescan runs
+on a worker while the caller drives the wallet's lock from another connection,
+and wallet_importdescriptors.py:717 catches that window by matching this line
+with the genesis hash in it.
+
+The variant text is asserted too: it is the half that says whether the filter
+index is being used, and both spellings were already here."
+  (with-wallet-chain-node (node "rescan-log")
+    (bl.rpc:dispatch-rpc-method node "createwallet" (wire-params '("rlw")))
+    (%wc-mine node 2 (%wc-optrue-address))
+    (let* ((genesis (bl.store:block-index-entry-hash
+                     (bl.store:get-block-at-height (bl:node-chain-state node) 0)))
+           (lines (with-rpc-wallet ("rlw")
+                    (capture-log-lines
+                     (lambda ()
+                       (bl.rpc:dispatch-rpc-method node "rescanblockchain"
+                                                   (wire-params '(0))))))))
+      (is-true (%wc-mentions-p
+                (format nil "Rescan started from block ~A... (slow variant inspecting all blocks)"
+                        (bl.rpc:hash-to-hex genesis))
+                lines)
+               "no Core-shaped rescan line among ~S" lines))))

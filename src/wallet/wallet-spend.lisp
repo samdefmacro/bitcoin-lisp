@@ -119,9 +119,29 @@ is exactly what the operator asked for.")
   "Core DUMMY_NESTED_P2WPKH_INPUT_SIZE (tx sizes fallback for unknown change).")
 (defconstant +min-standard-tx-nonwitness-size+ 65 "policy.h.")
 (defconstant +default-ancestor-limit+ 25
-  "Core DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT — the legacy
-package limits chain.getPackageLimits still reports for the eligibility
-filters (cluster limits are enforced by the mempool itself).")
+  "Core DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT (policy.h:75,77) —
+the legacy package limits chain.getPackageLimits still reports for the
+eligibility filters (cluster limits are enforced by the mempool itself).")
+
+(defvar *package-ancestor-limit* +default-ancestor-limit+
+  "Core -limitancestorcount, the ancestor half of chain.getPackageLimits
+(node/interfaces.cpp:709-717 over kernel/mempool_limits.h:24).
+
+A VARIABLE and not the constant, because the option is what the coin
+eligibility ladder is FOR: with cluster limits doing the mempool's own
+enforcement, this limit is read in exactly one place in this version of Core
+-- AutomaticCoinSelection (wallet/spend.cpp:880-883) -- where it bounds how
+far a chain of the wallet's own unconfirmed change may be extended before the
+next spend must start a new one. Reading the compile-time 25 there let the
+wallet pile every send onto ONE chain until the mempool refused it with
+TOO-LARGE-CLUSTER: wallet_basic.py:499 makes twelve sends over two chains with
+-limitancestorcount=6 and got eleven into the mempool.")
+
+(defvar *package-descendant-limit* +default-ancestor-limit+
+  "Core -limitdescendantcount, the other half of chain.getPackageLimits. The
+wallet calls it max_cluster_count (wallet/spend.cpp:883) and holds an output
+group's whole cluster to it; it is NOT -limitclustercount, which the mempool
+enforces for itself.")
 (defconstant +truc-max-weight+ (* 4 bl.mp:+truc-max-vsize+)
   "policy/truc_policy.h TRUC_MAX_WEIGHT.")
 (defconstant +truc-child-max-weight+
@@ -1322,8 +1342,8 @@ Returns (values sel-result error-message)."
 
 (defun %ordered-filters (include-unsafe)
   "Core AutomaticCoinSelection's eligibility cascade, exactly."
-  (let ((max-ancestors (max 1 +default-ancestor-limit+))
-        (max-cluster (max 1 +default-ancestor-limit+))
+  (let ((max-ancestors (max 1 *package-ancestor-limit*))
+        (max-cluster (max 1 *package-descendant-limit*))
         (filters (list (make-elig-filter :conf-mine 1 :conf-theirs 6
                                          :max-ancestors 0 :max-cluster-count 0
                                          :allow-mixed nil)
@@ -1383,9 +1403,9 @@ Returns (values sel-result error-message)."
               (total-unconf-long-chain 0))
           (dolist (group discarded)
             (incf total-discarded (out-group-selection-amount group))
-            (when (or (>= (out-group-ancestors group) +default-ancestor-limit+)
+            (when (or (>= (out-group-ancestors group) (max 1 *package-ancestor-limit*))
                       (>= (out-group-max-cluster-count group)
-                          +default-ancestor-limit+))
+                          (max 1 *package-descendant-limit*)))
               (incf total-unconf-long-chain
                     (out-group-selection-amount group))))
           (when (< (- total-amount total-discarded) value-to-select)

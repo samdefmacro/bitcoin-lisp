@@ -2481,3 +2481,51 @@ control that the signer itself is fine."
                 "control: the tree input does not sign even with its non_witness_utxo")
             (is (eq t (complete-p (%psbt-spending spk 100000)))
                 "a tr() script-path input carried by witness_utxo alone was refused")))))))
+
+(test walletcreatefundedpsbt-locks-the-coins-it-selected
+  "walletcreatefundedpsbt funds through the SAME wallet::FundTransaction as
+fundrawtransaction (wallet/rpc/spend.cpp:1766 -> :682), whose last step locks
+every input of the funded transaction when lock_unspents was asked for
+(wallet/spend.cpp:1538-1542).
+
+Ours parsed the option and then threw it away -- CreateTransaction was called
+directly and the flag was declared ignored -- so the coins stayed spendable and
+two successive calls funded the SAME UTXOs, leaving a pair of PSBTs of which
+only one could ever be broadcast. The first call here is the control: without
+the option nothing is locked, so the lock below comes from the option and not
+from funding."
+  (%with-pp-node (node "pp-lockunspent")
+    (%pp-fund-wallet node)
+    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 77))
+           (dest (%pp-optrue-address)))
+      (flet ((fund (&rest option-kvs)
+               (bl.rpc:dispatch-rpc-method
+                node "walletcreatefundedpsbt"
+                (wire-params (list '() (list (%ht dest 1)) 0
+                                   (apply #'%ht "fee_rate" 5 option-kvs)))))
+             (locked ()
+               (let ((rows (bl.rpc:dispatch-rpc-method
+                            node "listlockunspent" (wire-params '()))))
+                 (if (vectorp rows) '() rows))))
+        (is (null (locked)) "fixture: the wallet starts with no locked coins")
+        ;; Control: no lock_unspents, nothing locked.
+        (let ((psbt (bl.ser:decode-psbt (%aval "psbt" (fund)))))
+          (is (plusp (length (bl.ser:psbt-inputs psbt)))
+              "the control funded no inputs, so it proves nothing")
+          (is (null (locked))
+              "funding locked coins with no lock_unspents: ~S" (locked)))
+        ;; With the option, every input of the funded transaction is locked.
+        (let* ((psbt (bl.ser:decode-psbt (%aval "psbt" (fund "lock_unspents" t))))
+               (inputs (%pp-input-outpoints (bl.ser:psbt-tx psbt)))
+               (rows (locked)))
+          (is (= (length inputs) (length rows))
+              "~D input~:P funded, ~D locked" (length inputs) (length rows))
+          (dolist (op inputs)
+            (is-true (find-if (lambda (row)
+                                (and (string= (bl.rpc:hash-to-hex (car op))
+                                              (cdr (assoc "txid" row :test #'string=)))
+                                     (eql (cdr op)
+                                          (cdr (assoc "vout" row :test #'string=)))))
+                              rows)
+                     "input ~A:~D was not locked"
+                     (bl.rpc:hash-to-hex (car op)) (cdr op))))))))

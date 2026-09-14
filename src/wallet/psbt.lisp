@@ -1649,12 +1649,18 @@ array-of-objects form when output order matters."
             (setf (wcc-allow-other-inputs cc) (null inputs))
             (multiple-value-bind (change-position lock-unspents)
                 (%parse-fund-options node wallet cc options recipients t)
-              (declare (ignore lock-unspents))
               (setf (wcc-locktime cc) locktime)
+              ;; Core funds this through the SAME wallet::FundTransaction as
+              ;; fundrawtransaction (rpc/spend.cpp:1766 -> :682 -> spend.cpp:
+              ;; 1538-1542), whose last step locks every input of the funded
+              ;; transaction when lock_unspents was asked for. Calling
+              ;; CreateTransaction directly and dropping the flag left the
+              ;; coins unlocked, so two successive walletcreatefundedpsbt calls
+              ;; funded the same UTXOs and only one of the PSBTs could ever be
+              ;; broadcast.
               (multiple-value-bind (tx fee change-pos)
-                  (%create-transaction node wallet recipients change-position cc nil)
-                (unless tx
-                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message fee))
+                  (%fund-transaction-for-send node wallet recipients
+                                              change-position lock-unspents cc)
                 `(("psbt" . ,(%wallet-unsigned-psbt node wallet tx bip32derivs))
                   ("fee" . ,(bl.rpc:satoshi->btc fee))
                   ("changepos" . ,(or change-pos -1)))))))))))

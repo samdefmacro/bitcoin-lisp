@@ -1510,8 +1510,14 @@ away) / :user-abort."
         (rf nil)
         (skipped 0))
     (when bfi (setf rf (%make-wallet-rescan-filter wallet)))
-    (bl:log-info "Wallet ~A: rescan started from height ~D (~A)"
-                           (wallet-name wallet) start-height
+    ;; Core's own sentence, the BLOCK and not the height (wallet.cpp:1871,
+    ;; "Rescan started from block %s... (%s)"). The height reads more easily
+    ;; and is not what a caller can wait for: wallet_importdescriptors.py:717
+    ;; matches this line by its genesis hash to catch the rescan while the
+    ;; wallet it is running for is still unlocked.
+    (bl:log-info "Wallet ~A: Rescan started from block ~A... (~A)"
+                           (wallet-name wallet)
+                           (bl.rpc:hash-to-hex start-hash)
                            (if rf
                                "fast variant using block filters"
                                "slow variant inspecting all blocks"))

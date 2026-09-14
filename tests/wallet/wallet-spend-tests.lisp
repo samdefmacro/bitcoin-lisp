@@ -1673,3 +1673,46 @@ ParseOutputType and Core's own -5 (:547)."
         ;; empty one is Core's -5 and not the type error above.
         (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+ "Unknown change type ''")
                    (answer '(("change_type" . "")))))))))
+
+(test the-coin-eligibility-ladder-reads-limitancestorcount
+  "Core's AutomaticCoinSelection builds its eligibility ladder from
+chain.getPackageLimits (wallet/spend.cpp:872-883 over node/interfaces.cpp:
+709-717), so -limitancestorcount decides how far a chain of the wallet's own
+unconfirmed change may be extended before the next spend has to start a new
+one. Nothing else reads that limit any more: cluster limits are what the
+mempool enforces (txmempool.cpp:800-809).
+
+Ours read the compile-time DEFAULT_ANCESTOR_LIMIT of 25 instead, so the option
+did nothing and the wallet kept piling sends onto ONE chain until the mempool
+refused one with TOO-LARGE-CLUSTER -- wallet_basic.py:499 makes twelve sends
+over two chains under -limitancestorcount=6 and only eleven reached the
+mempool.
+
+With the limit at 3 and -walletrejectlongchains on (Core's default), the
+fourth send off a single confirmed coin has no eligible coin left and is
+Core's own refusal. The three that DO succeed are the positive control: the
+limit refuses the fourth, not every send."
+  (let ((bl.wallet:*package-ancestor-limit* 3)
+        (bl.wallet:*package-descendant-limit* 3)
+        (bl.wallet:*wallet-reject-long-chains* t))
+    (with-wallet-chain-node (node "ws-chainlimit")
+      (%ws-fund-wallet node)
+      (let ((dest (%wc-optrue-address)))
+        (flet ((send ()
+                 ;; An explicit fee_rate (the tenth positional argument), so
+                 ;; the answer here is coin selection's and never the fee
+                 ;; estimator's.
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.rpc:dispatch-rpc-method
+                     node "sendtoaddress"
+                     (wire-params (list dest 1 nil nil nil nil nil nil nil 10)))))))
+          ;; One SEND per check: a fiveam IS evaluates its message arguments
+          ;; eagerly, so naming (SEND) in the failure text would spend again.
+          (dotimes (i 3)
+            (let ((refusal (send)))
+              (is (null refusal) "send ~D of the chain was refused: ~S"
+                  (1+ i) refusal)))
+          (is (equal (cons bl.rpc:+rpc-wallet-insufficient-funds+
+                           "Unconfirmed UTXOs are available, but spending them creates a chain of transactions that will be rejected by the mempool")
+                     (send))))))))
