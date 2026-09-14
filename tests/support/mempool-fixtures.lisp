@@ -16,6 +16,25 @@
     (setf (aref spk 22) #x87)       ; OP_EQUAL
     spk))
 
+(defun p2sh-optrue-scriptsig ()
+  "scriptSig spending P2SH(OP_TRUE): a single push of the 1-byte redeemScript."
+  (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(#x01 #x51)))
+
+(defun pkg-tx (prev-txid prev-index out-value &key (sequence #xffffffff) (version 2))
+  "A non-witness tx spending (PREV-TXID, PREV-INDEX) via P2SH(OP_TRUE), paying
+OUT-VALUE to one P2SH(OP_TRUE) output."
+  (bl.ser:make-transaction
+   :version version
+   :inputs (vector (bl.ser:make-tx-in
+                  :previous-output (bl.ser:make-outpoint
+                                    :hash prev-txid :index prev-index)
+                  :script-sig (p2sh-optrue-scriptsig)
+                  :sequence sequence))
+   :outputs (vector (bl.ser:make-tx-out
+                   :value out-value
+                   :script-pubkey (p2sh-optrue-script-pubkey)))
+   :lock-time 0))
+
 (defun make-package-fixture (&key (fund-value 100000000) (fund-height 1) (current-height 200))
   "Return (values utxo-set mempool chain-state funding-txid). The funding UTXO is
 a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."

@@ -58,7 +58,7 @@ file reached the handler symbol directly."
    :inputs (vector (bl.ser:make-tx-in
                     :previous-output (bl.ser:make-outpoint
                                       :hash prev-txid :index prev-vout)
-                    :script-sig (%p2sh-optrue-scriptsig)
+                    :script-sig (p2sh-optrue-scriptsig)
                     :sequence sequence))
    :outputs (vector (bl.ser:make-tx-out
                      :value value :script-pubkey spk))

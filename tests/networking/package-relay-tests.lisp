@@ -15,7 +15,7 @@
 ;;; could never be accepted, mined or relayed.
 ;;;
 ;;; Spendable fixtures are the P2SH(OP_TRUE) transactions from
-;;; package-tests.lisp (%pkg-tx / make-package-fixture / %p2sh-optrue-*): standard,
+;;; package-tests.lisp (pkg-tx / make-package-fixture / %p2sh-optrue-*): standard,
 ;;; non-witness, and valid without a signing key. Non-witness means
 ;;; txid == wtxid, which is also the exact shape of the second divergence
 ;;; tested here.
@@ -60,7 +60,7 @@ transaction's own validity being at stake."
                       (bl.ser:make-tx-in
                        :previous-output (bl.ser:make-outpoint
                                          :hash (car in) :index (cdr in))
-                       :script-sig (%p2sh-optrue-scriptsig)
+                       :script-sig (p2sh-optrue-scriptsig)
                        :sequence #xffffffff))
                     inputs)
                    'vector)
@@ -140,9 +140,9 @@ asserted, because each one used to fail:
 Against main this fails at step 1 already, and there is no path at all from
 step 3 to the mempool."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
+    (let* ((parent (pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
-           (child (%pkg-tx pid 0 (- 100000000 5 50000)))
+           (child (pkg-tx pid 0 (- 100000000 5 50000)))
            (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
@@ -172,9 +172,9 @@ parent's very first fee failure forms the package (Core's
 ProcessInvalidTx -> Find1P1CPackage on first_time_failure,
 txdownloadman_impl.cpp:460-465). No re-announcement is needed."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
+    (let* ((parent (pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
-           (child (%pkg-tx pid 0 (- 100000000 5 50000)))
+           (child (pkg-tx pid 0 (- 100000000 5 50000)))
            (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
@@ -190,7 +190,7 @@ txdownloadman_impl.cpp:460-465). No re-announcement is needed."
 re-arriving low-fee parent is still not accepted. The fee floor is intact —
 1p1c relay makes the parent reconsiderable, not acceptable."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
+    (let* ((parent (pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
@@ -205,9 +205,9 @@ peer announced (txdownloadman_impl.cpp:303-307), so a flood of fake children
 from an attacker cannot displace the honest peer's real one. Here the child
 comes from peer B, the parent from peer A: no package is formed."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
+    (let* ((parent (pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
-           (child (%pkg-tx pid 0 (- 100000000 5 50000)))
+           (child (pkg-tx pid 0 (- 100000000 5 50000)))
            (cid (bl.ser:transaction-hash child))
            (peer-a (%pr-peer))
            (peer-b (%pr-peer)))
@@ -229,9 +229,9 @@ parent (txdownloadman_impl.cpp:371-396): the child stays in the orphanage.
 Previously the parent's fee failure sat in the MAIN filter and the child was
 blacklisted under both of its own ids — permanently, until the next block."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
+    (let* ((parent (pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
-           (child (%pkg-tx pid 0 (- 100000000 5 50000)))
+           (child (pkg-tx pid 0 (- 100000000 5 50000)))
            (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       ;; The precondition that makes this case distinct.
@@ -289,7 +289,7 @@ zero on the second would prove nothing."
     (let* ((peer (%pr-peer))
            ;; version 5 > +max-standard-tx-version+: rejected as
            ;; :version-non-standard, a plain (non-reconsiderable) failure.
-           (bad (%pkg-tx funding 0 (- 100000000 10000) :version 5))
+           (bad (pkg-tx funding 0 (- 100000000 10000) :version 5))
            (bad-id (bl.ser:transaction-hash bad)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
@@ -358,9 +358,9 @@ validate-package-for-mempool fails at the package-RBF step — a PACKAGE-level
 failure that overwrites no member result. Returns
 (values utxo mempool state rival parent child)."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((rival (%pkg-tx funding 0 (- 100000000 50000)))     ; fee 50000
-           (parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
-           (child (%pkg-tx (bl.ser:transaction-hash parent)
+    (let* ((rival (pkg-tx funding 0 (- 100000000 50000)))     ; fee 50000
+           (parent (pkg-tx funding 0 (- 100000000 5)))        ; fee 5
+           (child (pkg-tx (bl.ser:transaction-hash parent)
                            0 (- 100000000 5 10000))))          ; fee 10000
       (values utxo mempool state rival parent child))))
 
@@ -499,7 +499,7 @@ TX_MISSING_INPUTS, txdownloadman_impl.cpp:490-492), and is dropped on
 re-arrival WITHOUT being re-validated. The parent's :insufficient-fee still
 goes to the reconsiderable filter — CONTROL (b) again, on this path."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
+    (let* ((parent (pkg-tx funding 0 (- 100000000 5)))        ; fee 5
            (pid (bl.ser:transaction-hash parent))
            (pwtxid (bl.ser:transaction-wtxid parent))
            (child (%pr-badscript-child pid (- 100000000 5 10000)))
@@ -541,8 +541,8 @@ never forms and this control asserts nothing")
 which is what lets a failed 1p1c pairing be remembered once."
   (multiple-value-bind (u m c funding) (make-package-fixture)
     (declare (ignore u m c))
-    (let* ((a (%pkg-tx funding 0 99990000))
-           (b (%pkg-tx (bl.ser:transaction-hash a) 0 99980000))
+    (let* ((a (pkg-tx funding 0 99990000))
+           (b (pkg-tx (bl.ser:transaction-hash a) 0 99980000))
            (h1 (bl.val:package-hash (list a b)))
            (h2 (bl.val:package-hash (list b a))))
       (is (= 32 (length h1)))
@@ -1004,7 +1004,7 @@ from peer=0' while waiting for the transaction to reach node0's mempool.
 Nothing was announced and nothing was logged."
   (with-network (:regtest)
    (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-    (let* ((tx (%pkg-tx funding 0 (- 100000000 50000)))
+    (let* ((tx (pkg-tx funding 0 (- 100000000 50000)))
            (txid (bl.ser:transaction-hash tx))
            (ordinary (%pr-peer))
            (downstream (%pr-peer)))
@@ -1101,7 +1101,7 @@ greps for the forcerelay line that follows it."
                   :inputs (vector (bl.ser:make-tx-in
                                    :previous-output (bl.ser:make-outpoint
                                                      :hash funding :index 0)
-                                   :script-sig (%p2sh-optrue-scriptsig)
+                                   :script-sig (p2sh-optrue-scriptsig)
                                    :sequence #xffffffff))
                   :outputs (vector (bl.ser:make-tx-out
                                     :value (- 100000000 50000)
@@ -1146,7 +1146,7 @@ dropped and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
   (with-network (:regtest)
     (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
       (declare (ignore utxo state))
-      (let* ((tx (%pkg-tx funding 0 (- 100000000 23)))
+      (let* ((tx (pkg-tx funding 0 (- 100000000 23)))
              (txid (bl.ser:transaction-hash tx)))
         (bl.mp:accept-validated-tx mempool txid tx 23 200)
         (let* ((entry (bl.mp:mempool-get mempool txid))
