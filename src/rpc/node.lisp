@@ -173,6 +173,21 @@ the unbroadcast re-announce interval and then asserts the re-announce happened).
     ;; mockscheduler without a prior setmocktime relies on that.
     (setf bl.ser:*mock-time*
           (+ (bl.ser:get-unix-time) delta))
+    ;; Core's MockForward moves every scheduled task's deadline back by DELTA
+    ;; and the scheduler THREAD then runs whatever has come due
+    ;; (scheduler.cpp; rpc/node.cpp:86-99). Our periodic work has no thread of
+    ;; its own -- it is cadence-gated inside the sync thread's idle tick -- so
+    ;; running what is now due here is the same event, on the thread that has
+    ;; just moved the clock. Without it the work happens only when the sync
+    ;; thread next ticks, which is not within the one second
+    ;; feature_fee_estimation.py:345/:371 waits after the call, and on a node
+    ;; that has just restarted the first tick can be several seconds out.
+    (let ((node bl:*node*))
+      (when node
+        (let ((estimator (bl:node-fee-estimator node)))
+          (when estimator
+            (ignore-errors (bl.mp:maybe-flush-fee-estimates estimator))))
+        (ignore-errors (bl::maybe-dump-peer-addresses node))))
     :null))
 
 (defparameter *client-bug-report-url*

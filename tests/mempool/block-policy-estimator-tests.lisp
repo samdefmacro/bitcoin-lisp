@@ -665,4 +665,14 @@ second for that log line, so the cadence must be read off the mockable clock."
                "Core's sentence, with the path; got ~S" lines))
     ;; And the clock rearms rather than flushing on every later call.
     (is (null (bl.mp:maybe-flush-fee-estimates estimator))
-        "the interval restarts after a flush")))
+        "the interval restarts after a flush")
+    ;; `mockscheduler' must RUN what is now due, not merely move the clock:
+    ;; Core's MockForward pulls every scheduled deadline back and the
+    ;; scheduler thread runs what has come due (rpc/node.cpp:86-99). Our
+    ;; periodic work is cadence-gated inside the sync thread's idle tick, so
+    ;; the RPC runs it on the thread that moved the clock -- otherwise the
+    ;; flush waits for the next tick, which is not within the one second the
+    ;; test allows and can be several seconds on a node that just restarted.
+    (is-true (search "(bl.mp:maybe-flush-fee-estimates estimator)"
+                     (%rpc-source-text))
+             "mockscheduler no longer runs the due fee-estimate flush")))
