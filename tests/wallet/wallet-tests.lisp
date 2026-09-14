@@ -2161,6 +2161,69 @@ refuses to bump an already-bumped tx."
             (signals bl.rpc:rpc-error
               (bl.wallet::rpc-bumpfee node (list txid-hex (%ht "fee_rate" 40))))))))))
 
+(test bumpfee-outputs-replaces-the-original-outputs
+  "Core's bumpfee takes an `outputs' option -- a whole new output set that
+REPLACES the original transaction's (wallet/rpc/spend.cpp:1073-1080 builds it
+with AddOutputs; feebumper::CreateRateBumpTransaction:250 then reads
+`outputs.empty() ? wtx.tx->vout : outputs' and fills its recipients from that,
+:251-262). Its sibling `original_change_index' names which of the ORIGINAL
+outputs is the change to recycle, and the two are refused together
+(:161-165), as is an index past the end (:180-183).
+
+We accepted both option names in the argument table and then ignored them, so
+bumpfee(txid, outputs={addr: amount}) rebuilt the ORIGINAL outputs and paid the
+old destination -- wallet_bumpfee.py:345 asserts the bumped wallet transaction
+has one detail and that it names the NEW address.
+
+The default bump is the control: with no `outputs' the replacement must still
+carry the original destination, so a change that always rebuilt from the option
+would fail there."
+  (%with-pp-node (node "pp-bumpouts")
+    (%pp-fund-wallet node :blocks 5)
+    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 23))
+           (dest (%pp-optrue-address)))
+      (flet ((send (rate)
+               (bl.wallet::rpc-sendtoaddress
+                node (list dest 1 nil nil nil nil nil nil nil rate)))
+             (spk-of (address)
+               (nth-value 1 (bl.crypto:decode-address address :regtest)))
+             (outputs-of (txid-hex)
+               (map 'list #'bl.ser:tx-out-script-pubkey
+                    (bl.ser:transaction-outputs
+                     (%pp-mempool-tx node (bl.rpc:parse-hex-hash txid-hex))))))
+        ;; Control: no `outputs' option, so the original destination survives.
+        (let* ((plain (send 5))
+               (bumped (%aval "txid" (bl.wallet::rpc-bumpfee
+                                      node (list plain (%ht "fee_rate" 20))))))
+          (is-true (member (spk-of dest) (outputs-of bumped) :test #'equalp)
+                   "a plain bump must keep the original destination"))
+        ;; And with it, the new set replaces the old one entirely.
+        (let* ((new-address (bl.wallet::rpc-getnewaddress node '("" "bech32")))
+               (txid (send 5))
+               (bumped (%aval "txid"
+                              (bl.wallet::rpc-bumpfee
+                               node (list txid
+                                          (%ht "fee_rate" 20
+                                               "outputs" (list (%ht new-address "0.00030000")))))))
+               (scripts (outputs-of bumped)))
+          (is-true (member (spk-of new-address) scripts :test #'equalp)
+                   "the replacement does not pay the address `outputs' names")
+          (is-false (member (spk-of dest) scripts :test #'equalp)
+                    "the replacement still pays the ORIGINAL destination"))
+        ;; The two options Core refuses together, and an index past the end.
+        (let ((txid (send 5)))
+          (is (equal (cons -8 "The options 'outputs' and 'original_change_index' are incompatible. You can only either specify a new set of outputs, or designate a change output to be recycled.")
+                     (rpc-error-of
+                      (lambda ()
+                        (bl.wallet::rpc-bumpfee
+                         node (list txid (%ht "outputs" (list (%ht dest "0.00030000"))
+                                              "original_change_index" 0)))))))
+          (is (equal (cons -8 "Change position is out of range")
+                     (rpc-error-of
+                      (lambda ()
+                        (bl.wallet::rpc-bumpfee
+                         node (list txid (%ht "original_change_index" 9))))))))))))
+
 (test pp-psbtbumpfee-unsigned
   "psbtbumpfee returns an UNSIGNED PSBT of the replacement without broadcasting;
 the original stays in the mempool, and walletprocesspsbt completes the PSBT."
