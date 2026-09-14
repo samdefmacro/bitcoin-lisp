@@ -188,6 +188,63 @@ it hunts."
   "Memo for %ORPHAN-EXPORTED-FUNCTIONS: the sweep reads every file under src/
 and nothing between the tests in this file can change its answer.")
 
+(defvar *source-corpus* nil
+  "Memo: every file under src/ as (relative-name . lines), read once per image.
+Nothing between the tests here edits src/ -- but an EDIT BETWEEN RUNS does,
+and the memo cannot see it: see *SOURCE-CORPUS-STAMP*.")
+
+(defvar *source-corpus-stamp* nil
+  "The fingerprint of src/ as *SOURCE-CORPUS* last read it -- one
+(relative-name . file-write-date) pair per file, in corpus order.
+
+Why the memos need a stamp at all. The warm image holds *SOURCE-CORPUS* and
+everything derived from it for the life of the session, so after any edit,
+rebase or branch switch every ratchet in this file reports on a checkout that
+is no longer on disk -- in BOTH directions: a long-function ratchet accused a
+function byte-identical to its baseline (2026-09-14), and the same memo would
+as happily pass a ratchet the edit had just broken. Prose did not stop it
+twice, so %REFRESH-SOURCE-MEMOS makes it mechanical: every reader of a
+src-derived memo re-takes this fingerprint first and drops all of them when it
+has moved. A file EDITED, ADDED or REMOVED moves it, which is why it is the
+whole list and not a high-water mark.")
+
+(defvar *source-text* nil
+  "Memo: all of src/ as one downcased string (%SOURCE-TEXT).")
+
+(defvar *toplevel-definitions-cache* nil
+  "Memo: every top-level definition under src/ (%TOPLEVEL-DEFINITIONS).")
+
+(defun %source-files ()
+  "Every file of src/, sorted -- the corpus's own enumeration."
+  (sort (directory (merge-pathnames "src/**/*.lisp"
+                                    (asdf:system-source-directory :bitcoin-lisp)))
+        #'string< :key #'namestring))
+
+(defun %source-fingerprint (&optional (files (%source-files)))
+  "src/ as a list of (relative-name . file-write-date), in corpus order."
+  (let ((root (asdf:system-source-directory :bitcoin-lisp)))
+    (loop for path in files
+          collect (cons (enough-namestring path root)
+                        (or (ignore-errors (file-write-date path)) 0)))))
+
+(defun %source-memos-stale-p (stamp fingerprint)
+  "T when FINGERPRINT (src/ as it is now) is not the STAMP the memos were taken
+under: no stamp yet, a file written since, or a file added or removed."
+  (not (and stamp (equal stamp fingerprint))))
+
+(defun %refresh-source-memos ()
+  "Drop every memo derived from src/ when src/ has changed under the image.
+Called first by each of the three memo readers, so no entry point can reach a
+stale one. Returns T when it dropped them."
+  (let ((fingerprint (%source-fingerprint)))
+    (when (%source-memos-stale-p *source-corpus-stamp* fingerprint)
+      (setf *source-corpus* nil
+            *source-text* nil
+            *toplevel-definitions-cache* nil
+            *orphan-sweep-cache* nil
+            *source-corpus-stamp* fingerprint)
+      t)))
+
 (defun %orphan-exported-functions ()
   "Every exported function in the project's packages with no caller in src/.
 
@@ -198,6 +255,7 @@ in the tests package, or when src/ references the function as an object (see
 DEFSTRUCT-generated predicates and accessors are excluded: SBCL gives them a
 source-transform and hand-written functions have none, so the two separate
 cleanly and the many unused accessors do not bury the real finding."
+  (%refresh-source-memos)
   (or *orphan-sweep-cache*
       (setf *orphan-sweep-cache*
             (let* ((src (%source-text))
@@ -447,24 +505,19 @@ parallel script-check worker can reach it, synchronize it: ~S"
 ;;;; sees -- including a docstring line that happens to begin with a paren.
 ;;;; ====================================================================
 
-(defvar *source-corpus* nil
-  "Memo: every file under src/ as (relative-name . lines), read once per image.
-Nothing between the tests here edits src/.")
-
 (defun %source-corpus ()
+  (%refresh-source-memos)
   (or *source-corpus*
       (setf *source-corpus*
             (let ((root (asdf:system-source-directory :bitcoin-lisp)))
-              (loop for path in (sort (directory (merge-pathnames "src/**/*.lisp" root))
-                                      #'string< :key #'namestring)
+              (loop for path in (%source-files)
                     collect (cons (enough-namestring path root)
                                   (coerce (uiop:read-file-lines path :external-format :utf-8)
                                           'vector)))))))
 
-(defvar *source-text* nil)
-
 (defun %source-text ()
   "All of src/ as one downcased string, for call-site counting."
+  (%refresh-source-memos)
   (or *source-text*
       (setf *source-text*
             (with-output-to-string (o)
@@ -549,10 +602,9 @@ closing paren, which would count as a line."
                                               :preserve-whitespace t)))))
     (1+ (count #\Newline text :start start :end end))))
 
-(defvar *toplevel-definitions-cache* nil)
-
 (defun %toplevel-definitions ()
   "Every top-level DEFUN/DEFMACRO under src/, with its length in lines."
+  (%refresh-source-memos)
   (or *toplevel-definitions-cache*
       (setf *toplevel-definitions-cache*
             (loop for (file . lines) in (%source-corpus)
@@ -1994,3 +2046,65 @@ a foreign package and a prefix inside a string literal do not")
            (%package-layer "bitcoin-lisp.storage" order)))
     (is (= (%package-layer "bitcoin-lisp.coalton.interop" order)
            (%file-layer "src/coalton/interop.lisp" order)))))
+
+;;;; ====================================================================
+;;;; The src-derived memos must not outlive an edit
+;;;;
+;;;; Every ratchet in this file reads one of four memos taken from src/ once
+;;;; per image. A warm image that has answered one ratchet is then answering
+;;;; the rest -- and the next run, after a rebase or an edit -- from a
+;;;; checkout that is no longer on disk. Observed 2026-09-14 in both
+;;;; directions: a long-function ratchet accused a function byte-identical to
+;;;; its baseline, and the same memo would have passed a ratchet the edit had
+;;;; just broken. %REFRESH-SOURCE-MEMOS is the mechanical answer; these two
+;;;; tests are its controls, because a guard nothing exercises is a guard that
+;;;; can go inert exactly as quietly as the memo it replaced.
+;;;; ====================================================================
+
+(test source-memo-staleness-is-detected
+  "Positive control for the comparison %REFRESH-SOURCE-MEMOS asks. It must say
+STALE for each of the three ways src/ can move under a warm image -- a file
+written, a file added, a file removed -- and FRESH for the fingerprint it was
+taken from, or the refresh would either never fire or fire on every call."
+  (let* ((now (%source-fingerprint))
+         (written (cons (cons (car (first now)) (1+ (cdr (first now))))
+                        (rest now)))
+         (added (cons (cons "src/zzz-not-a-file.lisp" 1) now))
+         (removed (rest now)))
+    (is (plusp (length now)) "the fingerprint must cover a non-empty src/")
+    (is-false (%source-memos-stale-p now now)
+              "an unchanged src/ must not invalidate the memos")
+    (is-true (%source-memos-stale-p nil now)
+             "a memo with no stamp at all is stale")
+    (is-true (%source-memos-stale-p written now)
+             "a file written since the memo was taken must invalidate it")
+    (is-true (%source-memos-stale-p added now)
+             "a file added since the memo was taken must invalidate it")
+    (is-true (%source-memos-stale-p removed now)
+             "a file removed since the memo was taken must invalidate it")))
+
+(test every-source-memo-reader-consults-the-staleness-guard
+  "Each of the four memo readers must re-take the fingerprint BEFORE answering,
+or a reader that is never the first one called in a session keeps serving the
+value it cached. Planted here by poisoning one memo and moving the stamp out
+from under it: the reader must hand back the tree, not the poison."
+  (let ((stale '(("src/zzz-stamp-that-cannot-match.lisp" . 0))))
+    (%source-corpus) (%source-text) (%toplevel-definitions)
+    (setf *source-corpus* (list (cons "src/zzz-poison.lisp" #("(defun zzz-poison () 1)")))
+          *source-corpus-stamp* stale)
+    (is-false (assoc "src/zzz-poison.lisp" (%source-corpus) :test #'string=)
+              "%SOURCE-CORPUS must re-read src/ after the stamp moved")
+    (setf *source-text* "zzz-poison-marker"
+          *source-corpus-stamp* stale)
+    (is-false (search "zzz-poison-marker" (%source-text))
+              "%SOURCE-TEXT must re-read src/ after the stamp moved")
+    (setf *toplevel-definitions-cache*
+          (list (make-%definition :kind :defun :name "zzz-poison"
+                                  :file "src/zzz-poison.lisp" :line 1 :length 1))
+          *source-corpus-stamp* stale)
+    (is-false (find "zzz-poison" (%toplevel-definitions) :key #'%def-name :test #'string=)
+              "%TOPLEVEL-DEFINITIONS must re-read src/ after the stamp moved")
+    (setf *orphan-sweep-cache* (list "zzz-poison-export")
+          *source-corpus-stamp* stale)
+    (is-false (member "zzz-poison-export" (%orphan-exported-functions) :test #'string=)
+              "%ORPHAN-EXPORTED-FUNCTIONS must re-run after the stamp moved")))
