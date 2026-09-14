@@ -1110,17 +1110,35 @@ gating ~70 of Core's tests."
   "Core raises on a missing '@', a height that is not a non-negative integer,
 and a name that is not a buried deployment (chainparams.cpp:51-66). Silently
 ignoring a typo'd name is the worst outcome: the test then runs against the
-very height it was trying to move, and passes for the wrong reason."
+very height it was trying to move, and passes for the wrong reason.
+
+WHICH of the three it is matters as much as that it is one: Core checks in
+that order and prints a different sentence for each, and rpc_blockchain.py:
+179-190 starts a node three times to read all three back. `@5' is a NAME
+refusal (its height parses) and `csv@5@6' a HEIGHT one (the field after the
+FIRST '@' is `5@6')."
   (flet ((parsed (spec)
            (multiple-value-list
             (bl.val:parse-test-activation-height spec))))
     (is (equal '("csv" 5) (parsed "csv@5")))
     (is (equal '("segwit" 0) (parsed "segwit@0")))
-    (dolist (bad '("csv" "csv@" "csv@-1" "csv@abc" "@5" "nosuch@5"
-                   "CSV@5" "csv@5@6" "" nil))
-      (is (equal '(nil) (parsed bad)) "accepted ~S" bad)))
-  (dolist (bad '(("csv") ("nosuch@5") ("csv@-1")))
-    (signals error (bl.val:apply-test-activation-heights bad)))
+    (dolist (row '(("csv" :format) ("" :format) (nil :format)
+                   ("csv@" :height) ("csv@-1" :height) ("csv@abc" :height)
+                   ("csv@5@6" :height) ("csv@2147483647" :height)
+                   ("@5" :name) ("nosuch@5" :name) ("CSV@5" :name)))
+      (is (equal (list nil (second row)) (parsed (first row)))
+          "~S must be refused as ~S" (first row) (second row))))
+  ;; Core's three sentences, verbatim (chainparams.cpp:52, :58, :65): the whole
+  ;; argument in parentheses, never the half that was wrong.
+  (flet ((refusal (spec)
+           (handler-case (progn (bl.val:apply-test-activation-heights (list spec)) nil)
+             (error (e) (princ-to-string e)))))
+    (is (string= "Invalid name (name@2) for -testactivationheight=name@height."
+                 (refusal "name@2")))
+    (is (string= "Invalid height value (bip34@-2) for -testactivationheight=name@height."
+                 (refusal "bip34@-2")))
+    (is (string= "Invalid format () for -testactivationheight=name@height."
+                 (refusal ""))))
   (bl.val:apply-test-activation-heights nil))
 
 (test testactivationheight-and-mocktime-are-repeatable-options
