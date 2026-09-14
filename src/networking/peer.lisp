@@ -317,7 +317,23 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;;     requests to this peer start just above it, so we only ever ask a peer
   ;;     for blocks on the peer's OWN chain — the fix for fixating on a fork
   ;;     whose blocks no connected peer serves.
-  (last-common-block-hash nil))
+  (last-common-block-hash nil)
+  ;; --- Queued block announcements (Core Peer::m_blocks_for_headers_relay,
+  ;; net_processing.h). UpdatedBlockTip only QUEUES a new tip here
+  ;; (net_processing.cpp:2180-2188); SendMessages turns the whole queue into
+  ;; ONE announcement per pass (:5830-5956) -- up to 8 connected headers as a
+  ;; single headers message, or one inv for the tip. Ours announced
+  ;; synchronously from whatever thread connected the block, so a 400-block
+  ;; `generate' put 400 separate invs on the wire per peer.
+  ;;
+  ;; Oldest-first, and written only under the node lock (the connect path) or
+  ;; on the sync thread (the flush), which are the same two writers the peer
+  ;; list already has.
+  (blocks-for-headers-relay '() :type list)
+  ;; The highest header we have SENT this peer (Core
+  ;; CNodeState::pindexBestHeaderSent), the second half of PeerHasHeader: a
+  ;; header we just sent is one the peer has, even before it tells us so.
+  (best-header-sent-hash nil))
 
 (defun peer-log-name (peer)
   "How a log line names PEER: Core's `peer=%d%s' of GetId() and
@@ -843,7 +859,8 @@ announcements from us is PEER-TX-RELAY-P (their version's fRelay)."
   "Check if transaction relay is enabled for the current network: always on
 test networks, disabled by default on mainnet for safety (a non-participation
 posture stricter than Core's -blocksonly — it also gates block relay and
-local-submission announcements; see relay-block / relay-transaction).
+local-submission announcements; see flush-block-announcements /
+relay-transaction).
 Returns a strict boolean. The Core-parity incoming-tx switch is
 IGNORE-INCOMING-TXS-P, which this feeds."
   (and (or (member bl:*network* '(:testnet3 :testnet4 :signet :regtest))

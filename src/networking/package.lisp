@@ -379,6 +379,10 @@ headerssync.cpp. src/networking/.")
    #:peer-addr-rate-limited
    #:peer-addr-relay-enabled
    #:peer-best-known-block-hash
+   #:peer-blocks-for-headers-relay
+   #:peer-best-header-sent-hash
+   #:queue-block-announcement
+   #:flush-block-announcements
    #:peer-compact-block-high-bandwidth-to
    #:peer-connected-at
    #:peer-connection
@@ -392,7 +396,6 @@ headerssync.cpp. src/networking/.")
    #:peer-time-offset
    #:peer-tx-inv-queue
    #:process-headers
-   #:relay-block
    #:snapshot-per-msg-table
    #:start-ibd
    #:update-block-availability

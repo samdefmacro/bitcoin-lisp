@@ -4008,35 +4008,126 @@ the first — is scheduled 10min + rand(5min) out."
              (with-current-node-lock
                (reattempt-initial-broadcast peers mempool)))))))
 
-(defun block-relay-targets (source-peer peers)
-  "The peers a newly-connected block is announced to: every ready peer except
-SOURCE-PEER (which already has it)."
-  (remove-if (lambda (p)
-               (or (eq p source-peer)
-                   (not (eq (peer-state p) :ready))))
-             peers))
+(defconstant +max-blocks-to-announce+ 8
+  "Core MAX_BLOCKS_TO_ANNOUNCE (net_processing.cpp:134): the most headers one
+announcement may carry. A queue longer than this reverts to a single inv for
+the tip and lets the peer's own sync mechanism fetch the rest -- which is what
+keeps a deep reorg from turning into a headers flood.")
 
-(defun relay-block (header source-peer peers)
-  "Announce a newly-connected best-tip block to PEERS except SOURCE-PEER.
-BIP 130: peers that sent sendheaders get a headers message (the cheaper
-announcement Core prefers); the rest get an inv. Gated on relay-enabled-p so a
-relay-disabled node (mainnet default) stays a non-participant. Without this the
-node validates blocks but never propagates them — a pure block sink.
-Deliberately NOT gated on -blocksonly: blocksonly is a TX-relay switch only;
-Core relays blocks normally under it."
-  (unless (relay-enabled-p)
-    (return-from relay-block nil))
-  (let ((headers-msg (bl.ser:make-headers-message (list header)))
-        (inv-msg (bl.ser:make-inv-message
-                  (list (bl.ser:make-inv-vector
-                         :type bl.ser:+inv-type-block+
-                         :hash (bl.ser:block-header-hash header))))))
-    (dolist (peer (block-relay-targets source-peer peers))
-      (handler-case
-          (if (peer-prefers-headers peer)
-              (send-message peer headers-msg)
-              (send-message peer inv-msg))
-        (error () nil)))))
+(defun queue-block-announcement (peer hash)
+  "Queue HASH on PEER for the next announcement pass (Core UpdatedBlockTip
+pushing onto Peer::m_blocks_for_headers_relay, net_processing.cpp:2180-2188).
+
+QUEUEING, not sending, is the whole point: Core announces once per
+SendMessages pass, so a run of connected blocks becomes ONE headers message
+(or one inv for the tip), while announcing at connect time put one message per
+block on the wire -- 400 invs per peer for a 400-block `generate'."
+  (setf (peer-blocks-for-headers-relay peer)
+        (nconc (peer-blocks-for-headers-relay peer) (list hash))))
+
+(defun %peer-has-header-p (peer chain-state entry)
+  "Core PeerHasHeader (net_processing.cpp:1352-1359): the peer has ENTRY when
+it is an ANCESTOR of the peer's best-known block, or of the highest header we
+have already sent it.
+
+The ancestor half is what makes this true for everything BELOW the peer's tip,
+not just for the tip itself -- so a peer that announced block 100 is not sent
+blocks 1..99 back."
+  (flet ((covers (known-hash)
+           (let ((known (and known-hash
+                             (bl.store:get-block-index-entry chain-state known-hash))))
+             (and known
+                  (let ((ancestor (bl.store:entry-ancestor-at-height
+                                   known (bl.store:block-index-entry-height entry))))
+                    (and ancestor
+                         (equalp (bl.store:block-index-entry-hash ancestor)
+                                 (bl.store:block-index-entry-hash entry))))))))
+    (or (covers (peer-best-known-block-hash peer))
+        (covers (peer-best-header-sent-hash peer)))))
+
+(defun %announcement-headers (peer chain-state)
+  "The headers PEER's queue should be announced as, or NIL to fall back to an
+inv (Core SendMessages' fRevertToInv walk, net_processing.cpp:5830-5892).
+
+Core's rules, in Core's order: a peer that did not ask for headers gets an inv;
+so does a queue longer than MAX_BLOCKS_TO_ANNOUNCE. Otherwise walk the queue
+oldest-first, skipping what the peer already has until the first NEW block,
+then take the rest -- bailing out to an inv on anything that has left the
+active chain or does not connect to what came before it."
+  (let ((queue (peer-blocks-for-headers-relay peer)))
+    (when (or (not (peer-prefers-headers peer))
+              (> (length queue) +max-blocks-to-announce+))
+      (return-from %announcement-headers nil))
+    (let ((headers '())
+          (started nil)
+          (previous nil))
+      (dolist (hash queue (nreverse headers))
+        (let ((entry (bl.store:get-block-index-entry chain-state hash)))
+          (unless (and entry (bl.store:entry-on-active-chain-p chain-state entry))
+            (return-from %announcement-headers nil))
+          (when (and previous
+                     (not (equalp (bl.ser:block-header-prev-block
+                                   (bl.store:block-index-entry-header entry))
+                                  (bl.store:block-index-entry-hash previous))))
+            ;; The queued blocks do not chain: revert, as Core does.
+            (return-from %announcement-headers nil))
+          (setf previous entry)
+          (cond (started
+                 (push (bl.store:block-index-entry-header entry) headers))
+                ((%peer-has-header-p peer chain-state entry))  ; keep looking
+                ((let ((prev (bl.store:block-index-entry-prev-entry entry)))
+                   (or (null prev) (%peer-has-header-p peer chain-state prev)))
+                 (setf started t)
+                 (push (bl.store:block-index-entry-header entry) headers))
+                ;; Neither this header nor its parent will connect for the
+                ;; peer: an inv is the only useful answer.
+                (t (return-from %announcement-headers nil))))))))
+
+(defun %flush-peer-block-announcements (peer chain-state)
+  "Turn PEER's queued announcements into ONE message and clear the queue (Core
+SendMessages' block-announcement section, net_processing.cpp:5825-5956).
+Returns T when something was sent."
+  (let ((queue (peer-blocks-for-headers-relay peer)))
+    (when queue
+      (unwind-protect
+           (let ((headers (%announcement-headers peer chain-state)))
+             (cond
+               (headers
+                (send-message peer (bl.ser:make-headers-message headers))
+                ;; Remember the highest header sent: PeerHasHeader asks it
+                ;; next time, so the peer is never sent the same range twice.
+                (setf (peer-best-header-sent-hash peer)
+                      (bl.ser:block-header-hash (car (last headers))))
+                t)
+               (t
+                ;; Revert to an inv of the LAST queued hash -- Core's "just try
+                ;; to inv the tip" (:5931-5953) -- unless the peer has it.
+                (let* ((hash (car (last queue)))
+                       (entry (bl.store:get-block-index-entry chain-state hash)))
+                  (when (and entry
+                             (not (%peer-has-header-p peer chain-state entry)))
+                    (send-message
+                     peer
+                     (bl.ser:make-inv-message
+                      (list (bl.ser:make-inv-vector
+                             :type bl.ser:+inv-type-block+ :hash hash))))
+                    t)))))
+        (setf (peer-blocks-for-headers-relay peer) nil)))))
+
+(defun flush-block-announcements (peers chain-state)
+  "Announce every peer's queued blocks, one message per peer (Core's
+SendMessages pass). Driven from the idle tick, which is where the rest of
+SendMessages' per-pass duties already run. Gated on RELAY-ENABLED-P like
+RELAY-BLOCK, so a relay-disabled node stays a non-participant -- and it still
+CLEARS the queues, so they cannot grow without bound while relay is off."
+  (dolist (peer peers)
+    (when (peer-blocks-for-headers-relay peer)
+      (if (and (relay-enabled-p) (eq (peer-state peer) :ready))
+          (handler-case (%flush-peer-block-announcements peer chain-state)
+            (error (e)
+              (setf (peer-blocks-for-headers-relay peer) nil)
+              (bl:log-warn "Announcing to ~A failed: ~A" (peer-log-name peer) e)))
+          (setf (peer-blocks-for-headers-relay peer) nil)))))
 
 ;;; Sync operations
 
