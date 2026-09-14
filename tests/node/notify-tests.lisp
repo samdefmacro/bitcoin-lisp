@@ -213,3 +213,25 @@ not run a 29-bit window scan per block."
               "a bit that has only locked in is not a warning")
           (is (equal '("Unknown new rules activated (versionbit 13)")
                      (announce 432 nil))))))))
+
+(test blocknotify-passes-the-hash-the-rpcs-print
+  "Core's -blocknotify callback substitutes blockHash.GetHex() (init.cpp:2013),
+uint256's REVERSED spelling -- the one getbestblockhash and getblockhash
+answer. Ours passed the internal byte order, so every file an operator's
+`echo > $dir/%s' hook created was named the reversal of the hash the RPC had
+just returned. feature_notifications.py:88-96 mines ten blocks and compares
+the directory listing with the array generatetoaddress returned; both had ten
+entries and no entry in common."
+  (let ((cs (bl.store:make-chain-state))
+        (hash (bl.crypto:hex-to-bytes
+               "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")))
+    (%recording-notify-commands (records)
+      (let ((bl::*block-notify-command* "notify %s")
+            (bl.net:*cached-is-ibd* nil))
+        (bl:notify-block-tip cs hash 1))
+      (is (= 1 (length records)) "the hook must have run exactly once")
+      (is (string= "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+                   (cdr (first records)))
+          "the value passed for %s is the block hash as the RPCs print it")
+      (is (string= (bl.rpc:hash-to-hex hash) (cdr (first records)))
+          "and that is exactly HASH-TO-HEX, the RPC layer's own uint256 spelling"))))
