@@ -1096,3 +1096,73 @@ index is being used, and both spellings were already here."
                         (bl.rpc:hash-to-hex genesis))
                 lines)
                "no Core-shaped rescan line among ~S" lines))))
+
+(defun %wc-synthetic-block (node txs)
+  "A block carrying TXS, labelled with the node's own tip hash and height so
+the wallet's locator write has a block it can place. Only the transaction
+list and the header timestamp are read by the block-connected hook."
+  (values (bl.ser:make-bitcoin-block
+           :header (bl.ser:make-block-header
+                    :version 4 :timestamp (bl.ser:get-unix-time)
+                    :bits #x207fffff :nonce 0)
+           :transactions txs)
+          (bl.store:best-block-hash (bl:node-chain-state node))
+          (bl.store:current-height (bl:node-chain-state node))))
+
+(test a-spend-of-a-zero-value-output-is-still-from-this-wallet
+  "Core's CWallet::IsFromMe asks whether any input spends an outpoint the
+wallet holds a TXO for (wallet.cpp:1681-1688) -- PRESENCE, not value. Ours
+read it as its pre-m_txos form, GetDebit > 0, which is 0 for a zero-value
+output: the transaction SPENDING one was never recorded by
+AddToWalletIfInvolvingMe (:1211), so the output stayed in listunspent for
+good. A pay-to-anchor output is exactly that, and wallet_anchor.py:80 rescans
+the whole chain and expects listunspent to come back EMPTY.
+
+The first block is the positive control: a zero-value output IS received and
+listed, so the empty answer below comes from the spend and not from the
+wallet having ignored the output in the first place."
+  (with-wallet-chain-node (node "wc-zero-spend")
+    (bl.rpc:dispatch-rpc-method node "createwallet" (wire-params '("zv")))
+    (with-rpc-wallet ("zv")
+      (let* ((manager (bl:node-wallet-manager node))
+             (address (%wc-newaddress node))
+             (spk (nth-value 1 (bl.crypto:decode-address address :regtest)))
+             (funding (bl.ser:make-transaction
+                       :version 2
+                       :inputs (vector (bl.ser:make-tx-in
+                                        :previous-output (bl.ser:make-outpoint
+                                                          :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                               :initial-element 9)
+                                                          :index 0)
+                                        :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                        :sequence #xffffffff))
+                       :outputs (vector (bl.ser:make-tx-out :value 0 :script-pubkey spk))
+                       :lock-time 0))
+             (spend (bl.ser:make-transaction
+                     :version 2
+                     :inputs (vector (bl.ser:make-tx-in
+                                      :previous-output (bl.ser:make-outpoint
+                                                        :hash (bl.ser:transaction-hash funding)
+                                                        :index 0)
+                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                      :sequence #xffffffff))
+                     :outputs (vector (bl.ser:make-tx-out
+                                       :value 0 :script-pubkey (p2sh-optrue-script-pubkey)))
+                     :lock-time 0)))
+        (flet ((connect (tx)
+                 (multiple-value-bind (block hash height) (%wc-synthetic-block node (list tx))
+                   (bl.wallet:wallets-block-connected
+                    manager (bl:node-mempool node) (bl:node-chain-state node)
+                    block hash height)))
+               (unspent ()
+                 (let ((rows (bl.rpc:dispatch-rpc-method
+                              node "listunspent" (wire-params '(0)))))
+                   (if (vectorp rows) '() rows))))
+          (connect funding)
+          (is (= 1 (length (unspent)))
+              "the zero-value output was not received at all: ~S" (unspent))
+          (is (eql 0 (btc-amount (cdr (assoc "amount" (first (unspent)) :test #'string=))))
+              "the received output is not the zero-value one")
+          (connect spend)
+          (is (null (unspent))
+              "the spent zero-value output is still unspent: ~S" (unspent)))))))
