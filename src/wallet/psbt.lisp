@@ -1813,14 +1813,45 @@ Caller holds node + wallet locks."
             (return-from %create-rate-bump
               (values nil bl.rpc:+rpc-wallet-error+
                       (format nil "Unable to create transaction. ~A" new-fee))))
-          ;; BIP125 rule 3/4 (feebumper::CheckFeeRate minTotalFee): the new total
-          ;; fee must be at least the old fee plus one incremental relay fee over
-          ;; the replacement's size, or the node's mempool will reject it. Enforce
-          ;; it here so a too-low bump fails BEFORE we sign / mark the original
-          ;; replaced (%create-transaction already caps at -maxtxfee).
-          (let ((min-total (+ old-fee
-                              (bl.rpc:feerate-fee bl.mp:*incremental-relay-fee-rate*
-                                            (bl.ser:transaction-vsize new-tx)))))
+          ;; BIP125 rule 3/4 (feebumper::CheckFeeRate minTotalFee,
+          ;; feebumper.cpp:90-98): the new total fee must be at least the old
+          ;; fee plus one incremental relay fee over the replacement's size, or
+          ;; the node's mempool will reject it. Enforce it here so a too-low
+          ;; bump fails BEFORE we sign / mark the original replaced
+          ;; (%create-transaction already caps at -maxtxfee).
+          ;;
+          ;; The size is Core's maxTxSize -- CalculateMaximumSignedTxSize of
+          ;; the replacement (:290) -- and NOT the vsize of the transaction in
+          ;; hand, which is still UNSIGNED here and so a good 20% short of what
+          ;; the relay will weigh. Asking that transaction its vsize also
+          ;; POISONED it: transaction-weight caches on the struct and the
+          ;; wallet signs this very object in place afterwards, so the witness
+          ;; never entered the cached weight -- the mempool entry, the block
+          ;; template and gettransaction's decoded.vsize all read the unsigned
+          ;; size for the life of the transaction, and
+          ;; wallet_spend_unconfirmed.py:333 measured a correctly-priced bump
+          ;; as 66.6 sat/vB against its 60 target.
+          (let* ((max-tx-size
+                   (let* ((txouts (map 'list
+                                       (lambda (in)
+                                         (let* ((op (bl.ser:tx-in-previous-output in))
+                                                (thash (bl.ser:outpoint-hash op))
+                                                (n (bl.ser:outpoint-index op))
+                                                (txout (%wallet-input-txout node wallet thash n cc))
+                                                (preset (gethash (cons thash n) (wcc-presets cc))))
+                                           (cons (and txout (bl.ser:tx-out-script-pubkey txout))
+                                                 (and preset (wcc-preset-weight preset)))))
+                                       (bl.ser:transaction-inputs new-tx)))
+                          (sized (%max-signed-tx-size wallet cc new-tx txouts)))
+                     ;; A size we cannot estimate falls back to the serialized
+                     ;; BASE size, which is a lower bound and -- unlike
+                     ;; transaction-vsize -- caches nothing.
+                     (if (plusp sized)
+                         sized
+                         (length (bl.ser:serialize-transaction new-tx)))))
+                 (min-total (+ old-fee
+                               (bl.rpc:feerate-fee bl.mp:*incremental-relay-fee-rate*
+                                             max-tx-size))))
             (when (< new-fee min-total)
               (return-from %create-rate-bump
                 (values nil bl.rpc:+rpc-invalid-parameter+

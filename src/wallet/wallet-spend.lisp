@@ -806,7 +806,11 @@ TXID's mempool entry, both 0 when not in the mempool."
   avoid-partial-spends
   include-unsafe-inputs
   (version 2)
-  max-tx-weight)
+  max-tx-weight
+  ;; The node's mempool, for chain.calculateCombinedBumpFee over a finished
+  ;; selection (spend.cpp:788-800). NIL is Core's no-mempool branch, which
+  ;; answers 0 (node/interfaces.cpp:704-706).
+  mempool)
 
 (defun %group-outputs (node coins params filters)
   "Core GroupOutputs: (values filter-maps discarded-groups) — FILTER-MAPS a
@@ -1312,9 +1316,34 @@ Returns (values sel-result error-message)."
       (when (null results)
         (return-from %choose-selection-result
           (values nil (first (last errors)))))
-      ;; Bump-fee synergy discount: no bump-fee machinery — discount 0
-      ;; (divergence 2 in the file header).
+      ;; Bump-fee synergy: the per-coin ancestor bump fees were computed one
+      ;; outpoint at a time, so two selected coins sharing an unconfirmed
+      ;; ancestor each paid for it. ONE calculateCombinedBumpFee over the
+      ;; whole input set counts each ancestor once, and the difference is the
+      ;; selection's discount (spend.cpp:788-807,
+      ;; SelectionResult::SetBumpFeeDiscount). It lowers the waste, raises the
+      ;; effective value and is subtracted from the fee the build pays
+      ;; (coinselection.cpp:838-839, :887, :892) -- Core asserts it is never
+      ;; negative (:822), overlapping ancestry can only make the bill smaller.
       (dolist (result results)
+        (let ((outpoints '())
+              (summed 0))
+          (dolist (coin (sel-result-inputs result))
+            (when (<= (wallet-coin-depth coin) 0) ; bump fees exist only here
+              (push (cons (wallet-coin-txid coin) (wallet-coin-index coin))
+                    outpoints)
+              (incf summed (wallet-coin-bump-fee coin))))
+          (when outpoints
+            (let ((combined (mini-miner-total-bump-fee
+                             (csel-params-mempool params)
+                             (nreverse outpoints)
+                             (csel-params-effective-feerate params))))
+              (unless combined
+                (return-from %choose-selection-result
+                  (values nil "Failed to calculate bump fees, because unconfirmed UTXOs depend on an enormous cluster of unconfirmed transactions.")))
+              (let ((overestimate (- summed combined)))
+                (when (plusp overestimate)
+                  (setf (sel-result-bump-fee-discount result) overestimate))))))
         (sel-result-recalculate-waste result
                                       (csel-params-min-viable-change params)
                                       (csel-params-cost-of-change params)
@@ -1967,7 +1996,7 @@ its input (a tx we cannot fully verify is never broadcast)."
   "Core CreateTransactionInternal. Returns
 (values tx fee change-pos fee-reason) or (values nil error-message).
 Caller holds node + wallet locks."
-  (let ((params (make-csel-params :rng rng))
+  (let ((params (make-csel-params :rng rng :mempool (bl:node-mempool node)))
         (reservation (make-reservedest))
         (reserve-error nil)
         (keep-reservation nil))
