@@ -2039,7 +2039,8 @@ by TXID, so the cascade work list carries txids."
                            (let ((vsize (bl.mp:mempool-entry-vsize entry)))
                              (relay-transaction
                               otxid nil peers
-                              :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                              :fee-rate-per-kvb
+                              (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
                               :wtxid owtxid)))
                          (push otxid work))))   ; cascade to this tx's dependents
                     ((eq error :missing-input) nil)   ; still missing another parent
@@ -2147,7 +2148,8 @@ waiting on it. PEER is the source, excluded from relay."
         (let ((vsize (bl.mp:mempool-entry-vsize entry))
               (fee (bl.mp:mempool-entry-fee entry)))
           (relay-transaction txid peer peers
-                             :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                             :fee-rate-per-kvb
+                             (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
                              :wtxid wtxid))))
     (process-orphans txid utxo-set mempool chain-state peers
                      :recent-rejects recent-rejects)))
@@ -2315,7 +2317,8 @@ the first."
             (bl:log-info "Force relaying tx ~A (wtxid=~A) from peer=~D"
                          (shown txid) (shown wtxid) (peer-id peer))
             (relay-transaction txid peer peers
-                               :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                               :fee-rate-per-kvb
+                               (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
                                :wtxid wtxid))))))
 
 (define-p2p-handler ("tx" :needs-mempool t :rate-bucket peer-rate-limit-tx) (peer payload ctx)
@@ -3452,12 +3455,23 @@ forever."
   (round (* mean-seconds internal-time-units-per-second
             (- (log (- 1.0d0 (random 1.0d0)))))))
 
-(defun relay-transaction (txid source-peer peers &key fee-rate wtxid)
+(defun relay-transaction (txid source-peer peers &key fee-rate-per-kvb wtxid)
   "Queue a newly-accepted transaction for announcement to all connected
 peers except SOURCE-PEER. Nothing is sent here — flush-tx-announcements
 drains each peer's queue on its Poisson schedule (Core queues into
-m_tx_inventory_to_send exactly the same way). FEE-RATE is sat/vB, used
-against BIP133 feefilters at flush time. WTXID enables BIP339 MSG_WTX
+m_tx_inventory_to_send exactly the same way). FEE-RATE-PER-KVB is the
+transaction's fee rate in satoshis per KILO-vbyte, used against BIP133
+feefilters at flush time.
+
+Per KVB, and NOT sat/vB scaled up afterwards, which is what it used to be:
+the caller computed (floor fee vsize) and this multiplied by 1000, so every
+transaction paying under 1 sat/vB was queued at rate 0 and withheld from every
+peer that had sent a feefilter at all. p2p_feefilter.py:87 sets a filter of 150
+sat/kvB and expects transactions paying exactly 0.15 sat/vB; they were all
+dropped. Core compares fee against filterrate.GetFee(vsize) with no
+intermediate rate at all (net_processing.cpp:6072), and
+`floor(fee*1000/vsize) >= filter' is that comparison exactly, both sides being
+integers. WTXID enables BIP339 MSG_WTX
 announcements. Does nothing if relay is disabled for the network — but is
 deliberately NOT gated on -blocksonly: a blocksonly node still announces
 its OWN (locally-submitted) transactions, exactly like Core, whose
@@ -3465,7 +3479,7 @@ RelayTransaction has no ignore_incoming_txs check (incoming txs can't
 reach here anyway — their senders are disconnected)."
   (unless (relay-enabled-p)
     (return-from relay-transaction nil))
-  (let ((fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
+  (let ((fee-rate-per-kb (or fee-rate-per-kvb 0)))
     (dolist (peer peers)
       ;; Skip the source peer and disconnected peers
       (when (and (not (eq peer source-peer))
@@ -3877,7 +3891,8 @@ and queued, NIL otherwise."
       (let ((vsize (bl.mp:mempool-entry-vsize entry))
             (fee (bl.mp:mempool-entry-fee entry)))
         (relay-transaction txid nil peers
-                           :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                           :fee-rate-per-kvb
+                           (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
                            :wtxid (bl.mp:mempool-entry-wtxid entry)))
       t)))
 

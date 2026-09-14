@@ -2050,7 +2050,7 @@ until flush time."
          (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 22)))
     ;; Peer has no connection: an immediate send would error, a queue won't.
     (finishes (bl.net:relay-transaction
-               txid nil (list peer) :fee-rate 2 :wtxid wtxid))
+               txid nil (list peer) :fee-rate-per-kvb 2 :wtxid wtxid))
     (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (is-false (bl:recent-reject-p
                (bl.net:peer-announced-txs peer) txid))))
@@ -2067,7 +2067,7 @@ Send errors from the connectionless peer are swallowed."
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 23))
          (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 24)))
     (bl.net:relay-transaction
-     txid nil (list peer) :fee-rate 2 :wtxid wtxid)
+     txid nil (list peer) :fee-rate-per-kvb 2 :wtxid wtxid)
     ;; Arm pass: timer initialized, nothing flushed.
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (plusp (bl.net::peer-next-inv-send-time peer)))
@@ -2090,8 +2090,8 @@ m_tx_inventory_to_send the same way)."
          (peer (bl.net:make-peer :state :ready))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 25)))
     (setf (bl.net:peer-feefilter-rate peer) 1000000)
-    ;; fee-rate 1 sat/vB = 1000 sat/kvB < 1000000 filter.
-    (bl.net:relay-transaction txid nil (list peer) :fee-rate 1)
+    ;; 1 sat/kvB, far under the 1,000,000 sat/kvB filter.
+    (bl.net:relay-transaction txid nil (list peer) :fee-rate-per-kvb 1)
     (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (setf (bl.net::peer-next-inv-send-time peer) 1)
     (bl.net:flush-tx-announcements (list peer) nil)
@@ -2130,7 +2130,7 @@ inv has to suppress a wtxid announcement."
       (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) wtxid)
                "the announced id enters the announcer's known-tx filter")
       (bl.net:relay-transaction txid nil (list peer other)
-                                :fee-rate 2 :wtxid wtxid)
+                                :fee-rate-per-kvb 2 :wtxid wtxid)
       (is (null (bl.net:peer-tx-inv-queue peer))
           "and the announcer is not told about its own announcement")
       (is (= 1 (length (bl.net:peer-tx-inv-queue other)))
@@ -2147,7 +2147,7 @@ announced to that peer at all."
          (peer (bl.net:make-peer :state :ready))
          (txids (loop for i from 0 below 5100 collect (%relay-txid i))))
     (dolist (txid txids)
-      (bl.net:relay-transaction txid nil (list peer) :fee-rate 1))
+      (bl.net:relay-transaction txid nil (list peer) :fee-rate-per-kvb 1))
     (is (= 5100 (length (bl.net:peer-tx-inv-queue peer)))
         "nothing may be discarded on the way in")
     ;; 70 + 5 * floor(5100/1000) = 95, against the flat 70 of a queue at rest.
@@ -2183,7 +2183,7 @@ most, and made our inv order leak the order transactions reached us."
           do (%add-tx mempool tx :fee (* 1000 i)))
     (loop for txid in txids
           for i from 1
-          do (bl.net:relay-transaction txid nil (list peer) :fee-rate i))
+          do (bl.net:relay-transaction txid nil (list peer) :fee-rate-per-kvb i))
     (is (= 75 (length (bl.net:peer-tx-inv-queue peer))))
     (flush-peer-invs peer mempool)
     (let ((left (mapcar #'first (bl.net:peer-tx-inv-queue peer))))
@@ -2631,7 +2631,7 @@ blocksonly peer gets us disconnected)."
                    :state :ready :version (%w9-version-msg :relay t)))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 91)))
     (bl.net:relay-transaction
-     txid nil (list frelay0 frelay1) :fee-rate 2)
+     txid nil (list frelay0 frelay1) :fee-rate-per-kvb 2)
     (is (null (bl.net:peer-tx-inv-queue frelay0)))
     (is (= 1 (length (bl.net:peer-tx-inv-queue frelay1))))))
 
@@ -2700,7 +2700,7 @@ ignore_incoming_txs gate; only the receive side is switched off."
                    :state :ready :version (%w9-version-msg :relay t)))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 95)))
     (bl.net:relay-transaction
-     txid nil (list frelay1) :fee-rate 2)
+     txid nil (list frelay1) :fee-rate-per-kvb 2)
     (is (= 1 (length (bl.net:peer-tx-inv-queue frelay1))))))
 
 ;;;; Tx-request tracker: Core txrequest caps, delays, cleanup
@@ -4771,3 +4771,41 @@ hundred single-header announcements."
          (lambda () (bl.net:ingest-headers-from-peer peer (list orphan) state)))
         (is (= armed (bl.net:peer-last-getheaders-time peer))
             "control: an unconnecting announcement does not re-arm it")))))
+
+(test the-queued-feerate-is-per-kvb-not-a-truncated-sat-per-vbyte
+  "Core compares a queued transaction's fee against filterrate.GetFee(vsize)
+with no intermediate rate (net_processing.cpp:6072); since both sides are
+integers that is exactly `floor(fee*1000/vsize) >= filter'. Ours computed
+(floor fee vsize) at every relay site -- satoshis per VBYTE, truncated -- and
+multiplied by 1000 here, so every transaction paying under 1 sat/vB was queued
+at rate 0 and withheld from every peer that had sent a feefilter at all.
+
+p2p_feefilter.py:87 sets a filter of 150 (sat/kvB) and expects the three
+transactions paying exactly 0.15 sat/vB to be announced; all three were
+dropped, and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
+  (let* ((bl:*network* :regtest)
+         (filtered (bl.net:make-peer :state :ready))
+         (unfiltered (bl.net:make-peer :state :ready))
+         (txid (make-array 32 :element-type '(unsigned-byte 8)
+                              :initial-element 26)))
+    (setf (bl.net:peer-feefilter-rate filtered) 150)
+    ;; A 150-vbyte transaction paying 23 satoshis: 153 sat/kvB, over the
+    ;; filter, and 0 sat/vB once truncated.
+    (let ((rate (floor (* 1000 23) 150)))
+      (is (= 153 rate) "the rate the relay sites now compute")
+      (bl.net:relay-transaction txid nil (list filtered unfiltered)
+                                :fee-rate-per-kvb rate))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue unfiltered)))
+        "control: the peer with no filter is queued either way")
+    (flush-peer-invs filtered)
+    (flush-peer-invs unfiltered)
+    (is-true (bl:recent-reject-p (bl.net:peer-announced-txs filtered) txid)
+             "a sub-1-sat/vB transaction over the peer's filter is announced")
+    ;; And the filter still bites when the rate really is under it.
+    (let ((below (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 27)))
+      (bl.net:relay-transaction below nil (list filtered)
+                                :fee-rate-per-kvb 149)
+      (flush-peer-invs filtered)
+      (is-false (bl:recent-reject-p (bl.net:peer-announced-txs filtered) below)
+                "one satoshi per kvB under it is still withheld"))))

@@ -340,7 +340,7 @@ leaking into the default configuration."
           (txid (%rc-wtxid 1))
           (wtxid (%rc-wtxid 2)))
       (bl.net:relay-transaction txid nil (list peer)
-                                                  :wtxid wtxid :fee-rate 1)
+                                                  :wtxid wtxid :fee-rate-per-kvb 1)
       (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
           "an unregistered peer must be announced to, not reconciled with")
       (is-false (bl.net::peer-recon-set peer)
@@ -362,7 +362,7 @@ what keeps the first announcement from revealing the origin."
         (let ((wtxid (%rc-wtxid i)))
           (setf (bl.net:peer-tx-inv-queue peer) '())
           (bl.net:relay-transaction
-           wtxid nil peers :wtxid wtxid :fee-rate 1)
+           wtxid nil peers :wtxid wtxid :fee-rate-per-kvb 1)
           (if (bl.net:peer-tx-inv-queue peer)
               (incf announced)
               (incf held))))
@@ -383,7 +383,7 @@ else would only delay them, which is the opposite of the point."
      (dotimes (i 10)
        (let ((wtxid (%rc-wtxid i)))
          (bl.net:relay-transaction
-          wtxid nil (list peer) :wtxid wtxid :fee-rate 1)))
+          wtxid nil (list peer) :wtxid wtxid :fee-rate-per-kvb 1)))
      (is (= 10 (length (bl.net:peer-tx-inv-queue peer))))
      (is-false (bl.net::peer-recon-set peer)))))
 
@@ -395,7 +395,7 @@ vanishing into a set that can never describe it."
     (let ((peer (%rc-peer :registered t))
           (txid (%rc-wtxid 3)))
       (bl.net:relay-transaction txid nil (list peer)
-                                                  :wtxid nil :fee-rate 1)
+                                                  :wtxid nil :fee-rate-per-kvb 1)
       (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))))))
 
 (test only-the-dialling-side-opens-a-round
@@ -521,7 +521,7 @@ hold: one the twin holds, the full peer must announce instead."
                    for w = (%rc-wtxid i)
                    do (setf (bl.net:peer-tx-inv-queue twin) '())
                       (bl.net:relay-transaction w nil (cons twin others)
-                                                :wtxid w :fee-rate 1)
+                                                :wtxid w :fee-rate-per-kvb 1)
                    when (null (bl.net:peer-tx-inv-queue twin))
                      collect w into held
                    when (= 2 (length held))
@@ -529,13 +529,13 @@ hold: one the twin holds, the full peer must announce instead."
       (is (= (1- cap) (%rc-count set)))
       ;; Positive control: one slot left, so a held candidate is held.
       (bl.net:relay-transaction (first held-by-draw) nil (cons full others)
-                                :wtxid (first held-by-draw) :fee-rate 1)
+                                :wtxid (first held-by-draw) :fee-rate-per-kvb 1)
       (is (null (bl.net:peer-tx-inv-queue full))
           "below the cap the transaction is reconciled, not announced")
       (is (= cap (%rc-count set)))
       ;; The set is full: the next one the draw would hold is announced.
       (bl.net:relay-transaction (second held-by-draw) nil (cons full others)
-                                :wtxid (second held-by-draw) :fee-rate 1)
+                                :wtxid (second held-by-draw) :fee-rate-per-kvb 1)
       (is (= 1 (length (bl.net:peer-tx-inv-queue full)))
           "a full set falls back to an ordinary announcement")
       (is (equalp (second held-by-draw)
