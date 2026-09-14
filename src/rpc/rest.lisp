@@ -349,17 +349,21 @@ outpoints come from the URI."
             `(("chainHeight" . ,height)
               ("chaintipHash" . ,(hash-to-hex tip-hash))
               ("bitmap" . ,(map 'string (lambda (h) (if h #\1 #\0)) hits))
-              ("utxos" . ,(mapcar
-                           (lambda (coin)
-                             `(("height" . ,(bl.store:utxo-entry-height coin))
-                               ("value" . ,(satoshi->btc (bl.store:utxo-entry-value coin)))
-                               ;; Core ScriptToUniv with include_hex and
-                               ;; include_address (rest.cpp:1072).
-                               ("scriptPubKey"
-                                . ,(script-to-json
-                                    (bl.store:utxo-entry-script-pubkey coin)
-                                    :network network))))
-                           coins))))))
+              ;; An EMPTY list must encode as [], not null: NIL is JSON null,
+              ;; and a query whose every outpoint is spent has no utxos at all
+              ;; -- interface_rest.py:148 takes len() of this field.
+              ("utxos" . ,(or (mapcar
+                               (lambda (coin)
+                                 `(("height" . ,(bl.store:utxo-entry-height coin))
+                                   ("value" . ,(satoshi->btc (bl.store:utxo-entry-value coin)))
+                                   ;; Core ScriptToUniv with include_hex and
+                                   ;; include_address (rest.cpp:1072).
+                                   ("scriptPubKey"
+                                    . ,(script-to-json
+                                        (bl.store:utxo-entry-script-pubkey coin)
+                                        :network network))))
+                               coins)
+                              #()))))))
         (t
          (%rest-hex-or-bin
           ext (bl.crypto:bytes-to-hex

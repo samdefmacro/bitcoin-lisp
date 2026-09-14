@@ -5273,6 +5273,23 @@ by the blockfilter handler, which then reads the filter type as
       (is-false (search "Expected /rest/blockfilter/" body)
                 "blockfilterheaders was routed to the blockfilter handler"))))
 
+(test rest-getutxos-answers-an-empty-list-not-null
+  "A /rest/getutxos query whose every outpoint is spent (or unknown) has no
+utxos at all, and Core answers `\"utxos\": []' -- rest.cpp builds a UniValue
+VARR and pushes nothing into it. NIL encodes as JSON null here, so ours
+answered `\"utxos\": null' and interface_rest.py:148 took len() of None."
+  (let ((node (make-test-node))
+        (zeros (make-string 64 :initial-element #\0)))
+    (let* ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (body (rest-request node (format nil "/rest/getutxos/~A-0.json" zeros)))
+           (parsed (yason:parse body)))
+      (is (equal '() (gethash "utxos" parsed))
+          "an all-spent query must carry an empty ARRAY; got ~S" body)
+      ;; yason parses [] and null both to NIL, so the bytes are the assertion.
+      (is-true (search "\"utxos\":[]" (remove #\Space body))
+               "the JSON must read [] and not null; got ~S" body)
+      (is (equal "0" (gethash "bitmap" parsed))))))
+
 (test rest-errors-are-worded-as-core-words-them
   "Core's RESTERR sentences name the value they could not use: `Invalid hash:
 <str>' (rest.cpp:213, :331, :401, :636, :846), `<str> not found' (:341, :415,
