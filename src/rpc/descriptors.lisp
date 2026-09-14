@@ -375,7 +375,7 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
                                  :privkey priv
                                  :compressed-p compressed))))))
     ;; Extended key (with optional derivation path and ranged terminal).
-    (let ((k (bl.crypto:bip32-parse key-str)))
+    (let ((k (bl.crypto:bip32-parse key-str network)))
       (unless (and k (%extkey-valid-for-network-p k network))
         (%desc-error "key '~A' is not valid" key-str))
       ;; Ranged terminal is popped before the path is parsed (Core's

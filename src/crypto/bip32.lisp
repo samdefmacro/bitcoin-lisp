@@ -53,7 +53,6 @@
     (loop for i from 31 downto 0 do (setf (aref v i) (logand n #xff) n (ash n -8)))
     v))
 
-(defun %xprv-version-p (v) (bl.chain:ext-secret-prefix-known-p v))
 (defun %xprv->xpub-version (v)
   (bl.chain:chain-params-ext-public-prefix (bl.chain:chain-params-of-ext-prefix v)))
 
@@ -151,11 +150,9 @@ invalid-child case (IL >= n or zero key) — the caller should try the next inde
          (checksum (subseq (hash256 payload) 0 4)))
     (base58-encode (concatenate '(vector (unsigned-byte 8)) payload checksum))))
 
-(defun %xpub-version-p (v) (bl.chain:ext-public-prefix-known-p v))
-
-(defun bip32-parse (str)
+(defun bip32-parse (str &optional (network bl.chain:*network*))
   "Parse a Base58Check xprv/xpub STR into an ext-key, or NIL if it is not a
-valid extended key.
+valid extended key ON NETWORK.
 
 This used to check the checksum and nothing else, which meant it accepted 15 of
 the 16 keys in BIP32's own test vector 5 (Core bip32_tests.cpp:104-122) — every
@@ -174,20 +171,30 @@ Every rejection below corresponds to one of those vectors:
     rather than carried around as 33 opaque bytes;
   - depth 0 with a non-zero parent fingerprint, or with a non-zero child index.
     A master key has no parent and is nobody's child; claiming otherwise makes
-    the fingerprint chain a lie."
+    the fingerprint chain a lie.
+
+NETWORK is what Core's Params() is at each of these two functions: the prefix
+must be that chain's EXT_SECRET_KEY or EXT_PUBLIC_KEY and no other chain's
+(key_io.cpp:249-252, :272-275). Accepting any chain's prefix made a tpub a
+valid answer on mainnet -- the descriptor parser carried its own network check
+(descriptors.lisp %EXTKEY-VALID-FOR-NETWORK-P) and createwalletdescriptor's
+hdkey argument, Core's other DecodeExtPubKey caller (wallet/rpc/wallet.cpp:803),
+did not."
   ;; Core DecodeExtKey / DecodeExtPubKey (key_io.cpp:248, :271) call
   ;; DecodeBase58Check with 78 -- the 4-byte version prefix and
   ;; BIP32_EXTKEY_SIZE -- which is 82 raw bytes once the checksum is counted.
   (let ((bytes (base58-decode str 82)))
     (when (and bytes (= (length bytes) 82)
                (equalp (subseq bytes 78 82) (subseq (hash256 (subseq bytes 0 78)) 0 4)))
-      (let* ((version (%be->int (subseq bytes 0 4)))
-             (privatep (%xprv-version-p version))
+      (let* ((params (bl.chain:find-chain-params network))
+             (version (%be->int (subseq bytes 0 4)))
+             (privatep (= version (bl.chain:chain-params-ext-secret-prefix params)))
              (depth (aref bytes 4))
              (fingerprint (%be->int (subseq bytes 5 9)))
              (child (%be->int (subseq bytes 9 13)))
              (key (subseq bytes 45 78)))
-        (when (and (or privatep (%xpub-version-p version))
+        (when (and (or privatep
+                       (= version (bl.chain:chain-params-ext-public-prefix params)))
                    (if privatep
                        (and (zerop (aref key 0))
                             (let ((d (%be->int (subseq key 1 33))))
