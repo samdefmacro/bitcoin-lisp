@@ -475,8 +475,24 @@ TXO, else 0."
           :initial-value 0))
 
 (defun wallet-tx-from-me-p (wallet tx)
-  "Core CWallet::IsFromMe = GetDebit > 0."
-  (plusp (wallet-tx-debit wallet tx)))
+  "Core CWallet::IsFromMe (wallet.cpp:1681-1688): does any input spend an
+outpoint the wallet holds a TXO for?
+
+PRESENCE, not value. Reading it as `GetDebit > 0' -- which is what Core's own
+IsFromMe was before m_txos -- makes a spend of a ZERO-VALUE wallet output
+invisible: the debit of such an input is 0, so the spending transaction was
+never recorded and the output stayed in listunspent forever. That is exactly
+what a pay-to-anchor output is, and wallet_anchor.py:80 rescans the whole chain
+and expects listunspent to come back EMPTY once the anchor has been spent."
+  (block scan
+    (bl.ser:dovector
+        (input (bl.ser:transaction-inputs tx))
+      (let ((prevout (bl.ser:tx-in-previous-output input)))
+        (when (wallet-get-txo wallet
+                              (bl.ser:outpoint-hash prevout)
+                              (bl.ser:outpoint-index prevout))
+          (return-from scan t))))
+    nil))
 
 (defun wallet-tx-credit-raw (wallet tx)
   "receive.cpp TxGetCredit: Σ IsMine output values (no maturity handling)."
