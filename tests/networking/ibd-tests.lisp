@@ -746,26 +746,36 @@ re-request (e.g. after a reorg) starts fresh."
     (setf (bl.net:peer-state p) state-key)
     p))
 
-(test block-relay-targets-skips-source-and-nonready
-  "block-relay-targets announces a new block to every ready peer except the
-source (which already has it); non-ready peers are excluded."
-  (let ((src (%make-peer-with-state :ready))
-        (ready (%make-peer-with-state :ready))
-        (dead (%make-peer-with-state :disconnected)))
-    (is (equal (list ready)
-               (bl.net::block-relay-targets src (list src ready dead))))))
+(test announcements-are-dropped-when-relay-is-disabled
+  "Block announcement is a no-op when relay is disabled (our mainnet default),
+so a relay-off node never propagates blocks -- and the per-peer queue is
+CLEARED rather than left to grow for the life of the connection, which is the
+half a `no-op\' could get wrong. A non-ready peer is skipped the same way.
 
-(test relay-block-noop-when-relay-disabled
-  "relay-block is a no-op when relay is disabled (mainnet default), so a
-relay-off node never propagates blocks."
-  (let ((bl:*network* :mainnet)
-        (bl:*mainnet-relay-enabled* nil)
-        (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (is (null (bl.net:relay-block
-               (bl.ser:make-block-header
-                :version 1 :prev-block zeros :merkle-root zeros
-                :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
-               nil (list (%make-peer-with-state :ready)))))))
+Control: with relay on, the same queue produces a message."
+  (let ((zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (flet ((queued-peer (state-key)
+             (let ((p (%make-peer-with-state state-key)))
+               (bl.net:queue-block-announcement p zeros)
+               p)))
+      (let ((bl:*network* :mainnet)
+            (bl:*mainnet-relay-enabled* nil))
+        (let ((peer (queued-peer :ready)))
+          (is (null (captured-sends
+                     (lambda ()
+                       (bl.net:flush-block-announcements
+                        (list peer) (bl.store:make-chain-state)))))
+              "a relay-off node announces nothing")
+          (is (null (bl.net:peer-blocks-for-headers-relay peer))
+              "and does not let the queue grow")))
+      ;; A peer that is not :READY is skipped whatever the relay posture.
+      (let ((bl:*network* :regtest)
+            (peer (queued-peer :disconnected)))
+        (is (null (captured-sends
+                   (lambda ()
+                     (bl.net:flush-block-announcements
+                      (list peer) (bl.store:make-chain-state))))))
+        (is (null (bl.net:peer-blocks-for-headers-relay peer)))))))
 
 (test tx-request-tracker-dedups-and-records-announcers
   "tx-request-wanted-p requests from the first announcer only; a second peer
@@ -4368,7 +4378,18 @@ block-download drain, which is every block fetched after a headers
 announcement and every unsolicited block read mid-pass, was never announced
 onward: in the 2026-09-13 sweep example_test.py's node1 heard about one of the
 ten blocks node0 connected. The announcement is now the :updated-block-tip
-hook. Control: the same delivery with the IBD latch on announces nothing."
+hook.
+
+The hook only QUEUES, as Core's UpdatedBlockTip does; the message goes out
+when SendMessages runs, which here is FLUSH-BLOCK-ANNOUNCEMENTS. Which FORM it
+takes is Core's rule and not ours: a headers announcement is only useful when
+the peer can CONNECT it, so SendMessages sends headers only from the first
+block the peer lacks whose PARENT it has (:5877-5886) and otherwise reverts to
+an inv for the tip (:5931-5953). A peer we know nothing about gets the inv,
+which is what the sendheaders flag alone used to override.
+
+Controls: a peer whose best-known block IS the new tip already has it and is
+told nothing at all."
   (with-network (:regtest)
     (let* ((node (regtest-node-fixture "announce-drain"))
            (cs (bl:node-chain-state node))
@@ -4410,14 +4431,36 @@ hook. Control: the same delivery with the IBD latch on announces nothing."
                         (let ((b1 (mine)))
                           (deliver b1)
                           (is (= 1 (bl.store:current-height cs)) "the block connected")
+                          (is-true (bl.net:peer-blocks-for-headers-relay listener-peer)
+                                   "the hook queued the tip rather than sending it")
+                          (bl.net:flush-block-announcements (bl:node-peers node) cs)
                           (multiple-value-bind (command payload) (next-message-within client 3)
-                            (is (equal "headers" command)
+                            ;; Nothing is known of this peer's chain, so even a
+                            ;; sendheaders peer gets Core's inv fallback.
+                            (is (equal "inv" command)
                                 "a block the drain connected is announced onward")
                             (when payload
                               (is (equalp (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1))
-                                          (bl.ser:block-header-hash
-                                           (first (bl.ser:parse-headers-payload payload))))
-                                  "the announced header is the new tip's"))))
+                                          (bl.ser:inv-vector-hash
+                                           (first (bl.ser:parse-inv-payload payload))))
+                                  "the announced hash is the new tip's")))
+                          ;; Now the peer's best-known block is b1, so the NEXT
+                          ;; tip connects for it and the headers form is used.
+                          (setf (bl.net:peer-best-known-block-hash listener-peer)
+                                (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1)))
+                          (let ((b1a (mine)))
+                            (deliver b1a)
+                            (bl.net:flush-block-announcements (bl:node-peers node) cs)
+                            (multiple-value-bind (command payload)
+                                (next-message-within client 3)
+                              (is (equal "headers" command)
+                                  "a block whose parent the peer has goes as headers")
+                              (when payload
+                                (is (equalp (bl.ser:block-header-hash
+                                             (bl.ser:bitcoin-block-header b1a))
+                                            (bl.ser:block-header-hash
+                                             (first (bl.ser:parse-headers-payload payload))))
+                                    "and it is the new tip's header")))))
                         ;; Control: a peer whose best-known block IS the new tip
                         ;; already has it (Core PeerHasHeader, :1352, :5877) and
                         ;; is not told again. (The IBD gate cannot be shown here:
@@ -4426,12 +4469,118 @@ hook. Control: the same delivery with the IBD latch on announces nothing."
                           (setf (bl.net:peer-best-known-block-hash listener-peer)
                                 (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b2)))
                           (deliver b2)
-                          (is (= 2 (bl.store:current-height cs)))
+                          (is (= 3 (bl.store:current-height cs)))
+                          (bl.net:flush-block-announcements (bl:node-peers node) cs)
                           (is (null (next-message-within client 1))
                               "control: a peer that already has the tip is not told")))
                    (bl.net:disconnect-peer listener-peer)
                    (bl.net:disconnect-peer client))))
           (bl.net:close-listener srv))))))
+
+(test queued-announcements-coalesce-into-one-message
+  "Core's UpdatedBlockTip only QUEUES a new tip per peer
+(net_processing.cpp:2180-2188) and SendMessages turns the whole queue into ONE
+message per pass: up to MAX_BLOCKS_TO_ANNOUNCE connected headers as a single
+headers message (:5830-5892), and otherwise a single inv for the tip
+(:5931-5953). Ours announced synchronously from whichever thread connected the
+block, so a run of N blocks -- a `generate 400', a catch-up drain -- put N
+separate messages on the wire for every peer.
+
+Three arms, all Core's: a connected run goes as one headers message; a run
+LONGER than MAX_BLOCKS_TO_ANNOUNCE reverts to one inv for the tip (Core's
+`rely on the peer's synchronization mechanism in that case'); and headers the
+peer already has are skipped rather than resent."
+  (with-temp-directory (dir "bl-announce-coalesce")
+    (with-network (:regtest)
+      (let* ((cs (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid))
+             (prev genesis)
+             (entries (list genesis)))
+        (declare (ignorable store))
+        (bl.store:add-block-index-entry cs genesis)
+        (bl.store:update-chain-tip cs (%bd-hash 0) 0)
+        ;; A real chained header per height, so the connect check and
+        ;; PeerHasHeader have something to walk.
+        (loop for h from 1 to 12
+              do (let* ((header (bl.ser:make-block-header
+                                 :version 1
+                                 :prev-block (bl.store:block-index-entry-hash prev)
+                                 :merkle-root (%bd-hash (+ 100 h))
+                                 :timestamp (+ 1700000000 h)
+                                 :bits #x207fffff :nonce h))
+                        (e (bl.store:make-block-index-entry
+                            :hash (bl.ser:block-header-hash header)
+                            :height h :header header :prev-entry prev
+                            :chain-work (+ 1 h) :status :valid)))
+                   (bl.store:add-block-index-entry cs e)
+                   (bl.store:update-chain-tip
+                    cs (bl.store:block-index-entry-hash e) h)
+                   (setf prev e)
+                   (push e entries)))
+        (setf entries (nreverse entries))
+        (flet ((entry-at (h) (nth h entries))
+               (peer-knowing (h)
+                 (let ((p (bl.net:make-peer :address "198.51.100.5" :state :ready)))
+                   (setf (bl.net:peer-prefers-headers p) t
+                         (bl.net:peer-best-known-block-hash p)
+                         (bl.store:block-index-entry-hash (nth h entries)))
+                   p)))
+          ;; ARM 1: five blocks queued, one headers message carrying all five.
+          (let ((peer (peer-knowing 0)))
+            (loop for h from 1 to 5
+                  do (bl.net:queue-block-announcement
+                      peer (bl.store:block-index-entry-hash (entry-at h))))
+            (let ((sent (captured-sends
+                         (lambda ()
+                           (bl.net:flush-block-announcements (list peer) cs)))))
+              (is (= 1 (length sent)) "one message, not five")
+              (is (string= "headers" (message-command (first sent))))
+              (is (= 5 (length (bl.ser:parse-headers-payload
+                                (subseq (first sent) 24))))
+                  "carrying every queued header")
+              (is (null (bl.net:peer-blocks-for-headers-relay peer))
+                  "and the queue is emptied")))
+          ;; ARM 2: nine is past MAX_BLOCKS_TO_ANNOUNCE, so one inv for the tip.
+          (let ((peer (peer-knowing 0)))
+            (loop for h from 1 to 9
+                  do (bl.net:queue-block-announcement
+                      peer (bl.store:block-index-entry-hash (entry-at h))))
+            (let ((sent (captured-sends
+                         (lambda ()
+                           (bl.net:flush-block-announcements (list peer) cs)))))
+              (is (= 1 (length sent)))
+              (is (string= "inv" (message-command (first sent)))
+                  "a run past the cap reverts to an inv")
+              (is (equalp (bl.store:block-index-entry-hash (entry-at 9))
+                          (bl.ser:inv-vector-hash
+                           (first (bl.ser:parse-inv-payload (subseq (first sent) 24)))))
+                  "and the inv names the TIP of the run")))
+          ;; ARM 3: a peer already holding the first three is told only the rest.
+          (let ((peer (peer-knowing 3)))
+            (loop for h from 1 to 5
+                  do (bl.net:queue-block-announcement
+                      peer (bl.store:block-index-entry-hash (entry-at h))))
+            (let ((sent (captured-sends
+                         (lambda ()
+                           (bl.net:flush-block-announcements (list peer) cs)))))
+              (is (= 1 (length sent)))
+              (let ((headers (bl.ser:parse-headers-payload (subseq (first sent) 24))))
+                (is (= 2 (length headers))
+                    "PeerHasHeader's ANCESTOR half skips what the peer holds")
+                (is (equalp (bl.store:block-index-entry-hash (entry-at 4))
+                            (bl.ser:block-header-hash (first headers)))
+                    "starting at the first block it lacks"))))
+          ;; ARM 4: nothing new for a peer whose best-known block is the tip.
+          (let ((peer (peer-knowing 5)))
+            (loop for h from 1 to 5
+                  do (bl.net:queue-block-announcement
+                      peer (bl.store:block-index-entry-hash (entry-at h))))
+            (is (null (captured-sends
+                       (lambda ()
+                         (bl.net:flush-block-announcements (list peer) cs))))
+                "a peer that has them all is sent nothing")))))))
 
 ;;;; Unconnecting announcements buy one getheaders per response window
 

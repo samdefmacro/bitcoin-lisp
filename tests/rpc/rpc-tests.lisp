@@ -4574,19 +4574,23 @@ Two halves, because either alone would pass against the bug: that a NIL source
 peer excludes nobody (a locally mined block has no source to skip), and that
 the submitblock path actually makes the call."
   (let ((peer (bl.net:make-peer :address "10.9.9.9" :state :ready)))
-    ;; A ready peer with no connection: SEND-MESSAGE is a no-op on it, so the
-    ;; count is taken from the relay target list instead.
-    (is (equal (list peer)
-               (bl.net::block-relay-targets nil (list peer)))
-        "a NIL source peer must not exclude anybody — a locally mined block has no source")
+    ;; Core's UpdatedBlockTip queues the new tip on EVERY peer -- it excludes
+    ;; nobody, not even the one that delivered the block
+    ;; (net_processing.cpp:2180-2188). What stops it being announced back is
+    ;; PeerHasHeader at flush time: delivering a block sets that peer's
+    ;; best-known block to it. A locally mined block has no source at all.
+    (bl.net:queue-block-announcement peer (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 0))
+    (is-true (bl.net:peer-blocks-for-headers-relay peer)
+             "every peer is queued, source or not")
     ;; And the production announcement is the :updated-block-tip hook, the one
     ;; path every connect shares -- submitblock, the P2P handler and the
-    ;; block-download drain alike -- passing a NIL source.
+    ;; block-download drain alike.
     (let ((src (project-source-text "src/node/peers.lisp")))
       (is (search "define-validation-hook :updated-block-tip announce-block-tip" src)
           "the new-tip announcement hook is gone")
-      (is (search "(bl.net:relay-block (bl.store:block-index-entry-header entry) nil peers)" src)
-          "the hook must announce with a NIL source"))))
+      (is (search "(bl.net:queue-block-announcement peer hash)" src)
+          "the hook must QUEUE, leaving the message to the flush"))))
 
 (test getpeerinfo-rows-are-in-peer-id-order
   "Core's getpeerinfo comes out in ascending peer id: m_nodes is a vector

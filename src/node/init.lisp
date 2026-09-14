@@ -1291,6 +1291,16 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
     ;; :274-284).
     (bl.net:process-tx-requests ctx)
     (bl.net:retry-timed-out-tx-requests ctx)
+    ;; Queued block announcements: ONE
+    ;; message per peer for everything
+    ;; connected since the last pass
+    ;; (Core SendMessages' block section,
+    ;; net_processing.cpp:5825-5956, whose
+    ;; input UpdatedBlockTip only queues).
+    ;; Before the tx section, as in Core.
+    (bl.net:flush-block-announcements
+     (node-peers *node*)
+     (node-chain-state *node*))
     ;; Trickled tx announcements: drain
     ;; due per-peer inv queues each
     ;; second (Poisson schedules inside;

@@ -1332,22 +1332,15 @@ eviction sweep."
 
 ;;;; Announcing a new tip (Core PeerManagerImpl::UpdatedBlockTip)
 
-(defun %peer-already-has-block-p (peer hash)
-  "T when PEER's best-known block IS HASH: the peer that delivered it, or one
-that announced it to us. Core's PeerHasHeader (net_processing.cpp:1352) is
-asked of every queued announcement before it is sent (:5877); the ancestor
-half of that test is not needed for a tip that is one block past the
-peer's last-known one, which is the case an announcement exists for."
-  (let ((known (bl.net:peer-best-known-block-hash peer)))
-    (and known (equalp known hash))))
 
 (bl.vi:define-validation-hook :updated-block-tip announce-block-tip (chainstate hash height)
   "Announce the new tip to every ready peer that does not already have it
 (Core UpdatedBlockTip, net_processing.cpp:2160-2189: the hashes from the fork
 point to the new tip go onto every peer's m_blocks_for_headers_relay, and
 SendMessages turns them into a headers message or an inv). Not during IBD
-(:2165), and for the ACTIVE chain only. relay-block chooses headers or inv per
-peer (BIP 130) and is a no-op while relay is disabled.
+(:2165), and for the ACTIVE chain only. FLUSH-BLOCK-ANNOUNCEMENTS -- the idle
+tick's SendMessages -- chooses headers or inv per peer (BIP 130) and is a
+no-op while relay is disabled.
 
 Until this hook existed only two paths announced: the P2P block handler and
 submitblock. A block connected by the block-download drain -- every block
@@ -1359,14 +1352,14 @@ node0 connected ten pushed blocks and node1 heard about one of them."
   (when (and *node*
              (not (bl.store:chain-state-target-blockhash chainstate))
              (not (bl.net:initial-block-download-p chainstate)))
-    (let ((entry (bl.store:get-block-index-entry chainstate hash))
-          (peers (remove-if (lambda (p) (%peer-already-has-block-p p hash))
-                            (node-peers *node*))))
-      (when (and entry peers)
-        (handler-case
-            (bl.net:relay-block (bl.store:block-index-entry-header entry) nil peers)
-          ;; A send failure must not turn a connected block into an error:
-          ;; the block IS the tip either way.
-          (error (e)
-            (log-warn "Announcing new tip ~A failed: ~A"
-                      (bl.crypto:bytes-to-hex hash) e)))))))
+    (when (bl.store:get-block-index-entry chainstate hash)
+      ;; QUEUE only, as Core's UpdatedBlockTip does
+      ;; (net_processing.cpp:2180-2188). The idle tick's
+      ;; FLUSH-BLOCK-ANNOUNCEMENTS is SendMessages: it coalesces whatever
+      ;; accumulated into ONE message per peer, and it is the only place that
+      ;; decides headers-vs-inv and asks PeerHasHeader. Announcing here,
+      ;; synchronously from whichever thread connected the block, made a
+      ;; 400-block `generate' send 400 separate invs to every peer.
+      (bt:with-recursive-lock-held ((node-lock *node*))
+        (dolist (peer (node-peers *node*))
+          (bl.net:queue-block-announcement peer hash))))))
