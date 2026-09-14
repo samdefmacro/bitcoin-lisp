@@ -1619,16 +1619,7 @@ away) / :user-abort."
           (when done (return-from scan)))))
     ;; Scanning reached the tip: fold the current mempool in.
     (when (and (null max-height) (not (eq status :user-abort)))
-      (bl.rpc:with-node-lock (node)
-        (let ((mempool (bl:node-mempool node)))
-          (when mempool
-            (bl.mp:mempool-for-each
-             mempool
-             (lambda (txid entry)
-               (declare (ignore txid))
-               (wallet-transaction-added-to-mempool
-                wallet mempool
-                (bl.mp:mempool-entry-transaction entry))))))))
+      (request-mempool-transactions node wallet))
     (setf (wallet-scan-progress wallet) 1.0)
     (when rf
       (bl:log-info "Wallet ~A: fast rescan skipped ~D block~:P via block filters"
@@ -1637,6 +1628,33 @@ away) / :user-abort."
     ;; path actually fired rather than inferring it; all existing callers
     ;; destructure at most three values.
     (values status last-scanned-height last-scanned-hash skipped)))
+
+(defun request-mempool-transactions (node wallet)
+  "Core Chain::requestMempoolTransactions (node/interfaces.cpp:845-852): send
+WALLET a transactionAddedToMempool for every transaction in the pool, and
+return when the last one has been sent.
+
+The ORDER is Core's and is load-bearing: the notifications walk
+CTxMemPool::entryAll(), which is GetSortedScoreWithTopology()
+(txmempool.cpp:588-598), so an in-mempool parent always precedes its
+children. A child with no output of the wallet's -- a change-less sweep --
+is recognised only through the parent output it spends, so visiting it first
+drops it and nothing revisits it. A plain walk of the entry table did
+exactly that after a reorg put the parent back into a pool its child was
+already in, which is the pool wallet_rescan_unconfirmed.py builds
+(:46-49, :60-62) and the reason its :77 answered -5.
+
+Core calls this from two places and so do we: the end of a rescan that
+reached the tip (wallet.cpp:1991-1993) and postInitProcess after a wallet is
+loaded (wallet.cpp:3306-3309)."
+  (bl.rpc:with-node-lock (node)
+    (let ((mempool (bl:node-mempool node)))
+      (when mempool
+        (loop for (txid . entry) in (bl.mp:mempool-entries-parents-first mempool)
+              do (progn txid
+                        (wallet-transaction-added-to-mempool
+                         wallet mempool
+                         (bl.mp:mempool-entry-transaction entry))))))))
 
 (defun wallet-rescan-from-time (node wallet start-time &key (update t))
   "Core CWallet::RescanFromTime: scan from the first block that could

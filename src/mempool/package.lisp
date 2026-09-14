@@ -235,6 +235,7 @@ src/mempool/.")
    #:mempool-update-for-reorg
    #:mempool-get-transactions
    #:mempool-for-each
+   #:mempool-entries-parents-first
    ;; Block fee stats
    #:block-fee-stats
    #:make-block-fee-stats

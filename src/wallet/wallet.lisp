@@ -1903,16 +1903,7 @@ sequence has exactly one definition."
     ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
     ;; requestMempoolTransactions); the attach-chain scan only does this
     ;; when the wallet was behind the tip.
-    (bl.rpc:with-node-lock (node)
-      (let ((mempool (bl:node-mempool node)))
-        (when mempool
-          (bl.mp:mempool-for-each
-           mempool
-           (lambda (txid entry)
-             (declare (ignore txid))
-             (wallet-transaction-added-to-mempool
-              wallet mempool
-              (bl.mp:mempool-entry-transaction entry)))))))
+    (request-mempool-transactions node wallet)
     ;; Core postInitProcess: push the wallet's own unconfirmed txs back
     ;; into OUR mempool without relaying them (wallet.cpp:3305). Takes
     ;; its own locks — must run outside the node-lock hold above.

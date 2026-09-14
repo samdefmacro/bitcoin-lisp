@@ -1731,10 +1731,21 @@ START-NODE.")
   (when data-directory
     (merge-pathnames "mempool.dat" data-directory)))
 
-(defun %mempool-entries-parents-first (mempool)
+(defun mempool-entries-parents-first (mempool)
   "All (txid . entry) pairs ordered so every in-mempool parent precedes its
 children (ascending ancestor count; a child always counts more ancestors
-than any of its parents)."
+than any of its parents).
+
+This is the property Core's CTxMemPool::entryAll() carries
+(txmempool.cpp:588-598, over GetSortedScoreWithTopology): every consumer
+that must see a parent before its children asks for it rather than walking
+the entry table. Two do -- the mempool.dat dump, so a reload through normal
+acceptance resolves chained spends, and Chain::requestMempoolTransactions
+(node/interfaces.cpp:845-852), the wallet's catch-up, where a change-less
+child is recognisable only through the parent output it spends. A reorg
+re-add leaves the links right for this: MEMPOOL-UPDATE-FOR-REORG wires the
+pre-existing children of every re-added transaction before anyone reads the
+order."
   ;; Decorate-sort-undecorate: ancestor counts are computed ONCE per entry
   ;; (a sort :key would re-walk ancestors on every comparison).
   (let ((pairs '()))
@@ -1760,7 +1771,7 @@ them in."
   "The obfuscated region of a Core mempool.dat, before obfuscation is applied.
 Returns (values bytes entry-count) — the count so the caller does not have to
 recompute the parents-first ordering, which on a large mempool is not cheap."
-  (let ((ordered (%mempool-entries-parents-first mempool))
+  (let ((ordered (mempool-entries-parents-first mempool))
         (residual '())
         (unbroadcast (copy-list (mempool-unbroadcast-txids mempool))))
     (maphash (lambda (txid delta)

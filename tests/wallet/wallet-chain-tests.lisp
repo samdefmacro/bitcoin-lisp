@@ -526,6 +526,61 @@ the wallet simply lost track of the coin."
 
 ;;; --- Reorg across the funding tx + double-spend conflicts ---
 
+(test wallet-mempool-catch-up-visits-a-parent-before-its-child
+  "Core Chain::requestMempoolTransactions (node/interfaces.cpp:845-852) walks
+CTxMemPool::entryAll(), which is GetSortedScoreWithTopology()
+(txmempool.cpp:588-598) -- an ordering in which an in-mempool parent always
+precedes its children. The wallet's catch-up needs that: a child whose
+outputs are all foreign is recognised ONLY through its inputs, so it is
+detectable only once the parent that funded it is already in the wallet.
+
+wallet_rescan_unconfirmed.py builds exactly that pool and says why at
+:46-49: it confirms the parent, spends it with a change-less sweep, then
+INVALIDATES the parent's block, so the parent re-enters the mempool AFTER
+its child. Ours folded the mempool in with a plain hash-table walk, so the
+child was visited first, found nothing of the wallet's, and was dropped --
+wallet_rescan_unconfirmed.py:77 answered -5 Invalid or non-wallet
+transaction id while :76 (the parent) passed.
+
+The watched script here is the P2SH(OP_TRUE) the fixture mines to, which is
+what lets the child be assembled without the wallet signing anything."
+  (with-wallet-chain-node (node "memcatchup" :wallet "w")
+    (let* ((watched (%wc-optrue-address))
+           (foreign (concatenate '(vector (unsigned-byte 8))
+                                 #(#x00 #x14) (make-array 20 :initial-element 3)))
+           (fund (first (%wc-mine node 1 watched))))
+      (%wc-mine node 100 watched)               ; tip 101, coinbase@1 mature
+      (let* ((parent (%wc-spend-tx (%wc-coinbase-txid node fund) 0
+                                   (- +wc-subsidy+ 10000)
+                                   (%address-script watched :regtest)))
+             (parent-txid (%wc-send node parent))
+             (pblock (first (%wc-mine node 1 watched)))
+             ;; A change-less sweep of the parent's only output: nothing in
+             ;; it belongs to the wallet, so only its INPUT names it.
+             (child (%wc-spend-tx parent-txid 0 (- +wc-subsidy+ 20000) foreign))
+             (child-txid (%wc-send node child)))
+        ;; The reorg: the parent comes back to a mempool the child is in.
+        (bl.rpc:dispatch-rpc-method node "invalidateblock" (list pblock))
+        (is (= 2 (length (bl.rpc:dispatch-rpc-method node "getrawmempool" nil)))
+            "the reorg did not leave both transactions in the mempool")
+        ;; A wallet that saw none of it live, catching up through an import.
+        (with-rpc-wallet (nil)
+          (bl.rpc:dispatch-rpc-method node "createwallet" (list "catchup" t)))
+        (with-rpc-wallet ("catchup")
+          (let ((results (bl.rpc:dispatch-rpc-method
+                          node "importdescriptors"
+                          (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
+                                                   (format nil "addr(~A)" watched))
+                                           "timestamp" 0))))))
+            (is (eq t (%aval "success" (first results)))
+                "the watch-only import failed, so no catch-up ran"))
+          ;; wallet_rescan_unconfirmed.py:76-77, in order.
+          (is (= 0 (%aval "confirmations" (%wc-gettx node parent-txid)))
+              "the catch-up missed the mempool PARENT")
+          (is (= 0 (%aval "confirmations" (%wc-gettx node child-txid)))
+              "the catch-up missed the mempool child, so the fold-in ran it
+before its parent"))))))
+
 (test wallet-funding-reorg-and-conflicts
   "Reorging out the block that confirmed a wallet-funding tx returns it to
 the mempool (in-mempool state); a confirmed double-spend marks it
