@@ -513,6 +513,60 @@ already unwound, so the original frames are gone; what survives is the
 condition itself and the log line its handler wrote."
   (error condition))
 
+(defun %json-duplicate-keys-p (alist)
+  "True when ALIST, one JSON object as yason's :alist parse hands it over,
+names a key twice."
+  (loop with seen = '()
+        for (key . nil) in alist
+        when (member key seen :test #'equal) return t
+        do (push key seen)
+        finally (return nil)))
+
+(defun %json-objects-as-tables (value)
+  "Rebuild VALUE's JSON objects as hash tables, LEAVING an object that names a
+key twice as its alist. Applied to the :alist re-read below, so a duplicate
+key reaches its handler with both members, in order, and every other object in
+the same body keeps the shape the rest of the server reads with GETHASH."
+  (cond
+    ;; An empty object is NIL in this parse -- null is :NULL and an empty
+    ;; array is #() -- so it can only be {}.
+    ((null value) (make-hash-table :test 'equal))
+    ((and (consp value) (consp (first value)))
+     (let ((pairs (mapcar (lambda (pair)
+                            (cons (car pair) (%json-objects-as-tables (cdr pair))))
+                          value)))
+       (if (%json-duplicate-keys-p pairs)
+           pairs
+           (let ((table (make-hash-table :test 'equal)))
+             (dolist (pair pairs table)
+               (setf (gethash (car pair) table) (cdr pair)))))))
+    ((and (vectorp value) (not (stringp value)))
+     (map 'vector #'%json-objects-as-tables value))
+    (t value)))
+
+(defun %parse-json-body (body)
+  "BODY as JSON, with a repeated object key kept rather than refused.
+
+Core's UniValue does not deduplicate: an object is a vector of key/value
+pairs, reading pushes every member, and getKeys() hands the handler all of
+them in order. A repeated key is therefore a WELL-FORMED request whose
+duplicate is the handler's to judge -- ParseOutputs answers -8 \"Invalid
+parameter, duplicated address\" (rawtransaction_util.cpp:107-127), which
+rpc_rawtransaction.py:300 reads. yason refuses the whole body instead, and
+answering -32700 Parse error said the bytes were not JSON when they were.
+
+The common path is unchanged. Only a body that trips yason's duplicate-key
+error is read a second time, as alists, and rebuilt into the usual hash
+tables everywhere the keys are distinct."
+  (let ((yason:*parse-json-booleans-as-symbols* t)
+        (yason:*parse-json-arrays-as-vectors* t))
+    (handler-case (yason:parse body)
+      ;; yason::duplicate-key is internal to yason; it has no other name.
+      (yason::duplicate-key ()
+        (%json-objects-as-tables
+         (let ((yason:*parse-object-as* :alist))
+           (yason:parse body)))))))
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -526,9 +580,7 @@ be told from null — and %normalize-json-value turns them back into the lists
 handlers expect, leaving +json-empty-array+ where a top-level positional
 argument was `[]`."
   (handler-case
-      (let ((json (let ((yason:*parse-json-booleans-as-symbols* t)
-                        (yason:*parse-json-arrays-as-vectors* t))
-                    (yason:parse body))))
+      (let ((json (%parse-json-body body)))
         (cond
           ;; Batch request (array). A vector now, since that is how arrays
           ;; arrive; the members are objects and stay hash-tables. An EMPTY

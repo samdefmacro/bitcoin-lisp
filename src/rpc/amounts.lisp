@@ -346,37 +346,51 @@ send/walletcreatefundedpsbt docstrings."
          (dolist (obj outputs-param) (collect-object obj t)))
         (t (collect-object outputs-param))))
     (setf pairs (nreverse pairs))
-    (let ((seen (make-hash-table :test 'equal))
+    ;; The duplicate checks are Core's, in Core's positions
+    ;; (rawtransaction_util.cpp:101-127). Two of them, because a repeated
+    ;; "data" key is not a repeated ADDRESS and gets its own sentence. The
+    ;; address one is keyed by the DESTINATION rather than by the string --
+    ;; that is Core's std::set<CTxDestination> -- and it runs AFTER the address
+    ;; and the amount are parsed, so a repeated key that is also malformed
+    ;; reports the malformation, as its first copy already did.
+    (let ((destinations (bl.bytes:make-octets-hash-table))
+          (has-data nil)
           (recipients '())
           (keys '()))
       (loop for (key . value) in pairs
             do (unless (stringp key)
                  (error 'rpc-error :code +rpc-type-error+
                                    :message "Invalid parameter, key must be a string"))
-               (when (gethash key seen)
-                 (error 'rpc-error :code +rpc-invalid-parameter+
-                                   :message (format nil "Invalid parameter, duplicated address: ~A" key)))
-               (setf (gethash key seen) t)
                (push key keys)
                (if (string= key "data")
                    ;; Core ParseOutputs (rawtransaction_util.cpp:113):
                    ;; ParseHexV of getValStr() under the name "Data", so the
                    ;; offending text comes back in the message and a
                    ;; non-string value reads as the empty string.
-                   (let ((data (parse-hex-v value "Data")))
-                     (push (make-recipient :address nil
-                                           :script (%op-return-script data)
-                                           :amount 0)
-                           recipients))
+                   (progn
+                     (when has-data
+                       (error 'rpc-error :code +rpc-invalid-parameter+
+                                         :message "Invalid parameter, duplicate key: data"))
+                     (setf has-data t)
+                     (let ((data (parse-hex-v value "Data")))
+                       (push (make-recipient :address nil
+                                             :script (%op-return-script data)
+                                             :amount 0)
+                             recipients)))
                    (multiple-value-bind (type script)
                        (bl.crypto:decode-address key network)
                      (declare (ignore type))
                      (unless script
                        (error 'rpc-error :code +rpc-invalid-address-or-key+
                                          :message (format nil "Invalid Bitcoin address: ~A" key)))
-                     (push (make-recipient :address key :script script
-                                           :amount (amount-from-value value))
-                           recipients))))
+                     (let ((amount (amount-from-value value)))
+                       (when (gethash script destinations)
+                         (error 'rpc-error :code +rpc-invalid-parameter+
+                                           :message (format nil "Invalid parameter, duplicated address: ~A" key)))
+                       (setf (gethash script destinations) t)
+                       (push (make-recipient :address key :script script
+                                             :amount amount)
+                             recipients)))))
       (values (nreverse recipients) (nreverse keys)))))
 
 (defun %op-return-script (data)

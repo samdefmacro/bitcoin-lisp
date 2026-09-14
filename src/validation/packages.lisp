@@ -695,34 +695,92 @@ own result carries \"dust, tx with dust output must be 0-fee\"."
       (tx-reject-reason-string reason)
       "transaction failed"))
 
+;;;; testmempoolaccept's package path (Core ATMPArgs::PackageTestAccept,
+;;;; validation.cpp:499-513) is NOT the submitpackage path with the submission
+;;;; removed, and the differences are the point of the RPC:
+;;;;
+;;;;  * the package is validated as a package. One coin view covers the
+;;;;    confirmed UTXO set, the mempool and the members already checked, so a
+;;;;    child spending an in-package parent is answered on its merits instead
+;;;;    of `missing-inputs';
+;;;;  * the context-free package rules apply, and their verdict is about the
+;;;;    PACKAGE -- `package-not-sorted', `conflict-in-package',
+;;;;    `package-contains-duplicates' -- which the caller prints on every row;
+;;;;  * m_allow_replacement is FALSE (:505), so a member conflicting with a
+;;;;    mempool transaction is rejected as `bip125-replacement-disallowed'
+;;;;    however good a replacement it would make on its own: testmempoolaccept
+;;;;    answers for the package it was given, and that package is not a
+;;;;    replacement (rpc_packages.py:320-326, mempool_package_rbf.py:110);
+;;;;  * m_package_feerates is FALSE (:509), so every member pays its own fee
+;;;;    floor and reports its OWN effective feerate -- a package testres
+;;;;    therefore equals the individual testres of its members
+;;;;    (rpc_packages.py:100), which CPFP evaluation would not give;
+;;;;  * there is no child-with-parents gate: that one belongs to AcceptPackage
+;;;;    (:1639), so a 25-long chain is a legal thing to ask about
+;;;;    (rpc_packages.py:145-150).
+
+(defun %package-test-prechecks (package utxo-set mempool chain-state height
+                                results pkg-coins)
+  "PreChecks for EVERY member of PACKAGE first, so a package holding one member
+we will reject never pays for the others' signature verification
+(validation.cpp:1445-1473). Each member that passes adds its outputs to
+PKG-COINS, which is Core's m_viewmempool.PackageAddTransaction (:1473) -- the
+reason the member after it can spend them. Unconfirmed, so they carry the next
+block's height for BIP68, like MEMPOOL-EXTRA-COINS.
+
+Returns the %PKG-VAL records in package order, or NIL after recording the
+first failure in RESULTS: the rest of the members then have no result at all,
+which is what leaves their rows blank."
+  (let ((validated '()))
+    (dolist (tx package (nreverse validated))
+      (multiple-value-bind (valid err fee rset sigops modified-fee)
+          (validate-transaction-for-mempool tx utxo-set mempool height
+                                            :package-coins pkg-coins
+                                            :chain-state chain-state
+                                            :allow-replacement nil
+                                            :allow-sibling-eviction nil
+                                            :defer-script-checks t)
+        (declare (ignore rset))
+        (unless valid
+          (%mark-result-invalid (gethash (bl.ser:transaction-wtxid tx) results) err)
+          (return nil))
+        (push (%make-pkg-val tx (bl.ser:transaction-hash tx)
+                             (bl.ser:transaction-wtxid tx) (or fee 0)
+                             (bl.mp:sigop-adjusted-vsize
+                              (bl.ser:transaction-weight tx) sigops)
+                             sigops nil modified-fee)
+              validated)
+        (%add-package-coins pkg-coins tx (1+ height))))))
+
+(defun %package-test-script-pass (validated utxo-set mempool height pkg-coins
+                                  results)
+  "The script passes, member by member (validation.cpp:1533-1551). A member is
+recorded as accepted only once it has passed them, which is why the members
+BEFORE a script failure keep their full result and the ones after it have none
+yet. The effective feerate is the member's OWN modified feerate over its own
+vsize, covering its own wtxid alone -- m_package_feerates is false in this
+context (:1542-1545). Returns T when every member passed."
+  (dolist (v validated t)
+    (multiple-value-bind (ok err)
+        (mempool-script-checks (%pkg-val-tx v) utxo-set mempool height
+                               :package-coins pkg-coins)
+      (unless ok
+        (%mark-result-invalid (gethash (%pkg-val-wtxid v) results) err)
+        (return nil)))
+    (let ((vsize (%pkg-val-vsize v)))
+      (%mark-result-valid (gethash (%pkg-val-wtxid v) results)
+                          vsize (%pkg-val-fee v)
+                          (if (zerop vsize)
+                              0
+                              (/ (%pkg-val-modified-fee v) vsize))
+                          (list (%pkg-val-wtxid v))))))
+
 (defun test-package-acceptance (package utxo-set mempool chain-state)
   "Core MemPoolAccept::AcceptMultipleTransactionsInternal under
-ATMPArgs::PackageTestAccept (validation.cpp:1429-1553, args at :499-513) — the
-READ-ONLY package path, and the one testmempoolaccept takes whenever it is
-handed more than one transaction (rpc/mempool.cpp:343-346). The mempool is
-never touched.
-
-It is NOT the submitpackage path with the submission removed, and the
-differences are the whole point of the RPC:
-
-  * the package is validated as a package. One coin view covers the confirmed
-    UTXO set, the mempool and the members already checked, so a child spending
-    an in-package parent is answered on its merits instead of `missing-inputs';
-  * the context-free package rules apply, and their verdict is about the
-    PACKAGE — `package-not-sorted', `conflict-in-package',
-    `package-contains-duplicates' — which the caller prints on every row;
-  * m_allow_replacement is FALSE (:505), so a member conflicting with a
-    mempool transaction is rejected as `bip125-replacement-disallowed' however
-    good a replacement it would make on its own. testmempoolaccept answers for
-    the package it was given, and that package is not a replacement
-    (rpc_packages.py:320-326, mempool_package_rbf.py:110);
-  * m_package_feerates is FALSE (:509), so every member pays its own fee floor
-    and reports its OWN effective feerate — a package testres therefore equals
-    the individual testres of its members (rpc_packages.py:100), which is
-    exactly what submitpackage's CPFP evaluation would not give;
-  * there is no child-with-parents gate: that one belongs to AcceptPackage
-    (:1639), so a 25-long chain is a legal thing to ask about
-    (rpc_packages.py:145-150).
+ATMPArgs::PackageTestAccept (validation.cpp:1429-1553) — the READ-ONLY package
+path, and the one testmempoolaccept takes whenever it is handed more than one
+transaction (rpc/mempool.cpp:343-346). See the commentary above for how it
+differs from submitpackage's. The mempool is never touched.
 
 Returns (values package-error results):
 
@@ -735,7 +793,7 @@ Returns (values package-error results):
   never finished carries :not-validated and is rendered as txid and wtxid
   alone. WHICH pass failed decides how many of those there are: a PreChecks
   failure leaves every other member blank, while a script failure leaves the
-  members before it complete (%PACKAGE-TEST-ROWS in src/rpc/mempool.lisp)."
+  members before it complete (%TESTMEMPOOLACCEPT-ROWS, src/rpc/mempool.lisp)."
   (let ((height (bl.store:current-height chain-state)))
     ;; 0. Context-free package checks (:1436). PCKG_POLICY, no member results.
     (multiple-value-bind (ok reason) (package-well-formed package)
@@ -743,97 +801,60 @@ Returns (values package-error results):
         (return-from test-package-acceptance
           (values reason (%results-not-validated package reason)))))
     (let ((results (bl.bytes:make-octets-hash-table))   ; wtxid -> result
-          (pkg-coins (%make-package-coins))
-          (validated '()))
+          (pkg-coins (%make-package-coins)))
       (dolist (tx package)
         (let ((wtxid (bl.ser:transaction-wtxid tx)))
           (setf (gethash wtxid results)
                 (make-package-tx-result :txid (bl.ser:transaction-hash tx)
                                         :wtxid wtxid))))
-      (flet ((result-for (tx) (gethash (bl.ser:transaction-wtxid tx) results))
-             (ordered ()
+      (flet ((ordered ()
                (loop for tx in package
                      collect (gethash (bl.ser:transaction-wtxid tx) results))))
-        ;; 1. PreChecks for EVERY member first, so a package holding one member
-        ;; we will reject never pays for the others' signature verification
-        ;; (:1445-1450). The first failure ends the pass: that member gets its
-        ;; verdict, the rest stay blank.
-        (dolist (tx package)
-          (multiple-value-bind (valid err fee rset sigops modified-fee)
-              (validate-transaction-for-mempool tx utxo-set mempool height
-                                                :package-coins pkg-coins
-                                                :chain-state chain-state
-                                                :allow-replacement nil
-                                                :allow-sibling-eviction nil
-                                                :defer-script-checks t)
-            (declare (ignore rset))
-            (unless valid
-              (%mark-result-invalid (result-for tx) err)
-              (return-from test-package-acceptance (values nil (ordered))))
-            (push (%make-pkg-val tx (bl.ser:transaction-hash tx)
-                                 (bl.ser:transaction-wtxid tx) (or fee 0)
-                                 (bl.mp:sigop-adjusted-vsize
-                                  (bl.ser:transaction-weight tx) sigops)
-                                 sigops nil modified-fee)
-                  validated)
-            ;; This member's outputs are now spendable by the ones after it
-            ;; (:1473). Unconfirmed, so they carry the next block's height for
-            ;; BIP68, like MEMPOOL-EXTRA-COINS.
-            (%add-package-coins pkg-coins tx (1+ height))))
-        (setf validated (nreverse validated))
-        ;; 2. In-package TRUC topology, now that every vsize and parent is
-        ;; known (:1477-1483). PCKG_POLICY: no member results at all.
-        (dolist (v validated)
-          (let ((reason (package-truc-checks mempool (%pkg-val-tx v)
-                                             (%pkg-val-vsize v) package)))
-            (when reason
-              (return-from test-package-acceptance (values reason (ordered))))))
-        ;; 3. No package-feerate check and no package RBF here: m_package_feerates
-        ;; is false, and with replacement disallowed above there can be no
-        ;; conflicts left for PackageRBFChecks to judge (:1506, :1511).
-        ;;
-        ;; 4. Would the package fit the cluster limits (:1516-1520)? Staged and
-        ;; unstaged, so the mempool is unchanged. PCKG_POLICY
-        ;; (mempool_package_limits.py:28, mempool_sigoplimit.py:175).
-        (unless (bl.mp:mempool-package-fits-cluster-limits-p
-                 mempool
-                 (mapcar (lambda (v) (list (%pkg-val-tx v)
-                                           (%pkg-val-modified-fee v)
-                                           (%pkg-val-graph-weight v)))
-                         validated))
-          (return-from test-package-acceptance
-            (values :too-large-cluster (ordered))))
-        ;; 5. Ephemeral dust over the whole package (:1524-1531). PCKG_TX, so
-        ;; no package-error — only the child that stranded the dust answers.
-        (when *require-standard*
-          (multiple-value-bind (dust-ok dust-txid offender)
-              (check-ephemeral-spends package mempool)
-            (declare (ignore dust-txid))
-            (unless dust-ok
-              (let ((child (result-for (or offender (car (last package))))))
-                (when child
-                  (%mark-result-invalid child (ephemeral-spends-verdict offender))))
-              (return-from test-package-acceptance (values nil (ordered))))))
-        ;; 6. The script passes, member by member (:1533-1551). A member is
-        ;; recorded as accepted only once it has passed them, which is why the
-        ;; members before a script failure keep their full result and the ones
-        ;; after it do not have one yet. The effective feerate is the member's
-        ;; OWN modified feerate (m_package_feerates false, :1542-1545).
-        (dolist (v validated)
-          (multiple-value-bind (ok err)
-              (mempool-script-checks (%pkg-val-tx v) utxo-set mempool height
-                                     :package-coins pkg-coins)
-            (unless ok
-              (%mark-result-invalid (gethash (%pkg-val-wtxid v) results) err)
-              (return-from test-package-acceptance (values nil (ordered)))))
-          (let ((vsize (%pkg-val-vsize v)))
-            (%mark-result-valid (gethash (%pkg-val-wtxid v) results)
-                                vsize (%pkg-val-fee v)
-                                (if (zerop vsize)
-                                    0
-                                    (/ (%pkg-val-modified-fee v) vsize))
-                                (list (%pkg-val-wtxid v)))))
-        (values nil (ordered))))))
+        ;; 1. Every member's PreChecks, with the package's own coins.
+        (let ((validated (%package-test-prechecks package utxo-set mempool
+                                                  chain-state height results
+                                                  pkg-coins)))
+          (unless validated
+            (return-from test-package-acceptance (values nil (ordered))))
+          ;; 2. In-package TRUC topology, now that every vsize and parent is
+          ;; known (:1477-1483). PCKG_POLICY: no member results at all.
+          (dolist (v validated)
+            (let ((reason (package-truc-checks mempool (%pkg-val-tx v)
+                                               (%pkg-val-vsize v) package)))
+              (when reason
+                (return-from test-package-acceptance (values reason (ordered))))))
+          ;; 3. No package-feerate check and no package RBF here:
+          ;; m_package_feerates is false, and with replacement disallowed there
+          ;; can be no conflicts left for PackageRBFChecks (:1506, :1511).
+          ;;
+          ;; 4. Would the package fit the cluster limits (:1516-1520)? Staged
+          ;; and unstaged, so the mempool is unchanged. PCKG_POLICY
+          ;; (mempool_package_limits.py:28, mempool_sigoplimit.py:175).
+          (unless (bl.mp:mempool-package-fits-cluster-limits-p
+                   mempool
+                   (mapcar (lambda (v) (list (%pkg-val-tx v)
+                                             (%pkg-val-modified-fee v)
+                                             (%pkg-val-graph-weight v)))
+                           validated))
+            (return-from test-package-acceptance
+              (values :too-large-cluster (ordered))))
+          ;; 5. Ephemeral dust over the whole package (:1524-1531). PCKG_TX, so
+          ;; no package-error -- only the child that stranded the dust answers.
+          (when *require-standard*
+            (multiple-value-bind (dust-ok dust-txid offender)
+                (check-ephemeral-spends package mempool)
+              (declare (ignore dust-txid))
+              (unless dust-ok
+                (let ((child (gethash (bl.ser:transaction-wtxid
+                                       (or offender (car (last package))))
+                                      results)))
+                  (when child
+                    (%mark-result-invalid child (ephemeral-spends-verdict offender))))
+                (return-from test-package-acceptance (values nil (ordered))))))
+          ;; 6. The script passes.
+          (%package-test-script-pass validated utxo-set mempool height
+                                     pkg-coins results)
+          (values nil (ordered)))))))
 
 (defun validate-package-for-mempool (package utxo-set mempool chain-state
                                     &key client-maxfeerate)
