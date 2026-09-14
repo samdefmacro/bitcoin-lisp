@@ -1632,14 +1632,18 @@ is: it additionally requires data pending, so it is not this rule and cannot
 stand in for it. Core's fourth rule, the unfinished handshake, is peer state
 and lives in CHECK-HANDSHAKE-TIMEOUT.
 
-The receive rule is suspended for a SEND-PAUSED peer, and that is not a
-divergence but the consequence of one. Core's socket handler keeps receiving
-from a peer whose send buffer is over the cap, so its m_last_recv advances;
-our pump stops reading such a peer entirely (DRAIN-AND-REAP-PEER, Core's
-fPauseSend gate one level up in ProcessMessages), so its LAST-RECV-TIME would
-go stale for our own reason and this rule would disconnect a peer for the pause
-we imposed on it. A peer that never drains is still bounded --
-CONNECTION-SEND-STALLED-P fires on the same window."
+The receive rule is suspended for a RECEIVE-PAUSED peer, which is the one
+pause that stops our reads (CONNECTION-RECV-PAUSED-P: an over-cap backlog of
+messages read but not dispatched, Core fPauseRecv). LAST-RECV-TIME would then
+go stale for our own reason and this rule would disconnect a healthy peer for
+a pause we imposed on it.
+
+A SEND-paused peer is NOT exempt, and used to be: while the pause also stopped
+the socket read the exemption was forced, but the read now continues through a
+send pause exactly as Core's socket handler does (DRAIN-AND-REAP-PEER), so
+m_last_recv advances there as it does in Core and the rule applies unchanged.
+A peer that never drains is still bounded -- CONNECTION-SEND-STALLED-P fires on
+the same window."
   (let ((last-send (connection-last-send-time conn))
         (last-recv (connection-last-recv-time conn)))
     (cond
@@ -1651,7 +1655,7 @@ CONNECTION-SEND-STALLED-P fires on the same window."
       ((> unix-now (+ last-send +timeout-interval-seconds+))
        (format nil "socket sending timeout: ~Ds" (- unix-now last-send)))
       ((and (> unix-now (+ last-recv +timeout-interval-seconds+))
-            (not (connection-send-paused-p conn)))
+            (not (connection-recv-paused-p conn)))
        (format nil "socket receive timeout: ~Ds" (- unix-now last-recv))))))
 
 (defun check-handshake-timeout (peer)

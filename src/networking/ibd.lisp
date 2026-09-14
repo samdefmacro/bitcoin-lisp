@@ -2064,6 +2064,43 @@ clause and is likewise untouched."
         (%note-message-handler-error peer command payload c)
         (still-connected-p)))))
 
+(defun %dispatch-parked-messages (peer node-ctx ctx)
+  "Dispatch the messages PEER's connection parked while it was send-paused,
+oldest first, until the queue empties or the pause returns -- Core's
+ProcessMessages taking one message per call off m_msg_process_queue behind its
+`if (node.fPauseSend) return false;` (net_processing.cpp:5244-5245,
+net.cpp:4028-4041).
+
+Stopping on a RE-raised pause is the point: serving a parked getdata can refill
+the send buffer past the cap, and the rest of the queue then waits for the pass
+that finds it drained, exactly as an unread socket would have."
+  (loop repeat +max-messages-per-peer-per-cycle+
+        for conn = (peer-connection peer)
+        while (and conn
+                   (connection-connected conn)
+                   (not *ibd-stop-requested*)
+                   (not (connection-send-paused-p conn))
+                   (connection-parked-messages-p conn))
+        do (multiple-value-bind (command payload) (pop-parked-message conn)
+             (unless command (return))
+             (safely-dispatch-peer-message peer command payload node-ctx ctx))))
+
+(defun %deliver-peer-message (peer command payload node-ctx ctx)
+  "Dispatch COMMAND/PAYLOAD now, or park it on the connection when PEER is
+send-paused -- Core's socket handler always completes the read and only
+ProcessMessages declines to poll (net.cpp:4011-4026 against
+net_processing.cpp:5244-5245).
+
+A non-empty parked queue parks too, whatever the pause says: read order is
+dispatch order, and %DISPATCH-PARKED-MESSAGES can leave a remainder behind when
+it hits its own per-pass message budget."
+  (let ((conn (peer-connection peer)))
+    (if (and conn
+             (or (connection-send-paused-p conn)
+                 (connection-parked-messages-p conn)))
+        (park-received-message conn command payload)
+        (safely-dispatch-peer-message peer command payload node-ctx ctx))))
+
 (defun drain-and-reap-peer (peer node-ctx ctx)
   "Pump every currently-readable message from PEER, then reap it if its
 connection has gone dead. Mirrors the per-peer branch of Bitcoin Core's
@@ -2079,16 +2116,26 @@ Draining a peer whose remote has FIN'd eventually hits a zero-progress
 read, which flips connection-connected to NIL; handle-peer-fin then
 disconnects it so replace-disconnected-peers can refill the slot.
 
-A SEND-PAUSED peer is skipped entirely — this is Core's backpressure
-(`if (node.fPauseSend) return false;` before PollMessage,
-net_processing.cpp:5244-5245). Answering a peer whose socket has already
-taken all it can only buries the answer, so we stop consuming its input
-until the buffer drains; TCP then closes our receive window and the peer
-stops talking. The half-read-message reaper below is skipped with it: it
-measures from the last byte that ARRIVED, so running it while we are
-deliberately not reading would disconnect a healthy peer for our own
-pause. A peer that never drains is disconnected by check-peer-health's
-send-stall timeout instead.
+A SEND-PAUSED peer is still READ; what the pause stops is the DISPATCH.
+This is Core's shape exactly: its socket handler recv()s from every peer
+that is not fPauseRecv (net.cpp:2070, and fPauseSend appears nowhere in
+SocketHandlerConnected), the completed messages land in that peer's
+m_msg_process_queue (MarkReceivedMsgsForProcessing, net.cpp:4011-4026),
+and only the POLL off that queue is gated — `if (node.fPauseSend) return
+false;` sits immediately before PollMessage (net_processing.cpp:5244-5245).
+Messages read while the pause holds are parked on the connection and
+dispatched, oldest first, by the pass that finds the buffer drained.
+
+Reading on is not a nicety: a pause that stopped the read deadlocks two
+nodes that each queue an over-cap message to the other, because neither
+side ever consumes the bytes that would let the other side's queue drain
+(Core test/functional/p2p_net_deadlock.py). What bounds the parked queue is
+*MAX-RECEIVE-BUFFER-BYTES* (Core's m_recv_flood_size): past it the peer is
+RECEIVE-paused, we stop reading, and TCP's own window throttles it. The
+half-read-message reaper below is skipped while receive-paused — and only
+then — because it measures from the last byte that ARRIVED and would
+otherwise disconnect a healthy peer for a pause of our own making. A peer
+that never drains is disconnected by check-peer-health's send-stall timeout.
 
 The ONE thing that pause does not defer is the peer's own pending getdata:
 that runs first, above the gate, because it is the work the previous pass
@@ -2116,6 +2163,16 @@ paused peer's input is not read, so nothing can add to it until it drains."
        (error (c)
          (bl:log-warn "Error serving a deferred getdata for ~A: ~A"
                       (peer-log-name peer) c))))
+   ;; Messages an earlier send-paused pass parked go first, oldest first, and
+   ;; before anything is read this pass -- read order is dispatch order (Core
+   ;; polls one message per ProcessMessages call off the head of
+   ;; m_msg_process_queue). Re-checks the pause per message and stops again if
+   ;; serving one refilled the send buffer.
+   (when (and (eq (peer-state peer) :ready)
+              conn
+              (connection-connected conn)
+              (connection-parked-messages-p conn))
+     (%dispatch-parked-messages peer node-ctx ctx))
    (when (and (eq (peer-state peer) :ready)
               conn
               ;; Only drain a connection still believed live. If a previous
@@ -2123,10 +2180,11 @@ paused peer's input is not read, so nothing can add to it until it drains."
               ;; have NILed the socket), skip straight to handle-peer-fin —
               ;; no point waiting for input on a dead/closed socket.
               (connection-connected conn)
-              ;; Send backpressure: while this peer's own send buffer is
-              ;; over the cap we process none of its messages (see the
-              ;; docstring).
-              (not (connection-send-paused-p conn)))
+              ;; Receive backpressure: the ONE thing that stops us reading is
+              ;; an over-cap backlog of messages we have not dispatched (Core
+              ;; fPauseRecv, net.cpp:2070). Being send-paused is not that; see
+              ;; the docstring.
+              (not (connection-recv-paused-p conn)))
     (handler-case
         ;; Drain only as long as the socket actually has data ready
         ;; (usocket:wait-for-input :timeout 0 is non-blocking). This lets us
@@ -2150,6 +2208,10 @@ paused peer's input is not read, so nothing can add to it until it drains."
               ;; the connection — eleven seconds, measured.
               while (and (peer-connection peer)
                          (connection-input-pending-p (peer-connection peer))
+                         ;; The parked backlog filled up mid-drain: stop
+                         ;; reading (Core re-evaluates fPauseRecv on every
+                         ;; message added to the queue, net.cpp:4025).
+                         (not (connection-recv-paused-p (peer-connection peer)))
                          ;; Byte fairness, checked between messages: a peer
                          ;; with plenty to say costs one turn, not the pass
                          ;; (see +max-recv-bytes-per-peer-per-cycle+).
@@ -2163,7 +2225,7 @@ paused peer's input is not read, so nothing can add to it until it drains."
               ;; this peer (see safely-dispatch-peer-message); the next
               ;; liveness check then ends the drain. The outer handler-case
               ;; below remains the backstop for I/O errors from receive-message.
-              do (safely-dispatch-peer-message peer command payload node-ctx ctx)))
+              do (%deliver-peer-message peer command payload node-ctx ctx)))
       ((or stream-error usocket:socket-condition end-of-file) (c)
         (bl:log-cat "net" "I/O error during message drain, ~A: ~A"
                     (disconnect-msg peer) c)

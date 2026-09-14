@@ -168,16 +168,22 @@ us reading that peer's input (70502bf3)."
               (ignore-errors (usocket:socket-close server-conn))))
         (bl.net:close-listener srv)))))
 
-(test send-paused-peer-has-its-input-left-unread
-  "Core's backpressure runs on the INPUT side: ProcessMessages returns before
-polling a new message from a peer whose send buffer is over the cap
-(net_processing.cpp:5244-5245), so the work is deferred rather than answered
-into a socket that cannot take it. The pump must therefore leave a
-send-paused peer's readable message where it is, and pick it up once the
-buffer drains (70502bf3).
+(test send-paused-peer-is-read-but-not-dispatched
+  "Core's send backpressure runs on the DISPATCH side, never on the socket
+read. ProcessMessages returns before polling a new message from a peer whose
+send buffer is over the cap (net_processing.cpp:5244-5245), while the socket
+handler goes on recv()ing from it -- fPauseSend appears nowhere in
+SocketHandlerConnected, and completed messages are spliced into that peer's
+m_msg_process_queue (net.cpp:4011-4026) to be polled once the pause clears.
+
+So the pump must READ a send-paused peer's pending message (the bytes leave
+the socket, and the parked-byte count rises) and must NOT act on it. Stopping
+the read is what deadlocks two nodes that each queue an over-cap message to
+the other, neither ever consuming what would drain the other's queue --
+Core's test/functional/p2p_net_deadlock.py.
 
 The second half is the positive control: with the pause cleared and nothing
-else changed, the SAME pending message is read."
+else changed, the SAME message -- already off the socket -- is dispatched."
   (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
@@ -200,18 +206,80 @@ else changed, the SAME pending message is read."
                (setf (send-buffer-bytes conn)
                      (1+ bl.net:*max-send-buffer-bytes*))
                (is-true (bl.net:connection-send-paused-p conn))
-               (drain-peer-once peer (bl.ctx:make-node-context) nil)
-               (is (= 0 (bl.net:connection-bytes-received conn))
-                   "a send-paused peer's input is left unread")
-               (is-true (bl.net:connection-connected conn)
-                        "and the pause is not a reason to disconnect it")
-               ;; Positive control: unpause and the same message is consumed.
-               (setf (send-buffer-bytes conn) 0)
+               (is-false (bl.net:connection-recv-paused-p conn)
+                         "nothing is parked yet, so the read side is open")
                (drain-peer-once peer (bl.ctx:make-node-context) nil)
                (is (plusp (bl.net:connection-bytes-received conn))
-                   "and once drained the pending message is read after all")
+                   "a send-paused peer's socket is still read (Core net.cpp:2070)")
                (is (plusp (gethash "ping" (bl.net:peer-recv-per-msg peer) 0))
-                   "the message the pause deferred is the one dispatched"))
+                   "and it is accounted as received (Core mapRecvBytesPerMsgType)")
+               (is-true (bl.net:connection-parked-messages-p conn)
+                        "and the message it sent is parked, not acted on")
+               (is (plusp (bl.net:connection-recv-parked-bytes conn))
+                   "the parked message is charged against the receive cap")
+               ;; The handler's own side effect is the probe for dispatch: a
+               ;; ping is answered with a pong, so a sent byte means it ran.
+               (is (= 0 (bl.net:connection-bytes-sent conn))
+                   "the pause defers the DISPATCH: no pong was written")
+               (is-true (bl.net:connection-connected conn)
+                        "and the pause is not a reason to disconnect it")
+               ;; Positive control: unpause and the parked message is dispatched.
+               (setf (send-buffer-bytes conn) 0)
+               (drain-peer-once peer (bl.ctx:make-node-context) nil)
+               (is (plusp (bl.net:connection-bytes-sent conn))
+                   "the message the pause deferred is the one dispatched")
+               (is-false (bl.net:connection-parked-messages-p conn)
+                         "and the parked queue is empty again")
+               (is (= 0 (bl.net:connection-recv-parked-bytes conn))
+                   "with its bytes returned to the receive budget"))
+          (bl.net:close-connection conn)
+          (ignore-errors (usocket:socket-close sender))
+          (bl.net:close-listener srv))))))
+
+(test recv-paused-peer-stops-being-read
+  "The one backpressure that stops the socket read is the RECEIVE flood cap:
+Core selects a peer's socket for reading unless fPauseRecv (net.cpp:2070),
+and fPauseRecv is m_msg_process_queue_size > m_recv_flood_size, re-evaluated
+on every add and every poll (net.cpp:4025, :4037). Past the cap the peer is
+throttled by our own TCP window, which is what bounds the queue that the send
+pause fills.
+
+Positive control second: with the parked byte count back under the cap and
+nothing else changed, the SAME pending message is read."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (let* ((port (usocket:get-local-port srv))
+             (sender (usocket:socket-connect "127.0.0.1" port
+                                             :element-type '(unsigned-byte 8)))
+             (accepted (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
+             (conn (make-test-connection
+                    :socket accepted :host "127.0.0.1" :port port :connected t))
+             (peer (bl.net:make-peer :state :ready :address "127.0.0.1:8333"
+                                     :connection conn)))
+        (unwind-protect
+             (progn
+               (write-sequence (bl.ser:make-ping-message 43)
+                               (usocket:socket-stream sender))
+               (force-output (usocket:socket-stream sender))
+               (sleep 0.2)
+               ;; Over the receive cap: the read side closes.
+               (setf (bl.net:connection-recv-parked-bytes conn)
+                     (1+ bl.net:*max-receive-buffer-bytes*))
+               (is-true (bl.net:connection-recv-paused-p conn))
+               (drain-peer-once peer (bl.ctx:make-node-context) nil)
+               (is (= 0 (bl.net:connection-bytes-received conn))
+                   "a receive-paused peer's socket is not read")
+               (is-true (bl.net:connection-connected conn)
+                        "and the pause is not a reason to disconnect it")
+               ;; Positive control: back under the cap and the message arrives.
+               (setf (bl.net:connection-recv-parked-bytes conn) 0)
+               (drain-peer-once peer (bl.ctx:make-node-context) nil)
+               (is (plusp (bl.net:connection-bytes-received conn))
+                   "and once under the cap the pending message is read")
+               (is (plusp (bl.net:connection-bytes-sent conn))
+                   "and dispatched -- the pong proves it -- since the peer is
+not send-paused"))
           (bl.net:close-connection conn)
           (ignore-errors (usocket:socket-close sender))
           (bl.net:close-listener srv))))))
