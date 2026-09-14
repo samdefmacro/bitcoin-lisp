@@ -1990,7 +1990,13 @@ covers, so no witness can change it and no peer should be asked for the
 transaction again under either id. Any other failure may be a verdict on
 THIS witness alone, so the txid keeps its announcements."
   (let ((txid (bl.ser:transaction-hash tx))
-        (wtxid (bl.ser:transaction-wtxid tx)))
+        (wtxid (bl.ser:transaction-wtxid tx))
+        ;; The CLASS decides where a rejection is cached, and a verdict that
+        ;; carries Core's reject reason and debug message beside it is the
+        ;; list (KEYWORD DETAIL...) -- :witness-stripped is one of those, so
+        ;; asking EQ of the whole verdict would cache exactly the rejection
+        ;; Core caches nowhere.
+        (reason (bl.val:tx-reject-keyword reason)))
     (cond
       ((eq reason :missing-input) nil)
       ((eq reason :witness-stripped) nil)

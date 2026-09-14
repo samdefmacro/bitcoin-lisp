@@ -1504,7 +1504,13 @@ PolicyScriptChecks)."
         (bl.val:validate-transaction-for-mempool
          base utxo mempool 100)
       (is (null valid))
-      (is (eq err :witness-stripped)))
+      ;; Core re-states only the CLASS and keeps what the script pass
+      ;; reported (validation.cpp:1145-1148), so the verdict still carries
+      ;; the ScriptErrorString and CScriptCheck's per-input sentence.
+      (is (eq :witness-stripped (bl.val:tx-reject-keyword err)))
+      (is (eql 0 (search "mempool-script-verify-flag-failed ("
+                         (bl.val:tx-reject-reason-only err))))
+      (is (search "input 0 of " (or (bl.val:tx-reject-debug-string err) ""))))
     ;; Same tx shape spending a P2PKH coin: witness stripping cannot explain
     ;; the failure, so it is the generic policy-pass script rejection.
     (let ((base2 (make-mempool-test-tx :input-id 121 :value 50000000)))
@@ -1521,7 +1527,9 @@ PolicyScriptChecks)."
         ;; The reason carries the script error Core would name in its
         ;; parenthetical: the fixture's scriptSig does not satisfy the P2PKH
         ;; output it spends, so the failure is the OP_EQUALVERIFY.
-        (is (equal '(:mempool-script-verify-flag-failed :equalverify) err))))))
+        (is (eq :mempool-script-verify-flag-failed (bl.val:tx-reject-keyword err)))
+        (is (string= "mempool-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)"
+                     (bl.val:tx-reject-reason-only err)))))))
 
 (test mempool-coinbase-maturity-at-next-block-height
   "Core's mempool acceptance checks maturity at nSpendHeight = tip + 1
@@ -1554,7 +1562,13 @@ to evaluate maturity at the tip height itself, off by one."
          tx utxo mempool 99)
       (declare (ignore valid))
       (is (not (equal err :coinbase-not-mature)))
-      (is (equal '(:mempool-script-verify-flag-failed :equalverify) err)))))
+      (is (eq :mempool-script-verify-flag-failed (bl.val:tx-reject-keyword err)))
+        ;; Core's reject reason is the prefix plus ScriptErrorString
+        ;; (validation.cpp:2117); the failing input travels in the
+        ;; debug message beside it (:2018), not inside the reason.
+        (is (string= "mempool-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)"
+                     (bl.val:tx-reject-reason-only err)))
+        (is (search "input 0 of " (or (bl.val:tx-reject-debug-string err) ""))))))
 
 ;;;; Wave 9D: two-pass mempool script validation — PolicyScriptChecks
 ;;;; (STANDARD flags) then ConsensusScriptChecks (tip consensus flags),
@@ -1640,7 +1654,13 @@ MANDATORY-only flags and ACCEPTED it."
            tx utxo mempool 100)
         (is (null valid))
         ;; And it names WHICH standard flag rejected: Core's SCRIPT_ERR_CLEANSTACK.
-        (is (equal '(:mempool-script-verify-flag-failed :cleanstack) err))))
+        (is (eq :mempool-script-verify-flag-failed (bl.val:tx-reject-keyword err)))
+        ;; Core's reject reason is the prefix plus ScriptErrorString
+        ;; (validation.cpp:2117); the failing input travels in the
+        ;; debug message beside it (:2018), not inside the reason.
+        (is (string= "mempool-script-verify-flag-failed (Stack size must be exactly one after execution)"
+                     (bl.val:tx-reject-reason-only err)))
+        (is (search "input 0 of " (or (bl.val:tx-reject-debug-string err) "")))))
     ;; Control: the canonical single-push scriptSig sails through BOTH
     ;; passes and is accepted.
     (multiple-value-bind (tx utxo mempool)
@@ -1664,7 +1684,13 @@ consensus-valid but violates MINIMALDATA: rejected by the policy pass."
           (bl.val:validate-transaction-for-mempool
            tx utxo mempool 100)
         (is (null valid))
-        (is (equal '(:mempool-script-verify-flag-failed :minimaldata) err))))))
+        (is (eq :mempool-script-verify-flag-failed (bl.val:tx-reject-keyword err)))
+        ;; Core's reject reason is the prefix plus ScriptErrorString
+        ;; (validation.cpp:2117); the failing input travels in the
+        ;; debug message beside it (:2018), not inside the reason.
+        (is (string= "mempool-script-verify-flag-failed (Data push larger than necessary)"
+                     (bl.val:tx-reject-reason-only err)))
+        (is (search "input 0 of " (or (bl.val:tx-reject-debug-string err) "")))))))
 
 ;;;; PR3 ancestor/descendant tracking + chained spends
 

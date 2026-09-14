@@ -26,6 +26,9 @@ can. src/validation/.")
    #:block-reject-reason-string
    #:standard-output-script-p
    ;; Core's reject-reason vocabulary (keyword -> state.GetRejectReason())
+   #:tx-reject-keyword
+   #:tx-reject-reason-only
+   #:tx-reject-debug-string
    #:tx-reject-reason-string
    #:*tx-reject-reasons*
    ;; Package relay (submitpackage + opportunistic 1p1c)
