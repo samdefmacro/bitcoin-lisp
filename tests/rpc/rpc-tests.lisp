@@ -1820,6 +1820,29 @@ socket closes -- read 1. ping walks the same list."
     (is (integerp (cdr (assoc "maxmempool" result :test #'string=))))
     (is (integerp (cdr (assoc "usage" result :test #'string=))))))
 
+(test createrawtransaction-accepts-an-empty-outputs-array
+  "Core's outputs argument goes through get_array() (NormalizeOutputs,
+rawtransaction_util.cpp:81), which accepts an EMPTY array and then walks no
+keys, so createrawtransaction([], []) builds a transaction with no outputs
+rather than erroring -- rpc_rawtransaction.py:295 calls it for exactly that
+backwards compatibility. A top-level `[]' arrives here as the truthy
+empty-array sentinel, which is not a list, so the type-error arm this batch
+gave the argument would have claimed an array is not an array."
+  (let ((node (make-test-node)))
+    (flet ((create (outputs)
+             (bl.rpc:dispatch-rpc-method
+              node "createrawtransaction"
+              (wire-params (list (vector) outputs)))))
+      (is-true (stringp (create (vector)))
+               "an empty outputs ARRAY must build a transaction")
+      (is-true (stringp (create (make-hash-table :test 'equal)))
+               "and so must an empty outputs OBJECT")
+      ;; Control: a string is still Core's type error, which is what the
+      ;; sentinel arm must not swallow.
+      (is (equal (list -3   ; Core RPC_TYPE_ERROR, protocol.h
+                       "JSON value of type string is not of expected type array")
+                 (multiple-value-list (%rails-error (lambda () (create "foo")))))))))
+
 (test rpc-getmempoolinfo-reports-cores-policy-fields
   "getmempoolinfo's last four fields (rpc/mempool.cpp:1050-1053):
 maxdatacarriersize, limitclustercount, limitclustersize and optimal. Every

@@ -3389,6 +3389,11 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     (:bad-sequence-lock          . "bad-txns-nonfinal")                  ; :2555
     (:too-many-sigops            . "bad-blk-sigops")                     ; :2567
     (:coinbase-too-large         . "bad-cb-amount")                      ; :2609
+    ;; CheckBlock's size gate covers an EMPTY block and an oversized one with
+    ;; one reason (validation.cpp:3975-3979); :no-transactions is our name for
+    ;; the first of them (mining_template_verification.py:44 proposes an empty
+    ;; block and reads bad-blk-length).
+    (:no-transactions            . "bad-blk-length")                     ; :3977
     (:first-tx-not-coinbase      . "bad-cb-missing")                     ; :3984 CheckBlock
     (:multiple-coinbase          . "bad-cb-multiple")                    ; :3987
     ;; ConnectBlock relays the script pass's own reason, parenthetical and
