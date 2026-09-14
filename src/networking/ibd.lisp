@@ -1597,7 +1597,19 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
       (setf *ibd-gap-only-mode* t)))
 
   (let* ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
-         (ready-peers (sort (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers)
+         ;; COPY-LIST is load-bearing, not tidiness. REMOVE-IF-NOT may return
+         ;; the input list ITSELF when nothing is removed (SBCL does), and SORT
+         ;; is destructive -- so with every peer :READY this reordered the
+         ;; CALLER's list in place, and the caller's variable, still pointing at
+         ;; what used to be the head cell, came back with fewer peers on it.
+         ;; That list is RUN-IBD's own `peers', which is also
+         ;; (IBD-CONTEXT-PEERS ctx) and (NODE-CONTEXT-PEERS node-ctx) and the
+         ;; list the download loop DRAINS: the pass that sent a getdata dropped
+         ;; the peer it had just asked, whose block then sat unread on the
+         ;; socket until the request timed out sixty seconds later.
+         (ready-peers (sort (copy-list
+                             (remove-if-not (lambda (p) (eq (peer-state p) :ready))
+                                            peers))
                             #'< :key (lambda (p)
                                        (let ((lat (peer-ping-latency p)))
                                          (if (plusp lat) lat most-positive-fixnum)))))

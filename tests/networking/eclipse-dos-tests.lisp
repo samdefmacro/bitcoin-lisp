@@ -1001,7 +1001,36 @@ less than the operator asked for, silently."
     (is-false (bl.net:parse-whitelist-entry "noban@not-an-address"))
     ;; -whitebind refuses "out": a listening socket has no outgoing peers.
     (is-false (bl.net:parse-whitelist-entry
-               "noban,out@1.2.3.4" :allow-out nil)))
+               "noban,out@1.2.3.4" :allow-out nil))
+    ;; An EMPTY entry is legal and grants nothing -- Core's
+    ;; `else if (permission.length() == 0);' (net_permissions.cpp:67). This is
+    ;; how an operator writes "this range, and no permissions at all", and
+    ;; p2p_permissions.py:41-43 starts a node with `-whitelist=@127.0.0.1'
+    ;; and asserts the peer holds NONE. Refusing it made the option invalid,
+    ;; so the range was not granted rather than granted-empty -- a difference
+    ;; only the grant's own semantics show.
+    (is (= 0 (flags "@1.2.3.4")) "an empty permission list grants nothing")
+    (is (equal "1.2.3.4" (rest-of "@1.2.3.4")))
+    (is-true (bl.net:parse-whitelist-entry "@1.2.3.4")
+             "and the entry itself is accepted")
+    (is (= (flags "noban@1.2.3.4") (flags "noban,@1.2.3.4"))
+        "an empty entry among others is skipped, not looked up")
+    ;; ...but a DIRECTION with no permission is Core's "Only direction was
+    ;; set, no permissions" error (:80-83), which the empty entry is not.
+    (is-false (flags "in@1.2.3.4"))
+    (is-false (bl.net:parse-whitelist-entry "out@1.2.3.4"))
+    ;; The default direction is IN, not both: Core keeps separate incoming and
+    ;; outgoing range lists and a grant with no direction word joins only the
+    ;; incoming one (`if (connection_direction == ConnectionDirection::None)
+    ;; connection_direction = ConnectionDirection::In;', :77-79). Ours said
+    ;; :both, which handed an OUTBOUND peer in the range the operator's
+    ;; trusted-peer flags.
+    (is (eq :in (nth-value 1 (bl.net:parse-permission-flags "noban@1.2.3.4")))
+        "a grant with no direction word applies to inbound only")
+    (is (eq :in (nth-value 1 (bl.net:parse-permission-flags "1.2.3.4")))
+        "and so does the implicit, prefix-less form")
+    (is (eq :out (nth-value 1 (bl.net:parse-permission-flags "noban,out@1.2.3.4"))))
+    (is (eq :both (nth-value 1 (bl.net:parse-permission-flags "noban,in,out@1.2.3.4")))))
   ;; Rendering back, for getpeerinfo.permissions. "implicit" is not a
   ;; permission and is never listed.
   (is (equal '("noban" "download")
@@ -1179,6 +1208,45 @@ behaviour."
       (is-true (bl.net:record-misbehavior p "test"))
       (is (eq :disconnected (bl.net:peer-state p)))
       (is-true (bl.net:peer-discouraged-p "11.1.2.3")))))
+
+(test tx-inv-violation-line-names-the-hash
+  "Core prints the offending hash in this line -- `transaction (%s) inv sent in
+violation of protocol, %s' (net_processing.cpp:4169) -- and
+p2p_blocksonly.py:36 asserts on the line WITH the hash in it, under
+assert_debug_log. Ours logged the sentence without the hash, so the assertion
+never matched and an operator reading the log could not tell WHICH
+announcement cost the peer its connection.
+
+The hash is printed in uint256 display order (the wire bytes reversed), as
+inv.hash.ToString() does."
+  (let ((bl:*blocksonly* t)
+        (bl:*network* :regtest)
+        (hash (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+                ;; 0x1234 as a uint256: display order 00..001234, so the WIRE
+                ;; bytes are 34 12 00 .. 00 -- the same value p2p_blocksonly
+                ;; announces.
+                (setf (aref h 0) #x34 (aref h 1) #x12)
+                h)))
+    (let* ((peer (%g718-peer :conn-type :outbound-full-relay :inbound t))
+           ;; The line is a `net' DEBUG line, as Core's is: without the
+           ;; category enabled nothing is written and the assertions below
+           ;; would pass or fail on an empty buffer.
+           (bl.log::*debug-categories* (let ((h (make-hash-table :test 'equal)))
+                                        (setf (gethash "net" h) t)
+                                        h))
+           (lines (capture-log-lines
+                   (lambda ()
+                     (deliver-inv peer
+                                  (tx-inv-payload bl.ser:+inv-type-wtx+ hash)
+                                  (bl.ctx:make-node-context))))))
+      (is (eq :disconnected (bl.net:peer-state peer))
+          "a tx inv against our advertised fRelay=0 still costs the connection")
+      (is-true (find "inv sent in violation of protocol" lines :test #'search)
+               "and Core's sentence is logged")
+      (is-true (find "transaction (0000000000000000000000000000000000000000000000000000000000001234) inv sent in violation of protocol"
+                     lines :test #'search)
+               "with the announced hash in it, in display order"))))
 
 (test relay-permission-excuses-blocksonly-and-nothing-else
   "Core RejectIncomingTxs (net_processing.cpp:5686-5694): the \"relay\"
