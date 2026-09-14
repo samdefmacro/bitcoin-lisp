@@ -322,3 +322,38 @@ Two failures were bisected with the oracle on a scratch worktree:
 Deployed: testnet4 relaunched on `911848f9` (batches A-D), synced and out of
 IBD within a minute, 21 peers an hour later. Mainnet stays on `6011851b`
 until its restart is approved.
+
+## Round 4
+
+Batches F (P2P bookkeeping), G (wallet), H (mempool and mining RPCs) and J
+(init, config, interfaces) merged onto `main` through `bc65804a`, each with
+the branch battery green and the merged battery green before the push
+(38,956 → 39,242 checks). Their root causes are in the commit log between
+`7e124486` and `bc65804a`; the ones that changed the node's behaviour most:
+the accept loop handed each handshake to its own thread (one silent peer had
+blocked every other connection for 15 s), the tx-request tracker moved to the
+mockable clock, `-rpcthreads` stopped being a connection cap that blocked the
+HTTP accept loop, ZMQ bound once per address, a reject reason and its debug
+message became two fields as in Core, a disconnected block kept its validity,
+and the wallet's transaction map is walked in txid order (SBCL's `maphash` is
+arrival order; Core's `unordered_map` is not).
+
+### Round-4 sweep
+
+Binary `bc65804a`, classification in
+`docs/functional-sweep-2026-09-13/after-bc65804a.tsv`; the harness was started
+with staggered batches and the few race-hit tests were rerun serially:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | **100** | **137** | **3** | 23 |
+
+Thirty-one tests went to PASS and none left it. Every line-number retreat
+was checked against the test's own step log and turned out to be a helper
+frame or a load flake that passes alone (`feature_segwit` passes now;
+`p2p_segwit` reaches its block-relay subtest; `feature_fee_estimation` fails
+in the RBF section, one step past where batch J left it).
+
+Deployed: both live nodes to `bc65804a` (testnet4 first, then mainnet).
