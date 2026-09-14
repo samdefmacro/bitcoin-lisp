@@ -2066,6 +2066,60 @@ signed with any key in reach would fail there."
                                           (%aval "hex" signed))))
                        "the finalized transaction was refused by the node"))))))))
 
+(test walletprocesspsbt-drops-the-full-transaction-a-taproot-input-cannot-need
+  "Core FillPSBT ends with RemoveUnnecessaryTransactions (wallet.cpp:2229, and
+rpc/rawtransaction.cpp:211 for descriptorprocesspsbt): the non_witness_utxo it
+attached a moment earlier is dropped again from EVERY input when all of them
+are segwit v1-or-later and none asks for ANYONECANPAY (psbt.cpp:514-549). One
+non-segwit or segwit-v0 input, or one ANYONECANPAY sighash, and nothing is
+dropped -- the list is cleared and the loop breaks.
+
+The rule reads the input's OWN recorded sighash, which Core settles in
+SignPSBTInput before any key work (psbt.cpp:445-456): the resolved type is
+written whenever it is not the default for that input type, whether or not a
+signature follows. We wrote it only where a signature had succeeded, so on
+sign=false or for an input we hold no key for the ANYONECANPAY guard could not
+have fired -- which is why the drop was left unported and every taproot PSBT
+went out carrying the previous transactions in full.
+wallet_taproot.py:352-354 asserts a tr() input has witness_utxo and NO
+non_witness_utxo.
+
+PP-WALLETPROCESSPSBT-ATTACHES-NON-WITNESS-UTXO is the other half of the
+control and stays green: its inputs are segwit v0, where nothing may be
+dropped."
+  (%with-pp-node (node "pp-trdrop")
+    (%pp-fund-wallet node :blocks 2)
+    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 41))
+           (tr-address (bl.wallet::rpc-getnewaddress node '("" "bech32m")))
+           (tr-spk (nth-value 1 (bl.crypto:decode-address tr-address :regtest)))
+           (funding (bl.rpc:parse-hex-hash
+                     (bl.wallet::rpc-sendtoaddress
+                      node (list tr-address 1 nil nil nil nil nil nil nil 5))))
+           (funding-tx (%pp-mempool-tx node funding)))
+      (is (not (null funding-tx)) "fixture: the taproot funding never confirmed")
+      (%pp-mine node 1 (%pp-optrue-address))
+      (let ((vout (position tr-spk (bl.ser:transaction-outputs funding-tx)
+                            :key #'bl.ser:tx-out-script-pubkey :test #'equalp)))
+        (is (not (null vout)) "fixture: no output paid the taproot address")
+        (let* ((b64 (%aval "psbt"
+                           (bl.wallet::rpc-walletcreatefundedpsbt
+                            node (list (list (%ht "txid" (bl.rpc:hash-to-hex funding)
+                                                  "vout" vout))
+                                       (list (%ht (%pp-optrue-address) "0.50000000"))
+                                       0
+                                       (%ht "fee_rate" 10
+                                            "add_inputs" bl.rpc:+json-false+
+                                            "change_type" "bech32m")))))
+               (processed (bl.wallet::rpc-walletprocesspsbt node (list b64)))
+               (out (bl.ser:decode-psbt (%aval "psbt" processed))))
+          ;; Every input of this PSBT is the taproot one.
+          (loop for m across (bl.ser:psbt-inputs out)
+                do (is-true (bl.ser:psbt-map-find m bl.ser:+psbt-in-witness-utxo+)
+                            "a taproot input keeps its witness_utxo")
+                   (is-false (bl.ser:psbt-map-find
+                              m bl.ser:+psbt-in-non-witness-utxo+)
+                             "a taproot input must not carry the whole previous transaction")))))))
+
 (test pp-walletprocesspsbt-attaches-non-witness-utxo
   "Core FillPSBT (wallet.cpp:2201-2212) attaches the full previous transaction
 whenever an input lacks non_witness_utxo — a witness_utxo already present does

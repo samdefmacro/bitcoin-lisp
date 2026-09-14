@@ -1242,6 +1242,16 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                      map bl.ser:+psbt-in-final-scriptwitness+))
           (multiple-value-bind (eff record-p)
               (%psbt-effective-sighash map (first prev) user-sighash)
+            ;; Core settles the sighash on the INPUT before any key work
+            ;; (psbt.cpp:452-456): the resolved type is written whenever it is
+            ;; not the default for that input type, whether or not a signature
+            ;; follows. RemoveUnnecessaryTransactions reads exactly this field
+            ;; for its ANYONECANPAY guard (:535), so writing it only where a
+            ;; signature succeeded left that guard unable to fire on
+            ;; sign=false or on an input the wallet holds no key for.
+            (when record-p
+              (bl.ser:psbt-map-set
+               map bl.ser:+psbt-in-sighash+ empty (%psbt-uint32-le eff)))
             (multiple-value-bind (sig err)
                 (bl.rpc:compute-input-signatures tx i prev keymap pubmap tr-keymap
                                            (if (zerop eff) #x01 eff)
@@ -1265,10 +1275,6 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                   (bl.ser:psbt-map-set
                    map bl.ser:+psbt-in-witness-script+ empty
                    (bl.rpc:input-sig-witness-script sig)))
-                (when record-p
-                  (bl.ser:psbt-map-set
-                   map bl.ser:+psbt-in-sighash+ empty
-                   (%psbt-uint32-le eff)))
                 ;; Core CreateSig reuses a signature already present for a key
                 ;; (input.FillSignatureData loads existing partial_sigs) rather
                 ;; than re-signing — so an input already signed by this pubkey
@@ -1402,6 +1408,52 @@ Returns T when EVERY input is final."
                     (setf complete nil)))))))
     complete))
 
+(defun %psbt-witness-program-version (spk)
+  "The witness version of SPK, or NIL when it is not a witness program at all
+-- Core CScript::IsWitnessProgram's out-parameter (script/script.cpp)."
+  (when (bl.val:output-witness-program-p spk)
+    (let ((v (aref spk 0)))
+      (if (= v #x00) 0 (- v #x50)))))
+
+(defun %psbt-remove-unnecessary-transactions (psbt)
+  "Core RemoveUnnecessaryTransactions (psbt.cpp:514-549), the last step of
+CWallet::FillPSBT (wallet.cpp:2229) and of descriptorprocesspsbt's ProcessPSBT
+(rpc/rawtransaction.cpp:211): the non_witness_utxo records are dropped when
+EVERY input is a witness program of version 1 or later and none of them asks
+for ANYONECANPAY.
+
+One input that is not a witness program, or is segwit v0, or whose recorded
+sighash carries the ANYONECANPAY bit, clears the whole list and the loop
+breaks -- nothing is dropped anywhere. A segwit-v0 input needs the full
+previous transaction to authenticate its amount, and an ANYONECANPAY signature
+does not commit to the other inputs, so neither may lose it.
+
+An input with no recorded sighash is SIGHASH_DEFAULT / SIGHASH_ALL, which is
+Core's own reading (:533-535)."
+  (let ((to-drop '()))
+    (block scan
+      (loop for map across (bl.ser:psbt-inputs psbt)
+            for i from 0
+            do (let* ((out (%psbt-input-prevout
+                            map (aref (bl.ser:transaction-inputs
+                                       (bl.ser:psbt-tx psbt))
+                                      i)))
+                      (witness-utxo (bl.ser:psbt-map-find
+                                     map bl.ser:+psbt-in-witness-utxo+))
+                      (spk (and witness-utxo out (bl.ser:tx-out-script-pubkey out)))
+                      (version (and spk (%psbt-witness-program-version spk)))
+                      (sighash (%psbt-input-sighash-stored map)))
+                 (when (or (null version) (zerop version)
+                           (and sighash
+                                (= (logand sighash #x80) #x80)))
+                   (setf to-drop '())
+                   (return-from scan))
+                 (when (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+)
+                   (push i to-drop)))))
+    (dolist (i to-drop)
+      (bl.ser:psbt-map-remove-type (aref (bl.ser:psbt-inputs psbt) i)
+                                   bl.ser:+psbt-in-non-witness-utxo+))))
+
 (defun %psbt-signer-result (psbt finalize verify)
   "The {psbt, complete, hex?} object of walletprocesspsbt / descriptorprocesspsbt.
 When FINALIZE, PSBT is finalized in place; `complete' and the extracted hex
@@ -1427,6 +1479,9 @@ keep, and rpc_psbt.py:480-481 reads it as one:
 
 A caller that wants the network transaction calls finalizepsbt, which is what
 :485 then does."
+  ;; Core's position: the last act of FillPSBT / ProcessPSBT, before
+  ;; `complete' is computed (wallet.cpp:2229, rpc/rawtransaction.cpp:211).
+  (%psbt-remove-unnecessary-transactions psbt)
   (when finalize (%psbt-finalize-in-place psbt))
   (let ((complete (and (every #'%psbt-input-signed-p (bl.ser:psbt-inputs psbt))
                        (or (not verify)
