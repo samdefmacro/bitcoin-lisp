@@ -348,6 +348,76 @@ indistinguishable from a real answer."
              (bl.store:close-txospender-index idx)))
       (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
+(test txospenderindex-rows-outlive-a-disconnect-and-go-at-the-next-connect
+  "Core's indexes are never told about a disconnected block. BaseIndex has no
+BlockDisconnected handler at all: the rewind is driven from the NEXT
+BlockConnected, which notices the stored best block is not the new block's
+parent and walks pprev calling CustomRemove (index/base.cpp:363-367, :290-320).
+So between an invalidateblock and the next block, the spender index still
+answers with the transaction that spent the outpoint on the abandoned branch
+-- and rpc_gettxspendingprevout.py:198-200 asserts exactly that, naming the
+now-stale block: `tx2 is not in the mempool anymore, but still in txospender
+index which has not been rewound yet'.
+
+Our :block-disconnected hook erased the block's rows the moment it was
+disconnected, so the outpoint came back UNSPENT in that window -- Core's shape
+for `nothing ever spent it', and therefore indistinguishable from a real
+answer -- and a reorg that ended up re-connecting the same block paid to
+rebuild what it had just thrown away."
+  (let ((dir (%tsi-tmpdir "disconnect")))
+    (unwind-protect
+         (let ((cs (bl.store:init-chain-state dir))
+               (store (bl.store:init-block-store dir))
+               (idx (bl.store:init-txospender-index dir))
+               (node (bl:make-node)))
+           (unwind-protect
+                (let* ((genesis-hash (bl.store:best-block-hash cs))
+                       (genesis (bl.store:make-block-index-entry
+                                 :hash genesis-hash :height 0 :chain-work 0
+                                 :status :valid
+                                 :header (bl.ser:make-block-header
+                                          :version 1 :prev-block (%tsi-hash 0)
+                                          :merkle-root (%tsi-hash 0)
+                                          :timestamp 1231006505 :bits #x1d00ffff
+                                          :nonce 0 :cached-hash genesis-hash)))
+                       (a-op (%tsi-outpoint #xD1 0))
+                       (b-op (%tsi-outpoint #xD2 0))
+                       (bl:*node* node))
+                  (bl.store:add-block-index-entry cs genesis)
+                  (setf (bl:node-chainstates node) (list cs)
+                        (bl:node-block-store node) store
+                        (bl:node-txospenderindex node) idx)
+                  (multiple-value-bind (a a-block)
+                      (%tsi-extend cs store genesis (%tsi-hash #x1D) a-op)
+                    (let ((a-hash (bl.store:block-index-entry-hash a)))
+                      (bl.store:update-chain-tip cs a-hash 1)
+                      (bl:index-block-connected cs a-block a-hash 1 nil)
+                      (is (equalp a-hash (%tsi-spender-block-hash idx a-op))
+                          "the fixture did not index the connected block")
+                      ;; The disconnect. Core tells no index about it.
+                      (bl.store:update-chain-tip cs genesis-hash 0)
+                      (bl:index-block-disconnected cs a-block a-hash 1)
+                      (is (equalp a-hash (%tsi-spender-block-hash idx a-op))
+                          "the disconnected block's row was erased before any ~
+block replaced it")
+                      ;; The next block on the new branch: NOW the index
+                      ;; rewinds, because its best marker is not this block's
+                      ;; parent, and then indexes the arrival.
+                      (multiple-value-bind (b b-block)
+                          (%tsi-extend cs store genesis (%tsi-hash #x2D) b-op)
+                        (let ((b-hash (bl.store:block-index-entry-hash b)))
+                          (bl.store:update-chain-tip cs b-hash 1)
+                          (bl:index-block-connected cs b-block b-hash 1 nil)
+                          (is (null (%tsi-spender-block-hash idx a-op))
+                              "the abandoned branch's row survived the next connect")
+                          (is (equalp b-hash (%tsi-spender-block-hash idx b-op)))
+                          (multiple-value-bind (hash height)
+                              (bl.store:txospenderindex-best-block idx)
+                            (is (equalp b-hash hash))
+                            (is (= 1 height))))))))
+             (bl.store:close-txospender-index idx)))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+
 (test gettxspendingprevout-names-the-block-a-confirmed-spend-is-in
   "Core's index answer carries a `blockhash' the mempool answer cannot: the
 mempool branch pushes spendingtxid (and spendingtx), the txospenderindex
