@@ -972,11 +972,23 @@ mempool, exactly as in Core's early return.
                     (if (eq add-result :ok)
                         ;; Reported vsize/feerate use the sigop-adjusted size
                         ;; (Core MempoolAcceptResult carries ws.m_vsize).
+                        ;;
+                        ;; The reported BASE fee is ws.m_base_fees, but the
+                        ;; effective feerate is CFeeRate(ws.m_modified_fees,
+                        ;; ws.m_vsize) -- the PRIORITISED fee, not the base one
+                        ;; (validation.cpp:1295-1296). A zero-fee transaction
+                        ;; that prioritisetransaction lifted over the floor
+                        ;; entered on the strength of its delta, so answering
+                        ;; its base feerate reports the rate at which it did
+                        ;; NOT get in: mempool_limit.py:238 submits exactly
+                        ;; that as a package parent and reads a feerate of 0.
                         (let ((vsize (bl.mp:sigop-adjusted-vsize
                                       (bl.ser:transaction-weight tx)
                                       sigops)))
                           (%mark-result-valid res vsize fee
-                                              (if (zerop vsize) 0 (/ fee vsize))
+                                              (if (zerop vsize)
+                                                  0
+                                                  (/ (or modified-fee fee 0) vsize))
                                               (list wtxid)))
                         (progn
                           (setf quit-early t
