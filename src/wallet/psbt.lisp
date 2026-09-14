@@ -14,12 +14,6 @@
 ;;;; The serialization lives in serialization/psbt.lisp; here we interpret the
 ;;;; raw records into JSON and drive the roles.
 
-(defun %obj-pairs (obj)
-  "The (key . value) pairs of a JSON object (alist or hash-table)."
-  (cond ((hash-table-p obj)
-         (loop for k being the hash-keys of obj using (hash-value v) collect (cons k v)))
-        ((listp obj) obj)))
-
 (defun %psbt-decode-arg (b64 &optional (what "psbt"))
   "Decode a base64 PSBT argument, mapping any failure to a deserialization error."
   (unless (stringp b64)
@@ -33,77 +27,26 @@
 
 ;;; --- createpsbt ---
 
-(defun %psbt-build-unsigned-tx (inputs outputs locktime replaceable network)
-  "Build an unsigned transaction from RPC INPUTS/OUTPUTS (Core createpsbt shape)."
-  (unless (listp inputs)
-    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Invalid inputs"))
-  (let ((locktime (or locktime 0))
-        (tx-outputs '())
-        (seen-addrs (make-hash-table :test 'equal))
-        (data-seen nil))
-    (let ((tx-inputs
-            (loop for inp in inputs
-                  for txid = (bl.rpc:parse-hash-v (bl.rpc:obj-get inp "txid") "txid")
-                  for vout = (bl.rpc:obj-get inp "vout")
-                  for seq = (or (bl.rpc:obj-get inp "sequence")
-                                (bl.rpc:default-input-sequence replaceable locktime))
-                  do (unless (and (integerp vout) (>= vout 0))
-                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                         :message "Invalid input vout"))
-                  collect (bl.ser:make-tx-in
-                           :previous-output (bl.ser:make-outpoint
-                                             :hash txid :index vout)
-                           :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                           :sequence seq))))
-      (dolist (out (if (listp outputs) outputs
-                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                         :message "Invalid outputs")))
-        (dolist (pair (%obj-pairs out))
-          (destructuring-bind (key . val) pair
-            (if (string= key "data")
-                (progn
-                  (when data-seen
-                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                      :message "Duplicate key: data"))
-                  (setf data-seen t)
-                  (push (bl.ser:make-tx-out
-                         :value 0
-                         :script-pubkey (concatenate '(simple-array (unsigned-byte 8) (*))
-                                                      #(#x6a) (bl.ser:script-push-data
-                                                               (bl.crypto:hex-to-bytes val))))
-                        tx-outputs))
-                (multiple-value-bind (type spk) (bl.crypto:decode-address key network)
-                  (unless type
-                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
-                                      :message (format nil "Invalid address: ~A" key)))
-                  (when (gethash key seen-addrs)
-                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                      :message (format nil "Invalid parameter, duplicated address: ~A" key)))
-                  (setf (gethash key seen-addrs) t)
-                  (unless (and (numberp val) (<= 0 val 21000000))
-                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-amount+ :message "Invalid amount"))
-                  (push (bl.ser:make-tx-out
-                         :value (round (* val 100000000)) :script-pubkey spk)
-                        tx-outputs))))))
-      (bl.ser:make-transaction
-       :version 2
-       :inputs (coerce tx-inputs 'simple-vector)
-       :outputs (coerce (nreverse tx-outputs) 'simple-vector)
-       :lock-time locktime))))
-
 (bl.rpc:define-rpc "createpsbt" (node params)
   "Create a PSBT with no inputs/outputs metadata (Creator role).
-PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
-  ;; ⚠️ %POSITIONAL-ARRAY, not (first params): an empty JSON array arrives as
-  ;; the +json-empty-array+ SENTINEL, not as NIL, so that a handler can tell
-  ;; `[]' from a missing argument (server.lisp:349). Passing the sentinel on
-  ;; reaches code expecting a LIST and surfaces as RPC -32603 Internal error —
-  ;; which is what `createpsbt([], {...})' did, and rpc_psbt.py opens with it.
-  (let ((tx (%psbt-build-unsigned-tx (bl.rpc:positional-array (first params))
-                                     (second params)
-                                     (or (third params) 0)
-                                     (bl.rpc:positional-bool-or (fourth params) t)
-                                     (bl.rpc:rpc-get-network node))))
+PARAMS: (inputs outputs [locktime] [replaceable] [version]) -- Core's
+CreateTxDoc (rpc/rawtransaction.cpp:87-124), the same five arguments
+createrawtransaction takes.
+
+The transaction itself comes from BL.RPC:CONSTRUCT-TRANSACTION, which is
+Core's ConstructTransaction and the one createrawtransaction uses
+(rawtransaction.cpp:1644 vs :404). There used to be a second copy of it
+here, and it had drifted: no VERSION argument at all, so version=3 (TRUC)
+silently produced a version-2 transaction; outputs only as an ARRAY, where
+CreateTxDoc:104-105 accepts a dictionary too, so
+createpsbt(inputs=[], outputs={addr: 10}) -- wallet_v3_txs.py:450 -- was -8
+\"Invalid outputs\"; amounts parsed as a float times 1e8 rather than through
+AmountFromValue; and neither the locktime range check nor the
+explicit-replaceable contradiction check."
+  (let ((tx (bl.rpc:construct-transaction
+             (bl.rpc:rpc-get-network node)
+             (first params) (second params) (third params)
+             (fourth params) (fifth params))))
     (bl.ser:encode-psbt
      (bl.ser:make-empty-psbt tx))))
 
