@@ -842,6 +842,28 @@ the node is stopping."
       (json-array
        (%generate-to-script-pubkey node script-pubkey nblocks maxtries)))))
 
+(defun %script-from-descriptor (descriptor network)
+  "The ONE scriptPubKey a coinbase pays for DESCRIPTOR -- Core
+getScriptFromDescriptor (rpc/mining.cpp:184-217), which generatetodescriptor
+and generateblock both go through.
+
+Core's rule is a position, not a preference, and it exists because combo()
+expands to more than one script (descriptor.cpp ComboDescriptor::MakeScripts:
+P2PK, P2PKH, and for a COMPRESSED key also P2WPKH and P2SH-P2WPKH). One
+script means take it; four mean take the third, the P2WPKH; anything else
+means take the second, the P2PKH (rpc/mining.cpp:206-214).
+
+Ours took the first of the list for every descriptor, which for combo() is the
+P2PK -- a script that pays to a bare pubkey and so has no address at all, so
+rpc_generate.py:52-65 read the mined coinbase back and found no `address' key
+in its decoded scriptPubKey for either combo() form."
+  (let ((scripts (mapcar #'car (parse-output-descriptor descriptor network))))
+    (case (length scripts)
+      (0 nil)
+      (1 (first scripts))
+      (4 (third scripts))
+      (t (second scripts)))))
+
 (define-rpc "generatetodescriptor" (node (nblocks descriptor (maxtries :or 1000000)))
   "Mine NUM-BLOCKS blocks whose coinbase pays the scriptPubKey of DESCRIPTOR
 (Bitcoin Core generatetodescriptor; CPU mining, intended for regtest). PARAMS:
@@ -855,10 +877,10 @@ out or the node is stopping."
                         :message "num_blocks must be an integer"))
     (unless (stringp descriptor)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
-    ;; parse-output-descriptor signals rpc-error on a bad descriptor; take the
-    ;; first expanded script (Core's getScriptFromDescriptor).
-    (let* ((pairs (parse-output-descriptor descriptor network))
-           (script-pubkey (caar pairs)))
+    ;; parse-output-descriptor signals rpc-error on a bad descriptor;
+    ;; %SCRIPT-FROM-DESCRIPTOR picks the one script Core's
+    ;; getScriptFromDescriptor picks out of the expansion.
+    (let* ((script-pubkey (%script-from-descriptor descriptor network)))
       (unless script-pubkey
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Descriptor does not expand to a script"))
@@ -868,7 +890,7 @@ out or the node is stopping."
 (defun %resolve-coinbase-output-script (output network)
   "scriptPubKey for generateblock's OUTPUT — a descriptor (tried first, like
 Core's getScriptFromDescriptor) or an address. Signals rpc-error if neither."
-  (or (handler-case (caar (parse-output-descriptor output network))
+  (or (handler-case (%script-from-descriptor output network)
         (rpc-error () nil))
       (handler-case
           (multiple-value-bind (type spk) (bl.crypto:decode-address output network)

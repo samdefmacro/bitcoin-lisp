@@ -1162,6 +1162,49 @@ with a count of zero."
      (is (= h0 (bl.store:current-height
                 (bl:node-chain-state node)))))))
 
+(test generateblock-pays-a-combo-descriptor-the-script-core-pays
+  "combo() expands to more than one scriptPubKey, so Core's
+getScriptFromDescriptor picks one by POSITION: one script means take it, four
+mean take the third (the P2WPKH of a compressed key), and anything else means
+take the second (the P2PKH) -- rpc/mining.cpp:206-214. We took the first,
+which for combo() is the bare-pubkey P2PK, a script with no address; the
+coinbase rpc_generate.py:52-65 reads back therefore had no `address' field for
+either combo() form. The two keys below are that test's own
+(rpc_generate.py:53 and :62), so the expected scripts are its two addresses:
+bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080 and
+mkc9STceoCcjoXEXe6cm66iJbmjM6zR9B2."
+  (with-network (:regtest)
+    (flet ((coinbase-spk (descriptor suffix)
+             (let* ((node (regtest-node-fixture suffix))
+                    (r (bl.rpc:dispatch-rpc-method
+                        node "generateblock"
+                        (list descriptor '() bl.rpc:+json-false+)))
+                    (bytes (bl.crypto:hex-to-bytes
+                            (cdr (assoc "hex" r :test #'string=))))
+                    (blk (flexi-streams:with-input-from-sequence (s bytes)
+                           (bl.ser:read-bitcoin-block s))))
+               (bl.ser:tx-out-script-pubkey
+                (aref (bl.ser:transaction-outputs
+                       (first (bl.ser:bitcoin-block-transactions blk)))
+                      0)))))
+      (let* ((compressed "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+             (uncompressed "0408ef68c46d20596cc3f6ddf7c8794f71913add807f1dc55949fa805d764d191c0b7ce6894c126fce0babc6663042f3dde9b0cf76467ea315514e5a6731149c67")
+             (chash (bl.crypto:hash160 (bl.crypto:hex-to-bytes compressed)))
+             (uhash (bl.crypto:hash160 (bl.crypto:hex-to-bytes uncompressed))))
+        ;; A single-script descriptor still pays that script.
+        (is (equalp (bl.crypto:hex-to-bytes "51")
+                    (coinbase-spk "raw(51)" "combo-raw")))
+        ;; Four scripts (compressed key): the third, OP_0 <20-byte keyhash>.
+        (is (equalp (concatenate '(vector (unsigned-byte 8))
+                                 #(#x00 #x14) chash)
+                    (coinbase-spk (format nil "combo(~A)" compressed) "combo-c"))
+            "a compressed combo() coinbase pays P2WPKH, the third script")
+        ;; Two scripts (uncompressed key): the second, DUP HASH160 <20> EQUALVERIFY CHECKSIG.
+        (is (equalp (concatenate '(vector (unsigned-byte 8))
+                                 #(#x76 #xa9 #x14) uhash #(#x88 #xac))
+                    (coinbase-spk (format nil "combo(~A)" uncompressed) "combo-u"))
+            "an uncompressed combo() coinbase pays P2PKH, the second script")))))
+
 (test generateblock-includes-raw-tx-and-rejects-bad-output
   ;; A consensus-valid raw (non-coinbase) tx is included and the witness
   ;; commitment is computed over it (submit=false). The block is dry-run
