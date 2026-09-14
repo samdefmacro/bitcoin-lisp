@@ -143,18 +143,18 @@ address -30; absolute past timestamp -8 (Core net.cpp:766-812)."
          (progn
            ;; hostnames / garbage are not bannable addresses
            (is (= -30 (rpc-error-code-of
-                       (lambda () (bl.rpc::rpc-setban
+                       (lambda () (call-setban
                                    node (list "not-an-ip" "add"))))))
-           (is (null (bl.rpc::rpc-setban node (list "198.51.100.7" "add"))))
+           (is (null (call-setban node (list "198.51.100.7" "add"))))
            (is (= -23 (rpc-error-code-of
-                       (lambda () (bl.rpc::rpc-setban
+                       (lambda () (call-setban
                                    node (list "198.51.100.7" "add"))))))
            (is (= -8 (rpc-error-code-of
-                      (lambda () (bl.rpc::rpc-setban
+                      (lambda () (call-setban
                                   node (list "192.0.2.44" "add" 12345 t))))))
-           (is (null (bl.rpc::rpc-setban node (list "198.51.100.7" "remove"))))
+           (is (null (call-setban node (list "198.51.100.7" "remove"))))
            (is (= -30 (rpc-error-code-of
-                       (lambda () (bl.rpc::rpc-setban
+                       (lambda () (call-setban
                                    node (list "198.51.100.7" "remove")))))))
       (bl.net:clear-ban-list))))
 

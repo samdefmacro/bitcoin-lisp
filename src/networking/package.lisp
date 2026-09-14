@@ -293,6 +293,7 @@ headerssync.cpp. src/networking/.")
    #:+perm-addr+
    #:+perm-all+
    #:subnet-match-p
+   #:subnet-string
    #:address-in-subnets-p
    ;; ADDRv2 support (BIP 155)
    #:peer-wants-addrv2
@@ -319,6 +320,11 @@ headerssync.cpp. src/networking/.")
    #:peer-discouraged-p
    #:clear-discouraged
    #:*banned-peers*
+   #:ban-key
+   #:subnet-exactly-banned-p
+   #:ban-entry-created
+   #:ban-entry-until
+   #:ban-entry-subnet
    ;; DoS protection
    #:check-peer-rate-limit
    #:define-p2p-handler

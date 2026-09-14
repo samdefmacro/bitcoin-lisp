@@ -477,6 +477,23 @@ network tag before the netmask, so a v4 subnet never matches a v6 address and
          (loop for i below 16
                always (= (logand (aref address i) (aref mask i)) (aref masked i))))))
 
+(defun subnet-string (subnet)
+  "SUBNET as Core's CSubNet::ToString prints it (netaddress.cpp:1047-1080):
+the masked network address, then `/<cidr>' for IPv4 and IPv6 and nothing for
+the networks Core compares by equality.
+
+IPv4 is held here in its 16-byte mapped form, so its netmask covers 96 + N
+bits and the printed CIDR is that count less the 96 of the ::ffff: prefix --
+Core counts over a 4-byte address and prints /24 where our mask says /120."
+  (let* ((bits (loop for b across (subnet-netmask subnet)
+                     until (zerop b)
+                     sum (logcount b)))
+         (cidr (if (eq (subnet-network subnet) :ipv4) (- bits 96) bits)))
+    (format nil "~A/~D"
+            (network-address-to-string (subnet-network subnet)
+                                       (subnet-address subnet))
+            cidr)))
+
 (defun address-in-subnets-p (string subnets)
   "T when the address STRING parses and falls inside any of SUBNETS. An address
 that does not parse is refused, never defaulted in (Core ClientAllowed rejects

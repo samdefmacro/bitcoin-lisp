@@ -52,6 +52,9 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:deliver-getdata
    #:deliver-tx
    #:deliver-inv
+   #:call-setban
+   #:call-listbanned
+   #:call-clearbanned
    #:block-request-allowed-p
    #:reject-incoming-txs-p
    #:whitebind-address-refusal
