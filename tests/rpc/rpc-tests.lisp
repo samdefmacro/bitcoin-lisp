@@ -2565,7 +2565,8 @@ make."
            (independent (%pkg-tx funding-txid 1 99990000)))
       (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
              (aval (row key) (cdr (assoc key row :test #'string=))))
-        (bl.rpc::rpc-sendrawtransaction node (list (hex original)))
+        (bl.rpc:dispatch-rpc-method node "sendrawtransaction"
+                                    (wire-params (list (hex original))))
         (is (= 1 (bl.mp:mempool-count mempool)))
         ;; Alone: a perfectly good replacement.
         (let ((solo (%testmempoolaccept node (list (hex replacement)))))
@@ -4164,6 +4165,56 @@ makes the tests meaningful again."
     (is (equal as-alist as-hash)
         "the two JSON shapes produced different transactions:~%  ~A~%  ~A"
         as-alist as-hash)))
+
+(test jsonrpc-keeps-a-duplicated-object-key-for-the-handler-to-judge
+  "Core's UniValue does not deduplicate: an object is a vector of key/value
+pairs, reading pushes every member, and getKeys() hands the handler all of
+them in order (univalue). So a body with a repeated key is a WELL-FORMED
+request, and the duplicate is the HANDLER's to judge -- ParseOutputs answers
+-8 \"Invalid parameter, duplicated address: <addr>\" for a repeated address
+and -8 \"Invalid parameter, duplicate key: data\" for a second data output
+(rawtransaction_util.cpp:107-127). rpc_rawtransaction.py:300-302 sends both
+through multidict and reads those two messages.
+
+Our parser refused the whole body with -32700 Parse error, which says the
+bytes were not JSON -- they were -- and hid the answer the caller asked for."
+  (let* ((bl:*network* :regtest)
+         (node (bl:make-node :network :regtest))
+         (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy"))
+    (flet ((params-of (outputs)
+             (multiple-value-bind (kind method params)
+                 (bl.rpc::parse-json-rpc-request
+                  (format nil "{\"method\":\"createrawtransaction\",\"params\":[[],~A],\"id\":1}"
+                          outputs))
+               (is (eq :single kind))
+               (is (string= "createrawtransaction" method))
+               params)))
+      (flet ((create (outputs)
+               (bl.rpc:dispatch-rpc-method node "createrawtransaction"
+                                           (params-of outputs))))
+        ;; A repeated address: the request parses, and the handler answers.
+        (multiple-value-bind (code msg)
+            (%rails-error
+             (lambda () (create (format nil "{\"~A\":1,\"~A\":1}" addr addr))))
+          (is (eql -8 code) "a well-formed body with a repeated key was refused")
+          (is (string= (format nil "Invalid parameter, duplicated address: ~A" addr)
+                       msg)))
+        ;; A repeated data output has its own message, and it is NOT the
+        ;; address one: "data" is not an address.
+        (multiple-value-bind (code msg)
+            (%rails-error (lambda () (create "{\"data\":\"aa\",\"data\":\"bb\"}")))
+          (is (eql -8 code))
+          (is (string= "Invalid parameter, duplicate key: data" msg)))
+        ;; The array spelling of the same two, which never went through the
+        ;; parser's object path, answers identically.
+        (multiple-value-bind (code msg)
+            (%rails-error (lambda () (create "[{\"data\":\"aa\"},{\"data\":\"bb\"}]")))
+          (is (eql -8 code))
+          (is (string= "Invalid parameter, duplicate key: data" msg)))
+        ;; A body with no duplicate is untouched: objects are still hash
+        ;; tables, so nothing downstream of the parser changed shape.
+        (is (hash-table-p (second (params-of (format nil "{\"~A\":1}" addr)))))
+        (is (stringp (create (format nil "{\"~A\":1}" addr))))))))
 
 (test createrawtransaction-takes-cores-outputs-forms
   "Core parses this argument in ONE place and accepts TWO spellings.
