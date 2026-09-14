@@ -3054,15 +3054,69 @@ UTXO set that did not match the recorded tip."
        (is (equalp (bl.store:block-index-entry-hash a1)
                    (bl.store:best-block-hash chain-state)))
        (is (= 1 (bl.store:utxo-count utxo-set)))
-       ;; The two disconnected blocks were downgraded; A1, still connected,
-       ;; was not. (No claim about the B entries' status: connect-block stamps
-       ;; a stored competing-fork block :valid, so status says nothing here —
-       ;; the UTXO count above is what proves the fork never connected.)
-       (is (zerop (count :valid (rest a-entries)
-                         :key #'bl.store:block-index-entry-status)))
+       ;; The two disconnected blocks KEEP their validity: Core's DisconnectTip
+       ;; never lowers nStatus (validation.cpp:2940-2990), and a block that
+       ;; reached BLOCK_VALID_SCRIPTS stays fully validated whether or not it
+       ;; is on this chain -- which is what getchaintips reports as
+       ;; "valid-fork". What the stop must leave behind is a TIP that matches
+       ;; the coins, asserted above; the statuses say nothing about the
+       ;; disconnect and must not be read as if they did. (No claim about the
+       ;; B entries either: connect-block stamps a stored competing-fork block
+       ;; :valid, so the UTXO count above is what proves the fork never
+       ;; connected.)
+       (is (= 2 (count :valid (rest a-entries)
+                       :key #'bl.store:block-index-entry-status)))
        (is (eq :valid (bl.store:block-index-entry-status a1)))
        (is (not (%p3b-coinbase-in-utxo-set-p utxo-set block-store (first b-entries)))))
      (clear-undo-cache))))
+
+(test a-disconnected-block-stays-fully-validated
+  "Core's DisconnectTip moves the tip and touches nStatus not at all
+(validation.cpp:2940-2990): a block that reached BLOCK_VALID_SCRIPTS keeps it
+for the life of the index, because the verdict was about the BLOCK and a
+reorg is not news about the block. getchaintips reads exactly that to tell
+`valid-fork' -- fully validated, just not on this chain -- from
+`valid-headers', which means the body is here but was never validated
+(rpc/blockchain.cpp:1628-1639).
+
+This node downgraded every disconnected block to :header-valid, so
+rpc_getchaintips.py:60 saw an abandoned ten-block branch reported as
+never-validated. The rollback path keeps its downgrade, which is a different
+question: those blocks are being abandoned MID-reorg and PHASE B validates
+them again on the next attempt."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture "disconnect-keeps-validity")
+      (build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #xA0 2))
+      (let* ((old-tip (bl.store:get-block-index-entry
+                       chain-state (bl.store:best-block-hash chain-state)))
+             (fork-tip-hash (%stage-heavier-downloaded-fork
+                             chain-state block-store genesis-hash))
+             (fork-tip (bl.store:get-block-index-entry chain-state fork-tip-hash)))
+        (is (eq :valid (bl.store:block-index-entry-status old-tip))
+            "control: the original chain's tip is validated to begin with")
+        (is-true (bl.val:perform-reorg chain-state block-store utxo-set
+                                       old-tip fork-tip)
+                 "the fixture's reorg did not run")
+        (is (equalp fork-tip-hash (bl.store:best-block-hash chain-state))
+            "control: the reorg did not move the tip")
+        ;; The abandoned tip is off the chain and still fully validated.
+        (is (eq :valid (bl.store:block-index-entry-status old-tip)))
+        ;; ...which is what getchaintips reports as valid-fork.
+        (let ((node (make-test-node)))
+          (setf (bl:node-chain-state node) chain-state
+                (bl:node-block-store node) block-store)
+          (let* ((tips (bl.rpc:dispatch-rpc-method node "getchaintips" nil))
+                 (abandoned (find (bl.rpc:hash-to-hex
+                                   (bl.store:block-index-entry-hash old-tip))
+                                  tips
+                                  :key (lambda (tip)
+                                         (cdr (assoc "hash" tip :test #'string=)))
+                                  :test #'string=)))
+            (is-true abandoned "the abandoned branch is not reported as a tip")
+            (is (string= "valid-fork"
+                         (cdr (assoc "status" abandoned :test #'string=))))))))))
 
 (test reorg-stop-truncates-the-connect-without-rolling-back
   "A stop request during PHASE B must stop after the last fully connected fork

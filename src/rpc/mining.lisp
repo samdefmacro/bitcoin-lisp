@@ -257,7 +257,11 @@ point of the mode (check_pow=false, :750)."
               (error () (values nil :rejected)))
           (if ok
               :null
-              (string-downcase (symbol-name (or reason :rejected)))))))))
+              ;; Core's BIP22ValidationResult returns state.GetRejectReason()
+              ;; (rpc/mining.cpp:255-268), the same word submitblock answers,
+              ;; not the keyword's own name: mining_template_verification.py:44
+              ;; compares a proposal's answer with "bad-cb-missing".
+              (bl.val:block-reject-reason (or reason :rejected))))))))
 
 (defun %gbt-request-mode (params)
   "(VALUES mode data) from getblocktemplate's optional template-request object."
