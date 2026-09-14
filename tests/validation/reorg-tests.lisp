@@ -2635,9 +2635,14 @@ recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook
          ;; B2 :invalid (BLOCK_FAILED_VALID), B3 :invalid (BLOCK_FAILED_CHILD).
          (is (eq :invalid (bl.store:block-index-entry-status b2-entry)))
          (is (eq :invalid (bl.store:block-index-entry-status b3-entry)))
-         ;; B1 (a VALID ancestor of the invalid block) is NOT poisoned — the
-         ;; rollback restored it to :header-valid, recoverable.
-         (is (eq :header-valid (bl.store:block-index-entry-status b1-entry)))
+         ;; B1 (a VALID ancestor of the invalid block) is NOT poisoned. It
+         ;; connected before B2 failed, so it keeps the :valid it earned --
+         ;; validity is monotone, as Core's nStatus is, and the rollback's
+         ;; disconnect says nothing about the block. What makes it recoverable
+         ;; is that it is not :invalid.
+         (is (eq :valid (bl.store:block-index-entry-status b1-entry)))
+         (is-false (bl.store:entry-on-active-chain-p cs b1-entry)
+                   "and the rollback left it off the active chain")
          ;; Rolled back to chain A: tip + height unchanged, A1 valid.
          (is (equalp a1-hash (bl.store:best-block-hash cs)))
          (is (= 1 (bl.store:current-height cs)))
@@ -2912,8 +2917,16 @@ Control: the same block through validate-block WITHOUT :skip-header is
          (is (equalp a1-hash (bl.store:best-block-hash cs)))
          (is (= 1 (bl.store:current-height cs)))
          (is (eq :valid (bl.store:block-index-entry-status a1-entry)))
-         (is (eq :header-valid (bl.store:block-index-entry-status b1-entry)))
-         (is (eq :header-valid (bl.store:block-index-entry-status b2-entry))))
+         ;; Nothing poisoned. B1 connected before B2 was refused, and validity
+         ;; is monotone (Core's nStatus; the rollback's DisconnectTip does not
+         ;; lower it), so B1 keeps the :valid it earned -- that is a statement
+         ;; about B1, not about where the chain is. B2 never validated, so it
+         ;; is still header-only. Neither is :invalid: a header-rule verdict is
+         ;; not on the deterministic-invalid allowlist.
+         (is (eq :valid (bl.store:block-index-entry-status b1-entry)))
+         (is (eq :header-valid (bl.store:block-index-entry-status b2-entry)))
+         (is-false (bl.store:entry-on-active-chain-p cs b1-entry)
+                   "and B1 is off the active chain, whatever its status says"))
        (clear-undo-cache)))))
 
 (test reconsider-block-refuses-mtp-violating-target
@@ -3066,7 +3079,19 @@ UTXO set that did not match the recorded tip."
        ;; connected.)
        (is (= 2 (count :valid (rest a-entries)
                        :key #'bl.store:block-index-entry-status)))
+       (is (zerop (count :invalid a-entries
+                         :key #'bl.store:block-index-entry-status))
+           "an interrupted disconnect condemns no block")
        (is (eq :valid (bl.store:block-index-entry-status a1)))
+       (is (every (lambda (e) (eq :valid (bl.store:block-index-entry-status e)))
+                  (rest a-entries))
+           "and the blocks it disconnected keep the validity they earned")
+       ;; Where the chain IS is CChain::Contains, which the disconnect moved.
+       (is-true (bl.store:entry-on-active-chain-p chain-state a1))
+       (is (zerop (count-if (lambda (e)
+                              (bl.store:entry-on-active-chain-p chain-state e))
+                            (rest a-entries)))
+           "the disconnected blocks are off the active chain")
        (is (not (%p3b-coinbase-in-utxo-set-p utxo-set block-store (first b-entries)))))
      (clear-undo-cache))))
 

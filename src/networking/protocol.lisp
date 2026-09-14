@@ -2568,7 +2568,14 @@ because an old side-chain block is a fingerprint, not a service."
           (best-hdr (and best-header
                          (bl.store:block-index-entry-header best-header))))
       (and header best-hdr
-           ;; Core also requires BLOCK_VALID_SCRIPTS; :valid is our equivalent.
+           ;; Core requires BLOCK_VALID_SCRIPTS, i.e. the block was fully
+           ;; validated at some point; :valid is our equivalent. In Core that
+           ;; is a MONOTONE property -- DisconnectTip never lowers nStatus --
+           ;; so a block reorged off the chain stays servable, which is what
+           ;; p2p_fingerprint.py:93 asks for. Ours used to downgrade a
+           ;; disconnected block to :header-valid, and the fingerprint test
+           ;; got "ignoring request ... for an old block that is not on
+           ;; the main chain" for a block it had just watched us validate.
            (eq (bl.store:block-index-entry-status entry) :valid)
            (< (- (bl.ser:block-header-timestamp best-hdr)
                  (bl.ser:block-header-timestamp header))
@@ -3058,37 +3065,47 @@ returning ENTRIES whole; a STOP-HASH not present in ENTRIES also returns all."
 (defun getheaders-response-message (payload chain-state)
   "Build the headers message answering a getheaders PAYLOAD: up to
 +max-headers-count+ headers from our active chain just after the locator's fork
-point — or just the stop block's header when the locator is empty. Always
-returns a serialized headers message (empty when we have nothing to add).
-Mirrors Bitcoin Core's GETHEADERS handler."
+point — or just the stop block's header when the locator is empty. Returns a
+serialized headers message (empty when we have nothing to add), or NIL when
+Core sends nothing at all.
+Mirrors Bitcoin Core's GETHEADERS handler (net_processing.cpp:4426-4437)."
   (multiple-value-bind (locator-hashes stop-hash)
       (bl.ser:parse-block-locator-payload payload)
-    (let ((headers
-            (if (null locator-hashes)
-                ;; Null locator: return only the stop block's header, if it is on
-                ;; our active chain.
-                (let ((entry (bl.store:get-block-index-entry
-                              chain-state stop-hash)))
-                  (when (and entry
-                             (bl.store:entry-on-active-chain-p
-                              chain-state entry))
-                    (list (bl.store:block-index-entry-header entry))))
-                ;; Walk forward from the fork point, stop hash inclusive.
-                (let* ((fork (bl.store:find-fork-in-active-chain
-                              chain-state locator-hashes))
-                       (entries (bl.store:active-chain-entries-from
-                                 chain-state
-                                 (1+ (bl.store:block-index-entry-height fork))
-                                 bl.ser:+max-headers-count+)))
-                  (mapcar #'bl.store:block-index-entry-header
-                          (truncate-entries-at-stop entries stop-hash t))))))
-      (bl.ser:make-headers-message headers))))
+    (when (null locator-hashes)
+      ;; Null locator: Core answers with the stop block's header alone, and
+      ;; RETURNS -- sending no message whatsoever -- when it does not know the
+      ;; block or BlockRequestAllowed refuses it (:4429-4436). The gate is the
+      ;; same one the getdata path uses, so a RECENT stale block is served
+      ;; here too; asking only "is it on the active chain" refused a block
+      ;; this node had just reorged away from, which is what
+      ;; p2p_fingerprint.py:97 waits for.
+      (let ((entry (bl.store:get-block-index-entry chain-state stop-hash)))
+        (return-from getheaders-response-message
+          (when (and entry
+                     (%block-request-allowed-p
+                      chain-state entry (bl.store:best-header-entry chain-state)))
+            (bl.ser:make-headers-message
+             (list (bl.store:block-index-entry-header entry)))))))
+    ;; Walk forward from the fork point, stop hash inclusive.
+    (let* ((fork (bl.store:find-fork-in-active-chain
+                  chain-state locator-hashes))
+           (entries (bl.store:active-chain-entries-from
+                     chain-state
+                     (1+ (bl.store:block-index-entry-height fork))
+                     bl.ser:+max-headers-count+)))
+      (bl.ser:make-headers-message
+       (mapcar #'bl.store:block-index-entry-header
+               (truncate-entries-at-stop entries stop-hash t))))))
 
 (define-p2p-handler ("getheaders" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
   "Serve a peer's getheaders by sending the headers message built from PAYLOAD
-against our active chain (see getheaders-response-message)."
+against our active chain (see getheaders-response-message). NIL means Core
+sends nothing at all -- a null-locator request for a block we do not know or
+may not serve."
   (bl.ctx:with-node-context (chain-state) ctx
-  (send-message peer (getheaders-response-message payload chain-state))))
+  (let ((msg (getheaders-response-message payload chain-state)))
+    (when msg
+      (send-message peer msg)))))
 
 (defun getblocks-response-message (payload chain-state)
   "Build the inv message answering a getblocks PAYLOAD: up to

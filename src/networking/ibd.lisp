@@ -4178,15 +4178,21 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
           (current-height (bl.store:current-height chain-state)))
 
       ;; Skip blocks we already applied (duplicates from multiple peers).
-      ;; Distinct from competing-fork blocks at h ≤ current-height: those
-      ;; still have status :header-valid and we need to STORE them so a
-      ;; future reorg can use them. Only :valid means "already on our
-      ;; active chain."
+      ;; Distinct from competing-fork blocks at h ≤ current-height: those are
+      ;; NOT on our active chain and we need to STORE them so a future reorg
+      ;; can use them.
+      ;;
+      ;; The question is CChain::Contains -- is the active-chain block at this
+      ;; height this very block -- and not the entry's status. Status is a
+      ;; monotone property of the block (Core's nStatus; DisconnectTip never
+      ;; lowers it), so a block reorged OFF the chain is still :valid and would
+      ;; be skipped here as "already applied" while the active chain no longer
+      ;; holds it.
       (when (and (<= height current-height)
-                 (eq (bl.store:block-index-entry-status entry) :valid))
+                 (bl.store:entry-on-active-chain-p chain-state entry))
         (return-from process-received-block nil))
 
-      ;; A competing-fork block (h ≤ current, status :header-valid):
+      ;; A competing-fork block (h ≤ current, off the active chain):
       ;; store it and dispatch to activate-block. activate-block will
       ;; recognize the weaker-chain case and return :weaker-chain
       ;; without changing our active tip. A later block that pushes the
