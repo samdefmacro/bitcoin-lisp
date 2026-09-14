@@ -539,6 +539,11 @@ argument was `[]`."
            (values :batch (coerce json 'list)))
           ;; Single request (object)
           ((hash-table-p json)
+           ;; The id first, as Core does (rpc/request.cpp:206-211): every error
+           ;; from here on carries it, and its ABSENCE is carried too.
+           (multiple-value-bind (early-id early-present) (gethash "id" json)
+             (setf *request-id* early-id
+                   *request-id-present* (and early-present t)))
            (let ((method (gethash "method" json))
                  (params (gethash "params" json))
                  (version (request-json-version json)))
@@ -606,6 +611,20 @@ pairs — so without this every object-returning RPC errors out."
     ((and (consp x) (rpc-proper-list-p x))
      (mapcar #'rpc-result->json x))
     (t x)))
+
+(defvar *request-id* nil
+  "The \"id\" of the request being handled, for the error replies built after
+parsing has begun.")
+
+(defvar *request-id-present* t
+  "Whether the request object carried an \"id\" member at all.
+
+Core\'s JSONRPCRequest::id starts as a PRESENT null (request.h:55) and parse()
+replaces it with std::nullopt when the object has no id member -- BEFORE the
+version and method checks, under the comment `Parse id now so errors from here
+on will have the id\' (rpc/request.cpp:206-211). So a body that never parsed as
+JSON answers with `\"id\": null\', while `{\"jsonrpc\": 2, ...}\' answers with no
+id key at all; interface_rpc.py:189 and :204 compare the two whole objects.")
 
 (defun %make-rpc-reply (result error-obj id version id-present)
   "Assemble a JSON-RPC reply the way Core's JSONRPCReplyObj does
@@ -1296,6 +1315,15 @@ results anyway."
                             (not (rpc-method-allowed-p user method)))
                    (return (refuse method))))))))))
 
+(defun %write-json-reply (response)
+  "RESPONSE as Core writes a JSON-RPC reply: its JSON followed by a NEWLINE
+(httprpc.cpp:55 and :229 both append one). interface_http.py:179 compares the
+whole body byte for byte, and a client that reads line-delimited replies off a
+kept-alive connection needs the terminator."
+  (with-output-to-string (s)
+    (yason:encode response s)
+    (write-char #\Newline s)))
+
 (defun rpc-json-error (http-status code message)
   "Return a JSON-RPC error response string with the given HTTP status.
 These are pre-dispatch HTTP-level refusals (origin, rate limit, body size), so
@@ -1303,8 +1331,7 @@ no request version has been parsed: Core's JSONRPCRequest starts out
 V1_LEGACY with a null id (request.h:55,63), which is the shape used here."
   (setf (hunchentoot:return-code*) http-status)
   (setf (hunchentoot:content-type*) "application/json")
-  (with-output-to-string (s)
-    (yason:encode (make-rpc-error-response code message nil :v1) s)))
+  (%write-json-reply (make-rpc-error-response code message nil :v1)))
 
 (defun rpc-error-http-status (code)
   "HTTP status for a JSON-RPC 1.x error response (Core JSONErrorReply,
@@ -1381,6 +1408,15 @@ must stay a value test (NIL = success), not a key-presence test."
 the body-size limit onwards; split out of RPC-HANDLER so the authenticated
 user name reaches the -rpcwhitelist gate without the whole body having to
 nest inside the auth check."
+  ;; Core's JSONRPCRequest is constructed fresh per request with a PRESENT null
+  ;; id, which parse() then replaces or clears (rpc/request.h:55,
+  ;; rpc/request.cpp:206-211). These are that field.
+  (let ((*request-id* nil)
+        (*request-id-present* t))
+    (%rpc-handle-parsed request user)))
+
+(defun %rpc-handle-parsed (request user)
+  "The body of %RPC-HANDLE-AUTHORIZED, with the per-request id fields bound."
   ;; Check body size limit: 32 MiB (Core evhttp_set_max_body_size(MAX_SIZE),
   ;; httpserver.cpp:410). libevent answers an oversized body with 400.
   (let* ((content-length-str (hunchentoot:header-in :content-length request))
@@ -1388,7 +1424,7 @@ nest inside the auth check."
                               (parse-integer content-length-str :junk-allowed t))))
     (when (and content-length
                (> content-length +max-rpc-body-size+))
-      (return-from %rpc-handle-authorized
+      (return-from %rpc-handle-parsed
         (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                         "Request body too large"))))
 
@@ -1411,7 +1447,7 @@ nest inside the auth check."
         (body (hunchentoot:raw-post-data :force-text t)))
     ;; Post-read body size check (in case Content-Length was absent or wrong)
     (when (and body (> (length body) +max-rpc-body-size+))
-      (return-from %rpc-handle-authorized
+      (return-from %rpc-handle-parsed
         (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                         "Request body too large")))
     (handler-case
@@ -1423,7 +1459,7 @@ nest inside the auth check."
           ;; whether one exists.
           (unless (%rpc-request-allowed-p user request-type method-or-batch)
             (setf (hunchentoot:return-code*) hunchentoot:+http-forbidden+)
-            (return-from %rpc-handle-authorized ""))
+            (return-from %rpc-handle-parsed ""))
           (case request-type
             (:single
              (let ((response (handle-single-request *rpc-node* method-or-batch
@@ -1440,8 +1476,7 @@ nest inside the auth check."
                  (t
                   (setf (hunchentoot:return-code*)
                         (rpc-response-http-status response version))
-                  (with-output-to-string (s)
-                    (yason:encode response s))))))
+                  (%write-json-reply response)))))
             (:batch
              ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206),
              ;; except a non-empty all-notification batch, which answers 204
@@ -1454,8 +1489,7 @@ nest inside the auth check."
                   (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
                   "")
                  (t
-                  (with-output-to-string (s)
-                    (yason:encode (or responses #()) s))))))))
+                  (%write-json-reply (or responses #()))))))))
       (rpc-error (e)
         ;; Body-level failures (parse error -32700, invalid request -32600)
         ;; have no version context; Core treats them as 1.x — both for the
@@ -1464,29 +1498,26 @@ nest inside the auth check."
         ;; V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59).
         (setf (hunchentoot:return-code*)
               (rpc-error-http-status (rpc-error-code e)))
-        (with-output-to-string (s)
-          (yason:encode (make-rpc-error-response (rpc-error-code e)
-                                                 (rpc-error-message e)
-                                                 nil :v1)
-                        s)))
+        (%write-json-reply (make-rpc-error-response (rpc-error-code e)
+                                                    (rpc-error-message e)
+                                                    *request-id* :v1
+                                                    :id-present *request-id-present*)))
       (error (e)
         (bl.log:node-log :error "RPC handler error: ~A" e)
         (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
-        (with-output-to-string (s)
-          (yason:encode (make-rpc-error-response +rpc-internal-error+
-                                                 "Internal error"
-                                                 nil :v1)
-                        s)))
+        (%write-json-reply (make-rpc-error-response +rpc-internal-error+
+                                                    "Internal error"
+                                                    *request-id* :v1
+                                                    :id-present *request-id-present*)))
       (storage-condition (e)
         (bl.log:node-log :error "RPC handler exhausted a resource: ~A" (type-of e))
         (unless (rpc-recoverable-storage-condition-p e)
           (rpc-resignal-storage-condition e))
         (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
-        (with-output-to-string (s)
-          (yason:encode (make-rpc-error-response +rpc-internal-error+
-                                                 "Internal error"
-                                                 nil :v1)
-                        s))))))
+        (%write-json-reply (make-rpc-error-response +rpc-internal-error+
+                                                    "Internal error"
+                                                    *request-id* :v1
+                                                    :id-present *request-id-present*))))))
 
 (defclass rpc-acceptor (hunchentoot:easy-acceptor)
   ()

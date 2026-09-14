@@ -3279,6 +3279,41 @@ nothing else."
       (is (eq t (aref row 3))
           "~A arg ~D must be reported string-typed" (aref row 0) (aref row 1)))))
 
+(test a-json-rpc-reply-ends-in-a-newline-and-carries-cores-id
+  "Two shape details of a JSON-RPC reply that clients compare whole.
+
+Core appends a NEWLINE to every reply (httprpc.cpp:55 and :229);
+interface_http.py:179 compares the body byte for byte, and a client reading
+line-delimited replies off a kept-alive connection needs the terminator.
+
+And the `id' key is present only once the request object has been looked at.
+Core's JSONRPCRequest::id starts as a PRESENT null (request.h:55) and parse()
+replaces it with std::nullopt when the object has no id member -- BEFORE the
+version and method checks (request.cpp:206-211, `Parse id now so errors from
+here on will have the id'). So a body that never parsed as JSON answers
+`\"id\": null', while `{\"jsonrpc\": 2, \"method\": ...}' answers with no id key
+at all: interface_rpc.py:189 and :204 compare those two objects whole."
+  (let ((reply (bl.rpc::%write-json-reply
+                (bl.rpc::make-rpc-error-response -32700 "Parse error" nil :v1))))
+    (is (char= #\Newline (char reply (1- (length reply))))
+        "the reply must end in a newline; got ~S" reply)
+    (is (search "\"error\"" reply)))
+  ;; The id fields as the parser leaves them.
+  (flet ((parse (body)
+           (let ((bl.rpc::*request-id* nil)
+                 (bl.rpc::*request-id-present* t))
+             (ignore-errors (bl.rpc::parse-json-rpc-request body))
+             (list bl.rpc::*request-id* bl.rpc::*request-id-present*))))
+    ;; Never parsed as JSON: Core's initial present-null survives.
+    (is (equal '(nil t) (parse "not json"))
+        "a parse error keeps the initial present null id")
+    ;; Parsed, no id member: the key is dropped before the version is judged.
+    (is (equal '(nil nil) (parse "{\"jsonrpc\":2,\"method\":\"getblockcount\"}"))
+        "an object with no id member drops the key")
+    ;; Parsed with an id: it is carried into whatever error follows.
+    (is (equal '(7 t) (parse "{\"jsonrpc\":\"2.1\",\"id\":7,\"method\":\"getblockcount\"}"))
+        "the id is carried into the version error")))
+
 (test init-message-lines-are-cores
   "Core's non-GUI build logs every uiInterface.InitMessage as `init message:
 <text>` (noui.cpp:56) and the functional framework waits on those lines
@@ -9792,23 +9827,41 @@ need none and pass NIL, a method that reads the chain or the network needs one."
 
 (defun jsonrpc-handler-check (body expected-status expected-json &rest request-args)
   "Assert that POSTing BODY to rpc-handler answers EXPECTED-STATUS with
-EXPECTED-JSON as the exact response body."
+EXPECTED-JSON as the exact response body.
+
+Core terminates every JSON-RPC reply with a NEWLINE (httprpc.cpp:55, :229), so
+that byte is asserted here once and stripped before the JSON is compared --
+the callers all name the JSON they expect, not its terminator. An EMPTY body
+(the 204 and 403 answers) carries no newline."
   (multiple-value-bind (status json)
       (apply #'jsonrpc-handler-reply body request-args)
     (is (eql expected-status status)
         "~A~%  status: expected ~S, got ~S (body ~S)"
         body expected-status status json)
+    (when (plusp (length json))
+      (is (char= #\Newline (char json (1- (length json))))
+          "~A~%  body must end in Core's newline; got ~S" body json)
+      (setf json (string-right-trim '(#\Newline) json)))
     (is (string= expected-json json)
         "~A~%  body: expected ~S~%        got      ~S"
         body expected-json json)))
 
-(defun jsonrpc-legacy-error-json (code message)
+(defun jsonrpc-legacy-error-json (code message &key (id "null"))
   "The exact legacy-1.x error body Core's JSONErrorReply sends for a failure
-raised before any version is known: null result, the error object, null id
+raised before any version is known: null result, the error object, and the id
 (httprpc.cpp:41-59 over the default V1_LEGACY/VNULL-id JSONRPCRequest,
-request.h:55,63)."
-  (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"~A\"},\"id\":null}"
-          code message))
+request.h:55,63).
+
+ID is that field as JSON, or NIL for a request object that PARSED and carried
+no \"id\" member -- Core's parse() replaces the initial present null with
+std::nullopt before it judges the version or the method (request.cpp:206-211),
+so the key is absent from those replies and present, null, from a body that
+never parsed at all."
+  (if id
+      (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"~A\"},\"id\":~A}"
+              code message id)
+      (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"~A\"}}"
+              code message)))
 
 (test jsonrpc-handler-threads-request-version-into-the-reply
   "rpc-handler must hand handle-single-request the version and id-presence it
@@ -9952,21 +10005,31 @@ content-type guard in that chain; see the last case."
     ;; Missing method -> -32600, HTTP 400. Note the request says 2.0 and still
     ;; gets the legacy shape: pre-dispatch failures carry no version (the
     ;; documented deviation from Core, which has already recorded V2 here).
+    ;; The ID, though, IS carried: Core parses it before it judges the version
+    ;; or the method, `so errors from here on will have the id'
+    ;; (rpc/request.cpp:206-211).
     (jsonrpc-handler-check
      "{\"jsonrpc\":\"2.0\",\"id\":1}" 400
      (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
-                                "Missing method"))
+                                "Missing method" :id "1"))
+    ;; The same failure with NO id member: the key is dropped entirely, which
+    ;; is what interface_rpc.py:204 compares against.
+    (jsonrpc-handler-check
+     "{\"jsonrpc\":\"2.0\"}" 400
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
+                                "Missing method" :id nil))
     ;; A "method" that is present but not a string is Core's OTHER sentence
     ;; (rpc/request.cpp:236-237).
     (jsonrpc-handler-check
      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":7}" 400
      (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
-                                "Method must be a string"))
+                                "Method must be a string" :id "1"))
     ;; A result yason cannot encode reaches the handler's outermost clause.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-handler-dotted-method*)
      500
-     (jsonrpc-legacy-error-json bl.rpc:+rpc-internal-error+ "Internal error"))
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-internal-error+ "Internal error"
+                                :id "1"))
     ;; Oversized body (Content-Length over the 32 MiB cap) -> 400.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 400
@@ -10026,8 +10089,9 @@ sets the status and application/json, and its body is the V1_LEGACY shape."
                  429 bl.rpc:+rpc-misc-error+ "Rate limit exceeded")))
       (is (eql 429 (hunchentoot:return-code*)))
       (is (equal "application/json" (hunchentoot:content-type*)))
-      (is (string= (jsonrpc-legacy-error-json bl.rpc:+rpc-misc-error+
-                                              "Rate limit exceeded")
+      (is (string= (format nil "~A~%"
+                           (jsonrpc-legacy-error-json bl.rpc:+rpc-misc-error+
+                                                      "Rate limit exceeded"))
                    json)
           "rpc-json-error body: ~S" json))))
 
