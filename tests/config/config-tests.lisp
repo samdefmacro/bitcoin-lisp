@@ -1173,6 +1173,36 @@ ratchet asks of a second copy."
                           coinstatsindex txospenderindex reindex-chainstate
                           peer-block-filters port)))
 
+(test maxmempool-must-hold-one-cluster
+  "Core refuses a -maxmempool below limits.cluster_size_vbytes * 40 -- the
+size of one maximum cluster, which the pool could not otherwise admit --
+and rounds the byte figure UP to whole megabytes for the message
+(CTxMemPool's Flatten, txmempool.cpp:166-174). With the default 101 kvB
+cluster limit that is 5 MB, and mempool_limit.py:284 starts a node with
+-maxmempool=4 to read the sentence back.
+
+The check belongs after every option has been applied, not inside either
+argument's reader: -limitclustersize moves the floor, and Core makes the
+comparison at mempool construction."
+  (let ((bl.mp:*cluster-size-limit* 101000)
+        (bl.mp:*max-mempool-bytes* (* 4 1000 1000)))
+    (is (equal "-maxmempool must be at least 5 MB"
+               (%init-parameters-refusal :regtest nil nil nil nil nil nil nil
+                                         nil nil nil nil nil nil))))
+  ;; The floor follows -limitclustersize, as Core's does.
+  (let ((bl.mp:*cluster-size-limit* 300000)
+        (bl.mp:*max-mempool-bytes* (* 5 1000 1000)))
+    (is (equal "-maxmempool must be at least 12 MB"
+               (%init-parameters-refusal :regtest nil nil nil nil nil nil nil
+                                         nil nil nil nil nil nil))))
+  ;; At the floor, and above it, and at zero (no cap at all), it is accepted.
+  (dolist (bytes (list 0 (* 5 1000 1000) (* 300 1000 1000)))
+    (let ((bl.mp:*cluster-size-limit* 101000)
+          (bl.mp:*max-mempool-bytes* bytes))
+      (is (null (%init-parameters-refusal :regtest nil nil nil nil nil nil nil
+                                          nil nil nil nil nil nil))
+          "-maxmempool=~D bytes must be accepted" bytes))))
+
 (defun %vbparams-init (network specs)
   "The message %INIT-PARAMETERS refuses -vbparams=SPECS with on NETWORK, or
 NIL when it accepts them. The override is cleared afterwards either way."

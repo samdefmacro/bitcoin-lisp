@@ -326,6 +326,23 @@ heights, -test, -mocktime, the -peerblockfilters/-blockfilterindex gate,
   (when (and peer-block-filters (not blockfilterindex))
     (config-error "Cannot set -peerblockfilters without -blockfilterindex."))
 
+  ;; -maxmempool must hold at least one maximum-size cluster, or the pool
+  ;; could not admit a single one: Core refuses max_size_bytes below
+  ;; limits.cluster_size_vbytes * 40 (CTxMemPool's Flatten,
+  ;; txmempool.cpp:166-174), rounding the byte figure UP to whole megabytes
+  ;; for the message -- so the default 101 kvB cluster limit asks for 5 MB,
+  ;; which is what mempool_limit.py:284 reads back from a -maxmempool=4 start.
+  ;; Zero keeps its meaning (no cap at all) and is not refused. Checked here,
+  ;; after every option has been applied, because -limitclustersize moves the
+  ;; floor and Core makes the same check at mempool construction rather than
+  ;; while reading either argument.
+  (let ((floor-bytes (* bl.mp:*cluster-size-limit* 40)))
+    (when (or (minusp bl.mp:*max-mempool-bytes*)
+              (and (plusp bl.mp:*max-mempool-bytes*)
+                   (< bl.mp:*max-mempool-bytes* floor-bytes)))
+      (config-error "-maxmempool must be at least ~D MB"
+                    (ceiling floor-bytes 1000000))))
+
   ;; -dbcache, split across the coins cache AND every database's block cache
   ;; the way Core splits it (CalculateCacheSizes, node/caches.cpp:57-72, then
   ;; kernel::CacheSizes). We used to spend the whole budget on the in-memory
