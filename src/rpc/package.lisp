@@ -54,6 +54,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:register-rpc-method
    #:define-rpc
    #:dispatch-rpc-method
+   #:parse-json-rpc-request
 
    ;; The wallet manager, its chain-tracking fan-out and the rebroadcast
    ;; timer are BITCOIN-LISP.WALLET's exports (src/wallet/package.lisp).

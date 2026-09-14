@@ -327,21 +327,21 @@ non-P2PKH (bech32) address -3 'Address does not refer to key'."
   "parse-json-rpc-request reports :v2 only for jsonrpc:\"2.0\" and
 distinguishes an absent id (notification -> 204) from id:null."
   (multiple-value-bind (type method params id version id-present)
-      (bl.rpc::parse-json-rpc-request
+      (bl.rpc:parse-json-rpc-request
        "{\"jsonrpc\":\"2.0\",\"method\":\"m\"}")
     (declare (ignore method params id))
     (is (eq type :single))
     (is (eq version :v2))
     (is (null id-present)))
   (multiple-value-bind (type method params id version id-present)
-      (bl.rpc::parse-json-rpc-request
+      (bl.rpc:parse-json-rpc-request
        "{\"jsonrpc\":\"2.0\",\"method\":\"m\",\"id\":null}")
     (declare (ignore method params id))
     (is (eq type :single))
     (is (eq version :v2))
     (is (eq t id-present)))
   (multiple-value-bind (type method params id version id-present)
-      (bl.rpc::parse-json-rpc-request
+      (bl.rpc:parse-json-rpc-request
        "{\"method\":\"m\",\"id\":7}")
     (declare (ignore method params))
     (is (eq type :single))
@@ -353,9 +353,9 @@ distinguishes an absent id (notification -> 204) from id:null."
   "A parseable body with a missing method is -32600 INVALID_REQUEST, not
 -32700 PARSE_ERROR (previously swallowed by the outer handler)."
   (signals-rpc-error (:code -32600)
-    (bl.rpc::parse-json-rpc-request "{\"id\":1}"))
+    (bl.rpc:parse-json-rpc-request "{\"id\":1}"))
   (signals-rpc-error (:code -32700)
-    (bl.rpc::parse-json-rpc-request "not json")))
+    (bl.rpc:parse-json-rpc-request "not json")))
 
 ;;; ---------------------------------------------------------------------
 ;;; D. gettxout include_mempool

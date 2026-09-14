@@ -208,7 +208,7 @@ still have one; an object MEMBER keeps the present-p folding, because there a
 truthy sentinel would read as present-and-true. The %positional-bool helpers
 decode all three states."
   (multiple-value-bind (type method params)
-      (bl.rpc::parse-json-rpc-request
+      (bl.rpc:parse-json-rpc-request
        "{\"method\":\"x\",\"params\":[true,false,null,{\"a\":false,\"b\":true},[false]],\"id\":1}")
     (is (eq type :single))
     (is (string= method "x"))

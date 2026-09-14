@@ -125,7 +125,7 @@ arguments. One reach for the whole file: the handler is internal to BL.RPC
   "Test parsing valid JSON-RPC request"
   (let ((body "{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}"))
     (multiple-value-bind (type method params id)
-        (bl.rpc::parse-json-rpc-request body)
+        (bl.rpc:parse-json-rpc-request body)
       (is (eq type :single))
       (is (string= method "getblockcount"))
       (is (null params))
@@ -135,7 +135,7 @@ arguments. One reach for the whole file: the handler is internal to BL.RPC
   "Test parsing request with params"
   (let ((body "{\"jsonrpc\":\"2.0\",\"method\":\"getblockhash\",\"params\":[100],\"id\":\"test\"}"))
     (multiple-value-bind (type method params id)
-        (bl.rpc::parse-json-rpc-request body)
+        (bl.rpc:parse-json-rpc-request body)
       (is (eq type :single))
       (is (string= method "getblockhash"))
       (is (= (first params) 100))
@@ -145,7 +145,7 @@ arguments. One reach for the whole file: the handler is internal to BL.RPC
   "Test parsing batch request"
   (let ((body "[{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"id\":1},{\"jsonrpc\":\"2.0\",\"method\":\"getbestblockhash\",\"id\":2}]"))
     (multiple-value-bind (type requests)
-        (bl.rpc::parse-json-rpc-request body)
+        (bl.rpc:parse-json-rpc-request body)
       (is (eq type :batch))
       (is (= (length requests) 2)))))
 
@@ -160,7 +160,7 @@ differently is a top-level empty array: the +json-empty-array+ sentinel.
 
 The nesting rule is the one explicit false already follows — top level only."
   (flet ((params-of (json)
-           (nth-value 2 (bl.rpc::parse-json-rpc-request
+           (nth-value 2 (bl.rpc:parse-json-rpc-request
                          (format nil "{\"method\":\"m\",\"params\":~A,\"id\":1}" json)))))
     ;; The two that used to be indistinguishable.
     (let ((empty (second (params-of "[\"a\",[]]")))
@@ -288,12 +288,12 @@ transaction that is in that block."
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
   (signals bl.rpc:rpc-error
-    (bl.rpc::parse-json-rpc-request "not valid json")))
+    (bl.rpc:parse-json-rpc-request "not valid json")))
 
 (test json-rpc-parse-missing-method
   "Test parsing request without method returns error"
   (signals bl.rpc:rpc-error
-    (bl.rpc::parse-json-rpc-request "{\"jsonrpc\":\"2.0\",\"id\":1}")))
+    (bl.rpc:parse-json-rpc-request "{\"jsonrpc\":\"2.0\",\"id\":1}")))
 
 ;;; --- Hash Hex Helper Tests ---
 
@@ -3494,7 +3494,7 @@ at all: interface_rpc.py:189 and :204 compare those two objects whole."
   (flet ((parse (body)
            (let ((bl.rpc::*request-id* nil)
                  (bl.rpc::*request-id-present* t))
-             (ignore-errors (bl.rpc::parse-json-rpc-request body))
+             (ignore-errors (bl.rpc:parse-json-rpc-request body))
              (list bl.rpc::*request-id* bl.rpc::*request-id-present*))))
     ;; Never parsed as JSON: Core's initial present-null survives.
     (is (equal '(nil t) (parse "not json"))
@@ -4183,7 +4183,7 @@ bytes were not JSON -- they were -- and hid the answer the caller asked for."
          (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy"))
     (flet ((params-of (outputs)
              (multiple-value-bind (kind method params)
-                 (bl.rpc::parse-json-rpc-request
+                 (bl.rpc:parse-json-rpc-request
                   (format nil "{\"method\":\"createrawtransaction\",\"params\":[[],~A],\"id\":1}"
                           outputs))
                (is (eq :single kind))
@@ -7687,12 +7687,12 @@ early when the tip changes."
   "parse-json-rpc-request accepts a 1.0 (and version-less) envelope — stock
 bitcoin-cli sends those; rejecting non-2.0 made it unusable."
   (multiple-value-bind (kind method)
-      (bl.rpc::parse-json-rpc-request
+      (bl.rpc:parse-json-rpc-request
        "{\"jsonrpc\":\"1.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}")
     (is (eq :single kind))
     (is (string= "getblockcount" method)))
   (multiple-value-bind (kind method)
-      (bl.rpc::parse-json-rpc-request "{\"method\":\"uptime\",\"id\":1}")
+      (bl.rpc:parse-json-rpc-request "{\"method\":\"uptime\",\"id\":1}")
     (is (eq :single kind))
     (is (string= "uptime" method))))
 
@@ -9716,7 +9716,7 @@ handle-single-request -> yason:encode) and return (values parsed-reply
 json-text). Returns (values :no-reply nil) for a 2.0 notification, which
 rpc-handler answers with HTTP 204 and no body."
   (multiple-value-bind (kind method params id version id-present)
-      (bl.rpc::parse-json-rpc-request body)
+      (bl.rpc:parse-json-rpc-request body)
     (unless (eq kind :single)
       (error "jsonrpc-shape-reply: expected a single request, got ~S" kind))
     (if (and (eq version :v2) (not id-present))
@@ -9880,7 +9880,7 @@ a 2.0 member gets the strict shape, a 2.0 notification contributes no reply at
 all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
   (with-jsonrpc-shape-method
     (multiple-value-bind (kind requests)
-        (bl.rpc::parse-json-rpc-request
+        (bl.rpc:parse-json-rpc-request
          (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
                        {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
                        {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
