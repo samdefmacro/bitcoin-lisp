@@ -347,3 +347,62 @@ indistinguishable from a real answer."
                   (is (= 2 (bl.store:index-height idx cs))))
              (bl.store:close-txospender-index idx)))
       (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+
+(test gettxspendingprevout-names-the-block-a-confirmed-spend-is-in
+  "Core's index answer carries a `blockhash' the mempool answer cannot: the
+mempool branch pushes spendingtxid (and spendingtx), the txospenderindex
+branch pushes spendingtxid, BLOCKHASH and spendingtx
+(rpc/mempool.cpp:1015-1024). Without it a caller cannot tell a confirmed
+spend from an unconfirmed one, and rpc_gettxspendingprevout.py:132 compares
+the whole object.
+
+Driven through the RPC handler over a real index so the field comes from the
+index lookup rather than from a hand-built result."
+  (let ((dir (%tsi-tmpdir "rpc-blockhash")))
+    (unwind-protect
+         (let ((cs (bl.store:init-chain-state dir))
+               (store (bl.store:init-block-store dir))
+               (idx (bl.store:init-txospender-index dir))
+               (node (bl:make-node)))
+           (unwind-protect
+                (let* ((genesis-hash (bl.store:best-block-hash cs))
+                       (genesis (bl.store:make-block-index-entry
+                                 :hash genesis-hash :height 0 :chain-work 0
+                                 :status :valid
+                                 :header (bl.ser:make-block-header
+                                          :version 1 :prev-block (%tsi-hash 0)
+                                          :merkle-root (%tsi-hash 0)
+                                          :timestamp 1231006505 :bits #x1d00ffff
+                                          :nonce 0 :cached-hash genesis-hash)))
+                       (spent (%tsi-outpoint #xC1 0))
+                       (unspent (%tsi-outpoint #xC2 0))
+                       (block-hash (%tsi-hash #x1C)))
+                  (bl.store:add-block-index-entry cs genesis)
+                  (multiple-value-bind (entry block)
+                      (%tsi-extend cs store genesis block-hash spent)
+                    (bl.store:update-chain-tip
+                     cs (bl.store:block-index-entry-hash entry) 1)
+                    (bl.store:txospenderindex-add-block idx block block-hash)
+                    (bl.store:txospenderindex-set-best-block idx block-hash 1))
+                  (setf (bl:node-chainstates node) (list cs)
+                        (bl:node-block-store node) store
+                        (bl:node-txospenderindex node) idx)
+                  (flet ((query (op)
+                           (let ((h (make-hash-table :test 'equal)))
+                             (setf (gethash "txid" h)
+                                   (bl.rpc:hash-to-hex (bl.ser:outpoint-hash op))
+                                   (gethash "vout" h) (bl.ser:outpoint-index op))
+                             (first (bl.rpc::rpc-gettxspendingprevout
+                                     node (list (list h)))))))
+                    (let ((r (query spent)))
+                      (is-true (assoc "spendingtxid" r :test #'string=)
+                               "the fixture's confirmed spend was not found")
+                      (is (string= (bl.rpc:hash-to-hex block-hash)
+                                   (cdr (assoc "blockhash" r :test #'string=)))))
+                    ;; Control: an outpoint nothing spent gets neither key, so
+                    ;; blockhash really comes from the index hit.
+                    (let ((r (query unspent)))
+                      (is-false (assoc "spendingtxid" r :test #'string=))
+                      (is-false (assoc "blockhash" r :test #'string=)))))
+             (bl.store:close-txospender-index idx)))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))

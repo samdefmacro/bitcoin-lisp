@@ -96,7 +96,17 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
             ;; Acceptance is unconditionally full-RBF since cluster mempool;
             ;; Core hardcodes true (rpc/mempool.cpp:1048, field DEPRECATED).
             ("fullrbf" . t)
-            ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*)))))
+            ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))
+            ;; The remaining four policy fields Core reports
+            ;; (rpc/mempool.cpp:1050-1053). -datacarrier=0 is nullopt there
+            ;; and value_or(0) here, so a node that relays no OP_RETURN says
+            ;; 0 rather than its unused byte budget (mempool_args.cpp:94-98).
+            ("maxdatacarriersize" . ,(if bl:*accept-datacarrier*
+                                         bl:*max-datacarrier-bytes*
+                                         0))
+            ("limitclustercount" . ,(bl.mp:mempool-cluster-count-limit mempool))
+            ("limitclustersize" . ,(bl.mp:mempool-cluster-size-limit mempool))
+            ("optimal" . ,(json-bool (bl.mp:mempool-linearization-optimal-p mempool))))))
         `(("loaded" . ,+json-false+)
           ("size" . 0)
           ("bytes" . 0)
@@ -108,7 +118,13 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           ("incrementalrelayfee" . ,incfee)
           ("unbroadcastcount" . 0)
           ("fullrbf" . t)
-          ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))))))
+          ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))
+          ("maxdatacarriersize" . ,(if bl:*accept-datacarrier*
+                                       bl:*max-datacarrier-bytes*
+                                       0))
+          ("limitclustercount" . ,bl.mp:*cluster-count-limit*)
+          ("limitclustersize" . ,bl.mp:*cluster-size-limit*)
+          ("optimal" . t)))))
 
 (define-rpc "getrawmempool" (node ((verbose :bool) (mempool-sequence :bool)))
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t).
@@ -197,17 +213,25 @@ size, exactly Core's GetTxSize-based reporting."
           ("descendantcount" . ,dcount)
           ("descendantsize" . ,dsize)
           ("wtxid" . ,(hash-to-hex (bl.mp:mempool-entry-wtxid entry)))
-          ("depends" . ,(let ((deps '()))
-                          (maphash (lambda (p v) (declare (ignore v))
-                                     (push (hash-to-hex p) deps))
-                                   (bl.mp:mempool-entry-parents entry))
-                          deps))
+          ;; Both of these are UniValue VARRs in Core (entryToJSON,
+          ;; rpc/mempool.cpp:494-506), so an entry with no unconfirmed parents
+          ;; -- or, for the chain's last transaction, no unconfirmed children
+          ;; -- answers [] and never null. JSON-ARRAY is what makes an empty
+          ;; CL list encode as one: mempool_packages.py:108 compares
+          ;; entry['spentby'] against the empty list.
+          ("depends" . ,(json-array
+                         (let ((deps '()))
+                           (maphash (lambda (p v) (declare (ignore v))
+                                      (push (hash-to-hex p) deps))
+                                    (bl.mp:mempool-entry-parents entry))
+                           deps)))
           ;; In-mempool txs that spend this tx's outputs (Core "spentby").
-          ("spentby" . ,(let ((sb '()))
-                          (maphash (lambda (c v) (declare (ignore v))
-                                     (push (hash-to-hex c) sb))
-                                   (bl.mp:mempool-entry-children entry))
-                          sb))
+          ("spentby" . ,(json-array
+                         (let ((sb '()))
+                           (maphash (lambda (c v) (declare (ignore v))
+                                      (push (hash-to-hex c) sb))
+                                    (bl.mp:mempool-entry-children entry))
+                           sb)))
           ;; BIP125: whether the tx or any unconfirmed ancestor SIGNALS
           ;; replaceability (Core IsRBFOptIn, reporting only — acceptance is
           ;; unconditionally full-RBF; rpc/mempool.cpp:456,567, DEPRECATED).
@@ -392,8 +416,12 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
                               :message "Invalid parameter, vout cannot be negative"))
           (let* ((mem (and mempool
                            (bl.mp:mempool-spending-tx mempool txid vout)))
+                 (spender-block-hash nil)
                  (spender-tx (and (not mem) (not mempool-only)
-                                  (%txospender-confirmed-spender node index txid vout))))
+                                  (multiple-value-bind (tx block-hash)
+                                      (%txospender-confirmed-spender node index txid vout)
+                                    (setf spender-block-hash block-hash)
+                                    tx))))
             (cond
               (mem `(("txid" . ,txid-hex)
                      ("vout" . ,vout)
@@ -410,6 +438,13 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
                  ("vout" . ,vout)
                  ("spendingtxid"
                   . ,(hash-to-hex (bl.ser:transaction-hash spender-tx)))
+                 ;; The index answer names the BLOCK the spend is in, which
+                 ;; the mempool answer above cannot (rpc/mempool.cpp:
+                 ;; 1020-1021, o.pushKV("blockhash", ...)). It is the only
+                 ;; thing that tells a caller the spend is confirmed, and
+                 ;; rpc_gettxspendingprevout.py:132 compares the whole
+                 ;; object.
+                 ("blockhash" . ,(hash-to-hex spender-block-hash))
                  ,@(when return-tx
                      `(("spendingtx"
                         . ,(bl.crypto:bytes-to-hex
@@ -427,8 +462,10 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
       outpoints))))
 
 (defun %txospender-confirmed-spender (node index txid vout)
-  "The confirmed transaction that spent TXID:VOUT, from the spender index, or
-NIL.
+  "(VALUES SPENDING-TX BLOCK-HASH) for the confirmed spend of TXID:VOUT from
+the spender index, or NIL. The block hash is part of the answer, not a
+by-product: it is what Core's caller reports as `blockhash\'
+(rpc/mempool.cpp:1020-1021).
 
 The index key is a SALTED HASH of the outpoint, so two different outpoints can
 land under one key. Every candidate is read back from its block and checked
@@ -454,7 +491,8 @@ is a reorg the index has not been told about, and both are skipped."
                        (and entry (%block-on-active-chain-p entry chain-state))))
             (let ((tx (%tx-at-block-position block position)))
               (when (and tx (%tx-spends-outpoint-p tx txid vout))
-                (return-from %txospender-confirmed-spender tx)))))))
+                (return-from %txospender-confirmed-spender
+                  (values tx block-hash))))))))
     nil))
 
 (defun %tx-at-block-position (block position)
@@ -781,8 +819,11 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                                  (bl.net:current-for-fee-estimation-p
                                   chain-state))))
                 (unless (eq add-result :ok)
+                  ;; The state's own reject reason, as on every other path:
+                  ;; err_string is state.ToString() (node/transaction.cpp:21)
+                  ;; and the RPC prints exactly that (rpc/util.cpp:408-414).
                   (error 'rpc-error :code +rpc-transaction-rejected+
-                                    :message (format nil "Mempool rejection: ~A" add-result)))
+                                    :message (bl.val:tx-reject-reason-string add-result)))
                 ;; Track for best-effort initial broadcast (Core
                 ;; node/transaction.cpp:100-104), then queue the announcement
                 ;; to all relay peers.

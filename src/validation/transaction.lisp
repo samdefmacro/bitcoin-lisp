@@ -824,7 +824,19 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; (:1097-1098). All three shared :INSUFFICIENT-FEE here, so an RBF
     ;; rejection announced itself as a relay-floor one.
     (:rbf-insufficient-fee     . "insufficient fee")
-    (:package-rbf-insufficient-fee . "package RBF failed: insufficient anti-DoS fees"))
+    (:package-rbf-insufficient-fee . "package RBF failed: insufficient anti-DoS fees")
+    ;; The INSERTION verdicts -- MEMPOOL-ADD's own results, which reach a
+    ;; client through sendrawtransaction and submitpackage after the checks
+    ;; above have all passed. They had no row here, so the downcased keyword
+    ;; was reported and, on the sendrawtransaction path, wrapped in a prefix
+    ;; of this node's own invention ("Mempool rejection: TOO-LARGE-CLUSTER"):
+    ;; mempool_updatefromblock.py:192 and mempool_truc.py:238 both look for
+    ;; Core's "too-large-cluster" in the -26 message.
+    (:too-large-cluster        . "too-large-cluster")         ; validation.cpp:1021
+    (:mempool-full             . "mempool full")              ; :1401
+    (:duplicate                . "txn-already-in-mempool")    ; :825
+    (:conflict                 . "bip125-replacement-disallowed") ; :839
+    (:max-feerate-exceeded     . "max feerate exceeded"))     ; :1455
   "Our validation keywords in Core's reject-reason vocabulary.")
 
 (defparameter *tx-reject-debug-messages*

@@ -1820,6 +1820,64 @@ socket closes -- read 1. ping walks the same list."
     (is (integerp (cdr (assoc "maxmempool" result :test #'string=))))
     (is (integerp (cdr (assoc "usage" result :test #'string=))))))
 
+(test rpc-getmempoolinfo-reports-cores-policy-fields
+  "getmempoolinfo's last four fields (rpc/mempool.cpp:1050-1053):
+maxdatacarriersize, limitclustercount, limitclustersize and optimal. Every
+one of them was missing, which is a KeyError to a client that reads it --
+mempool_datacarrier.py:57 and mempool_cluster.py:319 both do.
+
+maxdatacarriersize is max_datacarrier_bytes.value_or(0), so -datacarrier=0
+answers 0 rather than the unused byte budget (mempool_args.cpp:94-98)."
+  (let* ((node (make-test-node))
+         (result (bl.rpc::rpc-getmempoolinfo node nil))
+         (get (lambda (k) (cdr (assoc k result :test #'string=)))))
+    (is (= bl:*max-datacarrier-bytes* (funcall get "maxdatacarriersize")))
+    (is (= bl.mp:*cluster-count-limit* (funcall get "limitclustercount")))
+    (is (= bl.mp:*cluster-size-limit* (funcall get "limitclustersize")))
+    (is (eq t (funcall get "optimal")))
+    ;; A node that relays no OP_RETURN reports 0, not its byte budget.
+    (let ((bl:*accept-datacarrier* nil))
+      (is (zerop (cdr (assoc "maxdatacarriersize"
+                             (bl.rpc::rpc-getmempoolinfo node nil)
+                             :test #'string=)))))
+    ;; The cluster fields come from THIS pool, not from the globals: a pool
+    ;; built under other limits reports its own.
+    (let* ((bl.mp:*cluster-count-limit* 7)
+           (bl.mp:*cluster-size-limit* 12345)
+           (other (bl.mp:make-mempool))
+           (other-node (make-test-node)))
+      (setf (bl:node-mempool other-node) other)
+      (let ((r (bl.rpc::rpc-getmempoolinfo other-node nil)))
+        (is (= 7 (cdr (assoc "limitclustercount" r :test #'string=))))
+        (is (= 12345 (cdr (assoc "limitclustersize" r :test #'string=))))))))
+
+(test rpc-mempool-entry-depends-and-spentby-are-arrays
+  "Core builds `depends' and `spentby' as UniValue VARRs (entryToJSON,
+rpc/mempool.cpp:494-506), so an entry at the end of a chain answers [] and
+never null. We emitted the CL empty list, which yason writes as null, and
+mempool_packages.py:108 compares the last entry's spentby with []."
+  (let* ((node (make-test-node))
+         (mempool (bl:node-mempool node))
+         (funding (%txid-array 77))
+         (parent (make-spending-test-tx funding :vout 0 :value 50000000))
+         (pid (bl.ser:transaction-hash parent))
+         (child (make-spending-test-tx pid :vout 0 :value 40000000))
+         (cid (bl.ser:transaction-hash child)))
+    (%add-tx mempool parent :fee 1000)
+    (%add-tx mempool child :fee 2000)
+    (let ((p (bl.rpc::rpc-getmempoolentry node (list (bl.rpc:hash-to-hex pid))))
+          (c (bl.rpc::rpc-getmempoolentry node (list (bl.rpc:hash-to-hex cid)))))
+      ;; The parent has no unconfirmed parents and the child no unconfirmed
+      ;; children: both empty, and both must still be arrays.
+      (is (equalp #() (cdr (assoc "depends" p :test #'string=))))
+      (is (equalp #() (cdr (assoc "spentby" c :test #'string=))))
+      ;; Control: the populated direction is a plain list of hex ids, which
+      ;; is what makes the empty case the only one JSON-ARRAY changes.
+      (is (equal (list (bl.rpc:hash-to-hex pid))
+                 (cdr (assoc "depends" c :test #'string=))))
+      (is (equal (list (bl.rpc:hash-to-hex cid))
+                 (cdr (assoc "spentby" p :test #'string=)))))))
+
 (test rpc-getrawmempool-non-verbose
   "getrawmempool non-verbose returns a JSON array of txids — [] for a new
 node, not null (it used to assert only LISTP, which NIL satisfies)."
@@ -1934,6 +1992,44 @@ code, carrying an uppercased Lisp keyword no client can match on."
           (bl:node-mempool node) mempool
           (bl:node-peers node) (list peer))
     node))
+
+(test rpc-sendrawtransaction-rejection-speaks-cores-vocabulary
+  "A rejection raised by the INSERTION step -- after every check passed --
+must report Core's own reject reason like any other. BroadcastTransaction
+sets err_string to state.ToString() and the RPC prints exactly that
+(node/transaction.cpp:21, rpc/util.cpp:408-414); this node wrapped the
+keyword in a prefix of its own -- Mempool rejection: TOO-LARGE-CLUSTER -- so
+mempool_updatefromblock.py:192 and mempool_truc.py:238, which both look for
+Core's too-large-cluster in the -26 message, saw a word that is in no Bitcoin
+implementation.
+
+The cluster-count limit is the reachable one: build the pool with a limit of
+1 so a child of an in-pool parent is the transaction the changeset refuses
+(validation.cpp:1020-1022)."
+  (let* ((bl.mp:*cluster-count-limit* 1)
+         (utxo-set (bl.store:make-utxo-set))
+         (mempool (bl.mp:make-mempool))
+         (chain-state (bl.store:make-chain-state :best-height 200))
+         (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (bl.store:add-utxo utxo-set funding 0 100000000
+                       (p2sh-optrue-script-pubkey) 1 :coinbase nil)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bl.net:make-peer :state :ready)))
+           (parent (%pkg-tx funding 0 (- 100000000 10000)))
+           (child (%pkg-tx (bl.ser:transaction-hash parent) 0
+                           (- 100000000 20000))))
+      (bl.rpc::rpc-sendrawtransaction
+       node (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction parent))))
+      (is-true (bl.mp:mempool-has mempool (bl.ser:transaction-hash parent))
+               "the fixture's parent did not enter the pool")
+      (multiple-value-bind (code message)
+          (%rails-error
+           (lambda ()
+             (bl.rpc::rpc-sendrawtransaction
+              node (list (bl.crypto:bytes-to-hex
+                          (bl.ser:serialize-transaction child))))))
+        (is (eql bl.rpc::+rpc-transaction-rejected+ code))
+        (is (string= "too-large-cluster" message))))))
 
 (test rpc-sendrawtransaction-broadcasts
   "sendrawtransaction accepts the tx, adds it to the mempool's unbroadcast
