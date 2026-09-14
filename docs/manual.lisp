@@ -896,9 +896,19 @@
 
   Invariants: the listening socket binds BEFORE the cookie is written,
   Core's order, so a second process on a running node's datadir cannot
-  clobber the live secret. The ACL gates the whole acceptor, so `/rest/`
-  and `/ui/` inherit it. The rate limiter throttles the UNAUTHENTICATED
-  side only. `-rpcwhitelist` gates the JSON-RPC surface only (Core
+  clobber the live secret. An EMPTY `-rpcpassword` means cookie
+  authentication whatever `-rpcuser` says (Core asks only whether the
+  password is non-empty, httprpc.cpp:245). The ACL gates the whole
+  acceptor, so `/rest/` and `/ui/` inherit it. The rate limiter throttles
+  the UNAUTHENTICATED side only. `-rpcthreads` bounds requests EXECUTING,
+  not connections: hunchentoot is thread-per-connection, so handing it to
+  the taskmaster as :max-thread-count stops the accept loop once that many
+  connections are held -- idle keep-alive ones included -- and Core's own
+  framework configures `rpcthreads=2`. The JSON-RPC handler claims exactly
+  `/` and the `/wallet/` prefix, as Core registers them; anything else is
+  Core's bare 404, and headers over 8,192 bytes are 400 before any routing.
+  Every reply ends in a NEWLINE, and its `id` key is present only once the
+  request object has been parsed. `-rpcwhitelist` gates the JSON-RPC surface only (Core
   registers the whitelist inside HTTPReq_JSONRPC, not around `/rest/`),
   keyed by the user name CHECK-AUTH returns, and a batch is refused as a
   unit when any member is off the list. A method is registered by its
@@ -1474,9 +1484,17 @@
   background (assumeutxo) chainstate's blocks are not announced, as Core's
   interface returns early for ChainstateRole::BACKGROUND.
 
+  One ADDRESS is one socket, shared by every topic published to it (Core
+  reuses the notifier already bound to the address,
+  zmq/zmqpublishnotifier.cpp:74-101). Binding per TOPIC instead leaves every
+  topic after the first on an endpoint failing with EADDRINUSE, and
+  `-zmqpubhashblock=X -zmqpubhashtx=X ...` on one endpoint is the ordinary
+  configuration.
+
   Traps: ZMQ_LINGER defaults to -1, so closing a socket with messages
   queued for a departed subscriber blocks forever -- it is set to 0 as Core
-  does. `bitcoin-block-transactions` is a LIST, not a vector."
+  does. A shared socket is closed ONCE, not once per publisher.
+  `bitcoin-block-transactions` is a LIST, not a vector."
   (bitcoin-lisp:zmq-start-publishers function)
   (bitcoin-lisp:zmq-stop-publishers function)
   (bitcoin-lisp:zmq-specs-from-config function)
@@ -1496,7 +1514,17 @@
   parameter interactions; `src/node/shutdown.lisp` installs the stop
   predicate every long loop polls.
 
-  Invariants: the RPC server comes up early and answers -28 until warmup
+  Invariants: BOTH the network data directory and the blocks directory are
+  claimed with Core's `.lock` (LockDirectories, init.cpp:1170-1174) before
+  anything reads them, and the pid file is written AFTER that lock, where
+  Core writes it -- otherwise a second node on a running node's datadir
+  overwrites the running node's pid file and deletes it on the way out.
+  A signet DERIVES its message start from its challenge (SigNetParams,
+  kernel/chainparams.cpp:507-511), so a custom `-signetchallenge` is a
+  different network on the wire. The DEFAULT onion-service target
+  (`<port>+1` on loopback) is bound only when no `-bind` was given, which
+  is Core's one branch that pushes it. The RPC server comes up early and
+  answers -28 until warmup
   finishes; the sync thread is the only writer of chain state; shutdown
   is cooperative, with a watchdog as the last resort; a node exits with
   Core's meaning of clean, error and watchdog. -blocknotify runs only
