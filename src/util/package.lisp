@@ -236,9 +236,7 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:chain-params-ext-secret-prefix
    #:chain-params-bip44-coin-type
    #:chain-params-of-ext-prefix
-   #:secret-prefix-known-p
-   #:ext-public-prefix-known-p
-   #:ext-secret-prefix-known-p))
+   #:secret-prefix-known-p))
 
 (defpackage #:bitcoin-lisp.context
   (:documentation "node-context (Core NodeContext): the references a message
