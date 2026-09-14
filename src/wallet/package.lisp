@@ -36,7 +36,11 @@ through the lower packages; the node reaches it only through these exports.")
    #:*wallet-reject-long-chains*
    #:*wallet-signal-rbf*
    #:*wallet-spend-zero-conf-change*
-   #:*default-keypool-size*))
+   #:*default-keypool-size*
+   ;; chain.getPackageLimits, which in this version of Core only the wallet's
+   ;; coin-eligibility ladder reads (-limitancestorcount / -limitdescendantcount)
+   #:*package-ancestor-limit*
+   #:*package-descendant-limit*))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

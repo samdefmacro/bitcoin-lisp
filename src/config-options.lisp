@@ -251,6 +251,21 @@
            (unless (plusp kvb)
              (config-error "limitclustersize must be a positive number of kvB"))
            (setf bl.mp:*cluster-size-limit* (* kvb 1000))))
+;; -limitancestorcount / -limitdescendantcount: the LEGACY package limits.
+;; They no longer gate mempool acceptance in this version of Core -- cluster
+;; limits do (CTxMemPool::CheckPolicyLimits, txmempool.cpp:800-809) -- and the
+;; only reader left is the wallet's coin-eligibility ladder, which consults
+;; them through chain.getPackageLimits (node/interfaces.cpp:709-717) so that a
+;; chain of its own unconfirmed change stops before a mempool would refuse it
+;; (wallet/spend.cpp:872-883). Accepted-but-ignored until now, which made the
+;; wallet pile every send onto ONE chain: wallet_basic.py:499.
+;;
+;; Core reads both with GetIntArg and clamps to 1 in the wallet rather than
+;; refusing here (spend.cpp:882-883), so 0 and negatives are not an error.
+(define-option "limitancestorcount" :type :int
+  :apply (lambda (n) (setf bl.wallet:*package-ancestor-limit* n)))
+(define-option "limitdescendantcount" :type :int
+  :apply (lambda (n) (setf bl.wallet:*package-descendant-limit* n)))
 ;; -signetchallenge: a custom signet block-challenge script, and
 ;; -signetseednode: the DNS/peer seeds that REPLACE the chain's own. Core
 ;; reads BOTH with GetArgs (ReadSigNetArgs, chainparams.cpp:28-40), so both
@@ -549,8 +564,8 @@ node's own address"))))
   "daemonwait" "dbbatchsize" "deprecatedrpc"
   "discover"
   "help" "i2pacceptincoming" "i2psam"
-  "ipcbind" "limitancestorcount" "limitancestorsize"
-  "limitdescendantcount" "limitdescendantsize"
+  "ipcbind" "limitancestorsize"
+  "limitdescendantsize"
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"
   "natpmp" "peerbloomfilters" "printpriority"

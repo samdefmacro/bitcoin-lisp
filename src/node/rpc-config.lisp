@@ -77,7 +77,18 @@ APPLY-CONFIG-GLOBALS."
       ;; -keypool sizes the keypool of wallets created AFTER it is set; an
       ;; existing wallet keeps the size it was made with, as in Core, where the
       ;; keypool size is per-wallet state.
-      (int-knob "keypool" bl.wallet:*default-keypool-size* :min 1))
+      ;;
+      ;; CLAMPED, never refused, so it gets no INT-KNOB: Core reads it as
+      ;; std::max(args.GetIntArg("-keypool", DEFAULT_KEYPOOL_SIZE), int64_t{1})
+      ;; (wallet/wallet.cpp:3066), and GetIntArg answers 0 for anything it
+      ;; cannot read, so 0, a negative and a garbage value all become 1.
+      ;; Refusing 0 as an invalid value stopped the node from starting at all:
+      ;; wallet_hd.py:21 runs its second node with -keypool=0 precisely so no
+      ;; address is handed out before the test asks for one.
+      (let ((v (lk "keypool")))
+        (when v
+          (setf bl.wallet:*default-keypool-size*
+                (max 1 (or (ignore-errors (conf-parse-int v)) 0))))))
     ;; -walletdir relocates <datadir>/wallets/ (Core init.cpp). Relative paths
     ;; hang off the data directory, as -rpccookiefile does.
     (let ((v (lk "walletdir")))
