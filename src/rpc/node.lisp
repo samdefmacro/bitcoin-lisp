@@ -139,8 +139,14 @@ whether it is currently enabled. Errors on an unknown category."
       (unless (and (stringp cat) (bl.log:disable-log-category cat))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "unknown logging category ~A" cat))))
+    ;; ALPHABETICAL, as Core answers: LogCategoriesList walks
+    ;; LOG_CATEGORIES_BY_STR, a std::map keyed by the category NAME
+    ;; (logging.cpp:172, :278-286), so its iteration order is sorted.
+    ;; rpc_misc.py:87-88 asserts `list(node.logging()) ==
+    ;; sorted(node.logging())'. Ours came out in declaration order, so a
+    ;; client rendering the object as given showed an arbitrary one.
     (mapcar (lambda (c) (cons c (json-bool (bl:log-category-enabled-p c))))
-            bl.log:+log-categories+)))
+            (sort (copy-list bl.log:+log-categories+) #'string<))))
 
 (define-rpc "mockscheduler" (node params)
   "Advance the scheduler by DELTA_TIME seconds (Core mockscheduler,
@@ -250,6 +256,33 @@ echojson from ONE RPCHelpMan (rpc/node.cpp:277-311), so the arg9 internal-bug
 trigger is this method's too."
   (declare (ignore node))
   (%echo-arguments params))
+
+(defun %logging-categories-help ()
+  "The sentence Core's `help logging' carries: `valid logging categories are:
+<names>', comma-separated and ALPHABETICAL (rpc/node.cpp builds it from
+LogCategoriesString, logging.cpp:288-292 over the sorted LOG_CATEGORIES_BY_STR).
+rpc_misc.py:90-93 builds the same string from the logging RPC's own keys and
+asserts it appears in the help."
+  (format nil "~%valid logging categories are: ~{~A~^, ~}"
+          (sort (copy-list bl.log:+log-categories+) #'string<)))
+
+(register-rpc-help-detail "logging" #'%logging-categories-help)
+
+(define-rpc "echoipc" (node (arg))
+  "Echo back ARG (Core echoipc, rpc/node.cpp:313-345). Hidden, and for
+testing only.
+
+Core spawns a bitcoin-node process and round-trips the string through it in a
+multiprocess build; without one it takes interfaces::MakeEcho() and the call
+is the identity. This node has no IPC, so it is always the identity -- which
+is Core's own non-multiprocess behaviour, not a stub. It exists because
+rpc_misc.py:96 calls it and rpc_help.py:110 fails a node whose
+dump_all_command_conversions is missing a method client.cpp lists."
+  (declare (ignore node))
+  (unless (stringp arg)
+    (error 'rpc-error :code +rpc-type-error+
+                      :message "JSON value of type null is not of expected type string"))
+  arg)
 
 (defun %dump-all-command-conversions ()
   "Core CRPCTable::dumpArgMap / RPCHelpMan::GetArgMap (rpc/util.cpp:833-863):
