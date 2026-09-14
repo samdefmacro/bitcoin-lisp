@@ -88,9 +88,24 @@ not halfway through startup.")
     (cffi:foreign-funcall "zmq_setsockopt" :pointer socket :int option
                                            :pointer v :size 4 :int)))
 
-(defun %zmq-open-publisher (topic address hwm)
+(defun %zmq-open-publisher (topic address hwm &optional existing-socket)
   "Bind one PUB socket, or return NIL after logging why. A publisher that
-cannot bind must not take the node down: Core reports and carries on."
+cannot bind must not take the node down: Core reports and carries on.
+
+EXISTING-SOCKET is the socket another topic already bound to this ADDRESS: an
+address is bound ONCE and every topic sent to it shares that socket, which is
+what Core does with its mapPublishNotifiers multimap
+(zmq/zmqpublishnotifier.cpp:74-101, `reuse the socket of the notifier already
+bound to this address\'). Binding per TOPIC instead made the second and every
+later topic on one address fail with EADDRINUSE -- and
+`-zmqpubhashblock=X -zmqpubhashtx=X -zmqpubrawblock=X -zmqpubrawtx=X\', all on
+one endpoint, is the ordinary configuration and the one interface_zmq.py uses
+throughout."
+  (when existing-socket
+    (log-info "ZMQ: publishing ~A to ~A (hwm ~D)" topic address hwm)
+    (return-from %zmq-open-publisher
+      (make-zmq-publisher :topic topic :address address
+                          :socket existing-socket :hwm hwm)))
   (let ((socket (cffi:foreign-funcall "zmq_socket" :pointer *zmq-context*
                                                    :int +zmq-pub+ :pointer)))
     (when (cffi:null-pointer-p socket)
@@ -121,23 +136,34 @@ SPECS nothing is loaded at all, which is the whole point of the lazy load."
       (setf *zmq-context* nil)
       (log-error "ZMQ: could not create a context: ~A" (%zmq-strerror))
       (return-from zmq-start-publishers 0)))
-  (let ((started 0))
+  (let ((started 0)
+        ;; address -> the socket already bound to it, so every topic sent to
+        ;; one endpoint shares one socket (Core's mapPublishNotifiers).
+        (bound (make-hash-table :test 'equal)))
     (dolist (spec specs started)
       (destructuring-bind (topic address &optional (hwm +default-zmq-sndhwm+)) spec
-        (let ((pub (%zmq-open-publisher topic address hwm)))
+        (let ((pub (%zmq-open-publisher topic address hwm
+                                        (gethash address bound))))
           (when pub
+            (setf (gethash address bound) (zmq-publisher-socket pub))
             (push pub *zmq-publishers*)
             (incf started)))))))
 
 (defun zmq-stop-publishers ()
   "Close every publisher and the context. LINGER is set to 0 first, exactly as
 Core does, or this blocks forever on anything still queued."
-  (dolist (pub *zmq-publishers*)
-    (let ((socket (zmq-publisher-socket pub)))
-      (when socket
-        (%zmq-setsockopt-int socket +zmq-linger+ 0)
-        (cffi:foreign-funcall "zmq_close" :pointer socket :int)
-        (setf (zmq-publisher-socket pub) nil))))
+  ;; One close per SOCKET, not per publisher: several topics share the socket
+  ;; of the address they were bound to, and closing it twice is a use-after-
+  ;; free inside libzmq.
+  (let ((closed '()))
+    (dolist (pub *zmq-publishers*)
+      (let ((socket (zmq-publisher-socket pub)))
+        (when socket
+          (unless (member socket closed :test #'cffi:pointer-eq)
+            (push socket closed)
+            (%zmq-setsockopt-int socket +zmq-linger+ 0)
+            (cffi:foreign-funcall "zmq_close" :pointer socket :int))
+          (setf (zmq-publisher-socket pub) nil)))))
   (setf *zmq-publishers* '())
   (when *zmq-context*
     (cffi:foreign-funcall "zmq_ctx_term" :pointer *zmq-context* :int)
