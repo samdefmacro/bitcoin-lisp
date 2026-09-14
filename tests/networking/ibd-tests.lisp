@@ -2291,6 +2291,23 @@ the pass runs and the timer re-arms."
     (bl.net:maybe-reattempt-initial-broadcast (list peer) mempool)
     (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (is (> bl.net::*next-initial-broadcast-time* 1))
+    ;; The deadline is on Core's MOCKABLE clock, the one `mockscheduler'
+    ;; moves: Core runs this pass on its CScheduler and mempool_unbroadcast.py
+    ;; :66 / mempool_persist.py:219 both jump that scheduler forward and then
+    ;; wait for the announcement. Measured from GET-INTERNAL-REAL-TIME, as it
+    ;; was, the deadline sat ten minutes of WALL time out and no RPC could
+    ;; reach it. A fresh peer, because the one above already knows the tx.
+    (let ((fresh (bl.net:make-peer :state :ready))
+          (base 1700000000))
+      (bl.net:reset-initial-broadcast-schedule)
+      (let ((bl.ser:*mock-time* base))
+        (bl.net:maybe-reattempt-initial-broadcast (list fresh) mempool)
+        (is (null (bl.net:peer-tx-inv-queue fresh))
+            "the arming pass announces nothing")
+        (setf bl.ser:*mock-time* (+ base (* 16 60)))   ; mockscheduler(16 * 60)
+        (bl.net:maybe-reattempt-initial-broadcast (list fresh) mempool)
+        (is (= 1 (length (bl.net:peer-tx-inv-queue fresh)))
+            "moving the mock clock past the interval must run the pass")))
     (bl.net:reset-initial-broadcast-schedule)))
 
 ;;;; Erlay P1: BIP330 sendtxrcncl handshake (Core-parity: handshake only)

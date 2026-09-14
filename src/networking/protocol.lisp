@@ -3970,13 +3970,20 @@ randrange(5min) each cycle so the cadence can't fingerprint the node
 (net_processing.cpp:1639-1641).")
 
 (defvar *next-initial-broadcast-time* 0
-  "internal-real-time deadline of the next unbroadcast re-announcement pass;
+  "Unix-time deadline of the next unbroadcast re-announcement pass;
 0 = not yet scheduled (armed on the first maybe- call, matching Core's
-initial scheduleFromNow a full interval out, net_processing.cpp:2036-2038).")
+initial scheduleFromNow a full interval out, net_processing.cpp:2036-2038).
 
-(defun %next-initial-broadcast-ticks ()
-  (+ (* +initial-broadcast-interval+ internal-time-units-per-second)
-     (random (* +initial-broadcast-jitter+ internal-time-units-per-second))))
+On the MOCKABLE clock (BL.SER:GET-UNIX-TIME), because Core runs this pass on
+its CScheduler and `mockscheduler' exists to move that scheduler forward:
+mempool_unbroadcast.py:66 and mempool_persist.py:219 both call it and then
+wait for the re-announcement. Measured from GET-INTERNAL-REAL-TIME, as this
+was, the deadline was ten minutes of WALL time away and no RPC could reach
+it -- both tests waited out their timeout with the transaction sitting in the
+unbroadcast set.")
+
+(defun %next-initial-broadcast-seconds ()
+  (+ +initial-broadcast-interval+ (random +initial-broadcast-jitter+)))
 
 (defun reset-initial-broadcast-schedule ()
   "Clear the re-announcement deadline (called at node start, alongside
@@ -3996,15 +4003,23 @@ reaches peers connected since the original announcement."
 (defun maybe-reattempt-initial-broadcast (peers mempool)
   "Run the unbroadcast re-announcement pass when due (call ~1x/second from
 the sync loop, our stand-in for Core's scheduler). Each cycle — including
-the first — is scheduled 10min + rand(5min) out."
+the first — is scheduled 10min + rand(5min) out, on the mockable clock."
   (when mempool
-    (let ((now (get-internal-real-time)))
+    (let ((now (bl.ser:get-unix-time)))
       (cond ((zerop *next-initial-broadcast-time*)
              (setf *next-initial-broadcast-time*
-                   (+ now (%next-initial-broadcast-ticks))))
+                   (+ now (%next-initial-broadcast-seconds))))
+            ;; A clock that moved BACKWARDS -- setmocktime to a base older
+            ;; than the stamp this node armed at start-up -- would otherwise
+            ;; park the deadline a whole mocked epoch away and the pass would
+            ;; never run again. Re-arm from where the clock now is.
+            ((> (- *next-initial-broadcast-time* now)
+                (+ +initial-broadcast-interval+ +initial-broadcast-jitter+))
+             (setf *next-initial-broadcast-time*
+                   (+ now (%next-initial-broadcast-seconds))))
             ((>= now *next-initial-broadcast-time*)
              (setf *next-initial-broadcast-time*
-                   (+ now (%next-initial-broadcast-ticks)))
+                   (+ now (%next-initial-broadcast-seconds)))
              (with-current-node-lock
                (reattempt-initial-broadcast peers mempool)))))))
 
