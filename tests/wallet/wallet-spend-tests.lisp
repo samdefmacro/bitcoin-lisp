@@ -757,6 +757,36 @@ tx gets no change output and overpays exactly the remainder."
         (is (= 900 (%ws-tx-fee node wallet tx)))
         (is (%ws-verify-ok-p node wallet tx))))))
 
+(test ws-sffo-empty-array-is-not-an-instruction
+  "Core's InterpretSubtractFeeFromOutputInstructions (wallet/rpc/spend.cpp:
+68-94) builds a set by iterating the argument's values, so an EMPTY array
+contributes nothing and is exactly as good as omitting it -- there is no
+`must be an array' check anywhere in it.
+
+A top-level empty array reaches a handler here as the empty-array SENTINEL,
+which is truthy and is not a list (src/rpc/server.lisp), so the LISTP guard
+refused it: wallet_basic.py:259 sends
+sendmany('', {addr: 10}, 0, \"\", [], fee_rate=...) and got
+-3 \"subtractfeefrom must be an array\". The two calls below must agree."
+  (with-wallet-chain-node (node "ws-sffo-empty" :wallet "sffoe")
+    (let* ((dest (%wc-optrue-address))
+           (amounts (let ((h (make-hash-table :test 'equal)))
+                      (setf (gethash dest h) 1)
+                      h)))
+      (flet ((sffo (value)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "sendmany"
+                   (wire-params (list "" amounts nil nil value)))))))
+        (let ((omitted (sffo nil))
+              (empty (sffo (vector))))
+          (is (equal omitted empty)
+              "an empty subtractfeefrom answered ~S where omitting it answers ~S"
+              empty omitted)
+          (is (not (equal (car empty) bl.rpc:+rpc-type-error+))
+              "an empty subtractfeefrom is still a type error: ~S" empty))))))
+
 (test ws-sffo-instruction-names-the-type-core-names
   "Core's InterpretSubtractFeeFromOutputInstructions refuses an instruction
 that is neither a string nor a number by NAMING its JSON type -- `Invalid
