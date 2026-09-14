@@ -1889,18 +1889,44 @@ test node) reports 0 rather than signalling: the field is informational."
             (error () nil))
           total))))
 
-(define-rpc "gettxoutsetinfo" (node ((hash-type :or "hash_serialized_3") hash-or-height))
+(define-rpc "gettxoutsetinfo" (node ((hash-type :or "hash_serialized_3") hash-or-height use-index))
   "Return statistics about the UTXO set. With a second argument (height or
 block hash) the stats are served for that historical height from the
-coinstatsindex (Core's use_index path)."
+coinstatsindex (Core's use_index path).
+
+The index serves the TIP too. Core's gate is `index_requested &&
+g_coin_stats_index\' (rpc/blockchain.cpp:1101, :1113) -- a height is not part
+of it -- and an index-backed answer carries `block_info\' and
+`total_unspendable_amount\' where an index-free one carries `transactions\' and
+`disk_size\' (:1128-1130). We used the index only when a height was asked for,
+so a node running -coinstatsindex answered the plain call from the coins view
+and feature_coinstatsindex.py:87 found no block_info in it."
   (let ((utxo-set (rpc-get-utxo-set node))
-        (chain-state (rpc-get-chain-state node)))
+        (chain-state (rpc-get-chain-state node))
+        ;; Core: `request.params[2].isNull() || request.params[2].get_bool()'
+        ;; (rpc/blockchain.cpp:1070) -- omitted or null means TRUE, and an
+        ;; explicit false must still read as false, which is why this goes
+        ;; through POSITIONAL-BOOL-OR rather than a lambda-list default: the
+        ;; explicit-false sentinel is TRUTHY in Lisp.
+        (use-index (positional-bool-or use-index t)))
     (unless (member hash-type '("hash_serialized_3" "muhash" "none") :test #'string=)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid hash_type (must be 'hash_serialized_3', 'muhash', or 'none')"))
+    (when (and hash-or-height (not use-index))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Cannot set use_index to false when querying for a specific block"))
     (when hash-or-height
       (return-from rpc-gettxoutsetinfo
         (%gettxoutsetinfo-from-index node hash-type hash-or-height)))
+    ;; No height: the index still answers, when there is one and the caller has
+    ;; not said otherwise, for every hash type but hash_serialized_3 (which the
+    ;; index does not carry).
+    (let ((csi (rpc-get-coinstatsindex node)))
+      (when (and use-index csi (bl.store:coinstatsindex-enabled csi)
+                 (not (string= hash-type "hash_serialized_3")))
+        (return-from rpc-gettxoutsetinfo
+          (%gettxoutsetinfo-from-index node hash-type
+                                       (bl.store:current-height chain-state)))))
     ;; Core holds cs_main across the coins-cache flush and the reads that
     ;; follow it (rpc/blockchain.cpp:1075-1084: ForceFlushStateToDisk, then
     ;; the coins view and the pindex it labels the answer with), and

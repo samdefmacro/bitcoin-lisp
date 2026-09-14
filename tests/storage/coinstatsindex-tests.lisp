@@ -123,6 +123,31 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
            (is-true (assoc "block_info" res :test #'string=))
            (is-true (assoc "unspendables" (cdr (assoc "block_info" res :test #'string=))
                            :test #'string=)))
+         ;; The TIP is index-backed too, with no height argument at all.
+         ;; Core's gate is `index_requested && g_coin_stats_index'
+         ;; (rpc/blockchain.cpp:1101, :1113); a height is not part of it, and
+         ;; an index-backed answer carries block_info and
+         ;; total_unspendable_amount where an index-free one carries
+         ;; transactions and disk_size (:1128-1130).
+         ;; feature_coinstatsindex.py:87 reads block_info out of the plain
+         ;; call, which we answered from the coins view.
+         (let ((res (bl.rpc::rpc-gettxoutsetinfo node (list "muhash"))))
+           (is-true (assoc "block_info" res :test #'string=)
+                    "the tip must come from the index when one is enabled")
+           (is-true (assoc "total_unspendable_amount" res :test #'string=))
+           (is (null (assoc "disk_size" res :test #'string=))
+               "an index answer has no disk_size")
+           (is (null (assoc "transactions" res :test #'string=))
+               "an index answer has no transactions"))
+         ;; use_index=false takes the coins view instead, and that answer is
+         ;; the OTHER shape.
+         ;; Explicit false, as the wire delivers it: the sentinel, not NIL --
+         ;; NIL is Core's isNull(), which means "use the default".
+         (let ((res (bl.rpc::rpc-gettxoutsetinfo
+                     node (list "muhash" nil bl.rpc:+json-false+))))
+           (is-true (assoc "disk_size" res :test #'string=))
+           (is-true (assoc "transactions" res :test #'string=))
+           (is (null (assoc "block_info" res :test #'string=))))
          ;; A height above the tip errors.
          (signals bl.rpc:rpc-error
            (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" (+ tip 100))))
