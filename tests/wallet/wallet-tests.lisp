@@ -2089,12 +2089,14 @@ control and stays green: its inputs are segwit v0, where nothing may be
 dropped."
   (%with-pp-node (node "pp-trdrop")
     (%pp-fund-wallet node :blocks 2)
-    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 41))
-           (tr-address (bl.wallet::rpc-getnewaddress node '("" "bech32m")))
+    (with-wallet-rng (41)
+     (let* ((rpc (lambda (method &rest params)
+                   (bl.rpc:dispatch-rpc-method node method params)))
+           (tr-address (funcall rpc "getnewaddress" "" "bech32m"))
            (tr-spk (nth-value 1 (bl.crypto:decode-address tr-address :regtest)))
            (funding (bl.rpc:parse-hex-hash
-                     (bl.wallet::rpc-sendtoaddress
-                      node (list tr-address 1 nil nil nil nil nil nil nil 5))))
+                     (funcall rpc "sendtoaddress" tr-address 1
+                              nil nil nil nil nil nil nil 5)))
            (funding-tx (%pp-mempool-tx node funding)))
       (is (not (null funding-tx)) "fixture: the taproot funding never confirmed")
       (%pp-mine node 1 (%pp-optrue-address))
@@ -2102,15 +2104,15 @@ dropped."
                             :key #'bl.ser:tx-out-script-pubkey :test #'equalp)))
         (is (not (null vout)) "fixture: no output paid the taproot address")
         (let* ((b64 (%aval "psbt"
-                           (bl.wallet::rpc-walletcreatefundedpsbt
-                            node (list (list (%ht "txid" (bl.rpc:hash-to-hex funding)
-                                                  "vout" vout))
-                                       (list (%ht (%pp-optrue-address) "0.50000000"))
-                                       0
-                                       (%ht "fee_rate" 10
-                                            "add_inputs" bl.rpc:+json-false+
-                                            "change_type" "bech32m")))))
-               (processed (bl.wallet::rpc-walletprocesspsbt node (list b64)))
+                           (funcall rpc "walletcreatefundedpsbt"
+                                    (list (%ht "txid" (bl.rpc:hash-to-hex funding)
+                                               "vout" vout))
+                                    (list (%ht (%pp-optrue-address) "0.50000000"))
+                                    0
+                                    (%ht "fee_rate" 10
+                                         "add_inputs" bl.rpc:+json-false+
+                                         "change_type" "bech32m"))))
+               (processed (funcall rpc "walletprocesspsbt" b64))
                (out (bl.ser:decode-psbt (%aval "psbt" processed))))
           ;; Every input of this PSBT is the taproot one.
           (loop for m across (bl.ser:psbt-inputs out)
@@ -2118,7 +2120,7 @@ dropped."
                             "a taproot input keeps its witness_utxo")
                    (is-false (bl.ser:psbt-map-find
                               m bl.ser:+psbt-in-non-witness-utxo+)
-                             "a taproot input must not carry the whole previous transaction")))))))
+                             "a taproot input must not carry the whole previous transaction"))))))))
 
 (test pp-walletprocesspsbt-attaches-non-witness-utxo
   "Core FillPSBT (wallet.cpp:2201-2212) attaches the full previous transaction
@@ -2234,11 +2236,13 @@ carry the original destination, so a change that always rebuilt from the option
 would fail there."
   (%with-pp-node (node "pp-bumpouts")
     (%pp-fund-wallet node :blocks 5)
-    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 23))
-           (dest (%pp-optrue-address)))
+    (with-wallet-rng (23)
+     (let* ((dest (%pp-optrue-address))
+            (rpc (lambda (method &rest params)
+                   (bl.rpc:dispatch-rpc-method node method params))))
       (flet ((send (rate)
-               (bl.wallet::rpc-sendtoaddress
-                node (list dest 1 nil nil nil nil nil nil nil rate)))
+               (funcall rpc "sendtoaddress" dest 1
+                        nil nil nil nil nil nil nil rate))
              (spk-of (address)
                (nth-value 1 (bl.crypto:decode-address address :regtest)))
              (outputs-of (txid-hex)
@@ -2247,18 +2251,17 @@ would fail there."
                      (%pp-mempool-tx node (bl.rpc:parse-hex-hash txid-hex))))))
         ;; Control: no `outputs' option, so the original destination survives.
         (let* ((plain (send 5))
-               (bumped (%aval "txid" (bl.wallet::rpc-bumpfee
-                                      node (list plain (%ht "fee_rate" 20))))))
+               (bumped (%aval "txid" (funcall rpc "bumpfee" plain
+                                              (%ht "fee_rate" 20)))))
           (is-true (member (spk-of dest) (outputs-of bumped) :test #'equalp)
                    "a plain bump must keep the original destination"))
         ;; And with it, the new set replaces the old one entirely.
-        (let* ((new-address (bl.wallet::rpc-getnewaddress node '("" "bech32")))
+        (let* ((new-address (funcall rpc "getnewaddress" "" "bech32"))
                (txid (send 5))
                (bumped (%aval "txid"
-                              (bl.wallet::rpc-bumpfee
-                               node (list txid
-                                          (%ht "fee_rate" 20
-                                               "outputs" (list (%ht new-address "0.00030000")))))))
+                              (funcall rpc "bumpfee" txid
+                                       (%ht "fee_rate" 20
+                                            "outputs" (list (%ht new-address "0.00030000"))))))
                (scripts (outputs-of bumped)))
           (is-true (member (spk-of new-address) scripts :test #'equalp)
                    "the replacement does not pay the address `outputs' names")
@@ -2269,14 +2272,14 @@ would fail there."
           (is (equal (cons -8 "The options 'outputs' and 'original_change_index' are incompatible. You can only either specify a new set of outputs, or designate a change output to be recycled.")
                      (rpc-error-of
                       (lambda ()
-                        (bl.wallet::rpc-bumpfee
-                         node (list txid (%ht "outputs" (list (%ht dest "0.00030000"))
-                                              "original_change_index" 0)))))))
+                        (funcall rpc "bumpfee" txid
+                                 (%ht "outputs" (list (%ht dest "0.00030000"))
+                                      "original_change_index" 0))))))
           (is (equal (cons -8 "Change position is out of range")
                      (rpc-error-of
                       (lambda ()
-                        (bl.wallet::rpc-bumpfee
-                         node (list txid (%ht "original_change_index" 9))))))))))))
+                        (funcall rpc "bumpfee" txid
+                                 (%ht "original_change_index" 9))))))))))))
 
 (test pp-psbtbumpfee-unsigned
   "psbtbumpfee returns an UNSIGNED PSBT of the replacement without broadcasting;

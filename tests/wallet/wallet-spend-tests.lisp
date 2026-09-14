@@ -1734,8 +1734,8 @@ The two lower bounds are the control: a change that simply paid less would
 fail them."
   (with-wallet-chain-node (node "ws-rbfbump")
     (multiple-value-bind (wallet address) (%ws-fund-wallet node)
-      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 4242))
-            (target 30))
+      (with-wallet-rng (4242)
+       (let ((target 30))
         (flet ((send-tx (dest amount rate)
                  (let ((txid (bl.rpc:parse-hex-hash
                               (%ws-sendtoaddress
@@ -1775,7 +1775,7 @@ fail them."
                     (feerate-of (list parent bumped)) (* 2 target))
                 (is (<= (feerate-of (list parent bumped)) (* 101/100 2 target))
                     "parent+replacement pay ~A sat/vB, over the ~A target by ~
-more than 1%" (feerate-of (list parent bumped)) (* 2 target))))))))))
+more than 1%" (feerate-of (list parent bumped)) (* 2 target)))))))))))
 
 (test two-inputs-sharing-an-unconfirmed-parent-bump-it-once
   "Core computes each candidate's ancestor bump fee ONE OUTPOINT AT A TIME
@@ -1796,8 +1796,8 @@ The two lower bounds are the control: they fail for a selection that pays too
 little, so a discount applied twice or to a confirmed input cannot pass here."
   (with-wallet-chain-node (node "ws-overlap")
     (multiple-value-bind (wallet address) (%ws-fund-wallet node)
-      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 909))
-            (target 30))
+      (with-wallet-rng (909)
+       (let ((target 30))
         (flet ((send-tx (dest amount rate)
                  (let ((txid (bl.rpc:parse-hex-hash
                               (%ws-sendtoaddress
@@ -1837,7 +1837,7 @@ little, so a discount applied twice or to a confirmed input cannot pass here."
               (is (<= (feerate-of (list parent child)) (* 101/100 target))
                   "parent+child pay ~A sat/vB, over the ~A target by more than ~
 1% -- the shared parent was bumped twice"
-                  (feerate-of (list parent child)) target))))))))
+                  (feerate-of (list parent child)) target)))))))))
 
 (test the-coin-eligibility-ladder-reads-limitancestorcount
   "Core's AutomaticCoinSelection builds its eligibility ladder from

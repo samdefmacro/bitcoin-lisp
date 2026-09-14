@@ -465,10 +465,3 @@ or NIL. The test chains share one pair, so the first of them answers for all."
   "Is BYTE some chain's SECRET_KEY (WIF) prefix?"
   (and (find byte *chain-params* :key #'chain-params-base58-secret-prefix) t))
 
-(defun ext-public-prefix-known-p (version)
-  "Is VERSION some chain's EXT_PUBLIC_KEY (xpub/tpub) prefix?"
-  (and (find version *chain-params* :key #'chain-params-ext-public-prefix) t))
-
-(defun ext-secret-prefix-known-p (version)
-  "Is VERSION some chain's EXT_SECRET_KEY (xprv/tprv) prefix?"
-  (and (find version *chain-params* :key #'chain-params-ext-secret-prefix) t))

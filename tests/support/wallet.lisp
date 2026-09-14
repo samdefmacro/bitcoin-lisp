@@ -108,6 +108,13 @@ two of its IBD-only assertions red, in a file nothing had touched."
          (bl.wallet:close-wallet-manager
           (bl:node-wallet-manager ,node)))))))
 
+(defmacro with-wallet-rng ((seed) &body body)
+  "Run BODY with the wallet's transaction RNG seeded from SEED, so a randomized
+change position, input order or change amount is reproducible. Named here
+because several wallet suites bind the same special."
+  `(let ((bl.wallet::*wallet-rng* (make-wallet-rng ,seed)))
+     ,@body))
+
 (defun regtest-wif (byte)
   "A deterministic regtest WIF, for the descriptor strings the wallet RPCs
 parse. Regtest and not mainnet: DecodeSecret reads the network's own prefix,

@@ -1212,6 +1212,19 @@ TAP_SCRIPT_SIG per (key, leaf) and one TAP_LEAF_SCRIPT per control block."
   (loop for (kd . nil) in (bl.ser:psbt-map-collect map keytype)
         thereis (equalp kd keydata)))
 
+(defun %psbt-note-sighash (map eff)
+  "Record the resolved sighash type EFF on the input MAP.
+
+Core settles it BEFORE any key work (psbt.cpp:452-456): the type is written
+whenever it is not the default for that input type, whether or not a signature
+follows. RemoveUnnecessaryTransactions reads exactly this field for its
+ANYONECANPAY guard (:535), so writing it only where a signature had succeeded
+left that guard unable to fire on sign=false, or on an input the wallet holds
+no key for."
+  (bl.ser:psbt-map-set map bl.ser:+psbt-in-sighash+
+                       (make-array 0 :element-type '(unsigned-byte 8))
+                       (%psbt-uint32-le eff)))
+
 (defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash
                                 &optional tr-scripts)
   "Compute + record partial signatures on every non-final input of PSBT the key
@@ -1242,16 +1255,7 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                      map bl.ser:+psbt-in-final-scriptwitness+))
           (multiple-value-bind (eff record-p)
               (%psbt-effective-sighash map (first prev) user-sighash)
-            ;; Core settles the sighash on the INPUT before any key work
-            ;; (psbt.cpp:452-456): the resolved type is written whenever it is
-            ;; not the default for that input type, whether or not a signature
-            ;; follows. RemoveUnnecessaryTransactions reads exactly this field
-            ;; for its ANYONECANPAY guard (:535), so writing it only where a
-            ;; signature succeeded left that guard unable to fire on
-            ;; sign=false or on an input the wallet holds no key for.
-            (when record-p
-              (bl.ser:psbt-map-set
-               map bl.ser:+psbt-in-sighash+ empty (%psbt-uint32-le eff)))
+            (when record-p (%psbt-note-sighash map eff))
             (multiple-value-bind (sig err)
                 (bl.rpc:compute-input-signatures tx i prev keymap pubmap tr-keymap
                                            (if (zerop eff) #x01 eff)
@@ -1839,6 +1843,91 @@ max(node incremental, wallet incremental), floored at GetMinimumFeeRate."
          (min-rate (%wallet-minimum-fee-rate node cc)))
     (max feerate min-rate)))
 
+(defun %bump-max-signed-size (node wallet cc tx)
+  "Core's maxTxSize for the replacement: CalculateMaximumSignedTxSize over the
+transaction's inputs and their spent scripts (feebumper.cpp:290).
+
+NOT the vsize of the transaction in hand, which is still UNSIGNED where the
+BIP125 floor is checked and so a good fifth short of what the relay weighs.
+Asking that transaction its vsize also POISONED it: transaction-weight caches
+on the struct and the wallet signs this very object in place afterwards, so the
+witness never entered the cached weight -- the mempool entry, the block
+template and gettransaction's decoded.vsize all read the unsigned size for the
+life of the transaction, and wallet_spend_unconfirmed.py:333 measured a
+correctly-priced bump as 66.6 sat/vB against its 60 target.
+
+A size that cannot be estimated falls back to the serialized BASE size, which
+is a lower bound and -- unlike transaction-vsize -- caches nothing."
+  (let* ((txouts (map 'list
+                      (lambda (in)
+                        (let* ((op (bl.ser:tx-in-previous-output in))
+                               (thash (bl.ser:outpoint-hash op))
+                               (n (bl.ser:outpoint-index op))
+                               (txout (%wallet-input-txout node wallet thash n cc))
+                               (preset (gethash (cons thash n) (wcc-presets cc))))
+                          (cons (and txout (bl.ser:tx-out-script-pubkey txout))
+                                (and preset (wcc-preset-weight preset)))))
+                      (bl.ser:transaction-inputs tx)))
+         (sized (%max-signed-tx-size wallet cc tx txouts)))
+    (if (plusp sized) sized (length (bl.ser:serialize-transaction tx)))))
+
+(defun %bump-select-original-inputs (node wallet cc inputs)
+  "Retrieve every original input's coin and Select it on the coin control, an
+external input getting its txout preset (feebumper.cpp:190-206). Returns the
+summed input value, or (values NIL message) when one is already spent."
+  (let ((input-value 0))
+    (bl.ser:dovector (in inputs)
+      (let* ((op (bl.ser:tx-in-previous-output in))
+             (thash (bl.ser:outpoint-hash op))
+             (n (bl.ser:outpoint-index op))
+             (txout (%wallet-input-txout node wallet thash n)))
+        (unless txout
+          (return-from %bump-select-original-inputs
+            (values nil (format nil "~A:~D is already spent"
+                                (bl.rpc:hash-to-hex thash) n))))
+        (let ((preset (wcc-select cc thash n)))
+          (unless (wallet-is-mine wallet (bl.ser:tx-out-script-pubkey txout))
+            (setf (wcc-preset-txout preset) txout)))
+        (incf input-value (bl.ser:tx-out-value txout))))
+    input-value))
+
+(defun %bump-insufficient-total-fee (node wallet cc new-tx old-fee new-fee)
+  "Core's minTotalFee arm of feebumper::CheckFeeRate (feebumper.cpp:90-98), as
+BIP125 rules 3 and 4: the new total fee must be at least the old fee plus one
+incremental relay fee over the replacement's size, or the node's mempool will
+reject the replacement. Returns Core's sentence when it is too low, NIL when it
+is not.
+
+Checked here, after the build, so a too-low bump fails BEFORE the replacement
+is signed and the original marked replaced (%create-transaction already caps at
+-maxtxfee)."
+  (let ((min-total (+ old-fee
+                      (bl.rpc:feerate-fee bl.mp:*incremental-relay-fee-rate*
+                                    (%bump-max-signed-size node wallet cc new-tx)))))
+    (when (< new-fee min-total)
+      (format nil "Insufficient total fee ~A, must be at least ~A (oldFee ~A + incrementalFee)"
+              (bl.rpc:format-money new-fee) (bl.rpc:format-money min-total)
+              (bl.rpc:format-money old-fee)))))
+
+(defun %bump-recipients (wallet txouts network original-change-index cc)
+  "Core CreateRateBumpTransaction's recipient fill (feebumper.cpp:251-262):
+every TXOUT becomes a recipient except the change, which becomes the coin
+control's destChange -- the output ORIGINAL-CHANGE-INDEX names when it was
+given, and otherwise whichever the wallet recognizes as its own."
+  (let ((recipients '()))
+    (loop for out in txouts
+          for i from 0
+          do (let ((spk (bl.ser:tx-out-script-pubkey out)))
+               (if (if original-change-index
+                       (= i original-change-index)
+                       (%output-is-change wallet spk))
+                   (setf (wcc-dest-change cc) spk)
+                   (push (bl.rpc:make-recipient
+                          :script spk :amount (bl.ser:tx-out-value out)
+                          :address (bl.rpc:script->address spk network))
+                         recipients))))
+    (nreverse recipients)))
+
 (defun %create-rate-bump (node wallet txid cc require-mine
                           &key new-outputs original-change-index)
   "Core feebumper::CreateRateBumpTransaction (subset). Rebuilds a higher-feerate
@@ -1869,21 +1958,12 @@ and an index past the end (:180-183)."
     (let* ((orig (wallet-tx-tx wtx))
            (inputs (bl.ser:transaction-inputs orig))
            (input-value 0))
-      ;; Retrieve every input's coin; select it on the coin control (external
-      ;; inputs get their txout preset). A spent input aborts.
-      (bl.ser:dovector (in inputs)
-        (let* ((op (bl.ser:tx-in-previous-output in))
-               (thash (bl.ser:outpoint-hash op))
-               (n (bl.ser:outpoint-index op))
-               (txout (%wallet-input-txout node wallet thash n)))
-          (unless txout
-            (return-from %create-rate-bump
-              (values nil bl.rpc:+rpc-misc-error+
-                      (format nil "~A:~D is already spent" (bl.rpc:hash-to-hex thash) n))))
-          (let ((preset (wcc-select cc thash n)))
-            (unless (wallet-is-mine wallet (bl.ser:tx-out-script-pubkey txout))
-              (setf (wcc-preset-txout preset) txout)))
-          (incf input-value (bl.ser:tx-out-value txout))))
+      (multiple-value-bind (value spent-message)
+          (%bump-select-original-inputs node wallet cc inputs)
+        (unless value
+          (return-from %create-rate-bump
+            (values nil bl.rpc:+rpc-misc-error+ spent-message)))
+        (setf input-value value))
       ;; Preconditions.
       (multiple-value-bind (ok code msg)
           (%bump-precondition-checks node wallet wtx require-mine)
@@ -1900,22 +1980,8 @@ and an index past the end (:180-183)."
                          (coerce (bl.ser:transaction-outputs orig) 'list)))
              (new-outputs-value (reduce #'+ txouts :key #'bl.ser:tx-out-value
                                                    :initial-value 0))
-             (recipients '()))
-        ;; Recipients = TXOUTS; the change output becomes destChange -- the one
-        ;; ORIGINAL-CHANGE-INDEX names when it was given, and otherwise
-        ;; whichever the wallet recognizes as its own (feebumper.cpp:251-262).
-        (loop for out in txouts
-              for i from 0
-              do (let ((spk (bl.ser:tx-out-script-pubkey out)))
-                   (if (if original-change-index
-                           (= i original-change-index)
-                           (%output-is-change wallet spk))
-                       (setf (wcc-dest-change cc) spk)
-                       (push (bl.rpc:make-recipient :script spk
-                                             :amount (bl.ser:tx-out-value out)
-                                             :address (bl.rpc:script->address spk network))
-                             recipients))))
-        (setf recipients (nreverse recipients))
+             (recipients (%bump-recipients wallet txouts network
+                                           original-change-index cc)))
         (when (null recipients)
           (unless (wcc-dest-change cc)
             (return-from %create-rate-bump
@@ -1943,51 +2009,11 @@ and an index past the end (:180-183)."
             (return-from %create-rate-bump
               (values nil bl.rpc:+rpc-wallet-error+
                       (format nil "Unable to create transaction. ~A" new-fee))))
-          ;; BIP125 rule 3/4 (feebumper::CheckFeeRate minTotalFee,
-          ;; feebumper.cpp:90-98): the new total fee must be at least the old
-          ;; fee plus one incremental relay fee over the replacement's size, or
-          ;; the node's mempool will reject it. Enforce it here so a too-low
-          ;; bump fails BEFORE we sign / mark the original replaced
-          ;; (%create-transaction already caps at -maxtxfee).
-          ;;
-          ;; The size is Core's maxTxSize -- CalculateMaximumSignedTxSize of
-          ;; the replacement (:290) -- and NOT the vsize of the transaction in
-          ;; hand, which is still UNSIGNED here and so a good 20% short of what
-          ;; the relay will weigh. Asking that transaction its vsize also
-          ;; POISONED it: transaction-weight caches on the struct and the
-          ;; wallet signs this very object in place afterwards, so the witness
-          ;; never entered the cached weight -- the mempool entry, the block
-          ;; template and gettransaction's decoded.vsize all read the unsigned
-          ;; size for the life of the transaction, and
-          ;; wallet_spend_unconfirmed.py:333 measured a correctly-priced bump
-          ;; as 66.6 sat/vB against its 60 target.
-          (let* ((max-tx-size
-                   (let* ((txouts (map 'list
-                                       (lambda (in)
-                                         (let* ((op (bl.ser:tx-in-previous-output in))
-                                                (thash (bl.ser:outpoint-hash op))
-                                                (n (bl.ser:outpoint-index op))
-                                                (txout (%wallet-input-txout node wallet thash n cc))
-                                                (preset (gethash (cons thash n) (wcc-presets cc))))
-                                           (cons (and txout (bl.ser:tx-out-script-pubkey txout))
-                                                 (and preset (wcc-preset-weight preset)))))
-                                       (bl.ser:transaction-inputs new-tx)))
-                          (sized (%max-signed-tx-size wallet cc new-tx txouts)))
-                     ;; A size we cannot estimate falls back to the serialized
-                     ;; BASE size, which is a lower bound and -- unlike
-                     ;; transaction-vsize -- caches nothing.
-                     (if (plusp sized)
-                         sized
-                         (length (bl.ser:serialize-transaction new-tx)))))
-                 (min-total (+ old-fee
-                               (bl.rpc:feerate-fee bl.mp:*incremental-relay-fee-rate*
-                                             max-tx-size))))
-            (when (< new-fee min-total)
+          (let ((too-low (%bump-insufficient-total-fee node wallet cc new-tx
+                                                       old-fee new-fee)))
+            (when too-low
               (return-from %create-rate-bump
-                (values nil bl.rpc:+rpc-invalid-parameter+
-                        (format nil "Insufficient total fee ~A, must be at least ~A (oldFee ~A + incrementalFee)"
-                                (bl.rpc:format-money new-fee) (bl.rpc:format-money min-total)
-                                (bl.rpc:format-money old-fee))))))
+                (values nil bl.rpc:+rpc-invalid-parameter+ too-low))))
           (values new-tx old-fee new-fee))))))
 
 (defun %bumpfee-options->cc (options cc)
