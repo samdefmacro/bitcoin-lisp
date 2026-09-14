@@ -3438,7 +3438,8 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     (:block-script-verify-flag-failed . "block-script-verify-flag-failed") ; :2119
     (:bad-proof-of-work          . "high-hash")                          ; :3864 CheckBlockHeader
     (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot
-    (:non-final-tx               . "bad-txns-nonfinal"))                 ; :4179 ContextualCheckBlock
+    (:non-final-tx               . "bad-txns-nonfinal")                  ; :4179 ContextualCheckBlock
+    (:bad-signet-solution        . "bad-signet-blksig"))                 ; :3964 CheckSignetBlockSolution
   "Block verdicts in Core's reject-reason vocabulary. A keyword with no entry
 is its own downcased name, which is what most of ours already are
 (unexpected-witness, time-too-old, bad-txns-duplicate, ...).")

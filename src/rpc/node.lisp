@@ -68,18 +68,37 @@ sleeping; almost every non-clean test depends on it."
           (if (zerop timestamp) nil timestamp))
     :null))
 
+(defconstant +heap-chunk-bytes+ #+sbcl sb-vm:gencgc-page-bytes #-sbcl 4096
+  "The allocation granule this node's heap is carved into -- SBCL\'s GC page.
+It stands in for the chunk of Core\'s locked pool: see GETMEMORYINFO.")
+
 (define-rpc "getmemoryinfo" (node params)
   "Report process memory use (Bitcoin Core getmemoryinfo). Reports the SBCL heap
-under the \"locked\" object Core uses."
+under the \"locked\" object Core uses.
+
+DIVERGENCE, stated rather than faked: Core\'s object describes its LockedPool,
+an mlock()ed arena it keeps keys in (support/lockedpool.h:57-64), and this node
+has no such arena -- the same secrets live in the ordinary heap. So the numbers
+describe the heap this node does have, in the units the field names mean:
+`used\'/`free\'/`total\' are the dynamic space, and `chunks_used\'/
+`chunks_free\' are that space counted in allocation granules (SBCL GC pages),
+which is what a chunk IS for Core\'s arena. `locked\' stays 0 because nothing
+here is mlock()ed, and claiming otherwise would be a security claim we cannot
+make.
+
+Reporting 0 chunks was worse than either: rpc_misc.py:61 asserts
+`chunks_used > 0\', and a caller watching for allocator pressure saw a
+constant."
   (declare (ignore node params))
-  (let ((used #+sbcl (sb-kernel:dynamic-usage) #-sbcl 0)
-        (total #+sbcl (sb-ext:dynamic-space-size) #-sbcl 0))
+  (let* ((used #+sbcl (sb-kernel:dynamic-usage) #-sbcl 0)
+         (total #+sbcl (sb-ext:dynamic-space-size) #-sbcl 0)
+         (free (max 0 (- total used))))
     `(("locked" . (("used" . ,used)
                    ("total" . ,total)
-                   ("free" . ,(max 0 (- total used)))
+                   ("free" . ,free)
                    ("locked" . 0)
-                   ("chunks_used" . 0)
-                   ("chunks_free" . 0))))))
+                   ("chunks_used" . ,(ceiling used +heap-chunk-bytes+))
+                   ("chunks_free" . ,(floor free +heap-chunk-bytes+)))))))
 
 (define-rpc "logging" (node params)
   "Get or set the active debug-logging categories (Bitcoin Core logging). PARAMS:
