@@ -63,7 +63,7 @@ The -8 is for a MALFORMED hash only. A well-formed hash naming no known block
 or transaction is the caller's -5 \"Block not found\", so a handler calls this
 first and looks the hash up afterwards."
   (unless (stringp value)
-    (%json-type-error value "string"))
+    (json-type-error value "string"))
   (or (parse-hex-hash value)
       (if (/= (length value) 64)
           (error 'rpc-error :code +rpc-invalid-parameter+
@@ -330,7 +330,7 @@ send/walletcreatefundedpsbt docstrings."
                  (in-array
                   (error 'rpc-error :code +rpc-invalid-parameter+
                                     :message "Invalid parameter, key-value pair not an object as expected"))
-                 (t (%json-type-error obj "array")))))
+                 (t (json-type-error obj "array")))))
       (cond
         ;; A top-level `[]' arrives as the empty-array sentinel, which is
         ;; TRUTHY and is not a list: Core's get_array() accepts it and

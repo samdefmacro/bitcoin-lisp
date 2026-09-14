@@ -1222,7 +1222,7 @@ suite stayed green."
           ;; type null is not of expected type string' where Core answers
           ;; `... of type string is not of expected type object'
           ;; (rpc_rawtransaction.py:267).
-          (unless (%json-object-p inp) (%json-type-error inp "object"))
+          (unless (%json-object-p inp) (json-type-error inp "object"))
           ;; Core AddInputs parses the txid before it reads vout.
           (let ((txid (parse-hash-v (obj-get inp "txid") "txid"))
                 (vout (obj-get inp "vout"))
@@ -1287,7 +1287,7 @@ drives through an EMPTY inputs array are reachable at all."
         (replaceable-p (positional-bool-or replaceable t))
         (locktime (or locktime 0)))
     (unless (or (null inputs) (%positional-array-p inputs))
-      (%json-type-error inputs "array"))
+      (json-type-error inputs "array"))
     (unless (and (integerp locktime) (<= 0 locktime #xffffffff))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid parameter, locktime out of range"))

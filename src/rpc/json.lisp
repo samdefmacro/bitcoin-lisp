@@ -242,7 +242,7 @@ getrawtransaction(txid, []) answer nothing at all where Core answers -3."
         ((or (listp value) (vectorp value)) "array")
         (t "null")))
 
-(defun %json-type-error (value expected)
+(defun json-type-error (value expected)
   "Signal Core's canonical UniValue type error for VALUE where EXPECTED was
 wanted: \"JSON value of type <actual> is not of expected type <expected>\"
 (univalue.cpp:210-214).

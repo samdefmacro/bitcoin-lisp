@@ -74,6 +74,9 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:json-bool
    ;; Core's uvTypeName: the word a diagnostic names a value's type with
    #:json-type-name
+   ;; Core's UniValue::checkType diagnostic, the one sentence its functional
+   ;; tests match on (univalue.cpp:210-214)
+   #:json-type-error
 
    ;; Empty-collection helpers (Core renders [] / {}, never null)
    #:json-array

@@ -1243,11 +1243,12 @@ follow from that and all three are Core's own:
     move."
   (with-wallet-test-node (node :keypool 4)
     (with-rpc-wallet (nil)
-      (bl.wallet::rpc-createwallet node '("cwd-hdkey")))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (wire-params '("cwd-hdkey"))))
     (with-rpc-wallet ("cwd-hdkey")
-      (let* ((rows (bl.wallet::rpc-gethdkeys
-                    node (list (let ((h (make-hash-table :test 'equal)))
-                                 (setf (gethash "private" h) t) h))))
+      (let* ((rows (bl.rpc:dispatch-rpc-method
+                    node "gethdkeys"
+                    (wire-params (list (let ((h (make-hash-table :test 'equal)))
+                                         (setf (gethash "private" h) t) h)))))
              (row (first rows))
              (own-xpub (cdr (assoc "xpub" row :test #'string=)))
              (own-xprv (cdr (assoc "xprv" row :test #'string=))))
@@ -1256,9 +1257,11 @@ follow from that and all three are Core's own:
         (flet ((answer (type key)
                  (rpc-error-of
                   (lambda ()
-                    (bl.wallet::rpc-createwalletdescriptor
-                     node (list type (let ((h (make-hash-table :test 'equal)))
-                                       (setf (gethash "hdkey" h) key) h)))))))
+                    (bl.rpc:dispatch-rpc-method
+                     node "createwalletdescriptor"
+                     (wire-params
+                      (list type (let ((h (make-hash-table :test 'equal)))
+                                   (setf (gethash "hdkey" h) key) h))))))))
           ;; The wallet's own root, for a type it already has.
           (is (equal (cons bl.rpc:+rpc-wallet-error+ "Descriptor already exists")
                      (answer "bech32m" own-xpub)))

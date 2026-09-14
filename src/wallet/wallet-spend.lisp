@@ -2690,6 +2690,20 @@ or (in tests) alists."
 (defun %opt-present-p (options key)
   (nth-value 1 (%opt options key)))
 
+(defun %opt-string (value)
+  "Core UniValue::get_str() on an option member (univalue.cpp:210-214): VALUE
+back when it is a string, and otherwise -3 \"JSON value of type <actual> is not
+of expected type string\" -- which rpc/server.cpp:512 turns into RPC_TYPE_ERROR.
+
+The check is on the member's PRESENCE, not its truth. Core's option blocks ask
+`options.exists(k)' and then get_str() it, so a member given as JSON null is
+present and fails HERE; reading the value's truth instead silently ignored it,
+and fundrawtransaction(rawtx, change_type=None) funded a transaction where
+Core answers -3 (wallet_fundrawtransaction.py:337)."
+  (unless (stringp value)
+    (bl.rpc:json-type-error value "string"))
+  value)
+
 (defun %parse-confirm-target (value)
   "Core ParseConfirmTarget."
   (unless (and (integerp value) (<= 1 value 1008))
@@ -2785,12 +2799,14 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
         (network (wallet-network wallet)))
     (when (%opt-present-p options "add_inputs")
       (setf (wcc-allow-other-inputs cc) (and (%opt options "add_inputs") t)))
-    (let ((change-address (or (%opt options "change_address")
-                              (%opt options "changeAddress"))))
-      (when change-address
+    (multiple-value-bind (change-address present)
+        (%opt options "change_address")
+      (unless present
+        (multiple-value-setq (change-address present) (%opt options "changeAddress")))
+      (when present
+        (%opt-string change-address)
         (multiple-value-bind (type script)
-            (and (stringp change-address)
-                 (bl.crypto:decode-address change-address network))
+            (bl.crypto:decode-address change-address network)
           (declare (ignore type))
           (unless script
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
@@ -2805,12 +2821,13 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "changePosition out of bounds"))
         (setf change-position pos)))
-    (let ((change-type (%opt options "change_type")))
-      (when change-type
+    (multiple-value-bind (change-type present) (%opt options "change_type")
+      (when present
         (when (wcc-dest-change cc)
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Cannot specify both change address and address type options"))
-        (let ((parsed (and (stringp change-type) (%parse-output-type change-type))))
+        (%opt-string change-type)
+        (let ((parsed (%parse-output-type change-type)))
           (unless parsed
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                               :message (format nil "Unknown change type '~A'" change-type)))

@@ -298,7 +298,7 @@ the bool branch). Explicit false arrives as the +json-false+ sentinel."
               ((or (eq v t) (eq v +json-false+))
                (error 'rpc-error :code +rpc-type-error+
                                  :message "Verbosity was boolean but only integer allowed"))
-              (t (%json-type-error v "number"))))))
+              (t (json-type-error v "number"))))))
 
 (defun block-body-checked (chain-state block-store hash)
   "The block for HASH, or the error Core raises for it: GetBlockChecked /
