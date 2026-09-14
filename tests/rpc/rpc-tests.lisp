@@ -10813,6 +10813,27 @@ the storage clause formats its TYPE. A blanket handler would print neither."
 
 ;;; --- getblockchaininfo's pruning fields ------------------------------------
 
+(test pruneheight-is-the-lowest-block-still-on-disk
+  "Core's `pruneheight' -- and the value pruneblockchain returns -- is
+GetFirstStoredBlock(tip)->nHeight, the height of the lowest block whose body
+is still there (rpc/blockchain.cpp:1426-1428 and :1671-1673). Ours reported
+one past the highest height DELETED, which is the same number only once
+something has actually been deleted: on a node that has pruned nothing the
+horizon reads 0 and we answered 1, while genesis is plainly on disk.
+rpc_blockchain.py:202 asserts the 0."
+  (with-network (:regtest)
+    (let ((node (regtest-node-fixture "pruneheight")))
+      (let ((bl:*prune-target-mib* 1))
+        (let ((info (bl.rpc:dispatch-rpc-method node "getblockchaininfo"
+                                                (wire-params '()))))
+          (is (= 0 (cdr (assoc "pruneheight" info :test #'string=)))
+              "a node that has pruned nothing still has genesis"))
+        (generate-regtest-blocks node 3)
+        (let ((info (bl.rpc:dispatch-rpc-method node "getblockchaininfo"
+                                                (wire-params '()))))
+          (is (= 0 (cdr (assoc "pruneheight" info :test #'string=)))
+              "and still does after three more blocks"))))))
+
 (test getblockchaininfo-names-a-prune-target-only-when-pruning-is-automatic
   "Core's getblockchaininfo adds pruneheight and automatic_pruning whenever
 pruning is on, and prune_target_size ONLY inside `if (automatic_pruning)'
