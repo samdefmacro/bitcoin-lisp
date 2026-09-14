@@ -41,6 +41,16 @@ what memory says -- the two are what a crash after a reorg compares."
     (when bytes
       (bl.wallet::wdb-parse-block-locator-value bytes))))
 
+(defun wallet-data-directory (manager)
+  "The directory a wallet MANAGER keeps its wallets and settings under. Two
+test files reached the slot directly, nine times between them."
+  (bl.wallet::wallet-manager-data-directory manager))
+
+(defun wallet-directory-of (manager name)
+  "The on-disk directory MANAGER would give the wallet called NAME, whether
+or not it exists -- what a rejected create or restore must NOT leave behind."
+  (bl.wallet::wallet-directory manager name))
+
 ;;;; Addressing one wallet through the RPC handlers
 
 (defmacro with-rpc-wallet ((name) &body body)
