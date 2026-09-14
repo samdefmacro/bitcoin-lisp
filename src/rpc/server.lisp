@@ -1602,6 +1602,24 @@ own 404, so the two agree without a handler of our own."
                 (alexandria:starts-with-subseq "/wallet/" script-name))
         'rpc-dispatch-handler))))
 
+(defun rpc-not-found-handler ()
+  "Core's answer for a path no handler claims: HTTP 404 and NOTHING else
+(http_request_cb, httpserver.cpp:287 -- `hreq->WriteReply(HTTP_NOT_FOUND)\'
+with no body).
+
+Without it hunchentoot answers its own HTML error page, which is a page this
+node did not write, naming a server and a version to anyone who probes the
+port."
+  (setf (hunchentoot:return-code*) hunchentoot:+http-not-found+
+        (hunchentoot:content-type*) "text/plain")
+  "")
+
+(defun make-not-found-dispatcher ()
+  "A dispatch-table entry that matches EVERY path. Installed FIRST, so every
+other surface is pushed in front of it and it is what is left when none of
+them claims the request."
+  (lambda (request) (declare (ignore request)) 'rpc-not-found-handler))
+
 (defun rpc-dispatch-handler ()
   "Dispatch handler for hunchentoot. Only handles POST requests."
   (if (eq (hunchentoot:request-method*) :post)
@@ -1912,6 +1930,11 @@ its own from OPTIONS; an option nobody reads is an error."
               ;; hunchentoot:*dispatch-table* is the step that makes requests
               ;; reachable, and a failed start must not leak them (it used to
               ;; leave *rpc-dispatcher* in the table when the bind threw).
+              ;; The catch-all goes in FIRST so everything else is pushed in
+              ;; front of it and it answers only what nothing else claims.
+              (let ((dispatcher (make-not-found-dispatcher)))
+                (push dispatcher pushed)
+                (push dispatcher hunchentoot:*dispatch-table*))
               (let ((dispatcher (make-json-rpc-dispatcher)))
                 (setf *rpc-dispatcher* dispatcher)
                 (push dispatcher pushed)
