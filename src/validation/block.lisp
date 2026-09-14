@@ -4338,11 +4338,44 @@ backstop against a candidate that reorgs away and reappears."
              (return))))))
     (values switched missing)))
 
+(defun %activate-best-valid-chain (chain-state block-store utxo-set
+                                   &key fee-estimator recent-rejects mempool)
+  "Core ActivateBestChain, run after a chain-control RPC has changed which
+blocks are eligible: switch to the most-work valid tip whose body we hold, if
+it now outweighs the active one. Returns (VALUES T NIL) -- including when
+there is nothing better to switch to -- or (VALUES NIL REASON)."
+  (let ((tip (bl.store:get-block-index-entry
+              chain-state (bl.store:best-block-hash chain-state)))
+        (target (best-valid-tip chain-state block-store)))
+    (if (and target tip
+             (> (bl.store:block-index-entry-chain-work target)
+                (bl.store:block-index-entry-chain-work tip)))
+        ;; perform-reorg validates the reactivated chain and rolls back
+        ;; (returning NIL) if one of its blocks is invalid -- in which case the
+        ;; chain correctly stays on TIP. Surface that rather than reporting
+        ;; success for a switch that did not happen.
+        (multiple-value-bind (ok detail)
+            (perform-reorg chain-state block-store utxo-set tip target
+                           :fee-estimator fee-estimator
+                           :recent-rejects recent-rejects :mempool mempool)
+          (if ok
+              (values t nil)
+              (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))
+        (values t nil))))
+
 (defun invalidate-block (chain-state block-store utxo-set block-hash
                          &key fee-estimator recent-rejects mempool)
   "Mark BLOCK-HASH and all its descendants :invalid, reorganizing the active
-chain back to BLOCK-HASH's parent if the active chain contained it. Returns
-(values t nil) on success, (values nil reason-keyword) on failure."
+chain back to BLOCK-HASH's parent if the active chain contained it, and then
+on to the best chain that is still valid. Returns (values t nil) on success,
+(values nil reason-keyword) on failure.
+
+The second reorg is Core's, and it is not optional: rpc/blockchain.cpp:
+1705-1709 calls InvalidateBlock and then ActivateBestChain, so invalidating a
+block of the active chain lands on the most-work valid tip, not on the
+invalidated block's parent. rpc_invalidateblock.py:52-56 reorgs a node onto a
+six-block chain, invalidates that chain's block 2, and expects the node back
+on its OWN four-block chain; we left it at height 1."
   (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
     (cond
       ((null entry) (values nil :block-not-found))
@@ -4375,7 +4408,11 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
          ;; was a second copy of the marking loop, which is how the fork warning
          ;; would have been left out of the RPC path.
          (%mark-block-subtree-invalid chain-state entry)
-         (values t nil))))))
+         ;; Core ActivateBestChain (rpc/blockchain.cpp:1707-1709).
+         (%activate-best-valid-chain chain-state block-store utxo-set
+                                     :fee-estimator fee-estimator
+                                     :recent-rejects recent-rejects
+                                     :mempool mempool))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
                          &key fee-estimator recent-rejects mempool)
@@ -4397,24 +4434,13 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
           ;; not Core's best header. Ours is recomputed now, which is what
           ;; that restart would report.
           (bl.store:recalculate-best-header chain-state)
-          (let ((tip (bl.store:get-block-index-entry
-                      chain-state (bl.store:best-block-hash chain-state)))
-                (target (best-valid-tip chain-state block-store)))
-            (when (and target tip
-                       (> (bl.store:block-index-entry-chain-work target)
-                          (bl.store:block-index-entry-chain-work tip)))
-              ;; perform-reorg now validates the reactivated chain and rolls
-              ;; back (returning NIL) if one of its blocks is invalid — in which
-              ;; case the chain correctly stays on TIP. Surface that rather than
-              ;; reporting success for a switch that didn't happen.
-              (multiple-value-bind (ok detail)
-                  (perform-reorg chain-state block-store utxo-set tip target
-                                 :fee-estimator fee-estimator
-                                 :recent-rejects recent-rejects :mempool mempool)
-                (unless ok
-                  (return-from reconsider-block
-                    (values nil (if (eq detail :interrupted) :interrupted :reorg-failed)))))))
-          (values t nil))
+          ;; Core ResetBlockFailureFlags then ActivateBestChain
+          ;; (rpc/blockchain.cpp:1749-1754) -- the same second step
+          ;; invalidateblock takes.
+          (%activate-best-valid-chain chain-state block-store utxo-set
+                                      :fee-estimator fee-estimator
+                                      :recent-rejects recent-rejects
+                                      :mempool mempool))
         (values nil :block-not-found))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
