@@ -313,21 +313,31 @@ whose key order is NOT preserved (yason); the array-of-objects form
 preserves order exactly — DIVERGENCE (cosmetic ordering only) noted in the
 send/walletcreatefundedpsbt docstrings."
   (let ((pairs '()))
-    (labels ((collect-object (obj)
+    (labels ((collect-object (obj &optional in-array)
                (cond
                  ((hash-table-p obj)
                   (maphash (lambda (k v) (push (cons k v) pairs)) obj))
                  ((and (listp obj) (every #'consp obj))
                   (dolist (pair obj) (push (cons (car pair) (cdr pair)) pairs)))
-                 (t (error 'rpc-error :code +rpc-type-error+
-                                      :message "Invalid parameter, outputs must be objects")))))
+                 ;; Core NormalizeOutputs judges the two positions apart
+                 ;; (rawtransaction_util.cpp:74-97): a MEMBER of the array
+                 ;; that is not an object is -8, while the argument itself
+                 ;; goes through get_array() and so answers UniValue's own
+                 ;; type error. Ours said "Invalid parameter, outputs must be
+                 ;; objects" for both, a sentence in no implementation;
+                 ;; rpc_rawtransaction.py:293 passes the string "foo" and
+                 ;; expects the type error.
+                 (in-array
+                  (error 'rpc-error :code +rpc-invalid-parameter+
+                                    :message "Invalid parameter, key-value pair not an object as expected"))
+                 (t (%json-type-error obj "array")))))
       (cond
         ((and (listp outputs-param) outputs-param
               (or (hash-table-p (first outputs-param))
                   (and (consp (first outputs-param))
                        (consp (car (first outputs-param))))))
          ;; Array of single-entry objects (order-preserving).
-         (dolist (obj outputs-param) (collect-object obj)))
+         (dolist (obj outputs-param) (collect-object obj t)))
         (t (collect-object outputs-param))))
     (setf pairs (nreverse pairs))
     (let ((seen (make-hash-table :test 'equal))

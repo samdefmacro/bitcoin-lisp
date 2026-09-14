@@ -271,6 +271,54 @@ either. IsWellFormedPackage maps that to the package-level \"conflict-in-package
         (is (eq :invalid (bl.val:package-tx-result-status
                           (%result-for results child))))))))
 
+(test package-msg-is-the-package-states-own-word
+  "Core keeps a TxValidationState per member and ONE PackageValidationState
+for the package, and submitpackage reports the second as package_msg
+(rpc/mempool.cpp:1395-1400). A per-member failure sets that state to PCKG_TX
+with the fixed string \"transaction failed\" (validation.cpp:1447,1458,1506,
+1537,1606,1707,1739,1753) -- the member's own reason stays in its own result
+-- while a verdict about the PACKAGE keeps its word (PCKG_POLICY, plus
+unspent-dust). Downcasing the member's keyword answered \"dust\" where
+mempool_ephemeral_dust.py:160 reads \"transaction failed\"."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    ;; A member that fails on its own: the package state says nothing about
+    ;; which member or why.
+    (let ((tx (%pkg-tx funding-txid 0 (- 100000000 5))))
+      (multiple-value-bind (msg results replaced package-msg)
+          (bl.val:validate-package-for-mempool
+           (list tx) utxo-set mempool chain-state)
+        (declare (ignore replaced))
+        (is (eq :insufficient-fee msg))
+        (is (string= "transaction failed" package-msg))
+        ;; ...and the member keeps its own reason, which is the half the
+        ;; RPC reports per wtxid.
+        (is (string= "min relay fee not met"
+                     (bl.val:tx-reject-reason-string
+                      (bl.val:package-tx-result-error (%result-for results tx))))))))
+  ;; A verdict about the package keeps its word.
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 50)))
+           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 (- (- 100000000 50) 50000))))
+      (multiple-value-bind (msg results replaced package-msg)
+          (bl.val:validate-package-for-mempool
+           (list child parent) utxo-set mempool chain-state)
+        (declare (ignore results replaced))
+        (is (eq :package-not-sorted msg))
+        (is (string= "package-not-sorted" package-msg)))))
+  ;; And the RPC reports exactly that string.
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let ((node (bl:make-node :network :testnet3))
+          (tx (%pkg-tx funding-txid 0 (- 100000000 5))))
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool)
+      (let ((r (bl.rpc:dispatch-rpc-method
+                node "submitpackage"
+                (wire-params (list (vector (bl.crypto:bytes-to-hex
+                                            (bl.ser:serialize-transaction tx))))))))
+        (is (string= "transaction failed"
+                     (cdr (assoc "package_msg" r :test #'string=))))))))
+
 (test package-dedup-already-in-mempool
   ;; A package whose parent is already in the mempool reports the parent as
   ;; :mempool-entry and still accepts the child.
