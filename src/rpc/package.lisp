@@ -99,6 +99,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:+tapleaf-version-tapscript+
    #:activate-submitted-block
    #:amount-from-value
+   #:construct-transaction
    #:build-spent-utxos
    #:compute-input-signatures
    #:desc-key-compressed-p

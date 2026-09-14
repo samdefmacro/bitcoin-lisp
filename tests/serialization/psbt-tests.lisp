@@ -170,6 +170,77 @@ equality)."
                                 bl.rpc:+json-false+))))
           (is (equalp (%psbt-ser out) (%psbt-ser (gethash "result" c))))))))
 
+(test psbt-createpsbt-is-core-construct-transaction
+  "Core's createpsbt calls the SAME ConstructTransaction as
+createrawtransaction (rpc/rawtransaction.cpp:1644 and :404, over
+rawtransaction_util.cpp:147-171), with the same CreateTxDoc arguments
+(rawtransaction.cpp:87-124): inputs, outputs, locktime, replaceable and
+VERSION. Ours had a second, thinner copy of that function, and the three
+differences below are what wallet_v3_txs.py:449-451 and
+rpc_rawtransaction.py reach:
+
+  - outputs as a DICTIONARY, which CreateTxDoc:104-105 accepts for
+    compatibility alongside the array of objects. Ours demanded a list and
+    answered -8 \"Invalid outputs\" to createpsbt(inputs=[], outputs={addr: 10}),
+    which is the call at wallet_v3_txs.py:450;
+  - the VERSION argument, absent entirely, so version=3 (TRUC) produced a
+    version-2 transaction with silently different relay policy;
+  - the locktime range and the explicit-replaceable contradiction check.
+
+The amounts are Core's AmountFromValue now too, not a float multiplied by
+1e8: createrawtransaction and createpsbt over the same arguments must give
+the same bytes, which is the strongest form this assertion takes."
+  ;; The empty inputs array reaches the handler as NIL here: createpsbt
+  ;; already folds the top-level empty-array sentinel with POSITIONAL-ARRAY
+  ;; (src/wallet/psbt.lisp), and rpc_psbt.py's own opening call pinned that.
+  (let* ((node (bl:make-node :network :regtest))
+         (addr "bcrt1qqurswpc8qurswpc8qurswpc8qurswpc8dxm0gk")
+         (dict (let ((h (make-hash-table :test 'equal)))
+                 (setf (gethash addr h) "10.00000000") h))
+         (arr (list (let ((h (make-hash-table :test 'equal)))
+                      (setf (gethash addr h) "10.00000000") h))))
+    ;; wallet_v3_txs.py:450 verbatim in shape: no inputs, a dict of outputs.
+    (let* ((b64 (%psbt-createpsbt node (list nil dict)))
+           (tx (bl.ser:psbt-tx (bl.ser:decode-psbt b64))))
+      (is (= 1 (length (bl.ser:transaction-outputs tx))))
+      (is (= 1000000000 (bl.ser:tx-out-value
+                         (aref (bl.ser:transaction-outputs tx) 0))))
+      ;; wallet_v3_txs.py:451: version=3 reaches the transaction.
+      (is (= 2 (bl.ser:transaction-version tx))))
+    (let* ((b64 (%psbt-createpsbt node (list nil dict 0
+                                             bl.rpc:+json-false+ 3)))
+           (tx (bl.ser:psbt-tx (bl.ser:decode-psbt b64))))
+      (is (= 3 (bl.ser:transaction-version tx))))
+    ;; The array form and the dictionary form are the same transaction, and
+    ;; both agree with createrawtransaction over the same arguments.
+    (let ((from-dict (bl.ser:psbt-tx
+                      (bl.ser:decode-psbt
+                       (%psbt-createpsbt node (list nil dict 0
+                                                    bl.rpc:+json-false+ 3)))))
+          (from-arr (bl.ser:psbt-tx
+                     (bl.ser:decode-psbt
+                      (%psbt-createpsbt node (list nil arr 0
+                                                   bl.rpc:+json-false+ 3)))))
+          (raw (bl.rpc:dispatch-rpc-method
+                node "createrawtransaction"
+                (list nil dict 0 bl.rpc:+json-false+ 3))))
+      (is (equalp (bl.ser:transaction-wire-bytes from-dict)
+                  (bl.ser:transaction-wire-bytes from-arr)))
+      (is (string= raw (bl.crypto:bytes-to-hex
+                        (bl.ser:transaction-wire-bytes from-dict)))
+          "createpsbt and createrawtransaction built different transactions"))
+    ;; Core's own range checks, which the second copy did not have.
+    (is (= bl.rpc:+rpc-invalid-parameter+
+           (rpc-error-code-of
+            (lambda () (%psbt-createpsbt node (list nil dict 0
+                                                    bl.rpc:+json-false+ 4)))))
+        "version 4 was accepted")
+    (is (= bl.rpc:+rpc-invalid-parameter+
+           (rpc-error-code-of
+            (lambda () (%psbt-createpsbt node (list nil dict
+                                                    #x100000000)))))
+        "an out-of-range locktime was accepted")))
+
 (test psbt-decodepsbt-shape
   "decodepsbt returns the expected top-level structure for a valid PSBT."
   (let ((data (%psbt-vectors)))

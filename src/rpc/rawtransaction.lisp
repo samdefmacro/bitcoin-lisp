@@ -1246,37 +1246,46 @@ suite stayed green."
              :sequence (or sequence
                            (default-input-sequence replaceable locktime)))))))
 
-(define-rpc "createrawtransaction"
-    (node (inputs outputs (locktime :or 0) replaceable version))
-  "Create an unsigned raw transaction (Core createrawtransaction ->
-ConstructTransaction, rpc/rawtransaction_util.cpp:147-171).
+(defun construct-transaction (network inputs outputs locktime replaceable version)
+  "Core ConstructTransaction (rpc/rawtransaction_util.cpp:147-171): the
+unsigned transaction its five CreateTxDoc arguments describe
+(rpc/rawtransaction.cpp:87-124).
 
-Three of ConstructTransaction's five arguments used to be discarded, and each
-absence was visible in the bytes:
+Core has ONE of these and three RPCs call it -- createrawtransaction
+(:404), createpsbt (:1644) and, through them, everything that builds a
+raw transaction from an argument list. This tree had a SECOND, thinner copy
+behind createpsbt, and the copies had drifted in four ways that Core's
+functional tests reach: it had no VERSION argument at all (so version=3,
+TRUC, produced a version-2 transaction with silently different relay
+policy), it refused the DICTIONARY form of outputs that CreateTxDoc:104-105
+accepts for compatibility, it parsed amounts as a float times 1e8 rather
+than through AmountFromValue, and it had neither the locktime range check
+nor the explicit-replaceable contradiction check.
 
-  - REPLACEABLE defaults to TRUE, because Core leaves `rbf' as std::nullopt
-    when the argument is absent and AddInputs asks `rbf.value_or(true)'. The
+Three of ConstructTransaction's own arguments were once discarded here too,
+and each absence was visible in the bytes:
+
+  - REPLACEABLE defaults to TRUE, because Core leaves `rbf\' as std::nullopt
+    when the argument is absent and AddInputs asks `rbf.value_or(true)\'. The
     per-input sequence was the literal 0xffffffff here, so a transaction built
     with a LOCKTIME was consensus-FINAL -- all-final sequences make nLockTime
     unenforceable, and an operator who asked for a timelocked transaction got
     one that can be mined at once -- and the RBF default was inverted.
-  - VERSION defaults to 2 and is refused outside 1..3, Core's standard range.
-    A caller asking for version 3 (TRUC) got a v2 transaction with silently
-    different relay policy.
+  - VERSION defaults to 2 and is refused outside 1..3, Core\'s standard range.
   - An explicit replaceable=TRUE with sequences that contradict it is an
     error, not a silent override.
 
-The argument ORDER is Core's too (locktime, then version, then inputs, then
+The argument ORDER is Core\'s too (locktime, then version, then inputs, then
 outputs), which is why the outputs diagnostics rpc_rawtransaction.py:293-302
 drives through an EMPTY inputs array are reachable at all."
-  (let ((network (rpc-get-network node))
-        ;; POSITIONAL-ARRAY, not the raw parameter: a top-level [] arrives as
+  (let (;; POSITIONAL-ARRAY, not the raw parameter: a top-level [] arrives as
         ;; the empty-array SENTINEL, which is truthy and is not a list.
         (input-list (positional-array inputs))
-        ;; Core's std::optional<bool>: value_or(true) for the sequence rule,
+        ;; Core\'s std::optional<bool>: value_or(true) for the sequence rule,
         ;; but only an EXPLICIT true triggers the contradiction check below,
         ;; which is the whole reason Core keeps the optional.
-        (replaceable-p (positional-bool-or replaceable t)))
+        (replaceable-p (positional-bool-or replaceable t))
+        (locktime (or locktime 0)))
     (unless (or (null inputs) (%positional-array-p inputs))
       (%json-type-error inputs "array"))
     (unless (and (integerp locktime) (<= 0 locktime #xffffffff))
@@ -1302,7 +1311,7 @@ drives through an EMPTY inputs array are reachable at all."
                   :inputs (coerce tx-inputs 'simple-vector)
                   :outputs (coerce tx-outputs 'simple-vector)
                   :lock-time locktime)))
-        ;; ConstructTransaction's last check (:167-169): an explicit
+        ;; ConstructTransaction\'s last check (:167-169): an explicit
         ;; replaceable=true whose supplied sequences do not signal is a
         ;; contradiction, not a silent override.
         (when (and (positional-bool replaceable)
@@ -1310,7 +1319,16 @@ drives through an EMPTY inputs array are reachable at all."
                    (not (bl.mp:tx-signals-rbf-p tx)))
           (error 'rpc-error :code +rpc-invalid-parameter+
                             :message "Invalid parameter combination: Sequence number(s) contradict replaceable option"))
-        (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx))))))
+        tx))))
+
+(define-rpc "createrawtransaction"
+    (node (inputs outputs (locktime :or 0) replaceable version))
+  "Create an unsigned raw transaction (Core createrawtransaction ->
+ConstructTransaction, rpc/rawtransaction_util.cpp:147-171)."
+  (bl.crypto:bytes-to-hex
+   (bl.ser:transaction-wire-bytes
+    (construct-transaction (rpc-get-network node)
+                           inputs outputs locktime replaceable version))))
 
 ;;; --- estimaterawfee (Core rpc/fees.cpp) and decodescript (rpc/rawtransaction.cpp) ---
 
