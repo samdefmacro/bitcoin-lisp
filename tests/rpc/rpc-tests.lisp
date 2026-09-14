@@ -3245,6 +3245,17 @@ secrets live in the ordinary heap -- so it reports that heap counted in the
 units the field names mean: allocation granules, which is what a chunk IS for
 Core's arena. Reporting a constant 0 failed the assertion AND told a caller
 watching for allocator pressure nothing."
+  ;; Core's MODE argument (rpc/node.cpp:733-760): "stats" is the default,
+  ;; "mallocinfo" takes the #else arm on a runtime without glibc's malloc_info,
+  ;; and anything else names itself. We ignored the argument and answered the
+  ;; stats object to every value, including rpc_misc.py:73's typo.
+  (is (equal (bl.rpc::rpc-getmemoryinfo nil nil)
+             (bl.rpc::rpc-getmemoryinfo nil (list "stats")))
+      "stats is the default")
+  (is (equal (cons -8 "mallocinfo mode not available")
+             (rpc-error-of (lambda () (bl.rpc::rpc-getmemoryinfo nil (list "mallocinfo"))))))
+  (is (equal (cons -8 "unknown mode foobar")
+             (rpc-error-of (lambda () (bl.rpc::rpc-getmemoryinfo nil (list "foobar"))))))
   (let* ((info (bl.rpc::rpc-getmemoryinfo nil nil))
          (locked (cdr (assoc "locked" info :test #'string=)))
          (used (cdr (assoc "used" locked :test #'string=)))

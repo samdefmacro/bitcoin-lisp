@@ -88,8 +88,27 @@ make.
 
 Reporting 0 chunks was worse than either: rpc_misc.py:61 asserts
 `chunks_used > 0\', and a caller watching for allocator pressure saw a
-constant."
-  (declare (ignore node params))
+constant.
+
+MODE is Core\'s argument (rpc/node.cpp:733-760): \"stats\" (the default) is the
+object below, \"mallocinfo\" is the glibc malloc_info XML -- which this runtime
+has no equivalent of, so it takes Core\'s own #else arm, `mallocinfo mode not
+available\' -- and any other value is `unknown mode <mode>\'. Ignoring the
+argument answered the stats object to every one of them, including the typo
+rpc_misc.py:73 sends."
+  (declare (ignore node))
+  (let ((mode (or (first params) "stats")))
+    (unless (stringp mode)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "JSON value of type null is not of expected type string"))
+    (cond
+      ((string= mode "stats"))
+      ((string= mode "mallocinfo")
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message "mallocinfo mode not available"))
+      (t
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message (format nil "unknown mode ~A" mode)))))
   (let* ((used #+sbcl (sb-kernel:dynamic-usage) #-sbcl 0)
          (total #+sbcl (sb-ext:dynamic-space-size) #-sbcl 0)
          (free (max 0 (- total used))))

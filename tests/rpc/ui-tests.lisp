@@ -364,8 +364,10 @@ correct ones pass — the Origin check must not weaken auth."
       (bl.rpc:stop-rpc-server))))
 
 (test ui-server-disabled-not-registered
-  "With the UI flag off, no /ui/ dispatcher exists — a GET lands on the
-RPC prefix dispatcher and is refused (405), never served."
+  "With the UI flag off, no /ui/ dispatcher exists — a GET reaches no handler
+and gets Core's bare 404 (httpserver.cpp:287): no page, and in particular not
+hunchentoot's own HTML error page, which is a document this node did not
+write."
   (bl.rpc:stop-rpc-server)
   (with-temp-directory (dir)
     (let ((port 19983)
@@ -376,7 +378,9 @@ RPC prefix dispatcher and is refused (405), never served."
              (is (not (null (bl.rpc:start-rpc-server node :port port))))
              (is (null bl.rpc::*ui-dispatcher*))
              (let ((r (%http-get port "/ui/")))
-               (is (member (%http-status r) '(404 405))
-                   "GET /ui/ with UI off must not serve (got ~A)" (%http-status r))
-               (is (not (search "<title>" r)))))
+               (is (eql 404 (%http-status r))
+                   "GET /ui/ with UI off must be Core's 404 (got ~A)"
+                   (%http-status r))
+               (is (not (search "<title>" r))
+                   "the 404 must carry no page of its own")))
         (bl.rpc:stop-rpc-server)))))
