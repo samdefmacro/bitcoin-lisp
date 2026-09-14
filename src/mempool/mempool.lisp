@@ -500,6 +500,36 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
                        :fallback-order #'%graph-txid-order)
          :type txgraph))
 
+(defun mempool-cluster-count-limit (mempool)
+  "The pool's cluster transaction-count limit -- Core
+m_opts.limits.cluster_count, which getmempoolinfo reports as
+\"limitclustercount\" (rpc/mempool.cpp:1051). Read off the graph, which is
+where -limitclustercount landed when the pool was built."
+  (txgraph-max-cluster-count (mempool-graph mempool)))
+
+(defun mempool-cluster-size-limit (mempool)
+  "The pool's cluster size limit in SIGOP-ADJUSTED VBYTES -- Core
+m_opts.limits.cluster_size_vbytes, getmempoolinfo's \"limitclustersize\"
+(rpc/mempool.cpp:1052). The graph holds it as WEIGHT, the way Core hands
+MakeTxGraph cluster_size_vbytes * WITNESS_SCALE_FACTOR
+(txmempool.cpp:179-181), so this divides it back."
+  (floor (txgraph-max-cluster-size (mempool-graph mempool)) 4))
+
+(defun mempool-linearization-optimal-p (mempool)
+  "Core m_txgraph->DoWork(0), getmempoolinfo's \"optimal\"
+(rpc/mempool.cpp:1053): whether the graph has no outstanding linearization
+work -- a zero budget makes it a pure query.
+
+Always true here. Core's graph is lazy and queues clusters at NEEDS_FIX /
+NEEDS_RELINEARIZE / ACCEPTABLE quality for a budgeted DoWork to improve;
+ours relinearizes every mutated cluster to optimality on the spot (see
+txgraph.lisp, `EAGER, not lazy\'), so no queue exists to drain. MEMPOOL is
+read so the answer stays a property of a POOL rather than a constant a
+caller could inline, and so this becomes a real query if the budgeted
+linearizer ever lands."
+  (declare (ignore mempool))
+  t)
+
 (defun mempool-dynamic-usage (mempool)
   "The pool's modeled dynamic memory usage — Core
 CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778-782), the number the

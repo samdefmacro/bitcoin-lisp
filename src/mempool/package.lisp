@@ -278,6 +278,9 @@ src/mempool/.")
    #:*bytes-per-sigop*
    #:*incremental-relay-fee-rate*
    #:mempool-max-size
+   #:mempool-cluster-count-limit
+   #:mempool-cluster-size-limit
+   #:mempool-linearization-optimal-p
    #:mempool-tx-or-ancestor-signals-rbf-p
    #:orphan-announcement-peer
    #:orphan-entry-announcements

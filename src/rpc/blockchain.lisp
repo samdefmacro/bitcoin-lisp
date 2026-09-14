@@ -2338,7 +2338,11 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
                 (setf scanned-to height))
               `(("from_height" . ,start)
                 ("to_height" . ,scanned-to)
-                ("relevant_blocks" . ,(nreverse relevant))
+                ;; A UniValue VARR in Core (rpc/blockchain.cpp, scanblocks),
+                ;; so a scan that matched nothing answers [] and a caller can
+                ;; still ask `blockhash in ...' of it
+                ;; (rpc_scanblocks.py:60).
+                ("relevant_blocks" . ,(json-array (nreverse relevant)))
                 ("completed" . ,(json-bool (not aborted)))))
          (%release-scanblocks))))
     (t
@@ -2494,7 +2498,10 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
                         nil)
                        chunks)))))))
       ;; chunks is reverse-order lists of entries; flatten once (O(total)).
-      `(("activity" . ,(apply #'append (nreverse chunks)))))))
+      ;; Core builds `activity' as a VARR (rpc/blockchain.cpp,
+      ;; getdescriptoractivity), so an unused descriptor answers [] rather
+      ;; than null -- rpc_getdescriptoractivity.py:40 takes its len().
+      `(("activity" . ,(json-array (apply #'append (nreverse chunks))))))))
 
 ;;; --- Difficulty, deployments, getblockfrompeer (Core rpc/blockchain.cpp) ---
 

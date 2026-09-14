@@ -68,7 +68,9 @@ quarters of the block's sigop budget unused."
                                 (bl.ser:transaction-wire-bytes tx)))
                     ("txid" . ,(hash-to-hex (bl.ser:transaction-hash tx)))
                     ("hash" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
-                    ("depends" . ,depends)
+                    ;; A VARR in Core (rpc/mining.cpp, BlockAssembler entries),
+                    ;; so a transaction with no in-template parents gets [].
+                    ("depends" . ,(json-array depends))
                     ("fee" . ,(bl.mp:mempool-entry-fee e))
                     ("sigops" . ,(let ((cost (bl.mp:mempool-entry-sigops e)))
                                    (if pre-segwit-p
