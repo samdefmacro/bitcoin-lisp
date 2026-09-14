@@ -1192,10 +1192,10 @@ runs unconditionally (validation.cpp:1338-1342).
 
 BYPASS-LIMITS is the same flag one step earlier, and here it decides the
 ENTRY SEQUENCE alone: Core stamps a bypass_limits admission with sequence 0
-rather than the counter's value (validation.cpp:918-920, "this allows txs
-from a block reorg to be marked earlier than any child txs that were already
-in the mempool"), because a peer may ask for a transaction the reorg put
-back before it was ever announced. The counter still advances, and the
+rather than the counter's value (validation.cpp:918-920, whose comment says
+this allows txs from a block reorg to be marked earlier than any child txs
+that were already in the mempool), because a peer may ask for a transaction
+the reorg put back before it was ever announced. The counter still advances, and the
 TransactionAddedToMempool signal still carries its value (:1309), so the ZMQ
 sequence stream is unaffected."
   ;; Check for duplicate

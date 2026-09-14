@@ -1163,10 +1163,11 @@ its pre-existing pool child; a disconnected tx whose inputs are gone on the
 new chain is dropped and its pool spender removed with it (Core
 removeRecursive, validation.cpp:317-321).
 
-The re-added transaction is also stamped ENTRY SEQUENCE 0 (Core
-validation.cpp:918-920: "Set entry_sequence to 0 when bypass_limits is used;
-this allows txs from a block reorg to be marked earlier than any child txs
-that were already in the mempool"). That stamp is what lets a peer ASK for
+The re-added transaction is also stamped ENTRY SEQUENCE 0. Core
+validation.cpp:918-920 says why in its own comment: entry_sequence is set to 0
+when bypass_limits is used, which allows txs from a block reorg to be marked
+earlier than any child txs that were already in the mempool. That stamp is
+what lets a peer ASK for
 it: the getdata gate serves a transaction only when its sequence is below the
 peer's last-inv snapshot, which starts at 1, and a transaction the reorg put
 back was never announced. Ours stamped the counter like any other admission,
