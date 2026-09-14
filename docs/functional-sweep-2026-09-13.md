@@ -240,3 +240,84 @@ Next round, from this sweep: the 13 RPC error texts still open (table above),
 8 "accepted what Core rejects", the 5 wallet-file (`wallet.dat`) failures,
 `p2p_node_network_limited.py:110` (a `getblockfrompeer` on a header-only
 block should be allowed), and the two remaining init-error texts.
+
+## Round 3
+
+Three, then three more, parallel batches on worktree branches, each with a
+pre-fix-red test and Core file:line per commit and a green cold battery on the
+branch; the coordinator rebased, ran the merged battery (fresh FASL volume
+wherever a defstruct changed) and pushed. Sixty-two code commits landed
+between `4c0db43b` and `7e124486`; the ones below are the root causes, grouped
+by what the functional suite was measuring.
+
+| area | root causes (commit subjects abridged) |
+|---|---|
+| Net, peer bookkeeping | the first peer is id 0 as Core's is; a closed connection no longer counts; the initial getheaders goes to each peer once (`fSyncStarted`); an addr-fetch peer is never asked for headers; an empty headers answer re-arms the throttle; a block batch is requested oldest first; a BIP37 `filter*` is refused without NODE_BLOOM; a peer is not disconnected for asking for what this node announced; an equal-work sibling is worth downloading (`<`, not `<=`); a compact block awaiting `getblocktxn` is in flight; a bare `-whitelist` grants Core's implicit permissions |
+| Init | Core's reindex-offer text; a relative `-pid` under the network datadir; owner-only files (Core's umask) |
+| Validation / mempool | a block's transaction verdict carries Core's reason and debug message (`*block-reject-reasons*`, incl. `high-hash`, `bad-txnmrklroot`, `bad-txns-nonfinal`); BIP68 is policy before CSV activates; an accepted transaction expires the stale ones; the replacement fee rejection is `insufficient fee`; a TRUC violation is one reason; savemempool through `.new` |
+| RPC arguments and texts | one `RPCTypeCheckObj` with `fStrict` (gettxspendingprevout's closed sets, the named-only options); `ParseHashV` words; combinerawtransaction, createrawtransaction, verifymessage (-3 base64, key hash), gettxoutproof as a set, loadtxoutset halves, a body the index placed but cannot read is `Block not found on disk`, `initialblockdownload` is the tip's age, `verificationprogress` is `GuessVerificationProgress`, getblocktemplate's pre-BIP141 units, submitblock indexes an unseen header and judges the block before its parent, testmempoolaccept reports only what Core finished, submitpackage's -25, getblockfrompeer's pre-segwit refusal, generate's deprecation text, `help <method>` answers the document and hides Core's hidden category, echo, getpeerinfo help, getblockchaininfo's prune target, a snapshot path under the datadir, decodescript's `wsh()` inference |
+| Signing / wallet | a partially signed multisig input is written and read back; a musig() participant key is the descriptor's; gethdkeys reports held keys; simulaterawtransaction refuses a foreign input; a PSBT process RPC reports the psbt it returns; pay-to-anchor signs with nothing; sendmany/sendall diagnostics |
+
+Two live-node hazards came out of the batches rather than the suite:
+`*ibd-context*` is rebound per pump tick, so anything an RPC reads from it
+sees a fresh context (the compact-block in-flight mark now goes through the
+peer); and block announcements are not coalesced -- one inv per connected
+block from the mining thread, where Core queues per peer and flushes up to
+eight headers (net_processing.cpp:2160-2189, :5830-5900). The second is open.
+
+### Round-3 sweep
+
+Binary `67b724d2` (batches A, B, C merged; D and E landed during the run),
+classification in `docs/functional-sweep-2026-09-13/after-67b724d2.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | **69** | **166** | **5** | 23 |
+
+Eleven more tests pass (`feature_maxtipage`, `feature_reindex_init`,
+`mempool_expiry`, `p2p_eviction`, `p2p_node_network_limited`,
+`p2p_nobloomfilter_messages`, `rpc_getblockstats`, `rpc_getdescriptorinfo`,
+`rpc_signmessagewithprivkey`, `rpc_txoutproof`, `wallet_address_types`,
+`wallet_keypool`, `wallet_sendmany`, `wallet_simulaterawtx`); about thirty
+failure points advanced. Batch D's oracle runs add `rpc_decodescript`,
+`rpc_named_arguments`, `rpc_orphans`, `rpc_preciousblock`; batch E's add
+`feature_posix_fs_permissions` and `feature_versionbits_warning`.
+
+Three things about the measurement itself, learned this round:
+
+- The eight-way parallel driver rewrote `build/bin/bitcoind` (a symlink
+  `conformance-config.sh` replaces at startup) from all eight runs at once;
+  sixteen tests failed inside their first second with `OSError: [Errno 22]`
+  before any node ran. They were rerun in staggered batches and folded in.
+  The harness must be started serially.
+- The classifier's failure point is the deepest frame in the test file. A
+  failure inside a helper (`rpc_packages.py:51`, `p2p_blocksonly.py:36`)
+  reads as a line-number retreat when the test in fact advanced; the last
+  `TestFramework (INFO)` step is the comparison that holds.
+- Under the eight-way load, `wallet_change_address`, `wallet_groups` and
+  `wallet_send` time out on mempool sync and pass alone: the 2-second
+  non-preferred-peer request delay plus a once-a-second scheduler is slow when
+  twenty-four nodes share the CPU. Not a defect, but it is what the numbers
+  above contain.
+
+Two failures were bisected with the oracle on a scratch worktree:
+
+- `p2p_net_deadlock` passed through round 2 only because the test sends its
+  two 4,000,000-byte messages to peer id 0, which did not exist while ids
+  started at 1. With ids as Core's, the messages go out, each node's send
+  buffer passes the 1 MB pause threshold, and each side stops READING the
+  paused peer, which is the deadlock the test is about: Core keeps receiving
+  under `fPauseSend` (only `ProcessMessages` returns early,
+  net_processing.cpp:5244) and pauses receiving only at `m_recv_flood_size`.
+  Open, and listed first for the next net batch.
+- `p2p_compactblocks_hb` has been intermittent since the baseline (three
+  timeouts, a fail, a pass, then three fails). Two modes were captured with a
+  temporary per-second drain log: a block an inbound peer says it sent that
+  never reaches our socket, and a fresh outbound dial that reads `Bad message
+  magic` a millisecond after sending `version`, before the remote replied.
+  Open.
+
+Deployed: testnet4 relaunched on `911848f9` (batches A-D), synced and out of
+IBD within a minute, 21 peers an hour later. Mainnet stays on `6011851b`
+until its restart is approved.
