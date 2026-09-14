@@ -307,12 +307,28 @@ so scanning stops at TX itself."
           when (gethash (bl.ser:transaction-hash ptx) possible)
             collect ptx)))
 
+(defun %truc-tx-names (tx)
+  "How Core names a transaction inside a TRUC-violation message: its txid,
+then its wtxid in parentheses — strprintf(\"%s (wtxid=%s)\", ...) at every one
+of truc_policy.cpp's sites."
+  (format nil "~A (wtxid=~A)"
+          (%tx-hash-hex (bl.ser:transaction-hash tx))
+          (%tx-hash-hex (bl.ser:transaction-wtxid tx))))
+
 (defun package-truc-checks (mempool tx vsize txns)
   "BIP431 TRUC (v3) topology checks for TX evaluated as part of the package
 TXNS — an exact port of Core PackageTRUCChecks (policy/truc_policy.cpp:
 58-170), which Core runs for every member of a multi-tx subset after all
 PreChecks (validation.cpp:1478-1483). VSIZE is TX's sigop-adjusted virtual
-size. Returns NIL when acceptable, else the rejection keyword.
+size. Returns NIL when acceptable, else (KEYWORD DETAIL).
+
+Every one of these verdicts is the same reject reason, \"TRUC-violation\"
+(validation.cpp:1480); the informative half is the SENTENCE PackageTRUCChecks
+itself returns, which the package state prints after it and mempool_truc.py
+compares whole (:284, :290, :297, :326, :421). The sentence names the
+transaction at fault, and for a descendant-count failure that is the PARENT,
+not the member being checked — one keyword for all six rules told a caller
+neither which rule nor which transaction.
 
 The per-tx SINGLE-TRUC-CHECKS only see in-mempool relatives; this adds the
 IN-PACKAGE dimension: ancestor counting includes in-package parents, the
@@ -322,83 +338,115 @@ a package sibling spending the same parent (with no sibling-eviction escape
 — the sibling is in the same package, truc_policy.cpp:127-136)."
   (let* ((v3 (= (bl.ser:transaction-version tx)
                 bl.mp:+truc-version+))
+         (self (%truc-tx-names tx))
          (mempool-parents (bl.mp:mempool-find-parents mempool tx))
          (in-package-parents (%in-package-parents txns tx)))
-    (if v3
-        (progn
-          ;; Single checks enforced this already; Core keeps it as an Assume
-          ;; (truc_policy.cpp:71-75) — keep it as a real check.
-          (when (> vsize bl.mp:+truc-max-vsize+)
-            (return-from package-truc-checks :truc-tx-too-big))
-          ;; Ancestor limit over BOTH parent sets (+ self).
-          (when (> (+ (length mempool-parents) (length in-package-parents) 1)
-                   bl.mp:+truc-ancestor-limit+)
-            (return-from package-truc-checks :truc-too-many-ancestors))
-          ;; A mempool parent must not have ancestors of its own
-          ;; (GetAncestorCount includes self, truc_policy.cpp:82-86).
-          (when mempool-parents
-            (when (> (+ (bl.mp:mempool-ancestor-stats
-                         mempool (first mempool-parents))
-                        (length in-package-parents) 1)
+    (flet ((too-many-ancestors (names)
+             (list :truc-too-many-ancestors
+                   (format nil "tx ~A would have too many ancestors" names)))
+           (descendant-limit (names)
+             (list :truc-descendant-limit
+                   (format nil "tx ~A would exceed descendant count limit"
+                           names))))
+      (if v3
+          (progn
+            ;; Single checks enforced this already; Core keeps it as an Assume
+            ;; (truc_policy.cpp:71-75) — keep it as a real check.
+            (when (> vsize bl.mp:+truc-max-vsize+)
+              (return-from package-truc-checks
+                (list :truc-tx-too-big
+                      (format nil "version=3 tx ~A is too big: ~D > ~D virtual bytes"
+                              self vsize bl.mp:+truc-max-vsize+))))
+            ;; Ancestor limit over BOTH parent sets (+ self).
+            (when (> (+ (length mempool-parents) (length in-package-parents) 1)
                      bl.mp:+truc-ancestor-limit+)
-              (return-from package-truc-checks :truc-too-many-ancestors)))
-          (when (or mempool-parents in-package-parents)
-            ;; A TRUC child cannot be too large.
-            (when (> vsize bl.mp:+truc-child-max-vsize+)
-              (return-from package-truc-checks :truc-child-too-big))
-            ;; Exactly 1 parent exists at this point, in mempool or package.
-            (multiple-value-bind (parent-txid parent-version parent-has-descendant)
-                (if mempool-parents
-                    (let* ((ptxid (first mempool-parents))
-                           (pe (bl.mp:mempool-get mempool ptxid)))
-                      (values ptxid
-                              (bl.ser:transaction-version
+              (return-from package-truc-checks (too-many-ancestors self)))
+            ;; A mempool parent must not have ancestors of its own
+            ;; (GetAncestorCount includes self, truc_policy.cpp:82-86).
+            (when mempool-parents
+              (when (> (+ (bl.mp:mempool-ancestor-stats
+                           mempool (first mempool-parents))
+                          (length in-package-parents) 1)
+                       bl.mp:+truc-ancestor-limit+)
+                (return-from package-truc-checks (too-many-ancestors self))))
+            (when (or mempool-parents in-package-parents)
+              ;; A TRUC child cannot be too large.
+              (when (> vsize bl.mp:+truc-child-max-vsize+)
+                (return-from package-truc-checks
+                  (list :truc-child-too-big
+                        (format nil "version=3 child tx ~A is too big: ~D > ~D virtual bytes"
+                                self vsize bl.mp:+truc-child-max-vsize+))))
+              ;; Exactly 1 parent exists at this point, in mempool or package.
+              (multiple-value-bind (parent-txid parent-version parent-has-descendant
+                                    parent-names)
+                  (if mempool-parents
+                      (let* ((ptxid (first mempool-parents))
+                             (pe (bl.mp:mempool-get mempool ptxid))
+                             (ptx (bl.mp:mempool-entry-transaction pe)))
+                        (values ptxid
+                                (bl.ser:transaction-version ptx)
+                                ;; GetDescendantCount(parent) > 1 (incl. self).
+                                (> (bl.mp:mempool-descendant-stats
+                                    mempool ptxid)
+                                   1)
+                                (%truc-tx-names ptx)))
+                      (let ((ptx (first in-package-parents)))
+                        (values (bl.ser:transaction-hash ptx)
+                                (bl.ser:transaction-version ptx)
+                                nil
+                                (%truc-tx-names ptx))))
+                ;; The parent must be TRUC too.
+                (unless (= parent-version bl.mp:+truc-version+)
+                  (return-from package-truc-checks
+                    (list :truc-v3-spends-nonv3
+                          (format nil "version=3 tx ~A cannot spend from non-version=3 tx ~A"
+                                  self parent-names))))
+                ;; No other package tx may spend the same parent (an in-package
+                ;; sibling — never evictable), and TX cannot have both a parent
+                ;; and an in-package child (truc_policy.cpp:122-143). The first
+                ;; names the PARENT whose descendant count would be exceeded;
+                ;; the second names the in-package CHILD that would be the
+                ;; ancestor too many.
+                (let ((txid (bl.ser:transaction-hash tx)))
+                  (dolist (ptx txns)
+                    (unless (eq ptx tx)
+                      (bl.ser:dovector
+                          (input (bl.ser:transaction-inputs ptx))
+                        (let ((prev (bl.ser:outpoint-hash
+                                     (bl.ser:tx-in-previous-output input))))
+                          (when (equalp prev parent-txid)
+                            (return-from package-truc-checks
+                              (descendant-limit parent-names)))
+                          (when (equalp prev txid)
+                            (return-from package-truc-checks
+                              (too-many-ancestors (%truc-tx-names ptx)))))))))
+                ;; A mempool parent that already has a descendant is at its
+                ;; limit (truc_policy.cpp:145-148).
+                (when parent-has-descendant
+                  (return-from package-truc-checks
+                    (descendant-limit parent-names)))))
+            nil)
+          ;; Non-TRUC transactions cannot have TRUC parents, in mempool or in
+          ;; the package (truc_policy.cpp:150-168).
+          (flet ((nonv3-spends-v3 (parent-names)
+                   (list :truc-nonv3-spends-v3
+                         (format nil "non-version=3 tx ~A cannot spend from version=3 tx ~A"
+                                 self parent-names))))
+            (dolist (ptxid mempool-parents)
+              (let ((pe (bl.mp:mempool-get mempool ptxid)))
+                (when (and pe
+                           (= (bl.ser:transaction-version
                                (bl.mp:mempool-entry-transaction pe))
-                              ;; GetDescendantCount(parent) > 1 (incl. self).
-                              (> (bl.mp:mempool-descendant-stats
-                                  mempool ptxid)
-                                 1)))
-                    (let ((ptx (first in-package-parents)))
-                      (values (bl.ser:transaction-hash ptx)
-                              (bl.ser:transaction-version ptx)
-                              nil)))
-              ;; The parent must be TRUC too.
-              (unless (= parent-version bl.mp:+truc-version+)
-                (return-from package-truc-checks :truc-v3-spends-nonv3))
-              ;; No other package tx may spend the same parent (an in-package
-              ;; sibling — never evictable), and TX cannot have both a parent
-              ;; and an in-package child (truc_policy.cpp:122-143).
-              (let ((txid (bl.ser:transaction-hash tx)))
-                (dolist (ptx txns)
-                  (unless (eq ptx tx)
-                    (bl.ser:dovector
-                        (input (bl.ser:transaction-inputs ptx))
-                      (let ((prev (bl.ser:outpoint-hash
-                                   (bl.ser:tx-in-previous-output input))))
-                        (when (equalp prev parent-txid)
-                          (return-from package-truc-checks :truc-descendant-limit))
-                        (when (equalp prev txid)
-                          (return-from package-truc-checks :truc-too-many-ancestors)))))))
-              ;; A mempool parent that already has a descendant is at its
-              ;; limit (truc_policy.cpp:145-148).
-              (when parent-has-descendant
-                (return-from package-truc-checks :truc-descendant-limit))))
-          nil)
-        ;; Non-TRUC transactions cannot have TRUC parents, in mempool or in
-        ;; the package (truc_policy.cpp:150-168).
-        (progn
-          (dolist (ptxid mempool-parents)
-            (let ((pe (bl.mp:mempool-get mempool ptxid)))
-              (when (and pe
-                         (= (bl.ser:transaction-version
-                             (bl.mp:mempool-entry-transaction pe))
-                            bl.mp:+truc-version+))
-                (return-from package-truc-checks :truc-nonv3-spends-v3))))
-          (dolist (ptx in-package-parents)
-            (when (= (bl.ser:transaction-version ptx)
-                     bl.mp:+truc-version+)
-              (return-from package-truc-checks :truc-nonv3-spends-v3)))
-          nil))))
+                              bl.mp:+truc-version+))
+                  (return-from package-truc-checks
+                    (nonv3-spends-v3
+                     (%truc-tx-names (bl.mp:mempool-entry-transaction pe)))))))
+            (dolist (ptx in-package-parents)
+              (when (= (bl.ser:transaction-version ptx)
+                       bl.mp:+truc-version+)
+                (return-from package-truc-checks
+                  (nonv3-spends-v3 (%truc-tx-names ptx)))))
+            nil)))))
 
 (defun %package-rbf-checks (txns validated mempool conflicts)
   "Core PackageRBFChecks (validation.cpp:1034-1130) for a multi-tx subset
