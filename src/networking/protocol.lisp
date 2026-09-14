@@ -1191,7 +1191,14 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
            ;; mainnet default, block-relay/feeler conns): disconnect (Core
            ;; net_processing.cpp:4168-4172).
            (when reject-tx-invs
-             (bl:log-cat "net" "transaction inv sent in violation of protocol, ~A"
+             ;; Core names the offending hash in this line
+             ;; (net_processing.cpp:4169, `transaction (%s) inv sent in
+             ;; violation of protocol, %s'), and p2p_blocksonly.py:36 asserts
+             ;; on the line WITH it. inv.hash.ToString() is uint256's display
+             ;; order, i.e. the wire bytes reversed.
+             (bl:log-cat "net"
+                         "transaction (~A) inv sent in violation of protocol, ~A"
+                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
                          (disconnect-msg peer))
              (disconnect-peer peer)
              (return-from handle-inv))

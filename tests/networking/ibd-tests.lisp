@@ -4557,6 +4557,64 @@ activation and the log said UNEXPECTED-WITNESS."
         (is-false (find "UNEXPECTED-WITNESS" lines :test #'search)
                   "and not the keyword's upper-case name")))))
 
+(test block-request-pass-leaves-the-callers-peer-list-alone
+  "REQUEST-BLOCKS-FROM-PEERS must not modify the list it is handed. It ranks
+its candidates by ping latency, and the ranking used to be
+`(sort (remove-if-not ...) ...)': REMOVE-IF-NOT is allowed to return the input
+list itself when nothing is removed (SBCL does), and SORT is destructive, so
+with every peer READY the caller's own list was reordered in place and the
+caller's variable -- still pointing at what used to be the head cell -- came
+back SHORTER.
+
+The caller is the block-download loop (RUN-IBD), whose list is also
+(IBD-CONTEXT-PEERS ctx) and (NODE-CONTEXT-PEERS node-ctx), and it is the list
+the loop drains. Observed 2026-09-14 with four ready peers: the pass that sent
+a getdata to one of them dropped that very peer out of the loop's list, so its
+block was never read off the socket and the node sat behind the tip until the
+in-flight request timed out -- Core's p2p_compactblocks_hb.py failing on
+`Block sync timed out after 60s'.
+
+Latencies are distinct and in the wrong order on purpose, so the ranking really
+does have work to do; a run where SORT changes nothing proves nothing."
+  (with-temp-directory (dir "bl-peerlist-stability")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1
+                       :status :valid))
+             (prev genesis))
+        (bl.store:add-block-index-entry state genesis)
+        (loop for h from 1 to 3
+              do (let ((e (bl.store:make-block-index-entry
+                           :hash (%bd-hash h) :height h
+                           :chain-work (+ 1 h) :prev-entry prev
+                           :status :header-valid)))
+                   (bl.store:add-block-index-entry state e)
+                   (setf prev e)))
+        (bl.store:update-chain-tip state (%bd-hash 0) 0)
+        (let* ((peers (loop for i from 0 below 4
+                            collect (let ((p (bl.net:make-peer
+                                              :address (format nil "198.51.100.~D" (+ 20 i))
+                                              :state :ready
+                                              :services (logior bl.ser:+node-network+
+                                                                bl.ser:+node-witness+))))
+                                      ;; 40, 30, 20, 10 ms: strictly descending,
+                                      ;; so the latency ranking must reorder all
+                                      ;; four.
+                                      (setf (bl.net:peer-ping-latency p) (- 40 (* 10 i))
+                                            (bl.net:peer-best-known-block-hash p) (%bd-hash 3))
+                                      p)))
+               (snapshot (copy-list peers)))
+          (with-ibd-context
+            (captured-sends
+             (lambda ()
+               (bl.net::request-blocks-from-peers peers state store))))
+          (is (= 4 (length peers))
+              "every peer handed in is still in the caller's list")
+          (is (equal snapshot peers)
+              "and in the order the caller had them"))))))
+
 (test block-requests-go-out-oldest-first
   "Core's SendMessages walks vToDownload -- which FindNextBlocksToDownload fills
 in ASCENDING height -- and emplaces each hash into vGetData in that order

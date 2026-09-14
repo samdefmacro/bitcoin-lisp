@@ -675,7 +675,16 @@ RECEIVE-MESSAGE-BLOCKING instead."
             ;; the connection (see %abandon-receive for why).
             (unless (equalp (bl.ser:message-header-magic header)
                             bl.ser:*network-magic*)
-              (bl:log-cat "net" "Bad message magic from ~A, disconnecting"
+              ;; The bytes we actually saw, as Core prints them (`Header
+              ;; error: Wrong MessageStart %s received, peer=%d`,
+              ;; net.cpp:753). Without them the line says only that the
+              ;; stream is out of frame, never where the stream came from --
+              ;; and a desynchronised read and a wrong-network peer produce
+              ;; exactly the same line.
+              (bl:log-cat "net"
+                          "Bad message magic ~A from ~A, disconnecting"
+                          (bl.crypto:bytes-to-hex
+                           (bl.ser:message-header-magic header))
                           (peer-log-name peer))
               (disconnect-peer peer)
               (return-from receive-message nil))

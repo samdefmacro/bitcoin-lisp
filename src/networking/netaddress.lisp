@@ -711,9 +711,26 @@ implicit defaults apply (Core NetPermissionFlags::Implicit).")
   "Parse Core's \"perm1,perm2@range\" prefix.
 
 Returns (values flags direction rest) — REST being the address part — or NIL
-when a permission name is unknown. With no @ at all there are no explicit
+when the entry is invalid. With no @ at all there are no explicit
 permissions and REST is the whole string, which is Core's implicit case
-(net_permissions.cpp:26-36)."
+(net_permissions.cpp:26-36).
+
+Two rules of Core's that are easy to miss and that p2p_permissions.py:148
+checks:
+
+- an EMPTY permission entry is legal (`else if (permission.length() == 0);',
+  net_permissions.cpp:67), so `-whitelist=@127.0.0.1' is a valid grant of NO
+  permissions -- the way an operator writes \"this range, and nothing else\".
+  Rejecting it made the whole option invalid and the node started with the
+  range ungranted rather than granted-empty.
+- the default direction is IN, not both (`if (connection_direction ==
+  ConnectionDirection::None) connection_direction = ConnectionDirection::In;',
+  net_permissions.cpp:77-79). Core keeps two range lists, incoming and
+  outgoing, and a grant with no direction word joins only the incoming one.
+
+And the converse of the empty-entry rule: a direction WITH no permission at
+all (`-whitelist=in@1.2.3.4') is Core's \"Only direction was set, no
+permissions\" error (:80-83), which is not the same thing as an empty entry."
   (let ((at (position #\@ string)))
     (if at
         (let ((flags 0)
@@ -724,11 +741,16 @@ permissions and REST is the whole string, which is Core's implicit case
                    (setf direction (if (eq direction :out) :both :in)))
                   ((string= name "out")
                    (setf direction (if (eq direction :in) :both :out)))
+                  ;; Empty entry: legal, and grants nothing.
+                  ((zerop (length name)))
                   (t (let ((bit (cdr (assoc name *permission-names* :test #'string=))))
                        (unless bit (return-from parse-permission-flags nil))
                        (setf flags (logior flags bit))))))
-          (values flags (or direction :both) rest))
-        (values +perm-implicit+ :both string))))
+          ;; Only a direction, no permission: Core refuses the whole entry.
+          (when (and direction (zerop flags))
+            (return-from parse-permission-flags nil))
+          (values flags (or direction :in) rest))
+        (values +perm-implicit+ :in string))))
 
 (defun %split-on-comma (string)
   (loop with start = 0
