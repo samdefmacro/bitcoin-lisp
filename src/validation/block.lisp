@@ -3187,12 +3187,13 @@ perform-reorg's success phase, so there is nothing to undo here."
       ;; (validation.cpp:2213-2219); it used to be discarded here.
       (bl.store:disconnect-block-from-utxo-set utxo-set block spent-utxos
                                                            :height height)
-      ;; The ROLLBACK path keeps its downgrade: these blocks were connected by
-      ;; a reorg this node is abandoning, and PHASE B re-validates them from
-      ;; scratch on the next attempt (the poisoning hook distinguishes
-      ;; :header-valid from :invalid). The successful disconnect above does
-      ;; NOT downgrade -- see there.
-      (setf (bl.store:block-index-entry-status entry) :header-valid)))
+      ;; The entry's STATUS is left alone here too, as Core leaves nStatus
+      ;; alone in DisconnectTip (validation.cpp:2960-2990): validity is a
+      ;; MONOTONE property of the block, not a statement about where the
+      ;; active chain is. These blocks really were fully validated; the reorg
+      ;; failed on a LATER one, and PHASE B's poisoning hook marks that one
+      ;; :invalid and its descendants failed-child.
+      ))
   ;; 2. Re-apply the original chain, fork-first (to-disconnect is tip-first).
   ;;    These blocks were valid when first connected; their undo data is
   ;;    still on disk, so a forward apply restores the exact prior UTXO set.
@@ -3695,25 +3696,11 @@ deferred to %REORG-COMMIT so a rolled-back reorg leaves nothing behind."
               (setf (reorg-disconnected-block-txs r) kept
                     (reorg-disconnected-bytes r) left)
               (incf (reorg-disconnected-dropped r) dropped))))
-        ;; The entry keeps its :VALID status. Bitcoin Core's DisconnectTip
-        ;; never lowers nStatus -- validity is monotone, and "is this block on
-        ;; the active chain" is a question for CChain::Contains
-        ;; (ENTRY-ON-ACTIVE-CHAIN-P), not for the status field. Downgrading to
-        ;; :header-valid here made a reorged-off block unservable: Core's
-        ;; BlockRequestAllowed (net_processing.cpp:1953-1960) asks
-        ;; IsValid(BLOCK_VALID_SCRIPTS) for a stale block, so
-        ;; p2p_fingerprint.py:93 -- which reorgs a block off and then asks for
-        ;; it by getdata -- got "ignoring request for an old block that is not
-        ;; on the main chain" and timed out.
+        ;; STATUS stays :valid: Core's DisconnectTip never lowers nStatus
+        ;; (validation.cpp:2940-2990); getchaintips reports such a block as
+        ;; valid-fork and BlockRequestAllowed still serves it (p2p_fingerprint).
         (push (cons block (bl.store:block-index-entry-height entry))
               (reorg-disconnected-blocks r))
-        ;; ENTRY's status is NOT lowered: Core's DisconnectTip touches
-        ;; nStatus not at all (validation.cpp:2940-2990), so a block that
-        ;; reached BLOCK_VALID_SCRIPTS stays fully validated off the chain --
-        ;; which is what getchaintips reports as valid-fork rather than
-        ;; valid-headers (rpc/blockchain.cpp:1628-1639,
-        ;; rpc_getchaintips.py:60). See %REORG-ROLLBACK for why the failed
-        ;; reorg's own disconnect is the other case.
         )))
 
   ;; Tip is now logically at the fork point. Set it so each fork block's
