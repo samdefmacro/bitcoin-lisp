@@ -1107,7 +1107,17 @@ missing-block list."
 (bypass_limits skips the fee floor, Core validation.cpp:945) and is wired to
 its pre-existing pool child; a disconnected tx whose inputs are gone on the
 new chain is dropped and its pool spender removed with it (Core
-removeRecursive, validation.cpp:317-321)."
+removeRecursive, validation.cpp:317-321).
+
+The re-added transaction is also stamped ENTRY SEQUENCE 0 (Core
+validation.cpp:918-920: "Set entry_sequence to 0 when bypass_limits is used;
+this allows txs from a block reorg to be marked earlier than any child txs
+that were already in the mempool"). That stamp is what lets a peer ASK for
+it: the getdata gate serves a transaction only when its sequence is below the
+peer's last-inv snapshot, which starts at 1, and a transaction the reorg put
+back was never announced. Ours stamped the counter like any other admission,
+so mempool_reorg.py:98-106 asked for the disconnected block's transaction and
+got notfound where Core answers with the transaction."
   (multiple-value-bind (utxo-set mempool chain-state funding)
       (make-package-fixture)
     (let* ((graph (bl.mp:mempool-graph mempool))
@@ -1125,8 +1135,11 @@ removeRecursive, validation.cpp:317-321)."
            (oid (bl.ser:transaction-hash orphan)))
       (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool orphan :fee 100 :height 200)))
-      (bl.val::readd-disconnected-txs-to-mempool
-       mempool (list dtx dtx2) utxo-set 200 chain-state)
+      (let ((counter-before (bl.mp:mempool-sequence mempool)))
+        (bl.val::readd-disconnected-txs-to-mempool
+         mempool (list dtx dtx2) utxo-set 200 chain-state)
+        (is (> (bl.mp:mempool-sequence mempool) counter-before)
+            "the admission counter still advances across a bypass-limits add"))
       ;; dtx re-entered fee-free and was wired to its child.
       (is (bl.mp:mempool-has mempool did))
       (is (bl.mp:mempool-has mempool cid))
@@ -1138,6 +1151,13 @@ removeRecursive, validation.cpp:317-321)."
       (is (not (bl.mp:mempool-has mempool d2id)))
       (is (not (bl.mp:mempool-has mempool oid)))
       (is (= 2 (bl.mp:mempool-count mempool)))
+      ;; Core's entry_sequence: 0 for the reorg re-add, the counter's value
+      ;; for a transaction that competed for its place (validation.cpp:920).
+      (is (= 0 (bl.mp:mempool-entry-sequence (bl.mp:mempool-get mempool did)))
+          "a reorg re-add is stamped sequence 0, so a peer may request it ~
+at once")
+      (is (plusp (bl.mp:mempool-entry-sequence (bl.mp:mempool-get mempool cid)))
+          "an ordinary admission keeps the counter's value")
       (bl.mp::%mempool-graph-verify mempool))))
 
 (test reorg-readd-drops-nonfinal-tx

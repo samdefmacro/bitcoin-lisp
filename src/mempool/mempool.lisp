@@ -1114,8 +1114,9 @@ RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
 (reorg re-add, package submission).
 
 BYPASS-LIMITS, PACKAGE-SUBMISSION and CHAINSTATE-CURRENT are three of Core's
-four NewMempoolTransactionInfo flags and go to the fee estimator, not to the
-acceptance itself; the fourth (no unconfirmed parents) is read off the entry.
+four NewMempoolTransactionInfo flags and go to the fee estimator; the fourth
+(no unconfirmed parents) is read off the entry. BYPASS-LIMITS ALSO reaches
+MEMPOOL-ADD, where it is Core's entry_sequence 0 (validation.cpp:918-920).
 CHAINSTATE-CURRENT defaults to TRUE, which is the answer for a synced node:
 compute it with BL.NET:CURRENT-FOR-FEE-ESTIMATION-P wherever a chain state is
 at hand."
@@ -1124,7 +1125,8 @@ at hand."
       (mempool-remove-recursive mempool rt)))
   (let ((entry (make-entry-from-tx tx (or fee 0) height
                                    :sigops sigops :entry-time entry-time)))
-    (let ((result (mempool-add mempool txid entry :defer-trim defer-trim)))
+    (let ((result (mempool-add mempool txid entry :defer-trim defer-trim
+                                                 :bypass-limits bypass-limits)))
       ;; Core LimitMempoolSize after a successful acceptance
       ;; (validation.cpp:1392-1394), under Core's own guard
       ;; `!package_submission && !bypass_limits'. Expiry lives here and
@@ -1171,7 +1173,7 @@ like Core removeUnchecked forwards its reason to TransactionRemovedFromMempool
 (txmempool.cpp:263-275), including the reason-BLOCK skip — the wallet learns
 about mined transactions from the block-connected hook instead.")
 
-(defun mempool-add (mempool txid entry &key defer-trim)
+(defun mempool-add (mempool txid entry &key defer-trim bypass-limits)
   "Add a transaction to the mempool.
 Returns :ok on success, or a rejection keyword: :duplicate, :conflict,
 :too-large-cluster (joining its in-mempool parents would form a cluster over
@@ -1186,7 +1188,16 @@ several transactions and re-limit ONCE afterwards — Core's guard is
 re-limit living at the end of MaybeUpdateMempoolForReorg (:387) for the
 reorg re-add and of AcceptPackage (:1728) for package submission. The
 cluster-limit rejection is NOT deferred: Core's CheckMemPoolPolicyLimits
-runs unconditionally (validation.cpp:1338-1342)."
+runs unconditionally (validation.cpp:1338-1342).
+
+BYPASS-LIMITS is the same flag one step earlier, and here it decides the
+ENTRY SEQUENCE alone: Core stamps a bypass_limits admission with sequence 0
+rather than the counter's value (validation.cpp:918-920, "this allows txs
+from a block reorg to be marked earlier than any child txs that were already
+in the mempool"), because a peer may ask for a transaction the reorg put
+back before it was ever announced. The counter still advances, and the
+TransactionAddedToMempool signal still carries its value (:1309), so the ZMQ
+sequence stream is unaffected."
   ;; Check for duplicate
   (when (mempool-has mempool txid)
     (return-from mempool-add :duplicate))
@@ -1229,10 +1240,14 @@ runs unconditionally (validation.cpp:1338-1342)."
         (return-from mempool-add :too-large-cluster))
       (setf (mempool-entry-graph-handle entry) handle))
 
-    ;; Stamp the admission sequence (Core addNewTransaction's
-    ;; GetAndIncrementSequence) — the getdata anti-probing gate compares this
-    ;; against each peer's last-inv-sequence snapshot.
-    (setf (mempool-entry-sequence entry) (mempool-next-sequence mempool))
+    ;; Stamp the admission sequence (Core's entry_sequence,
+    ;; validation.cpp:920) — the getdata anti-probing gate compares this
+    ;; against each peer's last-inv-sequence snapshot. Zero under
+    ;; BYPASS-LIMITS: a transaction the reorg put back was confirmed before
+    ;; any of this pool's entries and must be servable to a peer that never
+    ;; saw it announced.
+    (setf (mempool-entry-sequence entry)
+          (if bypass-limits 0 (mempool-next-sequence mempool)))
     (incf (mempool-next-sequence mempool))
 
     ;; Add to entries table
@@ -1288,8 +1303,12 @@ runs unconditionally (validation.cpp:1338-1342)."
   ;; fires the added signal before its final re-limit too (SubmitPackage,
   ;; validation.cpp:1292-1310) -- the eviction then surfaces as a
   ;; :size-limit removal. ZMQ and the wallet subscribe.
+  ;; The SIGNAL's sequence is the admission counter, always -- Core passes
+  ;; GetAndIncrementSequence() here (validation.cpp:1309) whatever
+  ;; entry_sequence was stamped with, so a reorg re-add still occupies its
+  ;; place in the ZMQ `sequence' stream instead of repeating 0.
   (bl.vi:notify-transaction-added (mempool-entry-transaction entry) txid
-                                  (mempool-entry-sequence entry))
+                                  (1- (mempool-next-sequence mempool)))
   :ok)
 
 (defun mempool-remove (mempool txid)
