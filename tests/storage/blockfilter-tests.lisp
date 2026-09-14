@@ -264,7 +264,10 @@ filter_false_positives keeps the true matches; idle status is null."
          ;; a script no block contains
          (let* ((res (bl.rpc::rpc-scanblocks node (list "start" (list "raw(6a00deadbeef)"))))
                 (blocks (cdr (assoc "relevant_blocks" res :test #'equal))))
-           (is (null blocks)))
+           ;; Core builds relevant_blocks as a VARR, so a scan that matched
+           ;; nothing answers [] and never null (rpc_scanblocks.py:60 asks
+           ;; `blockhash in ...' of it).
+           (is (equalp #() blocks)))
          ;; filter_false_positives verification path keeps the real matches
          (let ((opts (make-hash-table :test 'equal)))
            (setf (gethash "filter_false_positives" opts) t)

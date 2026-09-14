@@ -2172,12 +2172,12 @@ CheckInputScripts, validation.cpp:2117."
 state.GetRejectReason(), the token, and `reject-details' is state.ToString(),
 the token plus whatever debug message this particular rejection built
 (rpc/mempool.cpp:396-402). feature_rbf.py:112 reads both off one RBF
-rejection: the reason must be exactly "insufficient fee" while the details
+rejection: the reason must be exactly `insufficient fee' while the details
 carry the amounts. A verdict with no debug message reports the token for
 both, which is what mempool_accept_wtxid.py:59 asserts.
 
 A missing input is the one case with NEITHER field pair: Core substitutes its
-own "missing-inputs" for the reason and emits no details at all (:398-399)."
+own `missing-inputs' for the reason and emits no details at all (:398-399)."
   (let ((rbf (list :rbf-insufficient-fee
                    "rejecting replacement ab, not enough additional fees to relay; 0.00 < 0.00000011")))
     (is (string= "insufficient fee" (bl.val:tx-reject-reason-only rbf)))
