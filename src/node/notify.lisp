@@ -61,8 +61,16 @@ a filter on the announcement."
   (when (and *block-notify-command*
              (not (bl.store:chain-state-target-blockhash chainstate))
              (tip-notification-post-init-p chainstate))
+    ;; %s is the block hash as Core's blockTip callback formats it --
+    ;; uint256::GetHex (init.cpp:2013), which prints the 32 bytes REVERSED,
+    ;; the spelling getbestblockhash answers and an operator's script compares
+    ;; against. Ours printed the internal byte order, so every filename
+    ;; -blocknotify created was the reversal of the hash the RPC had just
+    ;; returned: feature_notifications.py:96 compares the two lists directly
+    ;; and found ten names, none of them a block it had mined.
     (run-notify-command *block-notify-command*
-                        :value (bl.crypto:bytes-to-hex hash))))
+                        :value (bl.crypto:bytes-to-hex
+                                (bl.crypto:reverse-bytes hash)))))
 
 (bl.vi:define-validation-hook :updated-block-tip warn-unknown-new-rules
     (chainstate hash height)
