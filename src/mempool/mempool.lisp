@@ -324,6 +324,13 @@ neither this RPC nor any other could repair."
         (when handle
           (txgraph-set-transaction-fee (mempool-graph mempool) handle modified))
         (setf (mempool-entry-modified-fee entry) modified)
+        ;; Core ++nTransactionsUpdated (txmempool.cpp:642), and only for a tx
+        ;; that is IN the pool: a delta stored against one that is not changes
+        ;; nothing a miner would build differently. Without it the
+        ;; getblocktemplate cache saw no change and handed back the template
+        ;; assembled before the prioritisation, which is what
+        ;; mining_prioritisetransaction.py:364 compares.
+        (incf (mempool-non-membership-updates mempool))
         ;; This is the only place the entry's modified fee and the graph's fee
         ;; move, so the agreement they are supposed to keep is asserted here,
         ;; on the success path, where nothing can skip it.
@@ -484,6 +491,12 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; value and increments it. MEMPOOL-SEQUENCE reads the counter (Core
   ;; GetSequence()) for the per-peer last-inv-sequence snapshots.
   (next-sequence 1 :type (unsigned-byte 64))
+  ;; Edits that changed no MEMBERSHIP but did change what a block template
+  ;; would contain -- prioritisations (Core ++nTransactionsUpdated at
+  ;; txmempool.cpp:642). MEMPOOL-TRANSACTIONS-UPDATED derives the rest of the
+  ;; counter from admissions and removals; this is the part no population
+  ;; count can show.
+  (non-membership-updates 0 :type (unsigned-byte 64))
   ;; The cluster/chunk engine (Core TxGraph), maintained in lockstep with
   ;; ENTRIES on every mutation. AUTHORITATIVE since the P4-P6 flips for
   ;; mining (chunk-walk block builder), eviction (worst-chunk trim), and the
@@ -572,9 +585,15 @@ differ.
 DERIVED rather than stored, and exactly so: NEXT-SEQUENCE counts all-time
 admissions, and admissions minus the current population is all-time removals, so
 their sum is Core's counter with no extra state to keep in step. Monotonically
-non-decreasing, since each half only ever grows."
+non-decreasing, since each half only ever grows.
+
+The third term is the edits that changed no membership: a prioritisation bumps
+Core's counter too (txmempool.cpp:642), and it must, because it changes which
+transactions a template would pick and in what order while the population
+stands still."
   (let ((admitted (1- (mempool-next-sequence mempool))))
-    (+ admitted (- admitted (mempool-count mempool)))))
+    (+ admitted (- admitted (mempool-count mempool))
+       (mempool-non-membership-updates mempool))))
 
 (defun mempool-effective-min-fee-rate (mempool &optional (now (bl.ser:get-unix-time)))
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
