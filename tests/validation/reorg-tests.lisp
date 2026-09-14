@@ -2587,7 +2587,8 @@ CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons)."
   "perform-reorg PHASE B: a fork block that DETERMINISTICALLY fails validate-block
 (:coinbase-too-large) is marked :invalid, its descendant subtree is
 BLOCK_FAILED_CHILD'd, the reorg rolls back, and ANCESTORS on the fork stay
-recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook."
+keep the :valid they earned (validity is monotone). Directly exercises the
+perform-reorg poisoning hook."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (make-activate-block-fixture "item14-phaseb")
