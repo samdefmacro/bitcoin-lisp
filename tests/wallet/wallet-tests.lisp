@@ -1259,13 +1259,13 @@ Ours bound the parsed descriptor first, so the same request answered -5
 \"Missing checksum\". Both single faults keep their own answer."
   (with-wallet-test-node (node :keypool 3)
     (with-rpc-wallet (nil)
-      (bl.wallet::rpc-createwallet node '("lbl")))
+      (bl.rpc:dispatch-rpc-method node "createwallet" '("lbl")))
     (with-rpc-wallet ("lbl")
       (let ((bare "pkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"))
         ;; wallet_labels.py:40-48: no checksum AND label "*".
         (let ((err (%aval "error"
-                          (first (bl.wallet::rpc-importdescriptors
-                                  node (list (list (%ht "desc" bare
+                          (first (bl.rpc:dispatch-rpc-method
+                                  node "importdescriptors" (list (list (%ht "desc" bare
                                                         "label" "*"
                                                         "timestamp" "now"))))))))
           (is (= -11 (%aval "code" err))
@@ -1274,16 +1274,16 @@ Ours bound the parsed descriptor first, so the same request answered -5
           (is (string= "Invalid label name" (%aval "message" err))))
         ;; A well-formed descriptor with the same label: still -11.
         (let ((err (%aval "error"
-                          (first (bl.wallet::rpc-importdescriptors
-                                  node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum bare)
+                          (first (bl.rpc:dispatch-rpc-method
+                                  node "importdescriptors" (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum bare)
                                                         "label" "*"
                                                         "timestamp" "now"))))))))
           (is (= -11 (%aval "code" err)))
           (is (string= "Invalid label name" (%aval "message" err))))
         ;; No label, no checksum: the parse error is still the answer.
         (let ((err (%aval "error"
-                          (first (bl.wallet::rpc-importdescriptors
-                                  node (list (list (%ht "desc" bare
+                          (first (bl.rpc:dispatch-rpc-method
+                                  node "importdescriptors" (list (list (%ht "desc" bare
                                                         "timestamp" "now"))))))))
           (is (= bl.rpc:+rpc-invalid-address-or-key+ (%aval "code" err)))
           (is (string= "Missing checksum" (%aval "message" err))))))))
@@ -1306,20 +1306,20 @@ WIF-key descriptor reports no HD keys, rather than reporting one or
 erroring."
   (with-wallet-test-node (node :keypool 4)
     (with-rpc-wallet (nil)
-      (bl.wallet::rpc-createwallet node '("hd")))
+      (bl.rpc:dispatch-rpc-method node "createwallet" '("hd")))
     (with-rpc-wallet ("hd")
-      (let ((rows (bl.wallet::rpc-gethdkeys node nil)))
+      (let ((rows (bl.rpc:dispatch-rpc-method node "gethdkeys" nil)))
         (is (= 1 (length rows))
             "~D roots before the combo() import" (length rows)))
       ;; The framework's coinbase import, verbatim in shape.
-      (let ((results (bl.wallet::rpc-importdescriptors
-                      node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
+      (let ((results (bl.rpc:dispatch-rpc-method
+                      node "importdescriptors" (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
                                                     (format nil "combo(~A)" (regtest-wif 9)))
                                             "timestamp" 0
                                             "label" "coinbase"))))))
         (is (eq t (%aval "success" (first results)))
             "the combo(WIF) import failed, so the case under test never arose"))
-      (let ((rows (bl.wallet::rpc-gethdkeys node nil)))
+      (let ((rows (bl.rpc:dispatch-rpc-method node "gethdkeys" nil)))
         (is (= 1 (length rows))
             "~D roots after importing a WIF-key descriptor" (length rows))
         (is (every (lambda (row)
@@ -1329,14 +1329,14 @@ erroring."
             "a row without an xpub came back")))
     ;; A wallet whose only descriptor is a WIF key has no HD key at all.
     (with-rpc-wallet (nil)
-      (bl.wallet::rpc-createwallet node (list "lonekey" nil t)))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "lonekey" nil t)))
     (with-rpc-wallet ("lonekey")
-      (let ((results (bl.wallet::rpc-importdescriptors
-                      node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
+      (let ((results (bl.rpc:dispatch-rpc-method
+                      node "importdescriptors" (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
                                                     (format nil "wpkh(~A)" (regtest-wif 11)))
                                             "timestamp" 0))))))
         (is (eq t (%aval "success" (first results)))))
-      (is (zerop (length (bl.wallet::rpc-gethdkeys node nil)))
+      (is (zerop (length (bl.rpc:dispatch-rpc-method node "gethdkeys" nil)))
           "a WIF-only wallet reported an HD key"))))
 
 (test walletnotify-runs-on-every-add-to-wallet
