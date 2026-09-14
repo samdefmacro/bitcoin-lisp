@@ -54,8 +54,16 @@ For testnet, data stays at the base directory (backward compatible)."
     ;; Ensure data directory exists
     (ensure-directories-exist (merge-pathnames "dummy" data-path))
 
-    ;; Set network configuration
-    (setf bl.ser:*network-magic* (network-magic network))
+    ;; Set network configuration. A signet DERIVES its message start from its
+    ;; challenge (Core SigNetParams, kernel/chainparams.cpp:507-511) -- the
+    ;; magic is that signet's identity, and two signets with different
+    ;; challenges must not exchange a single message. Ours used the table's
+    ;; constant whatever -signetchallenge said, so every custom signet spoke on
+    ;; the public signet's magic.
+    (setf bl.ser:*network-magic*
+          (if (eq network :signet)
+              (bl.val:signet-derived-magic)
+              (network-magic network)))
     (setf bl.net:*current-port* (network-port network))
     (setf bl.net:*dns-seeds* (network-dns-seeds network))
 
@@ -573,6 +581,11 @@ previous node's state."
 pruning mode announcement (Step 3)."
   (log-info "Bitcoin-Lisp Node v~A" (bl.ser:client-version-string))
   (log-info "Network: ~A" network)
+  ;; Core prints a signet's derived message start so an operator can see which
+  ;; signet this node is on (init.cpp:940-943); feature_signet.py:105 reads it.
+  (when (eq network :signet)
+    (log-info "Signet derived magic (message start): ~A"
+              (bl.crypto:bytes-to-hex bl.ser:*network-magic*)))
   (log-info "Data directory: ~A" (node-data-directory *node*))
 
   ;; Claim the directories before anything reads or writes them (Core locks the
@@ -1010,6 +1023,12 @@ than a hand-built one."
   ;; mempool and connect-block report into it through this one binding, and
   ;; LOAD-FEE-STATS restores its saved state into it -- so it exists FIRST.
   (setf bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+  ;; Arm the hourly flush clock at startup rather than at the first idle tick:
+  ;; a node still inside its first sync pass has not ticked yet, and Core's
+  ;; `mockscheduler' forwards the clock from wherever it is -- so a late arm
+  ;; put the deadline an hour PAST the forwarded time and the flush never came
+  ;; (feature_fee_estimation.py:371, the check right after a restart).
+  (bl.mp:arm-fee-estimate-flush-clock)
   (setf (node-fee-estimator *node*)
         (bl.mp:make-fee-estimator :data-directory data-directory))
   (bl.mp:load-fee-stats (node-fee-estimator *node*)))
@@ -1517,17 +1536,23 @@ listener, the onion listener with its Tor control connection, and
   (when (and sync listen)
     (start-inbound-listener *node* listen-bind))
 
-  ;; Tor onion service (-listenonion, default on like Core): a loopback
-  ;; listener the local Tor daemon forwards inbound onion connections to,
-  ;; plus the torcontrol client that registers the v3 onion service and
-  ;; AddLocal()s the .onion address for self-advertisement. Gated on LISTEN
-  ;; (Core: -listen=0 soft-disables -listenonion; the config layer errors on
-  ;; the explicit combination). Divergence from Core noted: Core binds its
-  ;; onion listener whenever it listens, even with -listenonion=0 — we only
-  ;; bind it when the service can actually exist.
-  (when (and sync listen listen-onion)
+  ;; The onion-service TARGET is bound whenever this node listens, whether or
+  ;; not an onion service will exist: Core pushes DefaultOnionServiceTarget
+  ;; into onion_binds when no -bind=...=onion was given (init.cpp:2174-2182)
+  ;; and CConnman::InitBinds binds every one of them (net.cpp:3437-3441),
+  ;; independently of -listenonion, which only decides whether StartTorControl
+  ;; runs (:2184-2191). We gated the BIND on -listenonion too, and Core's own
+  ;; framework writes `listenonion=0' into every node's config -- so
+  ;; feature_port.py, which reads `Bound to 127.0.0.1:<port+1>' out of
+  ;; debug.log, saw no such line under any configuration.
+  (when (and sync listen)
     (bl.net:clear-local-addresses)
-    (start-onion-listener *node*)
+    (start-onion-listener *node*))
+  ;; The torcontrol client that registers the v3 onion service and AddLocal()s
+  ;; the .onion address is what -listenonion actually governs. Gated on LISTEN
+  ;; as well (Core: -listen=0 soft-disables -listenonion; the config layer
+  ;; errors on the explicit combination).
+  (when (and sync listen listen-onion)
     (setf (node-tor-controller *node*)
           (bl.net:start-tor-control
            :control-spec tor-control

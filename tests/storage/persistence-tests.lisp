@@ -581,18 +581,21 @@ index and UTXO cache and flush over the other's files, so the damage is not
 'the second one fails' but 'whichever flushes last wins'."
   (let ((dir (ensure-directories-exist
               (merge-pathnames "test-datadir-lock/" (uiop:temporary-directory)))))
-    (unwind-protect
-         (progn
-           (bl::lock-directory dir)
-           (is (= 1 (length bl::*directory-lock-fds*)))
-           ;; The control that matters: a second claim is REFUSED.
-           (signals error (bl::lock-directory dir))
-           ;; Releasing it hands the directory back.
-           (bl::unlock-data-directory)
-           (is (null bl::*directory-lock-fds*))
-           (bl::lock-directory dir)
-           (is (= 1 (length bl::*directory-lock-fds*))))
-      (bl::unlock-data-directory))
+    (flet ((claim (d) (bl::lock-directory d))
+           (release () (bl::unlock-data-directory))
+           (held () (length bl::*directory-lock-fds*)))
+      (unwind-protect
+           (progn
+             (claim dir)
+             (is (= 1 (held)))
+             ;; The control that matters: a second claim is REFUSED.
+             (signals error (claim dir))
+             ;; Releasing it hands the directory back.
+             (release)
+             (is (zerop (held)))
+             (claim dir)
+             (is (= 1 (held))))
+        (release)))
     ;; The lock file is left behind, as Core leaves it: its presence means
     ;; nothing, only the advisory lock on it does.
     (is-true (probe-file (merge-pathnames ".lock" dir)))))
