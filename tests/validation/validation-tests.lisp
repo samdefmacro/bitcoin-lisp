@@ -1118,6 +1118,10 @@ script-failed and nothing else, which is what feature_nulldummy.py:144 and
 feature_taproot.py:1433 read off submitblock."
   (is (string= "bad-cb-missing" (bl.val:block-reject-reason :first-tx-not-coinbase)))
   (is (string= "bad-cb-multiple" (bl.val:block-reject-reason :multiple-coinbase)))
+  ;; CheckBlock's size gate covers an EMPTY block and an oversized one with
+  ;; ONE reason (validation.cpp:3979), so our two keywords share Core's word.
+  (is (string= "bad-blk-length" (bl.val:block-reject-reason :no-transactions)))
+  (is (string= "bad-blk-length" (bl.val:block-reject-reason :bad-blk-length)))
   (let ((verdict (list :block-script-verify-flag-failed :sig-nulldummy
                        "input 0 of aa (wtxid bb), spending cc:0")))
     (is (string= "block-script-verify-flag-failed (Dummy CHECKMULTISIG argument must be zero)"

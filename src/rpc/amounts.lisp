@@ -332,6 +332,12 @@ send/walletcreatefundedpsbt docstrings."
                                     :message "Invalid parameter, key-value pair not an object as expected"))
                  (t (%json-type-error obj "array")))))
       (cond
+        ;; A top-level `[]' arrives as the empty-array sentinel, which is
+        ;; TRUTHY and is not a list: Core's get_array() accepts it and
+        ;; ParseOutputs then walks no keys, so createrawtransaction([], [])
+        ;; builds a transaction with no outputs rather than erroring
+        ;; (rpc_rawtransaction.py:295).
+        ((eq outputs-param +json-empty-array+))
         ((and (listp outputs-param) outputs-param
               (or (hash-table-p (first outputs-param))
                   (and (consp (first outputs-param))
