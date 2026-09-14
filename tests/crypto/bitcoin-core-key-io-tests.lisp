@@ -262,3 +262,147 @@ checksum."
       (is-false (bl.crypto:bech32-decode str)
                 "~S was accepted but BIP173/BIP350 reject it" str))
     (is (= 32 (length cases)) "expected 32 invalid vectors, had ~D" (length cases))))
+
+;;;; bech32 error location (Core src/test/bech32_tests.cpp, the
+;;;; bech32_testvectors_invalid and bech32m_testvectors_invalid cases).
+
+(defparameter +bech32-invalid-vectors+
+  ;; (string message locations) -- Core's CASES/ERRORS pairs, in order.
+  '((" 1nwldj5" "Invalid character or mixed case" (0))
+    (#.(format nil "~C1axkwrx" (code-char #x7f)) "Invalid character or mixed case" (0))
+    (#.(format nil "~C1eym55h" (code-char #x80)) "Invalid character or mixed case" (0))
+    ("an84characterslonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1569pvx"
+     "Bech32 string too long" (90))
+    ("pzry9x0s0muk" "Missing separator" ())
+    ("1pzry9x0s0muk" "Invalid separator position" (0))
+    ("x1b4n0q5v" "Invalid Base 32 character" (2))
+    ("li1dgmt3" "Invalid separator position" (2))
+    (#.(format nil "de1lg7wt~C" (code-char #xff)) "Invalid character or mixed case" (8))
+    ;; The checksum is computed over the uppercase form, so the whole string is
+    ;; wrong rather than a few characters of it.
+    ("A1G7SGD8" "Invalid checksum" ())
+    ("10a06t8" "Invalid separator position" (0))
+    ("1qzzfhee" "Invalid separator position" (0))
+    ("a12UEL5L" "Invalid character or mixed case" (3 4 5 7))
+    ("A12uEL5L" "Invalid character or mixed case" (3))
+    ("abcdef1qpzrz9x8gf2tvdw0s3jn54khce6mua7lmqqqxw" "Invalid Bech32 checksum" (11))
+    ("test1zg69w7y6hn0aqy352euf40x77qddq3dc" "Invalid Bech32 checksum" (9 16)))
+  "Core bech32_tests.cpp bech32_testvectors_invalid (:57-95).")
+
+(defparameter +bech32m-invalid-vectors+
+  '((" 1xj0phk" "Invalid character or mixed case" (0))
+    (#.(format nil "~C1g6xzxy" (code-char #x7f)) "Invalid character or mixed case" (0))
+    (#.(format nil "~C1vctc34" (code-char #x80)) "Invalid character or mixed case" (0))
+    ("an84characterslonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11d6pts4"
+     "Bech32 string too long" (90))
+    ("qyrz8wqd2c9m" "Missing separator" ())
+    ("1qyrz8wqd2c9m" "Invalid separator position" (0))
+    ("y1b0jsk6g" "Invalid Base 32 character" (2))
+    ("lt1igcx5c0" "Invalid Base 32 character" (3))
+    ("in1muywd" "Invalid separator position" (2))
+    ("mm1crxm3i" "Invalid Base 32 character" (8))
+    ("au1s5cgom" "Invalid Base 32 character" (7))
+    ("M1VUXWEZ" "Invalid checksum" ())
+    ("16plkw9" "Invalid separator position" (0))
+    ("1p2gdwpf" "Invalid separator position" (0))
+    ("abcdef1l7aum6echk45nj2s0wdvt2fg8x9yrzpqzd3ryx" "Invalid Bech32m checksum" (21))
+    ("test1zg69v7y60n00qy352euf40x77qcusag6" "Invalid Bech32m checksum" (13 32)))
+  "Core bech32_tests.cpp bech32m_testvectors_invalid (:107-145).")
+
+(test bech32-locate-errors-matches-cores-vectors
+  "A bech32 string whose checksum fails carries more than `no': the BCH code
+locates one or two wrong characters, and Core reports those positions so a
+user who mistyped an address is told WHERE (bech32::LocateErrors,
+bech32.cpp:403-572). The arithmetic is in GF(1024) through log/exp tables
+generated from the defining polynomial x^2+9x+23.
+
+Core's own invalid vectors are the oracle, both encodings, message and
+positions each. Note what they pin besides the happy path: the two encodings
+are BOTH tried and the one with fewer located errors names the message, an
+all-uppercase string is `Invalid checksum' with NO positions because the
+checksum covers the case, and a string past 90 characters reports every
+index past the limit."
+  (dolist (vectors (list +bech32-invalid-vectors+ +bech32m-invalid-vectors+))
+    (dolist (case vectors)
+      (destructuring-bind (str message locations) case
+        (multiple-value-bind (m l) (bl.crypto:bech32-locate-errors str)
+          (is (string= message m) "~S: message ~S, expected ~S" str m message)
+          (is (equal locations l) "~S: locations ~S, expected ~S" str l locations))))))
+
+(test validateaddress-says-why-and-where-an-address-is-wrong
+  "validateaddress returns DecodeDestination's own error_str, and its
+error_locations when the fault is one or two bech32 characters
+(key_io.cpp:84-207, rpc/output_script.cpp:77-82). We answered one sentence --
+the generic encoding one -- for every rejection and an empty error_locations
+always, so every one of these fourteen cases read the same.
+
+The strings and the expected answers are rpc_invalid_address_message.py's
+(:19-96), run against regtest as that test does."
+  (with-network (:regtest)
+    (let ((node (bl:make-node :network :regtest)))
+      (flet ((check (address message &optional locations)
+               (let ((r (bl.rpc:dispatch-rpc-method node "validateaddress"
+                                                    (list address))))
+                 (is (eq 'yason:false (cdr (assoc "isvalid" r :test #'string=)))
+                     "~S was accepted" address)
+                 (is (string= message (cdr (assoc "error" r :test #'string=)))
+                     "~S: ~S" address (cdr (assoc "error" r :test #'string=)))
+                 (is (equal locations
+                            (coerce (cdr (assoc "error_locations" r :test #'string=))
+                                    'list))
+                     "~S: locations" address)))
+             (valid (address)
+               (let ((r (bl.rpc:dispatch-rpc-method node "validateaddress"
+                                                    (list address))))
+                 (is (eq t (cdr (assoc "isvalid" r :test #'string=)))
+                     "~S was rejected: ~S" address
+                     (cdr (assoc "error" r :test #'string=)))
+                 (is (null (assoc "error" r :test #'string=)))
+                 (is (null (assoc "error_locations" r :test #'string=))))))
+        ;; Bech32 faults that are about the address, not the encoding.
+        (check "bcrt1s0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v8n0nx0muaewav25430mtr"
+               "Invalid Bech32 address program size (41 bytes)")
+        (check "bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k7grplx"
+               "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")
+        (check "bcrt1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqdmchcc"
+               "Version 1+ witness address must use Bech32m checksum")
+        (check "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7k35mrzd"
+               "Version 0 witness address must use Bech32 checksum")
+        (check "bcrt130xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqynjegk"
+               "Invalid Bech32 address witness version")
+        (check "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kqqq5k3my"
+               "Invalid Bech32 v0 address program size (21 bytes), per BIP141")
+        ;; And the faults that are about the string: these carry positions.
+        (check "bcrt1q049edschfnwystcqnsvyfpj23mpsg3jcedq9xv049edschfnwystcqnsvyfpj23mpsg3jcedq9xv049edschfnwystcqnsvyfpj23m"
+               "Bech32 string too long"
+               (loop for i from 90 below 108 collect i))
+        (check "bcrt1q049edschfnwystcqnsvyfpj23mpsg3jcedq9xv"
+               "Invalid Bech32 checksum" '(9))
+        (check "bcrt1qax9suht3qv95sw33xavx8crpxduefdrsvgsklu"
+               "Invalid Bech32 checksum" '(22 43))
+        (check "BCRT1QPLMTZKC2XHARPPZDLNPAQL78RSHJ68U32RAH7R"
+               "Invalid Bech32 checksum" '(38))
+        (check "bcrtq049ldschfnwystcqnsvyfpj23mpsg3jcedq9xv" "Missing separator")
+        (check "bcrt1q04oldschfnwystcqnsvyfpj23mpsg3jcedq9xv"
+               "Invalid Base 32 character" '(8))
+        (check "bcrt1qdg3myrgvzw7ml8q0ejxhlkyxn7vl9r56yzkfgvzclrf4hkpx9yfqhpsuks"
+               "Invalid Bech32 checksum" '(19 30))
+        (check "bcrt1ptmp74ayg7p24uslctssvjm06q5phz4yrxucgnv"
+               "Invalid Bech32 checksum" '(5))
+        ;; Base58, whose three faults Core also tells apart.
+        (check "17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem"
+               "Invalid or unsupported Base58-encoded address.")
+        (check "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJJfn"
+               "Invalid checksum or length of Base58 address (P2PKH or P2SH)")
+        (check "2VKf7XKMrp4bVNVmuRbyCewkP8FhGLP2E54LHDPakr9Sq5mtU2"
+               "Invalid checksum or length of Base58 address (P2PKH or P2SH)")
+        (check "asfah14i8fajz0123f"
+               "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")
+        (check "1q049ldschfnwystcqnsvyfpj23mpsg3jcedq9xv"
+               "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")
+        ;; The valid ones stay valid, and carry neither field.
+        (valid "bcrt1qtmp74ayg7p24uslctssvjm06q5phz4yrxucgnv")
+        (valid "bcrt1p424qxxyd0r")
+        (valid "BCRT1QPLMTZKC2XHARPPZDLNPAQL78RSHJ68U33RAH7R")
+        (valid "bcrt1qdg3myrgvzw7ml9q0ejxhlkyxm7vl9r56yzkfgvzclrf4hkpx9yfqhpsuks")
+        (valid "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn")))))

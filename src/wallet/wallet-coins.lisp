@@ -902,8 +902,18 @@ PARAMS: (address)."
         (and (stringp address)
              (bl.crypto:decode-address address (wallet-network wallet)))
       (unless type
-        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
-                          :message "Invalid address"))
+        ;; Core throws DecodeDestination's OWN error_msg here and keeps the
+        ;; generic "Invalid address" only for the case where it set none
+        ;; (wallet/rpc/addresses.cpp:430-438);
+        ;; rpc_invalid_address_message.py:110-113 reads three of those
+        ;; sentences off getaddressinfo.
+        (let ((message (and (stringp address)
+                            (bl.crypto:decode-address-error
+                             address (wallet-network wallet)))))
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                            :message (if (and message (plusp (length message)))
+                                         message
+                                         "Invalid address"))))
       (with-wallet-lock (wallet)
         (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet script)
           (let* ((solvable (and spkm (%spkm-solvable-p spkm) t))

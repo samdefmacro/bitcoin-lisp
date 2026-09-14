@@ -156,6 +156,8 @@ hash.cpp. src/crypto/.")
    #:segwit-hrp
    #:segwit-address-decode
    #:decode-address
+   #:decode-address-error
+   #:bech32-locate-errors
    #:encode-p2pkh-address
    #:encode-p2sh-address
    #:encode-p2wpkh-address
