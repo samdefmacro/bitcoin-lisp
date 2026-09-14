@@ -275,12 +275,13 @@ classification in `docs/functional-sweep-2026-09-13/after-67b724d2.tsv`:
 | `580627ba` round 2 | 58 | 176 | 6 | 23 |
 | `67b724d2` round 3 | **69** | **166** | **5** | 23 |
 
-Eleven more tests pass (`feature_maxtipage`, `feature_reindex_init`,
+Fourteen tests went to PASS (`feature_maxtipage`, `feature_reindex_init`,
 `mempool_expiry`, `p2p_eviction`, `p2p_node_network_limited`,
 `p2p_nobloomfilter_messages`, `rpc_getblockstats`, `rpc_getdescriptorinfo`,
 `rpc_signmessagewithprivkey`, `rpc_txoutproof`, `wallet_address_types`,
-`wallet_keypool`, `wallet_sendmany`, `wallet_simulaterawtx`); about thirty
-failure points advanced. Batch D's oracle runs add `rpc_decodescript`,
+`wallet_keypool`, `wallet_sendmany`, `wallet_simulaterawtx`) and three left it
+(`p2p_compactblocks_hb`, `p2p_net_deadlock`, `wallet_change_address`, each
+explained below); about thirty failure points advanced. Batch D's oracle runs add `rpc_decodescript`,
 `rpc_named_arguments`, `rpc_orphans`, `rpc_preciousblock`; batch E's add
 `feature_posix_fs_permissions` and `feature_versionbits_warning`.
 
