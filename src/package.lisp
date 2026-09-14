@@ -244,6 +244,7 @@ init.cpp, node/. src/node/.")
    #:node-pending-onetry
    #:node-running
    #:run-inbound-listener
+   #:consider-outbound-evictions
    #:inbound-handshakes-in-flight
    #:node-syncing
    #:node-tip-liveness

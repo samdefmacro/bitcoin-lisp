@@ -2986,3 +2986,53 @@ and nothing to an inbound one, the direction being wrong."
       (is-false (noban-p (bl.net:make-peer :address "10.1.2.3" :state :ready
                                            :inbound t))
                 "an out-only grant reaches no inbound peer"))))
+
+(test the-chain-sync-sweep-runs-every-pass-and-survives-a-backward-clock
+  "Core calls ConsiderEviction from SendMessages itself, once per peer per
+message-handler iteration (net_processing.cpp:6159). Only
+CheckForStaleTipAndEvictPeers -- the extra-outbound sweep and the stale-tip
+check -- is on the 45-second EXTRA_PEER_CHECK_INTERVAL scheduler (:2034).
+
+Ours put the per-peer ladder behind that interval too, measured on the
+MOCKABLE clock, so a clock that moves BACKWARDS stalls it for good: the first
+sweep at start-up records a wall-clock stamp, the test then calls setmocktime
+with the framework's own 2011-era base, and `now - last' stays negative
+forever. p2p_outbound_eviction.py:46-56 connects an outbound peer, jumps the
+clock past CHAIN_SYNC_TIMEOUT and then past HEADERS_RESPONSE_TIME, and waits
+for the disconnect at :56; node0's log shows the ladder never walked at all.
+
+The start-up sweep here runs with no peers at a wall-clock-sized time, exactly
+as a real node's does before the test's first setmocktime."
+  (multiple-value-bind (state tip-hash low-hash) (%g708-chain 1000)
+    (declare (ignore tip-hash))
+    (let* ((node (make-test-node))
+           (peer (%g708-peer :best-hash low-hash))
+           (sent 0)
+           (real (fdefinition 'bl.net:send-message)))
+      (setf (bl:node-chain-state node) state)
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bl.net:send-message)
+                   (lambda (p m) (declare (ignore p m)) (incf sent)))
+             ;; Start-up, on the wall clock, with nothing connected yet.
+             (let ((bl.ser:*mock-time* 1780000000))
+               (bl:consider-outbound-evictions node))
+             (setf (bl:node-peers node) (list peer))
+             ;; setmocktime drops the clock to the framework's base.
+             (let ((bl.ser:*mock-time* 1000))
+               (bl:consider-outbound-evictions node)
+               (is (= 0 sent) "arming sends nothing")
+               (is (eq :ready (bl.net:peer-state peer))
+                   "and arming does not disconnect"))
+             ;; Past CHAIN_SYNC_TIMEOUT: one probing getheaders, no disconnect.
+             (let ((bl.ser:*mock-time* (+ 1000 1201)))
+               (bl:consider-outbound-evictions node)
+               (is (= 1 sent)
+                   "the ladder reaches its probe after a backward clock move")
+               (is (eq :ready (bl.net:peer-state peer))))
+             ;; A further HEADERS_RESPONSE_TIME: dropped.
+             (let ((bl.ser:*mock-time* (+ 1000 1201 121)))
+               (bl:consider-outbound-evictions node)
+               (is (eq :disconnected (bl.net:peer-state peer))
+                   "and the silent peer is evicted")))
+        (setf (fdefinition 'bl.net:send-message) real)))))
