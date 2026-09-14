@@ -1432,6 +1432,43 @@ restore must not leave a wallet directory behind."
                   (bl.wallet::wallet-directory (%node-manager node)
                                                       "from-corrupt"))))))))
 
+(test restorewallet-names-the-wallet-path-the-way-core-prints-it
+  "wallet_backup.py:99-101 builds the expected message itself, out of the
+path it expects the node to name:
+
+    not_created_wallet_file = node.wallets_path / wallet_name
+    error_message = \"Wallet file verification failed. Failed to load
+                     database path '{}'. Data is not in recognized
+                     format.\".format(not_created_wallet_file)
+
+so the sentence has to match to the character. Core's path comes from
+fs::PathToString(wallet_path) where wallet_path is GetWalletDir() /
+wallet_name (wallet/wallet.cpp:486, wallet/walletdb.cpp:1341) -- a directory
+path with NO trailing separator. Ours printed a Lisp directory pathname's
+namestring, which ends in one, so every wallet-path sentence read
+'.../wallets/res0/' where Core reads '.../wallets/res0'."
+  (with-wallet-test-node (node)
+    (let* ((manager (%node-manager node))
+           (dir (uiop:ensure-directory-pathname
+                 (bl.wallet::wallet-manager-data-directory manager)))
+           (bad (merge-pathnames "invalid_wallet_file.bak" dir))
+           (expected-dir (bl.wallet::wallet-directory manager "res0")))
+      (with-open-file (out bad :direction :output :if-exists :supersede
+                               :if-does-not-exist :create)
+        (write-string "invalid_wallet_content" out))
+      (let ((err (nth-value 1 (ignore-errors
+                               (bl.rpc:dispatch-rpc-method
+                                node "restorewallet"
+                                (list "res0" (namestring bad)))))))
+        (is (= -18 (bl.rpc:rpc-error-code err)))
+        (is (string= (format nil "Wallet file verification failed. Failed to ~
+load database path '~A'. Data is not in recognized format."
+                             (string-right-trim "/" (namestring expected-dir)))
+                     (bl.rpc:rpc-error-message err))
+            "~S" (bl.rpc:rpc-error-message err))
+        ;; wallet_backup.py:102: and nothing was created.
+        (is (not (uiop:directory-exists-p expected-dir)))))))
+
 (test wenc-backup-refuses-traversal-into-the-wallets-directory
   "The containment check must resolve `..` before comparing. A textual
 component-prefix test would let a destination spelled with a traversal
