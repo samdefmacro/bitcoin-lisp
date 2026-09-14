@@ -1433,12 +1433,55 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (values t nil)
         (values nil :bad-coinbase-height))))
 
-(defun script-checks-skippable-p (chain-state hash height)
-  "T when signature verification may be skipped for the block ENTRY names.
+(defvar *last-script-check-reason-logged* :unlogged
+  "The script-verification reason last written to the log, or :UNLOGGED.
 
-Core's fScriptChecks is a pure function of ASSUMEVALID (validation.cpp:2342-2380)
+Core keeps the same memo in ChainstateManager (m_last_script_check_reason_logged,
+validation.h:573) and writes the line only when the verdict CHANGES
+(validation.cpp:2493-2502) -- otherwise a sync would log it once per block.")
+
+(defun %script-check-reason (chain-state hash height)
+  "Core's script_check_reason (validation.cpp:2342-2380): the reason this block\'s
+signatures MUST be verified, as Core words it, or NIL when they may be skipped.
+
+The four reasons below are Core\'s first four, in Core\'s order. Core has three
+more that only ever make skipping STRICTER -- the block must be on the
+best-header chain, that header\'s work at or above nMinimumChainWork, and more
+than two weeks of equivalent work below it -- and all three need m_best_header,
+which Core maintains incrementally and we recompute by scanning the whole index
+(BEST-HEADER-ENTRY is O(index size) by its own docstring). Omitting them is a
+NARROWER skip window than Core\'s, never a wider one."
+  (let ((av (bl:network-assumevalid bl:*network*)))
+    (cond
+      ((null av) "assumevalid=0 (always verify)")
+      ((null hash) "assumevalid hash not in headers")
+      (t
+       (let ((av-entry (bl.store:get-block-index-entry chain-state av)))
+         (cond
+           ((null av-entry) "assumevalid hash not in headers")
+           (t
+            ;; The block must BE the assumevalid chain\'s block at this height.
+            ;; Taking a hash and height rather than an index entry is deliberate:
+            ;; on the tip-extension path the block is validated BEFORE
+            ;; connect-block creates its entry, so an entry-based predicate would
+            ;; silently answer NIL there and quietly verify every signature --
+            ;; safe, but it would make the assumevalid optimisation dead on the
+            ;; main IBD path rather than merely correct.
+            (let ((ancestor (bl.store:entry-ancestor-at-height av-entry height)))
+              (cond
+                ((and ancestor
+                      (equalp (bl.store:block-index-entry-hash ancestor) hash))
+                 nil)
+                ((> height (bl.store:block-index-entry-height av-entry))
+                 "block height above assumevalid height")
+                (t "block not in assumevalid chain"))))))))))
+
+(defun script-checks-skippable-p (chain-state hash height)
+  "T when signature verification may be skipped for the block HASH names.
+
+Core\'s fScriptChecks is a pure function of ASSUMEVALID (validation.cpp:2342-2380)
 and CHECKPOINTS PLAY NO PART IN IT. We reduced the whole thing to
-`height <= (max last-checkpoint-height assumevalid-height)', which is wrong in
+`height <= (max last-checkpoint-height assumevalid-height)\', which is wrong in
 two directions at once:
 
  - Only a HEIGHT was compared, so any block at or below that height had its
@@ -1457,31 +1500,24 @@ Both holes are closed by requiring what Core requires: assumevalid must be
 configured, its header must be in the index, and this block must be an ANCESTOR
 of it. The ancestry test is by hash, per GA9 S2-2.
 
-DELIBERATELY NOT IMPLEMENTED, and the reason is a real constraint rather than
-an oversight: Core additionally requires the block to be on the best-header
-chain, the best header's work to be at or above nMinimumChainWork, and more
-than two weeks of equivalent work to sit below the best header (its
-anti-extortion margin). All three need m_best_header, which Core maintains
-incrementally and we recompute by scanning the whole index --
-BEST-HEADER-ENTRY's own docstring says it is `O(index size) ... not for
-per-block paths'. Consulting it here would put an O(index) scan in the connect
-loop. Those three conditions only ever make skipping STRICTER, so omitting them
-is a smaller skip window than Core's, never a larger one; closing them properly
-means maintaining the best header incrementally first."
-  (let* ((av (bl:network-assumevalid bl:*network*))
-         (av-entry (and av (bl.store:get-block-index-entry chain-state av))))
-    (and hash av-entry
-         ;; The block must BE the assumevalid chain's block at this height.
-         ;; Taking a hash and height rather than an index entry is deliberate:
-         ;; on the tip-extension path the block is validated BEFORE
-         ;; connect-block creates its entry, so an entry-based predicate would
-         ;; silently answer NIL there and quietly verify every signature -- safe,
-         ;; but it would make the assumevalid optimisation dead on the main IBD
-         ;; path rather than merely correct.
-         (let ((ancestor (bl.store:entry-ancestor-at-height av-entry height)))
-           (and ancestor
-                (equalp (bl.store:block-index-entry-hash ancestor) hash)
-                t)))))
+The decision is also LOGGED as Core logs it (validation.cpp:2493-2502): one
+`Enabling script verification at block #<height> (<hash>): <reason>.\' -- or
+`Disabling ...\' -- each time the verdict changes, which is what
+feature_assumevalid.py:146 reads out of debug.log. Core writes the line from
+ConnectBlock for the validated, non-background chainstate; this is the
+predicate ConnectBlock asks, so the line is written here."
+  (let ((reason (%script-check-reason chain-state hash height)))
+    (unless (equal reason *last-script-check-reason-logged*)
+      (setf *last-script-check-reason-logged* reason)
+      (if reason
+          (bl:log-info "Enabling script verification at block #~D (~A): ~A."
+                       height
+                       (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
+                       reason)
+          (bl:log-info "Disabling script verification at block #~D (~A)."
+                       height
+                       (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))))
+    (null reason)))
 
 (defun calculate-block-weight (transactions)
   "Weight of the block whose transaction list is TRANSACTIONS (Core

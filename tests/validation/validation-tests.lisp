@@ -2693,3 +2693,48 @@ every RPC that reports a script type say \"nonstandard\" where Core says
         (is (string= "nonstandard"
                      (bl.val:script-type-name (bl.crypto:hex-to-bytes hex)))
             "~A must not classify as multisig" what)))))
+
+(test script-check-decision-is-logged-in-cores-words
+  "Core announces the script-verification verdict once, and only when it
+CHANGES: `Enabling script verification at block #<h> (<hash>): <reason>.'
+where <reason> is script_check_reason (validation.cpp:2342-2380, logged at
+:2493-2502). feature_assumevalid.py:146 reads that exact sentence out of
+debug.log, so the wording and the punctuation are the contract."
+  (with-network (:regtest)
+    (let* ((bl:*assumevalid-override* nil)     ; -assumevalid=0
+           (hash (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 0))
+           (bl.val::*last-script-check-reason-logged* :unlogged))
+      (setf (aref hash 31) #x12)
+      (let ((lines (capture-log-lines
+                    (lambda () (bl.val:script-checks-skippable-p nil hash 1)))))
+        (is (= 1 (length lines))
+            "one line for the first verdict, got ~S" lines)
+        (is (search (format nil "Enabling script verification at block #1 (~A): ~
+assumevalid=0 (always verify)."
+                            (bl.crypto:bytes-to-hex
+                             (bl.crypto:reverse-bytes hash)))
+                    (first lines))
+            "Core's sentence, verbatim; got ~S" (first lines)))
+      ;; Core's m_last_script_check_reason_logged: the same verdict again is
+      ;; silent, else an IBD writes this line once per block.
+      (is (null (capture-log-lines
+                 (lambda () (bl.val:script-checks-skippable-p nil hash 2))))
+          "an unchanged verdict must not be logged again"))))
+
+(test assumevalid-decision-is-announced-at-chainstate-load
+  "Core opens LoadChainstate with one of two sentences (node/chainstate.cpp:
+154-158); feature_init.py:67 waits for `Validating signatures for all blocks'
+before it kills the node, so a node that never writes it hangs that test."
+  (let ((bl:*assumevalid-override* nil))
+    (is (search "Validating signatures for all blocks."
+                (first (capture-log-lines
+                        (lambda () (bl::log-assumevalid-decision :regtest)))))
+        "the -assumevalid=0 sentence"))
+  (let ((bl:*assumevalid-override*
+          (bl.crypto:reverse-bytes (bl.crypto:hex-to-bytes (make-string 64 :initial-element #\a)))))
+    (is (search (format nil "Assuming ancestors of block ~A have valid signatures."
+                        (make-string 64 :initial-element #\a))
+                (first (capture-log-lines
+                        (lambda () (bl::log-assumevalid-decision :regtest)))))
+        "the configured-assumevalid sentence")))
