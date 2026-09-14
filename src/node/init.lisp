@@ -404,6 +404,24 @@ to move them (the node must be stopped)."
                   (first entry) (third entry) (second entry)))))))
 
 
+(defun whitebind-address-refusal (address)
+  "Core's message for a -whitebind ADDRESS half it will not accept, or NIL when
+the address is usable (NetWhitebindPermissions::TryParse,
+net_permissions.cpp:110-124): it Lookup()s the endpoint and refuses what does
+not resolve, then refuses a zero port.
+
+The address is a BIND endpoint, not a range. We bind a single listener from
+-bind/-port and keep only the PERMISSIONS of a -whitebind spec, but skipping
+this CHECK let a typo through in silence: `-whitebind=noban@127.0.0.1/10' --
+a netmask where an endpoint belongs -- started a node that granted noban to
+nobody, where Core refuses to start at all (p2p_permissions.py:101)."
+  (multiple-value-bind (host port) (bl.net:split-host-port address 0)
+    (cond ((or (zerop (length host))
+               (null (bl.net:parse-network-address host)))
+           (format nil "Cannot resolve -whitebind address: '~A'" address))
+          ((zerop port)
+           (format nil "Need to specify a port with -whitebind: '~A'" address)))))
+
 (defun %init-connection-options (data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly)
   "Connection options applied before any peer can connect: -blocksonly,
 -networkactive, -asmap, -whitelist / -whitebind, -acceptstalefeeestimates
@@ -468,22 +486,32 @@ to move them (the node must be stopped)."
   (setf bl.net:*whitelist-entries* '()
         bl.net:*whitebind-flags* 0)
   (dolist (spec whitelist)
-    (let ((entry (bl.net:parse-whitelist-entry spec)))
+    ;; The REASON is Core's own message for the refusal, reported verbatim:
+    ;; Core distinguishes "Invalid P2P permission", "Only direction was set, no
+    ;; permissions" and "Invalid netmask specified in -whitelist"
+    ;; (net_permissions.cpp:69, :80, :138), and p2p_permissions.py:98-99 starts
+    ;; the node with a bad spec and matches stderr against them. One generic
+    ;; sentence for all three told the operator the range was wrong when the
+    ;; permission word was.
+    (multiple-value-bind (entry reason) (bl.net:parse-whitelist-entry spec)
       (unless entry
-        (config-error "Invalid netmask, IP address or permission in -whitelist: '~A'" spec))
+        (config-error "~A" reason))
       (setf bl.net:*whitelist-entries*
             (append bl.net:*whitelist-entries* (list entry)))))
   (dolist (spec whitebind)
     ;; -whitebind is "perms@addr:port": the ADDRESS half is a bind target, not
     ;; a range, and we bind one listener, so only the PERMISSIONS are kept.
     ;; Core refuses "out" here — a listening socket has no outgoing peers.
-    (multiple-value-bind (flags direction rest)
-        (bl.net:parse-permission-flags spec)
-      (declare (ignore rest))
+    (multiple-value-bind (flags reason-or-direction rest)
+        (bl.net:parse-permission-flags spec :allow-out nil)
+      ;; :ALLOW-OUT NIL makes the parser itself refuse "out" with Core's own
+      ;; whitebind message, where Core refuses it (net_permissions.cpp:59-65) --
+      ;; before the only-direction check, so `-whitebind=out@...' reports the
+      ;; whitebind sentence rather than the other one.
       (unless flags
-        (config-error "Invalid permission in -whitebind: '~A'" spec))
-      (when (member direction '(:out))
-        (config-error "whitebind may only be used for incoming connections (\"out\" was passed)"))
+        (config-error "~A" reason-or-direction))
+      (let ((refusal (whitebind-address-refusal rest)))
+        (when refusal (config-error "~A" refusal)))
       (setf bl.net:*whitebind-flags*
             (logior bl.net:*whitebind-flags* flags))))
   (when (or whitelist whitebind)

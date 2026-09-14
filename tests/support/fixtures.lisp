@@ -302,6 +302,32 @@ a wtxidrelay peer, MSG_TX / MSG_WITNESS_TX otherwise."
            (list (bl.ser:make-inv-vector :type type :hash hash)))
           24))
 
+(defun block-request-allowed-p (chain-state entry best-header)
+  "Whether the shipped serving rule will hand ENTRY to a peer that asks for it
+(Core PeerManagerImpl::BlockRequestAllowed, net_processing.cpp:1953-1960): on
+the active chain always, off it only while recent by both the wall-clock and
+the work-equivalent measure.
+
+Two test files ask this question -- the getdata path and the getheaders
+null-locator path both gate on it -- which is why it is a fixture."
+  (bl.net::%block-request-allowed-p chain-state entry best-header))
+
+(defun reject-incoming-txs-p (peer)
+  "Whether this node refuses transactions from PEER (Core
+PeerManagerImpl::RejectIncomingTxs, net_processing.cpp:5686-5694). The shipped
+predicate, so a test asserting on one of its three call sites and a test
+asserting on the rule itself cannot drift apart."
+  (bl.net::reject-incoming-txs-p peer))
+
+(defun whitebind-address-refusal (address)
+  "Core's message for a -whitebind address half the node will not accept, or
+NIL (NetWhitebindPermissions::TryParse, net_permissions.cpp:110-124)."
+  (bl::whitebind-address-refusal address))
+
+(defun inv-vector-description (inv)
+  "One inv as Core's CInv::ToString prints it (protocol.cpp:58-84)."
+  (bl.net::%inv-vector-description inv))
+
 (defun deliver-inv (peer payload ctx)
   "Drive one inv message PAYLOAD through the shipped handler (Core's INV
 branch: block availability, AddTxAnnouncement, and the getdata it triggers)."

@@ -3906,13 +3906,13 @@ exactly which forks this node witnessed and kept. We had no such check at all."
     (let ((best tip))
       ;; On the active chain: always allowed, however old.
       (let ((on-chain (bl.store:get-block-at-height cs 5)))
-        (is-true (bl.net::%block-request-allowed-p cs on-chain best)))
+        (is-true (block-request-allowed-p cs on-chain best)))
       ;; Off-chain but recent: allowed.
       (let ((recent (%gd-entry :height 199 :work (* 200 (expt 2 32))
                                :timestamp (bl.ser:block-header-timestamp
                                            (bl.store:block-index-entry-header tip)))))
         (bl.store:add-block-index-entry cs recent)
-        (is-true (bl.net::%block-request-allowed-p cs recent best)))
+        (is-true (block-request-allowed-p cs recent best)))
       ;; Off-chain and older than a month by wall clock: refused.
       (let ((stale (%gd-entry :height 199 :work (* 200 (expt 2 32))
                               :timestamp (- (bl.ser:block-header-timestamp
@@ -3921,7 +3921,7 @@ exactly which forks this node witnessed and kept. We had no such check at all."
         (setf (bl.store:block-index-entry-hash stale)
               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 250))
         (bl.store:add-block-index-entry cs stale)
-        (is-false (bl.net::%block-request-allowed-p cs stale best)))
+        (is-false (block-request-allowed-p cs stale best)))
       ;; A block that never reached full validation is refused whatever its age
       ;; (Core requires BLOCK_VALID_SCRIPTS).
       (let ((unvalidated (%gd-entry :height 199 :work (* 200 (expt 2 32)) :status :header-valid
@@ -3930,7 +3930,7 @@ exactly which forks this node witnessed and kept. We had no such check at all."
         (setf (bl.store:block-index-entry-hash unvalidated)
               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 251))
         (bl.store:add-block-index-entry cs unvalidated)
-        (is-false (bl.net::%block-request-allowed-p cs unvalidated best))))))
+        (is-false (block-request-allowed-p cs unvalidated best))))))
 
 (test the-work-equivalent-age-catches-what-a-forged-timestamp-would-not
   "The second half of BlockRequestAllowed, and the reason it has two halves. A
@@ -3959,7 +3959,7 @@ cannot be: producing the work is the cost."
                  (bl.store:block-index-entry-header forged)))
              bl.net::+stale-relay-age-limit+))
       ;; ...and the work half refuses it anyway.
-      (is-false (bl.net::%block-request-allowed-p cs forged tip)))))
+      (is-false (block-request-allowed-p cs forged tip)))))
 
 (test a-network-limited-node-does-not-answer-below-its-promised-depth
   "Core net_processing.cpp:2385-2392. A node advertising NODE_NETWORK_LIMITED

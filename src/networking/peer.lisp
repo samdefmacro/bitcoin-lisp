@@ -862,6 +862,25 @@ BroadcastTransaction is unaffected by the flag)."
   (or bl:*blocksonly*
       (not (relay-enabled-p))))
 
+(defun reject-incoming-txs-p (peer)
+  "Core PeerManagerImpl::RejectIncomingTxs (net_processing.cpp:5686-5694): does
+this node refuse transactions from PEER?
+
+  - a block-relay-only or feeler connection may never send us txs, whatever its
+    permissions;
+  - otherwise, only the -blocksonly posture refuses, and the RELAY permission
+    excuses that clause -- and only that clause.
+
+ONE function because Core has one: the check is asked from two places -- the
+fRelay bit of the VERSION we send (net_processing.cpp:1573) and the tx handler
+that drops a peer for sending one anyway (:4475) -- and inlining it twice let
+them drift. The handler had the permission carve-out; the VERSION did not, so
+a node started with `-blocksonly -whitelist=relay@127.0.0.1' told that very
+peer fRelay=0 and then accepted its transactions (p2p_blocksonly.py:57)."
+  (or (not (peer-relays-txs-p peer))
+      (and (ignore-incoming-txs-p)
+           (not (peer-has-permission-p peer +perm-relay+)))))
+
 (defun peer-tx-relay-p (peer)
   "T when tx-relay state exists for PEER — the exact condition under which
 Core initializes Peer::TxRelay at VERSION time (net_processing.cpp:3681-3696):
@@ -1160,7 +1179,6 @@ go out, as they always did. Returns T."
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
 VERACK). Returns T if the version was sent."
   (let* ((services (local-services))
-         (relays (peer-relays-txs-p peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
          ;; The height is the CURRENT (active) chainstate's tip — never a
@@ -1179,12 +1197,13 @@ VERACK). Returns T if the version was sent."
                            ;; really us can be recognised when it echoes back.
                            :nonce (peer-local-nonce peer)
                            ;; Core my_tx_relay = !RejectIncomingTxs(pnode)
-                           ;; (net_processing.cpp:1573,5686-5693): false on
+                           ;; (net_processing.cpp:1573): false on
                            ;; block-relay/feeler connections AND in blocksonly
                            ;; mode (-blocksonly, or our mainnet relay-disabled
-                           ;; default). With fRelay=0 honest peers stop
+                           ;; default) unless this peer holds the RELAY
+                           ;; permission. With fRelay=0 honest peers stop
                            ;; announcing txs to us.
-                           :relay (and relays (not (ignore-incoming-txs-p)))))
+                           :relay (not (reject-incoming-txs-p peer))))
          (version-msg (bl.ser:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)

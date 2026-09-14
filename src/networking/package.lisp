@@ -270,6 +270,7 @@ headerssync.cpp. src/networking/.")
    #:parse-i2p-address
    #:network-address-to-string
    #:parse-network-address
+   #:split-host-port
    #:parse-subnet
    ;; -asmap
    #:load-asmap-file
