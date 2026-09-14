@@ -417,16 +417,33 @@ so the two compose rather than clobbering each other."
     (error (e)
       (init-error "Settings file could not be written: ~A" e))))
 
-(defvar *data-directory-lock-fd* nil
-  "Open file descriptor holding the exclusive advisory lock on the data
-directory's .lock file. Held for the lifetime of the process: closing it
-releases the lock and lets a second node open the same directory.")
+(defvar *directory-lock-fds* '()
+  "Open file descriptors holding the exclusive advisory locks on the .lock
+files of the directories this process claimed. Held for the lifetime of the
+process: closing one releases its lock and lets a second node open that
+directory.")
 (defconstant +flock-ex-nb+ 6
   "flock(2) LOCK_EX (2) | LOCK_NB (4) — take an exclusive lock, or fail
 immediately rather than waiting for the holder to exit.")
-(defun lock-data-directory (directory)
-  "Take Core's exclusive .lock on DIRECTORY (init.cpp:1158 -> util/fs_helpers.cpp:47).
-Signals an error if another process already holds it.
+
+(defun path-to-string (path)
+  "PATH as Core's fs::PathToString prints a directory: no trailing separator.
+
+Core names a directory in a message with fs::PathToString of an fs::path, and
+an fs::path carries no trailing separator. A Lisp DIRECTORY pathname's
+namestring does, so a sentence built with ~A read `.../regtest/' where Core
+reads `.../regtest' — and feature_filelock.py:33 builds the sentence it expects
+from the path itself and compares the whole line, so the one character was the
+whole failure."
+  (let ((text (namestring path)))
+    (if (and (> (length text) 1)
+             (char= (char text (1- (length text))) #\/))
+        (subseq text 0 (1- (length text)))
+        text)))
+
+(defun lock-directory (directory)
+  "Take Core's exclusive .lock on DIRECTORY (init.cpp:1158-1168 ->
+util/fs_helpers.cpp:47). Signals an init error if another process holds it.
 
 Two nodes sharing a data directory destroy it: each keeps its own in-memory
 block index and UTXO cache and flushes over the other's files, so the loser is
@@ -437,6 +454,7 @@ chainstate.dat and headerindex.dat.
 
 Advisory-only, like Core's: it stops a second bitcoin-lisp, not an unrelated
 process editing the files."
+  (ensure-directories-exist directory)
   (let* ((path (merge-pathnames ".lock" directory))
          (fd (handler-case
                  (sb-posix:open (namestring path)
@@ -452,19 +470,34 @@ process editing the files."
       ;; second node will not start searches for the string bitcoind prints.
       ;; Ours said "data directory" and joined the two halves with a semicolon.
       (let ((message (format nil "Cannot obtain a lock on directory ~A. ~A is probably already running."
-                             directory
+                             (path-to-string directory)
                              "bitcoin-lisp")))
         (log-error "~A" message)
         (init-error "~A" message)))
     ;; Keep the descriptor open. UNWIND from here on must not close it.
-    (setf *data-directory-lock-fd* fd)))
+    (push fd *directory-lock-fds*)))
+
+(defun lock-data-directories (data-directory blocks-directory)
+  "Claim BOTH directories Core claims (LockDirectories, init.cpp:1170-1174):
+the network data directory and the blocks directory.
+
+Core locks the blocks directory separately because -blocksdir can point it at
+another volume, which two nodes can then share while their data directories
+differ — and the blk/rev files are exactly what a second writer corrupts.
+feature_filelock.py:37 starts a second node with only -blocksdir pointing at a
+running node's directory and expects the same refusal."
+  (lock-directory data-directory)
+  (unless (equal (truename (ensure-directories-exist data-directory))
+                 (truename (ensure-directories-exist blocks-directory)))
+    (lock-directory blocks-directory)))
+
 (defun unlock-data-directory ()
-  "Release the data-directory lock, if this process holds it. The .lock file
-itself stays behind, as Core leaves it — its presence means nothing, only the
-advisory lock on it does."
-  (when *data-directory-lock-fd*
-    (ignore-errors (sb-posix:close *data-directory-lock-fd*))
-    (setf *data-directory-lock-fd* nil)))
+  "Release every directory lock this process holds. The .lock files themselves
+stay behind, as Core leaves them — their presence means nothing, only the
+advisory lock on them does."
+  (dolist (fd *directory-lock-fds*)
+    (ignore-errors (sb-posix:close fd)))
+  (setf *directory-lock-fds* '()))
 
 (defun %normalize-datadir (datadir)
   "DATADIR as a string that names a DIRECTORY, whatever spelling it arrived in.
