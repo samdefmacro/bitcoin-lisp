@@ -3237,6 +3237,41 @@ a reply shaped like a different one. interface_rpc.py:177, :204 and :207 send
                (version-of "1.1"))
         "\"1.1\" as a jsonrpc marker is refused, as Core refuses it")))
 
+(test the-logging-rpc-answers-alphabetically-and-says-so-in-its-help
+  "Core's logging RPC walks LOG_CATEGORIES_BY_STR, a std::map keyed by the
+category NAME (logging.cpp:172, :278-286), so the object comes back sorted --
+rpc_misc.py:87-88 asserts `list(node.logging()) == sorted(node.logging())'.
+Ours answered in declaration order, so a client rendering the object as given
+showed an arbitrary one. `help logging' carries the same list as a sentence
+(:90-93)."
+  (let* ((answer (bl.rpc::dispatch-rpc-method nil "logging" '()))
+         (names (mapcar #'car answer)))
+    (is (equal names (sort (copy-list names) #'string<))
+        "the categories must come back alphabetical; got ~S" names)
+    (is (= (length names) (length bl.log:+log-categories+))
+        "every category is reported")
+    (let ((help (bl.rpc::dispatch-rpc-method nil "help" (list "logging"))))
+      (is (search (format nil "valid logging categories are: ~{~A~^, ~}" names)
+                  help)
+          "help logging must carry the same list, in the same order"))))
+
+(test echoipc-echoes-its-argument
+  "Core's echoipc round-trips the string through a spawned bitcoin-node in a
+multiprocess build and through interfaces::MakeEcho() otherwise
+(rpc/node.cpp:313-345) -- the identity either way for a single-process node.
+It was not registered at all, so rpc_misc.py:96 could not call it and
+rpc_help.py:110 failed this node for a method client.cpp lists and the server
+does not serve."
+  (is (equal "hello" (bl.rpc::dispatch-rpc-method nil "echoipc" (list "hello"))))
+  ;; Hidden, like Core's (registered under the \"hidden\" category), so a bare
+  ;; `help' does not list it while `help echoipc' still answers.
+  (is-true (bl.rpc::rpc-method-hidden-p "echoipc"))
+  (is (null (search "echoipc"
+                    (bl.rpc::dispatch-rpc-method nil "help" '()))))
+  ;; And it appears in the conversion dump, which is what rpc_help.py reads.
+  (is-true (find-if (lambda (row) (string= (aref row 0) "echoipc"))
+                    (bl.rpc::%dump-all-command-conversions))))
+
 (test getmemoryinfo-reports-chunks-of-the-heap-it-has
   "Core's `locked' object describes its mlock()ed LockedPool
 (support/lockedpool.h:57-64) and rpc_misc.py:61-62 asserts chunks_used and

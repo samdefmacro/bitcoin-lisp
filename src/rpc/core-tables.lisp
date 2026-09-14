@@ -34,6 +34,7 @@
     ("descriptorprocesspsbt" (0 "psbt" . t) (1 "descriptors" . nil) (2 "sighashtype" . t) (3 "bip32derivs" . nil) (4 "finalize" . nil))
     ("disconnectnode" (1 "nodeid" . nil))
     ("dumptxoutset" (0 "path" . t) (1 "type" . t) (2 "options" . nil) (2 "rollback" . nil))
+    ("echoipc" (0 "arg" . t))
     ;; echojson's arguments are declared STR in Core's RPCHelpMan (with
     ;; skip_type_check, rpc/node.cpp:286-295), so dumpArgMap reports them as
     ;; string-typed even though client.cpp lists them as convertible -- the one
