@@ -978,7 +978,7 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
                 (gethash name (wallet-manager-wallets manager)))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-exists+
                           :message (format nil "Failed to restore wallet. Database file exists in '~A'."
-                                           (namestring path))))
+                                           (wallet-path-string path))))
       ;; Verify the whole dump BEFORE creating anything, so a bad file
       ;; leaves no directory behind.
       (let ((records (%parse-wallet-dump
@@ -987,7 +987,7 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
         (unless records
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                             :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Data is not in recognized format."
-                                             (namestring path))))
+                                             (wallet-path-string path))))
         (handler-case
             (let ((db (wallet-db-open path :create t)))
               (unwind-protect

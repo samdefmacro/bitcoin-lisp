@@ -366,6 +366,24 @@ directory.")
 (defun wallet-directory (manager name)
   (merge-pathnames (concatenate 'string name "/") (wallets-directory manager)))
 
+(defun wallet-path-string (path)
+  "PATH as Core's fs::PathToString prints a wallet path: no trailing
+separator.
+
+Core builds one with `GetWalletDir() / wallet_name'
+(wallet/wallet.cpp:486), and every sentence that names a wallet's database
+-- MakeDatabase's two (wallet/walletdb.cpp:1329-1382), RestoreWallet's
+already-exists pair (:504,:511), the load and corruption errors -- prints
+that. A Lisp DIRECTORY pathname's namestring ends in a separator instead, so
+those sentences read `.../wallets/w/\' where Core reads `.../wallets/w\',
+and wallet_backup.py:99-101 builds the string it expects from the path
+itself and compares the whole sentence."
+  (let ((text (namestring path)))
+    (if (and (> (length text) 1)
+             (char= (char text (1- (length text))) #\/))
+        (subseq text 0 (1- (length text)))
+        text)))
+
 (defun wallet-path-for (manager name)
   "WALLET-DIRECTORY of NAME, with any interrupted database rewrite finished
 first. Every path that asks whether NAME exists on disk goes through here: a
@@ -1036,7 +1054,7 @@ locked with no passphrase that can unlock it."
                 (probe-file path))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-exists+
                           :message (format nil "Failed to create database path '~A'. Database already exists."
-                                           (namestring path))))
+                                           (wallet-path-string path))))
       (let* ((encrypt-p (and (stringp passphrase) (plusp (length passphrase))))
              ;; A born-encrypted wallet is created blank so the seed can be
              ;; generated after the master key exists; the caller's own
@@ -1126,7 +1144,7 @@ Please try running the latest software version~%Details: ~A"
                condition)
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                     :message (format nil "Wallet loading failed. Unrecognized descriptor found. Loading wallet ~A~%~%The wallet might have been created on a newer version.~%Please try running the latest software version.~%"
-                                     (namestring (wallet-path wallet)))))
+                                     (wallet-path-string (wallet-path wallet)))))
 
 (defun %wallet-descriptor-from-record (wallet value network last-client)
   "The WalletDescriptor stored in VALUE, as (values descriptor creation-time
@@ -1355,7 +1373,7 @@ picks between the two sentences exactly this way (walletdb.cpp:1329-1382), and
 Wallet::Verify prefixes them."
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                     :message (format nil "Wallet file verification failed. Failed to load database path '~A'. ~A"
-                                     (namestring path)
+                                     (wallet-path-string path)
                                      (if (uiop:directory-exists-p path)
                                          "Data is not in recognized format."
                                          "Path does not exist."))))
@@ -1369,7 +1387,7 @@ CreateWallet both prefix \"Wallet file verification failed. \"
 -4. The engine's text is Core's too -- it goes in the reply there -- so it goes
 in ours, with a log line that keeps the path beside it."
   (bl:log-warn "wallet database at ~A could not be opened: ~A"
-               (namestring path) condition)
+               (wallet-path-string path) condition)
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                     :message (format nil "Wallet file verification failed. ~A" condition)))
 
@@ -1381,10 +1399,10 @@ answers with RPC_WALLET_ERROR (rpc/util.cpp:127-157). CONDITION is logged
 rather than shipped -- Core logs what the record loader knows and puts only
 this sentence in the reply."
   (bl:log-warn "wallet database at ~A could not be read: ~A"
-               (namestring path) condition)
+               (wallet-path-string path) condition)
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                     :message (format nil "Wallet loading failed. Error loading ~A: Wallet corrupted"
-                                     (namestring path))))
+                                     (wallet-path-string path))))
 
 (defun %wallet-drop-extraneous-master-keys (wallet)
   "Core's post-load cleanup for a wallet that should not exist: private keys
