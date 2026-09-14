@@ -685,6 +685,21 @@ pruning mode announcement (Step 3)."
         (log-info "Transaction relay: DISABLED (safety default)"))))
 
 
+(defun log-initload-thread (edge)
+  "Core hands the rest of start-up -- ImportBlocks (the -reindex replay and the
+-loadblock files), the index background sync and the mempool replay -- to a
+background thread run through util::TraceThread, which brackets it with
+\"initload thread start\" and \"initload thread exit\" (init.cpp:2026 over
+util/thread.cpp:20-22).
+
+We do that work inline on the init thread, in a different order, but a caller
+waiting for it can only wait on the exit line: wallet_reindex.py:64 restarts a
+node with -reindex=1 and reads the wallet again as soon as it appears. So the
+pair brackets the same WORK, which here ends with the external block files.
+
+EDGE is :START or :EXIT."
+  (log-info "initload thread ~(~A~)" edge))
+
 (defun %rebuild-block-index-from-block-files ()
   "The -reindex step: rebuild the block index from the block files already on
 disk. Additive -- an intact index is extended, never discarded.
@@ -1871,16 +1886,7 @@ Returns the node instance."
                           wallet-broadcast)
   (%init-lock-and-banner network blocks-directory pid-file data-directory)
   (init-message "Loading block index…")          ; init.cpp:1396
-  ;; Core hands the rest of start-up -- ImportBlocks (the -reindex replay and
-  ;; the -loadblock files), the index background sync and the mempool replay --
-  ;; to a background thread it runs through util::TraceThread, which brackets it
-  ;; with "initload thread start" and "initload thread exit" (init.cpp:2026 over
-  ;; util/thread.cpp:20-22). We do that work inline on the init thread, in a
-  ;; different order, but a caller waiting for it can only wait on the exit
-  ;; line: wallet_reindex.py:64 restarts a node with -reindex=1 and reads the
-  ;; wallet again as soon as it appears. So the pair brackets the same WORK,
-  ;; which here ends with the external block files below.
-  (log-info "initload thread start")
+  (log-initload-thread :start)
   (%init-load-chain network reindex blocks-directory)
   (%init-recover-chain reindex-chainstate)
   ;; LoadChainTip, where Core has it: the tip is settled before the mempool
@@ -1896,8 +1902,7 @@ Returns the node instance."
   ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
   ;; on it). A file that cannot be opened warns and the rest still run.
   (%import-external-block-files *node* load-block)
-  ;; The end of Core's initload thread (see its start above).
-  (log-info "initload thread exit")
+  (log-initload-thread :exit)
 
   ;; Startup is over: a stop arriving from here on has a fully-built node to
   ;; tear down, so the handler's no-watchdog fallback may run stop-node inline

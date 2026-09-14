@@ -77,6 +77,8 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    ;; Core's UniValue::checkType diagnostic, the one sentence its functional
    ;; tests match on (univalue.cpp:210-214)
    #:json-type-error
+   ;; Core's RPCTypeCheckObj (rpc/util.cpp:56-80), the closed-option-set gate
+   #:rpc-type-check-obj
 
    ;; Empty-collection helpers (Core renders [] / {}, never null)
    #:json-array
