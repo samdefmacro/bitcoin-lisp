@@ -182,12 +182,13 @@ the unbroadcast re-announce interval and then asserts the re-announce happened).
     ;; thread next ticks, which is not within the one second
     ;; feature_fee_estimation.py:345/:371 waits after the call, and on a node
     ;; that has just restarted the first tick can be several seconds out.
-    (let ((node bl:*node*))
-      (when node
-        (let ((estimator (bl:node-fee-estimator node)))
-          (when estimator
-            (ignore-errors (bl.mp:maybe-flush-fee-estimates estimator))))
-        (ignore-errors (bl::maybe-dump-peer-addresses node))))
+    ;; The fee-estimate flush alone: it is the one scheduled task a test drives
+    ;; through this RPC, and reaching further up into the node layer from here
+    ;; would be a new upward reference the layering ratchet refuses.
+    (let* ((node bl:*node*)
+           (estimator (and node (bl:node-fee-estimator node))))
+      (when estimator
+        (ignore-errors (bl.mp:maybe-flush-fee-estimates estimator))))
     :null))
 
 (defparameter *client-bug-report-url*
