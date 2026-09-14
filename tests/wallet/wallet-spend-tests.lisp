@@ -1636,3 +1636,40 @@ change that simply forced one type would fail there."
       "-changetype must win over the recipient-derived type")
   (is (= 1 (count :pubkeyhash (%ws-change-types :legacy nil)))
       "a legacy -addresstype takes legacy change, whatever the recipients are"))
+
+(test fundrawtransaction-option-members-are-read-as-core-reads-them
+  "Core's shared fund-option block asks `options.exists(k)' and then calls
+UniValue::get_str() on the member (wallet/rpc/spend.cpp:521-549), so a member
+given as JSON NULL is PRESENT and its get_str throws
+`JSON value of type null is not of expected type string' -- which
+rpc/server.cpp:512 reports as -3 (univalue.cpp:210-214).
+
+We read the member's TRUTH instead, so a null was indistinguishable from an
+absent member and was silently ignored: fundrawtransaction(rawtx,
+change_type=None) funded the transaction where wallet_fundrawtransaction.py:337
+expects that -3. Both members Core reads with get_str are here, and the
+positive control is the empty string, which IS a string and so reaches
+ParseOutputType and Core's own -5 (:547)."
+  (with-wallet-chain-node (node "ws-fundopt")
+    (%ws-fund-wallet node)
+    (let ((raw (one-input-tx-hex (format nil "~64,'0D" 1) 0
+                                 (p2sh-optrue-script-pubkey))))
+      (flet ((answer (options)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "fundrawtransaction" (wire-params (list raw options)))))))
+        ;; change_type=None: present, not a string.
+        (is (equal (cons -3 "JSON value of type null is not of expected type string")
+                   (answer '(("change_type" . nil)))))
+        ;; The same member as a number, to show the sentence names the type it
+        ;; found rather than the word "null".
+        (is (equal (cons -3 "JSON value of type number is not of expected type string")
+                   (answer '(("change_type" . 3)))))
+        ;; changeAddress is Core's other get_str member of this block (:523).
+        (is (equal (cons -3 "JSON value of type null is not of expected type string")
+                   (answer '(("changeAddress" . nil)))))
+        ;; Control: a present STRING still reaches ParseOutputType, so the
+        ;; empty one is Core's -5 and not the type error above.
+        (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+ "Unknown change type ''")
+                   (answer '(("change_type" . "")))))))))

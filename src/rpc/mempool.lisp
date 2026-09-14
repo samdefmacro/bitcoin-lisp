@@ -709,7 +709,7 @@ equals the members' individual answers (rpc_packages.py:100)."
     ;; the type error — which is what mempool_accept.py:100 asserts. NIL here
     ;; now means null/omitted only, so it is a type error as Core has it.
     (unless (%positional-array-p (first params))
-      (%json-type-error (first params) "array"))
+      (json-type-error (first params) "array"))
     ;; Core caps the batch at package size (rpc/mempool.cpp:322).
     (when (or (null txs) (> (length txs) bl.val:+max-package-count+))
       (error 'rpc-error :code +rpc-invalid-parameter+

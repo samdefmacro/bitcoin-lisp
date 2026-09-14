@@ -4113,11 +4113,11 @@ The type NAMES are Core's, not Lisp's, which is the part that would rot
 silently: a list is an \"array\", a hash-table an \"object\", and the false
 sentinel a \"bool\"."
   (flet ((message (value expected)
-           (handler-case (progn (bl.rpc::%json-type-error value expected) nil)
+           (handler-case (progn (bl.rpc:json-type-error value expected) nil)
              (bl.rpc:rpc-error (e)
                (bl.rpc:rpc-error-message e))))
          (code (value expected)
-           (handler-case (progn (bl.rpc::%json-type-error value expected) nil)
+           (handler-case (progn (bl.rpc:json-type-error value expected) nil)
              (bl.rpc:rpc-error (e)
                (bl.rpc:rpc-error-code e)))))
     (is (equal "JSON value of type string is not of expected type array"

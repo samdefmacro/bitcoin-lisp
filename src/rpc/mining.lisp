@@ -190,7 +190,7 @@ setClientRules empty."
           ;; type error rather than a rule that silently does not match
           ;; (rpc/mining.cpp:756-757, univalue type_error).
           (dolist (e elements)
-            (unless (stringp e) (%json-type-error e "string")))
+            (unless (stringp e) (json-type-error e "string")))
           elements)))))
 
 (defun %gbt-check-client-rules (node params)
@@ -1016,7 +1016,7 @@ type-checks an RPCArg::Type::NUM before the handler runs, so
 defaults the bad arguments were silently replaced by."
   (cond ((null value) default)
         ((integerp value) value)
-        (t (%json-type-error value "number"))))
+        (t (json-type-error value "number"))))
 
 (defun %block-entry-time (entry)
   "ENTRY's header timestamp (Core CBlockIndex::GetBlockTime)."
