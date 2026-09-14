@@ -1658,7 +1658,7 @@ wallets directory and 0600 on debug.log."
                                                     :if-does-not-exist :ignore))))
   ;; And the mask is installed by the executable's entry point, before it has
   ;; looked at an argument -- the datadir is created further down.
-  (is-true (member 'bl::node-main
+  (is-true (member 'bl:node-main
                    (mapcar #'car (sb-introspect:who-calls 'bl::setup-environment)))
            "node-main no longer installs Core's private umask"))
 

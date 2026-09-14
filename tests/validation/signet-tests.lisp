@@ -292,7 +292,7 @@ bytes of the double-SHA256 of the challenge serialized as a byte vector
 Ours was the chain-params constant whatever -signetchallenge said, so every
 custom signet spoke on the PUBLIC signet's magic -- feature_signet.py runs five
 nodes on three challenges and expects them not to connect across."
-  (let* ((default bl.val::*default-signet-challenge*)
+  (let* ((default bl.val:*default-signet-challenge*)
          (other (bl.crypto:hex-to-bytes
                  "512102f7561d208dd9ae99bf497273e16f389bcd2341ab7bc86f6d2a6ffd0fb34f0d0d51ae"))
          ;; The length prefix is part of the preimage, not an afterthought.

@@ -35,7 +35,7 @@
   "Drop the datadir lock a running node holds, without any of the flushing
 STOP-NODE does -- what a killed process leaves behind, and what a test that
 restarts a node over the same directory needs before it can."
-  (bl::unlock-data-directory))
+  (release-directory-locks))
 
 (defun %start-test-node (&rest args)
   "BL:START-NODE, with the fail-fast debugger hook it installs handed straight

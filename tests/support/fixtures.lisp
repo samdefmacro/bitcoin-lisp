@@ -139,6 +139,29 @@ bare form is (signals bl.rpc:rpc-error ...)"))
   (handler-case (progn (funcall thunk) nil)
     (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))
 
+(defun claim-directory (directory)
+  "Take the node's exclusive .lock on DIRECTORY (Core LockDirectory,
+init.cpp:1158-1168), signalling if another holder has it."
+  (bl::lock-directory directory))
+
+(defun claim-data-directories (data-directory blocks-directory)
+  "Claim both directories the node claims at start-up (Core LockDirectories,
+init.cpp:1170-1174)."
+  (bl::lock-data-directories data-directory blocks-directory))
+
+(defun release-directory-locks ()
+  "Release every directory lock this process holds, as shutdown does."
+  (bl::unlock-data-directory))
+
+(defun directory-locks-held ()
+  "How many directory locks this process is holding.
+
+These four are one fixture rather than thirteen reaches: the lock is asserted
+on from the persistence suite and released by the manual start-up suite, and
+the whole point of the ratchet is that a second file wanting an internal is
+where a fixture belongs."
+  (length bl::*directory-lock-fds*))
+
 (defun capture-log-lines (thunk)
   "The log lines THUNK emits, read out of a ring buffer private to this call.
 Named here because two wallet test files assert on what a code path logged --

@@ -16,6 +16,32 @@
   "An HTTP Basic Authorization header value carrying CREDENTIAL (\"user:pass\")."
   (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
 
+(defmacro %with-rpc-threads ((n) &body body)
+  "Run BODY with -rpcthreads bound to N and the worker semaphore reset, so the
+bound is rebuilt from N rather than inherited from an earlier test. One reach
+per internal instead of one per binding."
+  `(let ((bl.rpc:*rpc-threads* ,n)
+         (bl.rpc::*rpc-worker-semaphore* nil)
+         (bl.rpc::*rpc-worker-permits* nil))
+     ,@body))
+
+(defun %rpc-worker-semaphore ()
+  "The worker semaphore for the current -rpcthreads, or NIL when unbounded."
+  (bl.rpc::rpc-worker-semaphore))
+
+(defun %getmemoryinfo (params)
+  "getmemoryinfo through the exported dispatcher: the same door a client comes
+through, so the argument normalisation and Core's declared-type gate are part
+of what these tests exercise."
+  (bl.rpc:dispatch-rpc-method nil "getmemoryinfo" params))
+
+(defun %authorized-user (header)
+  "The user CHECK-AUTH authorizes HEADER for, or NIL -- Core's RPCAuthorized
+(httprpc.cpp:84-101). One reach for the whole file: the auth suites below ask
+this question forty-three times, and forty-three package-internal names is
+forty-three chances for one of them to drift."
+  (bl.rpc::check-auth header))
+
 (defun %http-raw-request (port lines &optional body)
   "Send an HTTP request (header LINES + optional BODY, CRLF framing) to
 127.0.0.1:PORT and return the whole response as a string."
@@ -2186,8 +2212,8 @@ CheckInputScripts, validation.cpp:2117."
         (is (eql 0 (search "mempool-script-verify-flag-failed (Stack size must be exactly one after execution), "
                            (or details ""))))
         (is (search (format nil "input 0 of ~A (wtxid ~A), spending "
-                            (bl.rpc::hash-to-hex (bl.ser:transaction-hash tx))
-                            (bl.rpc::hash-to-hex (bl.ser:transaction-wtxid tx)))
+                            (bl.rpc:hash-to-hex (bl.ser:transaction-hash tx))
+                            (bl.rpc:hash-to-hex (bl.ser:transaction-wtxid tx)))
                     (or details "")))))))
 
 (test rpc-testmempoolaccept-reject-details-is-cores-second-field
@@ -2977,15 +3003,15 @@ the whole RPC surface — loaded wallet included — open to any local process."
   ;; default startup: the .cookie pair is the credential
   (let ((bl.rpc::*rpc-credentials*
           (%plaintext-credentials bl.rpc::+rpc-cookie-user+ "deadbeef")))
-    (is (not (bl.rpc::check-auth nil)))
-    (is (not (bl.rpc::check-auth ""))))
+    (is (not (%authorized-user nil)))
+    (is (not (%authorized-user ""))))
   ;; -rpcuser/-rpcpassword startup
   (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
-    (is (not (bl.rpc::check-auth nil))))
+    (is (not (%authorized-user nil))))
   ;; no credential installed at all: nothing authorizes, not even an empty one
   (let ((bl.rpc::*rpc-credentials* '()))
-    (is (not (bl.rpc::check-auth nil)))
-    (is (not (bl.rpc::check-auth (%basic-auth-header ":"))))))
+    (is (not (%authorized-user nil)))
+    (is (not (%authorized-user (%basic-auth-header ":"))))))
 
 (test rpc-auth-header-parsing
   "check-auth parses the HTTP Basic header the way Core's RPCAuthorized does
@@ -2993,26 +3019,26 @@ the whole RPC surface — loaded wallet included — open to any local process."
 password may contain colons. Anything malformed is rejected, never accepted."
   (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
     ;; base64 of "testuser:testpass"
-    (is (bl.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
-    (is (bl.rpc::check-auth (%basic-auth-header "testuser:testpass")))
+    (is (%authorized-user "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (%authorized-user (%basic-auth-header "testuser:testpass")))
     ;; scheme name is case-insensitive, surrounding space is trimmed (Core
     ;; TrimStringView)
-    (is (bl.rpc::check-auth "basic dGVzdHVzZXI6dGVzdHBhc3M="))
-    (is (bl.rpc::check-auth "Basic  dGVzdHVzZXI6dGVzdHBhc3M= "))
+    (is (%authorized-user "basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (%authorized-user "Basic  dGVzdHVzZXI6dGVzdHBhc3M= "))
     ;; malformed shapes
-    (is (not (bl.rpc::check-auth "dGVzdHVzZXI6dGVzdHBhc3M=")))
-    (is (not (bl.rpc::check-auth "Bearer dGVzdHVzZXI6dGVzdHBhc3M=")))
-    (is (not (bl.rpc::check-auth "Basic ")))
-    (is (not (bl.rpc::check-auth "Basic not-base64!!")))
+    (is (not (%authorized-user "dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (%authorized-user "Bearer dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (%authorized-user "Basic ")))
+    (is (not (%authorized-user "Basic not-base64!!")))
     ;; no colon in the decoded credential
-    (is (not (bl.rpc::check-auth (%basic-auth-header "testusertestpass"))))
+    (is (not (%authorized-user (%basic-auth-header "testusertestpass"))))
     ;; near misses
-    (is (not (bl.rpc::check-auth (%basic-auth-header "testuser:testpas"))))
-    (is (not (bl.rpc::check-auth (%basic-auth-header "testuser:testpassX"))))
-    (is (not (bl.rpc::check-auth (%basic-auth-header "TESTUSER:testpass")))))
+    (is (not (%authorized-user (%basic-auth-header "testuser:testpas"))))
+    (is (not (%authorized-user (%basic-auth-header "testuser:testpassX"))))
+    (is (not (%authorized-user (%basic-auth-header "TESTUSER:testpass")))))
   ;; the split is on the first colon, so the password keeps the rest
   (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "u" "a:b:c")))
-    (is (bl.rpc::check-auth (%basic-auth-header "u:a:b:c")))))
+    (is (%authorized-user (%basic-auth-header "u:a:b:c")))))
 
 (test rpc-timing-resistant-equal
   "%timing-resistant-equal decides exactly what STRING= decides (Core
@@ -3114,27 +3140,23 @@ semaphore taken around request execution."
     (let ((node (make-test-node))
           (port 19993))
       (setf (bl:node-data-directory node) dir)
-      (let ((bl.rpc::*rpc-threads* 2)
-            (bl.rpc::*rpc-worker-semaphore* nil)
-            (bl.rpc::*rpc-worker-permits* nil))
+      (%with-rpc-threads (2)
         (unwind-protect
              (progn
                (is-true (bl.rpc:start-rpc-server node :port port))
                (let* ((taskmaster (hunchentoot::acceptor-taskmaster
-                                   bl.rpc::*rpc-server*))
+                                   bl.rpc:*rpc-server*))
                       (threads (hunchentoot::taskmaster-max-thread-count taskmaster))
                       (accepts (hunchentoot::taskmaster-max-accept-count taskmaster)))
-                 (is (or (null threads) (> threads bl.rpc::*rpc-threads*))
+                 (is (or (null threads) (> threads bl.rpc:*rpc-threads*))
                      "the accept loop must not be capped at -rpcthreads (~S)" threads)
                  (is (or (null threads) accepts)
                      "a capped taskmaster must REFUSE, not block: ~S/~S"
                      threads accepts)))
           (bl.rpc:stop-rpc-server)))
       ;; The bound itself is real: two permits, and the third caller waits.
-      (let ((bl.rpc::*rpc-threads* 2)
-            (bl.rpc::*rpc-worker-semaphore* nil)
-            (bl.rpc::*rpc-worker-permits* nil))
-        (let ((semaphore (bl.rpc::rpc-worker-semaphore)))
+      (%with-rpc-threads (2)
+        (let ((semaphore (%rpc-worker-semaphore)))
           (is-true semaphore "a semaphore exists when -rpcthreads is set")
           (is-true (bt:wait-on-semaphore semaphore :timeout 1))
           (is-true (bt:wait-on-semaphore semaphore :timeout 1))
@@ -3143,10 +3165,8 @@ semaphore taken around request execution."
           (bt:signal-semaphore semaphore)
           (bt:signal-semaphore semaphore)))
       ;; Unset means unbounded, as before.
-      (let ((bl.rpc::*rpc-threads* nil)
-            (bl.rpc::*rpc-worker-semaphore* nil)
-            (bl.rpc::*rpc-worker-permits* nil))
-        (is (null (bl.rpc::rpc-worker-semaphore))
+      (%with-rpc-threads (nil)
+        (is (null (%rpc-worker-semaphore))
             "no -rpcthreads, no bound")))))
 
 (test json-rpc-claims-only-the-paths-core-registers
@@ -3244,13 +3264,13 @@ rpc_misc.py:87-88 asserts `list(node.logging()) == sorted(node.logging())'.
 Ours answered in declaration order, so a client rendering the object as given
 showed an arbitrary one. `help logging' carries the same list as a sentence
 (:90-93)."
-  (let* ((answer (bl.rpc::dispatch-rpc-method nil "logging" '()))
+  (let* ((answer (bl.rpc:dispatch-rpc-method nil "logging" '()))
          (names (mapcar #'car answer)))
     (is (equal names (sort (copy-list names) #'string<))
         "the categories must come back alphabetical; got ~S" names)
     (is (= (length names) (length bl.log:+log-categories+))
         "every category is reported")
-    (let ((help (bl.rpc::dispatch-rpc-method nil "help" (list "logging"))))
+    (let ((help (bl.rpc:dispatch-rpc-method nil "help" (list "logging"))))
       (is (search (format nil "valid logging categories are: ~{~A~^, ~}" names)
                   help)
           "help logging must carry the same list, in the same order"))))
@@ -3262,12 +3282,12 @@ multiprocess build and through interfaces::MakeEcho() otherwise
 It was not registered at all, so rpc_misc.py:96 could not call it and
 rpc_help.py:110 failed this node for a method client.cpp lists and the server
 does not serve."
-  (is (equal "hello" (bl.rpc::dispatch-rpc-method nil "echoipc" (list "hello"))))
+  (is (equal "hello" (bl.rpc:dispatch-rpc-method nil "echoipc" (list "hello"))))
   ;; Hidden, like Core's (registered under the \"hidden\" category), so a bare
   ;; `help' does not list it while `help echoipc' still answers.
   (is-true (bl.rpc::rpc-method-hidden-p "echoipc"))
   (is (null (search "echoipc"
-                    (bl.rpc::dispatch-rpc-method nil "help" '()))))
+                    (bl.rpc:dispatch-rpc-method nil "help" '()))))
   ;; And it appears in the conversion dump, which is what rpc_help.py reads.
   (is-true (find-if (lambda (row) (string= (aref row 0) "echoipc"))
                     (bl.rpc::%dump-all-command-conversions))))
@@ -3284,14 +3304,14 @@ watching for allocator pressure nothing."
   ;; "mallocinfo" takes the #else arm on a runtime without glibc's malloc_info,
   ;; and anything else names itself. We ignored the argument and answered the
   ;; stats object to every value, including rpc_misc.py:73's typo.
-  (is (equal (bl.rpc::rpc-getmemoryinfo nil nil)
-             (bl.rpc::rpc-getmemoryinfo nil (list "stats")))
+  (is (equal (%getmemoryinfo nil)
+             (%getmemoryinfo (list "stats")))
       "stats is the default")
   (is (equal (cons -8 "mallocinfo mode not available")
-             (rpc-error-of (lambda () (bl.rpc::rpc-getmemoryinfo nil (list "mallocinfo"))))))
+             (rpc-error-of (lambda () (%getmemoryinfo (list "mallocinfo"))))))
   (is (equal (cons -8 "unknown mode foobar")
-             (rpc-error-of (lambda () (bl.rpc::rpc-getmemoryinfo nil (list "foobar"))))))
-  (let* ((info (bl.rpc::rpc-getmemoryinfo nil nil))
+             (rpc-error-of (lambda () (%getmemoryinfo (list "foobar"))))))
+  (let* ((info (%getmemoryinfo nil))
          (locked (cdr (assoc "locked" info :test #'string=)))
          (used (cdr (assoc "used" locked :test #'string=)))
          (free (cdr (assoc "free" locked :test #'string=)))
@@ -3629,19 +3649,19 @@ must keep working when the other is absent."
     (let ((bl.rpc::*rpc-credentials*
             (append (%plaintext-credentials bl.rpc::+rpc-cookie-user+ "deadbeef")
                     (list entry))))
-      (is (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))
-      (is (bl.rpc::check-auth (%basic-auth-header "__cookie__:deadbeef")))
-      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:swordfisH"))))
-      (is (not (bl.rpc::check-auth (%basic-auth-header "Alice:swordfish"))))
-      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:")))))
+      (is (%authorized-user (%basic-auth-header "alice:swordfish")))
+      (is (%authorized-user (%basic-auth-header "__cookie__:deadbeef")))
+      (is (not (%authorized-user (%basic-auth-header "alice:swordfisH"))))
+      (is (not (%authorized-user (%basic-auth-header "Alice:swordfish"))))
+      (is (not (%authorized-user (%basic-auth-header "alice:")))))
     ;; -rpcauth as the ONLY credential: Core allows -rpcauth without -rpcuser
     (let ((bl.rpc::*rpc-credentials* (list entry)))
-      (is (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))
-      (is (not (bl.rpc::check-auth nil)))
-      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:wrong")))))
+      (is (%authorized-user (%basic-auth-header "alice:swordfish")))
+      (is (not (%authorized-user nil)))
+      (is (not (%authorized-user (%basic-auth-header "alice:wrong")))))
     ;; and no entries means no fallback path opens up
     (let ((bl.rpc::*rpc-credentials* '()))
-      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))))))
+      (is (not (%authorized-user (%basic-auth-header "alice:swordfish")))))))
 
 ;;; --- -rpcwhitelist / -rpcwhitelistdefault (Core httprpc.cpp) ---
 
@@ -7520,10 +7540,10 @@ this test used to do — describes no reachable configuration."
                           (bl.rpc::rpc-credential-user
                            (first bl.rpc::*rpc-credentials*))))
              (let ((cookie (alexandria:read-file-into-string cookie-file)))
-               (is (bl.rpc::check-auth (%basic-auth-header cookie)))
-               (is (not (bl.rpc::check-auth
+               (is (%authorized-user (%basic-auth-header cookie)))
+               (is (not (%authorized-user
                          (%basic-auth-header "__cookie__:bad"))))
-               (is (not (bl.rpc::check-auth (%basic-auth-header "u:p")))))
+               (is (not (%authorized-user (%basic-auth-header "u:p")))))
              ;; shutdown removes the cookie it generated (Core DeleteAuthCookie)
              (bl.rpc:stop-rpc-server)
              (is (null (probe-file cookie-file)))
@@ -7532,9 +7552,9 @@ this test used to do — describes no reachable configuration."
              (is (not (null (bl.rpc:start-rpc-server
                              node :port 19994 :user "u" :password "p"))))
              (is (null (probe-file cookie-file)))
-             (is (bl.rpc::check-auth (%basic-auth-header "u:p")))
-             (is (not (bl.rpc::check-auth (%basic-auth-header "u:wrong"))))
-             (is (not (bl.rpc::check-auth
+             (is (%authorized-user (%basic-auth-header "u:p")))
+             (is (not (%authorized-user (%basic-auth-header "u:wrong"))))
+             (is (not (%authorized-user
                        (%basic-auth-header "__cookie__:p")))))
         (bl.rpc:stop-rpc-server)))))
 
@@ -7660,7 +7680,7 @@ gets 401 from a node that is perfectly fine, and nothing logs anything."
              (let ((live-cookie (alexandria:read-file-into-string cookie-file))
                    (live-credentials bl.rpc::*rpc-credentials*)
                    (live-dispatch hunchentoot:*dispatch-table*))
-               (is (bl.rpc::check-auth (%basic-auth-header live-cookie)))
+               (is (%authorized-user (%basic-auth-header live-cookie)))
                ;; the second process: same data directory, same port. The
                ;; "already running" guard is per-process, so unbind it to reach
                ;; the code a second process would run.
@@ -7676,7 +7696,7 @@ gets 401 from a node that is perfectly fine, and nothing logs anything."
                      "the failed start replaced the live node's credentials")
                  (is (eq live-dispatch hunchentoot:*dispatch-table*)
                      "the failed start leaked a dispatcher into hunchentoot:*dispatch-table*")
-                 (is (bl.rpc::check-auth (%basic-auth-header live-cookie)))
+                 (is (%authorized-user (%basic-auth-header live-cookie)))
                  ;; and a client reading .cookie off disk still gets in
                  (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
                                           :auth (or on-disk "__cookie__:gone"))))
@@ -7833,7 +7853,7 @@ address (with network), and per-input sequence — the fields explorers expect."
 (test rpc-getmemoryinfo-and-getrpcinfo-shape
   "getmemoryinfo reports the heap under \"locked\"; getrpcinfo reports
 active_commands + logpath."
-  (let ((mi (bl.rpc::rpc-getmemoryinfo nil nil)))
+  (let ((mi (%getmemoryinfo nil)))
     (is (assoc "locked" mi :test #'string=))
     (is (integerp (cdr (assoc "total" (cdr (assoc "locked" mi :test #'string=))
                               :test #'string=)))))
@@ -10224,29 +10244,29 @@ file read as UTF-8. For any non-ASCII byte the two disagree, so a correct
 non-ASCII -rpcpassword produced 401 forever, with nothing in the log to say the
 credential had been mangled rather than mistyped."
   (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "üser" "pässwörd")))
-    (is-true (bl.rpc::check-auth
+    (is-true (%authorized-user
               (%basic-auth-header-utf8 "üser:pässwörd"))
              "a UTF-8 credential that matches the configuration was refused")
     ;; A near miss is still refused — the fix must not have made it permissive.
-    (is-false (bl.rpc::check-auth
+    (is-false (%authorized-user
                (%basic-auth-header-utf8 "üser:pässwörX")))
     ;; And the latin-1 encoding of the same characters is a DIFFERENT byte
     ;; string, so it must not authorize.
-    (is-false (bl.rpc::check-auth
+    (is-false (%authorized-user
                (%basic-auth-header "üser:pässwörd")))))
 
 (test ascii-credentials-are-unchanged-by-the-byte-comparison
   "The byte comparison must be a strict generalization: every ASCII case that
 worked before still works, and every near miss is still refused."
   (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
-    (is-true (bl.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is-true (%authorized-user "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
     ;; A password containing colons still splits on the FIRST colon.
     (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "a:b:c")))
-      (is-true (bl.rpc::check-auth (%basic-auth-header "testuser:a:b:c"))))
-    (is-false (bl.rpc::check-auth (%basic-auth-header "testuser:testpas")))
-    (is-false (bl.rpc::check-auth (%basic-auth-header "testuse:testpass")))
+      (is-true (%authorized-user (%basic-auth-header "testuser:a:b:c"))))
+    (is-false (%authorized-user (%basic-auth-header "testuser:testpas")))
+    (is-false (%authorized-user (%basic-auth-header "testuse:testpass")))
     ;; Length differences must not short-circuit: an empty password never matches.
-    (is-false (bl.rpc::check-auth (%basic-auth-header "testuser:")))))
+    (is-false (%authorized-user (%basic-auth-header "testuser:")))))
 
 (test the-rpc-server-does-not-inspect-the-request-content-type
   "Core's HTTPReq_JSONRPC (httprpc.cpp:104-165) never looks at the request's

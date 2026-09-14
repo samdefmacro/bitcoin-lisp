@@ -14,6 +14,12 @@
 
 (in-suite :coinstatsindex-tests)
 
+(defun %txoutsetinfo (node params)
+  "gettxoutsetinfo through the exported dispatcher rather than the handler
+symbol -- the same door a client comes through, so the argument normalisation
+and Core's declared-type gate are part of what these tests exercise."
+  (bl.rpc:dispatch-rpc-method node "gettxoutsetinfo" params))
+
 (test coinstatsindex-muhash-matches-full-set
   "Backfilling the index over a mined regtest chain yields a tip MuHash equal
 to the direct whole-UTXO-set MuHash, and tip tallies equal to the live UTXO
@@ -112,7 +118,7 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
          ;; The hook kept the index at the tip.
          (is (= tip (bl.store:coinstatsindex-height csi)))
          ;; gettxoutsetinfo <tip> from the index matches the direct whole set.
-         (let* ((res (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
+         (let* ((res (%txoutsetinfo node (list "muhash" tip)))
                 (direct (bl.rpc:hash-to-hex
                          (bl.store:compute-utxo-set-muhash utxo))))
            (is (= tip (cdr (assoc "height" res :test #'string=))))
@@ -131,7 +137,7 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
          ;; transactions and disk_size (:1128-1130).
          ;; feature_coinstatsindex.py:87 reads block_info out of the plain
          ;; call, which we answered from the coins view.
-         (let ((res (bl.rpc::rpc-gettxoutsetinfo node (list "muhash"))))
+         (let ((res (%txoutsetinfo node (list "muhash"))))
            (is-true (assoc "block_info" res :test #'string=)
                     "the tip must come from the index when one is enabled")
            (is-true (assoc "total_unspendable_amount" res :test #'string=))
@@ -143,17 +149,17 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
          ;; the OTHER shape.
          ;; Explicit false, as the wire delivers it: the sentinel, not NIL --
          ;; NIL is Core's isNull(), which means "use the default".
-         (let ((res (bl.rpc::rpc-gettxoutsetinfo
+         (let ((res (%txoutsetinfo
                      node (list "muhash" nil bl.rpc:+json-false+))))
            (is-true (assoc "disk_size" res :test #'string=))
            (is-true (assoc "transactions" res :test #'string=))
            (is (null (assoc "block_info" res :test #'string=))))
          ;; A height above the tip errors.
          (signals bl.rpc:rpc-error
-           (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" (+ tip 100))))
+           (%txoutsetinfo node (list "muhash" (+ tip 100))))
          ;; hash_serialized_3 is not index-backed.
          (signals bl.rpc:rpc-error
-           (bl.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3" 1)))
+           (%txoutsetinfo node (list "hash_serialized_3" 1)))
          (bl.store:close-coinstatsindex csi))))))
 
 (test block-apply-drops-unspendable-outputs
@@ -433,9 +439,9 @@ same height still works."
             (active (bl.store:block-index-entry-hash
                      (bl.store:get-block-at-height cs tip))))
        (signals bl.rpc:rpc-error
-         (bl.rpc::rpc-gettxoutsetinfo
+         (%txoutsetinfo
           node (list "muhash" (bl.rpc:hash-to-hex stale))))
-       (let ((res (bl.rpc::rpc-gettxoutsetinfo
+       (let ((res (%txoutsetinfo
                    node (list "muhash" (bl.rpc:hash-to-hex active)))))
          (is (= tip (cdr (assoc "height" res :test #'string=)))))
        ;; A height above the best marker is not vouched for either.
@@ -443,5 +449,5 @@ same height still works."
         csi (1- tip) (bl.store:block-index-entry-hash
                       (bl.store:get-block-at-height cs (1- tip))))
        (signals bl.rpc:rpc-error
-         (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
+         (%txoutsetinfo node (list "muhash" tip)))
        (bl.store:close-coinstatsindex csi)))))

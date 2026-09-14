@@ -581,9 +581,9 @@ index and UTXO cache and flush over the other's files, so the damage is not
 'the second one fails' but 'whichever flushes last wins'."
   (let ((dir (ensure-directories-exist
               (merge-pathnames "test-datadir-lock/" (uiop:temporary-directory)))))
-    (flet ((claim (d) (bl::lock-directory d))
-           (release () (bl::unlock-data-directory))
-           (held () (length bl::*directory-lock-fds*)))
+    (flet ((claim (d) (claim-directory d))
+           (release () (release-directory-locks))
+           (held () (directory-locks-held)))
       (unwind-protect
            (progn
              (claim dir)
@@ -611,8 +611,8 @@ character."
               (merge-pathnames "test-datadir-lock-text/" (uiop:temporary-directory)))))
     (unwind-protect
          (progn
-           (bl::lock-directory dir)
-           (let ((message (handler-case (progn (bl::lock-directory dir) nil)
+           (claim-directory dir)
+           (let ((message (handler-case (progn (claim-directory dir) nil)
                             (error (e) (princ-to-string e)))))
              (is-true message "a second claim must be refused")
              (is (search (format nil "Cannot obtain a lock on directory ~A. ~
@@ -622,7 +622,7 @@ bitcoin-lisp is probably already running."
                  "Core's sentence, verbatim; got ~S" message)
              (is (null (search "/. bitcoin-lisp" message))
                  "no trailing separator before the full stop; got ~S" message)))
-      (bl::unlock-data-directory))))
+      (release-directory-locks))))
 
 (test blocks-directory-is-locked-as-well-as-the-datadir
   "Core's LockDirectories claims GetDataDirNet() AND GetBlocksDirPath()
@@ -636,19 +636,19 @@ with only -blocksdir pointing at a running node's directory."
          (blocks (ensure-directories-exist (merge-pathnames "blocks/" root))))
     (unwind-protect
          (progn
-           (bl::lock-data-directories data blocks)
-           (is (= 2 (length bl::*directory-lock-fds*))
+           (claim-data-directories data blocks)
+           (is (= 2 (directory-locks-held))
                "both directories claimed")
-           (signals error (bl::lock-directory blocks)))
-      (bl::unlock-data-directory))
+           (signals error (claim-directory blocks)))
+      (release-directory-locks))
     ;; A blocks directory that IS the data directory is one lock, not two --
     ;; the same process must not deadlock against its own claim.
     (unwind-protect
          (progn
-           (bl::lock-data-directories data data)
-           (is (= 1 (length bl::*directory-lock-fds*))
+           (claim-data-directories data data)
+           (is (= 1 (directory-locks-held))
                "one directory, one lock"))
-      (bl::unlock-data-directory))))
+      (release-directory-locks))))
 
 (defun %hidx-fixture (suffix)
   "A chain-state on a private directory with no header-index files."
