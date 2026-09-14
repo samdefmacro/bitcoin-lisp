@@ -1680,6 +1680,43 @@ ParseOutputType and Core's own -5 (:547)."
         (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+ "Unknown change type ''")
                    (answer '(("change_type" . "")))))))))
 
+(test an-empty-estimate-mode-is-refused-before-the-conf-target
+  "Core SetFeeEstimateMode (wallet/rpc/spend.cpp:230-235) runs
+FeeModeFromString over estimate_mode BEFORE ParseConfirmTarget reads
+conf_target, and FeeModeFromString (common/messages.cpp:93-103) matches the
+mode against FeeModeMap (:46-54), whose three entries are \"unset\",
+\"economical\" and \"conservative\" -- the EMPTY string is not one of them.
+
+Ours mapped \"\" to :unset as if it were the default, so the empty mode was
+accepted and the answer came from whatever the next argument did: with a
+fractional conf_target it was -8 \"Invalid conf_target, must be between 1 and
+1008\" where Core answers the estimate_mode sentence (rpc_psbt.py:630-632).
+
+The two positive controls are the modes that ARE in Core's map: with them the
+same fractional conf_target still reaches ParseConfirmTarget, so a change that
+simply refused every conf_target-bearing call would fail here."
+  (with-wallet-chain-node (node "ws-emptymode")
+    (bl.wallet::rpc-createwallet node '("w"))
+    (let ((raw (one-input-tx-hex (format nil "~64,\'0D" 1) 0
+                                 (p2sh-optrue-script-pubkey))))
+      (flet ((answer (options)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "fundrawtransaction" (wire-params (list raw options)))))))
+        ;; Core's own sentence for a mode outside the map.
+        (is (equal (cons -8 "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"")
+                   (answer '(("estimate_mode" . "") ("conf_target" . 1/10)))))
+        (is (equal (cons -8 "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"")
+                   (answer '(("estimate_mode" . "foo") ("conf_target" . 1/10)))))
+        ;; Controls: the three real modes are accepted and the conf_target is
+        ;; then the one that answers.
+        (dolist (mode '("unset" "economical" "conservative"))
+          (is (equal (cons -8 "Invalid conf_target, must be between 1 and 1008")
+                     (answer (list (cons "estimate_mode" mode)
+                                   (cons "conf_target" 1/10))))
+              "mode ~A must reach the conf_target check" mode))))))
+
 (test the-coin-eligibility-ladder-reads-limitancestorcount
   "Core's AutomaticCoinSelection builds its eligibility ladder from
 chain.getPackageLimits (wallet/spend.cpp:872-883 over node/interfaces.cpp:

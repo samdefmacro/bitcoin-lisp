@@ -2744,7 +2744,16 @@ Core answers -3 (wallet_fundrawtransaction.py:337)."
       "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\""))
 
 (defun %fee-mode-from-string (string)
-  (cond ((or (string-equal string "unset") (string= string "")) :unset)
+  "Core FeeModeFromString (common/messages.cpp:93-103): STRING is matched
+case-insensitively against FeeModeMap (:46-54), whose entries are exactly
+\"unset\", \"economical\" and \"conservative\". NIL when it is none of them.
+
+The EMPTY string is NOT one of them. Accepting it as :UNSET made
+SetFeeEstimateMode's first check (rpc/spend.cpp:230) pass, so the answer for
+estimate_mode=\"\" came from whatever the NEXT argument did -- with a
+fractional conf_target, -8 \"Invalid conf_target, must be between 1 and 1008\"
+where Core answers the estimate_mode sentence (rpc_psbt.py:630-632)."
+  (cond ((string-equal string "unset") :unset)
         ((string-equal string "economical") :economical)
         ((string-equal string "conservative") :conservative)))
 
