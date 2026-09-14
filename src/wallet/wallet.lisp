@@ -364,7 +364,21 @@ directory.")
                              (wallet-manager-data-directory manager))))))
 
 (defun wallet-directory (manager name)
-  (merge-pathnames (concatenate 'string name "/") (wallets-directory manager)))
+  "The directory wallet NAME lives in, under MANAGER's wallets directory.
+
+NAME becomes one literal directory COMPONENT rather than a namestring that is
+parsed. A Lisp namestring gives `*\', `?\', `[\' and `]\' meaning -- the
+pathname reader treats them as wildcards -- so building this by concatenating
+NAME into a string made a WILD pathname out of `w*t\' and refused `a[b\'
+outright with `parse error in namestring: #\\[ with no corresponding #\\]\'.
+Core joins a path and a filename (wallet/wallet.cpp:486); nothing in the name
+is interpreted, and feature_notifications.py creates a wallet named after every
+byte from 1 to 127, brackets and stars included."
+  (let ((base (wallets-directory manager)))
+    (make-pathname :directory (append (or (pathname-directory base) '(:relative))
+                                      (list name))
+                   :name nil :type nil :version nil
+                   :defaults base)))
 
 (defun wallet-path-string (path)
   "PATH as Core's fs::PathToString prints a wallet path: no trailing
@@ -377,12 +391,21 @@ already-exists pair (:504,:511), the load and corruption errors -- prints
 that. A Lisp DIRECTORY pathname's namestring ends in a separator instead, so
 those sentences read `.../wallets/w/\' where Core reads `.../wallets/w\',
 and wallet_backup.py:99-101 builds the string it expects from the path
-itself and compares the whole sentence."
-  (let ((text (namestring path)))
-    (if (and (> (length text) 1)
-             (char= (char text (1- (length text))) #\/))
-        (subseq text 0 (1- (length text)))
-        text)))
+itself and compares the whole sentence.
+
+Built from the pathname COMPONENTS, not from NAMESTRING: a wallet name may
+contain `*\', `?\', `[\' or `]\' (feature_notifications.py creates one out of
+every byte from 1 to 127) and NAMESTRING escapes those with a backslash for
+re-reading, which is not the name the caller passed and not what Core prints."
+  (let* ((directory (pathname-directory path))
+         (components (rest directory))
+         (leaf (when (pathname-name path)
+                 (if (pathname-type path)
+                     (format nil "~A.~A" (pathname-name path) (pathname-type path))
+                     (pathname-name path)))))
+    (if (eq (first directory) :absolute)
+        (format nil "/~{~A~^/~}~@[/~A~]" components leaf)
+        (format nil "~{~A~^/~}~@[~*~A~]" components leaf leaf))))
 
 (defun wallet-path-for (manager name)
   "WALLET-DIRECTORY of NAME, with any interrupted database rewrite finished
