@@ -15,6 +15,8 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
   (:use #:cl)
   (:export
    #:with-temp-directory
+   #:wallet-data-directory
+   #:wallet-directory-of
    #:make-temp-directory
    #:with-network
    #:make-test-node

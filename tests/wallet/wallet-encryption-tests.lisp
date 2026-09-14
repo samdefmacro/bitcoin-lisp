@@ -1228,8 +1228,7 @@ success while leaving nothing behind."
   (with-wallet-test-node (node)
     (let* ((bl.wallet::*rpc-wallet-name* "w")
            (dir (uiop:ensure-directory-pathname
-                 (bl.wallet::wallet-manager-data-directory
-                  (%node-manager node))))
+                 (wallet-data-directory (%node-manager node))))
            (no-extension (merge-pathnames "backup-no-ext" dir))
            (with-extension (merge-pathnames "backup.dump" dir)))
       (%wenc-fresh-wallet node "w")
@@ -1322,8 +1321,7 @@ not keep key material alive after the wallet is gone."
 (defun %wenc-backup-path (node name)
   (merge-pathnames (format nil "~A.dump" name)
                    (uiop:ensure-directory-pathname
-                    (bl.wallet::wallet-manager-data-directory
-                     (%node-manager node)))))
+                    (wallet-data-directory (%node-manager node)))))
 
 (test wenc-backup-restore-roundtrip
   "backupwallet writes a verifiable dump; restorewallet rebuilds a wallet
@@ -1413,8 +1411,7 @@ restore must not leave a wallet directory behind."
       ;; A corrupt dump: flip a byte in a record line.
       (let ((corrupt (merge-pathnames "corrupt.dump"
                                       (uiop:ensure-directory-pathname
-                                       (bl.wallet::wallet-manager-data-directory
-                                        (%node-manager node))))))
+                                       (wallet-data-directory (%node-manager node))))))
         (let ((lines (uiop:read-file-lines path)))
           (with-open-file (out corrupt :direction :output :if-exists :supersede
                                        :if-does-not-exist :create)
@@ -1429,8 +1426,7 @@ restore must not leave a wallet directory behind."
                                 node "restorewallet" (list "from-corrupt" (namestring corrupt)))))))
         ;; Nothing was created for the rejected restore.
         (is (not (uiop:directory-exists-p
-                  (bl.wallet::wallet-directory (%node-manager node)
-                                                      "from-corrupt"))))))))
+                  (wallet-directory-of (%node-manager node) "from-corrupt"))))))))
 
 (test restorewallet-names-the-wallet-path-the-way-core-prints-it
   "wallet_backup.py:99-101 builds the expected message itself, out of the
@@ -1450,9 +1446,9 @@ namestring, which ends in one, so every wallet-path sentence read
   (with-wallet-test-node (node)
     (let* ((manager (%node-manager node))
            (dir (uiop:ensure-directory-pathname
-                 (bl.wallet::wallet-manager-data-directory manager)))
+                 (wallet-data-directory manager)))
            (bad (merge-pathnames "invalid_wallet_file.bak" dir))
-           (expected-dir (bl.wallet::wallet-directory manager "res0")))
+           (expected-dir (wallet-directory-of manager "res0")))
       (with-open-file (out bad :direction :output :if-exists :supersede
                                :if-does-not-exist :create)
         (write-string "invalid_wallet_content" out))
@@ -1639,8 +1635,7 @@ testnet node — Core gets this from the network magic in the SQLite header."
         (bl.rpc:dispatch-rpc-method node "backupwallet" (list (namestring path))))
       (let ((foreign (merge-pathnames "foreign.dump"
                                       (uiop:ensure-directory-pathname
-                                       (bl.wallet::wallet-manager-data-directory
-                                        (%node-manager node))))))
+                                       (wallet-data-directory (%node-manager node))))))
         ;; Rewrite the network line; the checksum then also fails, which is
         ;; the belt-and-braces version of the same refusal.
         (let ((lines (uiop:read-file-lines path)))
@@ -1769,7 +1764,7 @@ The control comes first: the same body rewritten unchanged restores."
                      (is (eql 0 (search "Wallet file verification failed" message))
                          "~A: ~A" label message))
                    (is (not (uiop:directory-exists-p
-                             (bl.wallet::wallet-directory (%node-manager node) name)))
+                             (wallet-directory-of (%node-manager node) name)))
                        "~A left a wallet directory behind" label))))
           ;; Fewer than four lines: the header alone, no checksum.
           (refused "header-only" (subseq body 0 3) :checksum nil)

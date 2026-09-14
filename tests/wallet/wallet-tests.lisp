@@ -2027,7 +2027,7 @@ the original stays in the mempool, and walletprocesspsbt completes the PSBT."
 ;;;; ============================================================
 
 (defun %wallet-settings-dir (node)
-  (bl.wallet::wallet-manager-data-directory (%node-manager node)))
+  (wallet-data-directory (%node-manager node)))
 
 (defun %wallet-settings-path (node)
   (bl.wallet::settings-json-path (%wallet-settings-dir node)))
