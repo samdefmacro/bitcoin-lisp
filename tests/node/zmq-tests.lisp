@@ -338,3 +338,52 @@ nothing to bind and the option is silently inert."
      '(("zmqpubhashblock" . "tcp://127.0.0.1:28332") ("zmqpubhashblockhwm" . "7")))
     (is (equal '(("hashblock" "tcp://127.0.0.1:28332" 7))
                bl::*zmq-publisher-specs*))))
+
+(test zmq-topics-on-one-address-share-one-socket
+  "Core binds an ADDRESS once and every topic published to it shares that
+socket (CZMQAbstractPublishNotifier::Initialize, zmq/zmqpublishnotifier.cpp:
+74-101 -- `reuse the socket of the notifier already bound to this address').
+
+We bound per TOPIC, so the second and every later topic on one endpoint failed
+with `Address already in use' and was silently not published. That is the
+ORDINARY configuration -- `-zmqpubhashblock=X -zmqpubhashtx=X
+-zmqpubrawblock=X -zmqpubrawtx=X' on one endpoint -- and it is what
+interface_zmq.py uses throughout; the test never received its first
+notification and timed out."
+  (multiple-value-bind (address path) (%zmq-test-address "shared")
+    (unwind-protect
+         (progn
+           (is (= 4 (bl:zmq-start-publishers
+                     (list (list "hashblock" address 1000)
+                           (list "hashtx" address 1000)
+                           (list "rawblock" address 1000)
+                           (list "rawtx" address 1000))))
+               "all four topics on one endpoint must start")
+           (let ((sockets (remove-duplicates
+                           (mapcar #'bl::zmq-publisher-socket bl::*zmq-publishers*)
+                           :test #'cffi:pointer-eq)))
+             (is (= 1 (length sockets))
+                 "one address is one socket, shared by every topic on it"))
+           ;; And a DIFFERENT address is a different socket, so the sharing is
+           ;; by address and not a blanket single-socket bug.
+           (multiple-value-bind (address2 path2) (%zmq-test-address "shared2")
+             (unwind-protect
+                  (progn
+                    (is (= 1 (bl:zmq-start-publishers
+                              (list (list "sequence" address2 1000)))))
+                    (is (= 2 (length (remove-duplicates
+                                      (mapcar #'bl::zmq-publisher-socket
+                                              bl::*zmq-publishers*)
+                                      :test #'cffi:pointer-eq)))
+                        "a second address must bind its own socket"))
+               (ignore-errors (delete-file path2))))
+           ;; A subscriber on the shared endpoint receives a topic that is NOT
+           ;; the first one bound -- the ones that used to fail to bind.
+           (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element #xab)))
+             (let ((lines (%zmq-collect address "hashtx" 1
+                                        (lambda () (bl::zmq-notify-hash-tx hash)))))
+               (is (= 1 (length lines))
+                   "a topic bound after the first must still publish"))))
+      (bl:zmq-stop-publishers)
+      (ignore-errors (delete-file path)))))
