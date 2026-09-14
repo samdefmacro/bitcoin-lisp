@@ -114,13 +114,22 @@ bare multisig script regardless of address type. Uncompressed keys force legacy
                       `(("warnings" . ,(vector "Unable to make chosen address type, please ensure no uncompressed public keys are present."))))
               result))))))
 
-(defun %validateaddress-invalid ()
+(defun %validateaddress-invalid (address network)
   "The validateaddress result for an undecodable address (Core
 output_script.cpp:77-82): isvalid=false plus error_locations and an error
-string; none of address/scriptPubKey/isscript/iswitness appear."
-  `(("isvalid" . ,+json-false+)
-    ("error_locations" . #())
-    ("error" . "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")))
+string; none of address/scriptPubKey/isscript/iswitness appear.
+
+Both come from DecodeDestination, which says WHY it refused and, when a
+bech32 string's checksum fails, WHERE (key_io.cpp:84-207, bech32::LocateErrors
+at bech32.cpp:403). We answered one sentence for every rejection and an empty
+error_locations always, so a mistyped address learned only that it was wrong;
+rpc_invalid_address_message.py compares fourteen different sentences and the
+positions that come with four of them."
+  (multiple-value-bind (message locations)
+      (bl.crypto:decode-address-error address network)
+    `(("isvalid" . ,+json-false+)
+      ("error_locations" . ,(coerce locations 'vector))
+      ("error" . ,message))))
 
 (define-rpc "validateaddress" (node (address))
   "Validate a Bitcoin address and return metadata (Core validateaddress).
@@ -128,7 +137,8 @@ Booleans are real JSON booleans; the invalid shape carries error/
 error_locations like Core's."
   (let ((network (rpc-get-network node)))
     (unless (and (stringp address) (> (length address) 0))
-      (return-from rpc-validateaddress (%validateaddress-invalid)))
+      (return-from rpc-validateaddress
+        (%validateaddress-invalid (if (stringp address) address "") network)))
     (multiple-value-bind (type script-pubkey wit-ver wit-prog)
         (bl.crypto:decode-address address network)
       (if type
@@ -143,5 +153,5 @@ error_locations like Core's."
                                    `(("witness_version" . ,wit-ver)
                                      ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))))
             result)
-          (%validateaddress-invalid)))))
+          (%validateaddress-invalid address network)))))
 
