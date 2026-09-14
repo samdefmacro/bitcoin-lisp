@@ -1712,6 +1712,16 @@ option this repo keeps finding."
              (bl::remove-pid-file))
            ;; A negated -pid writes nothing at all.
            (is-false (bl::write-pid-file "0" dir))
+           ;; The DEFAULT onion target is bound only when no -bind was given:
+           ;; Core pushes DefaultOnionServiceTarget into onion_binds only in
+           ;; the branch where neither -bind=...=onion nor a plain -bind is
+           ;; present (init.cpp:2174-2182). With an explicit -bind it binds
+           ;; nothing extra -- and the functional framework's per-node ports
+           ;; are consecutive, so <p2p_port>+1 is the NEXT node's p2p port.
+           (let* ((src (%node-source-text))
+                  (guard (search "(when (and sync listen (not listen-bind-supplied-p))" src)))
+             (is-true guard
+                      "the onion-target bind is no longer gated on -bind being absent"))
            ;; And the WRITE happens after the directory lock, where Core's
            ;; does: bitcoind locks in AppInitLockDataDirectory and only then
            ;; reaches CreatePidFile, the first step of AppInitMain
