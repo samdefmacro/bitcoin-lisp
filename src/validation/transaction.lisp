@@ -1335,7 +1335,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
                (replaced-set nil))
 
           ;; EPHEMERAL DUST, part 2 (Core PreCheckEphemeralTx,
-          ;; ephemeral_policy.cpp:23, at validation.cpp:933 — after the fees
+          ;; ephemeral_policy.cpp:23-27, at validation.cpp:933 — after the fees
           ;; are known and BEFORE the sigop cap). A tx carrying dust must pay
           ;; NOTHING, base fee AND modified fee, so it is never worth mining
           ;; alone: the dust is safe only while swept as part of a package.
@@ -1343,7 +1343,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
                      (or (/= fee-value 0) (/= modified-fee-value 0))
                      (plusp (transaction-dust-output-count tx)))
             (return-from validate-transaction-for-mempool
-              (values nil :dust nil)))
+              (values nil (list :dust "tx with dust output must be 0-fee") nil)))
 
           ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST
           ;; (validation.cpp:937-939), after the dust check and not before it:

@@ -3145,6 +3145,11 @@ perform-reorg's success phase, so there is nothing to undo here."
       ;; (validation.cpp:2213-2219); it used to be discarded here.
       (bl.store:disconnect-block-from-utxo-set utxo-set block spent-utxos
                                                            :height height)
+      ;; The ROLLBACK path keeps its downgrade: these blocks were connected by
+      ;; a reorg this node is abandoning, and PHASE B re-validates them from
+      ;; scratch on the next attempt (the poisoning hook distinguishes
+      ;; :header-valid from :invalid). The successful disconnect above does
+      ;; NOT downgrade -- see there.
       (setf (bl.store:block-index-entry-status entry) :header-valid)))
   ;; 2. Re-apply the original chain, fork-first (to-disconnect is tip-first).
   ;;    These blocks were valid when first connected; their undo data is
@@ -3644,7 +3649,14 @@ deferred to %REORG-COMMIT so a rolled-back reorg leaves nothing behind."
               (incf (reorg-disconnected-dropped r) dropped))))
         (push (cons block (bl.store:block-index-entry-height entry))
               (reorg-disconnected-blocks r))
-        (setf (bl.store:block-index-entry-status entry) :header-valid))))
+        ;; ENTRY's status is NOT lowered: Core's DisconnectTip touches
+        ;; nStatus not at all (validation.cpp:2940-2990), so a block that
+        ;; reached BLOCK_VALID_SCRIPTS stays fully validated off the chain --
+        ;; which is what getchaintips reports as valid-fork rather than
+        ;; valid-headers (rpc/blockchain.cpp:1628-1639,
+        ;; rpc_getchaintips.py:60). See %REORG-ROLLBACK for why the failed
+        ;; reorg's own disconnect is the other case.
+        )))
 
   ;; Tip is now logically at the fork point. Set it so each fork block's
   ;; validate-block sees the fork's active chain for sequence-lock / MTP

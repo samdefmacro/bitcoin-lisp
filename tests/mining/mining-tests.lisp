@@ -1453,7 +1453,27 @@ because a proposal is by definition unmined."
                                     :initial-element #x42)))
              (hex (bl.crypto:bytes-to-hex
                    (bl.ser:serialize-witness-block stray))))
-        (is (equal "inconclusive-not-best-prevblk" (propose hex))))))))
+        (is (equal "inconclusive-not-best-prevblk" (propose hex))))
+      ;; A block on the RIGHT parent whose first transaction is not a coinbase
+      ;; is refused with Core's own reject reason. BIP22ValidationResult
+      ;; returns state.GetRejectReason() (rpc/mining.cpp:586-602), the same
+      ;; word submitblock answers, not the verdict keyword's own name: this
+      ;; answered "first-tx-not-coinbase" where
+      ;; mining_template_verification.py:44 reads "bad-cb-missing".
+      ;; A block this node would otherwise accept, with its coinbase replaced
+      ;; by an ordinary transaction, so every header rule passes and the
+      ;; verdict under test is CheckBlock's coinbase gate.
+      (let* ((cs (bl:node-chain-state node))
+             (block (bl.mining:assemble-full-block
+                     cs (bl:node-mempool node)
+                     :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+        (setf (bl.ser:bitcoin-block-transactions block)
+              (list (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element #x55)
+                             0 1000)))
+        (is (equal "bad-cb-missing"
+                   (propose (bl.crypto:bytes-to-hex
+                             (bl.ser:serialize-witness-block block))))))))))
 
 
 ;;;; --- getblocktemplate's contract with a real miner -----------------------

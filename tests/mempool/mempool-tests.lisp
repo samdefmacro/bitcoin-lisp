@@ -991,7 +991,17 @@ the rule was written; the test did not exist."
           (bl.val:validate-transaction-for-mempool
            (tx-paying (- funding 5000)) utxo mempool 100)
         (is (null valid))
-        (is (eq :dust err) "a dust-carrying tx that pays a fee must be refused"))
+        (is (eq :dust (bl.val:tx-reject-keyword err))
+            "a dust-carrying tx that pays a fee must be refused")
+        ;; PreCheckEphemeralTx writes a debug message beside the reason
+        ;; (ephemeral_policy.cpp:27), and it is what the caller is shown:
+        ;; mempool_ephemeral_dust.py:161 reads the pair off submitpackage's
+        ;; tx-results entry, which is state.ToString(). The dust rule in
+        ;; IsStandardTx writes none, so this one site is where it comes from.
+        (is (string= "tx with dust output must be 0-fee"
+                     (bl.val:tx-reject-debug-string err)))
+        (is (string= "dust, tx with dust output must be 0-fee"
+                     (bl.val:tx-reject-reason-string err))))
       ;; Zero fee (outputs == input) WITH dust: the dust gate does NOT fire.
       ;; It may still fail a later policy check, which is fine — the property
       ;; under test is that :dust is no longer the reason.
@@ -999,7 +1009,7 @@ the rule was written; the test did not exist."
           (bl.val:validate-transaction-for-mempool
            (tx-paying funding) utxo mempool 100)
         (declare (ignore valid))
-        (is (not (eq :dust err))
+        (is (not (eq :dust (bl.val:tx-reject-keyword err)))
             "a 0-fee tx may carry ephemeral dust")))))
 
 (test check-ephemeral-spends-requires-the-child-to-sweep-all-dust
@@ -1093,14 +1103,14 @@ instead (see mempool-ephemeral-dust-requires-zero-fee)."
       (multiple-value-bind (valid err)
           (bl.val:validate-transaction-for-mempool tx utxo mempool 100)
         (is (null valid))
-        (is (eq err :dust))))
+        (is (eq :dust (bl.val:tx-reject-keyword err)))))
     ;; Exactly one dust output passes the count rule and proceeds (here it
     ;; falls through to the unresolved input, proving it was NOT rejected
     ;; :dust).
     (multiple-value-bind (valid err)
         (bl.val:validate-transaction-for-mempool base utxo mempool 100)
       (is (null valid))
-      (is (not (eq err :dust))))))
+      (is (not (eq :dust (bl.val:tx-reject-keyword err)))))))
 
 (test mempool-rejects-nonpushonly-scriptsig
   "A tx whose scriptSig contains a non-push opcode is rejected."
@@ -1421,7 +1431,7 @@ that varies with the first."
                          utxo mempool 100 :chain-state chain-state))))
       ;; A 10,000,000-sat fee: the dust may not be paid for, and Core says so
       ;; before it looks at the sigop cost.
-      (is (eq :dust (err-of 90000000)))
+      (is (eq :dust (bl.val:tx-reject-keyword (err-of 90000000))))
       ;; Control: the same transaction paying NO fee is legal ephemeral dust,
       ;; so it passes PreCheckEphemeralTx and the same 72,000 sigops then reach
       ;; the cap -- both checks are live, and the assertion above is only about

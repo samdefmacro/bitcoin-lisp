@@ -1055,11 +1055,12 @@ package-feerate retry, validation.cpp:1694-1712)."
       (multiple-value-bind (msg results)
           (bl.val:validate-package-for-mempool
            (list p1 p2 child) utxo-set mempool chain-state)
-        (is (eq :dust msg))
+        (is (eq :dust (bl.val:tx-reject-keyword msg)))
         (is (eq :invalid (bl.val:package-tx-result-status
                           (%result-for results p1))))
-        (is (eq :dust (bl.val:package-tx-result-error
-                       (%result-for results p1))))
+        (is (eq :dust (bl.val:tx-reject-keyword
+                       (bl.val:package-tx-result-error
+                        (%result-for results p1)))))
         ;; P2 was validated on its own and ENTERED the mempool.
         (is (eq :valid (bl.val:package-tx-result-status
                         (%result-for results p2))))
