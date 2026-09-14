@@ -282,3 +282,20 @@ appears to be from the future. This may be due to your computer's date and ~
 time being set incorrectly. Only rebuild the block database if you are sure ~
 that your computer's date and time are correct")
                      refusal))))))))
+
+(test the-block-file-reindex-says-when-it-finished
+  "Core ends ImportBlocks' reindex branch with `Reindexing finished'
+(node/blockstorage.cpp:1291). It is what says the block files were all read
+rather than the node having given up partway, and
+feature_reindex_readonly.py:78 waits for it after making one block file
+unwritable -- precisely to check that a read-only file is READ and not an
+abort. Ours logged the count it added and then nothing."
+  (with-network (:regtest)
+    (let* ((tag (format nil "rfin~D" (get-internal-real-time)))
+           (node (coins-db-node-fixture tag)))
+      (let ((bl:*node* node))
+        (generate-regtest-blocks node 3)
+        (let ((lines (capture-log-lines
+                      (lambda () (bl::%rebuild-block-index-from-block-files)))))
+          (is-true (find "Reindexing finished" lines :test #'search)
+                   "Core's closing sentence; got ~S" lines))))))
