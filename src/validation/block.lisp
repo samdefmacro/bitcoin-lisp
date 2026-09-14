@@ -4541,7 +4541,34 @@ can neither wedge on an equal-work sibling nor advance past the base."
                                 :mempool mempool)
                  (%maybe-note-target-reached chain-state)
                  (values t nil))
-               (values nil error)))))
+               (progn
+                 ;; BLOCK_FAILED_VALID on the tip-extending block too. Core
+                 ;; marks a block its AcceptBlock gate refuses
+                 ;; (validation.cpp:4381-4389, every verdict but BLOCK_MUTATED)
+                 ;; and a block ConnectTip refuses (InvalidBlockFound), and
+                 ;; either way the entry carries the failure from then on. The
+                 ;; competing-fork arm below already did this; this arm did
+                 ;; not, so a block rejected while extending the tip was
+                 ;; indexed as merely header-valid and stayed that way.
+                 ;;
+                 ;; Two things read that mark. submitblock answers
+                 ;; "duplicate-invalid" for a block the index already knows is
+                 ;; invalid (rpc/mining.cpp:1073-1077) -- mining_basic.py:484
+                 ;; submits a non-final coinbase twice and reads the reject
+                 ;; reason both times -- and submitheader refuses a child of an
+                 ;; invalid block with "bad-prevblk" (:486-488).
+                 ;;
+                 ;; The allowlist is the one the fork arm uses: only a verdict
+                 ;; decided from txid-committed data and chain structure
+                 ;; poisons a block permanently, never a corrupt-body or
+                 ;; witness-dependent one, which a re-download can fix.
+                 (when (%deterministic-consensus-failure-p error)
+                   (let ((this-entry (bl.store:get-block-index-entry
+                                      chain-state
+                                      (bl.ser:block-header-hash header))))
+                     (when this-entry
+                       (%mark-block-subtree-invalid chain-state this-entry))))
+                 (values nil error))))))
 
       (t
        ;; Cases 2 and 3: prev != current best.

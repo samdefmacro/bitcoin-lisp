@@ -767,6 +767,57 @@ not active; contextual validation rejects that block as :unexpected-witness")
        ;; resubmit the same block → duplicate
        (is (string= "duplicate" (bl.rpc::rpc-submitblock node (list hex))))))))
 
+(test submitblock-answers-duplicate-invalid-for-a-block-it-already-refused
+  "Core's submitblock reads the block index before doing any work and answers
+\"duplicate-invalid\" when the entry it finds is already marked failed
+(rpc/mining.cpp:1073-1077). A block that FAILS gets marked -- AcceptBlock does
+it for every non-mutation verdict (validation.cpp:4381-4389) and
+InvalidBlockFound does it for a connect failure -- so the same bad block
+submitted twice gets its reject reason once and \"duplicate-invalid\"
+afterwards. mining_basic.py:483-484 asserts exactly that pair for a coinbase
+made non-final.
+
+Our competing-fork arm marked such a block; the arm that extends the CURRENT
+TIP did not, so the second submission re-ran the whole validation and answered
+the reject reason again -- and a child of the bad block would have been
+accepted as a header instead of refused with bad-prevblk (:486)."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "submit-dupinvalid"))
+           (cs (bl:node-chain-state node))
+           (block (bl.mining:assemble-full-block
+                   cs (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+           (cb (first (bl.ser:bitcoin-block-transactions block)))
+           (in0 (aref (bl.ser:transaction-inputs cb) 0))
+           ;; mining_basic.py:421-427 + :480-482: a coinbase whose input
+           ;; sequence is not SEQUENCE_FINAL, so its far-future nLockTime
+           ;; actually bites. Rebuilt rather than mutated, so no cached txid
+           ;; survives the change.
+           (nonfinal (bl.ser:make-transaction
+                      :version (bl.ser:transaction-version cb)
+                      :inputs (vector (bl.ser:make-tx-in
+                                       :previous-output (bl.ser:tx-in-previous-output in0)
+                                       :script-sig (bl.ser:tx-in-script-sig in0)
+                                       :sequence #xfffffffe))
+                      :outputs (bl.ser:transaction-outputs cb)
+                      :lock-time #xffffffff
+                      :witness (bl.ser:transaction-witness cb))))
+      (setf (bl.ser:bitcoin-block-transactions block) (list nonfinal)
+            (bl.ser:block-header-merkle-root (bl.ser:bitcoin-block-header block))
+            (bl.val:compute-merkle-root (list (bl.ser:transaction-hash nonfinal)))
+            (bl.ser:block-header-cached-hash (bl.ser:bitcoin-block-header block)) nil)
+      (bl.mining:mine-block block)
+      (let ((hex (bl.crypto:bytes-to-hex (bl.ser:serialize-witness-block block)))
+            (height (bl.store:current-height cs)))
+        (is (string= "bad-txns-nonfinal"
+                     (bl.rpc:dispatch-rpc-method node "submitblock" (list hex)))
+            "the first submission is judged and reports Core's reject reason")
+        (is (string= "duplicate-invalid"
+                     (bl.rpc:dispatch-rpc-method node "submitblock" (list hex)))
+            "the second is answered from the index, not judged again")
+        (is (= height (bl.store:current-height cs))
+            "neither submission moved the tip")))))
+
 (test submitblock-fills-missing-witness-nonce
   ;; Core UpdateUncommittedBlockStructures (validation.cpp:4017-4027), run by
   ;; submitblock before validation: a coinbase that carries the witness
