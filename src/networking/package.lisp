@@ -33,6 +33,12 @@ headerssync.cpp. src/networking/.")
    #:flush-send-buffer
    #:flush-peer-send-buffers
    #:*max-send-buffer-bytes*
+   ;; Receive-side backpressure (Core m_msg_process_queue / fPauseRecv): a
+   ;; send-paused peer is still READ, into the parked queue this bounds.
+   #:connection-recv-paused-p
+   #:connection-parked-messages-p
+   #:connection-recv-parked-bytes
+   #:*max-receive-buffer-bytes*
    #:*name-lookup*
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*

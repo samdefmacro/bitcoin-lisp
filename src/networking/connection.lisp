@@ -13,14 +13,35 @@ message may take the buffer past the cap (Core queues it the same way — a
 
 Going over the cap never costs a message. Core's CConnman::PushMessage
 (net.cpp:4088-4113) queues unconditionally and only SETS fPauseSend as a
-consequence; the backpressure is applied on the INPUT side, where
+consequence; the backpressure is applied on the PROCESSING side, where
 ProcessMessages returns before polling a new message from a send-paused peer
 (net_processing.cpp:5244-5245). Deferring the work instead of dropping it is
 what keeps a reply we already decided to send — a getheaders answer, a pong,
 a tx we just invd — from being silently lost while a large block streams to
 a slow peer, with nothing to retry it and the peer waiting forever on a
 request we had already consumed. What bounds a peer that never drains is the
-20-minute send-stall disconnect below, not a dropped message.")
+20-minute send-stall disconnect below, not a dropped message.
+
+The pause stops DISPATCH, never the socket read: Core's socket handler keeps
+calling recv() on a send-paused peer (CConnman::SocketHandlerConnected,
+net.cpp:2204 — fPauseSend appears nowhere in it) and the bytes accumulate in
+that peer's own message queue, which *MAX-RECEIVE-BUFFER-BYTES* bounds. Two
+nodes that each queue a message past the cap to the other would otherwise
+deadlock forever: each side stops reading, so neither side's queue ever
+drains (Core's test/functional/p2p_net_deadlock.py is exactly that shape).")
+
+(defvar *max-receive-buffer-bytes* 5000000
+  "Per-connection cap on the bytes of messages read off the socket but not yet
+dispatched, above which the connection is receive-paused (Core
+CNode::fPauseRecv against CConnman::nReceiveFloodSize, net.cpp:4025 and :4037;
+the cap is 1000 * -maxreceivebuffer, default DEFAULT_MAXRECEIVEBUFFER = 5000,
+net.h:98 / init.cpp:2106).
+
+This is the ONLY thing that stops us reading a peer. Core selects a peer's
+socket for reading unless fPauseRecv (net.cpp:2070) and re-evaluates the flag
+every time a message is added to or polled off the queue, so a peer whose
+messages we cannot keep up with is throttled by TCP's own window rather than
+by dropping anything.")
 
 (defconstant +timeout-interval-seconds+ (* 20 60)
   "Core TIMEOUT_INTERVAL (net.h:58-59), the ONE twenty-minute window every
@@ -96,6 +117,17 @@ peer from two directions.")
   ;; waiting, so the budgets live with them (receive-bytes for a blocking call,
   ;; connection-receive-expired-p for the pump).
   (recv-last-progress 0 :type integer)
+  ;; --- Parked inbound messages (Core CNode::m_msg_process_queue, net.h:1010)
+  ;; Whole messages read off the socket while the peer was send-paused, waiting
+  ;; for the pause to clear. Core reads into this queue on the socket thread
+  ;; (MarkReceivedMsgsForProcessing, net.cpp:4011-4026) and ProcessMessages
+  ;; takes one at a time off it (PollMessage, net.cpp:4028-4041) — only the
+  ;; TAKING is gated on fPauseSend, which is why a mutual over-cap send cannot
+  ;; wedge two Core nodes. Two-list FIFO like the send queue: push on IN, pop
+  ;; off the reversed OUT. Touched only by the receive pump (one thread).
+  (recv-parked-in nil :type list)
+  (recv-parked-out nil :type list)
+  (recv-parked-bytes 0 :type integer)
   ;; Framing state for the message half-read, once its fixed-size prefix is in
   ;; and decoded: the variable-length read that follows may itself span passes,
   ;; so it has to outlive the call that produced it. v1 parks the parsed
@@ -414,7 +446,12 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
         (connection-send-queue-bytes conn) 0
         (connection-recv-buffer conn) nil
         (connection-recv-filled conn) 0
-        (connection-recv-framing conn) nil))
+        (connection-recv-framing conn) nil
+        ;; ...and the messages parked behind a send pause, which are bounded by
+        ;; *max-receive-buffer-bytes* rather than by one message's size.
+        (connection-recv-parked-in conn) nil
+        (connection-recv-parked-out conn) nil
+        (connection-recv-parked-bytes conn) 0))
 
 (defun %connection-failed (conn reason)
   "Declare CONN dead because of REASON, one of the keywords
@@ -561,10 +598,63 @@ after a hard send failure (connection marked dead). Caller holds SEND-LOCK."
   "T while CONN's buffered unsent data exceeds the send-buffer cap (Core
 CNode::fPauseSend). Bulk producers (block serving in handle-getdata, exactly
 where Core checks it in ProcessGetData) stop sending to a paused peer, and
-the pump stops reading that peer's INBOUND messages (drain-and-reap-peer,
-Core's `if (node.fPauseSend) return false;` in ProcessMessages) until the
-buffer drains below the cap. Nothing already queued is discarded."
+the pump stops DISPATCHING that peer's inbound messages (drain-and-reap-peer,
+Core's `if (node.fPauseSend) return false;` in ProcessMessages,
+net_processing.cpp:5244-5245) until the buffer drains below the cap. Nothing
+already queued is discarded, in either direction: the messages that arrive
+while the pause holds are read off the socket and parked (see
+PARK-RECEIVED-MESSAGE), because a pause that stopped the READ would deadlock
+two nodes that each queued an over-cap message to the other."
   (> (connection-send-queue-bytes conn) *max-send-buffer-bytes*))
+
+(defconstant +parked-message-overhead-bytes+ 64
+  "Per-message accounting overhead charged to the parked-message budget, next
+to the payload's own bytes -- the command string and the cons cells that hold
+them. Core charges the same shape: CNetMessage::GetMemoryUsage is
+`sizeof(*this) + DynamicUsage(m_type) + m_recv.GetMemoryUsage()`
+(net.cpp:127-130), so an empty message is not free and a flood of tiny
+messages cannot sit under the cap forever.")
+
+(defun connection-recv-paused-p (conn)
+  "T while CONN's parked (read but not yet dispatched) messages exceed the
+receive-buffer cap (Core CNode::fPauseRecv, set from m_msg_process_queue_size
+against m_recv_flood_size on every add and every poll, net.cpp:4025 / :4037).
+
+Core stops selecting such a peer's socket for reading (net.cpp:2070) and so do
+we; the peer is then throttled by our TCP receive window, which is the whole
+point. This is the only backpressure that stops a read -- being SEND-paused
+does not."
+  (> (connection-recv-parked-bytes conn) *max-receive-buffer-bytes*))
+
+(defun connection-parked-messages-p (conn)
+  "T when CONN holds messages read off the socket but not yet dispatched."
+  (or (connection-recv-parked-out conn) (connection-recv-parked-in conn)))
+
+(defun %parked-message-bytes (payload)
+  "What one parked message costs against the receive-buffer cap."
+  (+ (length payload) +parked-message-overhead-bytes+))
+
+(defun park-received-message (conn command payload)
+  "Hold COMMAND/PAYLOAD on CONN until the peer's send pause clears (Core's
+MarkReceivedMsgsForProcessing splicing into m_msg_process_queue,
+net.cpp:4011-4026). Read order is dispatch order, so this is a FIFO."
+  (push (cons command payload) (connection-recv-parked-in conn))
+  (incf (connection-recv-parked-bytes conn) (%parked-message-bytes payload))
+  t)
+
+(defun pop-parked-message (conn)
+  "Take the oldest parked message off CONN as (VALUES COMMAND PAYLOAD), or NIL
+when none is parked (Core CNode::PollMessage, net.cpp:4028-4041)."
+  (when (and (null (connection-recv-parked-out conn))
+             (connection-recv-parked-in conn))
+    (setf (connection-recv-parked-out conn)
+          (nreverse (connection-recv-parked-in conn))
+          (connection-recv-parked-in conn) nil))
+  (let ((entry (pop (connection-recv-parked-out conn))))
+    (when entry
+      (decf (connection-recv-parked-bytes conn)
+            (%parked-message-bytes (cdr entry)))
+      (values (car entry) (cdr entry)))))
 
 (defun connection-send-stalled-p (conn)
   "T when CONN has had unsent data buffered while the socket accepted nothing
