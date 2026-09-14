@@ -230,11 +230,11 @@ STALE_RELAY_AGE_LIMIT relative to the best header, is refused."
            (best (bl.store:best-header-entry cs)))
       (is (eq :valid (bl.store:block-index-entry-status stale))
           "a reorged-off block keeps the validity it earned")
-      (is-true (bl.net::%block-request-allowed-p cs stale best)
+      (is-true (block-request-allowed-p cs stale best)
                "so a recent stale block is servable")
       ;; Control 1: never fully validated => refused.
       (setf (bl.store:block-index-entry-status stale) :header-valid)
-      (is-false (bl.net::%block-request-allowed-p cs stale best))
+      (is-false (block-request-allowed-p cs stale best))
       (setf (bl.store:block-index-entry-status stale) :valid)
       ;; Control 2: valid, but older than a month relative to the best header.
       (setf (bl.ser:block-header-timestamp
@@ -242,7 +242,7 @@ STALE_RELAY_AGE_LIMIT relative to the best header, is refused."
             (- (bl.ser:block-header-timestamp
                 (bl.store:block-index-entry-header best))
                (* 31 24 60 60)))
-      (is-false (bl.net::%block-request-allowed-p cs stale best)
+      (is-false (block-request-allowed-p cs stale best)
                 "an old stale block is a fingerprint, not a service"))))
 
 ;;;; getblocks-response-message

@@ -707,13 +707,24 @@ implicit defaults apply (Core NetPermissionFlags::Implicit).")
   ;; pseudo-permissions. Defaults to :both, as Core does when neither is given.
   (direction :both :type keyword))
 
-(defun parse-permission-flags (string)
+(defparameter +whitebind-out-error+
+  "whitebind may only be used for incoming connections (\"out\" was passed)"
+  "Core's message for `out' inside a -whitebind spec (net_permissions.cpp:62).")
+
+(defun parse-permission-flags (string &key (allow-out t))
   "Parse Core's \"perm1,perm2@range\" prefix.
 
-Returns (values flags direction rest) — REST being the address part — or NIL
-when the entry is invalid. With no @ at all there are no explicit
+Returns (values flags direction rest) — REST being the address part — or
+(values NIL reason) when the entry is invalid, REASON being the message Core
+prints for it verbatim: the functional suite matches on those strings
+(p2p_permissions.py:98-99). With no @ at all there are no explicit
 permissions and REST is the whole string, which is Core's implicit case
 (net_permissions.cpp:26-36).
+
+ALLOW-OUT NIL is -whitebind, where Core refuses the \"out\" word inside the
+parser itself (net_permissions.cpp:59-65, the `output_connection_direction ==
+nullptr' arm) — BEFORE the only-direction check below, so `-whitebind=out@...'
+reports the whitebind message and not the other one.
 
 Two rules of Core's that are easy to miss and that p2p_permissions.py:148
 checks:
@@ -740,15 +751,22 @@ permissions\" error (:80-83), which is not the same thing as an empty entry."
             (cond ((string= name "in")
                    (setf direction (if (eq direction :out) :both :in)))
                   ((string= name "out")
+                   (unless allow-out
+                     (return-from parse-permission-flags
+                       (values nil +whitebind-out-error+)))
                    (setf direction (if (eq direction :in) :both :out)))
                   ;; Empty entry: legal, and grants nothing.
                   ((zerop (length name)))
                   (t (let ((bit (cdr (assoc name *permission-names* :test #'string=))))
-                       (unless bit (return-from parse-permission-flags nil))
+                       (unless bit
+                         (return-from parse-permission-flags
+                           (values nil (format nil "Invalid P2P permission: '~A'" name))))
                        (setf flags (logior flags bit))))))
           ;; Only a direction, no permission: Core refuses the whole entry.
           (when (and direction (zerop flags))
-            (return-from parse-permission-flags nil))
+            (return-from parse-permission-flags
+              (values nil (format nil "Only direction was set, no permissions: '~A'"
+                                  string))))
           (values flags (or direction :in) rest))
         (values +perm-implicit+ :in string))))
 
@@ -760,19 +778,23 @@ permissions\" error (:80-83), which is not the same thing as an empty entry."
         do (setf start (1+ comma))))
 
 (defun parse-whitelist-entry (spec &key (allow-out t))
-  "Parse one -whitelist (or -whitebind) SPEC into a WHITELIST-ENTRY, or NIL.
+  "Parse one -whitelist (or -whitebind) SPEC into a WHITELIST-ENTRY, or
+(values NIL reason) — REASON being Core's own message for the refusal, which
+the functional suite matches on (p2p_permissions.py:98-99).
 
 ALLOW-OUT NIL is -whitebind, where Core refuses \"out\" outright: a listening
 socket has no outgoing connections to grant permissions to
-(net_permissions.cpp:60-64)."
-  (multiple-value-bind (flags direction rest) (parse-permission-flags spec)
-    (when (and flags
-               (or allow-out (not (member direction '(:out :both))))
-               ;; :both only reaches the refusal above when it came from an
-               ;; explicit \"out\"; the default :both carries no direction at all.
-               t)
-      (let ((subnet (parse-subnet rest)))
-        (when subnet (%make-whitelist-entry subnet flags direction))))))
+(net_permissions.cpp:59-65)."
+  (multiple-value-bind (flags direction rest)
+      (parse-permission-flags spec :allow-out allow-out)
+    (if (null flags)
+        ;; DIRECTION carries the reason when FLAGS is NIL.
+        (values nil direction)
+        (let ((subnet (parse-subnet rest)))
+          (if subnet
+              (%make-whitelist-entry subnet flags direction)
+              (values nil (format nil "Invalid netmask specified in -whitelist: '~A'"
+                                  rest)))))))
 
 (defvar *whitelist-entries* '()
   "Parsed -whitelist ranges, in configuration order.")

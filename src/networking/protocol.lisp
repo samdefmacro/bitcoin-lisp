@@ -1164,8 +1164,11 @@ wtxidrelay-mismatch skip, AddTxAnnouncement, best_block tracking plus a
 single MaybeSendGetHeaders after the inv vector is fully scanned)."
   (bl.ctx:with-node-context (chain-state mempool recent-rejects peers utxo-set) ctx
   (let ((inv-vectors (bl.ser:parse-inv-payload payload))
-        (reject-tx-invs (or (ignore-incoming-txs-p)
-                            (not (peer-relays-txs-p peer))))
+        ;; Core's own RejectIncomingTxs, not a third inlined copy of it
+        ;; (net_processing.cpp:4134) -- so the RELAY permission excuses the
+        ;; -blocksonly clause here exactly as it does for the VERSION we sent
+        ;; and for the tx handler.
+        (reject-tx-invs (reject-incoming-txs-p peer))
         (num-wtxid-peers (count-wtxid-relay-peers peers))
         (wanted '())
         (unknown-block-hash nil))
@@ -2347,9 +2350,7 @@ CTX's recent-rejects, when present, caches recently rejected txs."
   ;; permission excuses the -blocksonly clause and ONLY that clause; a
   ;; block-relay-only or feeler connection may never send txs whatever its
   ;; permissions).
-  (when (or (and (ignore-incoming-txs-p)
-                 (not (peer-has-permission-p peer +perm-relay+)))
-            (not (peer-relays-txs-p peer)))
+  (when (reject-incoming-txs-p peer)
     (bl:log-cat "net" "transaction sent in violation of protocol, ~A"
                 (disconnect-msg peer))
     (disconnect-peer peer)
@@ -2647,6 +2648,27 @@ form would waste the construction on both ends."
 the -maxuploadtarget serving limit (Core HISTORICAL_BLOCK_AGE,
 net_processing.cpp:120).")
 
+(defun %inv-vector-description (inv)
+  "One inv as Core's CInv::ToString prints it -- `<type> <hash>'
+(protocol.cpp:58-84). The type name is Core's own spelling, the
+MSG_WITNESS_FLAG bit shows as a `witness-' prefix, an unknown type falls back
+to `0x%08x', and the hash is in uint256 display order."
+  (let* ((type (bl.ser:inv-vector-type inv))
+         (witness (logtest type (ash 1 30)))
+         (masked (logand type (lognot (ash 1 30))))
+         (name (cond ((= masked bl.ser:+inv-type-tx+) "tx")
+                     ((= masked bl.ser:+inv-type-wtx+) "wtx")
+                     ((= masked bl.ser:+inv-type-block+) "block")
+                     ((= masked bl.ser:+inv-type-filtered-block+) "merkleblock")
+                     ((= masked bl.ser:+inv-type-cmpct-block+) "cmpctblock")
+                     (t nil))))
+    (format nil "~A ~A"
+            (if name
+                (concatenate 'string (if witness "witness-" "") name)
+                (format nil "0x~8,'0X" type))
+            (bl.crypto:bytes-to-hex
+             (bl.crypto:reverse-bytes (bl.ser:inv-vector-hash inv))))))
+
 (defun queue-getdata (peer invs)
   "Append INVS to PEER's pending getdata queue, oldest first (Core
 peer.m_getdata_requests.insert / push_back, net_processing.cpp:4260 and
@@ -2669,7 +2691,18 @@ enforces: a peer whose send buffer is over -maxsendbuffer is send-paused and
 served nothing more until it drains. A token bucket on TOP of that disconnects
 a peer for asking for exactly what this node announced to it, which is what a
 node doing its job looks like from the other side."
-  (queue-getdata peer (bl.ser:parse-inv-payload payload))
+  (let ((invs (bl.ser:parse-inv-payload payload)))
+    ;; Core's two lines, in Core's order (net_processing.cpp:4224-4229): the
+    ;; count, then the FIRST entry spelled out. p2p_blocksonly.py:64 waits on
+    ;; the second under assert_debug_log, and it is the only place the log says
+    ;; WHAT a peer asked for -- the generic `received: getdata (N bytes)' line
+    ;; above it names a byte count and nothing else.
+    (bl:log-cat "net" "received getdata (~D invsz) peer=~A"
+                (length invs) (peer-id peer))
+    (when invs
+      (bl:log-cat "net" "received getdata for: ~A peer=~A"
+                  (%inv-vector-description (first invs)) (peer-id peer)))
+    (queue-getdata peer invs))
   (process-peer-getdata peer ctx))
 
 (defun process-peer-getdata (peer ctx)

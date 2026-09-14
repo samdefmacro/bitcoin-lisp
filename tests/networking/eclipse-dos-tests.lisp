@@ -1002,6 +1002,19 @@ less than the operator asked for, silently."
     ;; -whitebind refuses "out": a listening socket has no outgoing peers.
     (is-false (bl.net:parse-whitelist-entry
                "noban,out@1.2.3.4" :allow-out nil))
+    ;; Each refusal carries Core's own message, because the functional suite
+    ;; starts a node with a bad spec and matches stderr against it
+    ;; (p2p_permissions.py:98-99). One generic sentence for all of them named
+    ;; the range when the permission word was what was wrong.
+    (is (equal "Invalid P2P permission: 'nosuchperm'"
+               (nth-value 1 (bl.net:parse-whitelist-entry "nosuchperm@1.2.3.4"))))
+    (is (equal "Only direction was set, no permissions: 'in,out@1.2.3.4'"
+               (nth-value 1 (bl.net:parse-whitelist-entry "in,out@1.2.3.4"))))
+    (is (equal "Invalid netmask specified in -whitelist: 'not-an-address'"
+               (nth-value 1 (bl.net:parse-whitelist-entry "noban@not-an-address"))))
+    (is (search "whitebind may only be used for incoming connections"
+                (nth-value 1 (bl.net:parse-whitelist-entry
+                              "noban,out@1.2.3.4" :allow-out nil))))
     ;; An EMPTY entry is legal and grants nothing -- Core's
     ;; `else if (permission.length() == 0);' (net_permissions.cpp:67). This is
     ;; how an operator writes "this range, and no permissions at all", and
@@ -1247,6 +1260,110 @@ inv.hash.ToString() does."
       (is-true (find "transaction (0000000000000000000000000000000000000000000000000000000000001234) inv sent in violation of protocol"
                      lines :test #'search)
                "with the announced hash in it, in display order"))))
+
+(test whitebind-address-half-is-checked-as-core-checks-it
+  "Core's -whitebind spec carries a BIND ENDPOINT after the @, and
+NetWhitebindPermissions::TryParse Lookup()s it: what does not resolve is
+\"Cannot resolve -whitebind address\" and a missing port is \"Need to specify a
+port with -whitebind\" (net_permissions.cpp:110-124). We bind one listener and
+keep only the permissions, so the address had been discarded unchecked --
+`-whitebind=noban@127.0.0.1/10' (a netmask where an endpoint belongs) started
+a node that granted noban to nobody, where Core refuses to start
+(p2p_permissions.py:101)."
+  (is-false (whitebind-address-refusal "127.0.0.1:19444")
+            "a real endpoint is accepted")
+  (is-false (whitebind-address-refusal "[::1]:19444"))
+  (is-true (search "Cannot resolve -whitebind address"
+                   (or (whitebind-address-refusal "127.0.0.1/10") "")))
+  (is-true (search "Cannot resolve -whitebind address"
+                   (or (whitebind-address-refusal "not-an-address:1234") "")))
+  (is-true (search "Need to specify a port with -whitebind"
+                   (or (whitebind-address-refusal "127.0.0.1") ""))))
+
+(test getdata-log-names-the-first-inv-as-core-does
+  "Core logs a getdata twice: the count, then the FIRST entry spelled out --
+`received getdata (%u invsz) peer=%d' and `received getdata for: %s peer=%d'
+(net_processing.cpp:4224-4229), the second through CInv::ToString
+(protocol.cpp:58-84). p2p_blocksonly.py:64 waits on the second under
+assert_debug_log, and it is the only line that says WHAT a peer asked for:
+ours logged a byte count and nothing else.
+
+The type spelling is Core's own -- `wtx' for MSG_WTX, a `witness-' prefix for
+MSG_WITNESS_FLAG -- and the hash is in uint256 display order."
+  (let* ((bl:*network* :regtest)
+         (hash (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref h 0) #x34 (aref h 1) #x12)
+                 h))
+         (peer (%g718-peer :inbound t))
+         (bl.log::*debug-categories* (let ((h (make-hash-table :test 'equal)))
+                                       (setf (gethash "net" h) t)
+                                       h))
+         (lines (capture-log-lines
+                 (lambda ()
+                   (bl.net::handle-getdata
+                    peer (tx-inv-payload bl.ser:+inv-type-wtx+ hash)
+                    (bl.ctx:make-node-context))))))
+    (is-true (find "received getdata (1 invsz)" lines :test #'search)
+             "the count line is logged")
+    (is-true (find "received getdata for: wtx 0000000000000000000000000000000000000000000000000000000000001234"
+                   lines :test #'search)
+             "and the first inv, spelled Core's way")
+    ;; The type spellings, straight from CInv::GetMessageType.
+    (flet ((desc (type) (inv-vector-description
+                         (bl.ser:make-inv-vector :type type :hash hash))))
+      (is (string= "tx 0000000000000000000000000000000000000000000000000000000000001234"
+                   (desc bl.ser:+inv-type-tx+)))
+      (is (string= "block 0000000000000000000000000000000000000000000000000000000000001234"
+                   (desc bl.ser:+inv-type-block+)))
+      (is (string= "merkleblock 0000000000000000000000000000000000000000000000000000000000001234"
+                   (desc bl.ser:+inv-type-filtered-block+)))
+      (is (string= "cmpctblock 0000000000000000000000000000000000000000000000000000000000001234"
+                   (desc bl.ser:+inv-type-cmpct-block+)))
+      (is-true (search "witness-tx " (desc bl.ser:+inv-type-witness-tx+))
+               "MSG_WITNESS_FLAG shows as Core's witness- prefix")
+      (is-true (search "0x" (desc 99))
+               "and an unknown type falls back to Core's hex form"))))
+
+(test relay-permission-reaches-every-reject-incoming-txs-site
+  "Core asks RejectIncomingTxs (net_processing.cpp:5686-5694) from three
+places, and a port that inlines it three times lets the copies drift: the
+fRelay bit of the VERSION we send (:1573), the inv handler's reject_tx_invs
+(:4134) and the tx handler (:4475). Ours had the RELAY-permission carve-out in
+the tx handler only, so a node started with `-blocksonly
+-whitelist=relay@127.0.0.1' advertised fRelay=0 to the very peer it would then
+accept transactions from -- and dropped that peer's tx INVS while accepting its
+txs. p2p_blocksonly.py:57 asserts the advertised bit.
+
+One function, asked here at all three. The controls are the two clauses the
+permission must NOT excuse: a block-relay-only and a feeler connection refuse
+txs whatever permissions they hold."
+  (let ((bl:*blocksonly* t)
+        (bl:*network* :regtest))
+    (with-whitelist (:entries '("relay@10.0.0.0/8"))
+      ;; PEER-PERMISSIONS is DERIVED from the address (Core recomputes nothing,
+      ;; but ours reads the ranges each time), so setting the address is all it
+      ;; takes for the grant to apply.
+      (flet ((peer-at (address &optional (conn-type :outbound-full-relay))
+               (let ((p (%g718-peer :conn-type conn-type :inbound t)))
+                 (setf (bl.net:peer-address p) address)
+                 p)))
+        ;; Without the permission, -blocksonly refuses at every site.
+        (let ((plain (peer-at "11.1.2.3")))
+          (is-true (reject-incoming-txs-p plain))
+          (is (= 0 (logand (bl.net:peer-permissions plain) bl.net:+perm-relay+))))
+        ;; With it, every site accepts.
+        (let ((privileged (peer-at "10.1.2.3")))
+          (is-true (bl.net:peer-has-permission-p privileged bl.net:+perm-relay+)
+                   "the fixture really did grant the permission")
+          (is-false (reject-incoming-txs-p privileged)
+                    "the relay permission excuses the -blocksonly clause"))
+        ;; ...but not the two connection-type clauses, whatever it holds.
+        (is-true (reject-incoming-txs-p (peer-at "10.1.2.3" :block-relay)))
+        (is-true (reject-incoming-txs-p (peer-at "10.1.2.3" :feeler)))
+        ;; And with -blocksonly off, an ordinary peer is accepted.
+        (let ((bl:*blocksonly* nil))
+          (is-false (reject-incoming-txs-p (peer-at "11.1.2.3"))))))))
 
 (test relay-permission-excuses-blocksonly-and-nothing-else
   "Core RejectIncomingTxs (net_processing.cpp:5686-5694): the \"relay\"

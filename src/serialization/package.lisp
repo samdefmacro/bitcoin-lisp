@@ -201,6 +201,7 @@ src/serialization/.")
    #:inv-vector-hash
    #:+inv-type-tx+
    #:+inv-type-block+
+   #:+inv-type-filtered-block+
    #:+inv-type-wtx+
    #:+inv-type-witness-tx+
    #:+inv-type-witness-block+
