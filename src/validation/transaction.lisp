@@ -1042,6 +1042,68 @@ carries the script error so it can be rendered with Core's parenthetical."
                           (%script-check-debug-string tx failed-input))))))
   (values t nil))
 
+(defun %mempool-script-passes (tx utxo-set current-height extra-coins)
+  "Both mempool script passes in Core's order — PolicyScriptChecks then
+ConsensusScriptChecks (validation.cpp:1533-1551). Returns (VALUES T NIL) or
+(VALUES NIL REASON)."
+  (multiple-value-bind (ok error)
+      (%policy-script-checks tx utxo-set extra-coins)
+    (unless ok (return-from %mempool-script-passes (values nil error))))
+  (multiple-value-bind (ok error)
+      (%consensus-script-checks tx utxo-set current-height extra-coins)
+    (unless ok (return-from %mempool-script-passes (values nil error))))
+  (values t nil))
+
+(defun mempool-script-checks (tx utxo-set mempool current-height
+                              &key package-coins)
+  "The script half of mempool acceptance for TX, run APART from its PreChecks.
+
+Core's package path is two passes over the whole package, not one pass per
+member: every member goes through PreChecks first, and only then does any
+member reach PolicyScriptChecks, so a package holding one member Core will
+reject never pays for the others' signature verification
+(AcceptMultipleTransactionsInternal, validation.cpp:1444-1474 then :1533-1551,
+\"Do all PreChecks first and fail fast to avoid running expensive script checks
+when unnecessary\"). VALIDATE-TRANSACTION-FOR-MEMPOOL with DEFER-SCRIPT-CHECKS
+is the first pass; this is the second.
+
+PACKAGE-COINS is the same table the PreChecks pass was given, so a member
+spending an earlier member's output resolves here too. Returns (VALUES T NIL)
+or (VALUES NIL REASON)."
+  (multiple-value-bind (extra-coins inputs-ok)
+      (mempool-extra-coins tx utxo-set mempool (1+ current-height) package-coins)
+    (unless inputs-ok
+      (return-from mempool-script-checks (values nil :missing-input)))
+    (%mempool-script-passes tx utxo-set current-height extra-coins)))
+
+(defun %mempool-presence-verdict (mempool tx allow-replacement)
+  "What MEMPOOL already holding something of TX's says about accepting it —
+Core PreChecks' three questions, in Core's order (validation.cpp:823-843).
+Returns the rejection keyword, or NIL when the pool has nothing to say.
+
+The first two probes say different things. The WTXID probe means we hold this
+exact transaction, byte for byte. Only if that misses does the TXID probe run,
+and a hit there means we hold a transaction with the same non-witness data
+under a different witness: the submitter's witness was replaced somewhere in
+transit, which is the only signal Core gives that malleation is happening
+(mempool_accept_wtxid.py asserts on the exact string). A txid hit is a
+superset of a wtxid hit, so a single txid probe rejects the same set — it just
+cannot tell the two apart.
+
+The third is the vin loop. A conflict with a mempool entry normally starts an
+RBF evaluation, which needs the fee and so happens much further down; with
+ALLOW-REPLACEMENT false there is nothing to evaluate and the conflict IS the
+answer, which is why Core gives it here. The position is the point: this
+verdict must not depend on the fee, on the standardness of the inputs, or on
+the scripts, none of which have been looked at yet."
+  (cond
+    ((bl.mp:mempool-get-by-wtxid mempool (bl.ser:transaction-wtxid tx))
+     :already-in-mempool)
+    ((bl.mp:mempool-has mempool (bl.ser:transaction-hash tx))
+     :same-nonwitness-data-in-mempool)
+    ((and (not allow-replacement) (bl.mp:find-rbf-conflicts mempool tx))
+     :conflict)))
+
 (defun %mempool-precheck-context-free (tx)
   "The first four checks of Core's MemPoolAccept::PreChecks (validation.cpp:
 798-815) — the ones that read only the transaction, before any chain or pool
@@ -1146,7 +1208,9 @@ the second reason."
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
                                               bypass-limits skip-rbf-check
-                                              (allow-sibling-eviction t))
+                                              (allow-sibling-eviction t)
+                                              (allow-replacement t)
+                                              defer-script-checks)
   "Validate a transaction for mempool acceptance.
 Performs consensus checks plus policy checks.
 Returns (VALUES T NIL FEE REPLACED SIGOPS MODIFIED-FEE DIRECT-CONFLICTS) on
@@ -1193,7 +1257,19 @@ ALLOW-SIBLING-EVICTION (default T, matching Core's single-transaction
 contexts, validation.cpp:487-497) lets a TRUC descendant-limit failure fall
 through to the RBF path when SINGLE-TRUC-CHECKS identifies an evictable
 sibling: the sibling is added to the conflict set and replacement economics
-decide (Core PreChecks, validation.cpp:950-970)."
+decide (Core PreChecks, validation.cpp:950-970).
+
+ALLOW-REPLACEMENT (default T) is Core's m_allow_replacement. NIL makes a
+conflict with a mempool transaction a plain rejection —
+\"bip125-replacement-disallowed\" — instead of the start of an RBF evaluation
+(validation.cpp:833-843). ATMPArgs::PackageTestAccept is the context that
+turns it off (:499-513), so testmempoolaccept never reports a package member
+as acceptable on the strength of a replacement it is not being asked to make.
+
+DEFER-SCRIPT-CHECKS returns after PreChecks, leaving the two script passes to
+MEMPOOL-SCRIPT-CHECKS. Core's package path runs PreChecks over every member
+before any member's scripts (validation.cpp:1444-1474, :1533-1551), and WHICH
+pass a member failed decides what the caller is told about the others."
   ;; 1-4, the checks that read only the transaction (Core validation.cpp:
   ;; 798-815). See %MEMPOOL-PRECHECK-CONTEXT-FREE for the order and why it is
   ;; observable.
@@ -1220,25 +1296,10 @@ decide (Core PreChecks, validation.cpp:950-970)."
         (return-from validate-transaction-for-mempool
           (values nil :non-final nil)))))
 
-  ;; 6. Already in the mempool (:823-830) — two probes, in Core's order, and
-  ;;    they say different things. The WTXID probe means we hold this exact
-  ;;    transaction, byte for byte. Only if that misses does the TXID probe
-  ;;    run, and a hit there means we hold a transaction with the same
-  ;;    non-witness data under a different witness: the submitter's witness
-  ;;    was replaced somewhere in transit, which is the only signal Core gives
-  ;;    that malleation is happening (mempool_accept_wtxid.py asserts on the
-  ;;    exact string). A txid hit is a superset of a wtxid hit, so a single
-  ;;    txid probe rejects the same set — it just cannot tell the two apart.
-  (cond
-    ((bl.mp:mempool-get-by-wtxid mempool (bl.ser:transaction-wtxid tx))
-     (return-from validate-transaction-for-mempool
-       (values nil :already-in-mempool nil)))
-    ((bl.mp:mempool-has mempool (bl.ser:transaction-hash tx))
-     (return-from validate-transaction-for-mempool
-       (values nil :same-nonwitness-data-in-mempool nil))))
-
-  ;; Conflicts with existing mempool entries are handled by BIP125 RBF after
-  ;; the fee is known (see the fee section below).
+  ;; 6. What the pool already holds (:823-843) — see %MEMPOOL-PRESENCE-VERDICT.
+  (let ((present (%mempool-presence-verdict mempool tx allow-replacement)))
+    (when present
+      (return-from validate-transaction-for-mempool (values nil present nil))))
 
   ;; Check inputs: each must reference a confirmed UTXO or an unconfirmed
   ;; in-mempool output (chained spend). EXTRA-COINS carries the latter, at
@@ -1437,15 +1498,13 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; The two script passes, Core's names (defined above this
           ;; function): STANDARD flags first, then the tip's consensus
           ;; flags to warm the cache block connection will hit. The policy
-          ;; pass carries Core's witness-stripped reclassification.
-          (multiple-value-bind (ok error)
-              (%policy-script-checks tx utxo-set extra-coins)
-            (unless ok
-              (return-from validate-transaction-for-mempool (values nil error nil))))
-          (multiple-value-bind (ok error)
-              (%consensus-script-checks tx utxo-set current-height extra-coins)
-            (unless ok
-              (return-from validate-transaction-for-mempool (values nil error nil))))
+          ;; pass carries Core's witness-stripped reclassification. A package
+          ;; caller defers them to its own second pass over every member.
+          (unless defer-script-checks
+            (multiple-value-bind (ok error)
+                (%mempool-script-passes tx utxo-set current-height extra-coins)
+              (unless ok
+                (return-from validate-transaction-for-mempool (values nil error nil)))))
 
 
           (values t nil fee-value

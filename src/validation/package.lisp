@@ -33,6 +33,7 @@ can. src/validation/.")
    #:*tx-reject-reasons*
    ;; Package relay (submitpackage + opportunistic 1p1c)
    #:validate-package-for-mempool
+   #:test-package-acceptance
    #:package-hash
    #:package-truc-checks
    #:package-well-formed
@@ -40,6 +41,7 @@ can. src/validation/.")
    #:+max-package-count+
    #:+max-package-weight+
    #:package-tx-result
+   #:make-package-tx-result
    #:package-tx-result-txid
    #:package-tx-result-wtxid
    #:package-tx-result-status

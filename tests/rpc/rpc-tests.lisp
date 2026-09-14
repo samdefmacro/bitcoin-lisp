@@ -2458,6 +2458,131 @@ once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
       ;; Still a dry run either way.
       (is (= 0 (bl.mp:mempool-count mempool))))))
 
+(test testmempoolaccept-validates-a-package-as-a-package
+  "More than one transaction is a PACKAGE, and Core validates it as one: the
+members share a coin view, so a child spending a parent that is in the same
+call — and nowhere else — is answered on its merits (validation.cpp:1473,
+m_viewmempool.PackageAddTransaction; rpc/mempool.cpp:343-346 routes anything
+longer than one transaction to ProcessNewPackage with test_accept).
+
+We validated each member independently against the mempool alone, so the
+child of an unconfirmed parent came back `missing-inputs' — the one answer a
+caller uses this RPC to avoid. Fee policy stays INDIVIDUAL here
+(m_package_feerates is false for PackageTestAccept, validation.cpp:509), so
+each member reports its own effective feerate over its own wtxid and a package
+answer equals the members' individual answers (rpc_packages.py:100)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bl.net:make-peer :state :ready)))
+           (parent (%pkg-tx funding-txid 0 99990000))
+           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
+      (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
+             (aval (row key) (cdr (assoc key row :test #'string=))))
+        (let ((r (%testmempoolaccept node (list (hex parent) (hex child)))))
+          (is (= 2 (length r)))
+          (is (eq t (aval (first r) "allowed")))
+          (is (eq t (aval (second r) "allowed"))
+              "the child of an in-package parent was judged without it")
+          ;; Each member's fees are its own: the effective feerate covers one
+          ;; wtxid, not the package's.
+          (is (equal (list (bl.crypto:bytes-to-hex
+                            (bl.crypto:reverse-bytes
+                             (bl.ser:transaction-wtxid child))))
+                     (coerce (cdr (assoc "effective-includes"
+                                         (aval (second r) "fees")
+                                         :test #'string=))
+                             'list)))
+          (is (plusp (aval (second r) "vsize"))))
+        ;; Still a dry run.
+        (is (= 0 (bl.mp:mempool-count mempool)))))))
+
+(test testmempoolaccept-reports-the-packages-own-verdict
+  "The context-free package rules judge the PACKAGE, not a member: Core states
+them in the PackageValidationState as PCKG_POLICY and rpc/mempool.cpp:360-362
+prints that state on EVERY row as `package-error', with no member reporting an
+`allowed' at all (IsWellFormedPackage, policy/packages.cpp:84-114;
+rpc_packages.py:149, :254-263, :312-317).
+
+Ours had no package phase, so a package Core refuses to look at came back with
+three ordinary per-transaction verdicts — and a reversed chain, whose child
+Core never validates, came back as `missing-inputs'."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (bl.store:add-utxo utxo-set funding-txid 1 100000000
+                       (p2sh-optrue-script-pubkey) 1 :coinbase nil)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bl.net:make-peer :state :ready)))
+           (parent (%pkg-tx funding-txid 0 99990000))
+           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000))
+           ;; Same coin, different value: a second transaction that conflicts
+           ;; with PARENT inside the package.
+           (rival (%pkg-tx funding-txid 0 99980000)))
+      (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
+             (errors (rows)
+               (mapcar (lambda (row)
+                         (cdr (assoc "package-error" row :test #'string=)))
+                       rows))
+             (allowed (rows)
+               (remove nil (mapcar (lambda (row)
+                                     (assoc "allowed" row :test #'string=))
+                                   rows))))
+        (let ((dup (%testmempoolaccept node (list (hex parent) (hex parent)))))
+          (is (equal '("package-contains-duplicates" "package-contains-duplicates")
+                     (errors dup)))
+          (is (null (allowed dup))
+              "a member of a package Core never validated carried a verdict"))
+        (let ((unsorted (%testmempoolaccept node (list (hex child) (hex parent)))))
+          (is (equal '("package-not-sorted" "package-not-sorted")
+                     (errors unsorted)))
+          (is (null (allowed unsorted))))
+        (let ((conflicting (%testmempoolaccept node (list (hex parent) (hex rival)))))
+          (is (equal '("conflict-in-package" "conflict-in-package")
+                     (errors conflicting)))
+          (is (null (allowed conflicting))))
+        ;; A well-formed package has no package-error at all.
+        (let ((ok (%testmempoolaccept node (list (hex parent) (hex child)))))
+          (is (equal '(nil nil) (errors ok))))
+        (is (= 0 (bl.mp:mempool-count mempool)))))))
+
+(test testmempoolaccept-allows-no-replacement-inside-a-package
+  "ATMPArgs::PackageTestAccept sets m_allow_replacement FALSE
+(validation.cpp:505), so a package member that conflicts with a mempool
+transaction is rejected outright — `bip125-replacement-disallowed',
+validation.cpp:839 — however good a BIP125 replacement it would be on its own.
+The same transaction asked about ALONE goes through ProcessTransaction, where
+replacement is allowed, and is accepted: rpc_packages.py:318-326 asserts both
+halves, and mempool_package_rbf.py:110 reads the package half.
+
+We validated every member as a single transaction, so testmempoolaccept said a
+package was acceptable on the strength of a replacement nobody had asked it to
+make."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (bl.store:add-utxo utxo-set funding-txid 1 100000000
+                       (p2sh-optrue-script-pubkey) 1 :coinbase nil)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bl.net:make-peer :state :ready)))
+           (original (%pkg-tx funding-txid 0 99990000 :sequence #xfffffffd))
+           (replacement (%pkg-tx funding-txid 0 99950000))
+           (independent (%pkg-tx funding-txid 1 99990000)))
+      (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
+             (aval (row key) (cdr (assoc key row :test #'string=))))
+        (bl.rpc::rpc-sendrawtransaction node (list (hex original)))
+        (is (= 1 (bl.mp:mempool-count mempool)))
+        ;; Alone: a perfectly good replacement.
+        (let ((solo (%testmempoolaccept node (list (hex replacement)))))
+          (is (eq t (aval (first solo) "allowed"))))
+        ;; In a package: refused, with Core's reason and its details, and the
+        ;; member Core never finished stays blank.
+        (let ((pkg (%testmempoolaccept node (list (hex independent)
+                                                  (hex replacement)))))
+          (is (equal '("txid" "wtxid") (mapcar #'car (first pkg))))
+          (is (eq 'yason:false (aval (second pkg) "allowed")))
+          (is (string= "bip125-replacement-disallowed"
+                       (aval (second pkg) "reject-reason")))
+          (is (string= "bip125-replacement-disallowed"
+                       (aval (second pkg) "reject-details"))))
+        ;; The original is untouched: this is a dry run either way.
+        (is (= 1 (bl.mp:mempool-count mempool)))))))
+
 (test package-client-maxfeerate-aborts-package
   "A member over submitpackage's maxfeerate aborts the WHOLE package before
 submission: that member is invalid with :max-feerate-exceeded, later members
