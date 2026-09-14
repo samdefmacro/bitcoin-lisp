@@ -250,6 +250,14 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; that is announcement-driven. Nothing clears it while the connection
   ;; lives: a fresh peer object is how a reconnect starts over.
   (headers-sync-started nil :type boolean)
+  ;; Deadline for this peer's INITIAL headers sync (Core
+  ;; Peer::m_headers_sync_timeout, net_processing.cpp:5814-5818), on the
+  ;; mockable clock in Unix seconds. NIL while no sync has been opened;
+  ;; an integer once one has; :NEVER once our header chain has caught up
+  ;; to within a day of now, which is Core's microseconds::max() -- "after
+  ;; we've caught up once, reset the timeout so we can't trigger disconnect
+  ;; later" (:6150-6153).
+  (headers-sync-timeout nil)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; Peer selected US as high-bandwidth (Core m_bip152_highbandwidth_from)
@@ -775,7 +783,7 @@ MANY peers must use RECEIVE-MESSAGE — waiting here is precisely what let one
 slow peer stall the rest.
 
 ⚠️ The residual is REAL and node-wide, not peer-local. Header sync runs on the
-SAME thread as the pump (sync-blockchain -> sync-headers-with-failover, and the
+SAME thread as the pump (sync-blockchain -> sync-headers-with-sync-peer, and the
 pump only runs after it returns), so while this waits on its chosen peer NO peer
 is drained. Its bound is loose too: sync-headers' attempt counter only advances
 on a silent peer, so one that keeps sending anything else runs 30 attempts x 5s
@@ -821,6 +829,24 @@ connect -> getheaders -> disconnect -> reconnect loop every 30 seconds against
 a peer the operator explicitly pinned. Feelers and inbound are excluded too."
   (and (not (peer-inbound peer))
        (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
+       t))
+
+(defun peer-preferred-download-p (peer)
+  "Core CNodeState::fPreferredDownload, assigned once at VERACK
+(net_processing.cpp:3750): `(!IsInboundConn() || HasPermission(NoBan)) &&
+!IsAddrFetchConn() && CanServeBlocks(peer)\'. Derived here rather than stored,
+because every input is already a property of the peer.
+
+It is the set the headers-download timeout counts: a stalling sync peer is
+dropped only when there is ANOTHER preferred-download peer to ask instead
+(net_processing.cpp:6128), so a node whose peers are all inbound keeps its
+sync peer -- Core: \"we have bigger problems if we can\'t get any outbound
+peers\"."
+  (and (or (not (peer-inbound peer))
+           (peer-has-permission-p peer +perm-noban+))
+       (not (eq (peer-conn-type peer) :addr-fetch))
+       (logtest (peer-services peer)
+                (logior bl.ser:+node-network+ bl.ser:+node-network-limited+))
        t))
 
 (defun peer-expects-services-p (peer)

@@ -2457,7 +2457,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
         (set-ibd-state :syncing-blocks)
         (progn
           (set-ibd-state :syncing-headers)
-          (sync-headers-with-failover peers chain-state ctx
+          (sync-headers-with-sync-peer peers chain-state ctx
                                       :recent-rejects recent-rejects
                                       :utxo-set utxo-set
                                       :block-store block-store
@@ -2703,9 +2703,15 @@ Asking a peer for headers here returns zero and costs a full round trip."
     (ibd-context-blocks-received ctx))))
 
 (defun %best-header-entry (chain-state)
-  "The highest-height entry in the block index (the header tip)."
+  "The highest-height entry in the block index (the header tip).
+
+The floor is -1, not 0: a node that has only loaded genesis has exactly ONE
+entry, at height 0, and a floor of 0 answered NIL for it -- so every caller
+(the two locators, the 24-hour carve-out, the headers-download timeout) treated
+a fresh node as having no header chain at all. Core's m_best_header is the
+genesis index entry at that point, never null (validation.cpp LoadBlockIndex)."
   (let ((best-entry nil)
-        (best-height 0))
+        (best-height -1))
     (maphash (lambda (hash entry)
                (declare (ignore hash))
                (when (> (bl.store:block-index-entry-height entry) best-height)
@@ -2790,6 +2796,75 @@ one at a time. A header-less synthetic index entry is not recent."
             (- (bl.ser:get-unix-time) (* 24 60 60)))
          t)))
 
+(defconstant +headers-download-timeout-base-seconds+ (* 15 60)
+  "Core HEADERS_DOWNLOAD_TIMEOUT_BASE (15min, net_processing.cpp:97): the fixed
+half of the budget the one peer we opened header sync with has to deliver a
+header chain.")
+
+(defconstant +headers-download-timeout-ms-per-header+ 1
+  "Core HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER (1ms, net_processing.cpp:98): the
+variable half, charged per header we EXPECT to be behind -- the age of our best
+header divided by the target spacing. A node resuming after a year owes the peer
+more time than one a block behind.")
+
+(defun %headers-download-timeout (chain-state now)
+  "Core's `current_time + HEADERS_DOWNLOAD_TIMEOUT_BASE + 1ms *
+(now - m_best_header->Time()) / nPowTargetSpacing' (net_processing.cpp:5814-5818),
+in whole seconds on the mockable clock.
+
+The expected-header count is the age of our best header over the target
+spacing; each costs a millisecond. Rounded UP so a deadline this node computes
+is never LATER than the one Core's own test derives (p2p_initial_headers_sync.py
+:37-44 uses math.ceil for the same reason)."
+  (let* ((best (%best-header-entry chain-state))
+         (header (and best (bl.store:block-index-entry-header best)))
+         (age (if header
+                  (max 0 (- now (bl.ser:block-header-timestamp header)))
+                  0))
+         (expected (floor age (bl.chain:chain-pow-target-spacing bl:*network*))))
+    (+ now +headers-download-timeout-base-seconds+
+       (ceiling (* expected +headers-download-timeout-ms-per-header+) 1000))))
+
+(defun headers-sync-started-count (peers)
+  "Core's nSyncStarted: how many LIVE peers hold the fSyncStarted latch
+(net_processing.cpp:847 and the FinalizeNode decrement at :1695-1696). Ours is
+a count over the peer list rather than a counter, so a peer that left took its
+latch with it by construction -- but a peer already marked :disconnected and
+not yet reaped must not keep the slot, or the node stops opening header sync
+with anyone."
+  (count-if (lambda (p)
+              (and (peer-headers-sync-started p) (peer-live-p p)))
+            peers))
+
+(defun open-header-sync (peer chain-state)
+  "Open header sync with PEER: send Core's initial getheaders, set fSyncStarted
+and arm the headers-download timeout (net_processing.cpp:5797-5821). Returns T
+when the request actually went out.
+
+The locator starts ONE BLOCK BACK from our header tip, which is Core's
+GetLocator(pindexBestHeader->pprev) and its reason: `this ensures that we always
+get a non-empty list of headers back as long as the peer is up-to-date', so the
+already-known fast path can record the peer's best block without a transfer."
+  (let* ((best (%best-header-entry chain-state))
+         (start (or (and best (bl.store:block-index-entry-prev-entry best)) best))
+         (locator (%locator-from-entry start chain-state)))
+    (when locator
+      ;; Through the throttle, as Core does -- `if (MaybeSendGetHeaders(node,
+      ;; GetLocator(pindexStart), peer))\' at :5810 -- so the latch is set only
+      ;; when a request actually went out, and the follow-up sync-headers on the
+      ;; same pass does not send a second one.
+      (when (ignore-errors (%maybe-send-getheaders peer locator))
+        (setf (peer-headers-sync-started peer) t
+              (peer-headers-sync-timeout peer)
+              (%headers-download-timeout chain-state (bl.ser:get-unix-time)))
+        ;; Core's own line, which p2p_initial_headers_sync.py:126 reads out of
+        ;; debug.log to know the sync was opened with THAT peer.
+        (bl:log-cat "net" "initial getheaders (~D) to peer=~D (startheight:~D)"
+                    (if start (bl.store:block-index-entry-height start) 0)
+                    (peer-id peer)
+                    (peer-start-height peer))
+        t))))
+
 (defun broadcast-initial-getheaders (peers chain-state)
   "Send the INITIAL getheaders — locator one block back from our header tip —
 to every ready peer we have not opened header sync with yet. Phase 1 learned
@@ -2833,24 +2908,14 @@ the gate cannot simply be `one peer, always'. In IBD the rotation away from a
 silent peer is SYNC-HEADERS-WITH-FAILOVER's, not this function's; Core's own
 rotation is the headers-download timeout (net_processing.cpp:6125-6146), which
 this tree does not have."
-  (let ((locator (build-header-locator-pprev chain-state))
-        ;; Core's nSyncStarted: the number of peers whose fSyncStarted is set
-        ;; (net_processing.cpp:826-827). Ours is the same count taken over the
-        ;; LIVE peer list -- a peer that left took its latch with it, which is
-        ;; what Core's FinalizeNode decrement does (net_processing.cpp:1695).
-        (sync-started (count-if #'peer-headers-sync-started peers))
+  (let ((sync-started (headers-sync-started-count peers))
         (best-header-recent (%best-header-is-recent-p chain-state)))
-    (when locator
-      (dolist (peer peers)
-        (when (and (header-sync-candidate-p peer)
-                   (not (peer-headers-sync-started peer))
-                   (or best-header-recent (zerop sync-started)))
-          (setf (peer-headers-sync-started peer) t)
-          (incf sync-started)
-          (ignore-errors
-           (send-message
-            peer
-            (bl.ser:make-getheaders-message locator))))))))
+    (dolist (peer peers)
+      (when (and (header-sync-candidate-p peer)
+                 (not (peer-headers-sync-started peer))
+                 (or best-header-recent (zerop sync-started)))
+        (when (open-header-sync peer chain-state)
+          (incf sync-started))))))
 
 ;;; --- Outbound chain-sync eviction (Core ConsiderEviction) ---
 ;;;
@@ -3682,7 +3747,7 @@ silence would rotate away from every healthy peer the moment we caught up."
                                            block-store fee-estimator)
   "Kick header sync with PEER, WITHOUT owning the message pump. Returns
 (values received-count stalled-p); STALLED-P is true when the peer never
-answered, the signal sync-headers-with-failover uses to rotate.
+answered, the signal the caller records for the peer it drives.
 
 This used to be a blocking request/response loop: send getheaders, then sit in
 receive-message-blocking on this one peer for up to 30 x 5s per batch. It runs
@@ -3769,34 +3834,104 @@ keeping. Core has no header-sync loop at all for the same reason."
                    received never-answered)
       (values received never-answered))))
 
-(defun sync-headers-with-failover (peers chain-state ctx
-                                   &key recent-rejects (sync-fn #'sync-headers)
-                                        utxo-set block-store fee-estimator)
-  "Run header sync against ready PEERS in descending start-height order,
-rotating to the next peer whenever one STALLS (sync-fn's 2nd value true),
-and stopping at the first that answers. Returns the peer that responded, or
-NIL if every ready peer stalled / none were ready. SYNC-FN is injectable so
-the rotation logic is testable without network I/O. The full node context
-(CTX + UTXO-SET/BLOCK-STORE/FEE-ESTIMATOR) is threaded to SYNC-FN so its
+(defun header-sync-peer (peers chain-state)
+  "The ONE peer this node is driving header sync with, or NIL -- Core's
+`if (!state.fSyncStarted && CanServeBlocks(peer) && ...)' guarded by
+`(nSyncStarted == 0 && sync_blocks_and_headers_from_peer) ||
+m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
+(net_processing.cpp:5797-5799). Opens a sync (fSyncStarted + the
+headers-download timeout) when none is open and the guard allows one.
+
+The order is Core's: m_nodes is walked oldest connection first, which is
+ascending peer id. It replaced a descending-start-height sort, which was the
+right rule for a rotation that moved on at the first silence and the wrong one
+for a single sync peer -- Core does not rank its candidates at all, and
+p2p_initial_headers_sync.py:176 requires the peer whose noban timeout was just
+reset to be reconsidered before a later-connected one."
+  (let ((candidates (stable-sort (remove-if-not #'header-sync-candidate-p
+                                                (copy-list peers))
+                                 #'< :key #'peer-id)))
+    (or (find-if #'peer-headers-sync-started candidates)
+        (when (or (%best-header-is-recent-p chain-state)
+                  (zerop (headers-sync-started-count peers)))
+          (let ((peer (first candidates)))
+            (when (and peer (open-header-sync peer chain-state))
+              peer))))))
+
+(defun sync-headers-with-sync-peer (peers chain-state ctx
+                                    &key recent-rejects (sync-fn #'sync-headers)
+                                         utxo-set block-store fee-estimator)
+  "Drive header sync with the single peer HEADER-SYNC-PEER names, and return it
+(NIL when there is none). SYNC-FN is injectable so the selection is testable
+without network I/O. The full node context (CTX +
+UTXO-SET/BLOCK-STORE/FEE-ESTIMATOR) is threaded to SYNC-FN so its
 interleaved-message drains can serve tx getdata and process blocks.
 
-Fixes the single-peer header-sync freeze: run-ibd previously synced from one
-peer chosen by start-height (frozen at handshake), with no failover — a quiet
-or dead-fork peer was re-picked every cycle and pinned the tip for hours."
-  (dolist (peer (sort (copy-list peers) #'> :key #'peer-start-height) nil)
-    (when *ibd-stop-requested*
-      (return nil))
-    (when (header-sync-candidate-p peer)
-      (setf (ibd-context-header-sync-peer ctx) peer)
-      (multiple-value-bind (count stalled)
-          (funcall sync-fn peer chain-state
-                   :recent-rejects recent-rejects
-                   :ctx ctx
-                   :utxo-set utxo-set
-                   :block-store block-store
-                   :fee-estimator fee-estimator)
-        (declare (ignore count))
-        (unless stalled (return peer))))))
+ONE PEER, and no rotation on silence. This used to try every ready peer in
+descending start-height order and move on whenever one stalled, so a node in
+IBD sent a getheaders to EVERY peer on every pass; p2p_initial_headers_sync.py
+:90-95 connects two more peers after the first and asserts that neither sees
+one. Core asks exactly one peer until the header chain is within a day of now
+(the carve-out in HEADER-SYNC-PEER), and its rotation away from a stalling peer
+is the headers-download timeout -- CONSIDER-HEADERS-SYNC-TIMEOUTS, which drops
+the peer and frees the latch -- not the next pass."
+  (unless *ibd-stop-requested*
+    (let ((peer (header-sync-peer peers chain-state)))
+      (when peer
+        (setf (ibd-context-header-sync-peer ctx) peer)
+        (funcall sync-fn peer chain-state
+                 :recent-rejects recent-rejects
+                 :ctx ctx
+                 :utxo-set utxo-set
+                 :block-store block-store
+                 :fee-estimator fee-estimator)
+        peer))))
+
+(defun consider-headers-sync-timeouts (peers chain-state now)
+  "Core's headers-download timeout sweep (net_processing.cpp:6124-6155), run
+once per pass over the whole peer set. Returns the list of (peer . verdict)
+pairs it acted on, verdict being :DISCONNECTED, :RESET or :CAUGHT-UP.
+
+The rule has three arms and all three matter:
+
+  * our header chain is within a day of now -- the sync succeeded, so the
+    timeout is retired for the life of the connection (`after we've caught up
+    once, reset the timeout so we can't trigger disconnect later', :6150-6153);
+  * the budget is spent, this is our ONLY sync peer, and there is another
+    preferred-download peer to ask instead -- drop it;
+  * ...unless it holds NoBan, in which case Core keeps the connection and
+    releases the latch instead, so the next pass opens sync with someone else.
+
+Without the `nSyncStarted == 1 and another preferred-download peer' guard a
+node whose peers are all inbound would disconnect the only peer it has."
+  (let ((acted '())
+        (recent (%best-header-is-recent-p chain-state))
+        (started (headers-sync-started-count peers))
+        (preferred (count-if #'peer-preferred-download-p peers)))
+    (dolist (peer peers acted)
+      (let ((deadline (peer-headers-sync-timeout peer)))
+        (when (and (peer-headers-sync-started peer)
+                   (integerp deadline))
+          (cond
+            (recent
+             (setf (peer-headers-sync-timeout peer) :never)
+             (push (cons peer :caught-up) acted))
+            ((and (> now deadline)
+                  (= started 1)
+                  (>= (- preferred (if (peer-preferred-download-p peer) 1 0)) 1))
+             (cond
+               ((peer-has-permission-p peer +perm-noban+)
+                (bl:log-info "Timeout downloading headers from noban peer, not ~A"
+                             (disconnect-msg peer))
+                (setf (peer-headers-sync-started peer) nil
+                      (peer-headers-sync-timeout peer) 0)
+                (decf started)
+                (push (cons peer :reset) acted))
+               (t
+                (bl:log-info "Timeout downloading headers, ~A" (disconnect-msg peer))
+                (disconnect-peer peer)
+                (decf started)
+                (push (cons peer :disconnected) acted))))))))))
 
 (defvar *forensic-store-from-height* nil
   "Debug: when set to an integer N, store every received block at

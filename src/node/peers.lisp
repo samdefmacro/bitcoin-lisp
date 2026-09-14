@@ -1265,6 +1265,17 @@ run at tip — exactly where eclipse resistance matters."
   (let ((now (bl.ser:get-unix-time)))
     (let ((chain-state (node-current-chainstate node)))
       (when chain-state
+        ;; Core checks the headers-download timeout in the same SendMessages
+        ;; pass, immediately above ConsiderEviction (net_processing.cpp:6124-6159).
+        ;; Whole-set rather than per-peer because the rule counts the set: it
+        ;; fires only when this is our ONLY headers-sync peer and there is
+        ;; another preferred-download peer to open one with.
+        (handler-case
+            (bl.net:consider-headers-sync-timeouts
+             (bt:with-recursive-lock-held ((node-lock node))
+               (copy-list (node-peers node)))
+             chain-state now)
+          (error (e) (log-warn "Headers-sync timeout sweep failed: ~A" e)))
         (dolist (peer (node-peers node))
           (handler-case
               (bl.net:consider-chain-sync-eviction

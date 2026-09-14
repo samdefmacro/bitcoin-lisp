@@ -1396,68 +1396,213 @@ of them needed the same fix."
       (is (null valid-headers))
       (is (null error)))))
 
-;;;; Header-sync peer failover (the testnet4 at-tip stall fix)
+;;;; One headers-sync peer (Core nSyncStarted / fSyncStarted) and the
+;;;; headers-download timeout that rotates away from it.
 
-(test header-sync-failover-rotates-past-stalled-peers
-  "sync-headers-with-failover tries ready peers in descending start-height
-order and rotates past any that STALL, stopping at the first that answers."
-  (let* ((ctx (%ibd-ctx))
-         ;; Three ready peers; the two highest-start-height ones stall.
-         (p-hi  (bl.net:make-peer :state :ready :start-height 900
-                                  :services bl.ser:+node-network+))
-         (p-mid (bl.net:make-peer :state :ready :start-height 800
-                                  :services bl.ser:+node-network+))
-         (p-lo  (bl.net:make-peer :state :ready :start-height 700
-                                  :services bl.ser:+node-network+))
-         (tried '())
-         ;; Stub: p-hi and p-mid stall (values 0 t); p-lo answers (values 3 nil).
-         (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
-                    (declare (ignore chain-state recent-rejects))
-                    (push peer tried)
-                    (if (eq peer p-lo) (values 3 nil) (values 0 t)))))
-    (let ((winner (bl.net::sync-headers-with-failover
-                   (list p-lo p-hi p-mid) nil ctx :sync-fn sync-fn)))
-      ;; Stopped at the first non-stalled peer.
-      (is (eq p-lo winner))
-      ;; Tried in start-height order hi -> mid -> lo, then stopped.
-      (is (equal (list p-hi p-mid p-lo) (nreverse tried)))
-      ;; header-sync-peer left pointing at the peer that answered.
-      (is (eq p-lo (bl.net::ibd-context-header-sync-peer ctx))))))
+(defun %hs-drive (peers chain ctx sync-fn)
+  "Drive one header-sync pass. One reach for the whole file (the :: ratchet)."
+  (bl.net::sync-headers-with-sync-peer peers chain ctx :sync-fn sync-fn))
 
-(test header-sync-failover-first-peer-answers
-  "When the highest-start-height peer answers, no rotation happens."
-  (let* ((ctx (%ibd-ctx))
-         (p-hi (bl.net:make-peer :state :ready :start-height 900
-                                 :services bl.ser:+node-network+))
-         (p-lo (bl.net:make-peer :state :ready :start-height 700
-                                 :services bl.ser:+node-network+))
-         (calls 0)
-         (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
-                    (declare (ignore peer chain-state recent-rejects))
-                    (incf calls) (values 10 nil))))
-    (is (eq p-hi (bl.net::sync-headers-with-failover
-                  (list p-lo p-hi) nil ctx :sync-fn sync-fn)))
-    (is (= 1 calls))))   ; stopped after the first peer
+(defun %hs-started-p (peer)
+  "Core CNodeState::fSyncStarted for PEER."
+  (bl.net::peer-headers-sync-started peer))
 
-(test header-sync-failover-all-stalled-and-skips-nonready
-  "All-stalled returns NIL; non-:ready peers are skipped entirely."
-  (let* ((ctx (%ibd-ctx))
-         (ready (bl.net:make-peer :state :ready :start-height 500
-                                  :services bl.ser:+node-network+))
-         (dead  (bl.net:make-peer :state :disconnected :start-height 999
-                                  :services bl.ser:+node-network+))
-         (tried '())
-         (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
-                    (declare (ignore chain-state recent-rejects))
-                    (push peer tried) (values 0 t))))
-    ;; All ready peers stall -> NIL.
-    (is (null (bl.net::sync-headers-with-failover
-               (list ready) nil ctx :sync-fn sync-fn)))
-    ;; The disconnected peer (higher start-height) is never tried.
-    (setf tried '())
-    (bl.net::sync-headers-with-failover
-     (list ready dead) nil ctx :sync-fn sync-fn)
-    (is (equal (list ready) (nreverse tried)))))
+(defun %hs-deadline (peer)
+  "Core Peer::m_headers_sync_timeout for PEER."
+  (bl.net::peer-headers-sync-timeout peer))
+
+(defun %hs-arm (peer deadline)
+  "Put PEER in the state Core's initial getheaders leaves behind: the latch
+set and the headers-download timeout at DEADLINE."
+  (setf (bl.net::peer-headers-sync-started peer) t
+        (bl.net::peer-headers-sync-timeout peer) deadline))
+
+(defun %hs-budget (chain now)
+  "The headers-download deadline Core would compute for CHAIN at NOW."
+  (bl.net::%headers-download-timeout chain now))
+
+(defun %hs-chain (&key (genesis-time 1296688600))
+  "A chain-state holding one genesis index entry whose header carries
+GENESIS-TIME, which is what the headers-sync guard and the download timeout
+both read."
+  (let* ((zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (state (bl.store:make-chain-state))
+         (genesis (bl.store:make-block-index-entry
+                   :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid
+                   :header (bl.ser:make-block-header
+                            :version 1 :prev-block zeros :merkle-root zeros
+                            :timestamp genesis-time :bits #x207fffff :nonce 0
+                            :cached-hash (%bd-hash 0)))))
+    (bl.store:add-block-index-entry state genesis)
+    (bl.store:update-chain-tip state (%bd-hash 0) 0)
+    state))
+
+(defun %hs-peer (id &key (start-height 100) inbound (conn-type :outbound-full-relay)
+                         (address "198.51.100.1"))
+  (bl.net:make-peer :state :ready :start-height start-height
+                    :id id :address address :inbound inbound
+                    :conn-type conn-type
+                    :services (logior bl.ser:+node-network+ bl.ser:+node-witness+)))
+
+(test header-sync-opens-with-exactly-one-peer-while-the-chain-is-old
+  "Core's SendMessages opens header sync with ONE peer while our best header is
+older than a day: `(nSyncStarted == 0 && sync_blocks_and_headers_from_peer) ||
+m_best_header->Time() > now - 24h' (net_processing.cpp:5799), and the latch
+keeps it there. p2p_initial_headers_sync.py:90-95 connects two more peers after
+the first and asserts NEITHER receives a getheaders."
+  (with-network (:regtest)
+    (let* ((ctx (%ibd-ctx))
+           (chain (%hs-chain))
+           (p0 (%hs-peer 0))
+           (p1 (%hs-peer 1))
+           (p2 (%hs-peer 2))
+           (peers (list p2 p0 p1))            ; list order is not id order
+           (driven '()))
+      (flet ((drive ()
+               (%hs-drive peers chain ctx
+                          (lambda (peer chain-state &key &allow-other-keys)
+                            (declare (ignore chain-state))
+                            (push peer driven)
+                            (values 0 t)))))
+        ;; First pass: one peer, and it is the oldest connection (Core walks
+        ;; m_nodes, which is ascending peer id).
+        (is (eq p0 (drive)))
+        ;; A stall does NOT rotate: the same peer is driven again.
+        (is (eq p0 (drive)))
+        (is (equal (list p0 p0) (nreverse driven)))
+        (is (= 1 (count-if #'%hs-started-p peers))
+            "exactly one peer holds Core's fSyncStarted")
+        (is-false (%hs-started-p p1))
+        (is-false (%hs-started-p p2))))))
+
+(test header-sync-opens-with-every-peer-once-the-chain-is-recent
+  "The 24-hour carve-out: with our best header at today's tip, Core drops the
+one-at-a-time rule and every candidate is asked, which is what a live node at
+its tip needs (p2p_add_connections.py)."
+  (with-network (:regtest)
+    (let* ((ctx (%ibd-ctx))
+           (chain (%hs-chain :genesis-time (bl.ser:get-unix-time)))
+           (p0 (%hs-peer 0))
+           (p1 (%hs-peer 1))
+           (peers (list p0 p1)))
+      (%hs-drive peers chain ctx
+                 (lambda (peer chain-state &key &allow-other-keys)
+                   (declare (ignore peer chain-state)) (values 0 t)))
+      (bl.net::broadcast-initial-getheaders peers chain)
+      (is (= 2 (count-if #'%hs-started-p peers))
+          "both peers are asked once the header chain is within a day of now"))))
+
+(test header-sync-reopens-once-the-sync-peer-is-gone
+  "Core decrements nSyncStarted in FinalizeNode (net_processing.cpp:1695-1696),
+so the slot a departed peer held is free again. Ours counts the latch over the
+LIVE peers, which is the same thing -- and a peer already marked :disconnected
+and not yet reaped must not keep it."
+  (with-network (:regtest)
+    (let* ((ctx (%ibd-ctx))
+           (chain (%hs-chain))
+           (p0 (%hs-peer 0))
+           (p1 (%hs-peer 1))
+           (peers (list p0 p1)))
+      (flet ((drive ()
+               (%hs-drive peers chain ctx
+                          (lambda (peer chain-state &key &allow-other-keys)
+                            (declare (ignore peer chain-state)) (values 0 t)))))
+        (is (eq p0 (drive)))
+        ;; While p0 lives, p1 is never opened.
+        (is (eq p0 (drive)))
+        (setf (bl.net:peer-state p0) :disconnected)
+        (is (eq p1 (drive)) "the slot frees when the sync peer goes")))))
+
+(test header-sync-honors-stop-request
+  "With a stop requested, no peer is driven and no sync is opened."
+  (with-network (:regtest)
+    (let* ((ctx (%ibd-ctx))
+           (chain (%hs-chain))
+           (peer (%hs-peer 0))
+           (calls 0))
+      (let ((bl.net::*ibd-stop-requested* t))
+        (is (null (%hs-drive (list peer) chain ctx
+                             (lambda (p cs &key &allow-other-keys)
+                               (declare (ignore p cs))
+                               (incf calls) (values 10 nil))))))
+      (is (= 0 calls))
+      (is-false (%hs-started-p peer)))))
+
+(test headers-download-timeout-is-core-base-plus-a-millisecond-per-header
+  "Core HEADERS_DOWNLOAD_TIMEOUT_BASE (15min) + HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER
+(1ms) x (now - m_best_header->Time()) / nPowTargetSpacing
+(net_processing.cpp:97-98, :5814-5818)."
+  (with-network (:regtest)
+    (let* ((now 2000000000)
+           ;; 600,000 seconds behind = 1000 expected headers = 1 second.
+           (chain (%hs-chain :genesis-time (- now 600000))))
+      (is (= (+ now 900 1) (%hs-budget chain now)))
+      ;; A best header AT now owes nothing beyond the base.
+      (is (= (+ now 900)
+             (%hs-budget (%hs-chain :genesis-time now) now))))))
+
+(test headers-download-timeout-drops-the-only-sync-peer
+  "Core: `current_time > m_headers_sync_timeout && nSyncStarted == 1 &&
+(m_num_preferred_download_peers - state.fPreferredDownload >= 1)' disconnects
+the stalling sync peer (net_processing.cpp:6128-6136). p2p_initial_headers_sync.py
+:152 reads the line out of debug.log."
+  (with-network (:regtest)
+    (let* ((chain (%hs-chain))
+           (now (bl.ser:get-unix-time))
+           ;; The sync peer is INBOUND, so it is not itself a preferred-download
+           ;; peer -- exactly the test's shape.
+           (sync-peer (%hs-peer 0 :inbound t :conn-type :inbound
+                                  :address "198.51.100.10"))
+           (other (%hs-peer 1 :address "198.51.100.11")))
+      (%hs-arm sync-peer (- now 1))
+      ;; Control: with no other preferred-download peer, Core keeps it.
+      (is (null (bl.net:consider-headers-sync-timeouts (list sync-peer) chain now))
+          "the only peer we have is never dropped for a headers timeout")
+      (is (eq :ready (bl.net:peer-state sync-peer)))
+      ;; With one, it goes.
+      (let ((acted (bl.net:consider-headers-sync-timeouts
+                    (list sync-peer other) chain now)))
+        (is (equal (list (cons sync-peer :disconnected)) acted)))
+      (is (eq :disconnected (bl.net:peer-state sync-peer))))))
+
+(test headers-download-timeout-keeps-a-noban-peer-and-frees-the-latch
+  "Core's noban arm: the connection is kept and fSyncStarted/nSyncStarted are
+released instead, so the next pass can open header sync elsewhere
+(net_processing.cpp:6139-6147)."
+  (with-network (:regtest)
+    (let ((bl.net:*whitelist-entries*
+            (list (bl.net:parse-whitelist-entry "noban@192.168.0.0/16"))))
+      (let* ((chain (%hs-chain))
+             (now (bl.ser:get-unix-time))
+             (sync-peer (%hs-peer 0 :inbound t :conn-type :inbound
+                                    :address "192.168.0.7"))
+             (other (%hs-peer 1 :address "198.51.100.11")))
+        (%hs-arm sync-peer (- now 1))
+        (is (equal (list (cons sync-peer :reset))
+                   (bl.net:consider-headers-sync-timeouts
+                    (list sync-peer other) chain now)))
+        (is (eq :ready (bl.net:peer-state sync-peer))
+            "a noban peer survives its own headers timeout")
+        (is-false (%hs-started-p sync-peer))
+        (is (= 0 (%hs-deadline sync-peer)))))))
+
+(test a-caught-up-header-chain-retires-the-headers-download-timeout
+  "Core: `after we've caught up once, reset the timeout so we can't trigger
+disconnect later' (net_processing.cpp:6150-6153) -- the peer can never be
+dropped for a headers timeout again, however far behind we fall."
+  (with-network (:regtest)
+    (let* ((now (bl.ser:get-unix-time))
+           (chain (%hs-chain :genesis-time now))
+           (sync-peer (%hs-peer 0 :inbound t :conn-type :inbound))
+           (other (%hs-peer 1 :address "198.51.100.11")))
+      (%hs-arm sync-peer (- now 1))
+      (is (equal (list (cons sync-peer :caught-up))
+                 (bl.net:consider-headers-sync-timeouts
+                  (list sync-peer other) chain now)))
+      (is (eq :ready (bl.net:peer-state sync-peer)))
+      ;; And it stays retired: a later sweep with an OLD chain does nothing.
+      (is (null (bl.net:consider-headers-sync-timeouts
+                 (list sync-peer other) (%hs-chain) (+ now 100000)))))))
 
 ;;;; Shutdown stop flag
 ;;;;
@@ -1465,20 +1610,6 @@ order and rotates past any that STALL, stopping at the first that answers."
 ;;;; flips node-running but run-ibd's inner loops never checked it and
 ;;;; ran until SIGKILL. *ibd-stop-requested* (set by stop-node via
 ;;;; request-ibd-stop) must make the IBD loops exit within seconds.
-
-(test header-sync-failover-honors-stop-request
-  "With a stop requested, the rotation exits before trying any peer."
-  (let* ((ctx (%ibd-ctx))
-         (ready (bl.net:make-peer :state :ready :start-height 500
-                                  :services bl.ser:+node-network+))
-         (calls 0)
-         (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
-                    (declare (ignore peer chain-state recent-rejects))
-                    (incf calls) (values 10 nil))))
-    (let ((bl.net::*ibd-stop-requested* t))
-      (is (null (bl.net::sync-headers-with-failover
-                 (list ready) nil ctx :sync-fn sync-fn))))
-    (is (= 0 calls))))
 
 (test run-ibd-honors-stop-request
   "run-ibd with pending work and a stop requested returns immediately
@@ -4990,15 +5121,15 @@ every ready peer, and the Phase-1 header sync picked the only one there was."
                                 :services 0)))
     ;; The behavioural assertions first, so the control run reports THEM and
     ;; not an undefined new symbol.
-    (let ((ctx (%ibd-ctx)))
+    (let ((ctx (%ibd-ctx))
+          (chain (%hs-chain)))
       (flet ((tried (peers)
                (let ((seen '()))
-                 (bl.net::sync-headers-with-failover
-                  peers nil ctx
-                  :sync-fn (lambda (peer chain-state &key &allow-other-keys)
-                             (declare (ignore chain-state))
-                             (push peer seen)
-                             (values 1 nil)))
+                 (%hs-drive peers chain ctx
+                            (lambda (peer chain-state &key &allow-other-keys)
+                              (declare (ignore chain-state))
+                              (push peer seen)
+                              (values 1 nil)))
                  (nreverse seen))))
         (is (null (tried (list fetch)))
             "Phase 1 never opens a header sync with an addr-fetch peer")

@@ -170,6 +170,7 @@ headerssync.cpp. src/networking/.")
    #:handle-message
    #:ingest-headers-from-peer
    #:header-sync-candidate-p
+   #:consider-headers-sync-timeouts
    #:broadcast-initial-getheaders
    #:handle-validation-failure
    #:peer-last-getheaders-time
