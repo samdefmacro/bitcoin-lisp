@@ -408,12 +408,19 @@ separators and traversal, not about the alphabet.
 ⚠️ Core additionally accepts an ABSOLUTE PATH and creates the wallet there
 (wallet_crosschain.py uses one). That is deliberately still refused: it is the
 one form that puts wallet files outside the datadir, and it is a widening of
-where this process writes rather than of what it will call a wallet."
+where this process writes rather than of what it will call a wallet.
+
+⚠️ A BACKSLASH is an ordinary filename character here. It is a separator only
+on Windows, and Core says so in its own tests: feature_notifications.py:24
+disallows `/\\?%*:|\"<>' on Windows and `/' alone everywhere else, then builds
+a wallet name out of every remaining byte from 1 to 127 -- backslash included.
+Refusing it was a Windows rule applied on a POSIX filesystem, and it refused a
+name Core creates."
   (and (stringp name)
        (plusp (length name))
        (not (member name '("." "..") :test #'string=))
        (notany (lambda (ch)
-                 (or (char= ch #\/) (char= ch #\\) (char= ch (code-char 0))))
+                 (or (char= ch #\/) (char= ch (code-char 0))))
                name)))
 
 ;;; --- SPKM key management ---

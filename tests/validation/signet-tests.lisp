@@ -282,3 +282,30 @@ the PUBLIC signet's wire."
         (is (null (bl.chain:chain-params-override :signet)))
         (is (equal '("seed.signet.bitcoin.sprovoost.nl" "seed.signet.achownodes.xyz")
                    (bl.chain:network-dns-seeds :signet)))))))
+
+(test signet-message-start-is-derived-from-the-challenge
+  "A signet's message start IS its identity: Core derives it as the first four
+bytes of the double-SHA256 of the challenge serialized as a byte vector
+(SigNetParams, kernel/chainparams.cpp:507-511), so two signets with different
+-signetchallenge values cannot exchange a single message.
+
+Ours was the chain-params constant whatever -signetchallenge said, so every
+custom signet spoke on the PUBLIC signet's magic -- feature_signet.py runs five
+nodes on three challenges and expects them not to connect across."
+  (let* ((default bl.val::*default-signet-challenge*)
+         (other (bl.crypto:hex-to-bytes
+                 "512102f7561d208dd9ae99bf497273e16f389bcd2341ab7bc86f6d2a6ffd0fb34f0d0d51ae"))
+         ;; The length prefix is part of the preimage, not an afterthought.
+         (shorter (subseq default 0 (1- (length default)))))
+    ;; Control: the default challenge must reproduce the shipped constant,
+    ;; which is what proves the derivation is Core's and not merely consistent.
+    (is (equalp (bl.chain:network-magic :signet)
+                (bl.val:signet-derived-magic default))
+        "the default challenge must derive the public signet's magic")
+    (is (not (equalp (bl.val:signet-derived-magic other)
+                     (bl.val:signet-derived-magic default)))
+        "a custom challenge must not share the public signet's magic")
+    (is (= 4 (length (bl.val:signet-derived-magic other))))
+    (is (not (equalp (bl.val:signet-derived-magic shorter)
+                     (bl.val:signet-derived-magic default)))
+        "the challenge's length is part of the preimage")))

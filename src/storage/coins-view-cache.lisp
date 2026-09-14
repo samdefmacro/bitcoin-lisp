@@ -1062,14 +1062,29 @@ in gettxoutsetinfo)."
         (coins-view-cache (%coin-view-iterate view #'collect)))
       (emit-group))))
 
+(defconstant +bogo-size-overhead+ 50
+  "Core GetBogoSize's fixed part (kernel/coinstats.cpp:36-44): 32 (txid) +
+4 (vout index) + 4 (height and coinbase flag) + 8 (amount) + 2 (scriptPubKey
+length) -- the size of a coin in the notional serialization gettxoutsetinfo
+reports as `bogosize', which is deliberately NOT the on-disk size.")
+
 (defun utxo-set-total-amount (view)
-  "Sum of all utxo-entry-value across the set."
-  (let ((total 0))
+  "Sum of all utxo-entry-value across the set.
+
+The SECOND value is the set\'s `bogosize\' (Core nBogoSize, the sum of
+GetBogoSize over every coin, kernel/coinstats.cpp:106). It rides along here
+because gettxoutsetinfo already walks this set three times and a fourth full
+walk for one accumulator would be the most expensive way to add a field."
+  (let ((total 0)
+        (bogo-size 0))
     (utxo-set-iterate view
                       (lambda (txid vout entry)
                         (declare (ignore txid vout))
-                        (incf total (utxo-entry-value entry))))
-    total))
+                        (incf total (utxo-entry-value entry))
+                        (incf bogo-size
+                              (+ +bogo-size-overhead+
+                                 (length (utxo-entry-script-pubkey entry))))))
+    (values total bogo-size)))
 
 (defun utxo-set-distinct-txids (view)
   "Count distinct transaction IDs with at least one unspent output.

@@ -1844,8 +1844,14 @@ that block's deltas. Only the muhash hash_type is index-backed."
             ("bestblock" . ,(if entry (hash-to-hex (bl.store:block-index-entry-hash entry)) ""))
             ("txouts" . ,(bl.store:coinstats-txout-count stats))
             ("bogosize" . ,(bl.store:coinstats-bogo-size stats))
-            ("muhash" . ,(hash-to-hex (bl.crypto:muhash-finalize
-                                       (bl.store:coinstats-muhash stats))))
+            ;; Core pushes the hash only for the hash type that was ASKED for
+            ;; (rpc/blockchain.cpp:1120-1125); `none' gets no hash at all.
+            ;; Emitting muhash regardless made the index answer differ from the
+            ;; index-free one by a key, which is exactly what
+            ;; feature_coinstatsindex.py:84-90 compares.
+            ,@(when (string= hash-type "muhash")
+                `(("muhash" . ,(hash-to-hex (bl.crypto:muhash-finalize
+                                             (bl.store:coinstats-muhash stats))))))
             ("total_amount" . ,(satoshi->btc (bl.store:coinstats-total-amount stats)))
             ("total_unspendable_amount" . ,(satoshi->btc unspendable-total))
             ("block_info"
@@ -1859,6 +1865,29 @@ that block's deltas. Only the muhash hash_type is index-backed."
                     ("bip30" . ,(satoshi->btc d-uns-bip30))
                     ("scripts" . ,(satoshi->btc d-uns-scripts))
                     ("unclaimed_rewards" . ,(satoshi->btc d-uns-unclaimed))))))))))))
+
+(defun %chainstate-disk-size (node)
+  "The estimated size of the chainstate on disk, in bytes -- Core\'s
+`disk_size\' (CCoinsViewDB::EstimateSize, reported at
+rpc/blockchain.cpp:1130).
+
+Core asks LevelDB for an approximation over the whole key range; this sums the
+files in the chainstate directory, which answers the same question the field
+name asks and does not go through the database at all. NIL data directory (a
+test node) reports 0 rather than signalling: the field is informational."
+  (let ((directory (and node (bl:node-data-directory node))))
+    (if (null directory)
+        0
+        (let ((chainstate (merge-pathnames "chainstate/" directory))
+              (total 0))
+          (handler-case
+              (dolist (file (directory (merge-pathnames "*.*" chainstate)))
+                (when (pathname-name file)
+                  (with-open-file (in file :element-type '(unsigned-byte 8)
+                                           :if-does-not-exist nil)
+                    (when in (incf total (file-length in))))))
+            (error () nil))
+          total))))
 
 (define-rpc "gettxoutsetinfo" (node ((hash-type :or "hash_serialized_3") hash-or-height))
   "Return statistics about the UTXO set. With a second argument (height or
@@ -1893,14 +1922,22 @@ coinstatsindex (Core's use_index path)."
              (best-hash (or (bl.store:coins-view-best-block utxo-set)
                             (bl.store:best-block-hash chain-state)))
              (txout-count (bl.store:utxo-count utxo-set))
-             (tx-count (bl.store:utxo-set-distinct-txids utxo-set))
-             (total-satoshis (bl.store:utxo-set-total-amount utxo-set))
-             (total-btc (satoshi->btc total-satoshis))
+             (tx-count (bl.store:utxo-set-distinct-txids utxo-set)))
+        (multiple-value-bind (total-satoshis bogo-size)
+            (bl.store:utxo-set-total-amount utxo-set)
+         (let* ((total-btc (satoshi->btc total-satoshis))
+             ;; Core's key order and its two index-absent fields
+             ;; (rpc/blockchain.cpp:1112-1130): `bogosize' is always there,
+             ;; and `transactions' and `disk_size' only when the coinstats
+             ;; INDEX was not used -- which is what feature_coinstatsindex.py:82
+             ;; deletes from the non-index answer before comparing the two.
              (result `(("height" . ,height)
                        ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-                       ("transactions" . ,tx-count)
                        ("txouts" . ,txout-count)
-                       ("total_amount" . ,total-btc))))
+                       ("bogosize" . ,bogo-size)
+                       ("total_amount" . ,total-btc)
+                       ("transactions" . ,tx-count)
+                       ("disk_size" . ,(%chainstate-disk-size node)))))
         ;; Add hash if requested (both hashes present the digest in display
         ;; byte order via hash-to-hex, matching Core's uint256 GetHex()).
         (cond
@@ -1914,7 +1951,7 @@ coinstatsindex (Core's use_index path)."
                                 `(("muhash"
                                    . ,(hash-to-hex (bl.store:compute-utxo-set-muhash
                                                     utxo-set))))))))
-        result))))
+        result))))))
 
 ;;; --- Block Statistics ---
 ;;;

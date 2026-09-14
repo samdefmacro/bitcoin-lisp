@@ -78,6 +78,7 @@ can. src/validation/.")
    #:check-signet-block-solution
    #:make-signet-txs
    #:signet-challenge-for-network
+   #:signet-derived-magic
    #:*signet-challenge*
    #:*default-signet-challenge*
    #:connect-block

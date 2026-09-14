@@ -1408,9 +1408,26 @@ hook wired inside the branch."
                           "-walletnotify did not run for a re-added wallet tx")))))
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore))))
-  ;; A command with an unsafe wallet name can never be built, because a wallet
-  ;; name outside [A-Za-z0-9._-] cannot exist in the first place.
-  (is-false (bl.wallet::%valid-wallet-name-p "a;rm -rf /"))
+  ;; A command with an unsafe wallet name can never be built, because a name
+  ;; carrying a path separator cannot exist in the first place.
+  ;;
+  ;; Core's own rule: on anything but Windows only `/' is disallowed
+  ;; (feature_notifications.py:24), and that test builds a wallet name out of
+  ;; every remaining byte from 1 to 127 -- backslash, quotes and control
+  ;; characters included -- then creates the wallet with it.
+  (flet ((accepted-p (name) (and (bl.wallet::%valid-wallet-name-p name) t)))
+    (is-false (accepted-p "a;rm -rf /"))
+    (is-true (accepted-p (coerce (loop for i from 1 below 128
+                                       unless (= i (char-code #\/))
+                                         collect (code-char i))
+                                 'string))
+             "the name feature_notifications.py creates must be accepted")
+    (is-true (accepted-p "back\\slash")
+             "a backslash is an ordinary filename character off Windows")
+    ;; The containment rule itself still holds.
+    (is-false (accepted-p "../evil"))
+    (is-false (accepted-p ".."))
+    (is-false (accepted-p "")))
   (dolist (name '("walletnotify"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))

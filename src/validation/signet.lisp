@@ -28,6 +28,23 @@ inside the coinbase's witness-commitment output.")
   "Active signet challenge scriptPubKey. Rebind for a custom signet
 (Core -signetchallenge); the default is the public signet challenge.")
 
+(defun signet-derived-magic (&optional (challenge *signet-challenge*))
+  "The 4 message-start bytes a signet network derives from its CHALLENGE
+(Core SigNetParams, kernel/chainparams.cpp:507-511): the first four bytes of
+the double-SHA256 of the challenge SERIALIZED AS A BYTE VECTOR, i.e. its
+CompactSize length followed by the script.
+
+The magic IS the signet\'s identity: two signets with different challenges must
+not exchange a single message, and Core gives them different message-start
+bytes for exactly that reason. Ours was the table\'s constant whatever
+-signetchallenge said, so every custom signet spoke on the public signet\'s
+magic -- feature_signet.py runs five nodes on three challenges and expects
+them not to connect across."
+  (let ((buffer (flexi-streams:with-output-to-sequence (out)
+                  (bl.ser:write-compact-size out (length challenge))
+                  (write-sequence challenge out))))
+    (subseq (bl.crypto:hash256 buffer) 0 4)))
+
 (defun signet-challenge-for-network (network)
   "The signet challenge scriptPubKey for NETWORK, or NIL if NETWORK is not signet."
   (when (eq network :signet) *signet-challenge*))

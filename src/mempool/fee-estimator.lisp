@@ -290,6 +290,14 @@ scheduler calls FlushFeeEstimates once an hour (init.cpp:1662).")
 call arms it, so the first flush is an hour after the node started rather
 than at once — Core's scheduleEvery fires after the first interval.")
 
+(defun arm-fee-estimate-flush-clock ()
+  "Start the hourly flush interval now (Core schedules FlushFeeEstimates at
+startup, init.cpp:1662). Called from init rather than left to the first idle
+tick: a node still inside its first sync pass has not ticked yet, and
+`mockscheduler\' forwards the clock from wherever it is -- so a late arm puts
+the deadline an hour PAST the forwarded time and the flush never comes."
+  (setf *last-fee-estimate-flush-time* (bl.ser:get-unix-time)))
+
 (defun maybe-flush-fee-estimates (estimator)
   "Flush fee estimates on Core's hourly cadence (init.cpp:1662).
 

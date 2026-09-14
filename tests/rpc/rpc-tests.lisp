@@ -3192,17 +3192,17 @@ request could make this process buffer."
                              :headers-in headers
                              :method :get
                              :server-protocol :http/1.1)))))
-    (is (<= (size (format nil "/~A" (make-string 1000 :initial-element #\x)))
-            bl.rpc::+max-http-headers-size+)
-        "a 1,000-character URI is under Core's cap")
-    (is (> (size (format nil "/~A" (make-string 10000 :initial-element #\x)))
-           bl.rpc::+max-http-headers-size+)
-        "a 10,000-character URI is over it")
-    ;; The headers count too, not only the URI.
-    (is (> (size "/" (list (cons :authorization (make-string 9000 :initial-element #\a))))
-           bl.rpc::+max-http-headers-size+)
-        "one huge header is over it as well")
-    (is (= 8192 bl.rpc::+max-http-headers-size+) "Core's MAX_HEADERS_SIZE")))
+    (let ((cap bl.rpc::+max-http-headers-size+))
+      (is (= 8192 cap) "Core's MAX_HEADERS_SIZE")
+      (is (<= (size (format nil "/~A" (make-string 1000 :initial-element #\x))) cap)
+          "a 1,000-character URI is under Core's cap")
+      (is (> (size (format nil "/~A" (make-string 10000 :initial-element #\x))) cap)
+          "a 10,000-character URI is over it")
+      ;; The headers count too, not only the URI.
+      (is (> (size "/" (list (cons :authorization
+                                   (make-string 9000 :initial-element #\a))))
+             cap)
+          "one huge header is over it as well"))))
 
 (test the-jsonrpc-version-field-is-validated-as-core-validates-it
   "Core accepts an absent/null `jsonrpc', the string \"1.0\" (V1_LEGACY) and
@@ -3257,8 +3257,9 @@ watching for allocator pressure nothing."
     (is (plusp chunks-free) "chunks_free must be above zero")
     ;; They are the heap in granules, not decoration: derived from the same
     ;; byte counts the object already reports.
-    (is (= chunks-used (ceiling used bl.rpc::+heap-chunk-bytes+)))
-    (is (= chunks-free (floor free bl.rpc::+heap-chunk-bytes+)))
+    (let ((granule bl.rpc::+heap-chunk-bytes+))
+      (is (= chunks-used (ceiling used granule)))
+      (is (= chunks-free (floor free granule))))
     ;; `locked' stays 0: nothing here is mlock()ed and saying otherwise would
     ;; be a security claim this node cannot make.
     (is (zerop (cdr (assoc "locked" locked :test #'string=))))))
