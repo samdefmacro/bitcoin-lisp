@@ -155,9 +155,9 @@ whose inputs are not there."
   (let ((bl:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
       (let* ((funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
-             (parent (%pkg-tx funding 0 (- 100000000 100)))
+             (parent (pkg-tx funding 0 (- 100000000 100)))
              (pid (bl.ser:transaction-hash parent))
-             (child (%pkg-tx pid 0 (- (- 100000000 100) 50000)))
+             (child (pkg-tx pid 0 (- (- 100000000 100) 50000)))
              (cid (bl.ser:transaction-hash child)))
         (%mine-add mp parent 100)
         (%mine-add mp child 50000)
@@ -1170,7 +1170,7 @@ with a count of zero."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "genblk-tx"))
           (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
-          (tx (%pkg-tx funding 0 99990000 :version 1))
+          (tx (pkg-tx funding 0 99990000 :version 1))
           (tx-hex (bl.crypto:bytes-to-hex
                    (bl.ser:serialize-transaction tx))))
      ;; A confirmed P2SH(OP_TRUE) coin the raw tx spends without a signature.
@@ -1196,7 +1196,7 @@ with a count of zero."
   ;; runs TestBlockValidity unconditionally, rpc/mining.cpp:389-393).
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "genblk-badtx"))
-          (bogus (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+          (bogus (pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 66)
                           0 1000 :version 1))
           (hex (bl.crypto:bytes-to-hex
@@ -1222,7 +1222,7 @@ Ours printed the raw keyword through ~A: `TestBlockValidity failed:
 MISSING-INPUT' -- upper case, our own vocabulary, no debug message, no txid."
   (with-network (:regtest)
     (let* ((node (regtest-node-fixture "genblk-words"))
-           (bogus (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+           (bogus (pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                           :initial-element 66)
                            0 1000 :version 1))
            (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction bogus)))
@@ -1468,7 +1468,7 @@ because a proposal is by definition unmined."
                      cs (bl:node-mempool node)
                      :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
         (setf (bl.ser:bitcoin-block-transactions block)
-              (list (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+              (list (pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                             :initial-element #x55)
                              0 1000)))
         (is (equal "bad-cb-missing"
@@ -2074,7 +2074,7 @@ move here; the second getblocktemplate returned the FIRST one, byte for byte."
              (utxos (bl.store:make-utxo-set))
              (funding (make-array 32 :element-type (quote (unsigned-byte 8))
                                      :initial-element 57))
-             (tx (%pkg-tx funding 0 99990000)))
+             (tx (pkg-tx funding 0 99990000)))
         (bl.store:add-utxo utxos funding 0 100000000
                            (p2sh-optrue-script-pubkey) 0 :coinbase nil)
         (setf (bl:node-chain-state node) cs

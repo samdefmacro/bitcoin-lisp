@@ -2033,7 +2033,7 @@ code, carrying an uppercased Lisp keyword no client can match on."
 ;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
 ;;;
 ;;; Uses the P2SH(OP_TRUE) fixture from package-tests.lisp (make-package-fixture /
-;;; %pkg-tx): standard, script-valid transactions with no signing key.
+;;; pkg-tx): standard, script-valid transactions with no signing key.
 
 (defun %broadcast-test-node (utxo-set mempool chain-state peer)
   "A test node wired to the fixture state with one ready relay peer."
@@ -2060,7 +2060,7 @@ txn-same-nonwitness-data-in-mempool."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
-           (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
+           (tx (pkg-tx funding-txid 0 (- 100000000 10000)))
            (txid (bl.ser:transaction-hash tx))
            (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))))
       (flet ((send (h) (bl.rpc:dispatch-rpc-method
@@ -2123,8 +2123,8 @@ The cluster-count limit is the reachable one: build the pool with a limit of
                        (p2sh-optrue-script-pubkey) 1 :coinbase nil)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
-           (parent (%pkg-tx funding 0 (- 100000000 10000)))
-           (child (%pkg-tx (bl.ser:transaction-hash parent) 0
+           (parent (pkg-tx funding 0 (- 100000000 10000)))
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0
                            (- 100000000 20000))))
       (bl.rpc::rpc-sendrawtransaction
        node (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction parent))))
@@ -2148,7 +2148,7 @@ unbroadcast set."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
-           (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
+           (tx (pkg-tx funding-txid 0 (- 100000000 10000)))
            (txid (bl.ser:transaction-hash tx))
            (hex (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))))
@@ -2174,7 +2174,7 @@ the unbroadcast set, and no announcement is queued."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
-           (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
+           (tx (pkg-tx funding-txid 0 (- 100000000 10000)))
            (hex (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))))
       (let ((r (first (%testmempoolaccept node (list hex)))))
@@ -2296,7 +2296,7 @@ own `missing-inputs' for the reason and emits no details at all (:398-399)."
    :inputs (vector (bl.ser:make-tx-in
                     :previous-output (bl.ser:make-outpoint
                                       :hash funding-txid :index 0)
-                    :script-sig (%p2sh-optrue-scriptsig)
+                    :script-sig (p2sh-optrue-scriptsig)
                     :sequence #xffffffff))
    :outputs (vector (bl.ser:make-tx-out
                      :value value
@@ -2314,7 +2314,7 @@ test_accept first and only submits once the fee is under the rail
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            ;; 1 BTC in, 0.01 BTC out: a 0.99 BTC fee on 85 vbytes, far over the
            ;; 0.1 BTC/kvB default (85 vbytes buys a 0.0085 BTC cap).
-           (tx (%pkg-tx funding-txid 0 1000000))
+           (tx (pkg-tx funding-txid 0 1000000))
            (hex (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))))
       (multiple-value-bind (code msg)
@@ -2340,7 +2340,7 @@ test_accept first and only submits once the fee is under the rail
                                        (bl.net:make-peer :state :ready)))
            (hex (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction
-                  (%pkg-tx funding-txid 0 99990000)))))
+                  (pkg-tx funding-txid 0 99990000)))))
       (is (= -8 (%rails-error
                  (lambda () (bl.rpc::rpc-sendrawtransaction node (list hex 1))))))
       ;; Just under the bound is fine.
@@ -2396,11 +2396,11 @@ transactions whose signatures Core deliberately never checked."
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
            (good (loop for index from 0 below 3
-                       collect (%pkg-tx funding-txid index 99999000)))
-           (garbage (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                       collect (pkg-tx funding-txid index 99999000)))
+           (garbage (pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                             :initial-element 0)
                              5 1000))
-           (bad-script (let ((tx (%pkg-tx funding-txid 0 99999000)))
+           (bad-script (let ((tx (pkg-tx funding-txid 0 99999000)))
                          (setf (bl.ser:tx-in-script-sig
                                 (aref (bl.ser:transaction-inputs tx) 0))
                                (make-array 0 :element-type '(unsigned-byte 8)))
@@ -2442,8 +2442,8 @@ once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
-           (parent (%pkg-tx funding-txid 0 1000000))
-           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 900000))
+           (parent (pkg-tx funding-txid 0 1000000))
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0 900000))
            (ph (bl.crypto:bytes-to-hex
                 (bl.ser:serialize-transaction parent)))
            (ch (bl.crypto:bytes-to-hex
@@ -2476,8 +2476,8 @@ answer equals the members' individual answers (rpc_packages.py:100)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
-           (parent (%pkg-tx funding-txid 0 99990000))
-           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
+           (parent (pkg-tx funding-txid 0 99990000))
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
       (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
              (aval (row key) (cdr (assoc key row :test #'string=))))
         (let ((r (%testmempoolaccept node (list (hex parent) (hex child)))))
@@ -2513,11 +2513,11 @@ Core never validates, came back as `missing-inputs'."
                        (p2sh-optrue-script-pubkey) 1 :coinbase nil)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
-           (parent (%pkg-tx funding-txid 0 99990000))
-           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000))
+           (parent (pkg-tx funding-txid 0 99990000))
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0 99980000))
            ;; Same coin, different value: a second transaction that conflicts
            ;; with PARENT inside the package.
-           (rival (%pkg-tx funding-txid 0 99980000)))
+           (rival (pkg-tx funding-txid 0 99980000)))
       (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
              (errors (rows)
                (mapcar (lambda (row)
@@ -2562,9 +2562,9 @@ make."
                        (p2sh-optrue-script-pubkey) 1 :coinbase nil)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
-           (original (%pkg-tx funding-txid 0 99990000 :sequence #xfffffffd))
-           (replacement (%pkg-tx funding-txid 0 99950000))
-           (independent (%pkg-tx funding-txid 1 99990000)))
+           (original (pkg-tx funding-txid 0 99990000 :sequence #xfffffffd))
+           (replacement (pkg-tx funding-txid 0 99950000))
+           (independent (pkg-tx funding-txid 1 99990000)))
       (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
              (aval (row key) (cdr (assoc key row :test #'string=))))
         (bl.rpc:dispatch-rpc-method node "sendrawtransaction"
@@ -2591,8 +2591,8 @@ make."
 submission: that member is invalid with :max-feerate-exceeded, later members
 are :not-validated, and nothing enters the mempool (validation.cpp:1365-1368)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
-    (let* ((parent (%pkg-tx funding-txid 0 1000000))
-           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 900000)))
+    (let* ((parent (pkg-tx funding-txid 0 1000000))
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0 900000)))
       (multiple-value-bind (msg results)
           (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state
@@ -2686,7 +2686,7 @@ with zero thread errors and every submitted tx in the pool exactly once."
                                     :initial-element (+ 50 i))))
         (bl.store:add-utxo utxo-set funding 0 100000000
                                        (p2sh-optrue-script-pubkey) 1 :coinbase nil)
-        (let ((tx (%pkg-tx funding 0 99990000)))
+        (let ((tx (pkg-tx funding 0 99990000)))
           (push (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))
                 hexes)
@@ -2781,7 +2781,7 @@ it came back."
     (let ((mempool (bl:node-mempool node))
           (txids '()))
       (dotimes (i 3)
-        (let* ((tx (%pkg-tx funding-txid i (- 100000000 10000)))
+        (let* ((tx (pkg-tx funding-txid i (- 100000000 10000)))
                (txid (bl.ser:transaction-hash tx)))
           (bl.mp:mempool-add
            mempool txid (bl.mp:make-entry-from-tx
@@ -2889,7 +2889,7 @@ rpc/mempool.cpp:1115-1116)."
            ;; Source pool: one accepted tx marked unbroadcast, saved to PATH.
            (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
              (declare (ignore utxo-set chain-state))
-             (let ((tx (%pkg-tx funding-txid 0 (- 100000000 10000))))
+             (let ((tx (pkg-tx funding-txid 0 (- 100000000 10000))))
                (setf txid (bl.ser:transaction-hash tx))
                ;; A current entry time, as a real dump carries: the startup
                ;; load keeps the saved time (use_current_time defaults off)

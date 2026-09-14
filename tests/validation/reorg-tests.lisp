@@ -1112,16 +1112,16 @@ removeRecursive, validation.cpp:317-321)."
       (make-package-fixture)
     (let* ((graph (bl.mp:mempool-graph mempool))
            ;; dtx: spends the confirmed funding output, paying ZERO fee.
-           (dtx (%pkg-tx funding 0 100000000))
+           (dtx (pkg-tx funding 0 100000000))
            (did (bl.ser:transaction-hash dtx))
            ;; Pool child of dtx (entered while dtx was confirmed).
-           (child (%pkg-tx did 0 99990000))
+           (child (pkg-tx did 0 99990000))
            (cid (bl.ser:transaction-hash child))
            ;; dtx2: its input never existed on the new chain.
-           (dtx2 (%pkg-tx (make-reorg-hash 4242) 0 500))
+           (dtx2 (pkg-tx (make-reorg-hash 4242) 0 500))
            (d2id (bl.ser:transaction-hash dtx2))
            ;; Pool spender of dtx2's output.
-           (orphan (%pkg-tx d2id 0 400))
+           (orphan (pkg-tx d2id 0 400))
            (oid (bl.ser:transaction-hash orphan)))
       (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool orphan :fee 100 :height 200)))
@@ -1153,7 +1153,7 @@ letting a premature tx re-enter the pool and get mined."
                     :inputs (vector (bl.ser:make-tx-in
                                      :previous-output (bl.ser:make-outpoint
                                                        :hash funding :index 0)
-                                     :script-sig (%p2sh-optrue-scriptsig)
+                                     :script-sig (p2sh-optrue-scriptsig)
                                      :sequence 0))   ; locktime enforced
                     :outputs (vector (bl.ser:make-tx-out
                                       :value 99990000
@@ -1458,7 +1458,7 @@ blocks' txs, never what already sat in the pool."
                     :inputs (vector (bl.ser:make-tx-in
                                      :previous-output (bl.ser:make-outpoint
                                                        :hash funding :index 0)
-                                     :script-sig (%p2sh-optrue-scriptsig)
+                                     :script-sig (p2sh-optrue-scriptsig)
                                      :sequence 0))   ; locktime enforced
                     :outputs (vector (bl.ser:make-tx-out
                                       :value 99990000
@@ -1466,11 +1466,11 @@ blocks' txs, never what already sat in the pool."
                     :lock-time 350))
            (lid (bl.ser:transaction-hash locked))
            ;; a pool child of the locked tx: removed as a descendant
-           (child (%pkg-tx lid 0 99980000))
+           (child (pkg-tx lid 0 99980000))
            (cid (bl.ser:transaction-hash child))
            ;; an unrelated, final pool tx: stays
            (funding2 (make-reorg-hash 4310))
-           (ok-tx (%pkg-tx funding2 0 99990000))
+           (ok-tx (pkg-tx funding2 0 99990000))
            (okid (bl.ser:transaction-hash ok-tx)))
       (bl.store:add-utxo utxo-set funding2 0 100000000
                                      (p2sh-optrue-script-pubkey) 1 :coinbase nil)
@@ -1494,9 +1494,9 @@ stays."
     (declare (ignore funding))
     (let* ((cb-young (make-reorg-hash 4320))     ; coinbase @ 150: age 51 < 100
            (cb-old (make-reorg-hash 4321))       ; coinbase @ 90: age 111 >= 100
-           (spend-young (%pkg-tx cb-young 0 99990000))
+           (spend-young (pkg-tx cb-young 0 99990000))
            (yid (bl.ser:transaction-hash spend-young))
-           (spend-old (%pkg-tx cb-old 0 99990000))
+           (spend-old (pkg-tx cb-old 0 99990000))
            (oid (bl.ser:transaction-hash spend-old)))
       (bl.store:add-utxo utxo-set cb-young 0 100000000
                                      (p2sh-optrue-script-pubkey) 150 :coinbase t)
@@ -1521,10 +1521,10 @@ removed: Core re-tests lockpoints against the new tip
            (coin2 (make-reorg-hash 4331))
            ;; 100-block relative lock on a coin confirmed at 150: at the new
            ;; tip 200 (spend height 201) only 51 blocks deep -> non-final.
-           (locked (%pkg-tx coin1 0 99990000 :sequence 100))
+           (locked (pkg-tx coin1 0 99990000 :sequence 100))
            (lid (bl.ser:transaction-hash locked))
            ;; 40-block lock on the same depth -> satisfied.
-           (ok-tx (%pkg-tx coin2 0 99990000 :sequence 40))
+           (ok-tx (pkg-tx coin2 0 99990000 :sequence 40))
            (okid (bl.ser:transaction-hash ok-tx)))
       (bl.store:add-utxo utxo-set coin1 0 100000000
                                      (p2sh-optrue-script-pubkey) 150 :coinbase nil)
@@ -1543,7 +1543,7 @@ re-filter — so a disconnected tx that is itself non-final under the new tip
 is caught even though the filter, not the re-add validation, is what sees
 the pool child it would strand. A re-added final tx survives the filter."
   (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
-    (let* ((dtx (%pkg-tx funding 0 100000000))   ; zero-fee, final: re-adds
+    (let* ((dtx (pkg-tx funding 0 100000000))   ; zero-fee, final: re-adds
            (did (bl.ser:transaction-hash dtx)))
       (bl.val::readd-disconnected-txs-to-mempool
        mempool (list dtx) utxo-set 200 chain-state)
