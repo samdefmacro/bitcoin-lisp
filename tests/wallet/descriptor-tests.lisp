@@ -1883,3 +1883,40 @@ string, so a wrong path is a wrong checksum too."
     ;; The written form is unchanged: normalizing is a second rendering, not a
     ;; rewrite of the descriptor the wallet stored.
     (is (string= written (bl.rpc:out-desc-string desc)))))
+
+(test a-musig-private-string-recurses-into-the-participants
+  "Core's MuSigPubkeyProvider::ToPrivateString (descriptor.cpp:715-732) asks
+each PARTICIPANT for its private form and reports has-priv as the OR over
+them, a participant without one contributing its public form. Ours had no
+musig arm at all: the expression fell through to the extended-key branch,
+found no root xprv of its own, and returned the public string with has-priv
+NIL -- and one such key makes the WHOLE descriptor's private string report
+failure (ToStringHelper's any_success, :905-938), which is how
+listdescriptors(true) answered -4 \"Unable to produce descriptor string\" for
+a wallet holding a musig() descriptor (wallet_listdescriptors.py:170).
+
+The private form of these is the string they were written with, since the
+private material is inline; the all-public one is the control that has-priv
+still says NO when no participant has a key."
+  (flet ((priv (s)
+           (multiple-value-bind (body ok)
+               (bl.rpc:out-desc-string-private (%desc-parse s :regtest)
+                                               :regtest (constantly nil))
+             (cons ok body))))
+    (let ((tprv "tprv8ZgxMBicQKsPeNLUGrbv3b7qhUk1LQJZAGMuk9gVuKh9sd4BWGp1eMsehUni6qGb8bjkdwBxCbgNGdh2bYGACK5C5dRTaif9KBKGVnSezxV")
+          (tpub "tpubD6NzVbkrYhZ4XcACN3PEwNjRpR1g4tZjBVk5pdMR2B6dbd3HYhdGVZNKofAiFZd9okBserZvv58A6tBX4pE64UpXGNTSesfUW7PpW36HuKz")
+          (other "tpubD6NzVbkrYhZ4Wo2WcFSgSqRD9QWkGxddo6WSqsVBx7uQ8QEtM7WncKDRjhFEexK119NigyCsFygA4b7sAPQxqebyFGAZ9XVV1BtcgNzbCRR"))
+      ;; wallet_listdescriptors.py:159 -- ranged derivation after the musig().
+      (let ((d (format nil "tr(03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,pk(musig(~A,~A)/7/8/*))"
+                       tprv tpub)))
+        (is (equal (cons t d) (priv d))))
+      ;; :160 -- per-participant derivation, the private half first again.
+      (let ((d (format nil "tr(03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,pk(musig(~A/10,~A/11)/*))"
+                       tprv tpub)))
+        (is (equal (cons t d) (priv d))))
+      ;; Control: no participant holds a key, so has-priv is NO and the string
+      ;; is the public one -- the same answer the missing arm used to give for
+      ;; every musig() expression.
+      (let ((d (format nil "tr(03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,pk(musig(~A,~A)/7/8/*))"
+                       other tpub)))
+        (is (equal (cons nil d) (priv d)))))))
