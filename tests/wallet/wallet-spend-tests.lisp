@@ -139,14 +139,21 @@ fixed-rate version at the 3000 sat/kvB dust relay rate."
     (is (= 546 (bl.wallet::%dust-threshold-at-rate p2pkh 3000)))
     (is (= 0 (bl.wallet::%dust-threshold-at-rate op-return 3000)))))
 
+(defun %feerate-arg (value)
+  "The sat/kvB the wallet's fee_rate argument parses to -- Core
+SetFeeEstimateMode's CFeeRate{AmountFromValue(fee_rate, /*decimals=*/3)}
+(wallet/rpc/spend.cpp:224). One reach for the whole file, so the two suites
+below name it once each instead of fifteen times."
+  (bl.wallet::%feerate-from-value value))
+
 (test ws-feerate-from-value
   "AmountFromValue(fee_rate, decimals=3): sat/vB to sat/kvB, 3 decimals max."
-  (is (= 10000 (bl.wallet::%feerate-from-value 10)))
-  (is (= 1100 (bl.wallet::%feerate-from-value "1.1")))
-  (is (= 1001 (bl.wallet::%feerate-from-value "1.001")))
-  (is (= 25000 (bl.wallet::%feerate-from-value 25)))
+  (is (= 10000 (%feerate-arg 10)))
+  (is (= 1100 (%feerate-arg "1.1")))
+  (is (= 1001 (%feerate-arg "1.001")))
+  (is (= 25000 (%feerate-arg 25)))
   (signals bl.rpc:rpc-error
-    (bl.wallet::%feerate-from-value "1.0001")))
+    (%feerate-arg "1.0001")))
 
 (test ws-feerate-is-parse-fixed-point-at-three-decimals
   "Core wallet/rpc/spend.cpp:224 parses fee_rate with AmountFromValue(v, 3),
@@ -158,27 +165,27 @@ ones Core's own suite sends: wallet_basic.py:242-244 computes
 Decimal('0.001')/1000*Decimal(1e8) => \"100.000000\" and
 wallet_fundrawtransaction.py:103 computes
 min_relay_tx_fee*Decimal(1e8)/1000 => \"1.00000\"."
-  (is (= 100000 (bl.wallet::%feerate-from-value "100.000000")))
-  (is (= 1000 (bl.wallet::%feerate-from-value "1.00000")))
-  (is (= 1000 (bl.wallet::%feerate-from-value "1.000")))
-  (is (= 2000 (bl.wallet::%feerate-from-value 2)))
+  (is (= 100000 (%feerate-arg "100.000000")))
+  (is (= 1000 (%feerate-arg "1.00000")))
+  (is (= 1000 (%feerate-arg "1.000")))
+  (is (= 2000 (%feerate-arg 2)))
   ;; ParseFixedPoint's own grammar, at three decimals.
-  (is (= 1000000 (bl.wallet::%feerate-from-value "1e3")))
-  (is (= 1 (bl.wallet::%feerate-from-value "0.001")))
+  (is (= 1000000 (%feerate-arg "1e3")))
+  (is (= 1 (%feerate-arg "0.001")))
   ;; A SIGNIFICANT fourth decimal is still finer than one unit: exponent < 0.
   (is (string= "Invalid amount"
                (bl.rpc:rpc-error-message
-                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value "1.0001"))))))
+                (nth-value 1 (ignore-errors (%feerate-arg "1.0001"))))))
   (is (string= "Invalid amount"
                (bl.rpc:rpc-error-message
-                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value "01"))))))
+                (nth-value 1 (ignore-errors (%feerate-arg "01"))))))
   ;; A parsed value outside MoneyRange is Core's other message.
   (is (string= "Amount out of range"
                (bl.rpc:rpc-error-message
-                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value "-1"))))))
+                (nth-value 1 (ignore-errors (%feerate-arg "-1"))))))
   (is (string= "Amount is not a number or string"
                (bl.rpc:rpc-error-message
-                (nth-value 1 (ignore-errors (bl.wallet::%feerate-from-value (list 1))))))))
+                (nth-value 1 (ignore-errors (%feerate-arg (list 1))))))))
 
 (test ws-amount-sub-satoshi-rejected
   "AmountFromValue rejects sub-satoshi precision (Core parses the decimal
