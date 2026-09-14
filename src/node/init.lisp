@@ -567,7 +567,7 @@ previous node's state."
     (defer-log :info "Wallet transactions will not be broadcast (-walletbroadcast=0)")))
 
 
-(defun %init-lock-and-banner (network)
+(defun %init-lock-and-banner (network blocks-directory)
   "The startup banner (Core InitLogging), the datadir lock
 (AppInitLockDirectories), SIGHUP log reopening, ZMQ publishers and the
 pruning mode announcement (Step 3)."
@@ -575,9 +575,12 @@ pruning mode announcement (Step 3)."
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))
 
-  ;; Claim the directory before anything reads or writes it (Core locks the
-  ;; datadir and the blocks dir in AppInitMain, init.cpp:1172).
-  (lock-data-directory (node-data-directory *node*))
+  ;; Claim the directories before anything reads or writes them (Core locks the
+  ;; datadir AND the blocks dir in AppInitLockDirectories, init.cpp:1170-1174).
+  (lock-data-directories (node-data-directory *node*)
+                         (blocks-dir-path blocks-directory
+                                          (node-data-directory *node*)
+                                          network))
 
   ;; SIGHUP reopens the log file, so an external logrotate can move it.
   (install-sighup-log-reopen)
@@ -1746,7 +1749,7 @@ Returns the node instance."
   (%init-connection-options data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly)
   (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1
                           wallet-broadcast)
-  (%init-lock-and-banner network)
+  (%init-lock-and-banner network blocks-directory)
   (init-message "Loading block index…")          ; init.cpp:1396
   (%init-load-chain network reindex blocks-directory)
   (%init-recover-chain reindex-chainstate)

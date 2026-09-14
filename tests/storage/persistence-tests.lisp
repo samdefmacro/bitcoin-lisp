@@ -583,19 +583,69 @@ index and UTXO cache and flush over the other's files, so the damage is not
               (merge-pathnames "test-datadir-lock/" (uiop:temporary-directory)))))
     (unwind-protect
          (progn
-           (bl::lock-data-directory dir)
-           (is-true (integerp bl::*data-directory-lock-fd*))
+           (bl::lock-directory dir)
+           (is (= 1 (length bl::*directory-lock-fds*)))
            ;; The control that matters: a second claim is REFUSED.
-           (signals error (bl::lock-data-directory dir))
+           (signals error (bl::lock-directory dir))
            ;; Releasing it hands the directory back.
            (bl::unlock-data-directory)
-           (is (null bl::*data-directory-lock-fd*))
-           (bl::lock-data-directory dir)
-           (is-true (integerp bl::*data-directory-lock-fd*)))
+           (is (null bl::*directory-lock-fds*))
+           (bl::lock-directory dir)
+           (is (= 1 (length bl::*directory-lock-fds*))))
       (bl::unlock-data-directory))
     ;; The lock file is left behind, as Core leaves it: its presence means
     ;; nothing, only the advisory lock on it does.
     (is-true (probe-file (merge-pathnames ".lock" dir)))))
+
+(test directory-lock-refusal-is-worded-and-punctuated-as-cores
+  "Core: `Cannot obtain a lock on directory %s. %s is probably already
+running.' with fs::PathToString of the directory (init.cpp:1165).
+feature_filelock.py:33 builds that whole sentence from the path it passed and
+compares it to stderr, so a Lisp DIRECTORY pathname's trailing separator --
+`.../regtest/' where Core prints `.../regtest' -- failed the test on one
+character."
+  (let ((dir (ensure-directories-exist
+              (merge-pathnames "test-datadir-lock-text/" (uiop:temporary-directory)))))
+    (unwind-protect
+         (progn
+           (bl::lock-directory dir)
+           (let ((message (handler-case (progn (bl::lock-directory dir) nil)
+                            (error (e) (princ-to-string e)))))
+             (is-true message "a second claim must be refused")
+             (is (search (format nil "Cannot obtain a lock on directory ~A. ~
+bitcoin-lisp is probably already running."
+                                 (string-right-trim "/" (namestring dir)))
+                         message)
+                 "Core's sentence, verbatim; got ~S" message)
+             (is (null (search "/. bitcoin-lisp" message))
+                 "no trailing separator before the full stop; got ~S" message)))
+      (bl::unlock-data-directory))))
+
+(test blocks-directory-is-locked-as-well-as-the-datadir
+  "Core's LockDirectories claims GetDataDirNet() AND GetBlocksDirPath()
+(init.cpp:1170-1174). -blocksdir can put the blk/rev files on a volume two
+nodes share while their data directories differ, and those files are exactly
+what a second writer corrupts; feature_filelock.py:37 starts a second node
+with only -blocksdir pointing at a running node's directory."
+  (let* ((root (ensure-directories-exist
+                (merge-pathnames "test-blocksdir-lock/" (uiop:temporary-directory))))
+         (data (ensure-directories-exist (merge-pathnames "data/" root)))
+         (blocks (ensure-directories-exist (merge-pathnames "blocks/" root))))
+    (unwind-protect
+         (progn
+           (bl::lock-data-directories data blocks)
+           (is (= 2 (length bl::*directory-lock-fds*))
+               "both directories claimed")
+           (signals error (bl::lock-directory blocks)))
+      (bl::unlock-data-directory))
+    ;; A blocks directory that IS the data directory is one lock, not two --
+    ;; the same process must not deadlock against its own claim.
+    (unwind-protect
+         (progn
+           (bl::lock-data-directories data data)
+           (is (= 1 (length bl::*directory-lock-fds*))
+               "one directory, one lock"))
+      (bl::unlock-data-directory))))
 
 (defun %hidx-fixture (suffix)
   "A chain-state on a private directory with no header-index files."
