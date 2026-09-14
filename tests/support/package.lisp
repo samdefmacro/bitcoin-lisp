@@ -29,6 +29,10 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:btc-amount
    #:rpc-error-code-of
    #:capture-log-lines
+   #:claim-directory
+   #:claim-data-directories
+   #:release-directory-locks
+   #:directory-locks-held
    #:next-message-within
    #:clear-recent-block-txs
    #:rpc-error-of
