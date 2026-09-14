@@ -1784,15 +1784,33 @@ max(node incremental, wallet incremental), floored at GetMinimumFeeRate."
          (min-rate (%wallet-minimum-fee-rate node cc)))
     (max feerate min-rate)))
 
-(defun %create-rate-bump (node wallet txid cc require-mine)
+(defun %create-rate-bump (node wallet txid cc require-mine
+                          &key new-outputs original-change-index)
   "Core feebumper::CreateRateBumpTransaction (subset). Rebuilds a higher-feerate
 replacement of the wallet tx TXID that re-spends all its inputs. Returns
 (values new-tx old-fee new-fee) on success, or (values nil error-code error-msg).
-Caller holds node + wallet locks."
+Caller holds node + wallet locks.
+
+NEW-OUTPUTS is the `outputs' option's output set, which REPLACES the original's
+(feebumper.cpp:250 `outputs.empty() ? wtx.tx->vout : outputs'), and
+ORIGINAL-CHANGE-INDEX names which of the ORIGINAL outputs is the change to
+recycle instead of detecting it (:255). Core refuses the two together (:161-165)
+and an index past the end (:180-183)."
+  ;; Core checks the incompatible pair FIRST, before the wallet is even
+  ;; consulted (feebumper.cpp:161-165).
+  (when (and new-outputs original-change-index)
+    (return-from %create-rate-bump
+      (values nil bl.rpc:+rpc-invalid-parameter+
+              "The options 'outputs' and 'original_change_index' are incompatible. You can only either specify a new set of outputs, or designate a change output to be recycled.")))
   (let ((wtx (wallet-get-wallet-tx wallet txid)))
     (unless wtx
       (return-from %create-rate-bump
         (values nil bl.rpc:+rpc-invalid-address-or-key+ "Invalid or non-wallet transaction id")))
+    (when (and original-change-index
+               (>= original-change-index
+                   (length (bl.ser:transaction-outputs (wallet-tx-tx wtx)))))
+      (return-from %create-rate-bump
+        (values nil bl.rpc:+rpc-invalid-parameter+ "Change position is out of range")))
     (let* ((orig (wallet-tx-tx wtx))
            (inputs (bl.ser:transaction-inputs orig))
            (input-value 0))
@@ -1820,24 +1838,36 @@ Caller holds node + wallet locks."
                                    :initial-value 0))
              (old-fee (- input-value output-value))
              (network (wallet-network wallet))
+             ;; Core's txouts (feebumper.cpp:250): the option's set when it was
+             ;; given, the original's otherwise. OLD-FEE above stays the
+             ;; ORIGINAL's arithmetic (:238-243) whichever it is.
+             (txouts (or new-outputs
+                         (coerce (bl.ser:transaction-outputs orig) 'list)))
+             (new-outputs-value (reduce #'+ txouts :key #'bl.ser:tx-out-value
+                                                   :initial-value 0))
              (recipients '()))
-        ;; Recipients = original outputs; a single change output becomes destChange.
-        (bl.ser:dovector
-            (out (bl.ser:transaction-outputs orig))
-          (let ((spk (bl.ser:tx-out-script-pubkey out)))
-            (if (%output-is-change wallet spk)
-                (setf (wcc-dest-change cc) spk)
-                (push (bl.rpc:make-recipient :script spk
-                                      :amount (bl.ser:tx-out-value out)
-                                      :address (bl.rpc:script->address spk network))
-                      recipients))))
+        ;; Recipients = TXOUTS; the change output becomes destChange -- the one
+        ;; ORIGINAL-CHANGE-INDEX names when it was given, and otherwise
+        ;; whichever the wallet recognizes as its own (feebumper.cpp:251-262).
+        (loop for out in txouts
+              for i from 0
+              do (let ((spk (bl.ser:tx-out-script-pubkey out)))
+                   (if (if original-change-index
+                           (= i original-change-index)
+                           (%output-is-change wallet spk))
+                       (setf (wcc-dest-change cc) spk)
+                       (push (bl.rpc:make-recipient :script spk
+                                             :amount (bl.ser:tx-out-value out)
+                                             :address (bl.rpc:script->address spk network))
+                             recipients))))
         (setf recipients (nreverse recipients))
         (when (null recipients)
           (unless (wcc-dest-change cc)
             (return-from %create-rate-bump
               (values nil bl.rpc:+rpc-invalid-parameter+
                       "Unable to create transaction. Transaction must have at least one recipient")))
-          (push (bl.rpc:make-recipient :script (wcc-dest-change cc) :amount output-value :sffo t
+          (push (bl.rpc:make-recipient :script (wcc-dest-change cc)
+                                :amount new-outputs-value :sffo t
                                 :address (bl.rpc:script->address (wcc-dest-change cc) network))
                 recipients)
           (setf (wcc-dest-change cc) nil))
@@ -1917,6 +1947,30 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
                               (%opt options "fee_rate") nil)))
   cc)
 
+(defun %bumpfee-new-outputs (options network)
+  "The `outputs' option of bumpfee / psbtbumpfee as Core reads it
+(wallet/rpc/spend.cpp:1073-1080): AddOutputs over a temporary transaction, whose
+vout becomes the replacement's output set. A JSON null is simply absent
+(`!options[\"outputs\"].isNull()'); an empty ARRAY is Core's own -8 (:1075-1077)."
+  (multiple-value-bind (outs present) (%opt options "outputs")
+    (when (and present outs)
+      (when (null (bl.rpc:positional-array outs))
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                          :message "Invalid parameter, output argument cannot be an empty array"))
+      (mapcar (lambda (r)
+                (bl.ser:make-tx-out :value (bl.rpc:recipient-amount r)
+                                    :script-pubkey (bl.rpc:recipient-script r)))
+              (bl.rpc:parse-outputs network outs)))))
+
+(defun %bumpfee-original-change-index (options)
+  "The `original_change_index' option (wallet/rpc/spend.cpp:1083-1085), declared
+VNUM in Core's option block (:1058) and read with getInt<uint32_t>."
+  (multiple-value-bind (idx present) (%opt options "original_change_index")
+    (when present
+      (unless (and (integerp idx) (not (minusp idx)))
+        (bl.rpc:json-type-error idx "number"))
+      idx)))
+
 (defun %bumpfee-helper (node params want-psbt)
   "Shared body of bumpfee / psbtbumpfee. PARAMS: (txid [options])."
   (let ((wallet (wallet-for-request node))
@@ -1930,14 +1984,27 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
         ;; Core gates BOTH bumpfee and psbtbumpfee: building the
         ;; replacement needs the keypool and, for bumpfee, the signature.
         (wallet-ensure-unlocked wallet)
-        (let ((txid (bl.rpc:parse-hash-v txid-hex "txid"))
-              (cc (make-wcc)))
+        (let* ((txid (bl.rpc:parse-hash-v txid-hex "txid"))
+               (cc (make-wcc))
+               (options (second params))
+               (new-outputs (%bumpfee-new-outputs options (wallet-network wallet)))
+               (original-change-index (%bumpfee-original-change-index options)))
           (setf (wcc-signal-bip125-rbf cc) t)   ; Core: default true, RBF replacement
-          (%bumpfee-options->cc (second params) cc)
-          (multiple-value-bind (mtx old-fee new-fee code msg)
-              (%create-rate-bump node wallet txid cc (not want-psbt))
+          (%bumpfee-options->cc options cc)
+          ;; THREE values either way: (tx old-fee new-fee) on success and
+          ;; (NIL code message) on failure, which is how %CREATE-RATE-BUMP and
+          ;; Core's feebumper::Result + errors vector both report. Binding five
+          ;; names read the code and the message from positions nothing ever
+          ;; fills, so EVERY bumpfee refusal left the RPC boundary as
+          ;; code NIL / message NIL -- wallet_bumpfee.py asserts the sentence
+          ;; on several of them.
+          (multiple-value-bind (mtx a b)
+              (%create-rate-bump node wallet txid cc (not want-psbt)
+                                 :new-outputs new-outputs
+                                 :original-change-index original-change-index)
             (unless mtx
-              (error 'bl.rpc:rpc-error :code code :message msg))
+              (error 'bl.rpc:rpc-error :code a :message b))
+            (let ((old-fee a) (new-fee b))
             (if want-psbt
                 `(("psbt" . ,(%wallet-unsigned-psbt node wallet mtx t))
                   ("origfee" . ,(bl.rpc:satoshi->btc old-fee))
@@ -1969,7 +2036,7 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
                       `(("txid" . ,(bl.rpc:hash-to-hex new-txid))
                         ("origfee" . ,(bl.rpc:satoshi->btc old-fee))
                         ("fee" . ,(bl.rpc:satoshi->btc new-fee))
-                        ("errors" . ,#()))))))))))))
+                        ("errors" . ,#())))))))))))))
 
 (bl.rpc:define-rpc "bumpfee" (node params)
   "Bump the fee of an unconfirmed wallet transaction, signing + broadcasting the
