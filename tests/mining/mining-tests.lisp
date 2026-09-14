@@ -848,7 +848,26 @@ accepted as a header instead of refused with bad-prevblk (:486)."
                      (bl.rpc:dispatch-rpc-method node "submitblock" (list hex)))
             "the second is answered from the index, not judged again")
         (is (= height (bl.store:current-height cs))
-            "neither submission moved the tip")))))
+            "neither submission moved the tip")
+        ;; And a header that EXTENDS the invalid block is refused outright:
+        ;; Core's AcceptBlockHeader answers BLOCK_INVALID_PREV "bad-prevblk"
+        ;; for a parent carrying BLOCK_FAILED_MASK, and submitheader hands
+        ;; that reason to the caller (mining_basic.py:486-489).
+        (let* ((child (bl.mining:assemble-full-block
+                       cs (bl:node-mempool node)
+                       :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+               (hdr (bl.ser:bitcoin-block-header child)))
+          (setf (bl.ser:block-header-prev-block hdr)
+                (bl.ser:block-header-hash (bl.ser:bitcoin-block-header block))
+                (bl.ser:block-header-cached-hash hdr) nil)
+          (let ((err (rpc-error-of
+                      (lambda ()
+                        (bl.rpc:dispatch-rpc-method
+                         node "submitheader"
+                         (list (bl.crypto:bytes-to-hex
+                                (bl.ser:serialize-block-header hdr))))))))
+            (is (equal '(-25 . "bad-prevblk") err)
+                "a child of an invalid block is bad-prevblk, not silently indexed")))))))
 
 (test submitblock-fills-missing-witness-nonce
   ;; Core UpdateUncommittedBlockStructures (validation.cpp:4017-4027), run by

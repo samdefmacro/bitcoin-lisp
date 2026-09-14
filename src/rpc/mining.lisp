@@ -759,10 +759,22 @@ header); errors if the parent is missing or the header fails validation."
       (when (bl.store:get-block-index-entry chain-state hash)
         (return-from rpc-submitheader nil))
       ;; Parent must be present first (Core's LookupBlockIndex check).
-      (unless (bl.store:get-block-index-entry chain-state prev)
-        (error 'rpc-error :code +rpc-verify-error+
-                          :message (format nil "Must submit previous header (~A) first"
-                                           (hash-to-hex prev))))
+      (let ((prev-entry (bl.store:get-block-index-entry chain-state prev)))
+        (unless prev-entry
+          (error 'rpc-error :code +rpc-verify-error+
+                            :message (format nil "Must submit previous header (~A) first"
+                                             (hash-to-hex prev))))
+        ;; A header extending a block already known to be invalid is refused
+        ;; outright: Core's AcceptBlockHeader answers BLOCK_INVALID_PREV
+        ;; "bad-prevblk" for `pindexPrev->nStatus & BLOCK_FAILED_MASK', and
+        ;; submitheader hands the reject reason to the caller as -25
+        ;; (rpc/mining.cpp:1119-1123). Ours went on to VALIDATE-HEADER-CHAIN,
+        ;; which indexes such a header as :invalid and never queues it for
+        ;; download -- correct for the P2P path, and silent, so the RPC
+        ;; answered null. mining_basic.py:489 submits a child of the
+        ;; non-final block it has just had refused and expects bad-prevblk.
+        (when (eq (bl.store:block-index-entry-status prev-entry) :invalid)
+          (error 'rpc-error :code +rpc-verify-error+ :message "bad-prevblk")))
       ;; Validate (PoW/MTP/difficulty) then add to the index.
       (multiple-value-bind (valid err)
           (bl.net:validate-header-chain (list header) chain-state)
