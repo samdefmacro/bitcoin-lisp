@@ -923,31 +923,52 @@ implementation would be a second set of derivation-path bugs."
       (wallet-add-active-spkm wallet spkm type internal :batch batch)
       spkm)))
 
-(defun %wallet-single-active-root-xprv (wallet)
-  "The one HD root every active descriptor uses, or an error naming the
-ambiguity (Core createwalletdescriptor's GetActiveHDPubKeys check).
+(defun wallet-get-key (wallet keyid)
+  "The 32-byte secret for KEYID from whichever descriptor SPKM holds it, or
+NIL (Core CWallet::GetKey, wallet.cpp:4519-4532).
+
+Wallet-wide, not per-SPKM: a key expression's root may have been imported
+through one descriptor and asked about through another, which is exactly what
+createwalletdescriptor does when it is handed an xpub. A locked encrypted
+wallet answers NIL for every keyid, as SPKM-PRIVKEY-PROVIDER does."
+  (loop for spkm being the hash-values of (wallet-spkms wallet)
+        for secret = (funcall (spkm-privkey-provider wallet spkm) keyid)
+        when secret return secret))
+
+(defun %wallet-single-active-hd-xpub (wallet)
+  "The one HD root xpub every active descriptor uses, or an error naming the
+ambiguity (Core CWallet::GetActiveHDPubKeys, wallet.cpp:4498-4517, as
+createwalletdescriptor consults it).
 
 Core refuses when the wallet has more than one active root rather than picking:
 generating a descriptor from the wrong seed produces addresses the operator
-cannot recover from their backup of the other one."
-  (let ((roots '()))
+cannot recover from their backup of the other one.
+
+PUBLIC roots, as Core's set<CExtPubKey> is. Collecting the PRIVATE roots
+instead made `which key' and `do we hold its secret' one question, so a wallet
+that holds no secret for its only active root reported the ambiguity error for
+a root that is not ambiguous at all."
+  (let ((roots '())
+        (keys '()))
     (dolist (table (list (wallet-external-spkms wallet)
                          (wallet-internal-spkms wallet)))
       (loop for spkm being the hash-values of table
             do (dolist (key (bl.rpc:out-desc-ordered-keys (desc-spkm-desc spkm)))
-                 (let ((xprv (bl.rpc:desc-key-root-xprv
-                              key (spkm-privkey-provider wallet spkm))))
-                   (when xprv
-                     (pushnew (bl.crypto:bip32-serialize xprv) roots
-                              :test #'string=))))))
-    (cond
-      ((null roots)
-       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
-                         :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
-      ((cdr roots)
-       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
-                         :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
-      (t (bl.crypto:bip32-parse (first roots))))))
+                 ;; A raw pubkey or WIF key in a descriptor is not an HD key and
+                 ;; has no xpub: Core's GetPubKeys splits the two apart and
+                 ;; GetActiveHDPubKeys keeps only the extended ones.
+                 (let* ((embedded (bl.rpc:desc-key-ext-privkey key))
+                        (xpub-key (or (bl.rpc:desc-key-extkey key)
+                                      (and embedded (bl.crypto:bip32-neuter embedded)))))
+                   (when xpub-key
+                     (let ((serialized (bl.crypto:bip32-serialize xpub-key)))
+                       (unless (member serialized roots :test #'string=)
+                         (push serialized roots)
+                         (push xpub-key keys))))))))
+    (unless (and keys (null (cdr keys)))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                        :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
+    (first keys)))
 
 (bl.rpc:define-rpc "createwalletdescriptor" (node params)
   "Create the wallet's descriptor for an address type it does not yet have
@@ -978,23 +999,31 @@ result is an array."
              (hdkey (and (hash-table-p options) (gethash "hdkey" options))))
         (with-wallet-lock (wallet)
           (wallet-ensure-unlocked wallet)
-          (let* ((root (if hdkey
-                           (or (ignore-errors (bl.crypto:bip32-parse hdkey))
+          ;; Core DecodeExtPubKey then CWallet::GetKey (wallet/rpc/wallet.cpp:
+          ;; 795-813): the hdkey argument names a PUBLIC root and the private
+          ;; half comes from the WALLET, never from the string. Reading the
+          ;; privateness of the parsed string instead refused every xpub the
+          ;; wallet does hold the key for -- wallet_createwalletdescriptor.py:93
+          ;; answered -5 "Private key for <xpub> is not known" for the wallet's
+          ;; OWN xpub, where Core reaches the descriptor it already has and
+          ;; answers -4 "Descriptor already exists".
+          (let* ((xpub (if hdkey
+                           (let ((parsed (and (stringp hdkey)
+                                              (ignore-errors (bl.crypto:bip32-parse hdkey)))))
+                             ;; DecodeExtPubKey reads the xpub prefix alone, so
+                             ;; an xprv is not a valid argument here.
+                             (when (or (null parsed) (bl.crypto:ext-key-privatep parsed))
                                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                                  :message "Unable to parse HD key. Please provide a valid xpub"))
-                           (%wallet-single-active-root-xprv wallet)))
-                 (xprv (if (bl.crypto:ext-key-privatep root)
-                           root
-                           ;; An xpub was given: we must hold its private half,
-                           ;; or the descriptor would be watch-only in a wallet
-                           ;; that claims to control it.
-                           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
-                                             :message (format nil "Private key for ~A is not known"
-                                                              (bl.crypto:bip32-serialize root)))))
-                 (xpub-string (bl.crypto:bip32-serialize
-                               (bl.crypto:bip32-neuter xprv)))
-                 (master-priv (subseq (bl.crypto:ext-key-key xprv) 1 33))
-                 (master-pub (bl.crypto:ext-key-public-bytes xprv))
+                             parsed)
+                           (%wallet-single-active-hd-xpub wallet)))
+                 (xpub-string (bl.crypto:bip32-serialize xpub))
+                 (master-pub (bl.crypto:ext-key-public-bytes xpub))
+                 (master-priv
+                   (or (wallet-get-key wallet (bl.crypto:hash160 master-pub))
+                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                                         :message (format nil "Private key for ~A is not known"
+                                                          xpub-string))))
                  (now (bl.ser:get-unix-time))
                  (made '()))
             (bl.store:with-leveldb-writebatch (batch)

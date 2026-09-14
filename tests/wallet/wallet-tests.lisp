@@ -1225,6 +1225,54 @@ derivation paths cannot drift between the two."
                 (lambda () (bl.wallet::rpc-createwalletdescriptor
                             node (list "bech32" opts))))))))))
 
+(test createwalletdescriptor-takes-the-private-half-from-the-wallet
+  "Core createwalletdescriptor asks the WALLET for the private half of the
+hdkey it was given (wallet/rpc/wallet.cpp:795-813: DecodeExtPubKey, then
+CWallet::GetKey(xpub.pubkey.GetID()), wallet.cpp:4519-4532). Three answers
+follow from that and all three are Core's own:
+
+  - the wallet's OWN xpub, for a type it already has, is -4 \"Descriptor
+    already exists\" (wallet_createwalletdescriptor.py:93). Reading the
+    privateness of the PARSED STRING instead answered -5 \"Private key for
+    <xpub> is not known\" for every xpub, since an xpub has no private half by
+    construction -- the wallet does;
+  - an XPRV is not an xpub: DecodeExtPubKey reads the public prefix alone, so
+    it is -5 \"Unable to parse HD key. Please provide a valid xpub\" (:94);
+  - an xpub whose secret the wallet does not hold keeps -5 \"Private key for
+    <xpub> is not known\" (:42), the control that the message did not merely
+    move."
+  (with-wallet-test-node (node :keypool 4)
+    (with-rpc-wallet (nil)
+      (bl.wallet::rpc-createwallet node '("cwd-hdkey")))
+    (with-rpc-wallet ("cwd-hdkey")
+      (let* ((rows (bl.wallet::rpc-gethdkeys
+                    node (list (let ((h (make-hash-table :test 'equal)))
+                                 (setf (gethash "private" h) t) h))))
+             (row (first rows))
+             (own-xpub (cdr (assoc "xpub" row :test #'string=)))
+             (own-xprv (cdr (assoc "xprv" row :test #'string=))))
+        (is (stringp own-xpub) "fixture: gethdkeys reported no xpub")
+        (is (stringp own-xprv) "fixture: gethdkeys reported no xprv")
+        (flet ((answer (type key)
+                 (rpc-error-of
+                  (lambda ()
+                    (bl.wallet::rpc-createwalletdescriptor
+                     node (list type (let ((h (make-hash-table :test 'equal)))
+                                       (setf (gethash "hdkey" h) key) h)))))))
+          ;; The wallet's own root, for a type it already has.
+          (is (equal (cons bl.rpc:+rpc-wallet-error+ "Descriptor already exists")
+                     (answer "bech32m" own-xpub)))
+          ;; An xprv where an xpub is wanted.
+          (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
+                           "Unable to parse HD key. Please provide a valid xpub")
+                     (answer "bech32m" own-xprv)))
+          ;; A well-formed xpub the wallet holds no secret for. BIP32's own
+          ;; test-vector-1 master xpub, so nothing in the fixture can have it.
+          (let ((foreign "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"))
+            (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
+                             (format nil "Private key for ~A is not known" foreign))
+                       (answer "bech32m" foreign)))))))))
+
 (test gethdkeys-groups-descriptors-under-their-root-key
   "Core gethdkeys. The grouping is the point: two descriptors derived from one
 HD root must appear as ONE entry with two descriptors, not two entries — that
