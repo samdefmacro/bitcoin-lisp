@@ -726,7 +726,7 @@ second value counts the sites that were checked."
                        (incf checked)
                        (multiple-value-bind (min max)
                            (handler-case
-                               (sb-format::%compiler-walk-format-string (second form) nil)
+                               (sb-format:%compiler-walk-format-string (second form) nil)
                              (error () (values nil nil)))
                          (let ((got (length (cddr form))))
                            (when (and min (or (< got min) (> got max)))
@@ -806,10 +806,7 @@ to make on purpose, so the set is pinned."
                                                  ; became %requeue-unpersisted-block
                                                  ; when the AcceptBlock body gate
                                                  ; landed here)
-
-    ;; BORDERLINE -- 203 against Core's ActivateBestChain 167. Left alone
-    ;; until perform-reorg is split, since the two share the same phases.
-    ("activate-block" . 203))                    ; validation/block.lisp
+    )
   "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+,
 each annotated above with its Bitcoin Core counterpart and the verdict.
 
@@ -821,7 +818,10 @@ the rule is SPLIT WHERE CORE SPLITS, and where it does not, name the
 exception with its counterpart and line count, exactly as the max-file-size
 metric already said for files. VALIDATE-BLOCK left this list in P6a, which
 made Core's CheckBlock/ContextualCheckBlock boundary a function boundary
-here too instead of a keyword flag.
+here too instead of a keyword flag. ACTIVATE-BLOCK left it in the round-3
+mempool/mining/RPC batch, at 203 against Core's ActivateBestChain 167: the
+BLOCK_FAILED_VALID marking its two failure arms had each open-coded became
+%POISON-FAILED-BLOCK, which is where Core keeps it too (InvalidBlockFound).
 
 The line count is pinned too, so an entry may shrink but not grow.
 See docs/refactoring-plan-2026-08-27.md 6b.")
@@ -1603,7 +1603,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 3849
+(defparameter +test-internal-reference-ceiling+ 3846
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1623,7 +1623,7 @@ sendcmpct through one helper; 4,201 with the mempool and addr-relay batches;
 4,196 once five getdata and gossip reaches moved into tests/support/; 4,187 when the
 spanning-forest tests folded fifteen sfl-linearize reaches into one helper; 4,178 with
 the tapscript signing batch; 4,129 once the tx-relay fixtures (deliver-tx and
-siblings) replaced the per-file reaches; 4,125 with the never-opened batch; 3,959 with the GA11 left-out net-peers and wallet batches; 3,957 with its rpc-config batch; 3,927 once thirty stale reaches named symbols their packages already exported; 3,902 when three parallel round-3 batches met at 3,932: two stale reaches, a shared reset fixture for a five-times-reached special, and the export of standard-output-script-p (a src caller, 26 test reaches) paid for the seam; 3,898 once the wallet batch's fee-rate suites named one %feerate-arg helper instead of fifteen reaches and its new wallet-RPC tests went through the exported dispatcher; 3,894 when %wt-at-height replaced six copies of the same chain-view setf in the wallet suite; 3,889 once wallet-data-directory and wallet-directory-of in tests/support/ replaced nine reaches into the wallet manager's paths; 3,865 after the round-3 init/RPC/HTTP batch, which added eleven white-box suites over internals that have no external caller and must not acquire one -- and paid for them several times over: %authorized-user folded forty-three CHECK-AUTH reaches in the RPC suite into one, gettxoutsetinfo and getmemoryinfo now go through the exported dispatcher (fourteen reaches gone), claim-directory and its three siblings in tests/support/ replaced thirteen directory-lock reaches across two files, %with-rpc-threads folded the worker-semaphore bindings, and six already-EXTERNAL names that were written with `::' now carry one colon; 3,849 when the package-path batch's two new reaches met main's lower ceiling and parse-json-rpc-request -- called by the HTTP server, reached twenty-five times by tests -- was exported and its reaches given one colon.
+siblings) replaced the per-file reaches; 4,125 with the never-opened batch; 3,959 with the GA11 left-out net-peers and wallet batches; 3,957 with its rpc-config batch; 3,927 once thirty stale reaches named symbols their packages already exported; 3,902 when three parallel round-3 batches met at 3,932: two stale reaches, a shared reset fixture for a five-times-reached special, and the export of standard-output-script-p (a src caller, 26 test reaches) paid for the seam; 3,898 once the wallet batch's fee-rate suites named one %feerate-arg helper instead of fifteen reaches and its new wallet-RPC tests went through the exported dispatcher; 3,894 when %wt-at-height replaced six copies of the same chain-view setf in the wallet suite; 3,889 once wallet-data-directory and wallet-directory-of in tests/support/ replaced nine reaches into the wallet manager's paths; 3,865 after the round-3 init/RPC/HTTP batch, which added eleven white-box suites over internals that have no external caller and must not acquire one -- and paid for them several times over: %authorized-user folded forty-three CHECK-AUTH reaches in the RPC suite into one, gettxoutsetinfo and getmemoryinfo now go through the exported dispatcher (fourteen reaches gone), claim-directory and its three siblings in tests/support/ replaced thirteen directory-lock reaches across two files, %with-rpc-threads folded the worker-semaphore bindings, and six already-EXTERNAL names that were written with `::' now carry one colon; 3,849 when the package-path batch's two new reaches met main's lower ceiling and parse-json-rpc-request -- called by the HTTP server, reached twenty-five times by tests -- was exported and its reaches given one colon. 3,846 with the round-3 mempool/mining/RPC batch: its one new reach, the -blocknotify command a third notify test binds, paid for by four reaches at names their FOREIGN package already exports (hunchentoot's taskmaster accessors and raw-post-data slot, sb-format's %compiler-walk-format-string).
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
