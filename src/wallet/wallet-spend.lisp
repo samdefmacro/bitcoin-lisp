@@ -1906,18 +1906,47 @@ TR-KEYMAP (keyed on the BIP86 untweaked-root form) by construction."
         (when script
           (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet script)
             (when (and spkm (spkm-have-private-keys-p spkm))
-              (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
-                (declare (ignore scripts))
-                (let ((provider (spkm-privkey-provider wallet spkm)))
-                  (loop for (key . pubkey) in pairs
-                        for priv = (%desc-key-priv-at key pos provider)
-                        do (when priv
-                             (%sign-map-add-key! keymap pubmap tr-keymap
-                                                 key pubkey priv pos))))
-                (let ((leaves (%spkm-tr-script-leaves spkm script pos)))
-                  (when leaves
-                    (setf (gethash (subseq script 2 34) tr-scripts) leaves)))))))))
+              (%sign-maps-add-spkm-at! wallet spkm pos keymap pubmap tr-keymap)
+              (let ((leaves (%spkm-tr-script-leaves spkm script pos)))
+                (when leaves
+                  (setf (gethash (subseq script 2 34) tr-scripts) leaves))))))))
     (values keymap pubmap tr-keymap tr-scripts)))
+
+(defun %wallet-spkm-deriving-pubkey (wallet pubkey)
+  "(values spkm range-index) of a loaded SPKM that derives PUBKEY, or NIL --
+Core DescriptorScriptPubKeyMan::GetSigningProvider(const CPubKey&)
+(scriptpubkeyman.cpp:1216-1233), which looks the key up in m_map_pubkeys and
+returns the signing provider for that index."
+  (loop for spkm being the hash-values of (wallet-spkms wallet)
+        for pos = (gethash pubkey (desc-spkm-pubkey-map spkm))
+        when (and pos (spkm-have-private-keys-p spkm))
+          do (return (values spkm pos))))
+
+(defun %sign-maps-add-spkm-at! (wallet spkm pos keymap pubmap tr-keymap)
+  "Merge the SPKM's whole expansion at POS into the signing maps -- Core's
+GetSigningProvider(index, /*include_private=*/true) followed by
+FlatSigningProvider::Merge (scriptpubkeyman.cpp:1228, :1339)."
+  (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
+    (declare (ignore scripts))
+    (let ((provider (spkm-privkey-provider wallet spkm)))
+      (loop for (key . pubkey) in pairs
+            for priv = (%desc-key-priv-at key pos provider)
+            do (when priv
+                 (%sign-map-add-key! keymap pubmap tr-keymap key pubkey priv pos))))))
+
+(defun %wallet-add-keys-for-pubkeys (wallet pubkeys keymap pubmap tr-keymap)
+  "Core DescriptorScriptPubKeyMan::FillPSBT's second branch -- \"Maybe there
+are pubkeys listed that we can sign for\" (scriptpubkeyman.cpp:1340-1377): for a
+script the wallet does NOT own, every pubkey the PSBT input lists is looked up
+in the SPKM's pubkey map and the provider for its index is merged in.
+
+This is the whole of multi-party signing. A cosigner's wallet holds the KEY and
+never the multisig script, so the script lookup finds nothing and only these
+pubkeys reach the signer."
+  (dolist (pk pubkeys)
+    (multiple-value-bind (spkm pos) (%wallet-spkm-deriving-pubkey wallet pk)
+      (when spkm
+        (%sign-maps-add-spkm-at! wallet spkm pos keymap pubmap tr-keymap)))))
 
 (defun %wallet-sign-transaction (wallet tx coins &key (sighash-byte 1))
   "Core CWallet::SignTransaction: sign every input COINS covers with keys

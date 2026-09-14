@@ -1990,6 +1990,82 @@ second call with sign=true (default) completes it."
         (is (eq t (%aval "complete" signed)))
         (is (stringp (%aval "hex" signed)))))))
 
+(test walletprocesspsbt-signs-for-a-key-a-foreign-script-lists
+  "Core's DescriptorScriptPubKeyMan::FillPSBT asks GetSigningProvider(script)
+first, and when the wallet does NOT own the script it falls back on the input's
+own key list -- \"Maybe there are pubkeys listed that we can sign for\"
+(scriptpubkeyman.cpp:1340-1377): every PSBT_IN_BIP32_DERIVATION pubkey, plus a
+taproot output key in both parities and the PSBT_IN_TAP_BIP32_DERIVATION keys,
+is looked up in m_map_pubkeys (:1216-1233) and the provider for that index is
+merged in. That fallback is the whole of multi-party signing: a cosigner's
+wallet holds the KEY and never the multisig script.
+
+We collected signing keys from the owning SPKM alone, so a wallet asked to
+cosign a script it does not own signed nothing and walletprocesspsbt answered
+complete false with no `hex'. wallet_fundrawtransaction.py:591 (a 2-of-2 whose
+two keys the DEFAULT wallet holds, signed in one call) and
+wallet_multisig_descriptor_psbt.py:123 (M participants signing in turn) both
+end in KeyError 'hex' on that.
+
+The watch-only wallet is the control: it holds the descriptor and no key, so
+its own walletprocesspsbt must still leave the PSBT incomplete -- a change that
+signed with any key in reach would fail there."
+  (%with-pp-node (node "pp-cosign")
+    (%pp-fund-wallet node)
+    (let ((bl.wallet::*wallet-rng* (make-wallet-rng 31)))
+      (flet ((rpc (wallet method &rest params)
+               (with-rpc-wallet (wallet)
+                 (bl.rpc:dispatch-rpc-method node method params))))
+        (rpc "w" "keypoolrefill" 20)
+        (let* ((a (rpc "w" "getnewaddress" "" "bech32"))
+               (b (rpc "w" "getnewaddress" "" "bech32"))
+               (pk-a (%aval "pubkey" (rpc "w" "getaddressinfo" a)))
+               (pk-b (%aval "pubkey" (rpc "w" "getaddressinfo" b)))
+               (msig (rpc "w" "createmultisig" 2 (list pk-a pk-b) "bech32"))
+               (msig-address (%aval "address" msig))
+               (msig-descriptor (%aval "descriptor" msig)))
+          (is (stringp msig-address) "fixture: createmultisig gave no address")
+          ;; The multisig is a script the signing wallet does NOT own.
+          (is (equal bl.rpc:+json-false+
+                     (%aval "ismine" (rpc "w" "getaddressinfo" msig-address)))
+              "fixture: the signing wallet already owns the multisig script")
+          (rpc "w" "sendtoaddress" msig-address "1.20000000"
+               nil nil nil nil nil nil nil 10)
+          (%pp-mine node 1 (%pp-optrue-address))
+          ;; A watch-only wallet that knows the descriptor and no key.
+          (rpc nil "createwallet" "wmulti" t)
+          (rpc "wmulti" "importdescriptors"
+               (list (%ht "desc" msig-descriptor "timestamp" "now")))
+          (let* ((funded (rpc "wmulti" "walletcreatefundedpsbt"
+                              '() (list (%ht (%pp-optrue-address) 1))
+                              0 (%ht "fee_rate" 10
+                                     "changeAddress" (rpc "w" "getrawchangeaddress" "bech32"))))
+                 (psbt (%aval "psbt" funded)))
+            (is (stringp psbt) "fixture: walletcreatefundedpsbt gave no psbt")
+            ;; The control: another wallet, with keys of its own and none of
+            ;; these, must sign nothing. The fallback looks up the input's
+            ;; pubkeys in the SPKM's own map, so a wallet that derives none of
+            ;; them has no business completing this.
+            (rpc nil "createwallet" "other")
+            (let ((stranger (rpc "other" "walletprocesspsbt" psbt)))
+              (is (equal bl.rpc:+json-false+ (%aval "complete" stranger))
+                  "a wallet holding neither key completed the 2-of-2")
+              (is (null (%aval "hex" stranger))
+                  "an incomplete PSBT must carry no network transaction"))
+            ;; And the wallet that owns neither the script nor its descriptor,
+            ;; only the two KEYS, signs it to completion.
+            (let ((signed (rpc "w" "walletprocesspsbt" psbt)))
+              (is (eq t (%aval "complete" signed))
+                  "the key holder did not complete the 2-of-2")
+              (is (stringp (%aval "hex" signed))
+                  "a complete PSBT must carry the network transaction")
+              ;; And it is a transaction the node accepts, which is the full
+              ;; script verification of the witness the wallet produced.
+              (is-true (and (stringp (%aval "hex" signed))
+                            (stringp (rpc nil "sendrawtransaction"
+                                          (%aval "hex" signed))))
+                       "the finalized transaction was refused by the node"))))))))
+
 (test pp-walletprocesspsbt-attaches-non-witness-utxo
   "Core FillPSBT (wallet.cpp:2201-2212) attaches the full previous transaction
 whenever an input lacks non_witness_utxo — a witness_utxo already present does
