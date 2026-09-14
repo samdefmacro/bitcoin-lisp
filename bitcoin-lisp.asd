@@ -298,6 +298,13 @@ this same package."
                                (:file "wallet")
                                (:file "wallet-crypt")
                                (:file "wallet-tx")
+                               ;; Core node/mini_miner.cpp: the bump fee the
+                               ;; wallet must pay for an unconfirmed input's
+                               ;; ancestors. Here rather than under node/
+                               ;; because the wallet compiles first and reads
+                               ;; the mempool through BL.MP, as the ancestry
+                               ;; helper beside it already does.
+                               (:file "mini-miner")
                                (:file "wallet-coins")
                                (:file "wallet-spend")
                                (:file "psbt")
