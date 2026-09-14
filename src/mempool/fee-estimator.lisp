@@ -187,7 +187,12 @@ entries (20 bytes each: height, median, low, high, tx-count), CRC32 (4 bytes)."
                                 :if-exists :supersede
                                 :if-does-not-exist :create)
           (write-sequence data-bytes stream)
-          (write-sequence (bl.store:compute-crc32 data-bytes) stream))))
+          (write-sequence (bl.store:compute-crc32 data-bytes) stream)))
+      ;; Core's line for a completed flush (CBlockPolicyEstimator::
+      ;; FlushFeeEstimates, policy/fees/block_policy_estimator.cpp:975).
+      ;; feature_fee_estimation.py:344 builds the whole sentence from the
+      ;; path it expects the file at, so the path is part of it.
+      (bl:log-cat "estimatefee" "Flushed fee estimates to ~A." (namestring path)))
     ;; Reset flush counter
     (setf (fee-estimator-blocks-since-flush estimator) 0)
     t))
@@ -275,6 +280,34 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
   (when (>= (fee-estimator-blocks-since-flush estimator)
             +fee-stats-flush-interval+)
     (save-fee-stats estimator)))
+
+(defconstant +fee-flush-interval-seconds+ 3600
+  "Core FEE_FLUSH_INTERVAL (policy/fees/block_policy_estimator.h:27): the
+scheduler calls FlushFeeEstimates once an hour (init.cpp:1662).")
+
+(defvar *last-fee-estimate-flush-time* nil
+  "When the hourly flush last ran, on the mockable clock. NIL until the first
+call arms it, so the first flush is an hour after the node started rather
+than at once — Core's scheduleEvery fires after the first interval.")
+
+(defun maybe-flush-fee-estimates (estimator)
+  "Flush fee estimates on Core's hourly cadence (init.cpp:1662).
+
+Ours only ever wrote fee_estimates.dat at shutdown and after a block count,
+so a node that ran for days and was killed lost every estimate it had
+learned -- the file exists precisely so a restart does not start blind.
+Driven off GET-UNIX-TIME rather than a separate scheduler thread, which is
+what makes Core's `mockscheduler' RPC advance it: feature_fee_estimation.py:
+345 forwards an hour and then waits ONE second for the log line."
+  (let ((now (bl.ser:get-unix-time)))
+    (cond
+      ((null *last-fee-estimate-flush-time*)
+       (setf *last-fee-estimate-flush-time* now)
+       nil)
+      ((>= (- now *last-fee-estimate-flush-time*) +fee-flush-interval-seconds+)
+       (setf *last-fee-estimate-flush-time* now)
+       (save-fee-stats estimator)
+       t))))
 
 ;;;; Fee Rate Estimation
 

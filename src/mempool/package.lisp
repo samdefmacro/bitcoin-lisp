@@ -257,6 +257,7 @@ src/mempool/.")
    ;; Fee stats persistence
    #:save-fee-stats
    #:load-fee-stats
+   #:maybe-flush-fee-estimates
    #:maybe-flush-fee-stats
    ;; Core CBlockPolicyEstimator (G7-21)
    #:*block-policy-estimator*

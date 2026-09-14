@@ -126,6 +126,11 @@ port can't be bound."
           (setf (node-listener-thread node)
                 (bt:make-thread (lambda () (run-inbound-listener node))
                                 :name "bitcoin-inbound-listener"))
+          ;; Core's line for a bound listening socket (CConnman::BindListenPort,
+          ;; net.cpp:3329). feature_port.py reads `Bound to <addr>:<port>' out
+          ;; of debug.log to check where -port and -bind actually put the
+          ;; socket, and it is the only record an operator has of the same.
+          (log-info "Bound to ~A:~D" bind (listen-port (node-network node)))
           (log-info "Listening for inbound peers on ~A:~D"
                     bind (listen-port (node-network node))))
         (log-warn "Inbound listening disabled: could not bind ~A:~D"
@@ -153,5 +158,6 @@ independent."
                 (bt:make-thread (lambda ()
                                   (run-inbound-listener node :socket sock :onion t))
                                 :name "bitcoin-onion-listener"))
+          (log-info "Bound to 127.0.0.1:~D" port)
           (log-info "Listening for inbound onion peers on 127.0.0.1:~D" port))
         (log-warn "Onion inbound listening disabled: could not bind 127.0.0.1:~D" port))))
