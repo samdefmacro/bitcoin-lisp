@@ -4507,6 +4507,31 @@ chainstates and for tests that drive activate-block directly."
                (equalp (bl.store:best-block-hash chain-state) target))
       (bl:maybe-validate-snapshot chain-state))))
 
+(defun %poison-failed-block (chain-state header error)
+  "Mark the block HEADER names, and every indexed descendant, :invalid when
+ERROR is a deterministic consensus verdict -- Core's BLOCK_FAILED_VALID plus
+BLOCK_FAILED_CHILD. Core sets them wherever a block is refused: AcceptBlock
+does it for every verdict but BLOCK_MUTATED (validation.cpp:4381-4389) and
+InvalidBlockFound does it for a connect failure, so the entry carries the
+failure from then on.
+
+Two answers are read off that mark. submitblock answers \"duplicate-invalid\"
+for a block the index already knows is invalid, before doing any work
+(rpc/mining.cpp:1073-1077) -- mining_basic.py:483-484 submits a non-final
+coinbase twice and reads the reject reason both times -- and submitheader
+refuses a child of an invalid block with \"bad-prevblk\" (:486).
+
+The allowlist is *DETERMINISTIC-INVALID-BLOCK-ERRORS*: only a verdict decided
+from txid-committed data and chain structure poisons a block permanently,
+never a corrupt-body or witness-dependent one that a re-download could fix,
+which is also why a mutation-class failure keeps answering itself on every
+resubmission as Core\'s BLOCK_MUTATED carve-out does."
+  (when (%deterministic-consensus-failure-p error)
+    (let ((entry (bl.store:get-block-index-entry
+                  chain-state (bl.ser:block-header-hash header))))
+      (when entry
+        (%mark-block-subtree-invalid chain-state entry)))))
+
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts fee-estimator
                             recent-rejects mempool)
@@ -4568,32 +4593,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
                  (%maybe-note-target-reached chain-state)
                  (values t nil))
                (progn
-                 ;; BLOCK_FAILED_VALID on the tip-extending block too. Core
-                 ;; marks a block its AcceptBlock gate refuses
-                 ;; (validation.cpp:4381-4389, every verdict but BLOCK_MUTATED)
-                 ;; and a block ConnectTip refuses (InvalidBlockFound), and
-                 ;; either way the entry carries the failure from then on. The
-                 ;; competing-fork arm below already did this; this arm did
-                 ;; not, so a block rejected while extending the tip was
-                 ;; indexed as merely header-valid and stayed that way.
-                 ;;
-                 ;; Two things read that mark. submitblock answers
-                 ;; "duplicate-invalid" for a block the index already knows is
-                 ;; invalid (rpc/mining.cpp:1073-1077) -- mining_basic.py:484
-                 ;; submits a non-final coinbase twice and reads the reject
-                 ;; reason both times -- and submitheader refuses a child of an
-                 ;; invalid block with "bad-prevblk" (:486-488).
-                 ;;
-                 ;; The allowlist is the one the fork arm uses: only a verdict
-                 ;; decided from txid-committed data and chain structure
-                 ;; poisons a block permanently, never a corrupt-body or
-                 ;; witness-dependent one, which a re-download can fix.
-                 (when (%deterministic-consensus-failure-p error)
-                   (let ((this-entry (bl.store:get-block-index-entry
-                                      chain-state
-                                      (bl.ser:block-header-hash header))))
-                     (when this-entry
-                       (%mark-block-subtree-invalid chain-state this-entry))))
+                 ;; The tip-extending arm poisons its failure too: this one did
+                 ;; not, so a block rejected here stayed in the index as merely
+                 ;; header-valid and submitblock re-judged it on every
+                 ;; resubmission (%POISON-FAILED-BLOCK).
+                 (%poison-failed-block chain-state header error)
                  (values nil error))))))
 
       (t
@@ -4680,22 +4684,13 @@ can neither wedge on an equal-work sibling nor advance past the base."
                            (bl:log-error
                             "Incoming block failed validation after reorg (~A); reverting to original chain"
                             error)
-                           ;; BLOCK_FAILED_VALID / _CHILD: only on a DETERMINISTIC
-                           ;; consensus verdict (never a corrupt-body / witness-
-                           ;; dependent / transient artifact), poison the incoming
-                           ;; block and any indexed descendants so it is never
-                           ;; re-activated or extended. The revert below cannot
-                           ;; clobber this: the incoming block was never connected,
-                           ;; and it sits above the reverted fork on neither reorg
+                           ;; Poison the incoming block and any indexed
+                           ;; descendants so it is never re-activated or
+                           ;; extended. The revert below cannot clobber this:
+                           ;; the incoming block was never connected, and it
+                           ;; sits above the reverted fork on neither reorg
                            ;; side.
-                           (when (%deterministic-consensus-failure-p error)
-                             (let ((this-entry
-                                     (bl.store:get-block-index-entry
-                                      chain-state
-                                      (bl.ser:block-header-hash
-                                       header))))
-                               (when this-entry
-                                 (%mark-block-subtree-invalid chain-state this-entry))))
+                           (%poison-failed-block chain-state header error)
                            (let ((fork-tip (bl.store:get-block-index-entry
                                             chain-state
                                             (bl.store:best-block-hash

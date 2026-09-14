@@ -3274,8 +3274,8 @@ semaphore taken around request execution."
                (is-true (bl.rpc:start-rpc-server node :port port))
                (let* ((taskmaster (hunchentoot::acceptor-taskmaster
                                    bl.rpc:*rpc-server*))
-                      (threads (hunchentoot::taskmaster-max-thread-count taskmaster))
-                      (accepts (hunchentoot::taskmaster-max-accept-count taskmaster)))
+                      (threads (hunchentoot:taskmaster-max-thread-count taskmaster))
+                      (accepts (hunchentoot:taskmaster-max-accept-count taskmaster)))
                  (is (or (null threads) (> threads bl.rpc:*rpc-threads*))
                      "the accept loop must not be capped at -rpcthreads (~S)" threads)
                  (is (or (null threads) accepts)
@@ -10149,7 +10149,7 @@ it through session-verify."
                                  :remote-addr "127.0.0.1"
                                  :server-protocol :http/1.1
                                  :content-stream nil)))
-    (setf (slot-value request 'hunchentoot::raw-post-data) octets)
+    (setf (slot-value request 'hunchentoot:raw-post-data) octets)
     request))
 
 (defun jsonrpc-handler-reply (body &rest request-args)
