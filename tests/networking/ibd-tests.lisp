@@ -1274,7 +1274,7 @@ of them needed the same fix."
   "Test that validate-block with :skip-scripts t skips script validation."
   ;; Create a minimal block with an invalid script that would normally fail.
   ;; With :skip-scripts t, it should still pass script validation.
-  ;; Without :skip-scripts, it should fail with :script-failed.
+  ;; Without :skip-scripts, the script pass fails and the block wears its reason.
   (let* ((bl:*network* :testnet3)
          (state (bl.store:init-chain-state
                  (merge-pathnames "test-skip-scripts/" (uiop:temporary-directory))))

@@ -1095,10 +1095,67 @@ body gate logs through it."
         (is-false ok "control: the corrupted body is refused")
         (is (keywordp reason))
         (let ((lines (capture-log-lines (lambda () (bl.val:accept-block-body bad cs)))))
-          (is-true (find (string-downcase (symbol-name reason)) lines :test #'search)
+          ;; Core's reject reason for the verdict, which for most keywords is
+          ;; the downcased name and for the ones in *BLOCK-REJECT-REASONS*
+          ;; is Core's own word (bad-cb-missing for :first-tx-not-coinbase).
+          (is-true (find (bl.val:block-reject-reason reason) lines :test #'search)
                    "the rejection line carries Core's lower-case reason")
           (is-false (find (symbol-name reason) lines :test #'search)
                     "and not the keyword's upper-case name"))))))
+(test block-reject-reasons-name-the-coinbase-and-the-script-error
+  "Two block verdicts spoke words no Bitcoin implementation uses.
+
+CheckBlock's first-transaction gate is Core's bad-cb-missing and its
+second-coinbase gate bad-cb-multiple (validation.cpp:3984,3987); ours reported
+the downcased keyword, so mining_template_verification.py:44 read
+first-tx-not-coinbase.
+
+A failed script pass in ConnectBlock relays the TRANSACTION's own state into
+the block's (validation.cpp:2532-2537), so the reject reason is
+block-script-verify-flag-failed with ScriptErrorString in parentheses (:2119)
+and the debug message is CScriptCheck's per-input sentence (:2018). Ours said
+script-failed and nothing else, which is what feature_nulldummy.py:144 and
+feature_taproot.py:1433 read off submitblock."
+  (is (string= "bad-cb-missing" (bl.val:block-reject-reason :first-tx-not-coinbase)))
+  (is (string= "bad-cb-multiple" (bl.val:block-reject-reason :multiple-coinbase)))
+  (let ((verdict (list :block-script-verify-flag-failed :sig-nulldummy
+                       "input 0 of aa (wtxid bb), spending cc:0")))
+    (is (string= "block-script-verify-flag-failed (Dummy CHECKMULTISIG argument must be zero)"
+                 (bl.val:block-reject-reason verdict)))
+    (is (string= "block-script-verify-flag-failed (Dummy CHECKMULTISIG argument must be zero), input 0 of aa (wtxid bb), spending cc:0"
+                 (bl.val:block-reject-reason-string verdict))))
+  ;; A verdict whose second element is a STRING is a debug message, not a
+  ;; script error, and must not be parenthesised -- the two shapes share the
+  ;; renderer.
+  (is (string= "bad-txns-inputs-missingorspent"
+               (bl.val:block-reject-reason '(:missing-input "detail here"))))
+  ;; And the verdict really comes out of the script pass: a block whose only
+  ;; spend cannot satisfy its scriptPubKey is refused with the ScriptError
+  ;; the interpreter reported, not with a word of ours.
+  (let* ((utxo (bl.store:make-utxo-set))
+         (funding (%txid-array 88))
+         (spend (make-spending-test-tx funding :vout 0 :value 1000))
+         (block (bl.ser:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (list (make-coinbase-transaction :value 5000000000 :height 1)
+                                     spend))))
+    ;; An OP_RETURN coin: nothing can spend it, so the pass fails and names
+    ;; the opcode.
+    (bl.store:add-utxo utxo funding 0 100000
+                       (make-array 2 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(#x6a #x51))
+                       0)
+    (multiple-value-bind (ok reason) (bl.val:validate-block-scripts block utxo)
+      (is-false ok "control: the block's spend must fail")
+      (is (eq :block-script-verify-flag-failed
+              (if (consp reason) (first reason) reason)))
+      (is (eql 0 (search "block-script-verify-flag-failed ("
+                         (bl.val:block-reject-reason reason))))
+      (is (search (format nil "input 0 of ~A (wtxid ~A), spending "
+                          (bl.rpc:hash-to-hex (bl.ser:transaction-hash spend))
+                          (bl.rpc:hash-to-hex (bl.ser:transaction-wtxid spend)))
+                  (bl.val:block-reject-reason-string reason)))))) 
+
 (test block-witness-stripped-p-detects-missing-nonce
   "block-witness-stripped-p is T when a block commits to witness but its coinbase
 witness is missing or not exactly one 32-byte item, and NIL for a witness-complete
@@ -1175,7 +1232,8 @@ witness-stripped block never persists (the testnet4 BAD-WITNESS-NONCE-SIZE wedge
       (multiple-value-bind (valid error)
           (bl.val:validate-block-scripts block utxo-set)
         (is (null valid))
-        (is (eq :script-failed error))))))
+        (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error))))))))
 
 (test validate-block-scripts-parallel-path
   "The opt-in parallel validation path (bl:*parallel-block-validation*
@@ -1229,7 +1287,8 @@ at mainnet scale), so only this test exercises it."
           (multiple-value-bind (valid error)
               (bl.val:validate-block-scripts blk utxo-set)
             (is (null valid))
-            (is (eq :script-failed error))))))))
+            (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error))))))))))
 
 ;;;; The script-execution cache on the BLOCK path
 ;;;
@@ -1300,7 +1359,8 @@ under a DIFFERENT flag string does not hit, since the flags are in the key."
       (multiple-value-bind (valid error)
           (bl.val:validate-block-scripts blk utxo-set :height 800000)
         (is (null valid))
-        (is (eq :script-failed error))))
+        (is (eql 0 (search "block-script-verify-flag-failed"
+                   (bl.val:block-reject-reason error))))))
     ;; CONTROL: an entry under other flags is a different key.
     (multiple-value-bind (blk utxo-set spend)
         (%sec-spend-block p2pkh empty 800000)

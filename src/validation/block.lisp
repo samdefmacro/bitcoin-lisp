@@ -852,9 +852,13 @@ set, so dropping the entry would be strictly worse than Core."
 (defun validate-tx-scripts (tx tx-idx utxo-set script-flags height
                             &key extra-coins spent-utxos)
   "Validate all input scripts of a single transaction. Returns
-T on success or NIL on failure. EXTRA-COINS is an optional (txid . index) ->
-utxo-entry table of coins created by earlier transactions in the same block,
-which are not in UTXO-SET yet.
+(VALUES T NIL NIL) on success and (VALUES NIL SCRIPT-ERROR FAILED-INPUT) on
+failure -- the two halves Core's CheckInputScripts reports, the ScriptError it
+puts in the reject reason and the input index CScriptCheck names in the debug
+message (validation.cpp:2018, :2117-2119). SCRIPT-ERROR is NIL when the pass
+failed without one, which is Core's SCRIPT_ERR_UNKNOWN_ERROR. EXTRA-COINS is
+an optional (txid . index) -> utxo-entry table of coins created by earlier
+transactions in the same block, which are not in UTXO-SET yet.
 
 SPENT-UTXOS, when supplied, is this transaction's already-resolved coins from
 PREFETCH-BLOCK-SPENT-COINS. Passing it is what makes a worker thread safe: the
@@ -866,7 +870,7 @@ interpreted again: SCRIPT-EXECUTION-CACHE-HIT-P is Core's CheckInputScripts
 short-circuit, and it comes first so a hit costs neither the coin resolution
 nor the sighash precomputation below."
   (when (script-execution-cache-hit-p tx script-flags)
-    (return-from validate-tx-scripts t))
+    (return-from validate-tx-scripts (values t nil nil)))
   (let* ((tx-inputs (bl.ser:transaction-inputs tx))
          (spent-utxos (or spent-utxos
                           (collect-spent-utxos tx-inputs utxo-set extra-coins)))
@@ -889,30 +893,33 @@ nor the sighash precomputation below."
                   (bl.crypto:bytes-to-hex
                    (bl.ser:outpoint-hash prevout))
                   (bl.ser:outpoint-index prevout)))
-               (return-from validate-tx-scripts nil))
-             (unless (validate-input-script tx input-idx utxo)
-               ;; Re-run with debug to capture the preimage for the log line
-               (let ((bl.interop:*debug-bip341-sighash* t))
-                 (validate-input-script tx input-idx utxo))
-               (let* ((prevout (bl.ser:tx-in-previous-output input))
-                      (wvec (bl.ser:transaction-witness tx))
-                      (witness (and wvec (aref wvec input-idx))))
-                 (bl:log-warn
-                  "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
-                  height tx-idx input-idx
-                  (bl.crypto:bytes-to-hex
-                   (bl.ser:outpoint-hash prevout))
-                  (bl.ser:outpoint-index prevout)
-                  (bl.crypto:bytes-to-hex
-                   (bl.store:utxo-entry-script-pubkey utxo))
-                  (bl.crypto:bytes-to-hex
-                   (bl.ser:tx-in-script-sig input))
-                  (length witness)
-                  (format nil "[~{~A~^,~}]"
-                          (mapcar #'bl.crypto:bytes-to-hex witness))
-                  bl.interop:*script-flags*))
-               (return-from validate-tx-scripts nil))
-          finally (return t))))
+               (return-from validate-tx-scripts (values nil nil input-idx)))
+             (multiple-value-bind (input-ok script-error)
+                 (validate-input-script tx input-idx utxo)
+               (unless input-ok
+                 ;; Re-run with debug to capture the preimage for the log line
+                 (let ((bl.interop:*debug-bip341-sighash* t))
+                   (validate-input-script tx input-idx utxo))
+                 (let* ((prevout (bl.ser:tx-in-previous-output input))
+                        (wvec (bl.ser:transaction-witness tx))
+                        (witness (and wvec (aref wvec input-idx))))
+                   (bl:log-warn
+                    "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
+                    height tx-idx input-idx
+                    (bl.crypto:bytes-to-hex
+                     (bl.ser:outpoint-hash prevout))
+                    (bl.ser:outpoint-index prevout)
+                    (bl.crypto:bytes-to-hex
+                     (bl.store:utxo-entry-script-pubkey utxo))
+                    (bl.crypto:bytes-to-hex
+                     (bl.ser:tx-in-script-sig input))
+                    (length witness)
+                    (format nil "[~{~A~^,~}]"
+                            (mapcar #'bl.crypto:bytes-to-hex witness))
+                    bl.interop:*script-flags*))
+                 (return-from validate-tx-scripts
+                   (values nil script-error input-idx))))
+          finally (return (values t nil nil)))))
 
 
 ;;;; Persistent script-check worker pool (Core CCheckQueue, checkqueue.h)
@@ -1013,6 +1020,21 @@ a node that never enables it should not carry idle threads."
         (setf *script-check-pool* nil)
         t))))
 
+(defun %block-script-verdict (tx script-error failed-input)
+  "Core's ConnectBlock verdict for a failed script pass: the TRANSACTION's
+own state, relayed into the block's (validation.cpp:2532-2537). The reject
+reason is `block-script-verify-flag-failed (<ScriptErrorString>)\' (:2119)
+and the debug message is CScriptCheck's `input %i of %s (wtxid %s), spending
+%s:%i\' (:2018); ConnectBlock passes both through unchanged, so the block
+wears the transaction's words.
+
+A bare :SCRIPT-FAILED is what this used to be -- a word no Bitcoin
+implementation uses, where feature_nulldummy.py:144 and feature_taproot.py:1433
+read the rejection off submitblock and look for the ScriptErrorString in it."
+  (list :block-script-verify-flag-failed
+        script-error
+        (and tx (%script-check-debug-string tx failed-input))))
+
 (defun run-script-checks (pool items)
   "Run ITEMS (a list of thunks) on POOL and return T when every one succeeded.
 
@@ -1069,17 +1091,34 @@ read and is not synchronized."
   (let* ((non-coinbase (rest txs))
          (prefetched (prefetch-block-spent-coins txs utxo-set extra-coins))
          (pool (ensure-script-check-pool *parallel-validation-workers*))
+         ;; The first failure's verdict, as Core's CheckInputScripts states it.
+         ;; The pool reports only a boolean, so the item records it here; the
+         ;; lock keeps two workers failing at once from interleaving, and the
+         ;; UNLESS keeps the FIRST one, which is the one Core would have
+         ;; returned on.
+         (verdict nil)
+         (verdict-lock (bt:make-lock "block-script-verdict"))
          ;; One item per transaction. Each closes over data that is already
          ;; resolved, so nothing here reaches the coins view.
          (items (loop for tx in non-coinbase
                       for i from 0
                       collect (let ((tx tx) (i i))
                                 (lambda ()
-                                  (validate-tx-scripts
-                                   tx (1+ i) utxo-set script-flags height
-                                   :extra-coins extra-coins
-                                   :spent-utxos (aref prefetched i)))))))
-    (run-script-checks pool items)))
+                                  (multiple-value-bind (ok script-error failed-input)
+                                      (validate-tx-scripts
+                                       tx (1+ i) utxo-set script-flags height
+                                       :extra-coins extra-coins
+                                       :spent-utxos (aref prefetched i))
+                                    (unless ok
+                                      (bt:with-lock-held (verdict-lock)
+                                        (unless verdict
+                                          (setf verdict
+                                                (%block-script-verdict
+                                                 tx script-error failed-input)))))
+                                    ok))))))
+    (if (run-script-checks pool items)
+        (values t nil)
+        (values nil (or verdict (%block-script-verdict nil nil nil))))))
 
 (defun validate-block-scripts (block utxo-set &key (height 0) extra-coins)
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
@@ -1110,19 +1149,20 @@ until now, accepts blocks Core rejects."
     (if (and bl:*parallel-block-validation*
              (>= (length (rest transactions)) +parallel-validation-min-txs+)
              (> *parallel-validation-workers* 1))
-        (if (validate-block-scripts-parallel transactions script-flags utxo-set height
-                                             :extra-coins extra-coins)
-            (values t nil)
-            (values nil :script-failed))
+        (validate-block-scripts-parallel transactions script-flags utxo-set height
+                                         :extra-coins extra-coins)
         ;; Sequential fallback (kept verbatim from the pre-Phase-3 path).
         (let ((bl.interop:*script-flags* script-flags))
           (loop for tx in (rest transactions)
                 for tx-idx from 1
-                do (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                script-flags height
-                                                :extra-coins extra-coins)
-                     (return-from validate-block-scripts
-                       (values nil :script-failed))))
+                do (multiple-value-bind (ok script-error failed-input)
+                       (validate-tx-scripts tx tx-idx utxo-set
+                                            script-flags height
+                                            :extra-coins extra-coins)
+                     (unless ok
+                       (return-from validate-block-scripts
+                         (values nil (%block-script-verdict
+                                      tx script-error failed-input))))))
           (values t nil)))))
 
 
@@ -3158,7 +3198,7 @@ perform-reorg's success phase, so there is nothing to undo here."
 ;;;;     changed = corruption = a re-download fixes it. (:bad-merkle-root is also
 ;;;;     THE canonical corrupt-body signal.) get-block already prunes a body that
 ;;;;     fails to deserialize, so such a block surfaces as MISSING, not here.
-;;;;   * Script failures (:script-failed), witness-commitment failures
+;;;;   * Script failures (:block-script-verify-flag-failed), witness-commitment failures
 ;;;;     (:bad-witness-nonce-size, :bad-witness-merkle-match, :unexpected-witness)
 ;;;;     and the CONTEXTUAL sigop budget (:too-many-sigops). These consume WITNESS
 ;;;;     bytes, which the block hash does NOT commit; a corrupt-but-present witness
@@ -3344,6 +3384,12 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     (:bad-sequence-lock          . "bad-txns-nonfinal")                  ; :2555
     (:too-many-sigops            . "bad-blk-sigops")                     ; :2567
     (:coinbase-too-large         . "bad-cb-amount")                      ; :2609
+    (:first-tx-not-coinbase      . "bad-cb-missing")                     ; :3984 CheckBlock
+    (:multiple-coinbase          . "bad-cb-multiple")                    ; :3987
+    ;; ConnectBlock relays the script pass's own reason, parenthetical and
+    ;; all (:2119); the keyword is Core's prefix and the verdict carries the
+    ;; ScriptError beside it.
+    (:block-script-verify-flag-failed . "block-script-verify-flag-failed") ; :2119
     (:bad-proof-of-work          . "high-hash")                          ; :3864 CheckBlockHeader
     (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot
     (:non-final-tx               . "bad-txns-nonfinal"))                 ; :4179 ContextualCheckBlock
@@ -3353,11 +3399,27 @@ is its own downcased name, which is what most of ours already are
 
 (defun block-reject-reason (error)
   "ERROR's Core reject reason alone -- state.GetRejectReason(). This is what
-BIP22 reports (submitblock), where ToString() would add the debug message."
-  (let ((reason (if (consp error) (first error) error)))
+BIP22 reports (submitblock), where ToString() would add the debug message.
+
+A verdict relayed from a script pass carries its ScriptError as the SECOND
+element and Core builds that INTO the reason, `<prefix> (<ScriptErrorString>)\'
+(validation.cpp:2119), with the per-input detail in the debug message. A
+STRING second element is a debug message instead and leaves the reason alone."
+  (let ((reason (if (consp error) (first error) error))
+        ;; A cons with a second element that is NOT a string is a script
+        ;; verdict; NIL there is Core's SCRIPT_ERR_UNKNOWN_ERROR, whose
+        ;; ScriptErrorString is the sentence "unknown error", so it still
+        ;; parenthesises.
+        (script-verdict (and (consp error) (cdr error)
+                             (not (stringp (second error))))))
     (cond ((null reason) "Valid")
-          ((keywordp reason) (or (cdr (assoc reason *block-reject-reasons*))
-                                 (string-downcase (symbol-name reason))))
+          ((keywordp reason)
+           (let ((base (or (cdr (assoc reason *block-reject-reasons*))
+                           (string-downcase (symbol-name reason)))))
+             (if script-verdict
+                 (format nil "~A (~A)" base
+                         (bl.interop:script-error-message (second error)))
+                 base)))
           (t (princ-to-string reason)))))
 
 (defun block-reject-reason-string (error)
@@ -3369,9 +3431,11 @@ Core's reject reasons already (bad-txnmrklroot, unexpected-witness, ...);
 logging them with ~A printed them UPPER CASE, and the functional framework
 greps the debug log for Core's spelling (p2p_segwit.py: `unexpected-witness`).
 The ones that are not are in *BLOCK-REJECT-REASONS*."
-  (if (and (consp error) (second error))
-      (format nil "~A, ~A" (block-reject-reason error) (second error))
-      (block-reject-reason error)))
+  (let ((debug (cond ((and (consp error) (stringp (second error))) (second error))
+                     ((and (consp error) (stringp (third error))) (third error)))))
+    (if debug
+        (format nil "~A, ~A" (block-reject-reason error) debug)
+        (block-reject-reason error))))
 
 (defun %mutated-block-error-p (error)
   "T iff ERROR is one of *MUTATED-BLOCK-ERRORS* (Core BLOCK_MUTATED). Reads
