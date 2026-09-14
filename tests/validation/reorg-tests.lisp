@@ -1625,6 +1625,72 @@ the pool child it would strand. A re-added final tx survives the filter."
       ;; the re-added tx passed the filter too
       (is (bl.mp:mempool-has mempool did)))))
 
+(test invalidateblock-stops-re-adding-after-core-tenth-disconnected-block
+  "Core's InvalidateBlock disconnects ONE block per pass and calls
+MaybeUpdateMempoolForReorg with fAddToMempool = (++disconnected <= 10)
+(validation.cpp:3621), so only the ten blocks nearest the old tip give their
+transactions back to the mempool; everything deeper is handed to the
+fAddToMempool=false arm, which only removeRecursive-s the pool entries that
+spent those transactions (:313-319). Every other reorg path -- the one
+ActivateBestChainStep drives -- re-adds unconditionally (:3298), so the cap
+belongs to invalidateblock alone.
+
+Ours re-added every disconnected block, whatever the depth. wallet_conflicts.py
+mines ELEVEN blocks for exactly this (:273-275 \"11 blocks are mined so that
+when they are invalidated, tx_2 does not get put back into the mempool\") and
+then asserts one transaction in the mempool at :293; ours held two.
+
+The control is the transaction in the block nearest the tip: it is the first
+disconnection, so it must come BACK. A change that simply stopped re-adding on
+this path would fail there."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture
+                  (format nil "invcap~D" (get-internal-real-time))))
+           (bl:*node* node)
+           ;; Mining flips a process-wide one-way latch; bind it so the suites
+           ;; after this one see what they saw before it.
+           (bl.net:*cached-is-ibd* bl.net:*cached-is-ibd*)
+           (chain-state (bl:node-chain-state node))
+           (store (bl:node-block-store node))
+           (mempool (bl:node-mempool node))
+           (descriptor (format nil "raw(~A)"
+                               (bl.crypto:bytes-to-hex (p2sh-optrue-script-pubkey)))))
+      (flet ((rpc (method &rest params)
+               (bl.rpc:dispatch-rpc-method node method params))
+             (coinbase-txid (height)
+               (bl.ser:transaction-hash
+                (first (bl.ser:bitcoin-block-transactions
+                        (bl.store:get-block
+                         store (bl.store:block-index-entry-hash
+                                (bl.store:get-block-at-height chain-state height))))))))
+        (flet ((mine (n) (rpc "generatetodescriptor" n descriptor))
+               (send (tx) (rpc "sendrawtransaction"
+                               (bl.crypto:bytes-to-hex
+                                (bl.ser:transaction-wire-bytes tx)))))
+          (mine 101)
+          ;; DEEP: confirmed in block 102, which invalidating 102 makes the
+          ;; ELEVENTH disconnection (the tip 112 is the first).
+          (let* ((deep (%pkg-tx (coinbase-txid 1) 0 4999990000))
+                 (deep-id (bl.ser:transaction-hash deep)))
+            (send deep)
+            (mine 1)                    ; height 102 carries DEEP
+            (mine 9)                    ; heights 103..111
+            ;; SHALLOW: confirmed in block 112, the FIRST disconnection.
+            (let* ((shallow (%pkg-tx (coinbase-txid 2) 0 4999990000))
+                   (shallow-id (bl.ser:transaction-hash shallow)))
+              (send shallow)
+              (mine 1)                  ; height 112 carries SHALLOW
+              (is (= 112 (bl.store:current-height chain-state)))
+              (is (zerop (bl.mp:mempool-count mempool))
+                  "both transactions must be confirmed before the rollback")
+              (rpc "invalidateblock" (rpc "getblockhash" 102))
+              (is (= 101 (bl.store:current-height chain-state)))
+              (is-true (bl.mp:mempool-has mempool shallow-id)
+                       "the tip block's transaction is the first disconnection and comes back")
+              (is-false (bl.mp:mempool-has mempool deep-id)
+                        "the eleventh disconnection is past Core's cap and must not")
+              (is (= 1 (bl.mp:mempool-count mempool))))))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Deep-reorg download-path regression (fix-deep-reorg-sequencing)
 ;;;

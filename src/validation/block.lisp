@@ -15,6 +15,20 @@
   "Cap on the transactions held for mempool re-add while a reorg is in flight
 (Core MAX_DISCONNECTED_TX_POOL_BYTES, kernel/disconnected_transactions.h:18).")
 
+(defconstant +max-invalidate-readd-blocks+ 10
+  "How many disconnected blocks, counted from the OLD TIP, give their
+transactions back to the mempool when INVALIDATE-BLOCK rolls the chain back.
+
+Core's InvalidateBlock disconnects one block per pass and calls
+MaybeUpdateMempoolForReorg with fAddToMempool = (++disconnected <= 10)
+(validation.cpp:3621) -- \"we are not doing a very deep invalidation (in which
+case keeping the mempool up to date is probably futile anyway)\" (:3617-3620).
+The blocks past it take the fAddToMempool=false arm, which only removes the
+pool entries that spent their transactions (:313-319).
+
+The cap is InvalidateBlock's alone: ActivateBestChainStep re-adds its whole
+disconnect pool unconditionally (:3298).")
+
 (defun trim-disconnect-pool (entries bytes)
   "Bound the reorg disconnect pool (Core LimitMemoryUsage,
 kernel/disconnected_transactions.cpp:31). ENTRIES is one (TXS . BYTES) cons
@@ -3121,7 +3135,20 @@ transactions removed."
           (incf removed (bl.mp:mempool-remove-recursive
                          mempool txid)))))))
 
-(defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height chain-state)
+(defun %reorg-drop-disconnected-tx (mempool tx)
+  "Core's fAddToMempool=false arm of MaybeUpdateMempoolForReorg
+(validation.cpp:313-319): removeRecursive(tx, REORG). TX is not offered back
+to the mempool at all, so anything in the pool that depends on it is now an
+orphan and goes with it -- and, in the rare case TX itself is in the pool,
+so does TX."
+  (let ((txid (bl.ser:transaction-hash tx)))
+    (if (bl.mp:mempool-has mempool txid)
+        (bl.mp:mempool-remove-recursive mempool txid)
+        (bl.mp:mempool-remove-spenders
+         mempool txid (length (bl.ser:transaction-outputs tx))))))
+
+(defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height chain-state
+                                          &key skipped-txs)
   "Re-add TXS from reorg-disconnected blocks into the mempool, best-effort —
 a port of Bitcoin Core's MaybeUpdateMempoolForReorg (validation.cpp:294-389).
 
@@ -3148,8 +3175,20 @@ validation.cpp:384-385 — finality, BIP68, coinbase maturity; the ordering
 is Core's MaybeUpdateMempoolForReorg exactly), and a final cap trim
 re-limits the pool (Core LimitMempoolSize, validation.cpp:387). Runs even
 with no TXS to re-add: the filter and trim concern the pool, not the
-disconnected blocks."
+disconnected blocks.
+
+SKIPPED-TXS are disconnected transactions the caller will not offer back --
+Core's fAddToMempool=false arm, which removeRecursive-s them instead
+(validation.cpp:313-319). INVALIDATE-BLOCK is the only caller that has any:
+everything past its tenth disconnected block (:3621)."
   (when mempool
+    ;; SKIPPED-TXS are the disconnected transactions a caller refuses to offer
+    ;; back at all -- INVALIDATE-BLOCK's blocks past Core's tenth disconnection
+    ;; (validation.cpp:3621). Core reaches them through the SAME function with
+    ;; fAddToMempool false, which is removeRecursive and nothing else.
+    (let ((bl.mp:*mempool-removal-reason* :reorg))
+      (dolist (tx skipped-txs)
+        (%reorg-drop-disconnected-tx mempool tx)))
     (let ((readded '()))                ; txids, most-recently-confirmed first
       (dolist (tx txs)
         (let ((txid (bl.ser:transaction-hash tx)))
@@ -3861,7 +3900,8 @@ when it was rolled back."
 
     (values t nil)))
 
-(defun %reorg-commit (r chain-state utxo-set mempool fee-estimator recent-rejects)
+(defun %reorg-commit (r chain-state utxo-set mempool fee-estimator recent-rejects
+                      &key max-readd-blocks)
   "PHASE C of a reorg: the observable side effects, committed only once the
 whole fork has validated and applied -- wallet and ZMQ notifications, the
 indexes, the fee estimator, the mempool removals and the disconnected-tx
@@ -3950,9 +3990,20 @@ relay filters."
 ;; request cut the reorg short.
 (let ((reached (bl.store:current-height chain-state)))
   (unless (historical-chainstate-p chain-state)
-    (readd-disconnected-txs-to-mempool
-     mempool (loop for entry in (reorg-disconnected-block-txs r) append (car entry))
-     utxo-set reached chain-state))
+    ;; MAX-READD-BLOCKS is Core's (++disconnected <= 10) in InvalidateBlock
+    ;; (validation.cpp:3621), counted from the OLD TIP. Our pool is
+    ;; oldest-block-first, so the blocks past the cap are the ones at the
+    ;; FRONT; they take the fAddToMempool=false arm instead. NIL (every other
+    ;; reorg driver, Core :3298) re-adds all of them.
+    (let* ((groups (reorg-disconnected-block-txs r))
+           (skipped (if max-readd-blocks
+                        (max 0 (- (length groups) max-readd-blocks))
+                        0)))
+      (readd-disconnected-txs-to-mempool
+       mempool (loop for entry in (nthcdr skipped groups) append (car entry))
+       utxo-set reached chain-state
+       :skipped-txs (loop for entry in (subseq groups 0 skipped)
+                          append (car entry)))))
 
   ;; Core CheckForkWarningConditions after every activation step
   ;; (validation.cpp:3302). A reorg is the step that most often clears the
@@ -3978,7 +4029,8 @@ relay filters."
                t))))
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
-                      &key fee-estimator recent-rejects mempool skip-scripts)
+                      &key fee-estimator recent-rejects mempool skip-scripts
+                           max-readd-blocks)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
 
@@ -3998,6 +4050,9 @@ Optionally updates FEE-ESTIMATOR with block fee statistics.
 Clears RECENT-REJECTS if provided (reorg may change transaction validity).
 When MEMPOOL is provided, removes connected blocks' txs from it and re-adds the
 disconnected blocks' txs (best-effort, re-validated against the new tip).
+MAX-READD-BLOCKS caps how many disconnected blocks, counted from the OLD TIP,
+may give their txs back -- Core's InvalidateBlock cap (validation.cpp:3621);
+NIL, the default, is ActivateBestChainStep's unconditional re-add (:3298).
 Side effects (indexes / fee-estimator / mempool / recent-rejects) are applied
 only after the whole fork validates, so a rolled-back reorg leaves them untouched.
 
@@ -4136,7 +4191,7 @@ comment above."
           (unless ok (return-from perform-reorg (values nil error))))
 
         (%reorg-commit r chain-state utxo-set mempool fee-estimator
-                       recent-rejects)))))
+                       recent-rejects :max-readd-blocks max-readd-blocks)))))
 
 ;;;; Chain-control helpers (invalidateblock / reconsiderblock)
 ;;;;
@@ -4396,7 +4451,11 @@ on its OWN four-block chain; we left it at height 1."
            (multiple-value-bind (ok detail)
                (perform-reorg chain-state block-store utxo-set tip parent
                               :fee-estimator fee-estimator
-                              :recent-rejects recent-rejects :mempool mempool)
+                              :recent-rejects recent-rejects :mempool mempool
+                              ;; Core InvalidateBlock's fAddToMempool
+                              ;; (validation.cpp:3621): only the ten blocks
+                              ;; nearest the old tip come back.
+                              :max-readd-blocks +max-invalidate-readd-blocks+)
              ;; Surface :interrupted as itself — the node is stopping, the reorg
              ;; did not fail — so the RPC reports why nothing was invalidated.
              (unless ok
