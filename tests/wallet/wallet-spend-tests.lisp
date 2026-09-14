@@ -1716,6 +1716,129 @@ simply refused every conf_target-bearing call would fail here."
                                    (cons "conf_target" 1/10))))
               "mode ~A must reach the conf_target check" mode))))))
 
+(test bumping-a-spend-of-an-unconfirmed-parent-pays-the-new-target-once
+  "Core's bumpfee rebuilds the replacement through CreateTransaction
+(feebumper.cpp:312), so the new transaction pays its own feerate plus what its
+unconfirmed ancestors cost to reach it -- and exactly that, because the
+selection's bump fees are reconciled against ONE calculateCombinedBumpFee for
+the whole input set (spend.cpp:788-807, SelectionResult::SetBumpFeeDiscount)
+and because CheckFeeRate prices the user's feerate the same way before the
+build (feebumper.cpp:83).
+
+wallet_spend_unconfirmed.py:326-333 bumps a 30 sat/vB child of a 1 sat/vB
+parent to 60 and asserts the PAIR lands at 60 and within 1% of it. Ours landed
+at 66.6 -- eleven percent over -- so the parent's bump was being paid more than
+once.
+
+The two lower bounds are the control: a change that simply paid less would
+fail them."
+  (with-wallet-chain-node (node "ws-rbfbump")
+    (multiple-value-bind (wallet address) (%ws-fund-wallet node)
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 4242))
+            (target 30))
+        (flet ((send-tx (dest amount rate)
+                 (let ((txid (bl.rpc:parse-hex-hash
+                              (%ws-sendtoaddress
+                               node (list dest amount nil nil nil nil nil nil nil rate)))))
+                   (%ws-mempool-tx node txid)))
+               (feerate-of (txs)
+                 (let ((fee 0) (vsize 0))
+                   (dolist (tx txs (/ fee vsize))
+                     (incf fee (%ws-tx-fee node wallet tx))
+                     (incf vsize (bl.ser:transaction-vsize tx))))))
+          (let ((parent (send-tx address 1 1)))
+            (is (not (null parent)) "the low-feerate parent never reached the mempool")
+            (is (< (feerate-of (list parent)) target)
+                "fixture: the parent already beats the target at ~A sat/vB"
+                (feerate-of (list parent)))
+            (let ((child (send-tx (%wc-optrue-address) 1/2 target)))
+              (is (not (null child)) "the child never reached the mempool")
+              (let* ((bumped-id
+                       (cdr (assoc "txid"
+                                   (bl.rpc:dispatch-rpc-method
+                                    node "bumpfee"
+                                    (wire-params
+                                     (list (bl.rpc:hash-to-hex
+                                            (bl.ser:transaction-hash child))
+                                           (let ((h (make-hash-table :test (quote equal))))
+                                             (setf (gethash "fee_rate" h) (* 2 target))
+                                             h))))
+                                   :test #'string=)))
+                     (bumped (and (stringp bumped-id)
+                                  (%ws-mempool-tx node (bl.rpc:parse-hex-hash bumped-id)))))
+                (is (not (null bumped)) "bumpfee produced no mempool transaction")
+                (is (>= (feerate-of (list bumped)) (* 2 target))
+                    "the replacement pays ~A sat/vB, under the ~A target"
+                    (feerate-of (list bumped)) (* 2 target))
+                (is (>= (feerate-of (list parent bumped)) (* 2 target))
+                    "parent+replacement pay ~A sat/vB, under the ~A target"
+                    (feerate-of (list parent bumped)) (* 2 target))
+                (is (<= (feerate-of (list parent bumped)) (* 101/100 2 target))
+                    "parent+replacement pay ~A sat/vB, over the ~A target by ~
+more than 1%" (feerate-of (list parent bumped)) (* 2 target))))))))))
+
+(test two-inputs-sharing-an-unconfirmed-parent-bump-it-once
+  "Core computes each candidate's ancestor bump fee ONE OUTPOINT AT A TIME
+(AvailableCoins over chain.calculateIndividualBumpFees, spend.cpp:515-522), so
+a selection that takes two outputs of the same unconfirmed parent has been
+charged for that parent twice. ChooseSelectionResult reconciles it: one
+calculateCombinedBumpFee over the whole chosen input set counts each shared
+ancestor once, and the difference becomes the selection's
+SetBumpFeeDiscount (spend.cpp:788-807), which lowers the waste, raises the
+selected effective value and is subtracted from the fee the build pays
+(coinselection.cpp:838-839, :887, :892).
+
+We had no discount at all, so the pair was over-paid by one whole parent bump.
+wallet_spend_unconfirmed.py:337-355 spends both outputs of a 1 sat/vB parent at
+the target and asserts the pair lands within 1% of it.
+
+The two lower bounds are the control: they fail for a selection that pays too
+little, so a discount applied twice or to a confirmed input cannot pass here."
+  (with-wallet-chain-node (node "ws-overlap")
+    (multiple-value-bind (wallet address) (%ws-fund-wallet node)
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 909))
+            (target 30))
+        (flet ((send-tx (dest amount rate)
+                 (let ((txid (bl.rpc:parse-hex-hash
+                              (%ws-sendtoaddress
+                               node (list dest amount nil nil nil nil nil nil nil rate)))))
+                   (%ws-mempool-tx node txid)))
+               (feerate-of (txs)
+                 (let ((fee 0) (vsize 0))
+                   (dolist (tx txs (/ fee vsize))
+                     (incf fee (%ws-tx-fee node wallet tx))
+                     (incf vsize (bl.ser:transaction-vsize tx))))))
+          ;; A cheap parent with TWO wallet outputs: the 25 BTC payment to
+          ;; ourselves and the change.
+          (let ((parent (send-tx address 25 1)))
+            (is (not (null parent)) "the low-feerate parent never reached the mempool")
+            (is (< (feerate-of (list parent)) target)
+                "fixture: the parent already beats the target at ~A sat/vB"
+                (feerate-of (list parent)))
+            ;; 30 BTC needs both of them, so the selection shares one ancestor.
+            (let ((child (send-tx (%wc-optrue-address) 30 target)))
+              (is (not (null child)) "the child never reached the mempool")
+              (let ((parent-id (bl.ser:transaction-hash parent)))
+                (is (= 2 (length (bl.ser:transaction-inputs child)))
+                    "fixture: the child took ~D input(s), not the two parent outputs"
+                    (length (bl.ser:transaction-inputs child)))
+                (is (every (lambda (in)
+                             (equalp parent-id
+                                     (bl.ser:outpoint-hash
+                                      (bl.ser:tx-in-previous-output in))))
+                           (bl.ser:transaction-inputs child))
+                    "fixture: the child spends something other than the parent"))
+              (is (>= (feerate-of (list child)) target)
+                  "the child pays ~A sat/vB, under the ~A target"
+                  (feerate-of (list child)) target)
+              (is (>= (feerate-of (list parent child)) target)
+                  "parent+child pay ~A sat/vB, under the ~A target"
+                  (feerate-of (list parent child)) target)
+              (is (<= (feerate-of (list parent child)) (* 101/100 target))
+                  "parent+child pay ~A sat/vB, over the ~A target by more than ~
+1% -- the shared parent was bumped twice"
+                  (feerate-of (list parent child)) target))))))))
+
 (test the-coin-eligibility-ladder-reads-limitancestorcount
   "Core's AutomaticCoinSelection builds its eligibility ladder from
 chain.getPackageLimits (wallet/spend.cpp:872-883 over node/interfaces.cpp:
