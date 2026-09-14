@@ -195,32 +195,56 @@ is BIP65 — the option takes the deployment's name, not the BIP number.")
 
 (defun parse-test-activation-height (spec)
   "Parse one -testactivationheight value, `name@height`, into (VALUES name
-height), or NIL when malformed. Core raises on a missing '@', a height that is
-not a non-negative integer, and a name that is not a buried deployment
-(chainparams.cpp:49-67)."
-  (when (stringp spec)
-    (let ((at (position #\@ spec)))
-      (when at
-        (let ((name (subseq spec 0 at))
-              (value (subseq spec (1+ at))))
-          (when (and (member name +buried-deployment-names+ :test #'string=)
-                     (plusp (length value))
-                     (every #'digit-char-p value))
-            (let ((height (parse-integer value :junk-allowed t)))
-              (when (and height (>= height 0))
-                (values name height)))))))))
+height), or (VALUES NIL REASON) when malformed.
+
+REASON is the one of Core's three refusals this SPEC earns, in Core's own
+order of checks (chainparams.cpp:49-67): :FORMAT when there is no '@' at all
+(:51-53), then :HEIGHT when what follows it is not an integer in
+[0, INT_MAX) (:55-59), then :NAME when what precedes it is not a buried
+deployment (:62-66). The order is part of the answer -- `@5' is a NAME
+refusal and `csv@x' a HEIGHT one -- and each has its own message, which
+APPLY-TEST-ACTIVATION-HEIGHTS prints verbatim."
+  (unless (stringp spec)
+    (return-from parse-test-activation-height (values nil :format)))
+  (let ((at (position #\@ spec)))
+    (unless at
+      (return-from parse-test-activation-height (values nil :format)))
+    (let* ((name (subseq spec 0 at))
+           (value (subseq spec (1+ at)))
+           ;; Core ToIntegral<int32_t>: the whole field, digits only, an
+           ;; optional leading '-', no whitespace and no junk.
+           (height (and (plusp (length value))
+                        (every #'digit-char-p
+                               (if (char= (char value 0) #\-)
+                                   (subseq value 1)
+                                   value))
+                        (or (char/= (char value 0) #\-) (> (length value) 1))
+                        (parse-integer value :junk-allowed nil))))
+      (cond ((or (null height) (minusp height) (>= height 2147483647))
+             (values nil :height))
+            ((not (member name +buried-deployment-names+ :test #'string=))
+             (values nil :name))
+            (t (values name height))))))
 
 (defun apply-test-activation-heights (specs)
   "Install the -testactivationheight overrides in SPECS. Signals on a malformed
 entry, as Core does — a typo'd deployment name that was silently ignored would
-leave the test running against the height it was trying to move."
+leave the test running against the height it was trying to move.
+
+Each refusal carries Core's own sentence for it (chainparams.cpp:52, :58, :65),
+naming the WHOLE argument rather than the half that was wrong, because that is
+what Core's strprintf is handed: rpc_blockchain.py:179-190 asserts all three at
+startup."
   (clrhash *test-activation-heights*)
   (dolist (spec specs)
     (multiple-value-bind (name height) (parse-test-activation-height spec)
       (unless name
-        (config-error "Invalid -testactivationheight=~A. Expected name@height, where ~
-name is one of ~{~A~^, ~} and height is a non-negative integer."
-               spec +buried-deployment-names+))
+        (config-error "~A (~A) for -testactivationheight=name@height."
+                      (ecase height
+                        (:format "Invalid format")
+                        (:height "Invalid height value")
+                        (:name "Invalid name"))
+                      (if (stringp spec) spec "")))
       (setf (gethash name *test-activation-heights*) height))))
 
 (defun %activation-height (name default)
