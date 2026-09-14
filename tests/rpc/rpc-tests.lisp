@@ -5176,6 +5176,46 @@ by the blockfilter handler, which then reads the filter type as
       (is-false (search "Expected /rest/blockfilter/" body)
                 "blockfilterheaders was routed to the blockfilter handler"))))
 
+(test rest-errors-are-worded-as-core-words-them
+  "Core's RESTERR sentences name the value they could not use: `Invalid hash:
+<str>' (rest.cpp:213, :331, :401, :636, :846), `<str> not found' (:341, :415,
+:658, :858), `Invalid height: <str>' (:1099), `Block height out of range'
+(:1110) and `Header count is invalid or out of acceptable range (1-2000):
+<str>' (:208, :527).
+
+Ours were generic -- `Invalid txid', `Invalid block hash', `Block not found',
+`Invalid count' -- so interface_rest.py:123 read `Invalid txid' where it
+compares the whole line against `Invalid hash: abc'."
+  (let ((node (make-test-node)))
+    (flet ((body-of (uri)
+             (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+               (handler-case (rest-request node uri)
+                 (error (e) (princ-to-string e))))))
+      (dolist (row '(("/rest/tx/abc.json" "Invalid hash: abc")
+                     ("/rest/block/abc.json" "Invalid hash: abc")
+                     ("/rest/headers/abc.json" "Invalid hash: abc")
+                     ("/rest/spenttxouts/abc.json" "Invalid hash: abc")
+                     ("/rest/blockhashbyheight/abc.json" "Invalid height: abc")))
+        (destructuring-bind (uri expected) row
+          (let ((b (body-of uri)))
+            (is-true (and (stringp b) (search expected b))
+                     "~A: wanted ~S, got ~S" uri expected b))))
+      ;; A well-formed hash nothing knows is "<hash> not found", naming it.
+      (let* ((zeros (make-string 64 :initial-element #\0))
+             (b (body-of (format nil "/rest/tx/~A.json" zeros))))
+        (is-true (and (stringp b) (search (format nil "~A not found" zeros) b))
+                 "an unknown txid must be named: ~S" b))
+      ;; A height past the tip is Core's own sentence, not "Block not found".
+      (let ((b (body-of "/rest/blockhashbyheight/999999.json")))
+        (is-true (and (stringp b) (search "Block height out of range" b))
+                 "a height past the tip: ~S" b))
+      ;; The count range, with the value as it arrived.
+      (let ((b (body-of (format nil "/rest/headers/~A.json?count=0"
+                                (make-string 64 :initial-element #\0)))))
+        (is-true (and (stringp b)
+                      (search "Header count is invalid or out of acceptable range (1-2000): 0" b))
+                 "count=0: ~S" b)))))
+
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
 serving something wrong or signalling out of the handler."
@@ -5188,7 +5228,9 @@ serving something wrong or signalling out of the handler."
       (dolist (uri '("/rest/spenttxouts/nothex.json"
                      "/rest/blockfilter/basic/nothex.json"))
         (let ((b (body-of uri)))
-          (is-true (and (stringp b) (search "Invalid block hash" b))
+          ;; Core's sentence names the value it could not parse
+          ;; (rest.cpp:331, :636): "Invalid hash: nothex".
+          (is-true (and (stringp b) (search "Invalid hash: nothex" b))
                    "~A did not refuse a bad hash: ~S" uri b)))
       ;; blockfilter without a filter type is a URI-format error.
       (let ((b (body-of "/rest/blockfilter/00.json")))
@@ -5491,7 +5533,7 @@ shorter route would swallow every blockpart request and try to read
       ;; A bad hash is still a bad hash — but only once the parameters are
       ;; valid, since Core validates them first (rest.cpp:480-497 delegates to
       ;; rest_block, where the hash is parsed).
-      (is-true (search "Invalid block hash"
+      (is-true (search "Invalid hash: nothex"
                        (req "/rest/blockpart/nothex.bin" '(("offset" . "0") ("size" . "1"))))))))
 
 (test rest-blockpart-range-check-is-cores

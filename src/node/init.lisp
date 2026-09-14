@@ -1298,6 +1298,15 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
           (ignore-errors
            (bl.net:maybe-start-reconciliation
             p now)))))
+    ;; Hourly fee-estimate flush (Core's scheduler,
+    ;; init.cpp:1662). Cadence-gated inside, so this is
+    ;; a cheap no-op most ticks -- and it is per TICK
+    ;; rather than per sync pass because `mockscheduler'
+    ;; forwards the clock and the test waits one second
+    ;; for the line.
+    (let ((estimator (node-fee-estimator *node*)))
+      (when estimator
+        (ignore-errors (bl.mp:maybe-flush-fee-estimates estimator))))
     ;; New headers announced: start the
     ;; next sync cycle now to fetch the
     ;; block instead of waiting out the

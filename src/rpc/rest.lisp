@@ -57,6 +57,13 @@
         (values (subseq path 0 dot) (subseq path (1+ dot)))
         (values path nil))))
 
+(defun %rest-bad-count-message (raw-count)
+  "Core's message for an out-of-range `count' query parameter
+(rest.cpp:207-209, :525-527): the accepted range and the value as it arrived,
+not a bare `Invalid count'."
+  (format nil "Header count is invalid or out of acceptable range (1-~D): ~A"
+          +rest-max-headers+ raw-count))
+
 (defun %rest-format-not-found (&optional (available ".bin, .hex, .json"))
   "Core's unknown-format response: HTTP 404 \"output format not found
 (available: ...)\" (rest.cpp RESTERR(HTTP_NOT_FOUND, ...) default arms)."
@@ -92,11 +99,13 @@ response. Caller has already validated EXT is one of those."
 (defun %rest-blockhashbyheight (node body ext)
   (let ((height (parse-integer body :junk-allowed t)))
     (unless (and height (>= height 0))
-      (return-from %rest-blockhashbyheight (%rest-error 400 "Invalid height")))
+      (return-from %rest-blockhashbyheight
+        (%rest-error 400 (format nil "Invalid height: ~A" body))))
     (let ((hash-hex (handler-case (rpc-getblockhash node (list height))
                       (rpc-error () nil))))
       (unless hash-hex
-        (return-from %rest-blockhashbyheight (%rest-error 404 "Block not found")))
+        (return-from %rest-blockhashbyheight
+          (%rest-error 404 "Block height out of range")))
       (%rest-by-ext ext
         :json (%rest-json `(("blockhash" . ,hash-hex)))
         :hex/bin (%rest-hex-or-bin ext hash-hex)))))
@@ -112,21 +121,21 @@ rest_block_notxdetails passes SHOW_TXID, i.e. verbosity 1. Serving verbosity 2
 here answered without any prevout, so a block explorer had to fetch every
 spent output itself."
   (unless (valid-hex-hash-p body)
-    (return-from %rest-block (%rest-error 400 "Invalid block hash")))
+    (return-from %rest-block (%rest-error 400 (format nil "Invalid hash: ~A" body))))
   (handler-case
       (%rest-by-ext ext
         :json (%rest-json (rpc-getblock node (list body (if notxdetails 1 3))))
         :hex/bin (%rest-hex-or-bin ext (rpc-getblock node (list body 0))))
-    (rpc-error () (%rest-error 404 "Block not found"))))
+    (rpc-error () (%rest-error 404 (format nil "~A not found" body)))))
 
 (defun %rest-tx (node body ext)
   (unless (valid-hex-hash-p body)
-    (return-from %rest-tx (%rest-error 400 "Invalid txid")))
+    (return-from %rest-tx (%rest-error 400 (format nil "Invalid hash: ~A" body))))
   (handler-case
       (%rest-by-ext ext
         :json (%rest-json (rpc-getrawtransaction node (list body t)))
         :hex/bin (%rest-hex-or-bin ext (rpc-getrawtransaction node (list body nil))))
-    (rpc-error () (%rest-error 404 "Transaction not found (mempool/txindex only on a pruned node)"))))
+    (rpc-error () (%rest-error 404 (format nil "~A not found" body)))))
 
 (defun %rest-headers (node body ext)
   "Up to COUNT headers starting at BODY (a block hash), walking forward on
@@ -146,16 +155,16 @@ Divergence kept deliberately: Core answers 200 with an empty array for a
 hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
 404 an existing client may rely on."
   (unless (valid-hex-hash-p body)
-    (return-from %rest-headers (%rest-error 400 "Invalid block hash")))
-  (let* ((count (let ((q (hunchentoot:get-parameter "count")))
-                  (or (and q (parse-integer q :junk-allowed t)) 5)))
+    (return-from %rest-headers (%rest-error 400 (format nil "Invalid hash: ~A" body))))
+  (let* ((raw-count (or (hunchentoot:get-parameter "count") "5"))
+         (count (parse-integer raw-count :junk-allowed t))
          (chain-state (rpc-get-chain-state node))
          (start (bl.store:get-block-index-entry
                  chain-state (parse-hex-hash body))))
-    (when (or (< count 1) (> count +rest-max-headers+))
-      (return-from %rest-headers (%rest-error 400 "Invalid count")))
+    (when (or (null count) (< count 1) (> count +rest-max-headers+))
+      (return-from %rest-headers (%rest-error 400 (%rest-bad-count-message raw-count))))
     (unless start
-      (return-from %rest-headers (%rest-error 404 "Block not found")))
+      (return-from %rest-headers (%rest-error 404 (format nil "~A not found" body))))
     ;; Walk forward via active-chain successors by height.
     (let ((entries
             (when (bl.store:entry-on-active-chain-p chain-state start)
@@ -403,7 +412,7 @@ not wrap, so a plain + is already the safe version."
     (cond
       ((null offset) (%rest-error 400 "Block part offset missing or invalid"))
       ((null size) (%rest-error 400 "Block part size missing or invalid"))
-      ((not (valid-hex-hash-p body)) (%rest-error 400 "Invalid block hash"))
+      ((not (valid-hex-hash-p body)) (%rest-error 400 (format nil "Invalid hash: ~A" body)))
       ((string= ext "json") (%rest-format-not-found ".bin, .hex"))
       ((not (or (string= ext "hex") (string= ext "bin")))
        (%rest-format-not-found ".bin, .hex"))
@@ -449,8 +458,8 @@ against the tip."
          (hash (and slash (subseq body (1+ slash)))))
     (cond
       ((null slash)
-       (%rest-error 400 "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>."))
-      ((not (valid-hex-hash-p hash)) (%rest-error 400 "Invalid block hash"))
+       (%rest-error 400 "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>"))
+      ((not (valid-hex-hash-p hash)) (%rest-error 400 (format nil "Invalid hash: ~A" hash)))
       (t
        (handler-case
            (let ((result (rpc-getblockfilter node (list hash filtertype))))
@@ -477,22 +486,22 @@ sequence that never existed."
          ;; two is the current <filtertype>/<blockhash> with ?count=.
          (deprecated (= (length parts) 3))
          (hash (if deprecated (third parts) (second parts)))
-         (count (if deprecated
-                    (parse-integer (second parts) :junk-allowed t)
-                    (let ((q (hunchentoot:get-parameter "count")))
-                      (or (and q (parse-integer q :junk-allowed t)) 5)))))
+         (raw-count (if deprecated
+                        (second parts)
+                        (or (hunchentoot:get-parameter "count") "5")))
+         (count (and raw-count (parse-integer raw-count :junk-allowed t))))
     (cond
       ((not (member (length parts) '(2 3)))
-       (%rest-error 400 "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>."))
-      ((not (valid-hex-hash-p hash)) (%rest-error 400 "Invalid block hash"))
+       (%rest-error 400 "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>"))
       ((or (null count) (< count 1) (> count +rest-max-headers+))
-       (%rest-error 400 "Invalid count"))
+       (%rest-error 400 (%rest-bad-count-message (or raw-count ""))))
+      ((not (valid-hex-hash-p hash)) (%rest-error 400 (format nil "Invalid hash: ~A" hash)))
       (t
        (let* ((chain-state (rpc-get-chain-state node))
               (start (bl.store:get-block-index-entry
                       chain-state (parse-hex-hash hash))))
          (cond
-           ((null start) (%rest-error 404 "Block not found"))
+           ((null start) (%rest-error 404 (format nil "~A not found" hash)))
            (t
             (handler-case
                 (let* ((entries
@@ -555,7 +564,7 @@ Both forms carry Core's REST-specific shape, which leads with a placeholder
 for the coinbase: %REST-SPENT-TXOUTS-BYTES for .bin/.hex and %BLOCK-UNDO-JSON
 for .json."
   (unless (valid-hex-hash-p body)
-    (return-from %rest-spenttxouts (%rest-error 400 "Invalid block hash")))
+    (return-from %rest-spenttxouts (%rest-error 400 (format nil "Invalid hash: ~A" body))))
   (let* ((hash (parse-hex-hash body))
          (store (and hash (rpc-get-block-store node)))
          (block (and store (bl.store:get-block store hash))))

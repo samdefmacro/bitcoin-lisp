@@ -618,3 +618,51 @@ LOAD-FEE-STATS, which is exactly what production did not do."
       (is (= saved (bl.mp:bpe-estimate-smart-fee
                     bl.mp:*block-policy-estimator* 6))
           "the restored estimator must answer what the saved one did"))))
+
+(test fee-estimates-are-flushed-on-cores-hourly-cadence
+  "Core's scheduler calls FlushFeeEstimates once an hour (init.cpp:1662,
+FEE_FLUSH_INTERVAL = 1h) and the flush logs `Flushed fee estimates to <path>.'
+(block_policy_estimator.cpp:975).
+
+We wrote fee_estimates.dat at shutdown and after a block count only, so a node
+that ran for days and was killed lost every estimate it had learned -- the file
+exists precisely so a restart does not start blind. feature_fee_estimation.py
+deletes the file, calls `mockscheduler' to forward an hour, and waits ONE
+second for that log line, so the cadence must be read off the mockable clock."
+  (let* ((dir (%fee-stats-fixture "flush-cadence"))
+         (estimator (bl.mp:make-fee-estimator :data-directory dir))
+         (path (merge-pathnames "fee_estimates.dat" dir))
+         (bl.mp::*last-fee-estimate-flush-time* nil)
+         (bl.ser:*mock-time* 1700000000))
+    (ignore-errors (delete-file path))
+    ;; The first call only arms the clock: Core's scheduleEvery fires after
+    ;; the first interval, not at once.
+    (is (null (bl.mp:maybe-flush-fee-estimates estimator))
+        "the first call must not flush")
+    (is (null (probe-file path)) "nothing written yet")
+    ;; Well short of an hour: still nothing.
+    (setf bl.ser:*mock-time* (+ 1700000000 3599))
+    (is (null (bl.mp:maybe-flush-fee-estimates estimator))
+        "3599 seconds is not an hour")
+    (is (null (probe-file path)) "control: still nothing written")
+    ;; An hour on the mockable clock, as `mockscheduler' produces it.
+    (setf bl.ser:*mock-time* (+ 1700000000 3600))
+    (let ((lines (let ((enabled (bl.log:log-category-enabled-p "estimatefee")))
+                   ;; The line is Core's LogDebug(BCLog::ESTIMATEFEE, ...); the
+                   ;; functional framework starts every node with -debug, so
+                   ;; the category is on there.
+                   (bl.log:enable-log-category "estimatefee")
+                   (unwind-protect
+                        (capture-log-lines
+                         (lambda ()
+                           (is-true (bl.mp:maybe-flush-fee-estimates estimator)
+                                    "an hour must flush")))
+                     (unless enabled
+                       (bl.log:disable-log-category "estimatefee"))))))
+      (is-true (probe-file path) "fee_estimates.dat is written")
+      (is-true (find (format nil "Flushed fee estimates to ~A." (namestring path))
+                     lines :test #'search)
+               "Core's sentence, with the path; got ~S" lines))
+    ;; And the clock rearms rather than flushing on every later call.
+    (is (null (bl.mp:maybe-flush-fee-estimates estimator))
+        "the interval restarts after a flush")))
