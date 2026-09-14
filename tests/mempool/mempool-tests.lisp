@@ -1037,14 +1037,24 @@ nothing tested it."
          (list parent (%eph-spend parent '(0 1))) nil)
       (is-true ok)
       (is (null offender)))
-    ;; A child that takes only the non-dust output STRANDS the dust.
-    (multiple-value-bind (ok offender)
+    ;; A child that takes only the non-dust output STRANDS the dust, and the
+    ;; check names the offender -- as the transaction, because Core's debug
+    ;; message for the rejection carries its txid AND its wtxid
+    ;; (ephemeral_policy.cpp:88-89) and mempool_ephemeral_dust.py:244
+    ;; compares the whole sentence.
+    (multiple-value-bind (ok offender offending-tx)
         (bl.val::check-ephemeral-spends
          (list parent (%eph-spend parent '(0))) nil)
       (is (null ok))
-      (is (equalp (bl.ser:transaction-hash
-                   (%eph-spend parent '(0)))
-                  offender)))
+      (let ((child (%eph-spend parent '(0))))
+        (is (equalp (bl.ser:transaction-hash child) offender))
+        (is (equalp (bl.ser:transaction-hash child)
+                    (bl.ser:transaction-hash offending-tx)))
+        (is (string= (format nil "missing-ephemeral-spends, tx ~A (wtxid=~A) did not spend parent's ephemeral dust"
+                             (bl.rpc:hash-to-hex (bl.ser:transaction-hash child))
+                             (bl.rpc:hash-to-hex (bl.ser:transaction-wtxid child)))
+                     (bl.val:tx-reject-reason-string
+                      (bl.val::ephemeral-spends-verdict offending-tx))))))
     ;; A child that spends ONLY the dust is also fine — the dust is gone.
     (multiple-value-bind (ok)
         (bl.val::check-ephemeral-spends

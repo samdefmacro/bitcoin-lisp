@@ -545,10 +545,20 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
       ;; validate-transaction-for-mempool only sees MEMPOOL parents; a dust
       ;; parent that is still in this package is only visible here. Read-only,
       ;; so it keeps the atomicity above.
-      (when (and *require-standard*
-                 (not (check-ephemeral-spends (mapcar #'%pkg-val-tx validated)
-                                              mempool)))
-        (return-from %accept-package-subset :unspent-dust))
+      (when *require-standard*
+        (multiple-value-bind (dust-ok dust-txid offender)
+            (check-ephemeral-spends (mapcar #'%pkg-val-tx validated) mempool)
+          (declare (ignore dust-txid))
+          (unless dust-ok
+            ;; The PACKAGE state is "unspent-dust" (validation.cpp:1527) and
+            ;; the CHILD's own state carries Core's missing-ephemeral-spends
+            ;; sentence (ephemeral_policy.cpp:88-89).
+            (let ((child (gethash (bl.ser:transaction-wtxid
+                                   (or offender (%pkg-val-tx (car (last validated)))))
+                                  results)))
+              (when child
+                (%mark-result-invalid child (ephemeral-spends-verdict offender))))
+            (return-from %accept-package-subset :unspent-dust))))
       ;; ---- Commit point: every check passed; mutate the mempool. ----
       ;; Evict the package-RBF replaced set once, up front — the analogue of
       ;; Core applying the changeset's removals with its additions.

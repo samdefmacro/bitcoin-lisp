@@ -374,7 +374,9 @@ rather than collected)."
   "Core CheckEphemeralSpends (ephemeral_policy.cpp:33): every transaction in
 TXNS must spend ALL of the dust outputs of each parent it spends from, where a
 parent is looked up first in TXNS itself and then in MEMPOOL. Returns
-(values ok-p offending-txid).
+(values ok-p offending-txid offending-tx) -- the transaction as well as its
+id, because Core's debug message for this rejection names both its txid and
+its wtxid (ephemeral_policy.cpp:88-89).
 
 Dust is only tolerated because it is ephemeral — created and destroyed inside
 one package, never left in the UTXO set for anyone to sweep. A child that
@@ -415,8 +417,34 @@ so the whole exemption depends on this check."
                                unspent-dust))))
           (when unspent-dust
             (return-from check-ephemeral-spends
-              (values nil (bl.ser:transaction-hash tx)))))))
-    (values t nil)))
+              (values nil (bl.ser:transaction-hash tx) tx))))))
+    (values t nil nil)))
+
+(defun %single-ephemeral-spend-verdict (tx mempool bypass-limits)
+  "The missing-ephemeral-spends verdict for TX on its own, or NIL.
+
+Core runs CheckEphemeralSpends with package={ptx} here (validation.cpp:1372),
+gated on require_standard AND !bypass_limits (:1370) -- both, not either.
+Only MEMPOOL parents are visible from this call; a parent still inside an
+unsubmitted package is covered by the package-level call in
+VALIDATE-PACKAGE-FOR-MEMPOOL."
+  (when (and *require-standard* (not bypass-limits))
+    (multiple-value-bind (ok txid offender) (check-ephemeral-spends (list tx) mempool)
+      (declare (ignore txid))
+      (unless ok (ephemeral-spends-verdict offender)))))
+
+(defun ephemeral-spends-verdict (offending-tx)
+  "Core's missing-ephemeral-spends rejection for OFFENDING-TX, reason and
+debug message both (ephemeral_policy.cpp:88-89). The message names the CHILD
+that stranded the dust, which is the only way a caller holding a package can
+tell which member it was; mempool_ephemeral_dust.py:244 compares the whole
+sentence."
+  (list :missing-ephemeral-spends
+        (if offending-tx
+            (format nil "tx ~A (wtxid=~A) did not spend parent's ephemeral dust"
+                    (%tx-hash-hex (bl.ser:transaction-hash offending-tx))
+                    (%tx-hash-hex (bl.ser:transaction-wtxid offending-tx)))
+            "")))
 
 (defun scriptsig-push-only-p (script-sig)
   "True if SCRIPT-SIG contains only push opcodes (every opcode <= OP_16),
@@ -1352,16 +1380,11 @@ decide (Core PreChecks, validation.cpp:950-970)."
             (return-from validate-transaction-for-mempool
               (values nil :too-many-sigops nil)))
 
-          ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends at
-          ;; validation.cpp:1372, with package={ptx}). Only MEMPOOL parents are
-          ;; visible from here; a parent still inside an unsubmitted package is
-          ;; covered by the package-level call in validate-package-for-mempool.
-          ;; Core gates this one on require_standard AND !bypass_limits
-          ;; (validation.cpp:1370) — both, not either.
-          (when (and *require-standard* (not bypass-limits)
-                     (not (check-ephemeral-spends (list tx) mempool)))
-            (return-from validate-transaction-for-mempool
-              (values nil :missing-ephemeral-spends nil)))
+          ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends,
+          ;; validation.cpp:1370-1372) -- see %SINGLE-EPHEMERAL-SPEND-VERDICT.
+          (let ((dust (%single-ephemeral-spend-verdict tx mempool bypass-limits)))
+            (when dust
+              (return-from validate-transaction-for-mempool (values nil dust nil))))
 
           ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
           ;; dynamic minimum when the mempool has been trimming). The rate is
