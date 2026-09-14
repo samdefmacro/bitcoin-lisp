@@ -1415,6 +1415,24 @@ hook wired inside the branch."
   ;; (feature_notifications.py:24), and that test builds a wallet name out of
   ;; every remaining byte from 1 to 127 -- backslash, quotes and control
   ;; characters included -- then creates the wallet with it.
+  ;; A name carrying a Lisp namestring wildcard must reach the filesystem as
+  ;; itself. `*', `?', `[' and `]' are pattern syntax when a namestring is
+  ;; PARSED, so building the wallet directory by concatenating the name into a
+  ;; string made a WILD pathname out of `w*t' and refused `a[b' outright with
+  ;; "parse error in namestring: #\[ with no corresponding #\]" -- an RPC -32603
+  ;; from createwallet, which is where feature_notifications.py:85 stopped.
+  (let ((manager (bl.wallet::make-wallet-manager :data-directory #p"/tmp/wdtest/")))
+    (dolist (name '("a[b]c" "star*" "quest?" "plain"))
+      (let ((directory (bl.wallet::wallet-directory manager name)))
+        (is (equal name (first (last (pathname-directory directory))))
+            "~S must be one literal directory component" name)
+        (is-false (wild-pathname-p directory)
+                  "~S must not produce a wild pathname" name)
+        ;; And the sentence an RPC prints is the name the caller passed, not
+        ;; NAMESTRING's re-readable escaping of it.
+        (is (equal (format nil "/tmp/wdtest/wallets/~A" name)
+                   (bl.wallet::wallet-path-string directory))
+            "~S must print unescaped" name))))
   (flet ((accepted-p (name) (and (bl.wallet::%valid-wallet-name-p name) t)))
     (is-false (accepted-p "a;rm -rf /"))
     (is-true (accepted-p (coerce (loop for i from 1 below 128
