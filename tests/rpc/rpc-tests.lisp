@@ -4313,6 +4313,43 @@ internal error."
           "the two JSON shapes produced different results:~%  ~A~%  ~A"
           from-alist from-hash))))
 
+(test signrawtransactionwithkey-refuses-a-bad-wif-as-an-invalid-key
+  "Core's DecodeSecret failure is RPC_INVALID_ADDRESS_OR_KEY -- the code every
+bad key or address gets -- and not the -8 an out-of-range argument gets
+(rpc/rawtransaction.cpp:748-752). Ours answered -8, so
+rpc_signrawtransactionwithkey.py:138, which passes privkeys=[\"123\"] and asks
+for -5 `Invalid private key\', read -8.
+
+Core decodes the TRANSACTION before it looks at any key (:740-743), so a bad
+key alongside bad hex is still the -22 decode failure; both rows are Core's
+own, in Core's order. The control is that a well-formed WIF for a key the
+transaction does not need is accepted and the call returns."
+  (let* ((bl:*network* :regtest)
+         (node (bl:make-node :network :regtest))
+         (txid "0000000000000000000000000000000000000000000000000000000000000001")
+         (spk (bl.crypto:hex-to-bytes
+               "76a91460baa0f494b38ce3c940dea67f3804dc52d1fb9488ac"))
+         (raw (one-input-tx-hex txid 0 spk))
+         ;; A regtest WIF for the all-ones secret: well-formed, and unrelated
+         ;; to the output above.
+         (good-wif (bl.crypto:private-key-to-wif
+                    (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 1)
+                    :network :regtest)))
+    (is (equal (cons -5 "Invalid private key")
+               (%rpc-wire-error node "signrawtransactionwithkey"
+                                (list raw (vector "123"))))
+        "a WIF that does not decode is Core's -5 Invalid private key")
+    (is (equal (cons -22 "TX decode failed. Make sure the tx has at least one input.")
+               (%rpc-wire-error node "signrawtransactionwithkey"
+                                (list (concatenate 'string raw "00")
+                                      (vector "123"))))
+        "and the transaction is decoded first, so bad hex wins")
+    ;; Control: a well-formed WIF is not refused.
+    (is (null (%rpc-wire-error node "signrawtransactionwithkey"
+                               (list raw (vector good-wif))))
+        "a well-formed WIF is accepted")))
+
 (test signrawtransactionwithkey-refuses-a-malformed-prevtxs-entry-in-cores-words
   "Core ParsePrevouts (rpc/rawtransaction_util.cpp:190-310) refuses every
 malformed prevtxs entry with a specific code and sentence; this handler

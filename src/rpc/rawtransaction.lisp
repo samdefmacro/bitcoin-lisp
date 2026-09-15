@@ -1189,8 +1189,13 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
       ;; Key map: derive each WIF's pubkey (per its compression flag) -> key-id.
       (dolist (wif wifs)
         (multiple-value-bind (sk compressed) (bl.crypto:wif-to-private-key wif)
+          ;; Core's DecodeSecret failure is RPC_INVALID_ADDRESS_OR_KEY, the
+          ;; code every bad key or address gets -- not the -8 an out-of-range
+          ;; argument gets (rpc/rawtransaction.cpp:751).
+          ;; rpc_signrawtransactionwithkey.py:138 passes "123" and asks for -5.
           (unless sk
-            (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid private key"))
+            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                              :message "Invalid private key"))
           (let ((pub (bl.crypto:derive-public-key sk :compressed compressed)))
             (setf (gethash (bl.crypto:hash160 pub) keymap) (cons sk pub))
             (setf (gethash pub pubmap) sk))
