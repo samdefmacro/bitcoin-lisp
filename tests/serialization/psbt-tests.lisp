@@ -1238,3 +1238,45 @@ asked to fill in a PSBT at all."
           (is (stringp (cdr (assoc "psbt" result :test #'string=))))
           (is (eq bl.rpc:+json-false+ (cdr (assoc "complete" result :test #'string=))))))))) 
 
+(test bumpfee-options-are-cores-closed-set
+  "bumpfee / psbtbumpfee run Core's RPCTypeCheckObj over their option block
+with fAllowNull AND fStrict (wallet/rpc/spend.cpp:1049-1059), so a key that is
+not one of the seven Core declares is -3 \"Unexpected key <k>\".
+
+totalFee and feeRate are the two this exists for: both were bumpfee options
+once and both were REMOVED, so a caller still passing one would otherwise have
+it silently ignored and the transaction bumped by something else entirely
+(wallet_bumpfee.py:126)."
+  (with-wallet-chain-node (node "bumpfee-opts" :wallet "w")
+    (let ((txid (make-string 64 :initial-element #\0)))
+      (flet ((bump (method options)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node method
+                   (wire-params (list txid options)))))))
+        (dolist (method '("bumpfee" "psbtbumpfee"))
+          (dolist (key '("totalFee" "feeRate"))
+            (let* ((options (let ((h (make-hash-table :test 'equal)))
+                              (setf (gethash key h) 1000) h))
+                   (answer (bump method options)))
+              (is (equal -3 (car answer))
+                  "~A ~A: expected -3, got ~S" method key answer)
+              (is (string= (format nil "Unexpected key ~A" key) (or (cdr answer) ""))
+                  "~A ~A: got ~S" method key (cdr answer)))))
+        ;; Control: a key Core DOES declare is not refused here -- the call
+        ;; fails later, on the txid, which is the -5/-8 of a wallet that has
+        ;; never seen that transaction.
+        (let* ((options (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "fee_rate" h) 10) h))
+               (answer (bump "bumpfee" options)))
+          (is (not (equal -3 (car answer)))
+              "fee_rate must not be refused as an unexpected key: ~S" answer))
+        ;; And a declared key of the WRONG type is Core's typed sentence, not
+        ;; the unexpected-key one.
+        (let* ((options (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "estimate_mode" h) 42) h))
+               (answer (bump "bumpfee" options)))
+          (is (equal -3 (car answer)))
+          (is (search "is not of expected type string" (or (cdr answer) ""))
+              "got ~S" (cdr answer)))))))

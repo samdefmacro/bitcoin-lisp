@@ -2037,6 +2037,33 @@ and an index past the end (:180-183)."
                 (values nil bl.rpc:+rpc-invalid-parameter+ too-low))))
           (values new-tx old-fee new-fee))))))
 
+(defun %check-bumpfee-options (options)
+  "Core's RPCTypeCheckObj over the bumpfee / psbtbumpfee option block
+(wallet/rpc/spend.cpp:1049-1059), in the order std::map visits the keys:
+fAllowNull, so a member given as null passes and its own getter judges it, and
+fSTRICT, so a key nobody asked for is -3 \"Unexpected key <k>\" rather than a
+silently ignored typo. fee_rate and outputs are Core's bare UniValueType() --
+SetFeeEstimateMode's AmountFromValue and AddOutputs check those later. Returns
+OPTIONS, so the check sits between Core's ParseHashV and the option readers
+without a binding nobody uses.
+
+The two keys this exists for are the ones Core REMOVED: totalFee and feeRate
+were bumpfee options once, and a caller still passing either would otherwise
+have it ignored and get a fee bumped by something else entirely
+(wallet_bumpfee.py:126 pins both)."
+  (when options
+    (bl.rpc:rpc-type-check-obj
+     options
+     '(("confTarget" . "number")
+       ("conf_target" . "number")
+       ("estimate_mode" . "string")
+       ("fee_rate" . nil)
+       ("original_change_index" . "number")
+       ("outputs" . nil)
+       ("replaceable" . "bool"))
+     :allow-null t :strict t))
+  options)
+
 (defun %bumpfee-options->cc (options cc)
   "Apply the bumpfee/psbtbumpfee OPTIONS (conf_target, fee_rate, replaceable,
 estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
@@ -2088,7 +2115,7 @@ VNUM in Core's option block (:1058) and read with getInt<uint32_t>."
         (wallet-ensure-unlocked wallet)
         (let* ((txid (bl.rpc:parse-hash-v txid-hex "txid"))
                (cc (make-wcc))
-               (options (second params))
+               (options (%check-bumpfee-options (second params)))
                (new-outputs (%bumpfee-new-outputs options (wallet-network wallet)))
                (original-change-index (%bumpfee-original-change-index options)))
           (setf (wcc-signal-bip125-rbf cc) t)   ; Core: default true, RBF replacement
