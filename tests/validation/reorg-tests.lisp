@@ -1670,13 +1670,13 @@ this path would fail there."
           (mine 101)
           ;; DEEP: confirmed in block 102, which invalidating 102 makes the
           ;; ELEVENTH disconnection (the tip 112 is the first).
-          (let* ((deep (%pkg-tx (coinbase-txid 1) 0 4999990000))
+          (let* ((deep (pkg-tx (coinbase-txid 1) 0 4999990000))
                  (deep-id (bl.ser:transaction-hash deep)))
             (send deep)
             (mine 1)                    ; height 102 carries DEEP
             (mine 9)                    ; heights 103..111
             ;; SHALLOW: confirmed in block 112, the FIRST disconnection.
-            (let* ((shallow (%pkg-tx (coinbase-txid 2) 0 4999990000))
+            (let* ((shallow (pkg-tx (coinbase-txid 2) 0 4999990000))
                    (shallow-id (bl.ser:transaction-hash shallow)))
               (send shallow)
               (mine 1)                  ; height 112 carries SHALLOW
