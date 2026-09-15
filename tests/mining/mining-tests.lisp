@@ -1188,6 +1188,57 @@ with a count of zero."
         (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list 0 "notanaddress")))
       (is (= 0 (bl.store:current-height cs))))))
 
+(test submitheader-answers-cores-reject-reason-token
+  "Core's submitheader hands the caller state.GetRejectReason() -- the TOKEN
+`time-too-old', not the joined ToString() its log line carries
+(rpc/mining.cpp:1130-1136, consensus/validation.h:85-122). Ours answered the
+debug sentence, so mining_basic.py:495 -- which solves a header stamped
+nTime=1 on top of the tip and asks for -25 `time-too-old' -- read `Timestamp
+at or before median-time-past for header <hash>'.
+
+The control below it is Core's other admission verdict on the same path: a
+header whose parent is not in the index is `prev-blk-not-found'
+(validation.cpp:4249)."
+  (with-network (:regtest)
+   (let* ((node (regtest-node-fixture "subhdr-reason"))
+          (cs (bl:node-chain-state node)))
+     ;; A real child of the tip, stamped before its parent's median-time-past
+     ;; and THEN solved, so the proof of work is the one for these bytes and
+     ;; the timestamp rule is what the header meets first.
+     (let* ((block (bl.mining:assemble-full-block
+                    cs (bl:node-mempool node)
+                    :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+            (hdr (bl.ser:bitcoin-block-header block)))
+       (setf (bl.ser:block-header-timestamp hdr) 1
+             (bl.ser:block-header-cached-hash hdr) nil)
+       (bl.mining:mine-block block)
+       (is (equal '(-25 . "time-too-old")
+                  (rpc-error-of
+                   (lambda ()
+                     (bl.rpc:dispatch-rpc-method
+                      node "submitheader"
+                      (list (bl.crypto:bytes-to-hex
+                             (bl.ser:serialize-block-header hdr)))))))
+           "a header at or before median-time-past is Core's time-too-old token")
+       (is (null (bl.store:get-block-index-entry
+                  cs (bl.ser:block-header-hash hdr)))
+           "and the refused header is not in the index"))
+     ;; Control: the parent-missing verdict is a token too, and a different one.
+     (let ((orphan (bl.ser:make-block-header
+                    :version 4
+                    :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                               :initial-element 7)
+                    :merkle-root (%zeros 32) :timestamp 1296688700
+                    :bits #x207fffff :nonce 0)))
+       (is (equal '(-25 . "Must submit previous header (0707070707070707070707070707070707070707070707070707070707070707) first")
+                  (rpc-error-of
+                   (lambda ()
+                     (bl.rpc:dispatch-rpc-method
+                      node "submitheader"
+                      (list (bl.crypto:bytes-to-hex
+                             (bl.ser:serialize-block-header orphan)))))))
+           "an unknown parent is refused by Core's own lookup sentence first")))))
+
 (test submitheader-accepts-valid-rejects-orphan
   ;; A mined header whose parent is known validates and is added to the index;
   ;; a header with an unknown parent and malformed hex both error.

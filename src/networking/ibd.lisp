@@ -690,8 +690,19 @@ whose nBits is negative / zero / overflowing / above the PoW limit is rejected
 
 (defun validate-header-chain (headers chain-state)
   "Validate a list of headers against the current chain state.
-Returns (VALUES valid-headers error-message).
-VALID-HEADERS is a list of headers that passed validation (may be fewer than input)."
+Returns (VALUES valid-headers debug-message reject-reason).
+VALID-HEADERS is a list of headers that passed validation (may be fewer than input).
+
+Core keeps a rejection in TWO fields and joins them only in ValidationState::
+ToString (consensus/validation.h:85-122): a short REJECT REASON -- the token
+`time-too-old', `bad-diffbits', `time-too-new', `bad-version(0x00000001)' --
+and a DEBUG MESSAGE built from this rejection's own values. Everything that
+reports a header rejection to a caller reports the token: submitheader hands
+it out as -25 (rpc/mining.cpp:1136 state.GetRejectReason()), while the P2P
+path logs the joined pair. Ours had only the sentence, so submitheader
+answered `Timestamp at or before median-time-past for header <hash>' where
+mining_basic.py:495 asks for `time-too-old'. The third value is the token;
+the second stays the sentence the log line has always carried."
   (let ((valid-headers '())
         (prev-hash nil)
         (prev-entry nil)
@@ -723,14 +734,18 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
               (return-from validate-header-chain
                 (values (nreverse valid-headers)
                         (format nil "Missing parent ~A"
-                                (bl.crypto:bytes-to-hex header-prev-hash)))))
+                                (bl.crypto:bytes-to-hex header-prev-hash))
+                        ;; Core AcceptBlockHeader, validation.cpp:4249.
+                        "prev-blk-not-found")))
 
             ;; Validate proof-of-work
             (unless (validate-header-pow header)
               (return-from validate-header-chain
                 (values (nreverse valid-headers)
                         (format nil "Invalid proof-of-work for header ~A"
-                                (bl.crypto:bytes-to-hex hash)))))
+                                (bl.crypto:bytes-to-hex hash))
+                        ;; Core CheckBlockHeader, validation.cpp:3864.
+                        "high-hash")))
 
             ;; Reject headers timestamped too far in the future (Core
             ;; ContextualCheckBlockHeader: block time > now + 2h). Admitting one
@@ -752,7 +767,9 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                           (format nil "Timestamp too far in the future for header ~A (~Ds past the ~Ds bound)"
                                   (bl.crypto:bytes-to-hex hash)
                                   overshoot
-                                  bl.val:+max-future-block-time+)))))
+                                  bl.val:+max-future-block-time+)
+                          ;; Core ContextualCheckBlockHeader, validation.cpp:4141.
+                          "time-too-new"))))
 
             ;; Validate timestamp > median-time-past. PARENT, not
             ;; HEADER-PREV-HASH: a mid-batch parent is a staging entry that is
@@ -762,7 +779,9 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
               (return-from validate-header-chain
                 (values (nreverse valid-headers)
                         (format nil "Timestamp at or before median-time-past for header ~A"
-                                (bl.crypto:bytes-to-hex hash)))))
+                                (bl.crypto:bytes-to-hex hash))
+                        ;; Core ContextualCheckBlockHeader, validation.cpp:4125.
+                        "time-too-old")))
 
             ;; Calculate new height and validate checkpoint
             (let* ((parent-height (if (eq parent prev-entry)
@@ -778,7 +797,9 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                 (unless valid
                   (return-from validate-header-chain
                     (values (nreverse valid-headers)
-                            (format nil "Bad difficulty at height ~D" new-height)))))
+                            (format nil "Bad difficulty at height ~D" new-height)
+                            ;; Core ContextualCheckBlockHeader, validation.cpp:4121.
+                            "bad-diffbits"))))
               ;; BIP94 timewarp mitigation at header ADMISSION (Core
               ;; ContextualCheckBlockHeader, validation.cpp:4129). This was
               ;; only enforced at connect time (validate-block-header); but
@@ -792,7 +813,9 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                      header new-height parent)
                 (return-from validate-header-chain
                   (values (nreverse valid-headers)
-                          (format nil "BIP94 timewarp violation at height ~D" new-height))))
+                          (format nil "BIP94 timewarp violation at height ~D" new-height)
+                          ;; Core ContextualCheckBlockHeader, validation.cpp:4134.
+                          "time-timewarp-attack")))
               ;; Softfork version minimums, gated by activation height (Core
               ;; ContextualCheckBlockHeader BIP34/66/65). No upper bound --
               ;; miners roll high version bits (overt AsicBoost).
@@ -808,12 +831,20 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                                                bl:*network*))))
                   (return-from validate-header-chain
                     (values (nreverse valid-headers)
-                            (format nil "Bad version at height ~D" new-height)))))
+                            (format nil "Bad version at height ~D" new-height)
+                            ;; Core spells the offending version into the token
+                            ;; itself (validation.cpp:4148).
+                            (format nil "bad-version(0x~(~8,'0X~))"
+                                    (ldb (byte 32 0) version))))))
 
               (unless (validate-checkpoint hash new-height)
                 (return-from validate-header-chain
                   (values (nreverse valid-headers)
-                          (format nil "Checkpoint mismatch at height ~D" new-height))))
+                          (format nil "Checkpoint mismatch at height ~D" new-height)
+                          ;; Core dropped its checkpoint check (validation.cpp:
+                          ;; 4108 keeps only the note); this is the token it
+                          ;; used while it had one.
+                          "bad-fork-prior-to-checkpoint")))
 
               ;; Header is valid - create temp entry for chain linkage of next header
               (push header valid-headers)
@@ -3132,7 +3163,7 @@ received message there too.
 Holds the node lock: process-headers mutates the block index the RPC
 threads read/write under the same lock."
   (with-current-node-lock
-   (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
+   (multiple-value-bind (valid error reason) (validate-header-chain headers chain-state)
     (when error
       ;; Core logs every ContextualCheckBlockHeader failure at
       ;; LogDebug(BCLog::VALIDATION) with the header hash and the state string
@@ -3141,7 +3172,11 @@ threads read/write under the same lock."
       ;; BLOCK_TIME_FUTURE (net_processing.cpp:1945-1946). A WARN here inverted
       ;; that: the one result Core singles out as nobody's fault was the single
       ;; most common line in the node's log.
-      (bl:log-cat "validation" "Header validation error: ~A" error))
+      ;;
+      ;; The state STRING is the pair joined, reason first
+      ;; (ValidationState::ToString, consensus/validation.h:111-122), so the
+      ;; log line leads with the same token submitheader answers with.
+      (bl:log-cat "validation" "Header validation error: ~@[~A, ~]~A" reason error))
     (let* (;; Core's received_new_header (net_processing.cpp:3079) is
            ;; `last_received_header == nullptr', where last_received_header is
            ;; the index lookup of headers.BACK() (:3052) — i.e. the LAST header

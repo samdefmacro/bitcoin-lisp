@@ -776,11 +776,17 @@ header); errors if the parent is missing or the header fails validation."
         (when (eq (bl.store:block-index-entry-status prev-entry) :invalid)
           (error 'rpc-error :code +rpc-verify-error+ :message "bad-prevblk")))
       ;; Validate (PoW/MTP/difficulty) then add to the index.
-      (multiple-value-bind (valid err)
+      ;;
+      ;; Core answers state.GetRejectReason() -- the TOKEN, not the joined
+      ;; ToString() the log line carries (rpc/mining.cpp:1130-1136). Ours
+      ;; answered the debug sentence, so mining_basic.py:495, which asks for
+      ;; `time-too-old', read `Timestamp at or before median-time-past for
+      ;; header <hash>'. VALIDATE-HEADER-CHAIN's third value is the token.
+      (multiple-value-bind (valid err reason)
           (bl.net:validate-header-chain (list header) chain-state)
         (unless valid
           (error 'rpc-error :code +rpc-verify-error+
-                            :message (or err "header validation failed")))
+                            :message (or reason err "header validation failed")))
         (bl.net:process-headers valid chain-state))
       nil))))
 
