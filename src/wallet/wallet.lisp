@@ -2099,23 +2099,60 @@ settings.json so the next node start loads it automatically."
         (setf warnings (append warnings (list (%load-on-startup-warning action)))))
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
+(defun %ensure-unique-wallet-name (arg)
+  "The wallet a request names, from the /wallet/<name> endpoint and the
+wallet_name ARGUMENT (Core EnsureUniqueWalletName, wallet/rpc/util.cpp:33-52):
+an endpoint wins, both given must agree, and neither is an error. The two
+sentences are Core's."
+  (let ((endpoint (%request-wallet-name)))
+    (cond ((and endpoint arg)
+           (unless (equal endpoint arg)
+             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                      :message "The RPC endpoint wallet and the wallet name parameter specify different wallets"))
+           arg)
+          (endpoint)
+          (arg)
+          (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                      :message "Either the RPC endpoint wallet or the wallet name parameter must be provided")))))
+
+(bl.rpc:define-rpc "migratewallet" (node (wallet-name passphrase))
+  "Refuse to migrate a wallet to a descriptor wallet, because every wallet
+this node can open already is one (Bitcoin Core migratewallet,
+wallet/rpc/wallet.cpp:582-639).
+
+Core's migration reads a Berkeley DB file and rewrites it as a descriptor
+wallet. This tree has no legacy wallet format at all -- descriptor-only, no
+BDB (docs/wallet-plan.md) -- so MigrateLegacyToDescriptor's own two refusals
+are the whole of it (wallet/wallet.cpp:4250-4271): a LOADED wallet is already
+a descriptor wallet, since a loaded one is the only kind there is; an unknown
+name does not exist; and a wallet on disk that is not a BDB file -- here, any
+of them -- is already a descriptor wallet. Both are RPC_WALLET_ERROR (-4).
+
+Registered rather than absent: an unregistered method is not in `help', and
+rpc_help.py:110 fails a node whose dump_all_command_conversions is missing a
+method Core's client.cpp lists -- migratewallet's two arguments were the only
+rows left out. Answering Core's own sentence also tells an operator who ran
+the migration why there is nothing to migrate, where an unknown-command error
+would suggest the node is too old."
+  (declare (ignore passphrase))
+  (let* ((manager (node-wallet-manager-checked node))
+         (name (%ensure-unique-wallet-name wallet-name))
+         (loaded (bt:with-recursive-lock-held ((wallet-manager-lock manager))
+                   (gethash name (wallet-manager-wallets manager)))))
+    (error 'bl.rpc:rpc-error
+           :code bl.rpc:+rpc-wallet-error+
+           :message (if (or loaded (member name (list-wallet-dir manager)
+                                           :test #'string=))
+                        "Error: This wallet is already a descriptor wallet"
+                        "Error: Wallet does not exist"))))
+
 (bl.rpc:define-rpc "unloadwallet" (node params)
   "Unload the wallet named by the endpoint or the wallet_name argument
 (Bitcoin Core unloadwallet); both given must match. PARAMS:
  (wallet_name load_on_startup) — load_on_startup false removes the wallet from
 settings.json so the next node start no longer loads it."
   (let* ((manager (node-wallet-manager-checked node))
-         (arg (first params))
-         (endpoint (%request-wallet-name))
-         (name (cond ((and endpoint arg)
-                      (unless (equal endpoint arg)
-                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                          :message "The RPC endpoint wallet and the wallet name parameter specify different wallets"))
-                      arg)
-                     (endpoint)
-                     (arg)
-                     (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                          :message "Either the RPC endpoint wallet or the wallet name parameter must be provided")))))
+         (name (%ensure-unique-wallet-name (first params))))
     (let ((wallet (bt:with-recursive-lock-held ((wallet-manager-lock manager))
                     (gethash name (wallet-manager-wallets manager)))))
       (unless wallet

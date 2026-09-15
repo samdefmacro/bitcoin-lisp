@@ -89,6 +89,7 @@
     ("loadwallet" (0 "filename" . t) (1 "load_on_startup" . nil))
     ("lockunspent" (0 "unlock" . nil) (1 "transactions" . nil) (2 "persistent" . nil))
     ("logging" (0 "include" . nil) (1 "exclude" . nil))
+    ("migratewallet" (0 "wallet_name" . t) (1 "passphrase" . t))
     ("prioritisetransaction" (1 "dummy" . nil) (2 "fee_delta" . nil))
     ("pruneblockchain" (0 "height" . nil))
     ("psbtbumpfee" (1 "conf_target" . nil) (1 "fee_rate" . nil) (1 "options" . nil) (1 "original_change_index" . nil) (1 "outputs" . nil) (1 "replaceable" . nil))

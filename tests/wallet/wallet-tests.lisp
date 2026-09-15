@@ -2739,3 +2739,51 @@ from funding."
                               rows)
                      "input ~A:~D was not locked"
                      (bl.rpc:hash-to-hex (car op)) (cdr op))))))))
+
+;;; --- migratewallet: registered, and Core's refusal ------------------------
+
+(test migratewallet-answers-cores-already-a-descriptor-wallet
+  "migratewallet exists and refuses, in Core's own words.
+
+Core migrates a Berkeley DB wallet into a descriptor one
+(wallet/rpc/wallet.cpp:582-639). This tree has no legacy wallet format at all,
+so MigrateLegacyToDescriptor's two early refusals are the whole answer
+(wallet/wallet.cpp:4250-4271, both RPC_WALLET_ERROR = -4): a wallet that is
+loaded, or on disk and not a BDB file, is already a descriptor wallet; a name
+with nothing behind it does not exist.
+
+The method was simply absent, which is not the same answer: rpc_help.py:110
+fails a node whose dump_all_command_conversions is missing a method Core's
+client.cpp lists, and migratewallet's two arguments were the last such rows.
+An operator running the migration got \"Method not found\" -- which reads as a
+node too old to have it -- instead of being told there is nothing to migrate."
+  (with-wallet-test-node (node)
+    (bl.rpc:dispatch-rpc-method node "createwallet" (wire-params '("mw")))
+    (let ((bl.wallet::*rpc-wallet-name* nil))
+      ;; A loaded wallet: Core asserts it is a descriptor wallet and says so.
+      (signals-rpc-error (:code -4 :exact-message
+                                "Error: This wallet is already a descriptor wallet")
+        (bl.rpc:dispatch-rpc-method node "migratewallet" (wire-params '("mw"))))
+      ;; The passphrase argument an encrypted wallet would need is accepted and
+      ;; changes nothing: the refusal comes before any secret is used.
+      (signals-rpc-error (:code -4 :exact-message
+                                "Error: This wallet is already a descriptor wallet")
+        (bl.rpc:dispatch-rpc-method node "migratewallet"
+                                    (wire-params '("mw" "hunter2"))))
+      ;; A name with nothing behind it is Core's other sentence.
+      (signals-rpc-error (:code -4 :exact-message "Error: Wallet does not exist")
+        (bl.rpc:dispatch-rpc-method node "migratewallet" (wire-params '("nosuch"))))
+      ;; Neither endpoint nor argument is EnsureUniqueWalletName's own refusal
+      ;; (wallet/rpc/util.cpp:46-49), which unloadwallet already answered.
+      (signals-rpc-error (:code -8 :exact-message
+                                "Either the RPC endpoint wallet or the wallet name parameter must be provided")
+        (bl.rpc:dispatch-rpc-method node "migratewallet" (wire-params '()))))
+    ;; And it is a method `help' knows, so its two arguments reach
+    ;; dump_all_command_conversions -- what rpc_help.py:110 reads.
+    (let ((dump (bl.rpc:dispatch-rpc-method
+                 node "help" (wire-params '("dump_all_command_conversions")))))
+      (is (= 2 (count "migratewallet" (coerce dump 'list)
+                      :key (lambda (row) (aref row 0)) :test #'string=))
+          "migratewallet contributes ~D conversion rows, Core lists 2"
+          (count "migratewallet" (coerce dump 'list)
+                 :key (lambda (row) (aref row 0)) :test #'string=)))))

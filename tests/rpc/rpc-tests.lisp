@@ -5076,11 +5076,13 @@ rpc_help.py passing."
              (ignore-errors (bl.rpc::register-all-methods))
              (missing (remove-if (lambda (m) (gethash m bl.rpc::*rpc-methods*))
                                  core-methods)))
-        ;; Not an assertion of zero — these are tracked, and the list moving is
-        ;; what matters. It IS an assertion that the list has not GROWN.
-        (is (<= (length missing) 2)
-            "Core methods with typed arguments that this node does not serve ~
-grew to ~D: ~S" (length missing) (sort missing #'string<))))))
+        ;; Zero since migratewallet was registered: every method Core lists
+        ;; with a typed argument is served here. The ceiling was 2 while this
+        ;; was a distance being closed; it is now the invariant rpc_help.py
+        ;; :110 asserts, so a method dropping out is a failure.
+        (is (null missing)
+            "Core methods with typed arguments that this node does not serve: ~S"
+            (sort missing #'string<))))))
 
 (defun %erf (&rest params)
   "estimaterawfee with PARAMS. One reach for the whole file."
