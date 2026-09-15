@@ -657,24 +657,70 @@ expansion needs unavailable private keys."
                                               :sync t)
           t))))
 
+(defun %spkm-reexpand-for-cache (wallet spkm index repaired)
+  "Re-derive INDEX from the descriptor's own key material, the way TopUp
+already does when the cache is short (Core TopUp's Expand fallback,
+scriptpubkeyman.cpp:1079-1094), merging the cache entries it produces into the
+SPKM's cache and accumulating into REPAIRED what still has to reach the disk.
+Returns (values scripts pubkeys), or NIL when the derivation needs private keys
+the wallet cannot provide."
+  (let ((temp (bl.rpc:make-descriptor-cache))
+        (provider (and (spkm-have-private-keys-p spkm)
+                       (spkm-privkey-provider wallet spkm))))
+    (handler-case
+        (multiple-value-bind (scripts pubkeys)
+            (bl.rpc:out-desc-expand-with-provider (desc-spkm-desc spkm) index
+                                                  provider temp)
+          (bl.rpc:descriptor-cache-merge-and-diff
+           repaired
+           (bl.rpc:descriptor-cache-merge-and-diff (desc-spkm-cache spkm) temp))
+          (bl:log-warn "Descriptor ~A: re-derived the xpub cache at index ~D; the stored cache was written under an older key-expression numbering"
+                       (desc-spkm-desc-string spkm) index)
+          (values scripts pubkeys))
+      (bl.rpc:descriptor-derivation-error () nil))))
+
 (defun spkm-set-cache (wallet spkm cache)
   "Install a loaded cache and rebuild the in-memory script/pubkey maps by
 expanding every cached index from it (Core SetCache, scriptpubkeyman.cpp:1429).
-WALLET is unused beyond symmetry with the other spkm operations."
-  (declare (ignore wallet))
+
+⚠️ A cache written before musig() participants had key-expression indexes of
+their own files the musig() expression's own xpubs one slot too low, so
+ExpandFromCache misses at an index the descriptor record says is cached --
+and Core's answer here is a hard error that refuses to LOAD THE WALLET. On a
+miss this re-derives the index, merges what it derived into the cache and
+persists it, so the repair costs one derivation per affected index, once; the
+error stays for a cache that is genuinely unusable.
+
+The repair is driven by the MISS rather than by a cache-version marker stored
+in the descriptor record: the miss IS the fact such a marker would predict, it
+is observed on the record that actually has the problem rather than on every
+record of a wallet that was once opened by an older build, and it needs nothing
+added to the wallet format to be read back. docs/wallet-plan.md records the
+decision."
   (setf (desc-spkm-cache spkm) cache)
-  (loop for i from (desc-spkm-range-start spkm) below (desc-spkm-range-end spkm)
-        do (multiple-value-bind (scripts pubkeys)
-               (bl.rpc:out-desc-expand-from-cache (desc-spkm-desc spkm) i cache)
-             (unless scripts
-               (wallet-error "Error: Unable to expand wallet descriptor from cache"))
-             (dolist (script scripts)
-               (let ((existing (gethash script (desc-spkm-script-map spkm))))
-                 (when (and existing (/= existing i))
-                   (wallet-error "Error: Already loaded script at index ~D as being at index ~D"
-                          i existing))))
-             (%spkm-note-expansion spkm i scripts pubkeys)
-             (incf (desc-spkm-max-cached-index spkm)))))
+  (let ((repaired (bl.rpc:make-descriptor-cache))
+        (repairs 0))
+    (loop for i from (desc-spkm-range-start spkm) below (desc-spkm-range-end spkm)
+          do (multiple-value-bind (scripts pubkeys)
+                 (bl.rpc:out-desc-expand-from-cache (desc-spkm-desc spkm) i cache)
+               (unless scripts
+                 (multiple-value-setq (scripts pubkeys)
+                   (%spkm-reexpand-for-cache wallet spkm i repaired))
+                 (when scripts (incf repairs)))
+               (unless scripts
+                 (wallet-error "Error: Unable to expand wallet descriptor from cache"))
+               (dolist (script scripts)
+                 (let ((existing (gethash script (desc-spkm-script-map spkm))))
+                   (when (and existing (/= existing i))
+                     (wallet-error "Error: Already loaded script at index ~D as being at index ~D"
+                            i existing))))
+               (%spkm-note-expansion spkm i scripts pubkeys)
+               (incf (desc-spkm-max-cached-index spkm))))
+    ;; One write for the whole descriptor, after the maps are consistent.
+    (when (plusp repairs)
+      (bl.store:with-leveldb-writebatch (batch)
+        (%spkm-write-cache-diff spkm repaired batch)
+        (bl.store:leveldb-write (wallet-db wallet) batch :sync t)))))
 
 (defun spkm-is-mine (spkm script)
   "Range index when SCRIPT belongs to this SPKM, else NIL (Core IsMine —

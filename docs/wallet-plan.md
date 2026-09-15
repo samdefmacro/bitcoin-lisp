@@ -172,6 +172,50 @@ Core parity minus the explicit out-of-scopes.
   tells the user to take a fresh backup. `createwallet` with a passphrase avoids the problem
   entirely: it is born encrypted and never writes a plaintext key record at all.
 
+### The descriptor xpub cache and musig() key-expression numbering
+
+A descriptor's expansion cache is keyed by KEY-EXPRESSION INDEX (Core's
+`key_exp_index`): one slot per key expression, holding its parent xpub, its
+derived xpubs and its last-hardened xpub. `SetCache` expands every index the
+descriptor record says is cached and a miss is a hard error, so the numbering
+is part of the on-disk format even though no number is written down.
+
+`musig()`'s **participants are key expressions with indexes of their own**, and
+Core assigns them BEFORE the aggregate's: `ParseMuSig` parses each participant
+with `ParsePubkey` (descriptor.cpp:1995), each of which advances
+`key_exp_index` for the `BIP32PubkeyProvider` it builds (:1950), and the
+`MuSigPubkeyProvider` then takes one more (:2099). We numbered the `musig()`
+expression alone, which left a participant with no cache slot — and the
+participant a wallet stores after importing the xprv form is a master xpub
+with a hardened path, which cannot be expanded from the string at all. Such a
+wallet imported, filled its IsMine script map while the keys were in hand, then
+answered -12 "Keypool ran out" to every `getnewaddress` and would have refused
+to load on the next start (wallet_musig.py:203).
+
+Adopting Core's numbering moves the slots of a descriptor that contains a
+`musig()`. **Decision (2026-09-15): a cache written under the old numbering is
+repaired on the MISS, not from a stored cache-version marker.** `SetCache`
+re-derives the index it could not expand the way `TopUp` already does when the
+cache is short, merges what it derived into the cache and persists it once per
+descriptor; only a cache that is genuinely unusable still raises Core's error.
+
+The reasons to prefer this over a version marker in the descriptor record:
+
+- The miss **is** the fact a marker would be predicting, observed on the record
+  that has the problem instead of on every record of a wallet an older build
+  once opened.
+- It needs nothing added to the wallet format, so there is no new field to
+  write, read back, or get wrong on a restored backup or a partially written
+  wallet.
+- It is not specific to this numbering change: any later one is repaired by the
+  same path.
+- The cost is bounded — one derivation per affected index, persisted — and it
+  needs the private keys exactly where `TopUp` already needs them, so a locked
+  wallet gets Core's own refusal rather than a wrong address.
+
+Only descriptors containing a `musig()` are affected; every other descriptor's
+indexes are unchanged, so an existing wallet's cache still resolves as it did.
+
 ## 6. Effort & risk
 
 - **~15-20 PRs, multi-wave** (comparable to the cluster-mempool track). P2 and P4 dominate.

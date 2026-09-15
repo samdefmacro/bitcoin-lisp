@@ -664,7 +664,22 @@ Core splits the same way when it decides which PubkeyProvider to build for the
 aggregate (descriptor.cpp:654-659)."
   (and (null (desc-key-path key)) (eq (desc-key-derive key) :none)))
 
-(defun %musig-aggregate-at (key pos &optional privkey-provider)
+(defun %musig-participant-pubkey-at (participant pos privkey-provider cache-ctx)
+  "The pubkey a musig() PARTICIPANT produces at POS. A participant is an
+ordinary key expression with an index of its own (OUT-DESC-KEY-INDEXES), so
+when CACHE-CTX names the wallet's cache machinery -- the index map, the read
+cache and the write cache, as %DESC-KEY-PUBKEY-AT-CACHED takes them -- it
+resolves through that, and straight from the descriptor's key material
+otherwise. Core has no branch here because MuSigPubkeyProvider simply calls
+GetPubKey on each participant provider and the caches travel in the arguments
+(descriptor.cpp:637-651)."
+  (if cache-ctx
+      (destructuring-bind (indexes read-cache write-cache) cache-ctx
+        (%desc-key-pubkey-at-cached participant indexes pos
+                                    read-cache write-cache privkey-provider))
+      (%desc-key-pubkey-at participant pos privkey-provider)))
+
+(defun %musig-aggregate-at (key pos &optional privkey-provider cache-ctx)
   "The MuSig2 aggregate of musig() KEY's participants at POS (Core
 MuSigPubkeyProvider::GetPubKey's aggregation half, descriptor.cpp:637-651).
 
@@ -684,21 +699,21 @@ same descriptor written two ways would be two different ADDRESSES."
   (let* ((participants (desc-key-musig-participants key))
          (ranged (some #'desc-key-ranged-p participants))
          (pubkeys (mapcar (lambda (p)
-                            (%desc-key-pubkey-at p (if ranged pos 0)
-                                                 privkey-provider))
+                            (%musig-participant-pubkey-at
+                             p (if ranged pos 0) privkey-provider cache-ctx))
                           participants)))
     (or (bl.crypto:musig-aggregate-pubkeys
          (sort (copy-list pubkeys) #'pubkey-lessp))
         (error 'descriptor-derivation-error))))
 
-(defun %musig-derivation-root (key pos &optional privkey-provider)
+(defun %musig-derivation-root (key pos &optional privkey-provider cache-ctx)
   "The BIP328 synthetic xpub a non-flat musig() KEY derives from, on the network
 its participants are written for. Fixed for the whole range — a musig() with a
 derivation cannot have ranged participants (descriptor.cpp:2022) — so POS only
 reaches the aggregation, which ignores it in that shape."
   (let ((first-participant (first (desc-key-musig-participants key))))
     (%musig-synthetic-xpub
-     (%musig-aggregate-at key pos privkey-provider)
+     (%musig-aggregate-at key pos privkey-provider cache-ctx)
      (bl.chain:chain-params-name
       (bl.chain:chain-params-of-ext-prefix
        (bl.crypto:ext-key-version
@@ -1417,11 +1432,30 @@ Consumers that slice this list positionally depend on the order — see
                 append (out-desc-ordered-keys child))))
 
 (defun out-desc-key-indexes (desc)
-  "EQ map from each desc-key of DESC to its key expression index."
-  (let ((table (make-hash-table :test 'eq)))
-    (loop for key in (out-desc-ordered-keys desc)
-          for i from 0
-          do (setf (gethash key table) i))
+  "EQ map from each desc-key of DESC -- and from each musig() PARTICIPANT --
+to its key expression index (Core's key_exp_index).
+
+⚠️ A musig()'s PARTICIPANTS are numbered, one index each, BEFORE the
+aggregate takes the next one: Core parses every participant with ParsePubkey
+(descriptor.cpp:1995), each of which advances key_exp_index for the
+BIP32PubkeyProvider it builds (:1950), and ParseMuSig then takes one more for
+the MuSigPubkeyProvider itself (:2099).
+
+That is not bookkeeping. An index is a CACHE SLOT, and without one a
+participant cannot be expanded from the wallet's xpub cache at all -- so a
+musig() whose participant has a HARDENED path, which is every participant a
+wallet stores after importing the xprv form, could be expanded only while the
+private keys were in hand. The wallet imported such a descriptor, filled its
+script map and then answered -12 \"Keypool ran out\" to getnewaddress, and
+would have refused to load the wallet again (wallet_musig.py:203)."
+  (let ((table (make-hash-table :test 'eq))
+        (index 0))
+    (labels ((number-key (key)
+               (dolist (participant (desc-key-musig-participants key))
+                 (number-key participant))
+               (setf (gethash key table) index)
+               (incf index)))
+      (mapc #'number-key (out-desc-ordered-keys desc)))
     table))
 
 ;;; --- Script construction ---
@@ -1949,10 +1983,12 @@ to hash the absent xpub and signal a type error out of the middle of an RPC."
              :key (concatenate '(vector (unsigned-byte 8)) #(0) priv)
              :privatep t))))))
 
-(defun %desc-key-pubkey-at-cached (key expr-index pos read-cache write-cache privkey-provider)
+(defun %desc-key-pubkey-at-cached (key indexes pos read-cache write-cache privkey-provider)
   "The pubkey KEY produces at POS, via the wallet cache machinery (Core
-BIP32PubkeyProvider::GetPubKey, descriptor.cpp:425-485). With READ-CACHE, only
-cached xpubs are consulted (Core ExpandFromCache) — a miss signals
+BIP32PubkeyProvider::GetPubKey, descriptor.cpp:425-485). INDEXES is the
+key-expression index map OUT-DESC-KEY-INDEXES builds; KEY's own index is the
+cache slot everything below files under. With READ-CACHE, only cached xpubs
+are consulted (Core ExpandFromCache) — a miss signals
 descriptor-derivation-error. Without it, hardened derivation pulls the root
 xprv from PRIVKEY-PROVIDER, and WRITE-CACHE (when given) collects the parent /
 derived / last-hardened xpubs exactly as Core caches them.
@@ -1961,16 +1997,18 @@ musig() arrives here like any other key expression, because in Core it IS one:
 MuSigPubkeyProvider (descriptor.cpp:633-700) aggregates its participants and
 then either returns the aggregate or hands the rest to a BIP32 provider built
 over the BIP328 synthetic xpub and carrying THIS key expression's index, so the
-aggregate's parent/derived xpubs cache under EXPR-INDEX like anyone else's. The
-participants resolve from the descriptor's own key material rather than through
-the cache: our key-expression indexes number the musig() expression, not the
-keys inside it, so there is no index to file a participant's xpub under, and a
-participant is always an xpub or a plain key that the descriptor itself carries."
+aggregate's parent/derived xpubs cache under that index like anyone else's.
+The PARTICIPANTS come back through this same function, under indexes of their
+own (Core numbers them first, descriptor.cpp:1995/:1950/:2099) — which is what
+gives a participant with a hardened path a cache slot, and so an expansion
+that does not need the private keys."
   (when (desc-key-pubkey key)
     (return-from %desc-key-pubkey-at-cached (desc-key-pubkey key)))
+  (let ((expr-index (gethash key indexes))
+        (cache-ctx (list indexes read-cache write-cache)))
   (when (and (desc-key-musig-participants key) (%musig-flat-key-p key))
     (return-from %desc-key-pubkey-at-cached
-      (%musig-aggregate-at key pos privkey-provider)))
+      (%musig-aggregate-at key pos privkey-provider cache-ctx)))
   (let* ((path (desc-key-path key))
          (derive (desc-key-derive key))
          (hardened-p (or (eq derive :hardened)
@@ -2008,7 +2046,7 @@ participant is always an xpub or a plain key that the descriptor itself carries.
                (when lh (setf last-hardened (bl.crypto:bip32-neuter lh))))))
           (t
            (let ((k (if (desc-key-musig-participants key)
-                        (%musig-derivation-root key pos privkey-provider)
+                        (%musig-derivation-root key pos privkey-provider cache-ctx)
                         (desc-key-extkey key))))
              (dolist (entry path)
                (setf k (bl.crypto:bip32-derive-child k entry)))
@@ -2037,7 +2075,7 @@ participant is always an xpub or a plain key that the descriptor itself carries.
               (setf (descriptor-cache-last-hardened write-cache expr-index)
                     last-hardened)))
           (setf (descriptor-cache-derived write-cache expr-index pos) final)))
-    (bl.crypto:ext-key-public-bytes final)))
+    (bl.crypto:ext-key-public-bytes final))))
 
 (defun %out-desc-expand-cached (desc pos &key read-cache write-cache privkey-provider)
   "Expand DESC at POS through the wallet cache machinery. Returns
@@ -2046,24 +2084,32 @@ expression, in expression order (feeds the SPKM's pubkey map). Signals
 descriptor-derivation-error when a needed cache entry or private key is
 missing (Core Expand/ExpandFromCache returning false)."
   (let* ((indexes (out-desc-key-indexes desc))
-         ;; Indexed by EXPRESSION index, not filled in call order. Script
-         ;; generation does not visit key expressions in parse order —
-         ;; `andor(X,Y,Z)' emits X NOTIF Z ELSE Y ENDIF
-         ;; (miniscript.lisp, the :ANDOR arm of the script builder) — so a
-         ;; push/nreverse here returned Y's and Z's pubkeys transposed, while
-         ;; %SPKM-EXPANSION-PAIRS zips this list against OUT-DESC-ORDERED-KEYS,
-         ;; which IS parse order. The wallet then believed a pubkey belonged to
+         (ordered (out-desc-ordered-keys desc))
+         ;; Slots are indexed by POSITION IN OUT-DESC-ORDERED-KEYS, which is
+         ;; what %SPKM-EXPANSION-PAIRS zips this list against -- NOT by the
+         ;; key-expression index, which now also numbers musig() participants
+         ;; and so runs ahead of it. Filling by position and not in call order
+         ;; is the older half of the same rule: script generation does not
+         ;; visit key expressions in parse order -- `andor(X,Y,Z)' emits
+         ;; X NOTIF Z ELSE Y ENDIF (miniscript.lisp, the :ANDOR arm of the
+         ;; script builder) -- so a push/nreverse here returned Y's and Z's
+         ;; pubkeys transposed and the wallet believed a pubkey belonged to
          ;; the wrong key expression: wrong origin in an inferred descriptor,
          ;; wrong provider consulted when signing.
-         (slots (make-array (hash-table-count indexes) :initial-element nil))
+         (positions (let ((table (make-hash-table :test 'eq)))
+                      (loop for key in ordered
+                            for p from 0
+                            do (setf (gethash key table) p))
+                      table))
+         (slots (make-array (length ordered) :initial-element nil))
          (scripts (%out-desc-expand-1
                    desc pos
                    (lambda (key)
-                     (let* ((i (gethash key indexes))
-                            (pk (%desc-key-pubkey-at-cached
-                                 key i pos
-                                 read-cache write-cache privkey-provider)))
-                       (when i (setf (aref slots i) pk))
+                     (let ((pk (%desc-key-pubkey-at-cached
+                                key indexes pos
+                                read-cache write-cache privkey-provider))
+                           (p (gethash key positions)))
+                       (when p (setf (aref slots p) pk))
                        pk)))))
     (values scripts (coerce slots 'list))))
 

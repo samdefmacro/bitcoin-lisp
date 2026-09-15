@@ -1920,3 +1920,149 @@ still says NO when no participant has a key."
       (let ((d (format nil "tr(03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,pk(musig(~A,~A)/7/8/*))"
                        other tpub)))
         (is (equal (cons nil d) (priv d)))))))
+
+;;; --- musig() key-expression indexes (Core key_exp_index) ---
+
+(defun %musig-wallet-key-pair (node name)
+  "(private-key-expression . public-key-expression) of NAME's tr() SPKM, the
+way wallet_musig.py:33-65 harvests one to build a cosigner's descriptor: the
+private descriptor's key up to its first path element, plus the origin path
+the public descriptor prints."
+  (with-rpc-wallet (nil)
+    (bl.rpc:dispatch-rpc-method node "createwallet" (list name)))
+  (with-rpc-wallet (name)
+    (flet ((tr-desc (private)
+             (let* ((result (bl.rpc:dispatch-rpc-method
+                             node "listdescriptors" (list private)))
+                    (descs (coerce (%aval "descriptors" result) 'list)))
+               (%aval "desc"
+                      (find-if (lambda (d)
+                                 (let ((s (%aval "desc" d)))
+                                   (and (stringp s) (eql 0 (search "tr(" s)))))
+                               descs)))))
+      (let* ((private (tr-desc t))
+             (public (tr-desc nil))
+             ;; tr(<key>/<path>)#cs -> <key>
+             (root (subseq private 3 (position #\/ private)))
+             ;; tr([fpr<origin>]<key>/<path>)#cs -> <origin>
+             (origin (subseq public (+ (position #\[ public) 9)
+                             (position #\] public)))
+             ;; tr([fpr<origin>]<xpub>/<path>)#cs -> [fpr<origin>]<xpub>
+             (pub-key (subseq public 3 (position #\/ public
+                                                 :start (position #\] public)))))
+        (cons (concatenate 'string root origin) pub-key)))))
+
+(defun %musig-cosigner-descriptor (pairs mine)
+  "wallet_musig.py's construct_and_import_musig_descriptor_in_wallets for
+cosigner MINE: a rawtr(musig(...)) naming our own PRIVATE key expression and
+everybody else's public one, each on its own BIP389 multipath."
+  (bl.rpc:descriptor-add-checksum
+   (format nil "rawtr(musig(~{~A~^,~}))"
+           (loop for (private . public) in pairs
+                 for i from 0
+                 collect (format nil "~A/<~D;~D>/*"
+                                 (if (= i mine) private public)
+                                 i (1+ i))))))
+
+(test a-musig-participant-has-a-cache-slot-of-its-own
+  "Core numbers a musig()'s PARTICIPANTS before the aggregate: ParseMuSig calls
+ParsePubkey per participant (descriptor.cpp:1995), each of which advances
+key_exp_index for the provider it builds (:1950), and the MuSigPubkeyProvider
+then takes one more (:2099).
+
+An index is a CACHE SLOT. Ours numbered the musig() expression alone, so a
+participant had nowhere to file its xpub and could be expanded only from key
+material -- and the participant a WALLET stores is a master xpub with a
+HARDENED path, i.e. it cannot be expanded from the string at all. The wallet
+imported such a descriptor, filled its IsMine script map while the private keys
+were in hand, and then answered -12 \"Keypool ran out\" to every getnewaddress;
+a restart would have refused to load it, because SetCache expands every cached
+index and errors when one misses (wallet_musig.py:203).
+
+The descriptor here is the PUBLIC form a wallet stores -- master xpub, hardened
+path -- expanded through a signing provider exactly as the wallet's SPKM does,
+and the assertion is the round trip: expand once collecting a cache, then
+expand the SAME position from that cache alone."
+  (with-wallet-chain-node (node "musig-index")
+    (let* ((pairs (loop for i below 3
+                        collect (%musig-wallet-key-pair
+                                 node (format nil "musig~D" i))))
+           (private-key (car (first pairs)))
+           (xprv (bl.crypto:bip32-parse
+                  (subseq private-key 0 (position #\/ private-key)) :regtest))
+           (secret (subseq (bl.crypto:ext-key-key xprv) 1))
+           (keyid (bl.crypto:hash160 (bl.crypto:ext-key-public-bytes xprv)))
+           (provider (lambda (id) (when (equalp id keyid) secret)))
+           ;; The same descriptor with our own participant PUBLIC: master xpub
+           ;; plus the hardened path, which is what the wallet writes down.
+           (public-pairs
+             (cons (let ((path (subseq private-key (position #\/ private-key))))
+                     (cons (concatenate 'string
+                                        (bl.crypto:bip32-serialize
+                                         (bl.crypto:bip32-neuter xprv))
+                                        path)
+                           (cdr (first pairs))))
+                   (rest pairs)))
+           (descriptor (%musig-cosigner-descriptor public-pairs 0))
+           (parsed (bl.rpc:parse-descriptors descriptor :regtest))
+           (desc (first parsed))
+           (cache (bl.rpc:make-descriptor-cache)))
+      (is (= 2 (length parsed))
+          "the <0;1> multipath denotes two descriptors, got ~D" (length parsed))
+      (is-true (bl.rpc:out-desc-ranged-p desc))
+      ;; The control: with no key material at all this descriptor cannot be
+      ;; expanded, so what the cache holds is the only thing that can answer.
+      (is (null (bl.rpc:out-desc-expand-from-cache desc 0 cache))
+          "an empty cache and no keys must not expand a hardened participant")
+      (multiple-value-bind (scripts pubkeys)
+          (bl.rpc:out-desc-expand-with-provider desc 0 provider cache)
+        (is (= 1 (length scripts)) "one scriptPubKey per position")
+        (is (= 1 (length pubkeys)) "one pubkey per key expression")
+        ;; The cache that expansion wrote must be enough to do it again.
+        (is (equalp scripts (bl.rpc:out-desc-expand-from-cache desc 0 cache))
+            "expanding position 0 from the cache the expansion just wrote")
+        (is (equalp (nth-value 1 (bl.rpc:out-desc-expand-from-cache desc 0 cache))
+                    pubkeys)))
+      ;; And at a position the write never visited, the cached PARENT xpubs
+      ;; carry the unhardened step (Core ExpandFromCache's own path).
+      (is-true (bl.rpc:out-desc-expand-from-cache desc 7 cache)
+               "a later position expands from the same parent xpubs"))))
+
+(test a-musig-wallet-hands-out-addresses-and-survives-a-reload
+  "End to end over the shipped RPCs, the way wallet_musig.py:203-207 does it:
+two cosigners import the same musig() descriptor -- each with its own private
+participant -- and must agree on the address, which must keep coming after the
+wallet is unloaded and loaded again (SetCache expands every cached index from
+the stored cache, so a numbering the cache does not match refuses the wallet)."
+  (with-wallet-chain-node (node "musig-e2e")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let* ((pairs (loop for i below 2
+                          collect (%musig-wallet-key-pair
+                                   node (format nil "cosign~D" i))))
+             (request (lambda (mine)
+                        (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "desc" h) (%musig-cosigner-descriptor pairs mine)
+                                (gethash "active" h) t
+                                (gethash "timestamp" h) "now")
+                          h))))
+        (dotimes (i 2)
+          (let ((result (first (rpc (format nil "cosign~D" i) "importdescriptors"
+                                    (list (funcall request i))))))
+            (is (eq t (%aval "success" result))
+                "cosigner ~D imported its musig descriptor: ~S" i result)))
+        (let ((first-address (rpc "cosign0" "getnewaddress" "" "bech32m")))
+          (is (stringp first-address)
+              "getnewaddress must answer an address, got ~S" first-address)
+          (is (equal first-address (rpc "cosign1" "getnewaddress" "" "bech32m"))
+              "the cosigners must agree on the musig address")
+          ;; A reload goes through SetCache over every stored index.
+          (rpc "cosign0" "unloadwallet")
+          (rpc nil "loadwallet" "cosign0")
+          (let ((next-address (rpc "cosign0" "getnewaddress" "" "bech32m")))
+            (is (stringp next-address)
+                "the reloaded wallet must still hand out addresses, got ~S"
+                next-address)
+            (is (not (equal first-address next-address))
+                "the reloaded wallet must not reissue the address it handed out")))))))
