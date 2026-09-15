@@ -1875,11 +1875,20 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
 
 ;;; --- UTXO Set Statistics ---
 
-(defun %gettxoutsetinfo-from-index (node hash-type hash-or-height)
+(defun %gettxoutsetinfo-from-index (node hash-type hash-or-height use-index)
   "Serve gettxoutsetinfo for a historical height from the coinstatsindex
 (Core's use_index path). HASH-OR-HEIGHT is an integer height or a block-hash
 hex. Returns the cumulative stats at that height plus a block_info object of
-that block's deltas. Only the muhash hash_type is index-backed."
+that block's deltas. Only the muhash hash_type is index-backed.
+
+The three refusals are the ones Core runs inside `if (!request.params[1]
+.isNull())' (rpc/blockchain.cpp:1086-1098), IN THAT ORDER: which one a caller
+gets for a doubly-invalid call is the caller's answer, and
+feature_coinstatsindex.py:300-302 asks for the hash-type sentence with
+use_index spelled true, false and omitted. USE-INDEX therefore reaches here
+rather than being gated one frame up. The tip call passes T and cannot trip any
+of them: its own caller has already found an enabled index and a hash type the
+index carries."
   (let* ((csi (rpc-get-coinstatsindex node))
          (chain-state (rpc-get-chain-state node)))
     (unless (and csi (bl.store:coinstatsindex-enabled csi))
@@ -1888,8 +1897,13 @@ that block's deltas. Only the muhash hash_type is index-backed."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Querying specific block heights requires coinstatsindex"))
     (when (string= hash-type "hash_serialized_3")
+      ;; Core's own sentence (rpc/blockchain.cpp:1091). Ours described the same
+      ;; refusal in different words, which feature_coinstatsindex.py:299 reads.
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "hash_serialized_3 is not available for historical heights; use 'muhash'"))
+                        :message "hash_serialized_3 hash type cannot be queried for a specific block"))
+    (unless use-index
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Cannot set use_index to false when querying for a specific block"))
     ;; Core's ParseHashOrHeight (rpc/blockchain.cpp:126-152): a HEIGHT is
     ;; resolved on the active chain, a HASH is a plain LookupBlockIndex with no
     ;; active-chain test at all. We refused a stale-branch hash outright,
@@ -2019,14 +2033,17 @@ and feature_coinstatsindex.py:87 found no block_info in it."
         ;; explicit-false sentinel is TRUTHY in Lisp.
         (use-index (positional-bool-or use-index t)))
     (unless (member hash-type '("hash_serialized_3" "muhash" "none") :test #'string=)
+      ;; Core's ParseHashType quotes the text it was handed
+      ;; (rpc/blockchain.cpp:975); rpc_blockchain.py:420 reads that sentence
+      ;; back for "foo hash". Ours listed the three legal spellings instead,
+      ;; which names the rule but not the value the caller sent.
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid hash_type (must be 'hash_serialized_3', 'muhash', or 'none')"))
-    (when (and hash-or-height (not use-index))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Cannot set use_index to false when querying for a specific block"))
+                        :message (format nil "'~A' is not a valid hash_type" hash-type)))
     (when hash-or-height
+      ;; The three refusals for a specific block are Core's, in Core's order,
+      ;; and they live in the callee -- see its docstring.
       (return-from rpc-gettxoutsetinfo
-        (%gettxoutsetinfo-from-index node hash-type hash-or-height)))
+        (%gettxoutsetinfo-from-index node hash-type hash-or-height use-index)))
     ;; No height: the index still answers, when there is one and the caller has
     ;; not said otherwise, for every hash type but hash_serialized_3 (which the
     ;; index does not carry).
@@ -2035,7 +2052,8 @@ and feature_coinstatsindex.py:87 found no block_info in it."
                  (not (string= hash-type "hash_serialized_3")))
         (return-from rpc-gettxoutsetinfo
           (%gettxoutsetinfo-from-index node hash-type
-                                       (bl.store:current-height chain-state)))))
+                                       (bl.store:current-height chain-state)
+                                       t))))
     ;; Core holds cs_main across the coins-cache flush and the reads that
     ;; follow it (rpc/blockchain.cpp:1075-1084: ForceFlushStateToDisk, then
     ;; the coins view and the pindex it labels the answer with), and

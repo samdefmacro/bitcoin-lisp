@@ -166,9 +166,25 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
          ;; A height above the tip errors.
          (signals bl.rpc:rpc-error
            (%txoutsetinfo node (list "muhash" (+ tip 100))))
-         ;; hash_serialized_3 is not index-backed.
-         (signals bl.rpc:rpc-error
-           (%txoutsetinfo node (list "hash_serialized_3" 1)))
+         ;; hash_serialized_3 is not index-backed, and Core says so in its own
+         ;; words (rpc/blockchain.cpp:1091) -- for every spelling of use_index,
+         ;; because that gate comes AFTER this one (:1095). Ours refused the
+         ;; explicit false first, so feature_coinstatsindex.py:302 read
+         ;; "Cannot set use_index to false when querying for a specific block"
+         ;; for a call whose fault Core names as the hash type.
+         (dolist (use-index (list :omitted t bl.rpc:+json-false+))
+           (signals-rpc-error
+               (:code -8 :exact-message
+                      "hash_serialized_3 hash type cannot be queried for a specific block")
+             (%txoutsetinfo node (if (eq use-index :omitted)
+                                     (list "hash_serialized_3" 1)
+                                     (list "hash_serialized_3" 1 use-index)))))
+         ;; An unknown hash type is Core's ParseHashType sentence, which quotes
+         ;; the text it was given (rpc/blockchain.cpp:975); rpc_blockchain.py
+         ;; :420 asks for it with a value carrying a space.
+         (signals-rpc-error (:code -8 :exact-message
+                                   "'foo hash' is not a valid hash_type")
+           (%txoutsetinfo node (list "foo hash")))
          (bl.store:close-coinstatsindex csi))))))
 
 (test block-apply-drops-unspendable-outputs
