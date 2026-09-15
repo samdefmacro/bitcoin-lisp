@@ -1938,3 +1938,70 @@ parent was not bumped" (feerate-of (list parent child)) target)
               (is (<= (feerate-of (list parent child)) (* 101/100 target))
                   "parent+child pay ~A sat/vB, over the ~A target by more ~
 than 1%" (feerate-of (list parent child)) target))))))))
+
+(test send-prices-an-external-preselected-input-from-the-utxo-set
+  "Core's wallet::FundTransaction fetches the pre-selected outpoints'
+coins from the UTXO set before selection and stores each one the wallet does
+NOT own on the coin control as an external input -- `wallet.chain().findCoins'
+then `preset_txin.SetTxOut' (spend.cpp:1509-1527). send, walletcreatefundedpsbt
+and fundrawtransaction all reach that function (rpc/spend.cpp:1285, :1445,
+:1767).
+
+Only fundrawtransaction did so here: send registered the outpoint as a preset
+with no txout at all, and FetchSelectedInputs then answered -4 \"Not found
+pre-selected input COutPoint(...)\" -- the sentence Core keeps for an outpoint
+that is in neither the wallet nor the chain. wallet_spend_unconfirmed.py:449
+is the shape that hit it: spending somebody else's output, with its descriptor
+in solving_data, to bump the parent that created it."
+  (with-wallet-chain-node (node "external-preset")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "ext")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((ext-address (rpc "ext" "getnewaddress" "" "bech32"))
+               (ext-descriptor (%aval "desc" (rpc "ext" "getaddressinfo" ext-address)))
+               (bl.wallet::*wallet-rng* (make-wallet-rng 91)))
+          (rpc "fund" "sendtoaddress" ext-address (bl.rpc:format-money 100000000)
+               nil nil nil nil nil nil nil 10)
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((coin (first (rpc "ext" "listunspent")))
+                 (external-txid (%aval "txid" coin))
+                 (external-vout (%aval "vout" coin))
+                 (input (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "txid" h) external-txid
+                                (gethash "vout" h) external-vout)
+                          h))
+                 (solving (let ((h (make-hash-table :test 'equal)))
+                            (setf (gethash "descriptors" h) (list ext-descriptor))
+                            h))
+                 (options (let ((h (make-hash-table :test 'equal)))
+                            (setf (gethash "inputs" h) (list input)
+                                  (gethash "solving_data" h) solving
+                                  (gethash "fee_rate" h) 10)
+                            h))
+                 (recipients (list (let ((h (make-hash-table :test 'equal)))
+                                     (setf (gethash (rpc "fund" "getnewaddress" "" "bech32") h)
+                                           (bl.rpc:format-money 50000000))
+                                     h))))
+            (is (stringp external-txid) "the fixture paid the external wallet")
+            ;; The build itself is the assertion: pre-fix this was -4.
+            (let ((result (rpc "fund" "send" recipients nil nil nil options)))
+              ;; `fund' holds no key for the external input, so Core's send
+              ;; answers complete false and hands back the PSBT to be signed.
+              (is (eq bl.rpc:+json-false+ (%aval "complete" result))
+                  "send should not claim a complete transaction: ~S" result)
+              (let* ((psbt (%aval "psbt" result))
+                     (decoded (rpc nil "decodepsbt" psbt))
+                     (tx (%aval "tx" decoded))
+                     (spent (mapcar (lambda (vin)
+                                      (cons (%aval "txid" vin) (%aval "vout" vin)))
+                                    (coerce (%aval "vin" tx) 'list))))
+                (is (member (cons external-txid external-vout) spent :test #'equal)
+                    "the built transaction must spend the pre-selected external ~
+outpoint; it spends ~S" spent)))))))))
+

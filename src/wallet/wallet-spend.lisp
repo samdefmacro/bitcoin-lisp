@@ -2507,6 +2507,44 @@ Caller holds node + wallet locks."
 
 ;;; --- FundTransaction core (spend.cpp:1494-1546) ---
 
+(defun %wallet-outpoint-mine-p (wallet txid vout)
+  "Core CWallet::IsMine(const COutPoint&) (wallet.cpp:1479-1484): the wallet
+knows the transaction AND owns the script of the output that outpoint names."
+  (let ((wtx (wallet-get-wallet-tx wallet txid)))
+    (and wtx
+         (< vout (length (bl.ser:transaction-outputs (wallet-tx-tx wtx))))
+         (%wallet-script-mine-p
+          wallet
+          (bl.ser:tx-out-script-pubkey
+           (aref (bl.ser:transaction-outputs (wallet-tx-tx wtx)) vout)))
+         t)))
+
+(defun %fill-external-preset-txouts (node wallet cc)
+  "Core wallet::FundTransaction's pre-selection step (spend.cpp:1509-1527): the
+txouts of the pre-selected outpoints are fetched from the UTXO set
+(`wallet.chain().findCoins(coins)') and every one the wallet does NOT own is
+stored on the coin control as an EXTERNAL input (`preset_txin.SetTxOut').
+
+Without it a caller's own `inputs' option naming an outpoint the wallet does
+not own reaches FetchSelectedInputs with no txout at all, and comes back as
+-4 \"Not found pre-selected input COutPoint(...)\" -- the sentence Core
+reserves for an outpoint that is in neither the wallet nor the chain. That is
+what wallet_spend_unconfirmed.py:449 hit: `send' with an external input plus
+solving_data, which is the documented way to bump a parent whose output
+belongs to somebody else.
+
+Returns (values t nil) or (values nil error-message)."
+  (dolist (outpoint (wcc-selected cc) (values t nil))
+    (destructuring-bind (txid . vout) outpoint
+      (let ((preset (wcc-select cc txid vout)))
+        (unless (or (wcc-preset-txout preset)
+                    (%wallet-outpoint-mine-p wallet txid vout))
+          (let ((txout (%wallet-input-txout node wallet txid vout cc)))
+            (unless txout
+              (return-from %fill-external-preset-txouts
+                (values nil "Unable to find UTXO for external input")))
+            (setf (wcc-preset-txout preset) txout)))))))
+
 (defun %fund-transaction (node wallet tx recipients change-pos lock-unspents cc)
   "Core wallet::FundTransaction: TX's inputs become preset inputs, its
 locktime/version transfer to the coin control, and CreateTransaction runs
@@ -2519,18 +2557,8 @@ Caller holds node + wallet locks."
     (let* ((prevout (bl.ser:tx-in-previous-output input))
            (txid (bl.ser:outpoint-hash prevout))
            (vout (bl.ser:outpoint-index prevout))
-           (preset (wcc-select cc txid vout))
-           (wtx (wallet-get-wallet-tx wallet txid))
-           (mine (and wtx
-                      (< vout (length (bl.ser:transaction-outputs
-                                       (wallet-tx-tx wtx))))
-                      (%wallet-script-mine-p
-                       wallet
-                       (bl.ser:tx-out-script-pubkey
-                        (aref (bl.ser:transaction-outputs
-                               (wallet-tx-tx wtx))
-                              vout))))))
-      (unless mine
+           (preset (wcc-select cc txid vout)))
+      (unless (%wallet-outpoint-mine-p wallet txid vout)
         (let ((txout (%wallet-input-txout node wallet txid vout cc)))
           (unless txout
             (return-from %fund-transaction
@@ -3514,7 +3542,15 @@ treats an unanswerable calculation as 0 here (value_or(0))."
   "The FundTransaction step of send/sendall's ConstructTransaction path:
 the preset inputs already live on CC (with sequences), so this is
 CreateTransaction unsigned + optional coin locking. Errors carry Core's
-FundTransaction wrapping (RPC_WALLET_ERROR)."
+FundTransaction wrapping (RPC_WALLET_ERROR).
+
+The external-txout fill is Core's, not ours to skip: send and
+walletcreatefundedpsbt reach wallet::FundTransaction through the same
+rpc/spend.cpp helper as fundrawtransaction does (:1285, :1445, :1767), and
+that function fetches the pre-selected coins before it selects anything."
+  (multiple-value-bind (ok fill-error) (%fill-external-preset-txouts node wallet cc)
+    (unless ok
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message fill-error)))
   (multiple-value-bind (tx fee change-pos)
       (%create-transaction node wallet recipients change-position cc nil)
     (unless tx
