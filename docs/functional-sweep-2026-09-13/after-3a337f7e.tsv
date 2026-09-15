@@ -31,9 +31,9 @@ PASS	feature_framework_testshell	-	PASS
 PASS	feature_framework_unit_tests	-	PASS
 PASS	feature_help	-	PASS
 FAIL	feature_includeconf	feature_includeconf.py:59	AssertionError: Unexpected stderr  != warning: -includeconf cannot be used from included files; igno
-FAIL	feature_index_prune	feature_index_prune.py:42	OSError: [Errno 22] Invalid argument: '/workspace/build/bin/bitcoind'
-FAIL	feature_init	-	OSError: [Errno 22] Invalid argument: '/workspace/build/bin/bitcoind'
-FAIL	feature_loadblock	-	OSError: [Errno 22] Invalid argument: '/workspace/build/bin/bitcoind'
+FAIL	feature_index_prune	feature_index_prune.py:103	AssertionError: not(249 == 248)
+FAIL	feature_init	feature_init.py:93	AssertionError: [node 0] Expected message(s) [b'scheduler thread start'] not found in log:
+PASS	feature_loadblock	-	PASS
 PASS	feature_logging	-	PASS
 PASS	feature_maxtipage	-	PASS
 TIMEOUT	feature_maxuploadtarget	-	TIMEOUT
@@ -64,8 +64,8 @@ SKIP	interface_bitcoin_cli	-	SKIP
 PASS	interface_http	-	PASS
 SKIP	interface_ipc	-	SKIP
 SKIP	interface_ipc_mining	-	SKIP
-FAIL	interface_rest	-	OSError: [Errno 22] Invalid argument: '/workspace/build/bin/bitcoind'
-FAIL	interface_rpc	-	OSError: [Errno 22] Invalid argument: '/workspace/build/bin/bitcoind'
+FAIL	interface_rest	interface_rest.py:87	AssertionError: Expected: 200, Got: 405 (Method Not Allowed) - Response: b''
+PASS	interface_rpc	-	PASS
 SKIP	interface_usdt_coinselection	-	SKIP
 SKIP	interface_usdt_mempool	-	SKIP
 SKIP	interface_usdt_net	-	SKIP
@@ -134,7 +134,7 @@ FAIL	p2p_message_capture	p2p_message_capture.py:65	IndexError: list index out of
 FAIL	p2p_mutated_blocks	p2p_mutated_blocks.py:85	AssertionError: Predicate ''''
 PASS	p2p_net_deadlock	-	PASS
 PASS	p2p_nobloomfilter_messages	-	PASS
-TIMEOUT	p2p_node_network_limited	-	TIMEOUT
+PASS	p2p_node_network_limited	-	PASS
 FAIL	p2p_opportunistic_1p1c	p2p_opportunistic_1p1c.py:514	AssertionError
 FAIL	p2p_orphan_handling	p2p_orphan_handling.py:271	RPC -1 reorg-failed
 FAIL	p2p_outbound_eviction	p2p_outbound_eviction.py:56	AssertionError: Predicate ''''
@@ -199,7 +199,7 @@ SKIP	tool_utils	-	SKIP
 PASS	tool_utxo_to_sqlite	-	PASS
 SKIP	tool_wallet	-	SKIP
 FAIL	wallet_abandonconflict	wallet_abandonconflict.py:242	AssertionError: not(2514.99986860 == 2494.99986860)
-TIMEOUT	wallet_address_types	-	TIMEOUT
+FAIL	wallet_address_types	wallet_address_types.py:91	AssertionError: Predicate ''''
 PASS	wallet_anchor	-	PASS
 FAIL	wallet_assumeutxo	wallet_assumeutxo.py:210	AssertionError: Expected substring not found in error message:
 PASS	wallet_avoid_mixing_output_types	-	PASS
@@ -241,7 +241,7 @@ FAIL	wallet_miniscript_decaying_multisig_descriptor_psbt	wallet_miniscript_decay
 FAIL	wallet_multisig_descriptor_psbt	wallet_multisig_descriptor_psbt.py:123	KeyError: 'hex'
 FAIL	wallet_multiwallet	wallet_multiwallet.py:78	AssertionError: not(False == True)
 FAIL	wallet_musig	wallet_musig.py:203	RPC -12 Error: Keypool ran out, please call keypoolrefill first
-FAIL	wallet_orphanedreward	wallet_orphanedreward.py:37	AssertionError: Mempool sync timed out after 60s:
+PASS	wallet_orphanedreward	-	PASS
 PASS	wallet_reindex	-	PASS
 FAIL	wallet_reorgsrestore	wallet_reorgsrestore.py:203	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260914T2
 PASS	wallet_rescan_unconfirmed	-	PASS
