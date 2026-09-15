@@ -949,6 +949,74 @@ order would silently lose the rest of the chain behind it."
            (is (= 5 added) "reverse storage order must still rebuild the whole chain")
            (is (= 0 orphans))))))))
 
+(test reindexing-names-the-out-of-order-blocks-as-core-names-them
+  "Core's LoadExternalBlockFile judges each record AS IT IS READ, against the
+index as it stands at that point: a block whose parent is not known yet is
+logged and parked under its parent's hash (validation.cpp:5048-5054), and when
+the parent lands every block parked under it -- and under those in turn -- is
+processed at once, one log line each (:5110-5134). Ours read every record into
+one table first and drained afterwards, which reaches the same index but can
+say nothing about which blocks were out of order.
+
+feature_reindex.py:69-73 swaps two blocks inside blk00000.dat and then asserts
+BOTH sentences appear in debug.log, so the wording is the contract. The chain
+below is stored newest-first, so blocks 5..2 are each out of order on arrival
+and block 1 releases all four."
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
+     (let* ((bl.store:*flat-block-files* t)
+            (store (bl.store:init-block-store dir))
+            (cs (bl.store:init-chain-state dir))
+            (genesis (bl.store:best-block-hash cs))
+            (blocks '()))
+       (bl.store:add-block-index-entry
+        cs (bl.store:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       (let ((prev genesis))
+         (loop for h from 1 to 5
+               do (let ((b (%ff-chain-block prev (+ 240 h) h)))
+                    (push (cons b h) blocks)
+                    (setf prev (bl.ser:block-header-hash
+                                (bl.ser:bitcoin-block-header b))))))
+       ;; BLOCKS is newest-first: every child is stored before its parent.
+       (dolist (pair blocks)
+         (bl.store:store-block store (car pair) :height (cdr pair)))
+       (let* ((store2 (bl.store:init-block-store dir))
+              (cs2 (bl.store:init-chain-state dir))
+              (added 0)
+              ;; The two lines are Core's LogDebug(BCLog::REINDEX), so the
+              ;; category has to be on for them to be written at all -- the
+              ;; functional framework starts every node with -debug
+              ;; (test_node.py:151).
+              (lines (unwind-protect
+                          (progn
+                            (bl.log:enable-log-category "reindex")
+                            (capture-log-lines
+                             (lambda ()
+                               (bl.store:add-block-index-entry
+                                cs2 (bl.store:make-block-index-entry
+                                     :hash genesis :height 0 :chain-work 1
+                                     :status :valid))
+                               (setf added (bl.store:reindex-block-index store2 cs2)))))
+                       (bl.log:disable-log-category "reindex"))))
+         (flet ((saying (text)
+                  (count-if (lambda (l) (search text l)) lines)))
+           (is (= 5 added) "the whole chain is still rebuilt")
+           (is (= 4 (saying "LoadExternalBlockFile: Out of order block"))
+               "one line per record read before its parent; lines were ~S" lines)
+           (is (= 4 (saying "LoadExternalBlockFile: Processing out of order child"))
+               "and one per parked record released when its parent landed")
+           (is (= 4 (saying ", parent "))
+               "Core names the parent in the out-of-order line")
+           ;; The hashes are Core's spelling: big-endian, as every RPC prints
+           ;; one. The tail block of the chain is the FIRST record in the file.
+           (let ((newest (bl.crypto:bytes-to-hex
+                          (bl.crypto:reverse-bytes
+                           (bl.ser:block-header-hash
+                            (bl.ser:bitcoin-block-header (car (first blocks))))))))
+             (is (plusp (saying (format nil "Out of order block ~A," newest)))
+                 "the hash is spelled big-endian, as uint256::ToString spells it"))))))))
+
 (test a-record-whose-parent-is-gone-is-reported-not-treated-as-corruption
   "On a pruned node the chain below the horizon is deleted, so records with no
 reachable parent are EXPECTED. Reporting the count lets an operator tell that

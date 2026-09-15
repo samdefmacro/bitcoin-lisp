@@ -41,79 +41,159 @@ blocks to rebuild an index would read the entire chain into memory."
                   (values header (bl.crypto:hash256 bytes)))
               (error () nil))))))))
 
+(defun %reindex-add-entry (chain-state hash header located parent)
+  "Add HASH's index entry under PARENT, carrying the record's position. Returns
+T when an entry was added."
+  (unless (get-block-index-entry chain-state hash)
+    (let ((entry (make-block-index-entry
+                  :hash hash
+                  :height (1+ (block-index-entry-height parent))
+                  :header header
+                  :prev-entry parent
+                  :chain-work (calculate-chain-work
+                               (bl.ser:block-header-bits header)
+                               (block-index-entry-chain-work parent))
+                  ;; The body is on disk but nothing has been re-validated, so
+                  ;; the entry claims only that its header is good. The
+                  ;; chainstate rebuild is what promotes blocks to :valid by
+                  ;; re-applying them.
+                  :status :header-valid)))
+      (%record-block-position entry located)
+      (add-block-index-entry chain-state entry)
+      t)))
+
+(defun %reindex-drain-children (chain-state pending hash)
+  "Core's recursive successor drain (validation.cpp:5110-5134): everything
+parked under HASH, then everything parked under those, breadth first. Returns
+the number of entries added.
+
+A queue rather than recursion: a parked run can be hundreds of thousands deep
+and recursion would exhaust the stack."
+  (let ((added 0)
+        (queue (list hash)))
+    (loop while queue
+          do (let* ((head (pop queue))
+                    (children (gethash head pending))
+                    (parent (get-block-index-entry chain-state head)))
+               (remhash head pending)
+               (when parent
+                 (dolist (child (reverse children))
+                   (destructuring-bind (child-hash child-header located) child
+                     ;; Core logs one line per child it reads back, before
+                     ;; AcceptBlock (validation.cpp:5122).
+                     (bl.log:log-cat "reindex"
+                                     "LoadExternalBlockFile: Processing out of order child ~A of ~A"
+                                     (%reindex-hash-text child-hash)
+                                     (%reindex-hash-text head))
+                     (when (%reindex-add-entry chain-state child-hash child-header
+                                               located parent)
+                       (incf added))
+                     (when (gethash child-hash pending)
+                       (push child-hash queue)))))))
+    added))
+
+(defun %reindex-hash-text (hash)
+  "HASH as Core's uint256::ToString spells it in these log lines: big-endian
+hex, the way every RPC reports a block hash."
+  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))
+
+(defun %reindex-records-in-file-order (store)
+  "Every flat record in STORE as (hash pos), in the order the files hold them.
+
+File order is the contract: Core reads a blk file record by record and decides
+each one against the index AS IT STANDS at that point, so which blocks come out
+`out of order' is a property of the bytes on disk. Walking the store's
+hash -> position map in hash-table order instead would make that answer depend
+on the table's iteration, which is arrival order and not file order."
+  (let ((records '()))
+    (maphash (lambda (hash located)
+               (when (flat-file-pos-p located)
+                 (push (cons hash located) records)))
+             (block-store-index store))
+    (sort records
+          (lambda (a b)
+            (let ((fa (flat-file-pos-file (cdr a)))
+                  (fb (flat-file-pos-file (cdr b))))
+              (if (= fa fb)
+                  (< (flat-file-pos-pos (cdr a)) (flat-file-pos-pos (cdr b)))
+                  (< fa fb)))))))
+
 (defun reindex-block-index (store chain-state)
   "Rebuild CHAIN-STATE's block index from STORE's block files.
 
 Returns (values entries-added orphans-left). Orphans are records whose parent
-never turned up: on a pruned node that is expected — the chain below the prune
-horizon is gone — and they are reported rather than treated as corruption.
+never turned up: on a pruned node that is expected -- the chain below the prune
+horizon is gone -- and they are reported rather than treated as corruption.
 
 The genesis entry is assumed to be present already; every other block is linked
-to its parent, which is what supplies its height and chain work. A block whose
-parent has not been seen yet is parked by prev-hash and drained as soon as the
-parent lands, so file order does not matter."
-  (let ((pending (make-hash-table :test 'equalp))   ; prev-hash -> list of (hash header)
+to its parent, which is what supplies its height and chain work.
+
+Core's shape, and it is the shape and not just the outcome that matters
+(LoadExternalBlockFile, validation.cpp:5006-5134): each record is judged as it
+is read, against the index as it stands. A block whose parent is not known YET
+is logged and parked in mapBlocksUnknownParent under its parent's hash
+(:5048-5054); a block whose parent IS known is added, and then everything
+parked under it -- and under those in turn -- is processed at once
+(:5110-5134). Ours read every record into one table first and drained
+afterwards, which reaches the same index but can say nothing about which
+blocks were out of order, and feature_reindex.py:69-73 swaps two blocks inside
+blk00000.dat precisely to watch for those two lines."
+  (let ((pending (make-hash-table :test 'equalp))   ; prev-hash -> list of (hash header pos)
+        (genesis (chain-state-genesis-hash chain-state))
         (added 0))
-    ;; Collect every record's header first. The store's index already knows
-    ;; where each block is — that map is rebuilt by the startup scan — so this
-    ;; walks it rather than re-reading the files record by record.
-    (let ((records '()))
-      (maphash (lambda (hash located)
-                 (when (flat-file-pos-p located)
-                   (push (cons hash located) records)))
-               (block-store-index store))
-      (dolist (record records)
-        (multiple-value-bind (header hash) (%reindex-header-of-record store (cdr record))
-          (when (and header hash)
-            ;; The record's position travels with the header: the entry built
-            ;; below is the only thing that will ever carry nFile/nDataPos, and
-            ;; without them a reindexed datadir writes undo data in the legacy
-            ;; format forever. Core drives the same field from its reindex path
-            ;; (UpdateBlockInfo, blockstorage.cpp:923-940, called from
-            ;; AcceptBlock's reindex branch, validation.cpp:4402-4403).
-            (push (list hash header (cdr record))
-                  (gethash (bl.ser:block-header-prev-block header)
-                           pending))))))
-    ;; Drain from every parent already in the index, adding children and then
-    ;; their children. A queue rather than recursion: a chain is hundreds of
-    ;; thousands deep and recursion would exhaust the stack.
-    (let ((queue '()))
-      (maphash (lambda (hash entry)
-                 (declare (ignore entry))
-                 (when (gethash hash pending) (push hash queue)))
-               (chain-state-block-index chain-state))
-      (loop while queue
-            do (let* ((parent-hash (pop queue))
-                      (children (gethash parent-hash pending))
-                      (parent (get-block-index-entry chain-state parent-hash)))
-                 (remhash parent-hash pending)
-                 (when parent
-                   (dolist (child children)
-                     (destructuring-bind (hash header located) child
-                       (unless (get-block-index-entry chain-state hash)
-                         (let ((entry (make-block-index-entry
-                                       :hash hash
-                                       :height (1+ (block-index-entry-height parent))
-                                       :header header
-                                       :prev-entry parent
-                                       :chain-work (calculate-chain-work
-                                                    (bl.ser:block-header-bits
-                                                     header)
-                                                    (block-index-entry-chain-work parent))
-                                       ;; The body is on disk but nothing has
-                                       ;; been re-validated, so the entry claims
-                                       ;; only that its header is good. The
-                                       ;; chainstate rebuild is what promotes
-                                       ;; blocks to :valid by re-applying them.
-                                       :status :header-valid)))
-                           (%record-block-position entry located)
-                           (add-block-index-entry chain-state entry)
-                           (incf added)))
-                       (when (gethash hash pending) (push hash queue)))))))
-      (values added
-              (let ((left 0))
-                (maphash (lambda (k v) (declare (ignore k)) (incf left (length v))) pending)
-                left)))))
+    (loop for (hash . located) in (%reindex-records-in-file-order store)
+          do (multiple-value-bind (header record-hash)
+                 (%reindex-header-of-record store located)
+               (when (and header record-hash)
+                 (let ((prev (bl.ser:block-header-prev-block header)))
+                   (cond
+                     ;; Already in the index: nothing to do, and never a
+                     ;; parent-lookup (genesis takes this arm on every run).
+                     ((get-block-index-entry chain-state record-hash))
+                     ;; Genesis's parent is the zero hash and will never be in
+                     ;; the index; Core excludes it from the check by name
+                     ;; (validation.cpp:5049).
+                     ((and genesis (equalp record-hash genesis)))
+                     (t
+                      (let ((parent (get-block-index-entry chain-state prev)))
+                        (cond
+                          ((null parent)
+                           (bl.log:log-cat "reindex"
+                                           "LoadExternalBlockFile: Out of order block ~A, parent ~A not known"
+                                           (%reindex-hash-text record-hash)
+                                           (%reindex-hash-text prev))
+                           (push (list record-hash header located)
+                                 (gethash prev pending)))
+                          (t
+                           ;; The record's position travels with the header:
+                           ;; the entry built here is the only thing that will
+                           ;; ever carry nFile/nDataPos, and without them a
+                           ;; reindexed datadir writes undo data in the legacy
+                           ;; format forever. Core drives the same field from
+                           ;; its reindex path (UpdateBlockInfo,
+                           ;; blockstorage.cpp:923-940, called from
+                           ;; AcceptBlock's reindex branch,
+                           ;; validation.cpp:4402-4403).
+                           (when (%reindex-add-entry chain-state record-hash
+                                                     header located parent)
+                             (incf added))
+                           (incf added (%reindex-drain-children
+                                        chain-state pending record-hash)))))))))))
+    ;; A parent that was already in the index when its children were parked
+    ;; cannot happen -- the check above would have taken the other arm -- but a
+    ;; run whose parents arrive only as OTHER parked blocks land does, so drain
+    ;; from every index entry once more before counting what is left.
+    (let ((roots '()))
+      (maphash (lambda (prev children)
+                 (declare (ignore children))
+                 (when (get-block-index-entry chain-state prev) (push prev roots)))
+               pending)
+      (dolist (root roots)
+        (incf added (%reindex-drain-children chain-state pending root))))
+    (values added
+            (let ((left 0))
+              (maphash (lambda (k v) (declare (ignore k)) (incf left (length v))) pending)
+              left))))
 
 ;;;; Reading blocks out of an EXTERNAL file (Core -loadblock)
 ;;;;
