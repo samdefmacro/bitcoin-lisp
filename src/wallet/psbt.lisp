@@ -1568,9 +1568,16 @@ Returns {psbt, complete, hex?}."
                                (if default-p nil byte)))
                (bip32derivs (bl.rpc:positional-bool-or (fourth params) t))
                (finalize (bl.rpc:positional-bool-or (fifth params) t)))
-          (when (and sign (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
-            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                              :message "Error: Private keys are disabled for this wallet"))
+          ;; Core gates this RPC on NOTHING but the passphrase: `if (sign)
+          ;; EnsureWalletIsUnlocked(*pwallet);' (wallet/rpc/spend.cpp:1631) is
+          ;; the whole precondition. A private-keys-disabled wallet is a
+          ;; legitimate walletprocesspsbt caller -- it is the UPDATER half of
+          ;; the watch-only/offline split, filling UTXOs and derivations for a
+          ;; PSBT another wallet will sign -- and FillPSBT simply signs nothing
+          ;; because its SPKMs hold no keys. Refusing it here (we answered -4
+          ;; "Private keys are disabled for this wallet") makes the default
+          ;; sign=true argument unusable on exactly the wallet the workflow is
+          ;; built around.
           (when sign (wallet-ensure-unlocked wallet))
           (%psbt-fill-wallet-utxos psbt wallet)
           (let ((coins (%psbt-coins-map psbt wallet nil)))

@@ -1204,3 +1204,37 @@ client can match."
         (is (equal -22 (car answer)))
         (is (eql 0 (search "TX decode failed" (or (cdr answer) ""))))))))
 
+(test walletprocesspsbt-updates-a-private-keys-disabled-wallet
+  "Core gates walletprocesspsbt on the passphrase and on nothing else: `if
+(sign) EnsureWalletIsUnlocked(*pwallet);' is the whole precondition
+(wallet/rpc/spend.cpp:1625-1633). A private-keys-disabled wallet is a
+legitimate caller -- it is the UPDATER half of the watch-only/offline split --
+and FillPSBT simply signs nothing, because its SPKMs hold no keys.
+
+We refused it with -4 \"Private keys are disabled for this wallet\" whenever
+`sign' was true, which is the DEFAULT, so the watch-only wallet could not be
+asked to fill in a PSBT at all."
+  (with-wallet-chain-node (node "psbt-watchonly" :wallet "w")
+    (let* ((psbt (bl.rpc:dispatch-rpc-method
+                  node "createpsbt"
+                  (list (wire-params
+                         (list (let ((h (make-hash-table :test 'equal)))
+                                 (setf (gethash "txid" h)
+                                       (make-string 64 :initial-element #\1)
+                                       (gethash "vout" h) 0)
+                                 h)))
+                        (wire-params
+                         (list (let ((h (make-hash-table :test 'equal)))
+                                 (setf (gethash (bl.rpc:dispatch-rpc-method
+                                                 node "getnewaddress" '())
+                                                h)
+                                       0.001d0)
+                                 h)))))))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "watch" t))
+      (let ((bl.wallet::*rpc-wallet-name* "watch"))
+        ;; sign defaults to TRUE; the answer is an updated PSBT, not a refusal.
+        (let ((result (bl.rpc:dispatch-rpc-method node "walletprocesspsbt"
+                                                  (list psbt))))
+          (is (stringp (cdr (assoc "psbt" result :test #'string=))))
+          (is (eq bl.rpc:+json-false+ (cdr (assoc "complete" result :test #'string=))))))))) 
+
