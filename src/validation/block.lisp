@@ -1294,6 +1294,51 @@ rejected, and the no-commitment+witness case is :unexpected-witness
           (values nil :unexpected-witness))))
     (values t nil)))
 
+(defun block-mutated-p (block check-witness-root)
+  "Core IsBlockMutated (validation.cpp:4059-4090): is BLOCK a MALLEATED copy of
+some other block -- one whose bytes differ but whose header, and therefore
+whose hash, do not? Returns (VALUES MUTATED-P REASON), REASON being the string
+Core's BlockValidationState::ToString() renders (\"reject-reason, debug
+message\") for the two arms that set one.
+
+The distinction matters because the verdict cannot be cached against the hash:
+the hash names the honest block too, so a peer that relays one mangled copy
+would otherwise poison the record permanently. Core's answer is to refuse the
+block at the wire, before it reaches validation or the download bookkeeping,
+and to punish the peer that sent it (net_processing.cpp:4871-4879).
+
+CHECK-WITNESS-ROOT is Core's expect_witness_commitment, i.e. whether segwit is
+active AFTER the block's parent -- which is why this is only asked of a block
+whose parent we already have."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (transactions (bl.ser:bitcoin-block-transactions block)))
+    ;; CheckMerkleRoot (validation.cpp:3869-3892).
+    (multiple-value-bind (computed mutated)
+        (compute-merkle-root (mapcar #'bl.ser:transaction-hash transactions))
+      (unless (equalp computed (bl.ser:block-header-merkle-root header))
+        (return-from block-mutated-p
+          (values t "bad-txnmrklroot, hashMerkleRoot mismatch")))
+      (when mutated
+        (return-from block-mutated-p
+          (values t "bad-txns-duplicate, duplicate transaction"))))
+    ;; No coinbase, or ANY transaction exactly 64 bytes long in legacy
+    ;; serialization: a 64-byte transaction is indistinguishable from an
+    ;; internal merkle node, which is the other half of CVE-2012-2459
+    ;; (validation.cpp:4067-4080). Core logs nothing for these.
+    (when (or (null transactions)
+              (not (is-coinbase-tx (first transactions))))
+      (return-from block-mutated-p (values t nil)))
+    (dolist (tx transactions)
+      (when (= 64 (length (bl.ser:serialize-transaction tx)))
+        (return-from block-mutated-p (values t nil))))
+    ;; CheckWitnessMalleation (validation.cpp:3902-3948).
+    (multiple-value-bind (ok reason)
+        (validate-witness-commitment block check-witness-root)
+      (unless ok
+        (return-from block-mutated-p
+          (values t (block-reject-reason-string reason)))))
+    (values nil nil)))
+
 (defun witness-reserved-value ()
   "A fresh copy of the BIP141 reserved witness value — the 32 zero bytes a
 coinbase's sole witness item must be when the block carries a witness

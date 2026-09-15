@@ -1268,6 +1268,95 @@ shape an attacker uses to buy an HB slot with a block we will never connect."
    :header (bl.ser:bitcoin-block-header block)
    :transactions (list (make-simple-tx #x99))))
 
+(test a-mutated-block-is-refused-at-the-wire-and-its-sender-punished
+  "Core refuses a MALLEATED block -- one whose bytes differ from an honest
+block's while its header, and so its hash, do not -- at the wire, before
+anything is written: IsBlockMutated at net_processing.cpp:4871-4879, then
+Misbehaving and RemoveBlockRequest for that peer alone.
+
+Ours handed it to the validator, which rejected it and then, through
+HANDLE-VALIDATION-FAILURE, freed the in-flight slot and re-queued the hash --
+so one mangled copy cancelled an honest peer's delivery of the real block, for
+free, as often as the attacker cared to repeat it. p2p_mutated_blocks.py:82-91
+sends exactly that while a getblocktxn to the honest peer is outstanding."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "mutated-gate"))
+           (cs (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
+           (store (bl:node-block-store node))
+           (mp (bl:node-mempool node))
+           (b1 (%g716-mine-on node (p2sh-optrue-script-pubkey)))
+           (mutated (%g716-corrupt-block b1))
+           (hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1))))
+      ;; The verdict, in the words Core's BlockValidationState renders.
+      (multiple-value-bind (m reason) (bl.val:block-mutated-p mutated t)
+        (is-true m "a block whose transactions do not build its merkle root is mutated")
+        (is (equal "bad-txnmrklroot, hashMerkleRoot mismatch" reason)))
+      ;; Control: the honest block is not mutated, so the gate cannot be
+      ;; refusing everything.
+      (is-false (bl.val:block-mutated-p b1 t))
+      (%g716-quiet
+       (with-ibd-context
+         (let ((honest (%g716-delivering-peer "198.51.100.30"))
+               (attacker (%g716-delivering-peer "198.51.100.31"))
+               (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                              :block-store store :mempool mp)))
+           ;; The honest peer is mid-download of this very hash.
+           (setf (gethash hash (bl.net:ibd-context-in-flight bl.net:*ibd-context*))
+                 (cons honest (get-internal-real-time)))
+           (deliver-ibd-message attacker "block" (%g716-block-payload mutated) ctx)
+           (is (eq :disconnected (bl.net:peer-state attacker))
+               "the peer that sent a mutated block is disconnected")
+           (is (eq honest (car (gethash hash (bl.net:ibd-context-in-flight
+                                              bl.net:*ibd-context*))))
+               "and the honest peer's download of the same hash is untouched")
+           (is (= 0 (bl.store:current-height cs))
+               "nothing was connected")))))))
+
+(test an-unconnectable-block-is-refused-in-cores-words-and-its-sender-punished
+  "Core's AcceptBlock runs AcceptBlockHeader first, so a block whose parent we
+do not have is BLOCK_MISSING_PREV: logged as `AcceptBlock FAILED
+(prev-blk-not-found)' (validation.cpp:4457) and punished
+(net_processing.cpp:1941-1943). Ours dropped it silently further down as
+`Received unknown block', so an attacker could push unconnectable bodies for
+free -- p2p_mutated_blocks.py:109-112 sends one and waits for the disconnect."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "unconnectable-block"))
+           (cs (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
+           (store (bl:node-block-store node))
+           (mp (bl:node-mempool node))
+           (b1 (%g716-mine-on node (p2sh-optrue-script-pubkey)))
+           ;; The same block re-parented onto a hash we have never seen, mined
+           ;; again so its own proof of work is sound: Core would answer
+           ;; high-hash rather than prev-blk-not-found otherwise.
+           (orphan (bl.ser:make-bitcoin-block
+                    :header (bl.ser:make-block-header
+                             :version (bl.ser:block-header-version
+                                       (bl.ser:bitcoin-block-header b1))
+                             :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element #x7b)
+                             :merkle-root (bl.ser:block-header-merkle-root
+                                           (bl.ser:bitcoin-block-header b1))
+                             :timestamp (bl.ser:block-header-timestamp
+                                         (bl.ser:bitcoin-block-header b1))
+                             :bits (bl.ser:block-header-bits
+                                    (bl.ser:bitcoin-block-header b1))
+                             :nonce 0)
+                    :transactions (bl.ser:bitcoin-block-transactions b1))))
+      (bl.mining:mine-block orphan)
+      (is-true (bl.val:check-proof-of-work (bl.ser:bitcoin-block-header orphan))
+               "the orphan's own proof of work is sound")
+      (%g716-quiet
+       (with-ibd-context
+         (let ((attacker (%g716-delivering-peer "198.51.100.32"))
+               (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                              :block-store store :mempool mp)))
+           (deliver-ibd-message attacker "block" (%g716-block-payload orphan) ctx)
+           (is (eq :disconnected (bl.net:peer-state attacker))
+               "a block on a parent we have never seen costs the sender the connection")
+           (is (= 0 (bl.store:current-height cs)))))))))
+
 (defun %g716-delivering-peer (address)
   (let ((p (%g716-peer)))
     (setf (bl.net:peer-address p) address)

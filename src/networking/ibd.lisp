@@ -1917,6 +1917,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
      (let* ((block (bl.ser:parse-block-payload payload))
             (header (bl.ser:bitcoin-block-header block))
             (hash (bl.ser:block-header-hash header)))
+       ;; Core's wire-level mutation gate, before ANY of the bookkeeping below
+       ;; (net_processing.cpp:4871-4879). This is the live path for a block
+       ;; message -- the drain dispatches it here and never reaches
+       ;; HANDLE-BLOCK -- so the gate has to be on both.
+       (when (%refuse-mutated-block peer block chain-state)
+         (return-from dispatch-ibd-message nil))
        ;; Forensic raw-payload capture: dump the wire-format
        ;; (witness-included) bytes to a side dir before parse loses
        ;; witness data. Triggered only when *forensic-store-from-height*
@@ -1953,6 +1959,24 @@ handler. Shared by the block-download drain and the at-tip reap pass."
             :count-fn (and ctx
                            (lambda (n)
                              (incf (ibd-context-headers-received ctx) n))))))
+       ;; ...and if the parent is still unknown, the header could not be
+       ;; indexed at all. Core's AcceptBlock runs AcceptBlockHeader first, so
+       ;; this is its BLOCK_MISSING_PREV: the block is refused with
+       ;; "AcceptBlock FAILED (prev-blk-not-found)" (validation.cpp:4457) and
+       ;; the sender is punished (MaybePunishNodeForBlock's BLOCK_MISSING_PREV
+       ;; arm, net_processing.cpp:1941-1943). Ours dropped it silently as
+       ;; "Received unknown block" further down, which let an attacker push
+       ;; unconnectable bodies for free; p2p_mutated_blocks.py:109-112 sends
+       ;; one and waits for the disconnect. The proof of work is asked FIRST
+       ;; because Core's AcceptBlockHeader does: CheckBlockHeader runs before
+       ;; the prev lookup, so a header that does not meet its own target is
+       ;; high-hash, not prev-blk-not-found.
+       (when (and (bl.val:check-proof-of-work header)
+                  (not (bl.store:get-block-index-entry
+                        chain-state (bl.ser:block-header-prev-block header))))
+         (bl:log-info "AcceptBlock FAILED (prev-blk-not-found)")
+         (record-misbehavior peer "prev-blk-not-found")
+         (return-from dispatch-ibd-message nil))
        ;; Per-peer availability: receiving a block proves peer had it.
        (update-block-availability peer chain-state hash)
        ;; Assumeutxo routing (Core ProcessNewBlock runs ABC on the current
