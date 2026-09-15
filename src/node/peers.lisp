@@ -1245,6 +1245,60 @@ timestamp would reset each pass and the cadence would be meaningless.")
 (defconstant +extra-peer-check-interval-seconds+ 45
   "Core EXTRA_PEER_CHECK_INTERVAL — cadence of the chain-sync sweep.")
 
+(defun run-header-sync-duties (node)
+  "Core's SendMessages header-sync duties, run once per message-handler pass:
+the headers-download timeout on the peer that holds the sync
+(net_processing.cpp:6124-6155), then the one initial getheaders it may open
+(:5797-5821).
+
+Core runs them the other way round -- open first, check second -- so a timeout
+that releases the latch is re-opened on the NEXT pass. Its passes are about
+100 ms and our idle tick is 200 ms, so the release and the re-open are done in
+the same tick here: p2p_initial_headers_sync.py:176 reads which peer is asked
+about 150 ms after a noban release, and a pass of slack loses it."
+  (consider-headers-sync-timeout node)
+  (maybe-open-header-sync node))
+
+(defun maybe-open-header-sync (node)
+  "Core's initial-getheaders step, run once per message-handler pass
+(net_processing.cpp:5797-5821, inside SendMessages and BEFORE the
+headers-download timeout check below it). HEADER-SYNC-PEER opens a sync when
+none is open and the guard allows one; it is a no-op otherwise.
+
+Driven from the per-second idle tick, not only from the sync cycle's Phase 1:
+after a noban peer's timeout releases the latch, p2p_initial_headers_sync.py
+:176 reads which peer is asked next about a fifth of a second later, and a
+cycle-length gap there leaves nobody asked."
+  (let ((chain-state (node-current-chainstate node)))
+    (when chain-state
+      (handler-case
+          (bl.net:header-sync-peer
+           (bt:with-recursive-lock-held ((node-lock node))
+             (copy-list (node-peers node)))
+           chain-state)
+        (error (e) (log-warn "Header-sync selection failed: ~A" e))))))
+
+(defun consider-headers-sync-timeout (node)
+  "Core's headers-download timeout, checked once per message-handler pass
+(net_processing.cpp:6124-6155, inside SendMessages and immediately above
+ConsiderEviction). Driven from the sync thread's per-second idle tick rather
+than from MAINTAIN-PEERS, because that runs once per ~30-second sync cycle:
+p2p_initial_headers_sync.py:169 jumps the clock past the budget and then reads
+the noban line out of debug.log inside an assert_debug_log whose body is a
+ping and a connection count, i.e. within about two seconds.
+
+Whole-set rather than per-peer: the rule counts the set -- it fires only when
+this is our ONLY headers-sync peer and there is another preferred-download
+peer to open one with."
+  (let ((chain-state (node-current-chainstate node)))
+    (when chain-state
+      (handler-case
+          (bl.net:consider-headers-sync-timeouts
+           (bt:with-recursive-lock-held ((node-lock node))
+             (copy-list (node-peers node)))
+           chain-state (bl.ser:get-unix-time))
+        (error (e) (log-warn "Headers-sync timeout sweep failed: ~A" e))))))
+
 (defun consider-outbound-evictions (node)
   "Core's two outbound-eviction sweeps, on Core's two cadences.
 
@@ -1265,17 +1319,6 @@ run at tip — exactly where eclipse resistance matters."
   (let ((now (bl.ser:get-unix-time)))
     (let ((chain-state (node-current-chainstate node)))
       (when chain-state
-        ;; Core checks the headers-download timeout in the same SendMessages
-        ;; pass, immediately above ConsiderEviction (net_processing.cpp:6124-6159).
-        ;; Whole-set rather than per-peer because the rule counts the set: it
-        ;; fires only when this is our ONLY headers-sync peer and there is
-        ;; another preferred-download peer to open one with.
-        (handler-case
-            (bl.net:consider-headers-sync-timeouts
-             (bt:with-recursive-lock-held ((node-lock node))
-               (copy-list (node-peers node)))
-             chain-state now)
-          (error (e) (log-warn "Headers-sync timeout sweep failed: ~A" e)))
         (dolist (peer (node-peers node))
           (handler-case
               (bl.net:consider-chain-sync-eviction

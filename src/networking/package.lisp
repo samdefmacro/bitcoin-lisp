@@ -171,6 +171,7 @@ headerssync.cpp. src/networking/.")
    #:ingest-headers-from-peer
    #:header-sync-candidate-p
    #:consider-headers-sync-timeouts
+   #:header-sync-peer
    #:broadcast-initial-getheaders
    #:handle-validation-failure
    #:peer-last-getheaders-time
