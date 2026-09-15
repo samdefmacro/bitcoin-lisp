@@ -846,7 +846,15 @@ accepted but ignored."
 (defun %chain-control-block (node params op)
   "Shared driver for invalidateblock/reconsiderblock: resolve the blockhash param
 and invoke OP (invalidate-block or reconsider-block) with the node's chain
-context. Returns null on success; errors otherwise."
+context. Returns null on success; errors otherwise.
+
+All three of Core's handlers answer a hash the block index does not hold with
+RPC_INVALID_ADDRESS_OR_KEY and the sentence `Block not found'
+(rpc/blockchain.cpp:1679, :1702, :1746) and every OTHER failure with
+RPC_DATABASE_ERROR carrying the validation state's string (:1687, :1713,
+:1758). Ours answered -1 with the reason keyword downcased, so an unknown
+block came back as -1 `block-not-found' where rpc_invalidateblock.py:140 asks
+for -5 `Block not found'."
   (let ((hash (parse-hash-v (first params) "blockhash")))
     ;; Node lock: these ops reorg the active chain, rewrite the UTXO set,
     ;; and re-add/evict mempool entries — the same mutations the sync
@@ -861,8 +869,11 @@ context. Returns null on success; errors otherwise."
                    hash
                    :mempool (rpc-get-mempool node))
         (unless ok
-          (error 'rpc-error :code +rpc-misc-error+
-                            :message (string-downcase (symbol-name reason))))
+          (if (eq reason :block-not-found)
+              (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                :message "Block not found")
+              (error 'rpc-error :code +rpc-database-error+
+                                :message (string-downcase (symbol-name reason)))))
         nil))))
 
 (define-rpc "invalidateblock" (node params)
