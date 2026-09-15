@@ -95,23 +95,30 @@ node can be trusted yet."
                 1.0d0
                 (min (/ (float count 1d0) (float expected 1d0)) 1.0d0)))))))
 
-(defun %first-stored-block-height (chain-state)
-  "Core BlockManager::GetFirstStoredBlock(tip)->nHeight: the height of the
-lowest block of the active chain whose body we still hold. Both
-getblockchaininfo's `pruneheight' and the value pruneblockchain returns are
-this number (rpc/blockchain.cpp:1426-1428 and :1671-1673), and ours reported
-the highest height DELETED instead -- the same number only once something has
-actually been deleted.
+(defun %last-pruned-block-height (chain-state)
+  "Core GetPruneHeight (rpc/blockchain.cpp:882-906): the height of the HIGHEST
+block that has been pruned, or NIL when nothing has been (Core's
+std::nullopt).
 
-Derived from the prune horizon rather than asked of the block store, and that
+Derived from the prune horizon rather than walked back from the tip, and that
 is not a shortcut: the horizon is the highest height whose file has been
-removed, and we prune whole files from the bottom, so the lowest height still
-present is one above it -- or genesis, when nothing has been pruned. Core
-WRITES the genesis block at start-up (LoadGenesisBlock) while we synthesise it
-from the chain parameters, so asking the store would answer 1 on a node that
-has pruned nothing and 0 is the right answer."
+removed, and we prune whole files from the bottom. Core's walk starts at
+chain[1] rather than at genesis, for the same reason our horizon starts at 0
+and means `nothing pruned' -- genesis has no undo data and is never counted as
+pruned."
   (let ((pruned (bl.store:chain-state-pruned-height chain-state)))
-    (if (plusp pruned) (1+ pruned) 0)))
+    (when (plusp pruned) pruned)))
+
+(defun %first-stored-block-height (chain-state)
+  "getblockchaininfo's `pruneheight': the height of the lowest block of the
+active chain whose body we still hold. Core writes it as
+`prune_height ? prune_height.value() + 1 : 0' (rpc/blockchain.cpp:1427-1428),
+so it is one MORE than what pruneblockchain returns -- ours reported the same
+number for both, and rpc_getblockfrompeer.py:131 and
+feature_index_prune.py:103 read 249 from pruneblockchain where Core answers
+248."
+  (let ((pruned (%last-pruned-block-height chain-state)))
+    (if pruned (1+ pruned) 0)))
 
 (define-rpc "getblockchaininfo" (node params)
   "Return blockchain state information."
@@ -2326,11 +2333,14 @@ Returns the height of the last pruned block."
                     :on-prune #'bl.val:delete-undo-file)))
       (bl:node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
                               pruned target-height)
-      ;; Core returns GetFirstStoredBlock(tip)->nHeight -- the height of the
-      ;; lowest block still on disk, the same number getblockchaininfo reports
-      ;; as `pruneheight' (rpc/blockchain.cpp:1671-1673). We returned the
-      ;; highest height DELETED, one less.
-      (%first-stored-block-height chain-state)))))
+      ;; Core returns GetPruneHeight(...).value_or(-1) -- the height of the
+      ;; HIGHEST block PRUNED, and -1 when nothing has been
+      ;; (rpc/blockchain.cpp:961-962, :882-906). That is one LESS than
+      ;; getblockchaininfo's `pruneheight', which is this value plus one
+      ;; (:1427-1428); we answered the same number for both, so
+      ;; feature_index_prune.py:103 and rpc_getblockfrompeer.py:131 -- which
+      ;; both prune a -fastprune regtest chain and assert 248 -- read 249.
+      (or (%last-pruned-block-height chain-state) -1)))))
 
 (define-rpc "migrateblocks" (node ((nblocks :or 1000) (start :or 0)))
   "Convert legacy per-block files into flat blk?????.dat files.

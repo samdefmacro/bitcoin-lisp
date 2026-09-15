@@ -66,9 +66,14 @@ PRUNEBLOCKCHAIN-PRUNES-A-FLAT-FILE, PRUNE-LOCK-*)."
          (chain-state (bl.store:init-chain-state base-path))
          (genesis-hash (bl.store:best-block-hash chain-state))
          (block-hashes (list genesis-hash)))
-    ;; Add genesis entry
+    ;; Add genesis entry. Every entry carries its HEADER: an index entry
+    ;; without one is not a thing the node can build, and any reader that asks
+    ;; the chain for a time, a difficulty or a median-time-past -- which is
+    ;; every chain RPC -- type-errors on the NIL.
     (let ((genesis-entry (bl.store:make-block-index-entry
-                          :hash genesis-hash :height 0 :chain-work 1 :status :valid)))
+                          :hash genesis-hash :height 0 :chain-work 1 :status :valid
+                          :header (bl.ser:bitcoin-block-header
+                                   (bl.store:make-genesis-block bl:*network*)))))
       (bl.store:add-block-index-entry chain-state genesis-entry)
       ;; Create and store N blocks with proper prev-entry links
       (let ((prev-hash genesis-hash)
@@ -79,7 +84,8 @@ PRUNEBLOCKCHAIN-PRUNES-A-FLAT-FILE, PRUNE-LOCK-*)."
                    (bl.store:store-block block-store block)
                    (let ((entry (bl.store:make-block-index-entry
                                  :hash block-hash :height h :chain-work (1+ h)
-                                 :status :valid :prev-entry prev-entry)))
+                                 :status :valid :prev-entry prev-entry
+                                 :header (bl.ser:bitcoin-block-header block))))
                      (bl.store:add-block-index-entry chain-state entry)
                      (bl.store:update-chain-tip chain-state block-hash h)
                      (push block-hash block-hashes)
@@ -328,6 +334,46 @@ but prune-old-blocks should not."
             ;; pruned-height should be updated (last pruned block)
             (is (> (bl.store:chain-state-pruned-height chain-state) 0))
             (is (< (bl.store:chain-state-pruned-height chain-state) 10))))
+      (cleanup-test-dir base-path))))
+
+(test pruneblockchain-returns-the-last-pruned-height-not-the-first-kept
+  "Core's two prune heights differ by one, and it is the same
+GetPruneHeight(...) behind both: pruneblockchain returns
+`GetPruneHeight(...).value_or(-1)\', the height of the HIGHEST block PRUNED
+(rpc/blockchain.cpp:961-962, :882-906), while getblockchaininfo\'s
+`pruneheight\' is `prune_height ? prune_height.value() + 1 : 0\' -- the lowest
+block still held (:1427-1428). Ours answered the lowest-still-held for both,
+so feature_index_prune.py:103 and rpc_getblockfrompeer.py:131, which each
+prune a -fastprune regtest chain and assert 248, read 249.
+
+The -1 row is Core\'s std::nullopt: a node that has pruned nothing reports it
+from pruneblockchain and 0 from getblockchaininfo."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (declare (ignore block-hashes))
+    (unwind-protect
+         (let ((node (make-test-node))
+               (bl:*prune-target-mib* 1))
+           (setf (bl:node-chain-state node) chain-state
+                 (bl:node-block-store node) block-store)
+           (flet ((pruneheight ()
+                    (cdr (assoc "pruneheight"
+                                (bl.rpc:dispatch-rpc-method
+                                 node "getblockchaininfo" (wire-params '()))
+                                :test #'string=))))
+             ;; Nothing pruned yet: Core\'s nullopt is -1 and 0.
+             (is (= -1 (bl.rpc:dispatch-rpc-method
+                        node "pruneblockchain" (wire-params (list 0)))))
+             (is (= 0 (pruneheight)))
+             ;; Prune, then the pair straddles the horizon.
+             (let ((answer (bl.rpc:dispatch-rpc-method
+                            node "pruneblockchain" (wire-params (list 10))))
+                   (horizon (bl.store:chain-state-pruned-height chain-state)))
+               (is (plusp horizon) "the fixture must actually have pruned")
+               (is (= horizon answer)
+                   "pruneblockchain returns the highest height deleted")
+               (is (= (1+ answer) (pruneheight))
+                   "and pruneheight is the first block still held, one more"))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.9: getblockchaininfo pruning fields
