@@ -1246,6 +1246,37 @@ The first row is rpc_blockchain.py:496-506 byte for byte."
     (is (null (%rpc-wire-error node "getnetworkhashps" (list 120 -1))))
     (is (null (%rpc-wire-error node "help" (list "getblockcount"))))))
 
+(test getchaintxstats-txrate-is-a-double-spelled-as-core-spells-one
+  "Core pushes `double(window_tx_count) / nTimeDiff\' and UniValue::setFloat
+writes a double with setprecision(16) (rpc/blockchain.cpp:1868,
+univalue.cpp:74-82), so one transaction every ten minutes is the token
+0.001666666666666667. Ours divided by a SINGLE-float -- (float x) is single in
+Common Lisp -- and let the Lisp printer spell the result, so the field read
+0.0016666667: rpc_blockchain.py:333 multiplies txrate by 600 and rounds to ten
+places, and got 1.0000000242 where Core gets 1.
+
+The chain is the synthetic 600-second ladder, the spacing Core\'s own test
+mines at, and every entry carries one transaction. The two other fields are
+asserted alongside it, because they are the numerator and denominator the
+token has to be the quotient of -- without them a right-looking spelling of
+the wrong division would pass."
+  (let ((node (make-test-node)))
+    (multiple-value-bind (cs tip) (make-versionbits-chain-with-tip 200)
+      (declare (ignore tip))
+      (maphash (lambda (h e)
+                 (declare (ignore h))
+                 (setf (bl.store:block-index-entry-tx-count e) 1))
+               (bl.store:chain-state-block-index cs))
+      (setf (bl:node-chain-state node) cs)
+      (let ((stats (bl.rpc:dispatch-rpc-method
+                    node "getchaintxstats" (wire-params (list 1)))))
+        (flet ((field (name) (cdr (assoc name stats :test #'string=))))
+          (is (equal 1 (field "window_tx_count")))
+          (is (equal 600 (field "window_interval"))
+              "the ladder is ten minutes a block, as Core\'s test mines it")
+          (is (equal "0.001666666666666667" (json-number-token (field "txrate")))
+              "txrate is a double spelled with sixteen significant digits"))))))
+
 (test rpc-call-with-the-wrong-number-of-arguments-is-the-help-text
   "Core gates the argument COUNT before it gates their types and before the
 handler body: RPCHelpMan::HandleRequest throws the help text when

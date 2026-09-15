@@ -1846,9 +1846,17 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
               (when window-known
                 (setf result (append result `(("window_tx_count" . ,window-tx))))
                 (when (plusp interval)
+                  ;; Core pushes `double(window_tx_count) / nTimeDiff' and
+                  ;; UniValue::setFloat spells a double with setprecision(16)
+                  ;; (rpc/blockchain.cpp:1868, univalue.cpp:75-82). Ours
+                  ;; divided by a SINGLE-float -- (float x) is single -- and
+                  ;; let the Lisp printer spell it, so one transaction every
+                  ;; ten minutes came out as 0.0016666667 where Core writes
+                  ;; 0.001666666666666667: rpc_blockchain.py:333 multiplies by
+                  ;; 600 and rounds to ten places, and read 1.0000000242.
                   (setf result
                         (append result
-                                `(("txrate" . ,(/ (float window-tx) interval)))))))))
+                                `(("txrate" . ,(json-float (/ window-tx interval))))))))))
           result)))))
 
 ;;; --- UTXO Set Statistics ---
