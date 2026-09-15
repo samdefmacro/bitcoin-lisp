@@ -1883,28 +1883,39 @@ that block's deltas. Only the muhash hash_type is index-backed."
     (when (string= hash-type "hash_serialized_3")
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "hash_serialized_3 is not available for historical heights; use 'muhash'"))
-    (let* ((height (cond
-                     ((integerp hash-or-height) hash-or-height)
-                     (t
-                      (let ((entry (bl.store:get-block-index-entry
-                                    chain-state (parse-hash-v hash-or-height
-                                                              "hash_or_height"))))
-                        (unless entry
+    ;; Core's ParseHashOrHeight (rpc/blockchain.cpp:126-152): a HEIGHT is
+    ;; resolved on the active chain, a HASH is a plain LookupBlockIndex with no
+    ;; active-chain test at all. We refused a stale-branch hash outright,
+    ;; because the index was keyed by height alone and answering would have
+    ;; served the ACTIVE chain's numbers under the stale block's hash. The
+    ;; index now keeps a reorged-out block's record under its own hash, the way
+    ;; Core's does, so the block can be answered for: feature_coinstatsindex.py
+    ;; :279-281 invalidates two blocks, mines two more, and asks for the
+    ;; invalidated tip by hash.
+    (let* ((entry (if (integerp hash-or-height)
+                      (bl.store:get-block-at-height chain-state hash-or-height)
+                      (let ((e (bl.store:get-block-index-entry
+                                chain-state (parse-hash-v hash-or-height
+                                                          "hash_or_height"))))
+                        (unless e
                           (error 'rpc-error :code +rpc-invalid-address-or-key+
                                             :message "Block not found"))
-                        ;; The header index resolves STALE-BRANCH hashes too,
-                        ;; and the index holds only active-chain statistics —
-                        ;; serving the active chain's numbers under a
-                        ;; stale-branch hash would be a silently wrong answer.
-                        (unless (bl.store:entry-on-active-chain-p
-                                 chain-state entry)
-                          (error 'rpc-error :code +rpc-invalid-parameter+
-                                            :message "Block is not on the active chain; the coinstatsindex holds active-chain statistics only"))
-                        (bl.store:block-index-entry-height entry)))))
-           (stats (bl.store:coinstatsindex-get-stats csi height))
-           (prev (and (plusp height)
-                      (bl.store:coinstatsindex-get-stats csi (1- height))))
-           (entry (bl.store:get-block-at-height chain-state height)))
+                        e)))
+           (height (if (integerp hash-or-height)
+                       hash-or-height
+                       (bl.store:block-index-entry-height entry)))
+           (stats (and entry
+                       (bl.store:coinstatsindex-get-block-stats
+                        csi (bl.store:block-index-entry-hash entry) height)))
+           ;; Core reads the previous statistics off pindex->pprev
+           ;; (rpc/blockchain.cpp:1134), the requested block's OWN parent -- for
+           ;; a reorged-out block that is the common ancestor, which is on the
+           ;; active chain.
+           (prev (let ((p (and entry (bl.store:block-index-entry-prev-entry entry))))
+                   (when p
+                     (bl.store:coinstatsindex-get-block-stats
+                      csi (bl.store:block-index-entry-hash p)
+                      (bl.store:block-index-entry-height p))))))
       ;; Records above the best marker are not vouched for: a rewind moves the
       ;; marker down and leaves the abandoned branch's records in place until
       ;; the backfill overwrites them.
