@@ -1208,6 +1208,57 @@ name -- (config-error \"...\") -- with the message text unchanged.")
                           (or (cdr (assoc place +bare-error-baseline+ :test #'string=)) 0)
                           "+BARE-ERROR-BASELINE+" "signal it through the module's bl.err function")))
 
+;;; --- an in-place transaction mutation invalidates its caches --------------
+
+(defparameter +transaction-mutation-writes+
+  '("(setf (bl.ser:tx-in-script-sig " "(setf (tx-in-script-sig "
+    "(setf (bl.ser:transaction-witness " "(setf (transaction-witness "
+    "(setf (bl.ser:transaction-inputs " "(setf (transaction-inputs "
+    "(setf (bl.ser:transaction-outputs " "(setf (transaction-outputs "
+    "(setf (bl.ser:transaction-version " "(setf (transaction-version "
+    "(setf (bl.ser:transaction-lock-time " "(setf (transaction-lock-time "
+    "(setf (bl.ser:tx-out-value " "(setf (tx-out-value "
+    "(setf (bl.ser:tx-out-script-pubkey " "(setf (tx-out-script-pubkey "
+    "(setf (bl.ser:tx-in-sequence " "(setf (tx-in-sequence "
+    "(setf (bl.ser:tx-in-previous-output " "(setf (tx-in-previous-output ")
+  "The writes that change what a transaction SERIALIZES to. Every one of them
+invalidates the txid, the wtxid or the weight memoized on the struct.")
+
+(defun %transaction-mutations-without-invalidation (&optional (corpus (%source-corpus)))
+  "Every (file . line) of CORPUS that mutates a transaction in place in a file
+that never calls INVALIDATE-TRANSACTION-CACHES.
+
+File granularity on purpose: the call is often a few forms away from the write
+(the signer writes a scriptSig inside a loop and drops the caches at the same
+place, %SENDALL-ASSIGN-REMAINDER drops them once after re-sizing every output),
+so a proximity rule would be either noisy or vacuous. What this catches is the
+case that actually happened: a NEW mutation site in a file that never learned
+about the caches at all."
+  (loop for (file . lines) in corpus
+        for calls-invalidate
+          = (loop for raw across lines
+                    thereis (search "invalidate-transaction-caches" raw))
+        unless calls-invalidate
+          append (let ((in-string nil))
+                   (loop for raw across lines
+                         append (multiple-value-bind (code next) (%code-only raw in-string)
+                                  (setf in-string next)
+                                  (when (some (lambda (pattern) (search pattern code))
+                                              +transaction-mutation-writes+)
+                                    (list (cons file (string-trim " " code)))))))))
+
+(test a-transaction-mutation-invalidates-its-caches
+  "A transaction memoizes its txid, its wtxid and its weight, so a file that
+writes a scriptSig, a witness, a locktime or an output value into one has to
+drop them (BL.SER:INVALIDATE-TRANSACTION-CACHES). Bitcoin Core cannot reach
+this -- CTransaction is immutable and everything that changes a transaction
+works on a cache-free CMutableTransaction (primitives/transaction.h:395-420 vs
+:329-341) -- so there is no reference rule to port, only this one."
+  (let ((violations (%transaction-mutations-without-invalidation)))
+    (is (null violations)
+        "~D in-place transaction mutation~:P in a file that never invalidates ~
+the cached txid/wtxid/weight: ~S" (length violations) violations)))
+
 ;;; --- layering -------------------------------------------------------------
 
 (defun %load-order ()
@@ -1957,6 +2008,16 @@ the measuring functions must measure a known shape correctly."
                "positive control: the dead-export sweep must flag an export that names nothing"))
       (delete-package probe)))
   (is (plusp (%test-internal-references)) "no :: references counted in tests/")
+  (is (equal '(("probe.lisp" . "(setf (bl.ser:transaction-witness tx) w)"))
+             (%transaction-mutations-without-invalidation
+              (list (cons "probe.lisp"
+                          (vector "(setf (bl.ser:transaction-witness tx) w)"
+                                  "\"(setf (bl.ser:tx-out-value o) 1)\""
+                                  "; (setf (bl.ser:transaction-lock-time tx) 0)"))
+                    (cons "guarded.lisp"
+                          (vector "(setf (bl.ser:tx-in-script-sig in) ss)"
+                                  "(bl.ser:invalidate-transaction-caches tx)")))))
+      "positive control: the mutation scanner must flag the unguarded write and not the string, the comment, or a file that does invalidate")
   (is (equal '(("probe.lisp" . "bl.val::check-block") ("probe.lisp" . "bl.val::check-block"))
              (%foreign-internal-references
               (list (cons "probe.lisp"
