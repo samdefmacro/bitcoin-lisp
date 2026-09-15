@@ -805,6 +805,54 @@ and its permanent presence is what shaped the restart-scan failure above."
              "the file holding genesis must be prunable like any other")
          (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir))))))))
 
+(test a-pruned-restart-does-not-write-genesis-again
+  "Core\'s LoadGenesisBlock returns early when the genesis hash is already in
+m_block_index (validation.cpp:4968-4969) -- the block-tree DATABASE, which is
+empty on exactly one occasion, the first start on this datadir. Ours asked
+whether genesis was in the BODY map, which a PRUNED node answers no to
+forever: the file holding genesis is the first one deleted, so every restart
+after the first prune wrote genesis again, into a new blk file at the end of
+the store. feature_remove_pruned_files_on_startup.py:64 counts the blk/rev
+files a pruned node keeps across a restart and found five where Core keeps
+four, the fifth holding one 293-byte record -- genesis.
+
+The condition is now `the store is empty\', which is the same occasion and the
+only one that can serve the purpose: genesis belongs at offset 0 of
+blk00000.dat, and once anything else is there it has nowhere to go."
+  (with-network (:mainnet)
+   ;; Control: a fresh store still takes genesis, at the head of file 0.
+   (with-temp-directory (fresh)
+     (let* ((bl.store:*flat-block-files* t)
+            (store (bl.store:init-block-store fresh))
+            (genesis (bl.store:best-block-hash (bl.store:init-chain-state fresh))))
+       (bl.store:ensure-genesis-on-disk store)
+       (is-true (bl.store:block-exists-p store genesis)
+                "a fresh store takes genesis")
+       (is-true (probe-file (merge-pathnames "blocks/blk00000.dat" fresh)))))
+   (with-temp-directory (dir)
+     (let ((genesis nil))
+       (let* ((bl.store:*flat-block-files* t)
+              (bl.store:*fast-prune* t)
+              (store (bl.store:init-block-store dir)))
+         (setf genesis (bl.store:best-block-hash (bl.store:init-chain-state dir)))
+         (bl.store:ensure-genesis-on-disk store)
+         (%ff-fill-two-blk-files store))
+       (is-true (probe-file (merge-pathnames "blocks/blk00001.dat" dir))
+                "the fixture must actually have rolled over to a second file")
+       ;; Exactly what a prune leaves behind: the file holding genesis is gone.
+       (delete-file (merge-pathnames "blocks/blk00000.dat" dir))
+       (let* ((bl.store:*flat-block-files* t)
+              (bl.store:*fast-prune* t)
+              (reopened (bl.store:init-block-store dir))
+              (before (length (directory (merge-pathnames "blocks/blk*.dat" dir)))))
+         (is-false (bl.store:block-exists-p reopened genesis)
+                   "the pruned restart has no genesis body, by construction")
+         (bl.store:ensure-genesis-on-disk reopened)
+         (is-false (bl.store:block-exists-p reopened genesis)
+                   "and start-up must not write it back")
+         (is (= before (length (directory (merge-pathnames "blocks/blk*.dat" dir))))
+             "so no blk file is opened for it"))))))
+
 ;;; --- Rebuilding the index from the files (P5) ---------------------------------
 
 (defun %ff-chain-block (prev-hash seed height)
