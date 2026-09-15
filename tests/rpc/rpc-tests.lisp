@@ -874,6 +874,53 @@ status with no scan running returns null; abort with no scan is a no-op."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-scantxoutset node (list "start")))))
 
+(test scantxoutset-reports-the-descriptor-inferred-from-each-match
+  "Core reports, per matched output, the descriptor INFERRED from that output's
+script -- `InferDescriptor(script, provider)->ToString()\', with the provider
+Expand has just filled in (rpc/blockchain.cpp:2395-2401). So a ranged combo()
+answers pkh([origin]<pubkey>)#checksum for the P2PKH output it produced at
+that index, naming the key and its derivation path. Ours reported the ranged
+expression the scan was started with -- the same string for every match, and
+the one string that says nothing about which output was found.
+
+The vectors are rpc_scantxoutset.py:116 byte for byte: the same tprv, the same
+0h/0h/* path, the same two expected descriptors including their checksums."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (utxo (bl:node-utxo-set node))
+         (desc "combo(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/0h/0h/*)")
+         (expected
+           '("pkh([0c5f9a1e/0h/0h/0]026dbd8b2315f296d36e6b6920b1579ca75569464875c7ebe869b536a7d9503c8c)#rthll0rg"
+             "pkh([0c5f9a1e/0h/0h/1]033e6f25d76c00bedb3a8993c7d5739ee806397f0529b1b31dda31ef890f19a60c)#mcjajulr")))
+    (flet ((p2pkh-of (pubkey-hex)
+             (concatenate '(vector (unsigned-byte 8))
+                          #(#x76 #xa9 #x14)
+                          (bl.crypto:hash160 (bl.crypto:hex-to-bytes pubkey-hex))
+                          #(#x88 #xac))))
+      ;; One coin per derivation index, paying the pkh() arm of combo().
+      (bl.store:add-utxo utxo (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 1)
+                         0 100000
+                         (p2pkh-of "026dbd8b2315f296d36e6b6920b1579ca75569464875c7ebe869b536a7d9503c8c")
+                         0)
+      (bl.store:add-utxo utxo (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 2)
+                         0 200000
+                         (p2pkh-of "033e6f25d76c00bedb3a8993c7d5739ee806397f0529b1b31dda31ef890f19a60c")
+                         0))
+    (let* ((r (bl.rpc:dispatch-rpc-method
+               node "scantxoutset"
+               (wire-params (list "start"
+                                  (vector (let ((h (make-hash-table :test 'equal)))
+                                            (setf (gethash "desc" h) desc
+                                                  (gethash "range" h) 1)
+                                            h))))))
+           (descs (sort (mapcar (lambda (u) (cdr (assoc "desc" u :test #'string=)))
+                                (coerce (cdr (assoc "unspents" r :test #'string=)) 'list))
+                        #'string<)))
+      (is (equal expected descs)
+          "each match must report ITS OWN expanded descriptor; got ~S" descs))))
+
 (defun %utxo-iterate-lock-observations (node thunk)
   "Run THUNK with BL.STORE:UTXO-SET-ITERATE instrumented, and return one
 answer per call it made: was NODE's lock held when the walk was entered?"

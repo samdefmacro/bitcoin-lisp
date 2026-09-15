@@ -54,6 +54,10 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:register-rpc-method
    #:define-rpc
    #:dispatch-rpc-method
+   ;; Core InferDescriptor: the concrete descriptor a matched script reports
+   #:infer-descriptor-body
+   #:descriptor-key-origin
+   #:descriptor-pairs-splitter
    #:parse-json-rpc-request
 
    ;; The wallet manager, its chain-tracking fan-out and the rebroadcast

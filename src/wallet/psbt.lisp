@@ -1334,7 +1334,7 @@ MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
                  (bl.ser:psbt-map-set
                   map bl.ser:+psbt-in-tap-internal-key+ empty
                   (bl.rpc:key-xonly-bytes pubkey))
-                 (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
+                 (multiple-value-bind (fpr path) (bl.rpc:descriptor-key-origin key pubkey pos)
                    (bl.ser:psbt-map-set
                     map bl.ser:+psbt-in-bip32+ pubkey
                     (%psbt-bip32-value fpr path)))))))
@@ -1384,7 +1384,7 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                                    map bl.ser:+psbt-out-tap-internal-key+
                                    empty (bl.rpc:key-xonly-bytes pubkey))
                                   (multiple-value-bind (fpr path)
-                                      (%desc-key-origin-info key pubkey pos)
+                                      (bl.rpc:descriptor-key-origin key pubkey pos)
                                     (bl.ser:psbt-map-set
                                      map bl.ser:+psbt-out-bip32+ pubkey
                                      (%psbt-bip32-value fpr path))))))))))))

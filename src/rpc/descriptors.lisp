@@ -1761,8 +1761,26 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
             (out-desc-node desc) nil keyfn)))))
 
 (defun %out-desc-expand-uncached (desc pos)
-  "Expand DESC at range position POS into its scriptPubKey list (Core Expand)."
-  (%out-desc-expand-1 desc pos (lambda (k) (%desc-key-pubkey-at k pos))))
+  "Expand DESC at range position POS into (values scripts pubkeys) -- Core's
+Expand, which fills a FlatSigningProvider beside the scripts. PUBKEYS is the
+derived pubkey per key EXPRESSION, in expression order, so it zips against
+OUT-DESC-ORDERED-KEYS.
+
+Indexed by expression index and not filled in call order, for the reason
+%OUT-DESC-EXPAND-CACHED states below: script generation does not visit key
+expressions in parse order, so a push/nreverse here would transpose two of
+them and every consumer would attribute a pubkey to the wrong key
+expression."
+  (let* ((indexes (out-desc-key-indexes desc))
+         (slots (make-array (hash-table-count indexes) :initial-element nil))
+         (scripts (%out-desc-expand-1
+                   desc pos
+                   (lambda (k)
+                     (let ((pk (%desc-key-pubkey-at k pos))
+                           (i (gethash k indexes)))
+                       (when i (setf (aref slots i) pk))
+                       pk)))))
+    (values scripts (coerce slots 'list))))
 
 ;;; --- Expansion cache (Core DescriptorCache intent: repeat expansion of a
 ;;; ranged descriptor at the same index must not redo EC derivation; a bounded
@@ -1788,22 +1806,28 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
 
 (defun out-desc-expand (desc pos)
   "Expand DESC at POS, with caching keyed on the canonical public body (which
-uniquely determines the scripts). Signals descriptor-derivation-error when
-private keys would be required — checked before the cache, so a cache entry
-warmed by the private descriptor never masks the error Core reports for its
-public-only form."
+uniquely determines the scripts). Returns (values scripts pubkeys), the second
+being the derived pubkey per key expression in expression order -- Core's
+Expand fills a FlatSigningProvider alongside the scripts, and every caller that
+then infers a descriptor from a matched script needs it. Signals
+descriptor-derivation-error when private keys would be required — checked
+before the cache, so a cache entry warmed by the private descriptor never masks
+the error Core reports for its public-only form."
   (when (%out-desc-needs-missing-privkey-p desc)
     (error 'descriptor-derivation-error))
-  (let ((key (cons (out-desc-string desc) pos)))
-    (or (bt:with-lock-held (*descriptor-cache-lock*)
-          (gethash key *descriptor-expansion-cache*))
-        (let ((scripts (%out-desc-expand-uncached desc pos)))
+  (let* ((key (cons (out-desc-string desc) pos))
+         (hit (bt:with-lock-held (*descriptor-cache-lock*)
+                (gethash key *descriptor-expansion-cache*))))
+    (if hit
+        (values (car hit) (cdr hit))
+        (multiple-value-bind (scripts pubkeys) (%out-desc-expand-uncached desc pos)
           (bt:with-lock-held (*descriptor-cache-lock*)
             (when (>= (hash-table-count *descriptor-expansion-cache*)
                       *descriptor-cache-max-entries*)
               (clrhash *descriptor-expansion-cache*))
-            (setf (gethash key *descriptor-expansion-cache*) scripts))
-          scripts))))
+            (setf (gethash key *descriptor-expansion-cache*)
+                  (cons scripts pubkeys)))
+          (values scripts pubkeys)))))
 
 ;;; --- DescriptorCache (Core descriptor.h DescriptorCache) ---
 ;;;
@@ -2292,6 +2316,155 @@ than one scriptPubKey, and a coinbase pays exactly one."
                     (error 'rpc-error :code +rpc-invalid-address-or-key+
                                       :message "Cannot derive script without private keys"))))))))
 
+;;; --- Inferred descriptors (Core script/descriptor.cpp InferDescriptor) ---
+;;;
+;;; The concrete descriptor a MATCHED script reports: `pkh([0c5f9a1e/0h/0h/0]
+;;; 026dbd...)#rthll0rg' rather than the ranged expression it was expanded
+;;; from. Core reaches it through InferDescriptor(script, provider), where the
+;;; provider is what Expand() just filled in (rpc/blockchain.cpp:2399-2401),
+;;; and both the wallet (listunspent, getaddressinfo) and the UTXO scan report
+;;; it. Ours had it, in the wallet, above the RPC layer that also wants it;
+;;; it lives here now, next to the parser and the key-expression accessors it
+;;; is written in terms of.
+(defun descriptor-key-origin (key pubkey pos)
+  "(values fingerprint-bytes path) — Core PubkeyProvider::GetKeyOrigin: a
+BIP32 key's fingerprint is its root key's, the path is the key's fixed path
+plus the range position; a const key's fingerprint is its own keyid prefix
+with an empty path; a declared [origin] prefixes both."
+  (multiple-value-bind (base-fpr base-path)
+      (if (desc-key-extkey key)
+          (values (subseq (bl.crypto:hash160
+                           (bl.crypto:ext-key-public-bytes
+                            (desc-key-extkey key)))
+                          0 4)
+                  (append (desc-key-path key)
+                          (ecase (desc-key-derive key)
+                            (:none nil)
+                            (:unhardened (list pos))
+                            (:hardened (list (logior pos #x80000000))))))
+          (values (subseq (bl.crypto:hash160 pubkey) 0 4) nil))
+    (if (desc-key-origin-fingerprint key)
+        (values (desc-key-origin-fingerprint key)
+                (append (desc-key-origin-path key) base-path))
+        (values base-fpr base-path))))
+
+(defun %inferred-key-string (key pubkey pos &key xonly)
+  "The concrete key expression InferPubkey renders: [origin]pubkey-hex,
+hardened markers as 'h' (apostrophe=false)."
+  (multiple-value-bind (fpr path) (descriptor-key-origin key pubkey pos)
+    (format nil "[~A~A]~A"
+            (bl.crypto:bytes-to-hex fpr)
+            (format-key-path path nil)
+            (bl.crypto:bytes-to-hex
+             (if xonly (key-xonly-bytes pubkey) pubkey)))))
+
+(defun descriptor-pairs-splitter (pairs)
+  "A closure that returns the slice of PAIRS belonging to each descriptor it is
+handed, advancing a cursor.
+
+PAIRS is flat across the whole descriptor and %INFER-DESC-BODY addresses it
+POSITIONALLY, so a sub-descriptor needs its own slice. OUT-DESC-ORDERED-KEYS
+lays a node's own keys down before its children's, in child order, so a walk
+that visits children in that same order only has to advance a cursor.
+
+A cursor and not an ASSOC per key: that would be O(K^2) in the descriptor's
+total key count, and %WALLET-INFERRED-DESCRIPTOR runs once per coin in
+listunspent, with multi_a leaves allowed up to 999 keys each.
+
+Returns NIL once PAIRS runs short, which %INFER-DESC-BODY turns into an
+unrenderable descriptor rather than one built from misaligned keys."
+  (lambda (desc)
+    (let ((n (length (out-desc-ordered-keys desc))))
+      (when (<= n (length pairs))
+        (prog1 (subseq pairs 0 n)
+          (setf pairs (nthcdr n pairs)))))))
+
+(defun infer-descriptor-body (desc script scripts pairs pos)
+  "The inferred descriptor body for SCRIPT owned by DESC at POS. SCRIPTS is
+DESC's expansion at POS, PAIRS the (desc-key . derived-pubkey) list in
+expression order. NIL when the descriptor kind cannot be inferred."
+  (flet ((key-string (pair &key xonly)
+           (%inferred-key-string (car pair) (cdr pair) pos :xonly xonly)))
+    (ecase (out-desc-kind desc)
+      ((:addr :raw) nil)
+      ;; Core builds the inferred pk() with the same m_xonly it parsed with
+      ;; (descriptor.cpp:2695 passes /*xonly=*/true for a tapscript leaf), so a
+      ;; leaf reports its key as 32-byte x-only hex and a top-level pk() does
+      ;; not.
+      (:pk (format nil "pk(~A)"
+                   (key-string (first pairs)
+                               :xonly (out-desc-xonly-script-p desc))))
+      (:pkh (format nil "pkh(~A)" (key-string (first pairs))))
+      (:wpkh (format nil "wpkh(~A)" (key-string (first pairs))))
+      (:combo
+       ;; InferScript works from the concrete script, so combo() infers to
+       ;; the specific form the script takes.
+       (let ((n (position script scripts :test #'equalp))
+             (ks (key-string (first pairs))))
+         (case n
+           (0 (format nil "pk(~A)" ks))
+           (1 (format nil "pkh(~A)" ks))
+           (2 (format nil "wpkh(~A)" ks))
+           (3 (format nil "sh(wpkh(~A))" ks)))))
+      ((:multi :sortedmulti :multi-a :sortedmulti-a)
+       ;; Core infers the EXPANDED script, which no longer records that the
+       ;; keys were sorted for it, so sortedmulti() reports as multi() with the
+       ;; keys in script (BIP67-sorted) order -- and sortedmulti_a() likewise
+       ;; as multi_a(). The tapscript pair pushes its keys x-only.
+       (let* ((kind (out-desc-kind desc))
+              (tap (and (member kind '(:multi-a :sortedmulti-a)) t))
+              (ordered (if (member kind '(:sortedmulti :sortedmulti-a))
+                           (sort (copy-list pairs) #'pubkey-lessp :key #'cdr)
+                           pairs)))
+         (format nil "~A(~D~{,~A~})"
+                 (if tap "multi_a" "multi")
+                 (out-desc-threshold desc)
+                 (mapcar (lambda (pair) (key-string pair :xonly tap)) ordered))))
+      (:sh (let ((sub (infer-descriptor-body (out-desc-sub desc) nil scripts pairs pos)))
+             (and sub (format nil "sh(~A)" sub))))
+      (:wsh (let ((sub (infer-descriptor-body (out-desc-sub desc) nil scripts pairs pos)))
+              (and sub (format nil "wsh(~A)" sub))))
+      ;; The subscript of wsh(<miniscript>) is an out-desc of kind :MINISCRIPT
+      ;; (descriptors.lisp, %PARSE-MINISCRIPT-DESCRIPTOR), and the :WSH clause
+      ;; above recurses straight into it. Without this clause that recursion was
+      ;; an ECASE failure — RPC -32603 "Internal error" — reachable from
+      ;; getaddressinfo and listunspent for any wallet holding a policy
+      ;; descriptor. The miniscript renders itself with each key expression
+      ;; replaced by its concrete inferred key, which is what every other kind
+      ;; here does.
+      (:miniscript
+       (let ((solved t))
+         (let ((text (bl.val:ms-node-to-string
+                      (out-desc-node desc)
+                      (lambda (key)
+                        (let ((pair (assoc key pairs :test #'eq)))
+                          (cond (pair (key-string pair))
+                                (t (setf solved nil) "")))))))
+           (and solved text))))
+      (:tr
+       ;; The internal key is the FIRST pair — OUT-DESC-ORDERED-KEYS numbers it
+       ;; before the tree's leaves — and the leaves render through the same
+       ;; brace reconstruction the descriptor printer uses.
+       (let ((internal (key-string (first pairs) :xonly t)))
+         (if (null (out-desc-tree desc))
+             (format nil "tr(~A)" internal)
+             ;; Each leaf gets ITS OWN pairs. The clauses here address PAIRS
+             ;; positionally -- (first pairs) means "this descriptor's key" --
+             ;; which holds only while the descriptor owns every pair. A tree
+             ;; breaks that: hand every leaf the whole list and they all render
+             ;; the tr() INTERNAL key, because that is the pair ORDERED-KEYS
+             ;; numbers first. The splitter starts AFTER the internal key.
+             (let* ((next (descriptor-pairs-splitter (rest pairs)))
+                    (tree (tr-tree-string
+                           (out-desc-tree desc)
+                           (lambda (leaf)
+                             (let ((own (funcall next leaf)))
+                               (and own (infer-descriptor-body leaf nil scripts
+                                                          own pos)))))))
+               (and tree (format nil "tr(~A,~A)" internal tree))))))
+      (:rawtr (format nil "rawtr(~A)" (key-string (first pairs) :xonly t))))))
+
+
 (defun descriptor-scanobject-scripts (scanobject network)
   "Expand a scanobject — a descriptor string or {\"desc\": ..., \"range\": ...}
 object — into a list of (script . canonical-descriptor) pairs. Port of Core's
@@ -2324,13 +2497,38 @@ string rather than the first branch's."
         (loop for i from low to high
               append (loop for desc in descs
                            for canonical in canonicals
-                           append (mapcar (lambda (script) (cons script canonical))
-                                          (handler-case (out-desc-expand desc i)
-                                            (descriptor-derivation-error ()
-                                              (error 'rpc-error
-                                                     :code +rpc-invalid-address-or-key+
-                                                     :message (format nil "Cannot derive script without private keys: '~A'"
-                                                                      desc-str)))))))))))
+                           append (%scanobject-pairs-at desc i canonical desc-str)))))))
+
+(defun %scanobject-pairs-at (desc i canonical desc-str)
+  "DESC's expansion at range position I as (script . descriptor) pairs.
+
+The descriptor is the one Core reports for that SCRIPT, not the expression it
+came from: scantxoutset runs `InferDescriptor(script, provider)->ToString()'
+over each expanded script, with the provider Expand has just filled in
+(rpc/blockchain.cpp:2395-2401). So combo(tprv.../0h/0h/*) reports each matched
+output as pkh([0c5f9a1e/0h/0h/0]026dbd...)#rthll0rg, and
+rpc_scantxoutset.py:116 asserts exactly those strings. Ours reported the
+ranged expression, the same text for every match.
+
+CANONICAL is the fallback for a shape nothing can be inferred from -- an
+addr() or raw() descriptor, where Core's InferScript also has nothing to say
+and the scan would otherwise report no descriptor at all."
+  (multiple-value-bind (scripts pubkeys)
+      (handler-case (out-desc-expand desc i)
+        (descriptor-derivation-error ()
+          (error 'rpc-error
+                 :code +rpc-invalid-address-or-key+
+                 :message (format nil "Cannot derive script without private keys: '~A'"
+                                  desc-str))))
+    (let ((pairs (mapcar #'cons (out-desc-ordered-keys desc) pubkeys)))
+      (mapcar (lambda (script)
+                (cons script
+                      (or (let ((body (ignore-errors
+                                       (infer-descriptor-body desc script scripts
+                                                              pairs i))))
+                            (and body (descriptor-add-checksum body)))
+                          canonical)))
+              scripts))))
 
 (defun %needle-scripts (scanobjects network)
   "Expand SCANOBJECTS (descriptor strings/objects) into an equalp hash-table

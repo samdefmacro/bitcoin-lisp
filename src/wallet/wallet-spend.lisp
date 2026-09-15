@@ -1873,7 +1873,7 @@ the wrong keys."
              (bl.crypto:bytes-to-hex output-key)
              (bl.crypto:bytes-to-hex (subseq script 2 34)))
             (return-from %spkm-tr-script-leaves nil))
-          (let ((next (%pairs-splitter (rest pairs))))
+          (let ((next (bl.rpc:descriptor-pairs-splitter (rest pairs))))
             (loop for (script leaf-hash control) in leaves
                   for (nil . leaf) in (bl.rpc:out-desc-tree desc)
                   for own = (funcall next leaf)
