@@ -70,6 +70,7 @@ can. src/validation/.")
    #:validate-block-scripts
    #:find-witness-commitment
    #:validate-witness-commitment
+   #:block-mutated-p
    #:update-uncommitted-block-structures
    #:witness-reserved-value
    #:block-witness-stripped-p

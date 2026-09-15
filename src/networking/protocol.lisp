@@ -1472,6 +1472,52 @@ sells an HB slot."
   (and (not (equalp tip-before hash))
        (equalp (bl.store:best-block-hash chain-state) hash)))
 
+(defun %refuse-mutated-block (peer block chain-state)
+  "Core's wire-level mutation gate on an arriving BLOCK
+(net_processing.cpp:4871-4879), run before anything else touches it. Returns T
+when the block was refused, in which case the caller must return.
+
+    if (prev_block && IsBlockMutated(*pblock, DeploymentActiveAfter(prev_block, SEGWIT))) {
+        LogDebug(BCLog::NET, \"Received mutated block from peer=%d\\n\", peer.m_id);
+        Misbehaving(peer, \"mutated block\");
+        RemoveBlockRequest(pblock->GetHash(), peer.m_id);
+        return;
+    }
+
+Everything about the placement is the point. A mutated block carries the HASH
+of the honest one, so letting it reach the validator means the honest block's
+own download bookkeeping is cleared by the copy -- our
+HANDLE-VALIDATION-FAILURE frees the in-flight slot and re-queues the hash, so
+an attacker could cancel an honest peer's delivery at will and repeat it. And
+the verdict must not be remembered against the hash, because the hash is not
+the attacker's to spoil: gated here, nothing is written at all.
+p2p_mutated_blocks.py:82-91 sends the mutated copy from a second peer while a
+getblocktxn to the honest one is outstanding, and asserts that the attacker is
+disconnected and the honest peer's `inflight' is untouched.
+
+The gate is asked only for a block whose parent we have, because the witness
+half of the question needs the parent's height to know whether segwit is
+active -- the same reason Core guards it with `prev_block &&'. Only THIS
+peer's request for the hash is withdrawn."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (prev (bl.store:get-block-index-entry
+                chain-state (bl.ser:block-header-prev-block header))))
+    (when prev
+      (multiple-value-bind (mutated reason)
+          (bl.val:block-mutated-p
+           block
+           (bl.val:segwit-active-at-height-p
+            (1+ (bl.store:block-index-entry-height prev))))
+        (when mutated
+          ;; Core's own two lines: the verdict from IsBlockMutated
+          ;; (validation.cpp:4063) and the peer it came from (:4874).
+          (when reason
+            (bl:log-cat "validation" "Block mutated: ~A" reason))
+          (bl:log-cat "net" "Received mutated block from peer=~D" (peer-id peer))
+          (record-misbehavior peer "mutated block")
+          (drop-block-in-flight (bl.ser:block-header-hash header) peer)
+          t)))))
+
 (define-p2p-handler "block" (peer payload ctx)
   "Handle a block message. When CTX carries peers and the block becomes the new
 active tip, announce it onward (BIP 130 headers / inv), so the node propagates
@@ -1482,6 +1528,8 @@ filled for plain block messages exactly as it is for reconstructed compact
 ones, so promotion must not be a compact-block-only privilege."
   (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects peers) ctx
   (let ((block (bl.ser:parse-block-payload payload)))
+    (when (and block (%refuse-mutated-block peer block chain-state))
+      (return-from handle-block nil))
     (when block
       (let ((connected
               (with-current-node-lock
