@@ -566,15 +566,22 @@ verbosity-2 caller gets the fee and no prevout objects."
       ("vsize" . ,(bl.ser:transaction-vsize tx))
       ("weight" . ,(bl.ser:transaction-weight tx))
       ("locktime" . ,(bl.ser:transaction-lock-time tx))
-      ("vin" . ,(loop for input across inputs
-                      for i from 0
-                      collect (input-to-json input (tx-input-witness tx i)
-                                             :prevout (and prevouts
-                                                           (nth i spent-coins))
-                                             :network network)))
-      ("vout" . ,(loop for out across outputs
+      ;; JSON-ARRAY, not the bare list: a transaction with NO inputs is a
+      ;; legitimate argument (createrawtransaction([], ...), the OP_RETURN
+      ;; template wallet_fundrawtransaction.py:731 decodes), and Core answers
+      ;; UniValue::VARR either way. A bare NIL leaves here as `null', and
+      ;; `len(dec_tx["vin"])' then fails on a value that is not a list.
+      ("vin" . ,(json-array
+                 (loop for input across inputs
                        for i from 0
-                       collect (output-to-json out i network)))
+                       collect (input-to-json input (tx-input-witness tx i)
+                                              :prevout (and prevouts
+                                                            (nth i spent-coins))
+                                              :network network))))
+      ("vout" . ,(json-array
+                  (loop for out across outputs
+                        for i from 0
+                        collect (output-to-json out i network))))
       ,@(when spent-coins
           ;; Core computes the fee from the spent coins whenever it has them,
           ;; independently of whether it renders the prevout objects.

@@ -11413,3 +11413,32 @@ had asked the unsigned replacement its vsize."
         (is (equalp (bl.ser:transaction-hash tx)
                     (bl.ser:transaction-wtxid tx)))))))
 
+(test a-transaction-with-no-inputs-decodes-to-an-empty-vin-array
+  "Core's TxToUniv builds vin and vout as UniValue::VARR and pushes each entry
+into it (core_io.cpp:455-525), so a transaction with NO inputs decodes to
+`\"vin\": []'. A zero-input transaction is an ordinary argument, not a
+malformed one: createrawtransaction([], {...}) is the standard way to start a
+raw transaction, and wallet_fundrawtransaction.py:731-736 decodes an
+OP_RETURN-only template and asks len(dec_tx['vin']).
+
+Ours rendered the empty list as JSON `null', which is not a length."
+  (let* ((node (make-test-node :network :regtest))
+         ;; The OP_RETURN template of wallet_fundrawtransaction.py:731:
+         ;; version 1, no inputs, one 0-value OP_RETURN "test" output.
+         (hex "0100000000010000000000000000066a047465737400000000")
+         (decoded (bl.rpc:dispatch-rpc-method node "decoderawtransaction"
+                                              (wire-params (list hex))))
+         (vin (cdr (assoc "vin" decoded :test #'string=)))
+         (vout (cdr (assoc "vout" decoded :test #'string=))))
+    (is (zerop (length vin)) "vin must be an empty sequence, got ~S" vin)
+    (is (not (null vin)) "vin must be an empty ARRAY, not JSON null")
+    (is (= 1 (length vout)))
+    ;; The control: a transaction WITH an input still decodes its inputs.
+    (let* ((with-input (bl.rpc:dispatch-rpc-method
+                        node "decoderawtransaction"
+                        (wire-params
+                         (list (one-input-tx-hex
+                                (make-string 64 :initial-element #\3) 0
+                                (bl.crypto:hex-to-bytes "6a0474657374"))))))
+           (ins (cdr (assoc "vin" with-input :test #'string=))))
+      (is (= 1 (length ins))))))
