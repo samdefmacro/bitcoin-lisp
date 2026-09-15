@@ -410,144 +410,13 @@ coin's spending fee, and its effective value falls by the same amount."
            (wallet-coin-fee coin))))
 
 ;;; --- Inferred descriptors (script/descriptor.cpp InferDescriptor) ---
-
-(defun %desc-key-origin-info (key pubkey pos)
-  "(values fingerprint-bytes path) — Core PubkeyProvider::GetKeyOrigin: a
-BIP32 key's fingerprint is its root key's, the path is the key's fixed path
-plus the range position; a const key's fingerprint is its own keyid prefix
-with an empty path; a declared [origin] prefixes both."
-  (multiple-value-bind (base-fpr base-path)
-      (if (bl.rpc:desc-key-extkey key)
-          (values (subseq (bl.crypto:hash160
-                           (bl.crypto:ext-key-public-bytes
-                            (bl.rpc:desc-key-extkey key)))
-                          0 4)
-                  (append (bl.rpc:desc-key-path key)
-                          (ecase (bl.rpc:desc-key-derive key)
-                            (:none nil)
-                            (:unhardened (list pos))
-                            (:hardened (list (logior pos #x80000000))))))
-          (values (subseq (bl.crypto:hash160 pubkey) 0 4) nil))
-    (if (bl.rpc:desc-key-origin-fingerprint key)
-        (values (bl.rpc:desc-key-origin-fingerprint key)
-                (append (bl.rpc:desc-key-origin-path key) base-path))
-        (values base-fpr base-path))))
-
-(defun %inferred-key-string (key pubkey pos &key xonly)
-  "The concrete key expression InferPubkey renders: [origin]pubkey-hex,
-hardened markers as 'h' (apostrophe=false)."
-  (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
-    (format nil "[~A~A]~A"
-            (bl.crypto:bytes-to-hex fpr)
-            (bl.rpc:format-key-path path nil)
-            (bl.crypto:bytes-to-hex
-             (if xonly (bl.rpc:key-xonly-bytes pubkey) pubkey)))))
-
-(defun %pairs-splitter (pairs)
-  "A closure that returns the slice of PAIRS belonging to each descriptor it is
-handed, advancing a cursor.
-
-PAIRS is flat across the whole descriptor and %INFER-DESC-BODY addresses it
-POSITIONALLY, so a sub-descriptor needs its own slice. OUT-DESC-ORDERED-KEYS
-lays a node's own keys down before its children's, in child order, so a walk
-that visits children in that same order only has to advance a cursor.
-
-A cursor and not an ASSOC per key: that would be O(K^2) in the descriptor's
-total key count, and %WALLET-INFERRED-DESCRIPTOR runs once per coin in
-listunspent, with multi_a leaves allowed up to 999 keys each.
-
-Returns NIL once PAIRS runs short, which %INFER-DESC-BODY turns into an
-unrenderable descriptor rather than one built from misaligned keys."
-  (lambda (desc)
-    (let ((n (length (bl.rpc:out-desc-ordered-keys desc))))
-      (when (<= n (length pairs))
-        (prog1 (subseq pairs 0 n)
-          (setf pairs (nthcdr n pairs)))))))
-
-(defun %infer-desc-body (desc script scripts pairs pos)
-  "The inferred descriptor body for SCRIPT owned by DESC at POS. SCRIPTS is
-DESC's expansion at POS, PAIRS the (desc-key . derived-pubkey) list in
-expression order. NIL when the descriptor kind cannot be inferred."
-  (flet ((key-string (pair &key xonly)
-           (%inferred-key-string (car pair) (cdr pair) pos :xonly xonly)))
-    (ecase (bl.rpc:out-desc-kind desc)
-      ((:addr :raw) nil)
-      ;; Core builds the inferred pk() with the same m_xonly it parsed with
-      ;; (descriptor.cpp:2695 passes /*xonly=*/true for a tapscript leaf), so a
-      ;; leaf reports its key as 32-byte x-only hex and a top-level pk() does
-      ;; not.
-      (:pk (format nil "pk(~A)"
-                   (key-string (first pairs)
-                               :xonly (bl.rpc:out-desc-xonly-script-p desc))))
-      (:pkh (format nil "pkh(~A)" (key-string (first pairs))))
-      (:wpkh (format nil "wpkh(~A)" (key-string (first pairs))))
-      (:combo
-       ;; InferScript works from the concrete script, so combo() infers to
-       ;; the specific form the script takes.
-       (let ((n (position script scripts :test #'equalp))
-             (ks (key-string (first pairs))))
-         (case n
-           (0 (format nil "pk(~A)" ks))
-           (1 (format nil "pkh(~A)" ks))
-           (2 (format nil "wpkh(~A)" ks))
-           (3 (format nil "sh(wpkh(~A))" ks)))))
-      ((:multi :sortedmulti :multi-a :sortedmulti-a)
-       ;; Core infers the EXPANDED script, which no longer records that the
-       ;; keys were sorted for it, so sortedmulti() reports as multi() with the
-       ;; keys in script (BIP67-sorted) order -- and sortedmulti_a() likewise
-       ;; as multi_a(). The tapscript pair pushes its keys x-only.
-       (let* ((kind (bl.rpc:out-desc-kind desc))
-              (tap (and (member kind '(:multi-a :sortedmulti-a)) t))
-              (ordered (if (member kind '(:sortedmulti :sortedmulti-a))
-                           (sort (copy-list pairs) #'bl.rpc:pubkey-lessp :key #'cdr)
-                           pairs)))
-         (format nil "~A(~D~{,~A~})"
-                 (if tap "multi_a" "multi")
-                 (bl.rpc:out-desc-threshold desc)
-                 (mapcar (lambda (pair) (key-string pair :xonly tap)) ordered))))
-      (:sh (let ((sub (%infer-desc-body (bl.rpc:out-desc-sub desc) nil scripts pairs pos)))
-             (and sub (format nil "sh(~A)" sub))))
-      (:wsh (let ((sub (%infer-desc-body (bl.rpc:out-desc-sub desc) nil scripts pairs pos)))
-              (and sub (format nil "wsh(~A)" sub))))
-      ;; The subscript of wsh(<miniscript>) is an out-desc of kind :MINISCRIPT
-      ;; (descriptors.lisp, %PARSE-MINISCRIPT-DESCRIPTOR), and the :WSH clause
-      ;; above recurses straight into it. Without this clause that recursion was
-      ;; an ECASE failure — RPC -32603 "Internal error" — reachable from
-      ;; getaddressinfo and listunspent for any wallet holding a policy
-      ;; descriptor. The miniscript renders itself with each key expression
-      ;; replaced by its concrete inferred key, which is what every other kind
-      ;; here does.
-      (:miniscript
-       (let ((solved t))
-         (let ((text (bl.val:ms-node-to-string
-                      (bl.rpc:out-desc-node desc)
-                      (lambda (key)
-                        (let ((pair (assoc key pairs :test #'eq)))
-                          (cond (pair (key-string pair))
-                                (t (setf solved nil) "")))))))
-           (and solved text))))
-      (:tr
-       ;; The internal key is the FIRST pair — OUT-DESC-ORDERED-KEYS numbers it
-       ;; before the tree's leaves — and the leaves render through the same
-       ;; brace reconstruction the descriptor printer uses.
-       (let ((internal (key-string (first pairs) :xonly t)))
-         (if (null (bl.rpc:out-desc-tree desc))
-             (format nil "tr(~A)" internal)
-             ;; Each leaf gets ITS OWN pairs. The clauses here address PAIRS
-             ;; positionally -- (first pairs) means "this descriptor's key" --
-             ;; which holds only while the descriptor owns every pair. A tree
-             ;; breaks that: hand every leaf the whole list and they all render
-             ;; the tr() INTERNAL key, because that is the pair ORDERED-KEYS
-             ;; numbers first. The splitter starts AFTER the internal key.
-             (let* ((next (%pairs-splitter (rest pairs)))
-                    (tree (bl.rpc:tr-tree-string
-                           (bl.rpc:out-desc-tree desc)
-                           (lambda (leaf)
-                             (let ((own (funcall next leaf)))
-                               (and own (%infer-desc-body leaf nil scripts
-                                                          own pos)))))))
-               (and tree (format nil "tr(~A,~A)" internal tree))))))
-      (:rawtr (format nil "rawtr(~A)" (key-string (first pairs) :xonly t))))))
+;;;
+;;; The body renderer itself is BL.RPC:INFER-DESCRIPTOR-BODY, next to the
+;;; descriptor parser and the key-expression accessors it is written in terms
+;;; of (src/rpc/descriptors.lisp). It moved there when scantxoutset needed the
+;;; same thing: Core's scan reports the descriptor INFERRED from each matched
+;;; script, through the very InferDescriptor this is a port of, so the renderer
+;;; cannot live above the RPC layer that also wants it.
 
 (defun %spkm-expansion-pairs (spkm pos)
   "(values scripts pairs) — the SPKM's expansion at POS with each derived
@@ -567,7 +436,7 @@ descriptor for SCRIPT, or NIL when the wallet cannot solve it."
     (when (and spkm (%spkm-solvable-p spkm))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (when scripts
-          (let ((body (%infer-desc-body (desc-spkm-desc spkm) script
+          (let ((body (bl.rpc:infer-descriptor-body (desc-spkm-desc spkm) script
                                         scripts pairs pos)))
             (and body (bl.rpc:descriptor-add-checksum body))))))))
 
@@ -969,7 +838,7 @@ PARAMS: (address)."
               ,@(when (and spkm (first key-origin))
                   (destructuring-bind (key pubkey key-pos) key-origin
                     (multiple-value-bind (fpr path)
-                        (%desc-key-origin-info key pubkey key-pos)
+                        (bl.rpc:descriptor-key-origin key pubkey key-pos)
                       `(("timestamp" . ,(desc-spkm-creation-time spkm))
                         ("hdkeypath" . ,(format nil "m~A" (bl.rpc:format-key-path path nil)))
                         ;; Descriptor wallets have no HD seed; Core reports
