@@ -574,36 +574,6 @@ used the legacy serializer, which dropped witness."
     ;; Total: 1.75 BTC = 175000000 satoshis
     (is (= (bl.store:utxo-set-total-amount utxo-set) 175000000))))
 
-(test utxo-set-total-amount-counts-the-whole-view
-  "gettxoutsetinfo's `txouts' must come from the same walk as its amount and
-its bogosize, because UTXO-COUNT answers from the in-memory table alone: for a
-LevelDB-backed view that is neither the whole set (it misses every flushed
-coin) nor only the live part of it (it counts the cache's spent-coin
-tombstones). Core fills all of nTransactionOutputs, nBogoSize and
-total_amount in ONE pass over the view (kernel/coinstats.cpp:96-107).
-
-Both errors reached the RPC: feature_coinstatsindex.py:91 read one coin too
-many on a chain whose single transaction had spent one output, and
-rpc_scantxoutset.py:66 read 32 txouts where scantxoutset, which walks the view
-properly, counted 216."
-  (%with-tmp-cache (cache)
-    (let ((k1 (%sample-utxo-key 91 0))
-          (k2 (%sample-utxo-key 92 0))
-          (k3 (%sample-utxo-key 93 0)))
-      (bl.store:coins-view-cache-add cache k1 (%sample-utxo-entry 1000 7))
-      (bl.store:coins-view-cache-add cache k2 (%sample-utxo-entry 2000 7))
-      (bl.store:coins-view-cache-add cache k3 (%sample-utxo-entry 4000 7))
-      ;; Flush two of them to the base, then spend one: the cache now holds a
-      ;; tombstone for a coin that is no longer in the set, and the base holds
-      ;; a coin the cache table has never heard of.
-      (bl.store:coins-view-cache-flush cache)
-      (bl.store:coins-view-cache-spend cache k1)
-      (multiple-value-bind (total bogo count) (bl.store:utxo-set-total-amount cache)
-        (is (= 6000 total) "the amount covers the base as well as the cache")
-        (is (= 2 count) "the count is the LIVE coins of the whole view")
-        (is (= (* 2 (+ 50 25)) bogo)
-            "and the bogosize is Core's 50 + scriptPubKey, per live coin")))))
-
 (test utxo-set-distinct-txids
   "Distinct txids should count unique transactions."
   (let ((utxo-set (bl.store:make-utxo-set))
@@ -997,6 +967,41 @@ readable while deleted keys stay gone -- exercises the FFI binding end-to-end."
        (bl.store:with-coins-view-db (,base-var ,path-var)
          (let ((,cache-var (bl.store:make-coins-view-cache ,base-var)))
            ,@body)))))
+
+;;; Placed here, below %WITH-TMP-CACHE, and not up with the in-memory
+;;; utxo-set tests it was written next to: a macro used ABOVE its own DEFMACRO
+;;; in the same file compiles as a FUNCTION call, so from a fresh FASL this
+;;; test died with "The function CACHE is undefined" while a warm image, where
+;;; the macro was already defined, ran it green.
+(test utxo-set-total-amount-counts-the-whole-view
+  "gettxoutsetinfo's `txouts' must come from the same walk as its amount and
+its bogosize, because UTXO-COUNT answers from the in-memory table alone: for a
+LevelDB-backed view that is neither the whole set (it misses every flushed
+coin) nor only the live part of it (it counts the cache's spent-coin
+tombstones). Core fills all of nTransactionOutputs, nBogoSize and
+total_amount in ONE pass over the view (kernel/coinstats.cpp:96-107).
+
+Both errors reached the RPC: feature_coinstatsindex.py:91 read one coin too
+many on a chain whose single transaction had spent one output, and
+rpc_scantxoutset.py:66 read 32 txouts where scantxoutset, which walks the view
+properly, counted 216."
+  (%with-tmp-cache (cache)
+    (let ((k1 (%sample-utxo-key 91 0))
+          (k2 (%sample-utxo-key 92 0))
+          (k3 (%sample-utxo-key 93 0)))
+      (bl.store:coins-view-cache-add cache k1 (%sample-utxo-entry 1000 7))
+      (bl.store:coins-view-cache-add cache k2 (%sample-utxo-entry 2000 7))
+      (bl.store:coins-view-cache-add cache k3 (%sample-utxo-entry 4000 7))
+      ;; Flush two of them to the base, then spend one: the cache now holds a
+      ;; tombstone for a coin that is no longer in the set, and the base holds
+      ;; a coin the cache table has never heard of.
+      (bl.store:coins-view-cache-flush cache)
+      (bl.store:coins-view-cache-spend cache k1)
+      (multiple-value-bind (total bogo count) (bl.store:utxo-set-total-amount cache)
+        (is (= 6000 total) "the amount covers the base as well as the cache")
+        (is (= 2 count) "the count is the LIVE coins of the whole view")
+        (is (= (* 2 (+ 50 25)) bogo)
+            "and the bogosize is Core's 50 + scriptPubKey, per live coin")))))
 
 (test coins-view-cache-add-then-get
   "Add via cache; subsequent get returns the entry."
