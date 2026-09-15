@@ -15,7 +15,21 @@
 ;;;; raw records into JSON and drive the roles.
 
 (defun %psbt-decode-arg (b64 &optional (what "psbt"))
-  "Decode a base64 PSBT argument, mapping any failure to a deserialization error."
+  "Core DecodeBase64PSBT (psbt.cpp:607-616) behind the ONE sentence every RPC
+that takes a PSBT argument answers: RPC_DESERIALIZATION_ERROR -22, message
+\"TX decode failed <error>\" -- walletprocesspsbt (wallet/rpc/spend.cpp:
+1618-1620), utxoupdatepsbt, finalizepsbt, combinepsbt, joinpsbts and analyzepsbt
+all strprintf that same pair (rpc/rawtransaction.cpp:1066-1067, :1593-1594,
+:1547-1548, :1813-1814, :1930-1931).
+
+The wording is not decoration: a caller that hands walletprocesspsbt a RAW
+TRANSACTION hex gets it, because the hex is legal base64 and the bytes then
+fail the magic check -- and the test that pins it looks for the prefix
+(rpc_psbt.py:668). Ours said \"psbt decode failed: ...\", which named the same
+fault in words no Core client parses.
+
+WHAT names the argument in the not-a-string refusal only; Core's own type check
+rejects that case before the handler runs."
   (unless (stringp b64)
     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                       :message (format nil "~A must be a base64 string" what)))
@@ -23,7 +37,7 @@
     (bl.rpc:rpc-error (e) (error e))
     (error (e)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                        :message (format nil "~A decode failed: ~A" what e)))))
+                        :message (format nil "TX decode failed ~A" e)))))
 
 ;;; --- createpsbt ---
 

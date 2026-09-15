@@ -1172,3 +1172,35 @@ rpc_psbt.py:485 then calls, and it gives the same bytes."
                         (wire-params (list (field unfinalized "psbt"))))))
             (is (eq t (field final "complete")))
             (is (equal (field finalized "hex") (field final "hex")))))))))
+
+(test a-psbt-argument-that-is-not-one-is-cores-tx-decode-failed
+  "Every RPC that takes a PSBT answers RPC_DESERIALIZATION_ERROR -22 with the
+message \"TX decode failed <error>\" -- Core strprintfs that pair at each of
+its DecodeBase64PSBT call sites (rpc/rawtransaction.cpp:1066-1067, :1593-1594,
+:1930-1931 and wallet/rpc/spend.cpp:1618-1620), and the error is
+DecodeBase64PSBT's own (psbt.cpp:607-616).
+
+The case that pins it is a RAW TRANSACTION hex handed to walletprocesspsbt:
+hex digits are legal base64, so the bytes decode and fail the PSBT magic
+(rpc_psbt.py:668). We answered \"psbt decode failed: ...\", a sentence no Core
+client can match."
+  (with-wallet-chain-node (node "psbt-decode-arg" :wallet "w")
+    (let ((rawtx (one-input-tx-hex (make-string 64 :initial-element #\4) 0
+                                   (bl.crypto:hex-to-bytes "6a0474657374"))))
+      (dolist (method '("decodepsbt" "analyzepsbt" "finalizepsbt"
+                        "walletprocesspsbt"))
+        (let ((answer (rpc-error-of
+                       (lambda ()
+                         (bl.rpc:dispatch-rpc-method node method (list rawtx))))))
+          (is (equal -22 (car answer))
+              "~A: expected -22, got ~S" method answer)
+          (is (eql 0 (search "TX decode failed" (or (cdr answer) "")))
+              "~A: expected Core's prefix, got ~S" method (cdr answer))))
+      ;; Not-base64 at all takes the same route, with the same prefix.
+      (let ((answer (rpc-error-of
+                     (lambda ()
+                       (bl.rpc:dispatch-rpc-method node "decodepsbt"
+                                                   (list "not a psbt!!!"))))))
+        (is (equal -22 (car answer)))
+        (is (eql 0 (search "TX decode failed" (or (cdr answer) ""))))))))
+
