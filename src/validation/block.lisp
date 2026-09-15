@@ -1321,16 +1321,27 @@ whose parent we already have."
       (when mutated
         (return-from block-mutated-p
           (values t "bad-txns-duplicate, duplicate transaction"))))
-    ;; No coinbase, or ANY transaction exactly 64 bytes long in legacy
-    ;; serialization: a 64-byte transaction is indistinguishable from an
-    ;; internal merkle node, which is the other half of CVE-2012-2459
-    ;; (validation.cpp:4067-4080). Core logs nothing for these.
+    ;; A 64-byte transaction is indistinguishable from an internal merkle
+    ;; node, the other half of CVE-2012-2459 -- but Core asks the question
+    ;; ONLY of a block with NO coinbase, and then ANSWERS with it, witness
+    ;; malleation unexamined (validation.cpp:4067-4080):
+    ;;
+    ;;     if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
+    ;;         return std::any_of(... GetSerializeSize(TX_NO_WITNESS(tx)) == 64);
+    ;;     } else { /* a 64-byte COINBASE needs 224 bits of work; neglected */ }
+    ;;
+    ;; so a coinbase-bearing block is never judged on it, and a
+    ;; coinbase-less block with no 64-byte transaction is NOT mutated -- it
+    ;; is merely invalid, which is a different verdict with a different
+    ;; punishment. Core logs nothing for this arm either way.
     (when (or (null transactions)
               (not (is-coinbase-tx (first transactions))))
-      (return-from block-mutated-p (values t nil)))
-    (dolist (tx transactions)
-      (when (= 64 (length (bl.ser:serialize-transaction tx)))
-        (return-from block-mutated-p (values t nil))))
+      (return-from block-mutated-p
+        (values (and (some (lambda (tx)
+                             (= 64 (length (bl.ser:serialize-transaction tx))))
+                           transactions)
+                     t)
+                nil)))
     ;; CheckWitnessMalleation (validation.cpp:3902-3948).
     (multiple-value-bind (ok reason)
         (validate-witness-commitment block check-witness-root)
