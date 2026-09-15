@@ -435,11 +435,67 @@ move to the tip — not a rebuild from genesis."
        (is (equalp tip-record (%csi-raw-record csi tip)))
        (bl.store:close-coinstatsindex csi)))))
 
-(test coinstatsindex-rpc-refuses-stale-branch-hash
-  "gettxoutsetinfo resolves a block hash to a height through the header index,
-which also resolves STALE-BRANCH hashes — and the index holds active-chain
-statistics only. Asking by a stale-branch hash must error rather than serve the
-active chain's numbers under that hash. Control: the active-chain hash at the
+(test coinstatsindex-answers-a-block-a-reorg-took-off-the-chain
+  "Core\'s index keeps a reorged-out block\'s record: the height key holds the
+block hash beside the value, and CustomRemove copies the record under that
+hash before another branch claims the height (coinstatsindex.cpp:216-234), so
+LookUpOne answers by hash afterwards (index/db_key.h:96-113). Ours was keyed by
+height ALONE, so the RPC had to refuse a stale-branch hash outright rather than
+serve the active chain\'s numbers under it -- and
+feature_coinstatsindex.py:279-281 invalidates two blocks, mines two more, and
+asks for the invalidated tip by hash.
+
+The two records are made distinguishable by indexing the branch with a
+different subsidy, so a lookup that silently fell back to the height record
+would report the other one\'s cumulative total."
+  (with-network (:regtest)
+   (multiple-value-bind (node csi cs tip)
+       (%csi-fixture (format nil "csireorg~D" (get-internal-real-time)) 4)
+     (let* ((active-entry (bl.store:get-block-at-height cs tip))
+            (active-hash (bl.store:block-index-entry-hash active-entry))
+            (block (bl.store:get-block (bl:node-block-store node) active-hash))
+            (undo (bl.val:get-undo-data active-hash))
+            (subsidy (bl.val:calculate-block-subsidy tip))
+            (branch-hash (%csi-fake-branch cs (1- tip) tip 150))
+            ;; Read through the HEIGHT key, which still names the active
+            ;; block at this point, so the baseline needs no new function.
+            (active-subsidy (bl.store:coinstats-total-subsidy
+                             (bl.store:coinstatsindex-get-stats csi tip))))
+       (is-true block "the fixture must have the tip block on disk")
+       ;; The competing block held the height first, with a subsidy of its own
+       ;; so the two records cannot be confused ...
+       (bl.store:coinstatsindex-add-block csi block branch-hash tip undo
+                                          (1+ subsidy))
+       ;; ... and then the active block reclaimed it, which is the moment Core
+       ;; copies what the height held under its own hash.
+       (bl.store:coinstatsindex-add-block csi block active-hash tip undo subsidy)
+       ;; End to end first, so a run against the previous code fails on the
+       ;; ANSWER and not on a symbol this change introduces.
+       (let ((res (%txoutsetinfo node (list "muhash" (bl.rpc:hash-to-hex branch-hash)))))
+         (is (= tip (cdr (assoc "height" res :test #'string=))))
+         (is (string= (bl.rpc:hash-to-hex branch-hash)
+                      (cdr (assoc "bestblock" res :test #'string=)))
+             "and reports the block that was asked for"))
+       (is (= active-subsidy
+              (bl.store:coinstats-total-subsidy
+               (bl.store:coinstatsindex-get-stats csi tip)))
+           "the height-keyed read still answers for the active chain")
+       (let ((by-active (bl.store:coinstatsindex-get-block-stats csi active-hash tip))
+             (by-branch (bl.store:coinstatsindex-get-block-stats csi branch-hash tip)))
+         (is (= active-subsidy (bl.store:coinstats-total-subsidy by-active))
+             "the height record is the active chain\'s again")
+         (is-true by-branch
+                  "the reorged-out block\'s record must survive under its hash")
+         (when by-branch
+           (is (= (1+ active-subsidy) (bl.store:coinstats-total-subsidy by-branch))
+               "and it must be the branch\'s own record, not the height\'s")))
+       (bl.store:close-coinstatsindex csi)))))
+
+(test coinstatsindex-rpc-refuses-a-branch-it-never-indexed
+  "The other half of the rule: a hash the header index resolves but the
+coinstats index has never held -- a branch whose blocks were never connected --
+has no record under either key, so it is refused rather than answered with
+whatever the height happens to hold now. Control: the active-chain hash at the
 same height still works."
   (with-network (:regtest)
    (multiple-value-bind (node csi cs tip)

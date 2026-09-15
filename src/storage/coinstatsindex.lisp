@@ -21,9 +21,24 @@
 ;;;;
 ;;;; LevelDB layout (dedicated DB under <datadir>/coinstatsindex/):
 ;;;;   key 0x53 || height(u32 BE)  ->  serialized stat record (see below)
+;;;;   key 0x48 || block-hash(32)  ->  the same record, for a block that a reorg
+;;;;                                   took off the active chain
 ;;;;   key 0x42 (meta)             ->  best-height(u32 LE) || best-hash(32)
+;;;;
+;;;; The two key spaces are Core's (index/db_key.h DBHeightKey / DBHashKey).
+;;;; Core's height record carries the block HASH beside the value and its
+;;;; lookup takes a (hash, height) pair: the height record answers when its
+;;;; hash matches, and otherwise the hash-keyed copy does (LookUpOne,
+;;;; db_key.h:96-113). The copy is made when the height record is about to be
+;;;; overwritten by another branch's block, which is what keeps a reorged-out
+;;;; block's statistics retrievable by hash -- feature_coinstatsindex.py:280
+;;;; asks for exactly that.
 
 (defconstant +csi-key-stat+ #x53 "LevelDB key prefix ('S') for per-height records.")
+(defconstant +csi-key-hash+ #x48
+  "LevelDB key prefix ('H') for a record keyed by BLOCK HASH: where a record
+goes when a reorg takes its block off the active chain and another block
+claims its height (Core index_util::DBHashKey).")
 
 (defstruct (coinstatsindex (:include base-index))
   "coinstatsindex state (open LevelDB handle + enabled flag).")
@@ -61,10 +76,19 @@ key order is height order)."
     (dotimes (i 4) (setf (aref be (- 3 i)) (logand (ash height (* -8 i)) #xff)))
     (index-key +csi-key-stat+ be)))
 
+(defun %csi-hash-key (hash)
+  "Key for the copy of a record made when its block left the active chain."
+  (index-key +csi-key-hash+ hash))
+
 ;; A record is: muhash numerator (384 LE) || denominator (384 LE) || 11 tallies
-;; each as a signed 64-bit little-endian value.
+;; each as a signed 64-bit little-endian value, then the 32-byte hash of the
+;; block the record belongs to. The hash is APPENDED rather than prefixed so a
+;; database written before it was recorded still decodes: such a record is
+;; simply one whose block is unknown, and a lookup by hash misses it rather
+;; than answering with another branch's numbers.
 (defconstant +csi-record-fields+ 11)
 (defconstant +csi-record-size+ (+ 384 384 (* 8 +csi-record-fields+)))
+(defconstant +csi-record-size-with-hash+ (+ +csi-record-size+ 32))
 
 (defun %write-i64-le (vec offset value)
   "Write VALUE as 8 little-endian bytes at OFFSET (two's complement)."
@@ -75,8 +99,15 @@ key order is height order)."
   (let ((v (loop for i below 8 sum (ash (aref vec (+ offset i)) (* 8 i)))))
     (if (>= v (ash 1 63)) (- v (ash 1 64)) v)))
 
-(defun %csi-encode-stat (stats)
-  (let ((v (make-array +csi-record-size+ :element-type '(unsigned-byte 8)))
+(defun %csi-record-block-hash (v)
+  "The block hash a stored record names, or NIL for a record written before the
+hash was recorded."
+  (when (>= (length v) +csi-record-size-with-hash+)
+    (subseq v +csi-record-size+ +csi-record-size-with-hash+)))
+
+(defun %csi-encode-stat (stats &optional block-hash)
+  (let ((v (make-array (if block-hash +csi-record-size-with-hash+ +csi-record-size+)
+                       :element-type '(unsigned-byte 8)))
         (mu (coinstats-muhash stats)))
     (replace v (bl.crypto:le-integer-to-bytes
                 (bl.crypto:muhash-numerator mu) 384))
@@ -96,6 +127,7 @@ key order is height order)."
                            (coinstats-unspendable-scripts stats)
                            (coinstats-unspendable-unclaimed stats))
           do (%write-i64-le v off val))
+    (when block-hash (replace v block-hash :start1 +csi-record-size+))
     v))
 
 (defun %csi-decode-stat (v)
@@ -144,13 +176,42 @@ Note the order: INDEX-BEST-BLOCK, the generic underneath, answers (hash height).
 (defun coinstatsindex-height (csi)
   (nth-value 0 (coinstatsindex-best csi)))
 
-(defun coinstatsindex-get-stats (csi height)
-  "Return the coinstats record at HEIGHT, or NIL if not indexed."
+(defun %csi-raw-at-height (csi height)
+  "The raw bytes of the record stored at HEIGHT, or NIL."
   (let ((db (coinstatsindex-db csi)))
     (when db
       (let ((v (leveldb-get db (%csi-stat-key height))))
-        (when (and v (>= (length v) +csi-record-size+))
-          (%csi-decode-stat v))))))
+        (when (and v (>= (length v) +csi-record-size+)) v)))))
+
+(defun coinstatsindex-get-stats (csi height)
+  "Return the coinstats record at HEIGHT, or NIL if not indexed.
+
+The ACTIVE chain's record: a reorg overwrites a height with the new branch's
+block, so this answers for whatever block holds HEIGHT now. Ask
+COINSTATSINDEX-GET-BLOCK-STATS when the question is about a particular block."
+  (let ((v (%csi-raw-at-height csi height)))
+    (when v (%csi-decode-stat v))))
+
+(defun coinstatsindex-get-block-stats (csi hash height)
+  "The coinstats record for the block HASH at HEIGHT, or NIL -- Core's
+index_util::LookUpOne (index/db_key.h:96-113).
+
+The height record answers when it names this block, which is the case for
+every block on the active chain. Otherwise the block has been reorged out and
+its record was copied under its own hash before the height was reused, so the
+hash key answers. A record written before the block hash was stored names no
+block and is taken as the height's, which is what it was."
+  (let ((db (coinstatsindex-db csi))
+        (v (%csi-raw-at-height csi height)))
+    (cond
+      ((null db) nil)
+      ((and v (let ((stored (%csi-record-block-hash v)))
+                (or (null stored) (equalp stored hash))))
+       (%csi-decode-stat v))
+      (t
+       (let ((hv (leveldb-get db (%csi-hash-key hash))))
+         (when (and hv (>= (length hv) +csi-record-size+))
+           (%csi-decode-stat hv)))))))
 
 (defun coinstatsindex-set-best (csi height hash)
   (index-set-best csi hash height))
@@ -265,7 +326,8 @@ Only writes if the index is empty."
              (< (coinstatsindex-height csi) 0))
     (let ((stats (make-coinstats :total-subsidy genesis-subsidy
                                  :unspendable-genesis genesis-subsidy)))
-      (leveldb-put (coinstatsindex-db csi) (%csi-stat-key 0) (%csi-encode-stat stats))
+      (leveldb-put (coinstatsindex-db csi) (%csi-stat-key 0)
+                   (%csi-encode-stat stats genesis-hash))
       (index-set-best csi genesis-hash 0)
       stats)))
 
@@ -288,11 +350,24 @@ the caller should stop/backfill)."
         ;; CDBBatch, index/base.cpp:270-288). As two separate puts, a kill
         ;; between them left the marker naming a height whose record was not
         ;; written, or a record no marker vouched for.
-        (let ((batch (leveldb-make-writebatch)))
+        (let ((batch (leveldb-make-writebatch))
+              ;; Core's CopyHeightIndexToHashIndex (coinstatsindex.cpp:222-225,
+              ;; run from CustomRemove as the rewind walks the abandoned
+              ;; branch): whatever this height held for ANOTHER block is
+              ;; copied under that block's own hash before it is overwritten,
+              ;; so a reorged-out block's statistics stay retrievable.
+              (displaced (let ((v (%csi-raw-at-height csi height)))
+                           (when v
+                             (let ((stored (%csi-record-block-hash v)))
+                               (when (and stored (not (equalp stored block-hash)))
+                                 (cons stored v)))))))
           (unwind-protect
                (progn
+                 (when displaced
+                   (leveldb-writebatch-put batch (%csi-hash-key (car displaced))
+                                           (cdr displaced)))
                  (leveldb-writebatch-put batch (%csi-stat-key height)
-                                         (%csi-encode-stat stats))
+                                         (%csi-encode-stat stats block-hash))
                  (leveldb-writebatch-put batch (base-index-meta-key csi)
                                          (index-meta-encode height block-hash))
                  (leveldb-write (coinstatsindex-db csi) batch))

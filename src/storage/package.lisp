@@ -278,6 +278,7 @@ src/storage/.")
    #:coinstatsindex-height
    #:coinstatsindex-best
    #:coinstatsindex-get-stats
+   #:coinstatsindex-get-block-stats
    #:coinstatsindex-add-block
    #:coinstatsindex-record-matches-block-p
    #:coinstatsindex-seed-genesis
