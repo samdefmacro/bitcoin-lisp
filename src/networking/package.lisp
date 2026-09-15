@@ -82,6 +82,10 @@ headerssync.cpp. src/networking/.")
    #:tx-request-disconnected-peer
    #:tx-request-count
    #:process-tx-requests
+   #:note-block-failure
+   #:clear-block-failure
+   #:block-failure-paused-p
+   #:+max-block-revalidation-attempts+
    ;; Steady-state message pump (post-IBD receive loop)
    #:pump-peer-messages
    #:ibd-context-headers-received
