@@ -258,6 +258,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; we've caught up once, reset the timeout so we can't trigger disconnect
   ;; later" (:6150-6153).
   (headers-sync-timeout nil)
+  ;; Core Peer::m_inv_triggered_getheaders_before_sync
+  ;; (net_processing.cpp:4197): set once a block INV from this peer has been
+  ;; answered with a getheaders while header sync was NOT open with it, so a
+  ;; peer earns at most one such getheaders before it becomes the sync peer.
+  (inv-triggered-getheaders-before-sync nil :type boolean)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; Peer selected US as high-bandwidth (Core m_bip152_highbandwidth_from)
@@ -353,6 +358,15 @@ one flag away and out of the default log, which is Core's privacy model
 (logging.h:28, net.cpp:704-707). Written once here rather than as an id and a
 LOG-IP argument at each of the thirty-odd call sites."
   (format nil "peer=~D~A" (peer-id peer) (bl:log-ip (peer-address peer))))
+
+(defvar *last-block-inv-triggering-headers-sync* nil
+  "Core PeerManagerImpl::m_last_block_inv_triggering_headers_sync
+(net_processing.cpp:4207): the hash of the last block announced by INV that
+made this node open a getheaders with a peer it had not started header sync
+with. NODE-WIDE, and that is the whole mechanism: with one initial-sync peer
+at a time, Core is willing to add ONE MORE peer per newly announced block, so
+the announcement is remembered here and every other peer announcing the SAME
+block is skipped.")
 
 (defun disconnect-msg (peer)
   "Core CNode::DisconnectMsg (net.cpp:709-714): \"disconnecting \" plus

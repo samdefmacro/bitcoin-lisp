@@ -4793,7 +4793,11 @@ throttle window is cleared, the next unconnecting message asks again."
   (with-network (:regtest)
     (let* ((node (regtest-node-fixture "unconnecting-throttle"))
            (cs (bl:node-chain-state node))
-           (srv (bl.net:open-listener "127.0.0.1" 0)))
+           (srv (bl.net:open-listener "127.0.0.1" 0))
+           ;; Core's m_last_block_inv_triggering_headers_sync is node-wide, so
+           ;; a test that reads the pre-sync gate must state where it starts;
+           ;; left ambient it carries the previous test's announcement in.
+           (bl.net::*last-block-inv-triggering-headers-sync* nil))
       (is-true srv)
       (when srv
         (unwind-protect
@@ -4847,7 +4851,11 @@ Control: a cleared window buys one more."
            (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set (bl:node-utxo-set node)
                                           :block-store (bl:node-block-store node)
                                           :mempool (bl:node-mempool node)))
-           (srv (bl.net:open-listener "127.0.0.1" 0)))
+           (srv (bl.net:open-listener "127.0.0.1" 0))
+           ;; Core's m_last_block_inv_triggering_headers_sync is node-wide, so
+           ;; a test that reads the pre-sync gate must state where it starts;
+           ;; left ambient it carries the previous test's announcement in.
+           (bl.net::*last-block-inv-triggering-headers-sync* nil))
       (is-true srv)
       (when srv
         (unwind-protect
@@ -4874,9 +4882,22 @@ Control: a cleared window buys one more."
                           (deliver-inv peer (block-inv #xB2) ctx)
                           (is (= one (getheaders-bytes))
                               "a second inv inside the window asks nothing more")
+                          ;; Core's other gate: a peer we have NOT opened
+                          ;; header sync with answers at most ONE inv
+                          ;; announcement, whatever the throttle says
+                          ;; (m_inv_triggered_getheaders_before_sync,
+                          ;; net_processing.cpp:4197).
                           (setf (bl.net:peer-last-getheaders-time peer) 0)
                           (deliver-inv peer (block-inv #xB3) ctx)
-                          (is (= (* 2 one) (getheaders-bytes)) "control: a cleared window buys one more")))
+                          (is (= one (getheaders-bytes))
+                              "a pre-sync peer earns one inv-triggered getheaders, not one per window")
+                          ;; Control: the SYNC peer answers every announcement,
+                          ;; so a cleared window buys one more.
+                          (%hs-arm peer (+ (bl.ser:get-unix-time) 900))
+                          (setf (bl.net:peer-last-getheaders-time peer) 0)
+                          (deliver-inv peer (block-inv #xB4) ctx)
+                          (is (= (* 2 one) (getheaders-bytes))
+                              "control: the sync peer's cleared window buys one more")))
                    (bl.net:disconnect-peer peer)
                    (bl.net:disconnect-peer client))))
           (bl.net:close-listener srv))))))
@@ -5103,6 +5124,54 @@ priming every peer it admits."
           ;; which is what a node at its tip does.
           (is (= 2 (broadcast recent c d))
               "at the tip both new peers are asked on the same pass"))))))
+
+(defun %hs-block-inv (hash)
+  "One block-inv message's payload, header stripped, as HANDLE-INV sees it."
+  (subseq (bl.ser:make-inv-message
+           (list (bl.ser:make-inv-vector :type bl.ser:+inv-type-block+
+                                         :hash hash)))
+          24))
+
+(test one-new-peer-per-announced-block-earns-a-getheaders
+  "Core answers a block INV naming a block we lack with a getheaders only when
+header sync is already open with that peer, or when the peer has not spent its
+one pre-sync announcement AND no other peer has already been opened on this
+very block: `state.fSyncStarted || (!peer.m_inv_triggered_getheaders_before_sync
+&& *best_block != m_last_block_inv_triggering_headers_sync)'
+(net_processing.cpp:4197-4210). That is what makes the rate ONE NEW PEER PER
+BLOCK while initial headers sync runs with a single peer.
+p2p_initial_headers_sync.py:105 announces one block from three peers and
+asserts exactly one of the two non-sync peers is asked."
+  (with-network (:regtest)
+    (let* ((chain (%hs-chain))
+           (ctx (bl.ctx:make-node-context :chain-state chain :peers '()))
+           (sync-peer (%hs-peer 0))
+           (p2 (%hs-peer 1 :address "198.51.100.21"))
+           (p3 (%hs-peer 2 :address "198.51.100.22"))
+           (block-a (%bd-hash 4001))
+           (block-b (%bd-hash 4002))
+           ;; Node-wide in production (Core's m_last_block_inv_triggering_
+           ;; headers_sync); bound so this test neither reads nor leaves state.
+           (bl.net::*last-block-inv-triggering-headers-sync* nil))
+      (%hs-arm sync-peer (+ (bl.ser:get-unix-time) 900))
+      (flet ((asked-p (peer hash)
+               (let ((sent (captured-sends
+                            (lambda () (deliver-inv peer (%hs-block-inv hash) ctx)))))
+                 (and (member "getheaders" sent :key #'message-command
+                                                :test #'string=)
+                      t))))
+        ;; The sync peer answers every announcement.
+        (is-true (asked-p sync-peer block-a))
+        ;; ...and exactly one of the other two is opened on block A.
+        (let ((first (asked-p p2 block-a))
+              (second (asked-p p3 block-a)))
+          (is (= 1 (count t (list first second)))
+              "exactly one of the two non-sync peers is asked for block A"))
+        ;; A NEW block opens the remaining one.
+        (is-true (asked-p p3 block-b))
+        ;; ...and never a second time, whatever it announces.
+        (is-false (asked-p p3 (%bd-hash 4003))
+                  "a peer spends its pre-sync announcement once")))))
 
 (test an-addr-fetch-peer-is-never-header-synced
   "Core's SendMessages opens header sync only with a peer that CanServeBlocks

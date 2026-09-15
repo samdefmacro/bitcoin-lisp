@@ -1259,11 +1259,34 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
     ;; HEADERS_RESPONSE_TIME per peer): a peer announcing block after block by
     ;; inv buys one getheaders per window, not one per inv -- p2p_sendheaders.py
     ;; :334 asserts exactly that no second getheaders follows the second inv.
+    ;;
+    ;; ONE NEW PEER PER ANNOUNCED BLOCK. Core's gate is
+    ;; `state.fSyncStarted || (!peer.m_inv_triggered_getheaders_before_sync &&
+    ;; *best_block != m_last_block_inv_triggering_headers_sync)'
+    ;; (net_processing.cpp:4197), with its own comment: with initial headers
+    ;; sync open with ONE peer at a time, Core is "willing to add one new peer
+    ;; per block to sync with as well, to sync quicker in the case where our
+    ;; initial peer is unresponsive (but less bandwidth than we'd use if we
+    ;; turned on sync with all peers)". The sync peer answers every
+    ;; announcement; every other peer answers at most one announcement ever,
+    ;; and only if no other peer has already been opened on THAT block.
+    ;; p2p_initial_headers_sync.py:105 announces one block from three peers
+    ;; and asserts that exactly one of the two non-sync peers is asked.
     (when (and unknown-block-hash
-               (%maybe-send-getheaders peer (build-header-locator chain-state)))
-      (bl:log-cat "net" "inv: unknown block ~A from ~A — sending getheaders"
-                  (bl.crypto:bytes-to-hex unknown-block-hash)
-                  (peer-log-name peer)))
+               (or (peer-headers-sync-started peer)
+                   (and (not (peer-inv-triggered-getheaders-before-sync peer))
+                        (not (equalp unknown-block-hash
+                                     *last-block-inv-triggering-headers-sync*)))))
+      (when (%maybe-send-getheaders peer (build-header-locator chain-state))
+        (bl:log-cat "net" "inv: unknown block ~A from ~A — sending getheaders"
+                    (bl.crypto:bytes-to-hex unknown-block-hash)
+                    (peer-log-name peer)))
+      ;; Recorded whether or not the request survived the throttle, as Core
+      ;; records it (net_processing.cpp:4202-4210): the budget this spends is
+      ;; the peer's one pre-sync announcement, and the block that spent it.
+      (unless (peer-headers-sync-started peer)
+        (setf (peer-inv-triggered-getheaders-before-sync peer) t
+              *last-block-inv-triggering-headers-sync* unknown-block-hash)))
     (when wanted
       (send-message peer
                     (bl.ser:make-getdata-message

@@ -1314,6 +1314,7 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
                      (merge-inbound-peers *node*)
                      (dial-queued-nodes *node*)
                      (> (length (node-peers *node*)) peers-before))))
+  (run-header-sync-duties *node*)   ; Core SendMessages, headers half
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the
   ;; periodic half of Core's
