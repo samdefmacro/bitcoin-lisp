@@ -1337,21 +1337,55 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                                       script
                                       (vector bl.rpc:+tapleaf-version-tapscript+)))))))))))))))
 
-(defun %psbt-add-map-derivs (map spk pos pairs)
-  "Add +psbt-in-bip32+ (ECDSA) / +psbt-in-tap-internal-key+ (taproot) records to
-MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
+(defun %psbt-tap-bip32-value (leaf-hashes fingerprint path)
+  "The value bytes of a PSBT_*_TAP_BIP32_DERIVATION record (BIP371, Core
+psbt.h:390-399): <compact size: number of leaf hashes><32-byte leaf hash>*
+followed by the ordinary <fingerprint><path> of a bip32 derivation record."
+  (let ((bb (bl.bytes:make-byte-buf)))
+    (bl.bytes:bb-write-varint bb (length leaf-hashes))
+    (dolist (hash leaf-hashes)
+      (bl.bytes:bb-write-bytes
+       bb (coerce hash '(simple-array (unsigned-byte 8) (*)))))
+    (bl.bytes:bb-write-bytes bb (%psbt-bip32-value fingerprint path))
+    (bl.bytes:bb-finish bb)))
+
+(defun %psbt-add-map-derivs (map spk pos pairs &optional spkm)
+  "Add the derivation records an UPDATER writes for a wallet-owned input or
+output: +psbt-in-bip32+ for an ECDSA script, and for a TAPROOT one
++psbt-in-tap-internal-key+ plus a +psbt-in-tap-bip32+ record per key whose
+origin the wallet knows.
+
+The taproot derivations are not optional decoration. Core's FillPSBT runs
+SignPSBTInput for every input whatever `sign' says, ProduceSignature fills
+sigdata.taproot_misc_pubkeys from the provider, and FromSignatureData copies
+the whole map into m_tap_bip32_paths (psbt.cpp:203-205) -- so every tr() input
+a descriptor wallet processes comes back carrying them, which is what
+wallet_taproot.py:361 asserts and what an offline signer needs to know which
+of its keys the input is for. We wrote the internal key alone.
+
+⚠️ The internal key is the descriptor's OWN key, i.e. the FIRST pair. The
+loop used to set +psbt-in-tap-internal-key+ once per pair under one empty
+keydata, so for a tr() WITH a script tree the last LEAF key silently won."
   (let ((taproot (eq (bl.val:classify-script spk)
                      :witness-v1-taproot))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
-    (loop for (key . pubkey) in pairs
-          do (if taproot
-                 (bl.ser:psbt-map-set
-                  map bl.ser:+psbt-in-tap-internal-key+ empty
-                  (bl.rpc:key-xonly-bytes pubkey))
-                 (multiple-value-bind (fpr path) (bl.rpc:descriptor-key-origin key pubkey pos)
-                   (bl.ser:psbt-map-set
-                    map bl.ser:+psbt-in-bip32+ pubkey
-                    (%psbt-bip32-value fpr path)))))))
+    (cond
+      ((not taproot)
+       (loop for (key . pubkey) in pairs
+             do (multiple-value-bind (fpr path) (bl.rpc:descriptor-key-origin key pubkey pos)
+                  (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-bip32+ pubkey
+                   (%psbt-bip32-value fpr path)))))
+      (pairs
+       (bl.ser:psbt-map-set
+        map bl.ser:+psbt-in-tap-internal-key+ empty
+        (bl.rpc:key-xonly-bytes (cdr (first pairs))))
+       (when spkm
+         (loop for (xonly leaf-hashes fpr path)
+                 in (%spkm-tap-bip32-origins spkm spk pos pairs)
+               do (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-tap-bip32+ xonly
+                   (%psbt-tap-bip32-value leaf-hashes fpr path))))))))
 
 (defun %psbt-add-wallet-input-derivs (psbt coins wallet)
   "Add input bip32 derivations / taproot internal keys for wallet-owned inputs
@@ -1369,7 +1403,7 @@ MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
                  (when spkm
                    (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                      (declare (ignore scripts))
-                     (%psbt-add-map-derivs map spk pos pairs))))))))
+                     (%psbt-add-map-derivs map spk pos pairs spkm))))))))
 
 (defun %psbt-add-wallet-output-derivs (psbt wallet)
   "Add output bip32 derivations / redeem / witness scripts for wallet-owned
@@ -1390,18 +1424,29 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                       map bl.ser:+psbt-out-witness-script+ empty witness)))
                  (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                    (declare (ignore scripts))
-                   (let ((taproot (eq (bl.val:classify-script spk)
-                                      :witness-v1-taproot)))
-                     (loop for (key . pubkey) in pairs
-                           do (if taproot
-                                  (bl.ser:psbt-map-set
-                                   map bl.ser:+psbt-out-tap-internal-key+
-                                   empty (bl.rpc:key-xonly-bytes pubkey))
-                                  (multiple-value-bind (fpr path)
-                                      (bl.rpc:descriptor-key-origin key pubkey pos)
-                                    (bl.ser:psbt-map-set
-                                     map bl.ser:+psbt-out-bip32+ pubkey
-                                     (%psbt-bip32-value fpr path))))))))))))
+                   ;; The output half of %PSBT-ADD-MAP-DERIVS, over the
+                   ;; PSBT_OUT_* keytypes: Core's UpdatePSBTOutput runs the
+                   ;; same ProduceSignature + FromSignatureData pair for an
+                   ;; output as SignPSBTInput does for an input
+                   ;; (psbt.cpp:262-298), so an output carries the same
+                   ;; internal key and taproot derivations.
+                   (cond
+                     ((not (eq (bl.val:classify-script spk) :witness-v1-taproot))
+                      (loop for (key . pubkey) in pairs
+                            do (multiple-value-bind (fpr path)
+                                   (bl.rpc:descriptor-key-origin key pubkey pos)
+                                 (bl.ser:psbt-map-set
+                                  map bl.ser:+psbt-out-bip32+ pubkey
+                                  (%psbt-bip32-value fpr path)))))
+                     (pairs
+                      (bl.ser:psbt-map-set
+                       map bl.ser:+psbt-out-tap-internal-key+ empty
+                       (bl.rpc:key-xonly-bytes (cdr (first pairs))))
+                      (loop for (xonly leaf-hashes fpr path)
+                              in (%spkm-tap-bip32-origins spkm spk pos pairs)
+                            do (bl.ser:psbt-map-set
+                                map bl.ser:+psbt-out-tap-bip32+ xonly
+                                (%psbt-tap-bip32-value leaf-hashes fpr path)))))))))))
 
 ;;; --- Completeness / extract ---
 

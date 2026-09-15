@@ -2005,3 +2005,69 @@ in solving_data, to bump the parent that created it."
                     "the built transaction must spend the pre-selected external ~
 outpoint; it spends ~S" spent)))))))))
 
+(test a-tr-input-carries-cores-taproot-bip32-derivations
+  "Core's FillPSBT runs SignPSBTInput for EVERY input whatever `sign' says;
+ProduceSignature fills sigdata.taproot_misc_pubkeys from the provider -- the
+tr() internal key with no leaf hashes (script/sign.cpp:561-566) and every leaf
+key it signs for with that leaf's hash (:361-369) -- and FromSignatureData
+copies the map into m_tap_bip32_paths (psbt.cpp:203-205). decodepsbt then
+reports it as `taproot_bip32_derivs' (rpc/rawtransaction.cpp:1288-1304).
+
+We wrote PSBT_IN_TAP_INTERNAL_KEY and nothing else, so a tr() input came back
+with no derivation an offline signer could match against its own keys
+(wallet_taproot.py:361 asserts the field on every tr() pattern it tests).
+
+⚠️ The internal key is the descriptor's OWN key. The record used to be written
+once per expansion key under the SAME empty keydata, so for a tr() WITH a
+script tree the last LEAF key silently overwrote it -- and `taproot_internal_key'
+was present, and wrong, which no assertion about presence can see."
+  (with-wallet-chain-node (node "tr-derivs")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "tr")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((tr-address (rpc "tr" "getnewaddress" "" "bech32m"))
+               (info (rpc "tr" "getaddressinfo" tr-address))
+               (bl.wallet::*wallet-rng* (make-wallet-rng 53)))
+          (is (search "tr(" (or (%aval "desc" info) ""))
+              "the fixture must hand out a tr() address, got ~S" (%aval "desc" info))
+          (rpc "fund" "sendtoaddress" tr-address (bl.rpc:format-money 100000000)
+               nil nil nil nil nil nil nil 10)
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((coin (first (rpc "tr" "listunspent")))
+                 (input (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "txid" h) (%aval "txid" coin)
+                                (gethash "vout" h) (%aval "vout" coin))
+                          h))
+                 (outputs (list (let ((h (make-hash-table :test 'equal)))
+                                  (setf (gethash optrue h)
+                                        (bl.rpc:format-money 50000000))
+                                  h)))
+                 (created (rpc nil "createpsbt" (list input) outputs))
+                 (processed (rpc "tr" "walletprocesspsbt" created))
+                 (decoded (rpc nil "decodepsbt" (%aval "psbt" processed)))
+                 (psbt-input (first (coerce (%aval "inputs" decoded) 'list)))
+                 (derivs (coerce (or (%aval "taproot_bip32_derivs" psbt-input) '())
+                                 'list)))
+            (is-true (or (%aval "witness_utxo" psbt-input)
+                         (%aval "non_witness_utxo" psbt-input))
+                     "the control: the updater filled the input's spent output")
+            (is (= 1 (length derivs))
+                "a key-path tr() input names exactly its internal key: ~S" derivs)
+            (let ((entry (first derivs)))
+              (is (equal (%aval "pubkey" entry)
+                         (%aval "taproot_internal_key" psbt-input))
+                  "the derivation is for the internal key: ~S vs ~S"
+                  (%aval "pubkey" entry) (%aval "taproot_internal_key" psbt-input))
+              (is (equalp #() (%aval "leaf_hashes" entry))
+                  "a key-path key carries no leaf hash: ~S" (%aval "leaf_hashes" entry))
+              (is (equal (%aval "master_fingerprint" entry)
+                         (%aval "hdmasterfingerprint" info))
+                  "the origin is the wallet's own: ~S vs ~S"
+                  (%aval "master_fingerprint" entry)
+                  (%aval "hdmasterfingerprint" info)))))))))

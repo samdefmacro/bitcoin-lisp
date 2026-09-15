@@ -1883,6 +1883,51 @@ the wrong keys."
                     collect (list script leaf-hash control
                                   (mapcar #'cdr own)))))))))
 
+(defun %spkm-tap-bip32-origins (spkm script pos pairs)
+  "Core's sigdata.taproot_misc_pubkeys for a taproot output of SPKM, as one
+(XONLY LEAF-HASHES FINGERPRINT PATH) per key whose origin the wallet knows --
+exactly the records FromSignatureData then writes as
+PSBT_IN/OUT_TAP_BIP32_DERIVATION (psbt.cpp:203-205, :296-297).
+
+Core fills that map from two sites, and they differ in what they carry:
+  - the tr() INTERNAL key, with NO leaf hashes (script/sign.cpp:561-566);
+  - every key of a leaf script it produces a signature for, with that leaf's
+    hash (script/sign.cpp:361-369), one key appearing under several leaves
+    when several leaves name it.
+
+PAIRS is the SPKM's expansion at POS. OUT-DESC-ORDERED-KEYS lays a node's OWN
+keys down before its children's, and every taproot descriptor a wallet SPKM
+can hold -- tr() and rawtr() -- has exactly one own key, so (FIRST PAIRS) is
+the internal key and the rest is sliced per leaf, the same way
+%SPKM-TR-SCRIPT-LEAVES slices it."
+  (let* ((desc (desc-spkm-desc spkm))
+         (entries (when pairs
+                    (list (list (car (first pairs)) (cdr (first pairs)) '())))))
+    (when (and (eq (bl.rpc:out-desc-kind desc) :tr)
+               (bl.rpc:out-desc-tree desc)
+               (>= (length script) 34))
+      (multiple-value-bind (output-key leaves)
+          (bl.rpc:tr-spend-data desc pos
+                                (lambda (k) (cdr (assoc k pairs :test #'eq))))
+        ;; The same guard %SPKM-TR-SCRIPT-LEAVES applies: the spend data must
+        ;; be for the output we are describing, never for another one.
+        (when (equalp output-key (subseq script 2 34))
+          (let ((next (%pairs-splitter (rest pairs))))
+            (loop for (nil leaf-hash) in leaves
+                  for (nil . leaf) in (bl.rpc:out-desc-tree desc)
+                  for slice = (funcall next leaf)
+                  do (dolist (pair slice)
+                       (let ((hit (assoc (car pair) entries :test #'eq)))
+                         (if hit
+                             (pushnew leaf-hash (third hit) :test #'equalp)
+                             (push (list (car pair) (cdr pair) (list leaf-hash))
+                                   entries)))))))))
+    (loop for (key pubkey hashes) in (nreverse entries)
+          collect (multiple-value-bind (fpr path)
+                      (%desc-key-origin-info key pubkey pos)
+                    (list (bl.rpc:key-xonly-bytes pubkey)
+                          (reverse hashes) fpr path)))))
+
 (defun %wallet-sign-maps (wallet tx coins)
   "(values keymap pubmap tr-keymap tr-scripts) covering every input of TX whose
 spent script belongs to a wallet SPKM. Each derived private key is verified to
