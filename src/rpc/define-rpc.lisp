@@ -40,6 +40,14 @@ argument saying whether Core declares it RPCArg::Optional::NO. Generated into
 rpc/core-tables.lisp; read by CHECK-RPC-ARG-COUNT -- the gate
 DISPATCH-RPC-METHOD runs before CHECK-RPC-ARG-TYPES -- and by RPC-USAGE-LINE.")
 
+(defvar *rpc-arg-oneline* '()
+  "((method rendering ...) ...): for every method, each positional argument as
+Core's one-line help spells it (RPCArg::ToString(oneline=true),
+rpc/util.cpp:1249-1291) -- a quoted string argument, a bare number, and a
+structured one as its INNER arguments or its oneline_description. Generated
+into rpc/core-tables.lisp; read by RPC-USAGE-LINE, which falls back to the
+argument's bare name for a method Core does not declare.")
+
 (defvar *rpc-named-only-args* '()
   "((method option-name ...) ...): the members of each method's
 OBJ_NAMED_PARAMS options object, which a named-parameter call may pass at

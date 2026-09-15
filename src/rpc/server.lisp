@@ -113,11 +113,10 @@ argument NAME of TYPE: a string argument is quoted, every other one is its
 bare name, and an alias pattern shows only its first spelling (GetFirstName,
 :912-915).
 
-Core renders an ARR or an OBJ argument as its INNER arguments -- `[fixedrate,
-...]', `{key:str,...}' -- or as the oneline_description its declaration
-overrides that with. Neither is in these tables (they carry top-level
-arguments only), so a structured argument shows as its bare name here. That
-is the one place RPC-USAGE-LINE is shorter than Core's first help line."
+The fallback for a method Core does not declare, and so has no row in
+*RPC-ARG-ONELINE*: that table carries Core's own rendering, including the
+INNER arguments of a structured one, which the name and type tables (top-level
+arguments only) cannot express."
   (let ((first-name (subseq name 0 (or (position #\| name) (length name)))))
     (if (member type '(:str :str-hex))
         (format nil "\"~A\"" first-name)
@@ -132,16 +131,29 @@ This is as much of the help text as this node has: no method here carries
 Core's description, argument and result sections, so the arity gate throws
 this line where Core throws the whole document. The first token is the
 method name either way, which is what Core's own functional tests assert on
-(rpc_rawtransaction.py:255-259, rpc_estimatefee.py:21-22)."
-  (let ((names (cdr (assoc method *rpc-named-arg-names* :test #'string=)))
-        (types (cdr (assoc method *rpc-arg-types* :test #'string=)))
-        (required (cdr (assoc method *rpc-arg-required* :test #'string=))))
+(rpc_rawtransaction.py:255-259, rpc_estimatefee.py:21-22) -- except
+rpc_scantxoutset.py:133, which asserts the whole line and reads the
+`[scanobjects,...]' an ARR argument renders as.
+
+Each argument is written as *RPC-ARG-ONELINE* has it, Core's own
+RPCArg::ToString(oneline=true); the row also STOPS where Core's loop stops, at
+the first hidden argument, so an argument the method still accepts need not
+appear. A method with no row -- one Core does not declare -- falls back to
+%RPC-ARG-USAGE over the name and type tables."
+  (let* ((oneline (assoc method *rpc-arg-oneline* :test #'string=))
+         (names (cdr (assoc method *rpc-named-arg-names* :test #'string=)))
+         (types (cdr (assoc method *rpc-arg-types* :test #'string=)))
+         (required (cdr (assoc method *rpc-arg-required* :test #'string=)))
+         (rendered (if oneline
+                       (cdr oneline)
+                       (loop for name in names
+                             for rest-types = types then (cdr rest-types)
+                             collect (%rpc-arg-usage name (car rest-types))))))
     (with-output-to-string (out)
       (write-string method out)
       (let ((was-optional nil))
-        (loop for name in names
+        (loop for text in rendered
               for rest-required = required then (cdr rest-required)
-              for rest-types = types then (cdr rest-types)
               do (write-char #\Space out)
                  (cond ((car rest-required)
                         (when was-optional (write-string ") " out))
@@ -149,7 +161,7 @@ method name either way, which is what Core's own functional tests assert on
                        (t
                         (unless was-optional (write-string "( " out))
                         (setf was-optional t)))
-                 (write-string (%rpc-arg-usage name (car rest-types)) out))
+                 (write-string text out))
         (when was-optional (write-string " )" out))))))
 
 (defun check-rpc-arg-count (method params)

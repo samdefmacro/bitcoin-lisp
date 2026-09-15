@@ -1379,6 +1379,45 @@ all, which is the order Core reaches transformNamedArguments in
       (is (equal (cons -8 "nblocks must be a positive integer")
                  (answer "migrateblocks" 0 0 0))))))
 
+(test rpc-usage-line-spells-a-structured-argument-as-core-does
+  "A usage line renders an ARR or OBJ argument as its INNER arguments --
+`[scanobjects,...]', `{\"rollback\":n,...}' -- or as the oneline_description
+its declaration overrides that with, which is Core's RPCArg::ToString(oneline)
+(rpc/util.cpp:1249-1291) and RPCArg::ToStringObj (:1209-1245).
+
+These lines were the argument's bare NAME, so the help text Core's arity error
+carries was shorter than Core's for every method taking a list or an object:
+rpc_scantxoutset.py:133 calls scantxoutset with no arguments and looks for
+`scantxoutset \"action\" ( [scanobjects,...] )' inside the -1, and read
+`scantxoutset \"action\" ( scanobjects )'.
+
+A HIDDEN argument ends the line where Core ends it (`if (arg.m_opts.hidden)
+break', rpc/util.cpp:778): stop's `wait' is declared hidden, so its summary is
+the bare method name even though the argument is still accepted."
+  (let ((node (make-test-node)))
+    (flet ((answer (method &rest params)
+             (cdr (%rpc-wire-error node method params))))
+      (is (equal "scantxoutset \"action\" ( [scanobjects,...] )"
+                 (answer "scantxoutset")))
+      (is (equal (concatenate 'string "scanblocks \"action\" ( [scanobjects,...] "
+                              "start_height stop_height \"filtertype\" options )")
+                 (answer "scanblocks")))
+      (is (equal (concatenate 'string "createrawtransaction "
+                              "[{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] "
+                              "[{\"address\":amount,...},{\"data\":\"hex\"},...] "
+                              "( locktime replaceable version )")
+                 (answer "createrawtransaction")))
+      (is (equal "dumptxoutset \"path\" ( \"type\" {\"rollback\":n,...} )"
+                 (answer "dumptxoutset")))
+      ;; getblockstats' `stats' is an ARR whose declaration overrides the
+      ;; rendering with the plain word (rpc/blockchain.cpp:1951).
+      (is (equal "getblockstats hash_or_height ( stats )"
+                 (answer "getblockstats")))
+      (is (equal "stop" (answer "stop" 1 2)))
+      ;; The unstructured lines the suite already pins are unchanged.
+      (is (equal "getblockhash height" (answer "getblockhash")))
+      (is (equal "help ( \"command\" )" (answer "help" "a" "b"))))))
+
 (test rpc-arg-types-table-agrees-with-the-names-table
   "Both generated tables come from the same RPCHelpMan declarations
 (scripts/gen-rpc-arg-names.py), so a method's type row can never be longer
