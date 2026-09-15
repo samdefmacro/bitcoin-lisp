@@ -991,12 +991,23 @@ healthy peers whenever a pump cycle ran long."
                 ;; LISTEN and the select below are separate syscalls, and a
                 ;; segment landing between them would otherwise read as a
                 ;; hangup and silently kill a healthy peer.
-                (when (and (data-available-p conn)
-                           (= (drain-available-bytes stream buffer filled
-                                                     (length buffer))
-                              filled))
-                  (return-from receive-bytes-resumable
-                    (%abandon-receive conn :peer-closed))))
+                ;;
+                ;; ⚠️ That second drain's RESULT is the read, not a probe. It
+                ;; writes into the same buffer, so discarding its value while
+                ;; keeping the first drain's leaves those bytes in the buffer
+                ;; with RECV-FILLED still naming the old fill: the next pass
+                ;; starts at the same index and overwrites them. It cost
+                ;; exactly one message header on a fresh connection — the
+                ;; segment carrying it landed between the two syscalls about
+                ;; one connection in twenty — after which the peer's VERSION
+                ;; PAYLOAD was read as a header and the connection died with
+                ;; "Bad message magic 80110100" (70016, the version field).
+                (when (data-available-p conn)
+                  (setf n (drain-available-bytes stream buffer filled
+                                                 (length buffer)))
+                  (when (= n filled)
+                    (return-from receive-bytes-resumable
+                      (%abandon-receive conn :peer-closed)))))
               (when (> n filled)
                 (setf (connection-recv-last-progress conn) now))
               (setf filled n)))

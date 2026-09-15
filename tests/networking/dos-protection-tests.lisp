@@ -918,6 +918,84 @@ while the reader is about to ask for ANNOUNCED-BYTES. Returns
     (values (make-test-connection :socket server :connected t)
             client server listener)))
 
+(defun %resumable-read (conn count)
+  "One pass of the non-blocking reader. The single reach into it for this
+file (the :: ratchet); seven tests drive it."
+  (bl.net::receive-bytes-resumable conn count))
+
+(defun %readiness-probe-name ()
+  "The readiness probe the resumable reader consults between its two drains.
+Named once so a test can script the segment that lands between them."
+  'bl.net::data-available-p)
+
+(defmacro %with-late-segment ((conn client server listener) &body body)
+  "A loopback pair whose peer sends NOTHING until the reader has already found
+the socket empty: DATA-AVAILABLE-P is replaced by a stub that delivers the
+bytes and only then answers T, which is exactly the interleaving the resumable
+reader guards against -- LISTEN and the readiness poll are separate syscalls,
+and a segment can land between them. The stub delivers once; later calls answer
+normally."
+  (let ((real (gensym "REAL")) (fired (gensym "FIRED")))
+    `(let* ((,listener (usocket:socket-listen "127.0.0.1" 0
+                                              :element-type '(unsigned-byte 8)))
+            (,client (usocket:socket-connect "127.0.0.1"
+                                             (usocket:get-local-port ,listener)
+                                             :element-type '(unsigned-byte 8)))
+            (,server (usocket:socket-accept ,listener
+                                            :element-type '(unsigned-byte 8)))
+            (,conn (make-test-connection :socket ,server :connected t))
+            (,real (fdefinition (%readiness-probe-name)))
+            (,fired nil))
+       (declare (ignorable ,conn ,client ,server ,listener))
+       (flet ((deliver-late (bytes)
+                (setf (fdefinition (%readiness-probe-name))
+                      (lambda (c &rest args)
+                        (declare (ignore args))
+                        (unless ,fired
+                          (setf ,fired t)
+                          (write-sequence bytes (usocket:socket-stream ,client))
+                          (force-output (usocket:socket-stream ,client))
+                          (sleep 0.2))
+                        (funcall ,real c)))))
+         (unwind-protect (progn ,@body)
+           (setf (fdefinition (%readiness-probe-name)) ,real)
+           (ignore-errors (usocket:socket-close ,client))
+           (ignore-errors (usocket:socket-close ,server))
+           (ignore-errors (usocket:socket-close ,listener)))))))
+
+(test a-segment-that-lands-during-the-eof-probe-is-kept
+  "The resumable reader answers \"readable, yet empty\" with a SECOND drain
+before calling it a hangup, because LISTEN and the readiness poll are separate
+syscalls. That second drain is a READ, not a probe: it writes into the same
+accumulator, so its result is the new fill. Discarding it -- keeping the first
+drain's count -- left the bytes in the buffer with RECV-FILLED still naming the
+old fill, and the next pass started at the same index and overwrote them.
+
+It cost exactly one message header on a fresh connection: the segment carrying
+a peer's VERSION landed between the two syscalls about one connection in
+twenty, the header was overwritten by the payload, and the connection died with
+`Bad message magic 80110100' -- 70016, the version field read as a network
+magic. Both directions, and both nodes in a connect_nodes pair
+(wallet_address_types.py's six-node mesh, p2p_compactblocks_hb.py)."
+  (with-network (:regtest)
+    (let ((header (%message-header-bytes
+                   (bl.ser:make-message-header
+                    :magic (copy-seq bl.ser:*network-magic*)
+                    :command "version" :payload-length 4
+                    :checksum (make-array 4 :element-type '(unsigned-byte 8)
+                                            :initial-element 0)))))
+      (%with-late-segment (conn client server listener)
+        (deliver-late header)
+        ;; The read that raced the arrival must return THOSE bytes.
+        (let ((got (%resumable-read conn 24)))
+          (is (not (eq :incomplete got))
+              "a 24-byte segment that arrived during the EOF probe completes the read")
+          (when (and got (not (eq :incomplete got)))
+            (is (equalp header got)
+                "and it is the bytes the peer sent, not the ones after them")))
+        (is (= 24 (bl.net:connection-bytes-received conn))
+            "the 24 bytes are accounted, so the next read starts after them")))))
+
 (defun %message-header-bytes (header)
   "HEADER on the wire. Five tests in this file frame a message by hand, and the
 serializer is internal, so the reach into it lives here once."
@@ -1449,7 +1527,7 @@ which is not what the code does."
       (unwind-protect
            (let ((units internal-time-units-per-second))
              (flet ((expired () (bl.net::connection-receive-expired-p conn))
-                    (read-24 () (bl.net::receive-bytes-resumable conn 24)))
+                    (read-24 () (%resumable-read conn 24)))
                (flet ((silent-for (seconds)
                         ;; Backdate the progress stamp instead of waiting.
                         (setf (bl.net::connection-recv-last-progress conn)
@@ -1618,8 +1696,8 @@ LogDebug(BCLog::NET) does not")
                (sleep 0.2)
                ;; First pass takes the 12 bytes already in the buffer; the
                ;; second finds the hangup behind them.
-               (is (eq :incomplete (bl.net::receive-bytes-resumable conn 24)))
-               (is (null (bl.net::receive-bytes-resumable conn 24))
+               (is (eq :incomplete (%resumable-read conn 24)))
+               (is (null (%resumable-read conn 24))
                    "the read sees the hangup")
                (reap conn)
                (let ((entry (logged "disconnecting")))
@@ -1937,7 +2015,7 @@ has actually sent (net.cpp:1323-1324)."
            (force-output (usocket:socket-stream sender))
            (sleep 0.2)
            (is (eq :incomplete
-                   (bl.net::receive-bytes-resumable conn announced))
+                   (%resumable-read conn announced))
                "the read is in progress, not complete")
            (is (= 1 (bl.net::connection-recv-filled conn)))
            (is (<= (length (bl.net::connection-recv-buffer conn))
@@ -1951,8 +2029,8 @@ has actually sent (net.cpp:1323-1324)."
                            (usocket:socket-stream sender))
            (force-output (usocket:socket-stream sender))
            (sleep 0.4)
-           (bl.net::receive-bytes-resumable conn announced)
-           (bl.net::receive-bytes-resumable conn announced)
+           (%resumable-read conn announced)
+           (%resumable-read conn announced)
            (is (> (bl.net::connection-recv-filled conn)
                   bl.net::+recv-reserve-ahead+)
                "the buffer grows as the peer earns it")
