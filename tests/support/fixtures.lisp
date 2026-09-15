@@ -217,9 +217,12 @@ through this instead of comparing against a double whose printed form it does
 not control -- which is what Core's own functional tests do when they read
 these fields as Decimal. A plain number passes through unchanged, so a field
 that is genuinely not an amount still works."
-  (let ((text (json-number-token value)))
-    (if (not (stringp text))
-        text
+  ;; The type test is on the VALUE, not on what JSON-NUMBER-TOKEN gives back:
+  ;; a field that is a plain STRING passes through unchanged, and reading it as
+  ;; an eight-decimal amount would be a parse error on a txid or a PSBT.
+  (if (not (bl.rpc::json-number-p value))
+      value
+      (let ((text (json-number-token value)))
         (let* ((negative (char= (char text 0) #\-))
                (dot (position #\. text))
                (whole (parse-integer text :start (if negative 1 0) :end dot))
