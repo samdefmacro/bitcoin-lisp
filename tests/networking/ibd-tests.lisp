@@ -717,6 +717,55 @@ our tip (best-known h=2, tip h=2)\' and sent nothing."
             (is (null (bl.net::find-blocks-to-download-for-peer poor state store 16))
                 "a strictly lighter chain is still nothing to fetch")))))))
 
+(test a-block-past-its-retry-budget-is-not-asked-for-again
+  "handle-validation-failure re-queues a block that failed validation for
++max-block-revalidation-attempts+ tries and then STOPS queuing it (a witness or
+body corruption may be peer-side; a real consensus failure is not). The
+per-peer download walk did not know about that pause: the failed block stayed
+the announcing peer's best-known block, so every pass asked for it again and
+the peer answered with the same bytes -- a tight getdata/reject loop that
+feature_csv_activation.py:181 sat in for its whole 60-second wait after
+sending a block whose CSV script fails. Before the peer-list truncation was
+fixed the loop happened to stop because the peer fell out of the list.
+
+Core has no such loop because a connect failure marks the block
+BLOCK_FAILED_VALID (InvalidBlockFound) and FindNextBlocksToDownload skips it
+(net_processing.cpp:1492-1497); ours keeps script failures recoverable, so the
+walk honours the retry pause instead. Control: below the budget the block is
+still requested."
+  (with-temp-directory (dir "bl-retry-pause")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1
+                       :status :valid))
+             (bad (bl.store:make-block-index-entry
+                   :hash (%bd-hash 9) :height 1 :chain-work 2
+                   :prev-entry genesis :status :header-valid)))
+        (dolist (e (list genesis bad))
+          (bl.store:add-block-index-entry state e))
+        (bl.store:update-chain-tip state (%bd-hash 0) 0)
+        (let ((peer (bl.net:make-peer :address "198.51.100.9" :state :ready
+                                      :services (logior bl.ser:+node-network+
+                                                        bl.ser:+node-witness+))))
+          (setf (bl.net:peer-best-known-block-hash peer) (%bd-hash 9))
+          (bl.net:clear-block-failure (%bd-hash 9))
+          (with-ibd-context
+            ;; Within the budget: still requested.
+            (dotimes (i bl.net:+max-block-revalidation-attempts+)
+              (bl.net:note-block-failure (%bd-hash 9)))
+            (is-false (bl.net:block-failure-paused-p (%bd-hash 9)))
+            (is (equalp (list (%bd-hash 9))
+                        (bl.net::find-blocks-to-download-for-peer peer state store 16))
+                "a block within its retry budget is not requested")
+            ;; One past the budget: paused, and the walk leaves it alone.
+            (bl.net:note-block-failure (%bd-hash 9))
+            (is-true (bl.net:block-failure-paused-p (%bd-hash 9)))
+            (is (null (bl.net::find-blocks-to-download-for-peer peer state store 16))
+                "a block past its retry budget was requested again"))
+          (bl.net:clear-block-failure (%bd-hash 9)))))))
+
 (test mark-block-received-clears-timeout-counter
   "A successful receive clears the per-hash timeout counter so a future
 re-request (e.g. after a reorg) starts fresh."
@@ -1537,16 +1586,16 @@ and spamming the log (the testnet4 wedge produced 6.5M lines / 1.1GB this way)."
         (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
     (clrhash bl.net::*block-failure-counts*)
     ;; increments per hash
-    (is (= 1 (bl.net::note-block-failure h1)))
-    (is (= 2 (bl.net::note-block-failure h1)))
-    (is (= 3 (bl.net::note-block-failure h1)))
+    (is (= 1 (bl.net:note-block-failure h1)))
+    (is (= 2 (bl.net:note-block-failure h1)))
+    (is (= 3 (bl.net:note-block-failure h1)))
     ;; independent per hash
-    (is (= 1 (bl.net::note-block-failure h2)))
-    (is (= 4 (bl.net::note-block-failure h1)))
+    (is (= 1 (bl.net:note-block-failure h2)))
+    (is (= 4 (bl.net:note-block-failure h1)))
     ;; clear resets a single hash
-    (bl.net::clear-block-failure h1)
-    (is (= 1 (bl.net::note-block-failure h1)))
-    (is (= 2 (bl.net::note-block-failure h2)))  ; h2 untouched
+    (bl.net:clear-block-failure h1)
+    (is (= 1 (bl.net:note-block-failure h1)))
+    (is (= 2 (bl.net:note-block-failure h2)))  ; h2 untouched
     (clrhash bl.net::*block-failure-counts*)))
 
 ;;;; Initial-block-download latch (Core IsInitialBlockDownload)

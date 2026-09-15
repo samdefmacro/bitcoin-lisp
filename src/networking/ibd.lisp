@@ -487,6 +487,16 @@ counts only grants a few extra retries — harmless).")
 (defvar *block-failure-counts* (make-hash-table :test 'equalp)
   "block-hash -> consecutive validation-failure count (bounded anti-spam throttle).")
 
+(defun block-failure-paused-p (hash)
+  "T once HASH has failed validation more than +max-block-revalidation-attempts+
+times: handle-validation-failure has stopped re-queuing it, and the per-peer
+download walk must stop asking for it too, or the announcing peer's best-known
+block is requested and rejected in a tight loop (feature_csv_activation.py:181).
+Core marks such a block BLOCK_FAILED_VALID and FindNextBlocksToDownload skips it
+(net_processing.cpp:1492-1497); ours keeps script failures recoverable and
+pauses instead. clear-block-failure lifts it."
+  (> (gethash hash *block-failure-counts* 0) +max-block-revalidation-attempts+))
+
 (defun note-block-failure (hash)
   "Increment and return the consecutive validation-failure count for HASH."
   (when (>= (hash-table-count *block-failure-counts*) +block-failure-counts-cap+)
@@ -1194,6 +1204,11 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                    ;; known. Skip it but keep walking toward the peer's tip, where
                    ;; shallower blocks become fetchable.
                    ((and is-limited (>= (- best-known-height h) 286)))
+                   ;; Past its retry budget: handle-validation-failure stopped
+                   ;; queuing it, so the walk stops asking for it (see
+                   ;; block-failure-paused-p); the walk continues so a block
+                   ;; above it on this peer's chain is not hidden by it.
+                   ((block-failure-paused-p hash))
                    (t
                     (push hash result)
                     (when (>= (length result) count)
