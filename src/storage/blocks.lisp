@@ -682,11 +682,26 @@ from INIT-BLOCK-STORE: Core writes genesis while initialising the CHAIN, not in
 the storage constructor, and a store opened for a migration, a test fixture or
 an offline tool has no business acquiring a block it was not given.
 
+Only into an EMPTY store, which is Core's own condition read through our
+bookkeeping: LoadGenesisBlock returns early when the genesis hash is already
+in m_block_index (validation.cpp:4968-4969), and that index is the block-tree
+database, which is empty on exactly one occasion -- the first start on this
+datadir. Ours asked whether genesis is in the BODY map, which a PRUNED node
+answers no to forever, because the file holding genesis is the first one
+deleted: every restart after the first prune wrote genesis again, into a new
+blk file at the end of the store. feature_remove_pruned_files_on_startup.py:64
+counts the blk/rev files a pruned node keeps across a restart and found five
+where Core keeps four, the fifth holding one 293-byte record -- genesis.
+
+The purpose above is served by the empty-store condition and only by it:
+genesis belongs at offset 0 of blk00000.dat, and once anything else has been
+written there is no longer anywhere to put it.
+
 Best effort by construction: a datadir that cannot be written (read-only, full
 disk) is a problem for whoever actually needs to write, not for start-up."
   (ignore-errors
    (let ((hash (ignore-errors (network-genesis-hash bl.chain:*network*))))
-     (when (and hash (not (gethash hash (block-store-index store))))
+     (when (and hash (zerop (hash-table-count (block-store-index store))))
        (let ((block (%genesis-block-body hash)))
          (when block
            (store-block store block :height 0)))))))
