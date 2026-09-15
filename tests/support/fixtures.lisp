@@ -196,6 +196,18 @@ NewMempoolTransactionInfo keywords."
   "Confirm TXIDS at HEIGHT with the fee estimator (processBlock)."
   (bl.mp::bpe-process-block estimator height txids))
 
+(defun json-number-token (value)
+  "The exact DIGITS a JSON number field carries, as a string -- or VALUE itself
+when the field is a plain Lisp number.
+
+Core chooses the spelling of every number it emits (UniValue holds the digits
+as a string, univalue.cpp:65-82) and its own tests read them back as Decimal,
+so a test that means to pin a spelling compares this text and never a Lisp
+float. BTC-AMOUNT is the amount-shaped reader built on top of it."
+  (if (bl.rpc::json-number-p value)
+      (bl.rpc::json-number-text value)
+      value))
+
 (defun btc-amount (value)
   "The BTC amount an RPC field holds, as an exact rational.
 
@@ -205,14 +217,14 @@ through this instead of comparing against a double whose printed form it does
 not control -- which is what Core's own functional tests do when they read
 these fields as Decimal. A plain number passes through unchanged, so a field
 that is genuinely not an amount still works."
-  (if (not (bl.rpc::json-number-p value))
-      value
-      (let* ((text (bl.rpc::json-number-text value))
-             (negative (char= (char text 0) #\-))
-             (dot (position #\. text))
-             (whole (parse-integer text :start (if negative 1 0) :end dot))
-             (fraction (parse-integer text :start (1+ dot))))
-        (* (if negative -1 1) (+ whole (/ fraction 100000000))))))
+  (let ((text (json-number-token value)))
+    (if (not (stringp text))
+        text
+        (let* ((negative (char= (char text 0) #\-))
+               (dot (position #\. text))
+               (whole (parse-integer text :start (if negative 1 0) :end dot))
+               (fraction (parse-integer text :start (1+ dot))))
+          (* (if negative -1 1) (+ whole (/ fraction 100000000)))))))
 
 (defun rpc-error-of (thunk)
   "(code . message) of the rpc-error THUNK signals, or NIL if it returns.
