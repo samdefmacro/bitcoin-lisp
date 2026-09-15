@@ -547,6 +547,69 @@ unknown output format (Core rest.cpp:919-947)."
         (is (= 404 (status)))
         (is (search "output format not found" resp))))))
 
+(defun %getutxos-post-body (check-mempool &rest outpoints)
+  "BIP64's binary request: the checkmempool flag, a CompactSize count, then
+each 32-byte txid with its u32-LE index. OUTPOINTS are (txid-hex . n)."
+  (let ((bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-u8 bb (if check-mempool 1 0))
+    (bl.ser:bb-write-varint bb (length outpoints))
+    (dolist (op outpoints)
+      (bl.ser:bb-write-bytes bb (bl.rpc:parse-hex-hash (car op)))
+      (bl.ser:bb-write-u32-le bb (cdr op)))
+    (bl.ser:bb-finish bb)))
+
+(test wave10-getutxos-reads-bip64s-posted-request
+  "BIP64 puts the outpoints in a POSTed binary body, and Core's REST serves
+that with the SAME handler: `oss >> fCheckMemPool; oss >> vOutPoints'
+(rest.cpp:967-968), reached over the ONE \"/rest/getutxos\" prefix it
+registers (:1153). Every POST here answered 405 and the bare URI routed
+nowhere, so interface_rest.py:167 -- which POSTs a checkmempool byte, a count
+and two outpoints to /rest/getutxos.bin -- got `Expected: 200, Got: 405
+(Method Not Allowed)'.
+
+.hex carries the same bytes in hex; .json has no body form, so a bodyless
+.json is Core's empty request. Giving both a URI and a body is Core's own
+refusal (:964)."
+  (multiple-value-bind (node txid-hex spk) (wave10-getutxos-node)
+    (let* ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (miss (make-string 64 :initial-element #\e))
+           (body (%getutxos-post-body nil (cons txid-hex 0) (cons miss 1))))
+      (flet ((status () (hunchentoot:return-code*)))
+        ;; The test's own request: two outpoints, one hit, binary out.
+        (let ((bytes (rest-request node "/rest/getutxos.bin" :post-body body)))
+          (is (= 200 (status)))
+          (is (typep bytes '(vector (unsigned-byte 8))))
+          (is (= (+ 4 32 2 1 (+ 4 4 8 1 (length spk))) (length bytes)))
+          ;; bitmap: one byte, the first outpoint hit and the second missed.
+          (is (= 1 (aref bytes 36)))
+          (is (= #x01 (aref bytes 37)))
+          (is (= 1 (aref bytes 38))))
+        ;; The same request in hex, and the same answer.
+        (let ((hex (rest-request node "/rest/getutxos.hex"
+                                 :post-body (map '(vector (unsigned-byte 8))
+                                                 #'char-code
+                                                 (bl.crypto:bytes-to-hex body)))))
+          (is (= 200 (status)))
+          (is (plusp (length hex)) "the hex answer is empty"))
+        ;; A body whose outpoint is cut short is Core's Parse error.
+        (rest-request node "/rest/getutxos.bin" :post-body (subseq body 0 20))
+        (is (= 400 (status)))
+        ;; .json takes no body: Core's JSON arm requires URI input.
+        (rest-request node "/rest/getutxos.json" :post-body body)
+        (is (= 400 (status)))
+        ;; URI outpoints AND a body: Core refuses the combination.
+        (let ((resp (rest-request node (format nil "/rest/getutxos/~A-0.bin" txid-hex)
+                                  :post-body body)))
+          (is (= 400 (status)))
+          (is (search "Combination of URI scheme inputs and raw post data"
+                      resp)))
+        ;; Neither: still the empty request.
+        (rest-request node "/rest/getutxos.bin")
+        (is (= 400 (status)))
+        ;; A GET on the bare URI is the same empty request, not a 404 route.
+        (rest-request node "/rest/getutxos.json")
+        (is (= 400 (status)))))))
+
 ;;; ---------------------------------------------------------------------
 ;;; F. Config wires
 ;;; ---------------------------------------------------------------------

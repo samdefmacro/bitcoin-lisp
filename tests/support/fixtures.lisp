@@ -500,9 +500,12 @@ jammed socket."
 
 ;;;; The REST interface
 
-(defun rest-request (node uri)
+(defun rest-request (node uri &key post-body)
   "Drive one /rest/ URI through the REST router (Core's rest.cpp dispatch) and
 return (values body status content-type).
+
+POST-BODY is the raw request body a POST carries; /rest/getutxos is the one
+endpoint that reads it (BIP64's binary request form).
 
 URI may carry a query string. REST-HANDLE takes the script name, as it does
 under Hunchentoot, while the parameters reach the handlers the way they do in
@@ -525,7 +528,7 @@ reach into the router from each of them."
                           :uri uri
                           :acceptor hunchentoot:*acceptor*
                           :headers-in nil
-                          :method :get
+                          :method (if post-body :post :get)
                           :server-protocol :http/1.1
                           :remote-addr "127.0.0.1"
                           :remote-port 0))
@@ -533,7 +536,7 @@ reach into the router from each of them."
            (if (boundp 'hunchentoot:*reply*)
                hunchentoot:*reply*
                (make-instance 'hunchentoot:reply))))
-    (values (bl.rpc::rest-handle node (hunchentoot:script-name*))
+    (values (bl.rpc::rest-handle node (hunchentoot:script-name*) post-body)
             (hunchentoot:return-code*)
             (hunchentoot:content-type*))))
 

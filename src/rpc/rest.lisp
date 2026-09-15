@@ -1,6 +1,6 @@
 (in-package #:bitcoin-lisp.rpc)
 
-;;; Bitcoin Core REST interface (HTTP GET, read-only) — src/rest.cpp.
+;;; Bitcoin Core REST interface (HTTP GET and POST, read-only) — src/rest.cpp.
 ;;;
 ;;; Mounted on the same Hunchentoot acceptor as JSON-RPC, under /rest/ —
 ;;; and, like Core, ONLY when -rest is given (DEFAULT_REST_ENABLE = false,
@@ -21,13 +21,13 @@
 ;;;   /rest/mempool/info.json
 ;;;   /rest/mempool/contents.json?verbose=<bool>&mempool_sequence=<bool>
 ;;;   /rest/getutxos[/checkmempool]/<txid>-<n>/...  .<json|hex|bin>
-;;;     (BIP64: bitmap + coins; GET-URI input only, no POST body)
+;;;     (BIP64: bitmap + coins; outpoints from the URI, or from a POSTed
+;;;      binary/hex body for .bin and .hex)
 ;;;   /rest/deploymentinfo[/<hash>].json
 ;;;   /rest/blockfilter/<filtertype>/<hash>.<json|hex|bin>
 ;;;   /rest/blockfilterheaders/<filtertype>/<hash>.<json|hex|bin>?count=<n>
 ;;;   /rest/spenttxouts/<hash>.<json|hex|bin>
 ;;;
-;;; NOT supported (out of scope here): POST-body getutxos input.
 
 (defconstant +rest-max-headers+ 2000
   "Cap on headers returned by /rest/headers, matching Core's MAX_REST_HEADERS.")
@@ -297,27 +297,84 @@ CompactSize+scriptPubKey."
         (bl.ser:bb-write-bytes bb spk)))
     (bl.ser:bb-finish bb)))
 
-(defun %rest-getutxos (node body ext)
+(defun %parse-getutxos-post-body (bytes)
+  "The BIP64 request body: a one-byte checkmempool flag, then a CompactSize
+count and that many 32-byte txid + u32-LE index outpoints (Core reads
+`oss >> fCheckMemPool; oss >> vOutPoints', rest.cpp:967-968). Returns
+(values T check-mempool outpoints), or NIL as the first value when the bytes
+do not read -- Core's own ios_base::failure, which it answers as \"Parse
+error\". A well-formed body asking for NOTHING is a success with no outpoints,
+which is why the flag is a separate value.
+
+The count is not capped here: Core deserializes the whole vector and applies
+MAX_GETUTXOS_OUTPOINTS afterwards, and a count the body cannot hold fails on
+the first read past its end."
+  (handler-case
+      (let* ((br (bl.ser:make-byte-reader-from bytes))
+             (check-mempool (bl.ser:br-read-bool br))
+             (outpoints '()))
+        (dotimes (i (bl.ser:br-read-compact-size br))
+          (declare (ignore i))
+          (let ((txid (bl.ser:br-read-bytes br 32)))
+            (push (cons txid (bl.ser:br-read-u32-le br)) outpoints)))
+        (values t check-mempool (nreverse outpoints)))
+    (error () nil)))
+
+(defun %rest-getutxos (node body ext &optional post-body)
   "BIP64 /rest/getutxos[/checkmempool]/<txid>-<n>/... (Core rest.cpp:
 896-1088): query up to 15 outpoints against the UTXO set, optionally
 overlaid with the mempool. .json emits {chainHeight, chaintipHash, bitmap
 (a string of 0/1 per outpoint), utxos:[{height, value, scriptPubKey}]};
-.bin/.hex emit the BIP64 binary form. POST-body input is not supported —
-outpoints come from the URI."
+.bin/.hex emit the BIP64 binary form.
+
+The outpoints come from the URI or, for .bin and .hex, from POST-BODY -- the
+binary request form BIP64 specifies, which Core reads with the SAME handler
+(:967-968) and which interface_rest.py:167 sends. Giving both is Core's
+\"Combination of URI scheme inputs and raw post data is not allowed\"; .json
+has no body form at all, so a bodyless .json is Core's empty request."
   (unless (member ext '("json" "bin" "hex") :test #'string=)
     (return-from %rest-getutxos (%rest-format-not-found)))
   (let* ((segments (remove "" (uiop:split-string body :separator "/") :test #'string=))
          (check-mempool (and segments (string= (first segments) "checkmempool")))
          (outpoint-strs (if check-mempool (rest segments) segments))
+         ;; Core's `fInputParsed': outpoints came from the URI. A bare
+         ;; /checkmempool with no outpoint is an empty request, below.
+         (uri-input nil)
          (outpoints '()))
-    (when (null outpoint-strs)
+    (when (and (null segments) (null post-body))
+      ;; Core rest.cpp:913-914: no body AND no URI parts at all.
       (return-from %rest-getutxos (%rest-error 400 "Error: empty request")))
-    (dolist (op outpoint-strs)
-      (multiple-value-bind (txid vout) (%parse-getutxos-outpoint op)
-        (unless txid
-          (return-from %rest-getutxos (%rest-error 400 "Parse error")))
-        (push (cons txid vout) outpoints)))
-    (setf outpoints (nreverse outpoints))
+    (when segments
+      (when (null outpoint-strs)
+        (return-from %rest-getutxos (%rest-error 400 "Error: empty request")))
+      (dolist (op outpoint-strs)
+        (multiple-value-bind (txid vout) (%parse-getutxos-outpoint op)
+          (unless txid
+            (return-from %rest-getutxos (%rest-error 400 "Parse error")))
+          (push (cons txid vout) outpoints)))
+      (setf outpoints (nreverse outpoints)
+            uri-input t))
+    (if (string= ext "json")
+        ;; Core's JSON arm accepts URI input only (:978-981).
+        (unless uri-input
+          (return-from %rest-getutxos (%rest-error 400 "Error: empty request")))
+        ;; .hex delivers the same bytes in hex; an unreadable hex body becomes
+        ;; the empty body, as Core's ParseHex does (:949-953).
+        (let ((bytes (if (string= ext "hex")
+                         (ignore-errors (bl.crypto:hex-to-bytes
+                                         (string-trim '(#\Space #\Newline #\Return #\Tab)
+                                                      (map 'string #'code-char post-body))))
+                         post-body)))
+          (when (plusp (length bytes))
+            (when uri-input
+              (return-from %rest-getutxos
+                (%rest-error 400 "Combination of URI scheme inputs and raw post data is not allowed")))
+            (multiple-value-bind (ok body-check-mempool body-outpoints)
+                (%parse-getutxos-post-body bytes)
+              (unless ok
+                (return-from %rest-getutxos (%rest-error 400 "Parse error")))
+              (setf check-mempool body-check-mempool
+                    outpoints body-outpoints)))))
     (when (> (length outpoints) +max-getutxos-outpoints+)
       (return-from %rest-getutxos
         (%rest-error 400 (format nil "Error: max outpoints exceeded (max: ~D, tried: ~D)"
@@ -613,9 +670,11 @@ before it."
           tx-undo)))
       tx-undos))))
 
-(defun rest-handle (node uri)
+(defun rest-handle (node uri &optional post-body)
   "Route a /rest/... URI (script-name, query already stripped by Hunchentoot)
-to its handler. Returns the response body; sets status/content-type.
+to its handler. Returns the response body; sets status/content-type. POST-BODY
+is the raw request body, which only /rest/getutxos reads (BIP64's binary
+request form).
 
 Warmup is checked FIRST, for every endpoint, and answers Core's HTTP 503
 \"Service temporarily unavailable: <status>\" (CheckWarmup, rest.cpp:170-176).
@@ -664,7 +723,15 @@ against a chainstate that was not consistent yet."
            (%rest-mempool node b e)))
         ((alexandria:starts-with-subseq "getutxos/" rest)
          (multiple-value-bind (b e) (%rest-split-ext (after "getutxos/"))
-           (%rest-getutxos node b e)))
+           (%rest-getutxos node b e post-body)))
+        ;; The bare form, whose outpoints are in the POST body: Core registers
+        ;; ONE "/rest/getutxos" prefix and ParseDataFormat splits the extension
+        ;; off whatever follows (rest.cpp:1153, :899). We routed only the
+        ;; slashed spelling, so interface_rest.py:167's POST /rest/getutxos.bin
+        ;; reached no handler at all.
+        ((alexandria:starts-with-subseq "getutxos" rest)
+         (multiple-value-bind (b e) (%rest-split-ext (after "getutxos"))
+           (%rest-getutxos node b e post-body)))
         ;; deploymentinfo takes an OPTIONAL hash, so both the bare and the
         ;; slashed forms route here (Core registers both, rest.cpp:1154-1155).
         ((alexandria:starts-with-subseq "deploymentinfo/" rest)
@@ -691,9 +758,17 @@ against a chainstate that was not consistent yet."
         (t (%rest-error 404 "Unknown REST endpoint"))))))
 
 (defun rest-dispatch-handler ()
-  "Hunchentoot handler for /rest/* — GET only."
-  (if (eq (hunchentoot:request-method*) :get)
-      (handler-case (rest-handle *rpc-node* (hunchentoot:script-name*))
+  "Hunchentoot handler for /rest/* — GET and POST.
+
+Core's REST endpoints are reached by whatever method libevent hands them; its
+HTTP server rejects only an UNKNOWN method (httpserver.cpp http_request_cb),
+and /rest/getutxos exists to be POSTed to -- BIP64 puts the outpoints in the
+request body. We answered 405 to every POST, so interface_rest.py:167 never
+reached the handler."
+  (if (member (hunchentoot:request-method*) '(:get :post))
+      (handler-case (rest-handle *rpc-node* (hunchentoot:script-name*)
+                                 (and (eq (hunchentoot:request-method*) :post)
+                                      (hunchentoot:raw-post-data :force-binary t)))
         (error (e)
           (bl.log:node-log :error "REST handler error: ~A" e)
           (%rest-error 500 "Internal error")))
