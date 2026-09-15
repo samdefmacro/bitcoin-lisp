@@ -11313,3 +11313,103 @@ everything wsh()."
                      (wire-params
                       (list "82012088a914ffffffffffffffffffffffffffffffffffffffff88210250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0ad51b2")))))
         (is (eql 0 (search "raw(" (cdr (assoc "desc" result :test #'string=)))))))))
+
+(test signing-in-place-drops-every-cache-measured-before-the-signature
+  "A transaction memoizes its txid, its wtxid and its weight, and the in-place
+signer (SIGN-TX-INPUTS, shared by signrawtransactionwithkey and the wallet)
+writes scriptSigs and witnesses into the very object that carries those memos.
+Bitcoin Core cannot reach this: CTransaction is immutable and caches at
+construction, and everything that CHANGES a transaction works on a
+CMutableTransaction, which caches nothing (primitives/transaction.h:395-420 vs
+:329-341). So every value measured before signing has to be dropped at the
+mutation.
+
+Two shapes, because they go stale differently: a LEGACY input's scriptSig is
+part of the txid, and a segwit input's witness is part of the weight and the
+wtxid alone. wallet_spend_unconfirmed.py:333 is what this cost -- a fee-bump
+priced at its target reported 66.6 sat/vB against 60, because the floor check
+had asked the unsigned replacement its vsize."
+  (let* ((k (let ((b (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 0)))
+              (setf (aref b 31) 7) b))
+         (pub (bl.crypto:derive-public-key k))
+         (pkh (bl.crypto:hash160 pub))
+         (p2pkh (concatenate '(vector (unsigned-byte 8))
+                             (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+         (p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) pkh)))
+    (flet ((unsigned-tx (prev-byte)
+             (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output
+                               (bl.ser:make-outpoint
+                                :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element prev-byte)
+                                :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 90000 :script-pubkey p2pkh))
+              :lock-time 0))
+           (sign (tx spk)
+             (let ((prevmap (make-hash-table :test (quote equalp)))
+                   (keymap (make-hash-table :test (quote equalp)))
+                   (pubmap (make-hash-table :test (quote equalp)))
+                   (tr-keymap (make-hash-table :test (quote equalp)))
+                   (op (bl.ser:tx-in-previous-output
+                        (aref (bl.ser:transaction-inputs tx) 0))))
+               (setf (gethash (cons (bl.ser:outpoint-hash op) 0) prevmap)
+                     (list spk 100000 nil nil)
+                     (gethash (bl.crypto:hash160 pub) keymap) (cons k pub)
+                     (gethash pub pubmap) k)
+               (bl.rpc:sign-tx-inputs tx prevmap keymap pubmap tr-keymap 1))))
+      ;; --- legacy P2PKH: the scriptSig is part of the txid ---
+      (let* ((tx (unsigned-tx 21))
+             (weight-before (bl.ser:transaction-weight tx))
+             (txid-before (bl.ser:transaction-hash tx))
+             (wtxid-before (bl.ser:transaction-wtxid tx)))
+        (is (null (sign tx p2pkh)))
+        (is (plusp (length (bl.ser:tx-in-script-sig
+                            (aref (bl.ser:transaction-inputs tx) 0))))
+            "control: the signer wrote a scriptSig")
+        ;; The memos must agree with the bytes the object now holds.
+        (is (= (* 4 (length (bl.ser:serialize-transaction tx)))
+               (bl.ser:transaction-weight tx)))
+        (is (equalp (bl.crypto:hash256 (bl.ser:serialize-transaction tx))
+                    (bl.ser:transaction-hash tx)))
+        (is (equalp (bl.ser:transaction-hash tx) (bl.ser:transaction-wtxid tx)))
+        (is (/= weight-before (bl.ser:transaction-weight tx)))
+        (is (not (equalp txid-before (bl.ser:transaction-hash tx))))
+        (is (not (equalp wtxid-before (bl.ser:transaction-wtxid tx)))))
+      ;; --- P2WPKH: the witness is part of the weight and the wtxid ---
+      (let* ((tx (unsigned-tx 22))
+             (weight-before (bl.ser:transaction-weight tx))
+             (txid-before (bl.ser:transaction-hash tx))
+             (wtxid-before (bl.ser:transaction-wtxid tx)))
+        (is (null (sign tx p2wpkh)))
+        (is-true (bl.ser:transaction-has-witness-p tx)
+                 "control: the signer installed a witness")
+        (is (= (+ (* 3 (length (bl.ser:serialize-transaction tx)))
+                  (length (bl.ser:serialize-witness-transaction tx)))
+               (bl.ser:transaction-weight tx)))
+        (is (equalp (bl.crypto:hash256 (bl.ser:serialize-witness-transaction tx))
+                    (bl.ser:transaction-wtxid tx)))
+        (is (/= weight-before (bl.ser:transaction-weight tx)))
+        ;; A segwit spend's TXID does not move -- its scriptSig stayed empty.
+        (is (equalp txid-before (bl.ser:transaction-hash tx)))
+        (is (not (equalp wtxid-before (bl.ser:transaction-wtxid tx)))))
+      ;; The helper every mutation site calls, asserted LAST so a pre-fix
+      ;; control reports the behavioural failures above and not this.
+      (let ((tx (unsigned-tx 23)))
+        (bl.ser:transaction-weight tx)
+        (bl.ser:transaction-hash tx)
+        (bl.ser:transaction-wtxid tx)
+        (setf (bl.ser:tx-in-script-sig (aref (bl.ser:transaction-inputs tx) 0))
+              (make-array 5 :element-type '(unsigned-byte 8) :initial-element 1))
+        (bl.ser:invalidate-transaction-caches tx)
+        (is (= (* 4 (length (bl.ser:serialize-transaction tx)))
+               (bl.ser:transaction-weight tx)))
+        (is (equalp (bl.crypto:hash256 (bl.ser:serialize-transaction tx))
+                    (bl.ser:transaction-hash tx)))
+        (is (equalp (bl.ser:transaction-hash tx)
+                    (bl.ser:transaction-wtxid tx)))))))
+

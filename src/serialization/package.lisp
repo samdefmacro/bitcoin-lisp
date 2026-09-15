@@ -121,6 +121,7 @@ src/serialization/.")
    #:transaction-has-witness-p
    #:transaction-vsize
    #:transaction-weight
+   #:invalidate-transaction-caches
    #:transaction-wire-bytes
    #:serialize-witness-transaction
    #:block-header

@@ -1363,8 +1363,9 @@ but no witness, install the reserved value as its witness — provided the paren
 is in CHAIN-STATE's index and segwit is active at BLOCK's height, the two gates
 Core applies. submitblock runs this before validation (rpc/mining.cpp:1076-1080)
 so a miner that serializes the template's coinbase without its witness is not
-refused with bad-witness-nonce-size. Mutates the coinbase in place and drops its
-cached weight, which the witness changes (mine-block does the same for the
+refused with bad-witness-nonce-size. Mutates the coinbase in place, so it drops
+every value memoized on it -- the witness changes its weight AND its wtxid, and
+only the weight was dropped here before (mine-block does the same for the
 header's cached hash)."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (prev (bl.store:get-block-index-entry
@@ -1376,8 +1377,8 @@ header's cached hash)."
                (find-witness-commitment coinbase)
                (not (bl.ser:transaction-has-witness-p coinbase)))
       (setf (bl.ser:transaction-witness coinbase)
-            (vector (list (witness-reserved-value)))
-            (bl.ser:transaction-cached-weight coinbase) nil))))
+            (vector (list (witness-reserved-value))))
+      (bl.ser:invalidate-transaction-caches coinbase))))
 
 (defun block-witness-stripped-p (block &optional height)
   "T if BLOCK carries a witness commitment in its coinbase outputs but its coinbase

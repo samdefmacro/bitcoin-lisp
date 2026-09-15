@@ -457,6 +457,28 @@ For legacy transactions: weight = total_size * 4. Cached on the tx struct."
                   (+ (* 3 base-size) total-size))
                 (* 4 (length (serialize-transaction tx)))))))
 
+(defun invalidate-transaction-caches (tx)
+  "Drop every value memoized on TX -- its txid, its wtxid and its weight -- and
+return TX. Call this at EVERY site that mutates a transaction in place.
+
+Bitcoin Core has no counterpart because it has no such mutation: CTransaction
+is immutable and caches its hashes at construction, and code that changes a
+transaction works on a CMutableTransaction, which caches nothing and is copied
+into a fresh CTransaction afterwards (primitives/transaction.h:395-420,
+:329-341). Our transaction struct is BOTH, so a signer that writes a scriptSig
+or a witness into an object someone has already measured leaves the memo behind
+-- and all three memos are wrong at once: a legacy input's TXID changes with
+its scriptSig, the wtxid and the weight change with either.
+
+⚠️ 2026-09-15: a fee-bump priced at exactly its target came back at 66.6 sat/vB
+against a 60 target, because a BIP125 floor check had asked the not-yet-signed
+replacement its vsize; the wallet then signed that same object and the
+witnessless weight stayed on it for the life of the transaction."
+  (setf (transaction-cached-hash tx) nil
+        (transaction-cached-wtxid tx) nil
+        (transaction-cached-weight tx) nil)
+  tx)
+
 (defun transaction-vsize (tx)
   "Calculate the virtual size (vsize) of a transaction in vbytes.
 vsize = ceiling(weight / 4). This is the metric used for fee rate calculation."

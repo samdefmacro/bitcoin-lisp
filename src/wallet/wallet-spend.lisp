@@ -1688,6 +1688,8 @@ as hard internal-bug errors (funds-critical invariants)."
           (setf (bl.ser:transaction-lock-time tx)
                 (max 0 (- block-height (wrng-randrange rng 100))))))
       (setf (bl.ser:transaction-lock-time tx) 0))
+  ;; nLockTime is part of the txid, so anything measured before this is stale.
+  (bl.ser:invalidate-transaction-caches tx)
   (let ((locktime (bl.ser:transaction-lock-time tx)))
     (unless (and (< locktime +locktime-threshold+) (<= locktime block-height))
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
@@ -2304,13 +2306,13 @@ Caller holds node + wallet locks."
                                                      (wcc-preset-script-witness preset)
                                                      any t)))
                                     (when any
-                                      (setf (bl.ser:transaction-witness tx)
-                                            witnesses)))
+                                      (setf (bl.ser:transaction-witness tx) witnesses)
+                                      (bl.ser:invalidate-transaction-caches tx)))
                                   (cond
                                     ((wcc-locktime cc)
-                                     (setf (bl.ser:transaction-lock-time tx)
-                                           (wcc-locktime cc))
-                                     (setf use-anti-fee-sniping nil)))
+                                     (setf (bl.ser:transaction-lock-time tx) (wcc-locktime cc)
+                                           use-anti-fee-sniping nil)
+                                     (bl.ser:invalidate-transaction-caches tx)))
                                   (when use-anti-fee-sniping
                                     (discourage-fee-sniping
                                      tx rng node
@@ -3490,7 +3492,9 @@ sized."
                                   (bl.ser:tx-out-script-pubkey output))
                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message (format nil "Specified output amount to ~A is below dust threshold."
-                                                     address))))))))
+                                                     address))))))
+    ;; An output value is part of the txid and of the weight.
+    (bl.ser:invalidate-transaction-caches tx)))
 
 (defun %sendall-bump-fee (node outpoints fee-rate)
   "sendall's budget for the unconfirmed ancestors of everything it sweeps

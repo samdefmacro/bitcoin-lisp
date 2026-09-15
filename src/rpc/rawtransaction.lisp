@@ -990,13 +990,18 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                           (push (cons i ferr) errors)
                           (setf (aref signed i) t))
                       (when ss
-                        (setf (bl.ser:tx-in-script-sig in) ss))
+                        (setf (bl.ser:tx-in-script-sig in) ss)
+                        ;; The scriptSig is part of a legacy input's TXID, and
+                        ;; of the wtxid and the weight of any input -- so the
+                        ;; memos measured before signing are all stale now.
+                        (bl.ser:invalidate-transaction-caches tx))
                       (when wit
                         (setf (aref witness i) wit)
                         (setf any-witness t)))))
               (push (cons i "no prevtx scriptPubKey provided") errors))))
       (when (or any-witness (bl.ser:transaction-witness tx))
-        (setf (bl.ser:transaction-witness tx) witness))
+        (setf (bl.ser:transaction-witness tx) witness)
+        (bl.ser:invalidate-transaction-caches tx))
       ;; Core's ProduceSignature does not take "no error" for complete: it ENDS
       ;; by running VerifyScript over the scriptSig/witness it just built, with
       ;; a real signature checker, and reports complete only if that passes
