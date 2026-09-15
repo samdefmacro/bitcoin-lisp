@@ -7530,14 +7530,23 @@ is why the type error is the one reported. We accepted both silently
 ;;; --- Chain control RPCs (error paths; full reorg behavior in reorg-tests) ---
 
 (test rpc-chain-control-errors
-  (let ((node (make-test-node)))
-    ;; a well-formed but unknown block hash -> error
-    (signals error
-      (bl.rpc::rpc-invalidateblock
-       node (list "00000000000000000000000000000000000000000000000000000000deadbeef")))
-    ;; a malformed hash -> error
-    (signals error
-      (bl.rpc::rpc-reconsiderblock node (list "not-a-hash")))))
+  "invalidateblock / reconsiderblock / preciousblock all look the hash up in
+the block index first and answer RPC_INVALID_ADDRESS_OR_KEY `Block not found'
+when it is not there (rpc/blockchain.cpp:1679, :1702, :1746); every other
+failure is RPC_DATABASE_ERROR carrying the validation state's string (:1687,
+:1713, :1758). Ours answered -1 with the reason keyword downcased, so an
+unknown block came back as -1 `block-not-found' where
+rpc_invalidateblock.py:140 asks for -5 `Block not found'. A malformed hash is
+ParseHashV's -8, before the lookup."
+  (let ((node (make-test-node))
+        (unknown "00000000000000000000000000000000000000000000000000000000deadbeef"))
+    (dolist (method '("invalidateblock" "reconsiderblock" "preciousblock"))
+      (is (equal (cons -5 "Block not found")
+                 (%rpc-wire-error node method (list unknown)))
+          "~A on an unknown hash is Core's -5 Block not found" method)
+      ;; Control: a malformed hash never reaches the index lookup.
+      (is (equal -8 (car (%rpc-wire-error node method (list "not-a-hash"))))
+          "~A on a malformed hash is still ParseHashV's -8" method))))
 
 ;;; --- setban / listbanned / clearbanned / getnettotals / verifychain ---
 

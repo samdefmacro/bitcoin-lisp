@@ -22,6 +22,7 @@
 (defconstant +rpc-invalid-parameter+ -8)
 (defconstant +rpc-client-not-connected+ -9)
 (defconstant +rpc-client-in-initial-download+ -10)
+(defconstant +rpc-database-error+ -20)
 (defconstant +rpc-deserialization-error+ -22)
 (defconstant +rpc-client-node-already-added+ -23)
 (defconstant +rpc-client-node-not-added+ -24)
