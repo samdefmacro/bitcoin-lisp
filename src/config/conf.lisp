@@ -14,6 +14,25 @@ GetConfigOptions with an `error` string and the node does not start; a config
 this malformed silently half-applying is how an operator ends up running
 settings they did not write."))
 
+(defun config-file-read-error (format-string &rest args)
+  "Signal one of the failures Core's ArgsManager::ReadConfigFiles returns
+ (common/config.cpp:130-215), carrying the prefix its only caller puts on it.
+
+Core keeps the sentence and the prefix apart -- ReadConfigFiles returns the
+sentence in `error', and common/init.cpp:39 reports it as `Error reading
+configuration file: %s' -- but the two never travel apart, so the prefix belongs
+to every one of these messages. It is the half that says the node could not get
+past its CONFIG FILE rather than past something else, and Core's framework
+compares the whole of stderr against it: feature_includeconf.py:70 and
+feature_config_args.py:52,62,80,555,559 all name the prefix.
+
+The steps AROUND the config read keep their own wording: the chain selectors'
+`Invalid combination ...' (SelectParams) and the ignored-conf refusal
+(common/init.cpp:65-95) are reported without it."
+  (error 'config-parse-error
+         :message (format nil "Error reading configuration file: ~?"
+                          format-string args)))
+
 (defun %conf-strip-comment (line)
   "Cut LINE at its first #, as Core does (config.cpp:41-44). Returns
  (values text used-hash-p).
@@ -71,21 +90,18 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                                                        (subseq line 1 (1- (length line)))))
                                          ".")))
                      ((char= (char line 0) #\-)
-                      (error 'config-parse-error
-                             :message (format nil "parse error on line ~D: ~A, options in ~
-                                                   configuration file must be specified ~
-                                                   without leading -" linenr line)))
+                      (config-file-read-error
+                       "parse error on line ~D: ~A, options in configuration file ~
+must be specified without leading -" linenr line))
                      (t
                       (let ((eq-pos (position #\= line)))
                         (unless eq-pos
-                          (error 'config-parse-error
-                                 :message
-                                 (format nil "parse error on line ~D: ~A~@[~A~]" linenr line
-                                         (when (and (>= (length line) 2)
-                                                    (string= "no" (subseq line 0 2)))
-                                           (format nil ", if you intended to specify a ~
-                                                        negated option, use ~A=1 instead"
-                                                   line)))))
+                          (config-file-read-error
+                           "parse error on line ~D: ~A~@[~A~]" linenr line
+                           (when (and (>= (length line) 2)
+                                      (string= "no" (subseq line 0 2)))
+                             (format nil ", if you intended to specify a negated ~
+option, use ~A=1 instead" line))))
                         ;; Core runs InterpretKey/InterpretValue over
                         ;; config-file keys exactly as over command-line ones
                         ;; (common/config.cpp:99 calls InterpretKey), so this is
@@ -101,11 +117,9 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                                                         (subseq line 0 eq-pos))))
                              (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos))))
                           (when (and used-hash (search "rpcpassword" key))
-                            (error 'config-parse-error
-                                   :message
-                                   (format nil "parse error on line ~D, using # in ~
-                                                rpcpassword can be ambiguous and should ~
-                                                be avoided" linenr)))
+                            (config-file-read-error
+                             "parse error on line ~D, using # in rpcpassword can be ~
+ambiguous and should be avoided" linenr))
                           (push (list section key value json) rows)))))))))
     (nreverse rows)))
 

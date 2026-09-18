@@ -73,6 +73,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:cli-parse-error-detail
    #:check-cli-args
    #:cli-arg-log-cells
+   #:config-file-read-error
    #:config-parse-error
    #:config-parse-error-message
    #:conf-settings-rows

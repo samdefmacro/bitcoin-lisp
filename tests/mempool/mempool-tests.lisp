@@ -2060,7 +2060,8 @@ different remedy."
     ;; The package form is its own reason (validation.cpp:1097-1098).
     (is (string= "package RBF failed: insufficient anti-DoS fees"
                  (bl.val:tx-reject-reason-string :package-rbf-insufficient-fee)))
-    ;; Controls: the two fee FLOORS keep their own words.
+    ;; Controls: the two fee FLOORS keep their own words, and neither gains a
+    ;; debug half -- a blanket "append a sentence to everything" would fail here.
     (is (string= "min relay fee not met"
                  (bl.val:tx-reject-reason-string :insufficient-fee)))
     (is (string= "mempool min fee not met"
@@ -2141,7 +2142,17 @@ failure, rbf.cpp:136-138)."
     (multiple-value-bind (ok reason)
         (bl.mp:check-rbf-rules mempool repl 1100 1000 4000 (list orig-txid))
       (is-false ok)
-      (is (eq reason :replacement-failed)))))
+      ;; The whole sentence Core throws, not just the class: the reason says a
+      ;; rule failed, and only ImprovesFeerateDiagram's debug half
+      ;; (rbf.cpp:137, passed to state.Invalid at validation.cpp:1028) says
+      ;; that this replacement pays MORE than what it replaces and was still
+      ;; refused because the diagram does not improve. feature_rbf.py:261
+      ;; matches on that half.
+      (is (string= "replacement-failed, insufficient feerate: does not improve feerate diagram"
+                   (bl.val:tx-reject-reason-string reason)))
+      ;; and the CLASS is unchanged, so the TX_RECONSIDERABLE membership tests
+      ;; that read the keyword out of a (KEYWORD DETAIL) verdict still see it.
+      (is (string= "replacement-failed" (bl.val:tx-reject-reason-only reason))))))
 
 (test rbf-rule3-and-rule4-survive
   "Rule 3 (pay >= replaced fees) and rule 4 (pay own bandwidth at the
@@ -3055,7 +3066,12 @@ diagram does NOT strictly improve — rejected :replacement-failed."
         (bl.mp:check-package-rbf-rules
          mempool 500 100 400 700 100 400 (list orig-txid))
       (is-false ok)
-      (is (eq reason :replacement-failed)))))
+      ;; Same verdict as the single-transaction diagram failure, carrying
+      ;; ImprovesFeerateDiagram's sentence (rbf.cpp:137): the package path
+      ;; reaches the same check (validation.cpp:1122).
+      (is (string= "replacement-failed" (bl.val:tx-reject-reason-only reason)))
+      (is (string= "replacement-failed, insufficient feerate: does not improve feerate diagram"
+                   (bl.val:tx-reject-reason-string reason))))))
 
 (test package-rbf-rules-cluster-caps
   "Rule 5's caps apply unchanged to the aggregate package conflicts."

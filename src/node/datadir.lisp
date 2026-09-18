@@ -125,9 +125,10 @@ fine; that is the default path, and creating THAT is the intended behaviour."
                                 datadir
                                 (concatenate 'string datadir "/")))))
         (unless (probe-file path)
-          (error 'bl.cfg:config-parse-error
-                 :message (format nil "specified data directory \"~A\" does not exist"
-                                  datadir)))))))
+          ;; ReadConfigFiles' last step (common/config.cpp:218-221), so it
+          ;; carries the config-read prefix and Core's closing period.
+          (bl.cfg:config-file-read-error
+           "specified data directory \"~A\" does not exist." datadir))))))
 
 (defun blocks-dir-path (blocks-directory data-directory network)
   "Where the blk/rev/xor files go -- Core ArgsManager::GetBlocksDirPath
@@ -192,13 +193,11 @@ same case seen from a later step: bitcoind never gets there, because
 ReadConfigFiles has already refused."
   (when conf-path
     (when (uiop:directory-exists-p conf-path)
-      (error 'bl.cfg:config-parse-error
-             :message (format nil "Config file \"~A\" is a directory."
-                              (namestring conf-path))))
+      (bl.cfg:config-file-read-error
+       "Config file \"~A\" is a directory." (namestring conf-path)))
     (when (and explicit-p (not (probe-file conf-path)))
-      (error 'bl.cfg:config-parse-error
-             :message (format nil "specified config file \"~A\" could not be opened."
-                              (namestring conf-path)))))
+      (bl.cfg:config-file-read-error
+       "specified config file \"~A\" could not be opened." (namestring conf-path))))
   conf-path)
 
 (defun %same-file-p (a b)
@@ -299,9 +298,15 @@ Core's rules, all of which apply here:
          (texts (list conf-text)))
     (dolist (name names)
       (let ((path (merge-pathnames name base)))
+        (when (uiop:directory-exists-p path)
+          ;; Core tests the include for a DIRECTORY first, and says so
+          ;; (common/config.cpp:185-188); ours fell through to the
+          ;; could-not-open sentence, which names the wrong problem.
+          (bl.cfg:config-file-read-error
+           "Included config file \"~A\" is a directory." (namestring path)))
         (unless (probe-file path)
-          (error 'bl.cfg:config-parse-error
-                 :message (format nil "Failed to include configuration file ~A" name)))
+          (bl.cfg:config-file-read-error
+           "Failed to include configuration file ~A" name))
         (let ((text (alexandria:read-file-into-string path)))
           ;; A recursive include is dropped with a warning, exactly as Core
           ;; does (it re-scans for includeconf after reading,

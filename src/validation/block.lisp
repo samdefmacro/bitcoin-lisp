@@ -2234,8 +2234,22 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
   (when context-free-only
     (return-from validate-block (values t nil nil)))
 
-  (%contextual-check-block block chain-state utxo-set current-height
-                           :skip-scripts skip-scripts))
+  (multiple-value-bind (ok error fees)
+      (%contextual-check-block block chain-state utxo-set current-height
+                               :skip-scripts skip-scripts)
+    (unless ok
+      ;; Core's one line for a block that failed ConnectBlock:
+      ;; `Block validation error: <state.ToString()>' (validation.cpp:2619).
+      ;; It is written for the UTXO-dependent verdicts only -- a CheckBlock
+      ;; failure returns from ConnectBlock before it (:2536) -- which is the
+      ;; split this function already has, CONTEXT-FREE-ONLY above.
+      ;;
+      ;; It is the only record of WHY a block the node had already accepted
+      ;; the header of was refused. feature_assumevalid.py:155 waits for
+      ;; `block-script-verify-flag-failed' in it to prove that a node WITHOUT
+      ;; -assumevalid really checked the signatures it was told to skip.
+      (bl:log-info "Block validation error: ~A" (block-reject-reason-string error)))
+    (values ok error fees)))
 
 (defun test-block-validity (block chain-state utxo-set
                             &key (current-time

@@ -3054,7 +3054,13 @@ bitcoin.conf, and only then is an explicitly named file that cannot be opened
 `specified config file \"<path>\" could not be opened.'. A directory used to
 pass the check (PROBE-FILE answers a truename for one) and the read that
 followed died with a stream error naming no option. Positive controls: a
-readable file is handed back untouched, and the DEFAULT path may be absent."
+readable file is handed back untouched, and the DEFAULT path may be absent.
+
+Both sentences carry `Error reading configuration file: ', the prefix
+ReadConfigFiles' only caller puts on everything it returns
+(common/init.cpp:39). Core keeps the two halves apart internally; they never
+reach an operator apart, and feature_config_args.py:52,559 compare the whole
+of stderr against the joined text."
   (with-temp-directory (dir)
     (flet ((check (path explicit-p)
              (bl::check-config-file-readable path explicit-p)))
@@ -3066,14 +3072,46 @@ readable file is handed back untouched, and the DEFAULT path may be absent."
         (is (eq conf (check conf t)))
         (is (eq conf (check conf nil)))
         (dolist (explicit-p '(t nil))
-          (is (equal (format nil "Config file \"~A\" is a directory."
+          (is (equal (format nil "Error reading configuration file: Config file ~
+\"~A\" is a directory."
                              (namestring subdir))
                      (%config-refusal (check subdir explicit-p)))
               "a directory at the config path, explicit-p ~A" explicit-p))
-        (is (equal (format nil "specified config file \"~A\" could not be opened."
+        (is (equal (format nil "Error reading configuration file: specified config ~
+file \"~A\" could not be opened."
                            (namestring missing))
                    (%config-refusal (check missing t))))
         (is (null (%config-refusal (check missing nil))))))))
+
+(test a-config-file-parse-error-names-the-config-file
+  "Core's three ReadConfigStream refusals (common/config.cpp:87-108) reach an
+operator through ReadConfigFiles' only caller, which reports them as `Error
+reading configuration file: <sentence>' (common/init.cpp:39). Ours reported the
+sentence alone, so a node that died on `parse error on line 1: garbage' never
+said WHICH file line 1 was in -- and feature_config_args.py:80,138,153,157
+compares the whole of stderr against the joined text.
+
+The prefix is the assertion; the sentences themselves were already Core's."
+  (flet ((refusal (text)
+           (handler-case (progn (bl.cfg:parse-bitcoin-conf text) nil)
+             (bl.cfg:config-parse-error (c)
+               (bl.cfg:config-parse-error-message c)))))
+    (let ((leading-dash (refusal (format nil "-dash=1~%")))
+          (no-equals (refusal (format nil "nono~%")))
+          (hash-in-password (refusal (format nil "rpcpassword=foo#bar~%"))))
+      (is (equal (format nil "Error reading configuration file: parse error on ~
+line 1: -dash=1, options in configuration file must be specified without ~
+leading -")
+                 leading-dash))
+      (is (equal (format nil "Error reading configuration file: parse error on ~
+line 1: nono, if you intended to specify a negated option, use nono=1 instead")
+                 no-equals))
+      (is (equal (format nil "Error reading configuration file: parse error on ~
+line 1, using # in rpcpassword can be ambiguous and should be avoided")
+                 hash-in-password))
+      ;; Positive control: a file Core accepts raises nothing at all, so the
+      ;; three above cannot be passing because everything signals.
+      (is (null (refusal (format nil "prune=550~%[regtest]~%rpcport=1~%")))))))
 
 (test a-datadir-bitcoin-conf-that-is-not-the-file-we-read-is-fatal
   "Both of Core's shadowing shapes. The assertions are on the SETTING that

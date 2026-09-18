@@ -1550,10 +1550,19 @@ has nothing to name."
 NIL when NEW strictly improves OLD, :too-large-cluster when the staging was
 uncalculable (an over-limit cluster, Core CheckMemPoolPolicyLimits failing
 before the diagram, validation.cpp:1020-1022), else :replacement-failed
-(Core ImprovesFeerateDiagram failure, rbf.cpp:136-138)."
+(Core ImprovesFeerateDiagram failure, rbf.cpp:136-138).
+
+The failure carries ImprovesFeerateDiagram's own sentence as Core's debug
+message, which ReplacementChecks passes to state.Invalid beside the reason
+(validation.cpp:1028). Without it a replacement paying MORE than everything it
+replaces was refused with the bare word `replacement-failed\', which says that
+a rule failed but not which one -- the sentence is what distinguishes "pays too
+little" from "would not improve the diagram", and feature_rbf.py:261 asserts
+on exactly that half of the -26 message."
   (cond ((eq old-diagram :uncalculable) :too-large-cluster)
         ((not (eq (compare-chunks new-diagram old-diagram) :greater))
-         :replacement-failed)))
+         (list :replacement-failed
+               "insufficient feerate: does not improve feerate diagram"))))
 
 (defun check-rbf-rules (mempool tx new-fee new-vsize new-weight direct-conflicts)
   "Apply the cluster-mempool replacement rules for TX (paying NEW-FEE — the

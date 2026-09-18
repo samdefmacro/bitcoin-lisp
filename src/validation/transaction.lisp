@@ -853,6 +853,10 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; rejection announced itself as a relay-floor one.
     (:rbf-insufficient-fee     . "insufficient fee")
     (:package-rbf-insufficient-fee . "package RBF failed: insufficient anti-DoS fees")
+    ;; And the FOURTH: the economic test, which is not arithmetic on fees but
+    ;; the feerate diagram (validation.cpp:1028). The downcased keyword already
+    ;; spelled this one right; the row says so, and pins it to Core's line.
+    (:replacement-failed       . "replacement-failed")           ; validation.cpp:1028
     ;; The INSERTION verdicts -- MEMPOOL-ADD's own results, which reach a
     ;; client through sendrawtransaction and submitpackage after the checks
     ;; above have all passed. They had no row here, so the downcased keyword
