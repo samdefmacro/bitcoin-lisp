@@ -2583,3 +2583,73 @@ the operator was told only that the option has no effect."
     (is (equal "/mnt/big" (getf plist :blocks-directory)))
     (is (null (bl.cfg:supplied-core-only-options merged))))
   (is (not (member :blocks-directory (start-node-plist '("-regtest"))))))
+
+;;;; -reindex: the snapshot chainstate and the indexes
+;;;;
+;;;; Two of the three Core-alignment items docs/reindex-decision-2026-09-18.md
+;;;; §6 asks for whether or not our -reindex ever becomes Core's: neither
+;;;; touches a block file, and both close a divergence a functional test reads.
+
+(defun %fake-snapshot-chainstate (dir)
+  "DIR given a persisted assumeutxo snapshot chainstate's on-disk footprint:
+chainstate_snapshot/ with its base_blockhash marker, and
+chainstate_snapshot.dat. Returns the snapshot dir."
+  (let* ((snap (merge-pathnames "chainstate_snapshot/" dir))
+         (marker (bl.store:snapshot-base-blockhash-path snap)))
+    (ensure-directories-exist marker)
+    (with-open-file (out marker :direction :output
+                                :element-type '(unsigned-byte 8)
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+      (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element #xB5)
+                      out))
+    (with-open-file (out (merge-pathnames "chainstate_snapshot.dat" dir)
+                         :direction :output :element-type '(unsigned-byte 8)
+                         :if-exists :supersede :if-does-not-exist :create)
+      (write-byte 0 out))
+    snap))
+
+(defun %recover-chain-over (dir reindex reindex-chainstate)
+  "Run the shipped start-up step %INIT-RECOVER-CHAIN over a node whose data
+directory is DIR, with the two reindex flags as given. Returns T when the
+snapshot chainstate's directory is still there afterwards."
+  (let ((node (bl:make-node :network :regtest :data-directory dir)))
+    (setf (bl:node-chainstates node)
+          (list (bl.store:init-chain-state dir :network :regtest)))
+    (let ((bl:*node* node))
+      (bl::%init-recover-chain reindex reindex-chainstate))
+    (and (bl.store:find-assumeutxo-chainstate-dir dir) t)))
+
+(test a-snapshot-chainstate-does-not-survive-a-reindex
+  "Core deletes the assumeutxo snapshot chainstate when the chainstate db is
+wiped, and BOTH reindex flags wipe it: options.wipe_chainstate_db is
+`do_reindex || do_reindex_chainstate' (init.cpp:1386), and LoadChainstate
+retargets the validated chainstate at the network tip and calls
+DeleteChainstate on the snapshot under exactly that flag
+ (node/chainstate.cpp:179-188, logging `[snapshot] deleting snapshot chainstate
+due to reindexing'). feature_assumeutxo.py:725-728 asserts one chainstate is
+all that remains after either.
+
+Ours honoured -reindex-chainstate only, so a -reindex on an assumeutxo node
+kept a snapshot chainstate whose coins Core had just discarded -- and the node
+came back up still following the snapshot's target instead of the network tip.
+
+The control is the arm that must NOT delete: a start with neither flag, where
+the snapshot chainstate is what start-up is supposed to adopt."
+  (with-network (:regtest)
+    (with-temp-directory (dir)
+      (%fake-snapshot-chainstate dir)
+      (is-true (%recover-chain-over dir nil nil)
+               "a start with no reindex flag deleted the snapshot chainstate"))
+    (with-temp-directory (dir)
+      (%fake-snapshot-chainstate dir)
+      (is-false (%recover-chain-over dir t nil)
+                "-reindex left the snapshot chainstate dir on disk")
+      (is-false (probe-file (merge-pathnames "chainstate_snapshot.dat" dir))
+                "-reindex left the snapshot chainstate's state file on disk"))
+    (with-temp-directory (dir)
+      (%fake-snapshot-chainstate dir)
+      (is-false (%recover-chain-over dir nil t)
+                "-reindex-chainstate stopped deleting the snapshot chainstate"))))
+

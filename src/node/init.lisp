@@ -936,21 +936,30 @@ startup refusal rather than a directory we create somewhere else."
       (when (plusp files)
         (log-info "Block file accounting: ~D flat block file~:P" files)))))
 
-(defun %init-recover-chain (reindex-chainstate)
+(defun %init-recover-chain (reindex reindex-chainstate)
   "Core Step 7 after LoadChainstate: the assumeutxo snapshot chainstate, crash
 recovery of an interrupted flush, snapshot validation at startup, undo storage
 and its pruned-horizon sweep, and -reindex-chainstate -- everything that needs
 the chain, store and coins view open and settles the tip before any block can
 connect."
   ;; Snapshot chainstate startup handling (Core LoadChainstate ordering,
-  ;; node/chainstate.cpp:151-238). -reindex-chainstate deletes a snapshot
-  ;; chainstate outright (Core wipe_chainstate_db) — the primary then
-  ;; rebuilds from stored blocks with no target. Otherwise, detect a
-  ;; persisted snapshot chainstate dir and re-init dual chainstates. Runs
-  ;; after the header index is loaded (the base entry must resolve) and
-  ;; before crash-recovery resolution below (a torn snapshot flush joins the
-  ;; pending-recovery list).
-  (if reindex-chainstate
+  ;; node/chainstate.cpp:151-238). EITHER reindex flag deletes a snapshot
+  ;; chainstate outright — the primary then rebuilds from stored blocks with
+  ;; no target. Otherwise, detect a persisted snapshot chainstate dir and
+  ;; re-init dual chainstates. Runs after the header index is loaded (the base
+  ;; entry must resolve) and before crash-recovery resolution below (a torn
+  ;; snapshot flush joins the pending-recovery list).
+  ;;
+  ;; Core's gate is options.wipe_chainstate_db, which is
+  ;; `do_reindex || do_reindex_chainstate' (init.cpp:1386) — BOTH flags, at
+  ;; node/chainstate.cpp:179-188 — and one chainstate is all that may remain
+  ;; after either (feature_assumeutxo.py:725-728). Ours honoured only
+  ;; -reindex-chainstate, so a -reindex on an assumeutxo node kept a snapshot
+  ;; chainstate whose coins Core had just discarded, and the node came back up
+  ;; still following the snapshot's target instead of the network tip. The
+  ;; block files and the primary chainstate are untouched by this: deleting the
+  ;; snapshot costs only the assumed UTXO set, which is re-loadable.
+  (if (or reindex reindex-chainstate)
       (when (bl.store:find-assumeutxo-chainstate-dir
              (node-data-directory *node*))
         (log-info "[snapshot] deleting snapshot chainstate due to reindexing")
@@ -1936,7 +1945,7 @@ Returns the node instance."
   (init-message "Loading block index…")          ; init.cpp:1396
   (log-initload-thread :start)
   (%init-load-chain network reindex blocks-directory)
-  (%init-recover-chain reindex-chainstate)
+  (%init-recover-chain reindex reindex-chainstate)
   ;; LoadChainTip, where Core has it: the tip is settled before the mempool
   ;; replay and the RPC server, and a coins pointer this node cannot place is
   ;; the chainstate-load failure Core offers a reindex for.
