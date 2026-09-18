@@ -2215,13 +2215,18 @@ returned with HAS-PRIV-P nil."
                       t)
               (values (desc-key-string key) nil))))))
 
-(defun desc-key-normalized-string (key expr-index cache privkey-provider)
+(defun desc-key-normalized-string (key expr-index cache privkey-provider
+                                   &optional indexes)
   "KEY's normalized public form (Core ToNormalizedString): BIP32 keys with
 hardened steps in their fixed path are rewritten as
 [fingerprint/path-to-last-hardened]xpub-at-last-hardened/rest/*, merging with
 any existing origin; hardened markers normalize to 'h'. Returns (values
 string ok-p) — OK-P nil when the last-hardened xpub is unavailable (no cache
-entry and no private key)."
+entry and no private key).
+
+INDEXES is the whole key-expression index table, needed only for musig(),
+whose PARTICIPANTS normalize one by one under their own cache slots
+(MuSigPubkeyProvider::ToNormalizedString, descriptor.cpp:735-753)."
   (flet ((wrap-origin (sub)
            ;; Core OriginPubkeyProvider::ToNormalizedString: merge our origin
            ;; with an origin the inner normalization produced.
@@ -2236,6 +2241,34 @@ entry and no private key)."
                      (concatenate 'string "[" origin "]" sub)))
                sub)))
     (cond
+      ;; musig(): every PARTICIPANT normalizes, each under its own cache slot,
+      ;; and the aggregate's own path follows (Core
+      ;; MuSigPubkeyProvider::ToNormalizedString, descriptor.cpp:735-753).
+      ;; Printing the participants' plain public form instead left a wallet
+      ;; that imported the xprv form reporting master xpubs with their whole
+      ;; hardened path, where the wallet that imported the public form reports
+      ;; Core's [fingerprint/86h/1h/0h]tpub.../0/* -- so the two wallets'
+      ;; parent_descs disagreed for the same output (wallet_musig.py:224).
+      ((desc-key-musig-participants key)
+       (let ((ok t))
+         (values
+          (wrap-origin
+           (format nil "musig(~{~A~^,~})~A~A"
+                   (mapcar (lambda (participant)
+                             (multiple-value-bind (string participant-ok)
+                                 (desc-key-normalized-string
+                                  participant
+                                  (and indexes (gethash participant indexes))
+                                  cache privkey-provider indexes)
+                               (unless participant-ok (setf ok nil))
+                               string))
+                           (desc-key-musig-participants key))
+                   (format-key-path (desc-key-path key) nil)
+                   (ecase (desc-key-derive key)
+                     (:none "")
+                     (:unhardened "/*")
+                     (:hardened "/*h"))))
+          ok)))
       ;; Const pubkeys normalize to their public form.
       ((desc-key-pubkey key)
        (values (wrap-origin (%desc-key-body-string key)) t))
@@ -2308,7 +2341,7 @@ prints its private form when available, its public form otherwise. Returns
              (lambda (key)
                (multiple-value-bind (s key-ok)
                    (desc-key-normalized-string key (gethash key indexes)
-                                               cache privkey-provider)
+                                               cache privkey-provider indexes)
                  (unless key-ok (setf ok nil))
                  s)))
             ok)))

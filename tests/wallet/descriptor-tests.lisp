@@ -2066,3 +2066,63 @@ the stored cache, so a numbering the cache does not match refuses the wallet)."
                 next-address)
             (is (not (equal first-address next-address))
                 "the reloaded wallet must not reissue the address it handed out")))))))
+
+(test a-musig-normalized-string-normalizes-every-participant
+  "Core's MuSigPubkeyProvider::ToNormalizedString asks each PARTICIPANT for its
+normalized form (descriptor.cpp:735-753), so a participant written as a master
+key with a hardened path comes back as Core's
+[fingerprint/86h/1h/0h]tpubACCOUNT/... -- the same rewrite every other BIP32 key
+expression gets.
+
+Ours normalized the aggregate alone and printed the participants in their plain
+public form, so the wallet holding a participant's PRIVATE key described the
+output by its master xpub and full hardened path while its cosigner, holding
+the public key expression, described the same output Core's way. Every field
+built from that string disagreed between the two wallets -- listdescriptors,
+and listunspent's parent_descs, which wallet_musig.py:224 compares across
+wallets by asserting the whole unspent entry is equal.
+
+The two cosigners are therefore the assertion: the same descriptor, opposite
+halves private, one normalized string."
+  (with-wallet-chain-node (node "musig-normalize")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let* ((pairs (loop for i below 2
+                          collect (%musig-wallet-key-pair
+                                   node (format nil "norm~D" i))))
+             (request (lambda (mine)
+                        (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "desc" h) (%musig-cosigner-descriptor pairs mine)
+                                (gethash "active" h) t
+                                (gethash "timestamp" h) "now")
+                          h))))
+        (dotimes (i 2)
+          (is (eq t (%aval "success"
+                           (first (rpc (format nil "norm~D" i) "importdescriptors"
+                                       (list (funcall request i))))))
+              "cosigner ~D imported its musig descriptor" i))
+        (flet ((musig-descriptors (wallet)
+                 (sort (loop for d in (coerce (%aval "descriptors"
+                                                     (rpc wallet "listdescriptors"))
+                                              'list)
+                             for s = (%aval "desc" d)
+                             when (and (stringp s) (search "musig(" s))
+                               collect s)
+                       #'string<)))
+          (let ((d0 (musig-descriptors "norm0"))
+                (d1 (musig-descriptors "norm1")))
+            (is-true d0 "the wallet lists no musig descriptor at all")
+            (is (equal d0 d1)
+                "the cosigners describe the same output differently:~% ~S~% ~S"
+                d0 d1)
+            (let ((s (first d0)))
+              (is-false (search "tprv" s)
+                        "a normalized descriptor must carry no private key: ~S" s)
+              (is (= 2 (loop with n = 0
+                             for start = 0 then (1+ found)
+                             for found = (search "]tpub" s :start2 start)
+                             while found do (incf n)
+                             finally (return n)))
+                  "both participants must be normalized to an [origin]tpub: ~S"
+                  s))))))))
