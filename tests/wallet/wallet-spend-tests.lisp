@@ -2005,6 +2005,60 @@ in solving_data, to bump the parent that created it."
                     "the built transaction must spend the pre-selected external ~
 outpoint; it spends ~S" spent)))))))))
 
+(test solving-data-pubkeys-answer-cores-three-hex-to-pubkey-refusals
+  "fundrawtransaction's solving_data pubkeys go through Core's HexToPubKey
+(wallet/rpc/spend.cpp:600), which refuses in three steps and names the string
+it was given each time (rpc/util.cpp:219-232): not hex, then not 33 or 65
+bytes, then not a point on the curve. We answered one sentence of our own,
+`Invalid public key: <hex>', for all three -- wallet_fundrawtransaction.py:
+1054-1055 reads the first two.
+
+The real pubkey is the control: it must fund, so a change that refused
+everything would fail there."
+  (with-wallet-chain-node (node "solving-pubkeys")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((outputs (list (let ((h (make-hash-table :test 'equal)))
+                                (setf (gethash optrue h)
+                                      (bl.rpc:format-money 10000000))
+                                h)))
+               (raw (rpc nil "createrawtransaction" '() outputs))
+               (own-pubkey (%aval "pubkey"
+                                  (rpc "fund" "getaddressinfo"
+                                       (rpc "fund" "getnewaddress" "" "bech32")))))
+          (flet ((fund (pubkey-hex)
+                   (let ((options (let ((h (make-hash-table :test 'equal)))
+                                    (setf (gethash "solving_data" h)
+                                          (let ((s (make-hash-table :test 'equal)))
+                                            (setf (gethash "pubkeys" s)
+                                                  (list pubkey-hex))
+                                            s)
+                                          ;; -fallbackfee is 0 on this fixture,
+                                          ;; so the control needs a feerate of
+                                          ;; its own to reach the funding.
+                                          (gethash "fee_rate" h) 10)
+                                    h)))
+                     (rpc "fund" "fundrawtransaction" raw options))))
+            (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
+                             "Pubkey \"not a pubkey\" must be a hex string")
+                       (rpc-error-of (lambda () (fund "not a pubkey")))))
+            (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
+                             "Pubkey \"01234567890a0b0c0d0e0f\" must have a length of either 33 or 65 bytes")
+                       (rpc-error-of (lambda () (fund "01234567890a0b0c0d0e0f")))))
+            (let ((off-curve (concatenate 'string "02" (make-string 64 :initial-element #\f))))
+              (is (equal (cons bl.rpc:+rpc-invalid-address-or-key+
+                               (format nil "Pubkey \"~A\" must be cryptographically valid."
+                                       off-curve))
+                         (rpc-error-of (lambda () (fund off-curve))))))
+            (is (stringp (%aval "hex" (with-wallet-rng (97) (fund own-pubkey))))
+                "a real pubkey in solving_data must still fund")))))))
+
 (test a-signed-witness-input-records-the-witness-utxo-it-signed-over
   "Core's SignPSBTInput writes the witness_utxo the moment it produces a
 WITNESS signature (psbt.cpp:495-501), and only then can

@@ -3098,7 +3098,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
         (multiple-value-bind (pubkeys pk-present) (%opt solving "pubkeys")
           (when pk-present
             (dolist (hex pubkeys)
-              (let ((pubkey (bl.rpc:parse-multisig-pubkey hex)))
+              (let ((pubkey (bl.rpc:hex-to-pubkey hex)))
                 (setf (gethash (bl.crypto:hash160 pubkey)
                                (wcc-external-pubkeys cc))
                       pubkey)

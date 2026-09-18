@@ -177,7 +177,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:parse-hex-v
    #:parse-merkle-block
    #:parse-multisig
-   #:parse-multisig-pubkey
+   #:hex-to-pubkey
    #:parse-outputs
    #:parse-sighash-type
    #:positional-array

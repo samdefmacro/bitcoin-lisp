@@ -29,16 +29,33 @@ Pubkeys are appended in the given order (Core does not sort them)."
     (vector-push-extend #xae out)          ; OP_CHECKMULTISIG
     (coerce out '(vector (unsigned-byte 8)))))
 
-(defun parse-multisig-pubkey (hex)
-  "Parse a hex-encoded 33/65-byte public key for createmultisig, validating it is
-a real point (Bitcoin Core HexToPubKey). Returns the key bytes; signals
-rpc-error otherwise."
-  (let ((bytes (handler-case (bl.crypto:hex-to-bytes hex)
-                 (error () nil))))
-    (unless (and bytes (member (length bytes) '(33 65))
-                 (bl.crypto:public-key-valid-p bytes))
+(defun hex-to-pubkey (hex)
+  "Core HexToPubKey (rpc/util.cpp:219-232): the bytes of a hex-encoded 33- or
+65-byte public key that is a real point.
+
+Core refuses in THREE steps and each one names the string it was handed --
+not hex, then the wrong length, then not cryptographically valid -- and every
+caller reports those words: createmultisig (rpc/output_script.cpp:130) and
+fundrawtransaction's solving_data pubkeys (wallet/rpc/spend.cpp:600) are both
+this function. We answered one sentence, `Invalid public key: <hex>', for all
+three, so a caller could not tell a typo from a key off the curve;
+wallet_fundrawtransaction.py:1054-1055 reads the first two.
+
+Core's IsHex refuses the empty string and any odd length
+(util/strencodings.cpp), so an empty string is not hex here either."
+  (unless (and (stringp hex) (plusp (length hex)) (evenp (length hex))
+               (every (lambda (ch) (digit-char-p ch 16)) hex))
+    (error 'rpc-error :code +rpc-invalid-address-or-key+
+                      :message (format nil "Pubkey \"~A\" must be a hex string" hex)))
+  (unless (or (= (length hex) 66) (= (length hex) 130))
+    (error 'rpc-error :code +rpc-invalid-address-or-key+
+                      :message (format nil "Pubkey \"~A\" must have a length of either 33 or 65 bytes"
+                                       hex)))
+  (let ((bytes (bl.crypto:hex-to-bytes hex)))
+    (unless (bl.crypto:public-key-valid-p bytes)
       (error 'rpc-error :code +rpc-invalid-address-or-key+
-                        :message (format nil "Invalid public key: ~A" hex)))
+                        :message (format nil "Pubkey \"~A\" must be cryptographically valid."
+                                         hex)))
     bytes))
 
 (define-rpc "createmultisig" (node (nrequired (keys :array) (address-type :or "legacy")))
@@ -58,7 +75,7 @@ bare multisig script regardless of address type. Uncompressed keys force legacy
                               (unless (stringp k)
                                 (error 'rpc-error :code +rpc-invalid-address-or-key+
                                                   :message "Invalid public key"))
-                              (parse-multisig-pubkey k))
+                              (hex-to-pubkey k))
                             keys))
            (requested (cond ((string= address-type "legacy") :legacy)
                             ((string= address-type "p2sh-segwit") :p2sh-segwit)
