@@ -32,6 +32,7 @@ headerssync.cpp. src/networking/.")
    #:connection-send-stalled-p
    #:flush-send-buffer
    #:flush-peer-send-buffers
+   #:peer-handshake-in-flight-p
    #:*max-send-buffer-bytes*
    ;; Receive-side backpressure (Core m_msg_process_queue / fPauseRecv): a
    ;; send-paused peer is still READ, into the parked queue this bounds.
@@ -134,6 +135,7 @@ headerssync.cpp. src/networking/.")
    #:peer-conn-type
    #:peer-relays-txs-p
    #:peer-tx-relay-p
+   #:peer-tx-relay-state-p
    #:peer-last-inv-sequence
    #:peer-getaddr-sent
    #:connect-peer
@@ -225,6 +227,7 @@ headerssync.cpp. src/networking/.")
    #:net-group-key
    #:make-address-key
    #:address-routable-p
+   #:address-publicly-routable-p
    #:network-key-id
    #:key-id-network
    #:save-address-book

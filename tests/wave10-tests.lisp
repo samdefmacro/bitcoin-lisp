@@ -88,10 +88,23 @@ unconnected peer."
                         (make-test-node) (list "abort")))))
 
 (test wave10-setnetworkactive-bare-boolean
-  "setnetworkactive returns the new state as a bare JSON boolean."
+  "setnetworkactive returns the new state as a bare JSON boolean, and says so in
+the log: Core's CConnman::SetNetworkActive opens with
+LogInfo(\"%s: %s\\n\", __func__, active) (net.cpp:3356), and rpc_net.py:218/:225
+wrap the call in assert_debug_log for `SetNetworkActive: false' and
+`SetNetworkActive: true'. Ours logged nothing at all, so both waits failed."
   (let ((node (make-test-node)))
-    (is (eq 'yason:false (bl.rpc::rpc-setnetworkactive node (list nil))))
-    (is (eq t (bl.rpc::rpc-setnetworkactive node (list t))))))
+    (let ((lines (capture-log-lines
+                  (lambda ()
+                    (is (eq 'yason:false
+                            (bl.rpc::rpc-setnetworkactive node (list nil))))))))
+      (is-true (find "SetNetworkActive: false" lines :test #'search)
+               "disabling the network is logged in Core's words"))
+    (let ((lines (capture-log-lines
+                  (lambda ()
+                    (is (eq t (bl.rpc::rpc-setnetworkactive node (list t))))))))
+      (is-true (find "SetNetworkActive: true" lines :test #'search)
+               "and so is re-enabling it"))))
 
 (test wave10-mempool-entry-unbroadcast-real
   "The mempool entry's unbroadcast field reflects the actual unbroadcast set

@@ -36,13 +36,19 @@ must coerce to a vector (NIL would encode as null, not [])."
   "Core GetNetworkName(ConnectedThroughNetwork()) for getpeerinfo's
 \"network\": a peer accepted through the local onion service is \"onion\"
 regardless of its socket address (127.0.0.1); otherwise the address's
-network, or \"not_publicly_routable\" when it isn't a routable literal."
+network, or \"not_publicly_routable\" when it isn't a routable literal.
+
+The routability question is Core's own -- ADDRESS-PUBLICLY-ROUTABLE-P, not the
+addrman dial predicate beside it, which keeps loopback and the private and
+documentation IPv4 ranges routable for regtest. Reading the dial predicate
+here reported \"ipv4\" for a peer connecting from 127.0.0.1, where
+rpc_net.py:148 expects \"not_publicly_routable\"."
   (multiple-value-bind (net bytes)
       (bl.net:parse-network-address
        (bl.net:peer-address peer))
     (cond
       ((bl.net:peer-inbound-onion peer) "onion")
-      ((and net (bl.net:address-routable-p bytes net))
+      ((and net (bl.net:address-publicly-routable-p bytes net))
        (ecase net
          (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
          (:i2p "i2p") (:cjdns "cjdns")))
@@ -160,6 +166,22 @@ networks have drifted from the ones it reports."
 
 (register-rpc-help-detail "getpeerinfo" #'%getpeerinfo-network-help)
 
+(defun %getnetworkinfo-network-help ()
+  "getnetworkinfo's per-network `name' result line, built the way Core builds
+it:
+
+    {RPCResult::Type::STR, \"name\",
+     \"network (\" + Join(GetNetworkNames(), \", \") + \")\"}  (rpc/net.cpp:735)
+
+The SECOND caller of GetNetworkNames that has to agree with the list itself --
+without append_unroutable here, because getnetworkinfo reports one object per
+routable network and never a `not_publicly_routable' one. rpc_net.py:243
+asserts the parenthesised list appears in help(\"getnetworkinfo\")."
+  (format nil "Result:~%  \"networks\" : [~%    { \"name\" : \"str\",    (string) network (~{~A~^, ~}) }~%  ]"
+          (network-names)))
+
+(register-rpc-help-detail "getnetworkinfo" #'%getnetworkinfo-network-help)
+
 (defun %peerinfo-rows (node)
   "One getpeerinfo row (a field alist) per CONNECTED peer — the body of Core's
 getpeerinfo loop, rpc/net.cpp:107-227.
@@ -200,6 +222,7 @@ whatever the cadence is."
               (minping (bl.net:peer-min-ping-latency peer))
               (ping-nonce (bl.net:peer-ping-nonce peer))
               (services (or (bl.net:peer-services peer) 0))
+              (tx-relay (bl.net:peer-tx-relay-state-p peer))
               (sh (or (bl.net:peer-start-height peer) -1))
               (hss (bl.net:peer-headers-sync peer))
               (transport (and conn (bl.net:connection-transport conn)))
@@ -234,12 +257,23 @@ whatever the cadence is."
            ;; Whether we relay txs to this peer: tx-relay state exists — the
            ;; connection type allows it AND the peer's version set fRelay
            ;; (Core CNodeStateStats::m_relay_txs).
-           ("relaytxes" . ,(json-bool (bl.net:peer-tx-relay-p peer)))
+           ;;
+           ;; These three, and minfeefilter below, are read off the Peer::TxRelay
+           ;; object, which Core only creates in the VERSION handler; with none,
+           ;; GetNodeStateStats fills in false / 0 / 0 / 0 rather than the peer's
+           ;; own values (net_processing.cpp:1819-1829). Asking
+           ;; PEER-TX-RELAY-P instead answered relaytxes true and
+           ;; last_inv_sequence 1 for a peer that had sent nothing at all.
+           ("relaytxes" . ,(json-bool tx-relay))
            ;; Mempool sequence snapshot of our last inv flush to this peer +
            ;; queued-but-unsent announcements (Core m_last_inv_sequence /
            ;; m_inv_to_send).
-           ("last_inv_sequence" . ,(bl.net:peer-last-inv-sequence peer))
-           ("inv_to_send" . ,(length (bl.net:peer-tx-inv-queue peer)))
+           ("last_inv_sequence" . ,(if tx-relay
+                                       (bl.net:peer-last-inv-sequence peer)
+                                       0))
+           ("inv_to_send" . ,(if tx-relay
+                                 (length (bl.net:peer-tx-inv-queue peer))
+                                 0))
            ("lastsend" . ,(%universal-to-unix
                            (if conn (bl.net:connection-last-send-time conn) 0)))
            ("lastrecv" . ,(%universal-to-unix
@@ -304,7 +338,9 @@ whatever the cadence is."
                              (bl.net:peer-permissions peer))))
                  (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
-           ("minfeefilter" . ,(satoshi->btc (bl.net:peer-feefilter-rate peer)))
+           ;; Core m_fee_filter_received, 0 with no Peer::TxRelay (:1827).
+           ("minfeefilter" . ,(satoshi->btc
+                               (if tx-relay (bl.net:peer-feefilter-rate peer) 0)))
            ("bytessent_per_msg" . ,(bl.net:snapshot-per-msg-table
                                     (bl.net:peer-sent-per-msg peer)))
            ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
@@ -601,7 +637,13 @@ When disabling, mark current peers disconnected (close socket + set state) —
 Core's socket thread does the same as a consequence of the cleared flag
 (net.cpp DisconnectNodes); the sync thread reaps them from node-peers,
 keeping it single-writer. Shared by setnetworkactive and dumptxoutset's
-rollback-time NetworkDisable. Returns STATE."
+rollback-time NetworkDisable. Returns STATE.
+
+Core opens with LogInfo(\"%s: %s\\n\", __func__, active) (net.cpp:3356), before
+the no-op early return, so the line appears on every call whether or not the
+flag moves. rpc_net.py:218 and :225 wrap setnetworkactive in assert_debug_log
+for exactly that line, in both directions."
+  (bl:log-info "SetNetworkActive: ~:[false~;true~]" state)
   (setf (bl:node-network-active node) state)
   (unless state
     (dolist (peer (bt:with-recursive-lock-held ((bl:node-lock node))

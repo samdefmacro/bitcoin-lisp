@@ -70,7 +70,10 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; CNode::nLocalHostNonce, net.h:994). Per-connection, never node-wide.
   (local-nonce 0 :type (unsigned-byte 64))
   (services 0 :type (unsigned-byte 64))
-  (start-height 0 :type (signed-byte 32))
+  ;; Core Peer::m_starting_height{-1} (net_processing.cpp:277): -1 is "the peer
+  ;; has not told us", and getpeerinfo reports it verbatim -- rpc_net.py:148
+  ;; reads -1 for a peer that never sent a VERSION. A 0 default said "genesis".
+  (start-height -1 :type (signed-byte 32))
   (user-agent "" :type string)
   (ping-nonce nil)
   ;; NIL means no ping has ever been sent on this connection, which is DUE, not
@@ -571,14 +574,32 @@ a later-loaded file, so a direct call would be a forward reference.")
   (when *peer-disconnect-hook*
     (ignore-errors (funcall *peer-disconnect-hook* peer))))
 
+(defun peer-handshake-in-flight-p (peer)
+  "T while PEER's version handshake is still running, i.e. Core's
+`!pnode->fSuccessfullyConnected' (net.cpp:2006, net_processing.cpp:5244).
+
+An accepted inbound peer is published at ACCEPT, as Core's CNode is
+(net.cpp:1854-1858), so it is in the node's peer list -- and in getpeerinfo --
+while a thread of its own drives its handshake. Every sync-thread duty that
+would touch that socket asks this first, because the two threads must not share
+the stream."
+  (member (peer-state peer) '(:connected :handshaking)))
+
 (defun flush-peer-send-buffers (peers)
   "Retry every connected peer's buffered unsent bytes without blocking — the
 periodic half of Core's per-socket SocketSendData, driven from the sync/IBD
 housekeeping loops (~1x/second) since we have no dedicated socket thread.
-No-op for peers with nothing buffered."
+No-op for peers with nothing buffered.
+
+Never a peer whose handshake is still running: that socket belongs to the
+handshake thread until it reaches :READY (an accepted inbound peer is published
+at ACCEPT, as Core's CNode is), and two threads writing one stream interleave.
+Nothing waits -- a mid-handshake peer's buffered bytes go out on the
+handshake's own next send."
   (dolist (peer peers)
     (let ((conn (peer-connection peer)))
-      (when (and conn (connection-connected conn))
+      (when (and conn (connection-connected conn)
+                 (not (peer-handshake-in-flight-p peer)))
         (flush-send-buffer conn)))))
 
 ;;; Message I/O
@@ -951,6 +972,21 @@ relaying — Core's pre-70001 default is fRelay=true (net_processing.cpp:3597)."
        (let ((v (peer-version peer)))
          (or (null v)
              (bl.ser:version-message-relay v)))))
+
+(defun peer-tx-relay-state-p (peer)
+  "T when PEER has a Peer::TxRelay at all -- Core's `peer->GetTxRelay() !=
+nullptr' (net_processing.cpp:1819). Core CREATES that object in the VERSION
+handler (:3681-3696), so a peer that has not sent one has none, and
+GetNodeStateStats then reports the no-object defaults rather than the peer's:
+m_relay_txs false, m_fee_filter_received 0, m_inv_to_send 0 and the stats
+struct's own m_last_inv_seq (:1825-1829).
+
+PEER-TX-RELAY-P answers the other question -- WOULD we relay to this peer --
+and deliberately treats a version-less peer as relaying, because Core's
+pre-70001 fRelay default is true. Reading that one in getpeerinfo reported
+relaytxes true and last_inv_sequence 1 for a peer that had said nothing
+(rpc_net.py:148 expects false and 0)."
+  (and (peer-version peer) (peer-tx-relay-p peer) t))
 
 ;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
 ;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist

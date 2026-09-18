@@ -220,6 +220,47 @@ and the fixtures in tests/ that depend on them."
            (:ipv6 (not (%ipv6-unroutable-p ip)))
            (t t)))))
 
+(defun %ipv4-unroutable-p (ip)
+  "The IPv4 exclusions Core's IsRoutable applies (netaddress.cpp:462-465), which
+ADDRESS-ROUTABLE-P deliberately does not: IsLocal (127.0.0.0/8 and 0.0.0.0/8,
+netaddress.cpp:341-347), RFC1918 private (10/8, 172.16/12, 192.168/16),
+RFC2544 benchmarking (198.18/15), RFC3927 link-local (169.254/16), RFC5737
+documentation (192.0.2/24, 198.51.100/24, 203.0.113/24) and RFC6598 shared
+address space (100.64/10).
+
+IP is either the four octets or the 16-byte IPv4-mapped form
+PARSE-NETWORK-ADDRESS hands back for :IPV4 (::ffff:a.b.c.d), so the octets are
+read from the END. Reading index 0 of the mapped form sees a zero byte, which
+is IsLocal, and calls every IPv4 address unroutable."
+  (let* ((o (- (length ip) 4))
+         (a (aref ip o)) (b (aref ip (+ o 1))) (c (aref ip (+ o 2))))
+    (or (member a '(0 127))                              ; IsLocal
+        (= a 10)                                         ; RFC1918
+        (and (= a 172) (<= 16 b 31))                     ; RFC1918
+        (and (= a 192) (= b 168))                        ; RFC1918
+        (and (= a 198) (member b '(18 19)))              ; RFC2544
+        (and (= a 169) (= b 254))                        ; RFC3927
+        (and (= a 192) (= b 0) (= c 2))                  ; RFC5737
+        (and (= a 198) (= b 51) (= c 100))               ; RFC5737
+        (and (= a 203) (= b 0) (= c 113))                ; RFC5737
+        (and (= a 100) (<= 64 b 127)))))                 ; RFC6598
+
+(defun address-publicly-routable-p (ip &optional net)
+  "Core IsRoutable in full (netaddress.cpp:462-465) -- WITHOUT the regtest
+carve-out ADDRESS-ROUTABLE-P makes for IPv4 private and documentation ranges.
+
+Two predicates because they answer two questions. Whether to STORE and dial an
+address is the one addrman asks, and this tree keeps 10/8 and 198.51.100/24
+dialable on purpose so private deployments and the addrman fixtures work.
+Whether an address has a publicly routable NETWORK is Core's GetNetClass
+(netaddress.cpp:920-926), which returns NET_UNROUTABLE for every range above --
+so getpeerinfo's `network' field reads `not_publicly_routable' for a loopback
+peer, which is what rpc_net.py:148 asserts for a connection from 127.0.0.1.
+Asking the dial predicate there answered `ipv4'."
+  (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
+    (and (address-routable-p ip net)
+         (not (and (eq net :ipv4) (%ipv4-unroutable-p ip))))))
+
 (defun peer-address-key (pa)
   "The addrman map key for record PA (network-typed)."
   (make-address-key (peer-address-ip pa) (peer-address-port pa)

@@ -8480,7 +8480,14 @@ emits it conditionally)."
       (is (null (assoc "pingtime" e :test #'string=)))
       (is (null (assoc "minping" e :test #'string=)))
       (is (null (assoc "pingwait" e :test #'string=)))
-      (is (eq t (cdr (assoc "relaytxes" e :test #'string=))))
+      ;; relaytxes is read off Peer::TxRelay, which Core only creates in the
+      ;; VERSION handler (net_processing.cpp:3681-3696); this peer has sent
+      ;; none, so GetNodeStateStats reports false (:1826) -- as it does for the
+      ;; block-relay peer below, for the other reason. RPC-GETPEERINFO-PARITY-
+      ;; FIELDS holds the true arm, on a peer that did send a version. This
+      ;; asserted true until 2026-09-18, when a peer with no version first
+      ;; reached getpeerinfo (it is published at accept now, rpc_net.py:137).
+      (is (eq 'yason:false (cdr (assoc "relaytxes" e :test #'string=))))
       ;; services is Core's 16-hex-digit string, not a number.
       (is (string= "0000000000000409" (cdr (assoc "services" e :test #'string=))))
       (is-true b)
@@ -8530,11 +8537,28 @@ through yason."
           (bl.net:connection-last-send-time conn)
           (get-universal-time))
     (incf (gethash "ping" (bl.net:peer-sent-per-msg peer) 0) 32)
-    (setf (bl:node-peers node) (list peer))
+    (setf (bl:node-peers node)
+          ;; Two peers, because `network' is a classification and one address
+          ;; exercises one arm of it: 203.0.113.0/24 is RFC5737 documentation
+          ;; space, which Core's GetNetClass calls NET_UNROUTABLE, while
+          ;; 8.8.8.8 is the ipv4 arm. This asserted "ipv4" for the
+          ;; documentation address until 2026-09-18, because the renderer asked
+          ;; addrman's DIAL predicate -- which keeps those ranges routable for
+          ;; regtest on purpose -- rather than Core's routability.
+          (list peer (bl.net:make-peer :address "8.8.8.8" :state :ready)))
     (let* ((rows (bl.rpc::rpc-getpeerinfo node nil))
-           (e (first rows))
+           (row-for (lambda (addr)
+                      (find addr rows :test #'search
+                            :key (lambda (r)
+                                   (cdr (assoc "addr" r :test #'string=))))))
+           (e (funcall row-for "203.0.113.5"))
            (f (lambda (k) (cdr (assoc k e :test #'string=)))))
-      (is (string= "ipv4" (funcall f "network")))
+      (is (string= "not_publicly_routable" (funcall f "network"))
+          "RFC5737 documentation space is not a publicly routable network")
+      (is (string= "ipv4"
+                   (cdr (assoc "network" (funcall row-for "8.8.8.8")
+                               :test #'string=)))
+          "control: a globally routable address is still ipv4")
       (is (equalp #("NETWORK" "WITNESS" "NETWORK_LIMITED")
                   (funcall f "servicesnames")))
       ;; ping stats in seconds, all present here.
@@ -8551,7 +8575,10 @@ through yason."
       (is (= 0 (funcall f "lastrecv")))
       (is (= 0 (funcall f "last_transaction")))
       (is (= 0 (funcall f "last_block")))
-      ;; inv queue counters.
+      ;; inv queue counters, and the true arm of relaytxes: this peer DID send
+      ;; a version whose fRelay is set, so it has a Peer::TxRelay and all three
+      ;; report the peer's own values rather than Core's no-object zeroes.
+      (is (eq t (funcall f "relaytxes")))
       (is (= 1 (funcall f "inv_to_send")))
       (is (= 1 (funcall f "last_inv_sequence")))
       ;; presync/headers cursors: nothing known yet.
@@ -11308,7 +11335,17 @@ appear in one and not the other."
         (is-true (assoc name counts :test #'string=)
                  "getaddrmaninfo reports no ~A row" name))
       ;; not_publicly_routable is documented but never counted, as in Core.
-      (is-false (assoc "not_publicly_routable" counts :test #'string=)))))
+      (is-false (assoc "not_publicly_routable" counts :test #'string=)))
+    ;; getnetworkinfo is the OTHER caller of the same list, and it takes it
+    ;; WITHOUT the unroutable name: its `networks' array is one object per
+    ;; routable network (Core rpc/net.cpp:735, Join(GetNetworkNames())).
+    ;; rpc_net.py:243 greps its help for that shorter list, which was absent.
+    (let ((text (bl.rpc:dispatch-rpc-method
+                 node "help" (wire-params (list "getnetworkinfo")))))
+      (is-true (search "(ipv4, ipv6, onion, i2p, cjdns)" text)
+               "getnetworkinfo's help did not name the networks: ~S" text)
+      (is-false (search "not_publicly_routable" text)
+                "and it must not name the unroutable one"))))
 
 ;;; --- signrawtransactionwithkey over a pay-to-anchor input -------------------
 

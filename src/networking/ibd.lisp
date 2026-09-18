@@ -2258,6 +2258,15 @@ paused peer's input is not read, so nothing can add to it until it drains."
   ;; between two reads of the slot would hand (connection-connected NIL) a NIL —
   ;; a TYPE-ERROR outside the handler-case below, which aborts the whole sync
   ;; cycle. Latent before; header sync now runs this several times a second.
+  ;;
+  ;; A peer whose handshake is still running is skipped whole -- not just the
+  ;; :READY-gated arms below, but the reap tail too. An accepted inbound peer is
+  ;; published at ACCEPT now (Core's CNode joins m_nodes there,
+  ;; net.cpp:1854-1858), so it reaches this list with its own thread reading its
+  ;; socket; touching the stream here would interleave with that read, and
+  ;; HANDLE-PEER-FIN would race the handshake's own disconnect.
+  (when (peer-handshake-in-flight-p peer)
+    (return-from drain-and-reap-peer nil))
   (let ((conn (peer-connection peer)))
    ;; Whatever a send-paused pass left in this peer's getdata queue is served
    ;; FIRST, before the pause gate below decides whether to read the peer at

@@ -10,6 +10,47 @@
 
 (in-suite :inbound-listening-tests)
 
+(test a-peer-that-sent-no-version-reports-cores-defaults
+  "An accepted peer is published before its handshake (Core's CNode joins
+m_nodes in CreateNodeFromAcceptedSocket, net.cpp:1854-1858), so getpeerinfo
+answers for a peer that has said nothing -- rpc_net.py:137-183 opens exactly
+such a connection and compares the whole row. Three of its fields came from
+defaults that were not Core's:
+
+  * startingheight: Core's Peer::m_starting_height is {-1}
+    (net_processing.cpp:277), `the peer has not told us'. Ours was 0, i.e.
+    `genesis'.
+  * relaytxes / last_inv_sequence / inv_to_send / minfeefilter: Core reads
+    these off Peer::TxRelay, which only the VERSION handler creates
+    (:3681-3696); with no object GetNodeStateStats fills in false and zeroes
+    (:1819-1829). PEER-TX-RELAY-P answers the OTHER question -- would we relay
+    to this peer -- and says yes for a version-less peer on purpose, because
+    Core's pre-70001 fRelay default is true. Reading it here reported
+    relaytxes true and last_inv_sequence 1 for a peer that had sent nothing.
+  * network: 127.0.0.1 is NET_UNROUTABLE to Core's GetNetClass. The renderer
+    asked addrman's DIAL predicate, which keeps loopback routable on purpose,
+    and answered `ipv4'."
+  (let ((fresh (bl.net:make-peer :address "127.0.0.1" :state :connected
+                                 :inbound t)))
+    ;; Behavioural first, in pre-existing names only.
+    (is (= -1 (bl.net:peer-start-height fresh))
+        "a peer that has sent no version has told us no starting height")
+    (is-true (bl.net:peer-tx-relay-p fresh)
+        "control: we WOULD relay to it -- Core's pre-70001 fRelay default")
+    ;; Then the names this fix introduces.
+    (is-false (bl.net:peer-tx-relay-state-p fresh)
+              "but it has no Peer::TxRelay yet, so getpeerinfo reports zeroes")
+    (multiple-value-bind (net bytes)
+        (bl.net:parse-network-address "127.0.0.1")
+      (is-true (bl.net:address-routable-p bytes net)
+               "control: loopback stays dialable for regtest")
+      (is-false (bl.net:address-publicly-routable-p bytes net)
+                "loopback is not a publicly routable network"))
+    (multiple-value-bind (net bytes)
+        (bl.net:parse-network-address "8.8.8.8")
+      (is-true (bl.net:address-publicly-routable-p bytes net)
+               "control: a globally routable address still is"))))
+
 (test inbound-handshake-loopback
   (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
@@ -311,7 +352,12 @@ runs with its own outbound-nonce registry so the inbound side does not
                ;; other.
                (let ((deadline (+ (get-internal-real-time)
                                   (* 5 internal-time-units-per-second))))
-                 (loop until (or (and good (bl:node-pending-inbound-peers node))
+                 ;; Wait for the SERVER side to finish: the queue holds the
+                 ;; silent peer from the moment it is accepted, so its presence
+                 ;; proves nothing -- a :READY peer in it does.
+                 (loop until (or (and good
+                                      (find :ready (bl:node-pending-inbound-peers node)
+                                            :key #'bl.net:peer-state))
                                  (> (get-internal-real-time) deadline))
                        do (sleep 0.02)))
                ;; The behavioural assertions, in pre-existing names only.
@@ -319,8 +365,19 @@ runs with its own outbound-nonce registry so the inbound side does not
                         "a second peer handshakes within five seconds while the first stays silent")
                (when good
                  (is (eq :ready (bl.net:peer-state good))))
-               (is (= 1 (length (bl:node-pending-inbound-peers node)))
-                   "and the node queued it for the sync thread, not the silent one")
+               ;; BOTH accepted connections are queued, because a peer is
+               ;; published at ACCEPT now (Core's CNode joins m_nodes there,
+               ;; net.cpp:1854-1858, and rpc_net.py:137 reads a getpeerinfo row
+               ;; for a peer that never sent a version). What separates them is
+               ;; the STATE: only the one that handshaked is :READY, and only a
+               ;; :READY peer is touched by any sync-thread socket duty.
+               (let ((queued (bl:node-pending-inbound-peers node)))
+                 (is (= 2 (length queued))
+                     "both accepted connections are queued, silent one included")
+                 (is (= 1 (count :ready queued :key #'bl.net:peer-state))
+                     "and exactly one of them has finished its handshake")
+                 (is (= 1 (count-if #'bl.net:peer-handshake-in-flight-p queued))
+                     "the silent peer is still mid-handshake"))
                ;; The silent peer is still being waited on, on its own thread.
                (is (plusp (bl:inbound-handshakes-in-flight))
                    "the silent peer's handshake is still in flight"))

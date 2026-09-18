@@ -23,8 +23,10 @@ peertimeout=999999999 into every node's config.")
   (bt:with-lock-held (*inbound-handshake-lock*) *inbound-handshakes-in-flight*))
 
 (defun %run-inbound-handshake (node peer onion)
-  "Run PEER's inbound version handshake and, if it succeeds, hand the peer to
-the sync thread through PENDING-INBOUND-PEERS. Runs on its OWN thread.
+  "Run PEER's inbound version handshake on its OWN thread. PEER is already in
+the node's hand-off queue when this starts (Core's CNode joins m_nodes at
+accept), so all this decides is whether the peer reaches :ready or is
+disconnected.
 
 Core adds an accepted socket to m_nodes at once (net.cpp:1854-1858) and lets
 ThreadMessageHandler run the version exchange, so its accept loop never waits
@@ -50,10 +52,9 @@ peertimeout=999999999."
                (progn
                  (bl.net:send-post-handshake-messages peer)
                  (bl.net:send-compact-block-negotiation peer)
-                 ;; Published only now: the sync thread pumps a peer the moment
-                 ;; it appears here, and these sends belong to the handshake.
-                 (bt:with-recursive-lock-held ((node-lock node))
-                   (push peer (node-pending-inbound-peers node)))
+                 ;; The peer was published at ACCEPT (see
+                 ;; ADMIT-INBOUND-CONNECTION); reaching :ready is what lets the
+                 ;; sync thread start doing socket work on it.
                  (log-cat "net"
                           "New inbound~:[~; onion~] peer connected: ~A, ~A"
                           onion
@@ -69,8 +70,22 @@ peertimeout=999999999."
       (decf *inbound-handshakes-in-flight*))))
 
 (defun admit-inbound-connection (node conn onion)
-  "Turn an accepted CONN into a peer and start its handshake off the accept
-loop. Returns the peer, or NIL when the connection was refused."
+  "Turn an accepted CONN into a peer, publish it, and start its handshake off
+the accept loop. Returns the peer, or NIL when the connection was refused.
+
+The peer is published BEFORE the handshake runs, which is where Core publishes
+one: CreateNodeFromAcceptedSocket hands out the node id and pushes the CNode
+into m_nodes (net.cpp:1854-1858) with fSuccessfullyConnected still false, and
+getpeerinfo reports it from that moment -- rpc_net.py:137 opens a connection
+that never sends a version and reads the row (id 2, version 0, subver \"\",
+startingheight -1, synced_headers/-blocks/presynced_headers -1), all of which
+are the defaults of a peer that has said nothing. Publishing only after the
+handshake meant such a peer was invisible for as long as it stayed silent, and
+the framework's wait_for_new_peer timed out after 5 s.
+
+Publishing early is safe because every socket duty the sync thread runs is
+gated on the peer being :READY -- the handshake thread owns this socket until
+it flips that state or disconnects the peer."
   (multiple-value-bind (allowed reason)
       (inbound-connection-allowed-p node (bl.net:connection-host conn) onion)
     (cond
@@ -83,6 +98,8 @@ loop. Returns the peer, or NIL when the connection was refused."
        (let ((peer (bl.net:make-inbound-peer
                     conn (bl.net:connection-host conn)
                     :inbound-onion onion)))
+         (bt:with-recursive-lock-held ((node-lock node))
+           (push peer (node-pending-inbound-peers node)))
          (bt:with-lock-held (*inbound-handshake-lock*)
            (incf *inbound-handshakes-in-flight*))
          (bt:make-thread (lambda () (%run-inbound-handshake node peer onion))

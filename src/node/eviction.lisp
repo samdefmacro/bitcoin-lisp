@@ -7,9 +7,15 @@
   (count-if #'bl.net:peer-inbound (node-peers node)))
 
 (defun merge-inbound-peers (node)
-  "Move handshaked inbound peers from the lock-guarded hand-off list into the
+  "Move accepted inbound peers from the lock-guarded hand-off list into the
 node's peer list (capped at *max-inbound-connections*; excess are disconnected). Called
-by the sync thread, so PEERS stays single-writer."
+by the sync thread, so PEERS stays single-writer.
+
+The queue holds every ACCEPTED connection, handshaked or not: Core's CNode
+joins m_nodes at accept (net.cpp:1854-1858) and the version exchange runs
+afterwards, so a peer that has sent nothing is still a peer getpeerinfo reports
+(rpc_net.py:137). A peer merged mid-handshake is inert to every sync-thread
+duty until its own thread flips it to :READY -- PEER-HANDSHAKE-IN-FLIGHT-P."
   (let ((pending (bt:with-recursive-lock-held ((node-lock node))
                    (prog1 (node-pending-inbound-peers node)
                      (setf (node-pending-inbound-peers node) nil)))))
