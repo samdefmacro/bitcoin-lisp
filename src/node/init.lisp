@@ -1115,7 +1115,35 @@ a -reindex, which is Core's `!do_reindex' guard: one retry, never a loop."
            (when (eq result :unresolvable)
              (log-error "Refusing to start: the rebuilt block index still cannot place the UTXO set.")
              (chainstate-load-error "Error initializing block database")))))
+      ;; The tip is settled: say which block this node came up on, where Core's
+      ;; LoadChainTip says it (validation.cpp:4612).
+      (log-loaded-best-chain (node-chain-state *node*))
       result)))
+
+(defun log-loaded-best-chain (chainstate)
+  "Core's closing line of LoadChainTip: `Loaded best chain: hashBestChain=<hash>
+height=<n> date=<iso8601>' (validation.cpp:4612).
+
+It is the one line that says which block this node came up on, and
+feature_init.py:72 interrupts start-up on it. Core appends progress=%f from
+GuessVerificationProgress; that estimate lives in the RPC layer here, so what
+this writes is the three facts the chainstate itself holds -- an omission, not
+a different number. A chainstate with no tip (a first run) logs nothing, as
+Core's LoadChainTip returns early on an empty coins view."
+  (let* ((hash (and chainstate (bl.store:best-block-hash chainstate)))
+         (entry (and hash (bl.store:get-block-index-entry chainstate hash)))
+         (header (and entry (bl.store:block-index-entry-header entry))))
+    (when header
+      (multiple-value-bind (sec min hour day month year)
+          ;; Core's FormatISO8601DateTime, i.e. UTC (util/time.cpp).
+          (decode-universal-time
+           (+ (bl.ser:block-header-timestamp header)
+              (encode-universal-time 0 0 0 1 1 1970 0))
+           0)
+        (log-info "Loaded best chain: hashBestChain=~A height=~D date=~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ"
+                  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
+                  (bl.store:current-height chainstate)
+                  year month day hour min sec)))))
 
 (defun %refuse-a-tip-from-the-future (chainstate)
   "Core VerifyLoadedChainstate's first test, before VerifyDB itself: a tip more
@@ -1267,6 +1295,9 @@ it; the indexes (Step 8) and -forcecompactdb."
   ;; Manual banlist persistence (Core BanMan <datadir>/banlist.json): load
   ;; previous bans (expired entries swept) and point future mutations at the
   ;; file — every setban/clearbanned dumps it immediately, like Core.
+  ;; BanMan's constructor announces the read the same way (banman.cpp:33), and
+  ;; feature_init.py:70 interrupts start-up on it.
+  (init-message "Loading banlist…")               ; banman.cpp:33
   (setf bl.net:*banlist-path*
         (merge-pathnames "banlist.json" (node-data-directory *node*)))
   (let ((n (bl.net:load-banlist)))
@@ -1808,7 +1839,17 @@ per-process sync state and the at-tip liveness signal reset for this run."
     (init-message "Starting network threads…")     ; net.cpp:3495
     (setf (node-sync-thread *node*)
           (bt:make-thread
-           (lambda () (%sync-thread-loop max-peers))
+           ;; Traced as Core's "opencon": this thread OPENS this node's
+           ;; automatic outbound connections -- %SYNC-THREAD-CONNECT first,
+           ;; then MAINTAIN-PEERS refilling slots every pass -- which is
+           ;; ThreadOpenConnections' job (net.cpp:3542) and exactly what
+           ;; feature_config_args.py:305 waits for the start line to know.
+           ;; It also carries the duties Core splits into the net, msghand
+           ;; and addcon threads (the receive pump, the send-buffer flush and
+           ;; -addnode maintenance in %SYNC-IDLE-TICK); those have no thread
+           ;; of their own here, so they get no start line of their own.
+           (lambda () (bl.log:trace-thread "opencon"
+                                           (lambda () (%sync-thread-loop max-peers))))
            :name "bitcoin-sync-thread"))))
 
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")

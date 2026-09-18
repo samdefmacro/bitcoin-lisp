@@ -1968,6 +1968,16 @@ its own from OPTIONS; an option nobody reads is an error."
                             ;; requests only under -debug=http.
                             (list :access-log-destination nil
                                   :message-log-destination nil))))
+              ;; Core's line for the HTTP server coming up, with the size of
+              ;; the pool that will execute requests (StartHTTPServer,
+              ;; httpserver.cpp:441). feature_init.py:69 interrupts start-up
+              ;; on it. *RPC-THREADS* is that pool here (the semaphore around
+              ;; request execution); NIL is this node's unbounded default, and
+              ;; says so rather than quoting a number it does not enforce.
+              (if *rpc-threads*
+                  (bl.log:node-log :info "Starting HTTP server with ~D worker threads"
+                                   *rpc-threads*)
+                  (bl.log:node-log :info "Starting HTTP server with unbounded worker threads (no -rpcthreads)"))
               (hunchentoot:start acceptor)
               (setf listening t)
 

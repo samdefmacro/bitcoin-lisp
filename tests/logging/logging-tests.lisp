@@ -375,3 +375,42 @@ gate that never scrolls at all cannot pass this test."
         (setf bl.log:*log-file-stream* saved-stream
               bl:*log-file-path* saved-path)
         (ignore-errors (delete-file path))))))
+
+;;; --- TraceThread (Core util::TraceThread) -----------------------------------
+
+(test trace-thread-brackets-the-body-with-cores-start-and-exit-lines
+  "Core util::TraceThread (util/thread.cpp:16-30): `<name> thread start' before
+the body, `<name> thread exit' after it, and on an escaping condition the
+report only -- no exit line, because Core's catch re-throws.
+
+Those lines are a contract with Core's functional framework: feature_init.py
+interrupts start-up on a named thread's start line, and
+feature_config_args.py:305 reads `opencon thread start' to know
+ThreadOpenConnections' start time has been set. A body that runs but logs
+nothing would pass every other test this node has."
+  (flet ((captured (name body)
+           (with-output-to-string (s)
+             (let ((bl.log:*log-stream* s)
+                   (bl.log:*log-file-stream* nil)
+                   (bl.log:*current-log-level* :info)
+                   (bl.log:*log-rate-limit* nil))
+               (ignore-errors (bl.log:trace-thread name body))))))
+    (let* ((ran nil)
+           (out (captured "opencon" (lambda () (setf ran t))))
+           (start (search "opencon thread start" out))
+           (exit (search "opencon thread exit" out)))
+      (is-true ran "the body must still run")
+      (is-true start)
+      (is-true exit)
+      (is-true (and start exit (< start exit))
+               "start is logged before the body, exit after it"))
+    ;; An escaping condition: reported like PrintExceptionContinue, and NO exit
+    ;; line -- the positive control for the assertion above, since a
+    ;; trace-thread that logged both lines unconditionally would pass it.
+    (let ((out (captured "net" (lambda () (error "boom")))))
+      (is-true (search "net thread start" out))
+      (is-true (search "boom" out))
+      (is-false (search "net thread exit" out)))
+    ;; The condition is re-signalled, not swallowed (util/thread.cpp:25).
+    (is-true (nth-value 1 (ignore-errors
+                           (bl.log:trace-thread "net" (lambda () (error "boom"))))))))

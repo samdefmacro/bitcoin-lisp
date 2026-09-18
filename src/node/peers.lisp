@@ -367,23 +367,40 @@ seeds."
     (when book
       (bt:make-thread
        (lambda ()
-         (handler-case
-             (let ((added 0))
-               (dolist (addr (bl.net:discover-peers))
-                 (multiple-value-bind (net ip-bytes)
-                     (bl.net:parse-network-address addr)
-                   (when (and net
-                              (not (bl.net:address-book-lookup
-                                    book ip-bytes port net)))
-                     (when (bl.net:address-book-add
-                            book
-                            (bl.net:make-peer-address
-                             :net net :ip ip-bytes :port port :services 0
-                             :last-seen (bl.ser:get-unix-time)))
-                       (incf added)))))
-               (log-info "DNS seeds contributed ~D new address~:P" added))
-           (error (e)
-             (log-warn "DNS seeding failed: ~A" e))))
+         (bl.log:trace-thread
+          "dnsseed"                     ; net.cpp:3527
+          (lambda ()
+            (let ((added 0)
+                  ;; Core's `found': every address the seeds RESOLVED to,
+                  ;; whether or not addrman already had it (net.cpp:2312,
+                  ;; incremented at :2378). Under a proxy the seeds are handed
+                  ;; on as hostnames instead of being resolved here, so nothing
+                  ;; is found -- which is what Core's HaveNameProxy branch does
+                  ;; too (net.cpp:2356-2358).
+                  (found 0))
+              (handler-case
+                  (dolist (addr (bl.net:discover-peers))
+                    (multiple-value-bind (net ip-bytes)
+                        (bl.net:parse-network-address addr)
+                      (when net
+                        (incf found)
+                        (unless (bl.net:address-book-lookup
+                                 book ip-bytes port net)
+                          (when (bl.net:address-book-add
+                                 book
+                                 (bl.net:make-peer-address
+                                  :net net :ip ip-bytes :port port :services 0
+                                  :last-seen (bl.ser:get-unix-time)))
+                            (incf added))))))
+                (error (e)
+                  (log-warn "DNS seeding failed: ~A" e)))
+              ;; Core's closing line of ThreadDNSAddressSeed (net.cpp:2389),
+              ;; written whatever the seeds answered -- a seed that cannot be
+              ;; reached still leaves the count behind, which is the only
+              ;; record that seeding ran at all. feature_config_args.py:305
+              ;; waits for it with an unreachable proxy, where it reads 0.
+              (log-info "~D addresses found from DNS seeds" found)
+              (log-info "DNS seeds contributed ~D new address~:P" added)))))
        :name "bitcoin-dnsseed-thread"))))
 
 (defun %record-outbound-result (address-book addr port peer success

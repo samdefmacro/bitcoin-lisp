@@ -50,6 +50,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:run-notify-command
    #:set-kernel-warning
    #:set-warning
+   #:trace-thread
    #:unset-warning
    #:warnings-for-rpc
    #:set-category-log-level))
@@ -780,6 +781,30 @@ since the safe set contains no quote of its own."
                           :value (format nil "'~A'"
                                          (bl.bytes:sanitize-string message))
                           :check nil))))
+
+(defun trace-thread (name function)
+  "Core util::TraceThread (util/thread.cpp:16-30): run FUNCTION as the body of a
+named thread, bracketed by `<NAME> thread start' and `<NAME> thread exit'.
+
+The pair is what Core's functional tests wait on to interrupt a node at a
+precise point of start-up (feature_init.py:63-85) and to see that a role's
+service has actually begun (feature_config_args.py:305 waits for `opencon
+thread start', so that ThreadOpenConnections' start time is set). Core writes
+the exit line only on a normal return: an escaping condition is reported the
+way PrintExceptionContinue reports it and then re-signalled, and no `thread
+exit' is written.
+
+NAME is Core's name for the ROLE the thread performs, so an operator comparing
+the two logs reads the same word. This node runs fewer threads than Core does;
+only the threads that exist are traced, and a Core thread name with no thread
+of its own here stays absent rather than being invented."
+  (log-info "~A thread start" name)
+  (handler-bind ((error (lambda (c)
+                          ;; PrintExceptionContinue: report it, then let it
+                          ;; propagate (util/thread.cpp:23-28).
+                          (log-error "~A thread: ~A" name c))))
+    (funcall function))
+  (log-info "~A thread exit" name))
 
 (defun set-kernel-warning (id message)
   "Core KernelNotifications::warningSet (kernel_notifications.cpp:79-85): record

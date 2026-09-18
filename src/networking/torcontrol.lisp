@@ -718,10 +718,15 @@ tor-controller."
         (bl.log:log-cat "tor" "Reading cached private key from ~A" key-file))
       (setf (tor-controller-thread ctl)
             (bt:make-thread (lambda ()
-                              (handler-case (%torcontrol-loop ctl)
-                                (error (e)
-                                  (bl.log:log-error
-                                   "tor: control thread died: ~A" e))))
+                              ;; Core's "torcontrol" thread (torcontrol.cpp:701
+                              ;; through util::TraceThread).
+                              (bl.log:trace-thread
+                               "torcontrol"
+                               (lambda ()
+                                 (handler-case (%torcontrol-loop ctl)
+                                   (error (e)
+                                     (bl.log:log-error
+                                      "tor: control thread died: ~A" e))))))
                             :name "torcontrol"))
       ctl)))
 

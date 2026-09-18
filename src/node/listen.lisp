@@ -124,8 +124,13 @@ port can't be bound."
         (progn
           (setf (node-listener-socket node) sock)
           (setf (node-listener-thread node)
-                (bt:make-thread (lambda () (run-inbound-listener node))
-                                :name "bitcoin-inbound-listener"))
+                (bt:make-thread
+                 ;; Traced as Core's "net": accepting inbound sockets is
+                 ;; ThreadSocketHandler's job (net.cpp:3522, whose
+                 ;; AcceptConnection half is all this thread does).
+                 (lambda () (bl.log:trace-thread
+                             "net" (lambda () (run-inbound-listener node))))
+                 :name "bitcoin-inbound-listener"))
           ;; Core's line for a bound listening socket (CConnman::BindListenPort,
           ;; net.cpp:3329). feature_port.py reads `Bound to <addr>:<port>' out
           ;; of debug.log to check where -port and -bind actually put the
