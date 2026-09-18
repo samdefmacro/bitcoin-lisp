@@ -780,6 +780,92 @@ height 1 where Core writes two."
       (is (= 0 (bl.ser:transaction-lock-time cb)) "nLockTime is nHeight - 1")
       (is (= #xffffffff (bl.ser:outpoint-index (bl.ser:tx-in-previous-output in0)))))))
 
+(defparameter +cores-mocktime-regtest-block-1+
+  (concatenate
+   'string
+   "0000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+   "35b99ed4e2e165de2ad77f1bba48049358c9bb740445f3c83ebdb3e83aa5bca8dbe5494d"
+   "ffff7f200000000001020000000001010000000000000000000000000000000000000000"
+   "000000000000000000000000ffffffff025100feffffff0200f2052a010000001976a914"
+   "2b4569203694fc997e13f2c0a1383b9e16c77a0d88ac0000000000000000266a24aa21a9"
+   "ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9012000"
+   "0000000000000000000000000000000000000000000000000000000000000000000000")
+  "Block 1 of the regtest chain rpc_dumptxoutset.py builds, witness-serialized.
+
+Not a number taken from Bitcoin Core -- Core's test pins only the hash at
+height 100 -- but the bytes that hash commits to. It is here as the DIAGNOSTIC
+half of the test below: when the height-100 constant stops matching, this says
+which field moved instead of leaving a bare hash mismatch.")
+
+(test a-mocktime-regtest-chain-is-cores-chain-byte-for-byte
+  "Bitcoin Core's own regtest chain, rebuilt here and compared on the hash Core
+pins. rpc_dumptxoutset.py:33-51 sets mocktime to the genesis timestamp plus
+one, mines COINBASE_MATURITY blocks to node 0's deterministic key
+(test_framework/test_node.py:216, address mjTkW3Dj...), and asserts the
+snapshot's base_hash is
+6885775faa46290bedfa071f22d0598c93f1d7e01f24607c4dedd69b9baa4a8f. That hash
+commits to all 100 blocks, so reproducing it proves every byte of every one:
+the coinbase's version, its BIP34 height push and single OP_0 extranonce, its
+sequence and nLockTime, the payout script, the witness commitment and its
+reserved value, and the header's version, timestamp and merkle root.
+
+The chain-versus-algorithm distinction is the point (feature_utxo_set_hash.py
+asks both questions, :67 and :70). A UTXO-set hash recomputed from the node's
+OWN coins passes for any chain the node built; only a constant computed from
+CORE's chain can fail for the block bytes, and this is that constant reached
+without a Core binary.
+
+The timestamps are their own assertion, because Core's UpdateTime is
+max(MTP + 1, now) (node/miner.cpp:49-57) and not simply `now'. Only the FIRST
+block carries the mocktime: from the second on, the median time past of the
+blocks already mined at that same second is itself the mocktime, so MTP + 1 is
+the larger of the two and the chain climbs one second per six blocks as the
+eleven-block median window fills. A node that wrote the mocktime into every
+header would produce a different chain from block 2 onward, and 100 such blocks
+end 18 seconds earlier than Core's."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture (format nil "corechain~D"
+                                               (get-internal-real-time))))
+           (chain-state (bl:node-chain-state node))
+           ;; Mining 100 blocks clears the process-global one-way IBD latch,
+           ;; which every later suite in the image would then inherit.
+           (bl.net:*cached-is-ibd* bl.net:*cached-is-ibd*)
+           (genesis-time (bl.ser:block-header-timestamp
+                          (bl.store:block-index-entry-header
+                           (bl.store:get-block-at-height chain-state 0))))
+           (bl.ser:*mock-time* (1+ genesis-time)))
+      (bl.rpc:dispatch-rpc-method
+       node "generatetoaddress"
+       (wire-params (list 100 "mjTkW3DjgyZck4KbiRusZsqTgaYTxdSz6z")))
+      (is (= 100 (bl.store:current-height chain-state))
+          "the fixture did not mine the chain the assertions are about")
+      (is (string= "6885775faa46290bedfa071f22d0598c93f1d7e01f24607c4dedd69b9baa4a8f"
+                   (bl.rpc:hash-to-hex (bl.store:best-block-hash chain-state)))
+          "the tip after 100 mocktime blocks is not Core's")
+      ;; Core's UpdateTime, max(MTP + 1, now): the mocktime wins once, then the
+      ;; median floor does.
+      (flet ((stamp (height)
+               (- (bl.ser:block-header-timestamp
+                   (bl.store:block-index-entry-header
+                    (bl.store:get-block-at-height chain-state height)))
+                  genesis-time)))
+        (is (= 1 (stamp 1)) "only the first block carries the mocktime")
+        (is (= 2 (stamp 2)) "from the second, MTP + 1 is the larger of the two")
+        ;; Settling to six blocks per second as the median window fills.
+        (is (equal '(2 2 3 3 3 3 4 4)
+                   (loop for h from 2 to 9 collect (stamp h))))
+        (is (= 19 (stamp 100))
+            "a chain stamped at the mocktime throughout would end here at 1"))
+      ;; And the bytes those hashes commit to, for the block at height 1.
+      (is (string= +cores-mocktime-regtest-block-1+
+                   (bl.crypto:bytes-to-hex
+                    (bl.ser:serialize-witness-block
+                     (bl.store:get-block
+                      (bl:node-block-store node)
+                      (bl.store:block-index-entry-hash
+                       (bl.store:get-block-at-height chain-state 1))))))
+          "block 1's serialized bytes moved"))))
+
 (test submitblock-round-trip
   ;; Build + mine a regtest block at the genesis tip, serialize it, submit the
   ;; hex via the RPC — accepted (null), tip advances, resubmit → "duplicate".
