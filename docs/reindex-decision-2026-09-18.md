@@ -1,5 +1,19 @@
 # `-reindex`: match Core, or keep the additive rebuild?
 
+**Status (2026-09-18): DECIDED — option (B).** The additive rebuild stays, and is now a
+*stated divergence* rather than an undocumented one: it is written at the option's own entry
+(`src/config-options.lisp`), in `docs/manual.lisp`'s storage section, and in
+`docs/functional-sweep-2026-09-13.md`, which marks the three wipe-dependent functional tests
+as known divergences. The three §6 items that are Core's behaviour *and* cost no block file
+were done at the same time: the persisted `'R'` resume marker (`BL.STORE:WRITE-REINDEX-FLAG`,
+bracketing `%REBUILD-BLOCK-INDEX-FROM-BLOCK-FILES`, read back by `%REINDEX-REQUESTED-P`),
+deletion of an assumeutxo snapshot chainstate under either reindex flag
+(`%INIT-RECOVER-CHAIN`), and a wipe-and-resync of every enabled index (`OPEN-INDEX-DB`'s
+`:wipe`, driven from `%START-INDEXES`). The deferred half is unchanged: wiping
+`blocks/index`, wiping the chainstate, and deleting pruned block files, none of which should
+be attempted before the three earlier functional failures in §3 are fixed and a local
+block-connect rate has actually been measured.
+
 Decision memo for the maintainer, 2026-09-18. Read-only analysis (functional sweep batch V):
 nothing was built, run or changed; Core citations are `refs/bitcoin` at the project pin
 `d3056bc1`. Question: our `-reindex` is *additive* — it extends the block index from the

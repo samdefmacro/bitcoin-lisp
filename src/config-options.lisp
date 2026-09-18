@@ -154,6 +154,19 @@
                           :collect :log-level-specs :repeatable t)
 (define-option "logratelimit" :key :log-rate-limit :type :bool)
 (define-option "flatblockfiles" :key :flat-block-files :type :bool)
+;; -reindex is a STATED DIVERGENCE from Core, decided 2026-09-18
+;; (docs/reindex-decision-2026-09-18.md). Core wipes four things and rebuilds
+;; them: the block tree db, the chainstate, the optional indexes, and -- in
+;; prune mode -- the block and undo files themselves (init.cpp:1344, :1386,
+;; :1905-1920; node/blockstorage.cpp:1234-1240). Ours rebuilds the BLOCK INDEX
+;; from the block files ADDITIVELY: an intact index is extended, never
+;; discarded, and neither the block files nor the chainstate are touched, so
+;; the flag stays a minutes-long local repair rather than a re-download. Three
+;; parts of Core's behaviour it does carry: the persisted resume marker, the
+;; deletion of an assumeutxo snapshot chainstate, and a wipe-and-resync of
+;; every enabled index. What it cannot do is repair a CORRUPT headerindex.dat
+;; -- start-up refuses that outright, and the file must be moved aside by hand
+;; -- or rebuild the UTXO set, which is -reindexchainstate and is not implied.
 (define-option "reindex" :key :reindex :type :bool)
 (define-option "port" :key :port :type :int :network-only t)
 (define-option "networkactive" :key :network-active :type :bool)

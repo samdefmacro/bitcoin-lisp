@@ -551,6 +551,32 @@
   disagree with a lookup; installing a second object left every ancestry
   walk handing out the superseded copy.
 
+  `-reindex` is a STATED DIVERGENCE from Core, decided 2026-09-18
+  (`docs/reindex-decision-2026-09-18.md`). Core's wipes four things and
+  rebuilds them from the block files: the block tree db, the chainstate,
+  every enabled index, and -- in prune mode -- the blk/rev files themselves
+  (`init.cpp:1344`, `:1386`, `:1905-1920`;
+  `node/blockstorage.cpp:1234-1240`). REINDEX-BLOCK-INDEX is ADDITIVE: it
+  walks the stored records in FILE order, skips every hash the index
+  already holds, links the rest to a parent and parks the ones whose parent
+  has not turned up yet, so an intact index is EXTENDED and never
+  discarded, and neither the block files nor the coins database are
+  touched. The flag is therefore a minutes-long local repair of a LOST
+  block index rather than a re-download; what it cannot do is repair a
+  CORRUPT `headerindex.dat` (start-up refuses that outright -- the file has
+  to be moved aside by hand) or rebuild the UTXO set, which is
+  `-reindexchainstate` and is not implied. Three pieces of Core's behaviour
+  it does carry, all of them free of the block files: WRITE-REINDEX-FLAG
+  brackets the walk with Core's persisted `R` marker, so an interrupted
+  reindex resumes on the next start with no option given
+  (`node/blockstorage.cpp:583-586`); an assumeutxo snapshot chainstate is
+  deleted, as under Core's `wipe_chainstate_db`
+  (`node/chainstate.cpp:179-188`); and every enabled index is wiped and
+  re-synced from genesis, as Core's `f_wipe` does (`index/base.cpp:68-73`)
+  -- on a pruned node that rebuild can only reach back to the prune
+  horizon. Genesis must be in the index BEFORE the walk starts, or every
+  record parks and nothing links.
+
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage
   never reads the node. An index whose startup catch-up is not wired is
@@ -597,6 +623,8 @@
   (bitcoin-lisp.storage:tx-index class)
   (bitcoin-lisp.storage:txospender-index class)
   (bitcoin-lisp.storage:reindex-block-index function)
+  (bitcoin-lisp.storage:write-reindex-flag function)
+  (bitcoin-lisp.storage:reindex-flag-set-p function)
   (bitcoin-lisp.storage:migrate-blocks-to-flat-files function))
 
 (defsection @net (:title "net: the transport")

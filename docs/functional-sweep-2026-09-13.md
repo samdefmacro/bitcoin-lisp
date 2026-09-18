@@ -163,6 +163,30 @@ not a node without RPC" (`start-rpc-early` signals `init-error` when
   wallet_listtransactions.py:229): the tests open `wallets/<name>/wallet.dat`;
   ours is a LevelDB directory (docs/coverage-vs-core-2026-08-24.md 15.5).
 
+### Known divergence: `-reindex` does not wipe (decided 2026-09-18)
+
+Our `-reindex` rebuilds the block index from the block files *additively* and wipes no block
+file, no chainstate and no block-tree database. That is a decision, not an omission
+(`docs/reindex-decision-2026-09-18.md`, option B), and it is now stated at the option's own
+entry and in `docs/manual.lisp`'s storage section. Three functional tests assert the wipe
+semantics and therefore cannot pass while the divergence stands. None of them currently
+fails *at* those lines — each fails earlier, for an unrelated reason — so nothing is blocked
+on the decision today:
+
+- `feature_remove_pruned_files_on_startup.py:65-68` — a prune-mode `-reindex` must leave
+  exactly `blk00000.dat` + `rev00000.dat` and `getblockcount() == 0`. Core deletes them in
+  `CleanupBlockRevFiles` (`node/blockstorage.cpp:654-688`). Fails earlier at `:64`.
+- `feature_index_prune.py:187-190` — an index whose best block is past the prune horizon
+  must start after `-reindex`. The index wipe is now ported (Core's `f_wipe`,
+  `index/base.cpp:68-73`), so this row needs only its earlier failure at `:103` fixed.
+- `feature_assumeutxo.py:725-728`, `:791-794` — one chainstate after either reindex flag.
+  The snapshot-chainstate deletion is now ported; fails earlier at `:187`.
+
+The three Core behaviours that cost no block file were taken on 2026-09-18: the persisted
+`'R'` resume marker, snapshot-chainstate deletion under either flag, and the index
+wipe-and-resync. `feature_reindex.py`, `feature_reindex_readonly.py`, `wallet_reindex.py`
+and `feature_loadblock.py` do not depend on the wipe.
+
 ## Ready-made batches from the baseline
 
 **RPC error text differs from Core's** (14 tests, each one message):
