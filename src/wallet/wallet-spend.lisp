@@ -1912,7 +1912,7 @@ the internal key and the rest is sliced per leaf, the same way
         ;; The same guard %SPKM-TR-SCRIPT-LEAVES applies: the spend data must
         ;; be for the output we are describing, never for another one.
         (when (equalp output-key (subseq script 2 34))
-          (let ((next (%pairs-splitter (rest pairs))))
+          (let ((next (bl.rpc:descriptor-pairs-splitter (rest pairs))))
             (loop for (nil leaf-hash) in leaves
                   for (nil . leaf) in (bl.rpc:out-desc-tree desc)
                   for slice = (funcall next leaf)
@@ -1924,7 +1924,7 @@ the internal key and the rest is sliced per leaf, the same way
                                    entries)))))))))
     (loop for (key pubkey hashes) in (nreverse entries)
           collect (multiple-value-bind (fpr path)
-                      (%desc-key-origin-info key pubkey pos)
+                      (bl.rpc:descriptor-key-origin key pubkey pos)
                     (list (bl.rpc:key-xonly-bytes pubkey)
                           (reverse hashes) fpr path)))))
 
