@@ -970,12 +970,30 @@ port overrides -port for the listener, as it does in Core."
                 '("-regtest" "-bind=127.0.0.1" "-port=12345") nil)))
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
     (is (= 12345 (getf plist :port))))
-  ;; An =onion bind names a Tor-only listener, not an address to bind: the raw
-  ;; string must not survive as one, or the node would try to bind
-  ;; "127.0.0.1:18445=onion" as a hostname.
+  ;; An =onion bind names the onion-service TARGET, not an address to bind:
+  ;; the raw string must not survive as one (the node would try to bind
+  ;; "127.0.0.1:18445=onion" as a hostname), the target must be carried
+  ;; through as given (init.cpp:2141-2147), and NO ordinary listening socket
+  ;; is opened at all -- bind_on_any is false as soon as any -bind is present
+  ;; and vBinds is empty (init.cpp:2162). Binding 0.0.0.0 as well, which the
+  ;; defaulted :LISTEN-BIND used to do, listens on a port nobody asked for;
+  ;; feature_bind_extra.py:94 compares the process's sockets against exactly
+  ;; what was asked for.
   (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18445=onion") nil)))
-    (is-false (getf plist :listen-bind)))
+    (is-true (member :listen-bind plist) "the key must be present and NIL")
+    (is-false (getf plist :listen-bind))
+    (is (equal '("127.0.0.1" . 18445) (getf plist :onion-bind))))
+  ;; No port on the =onion bind: the chain's port + 1, Core's
+  ;; default_bind_port_onion (init.cpp:2118).
+  (let ((plist (start-node-plist '("-regtest" "-bind=127.0.0.1=onion") nil)))
+    (is (equal '("127.0.0.1" . 18445) (getf plist :onion-bind))))
+  ;; Both forms together: the plain one binds, the =onion one is the target.
+  (let ((plist (start-node-plist
+                '("-regtest" "-bind=127.0.0.1:18455" "-bind=127.0.0.1:18456=onion") nil)))
+    (is (string= "127.0.0.1" (getf plist :listen-bind)))
+    (is (= 18455 (getf plist :port)))
+    (is (equal '("127.0.0.1" . 18456) (getf plist :onion-bind))))
   ;; Repeatable: the first plain bind is used, and neither occurrence errors.
   (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18445" "-bind=127.0.0.2:18446") nil)))
@@ -1842,10 +1860,15 @@ option this repo keeps finding."
            ;; present (init.cpp:2174-2182). With an explicit -bind it binds
            ;; nothing extra -- and the functional framework's per-node ports
            ;; are consecutive, so <p2p_port>+1 is the NEXT node's p2p port.
+           ;; An explicit -bind=...=onion is the other branch: that address IS
+           ;; the target (init.cpp:2141-2147).
            (let* ((src (%node-source-text))
-                  (guard (search "(when (and sync listen (not listen-bind-supplied-p))" src)))
+                  (guard (search "((not listen-bind-supplied-p)" src))
+                  (explicit (search "(cond (onion-bind" src)))
              (is-true guard
-                      "the onion-target bind is no longer gated on -bind being absent"))
+                      "the DEFAULT onion-target bind is no longer gated on -bind being absent")
+             (is-true explicit
+                      "an explicit -bind=...=onion no longer names the onion target"))
            ;; And the WRITE happens after the directory lock, where Core's
            ;; does: bitcoind locks in AppInitLockDataDirectory and only then
            ;; reaches CreatePidFile, the first step of AppInitMain

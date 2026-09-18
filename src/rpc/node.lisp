@@ -320,31 +320,6 @@ reason the method exists — it is undocumented and for testing only."
               (push (vector method position name (json-bool string-p)) rows))))))
     (coerce (nreverse rows) 'vector)))
 
-(defun %method-help-text (method)
-  "The help document for one METHOD, the shape Core's RPCHelpMan::ToString
-builds (rpc/util.cpp:773-793): the ONE-LINE summary -- the method name and
-its declared arguments, a run of optional ones wrapped in `( )' -- then a
-blank line, then the description.
-
-    getblockchaininfo
-
-    Returns an object containing various state info regarding blockchain
-    processing.
-
-The name-then-newline opening is the part clients rely on: Core's
-rpc_named_arguments.py:21 asserts `node.help(command='getblockchaininfo')
-.startswith('getblockchaininfo\\n')', and the web console reads the first
-word of each line. Answering the bare method name, as this did, has no
-newline at all.
-
-DIVERGENCE, unchanged from before: no method here carries Core's Arguments,
-Result or Examples sections, so the document stops after the description."
-  (let ((description (rpc-method-description method)))
-    (if description
-        (format nil "~A~%~%~A~%" (rpc-usage-line method)
-                (string-trim '(#\Space #\Tab #\Newline #\Return) description))
-        (format nil "~A~%" (rpc-usage-line method)))))
-
 (define-rpc "help" (node params)
   "List available RPC methods, or answer with one method's help document
 (Bitcoin Core help / CRPCTable::help, rpc/server.cpp:295-330).
@@ -375,7 +350,7 @@ rpc_help.py uses to check this node against Core's client.cpp."
        (%dump-all-command-conversions))
       ((and method (stringp method))
        (cond ((gethash method *rpc-help-texts*))
-             ((gethash method *rpc-methods*) (%method-help-text method))
+             ((gethash method *rpc-methods*) (rpc-help-document method))
              (t (format nil "help: unknown command: ~A" method))))
       (t
        (let ((names '()))

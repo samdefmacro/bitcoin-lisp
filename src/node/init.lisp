@@ -1730,7 +1730,8 @@ thread."
     (error () nil)))
 
 
-(defun %start-network-services (network sync listen listen-bind listen-bind-supplied-p listen-onion tor-control tor-password)
+(defun %start-network-services (network sync listen listen-bind listen-bind-supplied-p
+                               listen-onion tor-control tor-password onion-bind)
   "Core Step 12, start node: DNS seeding into the address book, the inbound
 listener, the onion listener with its Tor control connection, and
 -externalip's AddLocal entries."
@@ -1755,7 +1756,10 @@ listener, the onion listener with its Tor control connection, and
       (log-info "DNS seeding disabled (-dnsseed=0)"))
 
   ;; Inbound listening (depends on the sync thread to merge accepted peers).
-  (when (and sync listen)
+  ;; A NIL bind is "no ordinary listening socket": every -bind given was an
+  ;; =onion one, and Core binds nothing but the onion target then
+  ;; (init.cpp:2162, bind_on_any false with an empty vBinds).
+  (when (and sync listen listen-bind)
     (start-inbound-listener *node* listen-bind))
 
   ;; The DEFAULT onion-service target is bound whenever this node listens on a
@@ -1773,8 +1777,16 @@ listener, the onion listener with its Tor control connection, and
   ;; configuration. Binding it unconditionally is the other error: with an
   ;; explicit -bind Core binds nothing extra, and the framework's consecutive
   ;; per-node ports make <port>+1 the NEXT node's p2p port.
-  (when (and sync listen (not listen-bind-supplied-p))
-    (start-onion-listener *node*))
+  ;; An explicit -bind=<addr>[:<port>]=onion names the target itself
+  ;; (init.cpp:2141-2147); otherwise the DEFAULT target is bound only when no
+  ;; -bind was given at all.
+  (when (and sync listen)
+    (cond (onion-bind
+           (start-onion-listener *node*
+                                 :bind (car onion-bind)
+                                 :port (cdr onion-bind)))
+          ((not listen-bind-supplied-p)
+           (start-onion-listener *node*))))
   ;; The torcontrol client that registers the v3 onion service and AddLocal()s
   ;; the .onion address is what -listenonion actually governs. Gated on LISTEN
   ;; as well (Core: -listen=0 soft-disables -listenonion; the config layer
@@ -1787,7 +1799,12 @@ listener, the onion listener with its Tor control connection, and
            :password tor-password
            :data-directory (node-data-directory *node*)
            :virtual-port (network-port network)
-           :target-port (onion-listen-port *node*))))
+           ;; The Tor service maps to the onion target this node actually
+           ;; bound: onion_binds.front() in Core (init.cpp:2175-2176).
+           :target-host (if onion-bind (car onion-bind) "127.0.0.1")
+           :target-port (if onion-bind
+                            (cdr onion-bind)
+                            (onion-listen-port *node*)))))
 
   ;; -externalip: advertise the given addresses as our own (Core
   ;; init.cpp:1803-1808: AddLocal(addr, LOCAL_MANUAL) at the listen port).
@@ -1877,6 +1894,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (rpc-whitelist-default :unset)
                         (listen t)
                         (listen-bind "0.0.0.0" listen-bind-supplied-p)
+                        (onion-bind nil)
                         (listen-onion t)
                         (tor-control nil)
                         (tor-password nil)
@@ -2034,7 +2052,8 @@ Returns the node instance."
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 
-  (%start-network-services network sync listen listen-bind listen-bind-supplied-p listen-onion tor-control tor-password)
+  (%start-network-services network sync listen listen-bind listen-bind-supplied-p
+                           listen-onion tor-control tor-password onion-bind)
   ;; -loadblock=<file>: import external block files before declaring the node
   ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
   ;; on it). A file that cannot be opened warns and the rest still run.

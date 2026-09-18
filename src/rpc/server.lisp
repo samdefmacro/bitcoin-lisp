@@ -164,6 +164,37 @@ appear. A method with no row -- one Core does not declare -- falls back to
                  (write-string text out))
         (when was-optional (write-string " )" out))))))
 
+(defun rpc-help-document (method)
+  "The help document for one METHOD, the shape Core's RPCHelpMan::ToString
+builds (rpc/util.cpp:773-793): the ONE-LINE summary -- the method name and
+its declared arguments, a run of optional ones wrapped in `( )' -- then a
+blank line, then the description.
+
+    getblockchaininfo
+
+    Returns an object containing various state info regarding blockchain
+    processing.
+
+The name-then-newline opening is the part clients rely on: Core's
+rpc_named_arguments.py:21 asserts `node.help(command='getblockchaininfo')
+.startswith('getblockchaininfo\\n')', and the web console reads the first
+word of each line. Answering the bare method name, as this did, has no
+newline at all.
+
+It is also what a call with the wrong number of arguments is answered with:
+Core's IsValidNumArgs throws HelpResult, i.e. this whole document, and
+ExecuteCommand reports it as -1 (rpc/util.cpp:733-745, rpc/server.cpp:514-515).
+That is why it lives here, beside RPC-USAGE-LINE and CHECK-RPC-ARG-COUNT, in
+the server layer rather than beside the `help\' method that also renders it.
+
+DIVERGENCE, unchanged from before: no method here carries Core's Arguments,
+Result or Examples sections, so the document stops after the description."
+  (let ((description (rpc-method-description method)))
+    (if description
+        (format nil "~A~%~%~A~%" (rpc-usage-line method)
+                (string-trim '(#\Space #\Tab #\Newline #\Return) description))
+        (format nil "~A~%" (rpc-usage-line method)))))
+
 (defun check-rpc-arg-count (method params)
   "Core RPCHelpMan::IsValidNumArgs (rpc/util.cpp:733-745), run at the one
 dispatch point before any handler body: a call carrying fewer positional
@@ -194,8 +225,15 @@ transform first, as Core reaches transformNamedArguments before the actor
              (required (or (position t required-flags :from-end t) -1))
              (given (length params)))
         (unless (<= (1+ required) given total)
+          ;; Core throws the whole help DOCUMENT, not the usage line: HelpResult
+          ;; carries RPCHelpMan::ToString() (rpc/util.cpp:644,733-745) and
+          ;; ExecuteCommand reports it as -1 (rpc/server.cpp:514-515). Ours sent
+          ;; the synopsis alone, so a client that called a method wrong was told
+          ;; the argument NAMES and never what the method does --
+          ;; rpc_invalid_address_message.py:103 calls validateaddress with no
+          ;; arguments and looks for its description in the -1.
           (error 'rpc-error :code +rpc-misc-error+
-                            :message (rpc-usage-line method)))))))
+                            :message (rpc-help-document method)))))))
 
 (defun check-rpc-arg-types (method params)
   "Core's RPCHelpMan argument type gate (rpc/util.cpp:647-657), run once
@@ -1701,15 +1739,23 @@ are not loopback."
              (string= a "::1")
              (and (> (length a) 4) (string= (subseq a 0 4) "127."))))))
 
-(defun %rpc-bind-address (bind allow-ip &optional bind-supplied-p)
-  "The address the RPC acceptor may bind to. Core requires -rpcbind and
+(alexandria:define-constant +rpc-default-loopback-binds+ (list "::1" "127.0.0.1")
+  :test #'equal
+  :documentation
+  "The two addresses Core binds the RPC server to when -rpcbind and -rpcallowip
+were not both given: ::1 first, then 127.0.0.1 (HTTPBindAddresses,
+httpserver.cpp:320-321). Binding only the IPv4 loopback, as this node did,
+leaves a client that resolves `localhost' to ::1 -- which is the default on
+every dual-stack host -- unable to reach a node that is running perfectly
+well, and made the ACL's own ::1 floor unreachable.")
+
+(defun %rpc-bind-addresses (bind allow-ip &optional bind-supplied-p)
+  "The addresses the RPC server binds to, as a LIST. Core requires -rpcbind and
 -rpcallowip to be given TOGETHER and ignores both otherwise, rather than
 letting one flag expose the RPC port; it warns about whichever one was supplied
-alone (HTTPBindAddresses, httpserver.cpp:316-327).
-
-Core binds BOTH ::1 and 127.0.0.1 in the loopback default (httpserver.cpp:321-322)
-where we bind one address; that is why the ACL's ::1 floor cannot match on a
-default configuration here."
+alone (HTTPBindAddresses, httpserver.cpp:316-327). With neither in force the
+answer is both loopback addresses (+RPC-DEFAULT-LOOPBACK-BINDS+); rpc_bind.py:46
+compares the process's bound sockets against exactly that pair."
   (cond ((rpc-bind-loopback-p bind)
          ;; Core's warning here is about -rpcallowip given with no -rpcbind at
          ;; all; an explicit -rpcbind=127.0.0.1 alongside -rpcallowip takes its
@@ -1718,15 +1764,86 @@ default configuration here."
          (when (and allow-ip (not bind-supplied-p))
            (bl.log:node-log
             :warn "Option -rpcallowip was specified without -rpcbind; this ~
-doesn't usually make sense, as the RPC port stays on ~A" bind))
-         bind)
-        (allow-ip bind)
+doesn't usually make sense, as the RPC port stays on loopback"))
+         (if bind-supplied-p (list bind) +rpc-default-loopback-binds+))
+        (allow-ip (list bind))
         (t
          (bl.log:node-log
           :warn "-rpcbind=~A ignored because -rpcallowip was not specified, ~
-refusing to allow everyone to connect; the RPC port stays on 127.0.0.1"
+refusing to allow everyone to connect; the RPC port stays on loopback"
           (or bind "<any>"))
-         "127.0.0.1")))
+         +rpc-default-loopback-binds+)))
+
+(defvar *rpc-extra-servers* '()
+  "The acceptors beyond *RPC-SERVER* that this node bound, one per further
+address in +RPC-DEFAULT-LOOPBACK-BINDS+ or -rpcbind. Core binds several
+endpoints onto ONE evhttp (httpserver.cpp:341-357); hunchentoot has one socket
+per acceptor, so the dispatch table -- which is global, and the only thing that
+decides what a request reaches -- is shared and the sockets are separate.
+STOP-RPC-SERVER stops them with the primary.")
+
+(defun %rpc-acceptor-initargs ()
+  "The INITARGS every RPC acceptor is made with.
+
+-rpcthreads is NOT among them: it is not a taskmaster cap (see *RPC-THREADS*).
+Accepting stays unbounded, as it is in Core, and the bound is taken around
+request execution in ACCEPTOR-DISPATCH-REQUEST.
+
+-rpcservertimeout is, as INITARGS. This used to SETF
+hunchentoot:*default-connection-timeout* after the acceptor existed, and the
+special is only ever read as the read-timeout/write-timeout SLOT INITFORM -- so
+the assignment reached nothing and every RPC connection kept hunchentoot's
+20-second idle timeout. Core's functional framework writes
+rpcservertimeout=99000 into every node's config precisely so a connection
+survives a long wait; with the option inert, connect_nodes' first poll of the
+second node came ~50s after that node's last RPC call and died on a broken
+pipe. A dropped idle connection is invisible until a client stops reconnecting.
+
+And NOTHING goes to stderr. Hunchentoot defaults both logs there, so a node
+running normally dribbled an Apache-style access line per RPC call onto stderr
+-- which Core's test framework reads back at EVERY node stop and requires to be
+empty (test_node.py:502-509), so it would have failed every test that stops a
+node. Core logs HTTP requests only under -debug=http."
+  (list :read-timeout *rpc-server-timeout*
+        :write-timeout *rpc-server-timeout*
+        :access-log-destination nil
+        :message-log-destination nil))
+
+(defun %bind-rpc-acceptors (binds port collect &rest initargs)
+  "Bind an RPC acceptor on each address in BINDS at PORT, handing every
+acceptor that came up to COLLECT, and return the FIRST one that did.
+
+Core binds each endpoint in turn, logs `Binding RPC on address %s port %i' for
+it, and fails only when none of them bound (HTTPBindAddresses,
+httpserver.cpp:341-357). The same tolerance is what makes the ::1 default safe
+on a host with no IPv6 loopback: that endpoint is reported and skipped, and the
+node still serves on 127.0.0.1. If NO address bound, the condition from the
+last attempt is re-signalled, so the caller's address-in-use and generic arms
+report it exactly as they did when there was one socket."
+  (let ((primary nil)
+        (last-error nil))
+    (dolist (address binds)
+      (handler-case
+          ;; `[::1]' is how Core's documentation and its own tests spell an
+          ;; IPv6 literal with a port; the brackets are the SEPARATOR, never
+          ;; part of the address a socket is bound to.
+          (let ((acceptor (apply #'make-instance 'rpc-acceptor
+                                 :port port
+                                 :address (string-trim "[]" address)
+                                 initargs)))
+            (hunchentoot:start acceptor)
+            (funcall collect acceptor)
+            (unless primary (setf primary acceptor))
+            (bl.log:node-log :info "Binding RPC on address ~A port ~D" address port))
+        (error (e)
+          (setf last-error e)
+          (bl.log:node-log :warn "Unable to bind RPC on address ~A port ~D: ~A"
+                           address port e))))
+    (cond (primary primary)
+          (last-error (error last-error))
+          ;; Core's own sentence for an empty endpoint list
+          ;; (httpserver.cpp:414).
+          (t (bl.err:net-error "Unable to bind any endpoint for RPC server")))))
 
 (defun %parse-rpc-acl (allow-ip)
   "The RPC ACL for the -rpcallowip specs in ALLOW-IP, or NIL after logging when
@@ -1857,6 +1974,7 @@ The remaining keywords belong to the registered HTTP surfaces
 its own from OPTIONS; an option nobody reads is an error."
   (%check-surface-options options)
   (let ((port (or port (bl.chain:network-rpc-port bl.chain:*network*)))
+        (binds nil)
         (acl nil)
         (rpcauth-credentials nil)
         (whitelist (%parse-rpc-whitelist rpc-whitelist))
@@ -1869,7 +1987,7 @@ its own from OPTIONS; an option nobody reads is an error."
     (when *rpc-server*
       (bl.log:node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
-    (setf bind (%rpc-bind-address bind allow-ip bind-supplied-p))
+    (setf binds (%rpc-bind-addresses bind allow-ip bind-supplied-p))
 
     ;; WARMUP: answer -28 to everything until FINISH-RPC-WARMUP. Set before the
     ;; socket binds, so the very first request a client can make already gets
@@ -1907,7 +2025,7 @@ its own from OPTIONS; an option nobody reads is an error."
     ;; dispatchers are pushed last, so nothing can reach the handler at all in
     ;; that window.
     (let ((acceptor nil)
-          (listening nil)
+          (acceptors '())
           (credential-installed nil)
           (pushed '()))
       (flet ((abort-start ()
@@ -1921,8 +2039,8 @@ its own from OPTIONS; an option nobody reads is an error."
                (when pushed
                  (setf *rpc-dispatcher* nil)
                  (%stop-http-surfaces))
-               (when listening
-                 (handler-case (hunchentoot:stop acceptor) (error () nil)))
+               (dolist (a acceptors)
+                 (handler-case (hunchentoot:stop a) (error () nil)))
                (when credential-installed
                  (delete-rpc-cookie)
                  (setf *rpc-credentials* '() *rpc-cookie-path* nil
@@ -1932,42 +2050,9 @@ its own from OPTIONS; an option nobody reads is an error."
         (handler-case
             (progn
               (setf acceptor
-                    (apply #'make-instance 'rpc-acceptor
-                           :port port
-                           :address bind
-                           ;; -rpcthreads is NOT a taskmaster cap: see
-                           ;; *RPC-THREADS*. Accepting stays unbounded, as it
-                           ;; is in Core, and the bound is taken around request
-                           ;; execution in ACCEPTOR-DISPATCH-REQUEST below.
-                           (append
-                            ;; -rpcservertimeout, as INITARGS. This used to
-                            ;; SETF hunchentoot:*default-connection-timeout*
-                            ;; after the acceptor existed, and the special is
-                            ;; only ever read as the read-timeout/write-timeout
-                            ;; SLOT INITFORM — so the assignment reached
-                            ;; nothing and every RPC connection kept
-                            ;; hunchentoot's 20-second idle timeout.
-                            ;;
-                            ;; Core's functional framework writes
-                            ;; rpcservertimeout=99000 into every node's config
-                            ;; precisely so a connection survives a long wait.
-                            ;; With the option inert, connect_nodes' first
-                            ;; poll of the second node came ~50s after that
-                            ;; node's last RPC call and died on a broken pipe.
-                            ;; A dropped idle connection is invisible until a
-                            ;; client stops reconnecting.
-                            (list :read-timeout *rpc-server-timeout*
-                                  :write-timeout *rpc-server-timeout*)
-                            ;; NOTHING to stderr. Hunchentoot defaults both
-                            ;; logs there, so a node running normally dribbled
-                            ;; an Apache-style access line per RPC call onto
-                            ;; stderr — which Core's test framework reads back
-                            ;; at EVERY node stop and requires to be empty
-                            ;; (test_node.py:502-509), so it would have failed
-                            ;; every test that stops a node. Core logs HTTP
-                            ;; requests only under -debug=http.
-                            (list :access-log-destination nil
-                                  :message-log-destination nil))))
+                    (apply #'%bind-rpc-acceptors binds port
+                           (lambda (a) (push a acceptors))
+                           (%rpc-acceptor-initargs)))
               ;; Core's line for the HTTP server coming up, with the size of
               ;; the pool that will execute requests (StartHTTPServer,
               ;; httpserver.cpp:441). feature_init.py:69 interrupts start-up
@@ -1978,8 +2063,6 @@ its own from OPTIONS; an option nobody reads is an error."
                   (bl.log:node-log :info "Starting HTTP server with ~D worker threads"
                                    *rpc-threads*)
                   (bl.log:node-log :info "Starting HTTP server with unbounded worker threads (no -rpcthreads)"))
-              (hunchentoot:start acceptor)
-              (setf listening t)
 
               ;; Bound. Now install the one credential the handler authorizes
               ;; against (Core InitRPCAuthentication, httprpc.cpp:240-288).
@@ -2023,8 +2106,10 @@ its own from OPTIONS; an option nobody reads is an error."
                     (push dispatcher pushed)
                     (push dispatcher hunchentoot:*dispatch-table*))))
 
-              (setf *rpc-server* acceptor)
-              (bl.log:node-log :info "RPC server started on ~A:~A" bind port)
+              (setf *rpc-server* acceptor
+                    *rpc-extra-servers* (remove acceptor acceptors))
+              (bl.log:node-log :info "RPC server started on ~A:~A"
+                               (hunchentoot:acceptor-address acceptor) port)
               acceptor)
           (usocket:address-in-use-error ()
             (bl.log:node-log :error "RPC port ~A already in use, continuing without RPC" port)
@@ -2038,10 +2123,12 @@ its own from OPTIONS; an option nobody reads is an error."
   (when *rpc-server*
     (handler-case
         (progn
-          (hunchentoot:stop *rpc-server*)
+          (dolist (a (cons *rpc-server* *rpc-extra-servers*))
+            (hunchentoot:stop a))
           (bl.log:node-log :info "RPC server stopped"))
       (error (e)
         (bl.log:node-log :warn "Error stopping RPC server: ~A" e)))
+    (setf *rpc-extra-servers* '())
     ;; Remove dispatcher from dispatch table to prevent accumulation
     (when *rpc-dispatcher*
       (setf hunchentoot:*dispatch-table*

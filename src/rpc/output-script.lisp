@@ -148,8 +148,14 @@ positions that come with four of them."
       ("error_locations" . ,(coerce locations 'vector))
       ("error" . ,message))))
 
+;; The description opens with Core's own sentence for this method
+;; (validateaddress's RPCHelpMan, rpc/output_script.cpp): a docstring here IS
+;; the help document a client reads, and IS what a call with the wrong number
+;; of arguments is answered with, so the wording is part of the interface.
+;; rpc_invalid_address_message.py:103 calls validateaddress with no arguments
+;; and looks for exactly that sentence in the -1 it gets back.
 (define-rpc "validateaddress" (node (address))
-  "Validate a Bitcoin address and return metadata (Core validateaddress).
+  "Return information about the given bitcoin address.
 Booleans are real JSON booleans; the invalid shape carries error/
 error_locations like Core's."
   (let ((network (rpc-get-network node)))

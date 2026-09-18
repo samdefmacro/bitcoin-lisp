@@ -147,15 +147,19 @@ port + 1 (Core's default_bind_port_onion, init.cpp:2118 — -port shifts it
 too — and DefaultOnionServiceTarget)."
   (1+ (listen-port (node-network node))))
 
-(defun start-onion-listener (node)
-  "Open the onion-service target listener on 127.0.0.1:(port+1) and spawn its
-accept thread. Bound to loopback only — connections come exclusively from the
-local Tor daemon; the bind is never advertised (Core BF_DONT_ADVERTISE on
-onion binds). No-op (logged) if the port can't be bound; torcontrol still
-runs, matching Core, where a failed onion bind and the control thread are
-independent."
-  (let* ((port (onion-listen-port node))
-         (sock (bl.net:open-listener "127.0.0.1" port)))
+(defun start-onion-listener (node &key (bind "127.0.0.1") port)
+  "Open the onion-service target listener and spawn its accept thread.
+
+The default target is 127.0.0.1:(port+1) -- Core's DefaultOnionServiceTarget
+over default_bind_port_onion (init.cpp:2118,2180). BIND and PORT name it
+instead when the operator gave `-bind=<addr>[:<port>]=onion', which Core makes
+onion_binds.front() and binds as given (init.cpp:2141-2147). Loopback by
+default because connections come exclusively from the local Tor daemon; the
+bind is never advertised (Core BF_DONT_ADVERTISE on onion binds). No-op
+(logged) if the port can't be bound; torcontrol still runs, matching Core,
+where a failed onion bind and the control thread are independent."
+  (let* ((port (or port (onion-listen-port node)))
+         (sock (bl.net:open-listener bind port)))
     (if sock
         (progn
           (setf (node-onion-listener-socket node) sock)
@@ -163,6 +167,6 @@ independent."
                 (bt:make-thread (lambda ()
                                   (run-inbound-listener node :socket sock :onion t))
                                 :name "bitcoin-onion-listener"))
-          (log-info "Bound to 127.0.0.1:~D" port)
-          (log-info "Listening for inbound onion peers on 127.0.0.1:~D" port))
-        (log-warn "Onion inbound listening disabled: could not bind 127.0.0.1:~D" port))))
+          (log-info "Bound to ~A:~D" bind port)
+          (log-info "Listening for inbound onion peers on ~A:~D" bind port))
+        (log-warn "Onion inbound listening disabled: could not bind ~A:~D" bind port))))

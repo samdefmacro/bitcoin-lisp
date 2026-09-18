@@ -87,12 +87,27 @@ resolved network. Honors -server (enable RPC on the default port when no
       (let* ((specs (loop for (k . v) in alist when (string= k "bind") collect v))
              (parsed (loop for spec in specs
                            collect (multiple-value-list (parse-bind-option spec))))
-             (plain (remove-if (lambda (p) (or (null (first p)) (third p))) parsed)))
+             (plain (remove-if (lambda (p) (or (null (first p)) (third p))) parsed))
+             (onion (find-if (lambda (p) (and (first p) (third p))) parsed)))
+        ;; An =onion entry names the onion-service TARGET this node listens on
+        ;; (init.cpp:2141-2147 pushes it into onion_binds, and :2175 makes the
+        ;; first one the Tor target). Its port defaults to
+        ;; default_bind_port_onion, the chain's port + 1 (init.cpp:2118).
+        ;; Ours parsed the suffix and then threw the address away, so an
+        ;; explicit -bind=127.0.0.1:P=onion listened on the DEFAULT port+1
+        ;; instead of on P -- feature_bind_extra.py:94 compares the process's
+        ;; actual bound ports against exactly what was asked for.
+        (when onion
+          (setf (getf plist :onion-bind)
+                (cons (first onion)
+                      (or (second onion) (1+ (network-port network))))))
         (when (and specs (null plain))
-          ;; Every -bind was =onion or unparseable: do NOT leave the spec
-          ;; scan's raw string (which still carries ":port=onion") in the
-          ;; plist as a bind address.
-          (remf plist :listen-bind))
+          ;; Every -bind was =onion or unparseable. Core binds NO ordinary
+          ;; listening socket then: bind_on_any is false as soon as any -bind
+          ;; is given (init.cpp:2162), and vBinds is empty, so the onion target
+          ;; is the only socket. Ours dropped the raw spec and fell back to the
+          ;; 0.0.0.0 default, i.e. it listened on a port nobody asked for.
+          (setf (getf plist :listen-bind) nil))
         (when plain
           (destructuring-bind (host port onion-p) (first plain)
             (declare (ignore onion-p))

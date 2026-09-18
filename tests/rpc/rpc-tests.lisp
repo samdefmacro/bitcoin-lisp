@@ -1350,17 +1350,29 @@ all, which is the order Core reaches transformNamedArguments in
         (zeros (make-string 64 :initial-element #\0)))
     (flet ((answer (method &rest params)
              (%rpc-wire-error node method params)))
-      ;; One argument too many, for a method that declares none and for one
-      ;; that declares a single optional one. The second is rpc_help.py:126.
-      (is (equal (cons -1 "uptime") (answer "uptime" 1)))
-      (is (equal (cons -1 "help ( \"command\" )") (answer "help" "a" "b")))
-      ;; Too few: the one required argument of getblockhash.
-      (is (equal (cons -1 "getblockhash height") (answer "getblockhash")))
-      ;; An OPTIONAL argument before a required one still has to be passed --
-      ;; prioritisetransaction's `dummy\' sits between txid and fee_delta, so
-      ;; two arguments are too few even though only two are required.
-      (is (equal (cons -1 "prioritisetransaction \"txid\" ( dummy ) fee_delta")
-                 (answer "prioritisetransaction" zeros 0)))
+      ;; The message is the whole help DOCUMENT, which OPENS with the usage
+      ;; line: Core throws HelpResult, i.e. RPCHelpMan::ToString()
+      ;; (rpc/util.cpp:644,733-745), and rpc_invalid_address_message.py:103
+      ;; looks for a method's DESCRIPTION in the -1 a no-argument call gets.
+      (flet ((refusal-opens-with (usage answer)
+               (and (consp answer)
+                    (eql -1 (car answer))
+                    (eql 0 (search (format nil "~A~%" usage) (cdr answer))))))
+        ;; One argument too many, for a method that declares none and for one
+        ;; that declares a single optional one. The second is rpc_help.py:126.
+        (is-true (refusal-opens-with "uptime" (answer "uptime" 1)))
+        (is-true (refusal-opens-with "help ( \"command\" )" (answer "help" "a" "b")))
+        ;; Too few: the one required argument of getblockhash.
+        (is-true (refusal-opens-with "getblockhash height" (answer "getblockhash")))
+        ;; An OPTIONAL argument before a required one still has to be passed --
+        ;; prioritisetransaction's `dummy\' sits between txid and fee_delta, so
+        ;; two arguments are too few even though only two are required.
+        (is-true (refusal-opens-with "prioritisetransaction \"txid\" ( dummy ) fee_delta"
+                                     (answer "prioritisetransaction" zeros 0)))
+        ;; and it carries the description, which is the half a client needs and
+        ;; the half this used to drop.
+        (is-true (search "Return the hash of block at given height."
+                         (cdr (answer "getblockhash")))))
       ;; Positive controls. Exactly the maximum still RUNS: help answers with
       ;; that method's document, which OPENS with its usage line (Core
       ;; RPCHelpMan::ToString, rpc/util.cpp:773-793).
@@ -8223,22 +8235,32 @@ bind before giving up.)"
 (test rpc-bind-non-loopback-refused
   "-rpcbind is honoured only together with -rpcallowip; either flag alone falls
 back to loopback (HTTPBindAddresses, httpserver.cpp:316-327). Without that gate
-a single -rpcbind would put the whole RPC surface on the public internet."
-  ;; loopback binds are kept whatever -rpcallowip says
-  (dolist (loopback '("127.0.0.1" "127.0.0.2" "::1" "[::1]" "localhost"))
-    (dolist (allow-ip '(nil ("10.0.0.0/8")))
-      (is (string= loopback (bl.rpc::%rpc-bind-address loopback allow-ip))
-          "~S is loopback and must be kept (allow-ip ~S)" loopback allow-ip)))
-  ;; a non-loopback bind with no -rpcallowip falls back
-  (dolist (exposed '("0.0.0.0" "" "192.168.1.5" "::" "1.2.3.4" "127acme.example"))
-    (is (string= "127.0.0.1" (bl.rpc::%rpc-bind-address exposed nil))
-        "~S is not loopback and must fall back" exposed))
-  (is (string= "127.0.0.1" (bl.rpc::%rpc-bind-address nil nil)))
-  ;; with -rpcallowip the operator's address is used as given
-  (is (string= "10.0.0.5"
-               (bl.rpc::%rpc-bind-address "10.0.0.5" '("10.0.0.0/8"))))
-  (is (string= "0.0.0.0"
-               (bl.rpc::%rpc-bind-address "0.0.0.0" '("0.0.0.0/0")))))
+a single -rpcbind would put the whole RPC surface on the public internet.
+
+The fallback is BOTH loopback addresses, ::1 first and then 127.0.0.1
+(httpserver.cpp:320-321). Binding only the IPv4 one, as this node did, leaves a
+client that resolves `localhost' to ::1 unable to reach a node that is running:
+rpc_bind.py:46 compares the process's bound sockets against the pair."
+  (flet ((binds (bind allow-ip &optional supplied-p)
+           (bl.rpc::%rpc-bind-addresses bind allow-ip supplied-p)))
+    ;; A loopback bind the operator ASKED for is used as given, whatever
+    ;; -rpcallowip says.
+    (dolist (loopback '("127.0.0.1" "127.0.0.2" "::1" "[::1]" "localhost"))
+      (dolist (allow-ip '(nil ("10.0.0.0/8")))
+        (is (equal (list loopback) (binds loopback allow-ip t))
+            "~S is loopback and must be kept (allow-ip ~S)" loopback allow-ip)))
+    ;; No -rpcbind at all: the default pair, in Core's order.
+    (is (equal '("::1" "127.0.0.1") (binds "127.0.0.1" nil)))
+    (is (equal '("::1" "127.0.0.1") (binds "127.0.0.1" '("10.0.0.0/8"))))
+    (is (equal '("::1" "127.0.0.1") (binds nil nil)))
+    ;; A non-loopback bind with no -rpcallowip is ignored, and the fallback is
+    ;; the same pair -- not the address that was asked for.
+    (dolist (exposed '("0.0.0.0" "" "192.168.1.5" "::" "1.2.3.4" "127acme.example"))
+      (is (equal '("::1" "127.0.0.1") (binds exposed nil t))
+          "~S is not loopback and must fall back" exposed))
+    ;; with -rpcallowip the operator's address is used as given
+    (is (equal '("10.0.0.5") (binds "10.0.0.5" '("10.0.0.0/8") t)))
+    (is (equal '("0.0.0.0") (binds "0.0.0.0" '("0.0.0.0/0") t)))))
 
 ;;;; tx JSON field completeness (T3c)
 
