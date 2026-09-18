@@ -499,27 +499,27 @@ why this method lives here rather than in storage."
                                              (bl.val:calculate-block-subsidy height))
           nil))
 
+;;; -reindex WIPES every index here before it is opened. Core passes do_reindex
+;;; as each index's f_wipe (init.cpp:1905, :1909, :1915, :1920), which becomes
+;;; DBParams::wipe_data (index/base.cpp:68-73), so the index opens with a null
+;;; DB_BEST_BLOCK and BaseIndex::Init starts it from nothing (:119-133): a
+;;; rebuild from scratch, not a catch-up. What that is for is the case a
+;;; catch-up cannot reach -- an index whose best block is no longer on disk.
+;;; Its marker names a block a pruned node has dropped
+;;; (feature_index_prune.py:187-190), or one the rebuilt block index does not
+;;; place, and the catch-up has nothing to resume from; only a wipe gives it a
+;;; starting point again.
+;;;
+;;; The cost lands on a pruned node: a wiped index can only be rebuilt from the
+;;; blocks still on disk, so its history begins at the prune horizon. Core pays
+;;; the same price by another route -- its -reindex in prune mode deletes the
+;;; block files outright (CleanupBlockRevFiles, node/blockstorage.cpp:654-688)
+;;; and re-downloads the chain.
 (defun %start-indexes (txindex blockfilterindex txospenderindex coinstatsindex
                        reindex reindex-chainstate)
   "Open every enabled index on *NODE* and catch it up to the tip (Core
-init.cpp \"Step 8: start indexers\" -- our catch-ups are synchronous, see
-CATCH-UP-INDEX). Prune locks are re-registered from scratch.
-
-REINDEX is -reindex, and it WIPES each index before opening it. Core passes
-do_reindex as every index's f_wipe (init.cpp:1905, :1909, :1915, :1920), which
-becomes DBParams::wipe_data (index/base.cpp:68-73), so the index opens with a
-null DB_BEST_BLOCK and BaseIndex::Init starts it from nothing (:119-133): a
-rebuild from scratch, not a catch-up. What that is for is the case a catch-up
-cannot reach -- an index whose best block is no longer on disk. Its marker
-names a block a pruned node has dropped (feature_index_prune.py:187-190), or
-one the rebuilt block index does not place, and the catch-up has nothing to
-resume from; only a wipe gives it a starting point again.
-
-The cost lands on a pruned node: a wiped index can only be rebuilt from the
-blocks still on disk, so its history begins at the prune horizon. Core pays the
-same price for a different reason -- its -reindex in prune mode deletes the
-block files outright (CleanupBlockRevFiles, node/blockstorage.cpp:654-688) and
-re-downloads the chain."
+init.cpp \"Step 8: start indexers\"; our catch-ups are synchronous). Prune
+locks are re-registered from scratch; REINDEX wipes each index -- see above."
   ;; Transaction index. The catch-up is what makes enabling -txindex on a
   ;; synced node index history (build-tx-index had no caller until the txindex fix);
   ;; it resumes from the best-block marker, so a current index costs one

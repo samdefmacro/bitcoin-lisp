@@ -2656,15 +2656,17 @@ the snapshot chainstate is what start-up is supposed to adopt."
 ;;; --- the four indexes are wiped and re-synced by -reindex ------------------
 
 (defun %index-wipe-node (tag)
-  "A regtest node with a data directory of its own, its undo storage pointed
-at it, and three mined blocks -- the input %START-INDEXES needs."
+  "A regtest node with a data directory of its own and three mined blocks --
+the input %START-INDEXES needs.
+
+The undo storage is deliberately left alone. It is process-global (a path, a
+block store and a chain state) and nothing here reads it back, so pointing it
+at this fixture's temp directory only leaves every LATER suite reading undo
+data through a node that is gone -- which turned three index suites red in the
+same image while every test here stayed green."
   (let* ((node (regtest-node-fixture tag))
          (base (regtest-node-base-path tag)))
     (setf (bl:node-data-directory node) base)
-    (bl.val:initialize-undo-storage
-     (merge-pathnames "undo/" base)
-     :block-store (bl:node-block-store node)
-     :chain-state (bl:node-chain-state node))
     (let ((bl:*node* node))
       (generate-regtest-blocks node 3))
     node))
@@ -2690,7 +2692,13 @@ never ran, which is what says the observation happened at all."
            (let ((bl:*node* node))
              (bl::%start-indexes txindex blockfilterindex txospenderindex
                                  coinstatsindex reindex nil)))
-      (setf (fdefinition 'bl:catch-up-index) real))
+      (setf (fdefinition 'bl:catch-up-index) real)
+      ;; %START-INDEXES announces each catch-up as an RPC warmup status, and
+      ;; start-up clears it at the end (FINISH-RPC-WARMUP, the last thing
+      ;; START-NODE does). Left set, every RPC in the image answers -28 for the
+      ;; rest of the run: three index suites went red on RPC-ERROR after this
+      ;; test had passed.
+      (bl.rpc:finish-rpc-warmup))
     (values at-entry (funcall probe node))))
 
 (defmacro %index-wipe-test (name kind probe empty close &body doc)
