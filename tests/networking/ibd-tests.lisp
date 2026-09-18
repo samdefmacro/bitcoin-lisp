@@ -609,7 +609,28 @@ so our own insufficient bandwidth cannot evict several peers in a row."
                                 bl.net::+block-stalling-timeout-max+))))
         (is (= bl.net::+block-stalling-timeout-max+ expected)
             "the doubling must reach and stop at Core's 64s ceiling")
-        (is (= bl.net::+block-stalling-timeout-max+ (%bd-stalling-timeout)))))))
+        (is (= bl.net::+block-stalling-timeout-max+ (%bd-stalling-timeout)))
+        ;; ... and the doubling is not one-way. Core's BlockConnected reduces
+        ;; it x0.85 per connected block, truncated to whole seconds by the
+        ;; duration_cast and floored at the 2s default (:2076-2084). Ours only
+        ;; ever doubled, so a node whose downlink recovered kept the 64s ceiling
+        ;; for the life of the process and a real staller went undetected for
+        ;; half a minute; p2p_ibd_stalling.py:139 provides the withheld block
+        ;; and waits for `Decreased stalling timeout to 2 seconds'.
+        ;; Driven by the EVENT, as Core's is, so a block that connects through
+        ;; submitblock or a reorg counts too -- found by name so the assertion
+        ;; fails if the subscriber is ever unregistered.
+        (let ((hook (find "%NET-BLOCK-CONNECTED"
+                          (bl.vi:validation-hooks :block-connected)
+                          :key #'symbol-name :test #'string=)))
+          (is-true hook
+                   "nothing subscribed to block-connected to decay the timeout")
+          (when hook
+            (dolist (want '(54 45 38 32 27 22 18 15 12 10 8 6 5 4 3 2 2 2))
+              (funcall hook nil nil nil 1 nil)
+              (is (= want (%bd-stalling-timeout))
+                  "the next connected block must take the timeout to ~Ds"
+                  want))))))))
 
 (test the-window-staller-is-the-peer-holding-its-first-missing-block
   "Core FindNextBlocks (net_processing.cpp:1514-1531): when the walk reaches

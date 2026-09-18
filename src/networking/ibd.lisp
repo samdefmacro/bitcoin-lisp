@@ -1534,9 +1534,38 @@ peers due to our own downstream link being saturated\".")
 
 (defvar *block-stalling-timeout* +block-stalling-timeout-default+
   "Core PeerManagerImpl::m_block_stalling_timeout. DOUBLES toward
-+block-stalling-timeout-max+ every time a peer is dropped for stalling, and
-never falls: the back-off is what stops our own insufficient bandwidth from
-evicting several peers in a row.")
++block-stalling-timeout-max+ every time a peer is dropped for stalling (the
+back-off is what stops our own insufficient bandwidth from evicting several
+peers in a row) and decays back toward the default as blocks connect --
+%DECAY-BLOCK-STALLING-TIMEOUT.")
+
+(defun %decay-block-stalling-timeout ()
+  "Core PeerManagerImpl::BlockConnected (net_processing.cpp:2076-2084): `in case
+the dynamic timeout was doubled once or more, reduce it slowly back to its
+default value' -- x0.85 per connected block, truncated to whole seconds by the
+duration_cast, and floored at BLOCK_STALLING_TIMEOUT_DEFAULT.
+
+Without it the doubling was one-way: a node whose downlink recovered kept the
+64-second ceiling for the life of the process, so a genuinely stalling peer went
+undetected for half a minute. p2p_ibd_stalling.py:139 provides the withheld
+block and waits for `Decreased stalling timeout to 2 seconds'."
+  (let ((current *block-stalling-timeout*))
+    (when (/= current +block-stalling-timeout-default+)
+      (let ((next (max (floor (* current 85) 100)
+                       +block-stalling-timeout-default+)))
+        (setf *block-stalling-timeout* next)
+        (bl:log-debug "Decreased stalling timeout to ~D seconds" next)))))
+
+(bl.vi:define-validation-hook :block-connected %net-block-connected
+    (chainstate block block-hash height spent-utxos)
+  "The networking layer's CValidationInterface::BlockConnected subscriber. Core
+does two things there that belong to block download (:2074-2084): stamp
+m_last_tip_update, which NOTE-TIP-ADVANCED already does on the download path,
+and decay the dynamic stalling timeout. This is the decay, and it is driven by
+the event rather than by the drain loop so a block that connects through
+submitblock or a reorg counts too, as Core's does."
+  (declare (ignore chainstate block block-hash height spent-utxos))
+  (%decay-block-stalling-timeout))
 
 (defun block-download-deadline-ticks (&optional (downloading-peers (%peers-downloading-from)))
   "How long a peer may go without delivering the FRONT block it holds, in
