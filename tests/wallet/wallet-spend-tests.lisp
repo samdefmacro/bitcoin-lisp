@@ -2005,6 +2005,82 @@ in solving_data, to bump the parent that created it."
                     "the built transaction must spend the pre-selected external ~
 outpoint; it spends ~S" spent)))))))))
 
+(test a-signed-witness-input-records-the-witness-utxo-it-signed-over
+  "Core's SignPSBTInput writes the witness_utxo the moment it produces a
+WITNESS signature (psbt.cpp:495-501), and only then can
+RemoveUnnecessaryTransactions judge the non_witness_utxo: its whole rule reads
+the witness_utxo's scriptPubKey, so an input without that record stops the
+scan and nothing is dropped anywhere (psbt.cpp:518-526).
+
+We never wrote it. An input the updater had filled from the wallet's full
+previous transaction therefore carried that transaction out of
+walletprocesspsbt forever -- wallet_taproot.py:358-359 asserts the opposite
+pair for every tr() pattern it tests: non_witness_utxo absent and witness_utxo
+present.
+
+The segwit v0 input is the control, and it is Core's own rule rather than a
+weaker assertion: v0 cannot drop the full transaction (its amount is
+authenticated only there, psbt.cpp:527-531), so it must come back with BOTH."
+  (with-wallet-chain-node (node "tr-wutxo")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "tr")
+        ;; Two v0 coinbases: the wallet's CHANGE is bech32m, so spending the
+        ;; only one would leave the fund wallet no segwit v0 coin to control
+        ;; with.
+        (rpc nil "generatetoaddress" 2 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let ((tr-address (rpc "tr" "getnewaddress" "" "bech32m")))
+          (with-wallet-rng (59)
+            (rpc "fund" "sendtoaddress" tr-address (bl.rpc:format-money 100000000)
+                 nil nil nil nil nil nil nil 10))
+          (rpc nil "generatetoaddress" 1 optrue)
+          (flet ((processed-input (wallet prefix)
+                   ;; createpsbt over a coin of this wallet whose address is of
+                   ;; the kind under test, then the wallet updates and signs it
+                   ;; without finalizing -- the offline signer's path, and
+                   ;; wallet_taproot.py:352-353's.
+                   (let* ((coin (find-if (lambda (c)
+                                           (let ((a (%aval "address" c)))
+                                             (and (stringp a)
+                                                  (eql 0 (search prefix a)))))
+                                         (rpc wallet "listunspent")))
+                          (input (let ((h (make-hash-table :test 'equal)))
+                                   (setf (gethash "txid" h) (%aval "txid" coin)
+                                         (gethash "vout" h) (%aval "vout" coin))
+                                   h))
+                          (outputs (list (let ((h (make-hash-table :test 'equal)))
+                                           (setf (gethash optrue h)
+                                                 (bl.rpc:format-money 10000000))
+                                           h)))
+                          (created (rpc nil "createpsbt" (list input) outputs))
+                          (processed (rpc wallet "walletprocesspsbt" created
+                                          nil nil nil bl.rpc:+json-false+))
+                          (decoded (rpc nil "decodepsbt" (%aval "psbt" processed))))
+                     (first (coerce (%aval "inputs" decoded) 'list)))))
+            (let ((tr-input (processed-input "tr" "bcrt1p")))
+              (is-true (%aval "witness_utxo" tr-input)
+                       "a signed tr() input carries no witness_utxo: ~S"
+                       (mapcar #'car tr-input))
+              (is-false (%aval "non_witness_utxo" tr-input)
+                        "a signed tr() input still carries its non_witness_utxo: ~S"
+                        (mapcar #'car tr-input))
+              (is-true (or (%aval "taproot_key_path_sig" tr-input)
+                           (%aval "taproot_script_path_sigs" tr-input))
+                       "the tr() input was not signed at all: ~S"
+                       (mapcar #'car tr-input)))
+            (let ((v0-input (processed-input "fund" "bcrt1q")))
+              (is-true (%aval "witness_utxo" v0-input)
+                       "a signed segwit v0 input carries no witness_utxo: ~S"
+                       (mapcar #'car v0-input))
+              (is-true (%aval "non_witness_utxo" v0-input)
+                       "a segwit v0 input LOST the previous transaction that authenticates its amount: ~S"
+                       (mapcar #'car v0-input)))))))))
+
 (test a-tr-input-carries-cores-taproot-bip32-derivations
   "Core's FillPSBT runs SignPSBTInput for EVERY input whatever `sign' says;
 ProduceSignature fills sigdata.taproot_misc_pubkeys from the provider -- the

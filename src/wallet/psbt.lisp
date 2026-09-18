@@ -984,13 +984,11 @@ Already-signed inputs are skipped, as Core skips them (wallet.cpp:2192-2194).
 
 Core drops these again afterwards where they are provably redundant
 (RemoveUnnecessaryTransactions, psbt.cpp:514-549: every input segwit v1+ and
-no ANYONECANPAY). We deliberately do NOT: that rule keys on the PSBT's
-recorded sighash type, which Core writes for every input with a resolvable
-UTXO but we write only where a signature succeeded — so on `sign=false`, or
-for an input we hold no key for, the ANYONECANPAY guard could not fire and
-the drop would destroy data Core keeps. Our PSBTs are therefore larger than
-Core's for the taproot-only case; that is the safe direction. Settling the
-sighash where Core settles it is the prerequisite for porting the drop."
+no ANYONECANPAY), and so do we, in the same place -- the last act of the
+signer result (%PSBT-REMOVE-UNNECESSARY-TRANSACTIONS). That drop can only see
+an input whose witness_utxo is recorded, since its whole rule reads that
+record's scriptPubKey, and SignPSBTInput writes it the moment a witness
+signature is produced (psbt.cpp:495-501)."
   (let ((tx (bl.ser:psbt-tx psbt))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (loop for map across (bl.ser:psbt-inputs psbt)
@@ -1281,6 +1279,21 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
               (unless (or err
                           (and (%psbt-require-witness-sig-p map)
                                (not (bl.rpc:input-sig-witness-p sig))))
+                ;; Core SignPSBTInput:495-501: a WITNESS signature means the
+                ;; input is fully described by its spent output alone, so the
+                ;; witness_utxo record goes in -- and only then can
+                ;; RemoveUnnecessaryTransactions judge whether the
+                ;; non_witness_utxo may go, since its whole rule reads the
+                ;; witness_utxo's scriptPubKey. Without this a tr() input
+                ;; updated from the wallet's full previous transaction kept
+                ;; that transaction forever (wallet_taproot.py:358-359 asserts
+                ;; the opposite pair).
+                (when (bl.rpc:input-sig-witness-p sig)
+                  (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-witness-utxo+ empty
+                   (%serialize-txout-bytes
+                    (bl.ser:make-tx-out :value (second prev)
+                                        :script-pubkey (first prev)))))
                 (when (and (bl.rpc:input-sig-redeem sig)
                            (not (bl.ser:psbt-map-find
                                  map bl.ser:+psbt-in-redeem-script+)))
