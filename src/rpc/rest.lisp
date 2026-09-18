@@ -320,20 +320,16 @@ the first read past its end."
         (values t check-mempool (nreverse outpoints)))
     (error () nil)))
 
-(defun %rest-getutxos (node body ext &optional post-body)
-  "BIP64 /rest/getutxos[/checkmempool]/<txid>-<n>/... (Core rest.cpp:
-896-1088): query up to 15 outpoints against the UTXO set, optionally
-overlaid with the mempool. .json emits {chainHeight, chaintipHash, bitmap
-(a string of 0/1 per outpoint), utxos:[{height, value, scriptPubKey}]};
-.bin/.hex emit the BIP64 binary form.
+(defun %getutxos-request (body ext post-body)
+  "What a /rest/getutxos call is asking for, as (VALUES CHECK-MEMPOOL OUTPOINTS
+REFUSAL) -- a non-NIL REFUSAL being the response to send instead (Core
+rest.cpp:905-1000, which reads the request in this order).
 
 The outpoints come from the URI or, for .bin and .hex, from POST-BODY -- the
 binary request form BIP64 specifies, which Core reads with the SAME handler
 (:967-968) and which interface_rest.py:167 sends. Giving both is Core's
 \"Combination of URI scheme inputs and raw post data is not allowed\"; .json
 has no body form at all, so a bodyless .json is Core's empty request."
-  (unless (member ext '("json" "bin" "hex") :test #'string=)
-    (return-from %rest-getutxos (%rest-format-not-found)))
   (let* ((segments (remove "" (uiop:split-string body :separator "/") :test #'string=))
          (check-mempool (and segments (string= (first segments) "checkmempool")))
          (outpoint-strs (if check-mempool (rest segments) segments))
@@ -341,44 +337,56 @@ has no body form at all, so a bodyless .json is Core's empty request."
          ;; /checkmempool with no outpoint is an empty request, below.
          (uri-input nil)
          (outpoints '()))
-    (when (and (null segments) (null post-body))
+    (macrolet ((refuse (&rest args)
+                 `(return-from %getutxos-request
+                    (values nil nil (%rest-error ,@args)))))
       ;; Core rest.cpp:913-914: no body AND no URI parts at all.
-      (return-from %rest-getutxos (%rest-error 400 "Error: empty request")))
-    (when segments
-      (when (null outpoint-strs)
-        (return-from %rest-getutxos (%rest-error 400 "Error: empty request")))
-      (dolist (op outpoint-strs)
-        (multiple-value-bind (txid vout) (%parse-getutxos-outpoint op)
-          (unless txid
-            (return-from %rest-getutxos (%rest-error 400 "Parse error")))
-          (push (cons txid vout) outpoints)))
-      (setf outpoints (nreverse outpoints)
-            uri-input t))
-    (if (string= ext "json")
-        ;; Core's JSON arm accepts URI input only (:978-981).
-        (unless uri-input
-          (return-from %rest-getutxos (%rest-error 400 "Error: empty request")))
-        ;; .hex delivers the same bytes in hex; an unreadable hex body becomes
-        ;; the empty body, as Core's ParseHex does (:949-953).
-        (let ((bytes (if (string= ext "hex")
-                         (ignore-errors (bl.crypto:hex-to-bytes
-                                         (string-trim '(#\Space #\Newline #\Return #\Tab)
-                                                      (map 'string #'code-char post-body))))
-                         post-body)))
-          (when (plusp (length bytes))
-            (when uri-input
-              (return-from %rest-getutxos
-                (%rest-error 400 "Combination of URI scheme inputs and raw post data is not allowed")))
-            (multiple-value-bind (ok body-check-mempool body-outpoints)
-                (%parse-getutxos-post-body bytes)
-              (unless ok
-                (return-from %rest-getutxos (%rest-error 400 "Parse error")))
-              (setf check-mempool body-check-mempool
-                    outpoints body-outpoints)))))
-    (when (> (length outpoints) +max-getutxos-outpoints+)
-      (return-from %rest-getutxos
-        (%rest-error 400 (format nil "Error: max outpoints exceeded (max: ~D, tried: ~D)"
-                                 +max-getutxos-outpoints+ (length outpoints)))))
+      (when (and (null segments) (null post-body))
+        (refuse 400 "Error: empty request"))
+      (when segments
+        (when (null outpoint-strs) (refuse 400 "Error: empty request"))
+        (dolist (op outpoint-strs)
+          (multiple-value-bind (txid vout) (%parse-getutxos-outpoint op)
+            (unless txid (refuse 400 "Parse error"))
+            (push (cons txid vout) outpoints)))
+        (setf outpoints (nreverse outpoints)
+              uri-input t))
+      (if (string= ext "json")
+          ;; Core's JSON arm accepts URI input only (:978-981).
+          (unless uri-input (refuse 400 "Error: empty request"))
+          ;; .hex delivers the same bytes in hex; an unreadable hex body becomes
+          ;; the empty body, as Core's ParseHex does (:949-953).
+          (let ((bytes (if (string= ext "hex")
+                           (ignore-errors
+                            (bl.crypto:hex-to-bytes
+                             (string-trim '(#\Space #\Newline #\Return #\Tab)
+                                          (map 'string #'code-char post-body))))
+                           post-body)))
+            (when (plusp (length bytes))
+              (when uri-input
+                (refuse 400 "Combination of URI scheme inputs and raw post data is not allowed"))
+              (multiple-value-bind (ok body-check-mempool body-outpoints)
+                  (%parse-getutxos-post-body bytes)
+                (unless ok (refuse 400 "Parse error"))
+                (setf check-mempool body-check-mempool
+                      outpoints body-outpoints)))))
+      (when (> (length outpoints) +max-getutxos-outpoints+)
+        (refuse 400 (format nil "Error: max outpoints exceeded (max: ~D, tried: ~D)"
+                            +max-getutxos-outpoints+ (length outpoints))))
+      (values check-mempool outpoints nil))))
+
+(defun %rest-getutxos (node body ext &optional post-body)
+  "BIP64 /rest/getutxos[/checkmempool]/<txid>-<n>/... (Core rest.cpp:
+896-1088): query up to 15 outpoints against the UTXO set, optionally
+overlaid with the mempool. .json emits {chainHeight, chaintipHash, bitmap
+(a string of 0/1 per outpoint), utxos:[{height, value, scriptPubKey}]};
+.bin/.hex emit the BIP64 binary form. %GETUTXOS-REQUEST reads the request,
+from the URI or the POSTed body."
+  (unless (member ext '("json" "bin" "hex") :test #'string=)
+    (return-from %rest-getutxos (%rest-format-not-found)))
+  (multiple-value-bind (check-mempool outpoints refusal)
+      (%getutxos-request body ext post-body)
+    (when refusal (return-from %rest-getutxos refusal))
     ;; One consistent snapshot of tip + coins (+ mempool when checkmempool),
     ;; like Core's LOCK2(cs_main, mempool.cs) around process_utxos.
     (multiple-value-bind (height tip-hash hits coins)

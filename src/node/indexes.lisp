@@ -537,11 +537,8 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
     ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
     (let ((bfi (node-blockfilterindex *node*)))
       (bl.store:register-prune-lock
-       ;; Core registers its lock under the index's OWN name
-       ;; (BaseIndex::SetBestBlockIndex -> UpdatePruneLock(GetName(), ...),
-       ;; index/base.cpp:494), and that name is what the "limited pruning to
-       ;; height" line prints. INDEX-NAME already carries Core's spellings, so
-       ;; the log line reads as Core's does rather than naming the option.
+       ;; Under the INDEX's name, as Core registers it (index/base.cpp:494) --
+       ;; it is what PRUNE-LOCK-CEILING's "limited pruning to height" prints.
        (bl.store:index-name bfi)
        (lambda ()
          ;; -1 is "nothing indexed yet", which is Core's height_first ==

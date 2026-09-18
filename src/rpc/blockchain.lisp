@@ -1875,35 +1875,39 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
 
 ;;; --- UTXO Set Statistics ---
 
+(defun %gettxoutsetinfo-specific-block-gates (csi hash-type use-index)
+  "The three refusals Core runs inside `if (!request.params[1].isNull())'
+(rpc/blockchain.cpp:1086-1098), IN THAT ORDER.
+
+Which one a caller gets for a doubly-invalid call IS the caller's answer, so
+the order is the behaviour: feature_coinstatsindex.py:300-302 asks for the
+hash-type sentence with use_index spelled true, false and omitted, and this
+node answered the use_index one because that gate sat a frame higher up."
+  (unless (and csi (bl.store:coinstatsindex-enabled csi))
+    ;; Core RPC_INVALID_PARAMETER, not a misc error (rpc/blockchain.cpp:1088):
+    ;; feature_coinstatsindex.py:112 asks for -8 and the sentence.
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Querying specific block heights requires coinstatsindex"))
+  (when (string= hash-type "hash_serialized_3")
+    ;; Core's own sentence (rpc/blockchain.cpp:1091). Ours described the same
+    ;; refusal in different words, which feature_coinstatsindex.py:299 reads.
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "hash_serialized_3 hash type cannot be queried for a specific block"))
+  (unless use-index
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Cannot set use_index to false when querying for a specific block")))
+
 (defun %gettxoutsetinfo-from-index (node hash-type hash-or-height use-index)
   "Serve gettxoutsetinfo for a historical height from the coinstatsindex
 (Core's use_index path). HASH-OR-HEIGHT is an integer height or a block-hash
 hex. Returns the cumulative stats at that height plus a block_info object of
 that block's deltas. Only the muhash hash_type is index-backed.
 
-The three refusals are the ones Core runs inside `if (!request.params[1]
-.isNull())' (rpc/blockchain.cpp:1086-1098), IN THAT ORDER: which one a caller
-gets for a doubly-invalid call is the caller's answer, and
-feature_coinstatsindex.py:300-302 asks for the hash-type sentence with
-use_index spelled true, false and omitted. USE-INDEX therefore reaches here
-rather than being gated one frame up. The tip call passes T and cannot trip any
-of them: its own caller has already found an enabled index and a hash type the
-index carries."
+The tip call passes USE-INDEX T and cannot trip any of the gates below: its own
+caller has already found an enabled index and a hash type the index carries."
   (let* ((csi (rpc-get-coinstatsindex node))
          (chain-state (rpc-get-chain-state node)))
-    (unless (and csi (bl.store:coinstatsindex-enabled csi))
-      ;; Core RPC_INVALID_PARAMETER, not a misc error (rpc/blockchain.cpp:1088):
-      ;; feature_coinstatsindex.py:112 asks for -8 and the sentence.
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Querying specific block heights requires coinstatsindex"))
-    (when (string= hash-type "hash_serialized_3")
-      ;; Core's own sentence (rpc/blockchain.cpp:1091). Ours described the same
-      ;; refusal in different words, which feature_coinstatsindex.py:299 reads.
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "hash_serialized_3 hash type cannot be queried for a specific block"))
-    (unless use-index
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Cannot set use_index to false when querying for a specific block"))
+    (%gettxoutsetinfo-specific-block-gates csi hash-type use-index)
     ;; Core's ParseHashOrHeight (rpc/blockchain.cpp:126-152): a HEIGHT is
     ;; resolved on the active chain, a HASH is a plain LookupBlockIndex with no
     ;; active-chain test at all. We refused a stale-branch hash outright,
