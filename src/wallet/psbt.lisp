@@ -1975,6 +1975,41 @@ is signed and the original marked replaced (%create-transaction already caps at
               (bl.rpc:format-money new-fee) (bl.rpc:format-money min-total)
               (bl.rpc:format-money old-fee)))))
 
+(defun %bump-temp-transaction (orig txouts)
+  "Core's temp_mtx (feebumper.cpp:282-287): the ORIGINAL transaction with every
+input's signature data cleared and the replacement's output set in place. It is
+what CalculateMaximumSignedTxSize measures the replacement by, BEFORE the
+replacement is built -- the dummy signer expects empty witnesses for external
+inputs."
+  (bl.ser:make-transaction
+   :version (bl.ser:transaction-version orig)
+   :inputs (map 'simple-vector
+                (lambda (in)
+                  (bl.ser:make-tx-in
+                   :previous-output (bl.ser:tx-in-previous-output in)
+                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                   :sequence (bl.ser:tx-in-sequence in)))
+                (bl.ser:transaction-inputs orig))
+   :outputs (coerce txouts 'simple-vector)
+   :lock-time (bl.ser:transaction-lock-time orig)
+   :witness nil))
+
+(defun %bump-fee-rate-too-high (node wallet cc orig txouts)
+  "Core feebumper CheckFeeRate's -maxtxfee arm (feebumper.cpp:105-113): the
+total fee the USER-GIVEN feerate would pay over the replacement's maximum
+signed size, refused when it exceeds -maxtxfee. Returns Core's sentence, or
+NIL. Core asks this BEFORE CreateTransaction (:289), which is the whole point:
+coin selection for a fee nobody can pay fails as insufficient funds, and the
+caller who typed the feerate is told about the funds instead of the cap
+(wallet_bumpfee.py:132 reads the -maxtxfee sentence for fee_rate=100000)."
+  (let* ((max-size (%bump-max-signed-size node wallet cc
+                                          (%bump-temp-transaction orig txouts)))
+         (new-total-fee (bl.rpc:feerate-fee (wcc-feerate cc) max-size)))
+    (when (> new-total-fee bl:*wallet-max-tx-fee*)
+      (format nil "Specified or calculated fee ~A is too high (cannot be higher than -maxtxfee ~A)"
+              (bl.rpc:format-money new-total-fee)
+              (bl.rpc:format-money bl:*wallet-max-tx-fee*)))))
+
 (defun %bump-recipients (wallet txouts network original-change-index cc)
   "Core CreateRateBumpTransaction's recipient fill (feebumper.cpp:251-262):
 every TXOUT becomes a recipient except the change, which becomes the coin
@@ -2059,8 +2094,15 @@ and an index past the end (:180-183)."
                 recipients)
           (setf (wcc-dest-change cc) nil))
         ;; Feerate: user-provided (already on CC) or estimated from the old fee.
+        ;; Core checks a user-given feerate here, before the build
+        ;; (feebumper.cpp:278-292).
         (if (wcc-feerate cc)
-            (setf (wcc-override-feerate cc) t)
+            (progn
+              (setf (wcc-override-feerate cc) t)
+              (let ((too-high (%bump-fee-rate-too-high node wallet cc orig txouts)))
+                (when too-high
+                  (return-from %create-rate-bump
+                    (values nil bl.rpc:+rpc-wallet-error+ too-high)))))
             (setf (wcc-feerate cc) (%bump-estimate-feerate node wallet orig old-fee cc)
                   (wcc-override-feerate cc) t))
         ;; Re-spend all original inputs; may add more; no new unconfirmed inputs.

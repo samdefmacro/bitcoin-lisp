@@ -2281,6 +2281,56 @@ would fail there."
                         (funcall rpc "bumpfee" txid
                                  (%ht "original_change_index" 9))))))))))))
 
+(test bumpfee-prices-a-given-fee-rate-against-maxtxfee
+  "Core checks a USER-GIVEN feerate BEFORE it builds the replacement
+(feebumper.cpp:278-292): CheckFeeRate prices the feerate over the
+replacement's maximum signed size and refuses a total fee above -maxtxfee with
+-4 `Specified or calculated fee X is too high (cannot be higher than -maxtxfee
+Y)' (:105-113).
+
+We capped only inside the build, where a fee nobody can pay is a coin-selection
+failure, so the caller who typed the feerate was told about the funds or about
+the relay's own cap rather than about -maxtxfee -- wallet_bumpfee.py:132 reads
+Core's sentence for fee_rate=100000.
+
+A bump that fits under the cap is the control: a change that always refused
+would fail there."
+  (%with-pp-node (node "pp-bumpmax")
+    (%pp-fund-wallet node :blocks 5)
+    (with-wallet-rng (31)
+      (let* ((dest (%pp-optrue-address))
+             (rpc (lambda (method &rest params)
+                    (bl.rpc:dispatch-rpc-method node method params))))
+        (flet ((send (rate)
+                 (funcall rpc "sendtoaddress" dest 1
+                          nil nil nil nil nil nil nil rate)))
+          (is (stringp (%aval "txid" (funcall rpc "bumpfee" (send 5)
+                                              (%ht "fee_rate" 20))))
+              "a bump whose fee fits under -maxtxfee must still be built")
+          (let ((err (rpc-error-of
+                      (lambda ()
+                        (funcall rpc "bumpfee" (send 5)
+                                 (%ht "fee_rate" 100000))))))
+            (is (eql bl.rpc:+rpc-wallet-error+ (car err))
+                "bumpfee(fee_rate=100000) answered ~S" err)
+            (is-true (and (stringp (cdr err))
+                          (search "Specified or calculated fee 0.14" (cdr err)))
+                     "the message does not price the feerate over the replacement: ~S"
+                     (cdr err))
+            (is-true (and (stringp (cdr err))
+                          (search "is too high (cannot be higher than -maxtxfee 0.10)"
+                                  (cdr err)))
+                     "the message does not name -maxtxfee: ~S" (cdr err)))
+          ;; The cap the message names is the one in force.
+          (let* ((bl:*wallet-max-tx-fee* 100000)
+                 (err (rpc-error-of
+                       (lambda ()
+                         (funcall rpc "bumpfee" (send 5)
+                                  (%ht "fee_rate" 100000))))))
+            (is-true (and (stringp (cdr err))
+                          (search "-maxtxfee 0.001" (cdr err)))
+                     "a lowered -maxtxfee is not the one reported: ~S" (cdr err))))))))
+
 (test pp-psbtbumpfee-unsigned
   "psbtbumpfee returns an UNSIGNED PSBT of the replacement without broadcasting;
 the original stays in the mempool, and walletprocesspsbt completes the PSBT."
