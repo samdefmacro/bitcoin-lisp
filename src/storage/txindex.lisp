@@ -96,13 +96,17 @@ the flat txindex/ this tree used before — see kv/datadir.lisp."
           (aref v 35) (logand (ash tx-position -24) #xFF))
     v))
 
-(defun init-tx-index (base-path &key (enabled t))
+(defun init-tx-index (base-path &key (enabled t) wipe)
   "Initialize a transaction index at BASE-PATH.
 If ENABLED is nil, creates a disabled index that ignores add operations.
-No startup replay: the DB is the index."
+No startup replay: the DB is the index.
+
+WIPE discards the stored index first (Core's f_wipe for -reindex,
+init.cpp:1905), so the caller's catch-up rebuilds it from genesis."
   (open-index-db (make-tx-index :base-path (pathname base-path) :enabled enabled
                                 :cache-share :tx-index)
-                 (txindex-db-path base-path)))
+                 (txindex-db-path base-path)
+                 :wipe wipe))
 
 (defun close-tx-index (txindex)
   "Close the txindex database."

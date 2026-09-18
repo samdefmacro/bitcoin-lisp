@@ -156,12 +156,18 @@ already recorded."
                 (txospender-index-k1 index) k1)))
     index))
 
-(defun init-txospender-index (base-path &key (enabled t))
+(defun init-txospender-index (base-path &key (enabled t) wipe)
   "Open the spender index at BASE-PATH. A disabled index ignores every write,
-so callers do not have to test for it."
+so callers do not have to test for it.
+
+WIPE discards the stored index first (Core's f_wipe for -reindex,
+init.cpp:1909), so the caller's catch-up rebuilds it from genesis. The salt is
+drawn afresh on the next open, which is right: it keyed hashes of rows that no
+longer exist."
   (let ((index (open-index-db (make-txospender-index :base-path (pathname base-path)
                                                      :enabled enabled)
-                              (txospenderindex-db-path base-path))))
+                              (txospenderindex-db-path base-path)
+                              :wipe wipe)))
     (when (txospender-index-db index)
       (%txospender-load-salt index))
     index))

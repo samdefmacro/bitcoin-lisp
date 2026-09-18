@@ -500,10 +500,26 @@ why this method lives here rather than in storage."
           nil))
 
 (defun %start-indexes (txindex blockfilterindex txospenderindex coinstatsindex
-                       reindex-chainstate)
+                       reindex reindex-chainstate)
   "Open every enabled index on *NODE* and catch it up to the tip (Core
 init.cpp \"Step 8: start indexers\" -- our catch-ups are synchronous, see
-CATCH-UP-INDEX). Prune locks are re-registered from scratch."
+CATCH-UP-INDEX). Prune locks are re-registered from scratch.
+
+REINDEX is -reindex, and it WIPES each index before opening it. Core passes
+do_reindex as every index's f_wipe (init.cpp:1905, :1909, :1915, :1920), which
+becomes DBParams::wipe_data (index/base.cpp:68-73), so the index opens with a
+null DB_BEST_BLOCK and BaseIndex::Init starts it from nothing (:119-133): a
+rebuild from scratch, not a catch-up. What that is for is the case a catch-up
+cannot reach -- an index whose best block is no longer on disk. Its marker
+names a block a pruned node has dropped (feature_index_prune.py:187-190), or
+one the rebuilt block index does not place, and the catch-up has nothing to
+resume from; only a wipe gives it a starting point again.
+
+The cost lands on a pruned node: a wiped index can only be rebuilt from the
+blocks still on disk, so its history begins at the prune horizon. Core pays the
+same price for a different reason -- its -reindex in prune mode deletes the
+block files outright (CleanupBlockRevFiles, node/blockstorage.cpp:654-688) and
+re-downloads the chain."
   ;; Transaction index. The catch-up is what makes enabling -txindex on a
   ;; synced node index history (build-tx-index had no caller until the txindex fix);
   ;; it resumes from the best-block marker, so a current index costs one
@@ -511,7 +527,8 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
   (when txindex
     (log-info "Initializing transaction index...")
     (setf (node-tx-index *node*)
-          (bl.store:init-tx-index (node-data-directory *node*) :enabled t))
+          (bl.store:init-tx-index (node-data-directory *node*) :enabled t
+                                  :wipe reindex))
     (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
     (catch-up-index *node* (node-tx-index *node*))
     (log-info "Transaction index loaded: ~D entries"
@@ -529,7 +546,8 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
     (log-info "Initializing block filter index...")
     (setf (node-blockfilterindex *node*)
           (bl.store:init-blockfilterindex (node-data-directory *node*)
-                                                       :enabled t))
+                                                       :enabled t
+                                                       :wipe reindex))
     (log-info "Block filter index loaded: indexed to height ~D"
               (bl.store:blockfilterindex-height (node-blockfilterindex *node*)))
     ;; The filter index needs each block's undo data to build its filter, so
@@ -561,7 +579,8 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
     (log-info "Initializing spender index...")
     (setf (node-txospenderindex *node*)
           (bl.store:init-txospender-index (node-data-directory *node*)
-                                                      :enabled t))
+                                                      :enabled t
+                                                      :wipe reindex))
     (let ((best (bl.store:txospenderindex-best-block
                  (node-txospenderindex *node*))))
       (log-info "Spender index loaded: best block ~A"
@@ -578,7 +597,8 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
     (log-info "Initializing coinstats index...")
     (setf (node-coinstatsindex *node*)
           (bl.store:init-coinstatsindex (node-data-directory *node*)
-                                                    :enabled t))
+                                                    :enabled t
+                                                    :wipe reindex))
     (log-info "Coinstats index loaded: indexed to height ~D"
               (bl.store:coinstatsindex-height (node-coinstatsindex *node*)))
     ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->

@@ -155,12 +155,16 @@ hash was recorded."
 this tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :coinstats))
 
-(defun init-coinstatsindex (base-path &key (enabled t))
+(defun init-coinstatsindex (base-path &key (enabled t) wipe)
   "Open (creating if needed) the coinstatsindex under BASE-PATH. It shares the
 filter index's cache line: Core divides one budget across n_indexes
-(node/caches.cpp:66-70)."
+(node/caches.cpp:66-70).
+
+WIPE discards the stored index first (Core's f_wipe for -reindex,
+init.cpp:1920), so the caller's catch-up rebuilds it from genesis."
   (open-index-db (make-coinstatsindex :base-path (pathname base-path) :enabled enabled)
-                 (coinstatsindex-path base-path)))
+                 (coinstatsindex-path base-path)
+                 :wipe wipe))
 
 (defun close-coinstatsindex (csi)
   (close-index csi))

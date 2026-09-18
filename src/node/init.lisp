@@ -1174,7 +1174,7 @@ than a hand-built one."
         (bl.mp:make-fee-estimator :data-directory data-directory))
   (bl.mp:load-fee-stats (node-fee-estimator *node*)))
 
-(defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
+(defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
   "The RPC server, up early (Core Step 4a AppInitServers, answering
 RPC_IN_WARMUP while the rest loads); the recent-rejects filter, the fee
 estimator, the address book and banlist (Step 6); mempool.dat (Step 11); the
@@ -1245,7 +1245,7 @@ it; the indexes (Step 8) and -forcecompactdb."
   ;; Step 8 of Core's init (indexes): open every enabled index and catch it
   ;; up over the blocks already on disk before the sync thread starts.
   (%start-indexes txindex blockfilterindex txospenderindex coinstatsindex
-                  reindex-chainstate)
+                  reindex reindex-chainstate)
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
   ;; run), full-compact them to reclaim tombstone space -- e.g. the ~24M delete
@@ -1950,7 +1950,7 @@ Returns the node instance."
   ;; replay and the RPC server, and a coins pointer this node cannot place is
   ;; the chainstate-load failure Core offers a reindex for.
   (%init-chain-tip reindex)
-  (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
+  (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 

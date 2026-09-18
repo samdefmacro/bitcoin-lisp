@@ -35,10 +35,20 @@ indexes :INCLUDE it."
 
 ;;; --- The skeleton: open, close, key layout, the 36-byte marker ---
 
-(defun open-index-db (index path)
+(defun open-index-db (index path &key wipe)
   "Open (creating if needed) INDEX's LevelDB at PATH with its cache share,
-when the index is enabled; a disabled index keeps no handle."
+when the index is enabled; a disabled index keeps no handle.
+
+WIPE destroys whatever is at PATH first, so the index opens with no records and
+no best-block marker and its catch-up rebuilds it from genesis. That is Core's
+DBParams::wipe_data, which every index takes from init.cpp's do_reindex
+(init.cpp:1905/1909/1915/1920 -> index/base.cpp:68-73): a wiped DB reads a null
+DB_BEST_BLOCK, so BaseIndex::Init starts the index from nothing (:119-133).
+Wipe-and-resync, not catch-up -- the point being that a block index rebuilt
+from the block files must not be described by rows derived from the old one."
   (when (base-index-enabled index)
+    (when wipe
+      (leveldb-destroy-db path))
     (ensure-directories-exist path)
     (setf (base-index-db index)
           (leveldb-open-tuned

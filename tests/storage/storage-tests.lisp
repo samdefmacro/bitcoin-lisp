@@ -2653,3 +2653,120 @@ the snapshot chainstate is what start-up is supposed to adopt."
       (is-false (%recover-chain-over dir nil t)
                 "-reindex-chainstate stopped deleting the snapshot chainstate"))))
 
+;;; --- the four indexes are wiped and re-synced by -reindex ------------------
+
+(defun %index-wipe-node (tag)
+  "A regtest node with a data directory of its own, its undo storage pointed
+at it, and three mined blocks -- the input %START-INDEXES needs."
+  (let* ((node (regtest-node-fixture tag))
+         (base (regtest-node-base-path tag)))
+    (setf (bl:node-data-directory node) base)
+    (bl.val:initialize-undo-storage
+     (merge-pathnames "undo/" base)
+     :block-store (bl:node-block-store node)
+     :chain-state (bl:node-chain-state node))
+    (let ((bl:*node* node))
+      (generate-regtest-blocks node 3))
+    node))
+
+(defun %index-fill-around-catch-up (node probe &key txindex blockfilterindex
+                                                    txospenderindex
+                                                    coinstatsindex reindex)
+  "(values at-entry after) -- PROBE's answer for NODE's index at the moment
+%START-INDEXES entered the catch-up, and again once it returned.
+
+The wipe is only observable there: the catch-up fills the index straight
+afterwards, so an index that was wiped and one that was not look identical by
+the time start-up is over. AT-ENTRY comes back as :NOT-CALLED when the catch-up
+never ran, which is what says the observation happened at all."
+  (let ((at-entry :not-called)
+        (real (fdefinition 'bl:catch-up-index)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl:catch-up-index)
+                 (lambda (n index)
+                   (setf at-entry (funcall probe n))
+                   (funcall real n index)))
+           (let ((bl:*node* node))
+             (bl::%start-indexes txindex blockfilterindex txospenderindex
+                                 coinstatsindex reindex nil)))
+      (setf (fdefinition 'bl:catch-up-index) real))
+    (values at-entry (funcall probe node))))
+
+(defmacro %index-wipe-test (name kind probe empty close &body doc)
+  "One index kind's wipe test: build it, restart WITHOUT -reindex (the control:
+the catch-up must find it populated), restart WITH -reindex (it must find
+nothing), and in both cases end up populated again."
+  `(test ,name
+     ,@doc
+     (with-network (:regtest)
+       ;; The fixture's directory is keyed by its tag and REOPENED by a later
+       ;; test that passes the same one, so the tag carries the clock: a second
+       ;; run in one image must not find the first run's index already built.
+       (let ((node (%index-wipe-node
+                    (format nil "~A-~D" ,(string-downcase (symbol-name kind))
+                            (get-internal-real-time)))))
+         ;; Build it.
+         (multiple-value-bind (entry after)
+             (%index-fill-around-catch-up node ,probe ,kind t)
+           (is (not (eq :not-called entry))
+               "the catch-up never ran, so this test observed nothing")
+           (is (,empty entry) "a fresh index was not empty")
+           (is (not (,empty after)) "the catch-up did not fill the index"))
+         (funcall ,close node)
+         ;; CONTROL: a restart without -reindex keeps it.
+         (multiple-value-bind (entry after)
+             (%index-fill-around-catch-up node ,probe ,kind t)
+           (is (not (,empty entry))
+               "a restart without -reindex arrived at an EMPTY index")
+           (is (not (,empty after))))
+         (funcall ,close node)
+         ;; -reindex wipes it, and the sync builds it again.
+         (multiple-value-bind (entry after)
+             (%index-fill-around-catch-up node ,probe ,kind t :reindex t)
+           (is (,empty entry)
+               "-reindex did not wipe the index: the catch-up found it populated")
+           (is (not (,empty after))
+               "-reindex wiped the index and nothing re-synced it"))
+         (funcall ,close node)))))
+
+(%index-wipe-test the-txindex-is-wiped-and-re-synced-by-reindex
+    :txindex
+    (lambda (n) (bl.store:txindex-count (bl:node-tx-index n)))
+    zerop
+    (lambda (n) (bl.store:close-tx-index (bl:node-tx-index n)))
+  "Core hands do_reindex to the txindex as f_wipe (init.cpp:1905), which is
+DBParams::wipe_data (index/base.cpp:68-73): the index opens with a null
+DB_BEST_BLOCK and BaseIndex::Init starts it from nothing (:119-133). Ours kept
+every index across a -reindex, so an index whose best block the rebuilt block
+index cannot place -- or which a pruned node has dropped, which is what
+feature_index_prune.py:187-190 exercises -- had nothing to resume from and no
+way to be repaired.")
+
+(%index-wipe-test the-blockfilterindex-is-wiped-and-re-synced-by-reindex
+    :blockfilterindex
+    (lambda (n) (bl.store:blockfilterindex-height (bl:node-blockfilterindex n)))
+    minusp
+    (lambda (n) (bl.store:close-blockfilterindex (bl:node-blockfilterindex n)))
+  "Core's f_wipe for every enabled filter type (init.cpp:1915). -1 is the
+index's own `nothing indexed yet'.")
+
+(%index-wipe-test the-txospenderindex-is-wiped-and-re-synced-by-reindex
+    :txospenderindex
+    (lambda (n)
+      (if (bl.store:txospenderindex-best-block (bl:node-txospenderindex n)) 1 0))
+    zerop
+    (lambda (n) (bl.store:close-txospender-index (bl:node-txospenderindex n)))
+  "Core's f_wipe for the spender index (init.cpp:1909). A coinbase-only chain
+records no spends, so what the wipe has to reset here is the best-block marker
+-- and that marker is exactly what a catch-up resumes from.")
+
+(%index-wipe-test the-coinstatsindex-is-wiped-and-re-synced-by-reindex
+    :coinstatsindex
+    (lambda (n) (bl.store:coinstatsindex-height (bl:node-coinstatsindex n)))
+    (lambda (h) (<= h 0))
+    (lambda (n) (bl.store:close-coinstatsindex (bl:node-coinstatsindex n)))
+  "Core's f_wipe for the coinstatsindex (init.cpp:1920). Its running MuHash
+must be contiguous from genesis, so `resume from the marker' is the only shape
+it has -- and a marker it cannot place leaves it stuck until something wipes
+it.")

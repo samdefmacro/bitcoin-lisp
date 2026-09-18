@@ -40,11 +40,15 @@ indexes/blockfilter/basic/, falling back to the flat blockfilterindex/ this
 tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :blockfilter))
 
-(defun init-blockfilterindex (base-path &key (enabled t))
+(defun init-blockfilterindex (base-path &key (enabled t) wipe)
   "Open (creating if needed) the block filter index under BASE-PATH.
-A disabled index ignores writes and reads and holds no DB handle."
+A disabled index ignores writes and reads and holds no DB handle.
+
+WIPE discards the stored index first (Core's f_wipe for -reindex,
+init.cpp:1915), so the caller's catch-up rebuilds it from genesis."
   (open-index-db (make-blockfilterindex :base-path (pathname base-path) :enabled enabled)
-                 (blockfilterindex-path base-path)))
+                 (blockfilterindex-path base-path)
+                 :wipe wipe))
 
 (defun close-blockfilterindex (bfi)
   "Close the index's LevelDB handle."
