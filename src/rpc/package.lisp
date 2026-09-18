@@ -199,6 +199,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:decode-hex-tx
    #:decode-hex-tx-or-error
    #:find-coins
+   #:combine-signed-transactions
    #:parse-prevouts
    #:decode-tx
    #:iswitness-flags

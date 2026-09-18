@@ -419,8 +419,17 @@ vector."
                (out (bl.wallet::rpc-finalizepsbt node (list (gethash "extract" e)))))
           (is (string= (cdr (assoc "hex" out :test #'equal)) (gethash "result" e)))))))
 
-(test combinerawtransaction-merges
-  "combinerawtransaction keeps the most-complete scriptSig per input."
+(test combinerawtransaction-refuses-an-input-no-coin-answers-for
+  "Core looks every input's coin up in the chainstate + mempool view BEFORE it
+merges anything, and refuses a missing or already-spent one with
+RPC_VERIFY_ERROR `Input not found or already spent' (rpc/rawtransaction.cpp:
+637-653). rpc_createmultisig.py:158 reads it by combining the same pair of
+partial transactions again once their input has been spent.
+
+We never consulted a coin at all -- the merge was `keep the longest scriptSig',
+which needs nothing from the chain -- so this node, which knows no coin
+whatsoever, answered a transaction instead of the refusal. The merge itself is
+COMBINERAWTRANSACTION-MERGES-THE-SIGNATURES-CORE-MERGES, which needs a chain."
   (let* ((node (bl:make-node :network :regtest))
          (prevout (bl.ser:make-outpoint
                    :hash (make-array 32 :element-type '(unsigned-byte 8)) :index 0))
@@ -435,14 +444,12 @@ vector."
                                    :previous-output prevout :script-sig ss :sequence #xffffffff))
                   :outputs (vector out) :lock-time 0)))))
          (signed (funcall mk (coerce #(1 2 3 4 5) '(simple-array (unsigned-byte 8) (*)))))
-         (empty  (funcall mk (make-array 0 :element-type '(unsigned-byte 8))))
-         (combined (bl.wallet::rpc-combinerawtransaction node (list (list empty signed))))
-         (tx (bl.ser:br-read-transaction
-              (bl.ser:make-byte-reader-from
-               (coerce (bl.crypto:hex-to-bytes combined)
-                       '(simple-array (unsigned-byte 8) (*)))))))
-    (is (= 5 (length (bl.ser:tx-in-script-sig
-                      (aref (bl.ser:transaction-inputs tx) 0)))))))
+         (empty  (funcall mk (make-array 0 :element-type '(unsigned-byte 8)))))
+    (is (equal (cons -25 "Input not found or already spent")
+               (rpc-error-of
+                (lambda ()
+                  (bl.wallet::rpc-combinerawtransaction
+                   node (list (list empty signed)))))))))
 
 (test combinerawtransaction-refuses-an-empty-array-the-way-core-does
   "Core builds one CMutableTransaction per element and only THEN refuses an

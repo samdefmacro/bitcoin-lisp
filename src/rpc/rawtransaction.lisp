@@ -1062,6 +1062,140 @@ bare node) knows no coin."
                           nil nil)))))))
     coins))
 
+(defun %combined-input-elements (txs i)
+  "Every stack element ANY variant supplies for input I -- Core's
+sigdata.MergeSignatureData over DataFromTransaction(txv, i, coin)
+(rpc/rawtransaction.cpp:656-661). The extractor keeps bytes, not meaning: a
+duplicate is dropped and the rest are candidates the assembler sorts out."
+  (remove-duplicates
+   (loop for tx in txs
+         when (> (length (bl.ser:transaction-inputs tx)) i)
+           append (%input-stack-elements tx i))
+   :test #'equalp))
+
+(defun %revealed-prev-scripts (spk elements)
+  "(values redeem witness-script): the scripts a partially-signed input REVEALS
+among its own stack ELEMENTS, matched against the output SPK it spends. Core's
+SignatureExtractorChecker records them while it runs the script
+(DataFromTransaction, script/sign.cpp:603-628); here the hash decides, which
+needs no interpreter and cannot be fooled -- a P2SH redeemScript hashes to the
+output's hash160, a witnessScript to its (or its redeemScript's) sha256."
+  (let* ((type (bl.val:script-type-name spk))
+         (redeem (when (string= type "scripthash")
+                   (let ((hash (subseq spk 2 22)))
+                     (find-if (lambda (e) (equalp (bl.crypto:hash160 e) hash))
+                              elements))))
+         (program (cond ((string= type "witness_v0_scripthash") (subseq spk 2 34))
+                        ((and redeem (= (length redeem) 34)
+                              (= (aref redeem 0) #x00)
+                              (= (aref redeem 1) #x20))
+                         (subseq redeem 2 34)))))
+    (values redeem
+            (when program
+              (find-if (lambda (e) (equalp (bl.crypto:sha256 e) program))
+                       elements)))))
+
+(defun combine-signed-transactions (node txs)
+  "Core combinerawtransaction's body (rpc/rawtransaction.cpp:605-667): the hex
+of the first variant with every other variant's signatures merged in.
+
+Core does NOT pick the most complete input. It looks each input's coin up in
+the chainstate + mempool view and refuses a missing or spent one with
+RPC_VERIFY_ERROR `Input not found or already spent' (:650-653), merges the
+signature data of every variant for that input, and then runs ProduceSignature
+with the DUMMY signing provider (:662) -- which ASSEMBLES a scriptSig from
+signatures made by different signers. Taking the longest scriptSig instead
+cannot complete an m-of-n: two cosigners' transactions are the same length and
+each carries one signature, so the `winner' is still one signature short and
+the result is unbroadcastable (rpc_createmultisig.py:152-155 combines exactly
+that pair and sends the result; :158 reads the -25 once it is spent).
+
+Merging is the signer's own machinery with NO keys: the union of the variants'
+stack elements is planted on the input, and SIGN-TX-INPUTS recovers the
+signatures from it and finalizes, exactly as it does for a second wallet
+finishing what a first one started. An input shape that machinery does not
+assemble (a single-key input, a taproot one) keeps the most complete bytes the
+variants carry, which is what this RPC did for every input before."
+  (let* ((base (first txs))
+         (base-inputs (bl.ser:transaction-inputs base))
+         (n (length base-inputs))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (planted (make-array n :initial-element nil))
+         (best-scripts (make-array n :initial-element nil))
+         (best-witnesses (make-array n :initial-element nil))
+         (merged-inputs (make-array n)))
+    (dolist (tx (rest txs))
+      (unless (= (length (bl.ser:transaction-inputs tx)) n)
+        (error 'rpc-error :code +rpc-deserialization-error+
+                          :message "Input count mismatch between transactions")))
+    (dotimes (i n)
+      (let ((in0 (aref base-inputs i))
+            (best-ss (bl.ser:tx-in-script-sig (aref base-inputs i)))
+            (best-wit nil))
+        (dolist (tx txs)
+          (let ((ss (bl.ser:tx-in-script-sig (aref (bl.ser:transaction-inputs tx) i)))
+                (w (tx-input-witness tx i)))
+            (when (> (length ss) (length best-ss)) (setf best-ss ss))
+            (when (and w (plusp (length w))
+                       (or (null best-wit) (> (length w) (length best-wit))))
+              (setf best-wit w))))
+        (setf (aref best-scripts i) best-ss
+              (aref best-witnesses i) best-wit
+              (aref planted i) (%combined-input-elements txs i)
+              (aref merged-inputs i)
+              (bl.ser:make-tx-in
+               :previous-output (bl.ser:tx-in-previous-output in0)
+               :script-sig empty
+               :sequence (bl.ser:tx-in-sequence in0)))))
+    ;; Core's mergedTx: a clone of the first variant, carrying the merged
+    ;; signature data of all of them.
+    (let* ((merged (bl.ser:make-transaction
+                    :version (bl.ser:transaction-version base)
+                    :inputs merged-inputs
+                    :outputs (bl.ser:transaction-outputs base)
+                    :lock-time (bl.ser:transaction-lock-time base)
+                    :witness planted))
+           (coins (find-coins node merged)))
+      (dotimes (i n)
+        (let* ((op (bl.ser:tx-in-previous-output (aref merged-inputs i)))
+               (key (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op)))
+               (coin (gethash key coins)))
+          (unless coin
+            (error 'rpc-error :code +rpc-verify-error+
+                              :message "Input not found or already spent"))
+          (multiple-value-bind (redeem witness-script)
+              (%revealed-prev-scripts (first coin) (aref planted i))
+            (setf (gethash key coins)
+                  (list (first coin) (second coin) redeem witness-script)))))
+      (let ((errors (sign-tx-inputs merged coins
+                                    (make-hash-table :test 'equalp)
+                                    (make-hash-table :test 'equalp)
+                                    (make-hash-table :test 'equalp)
+                                    #x01)))
+        (declare (ignore errors))
+        ;; The planted elements are signature MATERIAL, never an input's final
+        ;; bytes: an input the assembler finished keeps what IT built (a legacy
+        ;; input's witness is therefore emptied, or the node answers
+        ;; bad-witness-nonstandard), and one it could not read keeps the most
+        ;; complete bytes the variants carry.
+        (let ((witness (bl.ser:transaction-witness merged)))
+          (dotimes (i n)
+            (let ((assembled (plusp (length (bl.ser:tx-in-script-sig
+                                             (aref merged-inputs i)))))
+                  (untouched (and witness (eq (aref witness i) (aref planted i)))))
+              (cond ((and (not assembled) (or (null witness) untouched))
+                     (setf (bl.ser:tx-in-script-sig (aref merged-inputs i))
+                           (aref best-scripts i))
+                     (when witness
+                       (setf (aref witness i) (aref best-witnesses i))))
+                    (untouched (setf (aref witness i) nil)))))
+          (setf (bl.ser:transaction-witness merged)
+                (if (and witness (some (lambda (w) (and w (plusp (length w)))) witness))
+                    witness
+                    nil))
+          (bl.ser:invalidate-transaction-caches merged)))
+      (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes merged)))))
+
 (defun parse-prevouts (prevtxs coins &key keystore-p)
   "Core ParsePrevouts (rpc/rawtransaction_util.cpp:190-310): fold the
 prevtxs argument PREVTXS -- NIL, or a list of JSON objects -- into COINS, the

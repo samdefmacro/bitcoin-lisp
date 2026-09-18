@@ -2201,3 +2201,91 @@ was present, and wrong, which no assertion about presence can see."
                   "the origin is the wallet's own: ~S vs ~S"
                   (%aval "master_fingerprint" entry)
                   (%aval "hdmasterfingerprint" info)))))))))
+
+(test combinerawtransaction-merges-the-signatures-core-merges
+  "Core's combinerawtransaction merges SIGNATURE DATA: for each input it takes
+the coin from the chainstate + mempool view, folds every variant's
+DataFromTransaction into one SignatureData and runs ProduceSignature with the
+dummy provider, which ASSEMBLES a scriptSig out of signatures made by
+different signers (rpc/rawtransaction.cpp:646-665).
+
+We kept the longest scriptSig per input instead. Two cosigners of a 2-of-3
+produce transactions of the SAME length, each carrying one signature, so the
+winner was still one signature short: the combined transaction could not be
+broadcast at all -- rpc_createmultisig.py:152-155 combines exactly that pair
+and sends the result.
+
+The two partial signatures are the control: each alone must report complete
+false, so a change that completed them on its own would fail here rather than
+prove the merge."
+  (with-wallet-chain-node (node "combine-multisig")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let* ((optrue (bl.crypto:encode-p2sh-address
+                      (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (secrets (loop for i below 3
+                            collect (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element (+ 11 i))))
+             (wifs (mapcar (lambda (sk)
+                             (bl.crypto:private-key-to-wif sk :network :regtest
+                                                              :compressed t))
+                           secrets))
+             (pubkeys (mapcar (lambda (sk)
+                                (bl.crypto:bytes-to-hex
+                                 (bl.crypto:derive-public-key sk :compressed t)))
+                              secrets)))
+        (rpc nil "createwallet" "w")
+        (rpc nil "generatetoaddress" 1 (rpc "w" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((multisig (rpc nil "createmultisig" 2 pubkeys))
+               (address (%aval "address" multisig))
+               (redeem (%aval "redeemScript" multisig))
+               (spk (nth-value 1 (bl.crypto:decode-address address :regtest)))
+               (funding-txid (with-wallet-rng (41)
+                               (rpc "w" "sendtoaddress" address
+                                    (bl.rpc:format-money 100000000)
+                                    nil nil nil nil nil nil nil 10))))
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((funding (bl.ser:parse-tx-payload
+                           (bl.crypto:hex-to-bytes
+                            (%aval "hex" (rpc "w" "gettransaction" funding-txid)))))
+                 (vout (position-if (lambda (o)
+                                      (equalp (bl.ser:tx-out-script-pubkey o) spk))
+                                    (bl.ser:transaction-outputs funding)))
+                 (input (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "txid" h) funding-txid
+                                (gethash "vout" h) vout)
+                          h))
+                 (outputs (list (let ((h (make-hash-table :test 'equal)))
+                                  (setf (gethash optrue h)
+                                        (bl.rpc:format-money 99900000))
+                                  h)))
+                 (raw (rpc nil "createrawtransaction" (list input) outputs))
+                 (prevtxs (list (list (cons "txid" funding-txid)
+                                      (cons "vout" vout)
+                                      (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
+                                      (cons "redeemScript" redeem)
+                                      (cons "amount" 1.0d0)))))
+            (is-true vout "the funding transaction must pay the multisig address")
+            (let ((part-a (rpc nil "signrawtransactionwithkey" raw
+                               (list (first wifs)) prevtxs))
+                  (part-c (rpc nil "signrawtransactionwithkey" raw
+                               (list (third wifs)) prevtxs)))
+              (is (eq bl.rpc:+json-false+ (%aval "complete" part-a))
+                  "one signature of a 2-of-3 must not be complete: ~S" part-a)
+              (is (eq bl.rpc:+json-false+ (%aval "complete" part-c))
+                  "one signature of a 2-of-3 must not be complete: ~S" part-c)
+              (let* ((hexes (list (%aval "hex" part-a) (%aval "hex" part-c)))
+                     (combined (rpc nil "combinerawtransaction" hexes)))
+                ;; The node accepting it is the assertion: a merge that kept
+                ;; one signature produces a transaction no node will take.
+                (is (stringp (rpc nil "sendrawtransaction" combined))
+                    "the merged transaction was refused by the node")
+                (rpc nil "generatetoaddress" 1 optrue)
+                ;; And once the input is spent, Core's coin lookup refuses.
+                (is (equal (cons -25 "Input not found or already spent")
+                           (rpc-error-of
+                            (lambda ()
+                              (rpc nil "combinerawtransaction" hexes))))
+                    "combining a spent input must be Core's -25")))))))))

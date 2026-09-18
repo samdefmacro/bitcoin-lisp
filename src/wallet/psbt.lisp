@@ -843,17 +843,17 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
 ;;; --- combinerawtransaction ---
 
 (bl.rpc:define-rpc "combinerawtransaction" (node params)
-  "Combine partially-signed raw transactions, taking the most-complete scriptSig
-and witness per input (prevout script types come from the UTXO set / mempool).
-PARAMS: (txs). Mirrors Core combinerawtransaction.
+  "Combine partially-signed raw transactions into one, merging the signatures
+of every variant per input. PARAMS: (txs). Mirrors Core combinerawtransaction
+(rpc/rawtransaction.cpp:605-667), whose body is BL.RPC:COMBINE-SIGNED-
+TRANSACTIONS -- the merge needs the spent coins and the signer's assembler,
+both of which live in the rpc layer.
 
 Core decodes every element FIRST and only then refuses an empty list, so a
 malformed element is named by index and an empty array is the -22 \"Missing
-transactions\" rpc_createmultisig.py:150 asks for (rpc/rawtransaction.cpp:
-608-619). A non-array never reaches here: `txs' is declared RPCArg::Type::ARR,
-which is the dispatcher's own -3 (core-tables.lisp, Core's params[0]
-.get_array())."
-  (declare (ignore node))
+transactions\" rpc_createmultisig.py:150 asks for (:608-619). A non-array never
+reaches here: `txs' is declared RPCArg::Type::ARR, which is the dispatcher's
+own -3 (core-tables.lisp, Core's params[0].get_array())."
   (let ((hexes (bl.rpc:positional-array (first params))))
     (let ((txs (loop for h in hexes
                      for idx from 0
@@ -863,42 +863,7 @@ sure the tx has at least one input." idx)))))
       (unless txs
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                  :message "Missing transactions"))
-      (let* ((base (first txs))
-             (nin (length (bl.ser:transaction-inputs base)))
-             (merged-ins (make-array nin))
-             (witnesses (make-array nin :initial-element nil))
-             (any-witness nil))
-        (dolist (tx (rest txs))
-          (unless (= (length (bl.ser:transaction-inputs tx)) nin)
-            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                              :message "Input count mismatch between transactions")))
-        (dotimes (i nin)
-          (let ((best-ss (bl.ser:tx-in-script-sig
-                          (aref (bl.ser:transaction-inputs base) i)))
-                (best-wit nil)
-                (in0 (aref (bl.ser:transaction-inputs base) i)))
-            (dolist (tx txs)
-              (let* ((in (aref (bl.ser:transaction-inputs tx) i))
-                     (ss (bl.ser:tx-in-script-sig in))
-                     (w (bl.rpc:tx-input-witness tx i)))
-                (when (> (length ss) (length best-ss)) (setf best-ss ss))
-                (when (and w (plusp (length w))
-                           (or (null best-wit) (> (length w) (length best-wit))))
-                  (setf best-wit w))))
-            (when best-wit (setf any-witness t (aref witnesses i) best-wit))
-            (setf (aref merged-ins i)
-                  (bl.ser:make-tx-in
-                   :previous-output (bl.ser:tx-in-previous-output in0)
-                   :script-sig best-ss
-                   :sequence (bl.ser:tx-in-sequence in0)))))
-        (let ((merged (bl.ser:make-transaction
-                       :version (bl.ser:transaction-version base)
-                       :inputs merged-ins
-                       :outputs (bl.ser:transaction-outputs base)
-                       :lock-time (bl.ser:transaction-lock-time base)
-                       :witness (if any-witness witnesses nil))))
-          (bl.crypto:bytes-to-hex
-           (bl.ser:transaction-wire-bytes merged)))))))
+      (bl.rpc:combine-signed-transactions node txs))))
 
 ;;;; =====================================================================
 ;;;; Wallet P5 — PSBT SIGNER role: walletprocesspsbt, descriptorprocesspsbt,
