@@ -2289,3 +2289,51 @@ prove the merge."
                             (lambda ()
                               (rpc nil "combinerawtransaction" hexes))))
                     "combining a spent input must be Core's -25")))))))))
+
+(test walletrejectlongchains-refuses-before-the-transaction-is-stored
+  "Core's CreateTransaction ends with the -walletrejectlongchains check
+(spend.cpp:1416-1422): Chain::checkChainLimits asks the mempool whether the
+transaction would fit its cluster limits (node/interfaces.cpp:718-723 ->
+CTxMemPool::CheckPolicyLimits) and the build FAILS if it would not, so nothing
+is stored and nothing is broadcast. Every CreateTransaction failure is -6 at
+the RPC edge, which is what wallet_basic.py:524 reads together with the
+sentence `too many unconfirmed transactions in cluster'.
+
+We ran no such check (documented divergence 3): the transaction was built,
+signed, STORED in the wallet and only then refused by the mempool at
+broadcast, so the RPC answered a txid for a transaction the network would
+never see and the wallet grew an entry Core does not create.
+
+Turning the option off is the control: Core then commits exactly as we always
+did, txid and all."
+  (let ((bl.mp:*cluster-count-limit* 3))
+    (with-wallet-chain-node (node "reject-long-chains")
+      (flet ((rpc (wallet method &rest params)
+               (with-rpc-wallet (wallet)
+                 (bl.rpc:dispatch-rpc-method node method params))))
+        (let ((optrue (bl.crypto:encode-p2sh-address
+                       (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+          (rpc nil "createwallet" "w")
+          (rpc nil "generatetoaddress" 1 (rpc "w" "getnewaddress" "" "bech32"))
+          (rpc nil "generatetoaddress" 101 optrue)
+          (with-wallet-rng (67)
+            (flet ((send ()
+                     (rpc "w" "sendtoaddress" optrue (bl.rpc:format-money 1000000)
+                          nil nil nil nil nil nil nil 10)))
+              ;; Each send spends the previous one's change, so the three of
+              ;; them are one cluster of three -- the limit this pool was
+              ;; built with.
+              (dotimes (i 3)
+                (is (stringp (send)) "send ~D must be accepted" i))
+              (is (= 3 (bl.mp:mempool-count (bl:node-mempool node)))
+                  "the fixture must leave a full cluster in the mempool")
+              (let ((before (length (coerce (rpc "w" "listtransactions") 'list))))
+                (is (equal (cons bl.rpc:+rpc-wallet-insufficient-funds+
+                                 "too many unconfirmed transactions in cluster")
+                           (rpc-error-of #'send)))
+                (is (= before (length (coerce (rpc "w" "listtransactions") 'list)))
+                    "the refused transaction must not be in the wallet")
+                ;; Control: with the option off Core builds and commits it.
+                (let ((bl.wallet::*wallet-reject-long-chains* nil))
+                  (is (stringp (send))
+                      "with -walletrejectlongchains off the build must succeed"))))))))))

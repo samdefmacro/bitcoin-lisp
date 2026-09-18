@@ -281,6 +281,7 @@ src/mempool/.")
    #:*incremental-relay-fee-rate*
    #:mempool-max-size
    #:mempool-cluster-count-limit
+   #:mempool-check-policy-limits
    #:mempool-cluster-size-limit
    #:mempool-linearization-optimal-p
    #:mempool-tx-or-ancestor-signals-rbf-p

@@ -1804,6 +1804,41 @@ rolled back)."
     (is-false (bl.mp:txgraph-oversized-p
                (bl.mp:mempool-graph mempool)))))
 
+(test mempool-check-policy-limits-answers-without-changing-the-pool
+  "Core CTxMemPool::CheckPolicyLimits (txmempool.cpp:800-809) answers whether a
+transaction WOULD fit the cluster limits: it stages the transaction into a
+throwaway ChangeSet and asks CheckMemPoolPolicyLimits, which is IsOversized on
+the txgraph (:1072-1080). The wallet asks it under -walletrejectlongchains
+before storing a transaction it could not broadcast (spend.cpp:1416-1422).
+
+The unrelated transaction is the control -- a full cluster must not make the
+answer NO for everything -- and the pool's own state afterwards is the point:
+a question that admitted its subject would wedge every caller."
+  (let* ((mempool (let ((bl.mp:*cluster-count-limit* 3)) (bl.mp:make-mempool)))
+         (root (make-mempool-test-tx :input-id 93))
+         (prev-txid (bl.ser:transaction-hash root)))
+    (is (eq :ok (%add-tx mempool root)))
+    (dotimes (i 2)
+      (let ((child (make-spending-test-tx prev-txid)))
+        (is (eq :ok (%add-tx mempool child)))
+        (setf prev-txid (bl.ser:transaction-hash child))))
+    (is (= 3 (bl.mp:mempool-count mempool)))
+    (let ((child (make-spending-test-tx prev-txid))
+          (stranger (make-mempool-test-tx :input-id 94)))
+      (is-false (bl.mp:mempool-check-policy-limits
+                 mempool child (bl.ser:transaction-weight child))
+                "a fourth link in a 3-cluster must not fit")
+      (is-true (bl.mp:mempool-check-policy-limits
+                mempool stranger (bl.ser:transaction-weight stranger))
+               "an unrelated transaction still fits")
+      ;; The question left nothing behind.
+      (is (= 3 (bl.mp:mempool-count mempool)))
+      (is-false (bl.mp:txgraph-oversized-p (bl.mp:mempool-graph mempool)))
+      (is (eq :ok (%add-tx mempool stranger))
+          "the pool must still accept what the question said would fit")
+      (is (eq :too-large-cluster (%add-tx mempool child))
+          "and still refuse what it said would not"))))
+
 (test mempool-cluster-size-limit
   "Acceptance is bounded by the cluster vsize limit: a chain whose total
 vsize would exceed *cluster-size-limit* is rejected at the tx that crosses

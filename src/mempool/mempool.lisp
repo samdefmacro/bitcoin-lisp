@@ -362,6 +362,35 @@ drift from the transaction and the sigop count the entry already holds."
   (transaction-graph-weight (mempool-entry-transaction entry)
                             (mempool-entry-sigops entry)))
 
+(defun mempool-check-policy-limits (mempool tx weight)
+  "Core CTxMemPool::CheckPolicyLimits (txmempool.cpp:800-809): would adding TX
+keep the cluster limits? Core stages it into a throwaway ChangeSet -- zero fee,
+zero sigops, its own weight -- processes the dependencies and asks
+CheckMemPoolPolicyLimits, which is IsOversized on the txgraph (:1072-1080).
+
+A QUESTION, not an admission: the staged transaction is removed again whatever
+the answer, so the pool is exactly as it was. The wallet is Core's caller
+(-walletrejectlongchains, spend.cpp:1416-1422, through Chain::checkChainLimits
+in node/interfaces.cpp:718-723), which asks before it stores a transaction it
+would then be unable to broadcast.
+
+WEIGHT is a parameter rather than measured here because the caller may hold a
+transaction that is NOT YET SIGNED: TRANSACTION-WEIGHT memoises on the struct,
+so measuring one before it is signed poisons the cached weight for the life of
+the object. For the same reason the staged handle carries NO payload -- the
+txid is memoised too, and the fallback order nothing is running here would be
+the only reader of it."
+  (let* ((graph (mempool-graph mempool))
+         (handle (txgraph-add-transaction graph 0 (sigop-adjusted-weight weight 0))))
+    (unwind-protect
+         (progn
+           (dolist (parent (mempool-find-parents mempool tx))
+             (txgraph-add-dependency
+              graph (mempool-entry-graph-handle (mempool-get mempool parent))
+              handle))
+           (not (txgraph-oversized-p graph)))
+      (txgraph-remove-transaction graph handle))))
+
 (defun mempool-entry-fee-rate (entry)
   "Fee rate (satoshis per virtual byte) for a mempool entry, using the
 prioritisation-modified fee (Core scores mining/eviction on modified fees)."

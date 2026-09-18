@@ -2488,13 +2488,27 @@ Caller holds node + wallet locks."
                                                     est-weight)))
                                           (when (> final-weight
                                                    bl.val:+max-standard-tx-weight+)
-                                            (fail "Transaction too large")))
-                                        (when (> current-fee
-                                                 bl:*wallet-max-tx-fee*)
-                                          (fail +max-fee-exceeded-message+))
-                                        ;; -walletrejectlongchains'
-                                        ;; checkChainLimits simulation is not
-                                        ;; run pre-commit (divergence 3).
+                                            (fail "Transaction too large"))
+                                          (when (> current-fee
+                                                   bl:*wallet-max-tx-fee*)
+                                            (fail +max-fee-exceeded-message+))
+                                          ;; Core's last check before success:
+                                          ;; under -walletrejectlongchains the
+                                          ;; transaction must pass the mempool's
+                                          ;; cluster limits BEFORE it is stored
+                                          ;; (spend.cpp:1416-1422 ->
+                                          ;; Chain::checkChainLimits,
+                                          ;; node/interfaces.cpp:718-723). Every
+                                          ;; CreateTransaction failure is -6 at
+                                          ;; the RPC edge, which is the code
+                                          ;; wallet_basic.py:524 reads with this
+                                          ;; sentence.
+                                          (when *wallet-reject-long-chains*
+                                            (let ((mempool (bl:node-mempool node)))
+                                              (when (and mempool
+                                                         (not (bl.mp:mempool-check-policy-limits
+                                                               mempool tx final-weight)))
+                                                (fail "too many unconfirmed transactions in cluster")))))
                                         (setf keep-reservation t)
                                         (bl:log-info
                                          "Coin Selection: Algorithm:~(~A~), Waste Metric Score:~D; fee ~D sat over ~D vB"
