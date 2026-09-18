@@ -115,6 +115,17 @@ setting in the order given (Core WriteSettings, common/settings.cpp:123-142)."
               (%json-escape (car cell)) (render-json-value (cdr cell))))
     (format out "~%}~%")))
 
+(defun %settings-row (name value)
+  "One (name string-value json) settings row: the string form an option reader
+sees and the stored JSON the negation span reads."
+  (list name
+        (cond ((eq value 'yason:false) "0")
+              ((eq value 'yason:true) "1")
+              ((null value) "0")
+              ((stringp value) value)
+              (t (render-json-value value)))
+        (render-json-value value)))
+
 (defun settings-config-rows (settings)
   "SETTINGS (name -> parsed JSON value) as the settings ROWS — (name
 string-value json) — that MERGED-CONFIG-ALIST resolves alongside the command
@@ -124,15 +135,20 @@ line and the config file. This is Core's `m_settings.rw_settings` source
 A JSON false is Core's negation: it reaches the option readers as \"0\" and it
 is what ends a settings span, which is why the row carries the stored JSON as
 well as the string. The values come straight from yason's parser, so
-RENDER-JSON-VALUE gives back exactly what Core would have written."
+RENDER-JSON-VALUE gives back exactly what Core would have written.
+
+An ARRAY contributes ONE ROW PER ELEMENT, which is what makes a list setting a
+list: Core's GetSettingsList splices an array value into the result
+(`if (value.isArray()) result.insert(..., value.getValues()...)',
+common/settings.cpp:230-234). Rendering the array itself into the option's
+string value instead made settings.json's wallet LIST a wallet NAME, and the
+node started with `Loading 2 wallets at startup: \"[\\\"default_wallet\\\"]\",
+\"default_wallet\"' -- one of them a wallet nobody could ever have created."
   (loop for (name . value) in settings
-        collect (list name
-                      (cond ((eq value 'yason:false) "0")
-                            ((eq value 'yason:true) "1")
-                            ((null value) "0")
-                            ((stringp value) value)
-                            (t (render-json-value value)))
-                      (render-json-value value))))
+        append (if (and (vectorp value) (not (stringp value)))
+                   (loop for element across value
+                         collect (%settings-row name element))
+                   (list (%settings-row name value)))))
 
 (defun validate-settings-values (settings)
   "The Core-worded init error a settings file's VALUES earn, or NIL.

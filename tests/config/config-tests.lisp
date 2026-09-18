@@ -2471,6 +2471,35 @@ the row keeps the stored `false` that tells the merge it is a NEGATION."
       (is-true (bl.cfg:setting-row-negated-p (row "listen")))
       (is-false (bl.cfg:setting-row-negated-p (row "prune"))))))
 
+(test a-settings-array-is-one-value-per-element
+  "Core's GetSettingsList SPLICES an array setting into the result -- `if
+(value.isArray()) result.insert(result.end(), value.getValues().begin(), ...)'
+(common/settings.cpp:230-234) -- which is what makes settings.json's `wallet'
+a LIST of wallets.
+
+We rendered the value with RENDER-JSON-VALUE whenever it was not a string, so
+the array itself became the option's string value: the node started with
+`Loading 2 wallets at startup: \"[\\\"default_wallet\\\"]\", \"default_wallet\"',
+one of them a wallet nobody could have created, and -wallet took a JSON array
+as a file name.
+
+The scalars are the control: a number and a JSON false keep their single row
+(the false is a negation, which is what ends a settings span)."
+  (let ((rows (bl:settings-config-rows
+               (bl:parse-settings-json
+                "{\"wallet\": [\"w1\", \"w2\"], \"prune\": 550, \"listen\": false}"
+                "/d/settings.json"))))
+    (is (equal '(("wallet" "w1" "\"w1\"")
+                 ("wallet" "w2" "\"w2\"")
+                 ("prune" "550" "550")
+                 ("listen" "0" "false"))
+               rows))
+    ;; An empty array contributes nothing at all, as an empty span does.
+    (is (null (remove "wallet" (bl:settings-config-rows
+                                (bl:parse-settings-json "{\"wallet\": []}"
+                                                        "/d/settings.json"))
+                      :key #'first :test-not #'string=)))))
+
 (test option-name-lookups-are-case-sensitive-like-core
   "Core folds an option name only on WIN32 (args.cpp:200-204), so
 GetArgFlags (:258-268) is a case-SENSITIVE map lookup: `-LogSourceLocations`
