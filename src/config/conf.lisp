@@ -222,3 +222,21 @@ it is \"0\", which would render as the string \"0\" instead."
            collect (list (conf-section-name network) name json))
      (loop for (name . json) in globals-json
            collect (list "" name json)))))
+
+(defun warn-includeconf-from-included-file (name &optional (stream *error-output*))
+  "Core's warning for an -includeconf found INSIDE an included config file:
+`warning: -includeconf cannot be used from included files; ignoring
+-includeconf=<name>' (common/config.cpp:212).
+
+Core writes it to STDERR, not to the log -- config files are read before
+debug.log exists, so the log is not a place an operator can be told. The whole
+of a node's stderr is also compared against the expected text at every stop by
+Core's framework (test_node.py:502-509), which is how
+feature_includeconf.py:59 asserts on this exact sentence; ours logged it
+instead, leaving stderr empty and an operator who collects stderr with nothing
+at all."
+  (format stream
+          "warning: -includeconf cannot be used from included files; ~
+ignoring -includeconf=~A~%"
+          name)
+  (finish-output stream))

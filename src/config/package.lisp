@@ -78,6 +78,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:conf-settings-rows
    #:parse-bitcoin-conf-sections
    #:parse-bitcoin-conf
+   #:warn-includeconf-from-included-file
    #:conf-global-entries
    #:resolve-network-from-config
    #:unknown-config-file-keys

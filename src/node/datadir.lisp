@@ -304,12 +304,12 @@ Core's rules, all of which apply here:
                  :message (format nil "Failed to include configuration file ~A" name)))
         (let ((text (alexandria:read-file-into-string path)))
           ;; A recursive include is dropped with a warning, exactly as Core
-          ;; does (it re-scans for includeconf after reading and prints
-          ;; "-includeconf cannot be used from included files").
+          ;; does (it re-scans for includeconf after reading,
+          ;; common/config.cpp:202-213) -- on STDERR, where Core puts it and
+          ;; where alone it can be read before debug.log exists.
           (dolist (inner (bl.cfg:parse-bitcoin-conf text nil))
             (when (string= (car inner) "includeconf")
-              (log-warn "-includeconf cannot be used from included files; ~
-                         ignoring -includeconf=~A" (cdr inner))))
+              (bl.cfg:warn-includeconf-from-included-file (cdr inner))))
           (log-info "Included configuration file ~A" name)
           (push text texts))))
     (nreverse texts)))

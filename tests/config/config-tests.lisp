@@ -237,6 +237,30 @@ outranks a global in the main one."
       (is (string= "8888" (cfg "rpcport" merged))
           "the included file's [main] section must outrank the main file's global"))))
 
+(test includeconf-inside-an-included-file-warns-on-stderr
+  "Core writes the recursive -includeconf warning to STDERR, not to the log
+(common/config.cpp:212), because config files are read before debug.log exists.
+Core's framework compares the WHOLE of a node's stderr against the expected
+text at every stop (test_node.py:502-509), so feature_includeconf.py:59 asserts
+on this sentence exactly; ours logged it, leaving stderr empty.
+
+The text is the assertion: a warning with different wording, or one that went
+somewhere else, is the same failure."
+  (let ((out (with-output-to-string (s)
+               (bl.cfg:warn-includeconf-from-included-file "relative2.conf" s))))
+    (is (string= (format nil "warning: -includeconf cannot be used from ~
+included files; ignoring -includeconf=relative2.conf~%")
+                 out)))
+  ;; It goes to *ERROR-OUTPUT* when no stream is named -- the whole point of
+  ;; the change -- and NOT to standard output.
+  (let* ((err (make-string-output-stream))
+         (out (with-output-to-string (o)
+                (let ((*error-output* err)
+                      (*standard-output* o))
+                  (bl.cfg:warn-includeconf-from-included-file "x.conf")))))
+    (is (string= "" out))
+    (is (search "ignoring -includeconf=x.conf" (get-output-stream-string err)))))
+
 (test each-config-file-gets-its-own-section-scope
   "Included files are separate STREAMS in Core, so a [section] left open at the
 end of one file does not carry into the next. Concatenating the texts — the
