@@ -1000,8 +1000,12 @@ instead of an operator told why."
     (%wc-mine node 2 (%wc-optrue-address))
     (let ((foreign-genesis (make-array 32 :element-type '(unsigned-byte 8)
                                           :initial-element #xfe))
+          ;; Core's LoadWalletInternal prefixes every LoadExisting failure --
+          ;; this one included -- with "Wallet loading failed. "
+          ;; (wallet.cpp:286-291).
           (message (concatenate
                     'string
+                    "Wallet loading failed. "
                     "Wallet files should not be reused across chains. "
                     "Restart bitcoind with -walletcrosschain to override.")))
       ;; Control: this chain's own locator reloads without complaint.
@@ -1166,3 +1170,58 @@ wallet having ignored the output in the first place."
           (connect spend)
           (is (null (unspent))
               "the spent zero-value output is still unspent: ~S" (unspent)))))))
+
+(test a-wallet-needing-blocks-the-background-sync-lacks-is-refused-by-height
+  "Core's AttachChain walks block data only when data can be MISSING --
+`chain.havePruned() || chain.hasAssumedValidChain()' -- and then descends from
+the tip for as long as the block below is on disk; if that walk stops ABOVE the
+height the rescan must start from, the load FAILS, naming the height at which
+the wallet will load (wallet.cpp:3237-3264). LoadWalletInternal prefixes the
+sentence with `Wallet loading failed. ' (wallet.cpp:286-291), which is what
+wallet_assumeutxo.py:208-210 reads back with -4.
+
+We compared the rescan height against the PRUNED height instead. An
+assumed-valid chain prunes nothing -- its missing blocks are the ones the
+background sync has not re-derived yet -- so that comparison never fired: the
+wallet loaded and its rescan then ran over blocks the node does not have.
+
+Two wallets on one node, which is the test's own shape (:200-210): the one
+whose locator is ABOVE the gap loads, the one below it is refused."
+  (with-wallet-chain-node (node "assumeutxo-load" :wallet "below")
+    (bl.rpc:dispatch-rpc-method node "createwallet" (list "above"))
+    (%wc-mine node 3 (%wc-optrue-address))
+    ;; A background (assumeutxo) chainstate is one still re-deriving history
+    ;; toward a target block, which is exactly what this slot says. It is a
+    ;; SECOND chainstate: the one carrying a target can never be the current
+    ;; one (SELECT-CURRENT-CHAINSTATE), which is the shape a loaded snapshot
+    ;; has.
+    (push (bl.store:make-chain-state
+           :target-blockhash (bl.store:best-block-hash (bl:node-chain-state node)))
+          (bl:node-chainstates node))
+    (is-true (bl:node-historical-chainstate node)
+             "the fixture must look like a background sync in progress")
+    ;; `below' stops here; `above' follows two more blocks before it stops.
+    (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "below"))
+    (let ((below-height (bl.store:current-height (bl:node-chain-state node))))
+      (%wc-mine node 2 (%wc-optrue-address))
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "above"))
+      (let ((above-height (bl.store:current-height (bl:node-chain-state node))))
+        (%wc-mine node 2 (%wc-optrue-address))
+        ;; The body one block above `below' is gone, as it would be while a
+        ;; background sync re-derives history: the walk stops at the block
+        ;; above it, which is where `above' starts.
+        (let ((missing (bl.store:get-block-at-height (bl:node-chain-state node)
+                                                     (1+ below-height))))
+          (is-true (bl.store:forget-block-body
+                    (bl:node-block-store node)
+                    (bl.store:block-index-entry-hash missing))
+                   "the fixture must remove a block body")
+          ;; Control: this wallet's rescan starts at the block the walk
+          ;; reaches, so Core loads it during the background sync.
+          (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "above")))
+          (is (equal (cons bl.rpc:+rpc-wallet-error+
+                           (format nil "Wallet loading failed. Error loading wallet. Wallet requires blocks to be downloaded, and software does not currently support loading wallets while blocks are being downloaded out of order when using assumeutxo snapshots. Wallet should be able to load successfully after node sync reaches height ~D"
+                                   above-height))
+                     (rpc-error-of
+                      (lambda ()
+                        (bl.rpc:dispatch-rpc-method node "loadwallet" (list "below")))))))))))

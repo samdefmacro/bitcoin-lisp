@@ -2025,7 +2025,12 @@ sequence has exactly one definition."
                                               :rescan-required rescan-required)))
       (when error-message
         (ignore-errors (unload-wallet manager wallet :force t))
-        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message error-message)))
+        ;; Core's LoadWalletInternal prefixes EVERY LoadExisting failure --
+        ;; AttachChain's among them -- with "Wallet loading failed. "
+        ;; (wallet.cpp:286-291), so loadwallet and restorewallet both report
+        ;; the sentence that way (wallet_assumeutxo.py:208).
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                          :message (format nil "Wallet loading failed. ~A" error-message))))
     ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
     ;; requestMempoolTransactions); the attach-chain scan only does this
     ;; when the wallet was behind the tip.
