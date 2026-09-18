@@ -83,8 +83,8 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
                            (some (lambda (in) (plusp (length (bl.ser:tx-in-script-sig in))))
                                  (bl.ser:transaction-inputs tx)))))
           (when (and has-sig (not permitsigdata))
-            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                              :message "Inputs must not have scriptSigs and scriptwitnesses. To convert anyway, permitsigdata must be set to true.")))
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
+                              :message "Inputs must not have scriptSigs and scriptWitnesses")))
         (let ((stripped (bl.ser:make-transaction
                          :version (bl.ser:transaction-version tx)
                          :inputs (map 'simple-vector

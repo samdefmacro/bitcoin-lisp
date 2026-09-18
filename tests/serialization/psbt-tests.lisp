@@ -274,6 +274,70 @@ tx is rejected unless permitsigdata."
                       (%psbt-ser (bl.ser:encode-psbt
                                   (bl.ser:make-empty-psbt tx)))))))))
 
+(defun %psbt-tx-with-input-0 (tx &key script-sig witness)
+  "TX with SCRIPT-SIG on its first input, or WITNESS as its first input's
+stack -- the two shapes Core's converttopsbt refuses."
+  (let ((ins (map 'simple-vector
+                  (lambda (in)
+                    (bl.ser:make-tx-in
+                     :previous-output (bl.ser:tx-in-previous-output in)
+                     :script-sig (bl.ser:tx-in-script-sig in)
+                     :sequence (bl.ser:tx-in-sequence in)))
+                  (bl.ser:transaction-inputs tx))))
+    (when script-sig
+      (setf (bl.ser:tx-in-script-sig (aref ins 0)) script-sig))
+    (bl.ser:make-transaction
+     :version (bl.ser:transaction-version tx)
+     :inputs ins
+     :outputs (bl.ser:transaction-outputs tx)
+     :lock-time (bl.ser:transaction-lock-time tx)
+     :witness (when witness
+                (let ((stacks (make-array (length ins) :initial-element nil)))
+                  (setf (aref stacks 0) witness)
+                  stacks)))))
+
+(test psbt-converttopsbt-refuses-signature-data
+  "converttopsbt answers Core's -22 and its own sentence for a transaction
+that carries a scriptSig or a witness, and strips them under permitsigdata
+(rpc/rawtransaction.cpp:1704-1711, rpc_psbt.py:676-684)."
+  (let ((data (%psbt-vectors)))
+    (if (null data)
+        (skip "refs/bitcoin rpc_psbt.json not present")
+        (let* ((node (bl:make-node :network :regtest))
+               (tx (bl.ser:psbt-tx
+                    (bl.ser:decode-psbt
+                     (gethash "result" (first (gethash "creator" data))))))
+               (hex (lambda (transaction)
+                      (bl.crypto:bytes-to-hex
+                       (bl.ser:transaction-wire-bytes transaction))))
+               (sig-tx (%psbt-tx-with-input-0
+                        tx :script-sig (bl.crypto:hex-to-bytes "0101")))
+               (wit-tx (%psbt-tx-with-input-0
+                        tx :witness (list (bl.crypto:hex-to-bytes "0101")))))
+          ;; the same transaction without signature data converts: the control
+          ;; that says the three refusals below are about the signature data.
+          (is-true (bl.wallet::rpc-converttopsbt node (list (funcall hex tx))))
+          (dolist (hexstring (list (funcall hex sig-tx) (funcall hex wit-tx)))
+            (signals-rpc-error
+                (:code bl.rpc:+rpc-deserialization-error+
+                 :exact-message "Inputs must not have scriptSigs and scriptWitnesses")
+              (bl.wallet::rpc-converttopsbt node (list hexstring)))
+            (signals-rpc-error
+                (:code bl.rpc:+rpc-deserialization-error+
+                 :exact-message "Inputs must not have scriptSigs and scriptWitnesses")
+              (bl.wallet::rpc-converttopsbt node (list hexstring bl.rpc:+json-false+))))
+          ;; permitsigdata converts and strips
+          (let ((converted (bl.ser:psbt-tx
+                            (bl.ser:decode-psbt
+                             (bl.wallet::rpc-converttopsbt
+                              node (list (funcall hex sig-tx) t))))))
+            (is (zerop (length (bl.ser:tx-in-script-sig
+                                (aref (bl.ser:transaction-inputs converted) 0))))
+                "permitsigdata left the scriptSig in place")
+            (is (equalp (bl.ser:transaction-wire-bytes tx)
+                        (bl.ser:transaction-wire-bytes converted))
+                "the stripped transaction is not the unsigned one"))))))
+
 ;;; --- combiner / join / analyze ---
 
 (defun %psbt-maps-equiv (a b)
