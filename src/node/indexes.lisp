@@ -537,7 +537,12 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
     ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
     (let ((bfi (node-blockfilterindex *node*)))
       (bl.store:register-prune-lock
-       "blockfilterindex"
+       ;; Core registers its lock under the index's OWN name
+       ;; (BaseIndex::SetBestBlockIndex -> UpdatePruneLock(GetName(), ...),
+       ;; index/base.cpp:494), and that name is what the "limited pruning to
+       ;; height" line prints. INDEX-NAME already carries Core's spellings, so
+       ;; the log line reads as Core's does rather than naming the option.
+       (bl.store:index-name bfi)
        (lambda ()
          ;; -1 is "nothing indexed yet", which is Core's height_first ==
          ;; INT_MAX: no height to protect, so no constraint. Returning it
@@ -583,7 +588,7 @@ CATCH-UP-INDEX). Prune locks are re-registered from scratch."
     ;; true): its per-block statistics are derived from undo data.
     (let ((csi (node-coinstatsindex *node*)))
       (bl.store:register-prune-lock
-       "coinstatsindex"
+       (bl.store:index-name csi)
        (lambda ()
          (let ((h (bl.store:coinstatsindex-height csi)))
            (and (plusp h) h)))))

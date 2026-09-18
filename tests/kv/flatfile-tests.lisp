@@ -1513,6 +1513,50 @@ locks for one index."
     (bl.store:clear-prune-locks)
     (is (= 1000 (bl.store:prune-lock-ceiling 1000)))))
 
+(test prune-lock-that-was-the-limit-names-itself-in-the-log
+  "Core logs `%s limited pruning to height %d' under BCLog::PRUNE whenever a
+prune lock ended up being the limit (validation.cpp:2734-2736), and
+feature_index_prune.py:99 requires the line -- with the height -- in debug.log
+while it prunes a node whose index is behind the tip. Nothing was logged here
+at all, so an operator whose pruneblockchain freed less than it asked for had
+no way to learn which index held the horizon down.
+
+Core sets limiting_lock only when last_prune EQUALS that lock's own height
+(:2731), so a lock the floor overrides names nobody, and the locks are visited
+in NAME order so a tie always names the same one."
+  (%with-clean-prune-locks
+    (let ((bl.log:*current-log-level* :debug))
+      (flet ((lines (height)
+               (capture-log-lines (lambda () (bl.store:prune-lock-ceiling height)))))
+        ;; No lock at all: nothing to name, so no line.
+        (is (null (remove-if-not (lambda (l) (search "limited pruning" l))
+                                 (lines 1000)))
+            "a node with no prune lock logged a limit")
+        (bl.store:register-prune-lock "coinstatsindex" (lambda () 700))
+        (let ((line (find-if (lambda (l) (search "limited pruning" l))
+                             (lines 1000))))
+          (is-true line "the limiting lock logged nothing")
+          (when line
+            (is-true (search "coinstatsindex limited pruning to height 689" line)
+                     "the line reads ~S" line)))
+        ;; The LOWEST lock is the one that ended up being the limit, and it is
+        ;; the one named -- not merely the last one visited.
+        (bl.store:register-prune-lock "basic block filter index" (lambda () 300))
+        (let ((line (find-if (lambda (l) (search "limited pruning" l))
+                             (lines 1000))))
+          (is-true line)
+          (when line
+            (is-true (search "basic block filter index limited pruning to height 289"
+                             line)
+                     "the line reads ~S" line)))
+        ;; A lock the floor overrides: Core's last_prune is 1 and does not equal
+        ;; that lock's own height, so limiting_lock stays unset.
+        (bl.store:clear-prune-locks)
+        (bl.store:register-prune-lock "coinstatsindex" (lambda () 3))
+        (is (null (remove-if-not (lambda (l) (search "limited pruning" l))
+                                 (lines 1000)))
+            "a lock the floor overrode named itself anyway")))))
+
 (test prune-lock-signalling-thunk-does-not-break-pruning
   "A thunk that errors (a closed index DB after shutdown, say) is treated as
 absent rather than taking the node's pruning down with it."

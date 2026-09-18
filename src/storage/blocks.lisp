@@ -846,16 +846,35 @@ after every connected block.")
 Core: last_prune starts at the chain height and each lock lowers it to
 height_first - PRUNE_LOCK_BUFFER - 1, floored at 1 (validation.cpp:2722-2732).
 A lock whose subsystem has no height yet does not constrain — that is Core's
-height_first == INT_MAX case."
-  (let ((ceiling chain-height))
-    (maphash (lambda (name height-fn)
-               (declare (ignore name))
-               (let ((height (ignore-errors (funcall height-fn))))
-                 (when height
-                   (setf ceiling
-                         (max 1 (min ceiling
-                                     (- height +prune-lock-buffer+ 1)))))))
-             *prune-locks*)
+height_first == INT_MAX case.
+
+The lock that ENDED UP being the limit names itself in the log, at Core's
+level and in Core's words: `%s limited pruning to height %d' under BCLog::PRUNE
+(validation.cpp:2734-2736). Core's test for it is
+feature_index_prune.py:99, which prunes with an index behind the tip and
+requires the line in debug.log — an operator whose pruneblockchain freed less
+than asked has no other way to learn WHICH index held the horizon down.
+
+Core's `limiting_lock' is set only when last_prune EQUALS that lock's own
+height (:2731), so a lock driven below the floor — one whose index sits near
+genesis, where max(1, ...) wins — names nobody: the answer is the floor, not
+that lock. The locks are visited in NAME order, where Core walks an
+unordered_map, so two locks tying on the same height always name the same one
+here rather than whichever the table happened to hold first."
+  (let ((ceiling chain-height)
+        (limiting nil))
+    (dolist (name (sort (loop for k being the hash-keys of *prune-locks*
+                              collect k)
+                        #'string<))
+      (let* ((height-fn (gethash name *prune-locks*))
+             (height (and height-fn (ignore-errors (funcall height-fn)))))
+        (when height
+          (let ((lock-height (- height +prune-lock-buffer+ 1)))
+            (setf ceiling (max 1 (min ceiling lock-height)))
+            (when (= ceiling lock-height)
+              (setf limiting name))))))
+    (when limiting
+      (bl.log:log-cat "prune" "~A limited pruning to height ~D" limiting ceiling))
     ceiling))
 
 (defun prune-flat-block-file (store file &key on-prune)
