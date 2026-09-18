@@ -717,6 +717,17 @@ pair brackets the same WORK, which here ends with the external block files.
 EDGE is :START or :EXIT."
   (log-info "initload thread ~(~A~)" edge))
 
+(defun %record-reindex-in-progress (on)
+  "Write the persisted resume marker under this node's data directory, or erase
+it, when there is one to keep it in.
+
+Core has no such condition -- its flag is a record in the block tree db it has
+just opened, so a node always has somewhere to put it. Here a node built
+without a data directory (every in-image fixture, and the embedded REPL use)
+has nowhere, and equally nothing to resume from on a later start."
+  (let ((dir (node-data-directory *node*)))
+    (when dir (bl.store:write-reindex-flag dir on))))
+
 (defun %rebuild-block-index-from-block-files ()
   "The -reindex step: rebuild the block index from the block files already on
 disk. Additive -- an intact index is extended, never discarded.
@@ -735,7 +746,7 @@ once the last one has been (:1288-1290). A run killed in between leaves the
 marker, and %REINDEX-REQUESTED-P makes the next start finish the job without
 the option."
   (when (node-block-store *node*)
-    (bl.store:write-reindex-flag (node-data-directory *node*) t)
+    (%record-reindex-in-progress t)
     (log-info "Reindex: rebuilding the block index from the block files...")
     (multiple-value-bind (added orphans)
         (bl.store:reindex-block-index
@@ -745,7 +756,7 @@ the option."
       (when (plusp added)
         (bl.store:save-header-index (node-chain-state *node*)
                                     :force-full t))
-      (bl.store:write-reindex-flag (node-data-directory *node*) nil)
+      (%record-reindex-in-progress nil)
       ;; Core's own sentence for the end of the reindex
       ;; (ImportBlocks, node/blockstorage.cpp:1291). It is what says the block
       ;; files were all read rather than the node having given up partway:
