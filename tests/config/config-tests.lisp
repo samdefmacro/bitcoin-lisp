@@ -1589,16 +1589,27 @@ there is a READ error, not a link error."
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
-(test notify-commands-substitute-only-shell-safe-values
+(test notify-commands-shell-escape-a-value-that-is-not-plain
   "Core replaces %s (and, for -walletnotify, %w/%b/%h) in a notify command and
 runs the result through the shell (init.cpp:2014-2017, wallet.cpp:1125-1150).
-The COMMAND is the operator's own, so the shell is the feature — but the
-SUBSTITUTED VALUE is not necessarily, and a value containing `;` or a backtick
-would be shell injection through a config option that looks inert. Every value
-we substitute is a hash, a decimal height, the literal \"unconfirmed\", or a
-wallet name (%VALID-WALLET-NAME-P already holds those to [A-Za-z0-9._-]), so
-refusing anything outside that set costs nothing and closes the route. Core
-instead shell-escapes %w and substitutes the rest raw."
+The COMMAND is the operator's own, so the shell is the feature; the SUBSTITUTED
+VALUE is not, and a value carrying `;` or a backtick would be shell injection
+through a config option that looks inert. Core's answer is ShellEscape
+(common/system.cpp:41-46) on %w -- single quotes, with an embedded quote
+written as '\\\"'\\\"' -- and a raw substitution for the rest, whose values are
+only ever hex, digits or the literal \"unconfirmed\".
+
+Ours REFUSED anything outside [A-Za-z0-9._-], on the stated grounds that a
+wallet name is held to that set too. It is not: the node's wallet-name rules
+admit a great deal more, and feature_notifications.py:43 creates a wallet named
+after every character from 1 to 127 and then waits for one -walletnotify file
+per transaction. It got none, and the log carried one `Refusing to substitute'
+line per block. Core's default wallet name -- the EMPTY string -- was refused
+by the same rule.
+
+A NUL is still refused: the command reaches /bin/sh as one argv element, which
+ends at the first NUL, so substituting one would silently truncate the
+operator's command."
   (flet ((sub (command &rest pairs)
            (bl.log::%notify-substitute command pairs)))
     (is (equal "echo deadbeef" (sub "echo %s" (cons #\s "deadbeef"))))
@@ -1615,13 +1626,46 @@ instead shell-escapes %w and substitutes the rest raw."
                     (cons #\b "unconfirmed") (cons #\h "-1"))))
     ;; An unlisted placeholder is left alone rather than eaten.
     (is (equal "%b" (sub "%b" (cons #\s "beef"))))
-    ;; A value can never introduce a placeholder of its own: % is outside the
-    ;; safe set, so the substitution is refused before the single pass that
-    ;; would not have rescanned it anyway.
-    (signals error (sub "x %s" (cons #\s "%w") (cons #\w "boom")))
-    (dolist (bad '("dead; rm -rf /" "`id`" "$(id)" "dead beef" "" "a/b" "*" nil))
-      (signals error (sub "echo %s" (cons #\s bad)))
-      (signals error (sub "echo %w" (cons #\w bad))))))
+    ;; ShellEscape, in Core's own spelling.
+    (is (equal "echo 'a b'" (sub "echo %w" (cons #\w "a b"))))
+    (is (equal "echo 'it'\"'\"'s'" (sub "echo %w" (cons #\w "it's"))))
+    ;; Core's default wallet name is the empty string, and it escapes to ''.
+    (is (equal "echo ''" (sub "echo %w" (cons #\w ""))))
+    ;; Every shape that used to be refused is now one quoted word.
+    (dolist (nasty '("dead; rm -rf /" "`id`" "$(id)" "dead beef" "a/b" "*"))
+      (is (equal (format nil "echo '~A'" nasty) (sub "echo %w" (cons #\w nasty)))
+          "~S was not escaped as one word" nasty))
+    ;; A value can never introduce a placeholder of its own -- the pass is
+    ;; single, and the quoting keeps the % out of the shell's hands too.
+    (is (equal "x '%w'" (sub "x %s" (cons #\s "%w") (cons #\w "boom"))))
+    ;; A NUL, and a non-string, are still refused.
+    (signals error (sub "echo %s" (cons #\s (format nil "a~Cb" (code-char 0)))))
+    (signals error (sub "echo %s" (cons #\s nil)))))
+
+(test a-notify-value-with-shell-syntax-runs-as-one-argument
+  "The end of the escaping: a value carrying shell syntax must reach the
+operator's command as ONE word and must not run anything of its own. Core's
+own -walletnotify test names its wallet after every character from 1 to 127 and
+then requires a file named `<wallet>_<txid>', which only a correctly escaped
+and then quote-removed substitution can produce."
+  (let* ((dir (merge-pathnames (format nil "bl-esc-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (nasty "a b';touch PWNED;'c"))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; The value names the file: it must land under its LITERAL text.
+           (bl.log:run-notify-command
+            (format nil "touch ~A%w" (namestring dir))
+            :substitutions (list (cons #\w nasty)) :wait t)
+           (is-true (probe-file (merge-pathnames nasty dir))
+                    "the escaped value did not reach the command as one word")
+           ;; And its shell syntax ran nothing: no PWNED anywhere.
+           (is (null (probe-file (merge-pathnames "PWNED" dir)))
+               "a substituted value executed a command of its own")
+           (is (null (probe-file (merge-pathnames "PWNED" (uiop:getcwd))))))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore)))))
 
 (test notify-commands-reach-the-plist
   "-shutdownnotify is repeatable — Core reads it with GetArgs and joins EVERY
@@ -1663,7 +1707,12 @@ immediately; -blocknotify is detached, so it is polled for."
   ;; A failing hook is logged, never signalled: it must not fail whatever
   ;; triggered it.
   (is-true (bl.log:run-notify-command "exit 1" :wait t))
-  (is-false (bl.log:run-notify-command "echo %s" :value "not hex")))
+  ;; A value that cannot be substituted at all -- one carrying a NUL, which
+  ;; would truncate the argv element the command travels in -- is reported as a
+  ;; failed hook rather than signalled. A value that merely carries shell
+  ;; syntax is escaped and runs (see the escaping tests above).
+  (is-false (bl.log:run-notify-command
+             "echo %s" :value (format nil "a~Cb" (code-char 0)) :wait t)))
 
 (defun %path-mode (path)
   "PATH's permission bits (the low nine of st_mode)."

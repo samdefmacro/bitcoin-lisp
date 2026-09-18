@@ -545,34 +545,68 @@ via the logging RPC (or the node is globally at :debug)."
 ;;;; AddToWallet, and wallet/wallet-tx.lisp compiles long before src/node/.
 
 (defun %notify-safe-value-p (value)
-  "Whether VALUE may be substituted into a shell command.
+  "Whether VALUE needs no quoting at all to be substituted into a shell
+command: [A-Za-z0-9._-], which is every character with no meaning to the shell.
 
-Restricted to [A-Za-z0-9._-], which admits every value we ever substitute — a
-hex hash, a decimal height, -1, \"unconfirmed\", and a wallet name, which
-%VALID-WALLET-NAME-P already holds to the same set — and admits no character
-with a meaning to the shell. Core instead shell-escapes %w and substitutes the
-rest raw; refusing outright is the same guarantee without the escaping."
+A hex hash, a decimal height, -1 and \"unconfirmed\" are all in this set, so the
+values Core substitutes RAW (%s, %b, %h) take this path. A WALLET NAME is not:
+Core's own wallet-name rules admit any character but a path separator, and
+feature_notifications.py:43 creates a wallet named after every printable and
+control character from 1 to 127 precisely to pin that. %NOTIFY-SHELL-ESCAPE is
+the answer for those."
   (and (stringp value)
        (plusp (length value))
        (every (lambda (ch)
                 (or (alphanumericp ch) (member ch '(#\. #\_ #\-))))
               value)))
 
+(defun %notify-shell-escape (value)
+  "VALUE as one shell word: Core's ShellEscape (common/system.cpp:41-46) --
+single-quoted, with each embedded quote written as the four characters
+'\"'\"'. Inside single quotes every byte but a quote is literal, so nothing
+the value carries can be read as syntax, and the shell removes the quoting
+before the command sees the word -- which is what lets a wallet named `a b'
+still produce the file `a b_<txid>'."
+  (with-output-to-string (out)
+    (write-char #\' out)
+    (loop for ch across value
+          do (if (char= ch #\')
+                 (write-string "'\"'\"'" out)
+                 (write-char ch out)))
+    (write-char #\' out)))
+
 (defun %notify-substitute (command substitutions &key (check t))
   "COMMAND with each (CHAR . VALUE) of SUBSTITUTIONS replacing %CHAR (Core
-ReplaceAll). With CHECK (the default), signals if any VALUE is not shell-safe.
+ReplaceAll). With CHECK (the default), a VALUE that is not already free of
+shell syntax is SHELL-ESCAPED first, as Core escapes %w
+(wallet/wallet.cpp:1146).
 
-CHECK NIL is for the ONE substitution whose value cannot be held to that set --
-Core's AlertNotify, which sanitizes a warning message and wraps it in single
-quotes instead (kernel_notifications.cpp:36-42). ALERT-NOTIFY is its only user
-and does exactly that; nothing else may pass NIL.
+Refusing such a value instead -- which is what this did -- makes the hook fire
+nothing at all for a wallet whose name is not [A-Za-z0-9._-], and the node's
+own wallet-name rules admit far more than that: feature_notifications.py names
+its wallet after every character from 1 to 127 and then waits for one file per
+transaction, of which it got none.
+
+A NUL is still refused. It cannot be escaped -- the command reaches
+/bin/sh as one argv element, which ends at the first NUL -- so substituting one
+would silently truncate the operator's command.
+
+CHECK NIL is for the ONE substitution whose value is quoted by its CALLER --
+Core's AlertNotify, which sanitizes a warning message to SAFE_CHARS_DEFAULT and
+wraps it in single quotes (kernel_notifications.cpp:36-42). ALERT-NOTIFY is its
+only user; nothing else may pass NIL.
 
 Single pass, so a substituted value can never itself be rescanned for a
 placeholder: a block hash cannot smuggle in a %w."
   (when check
-    (loop for (nil . value) in substitutions
-          unless (%notify-safe-value-p value)
-            do (internal-error "Refusing to substitute ~S into a notify command" value)))
+    (setf substitutions
+          (loop for (char . value) in substitutions
+                do (unless (and (stringp value) (not (find #\Nul value)))
+                     (internal-error "Refusing to substitute ~S into a notify command"
+                                     value))
+                collect (cons char (if (%notify-safe-value-p value)
+                                       value
+                                       (%notify-shell-escape value))))))
   (let ((out (make-string-output-stream))
         (i 0)
         (n (length command)))
