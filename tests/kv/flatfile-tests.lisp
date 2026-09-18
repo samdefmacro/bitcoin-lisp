@@ -1017,6 +1017,81 @@ and block 1 releases all four."
              (is (plusp (saying (format nil "Out of order block ~A," newest)))
                  "the hash is spelled big-endian, as uint256::ToString spells it"))))))))
 
+(test the-out-of-order-lines-do-not-depend-on-the-index-being-empty
+  "feature_reindex.py:71-74 swaps two blocks inside blk00000.dat, restarts with
+-reindex and waits for BOTH of Core's sentences. Core can decide `out of order'
+by asking its block index, because -reindex WIPED it: there, `not in the index'
+and `not read yet' are the same question. Ours is additive -- the index still
+holds all twelve blocks -- so asking the index answered `known' for every
+record, nothing was ever parked, and neither sentence was written: the test
+failed at :106 against a rebuild that was working correctly.
+
+The judgement is therefore made on FILE POSITION, which is the question Core is
+really asking: a parent that sits after this record has not been read yet. A
+record already in the index is parked all the same and adds nothing when it is
+drained, so the rebuild stays additive and idempotent -- which is what the
+second half of this test measures."
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
+     (let* ((bl.store:*flat-block-files* t)
+            (store (bl.store:init-block-store dir))
+            (cs (bl.store:init-chain-state dir))
+            (genesis (bl.store:best-block-hash cs))
+            (prev genesis)
+            (blocks '()))
+       (bl.store:add-block-index-entry
+        cs (bl.store:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       (loop for h from 1 to 3
+             do (let ((b (%ff-chain-block prev (+ 250 h) h)))
+                  (push (cons b h) blocks)
+                  (setf prev (bl.ser:block-header-hash
+                              (bl.ser:bitcoin-block-header b)))))
+       ;; Store the second block before the first, as the swap in
+       ;; blk00000.dat leaves them, and build the index as we go -- so by the
+       ;; end it holds every record, the state a -reindex actually starts from.
+       (setf blocks (nreverse blocks))
+       (let ((ordered (list (second blocks) (first blocks) (third blocks)))
+             (entries (list (cons genesis
+                                  (bl.store:get-block-index-entry cs genesis)))))
+         (dolist (pair ordered)
+           (bl.store:store-block store (car pair) :height (cdr pair)))
+         ;; The index knows all three, linked correctly, whatever order the
+         ;; file holds them in.
+         (dolist (pair blocks)
+           (let* ((hdr (bl.ser:bitcoin-block-header (car pair)))
+                  (hash (bl.ser:block-header-hash hdr))
+                  (parent (cdr (assoc (bl.ser:block-header-prev-block hdr)
+                                      entries :test #'equalp)))
+                  (entry (bl.store:make-block-index-entry
+                          :hash hash :height (cdr pair) :header hdr
+                          :prev-entry parent :chain-work (1+ (cdr pair))
+                          :status :valid)))
+             (bl.store:add-block-index-entry cs entry)
+             (push (cons hash entry) entries)))
+         (is (= 4 (hash-table-count (bl.store:chain-state-block-index cs)))
+             "the fixture must start from a FULL index, or this test asks ~
+nothing about the additive case")
+         (let* ((added nil)
+                (lines (unwind-protect
+                            (progn
+                              (bl.log:enable-log-category "reindex")
+                              (capture-log-lines
+                               (lambda ()
+                                 (setf added
+                                       (bl.store:reindex-block-index store cs)))))
+                         (bl.log:disable-log-category "reindex"))))
+           (flet ((saying (text) (count-if (lambda (l) (search text l)) lines)))
+             (is (= 1 (saying "LoadExternalBlockFile: Out of order block"))
+                 "the record stored before its parent was not named; lines were ~S"
+                 lines)
+             (is (= 1 (saying "LoadExternalBlockFile: Processing out of order child"))
+                 "and nothing was reported when its parent landed"))
+           (is (= 0 added)
+               "an index that already holds every record must gain nothing")
+           (is (= 4 (hash-table-count (bl.store:chain-state-block-index cs)))
+               "the additive rebuild changed the index it was given")))))))
+
 (test a-record-whose-parent-is-gone-is-reported-not-treated-as-corruption
   "On a pruned node the chain below the horizon is deleted, so records with no
 reachable parent are EXPECTED. Reporting the count lets an operator tell that

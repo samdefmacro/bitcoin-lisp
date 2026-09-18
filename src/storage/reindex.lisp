@@ -149,6 +149,25 @@ and recursion would exhaust the stack."
 hex, the way every RPC reports a block hash."
   (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))
 
+(defun %reindex-pos< (a b)
+  "T when flat record position A comes before B: file number, then offset."
+  (let ((fa (flat-file-pos-file a))
+        (fb (flat-file-pos-file b)))
+    (if (= fa fb)
+        (< (flat-file-pos-pos a) (flat-file-pos-pos b))
+        (< fa fb))))
+
+(defun %reindex-parent-comes-later-p (store prev located)
+  "T when PREV is a record of STORE's block files that sits AFTER the record at
+LOCATED -- the walk reads in file order, so that is exactly Core's `parent not
+known yet'.
+
+A parent that is not in the files at all answers NIL, not T: on a pruned node
+the chain below the horizon is gone, and treating its first surviving block as
+out of order would park every record behind a parent that is never coming."
+  (let ((at (gethash prev (block-store-index store))))
+    (and at (flat-file-pos-p at) (%reindex-pos< located at))))
+
 (defun %reindex-records-in-file-order (store)
   "Every flat record in STORE as (hash pos), in the order the files hold them.
 
@@ -162,13 +181,7 @@ on the table's iteration, which is arrival order and not file order."
                (when (flat-file-pos-p located)
                  (push (cons hash located) records)))
              (block-store-index store))
-    (sort records
-          (lambda (a b)
-            (let ((fa (flat-file-pos-file (cdr a)))
-                  (fb (flat-file-pos-file (cdr b))))
-              (if (= fa fb)
-                  (< (flat-file-pos-pos (cdr a)) (flat-file-pos-pos (cdr b)))
-                  (< fa fb)))))))
+    (sort records (lambda (a b) (%reindex-pos< (cdr a) (cdr b))))))
 
 (defun reindex-block-index (store chain-state)
   "Rebuild CHAIN-STATE's block index from STORE's block files.
@@ -199,14 +212,35 @@ blk00000.dat precisely to watch for those two lines."
                (when (and header record-hash)
                  (let ((prev (bl.ser:block-header-prev-block header)))
                    (cond
-                     ;; Already in the index: nothing to do, and never a
-                     ;; parent-lookup (genesis takes this arm on every run).
-                     ((get-block-index-entry chain-state record-hash))
                      ;; Genesis's parent is the zero hash and will never be in
                      ;; the index; Core excludes it from the check by name
                      ;; (validation.cpp:5049).
                      ((and genesis (equalp record-hash genesis)))
+                     ;; The parent is in these files, but the walk has not
+                     ;; reached it yet: Core's out-of-order case, and it is
+                     ;; decided on FILE POSITION rather than on what the index
+                     ;; holds. Core can ask the index because -reindex wiped it,
+                     ;; so `not in the index' and `not read yet' are the same
+                     ;; question there; ours is additive and the index already
+                     ;; answers yes for every record, which silently cost both
+                     ;; of Core's sentences -- feature_reindex.py:71-74 swaps two
+                     ;; blocks inside blk00000.dat and waits for exactly them.
+                     ;; A record already in the index is parked all the same:
+                     ;; the drain adds nothing for it, so the rebuild stays
+                     ;; additive and idempotent, and the log says what the files
+                     ;; actually look like.
+                     ((%reindex-parent-comes-later-p store prev located)
+                      (bl.log:log-cat "reindex"
+                                      "LoadExternalBlockFile: Out of order block ~A, parent ~A not known"
+                                      (%reindex-hash-text record-hash)
+                                      (%reindex-hash-text prev))
+                      (push (list record-hash header located)
+                            (gethash prev pending)))
                      (t
+                      ;; The parent was read earlier in this walk, or is not in
+                      ;; the files at all -- on a pruned node the chain below
+                      ;; the horizon is gone and the index we already have is
+                      ;; the only place its parent can be.
                       (let ((parent (get-block-index-entry chain-state prev)))
                         (cond
                           ((null parent)
@@ -231,10 +265,11 @@ blk00000.dat precisely to watch for those two lines."
                              (incf added))
                            (incf added (%reindex-drain-children
                                         chain-state pending record-hash)))))))))))
-    ;; A parent that was already in the index when its children were parked
-    ;; cannot happen -- the check above would have taken the other arm -- but a
-    ;; run whose parents arrive only as OTHER parked blocks land does, so drain
-    ;; from every index entry once more before counting what is left.
+    ;; Anything still parked whose parent the index DOES hold: a run whose
+    ;; parents arrive only as other parked blocks land, and a child whose
+    ;; parent record could not be read back even though its entry is in the
+    ;; index. Drain from every such entry once more before counting what is
+    ;; left, so the orphan count means `no parent anywhere' and nothing else.
     (let ((roots '()))
       (maphash (lambda (prev children)
                  (declare (ignore children))
