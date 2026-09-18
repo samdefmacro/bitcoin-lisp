@@ -21,6 +21,58 @@
 ;;;; by their parent's hash and drains it recursively after each accepted
 ;;;; block; so does this.
 
+;;;; The persisted reindex flag (Core BlockTreeDB's 'R' record)
+;;;;
+;;;; A reindex that is interrupted -- a kill, a power cut, an operator's
+;;;; Ctrl-C partway through a chain's worth of block files -- must not come
+;;;; back as an ordinary start over a half-rebuilt index. Core records the fact
+;;;; on disk: DB_REINDEX_FLAG 'R' in blocks/index (node/blockstorage.cpp:61),
+;;;; written when the block tree db is wiped (:1234-1236, through
+;;;; WriteReindexing at :73-80), read back by LoadBlockIndexDB (:583-586),
+;;;; where it clears m_blockfiles_indexed, and erased only once ImportBlocks
+;;;; has read every block file (:1288-1290). The NEXT start therefore reindexes
+;;;; WITHOUT the option, and keeps doing so until one run finishes.
+;;;;
+;;;; Ours is a file rather than a database record for the same reason our block
+;;;; index is a file: there is no blocks/index LevelDB to hold a key. It lives
+;;;; in the directory Core's key lives in.
+
+(defun reindex-flag-path (data-dir)
+  "The reindex-in-progress marker's path under DATA-DIR: blocks/index/reindex,
+beside the block index whose rebuild it describes."
+  (merge-pathnames "reindex" (datadir-block-index-path data-dir)))
+
+(defun write-reindex-flag (data-dir on)
+  "Core BlockTreeDB::WriteReindexing (node/blockstorage.cpp:73-80): record that
+a reindex is under way when ON, erase the record when ON is NIL. Returns ON.
+
+Written before the first block file is read and erased only after the last one,
+so a marker found at start-up means exactly `a reindex began here and did not
+finish'. Both the byte and the NAME are fsynced: a marker the crash it exists
+for can lose is no marker."
+  (let ((path (reindex-flag-path data-dir)))
+    (cond (on
+           (ensure-directories-exist path)
+           (with-open-file (out path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             ;; Core's record value is the one byte '1'; the marker is its
+             ;; PRESENCE, and nothing reads the contents back.
+             (write-byte (char-code #\1) out))
+           (fsync-file path)
+           (fsync-parent-directory path))
+          (t
+           (when (probe-file path)
+             (delete-file path)
+             (fsync-parent-directory path))))
+    on))
+
+(defun reindex-flag-set-p (data-dir)
+  "Core BlockTreeDB::ReadReindexing (node/blockstorage.cpp:82-85): T when an
+unfinished reindex is recorded under DATA-DIR. Its presence is the answer."
+  (and (probe-file (reindex-flag-path data-dir)) t))
+
 (defun %reindex-header-of-record (store pos)
   "Read just the 80-byte header at POS, de-obfuscated. Returns (values header
 hash) or NIL — a block's identity needs nothing more, and deserializing whole

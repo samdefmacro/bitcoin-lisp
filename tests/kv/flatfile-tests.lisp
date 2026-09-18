@@ -1072,6 +1072,85 @@ incomplete. Running it twice adds nothing the second time."
        (is (= 0 (bl.store:reindex-block-index store cs))
            "and a second pass adds nothing")))))
 
+(defun %ff-datadir-with-three-blocks (dir)
+  "DIR as a datadir holding three stored blocks above genesis and NO persisted
+header index -- the shape a node comes back in after losing blocks/index.
+Returns the hashes, oldest first."
+  (let* ((store (bl.store:init-block-store dir))
+         (cs (bl.store:init-chain-state dir))
+         (prev (bl.store:best-block-hash cs))
+         (hashes '()))
+    (loop for h from 1 to 3
+          do (let ((b (%ff-chain-block prev (+ 240 h) h)))
+               (bl.store:store-block store b :height h)
+               (setf prev (bl.ser:block-header-hash
+                           (bl.ser:bitcoin-block-header b)))
+               (push prev hashes)))
+    (nreverse hashes)))
+
+(defun %ff-load-chain-once (dir)
+  "Run the shipped start-up step %INIT-LOAD-CHAIN over DIR with NO -reindex,
+and return how many entries the block index ended up with. The coins DB it
+opens is closed again, so the next run over the same directory can open it."
+  (let ((node (bl:make-node :network :mainnet :data-directory dir)))
+    (let ((bl:*node* node))
+      (unwind-protect
+           (progn
+             (bl::%init-load-chain :mainnet nil nil)
+             (hash-table-count
+              (bl.store:chain-state-block-index (bl:node-chain-state node))))
+        (ignore-errors
+         (bl.store:close-chainstate-coins-view (bl:node-chain-state node)))))))
+
+(test an-interrupted-reindex-resumes-on-the-next-start-without-the-option
+  "Core records an unfinished reindex ON DISK and resumes it: the block tree db
+carries DB_REINDEX_FLAG 'R' (node/blockstorage.cpp:61), written when the db is
+wiped for -reindex (:1234-1236 over WriteReindexing, :73-80) and erased only
+once ImportBlocks has read every block file (:1288-1290). LoadBlockIndexDB
+reads it back and clears m_blockfiles_indexed (:583-586), so the NEXT start
+reindexes with no option given at all.
+
+Ours had no such record, so a reindex killed partway came back as an ordinary
+start: an additive rebuild stops wherever it died, the block index is missing
+every record the walk had not reached, and nothing anywhere says so. The
+option is not the interesting input here -- the MARKER is, which is why the
+control below runs the same start-up step over the same three blocks with the
+marker absent."
+  (with-network (:mainnet)
+    (let ((bl.store:*flat-block-files* t))
+      ;; Control: no marker, no option -- the rebuild must NOT run, so the
+      ;; index start-up produces holds genesis and nothing else.
+      (with-temp-directory (dir)
+        (%ff-datadir-with-three-blocks dir)
+        (is (= 1 (%ff-load-chain-once dir))
+            "a start with neither the option nor a marker reindexed anyway"))
+      ;; The marker an interrupted reindex leaves behind, written as bytes so
+      ;; this test does not depend on the writer it is checking.
+      (with-temp-directory (dir)
+        (%ff-datadir-with-three-blocks dir)
+        (let ((marker (merge-pathnames
+                       "reindex" (bl.store:datadir-block-index-path dir))))
+          (ensure-directories-exist marker)
+          (with-open-file (out marker :direction :output
+                                      :element-type '(unsigned-byte 8)
+                                      :if-exists :supersede
+                                      :if-does-not-exist :create)
+            (write-byte (char-code #\1) out))
+          (is (= 4 (%ff-load-chain-once dir))
+              "the recorded reindex was not resumed: genesis plus three blocks ~
+were expected in the index")
+          (is-false (probe-file marker)
+                    "the marker survived a rebuild that finished")))
+      ;; Last, the reader and writer by name: a control that fails here has
+      ;; already told us what it had to about the behaviour.
+      (with-temp-directory (dir)
+        (is-false (bl.store:reindex-flag-set-p dir))
+        (bl.store:write-reindex-flag dir t)
+        (is-true (bl.store:reindex-flag-set-p dir))
+        (is-true (probe-file (bl.store:reindex-flag-path dir)))
+        (bl.store:write-reindex-flag dir nil)
+        (is-false (bl.store:reindex-flag-set-p dir))))))
+
 ;;; --- Migrating legacy per-block files into flat files (P4) --------------------
 
 (defun %ff-migration-chain (dir n &key (seed-base 250))

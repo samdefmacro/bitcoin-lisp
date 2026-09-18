@@ -41,6 +41,9 @@ src/storage/.")
    #:block-store-file-info
    #:rebuild-block-file-info
    #:reindex-block-index
+   #:reindex-flag-path
+   #:write-reindex-flag
+   #:reindex-flag-set-p
    #:migrate-blocks-to-flat-files
    ;; Core datadir layout (kv/datadir.lisp)
    #:datadir-block-index-path

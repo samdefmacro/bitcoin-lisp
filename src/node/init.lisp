@@ -726,8 +726,16 @@ re-enters InitAndLoadChainstate with do_reindex true after a FAILURE the
 operator agreed to rebuild from (init.cpp:1860-1879), which wipes the block
 tree db and rebuilds it from the same files. Ours keeps what the index already
 holds, which reaches the same place from a deleted blocks/index without
-re-deciding anything that is still on disk."
+re-deciding anything that is still on disk.
+
+The persisted resume marker brackets the walk, where Core's 'R' flag brackets
+ImportBlocks: written before the first block file is read (Core writes it when
+it wipes the block tree db, node/blockstorage.cpp:1234-1236) and erased only
+once the last one has been (:1288-1290). A run killed in between leaves the
+marker, and %REINDEX-REQUESTED-P makes the next start finish the job without
+the option."
   (when (node-block-store *node*)
+    (bl.store:write-reindex-flag (node-data-directory *node*) t)
     (log-info "Reindex: rebuilding the block index from the block files...")
     (multiple-value-bind (added orphans)
         (bl.store:reindex-block-index
@@ -737,6 +745,7 @@ re-deciding anything that is still on disk."
       (when (plusp added)
         (bl.store:save-header-index (node-chain-state *node*)
                                     :force-full t))
+      (bl.store:write-reindex-flag (node-data-directory *node*) nil)
       ;; Core's own sentence for the end of the reindex
       ;; (ImportBlocks, node/blockstorage.cpp:1291). It is what says the block
       ;; files were all read rather than the node having given up partway:
@@ -745,6 +754,23 @@ re-deciding anything that is still on disk."
       ;; an abort.
       (log-info "Reindexing finished")
       added)))
+
+(defun %reindex-requested-p (reindex)
+  "Whether this start rebuilds the block index from the block files: the
+-reindex option, or the marker an earlier, interrupted reindex left on disk.
+
+Core's LoadBlockIndexDB reads the persisted 'R' flag back and clears
+m_blockfiles_indexed when it is set (node/blockstorage.cpp:583-586), so
+ImportBlocks reindexes on a start that was given no option at all. Without
+that, an interrupted reindex comes back as an ordinary start over whatever the
+walk had added before it died -- which for an ADDITIVE rebuild is a block index
+missing every record the walk had not reached yet, and no record anywhere that
+anything was left undone."
+  (let ((resume (and (node-data-directory *node*)
+                     (bl.store:reindex-flag-set-p (node-data-directory *node*)))))
+    (when (and resume (not reindex))
+      (log-info "Reindex: an unfinished reindex is recorded on disk; resuming it"))
+    (or reindex resume)))
 
 (defun log-assumevalid-decision (network)
   "Say which signatures this node intends to check (Core LoadChainstate,
@@ -892,7 +918,11 @@ startup refusal rather than a directory we create somewhere else."
   ;; extended rather than discarded — reindexing is additive, and a node that
   ;; threw away a good index to rebuild it would be strictly worse off if the
   ;; files turned out to be incomplete.
-  (when reindex
+  ;;
+  ;; The option is not the only way in: a marker from an interrupted reindex
+  ;; asks for one too, as Core's persisted 'R' flag does
+  ;; (node/blockstorage.cpp:583-586).
+  (when (%reindex-requested-p reindex)
     (%rebuild-block-index-from-block-files))
 
   ;; Per-file accounting for the flat block files, recovered by joining the
