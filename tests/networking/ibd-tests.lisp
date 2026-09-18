@@ -4924,6 +4924,66 @@ activation and the log said UNEXPECTED-WITNESS."
         (is-false (find "UNEXPECTED-WITNESS" lines :test #'search)
                   "and not the keyword's upper-case name")))))
 
+(test a-block-core-marks-failed-valid-is-not-re-requested
+  "Core Chainstate::InvalidBlockFound (validation.cpp:1985-1994) has no retry
+budget in it: a block whose connect fails is marked BLOCK_FAILED_VALID once, its
+descendants BLOCK_FAILED_CHILD, and AlreadyHaveBlock plus
+FindNextBlocksToDownload (net_processing.cpp:1497-1500) keep it out of the
+request path from then on. BLOCK_MUTATED is the single exemption (:1988),
+because the block hash does not commit to what that verdict read.
+
+Ours re-queued EVERY failure into pending-blocks for three more rounds and then
+went quiet -- a project invention with no counterpart in Core.
+feature_csv_activation.py:181 sends a block whose CSV script fails and waits for
+the getdata of the NEXT block: the budget was spent on the failing block, the
+announcing peer's best-known block was still that block, and the per-peer walk
+had nothing servable for the whole 60-second wait.
+
+HANDLE-VALIDATION-FAILURE now reads the mark the validator has already written
+(the block-index entry's :invalid, which %POISON-FAILED-BLOCK sets for every
+deterministic verdict) rather than counting, so the classification lives in one
+place. Five identical failures must queue nothing and must never reach the
+budget's pause line. Control: the same call for an entry that is NOT marked --
+the mutation class -- still re-queues."
+  (with-network (:regtest)
+    (with-ibd-context
+      (let* ((header (%mtp-header (%bd-hash 0) 1700000000 :grind nil))
+             (blk (bl.ser:make-bitcoin-block :header header :transactions '()))
+             (hash (bl.ser:block-header-hash header))
+             (state (bl.store:make-chain-state))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1
+                       :status :valid))
+             (entry (bl.store:make-block-index-entry
+                     :hash hash :height 1 :chain-work 2
+                     :prev-entry genesis :status :header-valid))
+             (pending (bl.net:ibd-context-pending-blocks bl.net:*ibd-context*)))
+        (bl.store:add-block-index-entry state genesis)
+        (bl.store:add-block-index-entry state entry)
+        (bl.store:update-chain-tip state (%bd-hash 0) 0)
+        (bl.net:clear-block-failure hash)
+        ;; Control: a verdict Core calls BLOCK_MUTATED leaves the entry
+        ;; unmarked, and the bounded re-download still asks for the block.
+        (bl.net:handle-validation-failure blk 1 :bad-witness-merkle-match state)
+        (is (eql 1 (gethash hash pending))
+            "control: a mutation-class failure is still re-queued")
+        (remhash hash pending)
+        (bl.net:clear-block-failure hash)
+        ;; Core's mark, as the validator leaves it on a script failure.
+        (setf (bl.store:block-index-entry-status entry) :invalid)
+        (let ((lines (capture-log-lines
+                      (lambda ()
+                        (dotimes (i 5)
+                          (bl.net:handle-validation-failure
+                           blk 1 :block-script-verify-flag-failed state))))))
+          (is-false (nth-value 1 (gethash hash pending))
+                    "a block Core marks BLOCK_FAILED_VALID was queued for download again")
+          (is-false (find "pausing tight re-request" lines :test #'search)
+                    "a final verdict spent the re-download budget instead of being final")
+          (is-true (find "block-script-verify-flag-failed" lines :test #'search)
+                   "the verdict is still logged in Core's words"))
+        (bl.net:clear-block-failure hash)))))
+
 (test block-request-pass-leaves-the-callers-peer-list-alone
   "REQUEST-BLOCKS-FROM-PEERS must not modify the list it is handed. It ranks
 its candidates by ping latency, and the ranking used to be

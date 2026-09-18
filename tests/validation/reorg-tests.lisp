@@ -2699,20 +2699,31 @@ Bitcoin Core vectors."
 ;;;; ===========================================================================
 
 (test item14-classification-allowlist-is-tight
-  "Unit lock on %deterministic-consensus-failure-p: exactly the txid-committed
-contextual consensus verdicts poison; every witness-dependent, structural/merkle,
-CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons)."
+  "Unit lock on %deterministic-consensus-failure-p: exactly the verdicts the
+block hash commits to poison; every mutation-class, structural/merkle,
+CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons).
+
+:BLOCK-SCRIPT-VERIFY-FLAG-FAILED is on the poisoning side as of 2026-09-18, the
+way Core's InvalidBlockFound marks every result but BLOCK_MUTATED
+(validation.cpp:1985-1994). This test previously asserted the opposite, which
+pinned a divergence: %CONTEXTUAL-CHECK-BLOCK runs the BIP141 witness commitment
+(block.lisp :2154) BEFORE script verification (:2173), so by the time the
+interpreter reads a witness byte that byte is committed. :TOO-MANY-SIGOPS stays
+transient because OUR order puts it at :2137, i.e. BEFORE that commitment check,
+unlike Core's."
   ;; Every allowlisted keyword classifies as deterministic-invalid.
   (dolist (k '(:duplicate-txid :missing-input :coinbase-not-mature
                :insufficient-funds :non-final-tx :bad-sequence-lock
-               :bad-coinbase-height :coinbase-too-large))
+               :bad-coinbase-height :coinbase-too-large
+               :block-script-verify-flag-failed))
     (is-true (bl.val::%deterministic-consensus-failure-p k)
              "~A must be deterministic-invalid" k))
   ;; Everything else must be TRANSIENT (recoverable) — must NOT poison. Includes
-  ;; witness-byte-dependent verdicts (script / witness-commitment / contextual
-  ;; sigops), corrupt-body signals (merkle), CheckBlock/structural failures,
-  ;; header keywords, the reorg control keywords, an unknown keyword, and NIL.
-  (dolist (k '(:block-script-verify-flag-failed :bad-witness-merkle-match :bad-witness-nonce-size
+  ;; the mutation class (witness-commitment / merkle), the sigop budget our own
+  ;; check order still reaches before that commitment check,
+  ;; CheckBlock/structural failures, header keywords, the reorg control
+  ;; keywords, an unknown keyword, and NIL.
+  (dolist (k '(:bad-witness-merkle-match :bad-witness-nonce-size
                :unexpected-witness :too-many-sigops
                :bad-merkle-root :bad-txns-duplicate :no-transactions
                :first-tx-not-coinbase :multiple-coinbase :block-too-heavy

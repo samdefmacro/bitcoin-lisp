@@ -3380,16 +3380,35 @@ perform-reorg's success phase, so there is nothing to undo here."
 ;;;;     changed = corruption = a re-download fixes it. (:bad-merkle-root is also
 ;;;;     THE canonical corrupt-body signal.) get-block already prunes a body that
 ;;;;     fails to deserialize, so such a block surfaces as MISSING, not here.
-;;;;   * Script failures (:block-script-verify-flag-failed), witness-commitment failures
-;;;;     (:bad-witness-nonce-size, :bad-witness-merkle-match, :unexpected-witness)
-;;;;     and the CONTEXTUAL sigop budget (:too-many-sigops). These consume WITNESS
-;;;;     bytes, which the block hash does NOT commit; a corrupt-but-present witness
-;;;;     (deserializes cleanly, passes merkle) would fail them yet re-download
-;;;;     clean. Witness-STRIPPED bodies are self-healed before PHASE B, but
-;;;;     corrupt-PRESENT witnesses are not — so every witness-dependent verdict
-;;;;     stays transient. Cost: a fork invalid ONLY by a bad signature is
-;;;;     soft-rejected (retry-best-reorg-candidate's bounded rejected-set) instead
-;;;;     of poisoned — redundant work, never a wedge (== pre-item behavior).
+;;;;   * The witness-commitment failures themselves (:bad-witness-nonce-size,
+;;;;     :bad-witness-merkle-match, :unexpected-witness) — these ARE Core's
+;;;;     BLOCK_MUTATED (*MUTATED-BLOCK-ERRORS*), and InvalidBlockFound skips
+;;;;     BLOCK_FAILED_VALID for exactly that class (validation.cpp:1988).
+;;;;   * The CONTEXTUAL sigop budget (:too-many-sigops). In Core this is a
+;;;;     ConnectBlock verdict past ContextualCheckBlock, so Core marks it; OURS
+;;;;     runs INSIDE %contextual-check-block's per-transaction loop (:2135-2137),
+;;;;     i.e. BEFORE the BIP141 witness-commitment check at :2154. Witness bytes
+;;;;     count toward GetTransactionSigOpCost, so at OUR position a
+;;;;     corrupt-but-present witness can raise this verdict with nothing having
+;;;;     checked that the witness is the committed one. It stays transient until
+;;;;     the check order matches Core's.
+;;;;
+;;;; DELIBERATELY INCLUDED, where the pre-2026-09-18 list excluded it:
+;;;;   * Script failures (:block-script-verify-flag-failed). Every path that can
+;;;;     raise this has already run %CHECK-BLOCK's merkle root + CVE-2012-2459
+;;;;     mutation check AND %CONTEXTUAL-CHECK-BLOCK-NO-UTXO's BIP141 witness
+;;;;     commitment (:2154 runs before the script check at :2173, and no keyword
+;;;;     can skip the former while running the latter — CONTEXT-FREE-ONLY returns
+;;;;     before both, SKIP-SCRIPTS disables only the latter). Past those two every
+;;;;     byte the interpreter reads is committed: the witness merkle root in the
+;;;;     coinbase commits the witnesses where segwit is active, and
+;;;;     :unexpected-witness refuses any witness at all where it is not. So a
+;;;;     clean re-download yields the identical bytes and the identical script
+;;;;     failure — Core's own reasoning, which is why InvalidBlockFound marks
+;;;;     every result BUT BLOCK_MUTATED. Keeping it transient is what made this
+;;;;     node re-request a CSV-failing block until a project-invented retry budget
+;;;;     paused it, after which the walk served nothing at all
+;;;;     (feature_csv_activation.py:181).
 ;;;;   * The control keywords the reorg machinery itself returns
 ;;;;     (:corrupt-undo, :reorg-refused, :weaker-chain, :unknown-parent,
 ;;;;     :reorg-failed, :block-missing, :block-not-found, :interrupted) — all
@@ -3404,12 +3423,18 @@ perform-reorg's success phase, so there is nothing to undo here."
     :non-final-tx         ; IsFinalTx against the fork height / MTP
     :bad-sequence-lock    ; BIP68 relative locktime not satisfied
     :bad-coinbase-height  ; BIP34 coinbase-height prefix mismatch
-    :coinbase-too-large)  ; coinbase pays more than subsidy + fees
+    :coinbase-too-large   ; coinbase pays more than subsidy + fees
+    ;; Script verification, which runs only after the merkle root and the BIP141
+    ;; witness commitment have both been checked -- so the witness bytes it
+    ;; reads are committed too. Core InvalidBlockFound marks every result but
+    ;; BLOCK_MUTATED (validation.cpp:1985-1994); see the section comment.
+    :block-script-verify-flag-failed)
   "Allowlist of VALIDATE-BLOCK error keywords that are DETERMINISTIC consensus
-verdicts — decided purely from txid-committed data + chain structure, never from
-witness bytes, and never a re-run of a CheckBlock test the block already passed
-at store time. A fork block failing one of these is permanently invalid
-regardless of any re-download, so it (and its descendants) may be marked
+verdicts — decided purely from data the block hash commits to (txid-committed
+transaction bytes, plus the witnesses once the BIP141 commitment has been
+checked) and chain structure, and never a re-run of a CheckBlock test the block
+already passed at store time. A block failing one of these is permanently
+invalid regardless of any re-download, so it (and its descendants) may be marked
 :invalid. Every other keyword is deliberately excluded — see the section comment
 above for why each exclusion could otherwise poison a recoverable block.")
 
@@ -3417,7 +3442,7 @@ above for why each exclusion could otherwise poison a recoverable block.")
   "T iff ERROR is a deterministic consensus verdict (member of
 *deterministic-invalid-block-errors*) — i.e. safe to permanently mark the failing
 block :invalid. Any other value — a transient control keyword, a corrupt-body /
-witness-dependent failure, or an unrecognized keyword — returns NIL, defaulting
+mutation-class failure, or an unrecognized keyword — returns NIL, defaulting
 to the SAFE non-poisoning (recoverable) behavior.
 
 A verdict that carries a debug message is the list (REASON DETAIL), Core's

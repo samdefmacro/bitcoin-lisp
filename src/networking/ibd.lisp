@@ -478,7 +478,12 @@ detector and normal header/tip sync remain the recovery path, so this is a PAUSE
 not a permanent reject — a later witness-complete copy (same hash) can still be
 processed and connect. A single bad/witness-stripped block spun this loop
 indefinitely and spammed 6.5M log lines / 1.1GB on testnet4
-(project_cmpctblock_witness_wedge).")
+(project_cmpctblock_witness_wedge).
+
+Reached ONLY by the verdicts Core calls BLOCK_MUTATED and the transient control
+keywords: a deterministic consensus verdict marks the block-index entry :invalid
+(Core InvalidBlockFound, validation.cpp:1985-1994) and HANDLE-VALIDATION-FAILURE
+never queues such a block again, so no budget is spent on it.")
 
 (defconstant +block-failure-counts-cap+ 4096
   "Hard cap on the failure-count map; cleared wholesale on overflow (losing a few
@@ -493,8 +498,9 @@ times: handle-validation-failure has stopped re-queuing it, and the per-peer
 download walk must stop asking for it too, or the announcing peer's best-known
 block is requested and rejected in a tight loop (feature_csv_activation.py:181).
 Core marks such a block BLOCK_FAILED_VALID and FindNextBlocksToDownload skips it
-(net_processing.cpp:1492-1497); ours keeps script failures recoverable and
-pauses instead. clear-block-failure lifts it."
+(net_processing.cpp:1492-1497); a deterministic verdict does that here too now,
+so this pause covers only the mutation-class failures a re-download can fix.
+clear-block-failure lifts it."
   (> (gethash hash *block-failure-counts* 0) +max-block-revalidation-attempts+))
 
 (defun note-block-failure (hash)
@@ -510,49 +516,72 @@ later reorg/re-org through the same hash starts with a fresh retry budget."
   (remhash hash *block-failure-counts*))
 
 (defun handle-validation-failure (block height error chain-state)
-  "Handle a block-validation failure during IBD, with a bounded retry budget.
+  "Handle a block-validation failure during IBD -- Bitcoin Core's
+Chainstate::InvalidBlockFound (validation.cpp:1985-1994), plus the bounded
+re-download the classes Core calls BLOCK_MUTATED still need here.
 
-For the first +max-block-revalidation-attempts+ failures of a given block hash we
-re-add it to pending-blocks so it can be re-requested from another peer (the
-failure may be peer-side corruption rather than a real consensus violation) and
-log the error. Past the budget we STOP re-queuing it (and go silent) so one
-persistently-failing block cannot spin the tight receive->validate->re-request
-loop or spam the log — the stuck-tip detector + normal sync remain the recovery
-path. This is a pause keyed on the count, never a permanent reject of the hash, so
-a witness-complete copy with the same hash can still connect later.
+Core's rule has no counter in it: a block whose ConnectBlock fails is marked
+BLOCK_FAILED_VALID once, its descendants BLOCK_FAILED_CHILD, and from then on
+AlreadyHaveBlock and FindNextBlocksToDownload (net_processing.cpp:1497-1500)
+keep it out of the request path forever. BLOCK_MUTATED is the one exception,
+because the block hash does not commit to what that verdict read.
 
-Bitcoin Core punishes the source peer in MaybePunishNodeForBlock
-(net_processing.cpp) on BLOCK_CONSENSUS / BLOCK_MUTATED but does not re-request —
-Core trusts its own validator. Ours is less battle-tested, so we re-request a few
-times before pausing."
-  (declare (ignore chain-state))
+So the branch here is Core's exception, not a retry budget: the validator has
+already run %POISON-FAILED-BLOCK on its way out (activate-block case 1,
+accept-block-body, perform-reorg phase B), so the block-index entry ALREADY
+carries :invalid whenever the verdict was deterministic. Reading the entry is
+therefore reading Core's own BLOCK_FAILED_VALID mark, and there is exactly one
+classification in the tree (*DETERMINISTIC-INVALID-BLOCK-ERRORS*) rather than
+a second copy here.
+
+  * entry :invalid  -- log the verdict once and stop. Never re-queued.
+  * anything else   -- the pre-existing bounded retry: re-add to pending-blocks
+    for +max-block-revalidation-attempts+ tries (the failure may be peer-side
+    corruption of bytes the hash does not commit), then pause. This is a pause
+    keyed on the count, never a permanent reject, so a witness-complete copy
+    with the same hash can still connect later.
+
+Punishing the source peer is the caller's job, as it is Core's
+(MaybePunishNodeForBlock, which misbehaves on BLOCK_CONSENSUS and BLOCK_MUTATED
+alike)."
   (when *ibd-context*
     (let* ((header (bl.ser:bitcoin-block-header block))
            (hash (bl.ser:block-header-hash header))
            (pending (ibd-context-pending-blocks *ibd-context*))
            (in-flight (ibd-context-in-flight *ibd-context*))
-           (count (note-block-failure hash)))
+           (entry (and chain-state
+                       (bl.store:get-block-index-entry chain-state hash)))
+           ;; Core's BLOCK_FAILED_VALID: the verdict is final and this block is
+           ;; never asked for again.
+           (failed-valid (and entry
+                              (eq (bl.store:block-index-entry-status entry)
+                                  :invalid))))
       ;; Always free the in-flight slot so a retry / another peer's copy can come.
       (remhash hash in-flight)
-      (cond
-        ((<= count +max-block-revalidation-attempts+)
-         ;; The verdict is rendered as Core's BlockValidationState::ToString()
-         ;; spells it (consensus/validation.h:110-121), the way Core's own
-         ;; "AcceptBlock FAILED (%s)" does (validation.cpp:4457): ~A on the
-         ;; keyword printed UPPER CASE, and the functional framework greps
-         ;; debug.log for the lower-case reason -- p2p_segwit.py:145 waits for
-         ;; `unexpected-witness', and THIS is the line an unsolicited block
-         ;; rejected by the download drain writes.
-         (bl:log-error "Block ~D validation failed: ~A (attempt ~D/~D)"
-                                 height (bl.val:block-reject-reason-string error)
-                                 count +max-block-revalidation-attempts+)
-         (unless (gethash hash pending)
-           (setf (gethash hash pending) height)))
-        ((= count (1+ +max-block-revalidation-attempts+))
-         ;; Cross the budget exactly once, then go quiet.
-         (bl:log-warn
-          "Block ~D (~A) failed validation ~D times; pausing tight re-request (stuck-tip detector + normal sync remain the recovery path)"
-          height (bl.crypto:bytes-to-hex hash) count))))))
+      ;; The verdict is rendered as Core's BlockValidationState::ToString()
+      ;; spells it (consensus/validation.h:110-121), the way Core's own
+      ;; "AcceptBlock FAILED (%s)" does (validation.cpp:4457): ~A on the
+      ;; keyword printed UPPER CASE, and the functional framework greps
+      ;; debug.log for the lower-case reason -- p2p_segwit.py:145 waits for
+      ;; `unexpected-witness', feature_csv_activation.py:409 for
+      ;; `block-script-verify-flag-failed (Negative locktime)', and THIS is the
+      ;; line a block rejected by the download drain writes.
+      (if failed-valid
+          (bl:log-error "Block ~D validation failed: ~A"
+                        height (bl.val:block-reject-reason-string error))
+          (let ((count (note-block-failure hash)))
+            (cond
+              ((<= count +max-block-revalidation-attempts+)
+               (bl:log-error "Block ~D validation failed: ~A (attempt ~D/~D)"
+                             height (bl.val:block-reject-reason-string error)
+                             count +max-block-revalidation-attempts+)
+               (unless (gethash hash pending)
+                 (setf (gethash hash pending) height)))
+              ((= count (1+ +max-block-revalidation-attempts+))
+               ;; Cross the budget exactly once, then go quiet.
+               (bl:log-warn
+                "Block ~D (~A) failed validation ~D times; pausing tight re-request (stuck-tip detector + normal sync remain the recovery path)"
+                height (bl.crypto:bytes-to-hex hash) count))))))))
 
 (defun check-stuck-tip ()
   "Halt IBD if the connect-tip has not advanced for longer than
