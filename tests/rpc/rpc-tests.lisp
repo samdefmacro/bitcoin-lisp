@@ -9655,6 +9655,12 @@ missing file or non-string path errors."
     (let ((info (first (bl.rpc::rpc-getpeerinfo node nil))))
       (is (integerp (cdr (assoc "id" info :test #'string=)))))))
 
+(defvar *gbfp-header-nonce* 0
+  "Serial number for RPC-GETBLOCKFROMPEER-PATHS's header. The successful call
+leaves an outstanding fetch request for that block -- nothing consumes one
+except the body arriving, which never does here -- so a fixed header would make
+the second run in one image find the first run's request already registered.")
+
 (test rpc-getblockfrompeer-paths
   "getblockfrompeer validates header/peer and dispatches a witness-block getdata."
   (let* ((bl:*prune-target-mib* nil)   ; deterministic: pruning off
@@ -9667,7 +9673,8 @@ missing file or non-string path errors."
                :version 1
                :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-               :timestamp 1 :bits #x1d00ffff :nonce 0))
+               :timestamp 1 :bits #x1d00ffff
+               :nonce (incf *gbfp-header-nonce*)))
          (hash (bl.ser:block-header-hash hdr))
          (hash-hex (bl.rpc:hash-to-hex hash)))
     (setf (bl:node-block-store node) store)
@@ -9688,10 +9695,20 @@ missing file or non-string path errors."
     (let ((peer (%rpc-fake-peer "1.2.3.4")))
       (setf (bl.net:peer-services peer) bl.ser:+node-witness+)
       (push peer (bl:node-peers node))
+      (is-false (bl.net:fetch-block-requested-p hash)
+                "control: nothing is outstanding before the call")
       (let ((r (bl.rpc::rpc-getblockfrompeer
                 node (list hash-hex (bl.net:peer-id peer)))))
         (is (hash-table-p r))
-        (is (= 0 (hash-table-count r)))))
+        (is (= 0 (hash-table-count r))))
+      ;; Core marks the block in flight before sending the getdata
+      ;; (FetchBlock -> BlockRequested, net_processing.cpp:1976-1979), and that
+      ;; is what makes fRequested true when the body arrives -- without which a
+      ;; body for a block the node has connected and since PRUNED is dropped by
+      ;; AcceptBlock's unrequested arm (validation.cpp:4369), the case its own
+      ;; comment at :4363 names. Ours sent a bare getdata and recorded nothing.
+      (is-true (bl.net:fetch-block-requested-p hash)
+               "getblockfrompeer recorded no request, so the body would be dropped"))
     ;; bad peer_id type → error
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))

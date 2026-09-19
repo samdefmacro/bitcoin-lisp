@@ -63,8 +63,18 @@ before genesis' and reports DEFINED for the whole ladder."
                               &key (value 5000000000)
                                    (timestamp (+ 1231006505 (* height 600)))
                                    (lock-time 0)
-                                   (sequence #xFFFFFFFF))
+                                   (sequence #xFFFFFFFF)
+                                   (version 1)
+                                   bip34)
   "Create a minimal test block for reorg tests.
+
+VERSION and BIP34 exist for tests that need the block to survive Core's
+AcceptBlock gate (BL.VAL:ACCEPT-BLOCK-BODY) and not only CONNECT-BLOCK, which
+these fixtures call directly: the defaults build a version-1 header whose
+coinbase carries no height, and regtest refuses that as bad-version and then
+bad-coinbase-height. :VERSION 4 :BIP34 T builds one the gate accepts -- the
+BIP34 height push goes in FRONT of the per-block bytes, so the coinbase still
+serializes uniquely.
 
 LOCK-TIME and SEQUENCE default to the always-final coinbase every caller
 wants; pass a future LOCK-TIME with a non-final SEQUENCE to build a block
@@ -84,9 +94,14 @@ We still set cached-hash on the coinbase as a small optimization for
 tests that compare txids before any disk round-trip — it must match
 the real hash256(serialize-tx) which it now does, since the unique
 script-sig makes the serialization deterministic per block."
-  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
-                       (replace s block-hash :start2 0 :end2 4)
-                       s))
+  (let* ((unique (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
+                   (replace s block-hash :start2 0 :end2 4)
+                   s))
+         (script-sig (if bip34
+                         (concatenate '(simple-array (unsigned-byte 8) (*))
+                                      (bl.val:encode-bip34-height height)
+                                      unique)
+                         unique))
          (coinbase-tx (bl.ser:make-transaction
                        :version 1
                        :inputs (vector (bl.ser:make-tx-in
@@ -104,7 +119,7 @@ script-sig makes the serialization deterministic per block."
          (merkle-root (bl.val:compute-merkle-root
                        (list (bl.ser:transaction-hash coinbase-tx))))
          (header (bl.ser:make-block-header
-                  :version 1
+                  :version version
                   :prev-block prev-hash
                   :merkle-root merkle-root
                   :timestamp timestamp
@@ -277,15 +292,18 @@ utxo-set (pass a coins-view-cache to exercise the LevelDB surface)."
       :header genesis-header))
     (values chain-state utxo-set block-store genesis-hash)))
 
-(defun build-and-connect (chain-state block-store utxo-set genesis-hash hashes)
+(defun build-and-connect (chain-state block-store utxo-set genesis-hash hashes
+                          &key (version 1) bip34)
   "Build a chain of coinbase-only blocks from GENESIS-HASH using HASHES,
 connecting each via connect-block. Returns the list of (block . index-entry)
-pairs in connect order."
+pairs in connect order. VERSION and BIP34 are MAKE-REORG-TEST-BLOCK's, for a
+caller that needs these blocks to pass Core's AcceptBlock gate as well."
   (let ((prev-hash genesis-hash)
         (results '()))
     (loop for h from 1
           for block-hash in hashes
-          do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+          do (let ((block (make-reorg-test-block prev-hash block-hash h
+                                                 :version version :bip34 bip34)))
                (bl.val:connect-block
                 block chain-state block-store utxo-set)
                (push (cons block (bl.store:get-block-index-entry

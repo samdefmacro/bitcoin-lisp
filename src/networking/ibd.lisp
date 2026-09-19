@@ -1351,6 +1351,52 @@ so our own saturated downlink cannot evict a fleet of honest peers."
                (ibd-context-in-flight *ibd-context*)))
     (length seen)))
 
+(defconstant +fetch-block-requests-cap+ 256
+  "Hard cap on *FETCH-BLOCK-REQUESTS*: the oldest entries are dropped wholesale
+on overflow. An operator calling getblockfrompeer more than this many times
+without the bodies arriving has other problems, and the only cost of forgetting
+one is that the block is dropped as unrequested, exactly as before.")
+
+(defvar *fetch-block-requests*
+  (bl.bytes:make-octets-hash-table :synchronized t)
+  "Block hashes the getblockfrompeer RPC has asked a peer for, and not yet seen.
+
+SYNCHRONIZED because its two ends are different threads: an RPC worker records
+the request, and the sync thread's receive pump reads and removes it.
+
+Core's FetchBlock marks the block in flight (BlockRequested,
+net_processing.cpp:1979) on the process-wide mapBlocksInFlight, and that is the
+whole reason fRequested exists: validation.cpp:4363 says removing it `would
+break the getblockfrompeer RPC', because a body the node has pruned is dropped
+at :4369 (`if (pindex->nTx != 0) return true') unless it was asked for.
+
+A process global rather than a slot on the IBD context, and deliberately so: the
+steady-state receive pump builds a FRESH ibd-context on every tick
+(PUMP-PEER-MESSAGES is called with a NIL context from the sync loop), so a hash
+the RPC thread wrote into that context's in-flight table would be gone before
+the block arrived -- and the RPC thread does not see the pump thread's binding
+of *IBD-CONTEXT* in any case.")
+
+(defun note-fetch-block-request (hash)
+  "Remember that getblockfrompeer asked a peer for HASH (Core FetchBlock ->
+BlockRequested, net_processing.cpp:1979). The body is accepted even where the
+node has the block's transactions already and has pruned its body."
+  (when (>= (hash-table-count *fetch-block-requests*) +fetch-block-requests-cap+)
+    (clrhash *fetch-block-requests*))
+  (setf (gethash hash *fetch-block-requests*) (get-internal-real-time))
+  hash)
+
+(defun fetch-block-requested-p (hash)
+  "T while a getblockfrompeer request for HASH is outstanding."
+  (nth-value 1 (gethash hash *fetch-block-requests*)))
+
+(defun %consume-fetch-block-request (hash)
+  "T (once) when HASH was asked for by getblockfrompeer -- Core's
+RemoveBlockRequest, which is what makes the request one-shot."
+  (when (fetch-block-requested-p hash)
+    (remhash hash *fetch-block-requests*)
+    t))
+
 (defun mark-block-in-flight (hash peer)
   "Mark a block as being requested from PEER."
   (when *ibd-context*
@@ -4429,6 +4475,71 @@ never a store."
         (setf (gethash hash (ibd-context-pending-blocks *ibd-context*))
               height)))))
 
+(defun %block-body-present-p (chain-state block-store entry)
+  "Core's `pindex->nStatus & BLOCK_HAVE_DATA' (validation.cpp:4350): do we hold
+this block's BODY right now? Both halves are cleared by a prune -- the block
+store drops the hash from its index (PRUNE-BLOCK-FILE) and the prune callback
+clears the index entry's data position (DELETE-UNDO-FILE, mirroring
+PruneOneBlockFile) -- so this answers NIL for a block the node connected long
+ago and has since pruned, which is exactly the state getblockfrompeer exists to
+repair. The block-store probe is asked too because a body in a legacy
+per-block file leaves the entry's data position NIL by design."
+  (declare (ignore chain-state))
+  (or (bl.store:block-index-entry-data-pos entry)
+      (and block-store
+           (bl.store:block-exists-p
+            block-store (bl.store:block-index-entry-hash entry))
+           t)))
+
+(defun %refetch-pruned-body (block chain-state block-store entry requested peer)
+  "Write BLOCK's body when it is a block already on our active chain whose body
+we had PRUNED and which we asked for again -- Core AcceptBlock's write step for
+a REQUESTED block that is not fAlreadyHave (validation.cpp:4350-4400). A no-op
+in every other case, which is the ordinary one: a duplicate of a block we still
+hold is simply dropped.
+
+REQUESTED is the caller's own fRequested; a hash getblockfrompeer asked for
+counts too, and is consumed here so the request is one-shot (Core's
+RemoveBlockRequest).
+
+Nothing is activated: the chain
+fAlreadyHave (validation.cpp:4350-4400). Nothing is activated: the chain
+already contains this block, so Core's ActivateBestChain is a no-op for it too,
+and rpc_getblockfrompeer.py:141 only waits for the body to become readable.
+
+Core's gate is narrower than the one PROCESS-RECEIVED-BLOCK used to apply.
+fAlreadyHave is `pindex->nStatus & BLOCK_HAVE_DATA' (validation.cpp:4350) -- do
+we hold the BODY -- and a block we connected and have since PRUNED has lost
+that bit (PruneOneBlockFile, blockstorage.cpp:264-270). What drops such a body
+is the UNREQUESTED arm at :4369, so an explicit fetch gets it written; that is
+what the comment at :4363 means by `removing fRequested ... would break the
+getblockfrompeer RPC'. Ours asked only where the block sat on the chain, so a
+refetched pruned body was dropped on arrival and rpc_getblockfrompeer.py:141
+waited out its timeout for a block that never became readable.
+
+The two guards the fork-storage path uses apply here for the same reasons: a
+witness-stripped copy must never reach disk, and AcceptBlock's validity gate is
+what stands between a peer and an arbitrary body under an honest header's hash."
+  (let ((hash (bl.store:block-index-entry-hash entry))
+        (height (bl.store:block-index-entry-height entry)))
+    (unless (and (or requested (%consume-fetch-block-request hash))
+                 (not (%block-body-present-p chain-state block-store entry)))
+      (return-from %refetch-pruned-body nil))
+    (cond
+      ((bl.val:block-witness-stripped-p block height)
+       (bl:log-debug "Refetched block ~D arrived witness-stripped; not storing"
+                     height))
+      ((not (%block-body-acceptable-p block chain-state peer)))
+      (t
+       (with-current-node-lock
+         (bl.store:note-block-position
+          chain-state hash
+          (nth-value 1 (bl.store:store-block
+                        block-store block :height height))))
+       (bl:log-cat "net" "Stored refetched body for pruned block ~D (~A)"
+                   height (bl.crypto:bytes-to-hex hash))
+       t))))
+
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects
                                   (wire-size 0) requested peer)
@@ -4453,13 +4564,13 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
     (let ((height (bl.store:block-index-entry-height entry))
           (current-height (bl.store:current-height chain-state)))
 
-      ;; Skip blocks we already applied (duplicates from multiple peers).
-      ;; The question is CChain::Contains, not the entry's STATUS: status is a
-      ;; monotone property of the block (Core's nStatus; DisconnectTip never
-      ;; lowers it), so a competing-fork block at h <= current-height may well
-      ;; be :valid and must still be stored for a future reorg.
+      ;; Skip blocks we already applied. The question is CChain::Contains, not
+      ;; the entry's STATUS, which is monotone (Core's nStatus; DisconnectTip
+      ;; never lowers it): a competing-fork block at or below the tip may be
+      ;; :valid and must still be stored. %REFETCH-PRUNED-BODY is the exception.
       (when (and (<= height current-height)
                  (bl.store:entry-on-active-chain-p chain-state entry))
+        (%refetch-pruned-body block chain-state block-store entry requested peer)
         (return-from process-received-block nil))
 
       ;; A competing-fork block (h ≤ current, off the active chain):

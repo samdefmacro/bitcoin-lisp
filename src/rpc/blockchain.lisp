@@ -2929,11 +2929,22 @@ the cross-thread send safe."
       ;; request to make, so Core says so instead of sending one.
       (unless (logtest (bl.net:peer-services peer) bl.ser:+node-witness+)
         (error 'rpc-error :code +rpc-misc-error+ :message "Pre-SegWit peer"))
+      ;; Core marks the block in flight BEFORE sending the getdata
+      ;; (FetchBlock -> BlockRequested, net_processing.cpp:1976-1979), and that
+      ;; mark is what makes fRequested true when the body arrives. Without it a
+      ;; body for a block the node has already connected and since PRUNED is
+      ;; dropped by AcceptBlock's unrequested arm (validation.cpp:4369) -- the
+      ;; case the comment at :4363 names -- so the RPC sent a getdata, the peer
+      ;; answered, and nothing was written.
+      (bl.net:note-fetch-block-request hash)
       (bl.net:send-message
        peer
        (bl.ser:make-getdata-message
         (list (bl.ser:make-inv-vector
                :type bl.ser:+inv-type-witness-block+
-               :hash hash)))))
+               :hash hash))))
+      ;; Core's own line for the request (net_processing.cpp:1993).
+      (bl:log-cat "net" "Requesting block ~A from peer=~D"
+                  (bl.crypto:bytes-to-hex hash) peer-id))
     ;; Core returns an empty object; an empty hash-table serializes as {}.
     (make-hash-table :test 'equal)))

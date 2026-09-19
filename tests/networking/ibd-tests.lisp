@@ -4945,6 +4945,67 @@ activation and the log said UNEXPECTED-WITNESS."
         (is-false (find "UNEXPECTED-WITNESS" lines :test #'search)
                   "and not the keyword's upper-case name")))))
 
+(defvar *pruned-refetch-fixture-counter* 0
+  "Serial number for A-REFETCHED-BODY's fixture directory. The activate-block
+fixture is keyed by suffix and reopens whatever is on disk, so a fixed suffix
+would make the second run in one image start from the first run's chain.")
+
+(test a-refetched-body-is-stored-for-a-block-whose-body-was-pruned
+  "Core AcceptBlock's fAlreadyHave is `pindex->nStatus & BLOCK_HAVE_DATA'
+(validation.cpp:4350) -- do we hold the BODY -- and a prune clears that bit
+along with nFile/nDataPos (PruneOneBlockFile, blockstorage.cpp:264-270). What
+drops the re-sent body of a block the node connected long ago is the
+UNREQUESTED arm at :4369 (`if (pindex->nTx != 0) return true'), so an explicit
+fetch gets it written; the comment at :4363 says removing fRequested `would
+break the getblockfrompeer RPC'.
+
+Ours asked instead whether the entry sat on the active chain at or below the
+tip, and dropped the body either way. getblockfrompeer sent its getdata, the
+peer answered, and nothing was written: rpc_getblockfrompeer.py:141 waited out
+its timeout for a block that never became readable. The request itself was not
+recorded anywhere either, so REQUESTED was NIL on the receive path -- and it
+cannot be recorded on the IBD context, because the steady-state pump builds a
+fresh one every tick.
+
+Control: the same body, unrequested, is still dropped."
+  (with-network (:regtest)
+    (multiple-value-bind (cs utxo store genesis)
+        (make-activate-block-fixture
+         (format nil "pruned-refetch-~D" (incf *pruned-refetch-fixture-counter*)))
+      (let* ((pairs (build-and-connect cs store utxo genesis
+                                       (make-test-chain-hashes #xC7 3)
+                                       ;; The refetched body runs Core's
+                                       ;; AcceptBlock gate, which a version-1
+                                       ;; header with no BIP34 coinbase height
+                                       ;; cannot pass on regtest.
+                                       :version 4 :bip34 t))
+             (blk (car (first pairs)))
+             (entry (cdr (first pairs)))
+             (hash (bl.store:block-index-entry-hash entry)))
+        (with-ibd-context
+          (is-true (bl.store:block-exists-p store hash)
+                   "the fixture must have written the block it connected")
+          (is-true (bl.store:entry-on-active-chain-p cs entry)
+                   "and it must be on the active chain, below the tip")
+          ;; Prune it the way the pruner does: the store forgets the body and
+          ;; the index entry loses its data position.
+          (bl.store:forget-block-body store hash)
+          (setf (bl.store:block-index-entry-data-pos entry) nil)
+          (is-false (bl.store:block-exists-p store hash)
+                    "the body must be gone before the refetch")
+          ;; Control: an unrequested copy is still dropped.
+          (deliver-block blk cs utxo store)
+          (is-false (bl.store:block-exists-p store hash)
+                    "an UNREQUESTED copy of a pruned block was written")
+          ;; getblockfrompeer asked for it -- Core's fRequested.
+          (bl.net:note-fetch-block-request hash)
+          (is-true (bl.net:fetch-block-requested-p hash))
+          (deliver-block blk cs utxo store)
+          (is-true (bl.store:block-exists-p store hash)
+                   "the refetched body of a pruned block was not written")
+          (is-false (bl.net:fetch-block-requested-p hash)
+                    "and the request is one-shot, as Core's RemoveBlockRequest is"))))))
+
 (test a-block-core-marks-failed-valid-is-not-re-requested
   "Core Chainstate::InvalidBlockFound (validation.cpp:1985-1994) has no retry
 budget in it: a block whose connect fails is marked BLOCK_FAILED_VALID once, its

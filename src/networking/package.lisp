@@ -381,6 +381,8 @@ headerssync.cpp. src/networking/.")
    #:ibd-context-in-flight
    #:ibd-context-pending-blocks
    #:ip-network
+   #:note-fetch-block-request
+   #:fetch-block-requested-p
    #:max-outbound-time-left-in-cycle
    #:outbound-target-bytes-left
    #:outbound-target-reached-p
