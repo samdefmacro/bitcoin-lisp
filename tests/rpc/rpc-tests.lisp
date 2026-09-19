@@ -386,6 +386,10 @@ the no-wallet/no-range constants; bad descriptors error."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getdescriptorinfo node (list "sh(multi(2,03aa,03bb))")))))
 
+(defun %deriveaddresses (node params)
+  "The deriveaddresses handler, reached once for the suite."
+  (bl.rpc::rpc-deriveaddresses node params))
+
 (test rpc-deriveaddresses
   "deriveaddresses returns the address(es) a descriptor's scriptPubKey
 encodes to (checksum required); combo() yields several (P2PK skipped);
@@ -396,26 +400,26 @@ address-less scripts error; range on an unranged descriptor rejected."
     (flet ((descsum (body) (bl.rpc:descriptor-add-checksum body)))
       ;; checksum is required (Core: "Missing checksum")
       (signals bl.rpc:rpc-error
-        (bl.rpc::rpc-deriveaddresses node (list (format nil "pkh(~A)" pk))))
+        (%deriveaddresses node (list (format nil "pkh(~A)" pk))))
       ;; pkh -> single P2PKH address; matches the direct encoder.
-      (let ((addrs (bl.rpc::rpc-deriveaddresses
+      (let ((addrs (%deriveaddresses
                     node (list (descsum (format nil "pkh(~A)" pk))))))
         (is (= 1 (length addrs)))
         (is (string= (bl.crypto:encode-p2pkh-address keyhash :testnet3)
                      (first addrs))))
       ;; wpkh -> single bech32 address.
-      (is (= 1 (length (bl.rpc::rpc-deriveaddresses
+      (is (= 1 (length (%deriveaddresses
                         node (list (descsum (format nil "wpkh(~A)" pk)))))))
       ;; combo emits pk+pkh+wpkh+sh(wpkh); the address-less P2PK script is
       ;; skipped (Core DeriveAddresses), leaving 3 addresses.
-      (is (= 3 (length (bl.rpc::rpc-deriveaddresses
+      (is (= 3 (length (%deriveaddresses
                         node (list (descsum (format nil "combo(~A)" pk)))))))
       ;; raw() non-standard script -> no address -> error
       (signals bl.rpc:rpc-error
-        (bl.rpc::rpc-deriveaddresses node (list (descsum "raw(51)"))))
+        (%deriveaddresses node (list (descsum "raw(51)"))))
       ;; range argument rejected for an unranged descriptor
       (signals bl.rpc:rpc-error
-        (bl.rpc::rpc-deriveaddresses
+        (%deriveaddresses
          node (list (descsum (format nil "wpkh(~A)" pk)) 5))))))
 
 ;;; --- Prioritisation RPC Tests ---
@@ -4608,7 +4612,7 @@ expansions carry none by construction, so requiring one per expansion answers
                             "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
                             "mDUjyEmNUWwx8UbK/1/<0;1>/*)"))
          (desc (format nil "~A#~A" body (bl.rpc::descriptor-checksum body)))
-         (result (bl.rpc::rpc-deriveaddresses node (list desc (list 1 2)))))
+         (result (%deriveaddresses node (list desc (list 1 2)))))
     ;; Core's own expected value, verbatim from the test.
     (is (equalp #(#("bcrt1q7c8mdmdktrzs8xgpjmqw90tjn65j5a3yj04m3n"
                     "bcrt1qs6n37uzu0v0qfzf0r0csm0dwa7prc0v5uavgy0")
@@ -4619,14 +4623,14 @@ expansions carry none by construction, so requiring one per expansion answers
     ;; A bad checksum on the multipath form is still refused — validating once
     ;; must not mean validating never.
     (signals error
-      (bl.rpc::rpc-deriveaddresses
+      (%deriveaddresses
        node (list (format nil "~A#00000000" body) (list 1 2))))
     ;; And an ordinary descriptor still returns a flat list.
     (let* ((single (concatenate 'string
                                 "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZ"
                                 "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
                                 "mDUjyEmNUWwx8UbK/1/1/*)"))
-           (flat (bl.rpc::rpc-deriveaddresses
+           (flat (%deriveaddresses
                   node (list (format nil "~A#~A" single
                                      (bl.rpc::descriptor-checksum single))
                              (list 1 2)))))

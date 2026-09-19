@@ -2617,7 +2617,18 @@ snapshot chainstate's directory is still there afterwards."
   (let ((node (bl:make-node :network :regtest :data-directory dir)))
     (setf (bl:node-chainstates node)
           (list (bl.store:init-chain-state dir :network :regtest)))
-    (let ((bl:*node* node))
+    ;; The fake snapshot's base (32 x #xB5) is made known to the chainparams:
+    ;; start-up refuses a snapshot base it has no assumeutxo data for, and
+    ;; that refusal is not what this test is about.
+    (let ((bl:*node* node)
+          (bl:*assumeutxo-data-override*
+            (list (bl:make-assumeutxo-data
+                   :height 1
+                   :blockhash (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element #xB5)
+                   :hash-serialized (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)
+                   :chain-tx-count 1))))
       (bl::%init-recover-chain reindex reindex-chainstate))
     (and (bl.store:find-assumeutxo-chainstate-dir dir) t)))
 
