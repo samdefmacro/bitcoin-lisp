@@ -2129,7 +2129,7 @@ compare two copies of the same wrong answer and report agreement."
            (cache (bl.store:make-coins-view-cache base))
            (parent (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
            (this-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB))
-           (coinbase (bl.tests::%make-coinbase-tx
+           (coinbase (%make-coinbase-tx
                       (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
                       5000
                       (make-array 1 :element-type '(unsigned-byte 8))))
