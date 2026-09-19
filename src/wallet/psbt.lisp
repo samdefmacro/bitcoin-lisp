@@ -2118,7 +2118,13 @@ without a binding nobody uses.
 The two keys this exists for are the ones Core REMOVED: totalFee and feeRate
 were bumpfee options once, and a caller still passing either would otherwise
 have it ignored and get a fee bumped by something else entirely
-(wallet_bumpfee.py:126 pins both)."
+(wallet_bumpfee.py:126 pins both).
+
+The check that follows it is Core's own next statement (:1062-1063): confTarget
+and conf_target are two spellings of ONE option, and a call that sets both has
+stated two targets. Core takes the DEPRECATED spelling when only it is given
+(:1066), so there is no order that answers the caller honestly -- both set is
+-8 (wallet_bumpfee.py:162)."
   (when options
     (bl.rpc:rpc-type-check-obj
      options
@@ -2129,7 +2135,11 @@ have it ignored and get a fee bumped by something else entirely
        ("original_change_index" . "number")
        ("outputs" . nil)
        ("replaceable" . "bool"))
-     :allow-null t :strict t))
+     :allow-null t :strict t)
+    (when (and (%opt-present-p options "confTarget")
+               (%opt-present-p options "conf_target"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+             :message "confTarget and conf_target options should not both be set. Use conf_target (confTarget is deprecated).")))
   options)
 
 (defun %bumpfee-options->cc (options cc)

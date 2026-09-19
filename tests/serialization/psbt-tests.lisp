@@ -1356,3 +1356,45 @@ it silently ignored and the transaction bumped by something else entirely
           (is (equal -3 (car answer)))
           (is (search "is not of expected type string" (or (cdr answer) ""))
               "got ~S" (cdr answer)))))))
+
+(test bumpfee-refuses-both-spellings-of-the-confirmation-target
+  "confTarget and conf_target are the SAME bumpfee option under two spellings,
+and Core refuses a call that sets both (wallet/rpc/spend.cpp:1062-1063), right
+after the option block's RPCTypeCheckObj and before anything reads a target.
+It matters because the deprecated spelling is the one Core takes when only it
+is given (:1066), so a caller that sets both has stated two different targets
+and cannot be told which one was used.
+
+We read them as (or conf_target confTarget) with no refusal, so
+bumpfee(txid, {confTarget: 123, conf_target: 456}) silently bumped at 456 --
+wallet_bumpfee.py:162 asserts Core's -8 instead.
+
+The two controls are each spelling ALONE: both must still reach the txid, so a
+change that simply refused any call carrying confTarget would fail them."
+  (with-wallet-chain-node (node "bumpfee-alias" :wallet "w")
+    (let ((txid (make-string 64 :initial-element #\0)))
+      (flet ((bump (method &rest kvs)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node method
+                   (wire-params
+                    (list txid
+                          (let ((h (make-hash-table :test 'equal)))
+                            (loop for (k v) on kvs by #'cddr
+                                  do (setf (gethash k h) v))
+                            h))))))))
+        (dolist (method '("bumpfee" "psbtbumpfee"))
+          (let ((answer (bump method "confTarget" 123 "conf_target" 456)))
+            (is (equal -8 (car answer))
+                "~A: expected -8, got ~S" method answer)
+            (is (string= "confTarget and conf_target options should not both be set. Use conf_target (confTarget is deprecated)."
+                         (or (cdr answer) ""))
+                "~A: got ~S" method (cdr answer))))
+        ;; Controls: one spelling at a time is a legal call, so the answer
+        ;; comes from the txid this wallet has never seen -- never the
+        ;; sentence above.
+        (dolist (key '("confTarget" "conf_target"))
+          (let ((answer (bump "bumpfee" key 123)))
+            (is (not (search "should not both be set" (or (cdr answer) "")))
+                "~A alone must not be refused as a conflict: ~S" key answer)))))))
