@@ -195,14 +195,16 @@ to its parent, which is what supplies its height and chain work.
 
 Core's shape, and it is the shape and not just the outcome that matters
 (LoadExternalBlockFile, validation.cpp:5006-5134): each record is judged as it
-is read, against the index as it stands. A block whose parent is not known YET
-is logged and parked in mapBlocksUnknownParent under its parent's hash
-(:5048-5054); a block whose parent IS known is added, and then everything
-parked under it -- and under those in turn -- is processed at once
-(:5110-5134). Ours read every record into one table first and drained
-afterwards, which reaches the same index but can say nothing about which
-blocks were out of order, and feature_reindex.py:69-73 swaps two blocks inside
-blk00000.dat precisely to watch for those two lines."
+is read, in file order. A block whose parent is not known YET is logged and
+parked in mapBlocksUnknownParent under its parent's hash (:5048-5054); a block
+whose parent IS known is added, and then everything parked under it -- and
+under those in turn -- is processed at once (:5110-5134). Ours read every
+record into one table first and drained afterwards, which reaches the same
+index but can say nothing about which blocks were out of order, and
+feature_reindex.py:69-73 swaps two blocks inside blk00000.dat precisely to
+watch for those two lines. `Not known yet' is decided on the record's FILE
+POSITION (%REINDEX-PARENT-COMES-LATER-P), not on the index: Core wiped its
+index first, while ours is additive and already holds every record on disk."
   (let ((pending (make-hash-table :test 'equalp))   ; prev-hash -> list of (hash header pos)
         (genesis (chain-state-genesis-hash chain-state))
         (added 0))
