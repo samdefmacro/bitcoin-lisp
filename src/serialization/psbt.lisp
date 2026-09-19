@@ -134,15 +134,53 @@ unconstrained (preserved verbatim)."
   (flet ((empty () (when (plusp keydata-len)
                      (serialization-error "PSBT key type ~D must have empty key data" keytype)))
          (nonempty () (when (zerop keydata-len)
-                        (serialization-error "PSBT key type ~D requires key data" keytype))))
+                        (serialization-error "PSBT key type ~D requires key data" keytype)))
+         (exactly (n) (when (/= keydata-len n)
+                        (serialization-error "PSBT key type ~D key data must be ~D bytes"
+                                             keytype n)))
+         (control-block ()
+           (unless (and (>= keydata-len 33) (zerop (mod (1- keydata-len) 32)))
+             (serialization-error
+              "PSBT taproot leaf script key's control block size is not valid"))))
     (ecase context
       (:global (case keytype ((#x00 #xfb) (empty)) (#x01 (nonempty))))
       (:input (case keytype
                 ((#x00 #x01 #x03 #x04 #x05 #x07 #x08 #x13 #x17 #x18) (empty))
-                ((#x02 #x06 #x0a #x0b #x0c #x0d #x14 #x15 #x16) (nonempty))))
+                ((#x02 #x06 #x0a #x0b #x0c #x0d) (nonempty))
+                (#x14 (exactly 64))    ; x-only pubkey + leaf hash
+                (#x15 (control-block))
+                (#x16 (exactly 32))))  ; x-only pubkey
       (:output (case keytype
                  ((#x00 #x01 #x05 #x06) (empty))
-                 ((#x02 #x07) (nonempty)))))))
+                 (#x02 (nonempty))
+                 (#x07 (exactly 32)))))))
+
+(defun %psbt-validate-value (context keytype value-len)
+  "Reject a known KEYTYPE whose VALUE length is illegal for its map CONTEXT.
+
+Core reads each of these into a fixed-width object, so the length is part of
+the format and not a policy: a taproot signature is 64 bytes, or 65 with the
+sighash byte appended (psbt.h:699-703 and :720-724); an x-only key or a merkle
+root read through UnserializeFromVector is 32 and that reader refuses any
+other length (:778, :788, :1029); a leaf script carries at least its one-byte
+leaf version (:739-741)."
+  (flet ((signature ()
+           (unless (<= 64 value-len 65)
+             (serialization-error "PSBT taproot signature must be 64 or 65 bytes")))
+         (thirty-two ()
+           (when (/= value-len 32)
+             (serialization-error "PSBT taproot key type ~D value must be 32 bytes"
+                                  keytype)))
+         (at-least-one ()
+           (when (zerop value-len)
+             (serialization-error "PSBT taproot leaf script must be at least 1 byte"))))
+    (ecase context
+      (:global)
+      (:input (case keytype
+                ((#x13 #x14) (signature))
+                (#x15 (at-least-one))
+                ((#x17 #x18) (thirty-two))))
+      (:output (case keytype (#x05 (thirty-two)))))))
 
 (defun %psbt-read-map (br context)
   "Read records from BR until the 0x00 separator; return a psbt-map. CONTEXT is
@@ -157,7 +195,8 @@ illegal key-data length (Core rejects those)."
           (when (member key records :key #'car :test #'equalp)
             (serialization-error "Duplicate key in PSBT map"))
           (multiple-value-bind (kt off) (psbt-key-type key)
-            (%psbt-validate-key context kt (- (length key) off)))
+            (%psbt-validate-key context kt (- (length key) off))
+            (%psbt-validate-value context kt (length value)))
           (push (cons key value) records))))
     (make-psbt-map :records (nreverse records))))
 
@@ -212,6 +251,17 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
     (unless (member (length (car d)) '(33 65))
       (serialization-error "PSBT input BIP32 derivation has an invalid public key"))))
 
+(defun %psbt-validate-output (map)
+  "Field-content checks on one output map that Core enforces at parse time.
+
+The BIP32 keypath key is a PUBKEY, so DeserializeHDKeypaths refuses any size
+but 33 or 65 (Core psbt.h:1018) -- the same rule the input side has always had
+here. Without it a 32-byte key, which is what an x-only taproot key looks
+like, was read as an ECDSA derivation."
+  (dolist (d (psbt-map-collect map +psbt-out-bip32+))
+    (unless (member (length (car d)) '(33 65))
+      (serialization-error "PSBT output BIP32 derivation has an invalid public key"))))
+
 (defun parse-psbt (bytes)
   "Parse a binary PSBT. Signals an error on any structural violation."
   (let ((br (make-byte-reader-from bytes)))
@@ -247,6 +297,7 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
             (serialization-error "Trailing data after PSBT"))
           (dotimes (i nin)
             (%psbt-validate-input (aref inputs i) (aref (transaction-inputs tx) i)))
+          (dotimes (i nout) (%psbt-validate-output (aref outputs i)))
           (make-psbt :tx tx :global global :inputs inputs :outputs outputs))))))
 
 ;;; --- serialize ---

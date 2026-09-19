@@ -38,23 +38,36 @@
           (is (>= n 30) "expected many valid vectors, got ~D" n)))))
 
 (test psbt-invalid-rejected
-  "Core 'invalid' PSBTs are rejected (structural checks). Deep taproot/musig
-field-length checks are not implemented, so we require the bulk, not all."
+  "EVERY PSBT in Core's `invalid' list is rejected. rpc_psbt.py:813-815 asks
+for exactly that -- each one is decodepsbt(-22, \"TX decode failed\") -- so a
+vector we accept is one our decoder hands on to a consumer that has no reason
+to doubt it.
+
+Eleven of the forty-one used to get through: the BIP371 taproot field lengths
+(Core psbt.h:691-790 for the input keytypes, :1022-1087 for the output ones)
+and one output BIP32 keypath whose key is 32 bytes where a pubkey is 33 or 65.
+The ceiling was written as `>= 30' and the eleven were described as checks we
+do not implement.
+
+The `valid' vectors are the control: they must still decode, so a length rule
+written one byte too tight fails here rather than passing."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
-        (let ((rejected 0) (total 0))
+        (let ((accepted '()) (total 0))
           (dolist (b64 (gethash "invalid" data))
             (incf total)
-            (when (handler-case
-                      (progn (bl.ser:parse-psbt (%psbt-b64->bytes b64))
-                             nil)
-                    (error () t))
-              (incf rejected)))
-          ;; 30/41: structural + v0 field-content checks. The rest are BIP371
-          ;; taproot / BIP327 musig deep field-length checks we don't implement.
-          (is (>= rejected 30)
-              "expected to reject most invalid PSBTs, got ~D/~D" rejected total)))))
+            (unless (handler-case
+                        (progn (bl.ser:parse-psbt (%psbt-b64->bytes b64))
+                               nil)
+                      (error () t))
+              (push b64 accepted)))
+          (is (null accepted)
+              "~D of ~D invalid PSBTs decoded: ~S"
+              (length accepted) total accepted)
+          (dolist (b64 (gethash "valid" data))
+            (is-true (bl.ser:parse-psbt (%psbt-b64->bytes b64))
+                     "a valid PSBT no longer decodes: ~A" b64))))))
 
 (defun %psbt-hand-built-bytes (&key version (prevout-index 0))
   "A hand-built 1-in/1-out PSBT spending PREVOUT-INDEX of a previous
@@ -897,11 +910,20 @@ gets that the other participants are not signing the same transaction."
     (is-true (%psbt-process-with-descriptors
               node (%psbt-add-tap-key-sig (%psbt-spending taproot-spk value) 64)
               descs))
-    ;; An EMPTY key-signature record is absent, not a zero-length signature:
-    ;; Core guards the check with !m_tap_key_sig.empty().
+    ;; Core's !m_tap_key_sig.empty() guard on that check (psbt.cpp:459-475) is
+    ;; about a field that was never PRESENT: a record carrying a ZERO-length
+    ;; signature never reaches it, because the deserializer refuses anything
+    ;; under 64 bytes first (psbt.h:699-701). This case used to assert the
+    ;; opposite and was pinning a divergence.
+    (signals-rpc-error (:code -22
+                        :exact-message
+                        "TX decode failed PSBT taproot signature must be 64 or 65 bytes")
+      (%psbt-process-with-descriptors
+       node (%psbt-add-tap-key-sig (%psbt-spending taproot-spk value) 0)
+       descs))
+    ;; The absent case, which is the one the guard is for: no record at all.
     (is-true (%psbt-process-with-descriptors
-              node (%psbt-add-tap-key-sig (%psbt-spending taproot-spk value) 0)
-              descs))))
+              node (%psbt-spending taproot-spk value) descs))))
 
 (test psbt-createpsbt-defaults-and-validation
   "createpsbt sequence follows Core (replaceable default true -> RBF; explicit
