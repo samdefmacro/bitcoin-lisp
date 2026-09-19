@@ -255,13 +255,25 @@ A NULL parameter passes, as Core's MatchesType does for an optional argument
 that is null; an argument a caller omitted is null here. The types come from
 *RPC-ARG-TYPES*, generated from Core, so a position Core does not gate --
 AMOUNT, RANGE, skip_type_check -- is not gated here either."
-  (let ((mismatches '()))
+  (let ((mismatches '())
+        (given (length params))
+        (required (cdr (assoc method *rpc-arg-required* :test #'string=))))
     (loop for type in (cdr (assoc method *rpc-arg-types* :test #'string=))
           for position from 1
           for tail = params then (cdr tail)
           for value = (car tail)
           for expected = (%rpc-expected-json-type type)
-          do (when (and expected value)
+          ;; A null is checked only where Core checks it: MatchesType lets a
+          ;; null through for an OPTIONAL argument and nowhere else
+          ;; (rpc/util.cpp:591-597), so an explicit null in a REQUIRED position
+          ;; is a type error like any other. POSITION <= GIVEN keeps the
+          ;; distinction that matters: a trailing argument the caller OMITTED
+          ;; is not a null it passed (and a named call's gap, which
+          ;; transformNamedArguments fills with null here as in Core, can only
+          ;; land on an optional position).
+          do (when (and expected
+                        (<= position given)
+                        (or value (nth (1- position) required)))
                (let ((actual (json-type-name value)))
                  (unless (string= expected actual)
                    (push (cons (format nil "Position ~D (~A)" position

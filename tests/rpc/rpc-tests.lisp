@@ -1089,13 +1089,16 @@ regression in either direction shows up."
                     "parameter 3 must be of length 64 (not 6, for 'foobar')")
               ;; rawtransaction_util.cpp:38 AddInputs -> "txid"
               (list "createrawtransaction"
+                    ;; #() and not (list): an empty JSON array, since both of
+                    ;; createrawtransaction's arrays are RPCArg::Optional::NO
+                    ;; and a null in one is a type error before ParseHashV.
                     (list (list (list (cons "txid" "foo") (cons "vout" 0)))
-                          (list))
+                          #())
                     -8 "txid must be of length 64 (not 3, for 'foo')")
               ;; rawtransaction_util.cpp:113 ParseOutputs -> ParseHexV "Data",
               ;; the wallet_send.py:277 sentence.
               (list "createrawtransaction"
-                    (list (list) (list (cons "data" "Hello World")))
+                    (list #() (list (cons "data" "Hello World")))
                     -8 "Data must be hexadecimal string (not 'Hello World')")
               ;; A non-string never reaches ParseHashV: the declared-type
               ;; gate refuses it first, exactly as Core's does.
@@ -1279,10 +1282,24 @@ The first row is rpc_blockchain.py:496-506 byte for byte."
                                       (list bl.rpc:+json-false+)))))
     (is (search "JSON value of type array is not of expected type string"
                 (cdr (%rpc-wire-error node "getblockheader" (list (vector))))))
-    ;; A null argument passes, as Core's MatchesType does for an optional one
-    ;; -- in a slot the method actually declares: getblockcount declares none,
-    ;; so a null there is Core's arity error and not a type one.
+    ;; A null argument passes where Core's MatchesType lets one through, which
+    ;; is an OPTIONAL declared slot (rpc/util.cpp:591-597): help's one argument
+    ;; is optional, so an explicit null there is accepted.
     (is (null (%rpc-wire-error node "help" (list nil))))
+    ;; In a REQUIRED slot it is not: MatchesType returns false and the position
+    ;; is reported like any other type mismatch. Ours let every null through,
+    ;; so validateaddress(None) reached the handler and answered normally --
+    ;; rpc_invalid_address_message.py:105 asks for the -3.
+    (let ((answer (%rpc-wire-error node "validateaddress" (list nil))))
+      (is (eql -3 (car answer)))
+      (is-true (search "JSON value of type null is not of expected type string"
+                       (cdr answer))))
+    ;; and a null a caller did NOT pass is still not a null: the trailing
+    ;; optional arguments of getblock stay omitted rather than becoming
+    ;; explicit nulls at a required position.
+    (is (equal (cons -5 "Block not found")
+               (%rpc-wire-error node "getblock"
+                                (list (make-string 64 :initial-element #\0)))))
     ;; skip_type_check positions are not gated: getblock takes a BOOL
     ;; verbosity (blockchain.cpp:771-772), so this reaches the handler and
     ;; fails its lookup instead.
@@ -5237,7 +5254,7 @@ a whole cycle (p2p_add_connections.py:78). Control: a live peer still counts."
     (is (= 0 (bl:peers-of-conn-type node :outbound-full-relay))
         "a closed connection is not a connection")
     (is-true (bl.rpc:dispatch-rpc-method node "addconnection"
-                                         (list "1.2.3.4:1" "outbound-full-relay" nil))
+                                         (list "1.2.3.4:1" "outbound-full-relay" bl.rpc:+json-false+))
              "the slot the closed connection held is free")
     (push (bl.net:make-peer :address "10.0.0.6" :state :ready
                             :conn-type :outbound-full-relay)
@@ -5246,7 +5263,7 @@ a whole cycle (p2p_add_connections.py:78). Control: a live peer still counts."
     (is (= bl.rpc::+rpc-client-node-capacity-reached+
            (rpc-error-code-of
             (lambda () (bl.rpc:dispatch-rpc-method
-                        node "addconnection" (list "1.2.3.4:2" "outbound-full-relay" nil)))))
+                        node "addconnection" (list "1.2.3.4:2" "outbound-full-relay" bl.rpc:+json-false+)))))
         "control: a live peer fills the one slot")))
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
@@ -6987,10 +7004,18 @@ The handler opened with a length check, so BOTH spellings were a hard -8
 `Invalid inputs' -- and because the check ran before the outputs were parsed,
 every outputs diagnostic rpc_rawtransaction.py:293-302 drives through an empty
 inputs array answered that same wrong message."
-  (dolist (empty (list #() nil))
-    (let ((hex (create-raw-tx empty +crt-data-output+)))
-      (is (= 0 (length (bl.ser:transaction-inputs (bl.rpc:decode-hex-tx hex)))))
-      (is (= 1 (length (bl.ser:transaction-outputs (bl.rpc:decode-hex-tx hex)))))))
+  (let ((hex (create-raw-tx #() +crt-data-output+)))
+    (is (= 0 (length (bl.ser:transaction-inputs (bl.rpc:decode-hex-tx hex)))))
+    (is (= 1 (length (bl.ser:transaction-outputs (bl.rpc:decode-hex-tx hex))))))
+  ;; A null is NOT the empty array over the wire: `inputs\' is
+  ;; RPCArg::Optional::NO (rawtransaction.cpp:90), so Core\'s MatchesType
+  ;; refuses a null there before AddInputs -- whose own null branch is
+  ;; reachable only from C++ callers -- and answers the same -3 as any other
+  ;; wrong type.
+  (let ((e (handler-case (progn (create-raw-tx nil +crt-data-output+) nil)
+             (bl.rpc:rpc-error (e) e))))
+    (is-true e "an explicit null inputs array was accepted")
+    (when e (is (= -3 (bl.rpc:rpc-error-code e)))))
   ;; Anything that is not an array is Core's -3 type error.
   (dolist (bad (list "nope" 7))
     (let ((e (handler-case (progn (create-raw-tx bad +crt-data-output+) nil)
@@ -11325,7 +11350,11 @@ both reached with NO keys and NO prevtxs at all (:98-108)."
                        (cons "amount" "0.00100000")))
          (result (bl.rpc:dispatch-rpc-method
                   node "signrawtransactionwithkey"
-                  (wire-params (list hex '() (list prevtx))))))
+                  ;; An empty privkeys ARRAY, not a null: `privkeys' is
+                  ;; RPCArg::Optional::NO (rawtransaction.cpp:683), so the
+                  ;; wire spelling of "no keys" is [] and a null is a type
+                  ;; error. #() is what WIRE-PARAMS turns into the sentinel.
+                  (wire-params (list hex #() (list prevtx))))))
     (flet ((field (name) (cdr (assoc name result :test #'string=))))
       (is (eq t (field "complete"))
           "a P2A input needs no key, so signing it is complete")
