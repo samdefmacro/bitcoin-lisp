@@ -212,6 +212,17 @@ checks on, small write buffer. Caller must call leveldb-destroy-options."
   (%leveldb-options-destroy options))
 
 ;;;; DB lifecycle.
+;;;;
+;;;; Core writes three lines per CDBWrapper it constructs: "Wiping LevelDB in
+;;;; <path>" before DestroyDB, "Opening LevelDB in <path>" before DB::Open and
+;;;; "Opened LevelDB successfully" after it (dbwrapper.cpp:232, :237, :243).
+;;;; They are part of the node's contract, not decoration: Core's own
+;;;; feature_reindex.py:95 restarts a node WITHOUT -reindex and asserts that
+;;;; "Opening LevelDB in <indexes/blockfilter/basic/db>" appears while
+;;;; "Wiping LevelDB in" the same path does not -- which is how it proves an
+;;;; interrupted reindex does not throw the index away on the next start. The
+;;;; path is printed the way fs::PathToString renders it, with no trailing
+;;;; separator, so %PATH-WITHOUT-TRAILING-SLASH and not NAMESTRING.
 
 (defun leveldb-open (path &optional options)
   "Open or create a LevelDB at PATH. Returns an opaque handle. Caller
@@ -221,8 +232,13 @@ internally with defaults."
   (let* ((own-options (null options))
          (opts (or options (leveldb-make-options))))
     (unwind-protect
-         (with-errptr (errptr)
-           (%leveldb-open opts (namestring path) errptr))
+         (progn
+           (bl.log:log-info "Opening LevelDB in ~A"
+                            (%path-without-trailing-slash path))
+           (let ((db (with-errptr (errptr)
+                       (%leveldb-open opts (namestring path) errptr))))
+             (bl.log:log-info "Opened LevelDB successfully")
+             db))
       (when own-options (leveldb-destroy-options opts)))))
 
 ;;;; -dbcache, split the way Core splits it (node/caches.cpp, kernel/caches.h)
@@ -358,8 +374,11 @@ mainnet node."
            (when cache (%leveldb-options-set-cache opts cache))
            (when filter (%leveldb-options-set-filter-policy opts filter))
            (%leveldb-options-set-max-file-size opts +leveldb-max-file-size+)
+           (bl.log:log-info "Opening LevelDB in ~A"
+                            (%path-without-trailing-slash path))
            (setf db (with-errptr (errptr)
                       (%leveldb-open opts (namestring path) errptr)))
+           (bl.log:log-info "Opened LevelDB successfully")
            (when (or cache filter)
              (bt:with-lock-held (*leveldb-owned-resources-lock*)
                (setf (gethash (cffi:pointer-address db) *leveldb-owned-resources*)
@@ -394,8 +413,12 @@ reopen (a reindex, a restart of the filter backfill) leaks its whole cache."
        (leveldb-close ,var))))
 
 (defun leveldb-destroy-db (path)
-  "Remove the LevelDB directory at PATH and all its contents."
+  "Remove the LevelDB directory at PATH and all its contents.
+
+Core's DBParams::wipe_data, which reaches DestroyDB the same way and logs the
+same line first (dbwrapper.cpp:231-234)."
   (ensure-libleveldb-loaded)
+  (bl.log:log-info "Wiping LevelDB in ~A" (%path-without-trailing-slash path))
   (let ((opts (leveldb-make-options)))
     (unwind-protect
          (with-errptr (errptr)

@@ -96,6 +96,74 @@ every index reopen leaks a whole cache. LEVELDB-CLOSE owns both halves of that."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
+(defun %ldb-log-message (lines prefix)
+  "The text of the first of LINES carrying PREFIX, from PREFIX to end of line,
+or NIL. A log entry is a timestamp, a level tag and then the message, so what
+follows the prefix is the whole of what the line SAYS -- which a SEARCH cannot
+tell apart from a longer path that merely starts the same way."
+  (loop for line in lines
+        for at = (search prefix line)
+        when at return (subseq line (+ at (length prefix)))))
+
+(test leveldb-open-and-wipe-log-core-s-lines
+  "Core writes one line per database it touches: \"Wiping LevelDB in <path>\"
+before DestroyDB, \"Opening LevelDB in <path>\" before DB::Open and \"Opened
+LevelDB successfully\" after it (dbwrapper.cpp:232, :237, :243).
+
+Those lines are read by Core's own suite. feature_reindex.py:95 restarts a node
+WITHOUT -reindex and asserts the filter index database is opened and NOT wiped,
+which is how it proves an interrupted reindex does not throw the index away on
+the next start. The path is fs::PathToString of the database directory and
+therefore carries no trailing separator, while SBCL renders every directory
+pathname with one."
+  (let* ((dir (merge-pathnames (format nil "bl-ldblog-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (printed (string-right-trim "/" (namestring dir))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           (let* ((db nil)
+                  (opened (capture-log-lines
+                           (lambda ()
+                             (setf db (bl.store:leveldb-open-tuned dir))))))
+             (bl.store:leveldb-close db)
+             ;; The message, not a substring of it: a line naming <dir>/ still
+             ;; CONTAINS <dir>, so a SEARCH cannot see the trailing separator
+             ;; Core does not print.
+             (is (equal printed (%ldb-log-message opened "Opening LevelDB in "))
+                 "open line was ~S, wanted the path ~S with no trailing slash"
+                 (%ldb-log-message opened "Opening LevelDB in ") printed)
+             (is-true (%ldb-log-message opened "Opened LevelDB successfully")
+                      "no success line: ~S" opened)
+             ;; Opening is not wiping -- the negative half of the assertion
+             ;; feature_reindex.py:95 makes.
+             (is-false (%ldb-log-message opened "Wiping LevelDB in ")))
+           (let ((wiped (capture-log-lines
+                         (lambda () (bl.store:leveldb-destroy-db dir)))))
+             (is (equal printed (%ldb-log-message wiped "Wiping LevelDB in "))
+                 "wipe line was ~S, wanted ~S"
+                 (%ldb-log-message wiped "Wiping LevelDB in ") printed)))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore)))))
+
+(test plain-leveldb-open-logs-the-same-two-lines
+  "LEVELDB-OPEN is the untuned opener the wallet database uses; Core logs every
+CDBWrapper the same way, so it carries the same two lines."
+  (let* ((dir (merge-pathnames (format nil "bl-ldblog2-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (printed (string-right-trim "/" (namestring dir))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           (let* ((db nil)
+                  (lines (capture-log-lines
+                          (lambda () (setf db (bl.store:leveldb-open dir))))))
+             (bl.store:leveldb-close db)
+             (is (equal printed (%ldb-log-message lines "Opening LevelDB in ")))
+             (is-true (%ldb-log-message lines "Opened LevelDB successfully"))))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore)))))
+
 (test tuned-leveldb-open-without-a-cache-registers-nothing-to-free
   "cache-bytes 0 and bloom-bits 0 means leveldb's own defaults: nothing is
 allocated, so nothing may be registered — a stale registry entry would be a
