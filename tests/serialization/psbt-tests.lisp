@@ -221,9 +221,14 @@ the same bytes, which is the strongest form this assertion takes."
                      (bl.ser:decode-psbt
                       (%psbt-createpsbt node (list nil arr 0
                                                    bl.rpc:+json-false+ 3)))))
+          ;; Over the DISPATCHER the empty inputs array has to be the wire
+          ;; spelling: `inputs' is RPCArg::Optional::NO (rawtransaction.cpp:90)
+          ;; and Core's MatchesType refuses a null there (rpc/util.cpp:591-597).
+          ;; The handler calls above pass NIL because that is what the
+          ;; normalizer hands a handler for [].
           (raw (bl.rpc:dispatch-rpc-method
                 node "createrawtransaction"
-                (list nil dict 0 bl.rpc:+json-false+ 3))))
+                (wire-params (list (vector) dict 0 bl.rpc:+json-false+ 3)))))
       (is (equalp (bl.ser:transaction-wire-bytes from-dict)
                   (bl.ser:transaction-wire-bytes from-arr)))
       (is (string= raw (bl.crypto:bytes-to-hex

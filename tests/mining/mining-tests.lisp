@@ -1267,7 +1267,10 @@ with a count of zero."
       ;; RPCArg::Type::NUM), so the code is -3 and not the handler's -8.
       (signals-rpc-error (:code -3)
         (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list "1" addr)))
-      (signals-rpc-error (:code -8)
+      ;; A null count is refused by the same gate for the same reason: Core's
+      ;; MatchesType lets a null through only for an OPTIONAL argument
+      ;; (rpc/util.cpp:591-597) and num_blocks is RPCArg::Optional::NO.
+      (signals-rpc-error (:code -3)
         (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list nil "raw(51)")))
       ;; Core's own order: the destination is decoded before generateBlocks.
       (signals-rpc-error (:code -5 :exact-message "Error: Invalid address")
@@ -1370,7 +1373,7 @@ header whose parent is not in the index is `prev-blk-not-found'
   ;; output and (submit=true) advances the chain.
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "genblk"))
-          (r (bl.rpc:dispatch-rpc-method node "generateblock" (list "raw(51)" '()))))
+          (r (bl.rpc:dispatch-rpc-method node "generateblock" (wire-params (list "raw(51)" (vector))))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
      (is (null (assoc "hex" r :test #'string=)))   ; no hex when submitted
      (is (= 1 (bl.store:current-height
@@ -1386,7 +1389,7 @@ header whose parent is not in the index is `prev-blk-not-found'
    (let* ((node (regtest-node-fixture "genblk-ns"))
           (h0 (bl.store:current-height (bl:node-chain-state node)))
           (r (bl.rpc:dispatch-rpc-method
-              node "generateblock" (list "raw(51)" '() bl.rpc:+json-false+))))
+              node "generateblock" (wire-params (list "raw(51)" (vector) bl.rpc:+json-false+)))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
      (is (stringp (cdr (assoc "hex" r :test #'string=))))
      ;; the hex round-trips to a block whose header hashes to the reported hash
@@ -1417,7 +1420,7 @@ mkc9STceoCcjoXEXe6cm66iJbmjM6zR9B2."
              (let* ((node (regtest-node-fixture suffix))
                     (r (bl.rpc:dispatch-rpc-method
                         node "generateblock"
-                        (list descriptor '() bl.rpc:+json-false+)))
+                        (wire-params (list descriptor (vector) bl.rpc:+json-false+))))
                     (bytes (bl.crypto:hex-to-bytes
                             (cdr (assoc "hex" r :test #'string=))))
                     (blk (flexi-streams:with-input-from-sequence (s bytes)
@@ -1469,7 +1472,7 @@ mkc9STceoCcjoXEXe6cm66iJbmjM6zR9B2."
        (is (= 2 (length (bl.ser:bitcoin-block-transactions blk)))))
      ;; bogus output (neither address nor descriptor) errors
      (signals bl.rpc:rpc-error
-       (bl.rpc:dispatch-rpc-method node "generateblock" (list "not-an-output" '()))))))
+       (bl.rpc:dispatch-rpc-method node "generateblock" (wire-params (list "not-an-output" (vector))))))))
 
 (test generateblock-testblockvalidity-rejects-bad-tx
   ;; A raw tx spending a nonexistent outpoint fails the pre-mining
