@@ -114,7 +114,10 @@ resolved network. Honors -server (enable RPC on the default port when no
             (setf (getf plist :listen-bind) host)
             ;; A port on -bind overrides -port for the listener, as it does in
             ;; Core, where the bind address carries its own port.
-            (when port (setf (getf plist :port) port)))))
+            (when port (setf (getf plist :port) port))))
+        (%check-binding-conflicts
+         alist parsed network
+         (loop for (k . v) in alist when (string= k "whitebind") collect v)))
       ;; -listen is decided in exactly one place: CONF-EFFECTIVE-LISTEN-FLAGS,
       ;; which replays Core's soft-set chain in Core's order (-bind beats
       ;; -connect beats -proxy). Deciding it here as well is how the -bind case
@@ -351,6 +354,44 @@ and this error exist."
                collect (format nil "Config setting for -~A only applied on ~A ~
                                     network when in [~A] section."
                                name chain chain)))))))
+
+(defun %check-binding-conflicts (alist parsed network whitebinds)
+  "Core CheckBindingConflicts (init.cpp:1271-1297), run over the three binding
+lists once they are parsed: whitebinds first, then plain -binds, then the
+=onion ones, all into ONE set. The first address:port that is already there is
+the error, and Core names it (init.cpp:2250-2255).
+
+Two listeners on one address is not a configuration a node can honour: the
+second bind fails at the socket, or -- with SO_REUSEADDR -- one of the two
+permission sets silently wins. Core refuses instead of starting half of what
+was asked for, and feature_bind_extra.py:100 asks for each of the six
+combinations of -bind, -bind=...=onion and -whitebind on one address.
+
+A whitebind's permissions prefix is not part of the address: `noban@1.2.3.4:1'
+binds 1.2.3.4:1 (NetWhitebindPermissions::TryParse, net_permissions.cpp)."
+  (declare (ignore alist))
+  (let ((seen (make-hash-table :test #'equal)))
+    (flet ((note (host port)
+             (when (and host port)
+               (let ((key (format nil "~A:~D" host port)))
+                 (when (gethash key seen)
+                   (config-error
+                    "Duplicate binding configuration for address ~A. ~
+Please check your -bind, -bind=...=onion and -whitebind settings." key))
+                 (setf (gethash key seen) t)))))
+      (dolist (spec whitebinds)
+        (let ((at (position #\@ spec :from-end t)))
+          (multiple-value-bind (host port)
+              (parse-bind-option (if at (subseq spec (1+ at)) spec))
+            (note host port))))
+      (dolist (p parsed)
+        (destructuring-bind (&optional host port onion-p) p
+          (unless onion-p
+            (note host (or port (network-port network))))))
+      (dolist (p parsed)
+        (destructuring-bind (&optional host port onion-p) p
+          (when onion-p
+            (note host (or port (1+ (network-port network))))))))))
 
 (defun args->start-node-plist (args &optional conf-text settings-rows)
   ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf

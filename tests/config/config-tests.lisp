@@ -1005,6 +1005,44 @@ port overrides -port for the listener, as it does in Core."
 NIL when it accepts it. The plist assembly is pure, so no global needs saving."
   (%config-refusal (start-node-plist args)))
 
+(test duplicate-binding-configuration-is-an-init-error
+  "Core CheckBindingConflicts (init.cpp:1271-1297) puts the whitebinds, the
+plain -binds and the =onion binds into ONE set and refuses the first repeated
+address:port, naming it (init.cpp:2250-2255). Two listeners on one address is
+not a configuration a node can honour -- the second bind fails at the socket,
+or one of the two permission sets silently wins -- so Core refuses rather than
+starting half of what was asked for.
+
+feature_bind_extra.py:99-103 asks for all six combinations of the three
+options on ONE address; this covers each pair, and the positive controls are
+the same options on DIFFERENT addresses."
+  (let ((addr "127.0.0.1:11012")
+        (other "127.0.0.1:11013"))
+    (flet ((refusal (&rest args)
+             (apply #'%start-node-plist-refusal "-regtest" args)))
+      (dolist (pair (list (list (format nil "-bind=~A" addr) (format nil "-bind=~A" addr))
+                          (list (format nil "-bind=~A" addr) (format nil "-bind=~A=onion" addr))
+                          (list (format nil "-bind=~A" addr) (format nil "-whitebind=noban@~A" addr))
+                          (list (format nil "-bind=~A=onion" addr) (format nil "-bind=~A=onion" addr))
+                          (list (format nil "-bind=~A=onion" addr) (format nil "-whitebind=noban@~A" addr))
+                          (list (format nil "-whitebind=noban@~A" addr) (format nil "-whitebind=noban@~A" addr))))
+        (is (equal (format nil "Duplicate binding configuration for address ~A. ~
+Please check your -bind, -bind=...=onion and -whitebind settings." addr)
+                   (apply #'refusal pair))
+            "~S was accepted" pair))
+      ;; Positive controls: the same options on two DIFFERENT addresses are a
+      ;; legitimate configuration, and so is one option alone.
+      (is-false (refusal (format nil "-bind=~A" addr) (format nil "-bind=~A" other)))
+      (is-false (refusal (format nil "-bind=~A" addr) (format nil "-bind=~A=onion" other)))
+      (is-false (refusal (format nil "-bind=~A" addr)))
+      ;; A -bind with no port takes the chain's default port, and the =onion
+      ;; default is that port + 1, so the pair does NOT collide.
+      (is-false (refusal "-bind=127.0.0.1" "-bind=127.0.0.1=onion"))
+      ;; but two portless -binds name the same socket twice.
+      (is (equal (format nil "Duplicate binding configuration for address 127.0.0.1:18444. ~
+Please check your -bind, -bind=...=onion and -whitebind settings.")
+                 (refusal "-bind=127.0.0.1" "-bind=127.0.0.1"))))))
+
 (test bind-or-whitebind-with-listen-0-is-an-init-error
   "GA10 3911beba. `nUserBind != 0 && !GetBoolArg(\"-listen\", DEFAULT_LISTEN)`
 => InitError(\"Cannot set -bind or -whitebind together with -listen=0\")
