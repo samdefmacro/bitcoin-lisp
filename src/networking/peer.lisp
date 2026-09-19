@@ -168,9 +168,12 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; enqueues under the same lock from RPC threads, and the flush
   ;; (flush-tx-announcements) takes it too.
   (tx-inv-queue '() :type list)
-  ;; internal-real-time deadline of the next inv flush for this peer
-  ;; (outbound peers only — inbound peers share one rotation, see
-  ;; *next-inbound-inv-flush*). 0 = not yet scheduled.
+  ;; Unix-time deadline of the next inv flush for this peer, on Core's
+  ;; MOCKABLE clock -- Core's m_next_inv_send_time comes from
+  ;; GetTime<microseconds>(), which setmocktime moves, and that is how the
+  ;; functional tests make a trickle fire without sleeping (outbound peers
+  ;; only; inbound peers share one rotation, see *next-inbound-inv-flush*).
+  ;; 0 = not yet scheduled.
   (next-inv-send-time 0 :type integer)
   ;; Health monitoring
   ;; Block delivery tracking.

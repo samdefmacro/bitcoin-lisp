@@ -2293,6 +2293,38 @@ Send errors from the connectionless peer are swallowed."
                (bl.net:peer-announced-txs peer) txid)
               "a wtxidrelay peer's filter is keyed by wtxid, not txid")))
 
+(test the-tx-trickle-timer-runs-on-cores-mockable-clock
+  "Core schedules both inv rotations from GetTime<microseconds>()
+(net_processing.cpp:5980-5990, m_next_inv_send_time and NextInvToInbounds),
+which is the MOCKABLE clock: setmocktime moves it, and that is how the
+functional framework makes a trickle fire without sleeping.
+
+Ours scheduled from GET-INTERNAL-REAL-TIME, a process-relative counter
+setmocktime cannot touch, so the deadline was unreachable by any amount of
+mocked time. mempool_persist.py:220 and mempool_reorg.py:111 bump the clock and
+expect the announcement.
+
+Driving the mock clock forward past the deadline must drain the queue; the
+control is the same peer with the clock left where it was."
+  (let* ((bl:*network* :regtest)
+         (bl.ser:*mock-time* 1700000000)
+         (peer (bl.net:make-peer :state :ready))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 31)))
+    (bl.net:relay-transaction txid nil (list peer) :fee-rate-per-kvb 2)
+    ;; Arm pass: the timer is set, nothing flushed.
+    (bl.net:flush-tx-announcements (list peer) nil)
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
+        "the arming pass must not flush")
+    ;; Control: time has not moved, so neither has the schedule.
+    (bl.net:flush-tx-announcements (list peer) nil)
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
+        "control: a pass at the same mocked time must not flush either")
+    ;; setmocktime forward, well past the 2s outbound mean.
+    (setf bl.ser:*mock-time* (+ bl.ser:*mock-time* 600))
+    (bl.net:flush-tx-announcements (list peer) nil)
+    (is (null (bl.net:peer-tx-inv-queue peer))
+        "the trickle did not fire after the mock clock moved past its deadline")))
+
 (test flush-drops-feefiltered-entries
   "A queued announcement below the peer's BIP133 feefilter is dropped at
 flush time — neither sent nor marked announced (Core skips it out of

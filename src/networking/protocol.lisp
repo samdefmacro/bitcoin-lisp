@@ -3580,14 +3580,32 @@ forever."
        (+ +inv-broadcast-target+ (* 5 (floor queue-length 1000)))))
 
 (defvar *next-inbound-inv-flush* 0
-  "internal-real-time deadline of the shared inbound inv rotation
-(Core NextInvToInbounds — one timer for all inbound peers).")
+  "Unix-time deadline of the shared inbound inv rotation, on Core's MOCKABLE
+clock (Core NextInvToInbounds — one timer for all inbound peers).")
 
 (defun %next-exp-interval-ticks (mean-seconds)
   "Ticks until the next event of a Poisson process with MEAN-SECONDS
-(Core rand_exp_duration): -mean * ln(U), U uniform in (0,1]."
+(Core rand_exp_duration): -mean * ln(U), U uniform in (0,1]. Still on
+INTERNAL-REAL-TIME, for the addr-relay timers whose Core counterparts read the
+steady clock; the tx-inv rotations use %NEXT-EXP-INTERVAL-SECONDS."
   (round (* mean-seconds internal-time-units-per-second
             (- (log (- 1.0d0 (random 1.0d0)))))))
+
+(defun %next-exp-interval-seconds (mean-seconds)
+  "Whole seconds until the next event of a Poisson process with MEAN-SECONDS
+(Core rand_exp_duration): -mean * ln(U), U uniform in (0,1], rounded UP so a
+schedule always advances on a one-second clock. Core measures the same draw in
+microseconds; the flush pass runs about once a second either way, so the extra
+resolution buys nothing here and a deadline equal to now would flush on every
+pass."
+  (max 1 (ceiling (* mean-seconds (- (log (- 1.0d0 (random 1.0d0))))))))
+
+(defun %inv-deadline-unreachable-p (deadline now mean-seconds)
+  "T when DEADLINE can no longer be reached because the clock moved BACKWARDS
+under it -- setmocktime hands the node a base far in the past, and a gate
+written `now >= deadline' then never opens again. Re-armed rather than trusted;
+Core recomputes its schedule from current_time on every SendMessages pass."
+  (and (plusp deadline) (> (- deadline now) (* 10 mean-seconds))))
 
 (defun relay-transaction (txid source-peer peers &key fee-rate-per-kvb wtxid)
   "Queue a newly-accepted transaction for announcement to all connected
@@ -3976,16 +3994,18 @@ Holds the node lock: the queues are also written by the RPC broadcast
 path (sendrawtransaction/submitpackage), which enqueues under the same
 lock from RPC handler threads."
   (with-current-node-lock
-    (let ((now (get-internal-real-time))
+    (let ((now (bl.ser:get-unix-time))
           (inbound-due nil))
       ;; Shared inbound rotation.
-      (cond ((zerop *next-inbound-inv-flush*)
+      (cond ((or (zerop *next-inbound-inv-flush*)
+                 (%inv-deadline-unreachable-p *next-inbound-inv-flush* now
+                                              +inbound-inv-broadcast-interval+))
              (setf *next-inbound-inv-flush*
-                   (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+))))
+                   (+ now (%next-exp-interval-seconds +inbound-inv-broadcast-interval+))))
             ((>= now *next-inbound-inv-flush*)
              (setf inbound-due t
                    *next-inbound-inv-flush*
-                   (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+)))))
+                   (+ now (%next-exp-interval-seconds +inbound-inv-broadcast-interval+)))))
       (dolist (peer peers)
         (when (and (eq (peer-state peer) :ready)
                    ;; fRelay=0 peers have no tx-relay state: no inv flushes,
@@ -3995,13 +4015,16 @@ lock from RPC handler threads."
           (if (peer-inbound peer)
               (when inbound-due
                 (%flush-peer-tx-invs peer mempool))
-              (cond ((zerop (peer-next-inv-send-time peer))
+              (cond ((or (zerop (peer-next-inv-send-time peer))
+                         (%inv-deadline-unreachable-p
+                          (peer-next-inv-send-time peer) now
+                          +outbound-inv-broadcast-interval+))
                      (setf (peer-next-inv-send-time peer)
-                           (+ now (%next-exp-interval-ticks
+                           (+ now (%next-exp-interval-seconds
                                    +outbound-inv-broadcast-interval+))))
                     ((>= now (peer-next-inv-send-time peer))
                      (setf (peer-next-inv-send-time peer)
-                           (+ now (%next-exp-interval-ticks
+                           (+ now (%next-exp-interval-seconds
                                    +outbound-inv-broadcast-interval+)))
                      (%flush-peer-tx-invs peer mempool)))))))))
 
