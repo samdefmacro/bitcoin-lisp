@@ -112,7 +112,7 @@ throughout."
       (log-error "ZMQ: could not create a PUB socket for ~A: ~A" topic (%zmq-strerror))
       (return-from %zmq-open-publisher nil))
     (%zmq-setsockopt-int socket +zmq-sndhwm+ hwm)
-    (let ((rc (cffi:with-foreign-string (a address)
+    (let ((rc (cffi:with-foreign-string (a (%zmq-bind-endpoint address))
                 (cffi:foreign-funcall "zmq_bind" :pointer socket :pointer a :int))))
       (when (minusp rc)
         (log-error "ZMQ: could not bind ~A to ~A: ~A" topic address (%zmq-strerror))
@@ -121,6 +121,26 @@ throughout."
         (return-from %zmq-open-publisher nil)))
     (log-info "ZMQ: publishing ~A to ~A (hwm ~D)" topic address hwm)
     (make-zmq-publisher :topic topic :address address :socket socket :hwm hwm)))
+
+(defun %zmq-bind-endpoint (address)
+  "ADDRESS as libzmq's zmq_bind spells it.
+
+Core documents a unix socket for -zmqpub* as `unix:<path>' (doc/zmq.md:87) and
+interface_zmq.py:148 starts the node with exactly that spelling while its own
+subscribers connect to `ipc://<path>' -- the same socket file under the two
+names. libzmq 4.3.5 in this image binds only the `ipc://' one and answers
+EINVAL for the other, so every unix-socket publisher failed to bind and the
+node published nothing at all: interface_zmq's ipc half never received a
+single notification and timed out.
+
+Only the PREFIX is rewritten; the address is kept as configured everywhere
+else, so the log line and getzmqnotifications report what the operator wrote,
+as Core's do."
+  (if (and (stringp address)
+           (>= (length address) 5)
+           (string= "unix:" (subseq address 0 5)))
+      (concatenate 'string "ipc://" (subseq address 5))
+      address))
 
 (defun zmq-start-publishers (specs)
   "Start a publisher per entry of SPECS, a list of (topic address hwm).

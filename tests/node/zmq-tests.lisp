@@ -339,6 +339,41 @@ nothing to bind and the option is silently inert."
     (is (equal '(("hashblock" "tcp://127.0.0.1:28332" 7))
                bl::*zmq-publisher-specs*))))
 
+(test zmq-binds-a-unix-socket-address-spelled-cores-way
+  "Core documents a unix socket for -zmqpub* as `unix:<path>' (doc/zmq.md:87),
+and interface_zmq.py:148 starts the node with that spelling while its own
+subscribers connect to `ipc://<path>' -- one socket file under two names.
+libzmq binds only the `ipc://' spelling here and answers EINVAL for the other,
+so every unix-socket publisher failed to bind: the node published nothing and
+the test's ipc half received no notification at all.
+
+Only the prefix is rewritten, and only for the bind: the configured address is
+what the log line and getzmqnotifications report, as in Core."
+  (multiple-value-bind (address path) (%zmq-test-address "unix-spelling")
+    (declare (ignore address))
+    (let ((configured (format nil "unix:~A" path)))
+      (unwind-protect
+           (progn
+             (is (= 1 (bl:zmq-start-publishers (list (list "hashblock" configured 1000))))
+                 "a unix:<path> publisher must bind")
+             ;; Reported as configured, not as rewritten.
+             (is (equal (list (list "pubhashblock" configured 1000))
+                        (bl:zmq-notifications-info)))
+             ;; And it really publishes: an independent subscriber on the
+             ;; ipc:// spelling of the same path reads the frame.
+             (let* ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element #xcd))
+                    (lines (%zmq-collect (format nil "ipc://~A" path) "hashblock" 1
+                                         (lambda () (bl::zmq-notify-hash-block hash)))))
+               (is (= 1 (length lines))
+                   "nothing arrived on the socket the operator named")))
+        (bl:zmq-stop-publishers)
+        (ignore-errors (delete-file path))))
+    ;; Controls: every other spelling is passed through untouched.
+    (is (equal "tcp://127.0.0.1:28332"
+               (bl::%zmq-bind-endpoint "tcp://127.0.0.1:28332")))
+    (is (equal "ipc:///tmp/x.sock" (bl::%zmq-bind-endpoint "ipc:///tmp/x.sock")))))
+
 (test zmq-rawtx-is-cores-with-witness-serialization
   "Core publishes rawtx as TX_WITH_WITNESS (zmqpublishnotifier.cpp:251), the
 same encoding every RPC hex field uses. Ours published the LEGACY bytes, so a
