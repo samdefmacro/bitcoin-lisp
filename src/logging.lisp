@@ -160,6 +160,36 @@ match on the rendered line:
                        (concatenate 'string (if has-category ":" "")
                                     (log-level-name level))))))))
 
+(defconstant +unix-epoch-universal-time+ 2208988800
+  "Universal time at the unix epoch. Spelled here rather than taken from
+BL.SER because the logging system loads long before serialization does.")
+
+(defun %log-timestamp ()
+  "The line's timestamp, from ONE reading of the wall clock.
+
+Core's LogTimestampStr formats a single GetTime<microseconds>()
+(FormatISO8601DateTime, logging.cpp), so its seconds and its microseconds
+cannot disagree. Ours took the date and seconds from GET-DECODED-TIME and the
+microseconds from GET-INTERNAL-REAL-TIME -- a process-relative counter with no
+relation to the wall clock, whose fraction is therefore uniform noise inside
+any given second. Consecutive lines ran backwards: a functional-test node's
+debug.log on 2026-09-19 has `03:05:04.964001' immediately followed by
+`03:05:04.021000'. debug.log is read in order, by people and by the test
+framework's assert_debug_log alike.
+
+GET-TIME-OF-DAY is gettimeofday(2): both halves come out of it together."
+  (multiple-value-bind (unix-sec usec)
+      #+sbcl (sb-ext:get-time-of-day)
+      #-sbcl (values (- (get-universal-time) +unix-epoch-universal-time+) 0)
+    (multiple-value-bind (sec min hour day month year)
+        (decode-universal-time (+ unix-sec +unix-epoch-universal-time+))
+      (if *log-time-micros*
+          ;; Core's -logtimemicros appends .%06d.
+          (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D.~6,'0D"
+                  year month day hour min sec usec)
+          (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
+                  year month day hour min sec)))))
+
 (defun format-log-entry (level format-string args &optional category)
   "Format a log entry and return the string.
 
@@ -171,20 +201,7 @@ how the fd>1023 select() failure reported itself on mainnet (2026-08-18): the
 diagnostic written to catch it logged `... with a non-I/O error: The' and put
 `value 3119 is not of type (UNSIGNED-BYTE 10)' in nine further lines, so a grep
 for the message returned nothing usable."
-  (let ((timestamp (multiple-value-bind (sec min hour day month year)
-                       (get-decoded-time)
-                     (if *log-time-micros*
-                         ;; Core's -logtimemicros appends .%06d. INTERNAL-REAL-TIME
-                         ;; is the only sub-second clock here; its fraction is what
-                         ;; distinguishes two lines inside one second, which is all
-                         ;; the flag is for.
-                         (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D.~6,'0D"
-                                 year month day hour min sec
-                                 (mod (round (* (get-internal-real-time)
-                                                (/ 1000000 internal-time-units-per-second)))
-                                      1000000))
-                         (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
-                                 year month day hour min sec)))))
+  (let ((timestamp (%log-timestamp)))
     (%log-escape-message
      (let ((*print-pretty* nil))
        (format nil "[~A] ~@[[~A] ~]~A~?"

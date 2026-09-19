@@ -214,6 +214,47 @@ and then DROPPED, so every categorized line came out as an untagged debug line
       (when entry
         (is-true (search "[net] a categorized line" entry))))))
 
+(test log-timestamps-do-not-go-backwards
+  "Every line's timestamp came from TWO clock readings: GET-DECODED-TIME for
+the date and seconds, and GET-INTERNAL-REAL-TIME -- a process-relative counter
+with no relation to the wall clock -- for the microseconds. The two are
+unrelated, so inside one second the sub-second field is effectively random and
+consecutive lines run backwards. Observed in a functional-test node's debug.log
+on 2026-09-19: `03:05:04.964001' immediately followed by `03:05:04.021000'.
+
+Core's LogTimestampStr formats ONE reading (FormatISO8601DateTime of
+GetTime<microseconds>(), logging.cpp), so its seconds and microseconds always
+agree; debug.log is read by people and by test frameworks in order.
+
+Sampling consecutive lines does not test this: within one wall second the old
+field HAPPENS to rise, and it only jumps when a second boundary or the
+counter's own wrap falls between two lines -- a coin flip, and a flaky test.
+What is always true of one reading and never of two is that the line's
+microseconds AGREE with the wall clock read immediately afterwards. Twenty
+samples, each within 100 ms; on the old field each sample agrees with
+probability about 0.2, so twenty of them is not luck."
+  (let ((bl.log:*current-log-level* :debug)
+        (bl.log:*log-time-micros* t)
+        (bl.log:*log-file-stream* nil))
+    (let ((stamps '())
+          (disagreements '()))
+      (dotimes (i 20)
+        (let* ((line (first (capture-log-lines
+                             (lambda () (bl:log-info "stamp ~D" i)))))
+               (now-usec (nth-value 1 (sb-ext:get-time-of-day)))
+               (stamp (subseq line 1 27))
+               (line-usec (parse-integer stamp :start 20 :end 26))
+               ;; Circular distance: the two readings can straddle a second.
+               (delta (min (mod (- now-usec line-usec) 1000000)
+                           (mod (- line-usec now-usec) 1000000))))
+          (push stamp stamps)
+          (when (> delta 100000)
+            (push (list stamp now-usec) disagreements))))
+      (is (= 20 (length stamps)))
+      (is (null disagreements)
+          "the sub-second field does not come from the clock the seconds do: ~S"
+          disagreements))))
+
 (test unsupported-logging-category-uses-cores-wording
   "feature_logging.py matches this as a FULL regex, so the wording is the
 contract: 'Error: Unsupported logging category -debug=abc.' — trailing period
