@@ -857,3 +857,68 @@ undo window."
                                                           (nth 5 block-hashes)))
                                     undo-dir)))))
         (cleanup-test-dir base-path)))))
+
+(test an-index-past-the-pruned-data-stops-startup
+  "Core verifies, before it starts ANY index, that every block from each
+index's sync position up to the tip is on disk -- with undo data for the
+indexes whose CustomOptions set connect_undo_data -- and turns a gap into an
+InitError naming the index (init.cpp:2314-2382). StartIndexBackgroundSync
+then returns false and its caller reports the fatal error that stops the node
+(:2040-2043), so stderr carries BOTH lines:
+
+  Error: basic block filter index best block of the index goes beyond pruned
+  data (including undo data). Please disable the index or reindex (which will
+  download the whole blockchain again)
+  Error: A fatal internal error occurred, see debug.log for details: Failed
+  to start indexes, shutting down...
+
+Ours synced as far as it could and logged a warning, so the node started and
+ran with an index silently stuck. feature_index_prune.py:154-159 prunes past
+three nodes' indexes and restarts each one expecting exactly that pair of
+lines; ours ran out the framework's 60-second wait.
+
+The two sentences differ only in naming undo data, which is why the index's
+own connect_undo_data decides between them: block and undo data are pruned
+together here, but Core reports them apart."
+  (flet ((refuse (index tip pruned)
+           ;; Returns (values error-text stderr-text).
+           (let* ((node (make-test-node))
+                  (cs (bl:node-validated-chainstate node))
+                  (err (make-string-output-stream)))
+             (bl.store:update-chain-tip
+              cs (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 9)
+              tip)
+             (setf (bl.store:chain-state-pruned-height cs) pruned)
+             (let ((*error-output* err))
+               (values (handler-case
+                           (progn (bl::%refuse-index-beyond-pruned-data node index)
+                                  nil)
+                         (error (e) (princ-to-string e)))
+                       (get-output-stream-string err))))))
+    ;; An index that has indexed nothing (height -1) on a node that has
+    ;; pruned past genesis: refused, and named.
+    (multiple-value-bind (text stderr)
+        (refuse (bl.store:make-blockfilterindex) 2000 1800)
+      (is-true text "a filter index past the pruned data did not stop startup")
+      (is-true (and text (search "Failed to start indexes, shutting down" text))
+               "the fatal line is not Core's: ~S" text)
+      (is-true (search "Error: basic block filter index best block of the index goes beyond pruned data (including undo data). Please disable the index or reindex (which will download the whole blockchain again)"
+                       stderr)
+               "stderr did not carry Core's index line: ~S" stderr))
+    ;; A block-only index gets the sentence WITHOUT the undo clause.
+    (multiple-value-bind (text stderr)
+        (refuse (bl.store:make-tx-index) 2000 1800)
+      (is-true text "a txindex past the pruned data did not stop startup")
+      (is-true (search "Error: txindex best block of the index goes beyond pruned data. Please disable the index or reindex (which will download the whole blockchain again)"
+                       stderr)
+               "stderr did not carry Core's block-only line: ~S" stderr))
+    ;; CONTROLS. Nothing pruned: an index at -1 still has genesis to start
+    ;; from, so a node with an index and no pruning starts.
+    (is-false (refuse (bl.store:make-blockfilterindex) 2000 0)
+              "an unpruned node refused to start its index")
+    ;; An empty chain is skipped outright (Core `if (current_height > 0)'):
+    ;; a first start with -prune and an index has indexed nothing and pruned
+    ;; nothing, and must not be refused.
+    (is-false (refuse (bl.store:make-blockfilterindex) 0 1800)
+              "a node with an empty chain refused to start its index")))

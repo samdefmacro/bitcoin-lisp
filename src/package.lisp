@@ -146,6 +146,7 @@ init.cpp, node/. src/node/.")
    #:node-main
    #:notify-block-tip
    #:run-notify-command
+   #:report-init-error
    #:+node-exit-clean+
    #:+node-exit-error+
    #:+node-exit-watchdog+

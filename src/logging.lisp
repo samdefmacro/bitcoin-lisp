@@ -48,6 +48,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:node-log
    #:reset-warnings
    #:run-notify-command
+   #:report-init-error
    #:set-kernel-warning
    #:set-warning
    #:trace-thread
@@ -683,6 +684,24 @@ many times we looked at it."
       (ecase (first line)
         (:info (log-info "~A" (second line)))
         (:warn (log-warn "~A" (second line)))))))
+
+(defun report-init-error (control &rest args)
+  "Print one startup refusal the way Core's noui prints an InitError: the
+message under an `Error: ' caption, on stderr (noui.cpp:29-31). Logs it too,
+because Core's InitError goes to the log as well.
+
+Unlike signalling an INIT-ERROR this does NOT end the process, which is the
+whole reason it exists: Core reports some refusals in two lines, the specific
+complaint and then the fatal error that actually stops the node -- an index
+whose best block is past the pruned data is reported at init.cpp:2366-2381
+and stopped at :2040-2043 -- and a functional test compares the WHOLE of
+stderr against both."
+  (let ((message (apply #'format nil control args)))
+    (log-error "~A" message)
+    (ignore-errors
+      (format *error-output* "Error: ~A~%" message)
+      (finish-output *error-output*))
+    message))
 
 (defun run-notify-command (command &key value substitutions (wait nil) (check t))
   "Run COMMAND through the shell. VALUE is shorthand for a single %s

@@ -1810,12 +1810,12 @@ message full of shell syntax comes out as one quoted word that runs nothing."
   ;; check; the RAW path is now the reference's own character class, so a
   ;; non-ASCII letter is escaped rather than handed to the shell on a claim
   ;; about Unicode that this code never examined.
-  (is (equal "echo deadbeef"
-             (bl.log::%notify-substitute "echo %s" (list (cons #\s "deadbeef")))))
-  (is (equal (format nil "echo 'caf~A'" (code-char 233))
-             (bl.log::%notify-substitute
-              "echo %w"
-              (list (cons #\w (format nil "caf~A" (code-char 233))))))))
+  (flet ((sub (command &rest pairs)
+           (bl.log::%notify-substitute command pairs)))
+    (is (equal "echo deadbeef" (sub "echo %s" (cons #\s "deadbeef"))))
+    (is (equal (format nil "echo 'caf~A'" (code-char 233))
+               (sub "echo %w"
+                    (cons #\w (format nil "caf~A" (code-char 233))))))))
 
 (test notify-commands-reach-the-plist
   "-shutdownnotify is repeatable — Core reads it with GetArgs and joins EVERY

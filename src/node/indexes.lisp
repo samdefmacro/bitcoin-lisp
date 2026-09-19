@@ -77,6 +77,70 @@ unavailable."
                   (return)))))
     done))
 
+(defvar *index-start-check* nil
+  "When T, CATCH-UP-INDEX refuses an index whose sync would need block data
+this node no longer has, instead of syncing as far as it can.
+
+Core asks that question once, in StartIndexBackgroundSync, before any index
+starts (init.cpp:2314-2382); everywhere else -- the restart after an
+assumeutxo promotion -- an index simply resumes. Binding it at the start-up
+call site rather than testing it inside keeps both callers of CATCH-UP-INDEX
+spelled the way they are, including the one a structural test names.")
+
+(defun %index-connects-undo-data-p (index)
+  "T when INDEX needs each block's undo data to index it -- Core's
+IndexOptions::connect_undo_data, set by the filter index
+(index/blockfilterindex.cpp:95) and coinstatsindex (:320) and left false by
+the txindex and the spender index. It decides which of Core's two refusals
+an unreachable start height gets, because block data and undo data are
+pruned together but reported apart."
+  (typep index '(or bl.store:blockfilterindex bl.store:coinstatsindex)))
+
+(defun %lowest-block-on-disk (chainstate)
+  "The lowest height whose block body is still on disk. Our prune cursor names
+the highest height that has been REMOVED, so nothing pruned (0) still leaves
+genesis in place."
+  (let ((pruned (bl.store:chain-state-pruned-height chainstate)))
+    (if (plusp pruned) (1+ pruned) 0)))
+
+(defun %refuse-index-beyond-pruned-data (node index)
+  "Stop start-up when INDEX would have to read blocks this node has pruned.
+
+Core verifies, before it starts ANY index, that every block from each index's
+sync position up to the tip is on disk -- with undo data for the indexes that
+need it -- and turns a gap into an InitError naming the index
+(init.cpp:2366-2381). StartIndexBackgroundSync then returns false and its
+caller reports the fatal error that stops the node (:2040-2043). An index
+whose best block is below the prune horizon has nothing to resume from: the
+blocks it still has to read are gone and will not come back.
+
+Ours synced as far as it could and logged a warning, so a node in that state
+started and ran with an index silently stuck, which is the state
+feature_index_prune.py:154-159 restarts three nodes to refuse.
+
+Core skips the check entirely while the chain is empty (`if (current_height >
+0)', :2321), and so must this: a fresh pruned datadir has indexed nothing and
+pruned nothing, and refusing there would stop every first start with
+-prune and an index."
+  (let* ((cs (node-validated-chainstate node))
+         (tip (bl.store:current-height cs)))
+    (when (plusp tip)
+      (let ((next-needed (1+ (bl.store:index-height index cs)))
+            (lowest (%lowest-block-on-disk cs)))
+        (when (< next-needed lowest)
+          (let ((name (bl.store:index-name index)))
+            ;; Core's two sentences differ only in naming undo data, and each
+            ;; goes out as its own InitError line before the fatal one.
+            (report-init-error
+             (if (%index-connects-undo-data-p index)
+                 "~A best block of the index goes beyond pruned data (including undo data). Please disable the index or reindex (which will download the whole blockchain again)"
+                 "~A best block of the index goes beyond pruned data. Please disable the index or reindex (which will download the whole blockchain again)")
+             name)
+            (init-error
+             "A fatal internal error occurred, see debug.log for details: ~
+Failed to start indexes, shutting down~A"
+             (code-char 8230))))))))
+
 (defun catch-up-index (node index)
   "Catch INDEX up to NODE's validated chainstate tip (Core BaseIndex::Sync):
 make its best marker trustworthy (INDEX-PREPARE-SYNC), then backfill the
@@ -87,6 +151,8 @@ exists, and the promoted snapshot chainstate after assumeutxo completion.
 Shared by startup and the post-promotion index rebind. Synchronous, unlike
 Core's background BaseIndex thread. Returns what INDEX-SYNC returned, or NIL
 when there was nothing to do."
+  (when *index-start-check*
+    (%refuse-index-beyond-pruned-data node index))
   (let* ((cs (node-validated-chainstate node))
          (tip (bl.store:current-height cs))
          (name (bl.store:index-name index)))

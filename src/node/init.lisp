@@ -1314,8 +1314,15 @@ it; the indexes (Step 8) and -forcecompactdb."
 
   ;; Step 8 of Core's init (indexes): open every enabled index and catch it
   ;; up over the blocks already on disk before the sync thread starts.
-  (%start-indexes txindex blockfilterindex txospenderindex coinstatsindex
-                  reindex reindex-chainstate)
+  ;;
+  ;; *INDEX-START-CHECK* is Core's StartIndexBackgroundSync data-availability
+  ;; gate (init.cpp:2314-2382), which runs HERE and nowhere else: an index
+  ;; whose sync would need blocks this node has pruned stops start-up instead
+  ;; of syncing as far as it can. The post-promotion index restart binds it
+  ;; nowhere, so that path keeps resuming, as Core's does.
+  (let ((*index-start-check* t))
+    (%start-indexes txindex blockfilterindex txospenderindex coinstatsindex
+                    reindex reindex-chainstate))
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
   ;; run), full-compact them to reclaim tombstone space -- e.g. the ~24M delete
