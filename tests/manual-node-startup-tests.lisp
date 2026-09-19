@@ -252,3 +252,47 @@ restart refused to start."
             "a healthy spending chain failed verification at level ~D" level)))
     (bl:stop-node)))
 
+
+(test a-tip-record-the-index-cannot-place-restarts-at-genesis
+  "Core keeps NO tip record outside blocks/: its chain tip IS the block index,
+so a node whose blocks/ and chainstate/ are both deleted starts from genesis.
+wallet_hd.py:73-79 deletes exactly those two and restarts the node over a
+restored wallet backup.
+
+Our chainstate.dat sits at the network-directory root and survived that
+deletion, so the node came back claiming the old height over an EMPTY block
+index: every locator it built named blocks it did not have, and the wallet's
+cross-chain guard refused the restored wallet as another chain's.
+
+The first restart is the control: with the directories intact the recorded tip
+is still the tip."
+  (%with-temporary-node (base "test-tip-no-index")
+    (%start-test-node :data-directory base :network :regtest :sync nil
+                      :rpc-port nil :listen nil :console-log nil)
+    (generate-regtest-blocks bl:*node* 8)
+    (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*))))
+    (bl:stop-node)
+    ;; Control: an ordinary restart keeps the tip.
+    (bl.net:reset-ibd-stop)
+    (%start-test-node :data-directory base :network :regtest :sync nil
+                      :rpc-port nil :listen nil :console-log nil)
+    (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*)))
+        "the control restart must keep the recorded tip")
+    (bl:stop-node)
+    ;; Now the wallet_hd.py shape: the two directories go, chainstate.dat stays.
+    (let ((network-dir (merge-pathnames "regtest/" base)))
+      (uiop:delete-directory-tree (merge-pathnames "blocks/" network-dir)
+                                  :validate t :if-does-not-exist :ignore)
+      (uiop:delete-directory-tree (merge-pathnames "chainstate/" network-dir)
+                                  :validate t :if-does-not-exist :ignore)
+      (is-true (probe-file (merge-pathnames "chainstate.dat" network-dir))
+               "the fixture must leave chainstate.dat behind"))
+    (bl.net:reset-ibd-stop)
+    (%start-test-node :data-directory base :network :regtest :sync nil
+                      :rpc-port nil :listen nil :console-log nil)
+    (let ((cs (bl:node-chain-state bl:*node*)))
+      (is (= 0 (bl.store:current-height cs))
+          "the node came up claiming a height its block index cannot place")
+      (is (equalp (bl.store:chain-state-genesis-hash cs)
+                  (bl.store:best-block-hash cs))))
+    (bl:stop-node)))

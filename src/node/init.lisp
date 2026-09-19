@@ -924,6 +924,34 @@ startup refusal rather than a directory we create somewhere else."
   ;; orphaned. See %ENSURE-GENESIS-INDEX-ENTRY.
   (%ensure-genesis-index-entry network)
 
+  ;; A recorded tip the block index cannot place is not a tip. Core keeps NO
+  ;; tip record outside blocks/ -- its chain tip IS the block index -- so a
+  ;; node whose blocks/ and chainstate/ are both gone starts from genesis;
+  ;; wallet_hd.py:73-79 deletes exactly those two and restarts. Our
+  ;; chainstate.dat sits at the network-directory root and survives, so the
+  ;; node came back claiming a height over an EMPTY index: every block locator
+  ;; it built named blocks it did not have, and the wallet's cross-chain guard
+  ;; refused the restored wallet as belonging to another chain.
+  ;;
+  ;; Only when the UTXO set is empty too. A tip the index cannot place OVER A
+  ;; POPULATED coins database is the other failure -- blocks/index removed,
+  ;; coins kept -- which Core reports as "Error initializing block database"
+  ;; and RECONCILE-COINS-DB-BEST-BLOCK already refuses to paper over.
+  (let* ((chain-state (node-chain-state *node*))
+         (tip (bl.store:best-block-hash chain-state))
+         (view (bl.store:chain-state-coins-view chain-state)))
+    (when (and tip
+               (not (equalp tip (bl.store:chain-state-genesis-hash chain-state)))
+               (null (bl.store:get-block-index-entry chain-state tip))
+               (typep view 'bl.store:coins-view-cache)
+               (bl.store:coins-view-empty-p view))
+      (log-warn "chainstate.dat names tip ~A at height ~D, which the block index does not hold, and the UTXO set is empty; starting from genesis"
+                (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes tip))
+                (bl.store:current-height chain-state))
+      (bl.store:update-chain-tip chain-state
+                                 (bl.store:chain-state-genesis-hash chain-state)
+                                 0)))
+
   ;; -reindex: rebuild the block index from the block files before anything
   ;; reads it. Runs AFTER the header index load so an intact index is simply
   ;; extended rather than discarded — reindexing is additive, and a node that
