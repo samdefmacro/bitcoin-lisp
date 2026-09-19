@@ -24,6 +24,27 @@
 ;;;; EMPTY datadir to a node that has one: on mainnet that means discarding a
 ;;;; synced chain and starting IBD from genesis. The same reasoning already
 ;;;; governs the network-subdirectory choice in node/datadir.lisp.
+;;;;
+;;;; Audited against Core d3056bc, path by path. Every NAME now agrees:
+;;;; blocks/ with blkNNNNN.dat, revNNNNN.dat and xor.dat; blocks/index/
+;;;; (init.cpp:1140); chainstate/ (validation.cpp:1873) with its snapshot
+;;;; sibling chainstate_snapshot/ (utxo_snapshot.h:128) and the _INVALID
+;;;; (validation.cpp:6229) and _todelete (:6309) names the snapshot paths use;
+;;;; indexes/txindex/ (txindex.cpp:52); and the three nested databases below.
+;;;;
+;;;; Three differences that remain are FORMAT, not location, and are named
+;;;; here so the next audit does not re-derive them:
+;;;;
+;;;;   - blocks/index/ is a LevelDB in Core (init.cpp:1140 hands it DBParams);
+;;;;     ours is one flat headerindex.dat inside that directory.
+;;;;   - indexes/blockfilter/basic/ holds Core's fltrNNNNN.dat flat files
+;;;;     (blockfilterindex.cpp:89, FlatFileSeq "fltr"); we keep each filter in
+;;;;     the LevelDB instead, so this tree writes no fltr file at all.
+;;;;   - chainstate.dat (and chainstate_snapshot.dat) are ours alone: Core
+;;;;     keeps the equivalent inside the coins database.
+;;;;
+;;;; Core's own doc/files.md lists the spender index as indexes/txospenderindex/
+;;;; while txospenderindex.cpp:64 appends "db"; the code is what the node does.
 
 (defun %dir-has-content-p (path)
   "T when PATH names a directory that actually holds something.
