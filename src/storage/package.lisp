@@ -51,6 +51,7 @@ src/storage/.")
    #:datadir-index-path
    #:datadir-layout-report
    #:migrate-datadir-layout
+   #:migrate-index-db-subdirectory
    #:count-legacy-blocks
    #:prune-flat-block-file
    #:store-block

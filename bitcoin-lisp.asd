@@ -428,6 +428,7 @@ this same package."
                              (:file "networking/addrman-tests")
                              ;; Compact block relay tests (BIP 152)
                              (:file "networking/compact-block-tests")
+                             (:file "kv/datadir-tests")
                              (:file "kv/db-cache-tests")
                                (:file "structural-tests")
                              ;; ADDRv2 tests (BIP 155)

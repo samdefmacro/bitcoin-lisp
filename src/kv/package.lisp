@@ -72,6 +72,7 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
    #:make-obfuscation-key
    #:max-blockfile-size
    #:migrate-datadir-layout
+   #:migrate-index-db-subdirectory
    #:obfuscate!
    #:obfuscation-key-active-p
    #:parse-flat-record-header

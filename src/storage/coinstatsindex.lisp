@@ -151,9 +151,12 @@ hash was recorded."
 ;;; --- open/close ---
 
 (defun coinstatsindex-path (base-path)
-  "Core's indexes/coinstatsindex/, falling back to the flat coinstatsindex/
-this tree used before — see kv/datadir.lisp."
-  (datadir-index-path (pathname base-path) :coinstats))
+  "Core's indexes/coinstatsindex/db/ (index/coinstatsindex.cpp:106), falling
+back to the flat coinstatsindex/ this tree used before — see kv/datadir.lisp.
+
+:MIGRATE moves a database this tree left one level up, in coinstatsindex/
+itself, down into its db/ the first time such a datadir is opened."
+  (datadir-index-path (pathname base-path) :coinstats :migrate t))
 
 (defun init-coinstatsindex (base-path &key (enabled t) wipe)
   "Open (creating if needed) the coinstatsindex under BASE-PATH. It shares the

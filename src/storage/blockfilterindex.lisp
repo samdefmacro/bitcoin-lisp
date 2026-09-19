@@ -36,9 +36,13 @@
 
 (defun blockfilterindex-path (base-path)
   "Directory holding the block filter index LevelDB. Core's
-indexes/blockfilter/basic/, falling back to the flat blockfilterindex/ this
-tree used before — see kv/datadir.lisp."
-  (datadir-index-path (pathname base-path) :blockfilter))
+indexes/blockfilter/basic/db/ (index/blockfilterindex.cpp:88), falling back to
+the flat blockfilterindex/ this tree used before — see kv/datadir.lisp.
+
+:MIGRATE moves a database this tree left one level up, in basic/ itself, down
+into basic/db/ the first time such a datadir is opened; a populated index must
+not be rebuilt from genesis just because the name for it changed."
+  (datadir-index-path (pathname base-path) :blockfilter :migrate t))
 
 (defun init-blockfilterindex (base-path &key (enabled t) wipe)
   "Open (creating if needed) the block filter index under BASE-PATH.

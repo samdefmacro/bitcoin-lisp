@@ -81,8 +81,10 @@ startup rewind cost a silent wrong answer rather than one slow rebuild."
   (txospenderindex-remove-block index block block-hash))
 
 (defun txospenderindex-db-path (base-path)
-  "Directory of the spender index LevelDB (Core's indexes/txospenderindex/)."
-  (datadir-index-path (pathname base-path) :txospenderindex))
+  "Directory of the spender index LevelDB: Core's indexes/txospenderindex/db/
+(index/txospenderindex.cpp:64). :MIGRATE moves a database left in the index
+directory itself down into its db/ the first time such a datadir is opened."
+  (datadir-index-path (pathname base-path) :txospenderindex :migrate t))
 
 (defun %txospender-hash (index txid vout)
   "The salted 64-bit digest of the outpoint TXID:VOUT.
