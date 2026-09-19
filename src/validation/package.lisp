@@ -108,6 +108,7 @@ can. src/validation/.")
    #:activate-best-chain
    #:best-valid-tip
    #:get-undo-data
+   #:store-undo-data
    #:invalidate-block
    #:reconsider-block
    #:precious-block

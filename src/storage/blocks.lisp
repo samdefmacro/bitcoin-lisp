@@ -274,6 +274,19 @@ so undo records pack independently of how full the blk file is."
     (incf (block-store-total-bytes store) (length record))
     (make-flat-file-pos file (+ start +storage-header-bytes+))))
 
+(defun undo-flat-file-present-p (store file)
+  "T when rev<FILE>.dat is on disk.
+
+Core's UndoReadFromDisk opens the rev file its caller's nUndoPos names and
+FAILS when it cannot (blockstorage.cpp:1075-1096); DisconnectBlock turns that
+failure into DISCONNECT_FAILED, so a node whose rev file has been moved out of
+the way cannot disconnect the block at all. Nothing else in the store answers
+that question on its own -- READ-UNDO-FLAT needs the record's position and the
+previous block's hash as well -- and an in-memory undo cache that outlives the
+file would otherwise keep serving a record the node can no longer read."
+  (and (probe-file (flat-file-name (%rev-seq store) (make-flat-file-pos file 0)))
+       t))
+
 (defun read-undo-flat (store pos prev-block-hash)
   "The serialized CBlockUndo payload whose record header sits 8 bytes before
 POS, or NIL when the record is missing, mis-framed, or fails its checksum.

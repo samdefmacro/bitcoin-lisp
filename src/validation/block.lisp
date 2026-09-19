@@ -2715,17 +2715,51 @@ the legacy self-describing format is written."
   (when (> (hash-table-count *block-undo-data*) +max-undo-cache+)
     (evict-undo-cache)))
 
+(defun %named-undo-record-missing-p (block-hash)
+  "T when BLOCK-HASH's index entry NAMES a rev record (nUndoPos) whose rev file
+is not on disk.
+
+This is the half of Core's UndoReadFromDisk an in-memory cache can hide. Core
+has no undo cache at all: DisconnectBlock reads the record out of the rev file
+every time and turns a failed read into DISCONNECT_FAILED
+(blockstorage.cpp:1075-1096), so a node whose rev file has been moved out of
+the way cannot disconnect the block -- which is exactly what
+rpc_dumptxoutset.py:22-27 renames rev00000.dat to assert.
+
+Only the rev file is checked, because it is the only record that can go away
+behind the cache's back: the legacy per-block file has one deleter,
+DELETE-UNDO-FILE, and that clears the cache entry and the index positions in
+the same breath. A rev file that is still there but holds a CORRUPT record is
+caught where it always was, by the checksum in READ-UNDO-FLAT."
+  (let ((file (%undo-flat-file-number block-hash)))
+    (and file
+         (let ((entry (bl.store:get-block-index-entry
+                       *undo-chain-state* block-hash)))
+           (and entry (bl.store:block-index-entry-undo-pos entry) t))
+         (not (bl.store:undo-flat-file-present-p *undo-block-store* file)))))
+
 (defun get-undo-data (block-hash)
-  "Get undo data for a block. Checks the in-memory cache first, then disk.
-Disk loads are deliberately NOT cached: this read path (reorg disconnects,
+  "Get undo data for a block, as (VALUES SPENT-UTXOS READABLE-P).
+
+READABLE-P is Core's UndoReadFromDisk verdict, and it is not the same question
+as whether SPENT-UTXOS is empty: a coinbase-only block's record is legitimately
+an empty list, and a caller that must refuse a disconnect has to tell that apart
+from a record it cannot read at all. NIL means the block's index entry names a
+rev record that is no longer on disk.
+
+Otherwise the in-memory cache answers first, then disk. Disk loads are
+deliberately NOT cached: this read path (reorg disconnects,
 getdescriptoractivity, the block filter backfill) has no eviction hook --
 entries it used to stash in *block-undo-data* carried no *undo-cache-heights*
 record, so evict-undo-cache could never see them and they were live heap
 forever. A filter backfill over the whole testnet4 chain accumulated ~4.5 GiB
 of undo lists that way and exhausted the 6 GiB heap at ~72k blocks. Only
 store-undo-data (the connect path, which does the height bookkeeping) caches."
-  (or (gethash block-hash *block-undo-data*)
-      (load-undo-data-from-disk block-hash)))
+  (if (%named-undo-record-missing-p block-hash)
+      (values nil nil)
+      (values (or (gethash block-hash *block-undo-data*)
+                  (load-undo-data-from-disk block-hash))
+              t)))
 
 ;;;; Recently-confirmed transactions + most-recent-block tx set
 ;;;;
@@ -4254,27 +4288,36 @@ comment above."
         ;; block silently corrupts the UTXO set: it removes the outputs the
         ;; block created but never restores the coins it spent, surfacing later
         ;; as spurious MISSING-INPUT wedges or double-spend acceptance (this node
-        ;; has a documented history of corrupt undo files). get-undo-data returns
-        ;; nil for BOTH a corrupt/missing undo file AND a legitimate coinbase-only
-        ;; block (empty undo), so require undo only for tx-count > 1, mirroring
-        ;; %warn-if-undo-empty's exemption. Refuse with a DISTINCT keyword — NOT
-        ;; the missing-block list, which would (wrongly) tell the caller to
-        ;; re-download the to-CONNECT fork; a corrupt LOCAL disconnect-side undo
-        ;; is not fixed by fetching fork blocks. Core aborts DisconnectBlock on
-        ;; undo-read failure (DISCONNECT_FAILED) for the same reason.
+        ;; has a documented history of corrupt undo files). Core aborts
+        ;; DisconnectBlock on an undo-read failure (DISCONNECT_FAILED,
+        ;; validation.cpp:2181-2185 over blockstorage.cpp:1075-1096) for the
+        ;; same reason, and it makes no exception for a coinbase-only block:
+        ;; every connected block has a rev record, so a rev file that is gone
+        ;; fails the disconnect whatever the block holds. That is the first
+        ;; test below — GET-UNDO-DATA's second value. The second test is ours:
+        ;; where no record was ever written, an EMPTY undo list is
+        ;; indistinguishable from a lost one, so it is refused for a SPENDING
+        ;; block and allowed for a coinbase-only one, mirroring
+        ;; %warn-if-undo-empty's exemption. Refuse with a DISTINCT keyword —
+        ;; NOT the missing-block list, which would (wrongly) tell the caller to
+        ;; re-download the to-CONNECT fork; a corrupt LOCAL disconnect-side
+        ;; undo is not fixed by fetching fork blocks.
         (dolist (entry (reorg-to-disconnect r))
           (let* ((block-hash (bl.store:block-index-entry-hash entry))
                  (block (bl.store:get-block block-store block-hash)))
-            (when (and block
-                       (> (length (bl.ser:bitcoin-block-transactions
-                                   block))
-                          1)
-                       (null (get-undo-data block-hash)))
-              (bl:log-error
-               "REORG REFUSED: corrupt/missing undo for spending block ~A at height ~D — refusing rather than corrupting the UTXO set"
-               (bl.crypto:bytes-to-hex block-hash)
-               (bl.store:block-index-entry-height entry))
-              (return-from perform-reorg (values nil :corrupt-undo)))))
+            (when block
+              (multiple-value-bind (undo readable)
+                  (get-undo-data block-hash)
+                (when (or (not readable)
+                          (and (> (length (bl.ser:bitcoin-block-transactions
+                                           block))
+                                  1)
+                               (null undo)))
+                  (bl:log-error
+                   "REORG REFUSED: corrupt/missing undo for block ~A at height ~D — refusing rather than corrupting the UTXO set"
+                   (bl.crypto:bytes-to-hex block-hash)
+                   (bl.store:block-index-entry-height entry))
+                  (return-from perform-reorg (values nil :corrupt-undo)))))))
 
         (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                old-height fork-height new-height)

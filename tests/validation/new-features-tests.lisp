@@ -62,7 +62,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
            ;; Initialize undo storage
            (bl.val:initialize-undo-storage base-path)
            ;; Store
-           (bl.val::store-undo-data block-hash spent-utxos 500)
+           (bl.val:store-undo-data block-hash spent-utxos 500)
            ;; Clear in-memory cache to force disk load
            (clear-undo-cache)
            (clrhash bl.val::*undo-cache-heights*)
@@ -98,7 +98,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
     (unwind-protect
          (progn
            (bl.val:initialize-undo-storage base-path)
-           (bl.val::store-undo-data block-hash spent-utxos 501)
+           (bl.val:store-undo-data block-hash spent-utxos 501)
            ;; Should hit cache (not disk)
            (let ((loaded (bl.val:get-undo-data block-hash)))
              (is (not (null loaded)))
@@ -119,7 +119,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
     (unwind-protect
          (progn
            (bl.val:initialize-undo-storage base-path)
-           (bl.val::store-undo-data block-hash spent-utxos 503)
+           (bl.val:store-undo-data block-hash spent-utxos 503)
            (clear-undo-cache)
            (clrhash bl.val::*undo-cache-heights*)
            (let ((loaded (bl.val:get-undo-data block-hash)))
@@ -137,7 +137,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
     (unwind-protect
          (progn
            (bl.val:initialize-undo-storage base-path)
-           (bl.val::store-undo-data block-hash spent-utxos 502)
+           (bl.val:store-undo-data block-hash spent-utxos 502)
            ;; Clear cache
            (clear-undo-cache)
            (clrhash bl.val::*undo-cache-heights*)
@@ -174,7 +174,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
     (unwind-protect
          (progn
            (bl.val:initialize-undo-storage base-path)
-           (bl.val::store-undo-data block-hash '() 503)
+           (bl.val:store-undo-data block-hash '() 503)
            ;; Verify the file was written
            (let ((path (bl.val::undo-file-path block-hash)))
              (is (not (null (probe-file path)))))

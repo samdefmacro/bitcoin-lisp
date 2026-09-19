@@ -268,6 +268,58 @@ save-undo-data-to-disk needs before it can write a rev record."
       (bl.store:note-block-position chain-state hash located)
       hash)))
 
+(test undo-read-fails-when-the-rev-file-is-gone
+  "The rev record is the fact, not the in-memory cache. Core has no undo cache
+at all: DisconnectBlock reads the record out of the rev file every time and a
+file it cannot open fails the disconnect (UndoReadFromDisk,
+blockstorage.cpp:1075-1096). rpc_dumptxoutset.py:22-27 renames rev00000.dat
+away and asserts the rollback answers `Could not roll back to requested
+height.'; ours served the just-connected block's undo out of the cache and
+rolled back happily.
+
+The COINBASE-ONLY block is the case that matters, because that is what
+`generate' mines: its record is legitimately an EMPTY list, so whether the
+record could be read cannot be decided from the list alone -- which is why
+GET-UNDO-DATA answers it as a second value."
+  (%with-undo-store (store chain-state dir)
+    ;; %BU-TEST-BLOCK builds its header from the defaults, so two of its
+    ;; blocks hash the SAME however their transactions differ; a nonce apiece
+    ;; is what makes them two blocks in the index.
+    (flet ((%nonced (block nonce)
+             (bl.ser:make-bitcoin-block
+              :header (bl.ser:make-block-header :nonce nonce)
+              :transactions (bl.ser:bitcoin-block-transactions block))))
+      (let* ((block (%nonced (%bu-test-block '()) 1))
+             (hash (%undo-store-block store chain-state block 4))
+             (spender (%nonced (%bu-test-block '(2)) 2))
+             (spent (%bu-spent-for spender))
+             (spender-hash (%undo-store-block store chain-state spender 5)))
+        (is (not (equalp hash spender-hash))
+            "the two fixture blocks are the same block")
+        ;; The connect path: the record reaches disk AND the cache.
+        (bl.val:store-undo-data hash '() 4 :block block)
+        (bl.val:store-undo-data spender-hash spent 5 :block spender)
+        ;; CONTROL, with the rev file where it belongs: the coinbase-only
+        ;; block's empty list is a successful READ, and the spender's triples
+        ;; come back.
+        (multiple-value-bind (undo readable) (bl.val:get-undo-data hash)
+          (is-true readable "a coinbase-only block's own record did not read")
+          (is (null undo) "a coinbase-only block spent something"))
+        (multiple-value-bind (undo readable) (bl.val:get-undo-data spender-hash)
+          (is-true readable)
+          (is (= (length spent) (length undo))))
+        ;; Move the rev file out of the way, as the functional test does.
+        (let ((rev (first (directory (merge-pathnames "**/rev*.dat" dir)))))
+          (is-true rev "no rev file was written")
+          (rename-file rev (make-pathname :name "bogus" :type "dat"
+                                          :defaults rev))
+          (is-false (nth-value 1 (bl.val:get-undo-data hash))
+                    "a renamed-away rev file still answered for a coinbase-only block")
+          (is-false (nth-value 1 (bl.val:get-undo-data spender-hash))
+                    "a renamed-away rev file still read as available")
+          (is-false (nth-value 0 (bl.val:get-undo-data spender-hash))
+                    "the undo cache served a record that is no longer on disk"))))))
+
 (test undo-round-trips-through-a-rev-file
   "The connect path writes Core's CBlockUndo into the rev file paired with the
 block's blk file, and the disconnect path reads the same triples back.

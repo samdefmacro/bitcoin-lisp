@@ -33,6 +33,7 @@ src/storage/.")
    #:block-flat-file-number
    #:store-undo-flat
    #:read-undo-flat
+   #:undo-flat-file-present-p
    #:block-file-info
    #:block-file-info-blocks
    #:block-file-info-size
