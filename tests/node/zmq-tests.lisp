@@ -339,6 +339,49 @@ nothing to bind and the option is silently inert."
     (is (equal '(("hashblock" "tcp://127.0.0.1:28332" 7))
                bl::*zmq-publisher-specs*))))
 
+(test zmq-rawtx-is-cores-with-witness-serialization
+  "Core publishes rawtx as TX_WITH_WITNESS (zmqpublishnotifier.cpp:251), the
+same encoding every RPC hex field uses. Ours published the LEGACY bytes, so a
+subscriber comparing the rawtx it received against the same transaction from
+getrawtransaction or getblock saw two different encodings for every segwit
+transaction -- the coinbase of every block mined since segwit activated
+included, since it carries the BIP141 reserved witness item.
+
+interface_zmq.py's sync-up loop is exactly that comparison (:161-173: the
+notification is matched against the block hash, the coinbase txid, the raw
+block and the raw coinbase), so the rawtx subscriber ignored one notification
+and then timed out, once per generated block, until the test's own deadline. It
+was not a message arriving late -- it was a message that could never match.
+
+Read back with the independent pyzmq subscriber, like every publisher test here."
+  (multiple-value-bind (address path) (%zmq-test-address "rawtx-witness")
+    (unwind-protect
+         (let* ((tx (bl.bytes:with-byte-reader (r (make-witness-test-tx-bytes))
+                      (bl.ser:br-read-transaction r)))
+                (witness-hex (bl.crypto:bytes-to-hex
+                              (bl.ser:transaction-wire-bytes tx)))
+                (legacy-hex (bl.crypto:bytes-to-hex
+                             (bl.ser:serialize-transaction tx))))
+           ;; The fixture must really carry a witness, or the two encodings are
+           ;; equal and this test proves nothing.
+           (is-true (bl.ser:transaction-has-witness-p tx))
+           (is (string/= witness-hex legacy-hex)
+               "the fixture's two encodings are identical, so this is vacuous")
+           (is (= 1 (bl:zmq-start-publishers (list (list "rawtx" address 1000)))))
+           (let ((lines (%zmq-collect address "rawtx" 1
+                                      (lambda ()
+                                        (bl:zmq-notify-tx-accepted
+                                         tx (bl.ser:transaction-hash tx) 1)))))
+             (is (= 1 (length lines)))
+             ;; "OK <topic> <body-hex> <sequence>"
+             (let ((body (and lines (third (uiop:split-string (first lines) :separator " ")))))
+               (is-true (and body (string-equal witness-hex body))
+                        "rawtx must carry the witness serialization, got ~S" body)
+               (is-false (and body (string-equal legacy-hex body))
+                         "rawtx is still the legacy serialization"))))
+      (bl:zmq-stop-publishers)
+      (ignore-errors (delete-file path)))))
+
 (test zmq-topics-on-one-address-share-one-socket
   "Core binds an ADDRESS once and every topic published to it shares that
 socket (CZMQAbstractPublishNotifier::Initialize, zmq/zmqpublishnotifier.cpp:

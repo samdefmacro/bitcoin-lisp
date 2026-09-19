@@ -278,11 +278,20 @@ whole node for an unused feature."
        t))
 
 (defun zmq-notify-transaction (tx txid)
-  "The hashtx / rawtx pair for one transaction (Core NotifyTransaction)."
+  "The hashtx / rawtx pair for one transaction (Core NotifyTransaction).
+
+rawtx is Core's TX_WITH_WITNESS serialization (zmqpublishnotifier.cpp:251),
+which is the same encoding every RPC hex field uses -- the extended form when
+the transaction carries witness data, legacy otherwise. Ours published the
+LEGACY bytes unconditionally, so every segwit transaction, the coinbase of
+every block since segwit activated included, was announced in an encoding no
+subscriber could match against the same transaction from the RPC: a rawtx
+subscriber comparing the two saw them differ forever. interface_zmq.py's sync-up
+loop (:161-173) does exactly that comparison, and never completed."
   (when (zmq-topic-active-p "hashtx")
     (zmq-notify-hash-tx txid))
   (when (zmq-topic-active-p "rawtx")
-    (zmq-notify-raw-tx (bl.ser:serialize-transaction tx))))
+    (zmq-notify-raw-tx (bl.ser:transaction-wire-bytes tx))))
 
 (defun zmq-notify-tx-accepted (tx txid mempool-sequence)
   "A transaction entered the mempool (Core TransactionAddedToMempool): the
