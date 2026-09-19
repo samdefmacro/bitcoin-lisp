@@ -1953,7 +1953,7 @@ socket closes -- read 1. ping walks the same list."
 (test rpc-getmempoolinfo
   "Test getmempoolinfo returns expected fields"
   (let* ((node (make-test-node))
-         (result (bl.rpc::rpc-getmempoolinfo node nil)))
+         (result (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)))
     ;; Check required fields exist
     (is (assoc "loaded" result :test #'string=))
     (is (assoc "size" result :test #'string=))
@@ -1997,7 +1997,7 @@ mempool_datacarrier.py:57 and mempool_cluster.py:319 both do.
 maxdatacarriersize is max_datacarrier_bytes.value_or(0), so -datacarrier=0
 answers 0 rather than the unused byte budget (mempool_args.cpp:94-98)."
   (let* ((node (make-test-node))
-         (result (bl.rpc::rpc-getmempoolinfo node nil))
+         (result (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil))
          (get (lambda (k) (cdr (assoc k result :test #'string=)))))
     (is (= bl:*max-datacarrier-bytes* (funcall get "maxdatacarriersize")))
     (is (= bl.mp:*cluster-count-limit* (funcall get "limitclustercount")))
@@ -2006,7 +2006,7 @@ answers 0 rather than the unused byte budget (mempool_args.cpp:94-98)."
     ;; A node that relays no OP_RETURN reports 0, not its byte budget.
     (let ((bl:*accept-datacarrier* nil))
       (is (zerop (cdr (assoc "maxdatacarriersize"
-                             (bl.rpc::rpc-getmempoolinfo node nil)
+                             (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)
                              :test #'string=)))))
     ;; The cluster fields come from THIS pool, not from the globals: a pool
     ;; built under other limits reports its own.
@@ -2015,7 +2015,7 @@ answers 0 rather than the unused byte budget (mempool_args.cpp:94-98)."
            (other (bl.mp:make-mempool))
            (other-node (make-test-node)))
       (setf (bl:node-mempool other-node) other)
-      (let ((r (bl.rpc::rpc-getmempoolinfo other-node nil)))
+      (let ((r (bl.rpc:dispatch-rpc-method other-node "getmempoolinfo" nil)))
         (is (= 7 (cdr (assoc "limitclustercount" r :test #'string=))))
         (is (= 12345 (cdr (assoc "limitclustersize" r :test #'string=))))))))
 
@@ -2834,7 +2834,7 @@ with zero thread errors and every submitted tx in the pool exactly once."
                   (lambda ()
                     (dotimes (j 40)
                       (bl.rpc:dispatch-rpc-method node "getrawmempool" (list t))
-                      (bl.rpc::rpc-getmempoolinfo node nil)
+                      (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)
                       (bl.rpc::rpc-getprioritisedtransactions node nil))))
                  :name "smoke-reader")
                 threads))
@@ -2863,13 +2863,13 @@ rpc/mempool.cpp:1047)."
          (tx (make-mempool-test-tx :input-id 201))
          (txid (bl.ser:transaction-hash tx)))
     (is (= 0 (cdr (assoc "unbroadcastcount"
-                         (bl.rpc::rpc-getmempoolinfo node nil)
+                         (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)
                          :test #'string=))))
     (is (eq :ok (bl.mp:mempool-add
                  mempool txid (bl.mp:make-entry-from-tx tx 1000 0))))
     (is-true (bl.mp:mempool-add-unbroadcast mempool txid))
     (is (= 1 (cdr (assoc "unbroadcastcount"
-                         (bl.rpc::rpc-getmempoolinfo node nil)
+                         (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)
                          :test #'string=))))))
 
 (defun %mempool-node (&optional (funding-outputs 1))
@@ -6102,7 +6102,7 @@ safe version — asserted here with a size large enough to have overflowed a
                      (bl.rpc::rpc-getblockchaininfo node nil)
                      (bl.rpc::rpc-getblockcount node nil)
                      (bl.rpc::rpc-getnetworkinfo node nil)
-                     (bl.rpc::rpc-getmempoolinfo node nil))
+                     (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil))
                  (error (e)
                    (declare (ignore e))
                    (bt:with-lock-held (error-lock)
@@ -7449,7 +7449,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (dolist (result (list (bl.rpc::rpc-getblockchaininfo node nil)
                           (bl.rpc::rpc-getnetworkinfo node nil)
                           (bl.rpc::rpc-getpeerinfo node nil)
-                          (bl.rpc::rpc-getmempoolinfo node nil)))
+                          (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)))
       (let* ((response (bl.rpc::make-rpc-response result "id" :v2))
              (json (with-output-to-string (s) (yason:encode response s)))
              (parsed (yason:parse json)))
