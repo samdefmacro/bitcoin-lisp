@@ -1202,6 +1202,22 @@ no key for."
                        (make-array 0 :element-type '(unsigned-byte 8))
                        (%psbt-uint32-le eff)))
 
+(defun %psbt-note-witness-utxo (map prev)
+  "Record the spent output of an input a WITNESS signature was just produced
+for -- Core SignPSBTInput's \"If we have a witness signature, put a witness
+UTXO\" (psbt.cpp:495-501).
+
+That record is what RemoveUnnecessaryTransactions judges the non_witness_utxo
+by: its rule reads the witness_utxo's scriptPubKey, so an input without one
+stops the scan and nothing is dropped anywhere. Without this a tr() input
+updated from the wallet's full previous transaction carried that transaction
+out of walletprocesspsbt forever (wallet_taproot.py:358-359)."
+  (bl.ser:psbt-map-set
+   map bl.ser:+psbt-in-witness-utxo+
+   (make-array 0 :element-type '(unsigned-byte 8))
+   (%serialize-txout-bytes
+    (bl.ser:make-tx-out :value (second prev) :script-pubkey (first prev)))))
+
 (defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash
                                 &optional tr-scripts)
   "Compute + record partial signatures on every non-final input of PSBT the key
@@ -1244,21 +1260,8 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
               (unless (or err
                           (and (%psbt-require-witness-sig-p map)
                                (not (bl.rpc:input-sig-witness-p sig))))
-                ;; Core SignPSBTInput:495-501: a WITNESS signature means the
-                ;; input is fully described by its spent output alone, so the
-                ;; witness_utxo record goes in -- and only then can
-                ;; RemoveUnnecessaryTransactions judge whether the
-                ;; non_witness_utxo may go, since its whole rule reads the
-                ;; witness_utxo's scriptPubKey. Without this a tr() input
-                ;; updated from the wallet's full previous transaction kept
-                ;; that transaction forever (wallet_taproot.py:358-359 asserts
-                ;; the opposite pair).
                 (when (bl.rpc:input-sig-witness-p sig)
-                  (bl.ser:psbt-map-set
-                   map bl.ser:+psbt-in-witness-utxo+ empty
-                   (%serialize-txout-bytes
-                    (bl.ser:make-tx-out :value (second prev)
-                                        :script-pubkey (first prev)))))
+                  (%psbt-note-witness-utxo map prev))
                 (when (and (bl.rpc:input-sig-redeem sig)
                            (not (bl.ser:psbt-map-find
                                  map bl.ser:+psbt-in-redeem-script+)))

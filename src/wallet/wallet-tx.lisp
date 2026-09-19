@@ -1742,6 +1742,38 @@ blocks stay in the index, and find-fork-in-active-chain handles them."
                    (bl.store:get-block-index-entry chain-state hash))
                  locator))))
 
+(defun %attach-chain-missing-data-error (node chain-state tip-height rescan-height)
+  "Core's block-data walk in AttachChain (wallet.cpp:3237-3264), run only when
+block data can be MISSING at all -- a pruned node, or one following an
+assumeutxo snapshot whose background sync has not reached the base yet. It
+descends from the tip for as long as the block below is on disk, and returns
+Core's refusal when that walk stops above the height the rescan must start
+from: the prune sentence when pruning is what removed the data, and otherwise
+the assumeutxo one, which names the height at which the wallet will load.
+
+The comparison this replaces asked only whether RESCAN-HEIGHT was below the
+PRUNED height, which no assumed-valid chain ever fails: its missing blocks are
+below the snapshot base while nothing is pruned, so a wallet that needs them
+was loaded and then rescanned over blocks the node does not have
+(wallet_assumeutxo.py:205-210)."
+  (when (or (bl:pruning-enabled-p) (bl:node-historical-chainstate node))
+    (let ((block-height tip-height)
+          (store (bl:node-block-store node)))
+      (flet ((on-disk-p (height)
+               (let ((entry (bl.store:get-block-at-height chain-state height)))
+                 (and entry store
+                      (bl.store:block-exists-p
+                       store (bl.store:block-index-entry-hash entry))))))
+        (loop while (and (> block-height 0)
+                         (on-disk-p (1- block-height))
+                         (/= rescan-height block-height))
+              do (decf block-height)))
+      (when (/= rescan-height block-height)
+        (if (bl:pruning-enabled-p)
+            "Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)"
+            (format nil "Error loading wallet. Wallet requires blocks to be downloaded, and software does not currently support loading wallets while blocks are being downloaded out of order when using assumeutxo snapshots. Wallet should be able to load successfully after node sync reaches height ~D"
+                    block-height))))))
+
 (defun wallet-attach-chain (node wallet &key rescan-required)
   "Port of CWallet::AttachChain's catch-up (wallet.cpp:3171): find the fork
 of the wallet's stored locator with the active chain, rescan from there
@@ -1796,37 +1828,9 @@ gate, the prune refusal and the reserver, is unchanged."
                   (if found
                       (bl.store:block-index-entry-height found)
                       tip-height)))
-          ;; Core's block-data walk (wallet.cpp:3237-3264), run only when block
-          ;; data can be MISSING at all -- a pruned node, or one following an
-          ;; assumeutxo snapshot whose background sync has not reached the
-          ;; base yet. It descends from the tip for as long as the block below
-          ;; is on disk, and refuses when that walk stops above the height the
-          ;; rescan must start from.
-          ;;
-          ;; The comparison this replaces asked only whether RESCAN-HEIGHT was
-          ;; below the pruned height, which no assumed-valid chain ever fails:
-          ;; its missing blocks are BELOW the snapshot base while nothing is
-          ;; pruned, so a wallet that needs them was loaded and then rescanned
-          ;; over blocks the node does not have
-          ;; (wallet_assumeutxo.py:205-210).
-          (when (or (bl:pruning-enabled-p) (bl:node-historical-chainstate node))
-            (let ((block-height tip-height)
-                  (store (bl:node-block-store node)))
-              (flet ((on-disk-p (height)
-                       (let ((entry (bl.store:get-block-at-height chain-state height)))
-                         (and entry store
-                              (bl.store:block-exists-p
-                               store (bl.store:block-index-entry-hash entry))))))
-                (loop while (and (> block-height 0)
-                                 (on-disk-p (1- block-height))
-                                 (/= rescan-height block-height))
-                      do (decf block-height)))
-              (when (/= rescan-height block-height)
-                (return-from wallet-attach-chain
-                  (if (bl:pruning-enabled-p)
-                      "Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)"
-                      (format nil "Error loading wallet. Wallet requires blocks to be downloaded, and software does not currently support loading wallets while blocks are being downloaded out of order when using assumeutxo snapshots. Wallet should be able to load successfully after node sync reaches height ~D"
-                              block-height))))))
+          (let ((missing (%attach-chain-missing-data-error
+                          node chain-state tip-height rescan-height)))
+            (when missing (return-from wallet-attach-chain missing)))
           (let ((start-entry (bl.store:get-block-at-height
                               chain-state rescan-height)))
             (when start-entry

@@ -2334,6 +2334,6 @@ did, txid and all."
                 (is (= before (length (coerce (rpc "w" "listtransactions") 'list)))
                     "the refused transaction must not be in the wallet")
                 ;; Control: with the option off Core builds and commits it.
-                (let ((bl.wallet::*wallet-reject-long-chains* nil))
+                (let ((bl.wallet:*wallet-reject-long-chains* nil))
                   (is (stringp (send))
                       "with -walletrejectlongchains off the build must succeed"))))))))))

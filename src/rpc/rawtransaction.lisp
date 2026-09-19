@@ -1168,9 +1168,9 @@ variants carry, which is what this RPC did for every input before."
             (setf (gethash key coins)
                   (list (first coin) (second coin) redeem witness-script)))))
       (let ((errors (sign-tx-inputs merged coins
-                                    (make-hash-table :test 'equalp)
-                                    (make-hash-table :test 'equalp)
-                                    (make-hash-table :test 'equalp)
+                                    (bl.bytes:make-octets-hash-table)
+                                    (bl.bytes:make-octets-hash-table)
+                                    (bl.bytes:make-octets-hash-table)
                                     #x01)))
         (declare (ignore errors))
         ;; The planted elements are signature MATERIAL, never an input's final

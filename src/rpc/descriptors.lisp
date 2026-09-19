@@ -2215,6 +2215,35 @@ returned with HAS-PRIV-P nil."
                       t)
               (values (desc-key-string key) nil))))))
 
+(defun %musig-normalized-body (key cache privkey-provider indexes)
+  "A musig() key expression's normalized body, participants first: Core's
+MuSigPubkeyProvider::ToNormalizedString asks each PARTICIPANT for its own
+normalized form, under that participant's own cache slot, and fails the whole
+expression when one cannot produce it (descriptor.cpp:735-753).
+
+Printing the participants' plain public form instead left the wallet that
+holds a participant's PRIVATE key describing an output by its master xpub and
+whole hardened path, where its cosigner described the same output Core's way
+(wallet_musig.py:224 compares listunspent across wallets). Returns (values
+body ok-p)."
+  (let ((ok t))
+    (values (format nil "musig(~{~A~^,~})~A~A"
+                    (mapcar (lambda (participant)
+                              (multiple-value-bind (string participant-ok)
+                                  (desc-key-normalized-string
+                                   participant
+                                   (and indexes (gethash participant indexes))
+                                   cache privkey-provider indexes)
+                                (unless participant-ok (setf ok nil))
+                                string))
+                            (desc-key-musig-participants key))
+                    (format-key-path (desc-key-path key) nil)
+                    (ecase (desc-key-derive key)
+                      (:none "")
+                      (:unhardened "/*")
+                      (:hardened "/*h")))
+            ok)))
+
 (defun desc-key-normalized-string (key expr-index cache privkey-provider
                                    &optional indexes)
   "KEY's normalized public form (Core ToNormalizedString): BIP32 keys with
@@ -2250,25 +2279,9 @@ whose PARTICIPANTS normalize one by one under their own cache slots
       ;; Core's [fingerprint/86h/1h/0h]tpub.../0/* -- so the two wallets'
       ;; parent_descs disagreed for the same output (wallet_musig.py:224).
       ((desc-key-musig-participants key)
-       (let ((ok t))
-         (values
-          (wrap-origin
-           (format nil "musig(~{~A~^,~})~A~A"
-                   (mapcar (lambda (participant)
-                             (multiple-value-bind (string participant-ok)
-                                 (desc-key-normalized-string
-                                  participant
-                                  (and indexes (gethash participant indexes))
-                                  cache privkey-provider indexes)
-                               (unless participant-ok (setf ok nil))
-                               string))
-                           (desc-key-musig-participants key))
-                   (format-key-path (desc-key-path key) nil)
-                   (ecase (desc-key-derive key)
-                     (:none "")
-                     (:unhardened "/*")
-                     (:hardened "/*h"))))
-          ok)))
+       (multiple-value-bind (body ok)
+           (%musig-normalized-body key cache privkey-provider indexes)
+         (values (wrap-origin body) ok)))
       ;; Const pubkeys normalize to their public form.
       ((desc-key-pubkey key)
        (values (wrap-origin (%desc-key-body-string key)) t))

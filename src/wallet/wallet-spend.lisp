@@ -2067,6 +2067,21 @@ its input (a tx we cannot fully verify is never broadcast)."
              :script-pubkey (bl.rpc:recipient-script recipient)))
           recipients))
 
+(defun %chain-limits-error (node tx weight)
+  "Core's last check before CreateTransaction succeeds (spend.cpp:1416-1422):
+under -walletrejectlongchains the transaction must pass the mempool's cluster
+limits BEFORE it is stored, which Chain::checkChainLimits asks
+CTxMemPool::CheckPolicyLimits (node/interfaces.cpp:718-723). Returns Core's
+sentence, or NIL.
+
+Every CreateTransaction failure is -6 at the RPC edge, which is the code
+wallet_basic.py:524 reads together with this sentence."
+  (when *wallet-reject-long-chains*
+    (let ((mempool (bl:node-mempool node)))
+      (when (and mempool
+                 (not (bl.mp:mempool-check-policy-limits mempool tx weight)))
+        "too many unconfirmed transactions in cluster"))))
+
 (defun %create-transaction-internal (node wallet recipients change-pos cc sign
                                      rng)
   "Core CreateTransactionInternal. Returns
@@ -2492,23 +2507,9 @@ Caller holds node + wallet locks."
                                           (when (> current-fee
                                                    bl:*wallet-max-tx-fee*)
                                             (fail +max-fee-exceeded-message+))
-                                          ;; Core's last check before success:
-                                          ;; under -walletrejectlongchains the
-                                          ;; transaction must pass the mempool's
-                                          ;; cluster limits BEFORE it is stored
-                                          ;; (spend.cpp:1416-1422 ->
-                                          ;; Chain::checkChainLimits,
-                                          ;; node/interfaces.cpp:718-723). Every
-                                          ;; CreateTransaction failure is -6 at
-                                          ;; the RPC edge, which is the code
-                                          ;; wallet_basic.py:524 reads with this
-                                          ;; sentence.
-                                          (when *wallet-reject-long-chains*
-                                            (let ((mempool (bl:node-mempool node)))
-                                              (when (and mempool
-                                                         (not (bl.mp:mempool-check-policy-limits
-                                                               mempool tx final-weight)))
-                                                (fail "too many unconfirmed transactions in cluster")))))
+                                          (let ((chain-limit
+                                                  (%chain-limits-error node tx final-weight)))
+                                            (when chain-limit (fail chain-limit))))
                                         (setf keep-reservation t)
                                         (bl:log-info
                                          "Coin Selection: Algorithm:~(~A~), Waste Metric Score:~D; fee ~D sat over ~D vB"
