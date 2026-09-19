@@ -546,8 +546,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (log-info "Initializing block filter index...")
     (setf (node-blockfilterindex *node*)
           (bl.store:init-blockfilterindex (node-data-directory *node*)
-                                                       :enabled t
-                                                       :wipe reindex))
+                                          :enabled t :wipe reindex))
     (log-info "Block filter index loaded: indexed to height ~D"
               (bl.store:blockfilterindex-height (node-blockfilterindex *node*)))
     ;; The filter index needs each block's undo data to build its filter, so
@@ -579,8 +578,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (log-info "Initializing spender index...")
     (setf (node-txospenderindex *node*)
           (bl.store:init-txospender-index (node-data-directory *node*)
-                                                      :enabled t
-                                                      :wipe reindex))
+                                          :enabled t :wipe reindex))
     (let ((best (bl.store:txospenderindex-best-block
                  (node-txospenderindex *node*))))
       (log-info "Spender index loaded: best block ~A"
@@ -597,8 +595,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (log-info "Initializing coinstats index...")
     (setf (node-coinstatsindex *node*)
           (bl.store:init-coinstatsindex (node-data-directory *node*)
-                                                    :enabled t
-                                                    :wipe reindex))
+                                        :enabled t :wipe reindex))
     (log-info "Coinstats index loaded: indexed to height ~D"
               (bl.store:coinstatsindex-height (node-coinstatsindex *node*)))
     ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->
