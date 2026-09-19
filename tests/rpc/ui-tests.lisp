@@ -124,10 +124,18 @@ harness in tests/ui/peers.test.mjs — run: scripts/dev.sh ui-test.)"
 (test ui-handle-serves-console-assets
   "The P4 console module is served with the JS content type, the shell wires
 in the console view + nav link, and `help` — the one RPC the page's
-autocomplete depends on — is registered and emits the newline-separated
-list of registered method names the page parses. (The page's parsing/
+autocomplete depends on — is registered and emits something the page's
+parseHelpText turns back into registered method names. (The page's parsing/
 autocomplete/history/rendering behavior is covered by the zero-dependency
-node harness in tests/ui/console.test.mjs — run: scripts/dev.sh ui-test.)"
+node harness in tests/ui/console.test.mjs — run: scripts/dev.sh ui-test.)
+
+The format is Core's now: `== Category ==' headings, a blank line before each
+but the first, and one USAGE line per method (rpc/server.cpp:69-115). This
+test used to require one bare method name per line, which was pinning our
+divergence from it; console.js parseHelpText has read both shapes since it
+was written, and its own harness has a Core-style vector, so what this has to
+check is that the first token of every command line is still a method the
+dispatcher knows."
   (with-ui-reply ()
     (let ((body (bl.rpc::ui-handle "/ui/js/console.js")))
       (is (= 200 (hunchentoot:return-code*)))
@@ -142,23 +150,35 @@ node harness in tests/ui/console.test.mjs — run: scripts/dev.sh ui-test.)"
   (bl.rpc::register-all-methods)
   (is (not (null (gethash "help" bl.rpc::*rpc-methods*)))
       "RPC method \"help\" (the console's autocomplete source) must be registered")
-  ;; help with no params: one registered method name per line, sorted —
-  ;; exactly the format console.js parseHelpText consumes.
+  ;; help with no params, read the way console.js parseHelpText reads it:
+  ;; drop blank lines and `== ... ==' headings, then take each remaining
+  ;; line's first token.
   (let* ((text (bl.rpc::rpc-help nil nil))
-         (lines (uiop:split-string text :separator '(#\Newline))))
+         (lines (uiop:split-string text :separator '(#\Newline)))
+         (headings (remove-if-not (lambda (line)
+                                    (and (> (length line) 2)
+                                         (string= "== " (subseq line 0 3))))
+                                  lines))
+         (commands (remove-if (lambda (line)
+                                (or (zerop (length line))
+                                    (member line headings :test #'string=)))
+                              lines))
+         (names (mapcar (lambda (line)
+                          (first (uiop:split-string line :separator " ")))
+                        commands)))
     (is (stringp text))
     (is (< 1 (length lines)))
-    (is (member "getblockcount" lines :test #'string=))
-    (is (member "help" lines :test #'string=))
-    (is (notany (lambda (line)
-                  (or (zerop (length line)) (find #\Space line)))
-                lines)
-        "every help line must be a single bare method name")
-    (is (every (lambda (line)
-                 (nth-value 1 (gethash line bl.rpc::*rpc-methods*)))
-               lines)
-        "every help line must be a registered method")
-    (is (equal lines (sort (copy-list lines) #'string<)))))
+    (is (plusp (length headings))
+        "the listing carries no category headings")
+    (is (member "getblockcount" names :test #'string=))
+    (is (member "help" names :test #'string=))
+    ;; The page's word list is built from these, so each must be callable.
+    (is (every (lambda (name)
+                 (nth-value 1 (gethash name bl.rpc::*rpc-methods*)))
+               names)
+        "every help command line must begin with a registered method")
+    (is (= (length names) (length (remove-duplicates names :test #'string=)))
+        "a method is listed twice")))
 
 (test ui-handle-serves-wallet-assets
   "The wallet, QR and wallet-crypt modules are served with the JS content
