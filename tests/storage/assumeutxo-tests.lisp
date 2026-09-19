@@ -200,7 +200,11 @@ retargeted at the base."
 (test assumeutxo-startup-redetection-rejects
   "Startup detection is conservative: a snapshot dir without a base_blockhash
 marker, or whose base header is missing from the index, does NOT create a
-second chainstate (single-chainstate startup, dir left for later adoption)."
+second chainstate (single-chainstate startup, dir left for later adoption).
+
+Case 2's marker names a base the CHAINPARAMS know (through the override),
+because one they do not know is a different verdict entirely -- see
+ASSUMEUTXO-STARTUP-REFUSES-A-BASE-THE-CHAINPARAMS-DO-NOT-KNOW."
   (with-temp-directory (dir)
     ;; Case 1: dir exists but no marker.
     (ensure-directories-exist (merge-pathnames "chainstate_snapshot/" dir))
@@ -214,10 +218,61 @@ second chainstate (single-chainstate startup, dir left for later adoption)."
                            :direction :output :element-type '(unsigned-byte 8)
                            :if-exists :supersede)
         (write-sequence (%au-hash #x77) out))
-      (is (null (bl::load-snapshot-chainstate node)))
-      (is (= 1 (length (bl:node-chainstates node))))
-      (is (null (bl.store:chain-state-target-blockhash
-                 (bl:node-chain-state node)))))))
+      (let ((bl:*assumeutxo-data-override*
+              (list (bl:make-assumeutxo-data
+                     :height 5 :blockhash (%au-hash #x77)
+                     :hash-serialized (%au-hash #x88) :chain-tx-count 6))))
+        (is (null (bl::load-snapshot-chainstate node)))
+        (is (= 1 (length (bl:node-chainstates node))))
+        (is (null (bl.store:chain-state-target-blockhash
+                   (bl:node-chain-state node))))))))
+
+(test assumeutxo-startup-refuses-a-base-the-chainparams-do-not-know
+  "A base_blockhash marker naming a block the chainparams carry no assumeutxo
+entry for STOPS the node; it does not warn. Core asks AssumeutxoForBlockhash
+the moment it loads the block index with a snapshot blockhash in hand, and
+nullopt is a fatalError whose LoadBlockIndex then returns false
+(node/blockstorage.cpp:429-434): the datadir is claiming a UTXO set this
+build has no commitment to check it against.
+
+feature_assumeutxo.py:177-191 writes a chainstate_snapshot/base_blockhash of
+32 'z' bytes and asserts the node exits with
+
+  Error: A fatal internal error occurred, see debug.log for details:
+  Assumeutxo data not found for the given blockhash '7a7a...7a'.
+
+and that the sentence is in debug.log. Ours logged `snapshot base block ...
+is not in the header index' and started normally.
+
+The hash is named in DISPLAY order, as Core names every block hash."
+  (with-temp-directory (dir)
+    (ensure-directories-exist (merge-pathnames "chainstate_snapshot/" dir))
+    (let* ((node (make-test-node))
+           (zs (make-array 32 :element-type '(unsigned-byte 8)
+                              :initial-element #x7a))
+           (hex (with-output-to-string (s) (dotimes (i 32) (write-string "7a" s)))))
+      (setf (bl:node-data-directory node) (pathname dir))
+      (with-open-file (out (bl.store:snapshot-base-blockhash-path
+                            (merge-pathnames "chainstate_snapshot/" dir))
+                           :direction :output :element-type '(unsigned-byte 8)
+                           :if-exists :supersede)
+        (write-sequence zs out))
+      ;; CONTROL: the chainparams really do not know this base.
+      (is-false (bl:assumeutxo-data-for-blockhash (bl:node-network node) zs))
+      (let ((text (handler-case (progn (bl::load-snapshot-chainstate node) nil)
+                    (error (e) (princ-to-string e)))))
+        (is-true text "an unknown snapshot base did not stop the node")
+        (is-true (and text
+                      (search "A fatal internal error occurred, see debug.log for details: "
+                              text))
+                 "the refusal is not worded as Core's fatal error: ~S" text)
+        (is-true (and text
+                      (search (format nil "Assumeutxo data not found for the given blockhash '~A'."
+                                      hex)
+                              text))
+                 "the refusal does not name the blockhash: ~S" text))
+      ;; No second chainstate was created on the way out.
+      (is (= 1 (length (bl:node-chainstates node)))))))
 
 ;;;; Dual-cursor download queue + base-in-chain peer filter
 

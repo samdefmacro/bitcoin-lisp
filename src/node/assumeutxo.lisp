@@ -113,6 +113,32 @@ historical chainstate's candidate filtering is the target guard there."
               (bl.store:current-height prev))
     snap))
 
+(defun %refuse-unknown-snapshot-base (node base-hash)
+  "Stop startup when the snapshot chainstate's base_blockhash marker names a
+block the chainparams carry no assumeutxo entry for.
+
+Core asks this question the moment it loads the block index with a snapshot
+blockhash in hand: AssumeutxoForBlockhash answering nullopt is a fatalError,
+not a warning, and LoadBlockIndex then returns false so the node never
+finishes starting (node/blockstorage.cpp:429-434). The datadir is claiming a
+UTXO set this build has no commitment to verify against, and there is nothing
+safe to do with it.
+
+The blockhash is named in Core's display order, the form the marker's own RPC
+and every log line use. The message reaches stderr through the same
+InitError path as any startup refusal, under the fatal-error caption Core's
+AbortNode adds (node/abort.cpp:21), which is what
+feature_assumeutxo.py:186-191 compares the whole of stderr against -- and it
+is logged first, because the same test asserts the sentence appears in
+debug.log."
+  (unless (assumeutxo-data-for-blockhash (node-network node) base-hash)
+    (let ((hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes base-hash))))
+      (log-error "Assumeutxo data not found for the given blockhash '~A'." hex)
+      (init-error
+       "A fatal internal error occurred, see debug.log for details: ~
+Assumeutxo data not found for the given blockhash '~A'."
+       hex))))
+
 (defun load-snapshot-chainstate (node)
   "Detect and re-adopt a persisted snapshot chainstate at startup (Core
 LoadAssumeutxoChainstate, validation.cpp:6170-6187, in node/chainstate.cpp
@@ -121,7 +147,10 @@ base_blockhash marker are the only persistent evidence; assumeutxo-status is
 re-derived as :unvalidated (never persisted). Must run after the primary
 chainstate's header index is loaded — the base entry has to resolve — and
 before crash-recovery resolution (a torn snapshot flush joins
-*pending-chainstate-recovery*). Returns the snapshot chainstate or NIL."
+*pending-chainstate-recovery*). Returns the snapshot chainstate or NIL.
+
+A marker naming a blockhash the CHAINPARAMS have no assumeutxo entry for is
+fatal, not a warning: %REFUSE-UNKNOWN-SNAPSHOT-BASE."
   (let* ((data-dir (node-data-directory node))
          (dir (bl.store:find-assumeutxo-chainstate-dir data-dir)))
     (when dir
@@ -130,6 +159,8 @@ before crash-recovery resolution (a torn snapshot flush joins
              (base-entry (and base-hash
                               (bl.store:get-block-index-entry
                                primary base-hash))))
+        (when base-hash
+          (%refuse-unknown-snapshot-base node base-hash))
         (cond
           ((null base-hash)
            (log-warn "[snapshot] snapshot chainstate dir is malformed! no base blockhash file exists at path ~A. Try deleting ~A and calling loadtxoutset again"
