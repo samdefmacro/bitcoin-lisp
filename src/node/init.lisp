@@ -1675,10 +1675,23 @@ seconds and dial again."
        (note-node-tip-progress *node*))
       (t
        (log-warn "No peers available, reconnecting in 5s...")
-       (loop repeat 5 while (node-running *node*)
-             do (sleep 1))
-       (connect-to-peers *node* max-peers
-                         :timeout 30 :min-peers 1)))))
+       ;; Merge each second, not only at the top of the next loop iteration:
+       ;; this branch runs when the node has NO peer, which is exactly when an
+       ;; inbound connection arrives at a node nothing has dialled, and a peer
+       ;; that arrives one millisecond into this wait would otherwise sit in
+       ;; the hand-off list for the whole five seconds before getpeerinfo could
+       ;; see it. Core's accepted socket joins m_nodes at accept and is visible
+       ;; at once (net.cpp:1854-1858); p2p_v2_misbehaving.py:143 opens one and
+       ;; gives wait_for_new_peer five seconds, which this wait spent. Leaving
+       ;; as soon as one appears also gets the dial out of the way, so the peer
+       ;; is pumped by the ordinary %SYNC-PASS ticks.
+       (loop repeat 5
+             while (and (node-running *node*) (null (node-peers *node*)))
+             do (sleep 1)
+                (merge-inbound-peers *node*))
+       (when (null (node-peers *node*))
+         (connect-to-peers *node* max-peers
+                           :timeout 30 :min-peers 1))))))
 
 (defun %sync-thread-loop (max-peers)
   "Core Step 12's sync thread: the startup dial, then the sync / follow-tip

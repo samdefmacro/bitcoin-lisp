@@ -1423,7 +1423,7 @@ On :FALLBACK-V1 (the peer never answered our key -- almost certainly a v1
 node), reconnect to the same host/port and continue in v1. Returns T when the
 version handshake may proceed (over whichever transport), NIL to give up."
   (let* ((conn (peer-connection peer))
-         (result (v2-handshake-outbound conn)))
+         (result (v2-handshake-outbound conn :peer-id (peer-id peer))))
     (cond
       ((v2-transport-p result)
        (setf (connection-transport conn) result)
@@ -1436,8 +1436,13 @@ version handshake may proceed (over whichever transport), NIL to give up."
          (when fresh
            (close-connection conn)
            (setf (peer-connection peer) fresh)
-           (bl:log-info "no v2 response, reconnected as v1, ~A"
-                        (peer-log-name peer))
+           ;; Core's own line for this reconnection (net.cpp:1951). Ours read
+           ;; "no v2 response, reconnected as v1", which says the same thing to
+           ;; a person and nothing to p2p_v2_transport.py:46, which names this
+           ;; exact text as the message that must NOT appear while two v2 nodes
+           ;; connect -- so that half of the assertion could never fail.
+           (bl:log-cat "net" "retrying with v1 transport protocol for peer=~D"
+                       (peer-id peer))
            t))))))
 
 (defun perform-handshake (peer &key (try-v2 (v2-available-p))
@@ -1481,7 +1486,9 @@ TIMEOUT than the outbound path bounds how long a silent inbound peer can
 stall. Returns T on success."
   (setf (peer-state peer) :handshaking)
   (when (v2-available-p)
-    (let ((detected (v2-detect-inbound (peer-connection peer) :timeout timeout)))
+    (let ((detected (v2-detect-inbound (peer-connection peer)
+                                       :timeout timeout
+                                       :peer-id (peer-id peer))))
       (cond ((v2-transport-p detected)
              (setf (connection-transport (peer-connection peer)) detected)
              (bl:log-cat "net" "v2 transport established (inbound), ~A"

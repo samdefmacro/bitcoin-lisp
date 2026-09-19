@@ -11,6 +11,51 @@
 between two sync cycles. The one internal reach of this file."
   (bl::%sync-idle-tick 1))
 
+(defun %offline-pass ()
+  "The sync thread's NO-PEER pass against BL:*NODE* (%SYNC-OFFLINE-ACTIVATION):
+activate whatever is on disk, then wait before dialling again."
+  (bl::%sync-offline-activation 0))
+
+(test the-no-peer-wait-admits-an-inbound-peer-that-arrives-during-it
+  "The sync loop merges the listener's hand-off list at the top of each
+iteration, and an iteration with no peers is %SYNC-OFFLINE-ACTIVATION, which
+slept five seconds before returning. A node nothing has dialled -- every
+functional test's node -- therefore took up to five seconds to show an accepted
+peer in getpeerinfo, and that is exactly the budget
+p2p_v2_misbehaving.py:143 gives wait_for_new_peer. Core's accepted socket joins
+m_nodes at accept and is visible at once (net.cpp:1854-1858).
+
+The wait now merges every second and stops as soon as a peer appears."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (unwind-protect
+           (let* ((bl:*network* :regtest)
+                  (port (usocket:get-local-port srv))
+                  (node (make-test-node :network :regtest))
+                  (bl:*node* node)
+                  (client (bl.net:connect-peer "127.0.0.1" port))
+                  (conn (and client (bl.net:accept-connection srv :timeout 10)))
+                  (server-peer (and conn (bl.net:make-inbound-peer conn "127.0.0.1"))))
+             (is-true client)
+             (is-true conn)
+             (when server-peer
+               (unwind-protect
+                    (progn
+                      (setf (bl:node-running node) t)
+                      ;; The listener's hand-off, as ADMIT-INBOUND-CONNECTION
+                      ;; does it -- at accept, with the handshake still running.
+                      (push server-peer (bl:node-pending-inbound-peers node))
+                      (is (null (bl:node-peers node)) "control: nothing admitted yet")
+                      (%offline-pass)
+                      (is-true (member server-peer (bl:node-peers node))
+                               "the no-peer wait must admit a peer that arrives during it")
+                      (is (null (bl:node-pending-inbound-peers node))))
+                 (setf (bl:node-running node) nil)
+                 (bl.net:disconnect-peer server-peer)
+                 (bl.net:disconnect-peer client))))
+        (bl.net:close-listener srv)))))
+
 (test idle-tick-admits-a-pending-inbound-peer-and-answers-it
   "An inbound peer the listener hands over during the sync thread's 30-second
 wait must be admitted and read by the NEXT idle tick, not by the next cycle.

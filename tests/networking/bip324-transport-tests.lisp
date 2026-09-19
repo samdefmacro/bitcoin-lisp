@@ -252,15 +252,39 @@ and pushed back so the v1 path reads them unchanged."
 
 (test v2-transport-outbound-fallback-on-silence
   "An outbound v2 attempt against a peer that never responds yields
-:FALLBACK-V1 (the caller then reconnects as v1)."
+:FALLBACK-V1 (the caller then reconnects as v1), and says on the way out that
+it started a v2 handshake.
+
+Core logs `start sending v2 handshake to peer=%d' from MarkBytesSent the moment
+the first byte of our ellswift key leaves while the transport still awaits the
+peer's (net.cpp:1534-1536). p2p_v2_transport.py:45 connects two v2 nodes inside
+an assert_debug_log for that line, with `retrying with v1 transport protocol for
+peer' as its UNEXPECTED message -- together they say the handshake was both
+attempted and not downgraded. Neither line existed here: the first assertion
+failed outright and the second could never fail, because our downgrade line was
+worded differently (`no v2 response, reconnected as v1')."
   (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         server                          ; kept open but silent
         ;; Server reads nothing and says nothing; use a short timeout.
-        (is (eq :fallback-v1
-                (bl.net::v2-handshake-outbound client
-                                                                :timeout 2))))))
+        ;; LET*, not LET: a closure in a parallel LET's initform sees the OUTER
+        ;; RESULT, so the assertion below would read the fresh NIL binding.
+        (let* ((result nil)
+               (enabled (bl.log:log-category-enabled-p "net"))
+               (lines (unwind-protect
+                           (progn
+                             (bl.log:enable-log-category "net")
+                             (capture-log-lines
+                              (lambda ()
+                                (setf result (bl.net::v2-handshake-outbound
+                                              client :timeout 2)))))
+                        (unless enabled
+                          (bl.log:disable-log-category "net")))))
+          (is (eq :fallback-v1 result))
+          (is-true (find "start sending v2 handshake to peer=" lines
+                         :test #'search)
+                   "the initiator's key went out unannounced")))))
 
 (test v2-receive-resumes-a-packet-split-across-passes
   "The property this transport was missing. BIP324 framing is a 3-byte length

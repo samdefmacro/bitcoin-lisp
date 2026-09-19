@@ -338,7 +338,21 @@ Returns the ready v2-transport or NIL."
         (when (%v2-recv-packet-blocking conn transport deadline)
           transport)))))
 
-(defun v2-handshake-outbound (conn &key (timeout 30))
+(defun %log-v2-handshake-start (peer-id)
+  "Core V2Transport::MarkBytesSent (net.cpp:1534-1536): the first bytes of our
+ellswift key leaving while the transport still awaits the peer's is what Core
+calls the start of the handshake, and it says so once per connection.
+
+p2p_v2_transport.py:45 connects two v2 nodes inside an assert_debug_log for
+`start sending v2 handshake to peer' with `retrying with v1 transport protocol
+for peer' as the UNEXPECTED message -- a pair that together says the v2
+handshake was both attempted and not downgraded. Neither line existed here, so
+the first half failed and the second was vacuous."
+  ;; BL.LOG, not BL: this file is in the bitcoin-lisp/net sub-system, which
+  ;; loads long before the top package exists. A warm image cannot tell.
+  (bl.log:log-cat "net" "start sending v2 handshake to peer=~A" (or peer-id "?")))
+
+(defun v2-handshake-outbound (conn &key (timeout 30) peer-id)
   "Attempt the v2 handshake as initiator on a fresh outbound CONN. Returns the
 ready v2-transport, :FALLBACK-V1 when the peer never responded to our key
 (the BIP324 signal that it is probably a v1-only node: caller reconnects and
@@ -351,6 +365,7 @@ speaks v1), or NIL on a hard failure or shutdown."
                                         cipher)
                                        garbage))
         (return-from v2-handshake-outbound nil))
+      (%log-v2-handshake-start peer-id)
       (let ((their-key (%v2-read conn 64 deadline)))
         (unless their-key
           ;; Don't reconnect-as-v1 mid-shutdown -- receive-bytes also returns
@@ -361,7 +376,7 @@ speaks v1), or NIL on a hard failure or shutdown."
          cipher their-key t bl.ser:*network-magic*)
         (%v2-finish-handshake conn cipher garbage deadline)))))
 
-(defun v2-detect-inbound (conn &key (timeout 15))
+(defun v2-detect-inbound (conn &key (timeout 15) peer-id)
   "Responder-side v1/v2 detection on a fresh inbound CONN: read the first 16
 bytes and compare with the v1 prefix (magic + \"version\" command). Returns
 :V1 with the bytes pushed back for the v1 path, a ready v2-transport for a v2
@@ -396,6 +411,10 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
                                             (bl.crypto:bip324-cipher-our-pubkey
                                              cipher)
                                             garbage))
+               ;; The responder's send state reaches Core's AWAITING_KEY only
+               ;; here, once the first 16 bytes have told it this is not a v1
+               ;; peer (net.cpp:1003 MAYBE_V1), so its handshake starts here.
+               (%log-v2-handshake-start peer-id)
                (%v2-finish-handshake conn cipher garbage deadline)))))))))
 
 (defun v2-available-p ()
