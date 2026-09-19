@@ -320,9 +320,65 @@ reason the method exists — it is undocumented and for testing only."
               (push (vector method position name (json-bool string-p)) rows))))))
     (coerce (nreverse rows) 'vector)))
 
+(defun %capitalize-category (category)
+  "CATEGORY with its first character upcased, as Core's Capitalize does
+(util/string.h) -- `blockchain' -> `Blockchain'. Only the first character:
+`rawtransactions' is one word to Core and stays one."
+  (if (plusp (length category))
+      (concatenate 'string (string-upcase (subseq category 0 1))
+                   (subseq category 1))
+      category))
+
+(defun %listable-methods ()
+  "The registered methods a bare `help' lists, ordered as CRPCTable::help
+orders them: by CATEGORY then NAME, which is what its
+`category + name' sort key comes to (rpc/server.cpp:75-80).
+
+Hidden methods are dropped here rather than at the heading, because Core
+drops them before the heading is ever considered (:85-86) -- a category whose
+every member is hidden must print no heading at all. A method with no
+category is listed last under an empty one; nothing reaches that today, and
+HELP-LISTING-COVERS-EVERY-REGISTERED-METHOD keeps it that way."
+  (let ((rows '()))
+    (maphash (lambda (name handler)
+               (declare (ignore handler))
+               (unless (rpc-method-hidden-p name)
+                 (push (cons (or (rpc-method-category name) "") name) rows)))
+             *rpc-methods*)
+    (sort rows (lambda (a b)
+                 (if (string= (car a) (car b))
+                     (string< (cdr a) (cdr b))
+                     (string< (car a) (car b)))))))
+
+(defun %help-listing ()
+  "The answer to a bare `help': Core's CRPCTable::help listing
+(rpc/server.cpp:69-115).
+
+One line per method -- the FIRST line of its help document, which is the
+usage line -- under a `== Category ==' heading emitted whenever the category
+changes, with a blank line before each heading except the first. Core builds
+exactly this and then drops the final newline (:113)."
+  (with-output-to-string (out)
+    (let ((category nil))
+      (loop for (row-category . name) in (%listable-methods)
+            for first = t then nil
+            do (unless (equal category row-category)
+                 (unless first (terpri out))
+                 (setf category row-category)
+                 (format out "== ~A ==~%" (%capitalize-category row-category)))
+               (format out "~A~%" (rpc-usage-line name)))
+      ;; Core's strRet.substr(0, size-1): the listing carries no trailing
+      ;; newline, and rpc_help.py's splitlines() over it must not end in an
+      ;; empty line.
+      (let ((so-far (get-output-stream-string out)))
+        (write-string (if (plusp (length so-far))
+                          (subseq so-far 0 (1- (length so-far)))
+                          so-far)
+                      out)))))
+
 (define-rpc "help" (node params)
   "List available RPC methods, or answer with one method's help document
-(Bitcoin Core help / CRPCTable::help, rpc/server.cpp:295-330).
+(Bitcoin Core help / CRPCTable::help, rpc/server.cpp:69-115).
 
 A bare call lists every method Core would list: the ones it files under the
 category \"hidden\" -- generate*, invalidateblock, setmocktime, echo,
@@ -332,9 +388,12 @@ node's interface. `help <name>' still answers for a hidden method, which is
 how rpc_orphans.py:152-153 tells the two apart: getorphantxs must be absent
 from the listing AND must not be an \"unknown command\".
 
-DIVERGENCE: the listing is one bare method name per line rather than Core's
-usage lines under `== Category ==' headings; this node carries no category
-for its methods (rpc_help.py's test_categories is what wants them).
+The listing is Core's: the commands are ordered by CATEGORY+NAME, each one
+contributes the first line of its help (its usage line), and a
+`== Capitalize(category) ==' heading is printed whenever the category
+changes, with a blank line before every heading but the first. This used to
+be one bare method name per line, and rpc_help.py:139-149 read the headings
+back as an EMPTY list.
 
 A method whose help text IS its behaviour registers it in *RPC-HELP-TEXTS*
 (register-rpc-help) and is answered from there first -- today `generate'
@@ -352,13 +411,7 @@ rpc_help.py uses to check this node against Core's client.cpp."
        (cond ((gethash method *rpc-help-texts*))
              ((gethash method *rpc-methods*) (rpc-help-document method))
              (t (format nil "help: unknown command: ~A" method))))
-      (t
-       (let ((names '()))
-         (maphash (lambda (k v)
-                    (declare (ignore v))
-                    (unless (rpc-method-hidden-p k) (push k names)))
-                  *rpc-methods*)
-         (format nil "~{~A~^~%~}" (sort names #'string<)))))))
+      (t (%help-listing)))))
 
 (define-rpc "getindexinfo" (node params)
   "Report the status of optional indexes (Bitcoin Core getindexinfo): txindex,

@@ -76,6 +76,27 @@ rpc/core-tables.lisp.")
 `help <name>', never listed by a bare `help'."
   (and (member method *rpc-hidden-methods* :test #'string=) t))
 
+(defvar *rpc-categories* '()
+  "((method . category) ...): the category Core files each method under, from
+the `{\"category\", &method}' rows of its CRPCCommand tables. CRPCTable::help
+groups a bare `help' by it -- the commands are sorted by category+name and a
+`== Capitalize(category) ==' heading is printed whenever the category changes
+(rpc/server.cpp:69-115), which is what rpc_help.py's test_categories reads
+back. Generated into rpc/core-tables.lisp by scripts/gen-rpc-categories.py,
+which prints *RPC-HIDDEN-METHODS* from the same rows so the two cannot
+drift.")
+
+(defvar *rpc-local-categories* '()
+  "((method . category) ...): the category for a method Core does not have, so
+one cannot silently default into the listing under the wrong heading. Kept
+apart from the generated table because rerunning the script must not drop
+it.")
+
+(defun rpc-method-category (method)
+  "METHOD's Core category, or NIL when nothing files it."
+  (or (cdr (assoc method *rpc-categories* :test #'string=))
+      (cdr (assoc method *rpc-local-categories* :test #'string=))))
+
 (defvar *rpc-help-details* '()
   "((method . thunk) ...): help text a method COMPUTES when asked, appended to
 its docstring by RPC-METHOD-DESCRIPTION.

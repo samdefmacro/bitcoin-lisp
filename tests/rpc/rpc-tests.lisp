@@ -11356,6 +11356,85 @@ hidden method listed."
                     "help ~A answered ~S" hidden text)
           (is (eql 0 (search hidden text))))))))
 
+(test help-lists-usage-lines-under-cores-category-headings
+  "CRPCTable::help sorts the commands by `category + name', prints
+`== ' + Capitalize(category) + ` ==' whenever the category changes -- with a
+blank line before every heading but the first -- writes ONE line per command
+(the first line of its help, i.e. its usage line), and drops the closing
+newline (rpc/server.cpp:69-115). rpc_help.py:139-149 reads the headings back
+as `[line[3:-3] for line in help().splitlines() if line.startswith('==')]'
+and compares them with the sorted component list.
+
+Ours listed one bare method name per line and no headings at all, so that
+comprehension produced []."
+  (let* ((node (make-test-node))
+         (listing (bl.rpc:dispatch-rpc-method node "help" (wire-params '())))
+         (lines (uiop:split-string listing :separator (string #\Newline)))
+         (titles (loop for l in lines
+                       when (and (> (length l) 4)
+                                 (string= "== " (subseq l 0 3)))
+                         collect (subseq l 3 (- (length l) 3)))))
+    ;; The headings rpc_help.py wants, in its own order (sorted).
+    (is (equal '("Blockchain" "Control" "Mining" "Network" "Rawtransactions"
+                 "Util" "Wallet" "Zmq")
+               titles)
+        "help's category headings were ~S" titles)
+    ;; No trailing newline: splitlines() must not report an empty last line.
+    (is (string/= "" (car (last lines)))
+        "the listing ends in a newline")
+    ;; A blank line before every heading but the first.
+    (loop for (prev this) on lines
+          while this
+          do (when (and prev (> (length this) 2) (string= "== " (subseq this 0 3)))
+               (is (string= "" prev)
+                   "no blank line before the heading ~S" this)))
+    ;; Every other line is a method's USAGE line, so its first token is the
+    ;; method name -- which is what rpc_help.py's dump_help() splits off.
+    (let ((names (loop for l in lines
+                       unless (or (string= "" l)
+                                  (and (> (length l) 2) (string= "== " (subseq l 0 3))))
+                         collect (first (uiop:split-string l :separator " ")))))
+      (is (= (length names) (length (remove-duplicates names :test #'string=)))
+          "a method is listed twice")
+      (is-true (member "getblockchaininfo" names :test #'string=))
+      ;; getblockhash carries its declared argument, as Core's usage line does.
+      (is-true (member "getblockhash height" lines :test #'string=)
+               "the listing does not carry usage lines")
+      ;; Core's hidden category is still absent.
+      (dolist (hidden '("getorphantxs" "setmocktime" "invalidateblock"))
+        (is-false (member hidden names :test #'string=)
+                  "~A was listed" hidden)))))
+
+(test help-listing-covers-every-registered-method
+  "Every method this node registers must carry a category, or it lands under
+an empty heading and invents a `==  ==' title rpc_help.py would read back.
+Core has a row for all but one of ours; that one is named in
+*RPC-LOCAL-CATEGORIES* so a NEW method cannot default into the listing
+silently.
+
+The category table is generated from Core (scripts/gen-rpc-categories.py) and
+the hidden list comes from the same rows, so this also pins that the two
+agree: a method Core files under \"hidden\" must be hidden here."
+  (bl.rpc::register-all-methods)
+  (let ((uncategorized '())
+        (disagreeing '()))
+    (maphash (lambda (name handler)
+               (declare (ignore handler))
+               (let ((category (bl.rpc::rpc-method-category name)))
+                 (when (or (null category) (string= category ""))
+                   (push name uncategorized))
+                 (when (and category
+                            (not (eq (and (string= category "hidden") t)
+                                     (bl.rpc::rpc-method-hidden-p name))))
+                   (push name disagreeing))))
+             bl.rpc::*rpc-methods*)
+    (is (null uncategorized)
+        "~D registered methods carry no category: ~S"
+        (length uncategorized) uncategorized)
+    (is (null disagreeing)
+        "the category table and the hidden list disagree about: ~S"
+        disagreeing)))
+
 (test getpeerinfo-help-names-the-networks-it-can-report
   "Core documents getpeerinfo's `network' field with the list it generates
 from the Network enum itself (rpc/net.cpp:137):
