@@ -571,11 +571,22 @@ values Core substitutes RAW (%s, %b, %h) take this path. A WALLET NAME is not:
 Core's own wallet-name rules admit any character but a path separator, and
 feature_notifications.py:43 creates a wallet named after every printable and
 control character from 1 to 127 precisely to pin that. %NOTIFY-SHELL-ESCAPE is
-the answer for those."
+the answer for those.
+
+Alphanumeric here is ASCII only -- Core's CHARS_ALPHA_NUM
+(util/strencodings.cpp:19-28), the same class SANITIZE-STRING is built on and
+for the same reason its docstring gives: CL:ALPHANUMERICP is true of every
+Unicode letter and digit, so it would hand a value straight to /bin/sh on a
+claim about characters this code has not examined. Escaping is never wrong,
+so the set that skips it is the reference's own."
   (and (stringp value)
        (plusp (length value))
        (every (lambda (ch)
-                (or (alphanumericp ch) (member ch '(#\. #\_ #\-))))
+                (let ((code (char-code ch)))
+                  (or (<= 48 code 57)          ; 0-9
+                      (<= 65 code 90)          ; A-Z
+                      (<= 97 code 122)         ; a-z
+                      (member ch '(#\. #\_ #\-)))))
               value)))
 
 (defun %notify-shell-escape (value)

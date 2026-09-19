@@ -1747,6 +1747,76 @@ and then quote-removed substitution can produce."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
+(test every-notify-hook-quotes-or-substitutes-nothing
+  "The audit the -walletnotify escaping asked for: the other operator hooks
+must not be protected by prose.
+
+Core's four hooks fall into three shapes, and each is checked here on the
+value it really carries:
+
+  -blocknotify     %s is blockHash.GetHex(), substituted raw (init.cpp:2013)
+  -walletnotify    %s/%w/%b/%h, %w through ShellEscape (wallet.cpp:1146)
+  -alertnotify     %s is SanitizeString'd to SAFE_CHARS_DEFAULT and then
+                   wrapped in single quotes by AlertNotify itself
+                   (kernel_notifications.cpp:36-42)
+  -startupnotify   no substitution at all (init.cpp:255-266)
+  -shutdownnotify  no substitution at all
+
+-alertnotify is the one that waives the shell-safe check (RUN-NOTIFY-COMMAND
+:CHECK NIL), on the grounds that its caller already quoted the value. That is
+the same `the other layer restricts this too' reasoning the -walletnotify
+allowlist was justified by before it turned out to be false, so it is pinned
+mechanically here rather than argued: the safe set contains no quote, so a
+message full of shell syntax comes out as one quoted word that runs nothing."
+  (let* ((dir (merge-pathnames (format nil "bl-notify-audit-~D/"
+                                       (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (nasty "boom '; touch PWNED; echo '"))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; -alertnotify's value, built exactly as ALERT-NOTIFY builds it
+           ;; and run through the same waived-check path, WAITED for so the
+           ;; assertion cannot race a detached process.
+           (bl.log:run-notify-command
+            (format nil "touch ~Aalert-%s" (namestring dir))
+            :value (format nil "'~A'" (bl.bytes:sanitize-string nasty))
+            :check nil :wait t)
+           (is (null (probe-file (merge-pathnames "PWNED" dir)))
+               "-alertnotify's message executed a command of its own")
+           (is (null (probe-file (merge-pathnames "PWNED" (uiop:getcwd)))))
+           ;; It did run, and made exactly ONE file: the sanitized message
+           ;; reached touch as a single word.
+           (let ((made (directory (merge-pathnames "alert-*" dir))))
+             (is (= 1 (length made))
+                 "-alertnotify produced ~D files, not one" (length made)))
+           ;; -startupnotify and -shutdownnotify substitute NOTHING, as
+           ;; Core's do not: a % in the operator's command stays literal.
+           (bl.log:run-notify-command
+            (format nil "touch ~Aplain-100%s" (namestring dir)) :wait t)
+           (is-true (probe-file (merge-pathnames "plain-100%s" dir))
+                    "a hook with no substitutions did not reach the shell verbatim"))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore))))
+  ;; The sanitizer -alertnotify's quoting rests on really does drop every
+  ;; quote, so the wrap cannot be broken out of -- with a control that it
+  ;; keeps what it is supposed to keep.
+  (dolist (ch (list #\' #\" #\` #\$ #\\))
+    (is (null (find ch (bl.bytes:sanitize-string (format nil "a~Cb" ch))))
+        "~C survived SanitizeString" ch))
+  (is (equal "ab" (bl.bytes:sanitize-string "a`b")))
+  (is (equal "a.b" (bl.bytes:sanitize-string "a.b")))
+  ;; -blocknotify's and -walletnotify's values go through the shell-safe
+  ;; check; the RAW path is now the reference's own character class, so a
+  ;; non-ASCII letter is escaped rather than handed to the shell on a claim
+  ;; about Unicode that this code never examined.
+  (is (equal "echo deadbeef"
+             (bl.log::%notify-substitute "echo %s" (list (cons #\s "deadbeef")))))
+  (is (equal (format nil "echo 'caf~A'" (code-char 233))
+             (bl.log::%notify-substitute
+              "echo %w"
+              (list (cons #\w (format nil "caf~A" (code-char 233))))))))
+
 (test notify-commands-reach-the-plist
   "-shutdownnotify is repeatable — Core reads it with GetArgs and joins EVERY
 one (init.cpp:257-265) — while -blocknotify is a single command."
