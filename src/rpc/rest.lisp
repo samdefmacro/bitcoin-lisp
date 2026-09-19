@@ -151,9 +151,14 @@ chain's H+1, H+2, ... and headers[1].previousblockhash did not match
 headers[0].hash. Once the start is on the active chain every successor is
 too, which is what makes the single check sufficient.
 
-Divergence kept deliberately: Core answers 200 with an empty array for a
-hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
-404 an existing client may rely on."
+An UNKNOWN hash is 200 with an empty result, not a 404: Core's
+LookupBlockIndex answers nullptr, the loop never runs, and the empty header
+vector is written with HTTP_OK. There is no error path for it in rest_headers
+at all -- the only 404s that endpoint has are for a MISSING BLOCK BODY, which
+headers do not need. This used to be a deliberate divergence here (\"an
+existing client may rely on it\"), which made a well-formed unknown hash and
+a fork header answer differently for the same non-answer;
+interface_rest.py:231 asks for the unknown hash and compares against []."
   (unless (valid-hex-hash-p body)
     (return-from %rest-headers (%rest-error 400 (format nil "Invalid hash: ~A" body))))
   (let* ((raw-count (or (hunchentoot:get-parameter "count") "5"))
@@ -163,11 +168,10 @@ hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
                  chain-state (parse-hex-hash body))))
     (when (or (null count) (< count 1) (> count +rest-max-headers+))
       (return-from %rest-headers (%rest-error 400 (%rest-bad-count-message raw-count))))
-    (unless start
-      (return-from %rest-headers (%rest-error 404 (format nil "~A not found" body))))
     ;; Walk forward via active-chain successors by height.
     (let ((entries
-            (when (bl.store:entry-on-active-chain-p chain-state start)
+            (when (and start
+                       (bl.store:entry-on-active-chain-p chain-state start))
               (loop with h = (bl.store:block-index-entry-height start)
                     for i from 0 below count
                     for e = start then (bl.store:get-block-at-height

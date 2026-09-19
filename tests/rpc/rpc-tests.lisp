@@ -10001,6 +10001,40 @@ structural."
           (is (= (1+ (* 3 160)) (length (rest-get genesis-hex "hex"))))
           (is (= (* 3 80) (length (rest-get genesis-hex "bin")))))))))
 
+(test rest-headers-answers-an-unknown-hash-with-an-empty-result
+  "A well-formed hash the index does not know is 200 with an empty result, not
+a 404: Core's LookupBlockIndex answers nullptr, the loop in rest_headers never
+runs, and the empty header vector goes out with HTTP_OK (rest.cpp:225-247).
+rest_headers has no not-found path at all. Ours answered 404 by a documented
+divergence, so interface_rest.py:231 read 404 where it compares against [] --
+and a fork header, which is equally unanswerable, already returned 200 [].
+
+The count check still comes FIRST, as Core's does, so an out-of-range count on
+an unknown hash is the count's own 400."
+  (multiple-value-bind (cs entries) (%make-served-chain 2)
+    (declare (ignore entries))
+    (let* ((node (make-test-node))
+           (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (unknown (make-string 64 :initial-element #\1)))
+      (setf (bl:node-chain-state node) cs)
+      (is-false (bl.store:get-block-index-entry
+                 cs (bl.rpc:parse-hex-hash unknown))
+                "the fixture knows the hash this test calls unknown")
+      (flet ((rest-get (ext)
+               (rest-request node (format nil "/rest/headers/~A.~A" unknown ext))))
+        (%with-rest-count ("1")
+          (is (string= "[]" (rest-get "json")))
+          (is (= 200 (hunchentoot:return-code*)))
+          (is (string= (format nil "~%") (rest-get "hex")))
+          (is (= 200 (hunchentoot:return-code*)))
+          (is (zerop (length (rest-get "bin"))))
+          (is (= 200 (hunchentoot:return-code*))))
+        ;; The count is still judged before the lookup.
+        (%with-rest-count ("0")
+          (let ((body (rest-get "json")))
+            (is-true (search "Header count is invalid" body)
+                     "an unknown hash swallowed the count complaint: ~S" body)))))))
+
 ;;; --- /rest/health liveness decision (item 6) ---
 
 (test rest-health-decision-logic
