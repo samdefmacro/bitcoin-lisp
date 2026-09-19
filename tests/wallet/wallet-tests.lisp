@@ -1897,7 +1897,8 @@ bound so the wallet chain hooks fire."
           (bl:node-wallet-manager ,node)))))))
 
 (defun %pp-mine (node n address)
-  (bl.rpc::rpc-generatetoaddress node (list n address)))
+  (bl.rpc:dispatch-rpc-method node "generatetoaddress"
+                              (wire-params (list n address))))
 
 (defun %pp-fund-wallet (node &key (blocks 1))
   "createwallet \"w\", mine BLOCKS coinbases to a fresh bech32 (P2WPKH) address,
@@ -1936,9 +1937,10 @@ that our own script verifier accepts and the mempool relays."
     (let ((wallet (%pp-fund-wallet node)))
       (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 42))
              (dest (%pp-optrue-address))
-             (created (bl.wallet::rpc-walletcreatefundedpsbt
-                       node (list '() (list (%ht dest 1))
-                                  0 (%ht "fee_rate" 5))))
+             (created (bl.rpc:dispatch-rpc-method
+                       node "walletcreatefundedpsbt"
+                       (wire-params (list '() (list (%ht dest 1))
+                                          0 (%ht "fee_rate" 5)))))
              (b64 (%aval "psbt" created)))
         (is (stringp b64))
         (is (> (%aval "fee" created) 0))
@@ -1956,7 +1958,8 @@ that our own script verifier accepts and the mempool relays."
                    (is (null (bl.ser:psbt-map-find
                               m bl.ser:+psbt-in-final-scriptsig+)))))
         ;; walletprocesspsbt (defaults: sign + finalize) completes it.
-        (let* ((processed (bl.wallet::rpc-walletprocesspsbt node (list b64)))
+        (let* ((processed (bl.rpc:dispatch-rpc-method
+                           node "walletprocesspsbt" (wire-params (list b64))))
                (hex (%aval "hex" processed)))
           (is (eq t (%aval "complete" processed)))
           (is (stringp hex))
@@ -2024,20 +2027,25 @@ second call with sign=true (default) completes it."
     (%pp-fund-wallet node)
     (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 99))
            (dest (%pp-optrue-address))
-           (b64 (%aval "psbt" (bl.wallet::rpc-walletcreatefundedpsbt
-                               node (list '() (list (%ht dest 1)) 0 (%ht "fee_rate" 5)))))
+           (b64 (%aval "psbt" (bl.rpc:dispatch-rpc-method
+                               node "walletcreatefundedpsbt"
+                               (wire-params
+                                (list '() (list (%ht dest 1)) 0
+                                      (%ht "fee_rate" 5))))))
            ;; sign=false, finalize=false: no partial sigs, incomplete.
-           (unsigned (bl.wallet::rpc-walletprocesspsbt
-                      node (list b64 bl.rpc:+json-false+ nil nil
-                                 bl.rpc:+json-false+))))
+           (unsigned (bl.rpc:dispatch-rpc-method
+                      node "walletprocesspsbt"
+                      (wire-params (list b64 bl.rpc:+json-false+ nil nil
+                                         bl.rpc:+json-false+)))))
       (is (eq bl.rpc:+json-false+ (%aval "complete" unsigned)))
       (let ((psbt (bl.ser:decode-psbt (%aval "psbt" unsigned))))
         (loop for m across (bl.ser:psbt-inputs psbt)
               do (is (null (bl.ser:psbt-map-collect
                             m bl.ser:+psbt-in-partial-sig+)))))
       ;; Now sign (defaults) -> complete + extractable.
-      (let ((signed (bl.wallet::rpc-walletprocesspsbt
-                     node (list (%aval "psbt" unsigned)))))
+      (let ((signed (bl.rpc:dispatch-rpc-method
+                     node "walletprocesspsbt"
+                     (wire-params (list (%aval "psbt" unsigned))))))
         (is (eq t (%aval "complete" signed)))
         (is (stringp (%aval "hex" signed)))))))
 
@@ -2185,8 +2193,11 @@ to cosign it. The v0 inputs here also pin RemoveUnnecessaryTransactions
     (%pp-fund-wallet node)
     (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 17))
            (dest (%pp-optrue-address))
-           (b64 (%aval "psbt" (bl.wallet::rpc-walletcreatefundedpsbt
-                               node (list '() (list (%ht dest 1)) 0 (%ht "fee_rate" 5)))))
+           (b64 (%aval "psbt" (bl.rpc:dispatch-rpc-method
+                               node "walletcreatefundedpsbt"
+                               (wire-params
+                                (list '() (list (%ht dest 1)) 0
+                                      (%ht "fee_rate" 5))))))
            (psbt (bl.ser:decode-psbt b64)))
       ;; Strip every non_witness_utxo, as an external creator that only
       ;; supplied witness_utxo would have left it.
@@ -2196,9 +2207,10 @@ to cosign it. The v0 inputs here also pin RemoveUnnecessaryTransactions
                (bl.ser:psbt-map-remove-type
                 m bl.ser:+psbt-in-non-witness-utxo+))
       (let* ((stripped (bl.ser:encode-psbt psbt))
-             (filled (bl.wallet::rpc-walletprocesspsbt
-                      node (list stripped bl.rpc:+json-false+ nil nil
-                                 bl.rpc:+json-false+)))
+             (filled (bl.rpc:dispatch-rpc-method
+                      node "walletprocesspsbt"
+                      (wire-params (list stripped bl.rpc:+json-false+ nil nil
+                                         bl.rpc:+json-false+))))
              (out (bl.ser:decode-psbt (%aval "psbt" filled))))
         (loop for m across (bl.ser:psbt-inputs out)
               do (is-true (bl.ser:psbt-map-find
@@ -2409,7 +2421,8 @@ the original stays in the mempool, and walletprocesspsbt completes the PSBT."
       ;; The original is untouched (psbtbumpfee does not broadcast).
       (is (not (null (%pp-mempool-tx node txid))))
       ;; walletprocesspsbt completes the replacement PSBT into a network tx.
-      (let ((processed (bl.wallet::rpc-walletprocesspsbt node (list b64))))
+      (let ((processed (bl.rpc:dispatch-rpc-method
+                        node "walletprocesspsbt" (wire-params (list b64)))))
         (is (eq t (%aval "complete" processed)))
         (is (stringp (%aval "hex" processed)))))))
 
