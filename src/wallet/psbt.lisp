@@ -1370,7 +1370,17 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
 
 (defun %psbt-add-wallet-input-derivs (psbt coins wallet)
   "Add input bip32 derivations / taproot internal keys for wallet-owned inputs
-(Core FillPSBT bip32derivs). Metadata only — helps offline signers."
+(Core FillPSBT bip32derivs). Metadata only — helps offline signers.
+
+An input that is already SIGNED is stepped over, because every FillPSBT loop
+Core runs opens with `if (PSBTInputSigned(input)) continue;' --
+CWallet::FillPSBT (wallet.cpp:2197-2198) and
+DescriptorScriptPubKeyMan::FillPSBT (scriptpubkeyman.cpp:1318-1320). That is
+what makes walletprocesspsbt IDEMPOTENT: finalizing an input drops its
+derivation records (%PSBT-SET-FINAL, as Core's FromSignatureData clears
+hd_keypaths on the complete branch), so an updater that ran over every input
+put them straight back and a second pass over a finished PSBT returned a
+different one -- rpc_psbt.py:780-782 compares the two."
   (let ((tx (bl.ser:psbt-tx psbt)))
     (loop for map across (bl.ser:psbt-inputs psbt)
           for in across (bl.ser:transaction-inputs tx)
@@ -1379,7 +1389,7 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
                                      (bl.ser:outpoint-index op))
                                coins)
           for spk = (and entry (first entry))
-          do (when spk
+          do (when (and spk (not (%psbt-input-signed-p map)))
                (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet spk)
                  (when spkm
                    (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)

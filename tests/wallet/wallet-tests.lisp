@@ -1964,7 +1964,58 @@ that our own script verifier accepts and the mempool relays."
                      (bl.crypto:hex-to-bytes hex))))
             (is (%pp-verify-ok-p node wallet tx))
             ;; The extracted tx relays.
-            (is (stringp (bl.rpc::rpc-sendrawtransaction node (list hex))))))))))
+            (is (stringp (bl.rpc:dispatch-rpc-method
+                          node "sendrawtransaction"
+                          (wire-params (list hex)))))))))))
+
+(test pp-walletprocesspsbt-is-idempotent-on-a-complete-psbt
+  "Every FillPSBT loop Core runs SKIPS an input that is already signed --
+CWallet::FillPSBT (wallet.cpp:2197-2198) and
+DescriptorScriptPubKeyMan::FillPSBT (scriptpubkeyman.cpp:1318-1320) both open
+with `if (PSBTInputSigned(input)) continue;', and PSBTInputSigned is the
+presence of a final scriptSig or scriptWitness (psbt.cpp:320-323). So
+processing an already-complete PSBT a second time changes nothing, which is
+what rpc_psbt.py:780-782 asserts:
+
+    complete_psbt = self.nodes[0].walletprocesspsbt(psbtx_info['psbt'])
+    double_processed_psbt = self.nodes[0].walletprocesspsbt(complete_psbt['psbt'])
+    assert_equal(complete_psbt, double_processed_psbt)
+
+Our updater half ran over EVERY input. Finalizing drops an input's derivation
+records -- Core's PSBTInput::FromSignatureData clears hd_keypaths on the
+complete branch (psbt.cpp) and %PSBT-SET-FINAL does the same -- so the second
+pass put a PSBT_IN_BIP32_DERIVATION back onto each finalized input and the two
+results differed by exactly those records: a finalized input carrying updater
+fields no signer will ever read.
+
+The control is the first pass: it must still complete AND come back with the
+derivations gone, so a change that simply stopped writing derivations at all
+would fail there rather than pass here."
+  (%with-pp-node (node "pp-twice")
+    (%pp-fund-wallet node)
+    (with-wallet-rng (7)
+      (let* ((dest (%pp-optrue-address))
+             (b64 (%aval "psbt"
+                         (bl.rpc:dispatch-rpc-method
+                          node "walletcreatefundedpsbt"
+                          (wire-params (list '() (list (%ht dest 1))
+                                             0 (%ht "fee_rate" 5))))))
+             (once (bl.rpc:dispatch-rpc-method
+                    node "walletprocesspsbt" (wire-params (list b64))))
+             (twice (bl.rpc:dispatch-rpc-method
+                     node "walletprocesspsbt"
+                     (wire-params (list (%aval "psbt" once))))))
+        (is (eq t (%aval "complete" once))
+            "fixture: the first pass did not complete")
+        ;; A finalized input keeps only its utxo and its final scripts.
+        (loop for m across (bl.ser:psbt-inputs
+                            (bl.ser:decode-psbt (%aval "psbt" once)))
+              do (is (null (bl.ser:psbt-map-collect m bl.ser:+psbt-in-bip32+))
+                     "a finalized input still carries a bip32 derivation"))
+        (is (equal (%aval "psbt" once) (%aval "psbt" twice))
+            "processing a complete PSBT again changed it")
+        (is (equal (%aval "hex" once) (%aval "hex" twice)))
+        (is (eq (%aval "complete" once) (%aval "complete" twice)))))))
 
 (test pp-walletprocesspsbt-sign-false-then-sign
   "walletprocesspsbt with sign=false only fills data (no sigs, incomplete); a
