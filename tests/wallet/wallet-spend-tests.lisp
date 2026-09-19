@@ -2028,7 +2028,13 @@ everything would fail there."
                                 (setf (gethash optrue h)
                                       (bl.rpc:format-money 10000000))
                                 h)))
-               (raw (rpc nil "createrawtransaction" '() outputs))
+               ;; [] goes through WIRE-PARAMS so it arrives as the empty-array
+               ;; sentinel; a bare NIL is JSON null, which Core refuses in a
+               ;; required position.
+               (raw (with-rpc-wallet (nil)
+                      (bl.rpc:dispatch-rpc-method
+                       node "createrawtransaction"
+                       (wire-params (list (vector) outputs)))))
                (own-pubkey (%aval "pubkey"
                                   (rpc "fund" "getaddressinfo"
                                        (rpc "fund" "getnewaddress" "" "bech32")))))

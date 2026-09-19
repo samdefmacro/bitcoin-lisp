@@ -1425,7 +1425,11 @@ break', rpc/util.cpp:778): stop's `wait' is declared hidden, so its summary is
 the bare method name even though the argument is still accepted."
   (let ((node (make-test-node)))
     (flet ((answer (method &rest params)
-             (cdr (%rpc-wire-error node method params))))
+             ;; The arity error carries the whole help DOCUMENT, as Core's
+             ;; does; the usage line is its first line.
+             (let ((message (cdr (%rpc-wire-error node method params))))
+               (subseq message 0 (or (position #\Newline message)
+                                     (length message))))))
       (is (equal "scantxoutset \"action\" ( [scanobjects,...] )"
                  (answer "scantxoutset")))
       (is (equal (concatenate 'string "scanblocks \"action\" ( [scanobjects,...] "
