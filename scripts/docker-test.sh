@@ -36,6 +36,13 @@ fi
 # transcript is scanned afterwards.
 TRANSCRIPT="$(mktemp -t bitcoin-lisp-cold)"
 trap 'rm -f "$TRANSCRIPT"; [ "$FRESH" = 1 ] && docker volume rm -f "$BITCOIN_LISP_FASL_VOLUME" >/dev/null 2>&1; true' EXIT
+# errexit is lifted for the suite pipeline alone: under `set -e -o pipefail' a
+# RED suite ended the script right here, before rc was read and before the
+# three transcript gates below ran -- so a failing run was also an unchecked
+# run (the tell was the missing `self-test ok' lines; seen 2026-09-19). The
+# gates now run on every transcript, and the suite's own status is the exit
+# code only when all of them pass.
+set +e
 "$(dirname "$0")/docker-sbcl.sh" --dynamic-space-size 4096 --non-interactive \
   --eval '(asdf:load-system "bitcoin-lisp/tests")' \
   --eval "(let ((r (fiveam:run $SUITE)))
@@ -46,6 +53,7 @@ trap 'rm -f "$TRANSCRIPT"; [ "$FRESH" = 1 ] && docker volume rm -f "$BITCOIN_LIS
             (unless (fiveam:results-status r) (sb-ext:exit :code 1)))" \
   2>&1 | tee "$TRANSCRIPT"
 rc=${PIPESTATUS[0]}
+set -e
 
 # A definition that replaces one already loaded under the same name is a
 # duplicate -- two files in one package defining the same function, the later
