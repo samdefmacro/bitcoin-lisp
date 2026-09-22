@@ -38,6 +38,7 @@
       bitcoin-lisp/storage        block store, coins view, chain state, indexes, pruning
       bitcoin-lisp/net            sockets, SOCKS5, BIP324 transport, BIP155, addrman, Tor
       bitcoin-lisp/rpc-server     JSON-RPC over HTTP, auth, warmup, DEFINE-RPC
+      bitcoin-lisp/cli            bitcoin-cli: the command-line client, a peer of the server
       bitcoin-lisp                script interpreter (Coalton), validation, mempool, mining,
                                   the P2P protocol, the RPC methods, wallet, node
 
@@ -64,6 +65,7 @@
   (@net section)
   (@p2p section)
   (@rpc-server section)
+  (@cli section)
   (@script section)
   (@validation section)
   (@mempool section)
@@ -995,6 +997,52 @@
   (bitcoin-lisp.rpc:+rpc-invalid-parameter+ constant)
   (bitcoin-lisp.rpc:*rpc-rate-limit* variable)
   (bitcoin-lisp.rpc:+max-rpc-body-size+ constant))
+
+(defsection @cli (:title "cli: bitcoin-cli")
+  "Compiled as `bitcoin-lisp/cli`, on the config layer and nothing above
+  it. Core: `bitcoin-cli.cpp` (the options, CallRPC, -getinfo, -netinfo,
+  -generate, -addrinfo, -rpcwait), `rpc/client.cpp` (which arguments are
+  JSON), `univalue` (reading and printing). The node executable IS the
+  client when started as `bitcoin-cli` -- NODE-MAIN asks
+  CLI-PROGRAM-NAME-P of argv[0] first -- and
+  `scripts/conformance-config.sh` links `build/bin/bitcoin-cli` to it,
+  so Core's framework finds it and one saved image serves both.
+
+  Invariants: RUN-CLI is the whole program as a function of argv and stdin
+  and returns stdout, stderr and the exit status; the network goes through
+  `*cli-transport*`, so every error text and exit code is testable with a
+  stub. A NUMBER keeps the text it arrived as (`(:num . \"2.50\")`) and is
+  printed back unchanged, as UniValue does; objects keep their order and
+  their duplicate keys. An argument is JSON only where
+  `*rpc-convert-params*` -- Core's table, verbatim -- says so. The exit
+  status is 0, 1 for any client-side failure, or the ABSOLUTE RPC error
+  code. The client reads bitcoin.conf with its OWN option table, bound over
+  `bl.cfg:*config-options*` for the call, so a node option in the file is
+  dropped and never leaks either way; `-rpcport` is network-only.
+
+  Traps: an IPv6 literal must never reach the resolver -- glibc refuses
+  `::1` under AI_ADDRCONFIG where the loopback is the only IPv6 address,
+  which is every container; the client connects to literals directly, and
+  the RPC acceptor binds and wakes an IPv6-literal listener itself.
+  `-named` with an explicit `args=` sends the key TWICE (pushKVEnd), and the
+  server refuses it."
+  (bitcoin-lisp.cli package)
+  (bitcoin-lisp.cli:run-cli function)
+  (bitcoin-lisp.cli:cli-main function)
+  (bitcoin-lisp.cli:cli-program-name-p function)
+  (bitcoin-lisp.cli:*cli-transport* variable)
+  (bitcoin-lisp.cli:uv-read function)
+  (bitcoin-lisp.cli:uv-write function)
+  (bitcoin-lisp.cli:*rpc-convert-params* variable)
+  (bitcoin-lisp.cli:rpc-convert-values function)
+  (bitcoin-lisp.cli:rpc-convert-named-values function)
+  (bitcoin-lisp.cli:split-rpc-host-port function)
+  "A number crosses the client as the text it arrived as:
+
+  ```cl-transcript
+  (bitcoin-lisp.cli:uv-write (bitcoin-lisp.cli:uv-read \"[0.00001000,\\\"x\\\"]\"))
+  => \"[0.00001000,\\\"x\\\"]\"
+  ```")
 
 (defsection @script (:title "script: the Coalton interpreter")
   "The one piece of the node written in Coalton: `src/coalton/` holds the

@@ -77,6 +77,10 @@ manager's files.")
 keys, libsecp256k1 returning failure.")
 (define-simple-error wallet-error
   "A wallet-internal failure that is not an RPC-level error code.")
+(define-simple-error cli-error
+  "A bitcoin-cli failure on the client side -- an argument, a port, a reply it
+cannot read -- which the client prints after `error: ' and exits 1 for
+(bitcoin-cli.cpp CommandLineRPC's catch).")
 
 (define-condition protocol-limit-error (serialization-error) ()
   (:documentation "A peer message declared more elements than the protocol

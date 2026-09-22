@@ -175,6 +175,28 @@ this same package."
                (:file "rpc/json")
                (:file "rpc/server")))
 
+(defsystem "bitcoin-lisp/cli"
+  :description "bitcoin-cli (Core src/bitcoin-cli.cpp, rpc/client.cpp, univalue):
+the command-line RPC client. A client of the JSON-RPC server that shares no
+code with it -- it reads the command line and bitcoin.conf through the config
+layer and talks HTTP on its own. The node executable runs it when invoked as
+bitcoin-cli (node-main)."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging"
+               "bitcoin-lisp/config" "bitcoin-lisp/serialization"
+               "cl-base64" "alexandria" (:require "sb-bsd-sockets"))
+  :pathname "src"
+  :serial t
+  :components ((:file "cli/package")
+               (:module "cli"
+                :serial t
+                :components ((:file "univalue")   ; Core UniValue: numbers keep their text
+                             (:file "convert")    ; rpc/client.cpp: which arguments are JSON
+                             (:file "args")       ; the options, bitcoin.conf, the chain, the cookie
+                             (:file "http")       ; one POST, libevent's view of it
+                             (:file "handlers")   ; the request handlers, -getinfo
+                             (:file "netinfo")    ; -netinfo
+                             (:file "main")))))   ; CallRPC, CommandLineRPC, main
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -189,6 +211,7 @@ this same package."
                "bitcoin-lisp/storage"
                "bitcoin-lisp/net"
                "bitcoin-lisp/rpc-server"
+               "bitcoin-lisp/cli"
                "ironclad"
                "nibbles"
                "cffi"
@@ -492,6 +515,8 @@ this same package."
                              (:file "networking/eclipse-dos-tests")
                              ;; bitcoin.conf + CLI argument parsing
                              (:file "config/config-tests")
+                             ;; bitcoin-cli (Core bitcoin-cli.cpp, rpc/client.cpp, univalue)
+                             (:file "cli/cli-tests")
                              ;; The chain-params table
                              (:file "util/chainparams-tests")
                              (:file "logging/logging-tests")

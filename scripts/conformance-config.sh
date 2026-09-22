@@ -33,8 +33,14 @@ mkdir -p "$ROOT/build/bin"
 # EINVAL, which surfaces as a whole batch of unrelated-looking failures.
 # Observed 2026-08-25 running four sweep batches at once. rename(2) has no such
 # window.
-ln -sfn "../$(basename "$BIN")" "$ROOT/build/bin/.bitcoind.$$"
-mv -f "$ROOT/build/bin/.bitcoind.$$" "$ROOT/build/bin/bitcoind"
+# The same executable is bitcoin-cli: node-main runs the client when it is
+# started under that name (src/cli/), so the framework finds the client where
+# it looks for it, BUILDDIR/bin/bitcoin-cli (util.py:317-343), with no second
+# image to build.
+for name in bitcoind bitcoin-cli; do
+  ln -sfn "../$(basename "$BIN")" "$ROOT/build/bin/.$name.$$"
+  mv -f "$ROOT/build/bin/.$name.$$" "$ROOT/build/bin/$name"
+done
 
 # Paths written INTO config.ini are resolved by whoever reads it, which is
 # python inside the container. CONFORMANCE_ROOT lets the caller say where the
@@ -57,10 +63,12 @@ EXEEXT=
 RPCAUTH=$CONFIG_ROOT/refs/bitcoin/share/rpcauth/rpcauth.py
 
 [components]
-# Only the node is ours. bitcoin-cli, bitcoin-tx, bitcoin-util, the wallet tool
-# and the fuzz/bench binaries do not exist here, so the tests that need them
-# are out of scope rather than failing (see the plan's classification).
+# The node and its client are ours (build/bin/bitcoind and build/bin/bitcoin-cli
+# are the same executable). bitcoin-tx, bitcoin-util, the wallet tool and the
+# fuzz/bench binaries do not exist here, so the tests that need them are out
+# of scope rather than failing (see the plan's classification).
 ENABLE_BITCOIND=true
+ENABLE_CLI=true
 ENABLE_WALLET=true
 ENABLE_ZMQ=true
 EOF

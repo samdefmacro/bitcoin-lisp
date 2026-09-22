@@ -2348,6 +2348,12 @@ stderr back at EVERY node stop and fails the test unless it is exactly empty
 every test that stops a node. Startup FAILURES do go to stderr, which is also
 Core's behaviour and what assert_start_raises_init_error reads."
   (sb-ext:disable-debugger)
+  ;; The same executable is bitcoin-cli when started under that name
+  ;; (scripts/conformance-config.sh links build/bin/bitcoin-cli to it), which
+  ;; is how Core's framework finds a client next to its node. Decided before
+  ;; anything of the node's runs: the client touches no datadir and no umask.
+  (when (bl.cli:cli-program-name-p (or (first sb-ext:*posix-argv*) ""))
+    (bl.cli:cli-main))
   ;; Core's main() runs SetupEnvironment first, before it has looked at a
   ;; single argument (bitcoind.cpp:269): the mask has to be in place before
   ;; ANYTHING is created, datadir included.

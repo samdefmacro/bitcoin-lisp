@@ -24,6 +24,7 @@ consensus / policy errors that carry Core's reject reason.")
    #:net-error
    #:crypto-error
    #:wallet-error
+   #:cli-error
    #:consensus-error
    #:policy-error
    #:error-reason))
@@ -72,6 +73,7 @@ consensus / policy errors that carry Core's reject reason.")
     ("BL.NET" . "BITCOIN-LISP.NETWORKING")
     ("BL.RPC" . "BITCOIN-LISP.RPC")
     ("BL.WALLET" . "BITCOIN-LISP.WALLET")
+    ("BL.CLI" . "BITCOIN-LISP.CLI")
     ("BL.CTYPES" . "BITCOIN-LISP.COALTON.TYPES")
     ("BL.CCRYPTO" . "BITCOIN-LISP.COALTON.CRYPTO")
     ("BL.CBIN" . "BITCOIN-LISP.COALTON.BINARY")
