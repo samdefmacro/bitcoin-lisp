@@ -1126,6 +1126,21 @@ witness-script), the shape FIND-COINS and PARSE-PREVOUTS fill and
 SIGN-TX-INPUTS reads. EQUALP because the key is a cons around the txid."
   (make-hash-table :test 'equalp))
 
+(defun find-transaction (node txid)
+  "The transaction TXID from the txindex, else the mempool, or NIL -- the
+lookup ProcessPSBT makes for each input's non_witness_utxo
+(rpc/rawtransaction.cpp:143-167)."
+  (or (let* ((tx-index (rpc-get-tx-index node))
+             (location (and tx-index (bl.store:tx-index-enabled tx-index)
+                            (bl.store:txindex-lookup tx-index txid)))
+             (block (and location
+                         (bl.store:get-block (rpc-get-block-store node)
+                                             (bl.store:tx-location-block-hash location)))))
+        (and block (find-tx-in-block block txid)))
+      (let* ((mempool (rpc-get-mempool node))
+             (entry (and mempool (bl.mp:mempool-get mempool txid))))
+        (and entry (bl.mp:mempool-entry-transaction entry)))))
+
 (defun find-coins (node tx)
   "Core FindCoins (node/coin.cpp:12-27) for TX's inputs: the coin each input
 spends, from the mempool view first (an unconfirmed parent's output) and the

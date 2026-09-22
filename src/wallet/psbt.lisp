@@ -580,39 +580,137 @@ we do not shuffle indices)."
           '("witness_v0_keyhash" "witness_v0_scripthash" "witness_v1_taproot")
           :test #'string=))
 
+(defun %psbt-provider-sub-scripts (spk expansions)
+  "(values redeem witness) the descriptor EXPANSIONS know for SPK -- the
+provider's GetCScript for its P2SH / P2WSH hash."
+  (let ((exp (gethash spk expansions)))
+    (when exp
+      (destructuring-bind (desc pos pairs) exp
+        (declare (ignore pairs))
+        (let ((inner (%desc-inner-scripts desc pos)))
+          (case (bl.rpc:out-desc-kind desc)
+            (:sh (values (first inner) (second inner)))
+            (:wsh (values nil (first inner)))))))))
+
+(defun %psbt-segwit-output-p (spk expansions)
+  "Core IsSegWitOutput (script/sign.cpp:1003-1019): a witness program, or a
+P2SH whose redeem script the provider knows and which is one."
+  (or (bl.val:output-witness-program-p spk)
+      (and (eq (bl.val:classify-script spk) :scripthash)
+           (let ((redeem (%psbt-provider-sub-scripts spk expansions)))
+             (and redeem (bl.val:output-witness-program-p redeem))))))
+
+(defun %psbt-update-input-from-provider (map tx-in expansions)
+  "SignPSBTInput with no key to sign with (ProcessPSBT's hidden-secret
+provider, rpc/rawtransaction.cpp:190-205): ProduceSignature finds what it can
+-- the redeem and witness scripts, the key derivations -- FromSignatureData
+records them, and an input whose solution is a WITNESS gets its witness_utxo
+(psbt.cpp:487-500). The witness question is ProduceSignature's: P2WPKH and
+P2TR always, P2WSH once its witness script is known, P2SH once its redeem
+script is a witness program whose own script is known (sign.cpp:757-789)."
+  (let* ((out (%psbt-input-prevout map tx-in))
+         (spk (and out (bl.ser:tx-out-script-pubkey out)))
+         (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (when spk
+      (multiple-value-bind (redeem witness) (%psbt-provider-sub-scripts spk expansions)
+        (let* ((redeem (or (bl.ser:psbt-map-find map bl.ser:+psbt-in-redeem-script+) redeem))
+               (witness (or (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-script+) witness))
+               (witness-p
+                 (case (bl.val:classify-script spk)
+                   ((:witness-v0-keyhash :witness-v1-taproot) t)
+                   (:witness-v0-scripthash (and witness t))
+                   (:scripthash
+                    (and redeem
+                         (case (bl.val:classify-script redeem)
+                           (:witness-v0-keyhash t)
+                           (:witness-v0-scripthash (and witness t))))))))
+          (when (and redeem (eq (bl.val:classify-script spk) :scripthash)
+                     (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-redeem-script+)))
+            (bl.ser:psbt-map-set map bl.ser:+psbt-in-redeem-script+ empty redeem))
+          (when (and witness witness-p
+                     (member (bl.val:classify-script (if (eq (bl.val:classify-script spk) :scripthash)
+                                                         redeem spk))
+                             '(:witness-v0-scripthash))
+                     (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-script+)))
+            (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-script+ empty witness))
+          (when (and witness-p (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-utxo+)))
+            (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
+                                 (%serialize-txout-bytes out)))
+          (let ((exp (gethash spk expansions)))
+            (when exp
+              (destructuring-bind (desc pos pairs) exp
+                (declare (ignore desc))
+                (%psbt-add-map-derivs map spk pos pairs)))))))))
+
 (bl.rpc:define-rpc "utxoupdatepsbt" (node params)
-  "Fill in each input's witness_utxo from the node's UTXO set for witness
-outputs. PARAMS: (psbt [descriptors]). Descriptors are not yet used (no
-descriptor-based script solving); the UTXO-filling role is implemented.
-Mirrors the no-key part of Core utxoupdatepsbt."
-  (let* ((psbt (%psbt-decode-arg (first params)))
-         (utxo-set (bl.rpc:rpc-get-utxo-set node))
-         (tx (bl.ser:psbt-tx psbt)))
-    (when utxo-set
-      (loop for in across (bl.ser:transaction-inputs tx)
-            for i from 0
-            for map = (aref (bl.ser:psbt-inputs psbt) i)
-            do (unless (or (bl.ser:psbt-map-find
-                            map bl.ser:+psbt-in-witness-utxo+)
-                           (bl.ser:psbt-map-find
-                            map bl.ser:+psbt-in-non-witness-utxo+))
-                 (let* ((op (bl.ser:tx-in-previous-output in))
-                        (entry (bl.store:get-utxo
-                                utxo-set
-                                (bl.ser:outpoint-hash op)
-                                (bl.ser:outpoint-index op))))
-                   (when (and entry (%psbt-witness-spk-p
-                                     (bl.store:utxo-entry-script-pubkey entry)))
-                     (let ((bb (bl.ser:make-byte-buf)))
-                       (bl.ser:bb-write-tx-out
-                        bb (bl.ser:make-tx-out
-                            :value (bl.store:utxo-entry-value entry)
-                            :script-pubkey (bl.store:utxo-entry-script-pubkey entry)))
-                       (bl.ser:psbt-map-set
-                        map bl.ser:+psbt-in-witness-utxo+
-                        (make-array 0 :element-type '(unsigned-byte 8))
-                        (bl.ser:bb-finish bb))))))))
-    (bl.ser:encode-psbt psbt)))
+  "Core utxoupdatepsbt = ProcessPSBT with a provider built from the optional
+DESCRIPTORS and every secret hidden (rpc/rawtransaction.cpp:128-212).
+PARAMS: (psbt [descriptors]).
+
+1. non_witness_utxo for each input from the txindex, else the mempool
+   (:143-167);
+2. for inputs still without one, the coin from the UTXO set / mempool view,
+   kept as witness_utxo only for a segwit output (IsSegWitOutput) (:170-184);
+3. every unsigned input updated as SignPSBTInput would with no key
+   (%PSBT-UPDATE-INPUT-FROM-PROVIDER), and outputs the descriptors know given
+   their scripts and derivations (UpdatePSBTOutput);
+4. RemoveUnnecessaryTransactions.
+
+Ours filled a witness_utxo from the UTXO set alone and ignored DESCRIPTORS, so
+an unconfirmed input got nothing, a legacy one never its non_witness_utxo, and
+a P2SH-P2WPKH never its redeem script -- rpc_psbt.py:895-905."
+  (bl.rpc:with-node-lock (node)
+    (let* ((psbt (%psbt-decode-arg (first params)))
+           (descs (second params))
+           (expansions (if (bl.rpc:positional-array descs)
+                           (%psbt-descriptor-expansions (bl.rpc:positional-array descs)
+                                                        (bl.rpc:rpc-get-network node))
+                           (bl.bytes:make-octets-hash-table)))
+           (tx (bl.ser:psbt-tx psbt))
+           (empty (make-array 0 :element-type '(unsigned-byte 8))))
+      (loop for map across (bl.ser:psbt-inputs psbt)
+            for in across (bl.ser:transaction-inputs tx)
+            unless (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+)
+              do (let ((prev (bl.rpc:find-transaction
+                              node (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in)))))
+                   (when prev
+                     (bl.ser:psbt-map-set map bl.ser:+psbt-in-non-witness-utxo+ empty
+                                          (bl.ser:serialize-transaction prev)))))
+      (let ((coins (bl.rpc:find-coins node tx)))
+        (loop for map across (bl.ser:psbt-inputs psbt)
+              for in across (bl.ser:transaction-inputs tx)
+              for op = (bl.ser:tx-in-previous-output in)
+              for coin = (gethash (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op))
+                                  coins)
+              when (and coin
+                        (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+))
+                        (%psbt-segwit-output-p (first coin) expansions))
+                do (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
+                                        (%serialize-txout-bytes
+                                         (bl.ser:make-tx-out :value (second coin)
+                                                             :script-pubkey (first coin))))))
+      (loop for map across (bl.ser:psbt-inputs psbt)
+            for in across (bl.ser:transaction-inputs tx)
+            unless (%psbt-input-signed-p map)
+              do (%psbt-update-input-from-provider map in expansions))
+      (loop for map across (bl.ser:psbt-outputs psbt)
+            for out across (bl.ser:transaction-outputs tx)
+            for spk = (bl.ser:tx-out-script-pubkey out)
+            for exp = (gethash spk expansions)
+            when exp
+              do (multiple-value-bind (redeem witness) (%psbt-provider-sub-scripts spk expansions)
+                   (when redeem (bl.ser:psbt-map-set map bl.ser:+psbt-out-redeem-script+ empty redeem))
+                   (when witness (bl.ser:psbt-map-set map bl.ser:+psbt-out-witness-script+ empty witness))
+                   (unless (eq (bl.val:classify-script spk) :witness-v1-taproot)
+                     (destructuring-bind (desc pos pairs) exp
+                       (declare (ignore desc))
+                       (loop for (key . pubkey) in pairs
+                             do (multiple-value-bind (fpr path)
+                                    (bl.rpc:descriptor-key-origin key pubkey pos)
+                                  (bl.ser:psbt-map-set map bl.ser:+psbt-out-bip32+ pubkey
+                                                       (%psbt-bip32-value fpr path))))))))
+      (%psbt-remove-unnecessary-transactions psbt)
+      (bl.ser:encode-psbt psbt))))
 
 ;;; --- analyzepsbt ---
 

@@ -1678,3 +1678,52 @@ the character it tripped on. Every valid vector still decodes (the control)."
           (is (null (decode valid)))
           (is (equal '(-22 . "TX decode failed invalid base64")
                      (decode (subseq valid 0 (1- (length valid)))))))))))
+
+(test utxoupdatepsbt-is-cores-processpsbt
+  "utxoupdatepsbt is ProcessPSBT with every secret hidden
+(rpc/rawtransaction.cpp:128-212): each input gets its whole previous
+transaction from the txindex or the MEMPOOL, a segwit coin found only in the
+UTXO set its witness_utxo, and SignPSBTInput with no key then adds what the
+descriptors reveal -- derivations, a P2SH redeem script -- plus a witness_utxo
+for any input whose solution is a witness (psbt.cpp:487-500). The keys each
+input ends up with are rpc_psbt.py:893-905's; we filled only witness_utxo from
+the UTXO set, so these unconfirmed coins got nothing at all."
+  (with-wallet-chain-node (node "utxoupdatepsbt")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (keys-of (psbt)
+             (mapcar (lambda (in)
+                       ;; An input with no fields decodes as an empty object.
+                       (unless (hash-table-p in) (sort (mapcar #'car in) #'string<)))
+                     (coerce (%aval "inputs" (bl.rpc:dispatch-rpc-method node "decodepsbt"
+                                                                         (list psbt)))
+                             'list))))
+      (let ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "w")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((addrs (mapcar (lambda (type) (rpc "w" "getnewaddress" "" type))
+                              '("bech32" "legacy" "p2sh-segwit")))
+               (inputs (loop for a in addrs
+                             for seed from 111
+                             collect (let ((txid (with-wallet-rng (seed)
+                                                   (rpc "fund" "sendtoaddress" a
+                                                        (bl.rpc:format-money 100000000)
+                                                        nil nil nil nil nil nil nil 10))))
+                                       (%ht "txid" txid
+                                            "vout" (%aval "vout"
+                                                          (find a (coerce (%aval "details" (rpc "w" "gettransaction" txid)) 'list)
+                                                                :key (lambda (d) (%aval "address" d))
+                                                                :test #'equal))))))
+               (psbt (rpc nil "createpsbt" inputs (list (%ht optrue "2.9")))))
+          (is (equal '(nil nil nil) (keys-of psbt)) "the control: createpsbt fills nothing")
+          (is (equal '(("non_witness_utxo" "witness_utxo") ("non_witness_utxo") ("non_witness_utxo"))
+                     (keys-of (rpc nil "utxoupdatepsbt" psbt))))
+          (is (equal '(("bip32_derivs" "non_witness_utxo" "witness_utxo")
+                       ("bip32_derivs" "non_witness_utxo")
+                       ("bip32_derivs" "non_witness_utxo" "redeem_script" "witness_utxo"))
+                     (keys-of (rpc nil "utxoupdatepsbt" psbt
+                                   (mapcar (lambda (a) (%aval "desc" (rpc "w" "getaddressinfo" a)))
+                                           addrs))))))))))

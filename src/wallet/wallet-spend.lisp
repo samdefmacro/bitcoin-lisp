@@ -451,8 +451,8 @@ SCRIPT's position, or the coin control's external solving data."
               (and pair (cdr pair))))))
       (and cc (gethash keyhash (wcc-external-pubkeys cc)))))
 
-(defun %desc-inner-scripts (desc)
-  "The redeem and witness scripts DESC's expansion at position 0 records --
+(defun %desc-inner-scripts (desc &optional (pos 0))
+  "The redeem and witness scripts DESC's expansion at position POS records --
 what Core's SHDescriptor/WSHDescriptor MakeScripts put in the provider's
 `scripts' next to the output script (script/descriptor.cpp, the
 out.scripts.emplace(CScriptID(scripts[0]), ...) of each), which is how a
@@ -464,10 +464,10 @@ left the redeem script unknown and wallet_fundrawtransaction.py:1072 was -4
     (let* ((sub (bl.rpc:out-desc-sub desc))
            (inner (handler-case
                       (first (bl.rpc:out-desc-expand-with-provider
-                              sub 0 (constantly nil) (bl.rpc:make-descriptor-cache)))
+                              sub pos (constantly nil) (bl.rpc:make-descriptor-cache)))
                     (bl.rpc:descriptor-derivation-error () nil))))
       (when inner
-        (cons inner (%desc-inner-scripts sub))))))
+        (cons inner (%desc-inner-scripts sub pos))))))
 
 (defun %known-sub-scripts (wallet cc script)
   "(values redeem-script witness-script) known for the P2SH/P2WSH SCRIPT."
