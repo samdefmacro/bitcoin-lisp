@@ -1943,7 +1943,11 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
             (return-from %check-block (values nil error nil))))
         (incf legacy-sigops (count-legacy-sigops tx)))
       (when (> (* legacy-sigops +witness-scale-factor+) +max-block-sigops-cost+)
-        (return-from %check-block (values nil :bad-blk-sigops))))
+        ;; With Core's debug message (validation.cpp:4009): the block's
+        ;; ToString() is `bad-blk-sigops, out-of-bounds SigOpCount', and
+        ;; feature_block.py:199 (TooManySigopsPerBlock) reads it whole.
+        (return-from %check-block
+          (values nil (list :bad-blk-sigops "out-of-bounds SigOpCount")))))
     (values t nil)))
 
 (defun %stage-block-outputs (tx pending-utxos height &key coinbase)
@@ -2147,7 +2151,8 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                                                       :count-witness count-witness))
                  (when (> total-sigops-cost +max-block-sigops-cost+)
                    (return-from %contextual-check-block
-                     (values nil :too-many-sigops nil)))
+                     ;; ConnectBlock's sentence (validation.cpp:2567).
+                     (values nil (list :too-many-sigops "too many sigops") nil)))
                  ;; Core's UpdateCoins order (validation.cpp:1996-2008): mark
                  ;; this transaction's inputs spent, THEN add its outputs. Only
                  ;; non-coinbase transactions reach here, so the coinbase's null

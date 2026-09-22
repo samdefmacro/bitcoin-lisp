@@ -2556,6 +2556,57 @@ BLOCK_CONSENSUS bad-cb-multiple. mining_template_verification.py:93."
                  (bl.store:get-block-index-entry cs dup-h)))
             "a mutation verdict must not mark the entry invalid")))))
 
+(test check-block-sigop-verdict-carries-cores-debug-message
+  "CheckBlock's legacy sigop budget refuses with reason bad-blk-sigops AND the
+debug message `out-of-bounds SigOpCount' (validation.cpp:4009), so the block's
+ToString() -- what AcceptBlock logs -- is `bad-blk-sigops, out-of-bounds
+SigOpCount'; feature_block.py:199 (TooManySigopsPerBlock) waits for exactly
+that. Ours carried the reason alone."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "check-block-sigop-debug")
+      (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA6 2))
+      (let* ((tip-entry (bl.store:get-block-index-entry
+                         cs (bl.store:best-block-hash cs)))
+             (tip-hash (bl.store:block-index-entry-hash tip-entry))
+             (h (first (make-test-chain-hashes #xB7 1)))
+             (base (make-reorg-test-block tip-hash h 3))
+             (heavy (bl.ser:make-transaction
+                     :version 1
+                     :inputs (vector (bl.ser:make-tx-in
+                                      :previous-output (bl.ser:make-outpoint
+                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                             :initial-element 5)
+                                                        :index 0)
+                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                      :sequence #xffffffff))
+                     :outputs (vector (bl.ser:make-tx-out
+                                       :value 0
+                                       :script-pubkey (make-array 20001 :element-type '(unsigned-byte 8)
+                                                                        :initial-element #xac)))
+                     :lock-time 0))
+             (txs (list (first (bl.ser:bitcoin-block-transactions base)) heavy))
+             (header (bl.ser:bitcoin-block-header base))
+             (blk (bl.ser:make-bitcoin-block
+                   :header (bl.ser:make-block-header
+                            :version (bl.ser:block-header-version header)
+                            :prev-block tip-hash
+                            :merkle-root (bl.val:compute-merkle-root
+                                          (mapcar #'bl.ser:transaction-hash txs))
+                            :timestamp (bl.ser:block-header-timestamp header)
+                            :bits (bl.ser:block-header-bits header)
+                            :nonce (bl.ser:block-header-nonce header)
+                            :cached-hash h)
+                   :transactions txs)))
+        (bl.store:add-block-index-entry
+         cs (bl.store:make-block-index-entry
+             :hash h :height 3 :prev-entry tip-entry
+             :chain-work 900000 :status :header-valid
+             :header (bl.ser:bitcoin-block-header blk)))
+        (is (equal "bad-blk-sigops, out-of-bounds SigOpCount"
+                   (bl.val:block-reject-reason-string
+                    (nth-value 1 (bl.val:accept-block-body blk cs)))))))))
+
 (test activate-block-does-not-store-a-body-that-fails-the-gate
   "ACTIVATE-BLOCK's weaker-chain case stores a block without connecting it, and
 did so with no CheckBlock at all -- the same hole as the two IBD persist paths,
