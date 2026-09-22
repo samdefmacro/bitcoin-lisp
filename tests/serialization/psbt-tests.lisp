@@ -1817,3 +1817,44 @@ signature of the key behind its witness program; 0.001 fee over 134 vbytes."
         (is (eql 134 (%aval "estimated_vsize" analyzed)))
         (is (< (abs (- (btc-amount (%aval "estimated_feerate" analyzed)) 0.00746268d0)) 1d-10))
         (is (< (abs (- (btc-amount (%aval "fee" analyzed)) 0.001d0)) 1d-10))))))
+
+(test decodepsbt-reports-the-hash-preimages
+  "decodepsbt reports each of the four hash-preimage maps -- PSBT_IN_RIPEMD160,
+_SHA256, _HASH160, _HASH256 -- as an object hash -> preimage in the record's
+byte order (rpc/rawtransaction.cpp:1215-1249). rpc_psbt.py:1160-1169 builds
+one input per kind and reads them back; we reported none. An input without
+one has no such key (the control)."
+  (let* ((node (make-test-node :network :regtest))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (map 'vector
+                           (lambda (b)
+                             (bl.ser:make-tx-in
+                              :previous-output (bl.ser:make-outpoint
+                                                :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                     :initial-element b)
+                                                :index 0)
+                              :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                              :sequence #xffffffff))
+                           '(#xaa #xbb #xcc #xdd #xee))
+              :outputs (vector (bl.ser:make-tx-out
+                                :value 0 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
+              :lock-time 0))
+         (psbt (bl.ser:make-empty-psbt tx))
+         (preimage (coerce #(1 2 3) '(simple-array (unsigned-byte 8) (*))))
+         (hashes (list (bl.crypto:ripemd160 preimage) (bl.crypto:sha256 preimage)
+                       (bl.crypto:hash160 preimage) (bl.crypto:hash256 preimage)))
+         (names '("ripemd160_preimages" "sha256_preimages" "hash160_preimages" "hash256_preimages")))
+    (loop for keytype in '(#x0a #x0b #x0c #x0d)
+          for hash in hashes
+          for i from 0
+          do (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) i) keytype hash preimage))
+    (let ((inputs (coerce (%aval "inputs" (bl.rpc:dispatch-rpc-method
+                                           node "decodepsbt" (list (bl.ser:encode-psbt psbt))))
+                          'list)))
+      (loop for in in inputs for name in names for hash in hashes
+            ;; An input with no fields at all decodes as {}.
+            do (is (equal (list (cons (bl.crypto:bytes-to-hex hash) "010203"))
+                          (and (listp in) (%aval name in)))
+                   "~A" name))
+      (is (hash-table-p (fifth inputs)) "the control: an input with nothing is {}"))))

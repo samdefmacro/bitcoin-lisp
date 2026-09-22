@@ -402,6 +402,17 @@ fingerprint><path>."
       (let ((fw (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-final-scriptwitness+)))
         (when fw (add "final_scriptwitness" (%psbt-parse-witness-stack fw))))
+      ;; The four hash-preimage maps, each an object hash -> preimage in the
+      ;; record's own byte order (rpc/rawtransaction.cpp:1215-1249;
+      ;; rpc_psbt.py:1160-1169 reads all four).
+      (loop for (keytype name) in '((#x0a "ripemd160_preimages") (#x0b "sha256_preimages")
+                                    (#x0c "hash160_preimages") (#x0d "hash256_preimages"))
+            for recs = (bl.ser:psbt-map-collect map keytype)
+            when recs
+              do (add name (bl.rpc:json-object
+                            (loop for (hash . preimage) in recs
+                                  collect (cons (bl.crypto:bytes-to-hex hash)
+                                                (bl.crypto:bytes-to-hex preimage))))))
       (%psbt-taproot-input-fields map #'add))
     (or (nreverse fields) (make-hash-table))))
 
