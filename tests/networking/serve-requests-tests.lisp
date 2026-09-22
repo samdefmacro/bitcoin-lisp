@@ -1003,3 +1003,47 @@ reply from the handler, ahead of everything."
       (is (plusp (length (%addr-queue peer))) "the sample is queued")
       (%flush-addrs-now (list peer))
       (is (= 1 (length sends)) "and leaves with the next flush"))))
+
+(test a-block-inv-asks-for-headers-from-our-valid-best-header
+  "Core builds the getheaders a block inv triggers from m_best_header
+(net_processing.cpp:4198), which is never an invalid block: marking one
+invalid recalculates it (validation.cpp:3638-3668, 6275-6283). Our header tip
+was the highest-HEIGHT index entry, so after a block failed validation every
+locator started at that block; p2p_segwit.py:376 announces a block on the real
+tip and waits for a getheaders whose locator starts at the tip."
+  (multiple-value-bind (cs entries) (%make-served-chain 3)   ; tip at height 3
+    (let* ((tip (nth 3 entries))
+           (bad-header (bl.ser:make-block-header
+                        :version 1 :prev-block (bl.store:block-index-entry-hash tip)
+                        :merkle-root (%uniq-hash 8801) :timestamp 1700000004
+                        :bits #x1d00ffff :nonce 1))
+           (peer (bl.net:init-peer-rate-limiters
+                  (bl.net:make-peer :address "test" :state :ready
+                                    :services bl.ser:+node-witness+)))
+           ;; A FRESH hash each run: the inv handler remembers the last block
+           ;; that triggered a pre-sync getheaders, process-wide, and a repeat
+           ;; of it is (rightly) not asked about again.
+           (announced (let ((h (make-array 32 :element-type '(unsigned-byte 8))))
+                        (dotimes (i 32 h) (setf (aref h i) (random 256))))))
+      ;; A rejected block one above the tip, still in the index.
+      (bl.store:add-block-index-entry
+       cs (bl.store:make-block-index-entry
+           :hash (bl.ser:block-header-hash bad-header) :height 4 :header bad-header
+           :prev-entry tip :chain-work 5 :status :invalid))
+      (let* ((sent (captured-sends
+                    (lambda ()
+                      (with-ibd-context
+                        (deliver-ibd-message
+                         peer "inv"
+                         (%message-payload
+                          (bl.ser:make-inv-message
+                           (list (bl.ser:make-inv-vector :type bl.ser:+inv-type-block+
+                                                         :hash announced))))
+                         (bl.ctx:make-node-context :chain-state cs))))))
+             (getheaders (find "getheaders" sent :key #'%message-command :test #'string=)))
+        (is-true getheaders "the unknown block is answered with a getheaders")
+        (when getheaders
+          (is (equalp (bl.store:block-index-entry-hash tip)
+                      (first (bl.ser:parse-block-locator-payload
+                              (%message-payload getheaders))))
+              "the locator starts at our valid tip, not at the rejected block"))))))

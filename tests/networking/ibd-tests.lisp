@@ -5381,9 +5381,12 @@ source forgotten because the block connected is not punished later."
                      :prev-entry genesis :status :header-valid)))
         (flet ((sender ()
                  (bl.net:make-peer
-                  :connection (make-test-connection :host "10.0.0.7" :port 18444
+                  ;; A documentation-range address, and the discouragement
+                  ;; is lifted afterwards: a punished address stays in the
+                  ;; process-wide filter, and later suites gossip 10.0.0.x.
+                  :connection (make-test-connection :host "198.51.100.77" :port 18444
                                                     :connected t :socket nil)
-                  :state :ready :address "10.0.0.7"
+                  :state :ready :address "198.51.100.77"
                   :conn-type :outbound-full-relay)))
           (bl.store:add-block-index-entry state genesis)
           (bl.store:add-block-index-entry state entry)
@@ -5407,6 +5410,7 @@ source forgotten because the block connected is not punished later."
             (bl.net:note-block-source hash peer)
             (bl.net:handle-validation-failure blk 1 :block-script-verify-flag-failed state)
             (is (eq :disconnected (bl.net:peer-state peer)))))
+        (bl.net:clear-discouraged)
         (bl.net:clear-block-failure hash)))))
 
 (test block-request-pass-leaves-the-callers-peer-list-alone
