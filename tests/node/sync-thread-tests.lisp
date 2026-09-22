@@ -119,7 +119,7 @@ not the handshake, which inbound-listening-tests covers."
       (unwind-protect
            (progn
              (setf (bl:node-running node) t)
-             (push (cons (format nil "127.0.0.1:~D" port) :outbound-full-relay)
+             (push (list (format nil "127.0.0.1:~D" port) :outbound-full-relay nil)
                    bl:*pending-test-connections*)
              (is (= 1 (length bl:*pending-test-connections*)) "control: one request queued")
              (%idle-tick)

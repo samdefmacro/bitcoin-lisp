@@ -56,6 +56,7 @@
   (added-nodes '() :type list)
   ;; addnode "onetry": one-shot dial requests handed off to the sync thread so
   ;; node-peers stays single-writer (only the sync thread pushes to it).
+  ;; Each entry is (spec . use-v2): the transport the RPC caller asked for.
   (pending-onetry '() :type list)
   ;; Durable at-tip liveness signal (item 6). last-tip-advance-time is the
   ;; node clock (get-node-time, so setmocktime reaches it) of the last observed active-chain tip

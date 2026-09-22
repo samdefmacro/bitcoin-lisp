@@ -1014,7 +1014,8 @@ talking to."
          t)))
 
 (defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay)
-                                                    count-failure)
+                                                    count-failure
+                                                    (use-v2 t))
   "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
 node-peers. CONN-TYPE sets the peer's connection type: :outbound-full-relay,
 :block-relay, :addr-fetch, :feeler, or :manual for an operator-named
@@ -1033,14 +1034,20 @@ each of those OpenNetworkConnection sites (net.cpp:2422, 2541, 2986, 1905): a
 manual target that is merely switched off must not have addrman failures
 charged against it. MAINTAIN-BLOCK-RELAY-PEERS is the one caller drawing from
 addrman on its own initiative, i.e. the one that is ThreadOpenConnections, and
-it passes %COUNT-ADDRMAN-FAILURES-P."
+it passes %COUNT-ADDRMAN-FAILURES-P.
+
+USE-V2 NIL dials plain v1 even on a v2 node: Core's OpenNetworkConnection takes
+use_v2transport per call (net.cpp:1905, 2541, 2986), and the addconnection and
+`addnode onetry' RPCs pass the caller's own choice. T means v2 when this node
+speaks it."
   (when (node-network-active node)
     (handler-case
         (let ((peer (%dial-outbound-peer node host port count-failure)))
           (when peer
             (setf (bl.net:peer-address peer) host)
             (if (bl.net:perform-handshake peer :conn-type conn-type
-                                                        :near-tip (bl.net:near-tip-p (node-chain-state node)))
+                                               :try-v2 (and use-v2 (bl.net:v2-available-p))
+                                               :near-tip (bl.net:near-tip-p (node-chain-state node)))
                 (progn
                   (bl.net:send-post-handshake-messages peer)
                   (bl.net:send-compact-block-negotiation peer)
@@ -1157,19 +1164,21 @@ sat on getpeerinfo for most of that cycle, once per connection."
     (let ((onetry (bt:with-recursive-lock-held ((node-lock node))
                     (prog1 (node-pending-onetry node)
                       (setf (node-pending-onetry node) nil)))))
-      (dolist (spec onetry)
-        (multiple-value-bind (host port) (parse-node-endpoint node spec)
-          (unless (peer-connected-to-endpoint-p node host port)
-            (establish-outbound-peer node host port :conn-type :manual)))))
+      (loop for (spec . use-v2) in onetry
+            do (multiple-value-bind (host port) (parse-node-endpoint node spec)
+                 (unless (peer-connected-to-endpoint-p node host port)
+                   (establish-outbound-peer node host port :conn-type :manual
+                                                           :use-v2 use-v2)))))
     ;; addconnection (regtest testing RPC): one dial per request, of the
     ;; connection TYPE the caller named — which is the whole point of the RPC,
     ;; since a test cannot otherwise ask for a block-relay or feeler slot.
     (let ((queued (bt:with-recursive-lock-held ((node-lock node))
                     (prog1 (nreverse *pending-test-connections*)
                       (setf *pending-test-connections* nil)))))
-      (dolist (request queued)
-        (multiple-value-bind (host port) (parse-node-endpoint node (car request))
-          (establish-outbound-peer node host port :conn-type (cdr request)))))))
+      (loop for (address conn-type use-v2) in queued
+            do (multiple-value-bind (host port) (parse-node-endpoint node address)
+                 (establish-outbound-peer node host port :conn-type conn-type
+                                                         :use-v2 use-v2))))))
 
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain the queued dials

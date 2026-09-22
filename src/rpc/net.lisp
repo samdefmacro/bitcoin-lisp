@@ -625,7 +625,12 @@ capacity check runs synchronously, because that is the answer the caller needs."
         (error 'rpc-error :code +rpc-client-node-capacity-reached+
                           :message "Error: Already at capacity for specified connection type."))
       (bt:with-recursive-lock-held ((bl:node-lock node))
-        (push (cons address conn-type) bl:*pending-test-connections*))
+        ;; The transport travels with the request: Core's AddConnection
+        ;; dials with exactly the v2transport the caller named
+        ;; (rpc/net.cpp:405-417, net.cpp:1905), which is how
+        ;; p2p_v2_encrypted.py:67 gets a v1 connection out of a v2 node.
+        (push (list address conn-type (positional-bool v2transport))
+              bl:*pending-test-connections*))
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 
@@ -648,13 +653,17 @@ spelled (Core CConnman::AddNode, net.cpp:3732-3744: \"127.1:18444\" is
                      (equalp resolved (%numeric-endpoint node added)))))
           (bl:node-added-nodes node))))
 
-(define-rpc "addnode" (node (spec command))
+(define-rpc "addnode" (node (spec command v2transport))
   "Manage manually-added peers (Bitcoin Core addnode). PARAMS:
 (node command [v2transport]). COMMAND is \"add\" (remember the peer and keep it
 connected), \"remove\", or \"onetry\" (dial once now). The actual dialing is
 handed to the sync thread (via added-nodes / pending-onetry) so node-peers stays
-single-writer. Returns null. v2transport is accepted and ignored — BIP324 v2
-transport is not implemented."
+single-writer. Returns null.
+
+V2TRANSPORT defaults to whether this node speaks BIP324 and is refused when it
+does not (rpc/net.cpp:349-354). A onetry dial carries it (net.cpp:359: the
+functional framework's connect_nodes(peer_advertises_v2=...) asks for v1 or v2
+this way); \"add\" entries keep dialing with the node's own setting."
   (unless (and (stringp spec) (plusp (length spec)))
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
   ;; An unknown command is answered with the method's help document as a
@@ -663,10 +672,14 @@ transport is not implemented."
   (unless (member command '("add" "remove" "onetry") :test #'equal)
     (error 'rpc-error :code +rpc-misc-error+
                       :message (rpc-help-document "addnode")))
+  (let ((use-v2 (positional-bool-or v2transport (bl.net:v2-available-p))))
+    (when (and use-v2 (not (bl.net:v2-available-p)))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Error: v2transport requested but not enabled (see -v2transport)"))
   (bt:with-recursive-lock-held ((bl:node-lock node))
     (cond
       ((equal command "onetry")
-       (push spec (bl:node-pending-onetry node)))
+       (push (cons spec use-v2) (bl:node-pending-onetry node)))
       ((equal command "add")
        (when (%added-node-duplicate-p node spec)
          (error 'rpc-error :code +rpc-client-node-already-added+
@@ -678,7 +691,7 @@ transport is not implemented."
          (error 'rpc-error :code +rpc-client-node-not-added+
                            :message "Error: Node could not be removed. It has not been added previously."))
        (setf (bl:node-added-nodes node)
-             (remove spec (bl:node-added-nodes node) :test #'string=)))))
+             (remove spec (bl:node-added-nodes node) :test #'string=))))))
   nil)
 
 (define-rpc "getaddednodeinfo" (node (filter))

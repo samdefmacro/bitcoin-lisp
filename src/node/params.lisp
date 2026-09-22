@@ -44,7 +44,7 @@ getaddednodeinfo reports -addnode and not -connect, exactly as Core's does —
 both are nonetheless dialed as MANUAL connections.")
 
 (defvar *pending-test-connections* '()
-  "Connections the addconnection RPC has asked for, as (address . conn-type),
+  "Connections the addconnection RPC has asked for, as (address conn-type use-v2),
 drained by the sync thread. A queue rather than a direct dial because node-peers
 is single-writer by design; Core's own AddConnection likewise returns before the
 connection completes. Regtest-only, like the RPC.")

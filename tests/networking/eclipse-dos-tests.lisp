@@ -3220,14 +3220,18 @@ and the dial's handler-case would otherwise swallow that as a failed dial)."
                  (lambda (chain-state) (declare (ignore chain-state)) nil)
                  (fdefinition 'bl.net:perform-handshake)
                  (lambda (peer &rest args)
-                   (push (cons (bl.net:peer-address peer) (getf args :conn-type))
+                   ;; The transport as PERFORM-HANDSHAKE would read it, its
+                   ;; own default included.
+                   (push (list (bl.net:peer-address peer) (getf args :conn-type)
+                               (getf args :try-v2 (bl.net:v2-available-p)))
                          seen)
                    nil))
-           (let ((node (%dial-probe-node '())))
+           (let ((node (%dial-probe-node '()))
+                 (bl.net:*v2-transport-enabled* t))
              (setf (bl:node-added-nodes node) (list "203.0.113.1:8333")
-                   (bl:node-pending-onetry node) (list "203.0.113.2:8333")
+                   (bl:node-pending-onetry node) (list (cons "203.0.113.2:8333" t))
                    bl:*pending-test-connections*
-                   (list (cons "203.0.113.3:8333" :block-relay)))
+                   (list (list "203.0.113.3:8333" :block-relay nil)))
              (bl::connect-added-nodes node)
              (let ((bl::*connect-nodes* (list "203.0.113.4:8333")))
                (bl::connect-specified-nodes node))))
@@ -3235,13 +3239,22 @@ and the dial's handler-case would otherwise swallow that as a failed dial)."
             (fdefinition 'bl.net:near-tip-p) real-near-tip
             (fdefinition 'bl.net:perform-handshake) real-handshake
             bl:*pending-test-connections* '()))
-    (flet ((type-of-host (host) (cdr (assoc host seen :test #'string=))))
+    (flet ((type-of-host (host) (second (assoc host seen :test #'string=)))
+           (v2-of-host (host) (third (assoc host seen :test #'string=))))
       (is (= 4 (length seen)) "control: all four destinations reached the handshake: ~S" seen)
       (is (eq :manual (type-of-host "203.0.113.1")) "addnode add: ~S" seen)
       (is (eq :manual (type-of-host "203.0.113.2")) "addnode onetry: ~S" seen)
       (is (eq :manual (type-of-host "203.0.113.4")) "-connect: ~S" seen)
       (is (eq :block-relay (type-of-host "203.0.113.3"))
-          "addconnection keeps the type it was asked for: ~S" seen))))
+          "addconnection keeps the type it was asked for: ~S" seen)
+      ;; ... and the TRANSPORT it was asked for (Core OpenNetworkConnection's
+      ;; use_v2transport, net.cpp:1905 and :359 of rpc/net.cpp):
+      ;; p2p_v2_encrypted.py:67 asks a v2 node for a v1 connection.
+      (when (bl.crypto:ellswift-available-p)
+        (is-true (v2-of-host "203.0.113.2")
+                 "control: `addnode onetry ... true' dials v2: ~S" seen)
+        (is-false (v2-of-host "203.0.113.3")
+                  "addconnection with v2transport=false dials v1 on a v2 node: ~S" seen)))))
 
 (test manual-peers-count-as-a-path-to-their-network
   "Core protects a full-relay peer from the extra-outbound rotation when it is

@@ -5493,7 +5493,7 @@ just that something connected."
                        node (list "1.2.3.4:1" (car pair) nil))))
           (is (equal (car pair) (cdr (assoc "connection_type" result :test #'string=))))
           (is (equal "1.2.3.4:1" (cdr (assoc "address" result :test #'string=))))
-          (is (equal (list (cons "1.2.3.4:1" (cdr pair)))
+          (is (equal (list (list "1.2.3.4:1" (cdr pair) nil))
                      bl:*pending-test-connections*)
               "~A did not queue its own connection type" (car pair))))
       (setf bl:*pending-test-connections* '())
@@ -9992,7 +9992,7 @@ all_networks aggregate; counts stay consistent with the address book."
       (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "add")))
     ;; onetry queues a one-shot dial without touching added-nodes
     (is (null (bl.rpc::rpc-addnode node '("9.9.9.9" "onetry"))))
-    (is (member "9.9.9.9" (bl:node-pending-onetry node) :test #'string=))
+    (is (member "9.9.9.9" (bl:node-pending-onetry node) :key #'car :test #'string=))
     (is (not (member "9.9.9.9" (bl:node-added-nodes node) :test #'string=)))
     ;; remove
     (is (null (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "remove"))))
