@@ -2012,8 +2012,7 @@ is_change_func that is OutputIsChange (wallet/rpc/transactions.cpp:757-770),
 so every vout the wallet counts as change carries ischange: true after its
 scriptPubKey (core_io.cpp:509-511) and no other vout has the key.
 wallet_basic.py:550 reads it for both sides of a sendtoaddress."
-  (let ((json (remove "hex" (bl.rpc:tx-to-json tx (wallet-network wallet))
-                      :key #'car :test #'equal))
+  (let ((json (bl.rpc:tx-to-json tx (wallet-network wallet) :include-hex nil))
         (outputs (bl.ser:transaction-outputs tx)))
     (mapcar (lambda (field)
               (if (equal (car field) "vout")

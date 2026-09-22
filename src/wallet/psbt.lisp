@@ -361,7 +361,7 @@ fingerprint><path>."
           (add "non_witness_utxo"
                (bl.rpc:tx-to-json (bl.ser:br-read-transaction
                             (bl.ser:make-byte-reader-from nwu))
-                           network))))
+                           network :include-hex nil))))
       (let ((wu (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-witness-utxo+)))
         (when wu
@@ -445,7 +445,7 @@ fingerprint><path>."
          (in-maps (bl.ser:psbt-inputs psbt))
          (out-maps (bl.ser:psbt-outputs psbt))
          (tx-ins (bl.ser:transaction-inputs tx))
-         (result `(("tx" . ,(bl.rpc:tx-to-json tx network)))))
+         (result `(("tx" . ,(bl.rpc:tx-to-json tx network :include-hex nil)))))
     ;; version
     (let ((ver (bl.ser:psbt-map-find
                 (bl.ser:psbt-global psbt)

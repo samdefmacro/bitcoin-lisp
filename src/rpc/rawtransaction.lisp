@@ -18,7 +18,8 @@ readings of one hex string are different transactions with different txids."
     (tx-to-json (decode-hex-tx-or-error hex-str "TX decode failed"
                                         :try-no-witness try-no-witness
                                         :try-witness try-witness)
-                (rpc-get-network node))))
+                (rpc-get-network node)
+                :include-hex nil)))
 
 (defun %not-found-transaction-message (reason)
   "REASON plus the sentence Core appends to every one of getrawtransaction's

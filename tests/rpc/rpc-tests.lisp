@@ -12342,3 +12342,35 @@ whose scriptPubKey is garbage, and one whose coin nobody knows."
                      (cdr (assoc "vout" (first errors) :test #'string=))
                      (cdr (assoc "txid" (second errors) :test #'string=))
                      (cdr (assoc "vout" (second errors) :test #'string=)))))))
+
+(test decoders-carry-no-hex-where-core-passes-include-hex-false
+  "TxToUniv's include_hex is FALSE for decoderawtransaction
+(rpc/rawtransaction.cpp:443) and for decodepsbt's `tx' (:1074); only
+getrawtransaction's verbose object and the block RPCs carry it.
+wallet_basic.py:584 compares gettransaction's decoded object with
+decoderawtransaction's key for key, and ours answered a hex from
+decoderawtransaction. getrawtransaction verbose keeps it (the control)."
+  (let* ((node (make-test-node :network :regtest))
+         (spk (coerce #(#x51) '(simple-array (unsigned-byte 8) (*))))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output
+                               (bl.ser:make-outpoint
+                                :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 9)
+                                :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey spk))
+              :lock-time 0))
+         (hex (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx)))
+         (decoded (bl.rpc:dispatch-rpc-method node "decoderawtransaction" (list hex)))
+         (psbt (bl.rpc:dispatch-rpc-method node "decodepsbt"
+                                           (list (bl.rpc:dispatch-rpc-method
+                                                  node "converttopsbt" (list hex))))))
+    (is-true (assoc "txid" decoded :test #'string=) "the control: a decoded object")
+    (is (null (assoc "hex" decoded :test #'string=)))
+    (is (null (assoc "hex" (cdr (assoc "tx" psbt :test #'string=)) :test #'string=)))
+    (is-true (assoc "hex" (bl.rpc:tx-to-json tx :regtest) :test #'string=)
+             "the default still carries it, for getrawtransaction verbose")))

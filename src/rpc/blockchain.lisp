@@ -551,7 +551,7 @@ int32 the wire field used to be read as."
     (when (and w (< index (length w)))
       (elt w index))))
 
-(defun tx-to-json (tx &optional network &key spent-coins prevouts)
+(defun tx-to-json (tx &optional network &key spent-coins prevouts (include-hex t))
   "Convert transaction to JSON. When NETWORK is supplied, output addresses are
 derived. Includes the size/weight/hex fields explorers and fee tools expect.
 
@@ -562,7 +562,14 @@ order — which unlocks Core's two extra fields (TxToUniv, core_io.cpp:455-525):
   prevout   only when PREVOUTS is true, which is verbosity 3
 
 Those two are gated separately in Core, so they are gated separately here: a
-verbosity-2 caller gets the fee and no prevout objects."
+verbosity-2 caller gets the fee and no prevout objects.
+
+INCLUDE-HEX is TxToUniv's include_hex. Core passes FALSE from
+decoderawtransaction (rpc/rawtransaction.cpp:443), decodepsbt's `tx' and
+non_witness_utxo (:1074, :1144) and gettransaction's `decoded'
+(wallet/rpc/transactions.cpp:759-762) -- wallet_basic.py:584 compares
+gettransaction's decoded with decoderawtransaction key for key, and ours
+answered a hex neither side of Core carries."
   (let* ((inputs (bl.ser:transaction-inputs tx))
          (outputs (bl.ser:transaction-outputs tx))
          (wire (bl.ser:transaction-wire-bytes tx))
@@ -604,7 +611,7 @@ verbosity-2 caller gets the fee and no prevout objects."
                 (out-total (loop for o across outputs
                                  sum (bl.ser:tx-out-value o))))
             `(("fee" . ,(satoshi->btc (- in-total out-total))))))
-      ("hex" . ,(bl.crypto:bytes-to-hex wire)))))
+      ,@(when include-hex `(("hex" . ,(bl.crypto:bytes-to-hex wire)))))))
 
 (defun input-to-json (input &optional witness-stack &key coinbase-tx-p prevout network)
   "Convert transaction input to JSON, including sequence and (when present) the
