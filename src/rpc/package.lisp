@@ -188,6 +188,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:parse-sighash-type
    #:positional-array
    #:json-member-empty-array-p
+   #:sign-errors-json
    #:positional-bool
    #:positional-bool-or
    #:pubkey-lessp

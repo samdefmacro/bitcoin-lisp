@@ -12291,3 +12291,54 @@ restarts with -blocksonly and expects exactly that. Control: without
         (signals-rpc-error (:code bl.rpc:+rpc-internal-error+
                             :exact-message "Fee estimation disabled")
           (bl.rpc:dispatch-rpc-method node method (list 2)))))))
+
+(test signrawtransaction-errors-carry-cores-txinerror-object
+  "Each failed input of signrawtransactionwithkey is Core's TxInErrorToJSON
+object (rpc/rawtransaction_util.cpp:174-188) -- txid, vout, witness, scriptSig,
+sequence, error -- in input order. Ours answered {error: \"Input N: ...\"}
+alone, so wallet_signrawtransactionwithwallet.py:110 found no `witness' and
+:118-121 no txid/vout. The vector is that test's: a valid P2PKH input, one
+whose scriptPubKey is garbage, and one whose coin nobody knows."
+  (let* ((node (make-test-node))
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (wif (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (pkh (bl.crypto:hash160 (bl.crypto:derive-public-key k1)))
+         (spk (concatenate '(vector (unsigned-byte 8))
+                           (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+         (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 40))
+         (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 41))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (map 'vector
+                           (lambda (h i)
+                             (bl.ser:make-tx-in
+                              :previous-output (bl.ser:make-outpoint :hash h :index i)
+                              :script-sig empty :sequence #xffffffff))
+                           (list txid-a txid-b txid-a) '(0 7 1))
+              :outputs (vector (bl.ser:make-tx-out :value 10000 :script-pubkey spk))
+              :lock-time 0))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex txid-a))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
+                              (cons "amount" 0.001d0))
+                        (list (cons "txid" (bl.rpc:hash-to-hex txid-b))
+                              (cons "vout" 7)
+                              (cons "scriptPubKey" "badbadbadbad")
+                              (cons "amount" 0.001d0))))
+         (result (bl.rpc:dispatch-rpc-method
+                  node "signrawtransactionwithkey"
+                  (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))
+                        (list wif) prevtxs)))
+         (errors (coerce (cdr (assoc "errors" result :test #'string=)) 'list)))
+    (is (not (eq t (cdr (assoc "complete" result :test #'string=)))))
+    (is (= 2 (length errors)) "errors: ~S" errors)
+    (dolist (e errors)
+      (is (equal '("txid" "vout" "witness" "scriptSig" "sequence" "error")
+                 (mapcar #'car e))))
+    (is (equal (list (bl.rpc:hash-to-hex txid-b) 7 (bl.rpc:hash-to-hex txid-a) 1)
+               (list (cdr (assoc "txid" (first errors) :test #'string=))
+                     (cdr (assoc "vout" (first errors) :test #'string=))
+                     (cdr (assoc "txid" (second errors) :test #'string=))
+                     (cdr (assoc "vout" (second errors) :test #'string=)))))))

@@ -3967,32 +3967,10 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                                      :message "Only DEFAULT sighash type is supported for taproot inputs")))
                coins))
             (let* ((sign-errors (%wallet-sign-transaction wallet tx coins
-                                                          :sighash-byte sighash-byte))
-                   (inputs (bl.ser:transaction-inputs tx))
-                   (witnesses (bl.ser:transaction-witness tx)))
+                                                          :sighash-byte sighash-byte)))
               (append
                `(("hex" . ,(bl.crypto:bytes-to-hex
                             (bl.ser:transaction-wire-bytes tx)))
                  ("complete" . ,(bl.rpc:json-bool (null sign-errors))))
                (when sign-errors
-                 `(("errors"
-                    . ,(mapcar
-                        (lambda (entry)
-                          (destructuring-bind (index . message) entry
-                            (let* ((input (aref inputs index))
-                                   (prevout (bl.ser:tx-in-previous-output input))
-                                   (stack (and witnesses
-                                               (< index (length witnesses))
-                                               (aref witnesses index))))
-                              ;; Core SignTransactionResultToJSON entry shape.
-                              `(("txid" . ,(bl.rpc:hash-to-hex
-                                            (bl.ser:outpoint-hash prevout)))
-                                ("vout" . ,(bl.ser:outpoint-index prevout))
-                                ("witness" . ,(or (mapcar #'bl.crypto:bytes-to-hex
-                                                          stack)
-                                                  #()))
-                                ("scriptSig" . ,(bl.crypto:bytes-to-hex
-                                                 (bl.ser:tx-in-script-sig input)))
-                                ("sequence" . ,(bl.ser:tx-in-sequence input))
-                                ("error" . ,message)))))
-                        sign-errors)))))))))))))
+                 `(("errors" . ,(bl.rpc:sign-errors-json tx sign-errors)))))))))))))

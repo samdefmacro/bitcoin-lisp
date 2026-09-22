@@ -1380,10 +1380,34 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
            `(("hex" . ,(bl.crypto:bytes-to-hex bytes))
              ("complete" . ,(json-bool (null sign-errors))))
            (when sign-errors
-             `(("errors" . ,(mapcar (lambda (e)
-                                      `(("error" . ,(format nil "Input ~D: ~A"
-                                                            (car e) (cdr e)))))
-                                    sign-errors))))))))))
+             `(("errors" . ,(sign-errors-json tx sign-errors))))))))))
+
+(defun sign-errors-json (tx sign-errors)
+  "The `errors' array of signrawtransactionwithkey / signrawtransactionwithwallet
+for SIGN-ERRORS, (input-index . message) pairs: Core's TxInErrorToJSON
+(rpc/rawtransaction_util.cpp:174-188) per failed input, in input order (the
+errors are a std::map<int, ...>, :333-335) -- txid, vout, the input's witness
+stack as hex, scriptSig hex, sequence and the error. signrawtransactionwithkey
+used to answer only {error: \"Input N: ...\"}, so wallet_signrawtransaction
+withwallet.py:110 found no `witness' and :118-121 no txid/vout to name the
+failing inputs by."
+  (let ((inputs (bl.ser:transaction-inputs tx))
+        (witnesses (bl.ser:transaction-witness tx)))
+    (mapcar (lambda (entry)
+              (destructuring-bind (index . message) entry
+                (let* ((input (aref inputs index))
+                       (prevout (bl.ser:tx-in-previous-output input))
+                       (stack (and witnesses
+                                   (< index (length witnesses))
+                                   (aref witnesses index))))
+                  `(("txid" . ,(hash-to-hex (bl.ser:outpoint-hash prevout)))
+                    ("vout" . ,(bl.ser:outpoint-index prevout))
+                    ("witness" . ,(or (mapcar #'bl.crypto:bytes-to-hex stack) #()))
+                    ("scriptSig" . ,(bl.crypto:bytes-to-hex
+                                     (bl.ser:tx-in-script-sig input)))
+                    ("sequence" . ,(bl.ser:tx-in-sequence input))
+                    ("error" . ,message)))))
+            (sort (copy-list sign-errors) #'< :key #'car))))
 
 (defun %add-inputs (inputs replaceable locktime)
   "Core AddInputs (rpc/rawtransaction_util.cpp:25-71): the tx-in list for the
