@@ -119,3 +119,128 @@ header's hash meet the header's own nBits, and nothing else changes."
   (is (eq #'bl.tools:run-bitcoin-tx (bl.tools:tool-for-program-name "/x/build/bin/bitcoin-tx")))
   (is (eq #'bl.tools:run-bitcoin-util (bl.tools:tool-for-program-name "bitcoin-util.exe")))
   (is (null (bl.tools:tool-for-program-name "/x/build/bin/bitcoind"))))
+
+;;; --- bitcoin-wallet (bitcoin-wallet.cpp, wallettool.cpp, dump.cpp) ---------
+
+(defun %wallet-tool (datadir &rest args)
+  "Run bitcoin-wallet over ARGS with -datadir=DATADIR -regtest, as
+tool_wallet.py:32-35 does. Returns (values stdout stderr exit-code)."
+  (let ((out (make-string-output-stream))
+        (err (make-string-output-stream)))
+    (let ((rc (bl.tools:run-bitcoin-wallet
+               (list* (format nil "-datadir=~A" (namestring datadir)) "-regtest" args)
+               :out out :err err)))
+      (values (get-output-stream-string out) (get-output-stream-string err) rc))))
+
+(defun %wallet-tool-error (datadir &rest args)
+  "The stderr of a bitcoin-wallet run that must fail with exit 1 and no
+stdout (tool_wallet.py:37-46), or a description of what happened instead."
+  (multiple-value-bind (out err rc) (apply #'%wallet-tool datadir args)
+    (if (and (= rc 1) (string= out ""))
+        (string-trim '(#\Newline) err)
+        (format nil "rc ~D stdout ~S stderr ~S" rc out err))))
+
+(defun %rewrite-dump (from to edit)
+  "Copy the dump FROM to TO with EDIT applied to each (key . value) line."
+  (with-open-file (in from)
+    (with-open-file (out to :direction :output :if-exists :supersede)
+      (loop for line = (read-line in nil nil)
+            while line
+            do (let* ((comma (position #\, line))
+                      (row (funcall edit (cons (subseq line 0 comma) (subseq line (1+ comma))))))
+                 (when row (format out "~A,~A~%" (car row) (cdr row))))))))
+
+(test bitcoin-wallet-refuses-bad-command-lines
+  "The command-line refusals tool_wallet.py:111-120 asserts, in Core's words."
+  (with-temp-directory (dir "bl-wallet-tool")
+    (is (equal "Error parsing command line arguments: Invalid command 'foo'"
+               (%wallet-tool-error dir "foo")))
+    (is (equal "Error parsing command line arguments: Invalid command 'help'"
+               (%wallet-tool-error dir "help")))
+    (is (equal "Error: Additional arguments provided (create). Methods do not take arguments. Please refer to `-help`."
+               (%wallet-tool-error dir "info" "create")))
+    (is (equal "Error parsing command line arguments: Invalid parameter -foo"
+               (%wallet-tool-error dir "-foo")))
+    (is (equal "No method provided. Run `bitcoin-wallet -help` for valid methods."
+               (%wallet-tool-error dir)))
+    (is (equal "Wallet name must be provided when creating a new wallet."
+               (%wallet-tool-error dir "create")))
+    (is (equal "Error parsing command line arguments: Invalid parameter -descriptors"
+               (%wallet-tool-error dir "-descriptors" "-wallet=x" "create")))
+    (is (equal "Wallet name cannot be empty" (%wallet-tool-error dir "-wallet=" "create")))
+    (is (search "Path does not exist."
+                (%wallet-tool-error dir "-wallet=nonexistent.dat" "info")))))
+
+(test bitcoin-wallet-create-info-dump-createfromdump
+  "create tops up and reports; info reads the same wallet back; dump writes
+Core's record format with its SHA256d checksum; createfromdump rebuilds a
+wallet whose own dump is the same records; and each createfromdump refusal
+is Core's sentence with no wallet left behind (tool_wallet.py:201-286)."
+  (with-temp-directory (dir "bl-wallet-tool")
+    (multiple-value-bind (out err rc) (%wallet-tool dir "-wallet=w" "create")
+      (is (= 0 rc))
+      (is (string= "" err))
+      (is (search (format nil "Topping up keypool...~%Wallet info~%===========~%Name: w~%")
+                  out))
+      (is (search (format nil "Descriptors: yes~%Encrypted: no~%HD (hd seed available): yes~%Keypool Size: 8000~%Transactions: 0~%Address Book: 0~%")
+                  out)))
+    (multiple-value-bind (out err rc) (%wallet-tool dir "-wallet=w" "info")
+      (is (= 0 rc))
+      (is (string= "" err))
+      (is (search "Keypool Size: 8000" out)))
+    (let ((dump (merge-pathnames "w.dump" dir))
+          (again (merge-pathnames "rt.dump" dir)))
+      (is (equal "No dump file provided. To use dump, -dumpfile=<filename> must be provided."
+                 (%wallet-tool-error dir "-wallet=w" "dump")))
+      (multiple-value-bind (out err rc)
+          (%wallet-tool dir "-wallet=w" (format nil "-dumpfile=~A" (namestring dump)) "dump")
+        (is (= 0 rc))
+        (is (string= "" err))
+        (is (string= (format nil "The dumpfile may contain private keys. To ensure the safety of your Bitcoin, do not share the dumpfile.~%")
+                     out)))
+      (let ((lines (uiop:read-file-lines dump)))
+        (is (equal "BITCOIN_CORE_WALLET_DUMP,1" (first lines)))
+        (is (equal "format,leveldb" (second lines)))
+        ;; The checksum is SHA256d over every line before it, newline included.
+        (is (equal (format nil "checksum,~A"
+                           (bl.crypto:bytes-to-hex
+                            (bl.crypto:hash256
+                             (bl.ser:utf8-string-to-bytes
+                              (format nil "~{~A~%~}" (butlast lines))))))
+                   (car (last lines)))))
+      (is (search "already exists. If you are sure this is what you want"
+                  (%wallet-tool-error dir "-wallet=w" (format nil "-dumpfile=~A" (namestring dump)) "dump")))
+      ;; The round trip.
+      (multiple-value-bind (out err rc)
+          (%wallet-tool dir "-wallet=load" (format nil "-dumpfile=~A" (namestring dump)) "createfromdump")
+        (is (= 0 rc))
+        (is (string= "" err))
+        (is (string= "" out)))
+      (%wallet-tool dir "-wallet=load" (format nil "-dumpfile=~A" (namestring again)) "dump")
+      (is (equal (uiop:read-file-lines dump) (uiop:read-file-lines again)))
+      (is (search "Database already exists."
+                  (%wallet-tool-error dir "-wallet=load" (format nil "-dumpfile=~A" (namestring dump))
+                                      "createfromdump")))
+      ;; Each damaged dump is refused and leaves no wallet behind.
+      (flet ((damaged (edit want)
+               (let ((bad (merge-pathnames "bad.dump" dir)))
+                 (%rewrite-dump dump bad edit)
+                 (is (search want (%wallet-tool-error dir "-wallet=badload"
+                                                      (format nil "-dumpfile=~A" (namestring bad))
+                                                      "createfromdump"))
+                     "wanted ~S" want)
+                 (is (null (uiop:directory-exists-p (merge-pathnames "regtest/wallets/badload/" dir)))))))
+        (damaged (lambda (row) (if (string= (car row) "BITCOIN_CORE_WALLET_DUMP")
+                                   (cons (car row) "2") row))
+                 "Error: Dumpfile version is not supported. This version of bitcoin-wallet only supports version 1 dumpfiles. Got dumpfile with version 2")
+        (damaged (lambda (row) (if (string= (car row) "BITCOIN_CORE_WALLET_DUMP")
+                                   (cons "not_the_right_magic" "1") row))
+                 "Error: Dumpfile identifier record is incorrect. Got \"not_the_right_magic\", expected \"BITCOIN_CORE_WALLET_DUMP\".")
+        (damaged (lambda (row) (if (string= (car row) "checksum")
+                                   (cons "checksum" (make-string 64 :initial-element #\1)) row))
+                 "Error: Dumpfile checksum does not match. Computed ")
+        (damaged (lambda (row) (unless (string= (car row) "checksum") row))
+                 "Error: Missing checksum")
+        (damaged (lambda (row) (if (string= (car row) "checksum")
+                                   (cons "checksum" "2222222222") row))
+                 "Error: Checksum is not the correct size")))))

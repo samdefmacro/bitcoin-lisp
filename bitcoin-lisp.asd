@@ -339,7 +339,10 @@ bitcoin-cli (node-main)."
                                ;; Core ExternalSignerScriptPubKeyMan: the
                                ;; wallet side of -signer, last, since it
                                ;; drives the spend and PSBT code above it.
-                               (:file "wallet-signer")))
+                               (:file "wallet-signer")
+                               ;; Core wallettool.cpp / dump.cpp: bitcoin-wallet's
+                               ;; info, create, dump and createfromdump.
+                               (:file "wallet-tool")))
                  ;; Core's side tools (bitcoin-util, bitcoin-tx, bitcoin-wallet):
                  ;; their own package, on top of the RPC helpers and the wallet
                  ;; they reuse. The executable runs one of them when started
@@ -352,6 +355,7 @@ bitcoin-cli (node-main)."
                                (:file "bitcoin-util")
                                (:file "script-asm")
                                (:file "bitcoin-tx")
+                               (:file "bitcoin-wallet")
                                (:file "dispatch")))
                  ;; The RPC server proper, last: it dispatches to everything above.
                  (:module "rpc-server"

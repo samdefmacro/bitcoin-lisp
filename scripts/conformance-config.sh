@@ -34,14 +34,15 @@ mkdir -p "$ROOT/build/bin"
 # Observed 2026-08-25 running four sweep batches at once. rename(2) has no such
 # window.
 # The same executable is bitcoin-cli and each of Core's side tools: node-main
-# runs the client (src/cli/) or bitcoin-util / bitcoin-tx (src/tools/) when it
-# is started under that name, so the framework finds them where it looks,
-# BUILDDIR/bin/<name> (util.py:317-343), with no second image to build.
+# runs the client (src/cli/) or bitcoin-util / bitcoin-tx / bitcoin-wallet
+# (src/tools/) when it is started under that name, so the framework finds
+# them where it looks, BUILDDIR/bin/<name> (util.py:317-343), with no second
+# image to build.
 # A link that already names the binary is left alone: every run calls this,
 # and a run whose links had just been replaced (atomically, with no other run
 # active) still got EINVAL exec'ing build/bin/bitcoin-cli through the Docker
 # bind mount -- observed 2026-09-23, one run in three.
-for name in bitcoind bitcoin-cli bitcoin-util bitcoin-tx; do
+for name in bitcoind bitcoin-cli bitcoin-util bitcoin-tx bitcoin-wallet; do
   target="../$(basename "$BIN")"
   if [ "$(readlink "$ROOT/build/bin/$name" 2>/dev/null || true)" != "$target" ]; then
     ln -sfn "$target" "$ROOT/build/bin/.$name.$$"
@@ -70,8 +71,8 @@ EXEEXT=
 RPCAUTH=$CONFIG_ROOT/refs/bitcoin/share/rpcauth/rpcauth.py
 
 [components]
-# The node, its client and its side tools bitcoin-util and bitcoin-tx are ours
-# (the same executable under each name). The wallet tool and the fuzz/bench
+# The node, its client and its side tools bitcoin-util, bitcoin-tx and
+# bitcoin-wallet are ours (the same executable under each name). The fuzz/bench
 # binaries do not exist here, so the tests that need them are out of scope
 # rather than failing (see the plan's classification).
 ENABLE_BITCOIND=true
@@ -79,6 +80,7 @@ ENABLE_CLI=true
 ENABLE_BITCOIN_UTIL=true
 # bitcoin-tx's flag is spelled BUILD_, not ENABLE_ (test_framework.py:993-995).
 BUILD_BITCOIN_TX=true
+ENABLE_WALLET_TOOL=true
 ENABLE_WALLET=true
 # -signer, enumeratesigners and walletdisplayaddress are always built here;
 # Core builds them behind ENABLE_EXTERNAL_SIGNER (rpc_signer.py,

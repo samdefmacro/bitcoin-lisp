@@ -26,6 +26,7 @@ wallet/dump.cpp. src/tools/.")
    ;; The entry points, one per Core program
    #:run-bitcoin-util
    #:run-bitcoin-tx
+   #:run-bitcoin-wallet
    #:tool-for-program-name
    #:tool-main
    ;; Core UniValue::write for the alist values the RPC layer builds

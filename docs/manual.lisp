@@ -46,7 +46,8 @@
   `bitcoin-lisp.nicknames`: `bl:` for the node package, then `bl.err`,
   `bl.bytes`, `bl.chain`, `bl.ctx`, `bl.rl`, `bl.crypto`, `bl.log`,
   `bl.cfg`, `bl.kv`, `bl.ser`, `bl.store`, `bl.net`, `bl.rpc`, `bl.val`,
-  `bl.mp`, `bl.mining`, `bl.wallet`, `bl.script`, `bl.interop`. The node
+  `bl.mp`, `bl.mining`, `bl.wallet`, `bl.tools`, `bl.script`,
+  `bl.interop`. The node
   package re-exports what it inherits from the layers below, so `bl:`
   keeps naming the whole API from above.
 
@@ -74,6 +75,7 @@
   (@rpc-methods section)
   (@wallet section)
   (@zmq section)
+  (@tools section)
   (@node section)
   (@interop section))
 
@@ -1532,6 +1534,16 @@
   mapTxSpends unwound per transaction so an outpoint a surviving
   conflicting spend also names stays spent.
 
+  External signers (`-signer`, Core `external_signer.cpp` and
+  `wallet/external_signer_scriptpubkeyman.cpp`) are
+  `external-signer.lisp` (the process protocol: each call is one child
+  whose FIRST stdout line is JSON, `run-command-parse-json`) and
+  `wallet-signer.lisp` (the wallet side). Such a wallet is keyless: its
+  descriptors come from the device's `getdescriptors`, and FinishTransaction
+  and bumpfee sign by handing the device the PSBT and continuing with the
+  transaction ITS answer extracts to. Core builds all of it behind
+  ENABLE_EXTERNAL_SIGNER; this node always has it.
+
   DELIBERATE DIVERGENCE, the one an operator sees first: a wallet is a
   LevelDB DIRECTORY under `wallets/<name>/`, not Core's single
   `wallet.dat` SQLite file, and `getwalletinfo`'s `format` says `leveldb`
@@ -1603,6 +1615,42 @@
   (bitcoin-lisp:zmq-notify-block-disconnected function)
   (bitcoin-lisp:zmq-notify-tx-accepted function)
   (bitcoin-lisp:zmq-notify-tx-removed function))
+
+(defsection @tools (:title "tools: bitcoin-util, bitcoin-tx, bitcoin-wallet")
+  "`src/tools/`, package `bl.tools`. Core: `bitcoin-util.cpp`,
+  `bitcoin-tx.cpp`, `bitcoin-wallet.cpp` with `wallet/wallettool.cpp` and
+  `wallet/dump.cpp` (whose wallet half is `src/wallet/wallet-tool.lisp`).
+  Core builds four programs; this project saves ONE image, and NODE-MAIN
+  runs the tool whose name argv[0] carries before it does anything a node
+  does. `scripts/conformance-config.sh` links each name to the node binary
+  under `build/bin/`, where Core's framework looks for it.
+
+  Invariants: a tool is a function of its arguments and its stdin that
+  writes to two streams and returns the exit code; only TOOL-MAIN exits,
+  so the unit suite replays Core's own vectors in-process
+  (`test/functional/data/util/bitcoin-util-test.json`, 107 of them, stdout
+  compared byte for byte). Each tool registers only its own options, as
+  Core's do: any other `-name` is `Invalid parameter -name`. The JSON a tool
+  prints is UniValue::write's layout, empty arrays split over two lines.
+
+  DELIBERATE DIVERGENCE: bitcoin-wallet works on this project's LevelDB
+  wallet directory, so `Format:` and a dump's `format` record say leveldb
+  and createfromdump accepts a leveldb or a sqlite dump -- the records
+  themselves are Core's schema byte for byte. The tool has no -keypool: its
+  wallets get Core's default 1000.
+
+  Traps: bitcoin-tx's registers are JSON read to the END of the text
+  (UniValue::read); a sign= prevtx with no amount is worth MAX_MONEY, and
+  a segwit signature over it is refused, as Core refuses it. bitcoin-util's
+  grind reads the target from the header's OWN nBits."
+  (bl.tools:tool-for-program-name function)
+  (bl.tools:tool-main function)
+  (bl.tools:run-bitcoin-util function)
+  (bl.tools:run-bitcoin-tx function)
+  (bl.tools:run-bitcoin-wallet function)
+  (bl.tools:univalue-write function)
+  (bl.tools:parse-script-asm function)
+  (bl.wallet:wallet-tool-execute function))
 
 (defsection @node (:title "node: start-up, the sync thread, shutdown")
   "The top of the stack. Core: `init.cpp` (AppInitMain in twelve steps

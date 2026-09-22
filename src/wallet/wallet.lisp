@@ -1623,7 +1623,7 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
           (%wallet-drop-extraneous-master-keys wallet))
         (values final-warnings rescan-required)))))
 
-(defun load-wallet (manager name &key chain-state)
+(defun load-wallet (manager name &key chain-state (top-up t))
   "Load an existing wallet from <wallets>/<name>/ and register it. Returns
 (values wallet warnings rescan-required). CHAIN-STATE resolves stored tx block
 heights; the locator catch-up rescan is a separate step (wallet-attach-chain)
@@ -1633,7 +1633,11 @@ split.
 RESCAN-REQUIRED is Core's DBErrors::NEED_RESCAN. Like CreateWalletFromFile
 (wallet.cpp:3140-3142) this is not a load failure: the wallet comes up, and
 the caller hands the flag to WALLET-ATTACH-CHAIN, which then rescans from
-height 0 rather than from a locator that no longer describes what loaded."
+height 0 rather than from a locator that no longer describes what loaded.
+
+TOP-UP NIL loads without the keypool top-up, as bitcoin-wallet's
+PopulateWalletFromDB does (wallet/wallettool.cpp:52-80): the offline tool
+reports the keypool it finds and writes no keys into the file."
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (when (gethash name (wallet-manager-wallets manager))
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-loaded+
@@ -1673,10 +1677,11 @@ height 0 rather than from a locator that no longer describes what loaded."
                               name)
                       warnings))
               ;; Try to top up the keypool (CWallet::LoadExisting).
-              (loop for spkm being the hash-values of (wallet-external-spkms wallet)
-                    do (spkm-top-up wallet spkm))
-              (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
-                    do (spkm-top-up wallet spkm)))
+              (when top-up
+                (loop for spkm being the hash-values of (wallet-external-spkms wallet)
+                      do (spkm-top-up wallet spkm))
+                (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
+                      do (spkm-top-up wallet spkm))))
           ;; A record scan that stops on a bad block is Core's DBErrors::CORRUPT
           ;; and answers as one; the LevelDB text stays in the log.
           (bl.err:storage-error (e)

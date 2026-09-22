@@ -36,6 +36,7 @@ through the lower packages; the node reaches it only through these exports.")
    #:*wallet-notify-command*
    #:*signer-command*
    #:run-command-parse-json
+   #:wallet-tool-execute
    #:*wallet-reject-long-chains*
    #:*wallet-signal-rbf*
    #:*wallet-spend-zero-conf-change*

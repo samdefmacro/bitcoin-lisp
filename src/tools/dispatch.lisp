@@ -9,7 +9,8 @@
 
 (defparameter +tools+
   (list (cons "bitcoin-util" #'run-bitcoin-util)
-        (cons "bitcoin-tx" #'run-bitcoin-tx))
+        (cons "bitcoin-tx" #'run-bitcoin-tx)
+        (cons "bitcoin-wallet" #'run-bitcoin-wallet))
   "Program name -> the function that runs that tool over its arguments.")
 
 (defun tool-for-program-name (argv0)
