@@ -1636,6 +1636,9 @@ in terms of clusters; and the old feerate-superiority test
     ;; EntriesAndTxidsDisjoint, rbf.cpp:85-98) — that would leave a dangling
     ;; input after the replaced set is evicted. (This is NOT old rule 2, which
     ;; is gone; it only forbids depending on the very txs being removed.)
+    ;; Its reject reason is "bad-txns-spends-conflicting-tx" with
+    ;; EntriesAndTxidsDisjoint's sentence as the debug message
+    ;; (validation.cpp:1356, rbf.cpp:92-94); rpc_psbt.py:189 matches the reason.
     (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
       (when (gethash (bl.ser:outpoint-hash
                       (bl.ser:tx-in-previous-output in))

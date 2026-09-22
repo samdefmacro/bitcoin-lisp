@@ -852,6 +852,7 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; (:1097-1098). All three shared :INSUFFICIENT-FEE here, so an RBF
     ;; rejection announced itself as a relay-floor one.
     (:rbf-insufficient-fee     . "insufficient fee")
+    (:spends-conflicting-tx    . "bad-txns-spends-conflicting-tx")   ; validation.cpp:1356
     (:package-rbf-insufficient-fee . "package RBF failed: insufficient anti-DoS fees")
     ;; And the FOURTH: the economic test, which is not arithmetic on fees but
     ;; the feerate diagram (validation.cpp:1028). The downcased keyword already

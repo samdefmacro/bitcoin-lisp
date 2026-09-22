@@ -2102,6 +2102,39 @@ alone."
       (is-false ok)
       (is (eq (first reason) :rbf-insufficient-fee)))))
 
+(test rbf-replacement-spending-what-it-replaces-is-cores-reason
+  "A replacement that spends an output of a transaction it would evict is
+rejected with Core's reason \"bad-txns-spends-conflicting-tx\" and
+EntriesAndTxidsDisjoint's sentence as the debug message (validation.cpp:1356,
+policy/rbf.cpp:85-98). Ours returned the bare keyword, which rendered as
+\"spends-conflicting-tx\", and rpc_psbt.py:189 matches Core's reason. The
+same replacement without the extra input passes (the control)."
+  (let* ((mempool (bl.mp:make-mempool))
+         (orig (%rbf-tx 190))
+         (orig-txid (bl.ser:transaction-hash orig))
+         (plain (%rbf-tx 190 :value 40000000))
+         (repl (bl.ser:make-transaction
+                :version 1
+                :inputs (vector (aref (bl.ser:transaction-inputs plain) 0)
+                                (bl.ser:make-tx-in
+                                 :previous-output (bl.ser:make-outpoint :hash orig-txid :index 0)
+                                 :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                 :sequence #xfffffffd))
+                :outputs (bl.ser:transaction-outputs plain)
+                :lock-time 0))
+         (hex (lambda (h) (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes h)))))
+    (%add-tx mempool orig :fee 1000)
+    (is-true (bl.mp:check-rbf-rules mempool plain 50000 200
+                                    (bl.ser:transaction-weight plain) (list orig-txid)))
+    (multiple-value-bind (ok reason)
+        (bl.mp:check-rbf-rules mempool repl 50000 300
+                               (bl.ser:transaction-weight repl) (list orig-txid))
+      (is-false ok)
+      (is (string= (format nil "bad-txns-spends-conflicting-tx, ~A spends conflicting transaction ~A"
+                           (funcall hex (bl.ser:transaction-hash repl))
+                           (funcall hex orig-txid))
+                   (bl.val:tx-reject-reason-string reason))))))
+
 (test rbf-fee-rejection-is-cores-insufficient-fee-sentence
   "The replacement rules' anti-DoS arithmetic is Core's THIRD fee rejection,
 and none of the three shares a reject reason with the others: CheckFeeRate has
