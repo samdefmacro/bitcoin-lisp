@@ -824,9 +824,16 @@ was never lifted, so our address could never have ridden the queue at all."
               "and does not go through the gossip queue")
           (is (plusp (%local-addr-deadline peer))
               "the 24-hour timer is armed")
-          ;; Due again: the repeat is QUEUED, not sent.
+          ;; Due again: the repeat is QUEUED, not sent -- and still logged, as
+          ;; Core logs every one in GetLocalAddrForPeer (net.cpp:262-264;
+          ;; p2p_addr_selfannouncement.py:136).
           (setf (%local-addr-deadline peer) 1)
-          (is (= 1 (bl.net:maybe-advertise-local-address (list peer) nil)))
+          (multiple-value-bind (n text)
+              (log-text-of "net" (lambda ()
+                                   (bl.net:maybe-advertise-local-address (list peer) nil)))
+            (is (= 1 n))
+            (is (search "Advertising address 1.2.3.4:8333" text)
+                "a repeat is logged like the first"))
           (is (= 1 (length sends)) "a repeat puts nothing on the wire of its own")
           (is (= 1 (length (%addr-queue peer)))
               "it waits in the gossip queue with everything else")

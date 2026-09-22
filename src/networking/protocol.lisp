@@ -3523,14 +3523,17 @@ IsAddrCompatible test."
                  :port (local-address-port la)
                  :services (local-services)
                  :last-seen (bl.ser:get-unix-time))))
+        ;; Core logs this in GetLocalAddrForPeer (net.cpp:262-264), i.e. for
+        ;; the repeats that ride the queue as well as for the first;
+        ;; p2p_addr_selfannouncement.py:136 waits for it after each 20-day
+        ;; bumpmocktime.
+        (bl:log-cat "net" "Advertising address ~A:~D to ~A"
+                    (peer-address-string pa)
+                    (peer-address-port pa)
+                    (peer-log-name peer))
         (if firstp
             (let ((msg (build-addr-response peer (list pa))))
-              (when (and msg (send-message peer msg))
-                (bl:log-cat "net" "Advertising address ~A:~D to ~A"
-                            (peer-address-string pa)
-                            (peer-address-port pa)
-                            (peer-log-name peer))
-                t))
+              (and msg (send-message peer msg) t))
             (push-address peer pa))))))
 
 (defun maybe-advertise-local-address (peers chain-state)
