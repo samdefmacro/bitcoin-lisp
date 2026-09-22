@@ -480,6 +480,26 @@ the package reason on every member and left the array out."
           (is (string= "package-not-validated"
                        (cdr (assoc "error" (cdr entry) :test #'string=)))))))))
 
+(test rpc-submitpackage-array-bounds-are-cores-sentence
+  "submitpackage refuses an empty array and one over 25 members with ONE
+sentence, Core's, period included: -8 `Array must contain between 1 and 25
+transactions.' (rpc/mempool.cpp:1351-1354). Ours had a sentence of its own for
+the empty array and dropped the period on the other; rpc_packages.py:410-411
+match both."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let ((node (bl:make-node :network :testnet3))
+          (hex (bl.crypto:bytes-to-hex
+                (bl.ser:serialize-transaction (pkg-tx funding-txid 0 99990000)))))
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool)
+      (signals-rpc-error (:code -8 :message "Array must contain between 1 and 25 transactions.")
+        (bl.rpc:dispatch-rpc-method node "submitpackage"
+                                    (wire-params (vector (vector)))))
+      (signals-rpc-error (:code -8 :message "Array must contain between 1 and 25 transactions.")
+        (bl.rpc:dispatch-rpc-method node "submitpackage"
+                                    (list (make-list 26 :initial-element hex)))))))
+
 (test rpc-submitpackage-broadcasts-accepted-members
   "submitpackage queues an announcement for every package member that made
 it into the mempool (Core rpc/mempool.cpp:1423-1444 runs

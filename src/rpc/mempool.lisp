@@ -890,12 +890,13 @@ member may send to a script that can never spend it."
   (let ((utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
-    (unless (and (listp hexes) hexes)
+    ;; One check, one sentence, Core's own, trailing period included
+    ;; (rpc/mempool.cpp:1351-1354); rpc_packages.py:410/:411 match it for []
+    ;; and for 26 members alike.
+    (when (or (null hexes) (> (length hexes) bl.val:+max-package-count+))
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "First parameter must be a non-empty array of tx hex"))
-    (when (> (length hexes) bl.val:+max-package-count+)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Array must contain between 1 and 25 transactions"))
+                        :message (format nil "Array must contain between 1 and ~D transactions."
+                                         bl.val:+max-package-count+)))
     (unless mempool
       ;; Core: RPC_CLIENT_MEMPOOL_DISABLED (-33), server_util.cpp:37.
       (error 'rpc-error :code +rpc-client-mempool-disabled+
