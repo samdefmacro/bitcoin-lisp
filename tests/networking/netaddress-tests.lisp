@@ -703,3 +703,43 @@ advertised listen port -- a -bind port, a non-noban -whitebind port, then
                  (and la (bl.net:local-address-port la)))))
         (is (eql 30006 (port-of 2 2 2 2)) "an explicit port is kept")
         (is (eql 30020 (port-of 3 3 3 3)) "otherwise GetListenPort, not -port")))))
+
+(defun %peer-reporting-our-address (peer-address inbound a b c d port)
+  "A peer at PEER-ADDRESS whose version message says it sees us at a.b.c.d:PORT."
+  (bl.net:make-peer
+   :address peer-address :inbound inbound :state :ready
+   :version (bl.bytes:with-byte-reader
+                (in (bl.ser:make-version-message-bytes
+                     :addr-recv (bl.ser:make-net-addr
+                                 :ip (bl.net:ipv4-to-mapped-ipv6 a b c d) :port port)))
+              (bl.ser:read-version-message in))))
+
+(test under-discover-a-peer-s-view-of-our-address-is-advertised
+  "GetLocalAddrForPeer's discovery branch (net.cpp:240-267): under -discover,
+when a routable peer reports a routable address for us and we have no routable
+address of our own, that report is what we advertise -- an inbound peer's whole
+(it saw our listening port), an outbound one's IP at our listen port
+(net.cpp:252-259). Ours had no such branch, the docstring saying fDiscover was
+permanently false; with -discover ported it is a drive site that must exist."
+  (%with-local-address-table
+    (let ((bl.net:*advertised-listen-port* 31001)
+          (inbound (%peer-reporting-our-address "8.8.8.8" t 1 2 3 4 18444))
+          (outbound (%peer-reporting-our-address "8.8.4.4" nil 1 2 3 4 55555)))
+      (let ((la (bl.net:get-local-addr-for-peer inbound)))
+        (is-true la)
+        (when la
+          (is (equalp (bl.net:ipv4-to-mapped-ipv6 1 2 3 4) (bl.net:local-address-bytes la)))
+          (is (= 18444 (bl.net:local-address-port la)) "inbound: the peer saw our port")))
+      (let ((la (bl.net:get-local-addr-for-peer outbound)))
+        (is-true la)
+        (when la
+          (is (= 31001 (bl.net:local-address-port la))
+              "outbound: the peer cannot see our listening port")))
+      (let ((bl.net:*discover* nil))
+        (is-false (bl.net:get-local-addr-for-peer inbound) "-discover=0: never"))
+      (is-false (bl.net:get-local-addr-for-peer
+                 (%peer-reporting-our-address "127.0.0.1" t 1 2 3 4 18444))
+                "a peer at an unroutable address is no source")
+      (is-false (bl.net:get-local-addr-for-peer
+                 (%peer-reporting-our-address "8.8.8.8" t 10 0 0 1 18444))
+                "an unroutable report is no address"))))

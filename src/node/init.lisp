@@ -1853,6 +1853,7 @@ listener, the onion listener with its Tor control connection, and
 
   ;; -externalip; runs after the tor block so its clear-local-addresses
   ;; cannot wipe these entries.
+  (setf bl.net:*advertised-listen-port* (get-listen-port network))
   (add-external-ip-locals network)
   ;; Discover, only when listening on the wildcard address (Core
   ;; init.cpp:2193-2197); a no-op under -discover=0.

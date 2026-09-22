@@ -3386,14 +3386,55 @@ address, or :unroutable when it cannot be typed (hostname addnode)."
         (declare (ignore bytes))
         (or net :unroutable))))
 
+(defun peer-addr-local (peer)
+  "The address PEER says it sees us at -- the addr_recv of the version message
+it sent (Core CNode::m_addr_local, set for every peer at
+net_processing.cpp:3674) -- as (VALUES network bytes port), or NIL before a
+version or when the field names no IP address."
+  (let ((vmsg (peer-version peer)))
+    (when vmsg
+      (let* ((addr (bl.ser:version-message-addr-recv vmsg))
+             (ip (bl.ser:net-addr-ip addr)))
+        (when (= 16 (length ip))
+          (values (ip-network ip) ip (bl.ser:net-addr-port addr)))))))
+
+(defun %peer-addr-local-good-p (peer)
+  "Core IsPeerAddrLocalGood (net.cpp:233-238): under -discover, a peer at a
+routable address whose report of our address is routable and on a reachable
+network."
+  (and *discover*
+       (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
+         (and net (address-publicly-routable-p bytes net)))
+       (multiple-value-bind (net bytes) (peer-addr-local peer)
+         (and net
+              (address-publicly-routable-p bytes net)
+              (reachable-network-p net)))))
+
 (defun get-local-addr-for-peer (peer)
   "The local address worth advertising to PEER, as a local-address record, or
 NIL (Core GetLocalAddrForPeer, net.cpp:240-267): the best mapLocalHost entry
 for the peer's connected-through network (privacy rule + reachability rank,
-best-local-address), provided it is routable. Core's other branch — sometimes
-echoing back the address the peer SEES us as — is fDiscover-gated, and we
-have no -discover support (fDiscover permanently false), so it never fires."
+best-local-address) -- except that under -discover, when the peer's report of
+our address is good, that report is used instead whenever we have no routable
+address of our own, and otherwise once in 2 (once in 8 for an address scoring
+above LOCAL_MANUAL): an inbound peer's report whole, an outbound one's IP
+only, keeping our port, since the peer cannot observe our listening port on a
+connection we opened. Whichever address results is advertised only if
+routable."
   (let ((la (best-local-address (peer-connected-through-network peer))))
+    (when (and (%peer-addr-local-good-p peer)
+               (or (null la)
+                   (not (address-publicly-routable-p (local-address-bytes la)
+                                                     (local-address-network la)))
+                   (zerop (random (if (> (local-address-score la) +local-manual+) 8 2)))))
+      (multiple-value-bind (net bytes port) (peer-addr-local peer)
+        (setf la (make-local-address
+                  :network net :bytes (copy-seq bytes)
+                  :port (if (peer-inbound peer)
+                            port
+                            ;; GetLocalAddress's fallback port is GetListenPort.
+                            (if la (local-address-port la) *advertised-listen-port*))
+                  :score 0))))
     (when (and la
                (address-routable-p (local-address-bytes la)
                                    (local-address-network la)))

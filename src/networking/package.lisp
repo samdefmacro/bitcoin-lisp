@@ -250,6 +250,8 @@ headerssync.cpp. src/networking/.")
    #:+local-if+
    #:+local-bind+
    #:*discover*
+   #:*advertised-listen-port*
+   #:peer-addr-local
    #:interface-addresses
    #:discover-local-addresses
    #:add-bound-local-address

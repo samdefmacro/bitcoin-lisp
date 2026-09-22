@@ -547,6 +547,12 @@ soft-set off by -proxy, -listen=0 and -externalip (init.cpp:796-819); an
 explicit -discover wins. Assigned once per run by APPLY-PARAMETER-INTERACTIONS.
 With it off, ADD-LOCAL takes only LOCAL_MANUAL-or-better entries (net.cpp:283).")
 
+(defvar *advertised-listen-port* 0
+  "Core GetListenPort as the node decided it at start-up (the node layer's
+GET-LISTEN-PORT, published here by %START-NETWORK-SERVICES): the port an
+outbound peer's report of our address is advertised at, since the peer cannot
+observe our listening port on a connection we opened (net.cpp:252-259).")
+
 (defvar *external-ips* '()
   "Raw -externalip strings from config (Core init.cpp:1803-1808), consumed
 at node startup: each parses through parse-network-address and lands in the
