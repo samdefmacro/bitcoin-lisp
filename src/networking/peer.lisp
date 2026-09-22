@@ -151,7 +151,7 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; so a flood cannot choose which addresses survive.
   (addrs-to-send (make-array 0 :adjustable t :fill-pointer 0)
                  :type (array t (*)))
-  ;; internal-real-time deadline of the next addr flush to this peer (Core
+  ;; Mockable Unix-time deadline of the next addr flush to this peer (Core
   ;; Peer::m_next_addr_send, net_processing.cpp:374). 0 = due now, which is
   ;; Core's initial value too.
   (next-addr-send 0 :type integer)
@@ -198,7 +198,7 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; this flag is what makes ConnectedThroughNetwork() answer :torv3 — the
   ;; network used for the self-advertisement privacy rule.
   (inbound-onion nil :type boolean)
-  ;; internal-real-time deadline of the next local-address self-announcement
+  ;; Mockable Unix-time deadline of the next local-address self-announcement
   ;; to this peer; 0 = none sent yet, due immediately (Core Peer::
   ;; m_next_local_addr_send, net_processing.cpp:376).
   (next-local-addr-send 0 :type integer)
@@ -1580,8 +1580,8 @@ rather than being recomputed as 50*1.1^k.")
 (defun %exponential-interval (mean-seconds)
   "Seconds until the next event of a Poisson process with MEAN-SECONDS (Core
 rand_exp_duration). Returns SECONDS, matching the unix-time clock the
-feefilter timers use — protocol.lisp's %next-exp-interval-ticks returns
-internal-real-time TICKS and must not be mixed with them."
+feefilter timers use, like protocol.lisp's %next-exp-interval-seconds (which
+rounds up instead)."
   (max 1 (round (* mean-seconds (- (log (- 1.0d0 (random 1.0d0))))))))
 
 (defun fee-filter-round (fee)

@@ -712,6 +712,33 @@ peer as one message carrying three entries, not as three messages."
         (is (string= "addrv2" (%message-command msg)))
         (is (= 3 (length (bl.ser:parse-addrv2-payload (%message-payload msg)))))))))
 
+(test addr-flush-deadline-is-on-the-mockable-clock
+  "Core's MaybeSendAddr reads current_time = GetTime<microseconds>(), the
+MOCKABLE clock, for m_next_addr_send and m_next_local_addr_send
+(net_processing.cpp:5737, :5535-5573). p2p_addr_relay.py:128-136 moves
+setmocktime 600 s forward to make every receiver's flush due and then pings
+each one; on the process clock ours kept its real-time schedule and only 3 of
+the 20 relayed addresses arrived (p2p_addr_relay.py:175)."
+  (let* ((t0 1700000000)
+         (bl.ser:*mock-time* t0)
+         (source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
+         (target (bl.net:make-peer :state :ready :addr-relay-enabled t
+                                   :address "1.1.1.1:8333"))
+         (peers (list source target)))
+    (%with-captured-sends (sends)
+      (bl.net:flush-addr-announcements peers)   ; arms the deadline
+      (%relay-address (%make-test-peer-address 8 0 0 1 8333) source peers)
+      (bl.net:flush-addr-announcements peers)
+      (is (= 0 (length sends)) "not due at the same mock instant")
+      (setf bl.ser:*mock-time* (+ t0 600))
+      (bl.net:flush-addr-announcements peers)
+      (is (= 1 (length sends)) "600 mock seconds later the flush is due")
+      ;; A clock moved far BACKWARDS re-arms rather than stalling forever.
+      (setf bl.ser:*mock-time* (- t0 100000))
+      (%relay-address (%make-test-peer-address 8 0 0 2 8333) source peers)
+      (bl.net:flush-addr-announcements peers)
+      (is (= 2 (length sends)) "a deadline stranded in the future is re-armed"))))
+
 (test addr-flush-waits-out-its-poisson-deadline
   "The flush is a schedule, not a drain: a peer whose m_next_addr_send has not
 passed is skipped and keeps its queue (net_processing.cpp:5571-5573). The

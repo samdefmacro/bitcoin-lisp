@@ -3517,14 +3517,19 @@ gains entries while the onion service (which requires listening) is up. Call
     (return-from maybe-advertise-local-address 0))
   (when (initial-block-download-p chain-state)
     (return-from maybe-advertise-local-address 0))
-  (let ((now (get-internal-real-time))
+  ;; The mockable clock in seconds, as the gossip flush's (Core reads the
+  ;; same current_time for both halves of MaybeSendAddr).
+  (let ((now (bl.ser:get-unix-time))
         (sent 0))
     (dolist (peer peers sent)
       (when (and (eq (peer-state peer) :ready)
                  ;; Core MaybeSendAddr self-advertises only on addr-relay
                  ;; peers (net_processing.cpp:5533).
                  (peer-addr-relay-enabled peer)
-                 (<= (peer-next-local-addr-send peer) now))
+                 (or (<= (peer-next-local-addr-send peer) now)
+                     (%inv-deadline-unreachable-p
+                      (peer-next-local-addr-send peer) now
+                      +avg-local-address-broadcast-interval+)))
         (let ((firstp (zerop (peer-next-local-addr-send peer))))
           ;; The reset happens whether or not we end up with an address to
           ;; announce, as it does in Core (it precedes GetLocalAddrForPeer).
@@ -3535,7 +3540,7 @@ gains entries while the onion service (which requires listening) is up. Call
         ;; Reschedule whether or not anything was sent (Core sets
         ;; m_next_local_addr_send unconditionally once due).
         (setf (peer-next-local-addr-send peer)
-              (+ now (%next-exp-interval-ticks
+              (+ now (%next-exp-interval-seconds
                       +avg-local-address-broadcast-interval+)))))))
 
 ;;; Gossiped-address flush (Core MaybeSendAddr's queue half,
@@ -3578,16 +3583,24 @@ redrawn as an exponential with mean +avg-address-broadcast-interval+ every
 time it does — including on a pass that finds the queue empty, which is what
 arms a freshly-ready peer's first interval. Returns the number of peers a
 message actually went out to."
-  (let ((now (get-internal-real-time))
+  ;; The MOCKABLE clock, in seconds: Core's current_time is
+  ;; GetTime<std::chrono::microseconds>() (net_processing.cpp:5737), and
+  ;; p2p_addr_relay.py:128-136 moves setmocktime 600 s forward precisely to
+  ;; make every peer's m_next_addr_send due. On the process clock the flush
+  ;; kept its real-time schedule and 3 of the 20 relayed addresses arrived.
+  (let ((now (bl.ser:get-unix-time))
         (sent 0))
     (dolist (peer peers sent)
       (when (and (eq (peer-state peer) :ready)
                  ;; Core MaybeSendAddr's first line: nothing to do for a peer
                  ;; without address relay (net_processing.cpp:5533).
                  (peer-addr-relay-enabled peer)
-                 (> now (peer-next-addr-send peer)))
+                 (or (> now (peer-next-addr-send peer))
+                     ;; A clock moved backwards under the deadline.
+                     (%inv-deadline-unreachable-p (peer-next-addr-send peer) now
+                                                  +avg-address-broadcast-interval+)))
         (setf (peer-next-addr-send peer)
-              (+ now (%next-exp-interval-ticks +avg-address-broadcast-interval+)))
+              (+ now (%next-exp-interval-seconds +avg-address-broadcast-interval+)))
         (when (%flush-peer-addrs peer)
           (incf sent))))))
 
@@ -3642,14 +3655,6 @@ forever."
 (defvar *next-inbound-inv-flush* 0
   "Unix-time deadline of the shared inbound inv rotation, on Core's MOCKABLE
 clock (Core NextInvToInbounds — one timer for all inbound peers).")
-
-(defun %next-exp-interval-ticks (mean-seconds)
-  "Ticks until the next event of a Poisson process with MEAN-SECONDS
-(Core rand_exp_duration): -mean * ln(U), U uniform in (0,1]. Still on
-INTERNAL-REAL-TIME, for the addr-relay timers whose Core counterparts read the
-steady clock; the tx-inv rotations use %NEXT-EXP-INTERVAL-SECONDS."
-  (round (* mean-seconds internal-time-units-per-second
-            (- (log (- 1.0d0 (random 1.0d0)))))))
 
 (defun %next-exp-interval-seconds (mean-seconds)
   "Whole seconds until the next event of a Poisson process with MEAN-SECONDS
