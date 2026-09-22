@@ -182,6 +182,112 @@ leaf version (:739-741)."
                 ((#x17 #x18) (thirty-two))))
       (:output (case keytype (#x05 (thirty-two)))))))
 
+(defun %psbt-tap-bip32-check (side value)
+  "Core's PSBT_{IN,OUT}_TAP_BIP32_DERIVATION value reader (psbt.h:755-768,
+:1075-1085): a compact-size count of 32-byte leaf hashes, then a key origin of
+the REST of the stated length. The hashes are read first, so a count whose
+hashes would overrun the value is \"<Side> Taproot BIP32 keypath has an
+invalid length\", and the origin that remains must be a non-empty multiple of
+four (DeserializeKeyOrigin, psbt.h:124-129)."
+  (let* ((br (make-byte-reader-from value))
+         (hashes-len (handler-case
+                         (let* ((n (br-read-compact-size br))
+                                (prefix (br-pos br)))
+                           (+ prefix (* 32 n)))
+                       (error () (1+ (length value))))))
+    (when (> hashes-len (length value))
+      (serialization-error "~A Taproot BIP32 keypath has an invalid length" side))
+    (let ((origin-len (- (length value) hashes-len)))
+      (when (or (zerop origin-len) (plusp (mod origin-len 4)))
+        (serialization-error "Invalid length for HD key path")))))
+
+(defun %psbt-tap-tree-check (value)
+  "Core's PSBT_OUT_TAP_TREE reader (psbt.h:1036-1070): a non-empty run of
+<depth><leaf version><compact-size script> leaves, each at most 128 deep with a
+valid leaf version, that together make a COMPLETE binary tree -- the
+TaprootBuilder Insert/IsComplete walk (script/signingprovider.cpp:411-431),
+kept here as which depths currently hold a pending node."
+  (when (zerop (length value))
+    (serialization-error "Output Taproot tree must not be empty"))
+  (let ((br (make-byte-reader-from value))
+        (branch (make-array 0 :adjustable t :fill-pointer t))
+        (valid t))
+    (loop until (br-eof-p br)
+          do (let ((depth (br-read-u8 br))
+                   (leaf-ver (br-read-u8 br)))
+               (br-read-var-bytes br)
+               (when (> depth 128)
+                 (serialization-error
+                  "Output Taproot tree has as leaf greater than Taproot maximum depth"))
+               (unless (zerop (logand leaf-ver 1))
+                 (serialization-error
+                  "Output Taproot tree has a leaf with an invalid leaf version"))
+               (when valid
+                 (if (< (1+ depth) (length branch))
+                     (setf valid nil)
+                     (progn
+                       (loop while (and valid (> (length branch) depth)
+                                        (aref branch depth))
+                             do (vector-pop branch)
+                                (when (zerop depth) (setf valid nil))
+                                (decf depth))
+                       (when valid
+                         (loop while (<= (length branch) depth)
+                               do (vector-push-extend nil branch))
+                         (setf (aref branch depth) t)))))))
+    (unless (and valid (or (zerop (length branch))
+                           (and (= 1 (length branch)) (aref branch 0))))
+      (serialization-error "Output Taproot tree is malformed"))))
+
+(defun %psbt-musig2-participants-check (side keydata value)
+  "Core DeserializeMuSig2ParticipantPubkeys (psbt.h:203-231) behind the
+34-byte key check of PSBT_{IN,OUT}_MUSIG2_PARTICIPANT_PUBKEYS (:791-798,
+:1088-1095): the key is a valid 33-byte aggregate, the value whole 33-byte
+valid participants."
+  (unless (= (length keydata) 33)
+    (serialization-error
+     "~A musig2 participants pubkeys aggregate key is not 34 bytes" side))
+  (unless (bl.crypto:public-key-valid-p keydata)
+    (serialization-error "~A musig2 aggregate pubkey is invalid" side))
+  (loop for i from 0 to (- (length value) 33) by 33
+        unless (bl.crypto:public-key-valid-p (subseq value i (+ i 33)))
+          do (serialization-error "~A musig2 participant pubkey is invalid" side))
+  (unless (zerop (mod (length value) 33))
+    (serialization-error
+     "~A musig2 participants pubkeys value size is not a multiple of 33" side)))
+
+(defun %psbt-musig2-session-check (what keydata value)
+  "PSBT_IN_MUSIG2_PUB_NONCE / _PARTIAL_SIG (Core psbt.h:801-836): key data is
+<participant 33><aggregate 33>[<leaf hash 32>], the aggregate checked first
+(DeserializeMuSig2ParticipantDataIdentifier, :237-256); a nonce is 66 bytes, a
+partial signature one 32-byte UnserializeFromVector."
+  (unless (member (length keydata) '(66 98))
+    (serialization-error
+     "Input musig2 ~A key is not expected size of 67 or 99 bytes" what))
+  (unless (bl.crypto:public-key-valid-p (subseq keydata 33 66))
+    (serialization-error "musig2 aggregate pubkey is invalid"))
+  (unless (bl.crypto:public-key-valid-p (subseq keydata 0 33))
+    (serialization-error "musig2 participant pubkey is invalid"))
+  (if (string= what "pubnonce")
+      (unless (= (length value) 66)
+        (serialization-error "Input musig2 pubnonce value is not 66 bytes"))
+      (unless (= (length value) 32)
+        (serialization-error "Size of value was not the stated size"))))
+
+(defun %psbt-validate-content (context keytype keydata value)
+  "The typed-value readers Core runs on the taproot-derivation, taproot-tree
+and MuSig2 records at parse time, with their own error sentences."
+  (case context
+    (:input (case keytype
+              (#x16 (%psbt-tap-bip32-check "Input" value))
+              (#x1a (%psbt-musig2-participants-check "Input" keydata value))
+              (#x1b (%psbt-musig2-session-check "pubnonce" keydata value))
+              (#x1c (%psbt-musig2-session-check "partial sig" keydata value))))
+    (:output (case keytype
+               (#x06 (%psbt-tap-tree-check value))
+               (#x07 (%psbt-tap-bip32-check "Output" value))
+               (#x08 (%psbt-musig2-participants-check "Output" keydata value))))))
+
 (defun %psbt-read-map (br context)
   "Read records from BR until the 0x00 separator; return a psbt-map. CONTEXT is
 :global/:input/:output for per-key validation. Signals on a duplicate key or an
@@ -196,7 +302,8 @@ illegal key-data length (Core rejects those)."
             (serialization-error "Duplicate key in PSBT map"))
           (multiple-value-bind (kt off) (psbt-key-type key)
             (%psbt-validate-key context kt (- (length key) off))
-            (%psbt-validate-value context kt (length value)))
+            (%psbt-validate-value context kt (length value))
+            (%psbt-validate-content context kt (subseq key off) value))
           (push (cons key value) records))))
     (make-psbt-map :records (nreverse records))))
 

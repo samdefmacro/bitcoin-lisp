@@ -69,6 +69,25 @@ written one byte too tight fails here rather than passing."
             (is-true (bl.ser:parse-psbt (%psbt-b64->bytes b64))
                      "a valid PSBT no longer decodes: ~A" b64))))))
 
+(test psbt-invalid-with-msg-carries-cores-sentence
+  "EVERY PSBT in Core's `invalid_with_msg' list is refused with Core's own
+sentence: rpc_psbt.py:816-818 asserts decodepsbt answers -22 \"TX decode
+failed <msg>\" for each pair. The twenty exercise the BIP371 taproot
+derivation and tree readers (psbt.h:755-768, :1036-1085) and the BIP373 MuSig2
+readers (:203-256, :791-836, :1088-1095). Eighteen used to DECODE, and the
+first died on an index past the end of the whole PSBT."
+  (let ((data (%psbt-vectors)))
+    (if (null data)
+        (skip "refs/bitcoin rpc_psbt.json not present")
+        (let ((n 0))
+          (dolist (pair (gethash "invalid_with_msg" data))
+            (let ((got (%psbt-parse-failure (%psbt-b64->bytes (first pair)))))
+              (incf n)
+              (is-true (and got (search (second pair) got))
+                       "invalid_with_msg #~D: want ~S, got ~S"
+                       n (second pair) got)))
+          (is (= n 20) "expected Core's 20 invalid_with_msg vectors, got ~D" n)))))
+
 (defun %psbt-hand-built-bytes (&key version (prevout-index 0))
   "A hand-built 1-in/1-out PSBT spending PREVOUT-INDEX of a previous
 transaction that has exactly ONE output, carried as the input's
