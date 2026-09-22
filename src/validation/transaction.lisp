@@ -873,7 +873,12 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; the rest of its reasons are named by their own keyword.
     (:package-rbf-not-1p1c . "package RBF failed: package must be 1-parent-1-child")
     (:package-rbf-mempool-ancestors
-     . "package RBF failed: new transaction cannot have mempool ancestors"))
+     . "package RBF failed: new transaction cannot have mempool ancestors")
+    ;; And its two economic ones (validation.cpp:1106-1107, :1119-1120).
+    (:package-feerate-not-above-parent
+     . "package RBF failed: package feerate is less than or equal to parent feerate")
+    (:package-rbf-diagram-failed
+     . "package RBF failed: insufficient feerate: does not improve feerate diagram"))
   "Our validation keywords in Core's reject-reason vocabulary.")
 
 (defparameter *tx-reject-debug-messages*

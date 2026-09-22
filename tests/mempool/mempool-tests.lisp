@@ -3069,19 +3069,25 @@ cover the replaced fees (plus its own bandwidth) is rejected."
          (orig (%rbf-tx 171))
          (orig-txid (bl.ser:transaction-hash orig)))
     (%add-tx mempool orig :fee 10000)
-    ;; Rule 3: 10 + 5000 < 10000.
+    ;; Rule 3: 10 + 5000 < 10000. The debug half is PaysForRBF's sentence,
+    ;; naming the CHILD (validation.cpp:1091-1098), and package_msg is the
+    ;; whole ToString() (mempool_package_rbf.py:156).
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 10 100 400 5000 100 400 (list orig-txid))
+         mempool 10 100 400 5000 100 400 (list orig-txid)
+         :child-txid orig-txid)
       (is-false ok)
-      (is (eq reason :package-rbf-insufficient-fee)))
+      (is (eq (bl.val:tx-reject-keyword reason) :package-rbf-insufficient-fee))
+      (is (string= (format nil "package RBF failed: insufficient anti-DoS fees, rejecting replacement ~A, less fees than conflicting txs; 0.0000501 < 0.0001"
+                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes orig-txid)))
+                   (bl.val:tx-reject-reason-string reason))))
     ;; Rule 4: totals exceed the replaced fee but not by the pair's own
     ;; bandwidth at 100 sat/kvB (needs ceil(200*100/1000) = 20 extra).
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
          mempool 10 100 400 10009 100 400 (list orig-txid))
       (is-false ok)
-      (is (eq reason :package-rbf-insufficient-fee)))))
+      (is (eq (bl.val:tx-reject-keyword reason) :package-rbf-insufficient-fee)))))
 
 (test package-rbf-rules-feerate-must-exceed-parent
   "The package feerate must STRICTLY exceed the parent's own feerate — the
@@ -3096,17 +3102,20 @@ pair must be a chunk on its own, not a child merely paying anti-DoS fees
         (bl.mp:check-package-rbf-rules
          mempool 5000 100 400 0 100 400 (list orig-txid))
       (is-false ok)
-      (is (eq reason :package-feerate-not-above-parent)))
+      (is (eq (bl.val:tx-reject-keyword reason) :package-feerate-not-above-parent))
+      ;; validation.cpp:1106-1108: reason, then both CFeeRates.
+      (is (string= "package RBF failed: package feerate is less than or equal to parent feerate, package feerate 0.00025000 BTC/kvB <= parent feerate is 0.00050000 BTC/kvB"
+                   (bl.val:tx-reject-reason-string reason))))
     ;; Equal feerates (parent 10, child 10 sat/vB) -> still rejected.
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
          mempool 1000 100 400 1000 100 400 (list orig-txid))
       (is-false ok)
-      (is (eq reason :package-feerate-not-above-parent)))))
+      (is (eq (bl.val:tx-reject-keyword reason) :package-feerate-not-above-parent)))))
 
 (test package-rbf-rules-diagram-must-improve
   "Rules 3/4 and the parent-feerate check can pass while the two-transaction
-diagram does NOT strictly improve — rejected :replacement-failed."
+diagram does NOT strictly improve — rejected with Core's package sentence."
   (let* ((mempool (bl.mp:make-mempool))
          (orig (%rbf-tx 173))
          (orig-txid (bl.ser:transaction-hash orig)))
@@ -3120,11 +3129,10 @@ diagram does NOT strictly improve — rejected :replacement-failed."
         (bl.mp:check-package-rbf-rules
          mempool 500 100 400 700 100 400 (list orig-txid))
       (is-false ok)
-      ;; Same verdict as the single-transaction diagram failure, carrying
-      ;; ImprovesFeerateDiagram's sentence (rbf.cpp:137): the package path
-      ;; reaches the same check (validation.cpp:1122).
-      (is (string= "replacement-failed" (bl.val:tx-reject-reason-only reason)))
-      (is (string= "replacement-failed, insufficient feerate: does not improve feerate diagram"
+      ;; The package path builds ImprovesFeerateDiagram's sentence (rbf.cpp
+      ;; :137) INTO its reason, with no debug message (validation.cpp:
+      ;; 1117-1120); mempool_package_rbf.py:354 reads it as package_msg.
+      (is (string= "package RBF failed: insufficient feerate: does not improve feerate diagram"
                    (bl.val:tx-reject-reason-string reason))))))
 
 (test package-rbf-rules-cluster-caps

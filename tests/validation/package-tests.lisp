@@ -554,7 +554,7 @@ the replaced tx's is rejected and the pool is untouched."
           (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state)
         (declare (ignore results))
-        (is (eq :package-rbf-insufficient-fee msg))
+        (is (eq :package-rbf-insufficient-fee (bl.val:tx-reject-keyword msg)))
         (is (null replaced)))
       (is (bl.mp:mempool-has mempool aid))
       (is (not (bl.mp:mempool-has mempool pid))))))

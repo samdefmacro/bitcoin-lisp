@@ -474,7 +474,8 @@ passed and REPLACED-SET (a txid hash-set) is what the package evicts."
             (%pkg-val-graph-weight parent)
             (%pkg-val-modified-fee child) (%pkg-val-vsize child)
             (%pkg-val-graph-weight child)
-            conflicts)
+            conflicts
+            :child-txid (bl.ser:transaction-hash (%pkg-val-tx child)))
          (if ok
              (values nil rset)
              (values reason nil)))))))
@@ -666,7 +667,8 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
     :truc-descendant-limit :truc-nonv3-spends-v3 :truc-v3-spends-nonv3
     ;; PackageRBFChecks (validation.cpp:1049-1119).
     :package-rbf-not-1p1c :package-rbf-mempool-ancestors
-    :package-rbf-insufficient-fee
+    :package-rbf-insufficient-fee :package-feerate-not-above-parent
+    :package-rbf-diagram-failed
     ;; The changeset's cluster limits (:1518) and the package dust sweep
     ;; (:1527), both judged over the whole subset.
     :too-large-cluster :unspent-dust)

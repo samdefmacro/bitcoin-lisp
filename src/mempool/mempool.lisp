@@ -1644,7 +1644,7 @@ in terms of clusters; and the old feerate-superiority test
 
 (defun check-package-rbf-rules (mempool parent-fee parent-vsize parent-weight
                                 child-fee child-vsize child-weight
-                                direct-conflicts)
+                                direct-conflicts &key child-txid)
   "Apply the package RBF rules for a 1-parent-1-child package whose members
 conflict with mempool transactions (Core PackageRBFChecks,
 validation.cpp:1034-1130). PARENT-FEE/CHILD-FEE are the prioritisation-
@@ -1682,10 +1682,14 @@ transactions (validation.cpp:1113-1121)."
     ;; failed: insufficient anti-DoS fees" (:1097-1098), and neither it nor
     ;; the single-transaction "insufficient fee" is CheckFeeRate's "min relay
     ;; fee not met" -- all three shared one keyword here.
-    (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
-                                 total-fee total-vsize)
-      (return-from check-package-rbf-rules
-        (values nil :package-rbf-insufficient-fee nil)))
+    ;; The debug half is PaysForRBF's sentence, attributed to the CHILD
+    ;; (validation.cpp:1091-1098); submitpackage's package_msg is the state's
+    ;; ToString(), so mempool_package_rbf.py:156/:168 read both halves.
+    (let ((detail (%rbf-pays-for-rbf (%rbf-replaced-fees mempool replaced)
+                                     total-fee total-vsize child-txid)))
+      (when detail
+        (return-from check-package-rbf-rules
+          (values nil (list :package-rbf-insufficient-fee detail) nil))))
     ;; Package feerate must strictly exceed the parent feerate, compared
     ;; EXACTLY. Core's PackageRBFChecks compares CFeeRate objects, and at this
     ;; revision CFeeRate holds a FeeFrac whose operator<=> delegates to
@@ -1706,7 +1710,14 @@ transactions (validation.cpp:1113-1121)."
     (when (<= (* total-fee parent-vsize)
               (* parent-fee total-vsize))
       (return-from check-package-rbf-rules
-        (values nil :package-feerate-not-above-parent nil)))
+        (values nil
+                (list :package-feerate-not-above-parent
+                      ;; validation.cpp:1108, both rates in CFeeRate::ToString
+                      ;; form (GetFeePerK, truncated; policy/feerate.cpp:33).
+                      (format nil "package feerate ~A <= parent feerate is ~A"
+                              (%fee-rate-string total-fee total-vsize)
+                              (%fee-rate-string parent-fee parent-vsize)))
+                nil)))
     ;; Economic test: stage the removal of the replaced set and the addition
     ;; of BOTH package transactions, then require a strict diagram improvement
     ;; (Core CheckMemPoolPolicyLimits + ImprovesFeerateDiagram over the
@@ -1717,8 +1728,23 @@ transactions (validation.cpp:1113-1121)."
                                       child-fee child-weight)
       (let ((verdict (%rbf-diagram-verdict old-diagram new-diagram)))
         (when verdict
-          (return-from check-package-rbf-rules (values nil verdict nil)))))
+          (return-from check-package-rbf-rules
+            ;; The package path builds ImprovesFeerateDiagram's sentence INTO
+            ;; the reason, with no debug message (validation.cpp:1117-1120).
+            (values nil
+                    (if (eq (if (consp verdict) (first verdict) verdict)
+                            :replacement-failed)
+                        :package-rbf-diagram-failed
+                        verdict)
+                    nil)))))
     (values t nil replaced)))
+
+(defun %fee-rate-string (fee vsize)
+  "Core CFeeRate(FEE, VSIZE).ToString(): the per-kvB rate, truncated, as
+`<BTC>.<8 digits> BTC/kvB' (policy/feerate.cpp:33)."
+  (let ((per-k (if (plusp vsize) (truncate (* fee 1000) vsize) 0)))
+    (multiple-value-bind (btc sats) (truncate per-k 100000000)
+      (format nil "~D.~8,'0D BTC/kvB" btc (abs sats)))))
 
 (defun mempool-package-fits-cluster-limits-p (mempool members)
   "Would admitting the whole package keep every cluster within the 64-tx /
