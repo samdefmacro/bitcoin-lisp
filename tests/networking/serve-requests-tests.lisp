@@ -440,18 +440,29 @@ STALE_RELAY_AGE_LIMIT relative to the best header, is refused."
    :port port :services 1 :last-seen 1700000000))
 
 (test getaddr-only-once-and-inbound-only
+  "Core answers getaddr only from an inbound peer and only once per
+connection, and LOGS both refusals under net (net_processing.cpp:4910-4924):
+p2p_addr_relay.py:307 waits for `Ignoring repeated \"getaddr\".'."
   (let ((bl:*node* nil))    ; book resolves to NIL: gating only, no send
     ;; Outbound peer: never marked as answered.
-    (let ((outbound (bl.net:make-peer :inbound nil)))
-      (bl.net::handle-getaddr outbound #() (bl.ctx:make-node-context))
+    (let ((outbound (bl.net:make-peer :inbound nil :conn-type :block-relay)))
+      (is (search "Ignoring \"getaddr\" from block-relay-only connection."
+                  (nth-value 1 (log-text-of
+                                "net"
+                                (lambda ()
+                                  (bl.net::handle-getaddr outbound #() (bl.ctx:make-node-context)))))))
       (is (null (bl.net:peer-getaddr-sent outbound))))
     ;; Inbound peer: answered exactly once (flag latches on first call).
     (let ((inbound (bl.net:make-peer :inbound t)))
       (is (null (bl.net:peer-getaddr-sent inbound)))
       (bl.net::handle-getaddr inbound #() (bl.ctx:make-node-context))
       (is-true (bl.net:peer-getaddr-sent inbound))
-      ;; Second call is a no-op; flag stays set.
-      (bl.net::handle-getaddr inbound #() (bl.ctx:make-node-context))
+      ;; Second call is a no-op; flag stays set, and it says so.
+      (is (search "Ignoring repeated \"getaddr\"."
+                  (nth-value 1 (log-text-of
+                                "net"
+                                (lambda ()
+                                  (bl.net::handle-getaddr inbound #() (bl.ctx:make-node-context)))))))
       (is-true (bl.net:peer-getaddr-sent inbound)))))
 
 (test build-addrv2-response-round-trips

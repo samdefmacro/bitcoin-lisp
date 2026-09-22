@@ -3380,6 +3380,16 @@ elicit more than one reply regardless of whether we had addresses to send."
   ;; Core SetupAddressRelay from the GETADDR handler.
   (unless (eq (peer-conn-type peer) :block-relay)
     (setf (peer-addr-relay-enabled peer) t))
+  ;; Core's two refusals, each logged under net (net_processing.cpp:4910-4924);
+  ;; p2p_addr_relay.py:307 waits for the second.
+  (cond ((not (peer-inbound peer))
+         (bl:log-cat "net" "Ignoring \"getaddr\" from ~A connection. peer=~A"
+                     (if (eq (peer-conn-type peer) :block-relay)
+                         "block-relay-only"
+                         (string-downcase (symbol-name (peer-conn-type peer))))
+                     (peer-id peer)))
+        ((peer-getaddr-sent peer)
+         (bl:log-cat "net" "Ignoring repeated \"getaddr\". peer=~A" (peer-id peer))))
   (when (and (peer-inbound peer)
              (not (peer-getaddr-sent peer)))
     (setf (peer-getaddr-sent peer) t)
