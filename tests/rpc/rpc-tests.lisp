@@ -6136,6 +6136,19 @@ compares the reply BYTES for 5a, -5, 0, 2001 and a 35-digit number; ours read
                                num #\Return #\Newline)
                        body)
                 "~A: ~S" num body)))
+        ;; /deploymentinfo refuses a malformed and an unknown hash alike with
+        ;; 400 (rest.cpp:755-765; interface_rest.py:519-524).
+        (destructuring-bind (body status &rest ignore)
+            (body-of (format nil "/rest/deploymentinfo/~A.json"
+                             "42759cde25462784395a337460bde75f58e73d3f08bd31fdc3507cbac856a2c4"))
+          (declare (ignore ignore))
+          (is (eql 400 status))
+          (is (equal (format nil "Block not found~C~C" #\Return #\Newline) body)))
+        (destructuring-bind (body status &rest ignore)
+            (body-of "/rest/deploymentinfo/abc.json")
+          (declare (ignore ignore))
+          (is (eql 400 status))
+          (is (equal (format nil "Invalid hash: abc~C~C" #\Return #\Newline) body)))
         ;; Control: a count in range answers.
         (is (eql 200 (second (body-of (format nil "/rest/headers/~A.json?count=5" genesis)))))
         ;; Core still serves the deprecated /rest/headers/<count>/<hash> and

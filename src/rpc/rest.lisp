@@ -596,12 +596,17 @@ is not a zero — it is a 400."
   "/rest/deploymentinfo[/<blockhash>] — JSON only, as in Core
 (rest_deploymentinfo, rest.cpp). The hash is optional: without one Core reports
 against the tip."
-  (if (string= ext "json")
-      (handler-case
-          (%rest-json (rpc-getdeploymentinfo
-                       node (if (plusp (length body)) (list body) nil)))
-        (rpc-error (e) (%rest-error 404 (rpc-error-message e))))
-      (%rest-format-not-found "json")))
+  (cond
+    ((not (string= ext "json")) (%rest-format-not-found "json"))
+    ;; Both refusals are 400 in Core, the unknown block included
+    ;; (rest.cpp:755-765; interface_rest.py:519-524).
+    ((and (plusp (length body)) (not (valid-hex-hash-p body)))
+     (%rest-error 400 (format nil "Invalid hash: ~A" body)))
+    (t
+     (handler-case
+         (%rest-json (rpc-getdeploymentinfo
+                      node (if (plusp (length body)) (list body) nil)))
+       (rpc-error (e) (%rest-error 400 (rpc-error-message e)))))))
 
 (defun %rest-blockfilter (node body ext)
   "/rest/blockfilter/<filtertype>/<blockhash> — the BIP158 filter for a block
