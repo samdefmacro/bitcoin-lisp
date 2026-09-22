@@ -450,7 +450,13 @@
 (define-option "blocksxor" :type :bool :global bl.store:*blocks-xor*)
 ;; -peertimeout: seconds a peer has to complete the version handshake (Core
 ;; DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
-(define-option "peertimeout" :type :int :min 1 :global *handshake-timeout-seconds*)
+;; A value below 1 is refused in Core's own words (init.cpp:1067-1069), which
+;; p2p_timeouts.py:105 matches against stderr in full.
+(define-option "peertimeout" :type :int
+  :apply (lambda (n)
+           (unless (plusp n)
+             (config-error "peertimeout must be a positive integer."))
+           (setf *handshake-timeout-seconds* n)))
 ;; -maxsendbuffer: per-connection cap on buffered unsent bytes. Core's value
 ;; is in KILOBYTES and it multiplies by 1000, not 1024 (init.cpp:2105,
 ;; DEFAULT_MAXSENDBUFFER = 1000 -> 1,000,000 bytes).

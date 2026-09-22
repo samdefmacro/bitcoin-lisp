@@ -2434,6 +2434,13 @@ over budget from the first message."
   (dolist (bad '((("peertimeout" . "0")) (("maxsendbuffer" . "-1"))
                  (("maxsendbuffer" . "x"))))
     (signals error (apply-config-globals bad)))
+  ;; Core's own words for the refusal (init.cpp:1067-1069); p2p_timeouts.py:105
+  ;; matches the whole stderr line.
+  (let ((saved bl:*handshake-timeout-seconds*))
+    (is (equal "peertimeout must be a positive integer."
+               (handler-case (progn (apply-config-globals '(("peertimeout" . "0"))) nil)
+                 (error (e) (princ-to-string e)))))
+    (setf bl:*handshake-timeout-seconds* saved))
   (dolist (name '("peertimeout" "maxsendbuffer"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
