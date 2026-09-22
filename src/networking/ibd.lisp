@@ -4131,6 +4131,17 @@ a peer at our own tip answers with a batch we already hold, and scoring that as
 silence would rotate away from every healthy peer the moment we caught up."
   (gethash "headers" (peer-recv-per-msg peer) 0))
 
+(defun %peer-caught-up-p (peer chain-state)
+  "T when PEER's best known block carries at least the chain work of our best
+header (Core's pindexBestKnownBlock against m_best_header)."
+  (let* ((known (and (peer-best-known-block-hash peer)
+                     (bl.store:get-block-index-entry
+                      chain-state (peer-best-known-block-hash peer))))
+         (best (%best-header-entry chain-state)))
+    (and known best
+         (>= (bl.store:block-index-entry-chain-work known)
+             (bl.store:block-index-entry-chain-work best)))))
+
 (defun sync-headers (peer chain-state &key recent-rejects ctx utxo-set
                                            block-store fee-estimator)
   "Kick header sync with PEER, WITHOUT owning the message pump. Returns
@@ -4147,6 +4158,16 @@ Now the wait IS a pump pass, and the sync itself continues through the ordinary
 message path (ingest-headers-from-peer sends its own follow-up getheaders), so
 this function only has to kick it off and report whether the peer is worth
 keeping. Core has no header-sync loop at all for the same reason."
+  ;; A peer that has already shown us a header with as much work as our best
+  ;; one has nothing to tell us: Core never re-asks a caught-up peer -- after
+  ;; the initial getheaders it asks again only for a maximum-size reply
+  ;; (net_processing.cpp:3105-3111) -- and relies on its announcements. The
+  ;; kick was ours alone, and it overwrote the peer's LAST getheaders:
+  ;; p2p_outbound_eviction.py:196-203 checks that a protected peer, which
+  ;; sent our tip header at connect, has seen no getheaders since its initial
+  ;; one.
+  (when (%peer-caught-up-p peer chain-state)
+    (return-from sync-headers (values 0 nil)))
   (let* ((start-received (if ctx (ibd-context-headers-received ctx) 0))
          (answered-before (%peer-headers-bytes peer))
          (last-answer answered-before)

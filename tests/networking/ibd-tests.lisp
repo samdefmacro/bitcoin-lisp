@@ -5870,3 +5870,25 @@ state (mapBlocksInFlight) for the life of the node."
           "and it is the one every other thread reads")
       (is (zerop (bl.net:ibd-context-headers-received second-pass))
           "control: each pass still reports only its own headers"))))
+
+(test header-sync-does-not-re-ask-a-caught-up-peer
+  "Core never re-sends getheaders to a peer that has already shown it a header
+with as much work as its best: after the initial getheaders it asks again only
+for a maximum-size reply (net_processing.cpp:3105-3111). Our per-pass header
+sync kick asked anyway, and that request became the peer's LAST getheaders --
+p2p_outbound_eviction.py:196-203 checks a protected peer, which sent our tip
+header at connect, has seen nothing since its initial one. Control: a peer
+that has shown us nothing is still kicked (the throttle stamp moves)."
+  (let* ((state (%make-ibd-latch-state 1700000000))
+         (tip (bl.store:best-block-hash state))
+         (caught-up (bl.net:make-peer :state :ready :best-known-block-hash tip))
+         (unknown (bl.net:make-peer :state :ready)))
+    (multiple-value-bind (received stalled)
+        (bl.net:sync-headers caught-up state)
+      (is (eql 0 received))
+      (is-false stalled "a caught-up peer is not stalled"))
+    (is (zerop (bl.net:peer-last-getheaders-time caught-up))
+        "no getheaders was sent to the caught-up peer")
+    (ignore-errors (bl.net:sync-headers unknown state))
+    (is (plusp (bl.net:peer-last-getheaders-time unknown))
+        "control: a peer we know nothing about is still asked")))
