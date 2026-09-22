@@ -4838,6 +4838,46 @@ still be refused, and must not grow the index."
 
 ;;;; Every new tip is announced (Core UpdatedBlockTip), whichever path connected it
 
+(test only-a-headers-message-triggers-the-direct-fetch
+  "Core's HeadersDirectFetchBlocks runs at the end of ProcessHeadersMessage
+(net_processing.cpp:3117). The header of a BLOCK message is indexed inside
+ProcessNewBlock instead and triggers nothing; our block path indexes that
+header through INGEST-HEADERS-FROM-PEER, and once the direct fetch existed it
+asked the sender for the very block it was delivering
+(p2p_sendheaders.py:567: the inv node must never receive a getdata)."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "direct-fetch-block-header"))
+           (cs (bl:node-chain-state node))
+           ;; A recent tip for CanDirectFetch: regtest genesis time + 1000 s.
+           (bl.ser:*mock-time* (+ 1296688602 1000))
+           (peer (bl.net:make-peer :address "test" :state :ready
+                                   :services bl.ser:+node-witness+))
+           (blk (let ((b (bl.mining:assemble-full-block
+                          cs (bl:node-mempool node)
+                          :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+                  (bl.mining:mine-block b)
+                  b))
+           (header (bl.ser:bitcoin-block-header blk))
+           (hash (bl.ser:block-header-hash header)))
+      (flet ((getdata-count (thunk)
+               (count-if (lambda (msg) (search "getdata" (map 'string #'code-char
+                                                              (subseq msg 4 16))))
+                         (captured-sends thunk))))
+        (unwind-protect
+             (with-ibd-context
+               (is (zerop (getdata-count
+                           (lambda ()
+                             (bl.net:ingest-headers-from-peer peer (list header) cs
+                                                              :direct-fetch nil))))
+                   "a block's own header asks for nothing")
+               (is-true (bl.store:get-block-index-entry cs hash) "but it is indexed")
+               ;; Positive control: the same header as a headers message IS
+               ;; direct-fetched.
+               (is (= 1 (getdata-count
+                         (lambda ()
+                           (bl.net:ingest-headers-from-peer peer (list header) cs))))))
+          (setf (bl.net:peer-state peer) :disconnected))))))
+
 (test a-block-connected-by-the-drain-is-announced-to-peers
   "Core queues every new tip for announcement to every peer from
 PeerManagerImpl::UpdatedBlockTip (net_processing.cpp:2160-2189), whatever

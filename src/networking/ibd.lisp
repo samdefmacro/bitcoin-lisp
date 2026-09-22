@@ -1303,9 +1303,6 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                    ((gethash hash in-flight)
                     (unless waiting-for
                       (setf waiting-for (car (gethash hash in-flight)))))
-                   ;; Asked for by HEADERS-DIRECT-FETCH, whose requests outlive
-                   ;; this pass's context: not ours to ask for again.
-                   ((direct-fetch-in-flight-p hash))
                    ;; Core (:1524-1531): the end of the window, with nothing
                    ;; collected for this peer -- we could fetch if the window
                    ;; were one larger, so whoever holds its first missing block
@@ -1749,6 +1746,16 @@ new requests are paused so peers do not deliver blocks we'd just drop +
 re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
+  ;; Core has ONE mapBlocksInFlight. The direct fetch's requests outlive the
+  ;; pass context they were made in, so fold the live ones into this pass's
+  ;; table first: the walk then treats them exactly as in flight (not asked
+  ;; for again, their holder counted as the one the window waits on) and the
+  ;; ordinary timeout re-routes one that never arrives.
+  (let ((in-flight (ibd-context-in-flight *ibd-context*)))
+    (dolist (hash (loop for h being the hash-keys of *direct-fetch-in-flight* collect h))
+      (let ((entry (%live-direct-fetch-entry hash)))
+        (when (and entry (not (gethash hash in-flight)))
+          (setf (gethash hash in-flight) entry)))))
 
   ;; Reassign blocks held by peers that have since disconnected — they'd
   ;; otherwise sit in-flight until the per-hash timeout before any live
@@ -2117,6 +2124,8 @@ handler. Shared by the block-download drain and the at-tip reap pass."
          (with-current-node-lock
            (ingest-headers-from-peer
             peer (list header) chain-state
+            ;; The body is in hand: no direct fetch for it.
+            :direct-fetch nil
             :count-fn (and ctx
                            (lambda (n)
                              (incf (ibd-context-headers-received ctx) n))))))
@@ -3929,7 +3938,7 @@ requested by anyone. Returns the hashes requested."
                                    hashes))))
           hashes)))))
 
-(defun ingest-headers-from-peer (peer headers chain-state &key count-fn)
+(defun ingest-headers-from-peer (peer headers chain-state &key count-fn (direct-fetch t))
   "Generic-path headers ingestion — BIP130 sendheaders announcements,
 unsolicited batches, and the at-tip/block-download message drains
 (handle-message / dispatch-ibd-message) — with the same low-work anti-DoS
@@ -3943,7 +3952,12 @@ machinery only protected the solicited path. The sync state lives on the
 peer (Core Peer::m_headers_sync), shared with sync-headers, so the two
 drivers can never run concurrent syncs against one peer; unlike the Phase-1
 loop, this path must send its own follow-up getheaders. Returns the number
-of headers added to the index."
+of headers added to the index.
+
+DIRECT-FETCH NIL is for the header of a BLOCK message: Core indexes that one
+inside ProcessNewBlock (AcceptBlockHeader), not through ProcessHeadersMessage,
+so it never triggers HeadersDirectFetchBlocks -- asking the sender for the
+very block it is delivering is what p2p_sendheaders.py:567 catches."
   (let ((full-batch (and headers
                          (= (length headers)
                             bl.ser:+max-headers-count+)))
@@ -4025,7 +4039,7 @@ of headers added to the index."
            (%store-validated-headers peer chain-state headers full-batch
                                      count-fn "Received")
          (%maybe-request-more-headers peer chain-state last-entry full-batch)
-         (headers-direct-fetch peer chain-state last-entry)
+         (when direct-fetch (headers-direct-fetch peer chain-state last-entry))
          added))
 
       ;; Connecting batch with new headers: anti-DoS work gate, then store.
@@ -4046,7 +4060,7 @@ of headers added to the index."
               (%store-validated-headers peer chain-state headers full-batch
                                         count-fn "Received")
             (%maybe-request-more-headers peer chain-state last-entry full-batch)
-            (headers-direct-fetch peer chain-state last-entry)
+            (when direct-fetch (headers-direct-fetch peer chain-state last-entry))
             added)))))))
 
 (defconstant +header-sync-silent-passes+ 50
