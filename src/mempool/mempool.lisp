@@ -618,18 +618,18 @@ bumped on every transaction that ENTERS or LEAVES the pool (:249, :305). Miners
 compare it across getblocktemplate calls to learn whether a fresh template would
 differ.
 
-DERIVED rather than stored, and exactly so: NEXT-SEQUENCE counts all-time
-admissions, and admissions minus the current population is all-time removals, so
-their sum is Core's counter with no extra state to keep in step. Monotonically
-non-decreasing, since each half only ever grows.
+DERIVED rather than stored, and exactly so: NEXT-SEQUENCE is Core's
+m_sequence_number, which advances once per admission and once per removal
+(txmempool.cpp:267, validation.cpp:1309), so less its starting value it is
+the membership half of Core's counter with no extra state to keep in step.
+Monotonically non-decreasing.
 
 The third term is the edits that changed no membership: a prioritisation bumps
 Core's counter too (txmempool.cpp:642), and it must, because it changes which
 transactions a template would pick and in what order while the population
 stands still."
-  (let ((admitted (1- (mempool-next-sequence mempool))))
-    (+ admitted (- admitted (mempool-count mempool))
-       (mempool-non-membership-updates mempool))))
+  (+ (1- (mempool-next-sequence mempool))
+     (mempool-non-membership-updates mempool)))
 
 (defun mempool-effective-min-fee-rate (mempool &optional (now (bl.ser:get-unix-time)))
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
@@ -1402,9 +1402,15 @@ shadow checks report as divergence."
       ;; Core removeUnchecked's TransactionRemovedFromMempool -- the single
       ;; removal chokepoint. Every subscriber (ZMQ, the wallet) skips reason
       ;; :block itself: a mined transaction is announced by the block.
-      (bl.vi:notify-transaction-removed
-       (mempool-entry-transaction entry) txid (mempool-entry-sequence entry)
-       *mempool-removal-reason*)
+      ;; Its sequence is a fresh GetAndIncrementSequence (txmempool.cpp:267),
+      ;; not the entry's admission stamp: in the ZMQ `sequence' stream a
+      ;; removal is an event of its own, numbered after the addition it
+      ;; undoes (interface_zmq.py:350-360 reads A 1, R 2, A 3).
+      (let ((sequence (mempool-next-sequence mempool)))
+        (incf (mempool-next-sequence mempool))
+        (bl.vi:notify-transaction-removed
+         (mempool-entry-transaction entry) txid sequence
+         *mempool-removal-reason*))
       entry)))
 
 (defun mempool-remove-recursive (mempool txid)

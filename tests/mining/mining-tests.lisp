@@ -533,8 +533,16 @@ LEAVES half is what this test is for."
       (let ((after-add (bl.mp:mempool-transactions-updated mp)))
         (is (> after-add empty) "an admission did not advance the counter")
         ;; And so does the removal, rather than moving it back.
-        (bl.mp:mempool-remove mp txid)
+        (let ((sequence (bl.mp:mempool-sequence mp)))
+          (bl.mp:mempool-remove mp txid)
+          ;; A removal takes its own GetAndIncrementSequence
+          ;; (txmempool.cpp:267): the ZMQ `sequence' stream numbers it after
+          ;; the addition it undoes (interface_zmq.py:350-360).
+          (is (= (1+ sequence) (bl.mp:mempool-sequence mp))
+              "a removal did not advance the mempool sequence"))
         (let ((after-remove (bl.mp:mempool-transactions-updated mp)))
+          (is (= 1 (- after-remove after-add))
+              "a removal is one update, no more")
           (is (> after-remove after-add)
               "a removal did not advance the counter")
           ;; The pool is empty again, but the counter is not back where it
