@@ -318,6 +318,10 @@ bitcoin-cli (node-main)."
                   :serial t
                   :components ((:file "package")
                                (:file "wallet-store")
+                               ;; Core external_signer.cpp / run_command.cpp:
+                               ;; the -signer process protocol, before the
+                               ;; wallet whose creation can call it.
+                               (:file "external-signer")
                                (:file "wallet")
                                (:file "wallet-crypt")
                                (:file "wallet-tx")
@@ -331,7 +335,11 @@ bitcoin-cli (node-main)."
                                (:file "wallet-coins")
                                (:file "wallet-spend")
                                (:file "psbt")
-                               (:file "signmessage")))
+                               (:file "signmessage")
+                               ;; Core ExternalSignerScriptPubKeyMan: the
+                               ;; wallet side of -signer, last, since it
+                               ;; drives the spend and PSBT code above it.
+                               (:file "wallet-signer")))
                  ;; Core's side tools (bitcoin-util, bitcoin-tx, bitcoin-wallet):
                  ;; their own package, on top of the RPC helpers and the wallet
                  ;; they reuse. The executable runs one of them when started
@@ -569,6 +577,8 @@ bitcoin-cli (node-main)."
                              ;; Wallet P6: crypter KATs, encryption lifecycle,
                              ;; locked-wallet gating, relock timer, backup
                              (:file "wallet/wallet-encryption-tests")
+                             ;; External signers (-signer, enumeratesigners, walletdisplayaddress)
+                             (:file "wallet/wallet-signer-tests")
                              ;; Process RNG seeding (*random-state* must not
                              ;; replay SBCL's build-time stream on every start)
                              (:file "crypto/entropy-tests")

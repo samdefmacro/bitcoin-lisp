@@ -101,6 +101,9 @@ APPLY-CONFIG-GLOBALS."
     ;; hang off the data directory, as -rpccookiefile does.
     (let ((v (lk "walletdir")))
       (when v (setf bl.wallet:*wallet-directory* v)))
+    ;; -signer: set on EVERY start, so a restart without it forgets the last
+    ;; one (Core's GetArg("-signer", "") reads only this run's arguments).
+    (setf bl.wallet:*signer-command* (or (lk "signer") ""))
     ;; -walletnotify: an operator hook, fired from AddToWallet.
     (let ((v (lk "walletnotify")))
       (when v (setf bl.wallet:*wallet-notify-command* v)))

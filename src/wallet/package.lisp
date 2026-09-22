@@ -34,6 +34,8 @@ through the lower packages; the node reaches it only through these exports.")
    #:*wallet-max-aps-fee*
    #:*wallet-min-tx-fee*
    #:*wallet-notify-command*
+   #:*signer-command*
+   #:run-command-parse-json
    #:*wallet-reject-long-chains*
    #:*wallet-signal-rbf*
    #:*wallet-spend-zero-conf-change*

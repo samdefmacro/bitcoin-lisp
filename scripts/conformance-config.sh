@@ -80,6 +80,10 @@ ENABLE_BITCOIN_UTIL=true
 # bitcoin-tx's flag is spelled BUILD_, not ENABLE_ (test_framework.py:993-995).
 BUILD_BITCOIN_TX=true
 ENABLE_WALLET=true
+# -signer, enumeratesigners and walletdisplayaddress are always built here;
+# Core builds them behind ENABLE_EXTERNAL_SIGNER (rpc_signer.py,
+# wallet_signer.py skip without it).
+ENABLE_EXTERNAL_SIGNER=true
 ENABLE_ZMQ=true
 EOF
 mv -f "$ROOT/test/config.ini.$$" "$ROOT/test/config.ini"

@@ -1128,8 +1128,35 @@ away, in which case the load-time catch-up rescans from genesis (safe)."
 
 ;;; --- Wallet creation (Core CreateWallet, wallet.cpp:377-470 + CWallet::CreateNew) ---
 
+(defun %setup-new-wallet-descriptors (wallet external-signer keyless-or-blank)
+  "Core CWallet::Create (wallet.cpp:3102-3104): an external signer's wallet
+always gets its descriptors -- from the signer -- and any other gets its own
+unless it is blank or has private keys disabled."
+  (cond (external-signer
+         (wallet-setup-external-signer-spkms wallet))
+        ((not keyless-or-blank)
+         (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
+                                                (wallet-network wallet))))))
+
+(defun %check-create-wallet-arguments (name disable-private-keys external-signer
+                                       passphrase)
+  "CREATE-WALLET's refusals, before anything touches the disk: the name, an
+external signer with private keys (wallet.cpp:400-405), then a passphrase
+with private keys disabled (wallet.cpp:408-413), in Core's order."
+  (unless (%valid-wallet-name-p name)
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                      :message (if (and (stringp name) (zerop (length name)))
+                                   "Wallet name cannot be empty"
+                                   (format nil "Invalid wallet name ~S" name))))
+  (when (and external-signer (not disable-private-keys))
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                             :message "Private keys must be disabled when using an external signer"))
+  (when (and disable-private-keys (stringp passphrase) (plusp (length passphrase)))
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                      :message "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled.")))
+
 (defun create-wallet (manager name &key disable-private-keys blank avoid-reuse
-                                        passphrase
+                                        external-signer passphrase
                                         last-block-hash (last-block-height 0))
   "Create, persist, and register a new descriptor wallet. Returns the wallet.
 Flags follow createwallet: DESCRIPTORS and LAST_HARDENED_XPUB_CACHED always
@@ -1148,14 +1175,7 @@ RPC handler because that is where Core refuses it (wallet.cpp:408-413), and
 because the wallet it would produce is the one Core's post-load cleanup has
 to repair: mkey rows with no crypted key, reporting itself encrypted and
 locked with no passphrase that can unlock it."
-  (unless (%valid-wallet-name-p name)
-    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                      :message (if (and (stringp name) (zerop (length name)))
-                                   "Wallet name cannot be empty"
-                                   (format nil "Invalid wallet name ~S" name))))
-  (when (and disable-private-keys (stringp passphrase) (plusp (length passphrase)))
-    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                      :message "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled."))
+  (%check-create-wallet-arguments name disable-private-keys external-signer passphrase)
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (let ((path (wallet-path-for manager name)))
       (when (or (gethash name (wallet-manager-wallets manager))
@@ -1173,7 +1193,8 @@ locked with no passphrase that can unlock it."
                             +wallet-flag-last-hardened-xpub-cached+
                             (if disable-private-keys +wallet-flag-disable-private-keys+ 0)
                             (if blank-flag +wallet-flag-blank-wallet+ 0)
-                            (if avoid-reuse +wallet-flag-avoid-reuse+ 0)))
+                            (if avoid-reuse +wallet-flag-avoid-reuse+ 0)
+                            (if external-signer +wallet-flag-external-signer+ 0)))
              (db (handler-case (wallet-db-open path :create t)
                    (bl.err:storage-error (e)
                      (%wallet-database-open-error path e))))
@@ -1190,9 +1211,8 @@ locked with no passphrase that can unlock it."
                                                 (wdb-int32-value +wallet-client-version+))
               (bl.store:leveldb-put db (wdb-key-simple +wdb-key-flags+)
                                                 (wdb-uint64-value flags) :sync t)
-              (unless (or disable-private-keys blank-flag)
-                (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
-                                                       (wallet-network wallet))))
+              (%setup-new-wallet-descriptors wallet external-signer
+                                             (or disable-private-keys blank-flag))
               (when encrypt-p
                 (unless (encrypt-wallet wallet passphrase)
                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
@@ -1215,6 +1235,11 @@ locked with no passphrase that can unlock it."
           (bl.err:storage-error (e)
             (bl.store:leveldb-close db)
             (%wallet-database-open-error path e))
+          ;; SetupDescriptorScriptPubKeyMans' runtime_error: RPC_MISC_ERROR.
+          (external-signer-error (e)
+            (bl.store:leveldb-close db)
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
+                                     :message (external-signer-error-message e)))
           (error (e)
             (bl.store:leveldb-close db)
             (error e)))
@@ -1968,9 +1993,6 @@ A non-empty PASSPHRASE creates the wallet already encrypted and locked."
     (when (eq (nth 5 params) bl.rpc:+json-false+)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet."))
-    (when (bl.rpc:positional-bool (nth 7 params))
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                        :message "Compiled without external signing support (required for external signing)"))
     (let ((passphrase (nth 3 params)))
       (when (and passphrase (not (stringp passphrase)))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
@@ -1988,6 +2010,10 @@ A non-empty PASSPHRASE creates the wallet already encrypted and locked."
                                    :blank (bl.rpc:positional-bool (nth 2 params))
                                    :avoid-reuse (bl.rpc:positional-bool
                                                  (nth 4 params))
+                                   ;; Core ORs in WALLET_FLAG_EXTERNAL_SIGNER
+                                   ;; (wallet/rpc/wallet.cpp:410-413).
+                                   :external-signer (bl.rpc:positional-bool
+                                                     (nth 7 params))
                                    :passphrase (let ((p (nth 3 params)))
                                                  (when (and (stringp p)
                                                             (plusp (length p)))
@@ -2250,7 +2276,8 @@ backend (leveldb, where Core says sqlite)."
                                  ("progress" . ,(wallet-scan-progress wallet)))
                                bl.rpc:+json-false+)))
           ("descriptors" . ,(bl.rpc:json-bool (wallet-flag-set-p wallet +wallet-flag-descriptors+)))
-          ("external_signer" . ,bl.rpc:+json-false+)
+          ("external_signer" . ,(bl.rpc:json-bool
+                                 (wallet-flag-set-p wallet +wallet-flag-external-signer+)))
           ("blank" . ,(bl.rpc:json-bool (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)))
           ,@(when birthtime `(("birthtime" . ,birthtime)))
           ("flags" . ,(or (loop for bit from 0 below 64

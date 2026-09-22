@@ -505,6 +505,10 @@
 (define-option "keypool")
 (define-option "walletdir" :network-only t)
 (define-option "walletnotify")
+;; -signer: the external signing tool (Core init.cpp, ENABLE_EXTERNAL_SIGNER),
+;; read by enumeratesigners and by an external-signer wallet's setup,
+;; walletdisplayaddress and signing (src/wallet/external-signer.lisp).
+(define-option "signer")
 ;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
 ;; -dnsseed's soft-set half (-connect, -maxconnections<=0, a -onlynet with
 ;; no clearnet) is in APPLY-PARAMETER-INTERACTIONS.
@@ -599,7 +603,6 @@ node's own address"))))
   "logtimestamps" "maxreceivebuffer"
   "natpmp" "peerbloomfilters" "printpriority"
   "rpcdoccheck"
-  "signer"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"
   "version")

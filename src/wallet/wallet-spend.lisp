@@ -3320,35 +3320,49 @@ holds node + wallet locks."
       (discourage-fee-sniping tx (%rng) node
                               (wallet-last-block-hash wallet)
                               (wallet-last-block-height wallet)))
-    (let* ((coins (%wallet-input-coins node wallet tx))
-           (sign-errors (%wallet-sign-transaction wallet tx coins))
-           (complete (null sign-errors))
-           (psbt-opt-in (and (%opt options "psbt") t))
-           (add-to-wallet (if (%opt-present-p options "add_to_wallet")
-                              (and (%opt options "add_to_wallet") t)
-                              t))
-           (result '()))
-      (when complete
-        ;; Funds rail: a complete tx must verify before it is committed,
-        ;; returned, or relayed.
-        (multiple-value-bind (ok bad-input) (%verify-tx-scripts tx coins)
-          (unless ok
-            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                              :message (format nil "Internal bug detected: signed transaction fails script verification at input ~D"
-                                               bad-input)))))
-      (when (or psbt-opt-in (not complete) (not add-to-wallet))
-        (push (cons "psbt" (%tx-to-finalized-psbt node wallet tx coins)) result))
-      (when complete
-        (push (cons "txid" (bl.rpc:hash-to-hex
-                            (bl.ser:transaction-hash tx)))
-              result)
-        (if (and add-to-wallet (not psbt-opt-in))
-            (%wallet-commit-transaction node wallet tx '())
-            (push (cons "hex" (bl.crypto:bytes-to-hex
-                               (bl.ser:transaction-wire-bytes tx)))
-                  result)))
-      (push (cons "complete" (bl.rpc:json-bool complete)) result)
-      (nreverse result))))
+    ;; An external-signer wallet signs through its device: FillPSBT without
+    ;; and then with signing, FinalizeAndExtractPSBT (wallet/rpc/spend.cpp:
+    ;; 111-123). What comes back is whatever the device signed, so the
+    ;; transaction from here on is the one extracted from ITS PSBT.
+    (multiple-value-bind (signer-psbt signer-complete)
+        (when (wallet-flag-set-p wallet +wallet-flag-external-signer+)
+          (%external-signer-fill-psbt node wallet tx))
+      (when signer-complete
+        (setf tx (%psbt-extract-tx signer-psbt)))
+      (let* ((coins (%wallet-input-coins node wallet tx))
+             (sign-errors (if signer-psbt
+                              (unless signer-complete '(:incomplete))
+                              (%wallet-sign-transaction wallet tx coins)))
+             (complete (null sign-errors))
+             (psbt-opt-in (and (%opt options "psbt") t))
+             (add-to-wallet (if (%opt-present-p options "add_to_wallet")
+                                (and (%opt options "add_to_wallet") t)
+                                t))
+             (result '()))
+        (when complete
+          ;; Funds rail: a complete tx must verify before it is committed,
+          ;; returned, or relayed.
+          (multiple-value-bind (ok bad-input) (%verify-tx-scripts tx coins)
+            (unless ok
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                                :message (format nil "Internal bug detected: signed transaction fails script verification at input ~D"
+                                                 bad-input)))))
+        (when (or psbt-opt-in (not complete) (not add-to-wallet))
+          (push (cons "psbt" (if signer-psbt
+                                 (bl.ser:encode-psbt signer-psbt)
+                                 (%tx-to-finalized-psbt node wallet tx coins)))
+                result))
+        (when complete
+          (push (cons "txid" (bl.rpc:hash-to-hex
+                              (bl.ser:transaction-hash tx)))
+                result)
+          (if (and add-to-wallet (not psbt-opt-in))
+              (%wallet-commit-transaction node wallet tx '())
+              (push (cons "hex" (bl.crypto:bytes-to-hex
+                                 (bl.ser:transaction-wire-bytes tx)))
+                    result)))
+        (push (cons "complete" (bl.rpc:json-bool complete)) result)
+        (nreverse result)))))
 
 ;;; --- SendMoney (rpc/spend.cpp:171-198) ---
 

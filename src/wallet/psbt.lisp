@@ -2194,8 +2194,11 @@ VNUM in Core's option block (:1058) and read with getInt<uint32_t>."
         (txid-hex (first params)))
     (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
+        ;; An external signer's wallet is keyless and still bumps: the
+        ;; device signs (wallet/rpc/spend.cpp:1035).
         (when (and (not want-psbt)
-                   (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
+                   (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
+                   (not (wallet-flag-set-p wallet +wallet-flag-external-signer+)))
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message "bumpfee is not available with wallets that have private keys disabled. Use psbtbumpfee instead."))
         ;; Core gates BOTH bumpfee and psbtbumpfee: building the
@@ -2229,8 +2232,20 @@ VNUM in Core's option block (:1058) and read with getInt<uint32_t>."
                   ("errors" . ,#()))
                 (progn
                   ;; Sign in place with the wallet keys, then verify.
+                  ;; feebumper::SignTransaction (feebumper.cpp:329-347): an
+                  ;; external-signer wallet signs through the device and
+                  ;; bumps with whatever transaction its PSBT extracts to.
+                  (when (wallet-flag-set-p wallet +wallet-flag-external-signer+)
+                    (multiple-value-bind (psbt complete)
+                        (handler-case (%external-signer-fill-psbt node wallet mtx)
+                          (bl.rpc:rpc-error () (values nil nil)))
+                      (unless complete
+                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                                                 :message "Transaction incomplete. Try psbtbumpfee instead."))
+                      (setf mtx (%psbt-extract-tx psbt))))
                   (let ((coins (%wallet-input-coins node wallet mtx cc)))
-                    (when (%wallet-sign-transaction wallet mtx coins)
+                    (when (and (not (wallet-flag-set-p wallet +wallet-flag-external-signer+))
+                               (%wallet-sign-transaction wallet mtx coins))
                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message "Can't sign transaction."))
                     (multiple-value-bind (verified bad) (%verify-tx-scripts mtx coins)
                       (unless verified

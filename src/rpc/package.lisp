@@ -76,6 +76,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:+rpc-misc-error+
    #:+rpc-invalid-address-or-key+
    #:+rpc-invalid-parameter+
+   #:+rpc-verify-error+
 
    ;; JSON boolean helpers (Core booleans are true/false, never null)
    #:+json-false+

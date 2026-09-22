@@ -11705,9 +11705,11 @@ comprehension produced []."
                        when (and (> (length l) 4)
                                  (string= "== " (subseq l 0 3)))
                          collect (subseq l 3 (- (length l) 3)))))
-    ;; The headings rpc_help.py wants, in its own order (sorted).
+    ;; The headings rpc_help.py wants, in its own order (sorted). Signer is
+    ;; there because this node always has the external-signer RPCs
+    ;; (rpc_help.py:147-148, ENABLE_EXTERNAL_SIGNER).
     (is (equal '("Blockchain" "Control" "Mining" "Network" "Rawtransactions"
-                 "Util" "Wallet" "Zmq")
+                 "Signer" "Util" "Wallet" "Zmq")
                titles)
         "help's category headings were ~S" titles)
     ;; No trailing newline: splitlines() must not report an empty last line.
