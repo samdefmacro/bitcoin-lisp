@@ -2572,3 +2572,64 @@ input\". Without the solving data the refusal stays (the control)."
                      (is (eql 0 (search "Not solvable pre-selected input" (or (cdr bare) "")))
                          "~A without solving data: ~S" shape bare)
                      (is (null solved) "~A with solving data: ~S" shape solved))))))))
+
+(test a-key-only-wallet-signs-a-script-path-from-the-psbts-own-leaves
+  "SignPSBTInput's FillSignatureData hands the input's PSBT_IN_TAP_LEAF_SCRIPT
+records to SignTaproot (psbt.cpp:111-160, script/sign.cpp:599-612), so a wallet
+holding only a LEAF key -- wallet_taproot.py's key_only_wallet, which imports
+wpkh(xprv/*) for every key of the tree -- signs the script path of an output it
+does not own. Ours only ever tried the leaves of a tr() it owned, and
+wallet_taproot.py:362 found no signature. The owning watch-only wallet is the
+updater that puts the leaf scripts and derivations in (the control: it signs
+nothing)."
+  (with-wallet-chain-node (node "key-only-leaf")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (import-req (desc &optional active)
+             (let ((h (make-hash-table :test 'equal)))
+               (setf (gethash "desc" h) desc (gethash "timestamp" h) "now")
+               (when active (setf (gethash "active" h) t))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address
+                      (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
+             (public (%aval "descriptor"
+                            (rpc nil "getdescriptorinfo"
+                                 (format nil "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,pk(~A/0/*))" tprv)))))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "online" t t)
+        (rpc nil "createwallet" "keys" nil t)
+        (is (eq t (%aval "success" (first (rpc "online" "importdescriptors"
+                                               (list (import-req public t)))))))
+        (is (eq t (%aval "success" (first (rpc "keys" "importdescriptors"
+                                               (list (import-req (bl.rpc:descriptor-add-checksum
+                                                              (format nil "wpkh(~A/0/*)" tprv)))))))))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let ((address (rpc "online" "getnewaddress" "" "bech32m"))
+              (bl.wallet::*wallet-rng* (make-wallet-rng 67)))
+          (rpc "fund" "sendtoaddress" address (bl.rpc:format-money 100000000)
+               nil nil nil nil nil nil nil 10)
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((coin (first (rpc "online" "listunspent")))
+                 (input (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "txid" h) (%aval "txid" coin)
+                                (gethash "vout" h) (%aval "vout" coin))
+                          h))
+                 (outputs (list (let ((h (make-hash-table :test 'equal)))
+                                  (setf (gethash optrue h) (bl.rpc:format-money 50000000))
+                                  h)))
+                 (updated (%aval "psbt" (rpc "online" "walletprocesspsbt"
+                                             (rpc nil "createpsbt" (list input) outputs)
+                                             t "DEFAULT" t bl.rpc:+json-false+)))
+                 (in-updated (first (coerce (%aval "inputs" (rpc nil "decodepsbt" updated)) 'list)))
+                 (signed (%aval "psbt" (rpc "keys" "walletprocesspsbt" updated
+                                            t "DEFAULT" t bl.rpc:+json-false+)))
+                 (in-signed (first (coerce (%aval "inputs" (rpc nil "decodepsbt" signed)) 'list))))
+            (is-true (%aval "taproot_scripts" in-updated) "the updater wrote the leaf scripts")
+            (is (null (%aval "taproot_script_path_sigs" in-updated))
+                "the control: the watch-only updater signs nothing")
+            (is (= 1 (length (coerce (or (%aval "taproot_script_path_sigs" in-signed) '())
+                                     'list)))
+                "the key-only wallet signs the leaf: ~S" in-signed)))))))

@@ -1706,6 +1706,48 @@ empty -- walletprocesspsbt answered complete false with no `hex'
                 wallet (%psbt-input-listed-pubkeys map spk)
                 keymap pubmap tr-keymap)))))
 
+(defun %psbt-add-input-tr-scripts (psbt coins tr-scripts)
+  "Core SignPSBTInput's input.FillSignatureData (psbt.cpp:111-160): the leaf
+scripts a taproot input CARRIES (PSBT_IN_TAP_LEAF_SCRIPT) join
+sigdata.tr_spenddata.scripts, and SignTaproot tries them whether or not the
+wallet owns the output (script/sign.cpp:599-612). A wallet that holds only a
+leaf KEY -- wallet_taproot.py's key_only_wallet imports wpkh(xprv/*) for every
+key of the tree -- signs the script path from the PSBT's own leaves; ours only
+ever tried the leaves of a tr() descriptor it owned, so it signed nothing
+(wallet_taproot.py:362).
+
+Adds, for each taproot input whose output key TR-SCRIPTS does not cover, one
+(SCRIPT LEAF-HASH CONTROL-BLOCK PUBKEYS) per tapscript leaf record; PUBKEYS are
+the input's PSBT_IN_TAP_BIP32_DERIVATION keys lifted to 33 bytes, which a pkh()
+leaf resolves its hash against."
+  (let ((tx (bl.ser:psbt-tx psbt)))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
+          for spk = (first (gethash (cons (bl.ser:outpoint-hash op)
+                                          (bl.ser:outpoint-index op))
+                                    coins))
+          do (when (and spk
+                        (eq (bl.val:classify-script spk) :witness-v1-taproot)
+                        (null (gethash (subseq spk 2 34) tr-scripts)))
+               (let ((pubkeys (mapcar (lambda (pair)
+                                        (concatenate '(simple-array (unsigned-byte 8) (*))
+                                                     #(2) (car pair)))
+                                      (bl.ser:psbt-map-collect
+                                       map bl.ser:+psbt-in-tap-bip32+)))
+                     (leaves '()))
+                 (loop for (control . value) in (bl.ser:psbt-map-collect
+                                                 map bl.ser:+psbt-in-tap-leaf-script+)
+                       for ver = (aref value (1- (length value)))
+                       for script = (subseq value 0 (1- (length value)))
+                       when (= ver bl.rpc:+tapleaf-version-tapscript+)
+                         do (push (list script
+                                        (bl.crypto:tap-leaf-hash ver script)
+                                        control pubkeys)
+                                  leaves))
+                 (when leaves
+                   (setf (gethash (subseq spk 2 34) tr-scripts) (nreverse leaves))))))))
+
 (bl.rpc:define-rpc "walletprocesspsbt" (node params)
   "Update a PSBT with wallet input info and sign the inputs we can (Bitcoin Core
 walletprocesspsbt). PARAMS: (psbt [sign] [sighashtype] [bip32derivs] [finalize]).
@@ -1741,6 +1783,7 @@ Returns {psbt, complete, hex?}."
                   (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
                 (%psbt-add-foreign-pubkey-keys psbt wallet coins
                                                keymap pubmap tr-keymap)
+                (%psbt-add-input-tr-scripts psbt coins tr-scripts)
                 (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
                                          tr-scripts)))
             (%psbt-signer-result psbt finalize t)))))))
