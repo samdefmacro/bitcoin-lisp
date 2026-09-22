@@ -127,6 +127,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:desc-key-path
    #:desc-key-musig-participants
    #:descriptor-musig2-participants
+   #:descriptor-musig2-participant-pairs
    #:desc-key-privkey
    #:desc-key-privkey-for
    #:desc-key-pubkey

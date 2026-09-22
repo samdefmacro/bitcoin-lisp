@@ -2506,7 +2506,21 @@ walletcreatefundedpsbt died with an internal error."
                        (is (= 1 (length out-parts)) "~A: output ~S" name out-parts)
                        (is (= 2 (length (coerce (%aval "participant_pubkeys" (first in-parts))
                                                 'list)))
-                           "~A: participants" name)))))))))
+                           "~A: participants" name)
+                       ;; Each participant's origin rides along as a taproot
+                       ;; derivation (SignMuSig2, script/sign.cpp:265-285;
+                       ;; wallet_musig.py:244-248).
+                       (dolist (m (list (first (coerce (%aval "inputs" decoded) 'list))
+                                        (first (coerce (%aval "outputs" decoded) 'list))))
+                         (let ((derived (mapcar (lambda (d) (%aval "pubkey" d))
+                                                (coerce (or (%aval "taproot_bip32_derivs" m) '())
+                                                        'list))))
+                           (dolist (pk (coerce (%aval "participant_pubkeys"
+                                                      (first (coerce (%aval "musig2_participant_pubkeys" m)
+                                                                     'list)))
+                                               'list))
+                             (is-true (member (subseq pk 2) derived :test #'equal)
+                                      "~A: participant ~A has no derivation" name pk))))))))))))
 
 (test fundrawtransaction-solves-nested-external-inputs-from-solving-data
   "An external pre-selected input is sized by InferDescriptor over the coin

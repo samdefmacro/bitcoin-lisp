@@ -736,6 +736,16 @@ the cache cannot produce one, as ExpandFromCache would fail."
                         pairs))))))
       (descriptor-derivation-error () nil))))
 
+(defun descriptor-musig2-participant-pairs (desc key pos &optional cache)
+  "(participant-key . pubkey) for each participant of the musig() key
+expression KEY of DESC at POS, resolved through CACHE as
+DESCRIPTOR-MUSIG2-PARTICIPANTS resolves them; NIL when one cannot be."
+  (let ((ctx (and cache (list (out-desc-key-indexes desc) cache nil))))
+    (handler-case
+        (mapcar (lambda (p) (cons p (%musig-participant-pubkey-at p pos nil ctx)))
+                (desc-key-musig-participants key))
+      (descriptor-derivation-error () nil))))
+
 (defun %musig-derivation-root (key pos &optional privkey-provider cache-ctx)
   "The BIP328 synthetic xpub a non-flat musig() KEY derives from, on the network
 its participants are written for. Fixed for the whole range — a musig() with a

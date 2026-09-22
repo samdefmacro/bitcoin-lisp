@@ -1971,6 +1971,17 @@ the internal key and the rest is sliced per leaf, the same way
                              (pushnew leaf-hash (third hit) :test #'equalp)
                              (push (list (car pair) (cdr pair) (list leaf-hash))
                                    entries)))))))))
+    ;; A musig() INTERNAL key: Core's SignMuSig2 records every participant's
+    ;; origin, with no leaf hash on the key path (script/sign.cpp:265-285),
+    ;; whenever a signature for the aggregate is attempted -- which FillPSBT
+    ;; does for every input (wallet_musig.py:244-248 finds each participant
+    ;; among an input's and an output's taproot derivations).
+    (when (and pairs (bl.rpc:desc-key-musig-participants (car (first pairs))))
+      (loop for (participant . pubkey)
+              in (bl.rpc:descriptor-musig2-participant-pairs
+                  desc (car (first pairs)) pos (desc-spkm-cache spkm))
+            unless (assoc participant entries :test #'eq)
+              do (push (list participant pubkey '()) entries)))
     (loop for (key pubkey hashes) in (nreverse entries)
           collect (multiple-value-bind (fpr path)
                       (bl.rpc:descriptor-key-origin key pubkey pos)
