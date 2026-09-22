@@ -381,3 +381,201 @@ frame or a load flake that passes alone (`feature_segwit` passes now;
 in the RBF section, one step past where batch J left it).
 
 Deployed: both live nodes to `bc65804a` (testnet4 first, then mainnet).
+
+## Round 5
+
+Batches I, N and S (net), K (mempool and package RPCs), M, P and R (RPC, REST,
+coinstats), L, O, Q, T and Z (wallet, PSBT, descriptors), W (reindex), X and Y
+(storage, datadir) and U (init, config, interfaces) merged onto `main` from
+`bc65804a` through `2a7074c4`: 148 commits, 22 of them `tests:` commits
+(ratchets, fixtures, merge seams). Each fix carries a pre-fix-red unit test and
+the Core file:line in its message; the merged battery ran on a fresh FASL volume
+before every push (39,242 → 40,290 checks) and the `::` ceiling fell from 3,865
+to 3,813. The behaviour changes that mattered most, by area:
+
+**Net.** Round 3's two bisected failures and one of its two live-node hazards
+are closed. Block announcements are queued per peer and flushed once a pass as
+one headers message of up to eight or one inv (`3f9f2ae8`,
+net_processing.cpp:2160-2189, :5825-5956); the other hazard, a fresh
+`*ibd-context*` per pump tick, is still open, and `74155cca` keeps its block
+request in a process-global table for that reason. The "Bad message magic
+80110100" seen on fresh connections was the resumable reader's second drain
+after its EOF probe: its byte count was discarded and the next pass overwrote
+the peer's first 24 bytes (`5040752a`). A send-paused peer is still read, its
+messages parked, as Core pauses dispatch and never the socket (`1ffdd838`,
+`p2p_net_deadlock`). A destructive `(sort (remove-if-not …))` had truncated the
+live peer list, dropping the peer a getdata had just gone to (`b64fa28c`, the
+"Block sync timed out" family). Header sync now drives one peer with Core's
+15-minute timeout doing the rotation, plus one new peer per inv'd block, in
+place of a failover that asked every peer on every pass (`1caceddd`,
+`749d15d4`). A mutated block is refused at the wire and its sender punished;
+one mangled copy had cancelled an honest peer's delivery (`5e380b1c`). A block
+that fails to connect is marked failed once, Core's InvalidBlockFound, instead
+of a retry budget (`6121e4a8`). Also: genesis carries its own proof, so every
+chain-work had been one block short and `-minimumchainwork` measured against
+it (`1ed67b03`); block validity is monotone, so a reorged-off block stays
+servable (`5f186ca3`); the ban list is keyed by subnet (`23b83f8b`); an
+accepted peer is published before its handshake (`18937510`); the tx-inv
+trickle and the unbroadcast re-announcement run on the mockable clock
+(`d1e73338`, `e3d34be8`); the stalling timeout decays as blocks connect
+(`ff43ea04`); a pruned block fetched by `getblockfrompeer` is written
+(`74155cca`).
+
+**Validation and storage.** Mined blocks are now Core's bytes: coinbase
+version 2 and a single `OP_0` extranonce where ours wrote 1 and four zero bytes,
+so the same RPCs built a different chain from Core's (`9507d894`), pinned on
+the `base_hash` Core's own `rpc_dumptxoutset.py` carries (`5a83b0ef`). A failed
+tip-extending block is marked invalid, so `submitblock` answers
+`duplicate-invalid` and a child header `bad-prevblk` (`af9df67a`, `8c9ef37b`);
+`invalidateblock` lands on the best chain still valid and re-adds at most ten
+blocks' transactions (`3a19182f`, `a6bda7b3`). A disconnect reads the rev
+record, not an undo cache that could serve a record whose file was gone
+(`2848a380`). A pruned restart no longer writes genesis into a new blk file
+(`8aa00e8c`). The reindex walk streams in file order and logs Core's
+out-of-order lines (`b2ff7eb1`, `c63e2fc9`). The filter and coinstats index
+databases open at Core's `…/db` and an existing one is moved there in place
+(`3f22c293`; the live nodes migrate on their next start), and every LevelDB
+open and wipe is logged in Core's words (`127f40b6`). An index whose best block
+is past the pruned data, and an assumeutxo base the chain parameters do not
+know, now stop start-up (`8c7ccc14`, `9a457df8`). A transaction's cached txid,
+wtxid and weight are dropped when it is mutated in place; a fee bump signed in
+place had kept its unsigned weight and reported 66.6 sat/vB against a 60 target
+(`2f0c63d8`).
+
+**Mempool and mining.** `testmempoolaccept` validates a package as a package
+(`3ebc9037`); a package TRUC violation carries Core's sentence (`e205d6a8`); a
+member accepted alone reports its prioritised feerate (`333bd7b5`);
+prioritisation invalidates the cached template (`d7ad0e5a`); a reorg re-add is
+stamped sequence 0 so a peer may fetch it (`bbe09369`); `-maxmempool` must hold
+one cluster (`316a7a99`); a combo() coinbase pays the script Core picks
+(`9db375bf`).
+
+**RPC and REST.** A repeated JSON key reaches the handler (`2d515492`); an
+undecodable address says why and where, Core's bech32 LocateErrors
+(`c6b12be2`); `submitheader` answers the reject token (`4c1f9b45`); a
+wrong-arity call answers the whole help document and an explicit null in a
+required argument is `-3` (`14914b1d`, `3ee4418b`); `help` lists usage lines
+under Core's category headings, from a table generated from Core's sources
+(`532efa3e`, `fa3e069a`); `migratewallet` exists, so no Core method with a
+typed argument is left unserved (`205903fa`); `combinerawtransaction` merges
+signatures instead of keeping the longest scriptSig (`2e8342b7`); `getchaintips`
+always reports the active tip (`01a573e5`); `/rest/getutxos` reads BIP64's POST
+body and `/rest/headers` answers an unknown hash with an empty result
+(`ef1a1c2d`, `a1b0fe40`); `gettxoutsetinfo` serves a reorged-out block's
+coinstats by hash (`747a3353`).
+
+**Wallet, PSBT and descriptors.** `node::MiniMiner` is ported, so an
+unconfirmed input is priced with its ancestors' bump fee and a shared ancestor
+is paid once (`aed46dc1`, `70def246`); `-limitancestorcount` and
+`-limitdescendantcount` reach coin selection (`888f892b`). A cosigner signs
+for a key an input lists when it does not own the script, which is what
+multi-party signing needs (`cf65f5b2`). `bumpfee`'s `outputs` replaces the
+outputs, and every refusal had left with code NIL because the helper bound five
+values of a three-value function (`7939a174`). A taproot PSBT drops the
+previous transactions it cannot need and records the `witness_utxo` it signed
+over (`8d0d6298`, `9e82bae3`). A `musig()` participant is a key expression with
+its own cache slot and normalizes as Core's does (`ca924814`, `a02ca2ed`).
+`walletprocesspsbt` runs on a private-keys-disabled wallet and is idempotent
+(`5eb7e09f`, `821e2c7f`); an extended key is read on the running chain only
+(`d4a9583d`); a zero-value output's spend is still from the wallet
+(`acacc9a9`); a load during a background sync is refused by height
+(`d8778aa5`); the BIP371 field lengths reject all 41 of Core's invalid PSBT
+vectors (`81707abe`).
+
+**Init, config and interfaces.** Long-lived threads log Core's `thread
+start`/`thread exit` lines (`99a04890`); config-read errors carry Core's
+prefix, and a block that fails ConnectBlock is logged (`1c6e33b5`);
+`-bind=…=onion` binds the address it names, the RPC server binds both
+loopbacks, and a duplicated binding is an init error (`14914b1d`,
+`bd1693bb`); ZMQ `rawtx` is the with-witness serialization, which is why
+`interface_zmq` timed out in its sync-up, and `unix:` addresses bind
+(`d724da1e`, `6fdb7885`); notify commands ShellEscape a value instead of refusing it and
+`-blocknotify` passes the hash in display order (`bdf40a7f`, `09c5db90`,
+`3ccdda96`); a log line's timestamp is one clock reading, so `debug.log` no
+longer runs backwards within a second (`fafcb414`).
+
+Three guards came out of the merges: the structural memos drop on a src edit
+(`20c4a811`), an in-place transaction mutation must invalidate the caches
+(`1a216f60`), and a red suite no longer skips the battery's three transcript
+gates (`9314beb7`). The cold lane's undefined-variable gate caught two
+docstrings ended early by an unescaped quote (`a2a645de`, `76dfbe48`).
+
+### Decisions recorded in Round 5
+
+- **`-reindex` stays additive** — [reindex-decision-2026-09-18.md](reindex-decision-2026-09-18.md),
+  option B, and "Known divergence" above. The three pieces that cost no block
+  file were ported: the `'R'` resume marker (`bdebf6ce`), snapshot-chainstate
+  deletion under either flag (`a59a188e`), and the index wipe-and-resync
+  (`2b1ab7c2`).
+- **Absolute wallet paths stay refused.** The containment rule is stated in
+  `%VALID-WALLET-NAME-P`'s docstring ([src/wallet/wallet.lisp](../src/wallet/wallet.lisp)):
+  an absolute path is the one form that writes wallet files outside the
+  datadir. `wallet_crosschain.py:32` fails on it (`-8 Invalid wallet name`) and
+  will while this stands.
+- **The RPC server binds `::1` and `127.0.0.1`, and one bound is enough** —
+  `+RPC-DEFAULT-LOOPBACK-BINDS+` and `%BIND-RPC-ACCEPTORS` in
+  [src/rpc/server.lisp](../src/rpc/server.lisp) (`14914b1d`, Core
+  httpserver.cpp:320-321, :341-357). Batch U reported that the socket library
+  in the image cannot listen on `::1`, so the node serves on `127.0.0.1` alone
+  there and `rpc_bind.py:46` stays red; not re-measured here.
+- **A `musig()` cache written under the old key numbering is repaired on the
+  miss**, not from a version marker — [wallet-plan.md](wallet-plan.md),
+  "The descriptor xpub cache and musig() key-expression numbering" (`ca924814`).
+
+### Round-5 sweep
+
+Binary `3a337f7e` (batches I, K, L, M; the flips rerun serially), classification
+in `docs/functional-sweep-2026-09-13/after-3a337f7e.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `3a337f7e` round 5, first half | **117** | **119** | **4** | 23 |
+<!-- sweep9: 2a7074c4 row -->
+
+Nineteen tests went to PASS (`feature_minchainwork`, `feature_utxo_set_hash`,
+`mempool_package_limits`, `mempool_sigoplimit`, `mining_prioritisetransaction`,
+`p2p_blocksonly`, `p2p_disconnect_ban`, `p2p_fingerprint`, `p2p_net_deadlock`,
+`p2p_permissions`, `rpc_getchaintips`, `rpc_gettxspendingprevout`, `rpc_setban`,
+`rpc_validateaddress`, `wallet_anchor`, `wallet_createwalletdescriptor`,
+`wallet_listdescriptors`, `wallet_reindex`, `wallet_sendall`) and two left it,
+each checked against its failure line:
+
+- `feature_csv_activation` (`:181`, `Predicate ''''`) is a real regression.
+  The node kept asking the announcing peer for a block whose script had
+  failed, a getdata/reject loop for the whole 60-second wait; before
+  `b64fa28c` the loop had ended only because that peer fell out of the
+  truncated list. `65422f45` made the walk honour the retry pause, which left
+  the node asking for nothing, and `6121e4a8` ported InvalidBlockFound in place
+  of the retry budget: FAIL → PASS on the oracle.
+- `wallet_address_types` (`:91`, `Predicate ''''`) is the 24-byte loss on a
+  fresh connection in its six-node mesh, a fault present before this round and
+  fixed by `5040752a`.
+
+`feature_proxy` went from a failure to a timeout. Twenty-three failure points
+moved later (`p2p_segwit` 200 → 309, `wallet_fundrawtransaction` 337 → 591,
+`rpc_getdescriptoractivity` 65 → 204, `feature_coinstatsindex` 91 → 280,
+`mempool_truc` 284 → 520, `wallet_hd` from an init failure to `:84`, ...).
+Twelve moved earlier. Three are helper frames reached after a line that now
+passes: `feature_assumeutxo` `:187` is the `expected_error` helper called at
+`:191`, after `:220`; `rpc_dumptxoutset` `:26` is reached from `:75`, after the
+`:50` `base_hash`; `mempool_limit` `:93` is in a sub-test `run_test` calls
+after `:238`. Two are the mempool-sync timeouts under the eight-way load
+(`wallet_basic`, `wallet_groups`), and `wallet_send` `:131` is inside its own
+`test_send` helper. `p2p_sendheaders` `:169`, `p2p_addrv2_relay` `:58` and
+`p2p_compactblocks_hb` `:32` are helper frames too, so only the step log can
+compare them (`p2p_sendheaders` failed at `:309` on `749d15d4`'s oracle runs;
+`p2p_compactblocks_hb` has been intermittent since the baseline).
+`p2p_ibd_stalling` stopped at `:106`, which passed on `ff43ea04`'s oracle run.
+Two are real retreats inside one sub-test, not bisected: `mempool_reorg`
+106 → 87 (three invs where, with no mocked time elapsed, the test expects none)
+and `p2p_opportunistic_1p1c` 557 → 514 (`test_orphanage_dos_many`).
+
+After the sweep, commit messages record six more oracle runs going FAIL → PASS:
+`feature_csv_activation` (`6121e4a8`), `p2p_initial_headers_sync`
+(`749d15d4`), `p2p_mutated_blocks` (`5e380b1c`), `p2p_ibd_stalling`
+(`ff43ea04`), `rpc_getblockfrompeer` (`74155cca`) and `feature_notifications`
+(`bdf40a7f`). The sweep of `2a7074c4`, which carries all of round 5, is
+running; its row goes in the table above.
