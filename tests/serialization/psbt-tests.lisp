@@ -1609,3 +1609,26 @@ answered -8 with words of our own."
                 (lambda ()
                   (bl.rpc:dispatch-rpc-method node "combinepsbt"
                                               (wire-params (list #())))))))))
+
+(test send-and-walletcreatefundedpsbt-refuse-options-input-weights
+  "send and walletcreatefundedpsbt take per-input weights inside the inputs
+array; an options.input_weights is -8 \"Input weights should be specified in
+inputs rather than in options.\" (SetOptionsInputWeights,
+wallet/rpc/spend.cpp:689-693, called at :1281 and :1763).
+wallet_send.py:504 got the funding error instead. Without the option the
+same call fails later, on the unknown input (the control)."
+  (with-wallet-chain-node (node "options-input-weights" :wallet "w")
+    (let* ((txid (make-string 64 :initial-element #\1))
+           (input (%ht "txid" txid "vout" 0))
+           (weights (list (%ht "txid" txid "vout" 0 "weight" 1000)))
+           (outputs (list (%ht (bl.crypto:encode-p2sh-address
+                                (bl.crypto:hash160 +optrue-redeem+) :regtest)
+                               "0.1")))
+           (want (cons -8 "Input weights should be specified in inputs rather than in options.")))
+      (flet ((call (method &rest params)
+               (rpc-error-of (lambda () (bl.rpc:dispatch-rpc-method node method params)))))
+        (is (equal want (call "send" outputs nil nil nil
+                              (%ht "inputs" (list input) "input_weights" weights))))
+        (is (equal want (call "walletcreatefundedpsbt" (list input) outputs 0
+                              (%ht "input_weights" weights))))
+        (is (not (equal want (call "send" outputs nil nil nil (%ht "inputs" (list input))))))))))

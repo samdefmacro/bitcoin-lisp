@@ -3267,6 +3267,16 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
         (setf (wcc-max-tx-weight cc) +truc-max-weight+)))
     (values change-position lock-unspents)))
 
+(defun %refuse-options-input-weights (options)
+  "Core SetOptionsInputWeights' first line (wallet/rpc/spend.cpp:689-693):
+send and walletcreatefundedpsbt take per-input weights INSIDE the inputs
+array, and an options.input_weights is -8 \"Input weights should be
+specified in inputs rather than in options.\" -- wallet_send.py:504; we went
+on and funded with it."
+  (when (%opt-present-p options "input_weights")
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                      :message "Input weights should be specified in inputs rather than in options.")))
+
 (defun %parse-rpc-inputs (inputs-param)
   "The inputs array of send/sendall/walletcreatefundedpsbt: a list of
 (txid vout sequence weight) tuples, order preserved."
@@ -3620,6 +3630,7 @@ form when output order matters."
                  (locktime (%opt options "locktime"))
                  (inputs (%parse-rpc-inputs (or (%opt options "inputs") '())))
                  (cc (make-wcc :version version)))
+            (%refuse-options-input-weights options)
             (when (and locktime (not (integerp locktime)))
               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                 :message "locktime must be an integer"))

@@ -2015,6 +2015,7 @@ array-of-objects form when output order matters."
           (unless (and (integerp locktime) (<= 0 locktime #xffffffff))
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Invalid parameter, locktime out of range"))
+          (%refuse-options-input-weights options)
           (multiple-value-bind (recipients keys)
               (bl.rpc:parse-outputs (wallet-network wallet) (second params))
             (%interpret-sffo (%opt options "subtractFeeFromOutputs") keys recipients)
