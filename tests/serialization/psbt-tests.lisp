@@ -1858,3 +1858,40 @@ one has no such key (the control)."
                           (and (listp in) (%aval name in)))
                    "~A" name))
       (is (hash-table-p (fifth inputs)) "the control: an input with nothing is {}"))))
+
+(test an-anyone-can-spend-input-finalizes-with-nothing-added
+  "ProduceSignature ends with VerifyScript over whatever it has
+(script/sign.cpp:799): an output whose script is satisfied by an EMPTY
+scriptSig and witness -- OP_TRUE -- is complete with nothing added, and
+finalizepsbt extracts the transaction as is (rpc_psbt.py:1183-1192). We
+called it incomplete. An OP_FALSE output stays incomplete (the control)."
+  (let ((node (make-test-node :network :regtest)))
+    (flet ((finalize (spk-byte)
+             (let* ((tx (bl.ser:make-transaction
+                         :version 2
+                         :inputs (vector (bl.ser:make-tx-in
+                                          :previous-output
+                                          (bl.ser:make-outpoint
+                                           :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                :initial-element #xdd)
+                                           :index 0)
+                                          :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                          :sequence 0))
+                         :outputs (vector (bl.ser:make-tx-out
+                                           :value 0
+                                           :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
+                         :lock-time 0))
+                    (psbt (bl.ser:make-empty-psbt tx))
+                    (bb (bl.ser:make-byte-buf)))
+               (bl.ser:bb-write-tx-out
+                bb (bl.ser:make-tx-out :value 0
+                                       :script-pubkey (coerce (vector spk-byte)
+                                                              '(simple-array (unsigned-byte 8) (*)))))
+               (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) 0) bl.ser:+psbt-in-witness-utxo+
+                                    (make-array 0 :element-type '(unsigned-byte 8))
+                                    (bl.ser:bb-finish bb))
+               (bl.rpc:dispatch-rpc-method node "finalizepsbt" (list (bl.ser:encode-psbt psbt))))))
+      (is (equal '(("hex" . "0200000001dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd0000000000000000000100000000000000000000000000")
+                   ("complete" . t))
+                 (finalize #x51)))
+      (is (not (eq t (%aval "complete" (finalize #x00))))))))

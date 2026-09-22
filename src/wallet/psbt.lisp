@@ -1058,6 +1058,26 @@ miniscript timelock is checked against."
              (t (values nil nil)))))
         (t (values nil nil))))))
 
+(defun %psbt-input-verifies-empty-p (map tx index)
+  "Whether input INDEX of the unsigned TX, with an EMPTY scriptSig and witness,
+already satisfies the output it spends (MAP's utxo). ProduceSignature ends by
+running VerifyScript over whatever it has (script/sign.cpp:799), so an
+anyone-can-spend output -- OP_TRUE -- is COMPLETE with nothing to add, and
+FinalizePSBT counts it finished while writing no final field (FromSignatureData
+keeps an empty scriptSig out, psbt.cpp:169-175). rpc_psbt.py:1183-1192 expects
+finalizepsbt to extract such a transaction; we called it incomplete."
+  (let ((out (%psbt-input-prevout map (aref (bl.ser:transaction-inputs tx) index))))
+    (and out
+         (zerop (length (bl.ser:tx-in-script-sig (aref (bl.ser:transaction-inputs tx) index))))
+         (handler-case
+             (let* ((entry (bl.store:make-utxo-entry
+                            :value (bl.ser:tx-out-value out)
+                            :script-pubkey (coerce (bl.ser:tx-out-script-pubkey out)
+                                                   '(simple-array (unsigned-byte 8) (*)))))
+                    (bl.interop:*script-flags* bl.val:+standard-script-verify-flags+))
+               (and (bl.val:validate-input-script tx index entry) t))
+           (error () nil)))))
+
 (defun %psbt-set-final (map scriptsig witness)
   "Record final scriptSig/scriptWitness on MAP and drop the now-obsolete signing
 fields (partial sigs, sighash, redeem/witness scripts, derivations)."
@@ -1156,9 +1176,10 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
             nil                          ; already final
             (let ((spk (%psbt-input-spk map (aref ins i))))
               (multiple-value-bind (ss wit) (if spk (%psbt-finalize map spk tx i) (values nil nil))
-                (if (or (and ss (plusp (length ss))) wit)
-                    (%psbt-set-final map ss wit)
-                    (setf complete nil)))))))
+                (cond ((or (and ss (plusp (length ss))) wit)
+                       (%psbt-set-final map ss wit))
+                      ((%psbt-input-verifies-empty-p map tx i))
+                      (t (setf complete nil))))))))
     (if (and complete extract)
         `(("hex" . ,(%psbt-extract-hex psbt)) ("complete" . t))
         `(("psbt" . ,(bl.ser:encode-psbt psbt))
@@ -1939,9 +1960,10 @@ Returns T when EVERY input is final."
             (let ((spk (%psbt-input-spk map (aref ins i))))
               (multiple-value-bind (ss wit)
                   (if spk (%psbt-finalize map spk tx i) (values nil nil))
-                (if (or (and ss (plusp (length ss))) wit)
-                    (%psbt-set-final map ss wit)
-                    (setf complete nil)))))))
+                (cond ((or (and ss (plusp (length ss))) wit)
+                       (%psbt-set-final map ss wit))
+                      ((%psbt-input-verifies-empty-p map tx i))
+                      (t (setf complete nil))))))))
     complete))
 
 (defun %psbt-witness-program-version (spk)
