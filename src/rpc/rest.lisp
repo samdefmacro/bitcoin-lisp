@@ -189,15 +189,29 @@ headers do not need. This used to be a deliberate divergence here (\"an
 existing client may rely on it\"), which made a well-formed unknown hash and
 a fork header answer differently for the same non-answer;
 interface_rest.py:231 asks for the unknown hash and compares against []."
-  (unless (valid-hex-hash-p body)
-    (return-from %rest-headers (%rest-error 400 (format nil "Invalid hash: ~A" body))))
-  (let* ((raw-count (or (hunchentoot:get-parameter "count") "5"))
-         (count (%rest-parse-count raw-count))
-         (chain-state (rpc-get-chain-state node))
-         (start (bl.store:get-block-index-entry
-                 chain-state (parse-hex-hash body))))
+  ;; Core's order (rest.cpp:185-215): the path shape -- the deprecated
+  ;; /rest/headers/<count>/<hash> or /rest/headers/<hash>?count= -- then the
+  ;; count, then the hash. interface_rest.py:430 asks both forms and compares.
+  (let* ((path (uiop:split-string body :separator "/"))
+         (raw-count (case (length path)
+                      (2 (first path))
+                      (1 (or (hunchentoot:get-parameter "count") "5"))
+                      (t (return-from %rest-headers
+                           (%rest-error 400 "Invalid URI format. Expected /rest/headers/<hash>.<ext>?count=<count>")))))
+         (hash-text (car (last path)))
+         (count (%rest-parse-count raw-count)))
     (when (or (null count) (< count 1) (> count +rest-max-headers+))
       (return-from %rest-headers (%rest-error 400 (%rest-bad-count-message raw-count))))
+    (unless (valid-hex-hash-p hash-text)
+      (return-from %rest-headers
+        (%rest-error 400 (format nil "Invalid hash: ~A" hash-text))))
+    (%rest-headers-from node hash-text count ext)))
+
+(defun %rest-headers-from (node hash-text count ext)
+  "COUNT headers from HASH-TEXT's block forward on the active chain, in EXT."
+  (let* ((chain-state (rpc-get-chain-state node))
+         (start (bl.store:get-block-index-entry
+                 chain-state (parse-hex-hash hash-text))))
     ;; Walk forward via active-chain successors by height.
     (let ((entries
             (when (and start

@@ -6141,7 +6141,14 @@ compares the reply BYTES for 5a, -5, 0, 2001 and a 35-digit number; ours read
                        body)
                 "~A: ~S" num body)))
         ;; Control: a count in range answers.
-        (is (eql 200 (second (body-of (format nil "/rest/headers/~A.json?count=5" genesis)))))))))
+        (is (eql 200 (second (body-of (format nil "/rest/headers/~A.json?count=5" genesis)))))
+        ;; Core still serves the deprecated /rest/headers/<count>/<hash> and
+        ;; answers it as the query form (rest.cpp:190-194;
+        ;; interface_rest.py:430 compares the two).
+        (let ((old-form (body-of (format nil "/rest/headers/1/~A.json" genesis)))
+              (new-form (body-of (format nil "/rest/headers/~A.json?count=1" genesis))))
+          (is (eql 200 (second old-form)))
+          (is (equal (first new-form) (first old-form))))))))
 
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
