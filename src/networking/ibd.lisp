@@ -512,8 +512,47 @@ clear-block-failure lifts it."
 
 (defun clear-block-failure (hash)
   "Forget HASH's failure count — call when a block connects successfully so a
-later reorg/re-org through the same hash starts with a fresh retry budget."
-  (remhash hash *block-failure-counts*))
+later reorg/re-org through the same hash starts with a fresh retry budget.
+Its recorded source goes too: the block was checked, and valid."
+  (remhash hash *block-failure-counts*)
+  (forget-block-source hash))
+
+;;; Core's mapBlockSource (net_processing.cpp:838): which peer a block BODY
+;;; came from, so that when validation later finds it invalid -- possibly much
+;;; later, after it sat in the download queue behind its parents -- that peer
+;;; is the one punished (BlockChecked -> MaybePunishNodeForBlock,
+;;; net_processing.cpp:2198-2227, 1908-1951). Recorded when the body is
+;;; handed to PROCESS-RECEIVED-BLOCK, consumed when the block is checked.
+
+(defconstant +block-sources-cap+ 4096
+  "Hard cap on *BLOCK-SOURCES*; cleared wholesale on overflow, which can only
+spare a peer one punishment.")
+
+(defvar *block-sources* (make-hash-table :test 'equalp :synchronized t)
+  "block-hash -> the peer that delivered the body, until the block is checked.")
+
+(defun note-block-source (hash peer)
+  "Record PEER as the source of the body of block HASH unless one is already
+recorded -- Core's mapBlockSource.emplace, which keeps the first
+(net_processing.cpp:4886-4893)."
+  (when (>= (hash-table-count *block-sources*) +block-sources-cap+)
+    (clrhash *block-sources*))
+  (unless (gethash hash *block-sources*)
+    (setf (gethash hash *block-sources*) peer)))
+
+(defun forget-block-source (hash)
+  "Drop HASH's recorded source (Core BlockChecked's mapBlockSource.erase)."
+  (remhash hash *block-sources*))
+
+(defun punish-block-source (hash reason)
+  "The block HASH failed validation for good: punish the peer that delivered
+it, if it is still connected, and forget it (Core BlockChecked ->
+MaybePunishNodeForBlock; a BLOCK_CONSENSUS verdict on a block that did not
+come in as a compact block is Misbehaving, net_processing.cpp:1920-1925)."
+  (let ((peer (gethash hash *block-sources*)))
+    (forget-block-source hash)
+    (when (and peer (not (eq (peer-state peer) :disconnected)))
+      (record-misbehavior peer reason))))
 
 (defun handle-validation-failure (block height error chain-state)
   "Handle a block-validation failure during IBD -- Bitcoin Core's
@@ -567,8 +606,13 @@ alike)."
       ;; `block-script-verify-flag-failed (Negative locktime)', and THIS is the
       ;; line a block rejected by the download drain writes.
       (if failed-valid
-          (bl:log-error "Block ~D validation failed: ~A"
-                        height (bl.val:block-reject-reason-string error))
+          (progn
+            (bl:log-error "Block ~D validation failed: ~A"
+                          height (bl.val:block-reject-reason-string error))
+            ;; Core's BlockChecked: the verdict is final, so whoever sent
+            ;; the body is punished (feature_assumevalid.py:155 waits for
+            ;; the disconnect).
+            (punish-block-source hash (bl.val:block-reject-reason-string error)))
           (let ((count (note-block-failure hash)))
             (cond
               ((<= count +max-block-revalidation-attempts+)
@@ -4629,11 +4673,12 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
          (mempool (and *ibd-context* (ibd-context-mempool *ibd-context*))))
     (when *ibd-context*
       (note-block-wire-size *ibd-context* wire-size))
-
     (unless entry
       (bl:log-warn "Received unknown block ~A"
                              (bl.crypto:bytes-to-hex hash))
       (return-from process-received-block nil))
+    (when peer
+      (note-block-source hash peer))
 
     (let ((height (bl.store:block-index-entry-height entry))
           (current-height (bl.store:current-height chain-state)))
@@ -4995,6 +5040,8 @@ the tip is ready to connect."
                  :mempool mempool))
             (cond
               (activated
+               (forget-block-source (bl.ser:block-header-hash
+                                     (bl.ser:bitcoin-block-header block)))
                (note-tip-advanced chain-state)
                (incf drained)
                (bl:log-debug "Drained queued block at height ~D" next-height))

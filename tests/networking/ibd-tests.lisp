@@ -5317,6 +5317,58 @@ the mutation class -- still re-queues."
                    "the verdict is still logged in Core's words"))
         (bl.net:clear-block-failure hash)))))
 
+(test a-block-that-fails-for-good-punishes-the-peer-that-sent-it
+  "Core remembers which peer delivered a block body (mapBlockSource,
+net_processing.cpp:4886-4893) and, when validation marks the block invalid,
+BlockChecked punishes that peer: a BLOCK_CONSENSUS verdict on a full block is
+Misbehaving (net_processing.cpp:2198-2227, 1920-1925). feature_assumevalid.py
+:155 sends a block with a bad signature and waits for the disconnect; ours
+logged the verdict and kept the peer, because the verdict arrives in the
+download drain, long after the handler that knew the sender returned.
+
+Controls: a mutation-class failure (entry not marked) punishes nobody, and a
+source forgotten because the block connected is not punished later."
+  (with-network (:regtest)
+    (with-ibd-context
+      (let* ((header (%mtp-header (%bd-hash 0) 1700000100 :grind nil))
+             (blk (bl.ser:make-bitcoin-block :header header :transactions '()))
+             (hash (bl.ser:block-header-hash header))
+             (state (bl.store:make-chain-state))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid))
+             (entry (bl.store:make-block-index-entry
+                     :hash hash :height 1 :chain-work 2
+                     :prev-entry genesis :status :header-valid)))
+        (flet ((sender ()
+                 (bl.net:make-peer
+                  :connection (make-test-connection :host "10.0.0.7" :port 18444
+                                                    :connected t :socket nil)
+                  :state :ready :address "10.0.0.7"
+                  :conn-type :outbound-full-relay)))
+          (bl.store:add-block-index-entry state genesis)
+          (bl.store:add-block-index-entry state entry)
+          (bl.store:update-chain-tip state (%bd-hash 0) 0)
+          (bl.net:clear-block-failure hash)
+          ;; Control 1: a mutation-class failure is not a final verdict.
+          (let ((peer (sender)))
+            (bl.net:note-block-source hash peer)
+            (bl.net:handle-validation-failure blk 1 :bad-witness-merkle-match state)
+            (is (eq :ready (bl.net:peer-state peer)))
+            (bl.net:clear-block-failure hash))
+          ;; Control 2: the block connected, so its source is forgotten.
+          (let ((peer (sender)))
+            (bl.net:note-block-source hash peer)
+            (bl.net:clear-block-failure hash)
+            (setf (bl.store:block-index-entry-status entry) :invalid)
+            (bl.net:handle-validation-failure blk 1 :block-script-verify-flag-failed state)
+            (is (eq :ready (bl.net:peer-state peer))))
+          ;; The final verdict punishes the sender.
+          (let ((peer (sender)))
+            (bl.net:note-block-source hash peer)
+            (bl.net:handle-validation-failure blk 1 :block-script-verify-flag-failed state)
+            (is (eq :disconnected (bl.net:peer-state peer)))))
+        (bl.net:clear-block-failure hash)))))
+
 (test block-request-pass-leaves-the-callers-peer-list-alone
   "REQUEST-BLOCKS-FROM-PEERS must not modify the list it is handed. It ranks
 its candidates by ping latency, and the ranking used to be

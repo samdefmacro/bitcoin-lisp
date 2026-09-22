@@ -86,6 +86,7 @@ headerssync.cpp. src/networking/.")
    #:process-tx-requests
    #:note-block-failure
    #:clear-block-failure
+   #:note-block-source
    #:block-failure-paused-p
    #:+max-block-revalidation-attempts+
    ;; Steady-state message pump (post-IBD receive loop)
