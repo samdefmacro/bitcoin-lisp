@@ -4032,60 +4032,56 @@ that connected mid-flush would see it."
           (bl.mp:mempool-sequence mempool))
     count)))
 
+(defun %next-inv-to-inbounds (now)
+  "Core NextInvToInbounds (net_processing.cpp:1172-1181): the shared inbound
+rotation's deadline, advanced to NOW plus a fresh draw once NOW has passed it
+(or the clock moved back out of its reach), and returned either way."
+  (when (or (< *next-inbound-inv-flush* now)
+            (%inv-deadline-unreachable-p *next-inbound-inv-flush* now
+                                         +inbound-inv-broadcast-interval+))
+    (setf *next-inbound-inv-flush*
+          (+ now (%next-exp-interval-seconds +inbound-inv-broadcast-interval+))))
+  *next-inbound-inv-flush*)
+
 (defun flush-tx-announcements (peers mempool)
   "Flush due per-peer tx announcement queues (call ~1x/second from the
-sync loop). Outbound peers each run an exponential timer with mean
-+outbound-inv-broadcast-interval+; all inbound peers flush together on
-the shared *next-inbound-inv-flush* rotation with mean
-+inbound-inv-broadcast-interval+ — Core net_processing.cpp:5980-5990.
-Holds the node lock: the queues are also written by the RPC broadcast
-path (sendrawtransaction/submitpackage), which enqueues under the same
-lock from RPC handler threads."
+sync loop): Core SendMessages' trickle gate (net_processing.cpp:5980-5990).
+Every peer carries its own m_next_inv_send_time -- an outbound peer's drawn
+with mean +outbound-inv-broadcast-interval+, an inbound peer's taken from the
+shared rotation (%NEXT-INV-TO-INBOUNDS, mean +inbound-inv-broadcast-interval+)
+-- and a peer whose time has passed trickles and re-draws. A peer's FIRST
+pass trickles too, its time starting at zero as Core's does: armed without a
+send, as this used to be, the first pass after a setmocktime jump armed the
+deadline past the frozen clock, and the queued inv never left
+(p2p_leak_tx.py:51, one run in two). A noban peer trickles on every pass
+(:5981). Holds the node lock: the queues are also written by the RPC
+broadcast path (sendrawtransaction/submitpackage), which enqueues under the
+same lock from RPC handler threads."
   (with-current-node-lock
-    (let ((now (bl.ser:get-unix-time))
-          (inbound-due nil))
-      ;; Shared inbound rotation.
-      (cond ((or (zerop *next-inbound-inv-flush*)
-                 (%inv-deadline-unreachable-p *next-inbound-inv-flush* now
-                                              +inbound-inv-broadcast-interval+))
-             (setf *next-inbound-inv-flush*
-                   (+ now (%next-exp-interval-seconds +inbound-inv-broadcast-interval+))))
-            ((>= now *next-inbound-inv-flush*)
-             (setf inbound-due t
-                   *next-inbound-inv-flush*
-                   (+ now (%next-exp-interval-seconds +inbound-inv-broadcast-interval+)))))
+    (let ((now (bl.ser:get-unix-time)))
       (dolist (peer peers)
         (when (and (eq (peer-state peer) :ready)
                    ;; fRelay=0 peers have no tx-relay state: no inv flushes,
                    ;; and no last-inv-sequence advance either (their getdata
                    ;; is ignored outright anyway).
                    (peer-tx-relay-p peer))
-          ;; A noban peer trickles on EVERY pass (Core SendMessages seeds
-          ;; fSendTrickle with HasPermission(NoBan), net_processing.cpp:5981);
-          ;; its timer still runs, but no longer gates it. The functional
-          ;; framework's `-whitelist=noban@127.0.0.1  # immediate tx relay'
-          ;; relies on it with the clock frozen by setmocktime
-          ;; (mempool_reorg.py:38 then :201's sync_all).
-          (let ((trickle (peer-has-permission-p peer +perm-noban+)))
-            (if (peer-inbound peer)
-                (when (or inbound-due trickle)
-                  (%flush-peer-tx-invs peer mempool))
-                (cond ((or (zerop (peer-next-inv-send-time peer))
-                           (%inv-deadline-unreachable-p
-                            (peer-next-inv-send-time peer) now
-                            +outbound-inv-broadcast-interval+))
-                       (setf (peer-next-inv-send-time peer)
-                             (+ now (%next-exp-interval-seconds
-                                     +outbound-inv-broadcast-interval+)))
-                       (when trickle
-                         (%flush-peer-tx-invs peer mempool)))
-                      ((>= now (peer-next-inv-send-time peer))
-                       (setf (peer-next-inv-send-time peer)
-                             (+ now (%next-exp-interval-seconds
-                                     +outbound-inv-broadcast-interval+)))
-                       (%flush-peer-tx-invs peer mempool))
-                      (trickle
-                       (%flush-peer-tx-invs peer mempool))))))))))
+          ;; noban: the framework's `-whitelist=noban@127.0.0.1  # immediate
+          ;; tx relay' relies on it under a frozen clock (mempool_reorg.py:38).
+          (let* ((trickle (peer-has-permission-p peer +perm-noban+))
+                 (next (peer-next-inv-send-time peer))
+                 (mean (if (peer-inbound peer)
+                           +inbound-inv-broadcast-interval+
+                           +outbound-inv-broadcast-interval+))
+                 (backwards (%inv-deadline-unreachable-p next now mean)))
+            (when (or backwards (zerop next) (>= now next))
+              ;; A clock that moved BACKWARDS re-arms without a send.
+              (unless backwards (setf trickle t))
+              (setf (peer-next-inv-send-time peer)
+                    (if (peer-inbound peer)
+                        (%next-inv-to-inbounds now)
+                        (+ now (%next-exp-interval-seconds mean)))))
+            (when trickle
+              (%flush-peer-tx-invs peer mempool))))))))
 
 ;;; Initial broadcast of locally-submitted transactions (Core
 ;;; BroadcastTransaction -> InitiateTxBroadcastToAll + the scheduled

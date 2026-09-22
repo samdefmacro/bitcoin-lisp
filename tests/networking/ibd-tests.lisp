@@ -2282,21 +2282,24 @@ until flush time."
                (bl.net:peer-announced-txs peer) txid))))
 
 (test flush-tx-announcements-drains-on-schedule
-  "First flush pass only arms an outbound peer's exponential timer (Core
-initializes m_next_inv_send_time the same way); once the deadline is
-due, the queue drains and the tx is marked known to the peer under the id
-that peer's inventory uses — the WTXID here, since it negotiated wtxidrelay
-(Core keys m_tx_inventory_known_filter by `m_wtxid_relay ? wtxid : txid`).
-Send errors from the connectionless peer are swallowed."
+  "A peer's first flush pass trickles and draws its exponential timer (Core's
+m_next_inv_send_time starts at zero, which is always past); a later pass
+drains only once that deadline is due, and the tx is marked known to the
+peer under the id that peer's inventory uses — the WTXID here, since it
+negotiated wtxidrelay (Core keys m_tx_inventory_known_filter by
+`m_wtxid_relay ? wtxid : txid`). Send errors from the connectionless peer
+are swallowed."
   (let* ((bl:*network* :regtest)
          (peer (bl.net:make-peer :state :ready :wtxid-relay t))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 23))
          (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 24)))
-    (bl.net:relay-transaction
-     txid nil (list peer) :fee-rate-per-kvb 2 :wtxid wtxid)
-    ;; Arm pass: timer initialized, nothing flushed.
+    ;; First pass: timer drawn (the queue was empty).
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (plusp (bl.net::peer-next-inv-send-time peer)))
+    (bl.net:relay-transaction
+     txid nil (list peer) :fee-rate-per-kvb 2 :wtxid wtxid)
+    ;; Not due yet (the draw is at least a second out): nothing flushed.
+    (bl.net:flush-tx-announcements (list peer) nil)
     (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     ;; Deadline in the past: flush drains and marks announced.
     (setf (bl.net::peer-next-inv-send-time peer) 1)
@@ -2325,11 +2328,10 @@ control is the same peer with the clock left where it was."
          (bl.ser:*mock-time* 1700000000)
          (peer (bl.net:make-peer :state :ready))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 31)))
-    (bl.net:relay-transaction txid nil (list peer) :fee-rate-per-kvb 2)
-    ;; Arm pass: the timer is set, nothing flushed.
+    ;; First pass: the timer is drawn (Core's first pass trickles an empty
+    ;; queue); the tx is queued after it.
     (bl.net:flush-tx-announcements (list peer) nil)
-    (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
-        "the arming pass must not flush")
+    (bl.net:relay-transaction txid nil (list peer) :fee-rate-per-kvb 2)
     ;; Control: time has not moved, so neither has the schedule.
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
@@ -2339,6 +2341,33 @@ control is the same peer with the clock left where it was."
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (null (bl.net:peer-tx-inv-queue peer))
         "the trickle did not fire after the mock clock moved past its deadline")))
+
+(test a-peers-first-trickle-pass-sends
+  "Core's m_next_inv_send_time starts at zero, so a peer's FIRST SendMessages
+pass is always past it and trickles (net_processing.cpp:5982-5989). Ours armed
+the timer on that pass and sent nothing; when the first pass came after a
+setmocktime jump, the deadline was armed PAST the frozen clock and the queued
+inv never left -- p2p_leak_tx.py:51 waits for exactly that inv after moving
+the clock 120 s (one run in two, depending on whether the sync thread had
+ticked before the jump). A second pass at the same frozen instant does not
+trickle again: the control."
+  (let* ((bl:*network* :regtest)
+         (bl.ser:*mock-time* 1820000000)
+         (peer (bl.net:make-peer :state :ready :inbound t))
+         (a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 51))
+         (b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 52)))
+    ;; The shared inbound rotation is already running at this instant (a
+    ;; pass with no peers draws it), as it is on a node whose sync thread
+    ;; ticked before the new peer's first pass.
+    (bl.net:flush-tx-announcements '() nil)
+    (bl.net:relay-transaction a nil (list peer) :fee-rate-per-kvb 2)
+    (bl.net:flush-tx-announcements (list peer) nil)
+    (is (null (bl.net:peer-tx-inv-queue peer))
+        "the first pass trickles the queued inv")
+    (bl.net:relay-transaction b nil (list peer) :fee-rate-per-kvb 2)
+    (bl.net:flush-tx-announcements (list peer) nil)
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
+        "control: the next pass at the same instant waits for the rotation")))
 
 (test a-noban-peer-trickles-on-every-pass
   "Core seeds fSendTrickle with HasPermission(NoBan) (net_processing.cpp:5981),

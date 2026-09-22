@@ -171,9 +171,9 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; Unix-time deadline of the next inv flush for this peer, on Core's
   ;; MOCKABLE clock -- Core's m_next_inv_send_time comes from
   ;; GetTime<microseconds>(), which setmocktime moves, and that is how the
-  ;; functional tests make a trickle fire without sleeping (outbound peers
-  ;; only; inbound peers share one rotation, see *next-inbound-inv-flush*).
-  ;; 0 = not yet scheduled.
+  ;; functional tests make a trickle fire without sleeping (an inbound
+  ;; peer's is read off the shared rotation, see *next-inbound-inv-flush*).
+  ;; 0 = no pass yet: the first one trickles, as Core's does.
   (next-inv-send-time 0 :type integer)
   ;; Health monitoring
   ;; Block delivery tracking.
