@@ -59,37 +59,71 @@ array is not null), or NIL and a second value of NIL when it is not JSON."
             (if (peek-char t in nil nil) (values nil nil) (values value t)))))
     (error () (values nil nil))))
 
+(defvar *signer-run-counter* (list 0)
+  "Serial number for %RUN-WITH-FILES's temporary names. Together with the pid
+it keeps two calls -- in this process or in another node sharing the
+temporary directory -- off each other's files; a random suffix would not,
+since every process started from the saved image starts from the same
+random state.")
+
+(defun %run-with-files (args stdin)
+  "Run ARGS (program first, looked up on PATH) with STDIN as its standard
+input; (values exit-code stdout stderr).
+
+All three streams go through temporary FILES. Handing SB-EXT:RUN-PROGRAM a
+Lisp string stream instead makes it copy through a pipe from a serve-event
+handler, and :WAIT returns when the child EXITS, not when that handler has
+drained the pipe -- so the output can be cut short and the handler outlive
+the call. A file the child writes and we read afterwards has neither
+problem."
+  (let* ((base (format nil "bl-signer-~D-~D" (sb-posix:getpid)
+                      (sb-ext:atomic-incf (car *signer-run-counter*))))
+         (dir (uiop:temporary-directory))
+         (in (merge-pathnames (format nil "~A.in" base) dir))
+         (out (merge-pathnames (format nil "~A.out" base) dir))
+         (err (merge-pathnames (format nil "~A.err" base) dir)))
+    (unwind-protect
+         (progn
+           (with-open-file (s in :direction :output :if-exists :supersede
+                                 :external-format :utf-8)
+             (write-string stdin s))
+           (let ((process (handler-case
+                              (sb-ext:run-program (first args) (rest args)
+                                                  :search t :wait t :input in
+                                                  :output out :if-output-exists :supersede
+                                                  :error err :if-error-exists :supersede)
+                            ;; cpp-subprocess's OSError: the child could not exec.
+                            (error (e)
+                              (let* ((text (princ-to-string e))
+                                     (colon (search ": " text :from-end t)))
+                                (%signer-fail "execve failed: ~A"
+                                              (if colon (subseq text (+ colon 2)) text)))))))
+             (flet ((slurp (path)
+                      (or (ignore-errors (uiop:read-file-string path :external-format :utf-8)) "")))
+               (values (sb-ext:process-exit-code process) (slurp out) (slurp err)))))
+      (dolist (path (list in out err))
+        (ignore-errors (delete-file path))))))
+
 (defun run-command-parse-json (args &optional (stdin ""))
-  "Core RunCommandParseJSON (common/run_command.cpp:17-47): run ARGS (program
-first, looked up on PATH) with STDIN on its standard input, and read the FIRST
-line of its stdout as JSON. A non-zero exit is \"RunCommandParseJSON error:
-process(<cmd>) returned <n>: <first stderr line>\"; output that is not JSON is
-\"Unable to parse JSON: <line>\". The child inherits the node's working
-directory, which is where Core's mock signer finds the files a test leaves
-for it (mocks/signer.py:14)."
+  "Core RunCommandParseJSON (common/run_command.cpp:17-47): run ARGS with
+STDIN on its standard input, and read the FIRST line of its stdout as JSON. A
+non-zero exit is \"RunCommandParseJSON error: process(<cmd>) returned <n>:
+<first stderr line>\"; output that is not JSON is \"Unable to parse JSON:
+<line>\". The child inherits the node's working directory, which is where
+Core's mock signer finds the files a test leaves for it (mocks/signer.py:14)."
   (when (null args) (return-from run-command-parse-json nil))
-  (let* ((out (make-string-output-stream))
-         (err (make-string-output-stream))
-         (process (handler-case
-                      (sb-ext:run-program (first args) (rest args)
-                                          :search t :wait t
-                                          :input (make-string-input-stream stdin)
-                                          :output out :error err)
-                    ;; cpp-subprocess's OSError: the child could not exec.
-                    (error (e)
-                      (let* ((text (princ-to-string e))
-                             (colon (search ": " text :from-end t)))
-                        (%signer-fail "execve failed: ~A"
-                                      (if colon (subseq text (+ colon 2)) text))))))
-         (code (sb-ext:process-exit-code process))
-         (result (%first-line (get-output-stream-string out)))
-         (error-line (%first-line (get-output-stream-string err))))
-    (unless (zerop code)
-      (%signer-fail "RunCommandParseJSON error: process(~{~A~^ ~}) returned ~D: ~A~%"
-                    args code error-line))
-    (multiple-value-bind (json ok) (%parse-signer-json result)
-      (unless ok (%signer-fail "Unable to parse JSON: ~A" result))
-      json)))
+  (multiple-value-bind (code stdout stderr) (%run-with-files args stdin)
+    (let ((result (%first-line stdout)))
+      (unless (zerop code)
+        ;; Core keeps only the first stderr line in the error; the log keeps
+        ;; the rest, which for a Python signer is where the traceback is.
+        (bl:log-warn "signer ~{~A~^ ~} exited ~D: ~A" args code
+                     (subseq stderr 0 (min 4000 (length stderr))))
+        (%signer-fail "RunCommandParseJSON error: process(~{~A~^ ~}) returned ~D: ~A~%"
+                      args code (%first-line stderr)))
+      (multiple-value-bind (json ok) (%parse-signer-json result)
+        (unless ok (%signer-fail "Unable to parse JSON: ~A" result))
+        json))))
 
 (defun %json-field (object name)
   (and (listp object) (cdr (assoc name object :test #'string=))))
