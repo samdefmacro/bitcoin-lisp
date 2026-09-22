@@ -244,3 +244,35 @@ targets) and that an explicit -dnsseed=1 is ignored under -proxy
     (is (has (lines '("fakeaddress1") '() t t)
              "-dnsseed is ignored when -connect is used and -proxy is specified"))
     (is (not (has (lines '("fakeaddress1") '() t nil) "-dnsseed is ignored")))))
+
+(test idle-tick-drops-a-handshake-that-outlived-peertimeout-on-the-mock-clock
+  "Core evaluates InactivityCheck on every socket-handler pass
+(SocketHandlerConnected, net.cpp:2218) against GetTime -- the MOCKABLE clock --
+and m_connected is that clock at accept (net.cpp:3982), so a test that freezes
+the clock, opens a connection that never finishes its handshake and then bumps
+the clock past -peertimeout sees the peer dropped at once:
+p2p_v2_misbehaving.py:155 and p2p_timeouts.py:98 give the disconnect ONE
+second. Ours judged the gate on the process's real clock, and ran it only from
+the once-per-pass MAINTAIN-PEERS sweep, up to 30 s later.
+
+Control: with the clock left at the connect time the same tick keeps the peer."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (t0 1780000000)
+         (bl.ser:*mock-time* t0)
+         (bl:*handshake-timeout-seconds* 3)
+         (peer (bl.net:make-peer :state :handshaking :address "203.0.113.9")))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t)
+           (push peer (bl:node-peers node))
+           (%idle-tick)
+           (is-true (member peer (bl:node-peers node))
+                    "control: inside -peertimeout on the mock clock the peer stays")
+           (setf bl.ser:*mock-time* (+ t0 4))
+           (%idle-tick)
+           (is-false (member peer (bl:node-peers node))
+                     "one tick after the mock clock passes -peertimeout the unfinished handshake is dropped")
+           (is (eq :disconnected (bl.net:peer-state peer))))
+      (setf (bl:node-running node) nil))))

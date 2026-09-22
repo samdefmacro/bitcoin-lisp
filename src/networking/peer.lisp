@@ -1478,7 +1478,11 @@ On :FALLBACK-V1 (the peer never answered our key -- almost certainly a v1
 node), reconnect to the same host/port and continue in v1. Returns T when the
 version handshake may proceed (over whichever transport), NIL to give up."
   (let* ((conn (peer-connection peer))
-         (result (v2-handshake-outbound conn :peer-id (peer-id peer))))
+         (result (progn
+                   (setf (connection-v2-detecting conn) t)
+                   (unwind-protect
+                        (v2-handshake-outbound conn :peer-id (peer-id peer))
+                     (setf (connection-v2-detecting conn) nil)))))
     (cond
       ((v2-transport-p result)
        (setf (connection-transport conn) result)
@@ -1541,9 +1545,12 @@ TIMEOUT than the outbound path bounds how long a silent inbound peer can
 stall. Returns T on success."
   (setf (peer-state peer) :handshaking)
   (when (v2-available-p)
-    (let ((detected (v2-detect-inbound (peer-connection peer)
-                                       :timeout timeout
-                                       :peer-id (peer-id peer))))
+    (let ((detected (let ((conn (peer-connection peer)))
+                      (setf (connection-v2-detecting conn) t)
+                      (unwind-protect
+                           (v2-detect-inbound conn :timeout timeout
+                                                   :peer-id (peer-id peer))
+                        (setf (connection-v2-detecting conn) nil)))))
       (cond ((v2-transport-p detected)
              (setf (connection-transport (peer-connection peer)) detected)
              (bl:log-cat "net" "v2 transport established (inbound), ~A"
@@ -1774,10 +1781,19 @@ sent once no ping is outstanding and this long has passed.")
 disconnects the peer (MaybeSendPing, net_processing.cpp:5487-5494) -- behind
 SHOULD-RUN-INACTIVITY-CHECKS-P, like every other liveness verdict.")
 
-(defun should-run-inactivity-checks-p (peer &optional (now (get-internal-real-time)))
+(defun should-run-inactivity-checks-p (peer &optional (unix-now (bl.ser:get-unix-time)))
   "T once PEER has been connected for longer than -peertimeout: Core's
 CConnman::ShouldRunInactivityChecks, `node.m_connected + m_peer_connect_timeout
 < now` (net.cpp:2003-2006).
+
+Both sides are on the MOCKABLE clock, as Core's are: m_connected is
+GetTime<seconds>() at construction (net.cpp:3982) and `now' is GetTime in
+SocketHandlerConnected, so PEER-CONNECTED-AT (a unix time stamped when the peer
+object is made) against GET-UNIX-TIME. This read the process-relative real
+clock (PEER-CONNECT-TIME) until 2026-09-23, so a test that froze the clock with
+setmocktime and then bumped it past -peertimeout never saw a handshake timeout
+(p2p_v2_misbehaving.py:155, p2p_timeouts.py:98), and one that left the clock
+frozen still got one in real time.
 
 In Core this is the master gate for EVERY liveness disconnect, not one timeout
 among several: it guards all four rules of InactivityCheck (net.cpp:2008-2058)
@@ -1790,13 +1806,11 @@ not disconnect peers (test/functional/test_framework/util.py:570-574). Ours
 disconnected on an outstanding ping at 1200 s under exactly that setting,
 because the ping timeout was not gated by the knob.
 
-A peer whose CONNECT-TIME was never stamped is exempt, the same reading
-CHECK-HANDSHAKE-TIMEOUT has always given a 0."
-  (let ((connected-at (peer-connect-time peer)))
+A peer whose CONNECTED-AT is 0 is exempt, the reading CHECK-HANDSHAKE-TIMEOUT
+has always given an unstamped connection time."
+  (let ((connected-at (peer-connected-at peer)))
     (and (not (zerop connected-at))
-         (< (+ connected-at (* bl:*handshake-timeout-seconds*
-                               internal-time-units-per-second))
-            now))))
+         (< (+ connected-at bl:*handshake-timeout-seconds*) unix-now))))
 
 (defun inactivity-check-reason (conn &optional (unix-now (bl.ser:get-node-time)))
   "Why CONN fails Core's CConnman::InactivityCheck (net.cpp:2008-2052), worded
@@ -1849,13 +1863,19 @@ disconnected, :ok otherwise.
 
 The gate IS the rule here: Core's own condition is that the connection has
 outlived -peertimeout without finishing its handshake, so this asks
-SHOULD-RUN-INACTIVITY-CHECKS-P rather than recomputing the same arithmetic."
+SHOULD-RUN-INACTIVITY-CHECKS-P rather than recomputing the same arithmetic.
+
+The line is Core's, word for word, and names the transport stage the way
+Core's does: \"V2 handshake timeout\" while the BIP324 exchange is still
+DETECTING (V2Transport::GetInfo reports that until the peer's version packet
+is in, net.cpp:1586-1592), \"version handshake timeout\" otherwise
+(net.cpp:2049-2056). p2p_v2_misbehaving.py:154 and p2p_timeouts.py:98 wait
+for exactly these texts."
   (if (and (member (peer-state peer) '(:connected :connecting :handshaking))
            (should-run-inactivity-checks-p peer))
-      (progn
-        (bl:log-cat "net" "version handshake timeout: ~,1Fs elapsed, ~A"
-                    (/ (float (- (get-internal-real-time) (peer-connect-time peer)))
-                       (float internal-time-units-per-second))
+      (let ((conn (peer-connection peer)))
+        (bl:log-cat "net" "~:[version~;V2~] handshake timeout, ~A"
+                    (and conn (connection-v2-detecting conn))
                     (disconnect-msg peer))
         :disconnect)
       :ok))
@@ -1879,7 +1899,7 @@ overwritten and its age never reset."
       ((peer-ping-nonce peer)
        (cond
          ((and (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
-               (should-run-inactivity-checks-p peer now))
+               (should-run-inactivity-checks-p peer))
           (bl:log-cat "net" "ping timeout: ~,1Fs, disconnecting peer=~A"
                       (/ (float age) (float internal-time-units-per-second))
                       (peer-id peer))
@@ -1925,7 +1945,7 @@ then MaybeSendPing (MAYBE-SEND-PING)."
       ;; retry buffered unsent bytes, non-blocking (Core's periodic
       ;; SocketSendData).
       (flush-send-buffer conn)
-      (when (should-run-inactivity-checks-p peer now)
+      (when (should-run-inactivity-checks-p peer)
         ;; Buffered data the socket has accepted nothing of for the stall
         ;; window (Core InactivityCheck "socket sending timeout", narrowed by
         ;; the pending-data test to the backpressure case).

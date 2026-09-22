@@ -1497,6 +1497,12 @@ sync thread with node-running still T is a socket-reading zombie)."
     (error (c)
       (log-error "Initial peer connection failed (retrying in loop): ~A" c))))
 
+(defun %sync-tick-liveness (node)
+  "The per-tick liveness verdicts, on the MOCKABLE clock: InactivityCheck for
+the handshakes still in flight (Core runs it on every socket-handler pass,
+net.cpp:2218)."
+  (check-handshaking-peers node))
+
 (defun %sync-idle-tick (second)
   "One sub-second tick of the sync thread's wait between sync passes (Core's
 per-peer ProcessMessages / SendMessages duties, bounded): admit the peers the
@@ -1510,17 +1516,17 @@ now: new headers arrived, a peer was admitted or dialed this tick, or the
 node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
   ;; Admit the peers that arrived during the wait BEFORE the pump reads, or
   ;; they sit in the hand-off list until the next cycle merges them: the
-  ;; listener's handshaked inbound peers, and the addnode-onetry /
-  ;; addconnection dials. Core has no such gap -- an accepted socket joins
-  ;; m_nodes at once (net.cpp:1854-1858) and ProcessMessages runs on it
-  ;; continuously. Measured before this: every functional test's python peer
-  ;; waited up to 30 s for its first reply, and each addconnection took a
-  ;; whole cycle.
+  ;; listener's inbound peers, and the addnode-onetry / addconnection dials.
+  ;; Core has no such gap -- an accepted socket joins m_nodes at once
+  ;; (net.cpp:1854-1858) and ProcessMessages runs on it continuously.
+  ;; Measured before this: every functional test's python peer waited up to
+  ;; 30 s for its first reply, and each addconnection took a whole cycle.
   (let* ((peers-before (length (node-peers *node*)))
          (admitted (progn
                      (merge-inbound-peers *node*)
                      (dial-queued-nodes *node*)
                      (> (length (node-peers *node*)) peers-before))))
+  (%sync-tick-liveness *node*)      ; InactivityCheck
   (run-header-sync-duties *node*)   ; Core SendMessages, headers half
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the

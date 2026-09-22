@@ -629,11 +629,11 @@ Returns the number of peers connected."
 
 ;;;; Peer Health and Reconnection
 
-(defun check-peers-health (node)
-  "Check health of all peers. Disconnect unresponsive ones.
+(defun check-peers-health (node &key (peers (node-peers node)))
+  "Check health of PEERS (default: all of NODE's). Disconnect unresponsive ones.
 Also checks compact block reconstruction timeouts (BIP 152)."
   (let ((to-disconnect '()))
-    (dolist (peer (node-peers node))
+    (dolist (peer peers)
       ;; Both checks below can WRITE (ping, compact-block getdata); a peer
       ;; that FIN'd since the last drain raises stream-error from that
       ;; write. Fold any error into :disconnect instead of letting it
@@ -656,6 +656,22 @@ Also checks compact block reconstruction timeouts (BIP 152)."
       (bt:with-recursive-lock-held ((node-lock node))
         (setf (node-peers node) (remove peer (node-peers node)))))
     (length to-disconnect)))
+
+(defun check-handshaking-peers (node)
+  "Run the liveness check on every peer still in its version handshake, from
+the sync thread's sub-second tick. Core evaluates InactivityCheck on every
+socket-handler pass (SocketHandlerConnected, net.cpp:2120-2125 and :2218), so a peer
+that outlives -peertimeout without finishing its handshake is dropped as soon
+as the (mockable) clock says so; p2p_v2_misbehaving.py:155 and
+p2p_timeouts.py:98 bump mocktime past -peertimeout and give the disconnect
+ONE second. MAINTAIN-PEERS' sweep runs once per sync pass, up to 30 s later.
+Ready peers keep that cadence: this is only the unfinished-handshake half."
+  (let ((unfinished (bt:with-recursive-lock-held ((node-lock node))
+                      (remove-if (lambda (p)
+                                   (member (bl.net:peer-state p) '(:ready :disconnected)))
+                                 (node-peers node)))))
+    (when unfinished
+      (check-peers-health node :peers unfinished))))
 
 (defun outbound-full-relay-peer-p (peer)
   "T iff PEER is a ready outbound full-relay connection — the only kind that

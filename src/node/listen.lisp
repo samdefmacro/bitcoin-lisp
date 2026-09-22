@@ -46,9 +46,7 @@ peertimeout=999999999."
   (unwind-protect
        (handler-case
            (if (bl.net:perform-inbound-handshake
-                peer
-                :timeout (min +inbound-handshake-timeout-cap-seconds+
-                              bl:*handshake-timeout-seconds*))
+                peer :timeout +inbound-handshake-timeout-cap-seconds+)
                (progn
                  (bl.net:send-post-handshake-messages peer)
                  (bl.net:send-compact-block-negotiation peer)

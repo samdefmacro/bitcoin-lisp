@@ -391,6 +391,7 @@ headerssync.cpp. src/networking/.")
    #:connection-port
    #:connection-socket
    #:connection-transport
+   #:connection-v2-detecting
    #:hss-current-height
    #:hss-state
    #:ibd-context-block-queue

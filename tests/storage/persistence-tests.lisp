@@ -1067,9 +1067,7 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
   ;; gate itself; this test is the ladder behind it.
   (flet ((peer-with-ping (age-seconds &key (nonce 7))
            (let ((peer (bl.net:make-peer :state :ready)))
-             (setf (bl.net:peer-connect-time peer)
-                   (- (get-internal-real-time)
-                      (* 3600 internal-time-units-per-second))
+             (setf (bl.net:peer-connected-at peer) (- (bl.ser:get-unix-time) 3600)
                    (bl.net:peer-ping-nonce peer) nonce
                    (bl.net:peer-last-ping-time peer)
                    (- (get-internal-real-time)

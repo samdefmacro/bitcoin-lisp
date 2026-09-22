@@ -215,24 +215,23 @@ same drained bucket is still refused."
   "Peers with recent connect time should be ok."
   (let ((peer (bl.net:make-peer
                :state :handshaking
-               :connect-time (get-internal-real-time))))
+               :connected-at (bl.ser:get-unix-time))))
     (is (eq :ok (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-disconnect-when-expired
   "Peers that exceeded handshake timeout should be flagged for disconnect."
-  (let* ((past-time (- (get-internal-real-time)
-                       (* (1+ bl:*handshake-timeout-seconds*)
-                          internal-time-units-per-second)))
+  (let* ((past-time (- (bl.ser:get-unix-time)
+                       (1+ bl:*handshake-timeout-seconds*)))
          (peer (bl.net:make-peer
                 :state :handshaking
-                :connect-time past-time)))
+                :connected-at past-time)))
     (is (eq :disconnect (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-not-checked-for-zero-connect-time
-  "Peers with connect-time 0 (default) should not be timed out."
+  "Peers with connected-at 0 (never stamped) should not be timed out."
   (let ((peer (bl.net:make-peer
                :state :connecting
-               :connect-time 0)))
+               :connected-at 0)))
     (is (eq :ok (bl.net:check-handshake-timeout peer)))))
 
 ;;;; ============================================================
@@ -1624,8 +1623,8 @@ Core's last_send rule and could not stand in for it."
          (window (* 20 60))
          (units internal-time-units-per-second))
     (flet ((connected-ago (seconds)
-             (setf (bl.net:peer-connect-time peer)
-                   (- (get-internal-real-time) (* seconds units))))
+             (setf (bl.net:peer-connected-at peer)
+                   (- (bl.ser:get-unix-time) seconds)))
            (talking-now ()
              (setf (bl.net:connection-last-send-time conn) (bl.ser:get-node-time)
                    (bl.net:connection-last-recv-time conn) (bl.ser:get-node-time))))
@@ -1671,7 +1670,7 @@ Core's last_send rule and could not stand in for it."
           "a peer younger than -peertimeout is exempt from every rule above")
       ;; ... and an unstamped connect time stays exempt, as CHECK-HANDSHAKE-TIMEOUT
       ;; has always read a 0.
-      (setf (bl.net:peer-connect-time peer) 0)
+      (setf (bl.net:peer-connected-at peer) 0)
       (is (eq :ok (bl.net:check-peer-health peer))))))
 
 (test dead-connection-reap-names-its-reason
@@ -2223,14 +2222,12 @@ level assertion below then measured that instead of the default."
 (defun %timed-out-handshake-peer ()
   "A peer whose handshake has outlived -peertimeout, at a routable address.
 
-CONNECT-TIME is on GET-INTERNAL-REAL-TIME, which SBCL counts from the first
-call, so 1 means \"one unit into this process\" and the peer's age is the
-PROCESS's age. Callers therefore bind -peertimeout to 0 rather than rely on the
-image being older than its default 60 s: the warm image always is, a
-freshly-started battery is not, and the cold lane failed on exactly that."
+CONNECTED-AT is a unix time on the mockable clock, so 1 is 1970 and the peer is
+decades past any -peertimeout; callers still bind -peertimeout to 0 so the
+verdict never depends on the knob's default."
   (bl.net:make-peer :state :handshaking
                     :address "203.0.113.77:8333"
-                    :connect-time 1))
+                    :connected-at 1))
 
 (test a-peer-line-names-the-id-and-hides-the-address
   "Core's per-peer lines are \"...peer=<id>\" plus CNode::LogIP, which is
@@ -2312,3 +2309,34 @@ no address at all, and an accepted inbound connection is announced as
              "the accept line must still be emitted: ~S" accepted)
     (is-false (search "192.0.2.44" accepted)
               "an inbound peer's address must not reach the log: ~S" accepted)))
+
+(test handshake-timeout-names-the-v2-stage-on-the-mock-clock
+  "Core's InactivityCheck judges an unfinished handshake on the MOCKABLE clock
+(m_connected = GetTime at accept, net.cpp:3982; `now' = GetTime in
+SocketHandlerConnected) and words the line by transport stage: \"V2 handshake
+timeout\" while V2Transport::GetInfo still reports DETECTING (net.cpp:1586-1592,
+2049-2052), \"version handshake timeout\" otherwise.
+p2p_v2_misbehaving.py:154 freezes the clock, lets real time pass, bumps the
+clock past -peertimeout=3 and waits for the V2 line.
+
+Control: with the clock still at the connect time the verdict is :ok however
+long the process has been up."
+  (let* ((t0 1780000000)
+         (bl.ser:*mock-time* t0)
+         (bl:*handshake-timeout-seconds* 3)
+         (conn (make-test-connection :host "203.0.113.78"))
+         (peer (bl.net:make-peer :state :handshaking :address "203.0.113.78"
+                                 :connection conn)))
+    (is (= t0 (bl.net:peer-connected-at peer)) "control: stamped on the mock clock")
+    (is (eq :ok (bl.net:check-handshake-timeout peer))
+        "a frozen clock inside -peertimeout keeps the peer, whatever the real clock says")
+    (setf bl.ser:*mock-time* (+ t0 4))
+    (is (eq :disconnect (bl.net:check-handshake-timeout peer))
+        "bumping the mock clock past -peertimeout times the handshake out")
+    (is-true (search "version handshake timeout, disconnecting peer="
+                     (%logged-net-lines (lambda () (bl.net:check-handshake-timeout peer))))
+             "a v1 (or finished v2) exchange keeps Core's version line")
+    (setf (bl.net:connection-v2-detecting conn) t)
+    (is-true (search "V2 handshake timeout, disconnecting peer="
+                     (%logged-net-lines (lambda () (bl.net:check-handshake-timeout peer))))
+             "while the BIP324 exchange is still detecting, Core's V2 line")))

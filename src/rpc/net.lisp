@@ -349,9 +349,13 @@ whatever the cadence is."
            ("connection_type" . ,(%connection-type-string
                                   (bl.net:peer-conn-type peer)))
            ;; Core TransportTypeAsString: the BIP324 v2 session lives in
-           ;; connection-transport (NIL = plaintext v1). Peers surface
-           ;; here only after the handshake, so "detecting" never applies.
-           ("transport_protocol_type" . ,(if transport "v2" "v1"))
+           ;; connection-transport (NIL = plaintext v1). A peer is published
+           ;; at accept, so one still in the BIP324 exchange reports
+           ;; "detecting", as V2Transport::GetInfo does (net.cpp:1586-1592).
+           ("transport_protocol_type"
+            . ,(cond ((and conn (bl.net:connection-v2-detecting conn)) "detecting")
+                     (transport "v2")
+                     (t "v1")))
            ;; BIP324 session id (v2 only; "" otherwise, like Core).
            ("session_id"
             . ,(let ((sid (and transport

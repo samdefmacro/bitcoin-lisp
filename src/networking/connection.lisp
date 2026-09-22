@@ -100,6 +100,12 @@ peer from two directions.")
   ;; BIP324 v2 session (a v2-transport struct), or NIL for plaintext v1.
   ;; Set once by the v2 handshake; message I/O in peer.lisp branches on it.
   (transport nil)
+  ;; T while a BIP324 exchange is under way and has not yet produced the
+  ;; peer's version packet: the inbound v1/v2 sniff and the v2 key/garbage/
+  ;; version exchange, either direction. Core reports that stage as
+  ;; TransportProtocolType::DETECTING (V2Transport::GetInfo, net.cpp:1586-1592),
+  ;; in getpeerinfo and in InactivityCheck's handshake-timeout line.
+  (v2-detecting nil :type boolean)
   ;; Bytes sniffed ahead of the stream (inbound v1-vs-v2 detection reads 16
   ;; bytes before knowing which transport owns them); receive-bytes serves
   ;; these before touching the socket.
