@@ -3096,3 +3096,47 @@ output keys, so a wallet holding rawtr(XPRV) could not spend its own coins
                                          nil nil nil nil nil nil nil 10)))))))
           (is (null err) "rawtr spend: ~S" err)
           (is-true (member txid (coerce (rpc nil "getrawmempool") 'list) :test #'equal)))))))
+
+(test a-key-only-wallet-signs-a-rawtr-key-path
+  "SignTaproot's last key-path attempt signs for the OUTPUT key itself,
+untweaked (make_keypath_sig(output, nullptr), script/sign.cpp:588-590), so a
+wallet holding only the key -- as wpkh(xprv/*) -- signs a PSBT spending a
+rawtr() output of that key (wallet_taproot.py:367's key_only_wallet on
+rawtr(XPRV)). Our signing maps offered that key only BIP86-tweaked. The
+watch-only updater signing nothing is the control; the finished transaction
+must pass testmempoolaccept."
+  (with-wallet-chain-node (node "key-only-rawtr")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
+             (public (%aval "descriptor" (rpc nil "getdescriptorinfo" (format nil "rawtr(~A/0/*)" tprv)))))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "online" t t)
+        (rpc nil "createwallet" "keys" nil t)
+        (rpc "online" "importdescriptors" (list (obj "desc" public "active" t "timestamp" "now")))
+        (rpc "keys" "importdescriptors"
+             (list (obj "desc" (bl.rpc:descriptor-add-checksum (format nil "wpkh(~A/0/*)" tprv))
+                        "timestamp" "now")))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let ((txid (with-wallet-rng (131)
+                      (rpc "fund" "sendtoaddress" (rpc "online" "getnewaddress" "" "bech32m")
+                           (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))))
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((coin (find txid (coerce (rpc "online" "listunspent") 'list)
+                             :key (lambda (c) (%aval "txid" c)) :test #'equal))
+                 (psbt (rpc nil "createpsbt" (list (obj "txid" txid "vout" (%aval "vout" coin)))
+                            (list (obj optrue (bl.rpc:format-money 99990000)))))
+                 (updated (rpc "online" "walletprocesspsbt" psbt))
+                 (signed (rpc "keys" "walletprocesspsbt" (%aval "psbt" updated))))
+            (is (not (eq t (%aval "complete" updated))) "the control: the updater signs nothing")
+            (is (eq t (%aval "complete" signed)) "the key-only wallet signs: ~S" signed)
+            (is-true (and (%aval "hex" signed)
+                          (eq t (%aval "allowed" (first (rpc nil "testmempoolaccept"
+                                                             (list (%aval "hex" signed))))))))))))))

@@ -1877,9 +1877,16 @@ full-point check."
                 (cons priv pubkey))
           (setf (gethash pubkey pubmap) priv)
           (when (= (length pubkey) 33)
-            (let ((qx (bl.interop:compute-tweaked-pubkey
-                       (bl.crypto:derive-xonly-pubkey priv))))
-              (when qx (setf (gethash qx tr-keymap) priv)))))
+            (let* ((x (bl.crypto:derive-xonly-pubkey priv))
+                   (qx (bl.interop:compute-tweaked-pubkey x)))
+              (when qx (setf (gethash qx tr-keymap) priv))
+              ;; SignTaproot's last key-path try is the OUTPUT key itself,
+              ;; untweaked (make_keypath_sig(output, nullptr),
+              ;; script/sign.cpp:588-590) -- a rawtr() output, spendable by
+              ;; any wallet holding its key; wallet_taproot.py:367's
+              ;; key-only wallet signs one that way.
+              (unless (gethash x tr-keymap)
+                (setf (gethash x tr-keymap) (cons priv :untweaked))))))
         (bl:log-warn
          "wallet-sign: derived key does not match expected pubkey at index ~D; key skipped"
          pos))))
