@@ -719,7 +719,9 @@ whose nBits is negative / zero / overflowing / above the PoW limit is rejected
 
 (defun validate-header-chain (headers chain-state)
   "Validate a list of headers against the current chain state.
-Returns (VALUES valid-headers debug-message reject-reason).
+Returns (VALUES valid-headers debug-message reject-reason rejected-hash);
+REJECTED-HASH names the header the verdict is about, which Core's
+AcceptBlockHeader log line leads with (validation.cpp:4240, :4257).
 VALID-HEADERS is a list of headers that passed validation (may be fewer than input).
 
 Core keeps a rejection in TWO fields and joins them only in ValidationState::
@@ -765,7 +767,8 @@ the second stays the sentence the log line has always carried."
                         (format nil "Missing parent ~A"
                                 (bl.crypto:bytes-to-hex header-prev-hash))
                         ;; Core AcceptBlockHeader, validation.cpp:4249.
-                        "prev-blk-not-found")))
+                        "prev-blk-not-found"
+                        hash)))
 
             ;; Validate proof-of-work
             (unless (validate-header-pow header)
@@ -774,7 +777,8 @@ the second stays the sentence the log line has always carried."
                         (format nil "Invalid proof-of-work for header ~A"
                                 (bl.crypto:bytes-to-hex hash))
                         ;; Core CheckBlockHeader, validation.cpp:3864.
-                        "high-hash")))
+                        "high-hash"
+                        hash)))
 
             ;; Reject headers timestamped too far in the future (Core
             ;; ContextualCheckBlockHeader: block time > now + 2h). Admitting one
@@ -798,7 +802,8 @@ the second stays the sentence the log line has always carried."
                                   overshoot
                                   bl.val:+max-future-block-time+)
                           ;; Core ContextualCheckBlockHeader, validation.cpp:4141.
-                          "time-too-new"))))
+                          "time-too-new"
+                          hash))))
 
             ;; Validate timestamp > median-time-past. PARENT, not
             ;; HEADER-PREV-HASH: a mid-batch parent is a staging entry that is
@@ -810,7 +815,8 @@ the second stays the sentence the log line has always carried."
                         (format nil "Timestamp at or before median-time-past for header ~A"
                                 (bl.crypto:bytes-to-hex hash))
                         ;; Core ContextualCheckBlockHeader, validation.cpp:4125.
-                        "time-too-old")))
+                        "time-too-old"
+                        hash)))
 
             ;; Calculate new height and validate checkpoint
             (let* ((parent-height (if (eq parent prev-entry)
@@ -828,7 +834,8 @@ the second stays the sentence the log line has always carried."
                     (values (nreverse valid-headers)
                             (format nil "Bad difficulty at height ~D" new-height)
                             ;; Core ContextualCheckBlockHeader, validation.cpp:4121.
-                            "bad-diffbits"))))
+                            "bad-diffbits"
+                            hash))))
               ;; BIP94 timewarp mitigation at header ADMISSION (Core
               ;; ContextualCheckBlockHeader, validation.cpp:4129). This was
               ;; only enforced at connect time (validate-block-header); but
@@ -844,7 +851,8 @@ the second stays the sentence the log line has always carried."
                   (values (nreverse valid-headers)
                           (format nil "BIP94 timewarp violation at height ~D" new-height)
                           ;; Core ContextualCheckBlockHeader, validation.cpp:4134.
-                          "time-timewarp-attack")))
+                          "time-timewarp-attack"
+                          hash)))
               ;; Softfork version minimums, gated by activation height (Core
               ;; ContextualCheckBlockHeader BIP34/66/65). No upper bound --
               ;; miners roll high version bits (overt AsicBoost).
@@ -864,7 +872,8 @@ the second stays the sentence the log line has always carried."
                             ;; Core spells the offending version into the token
                             ;; itself (validation.cpp:4148).
                             (format nil "bad-version(0x~(~8,'0X~))"
-                                    (ldb (byte 32 0) version))))))
+                                    (ldb (byte 32 0) version))
+                            hash))))
 
               (unless (validate-checkpoint hash new-height)
                 (return-from validate-header-chain
@@ -873,7 +882,8 @@ the second stays the sentence the log line has always carried."
                           ;; Core dropped its checkpoint check (validation.cpp:
                           ;; 4108 keeps only the note); this is the token it
                           ;; used while it had one.
-                          "bad-fork-prior-to-checkpoint")))
+                          "bad-fork-prior-to-checkpoint"
+                          hash)))
 
               ;; Header is valid - create temp entry for chain linkage of next header
               (push header valid-headers)
@@ -3365,7 +3375,7 @@ received message there too.
 Holds the node lock: process-headers mutates the block index the RPC
 threads read/write under the same lock."
   (with-current-node-lock
-   (multiple-value-bind (valid error reason) (validate-header-chain headers chain-state)
+   (multiple-value-bind (valid error reason rejected) (validate-header-chain headers chain-state)
     (when error
       ;; Core logs every ContextualCheckBlockHeader failure at
       ;; LogDebug(BCLog::VALIDATION) with the header hash and the state string
@@ -3378,7 +3388,15 @@ threads read/write under the same lock."
       ;; The state STRING is the pair joined, reason first
       ;; (ValidationState::ToString, consensus/validation.h:111-122), so the
       ;; log line leads with the same token submitheader answers with.
-      (bl:log-cat "validation" "Header validation error: ~@[~A, ~]~A" reason error))
+      ;;
+      ;; And it leads with the HASH: `AcceptBlockHeader: Consensus::
+      ;; ContextualCheckBlockHeader: <hash>, <reason>, <debug>'. feature_cltv.py
+      ;; :138 and feature_dersig.py:103 wait for `<hash>, bad-version(...)'.
+      (bl:log-cat "validation" "AcceptBlockHeader: Consensus::~A: ~@[~A, ~]~@[~A, ~]~A"
+                  (if (equal reason "high-hash")
+                      "CheckBlockHeader"          ; validation.cpp:4240
+                      "ContextualCheckBlockHeader")
+                  (and rejected (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes rejected))) reason error))
     (let* (;; Core's received_new_header (net_processing.cpp:3079) is
            ;; `last_received_header == nullptr', where last_received_header is
            ;; the index lookup of headers.BACK() (:3052) — i.e. the LAST header

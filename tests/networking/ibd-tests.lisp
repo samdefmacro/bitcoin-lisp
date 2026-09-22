@@ -1161,9 +1161,24 @@ the median-time-past, which fails the timestamp>MTP rule deterministically."
                                   (vector 1)  ; header-count varint
                                   (bl.ser:serialize-block-header bad-hdr)
                                   (vector 0)))) ; per-header tx-count varint
-        (bl.net::handle-headers nil payload (bl.ctx:make-node-context :chain-state state))
-        (is (null (bl.store:get-block-index-entry state bad-hash))
-            "invalid header must not be admitted by handle-headers")))))
+        (let ((text (nth-value
+                     1 (log-text-of
+                        "validation"
+                        (lambda ()
+                          (bl.net::handle-headers
+                           nil payload
+                           (bl.ctx:make-node-context :chain-state state)))))))
+          (is (null (bl.store:get-block-index-entry state bad-hash))
+              "invalid header must not be admitted by handle-headers")
+          ;; Core's AcceptBlockHeader line leads with the header's HASH
+          ;; (validation.cpp:4257): `<hash>, <reason>, <debug>'.
+          ;; feature_cltv.py:138 and feature_dersig.py:103 wait for exactly
+          ;; `<hash>, bad-version(0x00000003)'.
+          (is-true (search (format nil "CheckBlockHeader: ~A, "
+                                   (bl.crypto:bytes-to-hex
+                                    (bl.crypto:reverse-bytes bad-hash)))
+                           text)
+                   "the rejection is logged under the header's hash"))))))
 
 (test validate-header-chain-rejects-future-and-bad-version
   "CONSENSUS (Core ContextualCheckBlockHeader): at header admission we now also
