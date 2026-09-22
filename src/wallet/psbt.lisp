@@ -282,17 +282,14 @@ the length attributes a script-path nonce to the key path."
             `(("leaf_hash" . ,(bl.crypto:bytes-to-hex
                                (subseq keydata 66 98)))))))))
 
-(defun %psbt-musig2-json (map add)
-  "The BIP373 MuSig2 records of MAP, for decodepsbt.
-
-DECODING only. A MuSig2 signing session needs nonce state this node does not
-keep, and inventing one would be worse than useless: reusing a MuSig2 nonce
-across two messages leaks the private key outright. What a signer's user needs
-first is to SEE what a PSBT is asking of them, which is what this gives."
-  ;; PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: keydata is the aggregate, value is the
-  ;; participants concatenated.
+(defun %psbt-musig2-participants-json (map keytype add)
+  "decodepsbt's musig2_participant_pubkeys for PSBT_IN_ or
+PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS (KEYTYPE): Core reports the field on an
+input AND on an output (rpc/rawtransaction.cpp, and rpc_psbt.py:270 reads the
+output one). Keydata is the aggregate, the value the participants
+concatenated."
   (let ((parts (bl.ser:psbt-map-collect
-                map bl.ser:+psbt-in-musig2-participant-pubkeys+)))
+                map keytype)))
     (when parts
       (funcall add "musig2_participant_pubkeys"
                (bl.rpc:json-array
@@ -306,7 +303,16 @@ first is to SEE what a PSBT is asking of them, which is what this gives."
                                    . ,(bl.rpc:json-array
                                        (loop for i from 0 below (length value) by 33
                                              collect (bl.crypto:bytes-to-hex
-                                                      (subseq value i (+ i 33)))))))))))) 
+                                                      (subseq value i (+ i 33)))))))))))))
+
+(defun %psbt-musig2-json (map add)
+  "The BIP373 MuSig2 records of MAP, for decodepsbt.
+
+DECODING only. A MuSig2 signing session needs nonce state this node does not
+keep, and inventing one would be worse than useless: reusing a MuSig2 nonce
+across two messages leaks the private key outright. What a signer's user needs
+first is to SEE what a PSBT is asking of them, which is what this gives."
+  (%psbt-musig2-participants-json map bl.ser:+psbt-in-musig2-participant-pubkeys+ add)
   (let ((nonces (bl.ser:psbt-map-collect
                  map bl.ser:+psbt-in-musig2-pub-nonce+)))
     (when nonces
@@ -426,7 +432,9 @@ fingerprint><path>."
         (when derivs
           (add "taproot_bip32_derivs"
                (bl.rpc:json-array (mapcar (lambda (d) (%psbt-tap-bip32-json (car d) (cdr d)))
-                                   derivs))))))
+                                   derivs)))))
+      (%psbt-musig2-participants-json
+       map bl.ser:+psbt-out-musig2-participant-pubkeys+ #'add))
     (or (nreverse fields) (make-hash-table))))
 
 (bl.rpc:define-rpc "decodepsbt" (node params)
@@ -1394,6 +1402,21 @@ wallet_taproot.py:363-364 asserts both."
                           (concatenate '(vector (unsigned-byte 8))
                                        script (vector ver)))))))))))
 
+(defun %psbt-add-musig2-participants (map spkm pos keytype)
+  "PSBT_IN/OUT_MUSIG2_PARTICIPANT_PUBKEYS for every musig() key expression of
+SPKM's descriptor at POS: FromSignatureData inserts sigdata.musig2_pubkeys --
+the provider's aggregate_pubkeys, gathered by SignTaproot whether or not
+anything signs (script/sign.cpp:554-556) -- into m_musig2_participants for an
+input and an output alike (psbt.cpp:206, :299). Keydata is the 33-byte
+aggregate, the value the participants back to back (psbt.h:412-420).
+wallet_musig.py:229-231 counts them on the input and on the change output."
+  (loop for (aggregate . participants)
+          in (bl.rpc:descriptor-musig2-participants (desc-spkm-desc spkm) pos)
+        do (unless (%psbt-record-present-p map keytype aggregate)
+             (bl.ser:psbt-map-set
+              map keytype aggregate
+              (apply #'concatenate '(vector (unsigned-byte 8)) participants)))))
+
 (defun %psbt-add-map-derivs (map spk pos pairs &optional spkm)
   "Add the derivation records an UPDATER writes for a wallet-owned input or
 output: +psbt-in-bip32+ for an ECDSA script, and for a TAPROOT one
@@ -1427,6 +1450,8 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
         (bl.rpc:key-xonly-bytes (cdr (first pairs))))
        (when spkm
          (%psbt-add-tr-tree-records map spkm spk pos pairs nil)
+         (%psbt-add-musig2-participants
+          map spkm pos bl.ser:+psbt-in-musig2-participant-pubkeys+)
          (loop for (xonly leaf-hashes fpr path)
                  in (%spkm-tap-bip32-origins spkm spk pos pairs)
                do (bl.ser:psbt-map-set
@@ -1499,6 +1524,8 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                        map bl.ser:+psbt-out-tap-internal-key+ empty
                        (bl.rpc:key-xonly-bytes (cdr (first pairs))))
                       (%psbt-add-tr-tree-records map spkm spk pos pairs t)
+                      (%psbt-add-musig2-participants
+                       map spkm pos bl.ser:+psbt-out-musig2-participant-pubkeys+)
                       (loop for (xonly leaf-hashes fpr path)
                               in (%spkm-tap-bip32-origins spkm spk pos pairs)
                             do (bl.ser:psbt-map-set
