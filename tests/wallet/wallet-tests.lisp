@@ -2930,3 +2930,24 @@ node too old to have it -- instead of being told there is nothing to migrate."
           "migratewallet contributes ~D conversion rows, Core lists 2"
           (count "migratewallet" (coerce dump 'list)
                  :key (lambda (row) (aref row 0)) :test #'string=)))))
+
+(test bumpfee-replaces-a-transaction-that-does-not-signal
+  "feebumper::PreconditionChecks (wallet/feebumper.cpp:23-57) has no BIP125
+signaling arm -- the mempool replaces by full RBF whatever the original
+signals -- so a wallet transaction sent with replaceable=false is bumpable
+(wallet_bumpfee.py:374-377, test_nonrbf_bumpfee_succeeds). We refused it with
+\"Transaction is not BIP 125 replaceable\". The replacement must reach the
+mempool and evict the original (the control that full RBF really takes it)."
+  (%with-pp-node (node "pp-bump-nonrbf")
+    (%pp-fund-wallet node :blocks 5)
+    (with-wallet-rng (29)
+      (let* ((rpc (lambda (method &rest params)
+                    (bl.rpc:dispatch-rpc-method node method params)))
+             (txid (funcall rpc "sendtoaddress" (%pp-optrue-address) 1
+                            nil nil nil bl.rpc:+json-false+ nil nil nil 5))
+             (bumped (rpc-error-of
+                      (lambda () (funcall rpc "bumpfee" txid (%ht "fee_rate" 20))))))
+        (is (null bumped) "a non-signaling transaction is bumped: ~S" bumped)
+        (is (not (member txid (coerce (funcall rpc "getrawmempool") 'list)
+                         :test #'equal))
+            "the original left the mempool")))))

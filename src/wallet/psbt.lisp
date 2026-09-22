@@ -2074,8 +2074,14 @@ book entry."
         (return t)))))
 
 (defun %bump-precondition-checks (node wallet wtx require-mine)
-  "Core feebumper::PreconditionChecks. Returns (values ok error-code error-msg).
-Adds the task-mandated BIP125-replaceable requirement on the original tx."
+  "Core feebumper::PreconditionChecks (wallet/feebumper.cpp:23-57). Returns
+(values ok error-code error-msg).
+
+There is no BIP125-signaling arm, because Core has none: the mempool replaces
+by full RBF whatever the original signals (validation.cpp:490, which ours
+follows too), so a non-signaling wallet transaction is bumpable. We refused it
+with \"Transaction is not BIP 125 replaceable\" and
+wallet_bumpfee.py:374-377 (test_nonrbf_bumpfee_succeeds) failed on it."
   (let ((tx (wallet-tx-tx wtx))
         (mempool (bl:node-mempool node)))
     (cond
@@ -2093,9 +2099,6 @@ Adds the task-mandated BIP125-replaceable requirement on the original tx."
                (format nil "Cannot bump transaction ~A which was already bumped by transaction ~A"
                        (bl.rpc:hash-to-hex (wallet-tx-txid wtx))
                        (cdr (assoc "replaced_by_txid" (wallet-tx-map-value wtx) :test #'string=)))))
-      ((not (bl.mp:tx-signals-rbf-p tx))
-       (values nil bl.rpc:+rpc-wallet-error+
-               "Transaction is not BIP 125 replaceable"))
       ((and require-mine (not (%all-inputs-mine node wallet tx)))
        (values nil bl.rpc:+rpc-wallet-error+
                "Transaction contains inputs that don't belong to this wallet"))
