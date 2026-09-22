@@ -500,6 +500,31 @@ match both."
         (bl.rpc:dispatch-rpc-method node "submitpackage"
                                     (list (make-list 26 :initial-element hex)))))))
 
+(test rpc-getrawmempool-lists-the-pool-in-mining-order
+  "getrawmempool lists the pool the way Core's MempoolToJSON walks it:
+entryAll(), mapTx sorted by the txgraph's CompareMainOrder (rpc/mempool.cpp
+:579/:593, txmempool.cpp:572-598) -- not in arrival order, which a reorg that
+re-adds the same transactions changes (mempool_packages.py:244). A poorer
+transaction that arrived first is listed after a richer one; the verbose
+object carries the same order."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((node (bl:make-node :network :testnet3))
+           (poor (pkg-tx funding-txid 0 (- 100000000 1000)))
+           (rich (%rbf-tx 181))
+           (hex (lambda (tx) (bl.crypto:bytes-to-hex
+                              (bl.crypto:reverse-bytes (bl.ser:transaction-hash tx))))))
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool)
+      (is (eq :ok (%add-tx mempool poor :fee 1000)))
+      (is (eq :ok (%add-tx mempool rich :fee 50000)))
+      (is (equalp (list (funcall hex rich) (funcall hex poor))
+                  (coerce (bl.rpc:dispatch-rpc-method node "getrawmempool" '())
+                          'list)))
+      (is (equal (list (funcall hex rich) (funcall hex poor))
+                 (mapcar #'car (bl.rpc:dispatch-rpc-method
+                                node "getrawmempool" (list t))))))))
+
 (test rpc-submitpackage-broadcasts-accepted-members
   "submitpackage queues an announcement for every package member that made
 it into the mempool (Core rpc/mempool.cpp:1423-1444 runs

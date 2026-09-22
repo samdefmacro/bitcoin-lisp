@@ -149,16 +149,33 @@ answers with -8 rather than a partial result."
     (with-node-lock (node)
       (let ((rows '()))
         (when mempool
-          (bl.mp:mempool-for-each
-           mempool
-           (lambda (txid entry)
-             (push (if verbose
-                       ;; (txid . field-alist); the RPC normalizer turns the
-                       ;; whole thing into nested JSON objects.
-                       (cons (hash-to-hex txid)
-                             (%mempool-entry-fields mempool txid entry))
-                       (hash-to-hex txid))
-                   rows))))
+          ;; In MINING order, as Core lists them: MempoolToJSON walks
+          ;; entryAll(), which is GetSortedScoreWithTopology -- mapTx sorted
+          ;; by the txgraph's CompareMainOrder (rpc/mempool.cpp:579/:593,
+          ;; txmempool.cpp:572-598). Ours walked the entry table, i.e.
+          ;; arrival order, so a reorg that re-adds the same transactions in
+          ;; block order changed the answer; mempool_packages.py:244 asserts
+          ;; it does not. Stable, and arrival order where there is no main
+          ;; order to consult (an oversized graph).
+          (let ((pairs '()))
+            (bl.mp:mempool-for-each
+             mempool (lambda (txid entry) (push (cons txid entry) pairs)))
+            (setf pairs (nreverse pairs))
+            (when (bl.mp:mempool-mining-order-available-p mempool)
+              (setf pairs (stable-sort pairs
+                                       (lambda (a b)
+                                         (minusp (bl.mp:mempool-compare-mining-order
+                                                  mempool a b)))
+                                       :key #'car)))
+            (dolist (pair pairs)
+              (destructuring-bind (txid . entry) pair
+                (push (if verbose
+                          ;; (txid . field-alist); the RPC normalizer turns
+                          ;; the whole thing into nested JSON objects.
+                          (cons (hash-to-hex txid)
+                                (%mempool-entry-fields mempool txid entry))
+                          (hash-to-hex txid))
+                      rows)))))
         (setf rows (nreverse rows))
         ;; An empty (or absent) mempool still answers with a collection of
         ;; the right shape — a VOBJ ({}) when verbose, a VARR ([]) otherwise.
