@@ -1156,6 +1156,11 @@ missing-block list."
 ;;;; Reorg mempool bulk re-add (cluster mempool P8 — Core
 ;;;; MaybeUpdateMempoolForReorg, validation.cpp:294-389)
 
+(defun %readd-disconnected (&rest args)
+  "BL.VAL's reorg re-add (Core MaybeUpdateMempoolForReorg), the one internal
+this file's reorg-mempool tests drive directly."
+  (apply #'bl.val::readd-disconnected-txs-to-mempool args))
+
 (test reorg-readd-bulk-bypass-limits
   "readd-disconnected-txs-to-mempool: a ZERO-fee disconnected tx re-enters
 (bypass_limits skips the fee floor, Core validation.cpp:945) and is wired to
@@ -1191,7 +1196,7 @@ got notfound where Core answers with the transaction."
       (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool orphan :fee 100 :height 200)))
       (let ((counter-before (bl.mp:mempool-sequence mempool)))
-        (bl.val::readd-disconnected-txs-to-mempool
+        (%readd-disconnected
          mempool (list dtx dtx2) utxo-set 200 chain-state)
         (is (> (bl.mp:mempool-sequence mempool) counter-before)
             "the admission counter still advances across a bypass-limits add"))
@@ -1235,7 +1240,7 @@ letting a premature tx re-enter the pool and get mined."
                                       :script-pubkey (p2sh-optrue-script-pubkey)))
                     :lock-time 500))                 ; height 500 > next block 201
            (lid (bl.ser:transaction-hash locked)))
-      (bl.val::readd-disconnected-txs-to-mempool
+      (%readd-disconnected
        mempool (list locked) utxo-set 200 chain-state)
       (is (not (bl.mp:mempool-has mempool lid)))
       (is (= 0 (bl.mp:mempool-count mempool))))))
@@ -1553,7 +1558,7 @@ blocks' txs, never what already sat in the pool."
       (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
       ;; No disconnected txs at all — the filter must still run.
-      (bl.val::readd-disconnected-txs-to-mempool
+      (%readd-disconnected
        mempool '() utxo-set 200 chain-state)
       (is (not (bl.mp:mempool-has mempool lid)))
       (is (not (bl.mp:mempool-has mempool cid)))
@@ -1581,7 +1586,7 @@ stays."
       (is (eq :ok (%add-tx mempool spend-old :fee 10000 :height 200)))
       ;; New tip 200 -> spend height 201: 201-150 = 51 < 100 immature;
       ;; 201-90 = 111 mature.
-      (bl.val::readd-disconnected-txs-to-mempool
+      (%readd-disconnected
        mempool '() utxo-set 200 chain-state)
       (is (not (bl.mp:mempool-has mempool yid)))
       (is (bl.mp:mempool-has mempool oid)))))
@@ -1607,7 +1612,7 @@ removed: Core re-tests lockpoints against the new tip
                                      (p2sh-optrue-script-pubkey) 150 :coinbase nil)
       (is (eq :ok (%add-tx mempool locked :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
-      (bl.val::readd-disconnected-txs-to-mempool
+      (%readd-disconnected
        mempool '() utxo-set 200 chain-state)
       (is (not (bl.mp:mempool-has mempool lid)))
       (is (bl.mp:mempool-has mempool okid)))))
@@ -1638,7 +1643,7 @@ invalidateblock put tx3 back and left its height-locked child tx4 in the pool
         (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
         (is (< 201 (bl.val:get-csv-activation-height bl:*network*))
             "control: CSV is not active at the next block")
-        (bl.val::readd-disconnected-txs-to-mempool
+        (%readd-disconnected
          mempool '() utxo-set 200 chain-state)
         (is (not (bl.mp:mempool-has mempool lid))
             "a 100-block lock on a 51-deep coin is not final")
@@ -1652,7 +1657,7 @@ the pool child it would strand. A re-added final tx survives the filter."
   (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((dtx (pkg-tx funding 0 100000000))   ; zero-fee, final: re-adds
            (did (bl.ser:transaction-hash dtx)))
-      (bl.val::readd-disconnected-txs-to-mempool
+      (%readd-disconnected
        mempool (list dtx) utxo-set 200 chain-state)
       ;; the re-added tx passed the filter too
       (is (bl.mp:mempool-has mempool did)))))
