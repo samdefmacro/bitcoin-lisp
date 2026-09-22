@@ -2017,6 +2017,16 @@ block-relay-only peer (Core SetupAddressRelay)."
   ;; First addr-related message from an inbound peer enables address relay
   ;; (Core SetupAddressRelay; getpeerinfo addr_relay_enabled).
   (when peer (setf (peer-addr-relay-enabled peer) t))
+  ;; Core's oversize rule, and its words: `Misbehaving(peer, "<type> message
+  ;; size = N")' for either message type (net_processing.cpp:4046-4050);
+  ;; p2p_addrv2_relay.py:106 waits for `addrv2 message size = 1010'. The
+  ;; codec's own limit would reject the payload too, in words of its own.
+  (let ((count (bl.bytes:with-byte-reader (stream payload)
+                 (bl.bytes:br-read-compact-size stream))))
+    (when (> count bl.ser:+max-addr-count+)
+      (when peer
+        (record-misbehavior peer (format nil "addrv2 message size = ~D" count)))
+      (return-from handle-addrv2 0)))
   (multiple-value-bind (entries announced-count)
       (bl.ser:parse-addrv2-payload payload)
     (let ((added (%process-gossiped-addresses

@@ -383,6 +383,26 @@ be dropped before delivering anything useful."
       (is (= 2 added))
       (is (= 2 (bl.net:address-book-count book))))))
 
+(test oversized-addrv2-is-misbehaving-in-cores-words
+  "Core refuses an addr OR addrv2 message of more than 1000 entries with
+Misbehaving(peer, \"<type> message size = N\") (net_processing.cpp:4046-4050);
+p2p_addrv2_relay.py:106 sends 1010 and waits for `addrv2 message size =
+1010'. Ours rejected it from the codec, in words of its own."
+  (let* ((peer (bl.net:make-peer :address "10.0.0.8" :state :ready :inbound t
+                                 :connection (make-test-connection
+                                              :host "10.0.0.8" :port 18444
+                                              :connected t :socket nil)))
+         (payload (coerce (bl.bytes:with-byte-buf (s)
+                            (bl.bytes:bb-write-varint s 1010))
+                          '(simple-array (unsigned-byte 8) (*))))
+         (text (nth-value 1 (log-text-of
+                             "net"
+                             (lambda ()
+                               (bl.net:handle-addrv2 peer payload
+                                                     (bl.ctx:make-node-context)))))))
+    (is (search "addrv2 message size = 1010" text))
+    (is (eq :disconnected (bl.net:peer-state peer)))))
+
 ;;; Task 3.1: IPv4 from addrv2 converted to mapped-IPv6
 (test addrv2-ipv4-to-mapped-ipv6
   "IPv4 address from addrv2 is stored as IPv4-mapped IPv6 in address book."
