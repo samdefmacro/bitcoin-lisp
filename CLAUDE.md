@@ -22,7 +22,7 @@ default-OFF on mainnet (config flag `-wallet`); testnet4 first.
 Cross-package references use the package-local nicknames installed by
 `src/util/package.lisp` (`bitcoin-lisp.nicknames:*package-nicknames*`): `bl:` for the top
 package, `bl.err`, `bl.log`, `bl.kv`, `bl.bytes`, `bl.chain`, `bl.ctx`, `bl.rl`, `bl.crypto`,
-`bl.ser`, `bl.store`, `bl.val`, `bl.mp`, `bl.mining`, `bl.net`, `bl.rpc`, `bl.wallet`, `bl.cfg`, `bl.interop`,
+`bl.ser`, `bl.store`, `bl.val`, `bl.mp`, `bl.mining`, `bl.net`, `bl.rpc`, `bl.wallet`, `bl.tools`, `bl.cfg`, `bl.interop`,
 `bl.script`, `bl.ctypes`,
 `bl.cser`, `bl.cbin`, `bl.ccrypto`, `bl.tests`. Write `bl.ser:transaction-inputs`,
 never the full name. A branch that predates the nicknames rebases and runs

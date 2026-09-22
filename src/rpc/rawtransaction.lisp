@@ -1045,6 +1045,12 @@ null (or an empty array), not an object -- Core's isObject."
 
 ;; rpc-type-check-obj lives in amounts.lisp (Core RPCTypeCheckObj, with fStrict).
 
+(defun make-coins-map ()
+  "An empty coins map: (txid . vout) -> (script-pubkey amount redeem
+witness-script), the shape FIND-COINS and PARSE-PREVOUTS fill and
+SIGN-TX-INPUTS reads. EQUALP because the key is a cons around the txid."
+  (make-hash-table :test 'equalp))
+
 (defun find-coins (node tx)
   "Core FindCoins (node/coin.cpp:12-27) for TX's inputs: the coin each input
 spends, from the mempool view first (an unconfirmed parent's output) and the
@@ -1053,7 +1059,7 @@ chainstate's coins otherwise, as an EQUALP hash (txid . vout) ->
 SIGN-TX-INPUTS reads. An input nothing knows is simply absent, which is
 Core's cleared, IsSpent coin. A node without a chainstate (the unit tests'
 bare node) knows no coin."
-  (let ((coins (make-hash-table :test 'equalp)))
+  (let ((coins (make-coins-map)))
     (with-node-lock (node)
       (let ((utxo-set (rpc-get-utxo-set node))
             (mempool (rpc-get-mempool node)))

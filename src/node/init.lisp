@@ -2409,6 +2409,12 @@ Core's behaviour and what assert_start_raises_init_error reads."
   ;; anything of the node's runs: the client touches no datadir and no umask.
   (when (bl.cli:cli-program-name-p (or (first sb-ext:*posix-argv*) ""))
     (bl.cli:cli-main))
+  ;; Started as bitcoin-util / bitcoin-tx / bitcoin-wallet, the executable is
+  ;; that side tool and nothing else (src/tools/dispatch.lisp): no umask, no
+  ;; datadir, no node.
+  (let ((tool (bl.tools:tool-for-program-name (first sb-ext:*posix-argv*))))
+    (when tool
+      (bl.tools:tool-main tool (rest sb-ext:*posix-argv*))))
   ;; Core's main() runs SetupEnvironment first, before it has looked at a
   ;; single argument (bitcoind.cpp:269): the mask has to be in place before
   ;; ANYTHING is created, datadir included.

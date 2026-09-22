@@ -33,15 +33,15 @@ mkdir -p "$ROOT/build/bin"
 # EINVAL, which surfaces as a whole batch of unrelated-looking failures.
 # Observed 2026-08-25 running four sweep batches at once. rename(2) has no such
 # window.
-# The same executable is bitcoin-cli: node-main runs the client when it is
-# started under that name (src/cli/), so the framework finds the client where
-# it looks for it, BUILDDIR/bin/bitcoin-cli (util.py:317-343), with no second
-# image to build.
+# The same executable is bitcoin-cli and each of Core's side tools: node-main
+# runs the client (src/cli/) or bitcoin-util / bitcoin-tx (src/tools/) when it
+# is started under that name, so the framework finds them where it looks,
+# BUILDDIR/bin/<name> (util.py:317-343), with no second image to build.
 # A link that already names the binary is left alone: every run calls this,
 # and a run whose links had just been replaced (atomically, with no other run
 # active) still got EINVAL exec'ing build/bin/bitcoin-cli through the Docker
 # bind mount -- observed 2026-09-23, one run in three.
-for name in bitcoind bitcoin-cli; do
+for name in bitcoind bitcoin-cli bitcoin-util bitcoin-tx; do
   target="../$(basename "$BIN")"
   if [ "$(readlink "$ROOT/build/bin/$name" 2>/dev/null || true)" != "$target" ]; then
     ln -sfn "$target" "$ROOT/build/bin/.$name.$$"
@@ -70,12 +70,15 @@ EXEEXT=
 RPCAUTH=$CONFIG_ROOT/refs/bitcoin/share/rpcauth/rpcauth.py
 
 [components]
-# The node and its client are ours (build/bin/bitcoind and build/bin/bitcoin-cli
-# are the same executable). bitcoin-tx, bitcoin-util, the wallet tool and the
-# fuzz/bench binaries do not exist here, so the tests that need them are out
-# of scope rather than failing (see the plan's classification).
+# The node, its client and its side tools bitcoin-util and bitcoin-tx are ours
+# (the same executable under each name). The wallet tool and the fuzz/bench
+# binaries do not exist here, so the tests that need them are out of scope
+# rather than failing (see the plan's classification).
 ENABLE_BITCOIND=true
 ENABLE_CLI=true
+ENABLE_BITCOIN_UTIL=true
+# bitcoin-tx's flag is spelled BUILD_, not ENABLE_ (test_framework.py:993-995).
+BUILD_BITCOIN_TX=true
 ENABLE_WALLET=true
 ENABLE_ZMQ=true
 EOF

@@ -332,6 +332,19 @@ bitcoin-cli (node-main)."
                                (:file "wallet-spend")
                                (:file "psbt")
                                (:file "signmessage")))
+                 ;; Core's side tools (bitcoin-util, bitcoin-tx, bitcoin-wallet):
+                 ;; their own package, on top of the RPC helpers and the wallet
+                 ;; they reuse. The executable runs one of them when started
+                 ;; under its name (node-main).
+                 (:module "tools"
+                  :serial t
+                  :components ((:file "package")
+                               (:file "args")
+                               (:file "univalue")
+                               (:file "bitcoin-util")
+                               (:file "script-asm")
+                               (:file "bitcoin-tx")
+                               (:file "dispatch")))
                  ;; The RPC server proper, last: it dispatches to everything above.
                  (:module "rpc-server"
                   :pathname "rpc"
@@ -523,6 +536,8 @@ bitcoin-cli (node-main)."
                              ;; The chain-params table
                              (:file "util/chainparams-tests")
                              (:file "logging/logging-tests")
+                             ;; Core's side tools (bitcoin-util, bitcoin-tx, bitcoin-wallet)
+                             (:file "tools/tools-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
                              (:file "networking/socks5-tests")
                              ;; Tor control client + onion service + self-advertisement
