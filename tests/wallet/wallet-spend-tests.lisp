@@ -3030,7 +3030,13 @@ of the first leaf plus both keys of a pkh() second leaf is three
                                                'list))))
                        (is (= want (length (coerce (or (%aval "taproot_script_path_sigs" in) '())
                                                    'list)))
-                           "~A: ~D tapscript signature(s) in ~S" name want in)))))))))
+                           "~A: ~D tapscript signature(s) in ~S" name want in)
+                       ;; Only the pkh() leaf can be finished, from the PSBT's
+                       ;; own signatures and derivations (wallet_miniscript.py
+                       ;; :303-304).
+                       (is (eq (equal name "three")
+                               (eq t (%aval "complete" (rpc nil "finalizepsbt" (%aval "psbt" res)))))
+                           "~A: finalizable exactly when a leaf is fully signed" name)))))))))
 
 (test signrawtransactionwithwallet-solves-a-prevtx-from-the-wallets-own-scripts
   "signrawtransactionwithwallet signs with the WALLET as the provider, so a

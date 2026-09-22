@@ -1017,7 +1017,7 @@ miniscript timelock is checked against."
                ;; Script path, assembled from the parts a PSBT stores rather
                ;; than from a witness nobody could have put there — Core's
                ;; PSBTInput::FillSignatureData + ProduceSignature.
-               (let ((wit (%psbt-taproot-script-witness map)))
+               (let ((wit (%psbt-taproot-script-witness map tx index)))
                  (when wit (values empty wit))))))
         (:scripthash
          (when rs
@@ -1388,7 +1388,7 @@ and non_witness_utxo is absent."
        (not (bl.ser:psbt-map-find
              map bl.ser:+psbt-in-non-witness-utxo+))))
 
-(defun %psbt-taproot-script-witness (map)
+(defun %psbt-taproot-script-witness (map &optional tx index)
   "The witness for a taproot SCRIPT-path spend assembled from MAP's
 PSBT_IN_TAP_LEAF_SCRIPT and PSBT_IN_TAP_SCRIPT_SIG records, or NIL when no leaf
 is fully signed.
@@ -1414,12 +1414,48 @@ order -- see TR-LEAF-SATISFACTION, which derives why."
           (let* ((script (subseq value 0 (1- (length value))))
                  (leaf-hash (bl.crypto:tap-leaf-hash
                              (aref value (1- (length value))) script))
-                 (satisfaction (%tapscript-satisfaction script leaf-hash sigs)))
+                 (satisfaction (or (%tapscript-miniscript-satisfaction
+                                    script leaf-hash sigs map tx index)
+                                   (%tapscript-satisfaction script leaf-hash sigs))))
             (when satisfaction
               (let* ((stack (append satisfaction (list script control)))
                      (size (reduce #'+ stack :key #'length)))
                 (when (or (null best-size) (< size best-size))
                   (setf best stack best-size size))))))))))
+
+(defun %tapscript-miniscript-satisfaction (script leaf-hash sigs map tx index)
+  "The witness elements satisfying tapscript SCRIPT as Core's finalizer
+finds them: the leaf inferred as a tapscript miniscript and satisfied from the
+PSBT's own data (SignTaprootScript's Satisfier, script/sign.cpp:528-540) --
+the PSBT_IN_TAP_SCRIPT_SIG records for this leaf, a pkh() key from those
+records or the input's taproot derivations, the input's hash preimages, the
+transaction's timelocks. NIL when it does not infer, or the satisfaction is
+incomplete or malleable. A leaf the fixed shapes of %TAPSCRIPT-SATISFACTION
+do not cover -- and(v:pkh(A),pk(B)) among them -- was left unfinalized
+(wallet_miniscript.py:304)."
+  (let ((by-hash (bl.bytes:make-octets-hash-table)))
+    (dolist (rec (append sigs (bl.ser:psbt-map-collect map bl.ser:+psbt-in-tap-bip32+)))
+      (let ((xonly (subseq (car rec) 0 (min 32 (length (car rec))))))
+        (when (= (length xonly) 32)
+          (setf (gethash (bl.crypto:hash160 xonly) by-hash) xonly))))
+    (let ((node (bl.val:ms-from-script script :ctx :tapscript
+                                              :pkh-resolver (lambda (h) (gethash h by-hash)))))
+      (when node
+        (multiple-value-bind (stack malleable)
+            (bl.val:ms-satisfy
+             node
+             (bl.val:make-ms-satisfier
+              :sign-fn (lambda (xonly)
+                         (cdr (find-if (lambda (rec)
+                                         (let ((kd (car rec)))
+                                           (and (= (length kd) 64)
+                                                (equalp (subseq kd 0 32) xonly)
+                                                (equalp (subseq kd 32 64) leaf-hash))))
+                                       sigs)))
+              :preimage-fn (lambda (kind hash) (%psbt-preimage map kind hash))
+              :check-older-fn (lambda (v) (and tx (bl.val:ms-check-older tx index v)))
+              :check-after-fn (lambda (v) (and tx (bl.val:ms-check-after tx index v)))))
+          (and stack (not malleable) stack))))))
 
 (defun %tapscript-satisfaction (script leaf-hash sigs)
   "The witness elements satisfying the tapscript SCRIPT from SIGS -- a list of
