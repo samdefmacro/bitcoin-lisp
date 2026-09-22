@@ -3411,14 +3411,20 @@ elicit more than one reply regardless of whether we had addresses to send."
         ;; network sees the SAME snapshot for 21-27h, so reconnecting harvests
         ;; nothing new. Banned/discouraged addresses were filtered when the
         ;; cache was filled.
-        (let* ((addrs (cached-getaddr-response
-                       book
-                       (peer-connected-through-network peer)
-                       (bl.ser:get-unix-time)))
-               ;; NIL when the peer is v1-only and every address was non-IP.
-               (msg (and addrs (build-addr-response peer addrs))))
-          (when msg
-            (send-message peer msg))))))))
+        ;;
+        ;; QUEUED, as Core's `for (const CAddress &addr : vAddr)
+        ;; PushAddress(peer, addr)' (net_processing.cpp:4926-4936): the reply
+        ;; leaves with the next addr flush, and a first self-announcement due
+        ;; on the same pass goes out BEFORE it, alone
+        ;; (p2p_addr_selfannouncement.py:48-54 asserts it is the first addr
+        ;; message). PUSH-ADDRESS applies the same known/compatible filters,
+        ;; and the queue is cleared first, as Core's is.
+        (setf (fill-pointer (peer-addrs-to-send peer)) 0)
+        (dolist (pa (cached-getaddr-response
+                     book
+                     (peer-connected-through-network peer)
+                     (bl.ser:get-unix-time)))
+          (push-address peer pa)))))))
 
 ;;; Local-address self-advertisement (Core MaybeSendAddr's local-address half,
 ;;; net_processing.cpp:5530-5567 + GetLocalAddrForPeer, net.cpp:240-267)

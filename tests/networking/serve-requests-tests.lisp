@@ -979,3 +979,27 @@ and wrote nothing."
                                           (remove 0 (subseq bytes 8 20)))))
                  (is (= 8 (loop for i below 4 sum (ash (aref bytes (+ 20 i)) (* 8 i)))))))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(test getaddr-response-is-queued-for-the-addr-flush
+  "Core answers getaddr by PushAddress-ing the sample onto the peer's addr
+queue (after clearing it) and lets MaybeSendAddr send it
+(net_processing.cpp:4926-4936) -- which also sends a first self-announcement
+due on the same pass BEFORE the queue, alone; p2p_addr_selfannouncement.py:
+48-54 asserts the self-announcement is the first addr message. Ours sent the
+reply from the handler, ahead of everything."
+  ;; An IPv6 requestor: the per-network response cache the other getaddr
+  ;; tests fill is keyed :ipv4 / :torv3, and any :ipv6 snapshot left by an
+  ;; earlier run of this test is just as non-empty.
+  (let ((bl:*node* nil)
+        (book (%g720-book 50))
+        (peer (bl.net:init-peer-rate-limiters
+               (bl.net:make-peer :state :ready :inbound t :address "2600::1"
+                                 :addr-relay-enabled t))))
+    (%with-captured-sends (sends)
+      (with-ibd-context
+        (deliver-ibd-message peer "getaddr" #()
+                             (bl.ctx:make-node-context :address-book book)))
+      (is (= 0 (length sends)) "nothing is sent from the handler")
+      (is (plusp (length (%addr-queue peer))) "the sample is queued")
+      (%flush-addrs-now (list peer))
+      (is (= 1 (length sends)) "and leaves with the next flush"))))
