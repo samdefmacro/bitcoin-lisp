@@ -70,6 +70,16 @@ hold is that CONNECTION-INPUT-PENDING-P sees the buffered remainder."
                  "buffered input is invisible to the drain loop — the second ~
 message of any pair sharing a TCP segment waits for unrelated traffic")))))
 
+(defun %v2t-detect (conn &rest args)
+  "The responder's v1/v2 sniff and v2 handshake (BL.NET's V2-DETECT-INBOUND),
+the one reach into it for this file."
+  (apply #'bl.net::v2-detect-inbound conn args))
+
+(defun %v2t-initiate (conn &rest args)
+  "The initiator's v2 handshake (BL.NET's V2-HANDSHAKE-OUTBOUND), the one reach
+into it for this file."
+  (apply #'bl.net::v2-handshake-outbound conn args))
+
 (defun %v2t-drain (conn &key (seconds 10))
   "Push CONN's queued unsent bytes onto the wire, or give up after SECONDS.
 
@@ -117,7 +127,7 @@ must be skipped, and a 0-length payload."
                   (lambda ()
                     (handler-case
                         (let ((transport (progn
-                                           (prog1 (bl.net::v2-handshake-outbound
+                                           (prog1 (%v2t-initiate
                                                    client :timeout 60)
                                              ;; The HANDSHAKE's own sends go
                                              ;; through send-bytes too, and the
@@ -146,7 +156,7 @@ must be skipped, and a 0-length payload."
                                   (setf client-result (list cmd payload))))))
                       (error (e) (setf client-result (list :error e)))))
                   :name "v2-initiator")))
-          (let ((transport (prog1 (bl.net::v2-detect-inbound
+          (let ((transport (prog1 (%v2t-detect
                                    server :timeout 60)
                              (%v2t-drain server))))
             (is-true (bl.net:v2-transport-p transport))
@@ -182,9 +192,9 @@ oversize length descriptor."
                (thread (bt:make-thread
                         (lambda ()
                           (setf client-transport
-                                (bl.net::v2-handshake-outbound
+                                (%v2t-initiate
                                  client :timeout 10))))))
-          (let ((server-transport (bl.net::v2-detect-inbound
+          (let ((server-transport (%v2t-detect
                                    server :timeout 10)))
             (bt:join-thread thread)
             (is-true (bl.net:v2-transport-p server-transport))
@@ -228,7 +238,7 @@ and pushed back so the v1 path reads them unchanged."
         (let ((version-msg (%v2t-frame "version" (%bc-hex "00010203"))))
           (bl.net:send-bytes client version-msg)
           (%v2t-drain client)
-          (is (eq :v1 (bl.net::v2-detect-inbound server :timeout 5)))
+          (is (eq :v1 (%v2t-detect server :timeout 5)))
           ;; The sniffed 16 bytes plus the rest must reassemble the message.
           (let ((got (bl.net:receive-bytes
                       server (length version-msg) :timeout 5)))
@@ -248,7 +258,7 @@ and pushed back so the v1 path reads them unchanged."
                 do (setf (aref bytes i) (char-code c)))
           (bl.net:send-bytes client bytes)
           (%v2t-drain client)
-          (is-false (bl.net::v2-detect-inbound server :timeout 5))))))
+          (is-false (%v2t-detect server :timeout 5))))))
 
 (test v2-transport-outbound-fallback-on-silence
   "An outbound v2 attempt against a peer that never responds yields
@@ -277,7 +287,7 @@ worded differently (`no v2 response, reconnected as v1')."
                              (bl.log:enable-log-category "net")
                              (capture-log-lines
                               (lambda ()
-                                (setf result (bl.net::v2-handshake-outbound
+                                (setf result (%v2t-initiate
                                               client :timeout 2)))))
                         (unless enabled
                           (bl.log:disable-log-category "net")))))
@@ -305,12 +315,12 @@ length it yielded has to survive the gap between passes."
                         (lambda ()
                           (handler-case
                               (setf client-transport
-                                    (bl.net::v2-handshake-outbound
+                                    (%v2t-initiate
                                      client :timeout 10))
                             (error (e) (setf client-transport e))))
                         :name "v2-split-initiator")))
           (let ((server-transport
-                  (bl.net::v2-detect-inbound server :timeout 10)))
+                  (%v2t-detect server :timeout 10)))
             (bt:join-thread thread)
             (is-true (bl.net:v2-transport-p server-transport))
             (is-true (bl.net:v2-transport-p client-transport))
@@ -388,12 +398,12 @@ resumes, after every other peer has had a turn."
                         (lambda ()
                           (handler-case
                               (setf client-transport
-                                    (bl.net::v2-handshake-outbound
+                                    (%v2t-initiate
                                      client :timeout 10))
                             (error (e) (setf client-transport e))))
                         :name "v2-decoy-initiator")))
           (let ((server-transport
-                  (bl.net::v2-detect-inbound server :timeout 10)))
+                  (%v2t-detect server :timeout 10)))
             (bt:join-thread thread)
             (when (and (bl.net:v2-transport-p server-transport)
                        (bl.net:v2-transport-p client-transport))
@@ -422,3 +432,53 @@ resumes, after every other peer has had a turn."
                     "and it yields promptly"))
               (is-true (bl.net:connection-connected server)
                        "sending decoys is legal — the peer keeps its connection")))))))
+
+(defun %v2t-net-lines (thunk)
+  "The log lines THUNK emits with the net category switched on."
+  (let ((enabled (bl.log:log-category-enabled-p "net")))
+    (unwind-protect
+         (progn (bl.log:enable-log-category "net")
+                (capture-log-lines thunk))
+      (unless enabled (bl.log:disable-log-category "net")))))
+
+(test v2-transport-errors-are-logged-in-cores-words
+  "Core names each BIP324 failure in a per-peer line of its own
+(V2Transport, net.cpp:1132-1133, 1190, 1219, 1234), and
+p2p_v2_misbehaving.py:177 waits for them by text: a responder that reads
+4095+16 bytes of garbage without the terminator logs
+\"V2 transport error: missing garbage terminator, peer=N\". Ours said
+\"V2 transport: missing garbage terminator\" with no peer, and the wrong-magic
+v1 line was worded differently too."
+  (if (not (bl.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (progn
+        (%with-loopback-pair (client server)
+          ;; A 64-byte key (any 64 bytes decode under ElligatorSwift; this one
+          ;; is no v1 prefix) followed by garbage that never ends.
+          (let ((key (make-array 64 :element-type '(unsigned-byte 8) :initial-element #x5a))
+                (junk (make-array (+ 4095 16) :element-type '(unsigned-byte 8)
+                                              :initial-element #xa5))
+                (result :unset))
+            (bl.net:send-bytes client key)
+            (bl.net:send-bytes client junk)
+            (%v2t-drain client)
+            (let ((lines (%v2t-net-lines
+                          (lambda ()
+                            (setf result (%v2t-detect server :timeout 5
+                                                                           :peer-id 7))))))
+              (is (null result) "control: the handshake is refused")
+              (is-true (find "V2 transport error: missing garbage terminator, peer=7" lines
+                             :test #'search)
+                       "Core's line, with the peer id: ~S" lines))))
+        (%with-loopback-pair (client server)
+          (let ((bytes (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+            (replace bytes (%bc-hex "ffaaffaa"))
+            (loop for c across "version" for i from 4
+                  do (setf (aref bytes i) (char-code c)))
+            (bl.net:send-bytes client bytes)
+            (%v2t-drain client)
+            (let ((lines (%v2t-net-lines
+                          (lambda () (%v2t-detect server :timeout 5)))))
+              (is-true (find "V2 transport error: V1 peer with wrong MessageStart ffaaffaa"
+                             lines :test #'search)
+                       "Core's wrong-magic line: ~S" lines)))))))

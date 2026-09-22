@@ -57,6 +57,9 @@ through the v2 packet layer."
   (cipher nil)
   ;; The peer's garbage: AAD for the first packet we receive, then cleared.
   (recv-aad nil)
+  ;; The owning peer's id, for Core's per-peer "V2 transport error: ...,
+  ;; peer=N" lines (V2Transport::m_nodeid); NIL when the caller had none.
+  (peer-id nil)
   ;; Serializes encrypt+write as one unit: the sync thread and RPC-thread
   ;; senders (ping, getblockfrompeer) share a connection, and the packet
   ;; cipher's nonce advances per encryption -- wire order must equal encrypt
@@ -162,8 +165,10 @@ body length is parked on the CONNECTION between passes rather than recomputed."
         (let ((len (bl.crypto:bip324-cipher-decrypt-length
                     (v2-transport-cipher transport) len3)))
           (when (> len +v2-max-contents-len+)
-            ;; No line of its own: the reap reports the reason once, the way
-            ;; Core reports every socket-level disconnect once (HANDLE-PEER-FIN).
+            ;; Core's own line (net.cpp:1219); the reap then reports the
+            ;; socket-level reason once (HANDLE-PEER-FIN).
+            (bl.log:log-cat "net" "V2 transport error: packet too large (~D bytes), peer=~A"
+                            len (v2-transport-peer-id transport))
             (return (%connection-failed conn :v2-oversize-packet)))
           ;; The cipher has advanced: from here the packet must complete or the
           ;; connection dies.
@@ -184,6 +189,13 @@ body length is parked on the CONNECTION between passes rather than recomputed."
            (v2-transport-cipher transport) rest
            (or (v2-transport-recv-aad transport) *v2-empty-bytes*))
         (unless contents
+          ;; Core's line (net.cpp:1234), whose count is m_recv_len: the
+          ;; contents length the descriptor announced, header byte and tag
+          ;; excluded. p2p_v2_misbehaving.py:177 waits for it.
+          (bl.log:log-cat "net" "V2 transport error: packet decryption failure (~D bytes), peer=~A"
+                          (- (length rest) bl.crypto:+bip324-header-len+
+                             bl.crypto:+poly1305-taglen+)
+                          (v2-transport-peer-id transport))
           (return (%connection-failed conn :v2-auth-failure)))
         ;; AAD (the peer's garbage) is authenticated by the first packet.
         (setf (v2-transport-recv-aad transport) nil)
@@ -291,7 +303,7 @@ resumable one."
          (garbage (ironclad:random-data garbage-len)))
     (values cipher garbage)))
 
-(defun %v2-scan-garbage (conn cipher deadline)
+(defun %v2-scan-garbage (conn cipher deadline peer-id)
   "Consume the peer's garbage up to and including its garbage terminator.
 Returns the garbage bytes (terminator excluded) or NIL if no terminator
 appears within the 4095+16 byte bound (or the DEADLINE passes)."
@@ -309,14 +321,15 @@ appears within the 4095+16 byte bound (or the DEADLINE passes)."
           (when (not (mismatch terminator buf :start2 (- n term-len)))
             (return (subseq buf 0 (- n term-len))))
           (when (>= n (+ +v2-max-garbage-len+ term-len))
-            (bl.log:log-cat "net" "V2 transport: missing garbage terminator~A"
-                            (bl.log:log-ip (connection-host conn)))
+            ;; Core's line, word for word (net.cpp:1190).
+            (bl.log:log-cat "net" "V2 transport error: missing garbage terminator, peer=~A"
+                            peer-id)
             (return nil))
           (let ((next (%v2-read conn 1 deadline)))
             (unless next (return nil))
             (vector-push-extend (aref next 0) buf)))))))
 
-(defun %v2-finish-handshake (conn cipher garbage deadline)
+(defun %v2-finish-handshake (conn cipher garbage deadline peer-id)
   "Common tail of both roles, after the ciphers are initialized and our key +
 garbage are on the wire: send our terminator + version packet (authenticating
 our GARBAGE as AAD), scan their garbage, and receive their version packet.
@@ -329,10 +342,11 @@ Returns the ready v2-transport or NIL."
                         cipher *v2-empty-bytes* garbage nil))))
     (unless (send-bytes conn terminator+version)
       (return-from %v2-finish-handshake nil))
-    (let ((their-garbage (%v2-scan-garbage conn cipher deadline)))
+    (let ((their-garbage (%v2-scan-garbage conn cipher deadline peer-id)))
       (unless their-garbage (return-from %v2-finish-handshake nil))
       (let ((transport (make-v2-transport :cipher cipher
-                                          :recv-aad their-garbage)))
+                                          :recv-aad their-garbage
+                                          :peer-id peer-id)))
         ;; Their first non-decoy packet is version negotiation; contents are
         ;; ignored (empty today; extensions may add to it).
         (when (%v2-recv-packet-blocking conn transport deadline)
@@ -374,7 +388,7 @@ speaks v1), or NIL on a hard failure or shutdown."
             (if (ibd-stop-requested-p) nil :fallback-v1)))
         (bl.crypto:bip324-cipher-initialize
          cipher their-key t bl.ser:*network-magic*)
-        (%v2-finish-handshake conn cipher garbage deadline)))))
+        (%v2-finish-handshake conn cipher garbage deadline peer-id)))))
 
 (defun v2-detect-inbound (conn &key (timeout 15) peer-id)
   "Responder-side v1/v2 detection on a fresh inbound CONN: read the first 16
@@ -394,8 +408,9 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
       ;; command but the magic doesn't (else the branch above hit). Not a v2
       ;; key; log and drop (Core does the same for the logging value).
       ((not (mismatch first16 v1-prefix :start1 4 :start2 4))
-       (bl.log:log-cat "net" "V2 transport: v1 peer with wrong network magic~A"
-                       (bl.log:log-ip (connection-host conn)))
+       ;; Core's line (net.cpp:1132-1133): the four magic bytes in hex.
+       (bl.log:log-cat "net" "V2 transport error: V1 peer with wrong MessageStart ~(~{~2,'0X~}~)"
+                       (coerce (subseq first16 0 4) 'list))
        nil)
       (t
        ;; v2: FIRST16 is the start of the peer's 64-byte ellswift key.
@@ -415,7 +430,7 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
                ;; here, once the first 16 bytes have told it this is not a v1
                ;; peer (net.cpp:1003 MAYBE_V1), so its handshake starts here.
                (%log-v2-handshake-start peer-id)
-               (%v2-finish-handshake conn cipher garbage deadline)))))))))
+               (%v2-finish-handshake conn cipher garbage deadline peer-id)))))))))
 
 (defun v2-available-p ()
   "T when v2 transport is enabled and the crypto backend supports it."
