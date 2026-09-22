@@ -184,6 +184,44 @@ block's parent, and that block is announced as a header, not an inv
                             (bl.ser:parse-headers-payload
                              (%message-payload (first sent))))))))))
 
+(test a-reorg-announces-every-new-block-oldest-first
+  "Core's UpdatedBlockTip queues every block from the new tip back to the fork
+point with the previous tip, oldest first, at most MAX_BLOCKS_TO_ANNOUNCE of
+them (net_processing.cpp:2169-2188). A reorg is one tip update, so we queued
+its tip alone; the tip's parent then looked unknown to a sendheaders peer and
+the announcement fell back to an inv (p2p_sendheaders.py:371-375 mines a
+7-block reorg and expects all 7 headers)."
+  (multiple-value-bind (cs entries) (%make-served-chain 3)   ; genesis, A1..A3
+    (let* ((genesis (first entries))
+           (branch (loop with prev = genesis
+                         for h from 1 to 10
+                         collect (let* ((header (bl.ser:make-block-header
+                                                 :version 1
+                                                 :prev-block (bl.store:block-index-entry-hash prev)
+                                                 :merkle-root (%uniq-hash (+ 9000 h))
+                                                 :timestamp (+ 1700001000 h)
+                                                 :bits #x1d00ffff :nonce h))
+                                        (entry (bl.store:make-block-index-entry
+                                                :hash (bl.ser:block-header-hash header)
+                                                :height h :header header :prev-entry prev
+                                                :chain-work (+ 100 h) :status :valid)))
+                                   (bl.store:add-block-index-entry cs entry)
+                                   (setf prev entry))))
+           (hash-of #'bl.store:block-index-entry-hash))
+      ;; A 7-block reorg from A3: B1..B7, oldest first.
+      (is (equalp (mapcar hash-of (subseq branch 0 7))
+                  (bl:blocks-to-announce cs (nth 6 branch)
+                                         (%entry-hash entries 3))))
+      ;; A plain extension: the new block alone.
+      (is (equalp (list (%entry-hash entries 3))
+                  (bl:blocks-to-announce cs (nth 3 entries) (%entry-hash entries 2))))
+      ;; A 10-block reorg is cut at MAX_BLOCKS_TO_ANNOUNCE = 8, keeping the top.
+      (is (equalp (mapcar hash-of (subseq branch 2 10))
+                  (bl:blocks-to-announce cs (nth 9 branch) (%entry-hash entries 3))))
+      ;; No previous tip known: the tip alone.
+      (is (equalp (list (funcall hash-of (nth 6 branch)))
+                  (bl:blocks-to-announce cs (nth 6 branch) nil))))))
+
 (test getheaders-null-locator-returns-stop-header
   (multiple-value-bind (cs entries) (%make-served-chain 5)
     (let* ((payload (%getheaders-payload '() (%entry-hash entries 3)))

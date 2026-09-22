@@ -405,6 +405,7 @@ headerssync.cpp. src/networking/.")
    #:peer-blocks-for-headers-relay
    #:peer-best-header-sent-hash
    #:queue-block-announcement
+   #:+max-blocks-to-announce+
    #:flush-block-announcements
    #:peer-compact-block-high-bandwidth-to
    #:peer-connected-at

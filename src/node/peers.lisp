@@ -1485,6 +1485,29 @@ eviction sweep."
 ;;;; Announcing a new tip (Core PeerManagerImpl::UpdatedBlockTip)
 
 
+(defvar *previous-tip-hash* nil
+  "The active tip the previous :updated-block-tip announcement saw: Core's
+pindexFork is the fork point between it and the new tip.")
+
+(defun blocks-to-announce (chainstate new-entry previous-tip-hash)
+  "Core UpdatedBlockTip's vHashes, oldest first (net_processing.cpp:2169-2188):
+every block from NEW-ENTRY back to the fork point with the previous tip
+PREVIOUS-TIP-HASH -- the blocks that were not in the best chain before -- at
+most MAX_BLOCKS_TO_ANNOUNCE of them. With no previous tip, the new tip alone."
+  (let* ((previous (and previous-tip-hash
+                        (bl.store:get-block-index-entry chainstate previous-tip-hash)))
+         (fork (and previous (bl.val:find-fork-point new-entry previous)))
+         (hashes '()))
+    (loop for entry = new-entry then (bl.store:block-index-entry-prev-entry entry)
+          while (and entry
+                     (not (and fork (equalp (bl.store:block-index-entry-hash entry)
+                                            (bl.store:block-index-entry-hash fork))))
+                     (< (length hashes) bl.net:+max-blocks-to-announce+))
+          do (push (bl.store:block-index-entry-hash entry) hashes)
+          ;; No previous tip to measure from: the new tip alone.
+          until (null fork))
+    hashes))
+
 (bl.vi:define-validation-hook :updated-block-tip announce-block-tip (chainstate hash height)
   "Announce the new tip to every ready peer that does not already have it
 (Core UpdatedBlockTip, net_processing.cpp:2160-2189: the hashes from the fork
@@ -1494,6 +1517,12 @@ SendMessages turns them into a headers message or an inv). Not during IBD
 tick's SendMessages -- chooses headers or inv per peer (BIP 130) and is a
 no-op while relay is disabled.
 
+A reorg is ONE tip update whose new blocks are all queued, oldest first, so a
+sendheaders peer is sent the whole new branch as headers when it is short
+enough (p2p_sendheaders.py:371-375 mines a 7-block reorg and expects all 7);
+queueing the tip alone made its parent look unknown to the peer and the
+announcement fell back to an inv.
+
 Until this hook existed only two paths announced: the P2P block handler and
 submitblock. A block connected by the block-download drain -- every block
 the sync pass fetches after a headers announcement, and every unsolicited
@@ -1502,16 +1531,22 @@ reorg announced nothing at all. In the 2026-09-13 sweep example_test.py's
 node0 connected ten pushed blocks and node1 heard about one of them."
   (declare (ignore height))
   (when (and *node*
-             (not (bl.store:chain-state-target-blockhash chainstate))
-             (not (bl.net:initial-block-download-p chainstate)))
-    (when (bl.store:get-block-index-entry chainstate hash)
-      ;; QUEUE only, as Core's UpdatedBlockTip does
-      ;; (net_processing.cpp:2180-2188). The idle tick's
-      ;; FLUSH-BLOCK-ANNOUNCEMENTS is SendMessages: it coalesces whatever
-      ;; accumulated into ONE message per peer, and it is the only place that
-      ;; decides headers-vs-inv and asks PeerHasHeader. Announcing here,
-      ;; synchronously from whichever thread connected the block, made a
-      ;; 400-block `generate' send 400 separate invs to every peer.
-      (bt:with-recursive-lock-held ((node-lock *node*))
-        (dolist (peer (node-peers *node*))
-          (bl.net:queue-block-announcement peer hash))))))
+             (not (bl.store:chain-state-target-blockhash chainstate)))
+    (let ((entry (bl.store:get-block-index-entry chainstate hash)))
+      (when entry
+        (let ((hashes (blocks-to-announce chainstate entry *previous-tip-hash*)))
+          ;; The fork is measured from every tip update, IBD included, as
+          ;; Core's pindexFork is; only the announcing is skipped in IBD.
+          (setf *previous-tip-hash* hash)
+          (unless (bl.net:initial-block-download-p chainstate)
+            ;; QUEUE only, as Core's UpdatedBlockTip does
+            ;; (net_processing.cpp:2180-2188). The idle tick's
+            ;; FLUSH-BLOCK-ANNOUNCEMENTS is SendMessages: it coalesces whatever
+            ;; accumulated into ONE message per peer, and it is the only place
+            ;; that decides headers-vs-inv and asks PeerHasHeader. Announcing
+            ;; here, synchronously from whichever thread connected the block,
+            ;; made a 400-block `generate' send 400 separate invs to every peer.
+            (bt:with-recursive-lock-held ((node-lock *node*))
+              (dolist (peer (node-peers *node*))
+                (dolist (h hashes)
+                  (bl.net:queue-block-announcement peer h))))))))))
