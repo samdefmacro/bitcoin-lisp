@@ -233,6 +233,7 @@ init.cpp, node/. src/node/.")
    #:start-fixed-seed-fallback
    #:apply-initial-network-active
    #:blocks-to-announce
+   #:log-connect-overrides
    #:maybe-add-fixed-seeds
    #:*seed-nodes*
    #:*use-addrman-outgoing*

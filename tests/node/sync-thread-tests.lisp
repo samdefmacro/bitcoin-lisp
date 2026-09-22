@@ -224,3 +224,23 @@ every start. Ours logged only the disabled case, in words of its own."
                   (search (format nil "SetNetworkActive: ~:[false~;true~]" active)
                           (princ-to-string l)))
                 lines)))))
+
+(test connect-logs-what-it-overrides
+  "Under -connect Core notes that -seednode is ignored (when there are
+targets) and that an explicit -dnsseed=1 is ignored under -proxy
+(init.cpp:2214-2229); feature_config_args.py:378-384 waits for both."
+  (flet ((lines (targets seednode dns proxy)
+           (let ((bl:*dns-seed-enabled* dns)
+                 (bl.net:*proxy* (and proxy (bl.net:make-proxy :host "127.0.0.1" :port 1))))
+             (mapcar #'princ-to-string
+                     (capture-log-lines
+                      (lambda () (bl:log-connect-overrides targets seednode))))))
+         (has (lines text) (some (lambda (l) (search text l)) lines)))
+    (let ((l (lines '("fakeaddress1") '("fakeaddress2") nil nil)))
+      (is (has l "-seednode is ignored when -connect is used"))
+      (is (not (has l "-dnsseed is ignored"))))
+    (is (not (has (lines '() '("fakeaddress2") nil nil) "-seednode is ignored"))
+        "-connect=0 ignores nothing: there is no -connect target")
+    (is (has (lines '("fakeaddress1") '() t t)
+             "-dnsseed is ignored when -connect is used and -proxy is specified"))
+    (is (not (has (lines '("fakeaddress1") '() t nil) "-dnsseed is ignored")))))

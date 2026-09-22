@@ -577,8 +577,21 @@ nobody, where Core refuses to start at all (p2p_permissions.py:101)."
           (log-info "Connecting only to -connect peers: ~{~A~^, ~}" targets)
           (log-info "Outbound connections disabled (-connect=0)"))
       (when (and targets (node-added-nodes *node*))
-        ;; Core logs the same precedence note for -seednode.
-        (log-info "-addnode peers are dialed alongside -connect")))))
+        (log-info "-addnode peers are dialed alongside -connect"))
+      (log-connect-overrides targets seednode))))
+
+(defun log-connect-overrides (connect-targets seednode)
+  "The two notes Core writes when -connect (or -noconnect) takes over outbound
+selection (init.cpp:2214-2229): -seednode is ignored once there are
+CONNECT-TARGETS, and an EXPLICIT -dnsseed=1 is ignored when -proxy is also
+given. `Explicit' needs no raw-argument test here: under -connect the soft-set
+rule has already turned an unset -dnsseed off, so *DNS-SEED-ENABLED* can only
+still be true because the operator said so. feature_config_args.py:378-384
+waits for both lines."
+  (when (and connect-targets seednode)
+    (log-info "-seednode is ignored when -connect is used"))
+  (when (and *dns-seed-enabled* bl.net:*proxy*)
+    (log-info "-dnsseed is ignored when -connect is used and -proxy is specified")))
 
 
 (defun %init-shutdown-latches (log-rate-limit flat-block-files persist-mempool persist-mempool-v1
