@@ -2188,6 +2188,7 @@ the incremental relay fee, so newcomers must beat what was just trimmed
 connects. Returns the number of transactions removed."
   (let ((graph (mempool-graph mempool))
         (removed 0)
+        (max-rate-removed 0)
         (*mempool-removal-reason* :size-limit))
     (%with-graph-verify-batch (mempool)
       (loop while (and (plusp (mempool-count mempool))
@@ -2211,6 +2212,7 @@ connects. Returns the number of transactions removed."
                    ;; bump also STOPS the decay clock. Nothing lowers the
                    ;; floor again until a block connects, or a newcomer at
                    ;; the feerate just evicted walks straight back in.
+                   (setf max-rate-removed (max max-rate-removed rate))
                    (when (> rate (mempool-rolling-min-fee-rate mempool))
                      (setf (mempool-rolling-min-fee-rate mempool)
                            (coerce rate 'double-float)
@@ -2224,6 +2226,14 @@ connects. Returns the number of transactions removed."
                  (dolist (h handles)
                    (when (mempool-remove mempool (tx-handle-data h))
                      (incf removed))))))
+    ;; Core's summary line (txmempool.cpp:908-910), the removed feerate in
+    ;; CFeeRate::ToString's BTC/kvB form (policy/feerate.cpp:33).
+    ;; mempool_limit.py:92 waits for it around a package that trims the pool.
+    (when (plusp max-rate-removed)
+      (bl:log-cat "mempool" "Removed ~D txn, rolling minimum fee bumped to ~D.~8,'0D BTC/kvB"
+                  removed
+                  (floor (round max-rate-removed) 100000000)
+                  (mod (round max-rate-removed) 100000000)))
     removed))
 
 ;;;; Expiry and periodic trim

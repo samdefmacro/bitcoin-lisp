@@ -1997,6 +1997,24 @@ minimum fee past its feerate, so an equal-feerate retry cannot loop."
     (is (= (+ (truncate (* 30 1000) poor-vsize) 100)
            (%rolling-min-fee mempool)))))
 
+(test mempool-trim-logs-the-rolling-fee-bump
+  "TrimToSize ends with Core's summary line when it removed anything:
+`Removed <n> txn, rolling minimum fee bumped to <feerate>', the feerate in
+CFeeRate::ToString's BTC/kvB form (txmempool.cpp:908-910,
+policy/feerate.cpp:33). mempool_limit.py:92 waits for it."
+  (let* ((mempool (bl.mp:make-mempool :max-size 800))
+         (rich (make-mempool-test-tx :input-id 105))
+         (poor (make-mempool-test-tx :input-id 106))
+         (rate (+ (truncate (* 30 1000) (bl.ser:transaction-vsize poor)) 100)))
+    (is (eq :ok (%add-tx mempool rich :fee 50000)))
+    (let ((text (nth-value 1 (log-text-of "mempool"
+                                          (lambda ()
+                                            (%add-tx mempool poor :fee 30))))))
+      (is-true (search (format nil "Removed 1 txn, rolling minimum fee bumped to 0.~8,'0D BTC/kvB"
+                               rate)
+                       text)
+               "the trim's summary line"))))
+
 ;;;; PR4 RBF (BIP125)
 
 (defun %rbf-tx (input-id &key (sequence #xfffffffd) (value 50000000))
