@@ -324,6 +324,30 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
     (drain-peer-once peer (bl.ctx:make-node-context) ctx)
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
+(test an-addr-fetch-peer-is-dropped-after-five-minutes
+  "Core SendMessages disconnects an addr-fetch connection once it is older than
+10 * AVG_ADDRESS_BROADCAST_INTERVAL = 300 s on the mockable clock
+(net_processing.cpp:5751-5755); p2p_addrfetch.py:76-81 moves setmocktime to
++295 (kept) and +301 (dropped). Ours kept such a peer forever."
+  (let* ((t0 1700000000)
+         (bl.ser:*mock-time* t0))
+    (flet ((peer-of (type)
+             (bl.net:make-peer
+              :connection (make-test-connection :host "10.0.0.6" :port 18444
+                                                :connected t :socket nil)
+              :state :ready :address "10.0.0.6" :conn-type type
+              :connected-at t0)))
+      (let ((fetch (peer-of :addr-fetch))
+            (full (peer-of :outbound-full-relay)))
+        (setf bl.ser:*mock-time* (+ t0 300))
+        (drain-peer-once fetch (bl.ctx:make-node-context) (%ibd))
+        (is (eq :ready (bl.net:peer-state fetch)) "300 s is not yet past the limit")
+        (setf bl.ser:*mock-time* (+ t0 301))
+        (drain-peer-once full (bl.ctx:make-node-context) (%ibd))
+        (is (eq :ready (bl.net:peer-state full)) "only an addr-fetch peer has the limit")
+        (drain-peer-once fetch (bl.ctx:make-node-context) (%ibd))
+        (is (eq :disconnected (bl.net:peer-state fetch)))))))
+
 ;;;; Timeout Tests
 
 (test timeout-detection

@@ -2297,6 +2297,20 @@ it hits its own per-pass message budget."
         (park-received-message conn command payload)
         (safely-dispatch-peer-message peer command payload node-ctx ctx))))
 
+(defconstant +addr-fetch-timeout-seconds+ (* 10 30)
+  "Core's addr-fetch lifetime, 10 * AVG_ADDRESS_BROADCAST_INTERVAL (30 s,
+net_processing.cpp:160 and :5751).")
+
+(defun addr-fetch-timed-out-p (peer &optional (now (bl.ser:get-unix-time)))
+  "T when PEER is a handshaked addr-fetch connection older than
++ADDR-FETCH-TIMEOUT-SECONDS+ on the mockable clock (Core SendMessages,
+net_processing.cpp:5751: `current_time - node.m_connected >
+10 * AVG_ADDRESS_BROADCAST_INTERVAL')."
+  (and (eq (peer-conn-type peer) :addr-fetch)
+       (eq (peer-state peer) :ready)
+       (peer-connection peer)
+       (> (- now (peer-connected-at peer)) +addr-fetch-timeout-seconds+)))
+
 (defun drain-and-reap-peer (peer node-ctx ctx)
   "Pump every currently-readable message from PEER, then reap it if its
 connection has gone dead. Mirrors the per-peer branch of Bitcoin Core's
@@ -2443,6 +2457,13 @@ paused peer's input is not read, so nothing can add to it until it drains."
         (bl:log-cat "net" "malformed message during drain, ~A: ~A"
                     (disconnect-msg peer) c)
         (handler-case (disconnect-peer peer) (error () nil))))
+    ;; An addr-fetch connection that has not delivered its addresses within
+    ;; 10 x AVG_ADDRESS_BROADCAST_INTERVAL of the MOCKABLE clock is dropped
+    ;; (Core SendMessages, net_processing.cpp:5751-5755, per pass and after the
+    ;; handshake; p2p_addrfetch.py:76-81 moves setmocktime past 300 s).
+    (when (addr-fetch-timed-out-p peer)
+      (bl:log-cat "net" "addrfetch connection timeout, ~A" (disconnect-msg peer))
+      (handler-case (disconnect-peer peer) (error () nil)))
     ;; Reap a message the peer began and then abandoned. The reader no longer
     ;; waits for the rest of one, so a peer that sends a header and goes silent
     ;; produces nothing readable: the drain above skips it every cycle and the
