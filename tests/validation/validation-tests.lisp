@@ -2508,6 +2508,49 @@ proves the CONTEXTUAL half runs here too."
                     (nth-value 1 (bl.val:accept-block-body nonfinal cs)))
                 "the gate skipped Core's ContextualCheckBlock half")))))))
 
+(test check-block-reads-the-mutation-flag-before-the-coinbase-rules
+  "Core CheckBlock checks the merkle root AND its CVE-2012-2459 mutation flag
+before any structure rule (validation.cpp:3960-3987: `all
+potential-corruption validation must be done before we do any transaction
+validation'). A block whose coinbase is listed twice, under a root that
+commits to that list, is therefore BLOCK_MUTATED bad-txns-duplicate -- which
+the hash does not commit to, so the entry is NOT marked invalid -- not
+BLOCK_CONSENSUS bad-cb-multiple. mining_template_verification.py:93."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "check-block-mutation-order")
+      (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA5 2))
+      (let* ((tip-entry (bl.store:get-block-index-entry
+                         cs (bl.store:best-block-hash cs)))
+             (tip-hash (bl.store:block-index-entry-hash tip-entry))
+             (dup-h (first (make-test-chain-hashes #xB4 1)))
+             (base (make-reorg-test-block tip-hash dup-h 3))
+             (cb (first (bl.ser:bitcoin-block-transactions base)))
+             (header (bl.ser:bitcoin-block-header base))
+             (txs (list cb cb))
+             (dup (bl.ser:make-bitcoin-block
+                   :header (bl.ser:make-block-header
+                            :version (bl.ser:block-header-version header)
+                            :prev-block tip-hash
+                            :merkle-root (bl.val:compute-merkle-root
+                                          (mapcar #'bl.ser:transaction-hash txs))
+                            :timestamp (bl.ser:block-header-timestamp header)
+                            :bits (bl.ser:block-header-bits header)
+                            :nonce (bl.ser:block-header-nonce header)
+                            :cached-hash dup-h)
+                   :transactions txs)))
+        (bl.store:add-block-index-entry
+         cs (bl.store:make-block-index-entry
+             :hash dup-h :height 3 :prev-entry tip-entry
+             :chain-work 900000 :status :header-valid
+             :header (bl.ser:bitcoin-block-header dup)))
+        (is (eq :bad-txns-duplicate
+                (nth-value 1 (bl.val:accept-block-body dup cs))))
+        (is (eq :header-valid
+                (bl.store:block-index-entry-status
+                 (bl.store:get-block-index-entry cs dup-h)))
+            "a mutation verdict must not mark the entry invalid")))))
+
 (test activate-block-does-not-store-a-body-that-fails-the-gate
   "ACTIVATE-BLOCK's weaker-chain case stores a block without connecting it, and
 did so with no CheckBlock at all -- the same hole as the two IBD persist paths,

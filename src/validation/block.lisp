@@ -1853,23 +1853,6 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
           (unless valid
             (return-from %check-block (values nil error nil))))))
 
-    ;; Must have at least one transaction (coinbase)
-    (when (null transactions)
-      (return-from %check-block
-        (values nil :no-transactions)))
-
-    ;; First transaction must be coinbase
-    (let ((first-tx (first transactions)))
-      (unless (is-coinbase-tx first-tx)
-        (return-from %check-block
-          (values nil :first-tx-not-coinbase))))
-
-    ;; Other transactions must not be coinbase
-    (loop for tx in (rest transactions)
-          when (is-coinbase-tx tx)
-            do (return-from %check-block
-                 (values nil :multiple-coinbase)))
-
     ;; BIP325: on signet every block must carry a valid signet solution -- a
     ;; signature over the block by the network's challenge key. Without it,
     ;; :signet would follow any low-difficulty chain. Runs regardless of
@@ -1896,6 +1879,32 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
         (when mutated
           (return-from %check-block
             (values nil :bad-txns-duplicate)))))
+
+    ;; The structure checks come AFTER the merkle root and its mutation flag,
+    ;; as in Core CheckBlock (validation.cpp:3960-3987): "all
+    ;; potential-corruption validation must be done before we do any
+    ;; transaction validation". A one-transaction block with its coinbase
+    ;; duplicated is BLOCK_MUTATED bad-txns-duplicate there -- a verdict the
+    ;; block's hash does not commit to -- where ours answered bad-cb-multiple
+    ;; (mining_template_verification.py:93).
+    ;;
+    ;; Must have at least one transaction (coinbase); the empty list's root
+    ;; is all zeroes, so an empty block reaches this with its root matched.
+    (when (null transactions)
+      (return-from %check-block
+        (values nil :no-transactions)))
+
+    ;; First transaction must be coinbase
+    (let ((first-tx (first transactions)))
+      (unless (is-coinbase-tx first-tx)
+        (return-from %check-block
+          (values nil :first-tx-not-coinbase))))
+
+    ;; Other transactions must not be coinbase
+    (loop for tx in (rest transactions)
+          when (is-coinbase-tx tx)
+            do (return-from %check-block
+                 (values nil :multiple-coinbase)))
 
     ;; Validate block weight (BIP 141)
     (let ((weight (calculate-block-weight transactions)))
