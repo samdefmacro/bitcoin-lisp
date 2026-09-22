@@ -637,3 +637,35 @@ listunspent flags them reused, and the destdata record survives reload."
               (let ((mine (%wb-balances node)))
                 (is (%wb= 0.0d0 (%wb-aval "trusted" mine)))
                 (is (%wb= 49.9999d0 (%wb-aval "used" mine)))))))))))
+
+(test bumpfee-ignores-an-abandoned-descendant
+  "feebumper::PreconditionChecks refuses a transaction that HasWalletSpend,
+and that is IsSpent over its outputs: spent by a wallet tx that is NOT
+abandoned, block-conflicted or mempool-conflicted (wallet.cpp:712-722,
+:770-785). We counted any spender, so once its child was evicted and abandoned
+the parent still could not be bumped -- wallet_bumpfee.py:459. The refusal
+while the child is live is the control."
+  (with-wallet-chain-node (node "bump-abandoned-child" :wallet "w")
+    (let* ((rpc (lambda (method &rest params)
+                  (bl.rpc:dispatch-rpc-method node method params)))
+           (addr (funcall rpc "getnewaddress" "" "bech32")))
+      (%wc-mine node 1 addr)
+      (%wc-mine node 101 (%wc-optrue-address))
+      (with-wallet-rng (97)
+        (let* ((parent (funcall rpc "sendtoaddress" (funcall rpc "getnewaddress" "" "bech32")
+                                (bl.rpc:format-money 100000000)
+                                nil nil nil nil nil nil nil 2))
+               (child (%wb-aval "txid"
+                                (funcall rpc "send"
+                                         (list (%ht (%wc-optrue-address) "0.0002"))
+                                         nil nil nil
+                                         (%ht "inputs" (list (%ht "txid" parent "vout" 0))
+                                              "fee_rate" 2)))))
+          (is (equal -8 (car (rpc-error-of
+                              (lambda () (funcall rpc "bumpfee" parent (%ht "fee_rate" 20))))))
+              "the control: a live child blocks the bump")
+          (%wb-evict-tx node (bl.rpc:parse-hex-hash child))
+          (funcall rpc "abandontransaction" child)
+          (let ((bumped (rpc-error-of
+                         (lambda () (funcall rpc "bumpfee" parent (%ht "fee_rate" 20))))))
+            (is (null bumped) "an abandoned child does not: ~S" bumped)))))))

@@ -2089,10 +2089,14 @@ book entry."
     t))
 
 (defun %wallet-has-spend (wallet tx)
-  "Core CWallet::HasWalletSpend: a wallet tx spends one of TX's outputs."
+  "Core CWallet::HasWalletSpend (wallet.cpp:712-722): one of TX's outputs
+IsSpent -- spent by a wallet tx that is not abandoned, block-conflicted or
+mempool-conflicted (:770-785). We counted ANY spender, so an abandoned child
+still blocked bumping its parent: wallet_bumpfee.py:459
+(test_bumpfee_with_abandoned_descendant_succeeds)."
   (let ((txid (bl.ser:transaction-hash tx)))
     (dotimes (n (length (bl.ser:transaction-outputs tx)) nil)
-      (when (gethash (%wtx-outpoint-key txid n) (wallet-tx-spends wallet))
+      (when (wallet-outpoint-spent-p wallet txid n)
         (return t)))))
 
 (defun %bump-precondition-checks (node wallet wtx require-mine)
