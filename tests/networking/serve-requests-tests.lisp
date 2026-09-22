@@ -264,15 +264,17 @@ stale, are not fetched."
             (is (equalp (list (bl.store:block-index-entry-hash equal-work))
                         (getdata-hashes
                          (captured-sends
-                          (lambda () (bl.net:headers-direct-fetch peer cs equal-work))))))))
-        (with-ibd-context
-          (let ((bl.ser:*mock-time* 1700000100))
+                          (lambda () (bl.net:headers-direct-fetch peer cs equal-work))))))
+            ;; The node keeps ONE context for its life (every pump pass works
+            ;; in it and a sync pass carries its in-flight table over;
+            ;; the-receive-pump-keeps-the-nodes-ibd-context), as Core keeps one
+            ;; mapBlocksInFlight: the request is still there for the next
+            ;; headers message (p2p_sendheaders.py:497-504).
             (is (null (getdata-hashes
                        (captured-sends
                         (lambda () (bl.net:headers-direct-fetch peer cs equal-work)))))
-                "a block already in flight is not asked for twice, even from a
-fresh pass context")))
-        ;; The request dies with its peer; a stale tip then still refuses.
+                "a block already in flight is not asked for twice")))
+        ;; A new peer in a new context; a stale tip then still refuses.
         (setf (bl.net:peer-state peer) :disconnected)
         (let ((other (bl.net:make-peer :address "test2" :state :ready
                                        :services bl.ser:+node-witness+)))
