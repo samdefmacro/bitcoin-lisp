@@ -3052,3 +3052,41 @@ requires redeemScript\". The bech32 case is the control."
                (res (funcall rpc "signrawtransactionwithwallet" raw
                              (list (%ht "txid" txid "vout" 3 "scriptPubKey" spk "amount" 1)))))
           (is (eq t (%aval "complete" res)) "~A: ~S" type res))))))
+
+(test a-rawtr-output-spends-with-its-untweaked-key
+  "A rawtr(KEY) output's key IS its output key, and SignTaproot's key path
+signs it with the untweaked secret (make_keypath_sig(output, nullptr),
+script/sign.cpp:576-590). Our taproot signing maps held only BIP86-tweaked
+output keys, so a wallet holding rawtr(XPRV) could not spend its own coins
+(wallet_taproot.py:298). The spend must reach the mempool."
+  (with-wallet-chain-node (node "rawtr-spend")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+            (tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK"))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "raw" nil t)
+        (rpc "raw" "importdescriptors"
+             (list (obj "desc" (bl.rpc:descriptor-add-checksum (format nil "rawtr(~A/0/*)" tprv))
+                        "active" t "timestamp" "now")
+                   (obj "desc" (bl.rpc:descriptor-add-checksum (format nil "rawtr(~A/1/*)" tprv))
+                        "active" t "internal" t "timestamp" "now")))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (with-wallet-rng (121)
+          (rpc "fund" "sendtoaddress" (rpc "raw" "getnewaddress" "" "bech32m")
+               (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))
+        (rpc nil "generatetoaddress" 1 optrue)
+        (let* ((txid nil)
+               (err (rpc-error-of
+                     (lambda ()
+                       (with-wallet-rng (123)
+                         (setf txid (rpc "raw" "sendtoaddress" optrue (bl.rpc:format-money 50000000)
+                                         nil nil nil nil nil nil nil 10)))))))
+          (is (null err) "rawtr spend: ~S" err)
+          (is-true (member txid (coerce (rpc nil "getrawmempool") 'list) :test #'equal)))))))

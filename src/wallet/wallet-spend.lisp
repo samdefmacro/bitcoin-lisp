@@ -1997,10 +1997,26 @@ TR-KEYMAP (keyed on the BIP86 untweaked-root form) by construction."
             (when (and spkm (spkm-have-private-keys-p spkm))
               (%sign-maps-add-spkm-at! wallet spkm pos keymap pubmap tr-keymap)
               (%sign-maps-add-tr-tree-key-path! wallet spkm script pos tr-keymap)
+              (%sign-maps-add-rawtr-key! wallet spkm script pos tr-keymap)
               (let ((leaves (%spkm-tr-script-leaves spkm script pos)))
                 (when leaves
                   (setf (gethash (subseq script 2 34) tr-scripts) leaves))))))))
     (values keymap pubmap tr-keymap tr-scripts)))
+
+(defun %sign-maps-add-rawtr-key! (wallet spkm script pos tr-keymap)
+  "A rawtr(KEY) output's key IS its output key, spent by a signature from the
+UNTWEAKED secret (SignTaproot's make_keypath_sig(output, nullptr),
+script/sign.cpp:576-590). TR-KEYMAP holds BIP86-tweaked keys otherwise, so a
+wallet holding rawtr(XPRV) could not spend its own coins
+(wallet_taproot.py:298, `Signing transaction failed'). Filed as
+(secret . :UNTWEAKED), and only when the secret reproduces the output key."
+  (when (eq (bl.rpc:out-desc-kind (desc-spkm-desc spkm)) :rawtr)
+    (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
+      (declare (ignore scripts))
+      (let ((priv (and pairs (%desc-key-priv-at (car (first pairs)) pos
+                                                (spkm-privkey-provider wallet spkm)))))
+        (when (and priv (equalp (bl.crypto:derive-xonly-pubkey priv) (subseq script 2 34)))
+          (setf (gethash (subseq script 2 34) tr-keymap) (cons priv :untweaked)))))))
 
 (defun %sign-maps-add-tr-tree-key-path! (wallet spkm script pos tr-keymap)
   "The KEY path of a tr() output WITH a script tree, when the wallet holds the

@@ -650,6 +650,9 @@ the BIP341 sighash commits to all of them."
          ;; empty tweak) or (secret . merkle-root) for an output WITH a script
          ;; tree, whose key path Core signs with the internal key tweaked by the
          ;; root (SignTaproot's make_keypath_sig, script/sign.cpp:576-590).
+         ;; ... or (secret . :UNTWEAKED) for a rawtr() output, whose output
+         ;; key IS the key: CreateSchnorrSig with no merkle root signs untweaked
+         ;; (script/sign.cpp:576-590 via make_keypath_sig(output, nullptr)).
          (sk (if (consp entry) (car entry) entry))
          (root (and (consp entry) (cdr entry)))
          (leaves (and tr-scripts (gethash output-key tr-scripts))))
@@ -667,7 +670,9 @@ the BIP341 sighash commits to all of them."
              (values nil "P2TR SIGHASH_SINGLE has no output at this input index")
              (values (%make-input-sig
                       :kind :p2tr :needed 1
-                      :tap (%tap-sig (bl.crypto:taproot-tweak-private-key sk root)
+                      :tap (%tap-sig (if (eq root :untweaked)
+                                         sk
+                                         (bl.crypto:taproot-tweak-private-key sk root))
                                      sighash tap-sighash-type))))))
       (t
        (multiple-value-bind (stack leaf-sigs leaf)
