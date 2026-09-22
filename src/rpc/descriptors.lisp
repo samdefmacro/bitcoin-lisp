@@ -2539,9 +2539,16 @@ expression order. NIL when the descriptor kind cannot be inferred."
        ;; as multi_a(). The tapscript pair pushes its keys x-only.
        (let* ((kind (out-desc-kind desc))
               (tap (and (member kind '(:multi-a :sortedmulti-a)) t))
-              (ordered (if (member kind '(:sortedmulti :sortedmulti-a))
-                           (sort (copy-list pairs) #'pubkey-lessp :key #'cdr)
-                           pairs)))
+              ;; sortedmulti_a sorts the X-ONLY keys (descriptor.cpp:
+              ;; 1325-1337), so it is by those that the inferred multi_a must
+              ;; list them: ordered by the 33-byte form, the parity byte came
+              ;; first and a key set straddling 02/03 inferred a descriptor for
+              ;; a DIFFERENT address (wallet_taproot.py:254).
+              (ordered (case kind
+                         (:sortedmulti (sort (copy-list pairs) #'pubkey-lessp :key #'cdr))
+                         (:sortedmulti-a (sort (copy-list pairs) #'pubkey-lessp
+                                               :key (lambda (pair) (key-xonly-bytes (cdr pair)))))
+                         (t pairs))))
          (format nil "~A(~D~{,~A~})"
                  (if tap "multi_a" "multi")
                  (out-desc-threshold desc)

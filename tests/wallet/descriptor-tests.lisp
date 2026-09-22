@@ -2166,3 +2166,30 @@ halves private, one normalized string."
                              finally (return n)))
                   "both participants must be normalized to an [origin]tpub: ~S"
                   s))))))))
+
+(test an-inferred-sortedmulti-a-lists-its-keys-in-x-only-order
+  "sortedmulti_a() sorts its keys as X-ONLY keys (script/descriptor.cpp:
+1325-1337), and the multi_a() InferDescriptor gives back lists them in script
+order. We sorted the 33-byte forms, where the parity byte decides first, so a
+key set straddling 02/03 inferred a multi_a() whose address is a different
+one: getaddressinfo's desc did not rederive the address (wallet_taproot.py:254).
+Every one of the first three addresses must round-trip; the first is the one
+whose keys straddle the parity."
+  (with-wallet-chain-node (node "sortedmulti-a-infer")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let* ((tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
+             (pub (%aval "descriptor"
+                         (rpc nil "getdescriptorinfo"
+                              (format nil "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,sortedmulti_a(1,~A/0/*,~A/1/*,~A/2/*))"
+                                      tprv tprv tprv))))
+             (h (make-hash-table :test 'equal)))
+        (setf (gethash "desc" h) pub (gethash "active" h) t (gethash "timestamp" h) "now")
+        (rpc nil "createwallet" "g" t t)
+        (rpc "g" "importdescriptors" (list h))
+        (dotimes (i 3)
+          (let* ((address (rpc "g" "getnewaddress" "" "bech32m"))
+                 (desc (%aval "desc" (rpc "g" "getaddressinfo" address))))
+            (is (equal (list address) (coerce (rpc nil "deriveaddresses" desc) 'list))
+                "address ~D: ~A does not rederive from ~A" i address desc)))))))
