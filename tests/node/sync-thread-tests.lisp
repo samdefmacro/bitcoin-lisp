@@ -305,3 +305,41 @@ ONE idle tick, with Core's line."
              (is-true (find "Outbound peer has old chain" lines :test #'search)
                       "one idle tick must walk the ladder to the disconnect: ~S" lines)))
       (setf (bl:node-running node) nil))))
+
+(test an-addconnection-feeler-is-dropped-once-its-handshake-is-done
+  "Core's VERSION handler disconnects a feeler as soon as the version is in:
+\"feeler connection completed, disconnecting peer=N\"
+(net_processing.cpp:3807-3811). The addconnection RPC is how a test asks for
+one (p2p_handshake.py:97-98 waits for the line and for getpeerinfo to empty);
+ours kept an addconnection feeler as an ordinary peer. CONNECT-PEER and
+PERFORM-HANDSHAKE are stubbed so the idle tick's real dial path runs up to a
+completed handshake."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (bl:*pending-test-connections* (list (list "203.0.113.20:18444" :feeler nil)))
+         (real-connect (fdefinition 'bl.net:connect-peer))
+         (real-handshake (fdefinition 'bl.net:perform-handshake))
+         (enabled (bl.log:log-category-enabled-p "net"))
+         (lines nil))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t
+                 (fdefinition 'bl.net:connect-peer)
+                 (lambda (host &optional port &rest more)
+                   (declare (ignore port more))
+                   (bl.net:make-peer :address host :state :connected))
+                 (fdefinition 'bl.net:perform-handshake)
+                 (lambda (peer &rest args)
+                   (setf (bl.net:peer-state peer) :ready
+                         (bl.net:peer-conn-type peer) (getf args :conn-type))
+                   t))
+           (bl.log:enable-log-category "net")
+           (setf lines (capture-log-lines #'%idle-tick)))
+      (setf (fdefinition 'bl.net:connect-peer) real-connect
+            (fdefinition 'bl.net:perform-handshake) real-handshake
+            (bl:node-running node) nil)
+      (unless enabled (bl.log:disable-log-category "net")))
+    (is-true (find "feeler connection completed, disconnecting peer=" lines :test #'search)
+             "Core's line once the feeler's handshake is done: ~S" lines)
+    (is (null (bl:node-peers node)) "and the feeler never joins the peer set")))

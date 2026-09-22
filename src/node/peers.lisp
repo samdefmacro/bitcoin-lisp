@@ -1064,13 +1064,19 @@ speaks it."
             (if (bl.net:perform-handshake peer :conn-type conn-type
                                                :try-v2 (and use-v2 (bl.net:v2-available-p))
                                                :near-tip (bl.net:near-tip-p (node-chain-state node)))
+                (if (eq conn-type :feeler)
+                    ;; A feeler has done its job once the version is in: Core's
+                    ;; VERSION handler disconnects it (net_processing.cpp:
+                    ;; 3807-3811); the addconnection RPC is how a test asks for
+                    ;; one (p2p_handshake.py:97-98).
+                    (progn (%feeler-completed peer) nil)
                 (progn
                   (bl.net:send-post-handshake-messages peer)
                   (bl.net:send-compact-block-negotiation peer)
                   (bt:with-recursive-lock-held ((node-lock node))
                     (push peer (node-peers node)))
                   (log-info "Added-node peer connected: ~A" host)
-                  peer)
+                  peer))
                 (progn (bl.net:disconnect-peer peer) nil))))
       (error (c)
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
@@ -1293,6 +1299,12 @@ Each carries blocks/headers only (relay=0), never tx relay."
                  (return))
                (log-info "Opened block-relay-only peer ~A" ip)))))
 
+(defun %feeler-completed (peer)
+  "Drop a feeler whose handshake is done, with Core's line: \"feeler connection
+completed, disconnecting peer=N\" (net_processing.cpp:3807-3811)."
+  (bl:log-cat "net" "feeler connection completed, ~A" (bl.net:disconnect-msg peer))
+  (bl.net:disconnect-peer peer))
+
 (defun do-feeler-connection (node host port count-failure)
   "Open a short-lived feeler connection: connect, handshake, and on success mark
 the address good (promoting it new -> tried). Always disconnects afterward --
@@ -1306,15 +1318,16 @@ through the same OpenNetworkConnection call as any other automatic dial
       (let ((peer (%dial-outbound-peer node host port count-failure)))
         (when peer
           (setf (bl.net:peer-address peer) host)
-          (when (bl.net:perform-handshake peer :conn-type :feeler)
-            (multiple-value-bind (net ip-bytes)
-                (bl.net:parse-network-address host)
-              (when net
-                (bl.net:address-book-good
-                 (node-address-book node) ip-bytes port
-                 (bl.ser:get-unix-time) net)))
-            (log-debug "Feeler validated ~A (new -> tried)" host))
-          (bl.net:disconnect-peer peer)))
+          (cond ((bl.net:perform-handshake peer :conn-type :feeler)
+                 (multiple-value-bind (net ip-bytes)
+                     (bl.net:parse-network-address host)
+                   (when net
+                     (bl.net:address-book-good
+                      (node-address-book node) ip-bytes port
+                      (bl.ser:get-unix-time) net)))
+                 (log-debug "Feeler validated ~A (new -> tried)" host)
+                 (%feeler-completed peer))
+                (t (bl.net:disconnect-peer peer)))))
     (error (c)
       (log-debug "Feeler to ~A:~D failed: ~A" host port c))))
 
