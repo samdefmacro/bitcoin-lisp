@@ -450,6 +450,17 @@ these two is that they refuse a proof that does not hold up."
                        (handler-case
                            (progn (rpc "w" "removeprunedfunds" cb) "")
                          (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
+          ;; A malformed txid is Core's ParseHashV(request.params[0], "txid")
+          ;; (wallet/rpc/backup.cpp:115, rpc/util.cpp:117-125): -8 in its two
+          ;; sentences, not a wallet-local parser's wording.
+          (is (equal (cons -8 "txid must be of length 64 (not 2, for '00')")
+                     (rpc-error-of (lambda () (rpc "w" "removeprunedfunds" "00")))))
+          (is (equal (cons -8 (format nil "txid must be hexadecimal string (not '~A')"
+                                      (make-string 64 :initial-element #\z)))
+                     (rpc-error-of
+                      (lambda ()
+                        (rpc "w" "removeprunedfunds"
+                             (make-string 64 :initial-element #\z))))))
           ;; --- importprunedfunds ---
           (is (null (rpc "w" "importprunedfunds" rawtx proof)))
           (let ((gettx (rpc "w" "gettransaction" cb)))
