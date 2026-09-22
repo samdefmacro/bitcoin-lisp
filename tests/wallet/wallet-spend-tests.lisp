@@ -2377,3 +2377,59 @@ was missing everywhere."
           (is (null (assoc "ischange" payment :test #'equal)))
           (is-true change)
           (is (eq t (%aval "ischange" change))))))))
+
+(test a-tr-tree-psbt-carries-its-merkle-root-scripts-and-tree
+  "Core's FromSignatureData copies the provider's TaprootSpendData into every
+tr() input it updates -- PSBT_IN_TAP_MERKLE_ROOT and one PSBT_IN_TAP_LEAF_SCRIPT
+per leaf (psbt.cpp:197-202) -- and a wallet-owned tr() OUTPUT gets
+PSBT_OUT_TAP_TREE from the builder (:293-295), which decodepsbt expands into
+{depth, leaf_ver, script} objects (rpc/rawtransaction.cpp:1425-1437).
+wallet_taproot.py:363-364 asserts taproot_merkle_root and taproot_scripts on
+every input carrying a script-path signature; the root was never written."
+  (with-wallet-chain-node (node "tr-tree")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest))
+            (import (let ((h (make-hash-table :test 'equal)))
+                      (setf (gethash "desc" h)
+                            (bl.rpc:descriptor-add-checksum
+                             "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,pk(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/0/*))")
+                            (gethash "active" h) t
+                            (gethash "timestamp" h) "now")
+                      h)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "tr" nil t)
+        (is (eq t (%aval "success" (first (rpc "tr" "importdescriptors" (list import))))))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let ((tr-address (rpc "tr" "getnewaddress" "" "bech32m"))
+              (bl.wallet::*wallet-rng* (make-wallet-rng 57)))
+          (rpc "fund" "sendtoaddress" tr-address (bl.rpc:format-money 100000000)
+               nil nil nil nil nil nil nil 10)
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((coin (first (rpc "tr" "listunspent")))
+                 (input (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "txid" h) (%aval "txid" coin)
+                                (gethash "vout" h) (%aval "vout" coin))
+                          h))
+                 (outputs (list (let ((h (make-hash-table :test 'equal)))
+                                  (setf (gethash (rpc "tr" "getnewaddress" "" "bech32m") h)
+                                        (bl.rpc:format-money 50000000))
+                                  h)))
+                 (created (rpc nil "createpsbt" (list input) outputs))
+                 (processed (rpc "tr" "walletprocesspsbt" created t "ALL" t nil))
+                 (decoded (rpc nil "decodepsbt" (%aval "psbt" processed)))
+                 (psbt-input (first (coerce (%aval "inputs" decoded) 'list)))
+                 (psbt-output (first (coerce (%aval "outputs" decoded) 'list)))
+                 (tree (coerce (or (%aval "taproot_tree" psbt-output) '()) 'list)))
+            (is-true (%aval "taproot_script_path_sigs" psbt-input)
+                     "the control: the leaf key signed the script path")
+            (is (= 64 (length (or (%aval "taproot_merkle_root" psbt-input) ""))))
+            (is (= 1 (length (coerce (or (%aval "taproot_scripts" psbt-input) '())
+                                     'list))))
+            (is (= 1 (length tree)))
+            (is (equal '(0 192)
+                       (list (%aval "depth" (first tree))
+                             (%aval "leaf_ver" (first tree)))))))))))

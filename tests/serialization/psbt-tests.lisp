@@ -1051,11 +1051,12 @@ rawtransaction.cpp:1253-1314)."
                    (elt (cdr (assoc "leaf_hashes" d :test #'string=)) 0)))))))
 
 (test decodepsbt-reports-taproot-output-fields
-  "PSBT_OUT_TAP_TREE is one opaque blob of (depth, leaf_ver, script) tuples;
-Core reports it as hex rather than expanding it, so we do the same rather than
-inventing a shape a client would not recognise."
+  "PSBT_OUT_TAP_TREE is a run of (depth, leaf_ver, script) tuples, and Core
+expands them into one {depth, leaf_ver, script} object each
+(rpc/rawtransaction.cpp:1425-1437). This test used to pin the whole blob as a
+hex string, a shape no Core client reads."
   (let* ((xonly (%tap-bytes 32 #x11))
-         (tree (%tap-bytes 8 #x22))
+         (tree (coerce #(0 #xc0 1 #x51) '(simple-array (unsigned-byte 8) (*))))
          (map (bl.ser:make-psbt-map
                :records
                (list (%tap-record bl.ser:+psbt-out-tap-internal-key+
@@ -1069,7 +1070,8 @@ inventing a shape a client would not recognise."
          (json (bl.wallet::%psbt-output-json map)))
     (flet ((f (k) (cdr (assoc k json :test #'string=))))
       (is (equal (bl.crypto:bytes-to-hex xonly) (f "taproot_internal_key")))
-      (is (equal (bl.crypto:bytes-to-hex tree) (f "taproot_tree")))
+      (is (equal '((("depth" . 0) ("leaf_ver" . #xc0) ("script" . "51")))
+                 (f "taproot_tree")))
       (let ((d (elt (f "taproot_bip32_derivs") 0)))
         (is (equal "09090909" (cdr (assoc "master_fingerprint" d :test #'string=))))
         ;; A zero leaf-hash count is legal: the key is used for key-path only.

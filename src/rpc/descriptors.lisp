@@ -1695,7 +1695,7 @@ equally valid one, changing the txid of a transaction already in flight."
 
 (defun %tr-tree-parts (desc pos keyfn track-paths)
   "The shared taproot computation behind %TR-OUTPUT-KEY and TR-SPEND-DATA, as
-(values OUTPUT-KEY PARITY INTERNAL-KEY LEAVES PATHS), where LEAVES is one
+(values OUTPUT-KEY PARITY INTERNAL-KEY LEAVES PATHS ROOT), where LEAVES is one
 (SCRIPT . LEAF-HASH) per leaf in tr()'s parse order. One walk of the tree, so
 the address a descriptor DERIVES and the address its spend data is built for
 can never disagree, and the leaf hashes the tree was folded from are handed
@@ -1720,7 +1720,7 @@ PATHS is NIL unless TRACK-PATHS — see %TAPROOT-TREE."
            internal (bl.crypto:tap-tweak-hash internal root))
         (unless output-key
           (error 'descriptor-derivation-error))
-        (values output-key parity internal leaves paths)))))
+        (values output-key parity internal leaves paths root)))))
 
 (defun tr-spend-data (desc pos keyfn)
   "What it takes to SPEND the tr() descriptor DESC at range position POS
@@ -1728,12 +1728,15 @@ PATHS is NIL unless TRACK-PATHS — see %TAPROOT-TREE."
 
   OUTPUT-KEY  the 32-byte tweaked key, i.e. the witness program;
   LEAVES      one (SCRIPT LEAF-HASH CONTROL-BLOCK) per leaf, in tr()'s parse
-              order; empty when there is no tree.
+              order; empty when there is no tree;
+  MERKLE-ROOT the 32-byte root the internal key was tweaked by, or NIL when
+              there is no tree (TaprootSpendData::merkle_root, which
+              FromSignatureData copies into PSBT_IN_TAP_MERKLE_ROOT).
 
 The output key's Y PARITY goes into each control block's first byte and is not
 derivable from OUTPUT-KEY, which is x-only — it is consumed here rather than
 returned, since no caller needs it on its own."
-  (multiple-value-bind (output-key parity internal leaves paths)
+  (multiple-value-bind (output-key parity internal leaves paths root)
       (%tr-tree-parts desc pos keyfn t)
     (values output-key
             (loop for (script . leaf-hash) in leaves
@@ -1741,7 +1744,8 @@ returned, since no caller needs it on its own."
                   collect (list script leaf-hash
                                 (%taproot-control-block
                                  +tapleaf-version-tapscript+ parity
-                                 internal path))))))
+                                 internal path)))
+            root)))
 
 (defun %tr-output-key (desc pos keyfn)
   "The 32-byte taproot output key for a tr() descriptor: the internal key

@@ -251,6 +251,19 @@ tr() script-path signing means anything."
                       (bl.crypto:bytes-to-hex mr))))
   (%psbt-musig2-json map add))
 
+(defun %psbt-tap-tree-json (value)
+  "decodepsbt's taproot_tree array for a PSBT_OUT_TAP_TREE VALUE: one
+{depth, leaf_ver, script} per tuple (Core rpc/rawtransaction.cpp:1425-1437).
+The reader has already refused a malformed tree."
+  (let ((br (bl.bytes:make-byte-reader-from value)))
+    (loop until (bl.bytes:br-eof-p br)
+          collect (let* ((depth (bl.bytes:br-read-u8 br))
+                         (leaf-ver (bl.bytes:br-read-u8 br))
+                         (script (bl.bytes:br-read-var-bytes br)))
+                    `(("depth" . ,depth)
+                      ("leaf_ver" . ,leaf-ver)
+                      ("script" . ,(bl.crypto:bytes-to-hex script)))))))
+
 (defun %psbt-musig2-keydata-json (keydata)
   "The (participant, aggregate, leaf-hash) a MuSig2 nonce or partial-signature
 keydata names, or NIL when it is malformed.
@@ -403,11 +416,11 @@ fingerprint><path>."
       (let ((tk (bl.ser:psbt-map-find
                  map bl.ser:+psbt-out-tap-internal-key+)))
         (when tk (add "taproot_internal_key" (bl.crypto:bytes-to-hex tk))))
-      ;; PSBT_OUT_TAP_TREE is one opaque blob of (depth, leaf_ver, script)
-      ;; tuples; Core reports it as hex rather than expanding it.
+      ;; PSBT_OUT_TAP_TREE: Core expands the (depth, leaf_ver, script)
+      ;; tuples into one object each (rpc/rawtransaction.cpp:1425-1437).
       (let ((tree (bl.ser:psbt-map-find
                    map bl.ser:+psbt-out-tap-tree+)))
-        (when tree (add "taproot_tree" (bl.crypto:bytes-to-hex tree))))
+        (when tree (add "taproot_tree" (%psbt-tap-tree-json tree))))
       (let ((derivs (bl.ser:psbt-map-collect
                      map bl.ser:+psbt-out-tap-bip32+)))
         (when derivs
@@ -1330,6 +1343,57 @@ followed by the ordinary <fingerprint><path> of a bip32 derivation record."
     (bl.bytes:bb-write-bytes bb (%psbt-bip32-value fingerprint path))
     (bl.bytes:bb-finish bb)))
 
+(defun %spkm-tr-tree-data (spkm spk pos pairs)
+  "The rest of Core's TaprootSpendData for a tr()-with-tree output SPKM owns,
+as (values MERKLE-ROOT LEAVES DEPTHS): LEAVES one (SCRIPT LEAF-HASH
+CONTROL-BLOCK) per leaf and DEPTHS each leaf's depth, in tr()'s parse order --
+which is the order TaprootBuilder::GetTreeTuples walks. NIL for a key-path-only
+tr(), anything that is not tr(), or spend data that does not derive SPK (the
+guard %SPKM-TR-SCRIPT-LEAVES applies)."
+  (let ((desc (desc-spkm-desc spkm)))
+    (when (and (eq (bl.rpc:out-desc-kind desc) :tr)
+               (bl.rpc:out-desc-tree desc)
+               (>= (length spk) 34))
+      (multiple-value-bind (output-key leaves root)
+          (bl.rpc:tr-spend-data desc pos
+                                (lambda (k) (cdr (assoc k pairs :test #'eq))))
+        (when (equalp output-key (subseq spk 2 34))
+          (values root leaves
+                  (mapcar #'car (bl.rpc:out-desc-tree desc))))))))
+
+(defun %psbt-add-tr-tree-records (map spkm spk pos pairs outputp)
+  "Core FromSignatureData's tr_spenddata half. An INPUT gets
+PSBT_IN_TAP_MERKLE_ROOT and one PSBT_IN_TAP_LEAF_SCRIPT per leaf (psbt.cpp:
+197-202); an OUTPUT gets PSBT_OUT_TAP_TREE, the tree tuples
+<depth><leaf version><script> (:293-295). The provider knows them for every
+tr() output the wallet owns, whether or not anything is signed, so a script-path
+signature always travels with the root and scripts that verify it --
+wallet_taproot.py:363-364 asserts both."
+  (multiple-value-bind (root leaves depths) (%spkm-tr-tree-data spkm spk pos pairs)
+    (when root
+      (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+            (ver bl.rpc:+tapleaf-version-tapscript+))
+        (if outputp
+            (let ((bb (bl.bytes:make-byte-buf)))
+              (loop for (script) in leaves
+                    for depth in depths
+                    do (bl.bytes:bb-write-u8 bb depth)
+                       (bl.bytes:bb-write-u8 bb ver)
+                       (bl.bytes:bb-write-varint bb (length script))
+                       (bl.bytes:bb-write-bytes bb script))
+              (bl.ser:psbt-map-set map bl.ser:+psbt-out-tap-tree+ empty
+                                   (bl.bytes:bb-finish bb)))
+            (progn
+              (bl.ser:psbt-map-set map bl.ser:+psbt-in-tap-merkle-root+ empty
+                                   (coerce root '(simple-array (unsigned-byte 8) (*))))
+              (loop for (script nil control) in leaves
+                    do (unless (%psbt-record-present-p
+                                map bl.ser:+psbt-in-tap-leaf-script+ control)
+                         (bl.ser:psbt-map-set
+                          map bl.ser:+psbt-in-tap-leaf-script+ control
+                          (concatenate '(vector (unsigned-byte 8))
+                                       script (vector ver)))))))))))
+
 (defun %psbt-add-map-derivs (map spk pos pairs &optional spkm)
   "Add the derivation records an UPDATER writes for a wallet-owned input or
 output: +psbt-in-bip32+ for an ECDSA script, and for a TAPROOT one
@@ -1362,6 +1426,7 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
         map bl.ser:+psbt-in-tap-internal-key+ empty
         (bl.rpc:key-xonly-bytes (cdr (first pairs))))
        (when spkm
+         (%psbt-add-tr-tree-records map spkm spk pos pairs nil)
          (loop for (xonly leaf-hashes fpr path)
                  in (%spkm-tap-bip32-origins spkm spk pos pairs)
                do (bl.ser:psbt-map-set
@@ -1433,6 +1498,7 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                       (bl.ser:psbt-map-set
                        map bl.ser:+psbt-out-tap-internal-key+ empty
                        (bl.rpc:key-xonly-bytes (cdr (first pairs))))
+                      (%psbt-add-tr-tree-records map spkm spk pos pairs t)
                       (loop for (xonly leaf-hashes fpr path)
                               in (%spkm-tap-bip32-origins spkm spk pos pairs)
                             do (bl.ser:psbt-map-set
