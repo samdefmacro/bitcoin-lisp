@@ -1185,6 +1185,17 @@ rather than at either site."
                   0)))
     (values eval-height mtp mtp)))
 
+(defun %with-sibling-eviction (reason sibling-eviction)
+  "REASON, a ReplacementChecks verdict, marked the way Core spells a
+replacement that evicts a TRUC sibling: `too many potential replacements
+(including sibling eviction)' and `insufficient fee (including sibling
+eviction)' (validation.cpp:997, :1011; mempool_truc.py:519). The keyword --
+and so the reconsiderable class -- is the plain verdict's."
+  (if (and sibling-eviction (consp reason)
+           (member (first reason) '(:rbf-insufficient-fee :too-many-clusters)))
+      (list (first reason) (second reason) :sibling-eviction)
+      reason))
+
 (defun %replacement-checks (mempool tx modified-fee vsize sigops direct-conflicts)
   "Core MemPoolAccept::ReplacementChecks (validation.cpp:981-1032), which is a
 method of its own there rather than a stretch of PreChecks: apply the
@@ -1437,8 +1448,7 @@ pass a member failed decides what the caller is told about the others."
                        sigops-cost))
                (direct-conflicts (bl.mp:find-rbf-conflicts mempool tx))
                (replaced-set nil)
-               ;; Core ws.m_sibling_eviction (validation.cpp:966).
-               (sibling-eviction nil))
+               (sibling-eviction nil))  ; Core ws.m_sibling_eviction
 
           ;; EPHEMERAL DUST, part 2 (Core PreCheckEphemeralTx,
           ;; ephemeral_policy.cpp:23-27, at validation.cpp:933 — after the fees
@@ -1483,10 +1493,9 @@ pass a member failed decides what the caller is told about the others."
             (multiple-value-bind (truc-ok truc-reason sibling)
                 (bl.mp:single-truc-checks mempool tx vsize direct-conflicts)
               (unless truc-ok
-                (if (and sibling allow-sibling-eviction (not skip-rbf-check))
-                    (progn
-                      (setf sibling-eviction t)
-                      (pushnew sibling direct-conflicts :test #'equalp))
+                (if (setf sibling-eviction
+                          (and sibling allow-sibling-eviction (not skip-rbf-check)))
+                    (pushnew sibling direct-conflicts :test #'equalp)
                     (return-from validate-transaction-for-mempool
                       (values nil truc-reason nil))))))
 
@@ -1501,18 +1510,7 @@ pass a member failed decides what the caller is told about the others."
                                      sigops-cost direct-conflicts)
               (unless ok
                 (return-from validate-transaction-for-mempool
-                  (values nil
-                          ;; Core's m_sibling_eviction suffix on the two
-                          ;; reasons ReplacementChecks writes with it
-                          ;; (validation.cpp:997, :1011); mempool_truc.py:519.
-                          (if (and sibling-eviction (consp reason)
-                                   (member (first reason)
-                                           '(:rbf-insufficient-fee
-                                             :too-many-clusters)))
-                              (list (first reason) (second reason)
-                                    :sibling-eviction)
-                              reason)
-                          nil)))
+                  (values nil (%with-sibling-eviction reason sibling-eviction) nil)))
               (setf replaced-set rset)))
 
           ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends,
