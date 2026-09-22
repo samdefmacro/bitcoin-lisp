@@ -16,6 +16,11 @@
 #   scripts/conformance.sh --runner --extended         # Core's test_runner.py
 #
 # BL_CONFORMANCE_TIMEOUT caps each test (default 300s).
+# BL_CONFORMANCE_ARGS is appended to every test's command line, e.g.
+#   BL_CONFORMANCE_ARGS=--timeout-factor=4 for a test that starts a dozen nodes.
+# BL_CONFORMANCE_REFERENCE=<tag> runs the test against Core's OWN bitcoind of
+# that previous release (e.g. v28.2, see scripts/get-previous-releases.sh)
+# instead of ours: when a test fails here, it says whether Core passes it.
 #
 # Everything runs in the pinned project container. Nothing is published to a
 # host port: Core's framework binds 127.0.0.1 inside the container's own
@@ -53,6 +58,7 @@ OUT="$TMPDIR_REL/$RUN_ID"
 mkdir -p "$REPO/$OUT"
 
 MODE=tests
+NEEDS_LOCAL_ADDRS=0
 if [ "${1:-}" = "--runner" ]; then MODE=runner; shift; fi
 
 if [ "$MODE" = runner ]; then
@@ -66,6 +72,13 @@ else
   for t in "$@"; do
     # Each test gets its own tmpdir; the framework refuses a non-empty one.
     name="$(basename "$t" .py)"
+    # The two -bind/-discover tests skip unless routable addresses are on an
+    # interface and the test is told so; see scripts/conformance-local-addresses.py.
+    extra=""
+    case "$name" in
+      feature_bind_port_discover) extra="--ihave1111and2222"; NEEDS_LOCAL_ADDRS=1 ;;
+      feature_bind_port_externalip) extra="--ihave1111"; NEEDS_LOCAL_ADDRS=1 ;;
+    esac
     # A per-test timeout, because an oracle you are afraid to run is not one.
     # A node that wedges takes the whole batch with it otherwise, and "wedged"
     # is exactly the kind of finding this suite exists to produce.
@@ -73,7 +86,7 @@ else
          timeout -k 10 ${BL_CONFORMANCE_TIMEOUT:-300} \
          python3 \$(case '$t' in /*) echo '$t';; */*) echo /workspace/'$t';; *) echo /workspace/refs/bitcoin/test/functional/'$t';; esac) \
            --configfile=/workspace/test/config.ini \
-           --tmpdir=/workspace/$OUT/$name; \
+           --tmpdir=/workspace/$OUT/$name $extra ${BL_CONFORMANCE_ARGS:-}; \
          rc=\$?; \
          if [ \$rc = 0 ]; then echo 'RESULT $name PASS'; \
          elif [ \$rc = 77 ]; then echo 'RESULT $name SKIP'; \
@@ -83,6 +96,15 @@ else
 fi
 
 TTY_FLAGS="-i"; [ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
+
+# NET_ADMIN is granted only to a run that includes one of the two tests above,
+# and only inside the container's own network namespace (never --privileged,
+# never host networking): it is what lets the helper add 1.1.1.1 and 2.2.2.2.
+CAP_FLAGS=""
+if [ "$NEEDS_LOCAL_ADDRS" = 1 ]; then
+  CAP_FLAGS="--cap-add NET_ADMIN"
+  CMD="python3 /workspace/scripts/conformance-local-addresses.py && $CMD"
+fi
 
 # Previous releases (Core test/get_previous_releases.py): the tests that
 # add_nodes(versions=[...]) an old bitcoind skip with "previous releases not
@@ -112,6 +134,16 @@ if ls "$ARCHIVES"/bitcoin-*.tar.gz >/dev/null 2>&1; then
         echo "previous release $tag extracted" >&2
       done'
   RELEASE_FLAGS="-v $RELEASES_VOL:/releases:ro -e PREVIOUS_RELEASES_DIR=/releases"
+  # The framework takes a binary from $BITCOIND before config.ini
+  # (test_framework/util.py:317-343).
+  if [ -n "${BL_CONFORMANCE_REFERENCE:-}" ]; then
+    RELEASE_FLAGS="$RELEASE_FLAGS -e BITCOIND=/workspace/scripts/conformance-reference-bitcoind.sh"
+    RELEASE_FLAGS="$RELEASE_FLAGS -e BL_REFERENCE_BITCOIND=/releases/$BL_CONFORMANCE_REFERENCE/bin/bitcoind"
+    echo "reference run: Core $BL_CONFORMANCE_REFERENCE's bitcoind, not ours" >&2
+  fi
+elif [ -n "${BL_CONFORMANCE_REFERENCE:-}" ]; then
+  echo "BL_CONFORMANCE_REFERENCE needs scripts/get-previous-releases.sh first." >&2
+  exit 1
 fi
 
 echo "conformance run $RUN_ID -> $OUT" >&2
@@ -121,5 +153,5 @@ docker run --rm $TTY_FLAGS \
   --label "io.common-lisp-workbench.checkout=$CHECKOUT_SHORT" \
   -w /workspace \
   -e HOME=/tmp \
-  $RELEASE_FLAGS \
+  $RELEASE_FLAGS $CAP_FLAGS \
   "$IMAGE" bash -lc "$CMD"
