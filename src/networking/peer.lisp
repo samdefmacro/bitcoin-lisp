@@ -1377,6 +1377,29 @@ NODE_NETWORK_LIMITED|NODE_WITNESS from a limited peer once we are NEAR-TIP
   "Core HasAllDesirableServiceFlags (net_processing.cpp:1753-1756)."
   (zerop (logandc2 (desirable-service-flags services near-tip) services)))
 
+(defun %receive-first-version (peer timeout)
+  "Read messages until PEER's VERSION arrives, within TIMEOUT seconds overall,
+and return it as (values command payload); NIL on silence, EOF or timeout.
+
+Anything else before the VERSION is IGNORED with Core's line, not treated as a
+failed handshake: ProcessMessage returns early on `pfrom.nVersion == 0' after
+logging \"non-version message before version handshake\"
+(net_processing.cpp:3814-3818), and the connection stays up until the
+handshake timeout. p2p_timeouts.py:72 sends a ping first, waits for that line
+and then asserts the peer is still connected."
+  (let* ((units internal-time-units-per-second)
+         (deadline (+ (get-internal-real-time) (round (* timeout units)))))
+    (loop
+      (let ((remaining (/ (max 0 (- deadline (get-internal-real-time))) units)))
+        (when (<= remaining 0) (return nil))
+        (multiple-value-bind (command payload)
+            (receive-message-blocking peer :timeout remaining)
+          (cond ((null command) (return nil))
+                ((string= command "version") (return (values command payload)))
+                (t (bl:log-cat "net" "non-version message before version handshake. ~
+                                      Message \"~A\" from peer=~A"
+                               (bl.bytes:sanitize-string command) (peer-id peer)))))))))
+
 (defun %receive-and-store-version (peer &key (timeout 30) near-tip)
   "Receive the peer's version message and record its services/height/user-agent.
 Returns T on success, NIL if the first message wasn't a version — or if Core
@@ -1385,7 +1408,7 @@ services (net_processing.cpp:3611-3619), or any peer announcing a protocol
 older than +min-peer-proto-version+ (:3623-3627). NEAR-TIP widens the
 desirable set to limited peers, as in Core."
   (multiple-value-bind (command payload)
-      (receive-message-blocking peer :timeout timeout)
+      (%receive-first-version peer timeout)
     (when (and command (string= command "version"))
       (bl.bytes:with-byte-reader (stream payload)
         (let* ((version-msg (bl.ser:read-version-message stream))
@@ -1469,7 +1492,12 @@ structural fix; this bounds the damage in the meantime."
                ((string= command "wtxidrelay") (setf (peer-wtxid-relay peer) t))
                ((string= command "sendtxrcncl")
                 (unless (%handle-handshake-sendtxrcncl peer payload)
-                  (return nil)))))
+                  (return nil)))
+               ;; Everything else is ignored until VERACK, with Core's line
+               ;; (net_processing.cpp:4015-4018); p2p_timeouts.py:69 waits
+               ;; for it.
+               (t (bl:log-cat "net" "Unsupported message \"~A\" prior to verack from peer=~A"
+                              (bl.bytes:sanitize-string command) (peer-id peer)))))
         finally (return nil)))))
 
 (defun %v2-try-outbound (peer)

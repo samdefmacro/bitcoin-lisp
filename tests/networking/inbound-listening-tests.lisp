@@ -457,3 +457,46 @@ protocol and collects every command the node sends back."
                   "a 70015 peer must not be offered wtxid relay")
         (is-false (sent old "sendaddrv2")
                   "nor addrv2, which Core withholds as a courtesy below 70016")))))
+
+(test a-message-before-version-is-ignored-not-fatal
+  "Core ignores anything a peer sends before its VERSION -- ProcessMessage logs
+\"non-version message before version handshake\" and returns
+(net_processing.cpp:3814-3818) -- and the connection lives on until the
+handshake timeout. p2p_timeouts.py:72 sends a ping first and then asserts the
+peer is still connected. Ours treated a first message that was not VERSION as
+a failed handshake and dropped the peer on the spot.
+
+Control: the same dial without the stray ping completes too
+(inbound-handshake-loopback)."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (unwind-protect
+           (let* ((port (usocket:get-local-port srv))
+                  (server-peer nil)
+                  (server-thread
+                    (bt:make-thread
+                     (lambda ()
+                       (with-private-outbound-nonces
+                         (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                           (when conn
+                             (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
+                               (if (ignore-errors (bl.net:perform-inbound-handshake p :timeout 10))
+                                   (setf server-peer p)
+                                   (ignore-errors (bl.net:disconnect-peer p))))))))
+                     :name "test-early-ping-accept")))
+             (sleep 0.3)
+             (let ((client (bl.net:connect-peer "127.0.0.1" port)))
+               (is-true client)
+               (when client
+                 (bl.net:send-message client (bl.ser:make-ping-message 7))
+                 (is-true (ignore-errors (bl.net:perform-handshake client))
+                          "the dialer's handshake completes over the stray ping")
+                 (bt:join-thread server-thread)
+                 (is-true server-peer
+                          "a ping before VERSION must not end the inbound handshake")
+                 (when server-peer
+                   (is (eq :ready (bl.net:peer-state server-peer)))
+                   (bl.net:disconnect-peer server-peer))
+                 (bl.net:disconnect-peer client))))
+        (bl.net:close-listener srv)))))
