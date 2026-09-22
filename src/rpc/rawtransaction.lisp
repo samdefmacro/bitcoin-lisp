@@ -627,7 +627,13 @@ nothing about the tree. *current-tx* / *current-spent-utxos* /
 *current-input-index* / *precomputed-sighash* must be bound by the caller --
 the BIP341 sighash commits to all of them."
   (let* ((output-key (subseq spk 2 34))
-         (sk (gethash output-key tr-keymap))
+         (entry (gethash output-key tr-keymap))
+         ;; An entry is the untweaked secret (a key-path-only output, BIP86's
+         ;; empty tweak) or (secret . merkle-root) for an output WITH a script
+         ;; tree, whose key path Core signs with the internal key tweaked by the
+         ;; root (SignTaproot's make_keypath_sig, script/sign.cpp:576-590).
+         (sk (if (consp entry) (car entry) entry))
+         (root (and (consp entry) (cdr entry)))
          (leaves (and tr-scripts (gethash output-key tr-scripts))))
     (cond
       ((and (null sk) (null leaves)) (values nil "no key for P2TR (key path)"))
@@ -643,7 +649,7 @@ the BIP341 sighash commits to all of them."
              (values nil "P2TR SIGHASH_SINGLE has no output at this input index")
              (values (%make-input-sig
                       :kind :p2tr :needed 1
-                      :tap (%tap-sig (bl.crypto:taproot-tweak-private-key sk)
+                      :tap (%tap-sig (bl.crypto:taproot-tweak-private-key sk root)
                                      sighash tap-sighash-type))))))
       (t
        (multiple-value-bind (stack leaf-sigs leaf)

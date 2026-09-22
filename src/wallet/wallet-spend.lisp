@@ -1989,10 +1989,32 @@ TR-KEYMAP (keyed on the BIP86 untweaked-root form) by construction."
           (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet script)
             (when (and spkm (spkm-have-private-keys-p spkm))
               (%sign-maps-add-spkm-at! wallet spkm pos keymap pubmap tr-keymap)
+              (%sign-maps-add-tr-tree-key-path! wallet spkm script pos tr-keymap)
               (let ((leaves (%spkm-tr-script-leaves spkm script pos)))
                 (when leaves
                   (setf (gethash (subseq script 2 34) tr-scripts) leaves))))))))
     (values keymap pubmap tr-keymap tr-scripts)))
+
+(defun %sign-maps-add-tr-tree-key-path! (wallet spkm script pos tr-keymap)
+  "The KEY path of a tr() output WITH a script tree, when the wallet holds the
+internal key: Core's SignTaproot signs it with the internal key tweaked by the
+merkle root (make_keypath_sig over tr_spenddata, script/sign.cpp:576-590).
+TR-KEYMAP otherwise holds only BIP86 (empty-tweak) output keys, which a tree
+output never is, so a wallet holding tr(XPRV,{...,pk(XPUB)}) could not spend
+its own coins -- wallet_taproot.py:298, `Signing transaction failed'. The
+entry is (secret . merkle-root) under the output key, and only when the spend
+data derives exactly this output (%SPKM-TR-TREE-DATA's guard)."
+  (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
+    (declare (ignore scripts))
+    (let ((root (and pairs (%spkm-tr-tree-data spkm script pos pairs))))
+      (when root
+        (let ((priv (%desc-key-priv-at (car (first pairs)) pos
+                                       (spkm-privkey-provider wallet spkm))))
+          (when (and priv
+                     (equalp (bl.crypto:derive-xonly-pubkey priv)
+                             (bl.rpc:key-xonly-bytes (cdr (first pairs)))))
+            (setf (gethash (subseq script 2 34) tr-keymap)
+                  (cons priv (coerce root '(simple-array (unsigned-byte 8) (*)))))))))))
 
 (defun %wallet-spkm-deriving-pubkey (wallet pubkey)
   "(values spkm range-index) of a loaded SPKM that derives PUBKEY, or NIL --

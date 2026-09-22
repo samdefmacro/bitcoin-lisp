@@ -2720,3 +2720,50 @@ partial_signatures). The finished transaction must pass testmempoolaccept."
               (is (= 1 (sig-count (%aval "psbt" half))) "A's signature is recorded")
               (is (eq t (%aval "complete" full)) "B completes it: ~S" full)
               (is-true (and (%aval "hex" full) (accepted-p (%aval "hex" full)))))))))))
+
+(test a-tr-tree-output-spends-by-its-tweaked-key-path
+  "SignTaproot signs a tr() output's KEY path with the internal key tweaked by
+the tree's merkle root (make_keypath_sig over tr_spenddata, script/sign.cpp:
+576-590). Our signing maps held only BIP86 (empty-tweak) output keys, so a
+wallet holding tr(XPRV,{pk(H),{pk(H),pk(XPUB)}}) -- the leaf key someone
+else's -- could not spend its own coins: wallet_taproot.py:298, `Signing
+transaction failed'. The spend must also be accepted by the node's own
+validation (the control that the tweak is the right one)."
+  (with-wallet-chain-node (node "tr-tree-keypath")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (mine "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
+             (theirs (let ((d (%aval "descriptor"
+                                     (rpc nil "getdescriptorinfo"
+                                          "pk(tprv8ZgxMBicQKsPeNLUGrbv3b7qhUk1LQJZAGMuk9gVuKh9sd4BWGp1eMsehUni6qGb8bjkdwBxCbgNGdh2bYGACK5C5dRTaif9KBKGVnSezxV)"))))
+                       (subseq d 3 (position #\) d))))
+             (h "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"))
+        (flet ((tree (branch)
+                 (bl.rpc:descriptor-add-checksum
+                  (format nil "tr(~A/~D/*,{pk(~A),{pk(~A),pk(~A/~D/*)}})"
+                          mine branch h h theirs branch))))
+          (rpc nil "createwallet" "fund")
+          (rpc nil "createwallet" "tr" nil t)
+          (rpc "tr" "importdescriptors"
+               (list (obj "desc" (tree 0) "active" t "timestamp" "now")
+                     (obj "desc" (tree 1) "active" t "internal" t "timestamp" "now")))
+          (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+          (rpc nil "generatetoaddress" 101 optrue)
+          (with-wallet-rng (75)
+            (rpc "fund" "sendtoaddress" (rpc "tr" "getnewaddress" "" "bech32m")
+                 (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let ((sent (rpc-error-of
+                       (lambda ()
+                         (with-wallet-rng (77)
+                           (rpc "tr" "sendtoaddress" optrue (bl.rpc:format-money 50000000)
+                                nil nil nil nil nil nil nil 20))))))
+            (is (null sent) "the tree output spends by its key path: ~S" sent)
+            (is (= 1 (length (coerce (rpc nil "getrawmempool") 'list)))
+                "and the node's own validation accepted it")))))))
