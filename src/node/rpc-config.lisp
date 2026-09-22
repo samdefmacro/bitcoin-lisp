@@ -1,5 +1,20 @@
 (in-package #:bitcoin-lisp)
 
+(defun %apply-rpc-pool-options (lookup)
+  "-rpcthreads / -rpcworkqueue: the HTTP worker pool and the depth of the queue
+in front of it, read through LOOKUP (option name -> value or NIL). Core reads
+both as std::max(gArgs.GetArg(name, DEFAULT), 1) (httpserver.cpp:419, :440):
+GetArg's integer is LocaleIndependentAtoi, so `0', `-3' and `abc' all start the
+server with ONE, and nothing is refused. Set every time, absent included, so
+the value never depends on an earlier call."
+  (flet ((at-least-one (name default)
+           (let ((v (funcall lookup name)))
+             (max 1 (if v (bl.cfg:locale-independent-atoi v) default)))))
+    (setf bl.rpc:*rpc-threads*
+          (at-least-one "rpcthreads" bl.rpc:+default-http-threads+)
+          bl.rpc:*rpc-work-queue*
+          (at-least-one "rpcworkqueue" bl.rpc:+default-http-workqueue+))))
+
 (defun apply-rpc-config-globals (alist)
   "Apply the process-global RPC options from a merged config ALIST.
 
@@ -23,19 +38,7 @@ APPLY-CONFIG-GLOBALS."
           (unless perms
             (config-error "Invalid -rpccookieperms=~A (must be owner, group or all)" v))
           (setf bl.rpc:*rpc-cookie-perms* perms))))
-    ;; -rpcthreads / -rpcworkqueue: the HTTP worker pool and the depth of the
-    ;; queue in front of it. Core reads both as
-    ;; std::max(gArgs.GetArg(name, DEFAULT), 1) (httpserver.cpp:419, :440):
-    ;; GetArg's integer is LocaleIndependentAtoi, so `0', `-3' and `abc' all
-    ;; start the server with ONE, and nothing is refused. Set every time,
-    ;; absent included, so the value never depends on an earlier call.
-    (flet ((at-least-one (name default)
-             (let ((v (lk name)))
-               (max 1 (if v (bl.cfg:locale-independent-atoi v) default)))))
-      (setf bl.rpc:*rpc-threads*
-            (at-least-one "rpcthreads" bl.rpc:+default-http-threads+)
-            bl.rpc:*rpc-work-queue*
-            (at-least-one "rpcworkqueue" bl.rpc:+default-http-workqueue+)))
+    (%apply-rpc-pool-options #'lk)
     ;; -rpcservertimeout: seconds an idle RPC connection is held (Core
     ;; DEFAULT_HTTP_SERVER_TIMEOUT). 0 means no timeout, as in Core.
     (let ((v (lk "rpcservertimeout")))
