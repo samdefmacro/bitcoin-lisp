@@ -137,6 +137,11 @@ arguments is sent TWICE, for the server to refuse (pushKVEnd appends)."
     (is (string= "{\"arg0\":[\"data=test\"],\"arg1\":42}"
                  (named "echojson" "arg0=[\"data=test\"]" "arg1=42")))
     (is (string= "{\"args\":[\"my=wallet\"]}" (named "createwallet" "my=wallet")))
+    ;; rpc_psbt.py:379-399: base64 padding is an `=' in a STRING slot.
+    (is (string= "{\"args\":[\"cHNidP8BAA==\"]}" (named "decodepsbt" "cHNidP8BAA==")))
+    (is (string= "{\"psbt\":\"cHNidP8BAA==\"}" (named "decodepsbt" "psbt=cHNidP8BAA==")))
+    (is (string= "{\"extract\":true,\"args\":[\"cHNidP8BAA==\"]}"
+                 (named "finalizepsbt" "cHNidP8BAA==" "extract=true")))
     (is (string= "{\"args\":\"[0,1,2,3]\",\"args\":[\"4\",\"5\"]}"
                  (named "echo" "args=[0,1,2,3]" "4" "5")))))
 
