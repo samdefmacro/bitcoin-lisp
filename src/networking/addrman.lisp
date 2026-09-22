@@ -431,6 +431,21 @@ incumbent back to a new bucket."
   "Total addresses tracked (new + tried)."
   (+ (address-book-n-new book) (address-book-n-tried book)))
 
+(defun address-book-empty-networks (book networks)
+  "The members of NETWORKS for which BOOK holds no address (Core
+CConnman::GetReachableEmptyNetworks over g_reachable_nets, net.cpp:2490-2501,
+whose per-network test is AddrMan::Size(net) == 0). Walks the records only
+until every network has been seen once."
+  (let ((empty (copy-list networks)))
+    (when (plusp (address-book-count book))
+      (block walk
+        (maphash (lambda (id pa)
+                   (declare (ignore id))
+                   (setf empty (delete (peer-address-network pa) empty))
+                   (when (null empty) (return-from walk)))
+                 (address-book-info book))))
+    empty))
+
 (defun address-book-lookup (book ip port &optional net)
   "Return the record for IP:PORT on network NET (NIL derives IPv4/IPv6 from
 the 16-byte form), or NIL (Core Find)."

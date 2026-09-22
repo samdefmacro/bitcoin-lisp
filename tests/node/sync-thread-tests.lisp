@@ -140,3 +140,72 @@ pending, none queued to dial and no headers arriving returns NIL, so the
            (setf (bl:node-running node) t)
            (is-false (%idle-tick)))
       (setf (bl:node-running node) nil))))
+
+(test fixed-seeds-follow-cores-fallback-rule
+  "Core ThreadOpenConnections (net.cpp:2562-2640) adds the chain's fixed seeds
+ONCE, for the reachable networks the address book has nothing for: at once
+when no other address source exists (-dnsseed=0, no -seednode, no -addnode),
+otherwise after 60 s of the mockable clock; -fixedseeds=0 only logs. The node
+used to merge them into its first dial list whenever that list had fewer than
+eight /16 groups, logged none of Core's lines, and never added them to the
+address book (feature_config_args.py:320-366)."
+  (let* ((t0 1700000000)
+         (bl:*network* :testnet4)
+         (bl.ser:*mock-time* t0)
+         (bl.net:*reachable-networks* '(:ipv4 :ipv6))
+         (bl:*dns-seed-enabled* nil)
+         (bl:*seed-nodes* '())
+         (bl:*use-addrman-outgoing* t)
+         (bl:*fixed-seeds-enabled* t)
+         (seeds (length (bl.chain:chain-params-fixed-seeds
+                         (bl.chain:find-chain-params :testnet4)))))
+    (flet ((fresh-node ()
+             (let ((node (make-test-node :network :testnet4)))
+               (setf (bl:node-address-book node) (bl.net:make-address-book))
+               node))
+           (logged-p (lines text)
+             (some (lambda (l) (search text (princ-to-string l))) lines)))
+      ;; No other source: added on the first pass, and only once.
+      (let* ((node (fresh-node))
+             (added nil)
+             (lines (capture-log-lines
+                     (lambda ()
+                       (bl:start-fixed-seed-fallback)
+                       (setf added (bl:maybe-add-fixed-seeds node))))))
+        (is (logged-p lines "Adding fixed seeds as -dnsseed=0"))
+        (is (eql seeds added))
+        (is (plusp (bl.net:address-book-count (bl:node-address-book node))))
+        (is (null (bl:maybe-add-fixed-seeds node))))
+      ;; DNS seeding on: nothing until the MOCK clock passes 60 s.
+      (let ((bl:*dns-seed-enabled* t)
+            (node (fresh-node)))
+        (bl:start-fixed-seed-fallback)
+        (is (null (bl:maybe-add-fixed-seeds node)))
+        (setf bl.ser:*mock-time* (+ t0 60))
+        (is (null (bl:maybe-add-fixed-seeds node)))
+        (setf bl.ser:*mock-time* (+ t0 61))
+        (let ((lines (capture-log-lines
+                      (lambda () (is (eql seeds (bl:maybe-add-fixed-seeds node)))))))
+          (is (logged-p lines "Adding fixed seeds as 60 seconds have passed"))
+          (is (logged-p lines (format nil "Added ~D fixed seeds" seeds))))
+        (setf bl.ser:*mock-time* t0))
+      ;; An -addnode is another source, so the immediate branch is closed.
+      (let ((node (fresh-node)))
+        (setf (bl:node-added-nodes node) (list "fakenodeaddr"))
+        (bl:start-fixed-seed-fallback)
+        (is (null (bl:maybe-add-fixed-seeds node))))
+      ;; Every reachable network already has an address: nothing to add.
+      (let ((node (fresh-node))
+            (bl.net:*reachable-networks* '(:ipv4)))
+        (bl.net:address-book-add (bl:node-address-book node)
+                                 (bl.net:make-peer-address
+                                  :net :ipv4 :ip (bl.net:string-to-ip-bytes "8.8.8.8")
+                                  :port 48333 :services 0 :last-seen t0))
+        (bl:start-fixed-seed-fallback)
+        (is (null (bl:maybe-add-fixed-seeds node))))
+      ;; -fixedseeds=0: Core's one line, and never an addition.
+      (let* ((bl:*fixed-seeds-enabled* nil)
+             (node (fresh-node))
+             (lines (capture-log-lines #'bl:start-fixed-seed-fallback)))
+        (is (logged-p lines "Fixed seeds are disabled"))
+        (is (null (bl:maybe-add-fixed-seeds node)))))))

@@ -1041,6 +1041,25 @@ it passes %COUNT-ADDRMAN-FAILURES-P."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
+(defun %numeric-endpoint (node spec)
+  "Core LookupNumeric(SPEC, default port): (ip-bytes . port) when SPEC's host
+is a numeric address, else NIL."
+  (multiple-value-bind (host port) (parse-node-endpoint node spec)
+    (let ((ip (bl.net:numeric-host-ip-bytes host)))
+      (and ip (cons ip port)))))
+
+(defun added-node-duplicate-p (node spec)
+  "Whether SPEC names a node already on NODE's added-node list: the same
+string, or -- when SPEC is numeric -- the same address and port however it is
+spelled (Core CConnman::AddNode, net.cpp:3732-3744: \"127.1:18444\" is
+\"127.0.0.1:18444\")."
+  (let ((resolved (%numeric-endpoint node spec)))
+    (some (lambda (added)
+            (or (string= spec added)
+                (and resolved
+                     (equalp resolved (%numeric-endpoint node added)))))
+          (node-added-nodes node))))
+
 (defun connect-seed-nodes (node)
   "Dial each -seednode once as an addr-fetch peer (Core ProcessAddrFetch,
 net.cpp). The handshake already sends GETADDR for any non-block-relay outbound
@@ -1056,6 +1075,68 @@ never started) and never reaches the seed queue."
         (unless (peer-connected-to-endpoint-p node host port)
           (log-info "Fetching addresses from -seednode ~A" spec)
           (establish-outbound-peer node host port :conn-type :addr-fetch))))))
+
+;;; Core ThreadOpenConnections' fixed-seed fallback (net.cpp:2562-2640). The
+;;; two specials are that thread's locals `start' and `add_fixed_seeds'; they
+;;; are re-armed by START-FIXED-SEED-FALLBACK at the top of every sync thread,
+;;; so an in-image restart never inherits a previous run's latch.
+(defvar *fixed-seeds-pending* nil
+  "Core's add_fixed_seeds: T until the fixed seeds have been added once (or
+-fixedseeds=0 disabled them).")
+
+(defvar *fixed-seed-clock-start* 0
+  "Core's `start' in ThreadOpenConnections: the mockable Unix time the
+outbound-connection loop began; the fixed seeds are added 60 s after it.")
+
+(defun start-fixed-seed-fallback ()
+  "Arm the fixed-seed fallback at the start of the outbound-connection loop
+(Core net.cpp:2556-2573). Only a node that chooses its own outbound peers runs
+it: with -connect Core never reaches this part of ThreadOpenConnections (or
+does not start the thread at all for -connect=0, net.cpp:3540)."
+  (setf *fixed-seed-clock-start* (bl.ser:get-unix-time)
+        *fixed-seeds-pending* nil)
+  (when (addrman-outgoing-enabled-p)
+    (if *fixed-seeds-enabled*
+        (setf *fixed-seeds-pending* t)
+        (log-info "Fixed seeds are disabled"))))
+
+(defun maybe-add-fixed-seeds (node)
+  "One pass of Core's fixed-seed fallback (net.cpp:2601-2640): once some
+reachable network has no address in the address book, add the chain's fixed
+seeds for those networks -- after 60 s of the mockable clock, or at once when
+there is no other address source (-dnsseed=0, no -seednode, no -addnode).
+Runs at most once per sync thread. Returns the number of seeds added, or NIL
+when nothing was due."
+  (let ((book (node-address-book node)))
+    (when (and *fixed-seeds-pending* book)
+      (let* ((timed-out (> (bl.ser:get-unix-time)
+                           (+ *fixed-seed-clock-start* 60)))
+             (no-sources (and (not *dns-seed-enabled*)
+                              (null *seed-nodes*)
+                              (null (node-added-nodes node))))
+             (empty (and (or timed-out no-sources)
+                         (bl.net:address-book-empty-networks
+                          book bl.net:*reachable-networks*))))
+        (when empty
+          (if timed-out
+              (log-info "Adding fixed seeds as 60 seconds have passed and addrman is empty for at least one reachable network")
+              (log-info "Adding fixed seeds as -dnsseed=0 (or IPv4/IPv6 connections are disabled via -onlynet) and neither -addnode nor -seednode are provided"))
+          (let ((port (network-port (node-network node)))
+                (added 0))
+            (dolist (seed (bl.chain:chain-params-fixed-seeds
+                           (bl.chain:find-chain-params (node-network node))))
+              (multiple-value-bind (net ip-bytes) (bl.net:parse-network-address seed)
+                ;; Only the networks that are reachable and empty
+                ;; (net.cpp:2624-2632).
+                (when (and net (member net empty))
+                  (bl.net:address-book-add
+                   book (bl.net:make-peer-address
+                         :net net :ip ip-bytes :port port :services 0
+                         :last-seen (bl.ser:get-unix-time)))
+                  (incf added))))
+            (setf *fixed-seeds-pending* nil)
+            (log-info "Added ~D fixed seeds from reachable networks." added)
+            added))))))
 
 (defun connect-specified-nodes (node)
   "Keep every -connect target connected (Core ThreadOpenConnections' first

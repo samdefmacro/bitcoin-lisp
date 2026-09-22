@@ -9805,6 +9805,26 @@ all_networks aggregate; counts stay consistent with the address book."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-addnode node '(42 "add")))))
 
+(test rpc-addnode-refuses-an-equivalent-numeric-address
+  "Core CConnman::AddNode (net.cpp:3732-3744) compares LookupNumeric results,
+so a second spelling of an added address is `already added' too: 127.1 is
+127.0.0.1 in inet_aton notation (rpc_net.py:252-255). A hostname and a
+different port stay distinct."
+  (let ((node (make-test-node)))                 ; default P2P port 18333
+    (flet ((add (spec) (bl.rpc:dispatch-rpc-method node "addnode" (list spec "add")))
+           (code (thunk) (handler-case (progn (funcall thunk) nil)
+                           (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e)))))
+      (add "127.0.0.1:18444")
+      (is (eql -23 (code (lambda () (add "127.1:18444")))))
+      (is (eql -23 (code (lambda () (add "0x7f.0.0.1:18444")))))
+      (add "10.0.0.1")
+      (is (eql -23 (code (lambda () (add "10.1:18333")))))
+      ;; Not the same endpoint: another port, or an out-of-range short form.
+      (is (null (code (lambda () (add "127.1:18445")))))
+      (is (null (code (lambda () (add "127.256.1:18444")))))
+      (is (equal '("127.0.0.1:18444" "10.0.0.1" "127.1:18445" "127.256.1:18444")
+                 (bl:node-added-nodes node))))))
+
 (test rpc-getaddednodeinfo-reports-state
   "getaddednodeinfo reports each added node + whether a matching peer is live."
   (let ((node (make-test-node)))

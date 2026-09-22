@@ -177,6 +177,48 @@ accepts via inet_pton (netbase LookupHost). Scoped (%zone) forms are rejected."
                            (aref bytes (1+ (* 2 i))) (logand w #xFF)))
             bytes))))))
 
+(defun %parse-ipv4-aton (string)
+  "Parse STRING in inet_aton's numeric IPv4 notation -- one to four
+dot-separated parts, each decimal, 0x-hex or 0-led octal, the LAST part
+filling every byte the earlier ones left (\"127.1\" is 127.0.0.1, \"10.65535\"
+is 10.0.255.255). Returns the 16-byte mapped form, or NIL. This is what Core's
+numeric Lookup accepts on glibc, where getaddrinfo(AI_NUMERICHOST) goes through
+inet_aton (netbase.cpp:45-60 WrappedGetAddrInfo; rpc_net.py:252-255 relies on
+it)."
+  (let ((parts (uiop:split-string string :separator ".")))
+    (when (<= 1 (length parts) 4)
+      (let ((values
+              (loop for part in parts
+                    collect (let* ((hex (and (> (length part) 2)
+                                             (char= (char part 0) #\0)
+                                             (char-equal (char part 1) #\x)))
+                                   (octal (and (not hex) (> (length part) 1)
+                                               (char= (char part 0) #\0)))
+                                   (radix (cond (hex 16) (octal 8) (t 10)))
+                                   (digits (if hex (subseq part 2) part)))
+                              (if (and (plusp (length digits))
+                                       (every (lambda (c) (digit-char-p c radix))
+                                              digits))
+                                  (parse-integer digits :radix radix)
+                                  (return-from %parse-ipv4-aton nil))))))
+        (let* ((n (length values))
+               (last-max (1- (expt 256 (- 5 n)))))
+          (when (and (every (lambda (v) (<= v 255)) (butlast values))
+                     (<= (car (last values)) last-max))
+            (let ((word (car (last values))))
+              (loop for v in (butlast values)
+                    for shift downfrom 24 by 8
+                    do (incf word (ash v shift)))
+              (ipv4-to-mapped-ipv6 (ldb (byte 8 24) word) (ldb (byte 8 16) word)
+                                   (ldb (byte 8 8) word) (ldb (byte 8 0) word)))))))))
+
+(defun numeric-host-ip-bytes (string)
+  "The 16-byte address a NUMERIC host STRING names (Core LookupNumeric's
+host half, netbase.cpp:216-224): any form STRING-TO-IP-BYTES reads, plus
+inet_aton's short IPv4 forms. NIL for a hostname."
+  (or (string-to-ip-bytes string)
+      (%parse-ipv4-aton string)))
+
 (defun string-to-ip-bytes (addr-string)
   "Parse an IP-address string to its 16-byte internal form: an IPv4 dotted
 quad (kept as IPv4-mapped IPv6, the historical form) or any IPv6 text form

@@ -1440,6 +1440,7 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
                      (merge-inbound-peers *node*)
                      (dial-queued-nodes *node*)
                      (> (length (node-peers *node*)) peers-before))))
+  (maybe-add-fixed-seeds *node*)    ; Core ThreadOpenConnections, every pass
   (run-header-sync-duties *node*)   ; Core SendMessages, headers half
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the
@@ -1705,7 +1706,8 @@ seconds and dial again."
        (loop repeat 5
              while (and (node-running *node*) (null (node-peers *node*)))
              do (sleep 1)
-                (merge-inbound-peers *node*))
+                (merge-inbound-peers *node*)
+                (maybe-add-fixed-seeds *node*))
        (when (null (node-peers *node*))
          (connect-to-peers *node* max-peers
                            :timeout 30 :min-peers 1))))))
@@ -1718,6 +1720,10 @@ live backtrace and retried after a short backoff, never allowed to end the
 thread."
   (handler-case
       (progn
+        ;; Core takes ThreadOpenConnections' `start' before its loop and checks
+        ;; the fixed seeds on every pass of it (net.cpp:2556-2640).
+        (start-fixed-seed-fallback)
+        (maybe-add-fixed-seeds *node*)
         (%sync-thread-connect max-peers)
         ;; Sync + follow-tip loop runs until node shutdown. The
         ;; previous early-return on "sync complete" exited the only

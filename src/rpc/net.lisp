@@ -630,7 +630,7 @@ transport is not implemented."
       ((equal command "onetry")
        (push spec (bl:node-pending-onetry node)))
       ((equal command "add")
-       (when (member spec (bl:node-added-nodes node) :test #'string=)
+       (when (bl:added-node-duplicate-p node spec)
          (error 'rpc-error :code +rpc-client-node-already-added+
                            :message "Error: Node already added"))
        (setf (bl:node-added-nodes node)

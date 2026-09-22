@@ -216,6 +216,7 @@ headerssync.cpp. src/networking/.")
    #:address-book-add
    #:address-book-lookup
    #:address-book-count
+   #:address-book-empty-networks
    #:address-book-good
    #:address-book-attempt
    #:address-book-connected
@@ -237,6 +238,7 @@ headerssync.cpp. src/networking/.")
    #:ipv4-to-mapped-ipv6
    #:ip-bytes-to-string
    #:string-to-ip-bytes
+   #:numeric-host-ip-bytes
    ;; Network-typed addresses (BIP155): codecs + reachability (netaddress.lisp)
    #:+bip155-networks+
    #:network-address-length

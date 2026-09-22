@@ -229,6 +229,11 @@ init.cpp, node/. src/node/.")
    #:load-mempool-from-disk
    #:make-node
    #:node-added-nodes
+   #:added-node-duplicate-p
+   #:start-fixed-seed-fallback
+   #:maybe-add-fixed-seeds
+   #:*seed-nodes*
+   #:*use-addrman-outgoing*
    #:node-address-book
    #:node-block-store
    #:node-blockfilterindex
