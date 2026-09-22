@@ -247,6 +247,26 @@ One iterator seek, no full scan."
          (let ((k (leveldb-iter-key iter)))
            (and (>= (length k) 1) (= (aref k 0) +db-prefix-coin+))))))
 
+(defconstant +db-prefix-legacy-coins+ #x63     ; 'c' -- Core's DB_COINS
+  "Key prefix of the per-transaction coin records Core wrote before 0.15
+(txdb.cpp:27, deprecated by commit 1088b02f). Nothing here writes it; it is
+only looked for, to refuse such a database the way Core does.")
+
+(defun coins-view-db-needs-upgrade-p (view)
+  "T iff the coins LevelDB still holds a pre-0.15 per-transaction record
+(Core CCoinsViewDB::NeedsUpgrade, txdb.cpp:32-39: a seek to DB_COINS that
+lands on a valid key). Core refuses to load such a chainstate and names
+-reindex-chainstate as the way out (node/chainstate.cpp:103-109); a wipe
+makes the question moot, which is why the caller skips it under -reindex and
+-reindex-chainstate. One iterator seek, no scan."
+  (declare (type coins-view-db view))
+  (with-leveldb-iterator (iter (cvdb-db view))
+    (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
+                                          :initial-element +db-prefix-legacy-coins+))
+    (and (leveldb-iter-valid-p iter)
+         (let ((k (leveldb-iter-key iter)))
+           (and (>= (length k) 1) (= (aref k 0) +db-prefix-legacy-coins+))))))
+
 (defun coins-view-db-erase-all-coins (view)
   "Empty the base LevelDB: delete every coin ('C') entry AND the best-block
 ('B') pointer, in bounded writebatches, keeping only the 'M' migration marker.

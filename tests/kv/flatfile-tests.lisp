@@ -1172,7 +1172,7 @@ opens is closed again, so the next run over the same directory can open it."
     (let ((bl:*node* node))
       (unwind-protect
            (progn
-             (bl::%init-load-chain :mainnet nil nil)
+             (bl::%init-load-chain :mainnet nil nil nil)
              (hash-table-count
               (bl.store:chain-state-block-index (bl:node-chain-state node))))
         (ignore-errors

@@ -239,3 +239,44 @@ one chainstate is the best header seen through the other."
     (is (eq g (bl.store:best-header-entry snapshot)))
     (bl.store:add-block-index-entry snapshot h1)
     (is (eq h1 (bl.store:best-header-entry primary)))))
+
+(test a-pre-0-15-coins-database-is-recognised-as-one
+  "Core refuses to load a chainstate that still holds the per-transaction coin
+records it stopped writing in 0.15 (DB_COINS, key prefix 'c'), telling the
+operator to run -reindex-chainstate (node/chainstate.cpp:103-109,
+txdb.cpp:32-39). feature_unsupported_utxo_db.py:48 puts a v0.14.3 chainstate
+under the node and expects that refusal; ours opened it, found none of its
+'C' coins, and started as if the set were empty.
+
+The positive case is a database holding one 'c' record; the controls are an
+empty database and one holding only today's 'C' coins, neither of which may
+be refused."
+  (with-temp-directory (dir "bl-legacy-coins")
+    (let ((legacy (namestring (merge-pathnames "legacy/" dir)))
+          (modern (namestring (merge-pathnames "modern/" dir)))
+          (empty (namestring (merge-pathnames "empty/" dir))))
+      ;; Key shape of Core's pre-0.15 record: 'c' then the 32-byte txid.
+      (bl.store:with-leveldb (db legacy)
+        (let ((key (make-array 33 :element-type '(unsigned-byte 8) :initial-element 7)))
+          (setf (aref key 0) (char-code #\c))
+          (bl.store:leveldb-put db key (make-array 3 :element-type '(unsigned-byte 8)
+                                                     :initial-element 1))))
+      ;; A current-format coin: 'C' + txid + vout, written through the view.
+      (bl.store:with-coins-view-db (view modern)
+        (bl.store:coins-view-db-put
+         view (bl.store:make-utxo-key (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 9)
+                                      0)
+         (bl.store:make-utxo-entry :value 5000000000
+                                   :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x51)
+                                   :height 1 :coinbase t)))
+      (bl.store:with-coins-view-db (view empty)
+        (is-false (bl.store:coins-view-db-needs-upgrade-p view)
+                  "an empty chainstate is not a legacy one"))
+      (bl.store:with-coins-view-db (view modern)
+        (is-false (bl.store:coins-view-db-needs-upgrade-p view)
+                  "a chainstate of 'C' coins is today's format"))
+      (bl.store:with-coins-view-db (view legacy)
+        (is-true (bl.store:coins-view-db-needs-upgrade-p view)
+                 "a 'c' record is Core's pre-0.15 coins format")))))

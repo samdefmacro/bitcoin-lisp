@@ -797,7 +797,7 @@ or the node is riding an assumevalid point, and which one."
                   (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes av)))
         (log-info "Validating signatures for all blocks."))))
 
-(defun %init-load-chain (network reindex blocks-directory)
+(defun %init-load-chain (network reindex reindex-chainstate blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
 index, -reindex, and the block-store <-> header-index position map.
 
@@ -888,6 +888,14 @@ startup refusal rather than a directory we create somewhere else."
        utxoset-dat chainstate-path)
       (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
     (let ((view (bl.store:open-coins-view-db chainstate-path)))
+      ;; Refuse a pre-0.15 coins database, as Core does right after opening
+      ;; it (node/chainstate.cpp:103-109). Either reindex flag wipes the
+      ;; coins before they are read, which is why Core's check is a no-op
+      ;; then and ours is skipped (feature_unsupported_utxo_db.py:48-56).
+      (when (and (not (or reindex reindex-chainstate))
+                 (bl.store:coins-view-db-needs-upgrade-p view))
+        (bl.store:close-coins-view-db view)
+        (init-error "Unsupported chainstate database format found. Please restart with -reindex-chainstate. This will rebuild the chainstate database."))
       (setf (bl.store:chain-state-coins-view primary)
             (bl.store:make-coins-view-cache view))
       ;; Adopt the stored pointer so a flush before the first block-level
@@ -2062,7 +2070,7 @@ Returns the node instance."
   (%init-lock-and-banner network blocks-directory pid-file data-directory)
   (init-message "Loading block index…")          ; init.cpp:1396
   (log-initload-thread :start)
-  (%init-load-chain network reindex blocks-directory)
+  (%init-load-chain network reindex reindex-chainstate blocks-directory)
   (%init-recover-chain reindex reindex-chainstate)
   ;; LoadChainTip, where Core has it: the tip is settled before the mempool
   ;; replay and the RPC server, and a coins pointer this node cannot place is
