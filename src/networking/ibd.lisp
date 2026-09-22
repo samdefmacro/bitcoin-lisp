@@ -4558,6 +4558,30 @@ what stands between a peer and an arbitrary body under an honest header's hash."
                    height (bl.crypto:bytes-to-hex hash))
        t))))
 
+(defun %judge-failed-tip-block (block chain-state peer error)
+  "A block at tip+1 from PEER failed to activate with ERROR. Core would have
+refused it in AcceptBlock BEFORE any connect -- CheckBlock and
+ContextualCheckBlock, marking the entry BLOCK_FAILED_VALID for every verdict
+but BLOCK_MUTATED (validation.cpp:4381-4389) -- and then punished the sender
+through MaybePunishNodeForBlock for BLOCK_CONSENSUS and BLOCK_MUTATED alike
+(net_processing.cpp:1908-1926). Ours validated inside ACTIVATE-BLOCK and
+marked only the connect-time verdicts, so a block failing CheckTransaction
+(bad-txns-vout-empty) was re-requested from the same peer three times and the
+peer kept: feature_block.py:199 waits for the disconnect after its first
+invalid block.
+
+Running the gate here, on the failure path only, costs nothing on the honest
+path: it re-derives the AcceptBlock verdict, marks the entry through
+BL.VAL:ACCEPT-BLOCK-BODY and punishes PEER. A block that passes the gate
+failed in ConnectBlock, which marked it already when the verdict is
+deterministic; the sender is punished for that one too, and for nothing else."
+  (when (and peer (not (%block-body-acceptable-p block chain-state peer)))
+    (return-from %judge-failed-tip-block t))
+  (when (and peer (bl.val:deterministic-consensus-failure-p error))
+    (record-misbehavior peer (format nil "invalid block (~A)"
+                                     (bl.val:block-reject-reason-string error))))
+  nil)
+
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects
                                   (wire-size 0) requested peer)
@@ -4771,8 +4795,8 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                  (note-reorg-candidate entry chain-state)
                  nil)
                 (t
-                 ;; handle-validation-failure logs (throttled by retry count) and
-                 ;; manages re-request budget.
+                 ;; AcceptBlock's mark and the sender's punishment first.
+                 (%judge-failed-tip-block block chain-state peer error)
                  (handle-validation-failure block height error chain-state)
                  nil)))))
 

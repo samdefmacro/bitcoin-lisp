@@ -4672,6 +4672,63 @@ authenticates -- poison the entry and its indexed descendants."
                      (bl.store:get-block-index-entry cs child-h)))
                 "the doomed subtree was not marked (Core BLOCK_FAILED_CHILD)")))))))
 
+(test a-tip-block-failing-checkblock-is-marked-and-its-sender-punished
+  "A block at tip+1 that fails CheckBlock is refused by Core's AcceptBlock
+BEFORE any connect: its entry is marked BLOCK_FAILED_VALID (the verdict is not
+BLOCK_MUTATED; validation.cpp:4381-4389) and MaybePunishNodeForBlock
+disconnects the sender (net_processing.cpp:1908-1926). The reason is the
+transaction's own word, which CheckBlock relays (validation.cpp:3992-3996).
+Ours validated inside ACTIVATE-BLOCK, logged `no-outputs', re-requested the
+block three times from the same peer and kept the peer: feature_block.py:199
+waits for `bad-txns-vout-empty' and the disconnect."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash tip-entry)
+        (%forged-body-fixture "tip-block-checkblock")
+      (declare (ignore genesis-hash))
+      (let* ((tip-hash (bl.store:block-index-entry-hash tip-entry))
+             (h (first (make-test-chain-hashes #xB6 1)))
+             (base (make-reorg-test-block tip-hash h 3))
+             (no-outputs (bl.ser:make-transaction
+                          :version 1
+                          :inputs (vector (bl.ser:make-tx-in
+                                           :previous-output (bl.ser:make-outpoint
+                                                             :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                                  :initial-element 9)
+                                                             :index 0)
+                                           :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                           :sequence #xffffffff))
+                          :outputs (vector)
+                          :lock-time 0))
+             (txs (list (first (bl.ser:bitcoin-block-transactions base)) no-outputs))
+             (header (bl.ser:bitcoin-block-header base))
+             (bad (bl.ser:make-bitcoin-block
+                   :header (bl.ser:make-block-header
+                            :version (bl.ser:block-header-version header)
+                            :prev-block tip-hash
+                            :merkle-root (bl.val:compute-merkle-root
+                                          (mapcar #'bl.ser:transaction-hash txs))
+                            :timestamp (bl.ser:block-header-timestamp header)
+                            :bits (bl.ser:block-header-bits header)
+                            :nonce (bl.ser:block-header-nonce header)
+                            :cached-hash h)
+                   :transactions txs))
+             (peer (bl.net:make-peer)))
+        (%index-header cs bad h 3 tip-entry 900000)
+        (let ((text (nth-value 1 (log-text-of
+                                  "net"
+                                  (lambda ()
+                                    (with-ibd-context
+                                      (deliver-block bad cs utxo store
+                                                     :requested t :peer peer)))))))
+          (is (search "bad-txns-vout-empty" text)
+              "Core's reason, relayed from CheckTransaction")
+          (is (eq :invalid
+                  (bl.store:block-index-entry-status
+                   (bl.store:get-block-index-entry cs h)))
+              "the entry was not marked (Core AcceptBlock)")
+          (is (eq :disconnected (bl.net:peer-state peer))
+              "the sender was not punished (MaybePunishNodeForBlock)"))))))
+
 ;;;; The block-download drain indexes an unseen header before judging the body
 
 (test drain-accepts-an-unsolicited-block-whose-header-it-has-never-seen

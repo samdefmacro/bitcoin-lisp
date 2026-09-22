@@ -24,6 +24,7 @@ can. src/validation/.")
    #:fee-floor-reason
    #:block-reject-reason
    #:block-reject-reason-string
+   #:deterministic-consensus-failure-p
    #:standard-output-script-p
    ;; Core's reject-reason vocabulary (keyword -> state.GetRejectReason())
    #:tx-reject-keyword

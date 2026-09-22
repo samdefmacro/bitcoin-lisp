@@ -3645,7 +3645,20 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     (:bad-proof-of-work          . "high-hash")                          ; :3864 CheckBlockHeader
     (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot
     (:non-final-tx               . "bad-txns-nonfinal")                  ; :4179 ContextualCheckBlock
-    (:bad-signet-solution        . "bad-signet-blksig"))                 ; :3964 CheckSignetBlockSolution
+    (:bad-signet-solution        . "bad-signet-blksig")                  ; :3964 CheckSignetBlockSolution
+    ;; CheckBlock relays CheckTransaction's reason as the block's
+    ;; (validation.cpp:3992-3996: tx_state.GetRejectReason()), so these are
+    ;; the transaction's words (consensus/tx_check.cpp:15-56);
+    ;; feature_block.py:199 reads them in the debug log.
+    (:no-inputs                  . "bad-txns-vin-empty")
+    (:no-outputs                 . "bad-txns-vout-empty")
+    (:tx-oversize                . "bad-txns-oversize")
+    (:negative-output            . "bad-txns-vout-negative")
+    (:output-too-large           . "bad-txns-vout-toolarge")
+    (:total-output-too-large     . "bad-txns-txouttotal-toolarge")
+    (:duplicate-inputs           . "bad-txns-inputs-duplicate")
+    (:bad-coinbase-length        . "bad-cb-length")
+    (:bad-prevout-null           . "bad-txns-prevout-null"))
   "Block verdicts in Core's reject-reason vocabulary. A keyword with no entry
 is its own downcased name, which is what most of ours already are
 (unexpected-witness, time-too-old, bad-txns-duplicate, ...).")
@@ -4708,6 +4721,12 @@ chainstates and for tests that drive activate-block directly."
     (when (and target
                (equalp (bl.store:best-block-hash chain-state) target))
       (bl:maybe-validate-snapshot chain-state))))
+
+(defun deterministic-consensus-failure-p (error)
+  "The network layer's question of %DETERMINISTIC-CONSENSUS-FAILURE-P: whether
+a connect-time verdict is one Core marks BLOCK_FAILED_VALID, and so one it
+punishes the sending peer for."
+  (%deterministic-consensus-failure-p error))
 
 (defun %poison-failed-block (chain-state header error)
   "Mark the block HEADER names, and every indexed descendant, :invalid when
