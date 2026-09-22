@@ -1795,11 +1795,18 @@ seconds and dial again."
        ;; gives wait_for_new_peer five seconds, which this wait spent. Leaving
        ;; as soon as one appears also gets the dial out of the way, so the peer
        ;; is pumped by the ordinary %SYNC-PASS ticks.
+       ;;
+       ;; The RPC-queued dials (addconnection, addnode onetry) are drained on
+       ;; the same beat: Core's AddConnection dials on the RPC thread itself
+       ;; (net.cpp:1871-1907), and a node with no peer is exactly where
+       ;; p2p_handshake.py:100-104 asks for one -- to itself, expecting the
+       ;; self-connection line within the default two-second log wait.
        (loop repeat 5
              while (and (node-running *node*) (null (node-peers *node*)))
              do (sleep 1)
                 (merge-inbound-peers *node*)
-                (maybe-add-fixed-seeds *node*))
+                (maybe-add-fixed-seeds *node*)
+                (dial-queued-nodes *node*))
        (when (null (node-peers *node*))
          (connect-to-peers *node* max-peers
                            :timeout 30 :min-peers 1))))))

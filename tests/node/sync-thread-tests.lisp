@@ -343,3 +343,41 @@ completed handshake."
     (is-true (find "feeler connection completed, disconnecting peer=" lines :test #'search)
              "Core's line once the feeler's handshake is done: ~S" lines)
     (is (null (bl:node-peers node)) "and the feeler never joins the peer set")))
+
+(test the-no-peer-wait-dials-a-queued-addconnection
+  "A node with no peer sits in %SYNC-OFFLINE-ACTIVATION's five-second wait,
+and an addconnection that arrives then was dialed only after it -- Core's
+AddConnection dials on the RPC thread itself (net.cpp:1871-1907).
+p2p_handshake.py:100-104 asks a peerless node to connect to itself and waits
+two seconds for the self-connection line. The wait now drains the RPC-queued
+dials every second, like the hand-off list. CONNECT-PEER and
+PERFORM-HANDSHAKE are stubbed so the dial completes."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (bl:*pending-test-connections*
+           (list (list "203.0.113.21:18444" :outbound-full-relay nil)))
+         (real-connect (fdefinition 'bl.net:connect-peer))
+         (real-handshake (fdefinition 'bl.net:perform-handshake))
+         (started (get-internal-real-time)))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t
+                 (fdefinition 'bl.net:connect-peer)
+                 (lambda (host &optional port &rest more)
+                   (declare (ignore port more))
+                   (bl.net:make-peer :address host :state :connected))
+                 (fdefinition 'bl.net:perform-handshake)
+                 (lambda (peer &rest args)
+                   (declare (ignore args))
+                   (setf (bl.net:peer-state peer) :ready)
+                   t))
+           (%offline-pass))
+      (setf (fdefinition 'bl.net:connect-peer) real-connect
+            (fdefinition 'bl.net:perform-handshake) real-handshake
+            (bl:node-running node) nil))
+    (is (null bl:*pending-test-connections*) "the queued dial was taken")
+    (is (= 1 (length (bl:node-peers node))) "and the peer it made is admitted")
+    (is (< (- (get-internal-real-time) started)
+           (* 4 internal-time-units-per-second))
+        "within the wait, not after it")))
