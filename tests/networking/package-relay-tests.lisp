@@ -1165,3 +1165,33 @@ dropped and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
               (flush-peer-invs peer mempool)
               (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) txid)
                        "the transaction clears a filter below its real rate"))))))))
+
+(test a-requested-tx-is-never-charged-to-the-tx-rate-limit
+  "Core never disconnects a peer for how MANY transactions it sends. Our tx
+token bucket used to be charged for every tx message before dispatch, so a
+peer answering our own getdatas was dropped once a relay burst passed the
+bucket: feature_fee_estimation.py:283-291 relays 250 transactions between its
+nodes, one logged \"Rate limit exceeded on tx messages\" against the relaying
+peer, and sync_blocks then found a node with no peers at all. The bucket is
+now charged for UNSOLICITED transactions only.
+
+Control: with the same empty bucket an unsolicited transaction still
+disconnects its sender."
+  (let ((bl:*rate-limit-tx* '(0.0 . 0.0)))  ; an empty bucket from the start
+    (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+      (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+             (txid (bl.ser:transaction-hash tx))
+             (asked (%pr-peer))
+             (stranger (%pr-peer)))
+        (%with-fresh-rejects (rejects)
+          (bl.net:handle-message stranger "tx" (%pr-payload tx)
+                                 (%pr-ctx state utxo mempool rejects))
+          (is (eq :disconnected (bl.net:peer-state stranger))
+              "control: an unsolicited tx on an empty bucket still disconnects")
+          (is-false (bl.mp:mempool-has mempool txid))
+          (is-true (bl.net:tx-request-wanted-p txid asked) "we request it from ASKED")
+          (bl.net:handle-message asked "tx" (%pr-payload tx)
+                                 (%pr-ctx state utxo mempool rejects))
+          (is (eq :ready (bl.net:peer-state asked))
+              "the peer that answered our getdata is not rate-limited")
+          (is-true (bl.mp:mempool-has mempool txid)))))))

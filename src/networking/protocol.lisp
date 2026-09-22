@@ -725,6 +725,22 @@ scheduler would issue no further request for it."
     (%tx-request-make-completed hash peer)))
 
 
+(defun tx-request-in-flight-to-p (hash peer)
+  "T when our request for HASH is outstanding at PEER -- the transaction PEER
+is sending is one we asked it for (Core's REQUESTED state for the
+(peer, txhash) announcement, txrequest.cpp)."
+  (bt:with-lock-held (*tx-request-lock*)
+    (eq peer (car (gethash hash *tx-in-flight*)))))
+
+(defun %unsolicited-tx-over-limit-p (peer txid wtxid)
+  "T when PEER sent a transaction we did NOT request from it and its tx token
+bucket is empty. A requested transaction is never charged: its rate is ours,
+set by the getdatas we chose to send."
+  (and (not (tx-request-in-flight-to-p txid peer))
+       (not (tx-request-in-flight-to-p wtxid peer))
+       (peer-rate-limit-tx peer)
+       (not (bl:token-bucket-allow-p (peer-rate-limit-tx peer)))))
+
 (defun tx-request-candidate-peers (hash)
   "Every peer with a LIVE (non-COMPLETED) announcement of HASH — Core
 TxRequestTracker::GetCandidatePeers (txrequest.cpp:568-576). Orphan intake
@@ -2440,9 +2456,18 @@ the first."
                                (if (plusp vsize) (floor (* 1000 fee) vsize) 0)
                                :wtxid wtxid))))))
 
-(define-p2p-handler ("tx" :needs-mempool t :rate-bucket peer-rate-limit-tx) (peer payload ctx)
+(define-p2p-handler ("tx" :needs-mempool t) (peer payload ctx)
   "Handle a tx message. Validate, add to mempool, and relay.
-CTX's recent-rejects, when present, caches recently rejected txs."
+CTX's recent-rejects, when present, caches recently rejected txs.
+
+The per-peer tx token bucket (not a Core rule: Core never disconnects for the
+NUMBER of transactions a peer sends) is charged only for an UNSOLICITED
+transaction, after the parse, by %UNSOLICITED-TX-OVER-LIMIT-P. It used to be
+charged for every tx message before dispatch, so a peer answering our own
+getdatas was disconnected once a burst passed fifty: feature_fee_estimation.py
+:283-291 relays 250 transactions between three nodes, the receiving node
+logged \"Rate limit exceeded on tx messages\" and dropped the relaying peer, and
+sync_blocks found a node with no peers at all."
   (bl.ctx:with-node-context (utxo-set mempool chain-state peers recent-rejects) ctx
   ;; A tx sent where we advertised fRelay=0 (-blocksonly / relay-disabled
   ;; mainnet default, block-relay/feeler conns) violates the protocol:
@@ -2490,6 +2515,11 @@ CTX's recent-rejects, when present, caches recently rejected txs."
               ;; any more. MSG_WTX announcements are tracked under the wtxid,
               ;; so answer that key too (txids and wtxids never collide; for
               ;; no-witness txs they are equal and one call suffices).
+              (when (%unsolicited-tx-over-limit-p peer txid wtxid)
+                (bl:log-warn "Rate limit exceeded on tx messages, ~A"
+                             (disconnect-msg peer))
+                (disconnect-peer peer)
+                (return-from handle-tx nil))
               (tx-request-received-response peer txid)
               (unless (equalp wtxid txid)
                 (tx-request-received-response peer wtxid))
