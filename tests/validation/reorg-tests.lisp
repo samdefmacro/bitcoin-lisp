@@ -1612,6 +1612,38 @@ removed: Core re-tests lockpoints against the new tip
       (is (not (bl.mp:mempool-has mempool lid)))
       (is (bl.mp:mempool-has mempool okid)))))
 
+(test reorg-refilter-applies-bip68-below-the-csv-height
+  "The re-filter's BIP68 and finality checks are POLICY, as in PreChecks: Core's
+filter_final_and_mature calls CheckSequenceLocksAtTip and CheckFinalTxAtTip
+(validation.cpp:341-366) with no deployment test at all -- only ConnectBlock
+gates the rules on CSV. Ours ran BIP68 only once CSV was active, so on
+feature_bip68_sequence.py's chain (-testactivationheight=csv@432, height ~220)
+invalidateblock put tx3 back and left its height-locked child tx4 in the pool
+(:319). Same shape as the test above, with CSV moved out of reach."
+  (let ((bl.val:*test-activation-heights* (make-hash-table :test 'equal)))
+    (bl.val:apply-test-activation-heights '("csv@432"))
+    (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
+      (declare (ignore funding))
+      (let* ((coin1 (make-reorg-hash 4340))
+             (coin2 (make-reorg-hash 4341))
+             (locked (pkg-tx coin1 0 99990000 :sequence 100))
+             (lid (bl.ser:transaction-hash locked))
+             (ok-tx (pkg-tx coin2 0 99990000 :sequence 40))
+             (okid (bl.ser:transaction-hash ok-tx)))
+        (bl.store:add-utxo utxo-set coin1 0 100000000
+                           (p2sh-optrue-script-pubkey) 150 :coinbase nil)
+        (bl.store:add-utxo utxo-set coin2 0 100000000
+                           (p2sh-optrue-script-pubkey) 150 :coinbase nil)
+        (is (eq :ok (%add-tx mempool locked :fee 10000 :height 200)))
+        (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
+        (is (< 201 (bl.val:get-csv-activation-height bl:*network*))
+            "control: CSV is not active at the next block")
+        (bl.val::readd-disconnected-txs-to-mempool
+         mempool '() utxo-set 200 chain-state)
+        (is (not (bl.mp:mempool-has mempool lid))
+            "a 100-block lock on a 51-deep coin is not final")
+        (is (bl.mp:mempool-has mempool okid))))))
+
 (test reorg-refilter-runs-after-readd
   "Ordering matches Core MaybeUpdateMempoolForReorg: re-add first, then the
 re-filter — so a disconnected tx that is itself non-final under the new tip

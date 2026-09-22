@@ -3155,31 +3155,35 @@ Returns the common ancestor block-index-entry."
     (nreverse entries)))
 
 (defun %mempool-entry-invalid-after-reorg-p (mempool entry utxo-set eval-height
-                                             chain-state mtp locktime-time
-                                             csv-active)
+                                             chain-state mtp)
   "Core's filter_final_and_mature predicate (validation.cpp:341-382), run
 over a mempool entry after a reorg: T when the entry would be invalid in
 the next block on the NEW chain and must be removed with its descendants —
 no longer final, BIP68 sequence locks no longer satisfied, or spending a
 now-immature coinbase. EVAL-HEIGHT is the next block's height (new tip +
-1); MTP the new tip's median-time-past; LOCKTIME-TIME the BIP113 clock for
-absolute locktimes (MTP once CSV is active, mirroring the acceptance path)."
+1); MTP the new tip's median-time-past, which is the clock for BOTH rules
+whatever the deployments say -- CheckFinalTxAtTip and CheckSequenceLocksAtTip
+are policy here, as in PreChecks, and only ConnectBlock gates them on CSV."
   (let ((tx (bl.mp:mempool-entry-transaction entry)))
     (or
      ;; The transaction must still be final (Core CheckFinalTxAtTip:
      ;; next-block height + tip MTP, validation.cpp:347-348).
-     (not (check-transaction-final tx eval-height locktime-time))
+     (not (check-transaction-final tx eval-height mtp))
      ;; BIP68 re-tested against the new chain. Core re-tests cached
      ;; LockPoints and recalculates stale ones (TestLockPointValidity /
      ;; CalculateLockPointsAtTip, validation.cpp:350-366); we cache no
      ;; lockpoints, so always recalculate. In-mempool prevouts count as
      ;; confirming in the next block, like acceptance (mempool-extra-coins).
-     (and csv-active
-          (multiple-value-bind (extra ok)
-              (mempool-extra-coins tx utxo-set mempool eval-height)
-            (or (not ok)   ; an input no longer exists anywhere — invalid
-                (not (check-sequence-locks tx utxo-set eval-height mtp
-                                           chain-state :pending-utxos extra)))))
+     ;;
+     ;; Not gated on CSV: this used to be `(and csv-active ...)', so below
+     ;; the deployment height a reorg left BIP68-locked children in the pool
+     ;; that acceptance -- which never gated the rule -- would have refused
+     ;; (feature_bip68_sequence.py:319 runs at csv@432, height ~220).
+     (multiple-value-bind (extra ok)
+         (mempool-extra-coins tx utxo-set mempool eval-height)
+       (or (not ok)   ; an input no longer exists anywhere — invalid
+           (not (check-sequence-locks tx utxo-set eval-height mtp
+                                      chain-state :pending-utxos extra))))
      ;; Coinbase spends must still be mature (validation.cpp:368-379):
      ;; skip inputs funded by other mempool txs (unconfirmed, never
      ;; coinbase); a confirmed coin must be COINBASE_MATURITY deep at the
@@ -3216,12 +3220,6 @@ transactions removed."
   (let* ((eval-height (1+ height))
          (tip-hash (bl.store:best-block-hash chain-state))
          (mtp (or (compute-median-time-past chain-state tip-hash) 0))
-         (csv-active (>= eval-height
-                         (get-csv-activation-height bl:*network*)))
-         ;; BIP113: same clock the acceptance path uses (transaction.lisp).
-         (locktime-time (if csv-active
-                            mtp
-                            (bl.ser:get-unix-time)))
          (flagged '()))
     ;; Flag first (Core collects to_remove over all of mapTx), remove after —
     ;; the entries table must not be mutated mid-iteration.
@@ -3229,8 +3227,7 @@ transactions removed."
      mempool
      (lambda (txid entry)
        (when (%mempool-entry-invalid-after-reorg-p
-              mempool entry utxo-set eval-height chain-state
-              mtp locktime-time csv-active)
+              mempool entry utxo-set eval-height chain-state mtp)
          (push txid flagged))))
     (let ((removed 0)
           (bl.mp:*mempool-removal-reason* :reorg))

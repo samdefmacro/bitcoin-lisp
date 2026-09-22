@@ -1153,8 +1153,11 @@ bytes."
   "The tip context Core's PreChecks judges both locktime rules against.
 A mempool transaction is evaluated as if it were in the NEXT block (tip+1)
 with the tip's median-time-past, so the pool never holds a transaction that
-cannot yet be mined. Returns (VALUES EVAL-HEIGHT LOCKTIME-TIME MTP
-CSV-ACTIVE).
+cannot yet be mined. Returns (VALUES EVAL-HEIGHT LOCKTIME-TIME MTP).
+LOCKTIME-TIME is the MTP whatever the deployments say: CheckFinalTxAtTip
+reads active_chain_tip.GetMedianTimePast() unconditionally
+(validation.cpp:157-166). Ours fell back to the wall clock below the CSV
+height, which is the pre-BIP113 rule, not a mempool one.
 
 Core reads these off one CBlockIndex (CheckFinalTxAtTip and
 CheckSequenceLocksAtTip both take the tip); ours are two calls at two
@@ -1164,15 +1167,8 @@ rather than at either site."
   (let* ((eval-height (1+ current-height))
          (mtp (or (compute-median-time-past
                    chain-state (bl.store:best-block-hash chain-state))
-                  0))
-         (csv-active (>= eval-height (get-csv-activation-height bl:*network*))))
-    ;; BIP113: locktime compares against MTP once CSV is active (true on all
-    ;; our networks at tip); fall back to wall-clock for the pre-activation
-    ;; window.
-    (values eval-height
-            (if csv-active mtp (bl.ser:get-unix-time))
-            mtp
-            csv-active)))
+                  0)))
+    (values eval-height mtp mtp)))
 
 (defun %replacement-checks (mempool tx modified-fee vsize sigops direct-conflicts)
   "Core MemPoolAccept::ReplacementChecks (validation.cpp:981-1032), which is a
@@ -1345,9 +1341,9 @@ pass a member failed decides what the caller is told about the others."
     ;; validation.cpp:218) and only ConnectBlock gates the rule on the
     ;; deployment (:2475-2479) -- BIP68 is relay policy, then consensus.
     (when chain-state
-      (multiple-value-bind (eval-height locktime-time mtp csv-active)
+      (multiple-value-bind (eval-height locktime-time mtp)
           (%mempool-lock-context chain-state current-height)
-        (declare (ignore locktime-time csv-active))
+        (declare (ignore locktime-time))
         (unless (check-sequence-locks tx utxo-set eval-height mtp chain-state
                                       :pending-utxos extra-coins)
           (return-from validate-transaction-for-mempool
