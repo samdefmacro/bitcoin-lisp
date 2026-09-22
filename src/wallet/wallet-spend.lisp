@@ -2073,6 +2073,23 @@ NIL = complete."
         (%wallet-sign-maps wallet tx coins)
       (bl.rpc:sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte tr-scripts))))
 
+(defun %fill-wallet-sub-scripts (wallet coins)
+  "Give every coin in COINS the redeem / witness script the wallet knows for
+its scriptPubKey when the entry carries none. Core signs with the WALLET as
+the provider, so a prevtx that names a wallet P2SH-P2WPKH output by
+scriptPubKey alone -- no redeemScript -- is still solvable (GetCScript finds
+it); PARSE-PREVOUTS replaces the wallet's entry with the bare
+(scriptPubKey amount), and signing then failed \"P2SH requires redeemScript\"
+(wallet_signrawtransactionwithwallet.py:261, the p2sh-segwit case)."
+  (maphash (lambda (key entry)
+             (when (and (null (third entry)) (null (fourth entry)))
+               (multiple-value-bind (redeem witness)
+                   (%known-sub-scripts wallet nil (first entry))
+                 (when (or redeem witness)
+                   (setf (gethash key coins)
+                         (list (first entry) (second entry) redeem witness))))))
+           coins))
+
 (defun %wallet-input-coins (node wallet tx &optional cc)
   "The signing/verification coins map for TX: (txid . vout) ->
 (script-pubkey amount redeem witness-script), sourced from the wallet's
@@ -3999,6 +4016,7 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
             ;; redeemScript/witnessScript are not read here, the wallet holds
             ;; its own scripts.
             (bl.rpc:parse-prevouts (bl.rpc:positional-array (second params)) coins)
+            (%fill-wallet-sub-scripts wallet coins)
             ;; Explicit non-DEFAULT sighash types cannot be honored on
             ;; taproot inputs yet (the P2TR arm signs keypath
             ;; SIGHASH_DEFAULT): refuse rather than silently sign with a

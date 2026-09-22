@@ -3026,3 +3026,24 @@ a leaf we could satisfy, so the PSBT came back with none."
                        (is (= want (length (coerce (or (%aval "taproot_script_path_sigs" in) '())
                                                    'list)))
                            "~A: ~D tapscript signature(s) in ~S" name want in)))))))))
+
+(test signrawtransactionwithwallet-solves-a-prevtx-from-the-wallets-own-scripts
+  "signrawtransactionwithwallet signs with the WALLET as the provider, so a
+prevtx that names one of the wallet's P2SH-P2WPKH outputs by scriptPubKey and
+amount alone -- no redeemScript -- is still solvable: GetCScript finds the
+redeem script in the wallet (wallet_signrawtransactionwithwallet.py:250-261).
+Our coins entry for it came from the prevtx alone and signing failed \"P2SH
+requires redeemScript\". The bech32 case is the control."
+  (with-wallet-chain-node (node "signraw-own-scripts" :wallet "w")
+    (let ((rpc (lambda (method &rest params)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+          (txid "1d1d4e24ed99057e84c3f80fd8fbec79ed9e1acee37da269356ecea000000000"))
+      (dolist (type '("bech32" "p2sh-segwit"))
+        (let* ((address (funcall rpc "getnewaddress" "" type))
+               (spk (%aval "scriptPubKey" (funcall rpc "getaddressinfo" address)))
+               (raw (funcall rpc "createrawtransaction"
+                             (list (%ht "txid" txid "vout" 3 "sequence" 1000))
+                             (list (%ht (funcall rpc "getnewaddress" "" "bech32") "1"))))
+               (res (funcall rpc "signrawtransactionwithwallet" raw
+                             (list (%ht "txid" txid "vout" 3 "scriptPubKey" spk "amount" 1)))))
+          (is (eq t (%aval "complete" res)) "~A: ~S" type res))))))
