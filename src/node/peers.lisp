@@ -145,17 +145,29 @@ candidates."
     (handler-case (delete-file path)
       (file-error () )
       (error (c) (log-debug "Could not consume ~A: ~A" path c)))
+    (setf *pending-anchor-addresses* nil)
     (when bytes
+      (let ((entries (parse-anchor-entries bytes)))
+        ;; Core ReadAnchors' own line for a file it could read
+        ;; (addrdb.cpp:239).
+        (log-info "Loaded ~D addresses from \"anchors.dat\"" (length entries))
+        (setf *pending-anchor-addresses*
+              (loop for (net addr-bytes port) in entries
+                    when (and (bl.net:dialable-network-p net)
+                              (bl.net:reachable-network-p net))
+                      collect (cons (bl.net:network-address-to-string
+                                     net addr-bytes)
+                                    port)))))
+    ;; CConnman::Start's line, written whatever the file held -- a missing or
+    ;; unreadable anchors.dat is 0 -- and only for a node that picks its own
+    ;; outbound peers (net.cpp:3485-3492). feature_anchors.py:78 perturbs the
+    ;; file and waits for `0 block-relay-only anchors will be tried'.
+    (when (> (length *pending-anchor-addresses*) +max-anchors+)
       (setf *pending-anchor-addresses*
-            (loop for (net addr-bytes port) in (parse-anchor-entries bytes)
-                  when (and (bl.net:dialable-network-p net)
-                            (bl.net:reachable-network-p net))
-                    collect (cons (bl.net:network-address-to-string
-                                   net addr-bytes)
-                                  port)))
-      (when *pending-anchor-addresses*
-        (log-info "Loaded ~D anchor peer~:P for priority reconnection"
-                  (length *pending-anchor-addresses*))))))
+            (subseq *pending-anchor-addresses* 0 +max-anchors+)))
+    (when (addrman-outgoing-enabled-p)
+      (log-info "~D block-relay-only anchors will be tried for connections."
+                (length *pending-anchor-addresses*)))))
 
 (defun %reachable-seed-addresses (addresses)
   "Keep only the seed-derived ADDRESSES (strings) we may actually dial.

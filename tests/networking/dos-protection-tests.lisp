@@ -481,14 +481,26 @@ restores them (in order) for priority reconnection. Inbound peers excluded."
           ;; Connection-less test peers save the network default port; load
           ;; yields (host . stored-port) dial candidates.
           (dp (bl:network-port (bl:node-network node))))
-      (bl::load-anchors node)
-      (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
-                 bl::*pending-anchor-addresses*))
+      (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
+        (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
+                   bl::*pending-anchor-addresses*))
+        ;; Core's two lines: ReadAnchors' count and CConnman::Start's
+        ;; (addrdb.cpp:239, net.cpp:3491).
+        (is-true (find "Loaded 2 addresses from \"anchors.dat\"" lines :test #'search))
+        (is-true (find "2 block-relay-only anchors will be tried for connections."
+                       lines :test #'search)))
       ;; Core ReadAnchors removes the file unconditionally (addrdb.cpp:244):
       ;; anchors are one-shot, so a crash loop cannot re-dial the same two
       ;; peers on every start.
       (is-false (probe-file (bl::anchors-dat-path
-                             (bl:node-data-directory node)))))))
+                             (bl:node-data-directory node))))
+      ;; No file, or one that does not read, is 0 anchors -- said all the
+      ;; same, which is what feature_anchors.py:78 waits for after
+      ;; perturbing the file.
+      (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
+        (is (null bl::*pending-anchor-addresses*))
+        (is-true (find "0 block-relay-only anchors will be tried for connections."
+                       lines :test #'search))))))
 
 (test anchors-v1-file-migrates-on-load
   "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
