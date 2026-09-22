@@ -513,10 +513,11 @@ that does not parse is refused, never defaulted in (Core ClientAllowed rejects
 ;;;
 ;;; The addresses THIS node is reachable at, for self-advertisement. The
 ;;; writers are the torcontrol client (ADD_ONION -> add-local, Core
-;;; AddLocal(service, LOCAL_MANUAL)) and -externalip at startup; there is no
-;;; interface discovery (Core Discover()/-discover), so entries are always
-;;; LOCAL_MANUAL. The map is read by the sync thread (self-advertisement) and
-;;; written by the torcontrol thread — hence the lock.
+;;; AddLocal(service, LOCAL_MANUAL)), -externalip at startup, and under
+;;; -discover the listening socket's own address (LOCAL_BIND) and the
+;;; machine's interface addresses (Core Discover(), LOCAL_IF). The map is read
+;;; by the sync thread (self-advertisement) and getnetworkinfo, and written by
+;;; the torcontrol thread — hence the lock.
 
 ;; Core LocalServiceInfo scores (net.h:152-160).
 (defconstant +local-none+ 0)
@@ -536,6 +537,15 @@ reachable at (Core mapLocalHost key + LocalServiceInfo)."
 (defvar *local-addresses* '()
   "List of local-address records (Core mapLocalHost). Guarded by
 *local-addresses-lock*.")
+
+(defvar *discover* t
+  "Core fDiscover (net.cpp:116, set from -discover at init.cpp:1578): whether
+this node may learn its own addresses -- the listening socket's address
+(CConnman::Bind, net.cpp:3418-3420) and the machine's interfaces (Discover,
+net.cpp:3343-3352) -- rather than only being told them. Core's default is on,
+soft-set off by -proxy, -listen=0 and -externalip (init.cpp:796-819); an
+explicit -discover wins. Assigned once per run by APPLY-PARAMETER-INTERACTIONS.
+With it off, ADD-LOCAL takes only LOCAL_MANUAL-or-better entries (net.cpp:283).")
 
 (defvar *external-ips* '()
   "Raw -externalip strings from config (Core init.cpp:1803-1808), consumed
@@ -574,14 +584,13 @@ entry and updates on re-add. Caller holds *local-addresses-lock*."
   "Register an address this node is reachable at (Core AddLocal,
 net.cpp:277-303). Rejects unroutable addresses and unreachable networks
 (g_reachable_nets gate: e.g. -onion=0 keeps an onion service from being
-advertised); without discovery support, only LOCAL_MANUAL-or-better entries
-are accepted (Core's !fDiscover gate, with fDiscover permanently false for
-us). Re-adding an existing address with a score at least as high bumps its
-score by one and updates the port, exactly like Core. Returns T if the
-address is (now) present."
+advertised); with -discover off only LOCAL_MANUAL-or-better entries are
+accepted (Core's !fDiscover gate, net.cpp:283). Re-adding an existing address
+with a score at least as high bumps its score by one and updates the port,
+exactly like Core. Returns T if the address is (now) present."
   (unless (address-routable-p bytes network)
     (return-from add-local nil))
-  (when (< score +local-manual+)
+  (when (and (not *discover*) (< score +local-manual+))
     (return-from add-local nil))
   (unless (reachable-network-p network)
     (return-from add-local nil))
@@ -609,6 +618,87 @@ address only, like the map)."
     (let ((la (%find-local-address network bytes)))
       (when la
         (setf *local-addresses* (remove la *local-addresses*))))))
+
+;;; Interface discovery (Core GetLocalAddresses, common/netif.cpp:367-381,
+;;; and Discover, net.cpp:3343-3352)
+
+(defun interface-addresses ()
+  "Every address on an interface that is UP and not a loopback, as a list of
+(network . bytes) in PARSE-NETWORK-ADDRESS's representation -- Core's POSIX
+GetLocalAddresses (common/netif.cpp:367-381: getifaddrs, skip entries with no
+address, not IFF_UP, or IFF_LOOPBACK, keep AF_INET and AF_INET6).
+
+Linux only, which is where the node runs: struct ifaddrs is ifa_next,
+ifa_name, the 32-bit ifa_flags at offset 16 and ifa_addr at offset 24 on
+LP64, and a sockaddr's family is the u16 at offset 0 (BSD puts a length byte
+first). Elsewhere this answers NIL, the same as a machine with no routable
+interface."
+  #+(and sbcl linux)
+  (let ((cell (sb-alien:make-alien sb-sys:system-area-pointer))
+        (found '()))
+    (unwind-protect
+         (when (zerop (sb-alien:alien-funcall
+                       (sb-alien:extern-alien
+                        "getifaddrs"
+                        (function sb-alien:int (* sb-sys:system-area-pointer)))
+                       cell))
+           (let ((head (sb-alien:deref cell)))
+             (unwind-protect
+                  (loop for ifa = head then (sb-sys:sap-ref-sap ifa 0)
+                        until (zerop (sb-sys:sap-int ifa))
+                        do (let ((flags (sb-sys:sap-ref-32 ifa 16))
+                                 (addr (sb-sys:sap-ref-sap ifa 24)))
+                             (when (and (/= 0 (sb-sys:sap-int addr))
+                                        (logtest flags #x1)          ; IFF_UP
+                                        (not (logtest flags #x8)))   ; IFF_LOOPBACK
+                               (let ((ip (case (sb-sys:sap-ref-16 addr 0)
+                                           (2        ; AF_INET: sin_addr at 4
+                                            (let ((v (make-array 16 :element-type '(unsigned-byte 8)
+                                                                    :initial-element 0)))
+                                              (setf (aref v 10) #xff (aref v 11) #xff)
+                                              (dotimes (i 4 v)
+                                                (setf (aref v (+ 12 i))
+                                                      (sb-sys:sap-ref-8 addr (+ 4 i))))))
+                                           (10       ; AF_INET6: sin6_addr at 8
+                                            (let ((v (make-array 16 :element-type '(unsigned-byte 8))))
+                                              (dotimes (i 16 v)
+                                                (setf (aref v i)
+                                                      (sb-sys:sap-ref-8 addr (+ 8 i)))))))))
+                                 (when ip
+                                   (push (cons (ip-network ip) ip) found))))))
+               (sb-alien:alien-funcall
+                (sb-alien:extern-alien "freeifaddrs"
+                                       (function sb-alien:void sb-sys:system-area-pointer))
+                head))))
+      (sb-alien:free-alien cell))
+    (nreverse found))
+  #-(and sbcl linux)
+  nil)
+
+(defun discover-local-addresses (port)
+  "Core Discover (net.cpp:3343-3352): under -discover, every interface address
+Core's IsRoutable accepts becomes a LOCAL_IF entry at PORT, the listen port
+(the CNetAddr overload of AddLocal, net.cpp:305-308, adds GetListenPort()).
+Core calls it only when the node listens on the wildcard address
+(init.cpp:2193-2197). Returns the entries added."
+  (when *discover*
+    (loop for (network . bytes) in (interface-addresses)
+          when (and (address-publicly-routable-p bytes network)
+                    (add-local network bytes port +local-if+))
+            collect (progn
+                      (bl.log:log-info "Discover: ~A"
+                                       (network-address-to-string network bytes))
+                      (cons network bytes)))))
+
+(defun add-bound-local-address (host port)
+  "Core CConnman::Bind's advertisement (net.cpp:3418-3420): under -discover,
+a listening socket bound to a routable address makes that address a
+LOCAL_BIND entry at the bound PORT. The wildcard and loopback binds are not
+routable and add nothing. HOST is the bind address as given."
+  (when *discover*
+    (multiple-value-bind (network bytes) (parse-network-address host)
+      (when (and network (address-publicly-routable-p bytes network))
+        (add-local network bytes port +local-bind+)))))
 
 ;; Core GetReachabilityFrom's Reachability enum (netaddress.cpp:715-723).
 ;; We omit the Teredo (RFC4380) and tunneled-IPv6 (RFC3964/6052/6145)

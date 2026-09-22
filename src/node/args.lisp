@@ -175,6 +175,28 @@ start-node-from-args."
   (apply-option-globals merged)
   (apply-parameter-interactions merged))
 
+(defun listen-port-from-binds (merged)
+  "The port Core's GetListenPort takes from the bindings, or NIL when it falls
+through to -port (net.cpp:138-162): the first -bind that names a port, else
+the first -whitebind whose permissions do not include noban (a -whitebind
+must name one). An =onion bind does not parse as an address there, so it
+names no port. It is the port the node ADVERTISES -- -externalip and
+interface addresses are added at it -- which feature_bind_port_externalip.py
+checks in getnetworkinfo's localaddresses."
+  (or (loop for (k . v) in merged
+            when (string= k "bind")
+              do (multiple-value-bind (host port onion-p) (parse-bind-option v)
+                   (when (and host port (not onion-p)) (return port))))
+      (loop for (k . v) in merged
+            when (string= k "whitebind")
+              do (multiple-value-bind (flags direction rest)
+                     (bl.net:parse-permission-flags v :allow-out nil)
+                   (declare (ignore direction))
+                   (when (and flags
+                              (/= (logand flags bl.net:+perm-noban+) bl.net:+perm-noban+))
+                     (multiple-value-bind (host port onion-p) (parse-bind-option rest)
+                       (when (and host port (not onion-p)) (return port))))))))
+
 (defun apply-parameter-interactions (merged)
   "The options whose value depends on ANOTHER option (Core init.cpp Step 2
 \"parameter interactions\" and the proxy / reachability block of Step 6),
@@ -253,6 +275,27 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
                 ((lk "proxy")
                  (setf bl.net:*onion-proxy*
                        bl.net:*proxy*))))))
+    ;; -discover (Core init.cpp:796-819, read at :1578): on unless -proxy
+    ;; (a real one: "" and "0" are none, :786-787), an effective -listen=0 or
+    ;; any -externalip soft-set it off; an explicit value wins either way.
+    ;; Always assigned, so an in-image restart does not inherit a previous
+    ;; run's.
+    (setf bl.net:*discover*
+          (let ((explicit (lk "discover"))
+                (proxy (lk "proxy")))
+            (cond (explicit (conf-parse-bool explicit))
+                  ((and proxy (string/= proxy "") (string/= proxy "0"))
+                   (defer-log :info "parameter interaction: -proxy set -> setting -discover=0")
+                   nil)
+                  ((not (conf-effective-listen-flags merged))
+                   (defer-log :info "parameter interaction: -listen=0 -> setting -discover=0")
+                   nil)
+                  ((lk "externalip")
+                   (defer-log :info "parameter interaction: -externalip set -> setting -discover=0")
+                   nil)
+                  (t t))))
+    (setf *bind-on-any* (not (or (lk "bind") (lk "whitebind")))
+          *listen-port-from-binds* (listen-port-from-binds merged))
     ;; Network reachability. -onlynet (repeatable) replaces the reachable set
     ;; (Core init.cpp:1529-1536 g_reachable_nets.RemoveAll + Add per value);
     ;; it restricts AUTOMATIC outbound selection and gossip storage only —

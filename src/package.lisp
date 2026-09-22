@@ -194,6 +194,11 @@ init.cpp, node/. src/node/.")
    #:*interrupt-check*
    #:interrupt-requested-p
    #:listen-port
+   #:get-listen-port
+   #:listen-port-from-binds
+   #:*listen-port-from-binds*
+   #:*bind-on-any*
+   #:add-external-ip-locals
    #:index-block-connected
    #:index-block-disconnected
    #:node-indexes

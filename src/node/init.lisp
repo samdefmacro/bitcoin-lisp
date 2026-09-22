@@ -408,7 +408,9 @@ txindex ~D MiB, per-index ~D MiB"
   ;; happens after the tor block in %START-NETWORK-SERVICES, whose clear-local-addresses would
   ;; otherwise wipe it.
   (dolist (spec bl.net:*external-ips*)
-    (unless (bl.net:parse-network-address spec)
+    ;; An address with a port of its own (`-externalip=2.2.2.2:30006') is
+    ;; Core's too: Lookup splits the port off first.
+    (unless (bl.net:parse-network-address (or (parse-bind-option spec) spec))
       (config-error "Cannot resolve -externalip address: '~A'" spec))))
 
 
@@ -1758,6 +1760,21 @@ thread."
     (error () nil)))
 
 
+(defun add-external-ip-locals (network)
+  "-externalip: advertise each given address as our own (Core
+init.cpp:1803-1808: AddLocal(addr, LOCAL_MANUAL)), at the port the value names
+or else GetListenPort -- Lookup(strAddr, GetListenPort()) keeps an explicit
+port. feature_bind_port_externalip.py checks the port in getnetworkinfo's
+localaddresses for twelve combinations of -externalip, -port, -bind and
+-whitebind. Validated resolvable in %INIT-PARAMETERS."
+  (dolist (spec bl.net:*external-ips*)
+    (multiple-value-bind (host port) (parse-bind-option spec)
+      (multiple-value-bind (net bytes)
+          (bl.net:parse-network-address (or host spec))
+        (when net
+          (bl.net:add-local net bytes (or port (get-listen-port network))
+                            bl.net:+local-manual+))))))
+
 (defun %start-network-services (network sync listen listen-bind listen-bind-supplied-p
                                listen-onion tor-control tor-password onion-bind)
   "Core Step 12, start node: DNS seeding into the address book, the inbound
@@ -1834,17 +1851,13 @@ listener, the onion listener with its Tor control connection, and
                             (cdr onion-bind)
                             (onion-listen-port *node*)))))
 
-  ;; -externalip: advertise the given addresses as our own (Core
-  ;; init.cpp:1803-1808: AddLocal(addr, LOCAL_MANUAL) at the listen port).
-  ;; Validated resolvable in %INIT-PARAMETERS; runs after the tor block so its
-  ;; clear-local-addresses cannot wipe these entries.
-  (dolist (spec bl.net:*external-ips*)
-    (multiple-value-bind (net bytes)
-        (bl.net:parse-network-address spec)
-      (when net
-        (bl.net:add-local
-         net bytes (listen-port network)
-         bl.net:+local-manual+)))))
+  ;; -externalip; runs after the tor block so its clear-local-addresses
+  ;; cannot wipe these entries.
+  (add-external-ip-locals network)
+  ;; Discover, only when listening on the wildcard address (Core
+  ;; init.cpp:2193-2197); a no-op under -discover=0.
+  (when (and listen *bind-on-any*)
+    (bl.net:discover-local-addresses (get-listen-port network))))
 
 (defun %finish-init-and-start-sync (rpc-port startup-notify sync max-peers)
   "Core Step 13 (finished): mark the node running, end RPC warmup and fire

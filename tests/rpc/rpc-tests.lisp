@@ -1973,6 +1973,38 @@ reads the other (p2p_add_connections.py:73)."
         (is (= 2 (field "connections")) "a :disconnected peer is not a connection")
         (is (= 1 (field "connections_in")))
         (is (= 1 (field "connections_out")))))))
+(test getnetworkinfo-lists-the-local-address-table
+  "getnetworkinfo's localaddresses is mapLocalHost, one {address, port, score}
+per entry in the map's address order (rpc/net.cpp:721-733). Both
+feature_bind_port tests read nothing else. Ours answered a constant empty
+array whatever -externalip, a Tor onion service or a bind had added."
+  (let ((node (make-test-node))
+        (saved (bl.net:local-addresses)))
+    (unwind-protect
+         (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6)))
+           (bl.net:clear-local-addresses)
+           (bl.net:add-local :ipv4 (bl.net:ipv4-to-mapped-ipv6 2 2 2 2) 30006
+                             bl.net:+local-manual+)
+           (bl.net:add-local :ipv4 (bl.net:ipv4-to-mapped-ipv6 1 1 1 1) 31001
+                             bl.net:+local-manual+)
+           (let ((rows (cdr (assoc "localaddresses"
+                                   (bl.rpc:dispatch-rpc-method node "getnetworkinfo" '())
+                                   :test #'string=))))
+             (flet ((field (row name) (cdr (assoc name row :test #'string=))))
+               (is (= 2 (length rows)))
+               (is (equal '("1.1.1.1" "2.2.2.2")
+                          (mapcar (lambda (r) (field r "address")) rows))
+                   "rows come in the map's address order")
+               (is (equal '(31001 30006) (mapcar (lambda (r) (field r "port")) rows)))
+               (is (equal (list bl.net:+local-manual+ bl.net:+local-manual+)
+                          (mapcar (lambda (r) (field r "score")) rows))))))
+      (bl.net:clear-local-addresses)
+      (dolist (la saved)
+        (bl.net:add-local (bl.net:local-address-network la)
+                          (bl.net:local-address-bytes la)
+                          (bl.net:local-address-port la)
+                          bl.net:+local-manual+)))))
+
 (test rpc-getnetworkinfo-localrelay-blocksonly
   "localrelay = !IgnoresIncomingTxs (Core): true on a test network by
 default, json-false under -blocksonly."

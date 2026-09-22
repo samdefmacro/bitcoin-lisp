@@ -154,7 +154,10 @@ port can't be bound."
           ;; socket, and it is the only record an operator has of the same.
           (log-info "Bound to ~A:~D" bind (listen-port (node-network node)))
           (log-info "Listening for inbound peers on ~A:~D"
-                    bind (listen-port (node-network node))))
+                    bind (listen-port (node-network node)))
+          ;; Under -discover a routable bind address is one we are reachable
+          ;; at (CConnman::Bind, net.cpp:3418-3420).
+          (bl.net:add-bound-local-address bind (listen-port (node-network node))))
         (log-warn "Inbound listening disabled: could not bind ~A:~D"
                   bind (listen-port (node-network node))))))
 

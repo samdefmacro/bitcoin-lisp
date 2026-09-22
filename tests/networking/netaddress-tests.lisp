@@ -622,3 +622,84 @@ peers are grouped through this exact path (their socket address strings)."
                (bl.net:peer-address-string
                 (bl.net:make-peer-address
                  :net :i2p :ip (%na-hex +i2p-hash-1+))))))
+
+;;; -discover: the addresses a node learns itself (Core Discover and Bind)
+
+(defmacro %with-local-address-table (&body body)
+  "Run BODY against an empty local-address table with IPv4/IPv6 reachable,
+restoring the table and the -discover flag afterwards."
+  `(let ((saved (bl.net:local-addresses))
+         (bl.net:*reachable-networks* '(:ipv4 :ipv6))
+         (bl.net:*discover* t))
+     (unwind-protect
+          (progn (bl.net:clear-local-addresses) ,@body)
+       (bl.net:clear-local-addresses)
+       (dolist (la saved)
+         (bl.net:add-local (bl.net:local-address-network la)
+                           (bl.net:local-address-bytes la)
+                           (bl.net:local-address-port la)
+                           bl.net:+local-manual+)))))
+
+(test a-routable-bind-address-is-a-local-address-under-discover
+  "CConnman::Bind (net.cpp:3418-3420): under -discover, a listening socket
+bound to a ROUTABLE address makes it a LOCAL_BIND entry at the bound port.
+feature_bind_port_discover.py:66-75 binds 1.1.1.1 and expects it, and only it,
+in localaddresses. The wildcard and loopback binds are not routable (Core's
+IsRoutable, not the dial predicate that keeps private ranges dialable), and
+-discover=0 adds nothing."
+  (%with-local-address-table
+    (bl.net:add-bound-local-address "0.0.0.0" 31001)
+    (bl.net:add-bound-local-address "127.0.0.1" 31001)
+    (bl.net:add-bound-local-address "10.0.0.7" 31001)
+    (is (null (bl.net:local-addresses))
+        "wildcard, loopback and RFC1918 binds are not advertised")
+    (let ((bl.net:*discover* nil))
+      (bl.net:add-bound-local-address "1.1.1.1" 31001))
+    (is (null (bl.net:local-addresses)) "-discover=0 learns nothing")
+    (is-true (bl.net:add-bound-local-address "1.1.1.1" 31001))
+    (let ((entries (bl.net:local-addresses)))
+      (is (= 1 (length entries)))
+      (is (= 31001 (bl.net:local-address-port (first entries))))
+      (is (= bl.net:+local-bind+ (bl.net:local-address-score (first entries)))))))
+
+(test discover-adds-only-the-publicly-routable-interface-addresses
+  "Core Discover (net.cpp:3343-3352) walks GetLocalAddresses (getifaddrs, up
+and not loopback, common/netif.cpp:367-381) and AddLocal keeps what IsRoutable
+accepts, at GetListenPort. A container's interfaces carry a private address,
+so the positive control is that getifaddrs answered at all; nothing it answered
+may be advertised unless it is publicly routable."
+  (%with-local-address-table
+    (let ((found (bl.net:interface-addresses)))
+      #+linux (is (plusp (length found)) "getifaddrs reported no interface")
+      (dolist (entry found)
+        (is (= 16 (length (cdr entry))))
+        (is (member (car entry) '(:ipv4 :ipv6 :cjdns))))
+      (let ((added (bl.net:discover-local-addresses 31001)))
+        (dolist (entry added)
+          (is-true (bl.net:address-publicly-routable-p (cdr entry) (car entry))))
+        (is (= (length added) (length (bl.net:local-addresses))))
+        (dolist (la (bl.net:local-addresses))
+          (is (= 31001 (bl.net:local-address-port la)))
+          (is (= bl.net:+local-if+ (bl.net:local-address-score la)))))
+      (let ((bl.net:*discover* nil))
+        (bl.net:clear-local-addresses)
+        (is (null (bl.net:discover-local-addresses 31001)))))))
+
+(test externalip-keeps-its-own-port-and-otherwise-takes-the-listen-port
+  "init.cpp:1803-1808 adds each -externalip with Lookup(strAddr,
+GetListenPort()): a value with a port keeps it, one without takes the
+advertised listen port -- a -bind port, a non-noban -whitebind port, then
+-port (feature_bind_port_externalip.py's twelve rows). Ours always used the
+-port value."
+  (%with-local-address-table
+    (let ((bl.net:*external-ips* '("2.2.2.2:30006" "3.3.3.3"))
+          (bl:*listen-port-from-binds* 30020)
+          (bl:*p2p-port-override* 30019))
+      (bl:add-external-ip-locals :regtest)
+      (flet ((port-of (a b c d)
+               (let ((la (find (bl.net:ipv4-to-mapped-ipv6 a b c d)
+                               (bl.net:local-addresses)
+                               :key #'bl.net:local-address-bytes :test #'equalp)))
+                 (and la (bl.net:local-address-port la)))))
+        (is (eql 30006 (port-of 2 2 2 2)) "an explicit port is kept")
+        (is (eql 30020 (port-of 3 3 3 3)) "otherwise GetListenPort, not -port")))))

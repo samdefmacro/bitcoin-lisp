@@ -573,8 +573,62 @@ tests cannot leak reachability or seed state into each other."
          (bl.net:*onion-proxy* nil)
          (bl:*dns-seed-enabled* t)
          (bl::*force-dns-seed* nil)
-         (bl:*fixed-seeds-enabled* t))
+         (bl:*fixed-seeds-enabled* t)
+         (bl.net:*external-ips* '())
+         (bl.net:*discover* t)
+         (bl:*bind-on-any* t)
+         (bl:*listen-port-from-binds* nil))
      ,@body))
+
+(defun %discover-after (&rest cli)
+  "Value of -discover (bl.net:*discover*) after applying CLI."
+  (%with-net-config-globals
+    (apply-config-globals (bl.cfg:parse-cli-args cli))
+    bl.net:*discover*))
+
+(test discover-is-on-unless-proxy-listen-or-externalip-turn-it-off
+  "Core's fDiscover defaults on (net.cpp:116, init.cpp:1578) and three
+parameter interactions soft-set it off: a real -proxy (\"\" and \"0\" are none),
+-listen=0, and any -externalip (init.cpp:786-819). An explicit -discover wins
+over all three -- feature_bind_port_discover.py passes -discover with a -bind
+and expects the bound address in localaddresses. Ours had no -discover at all:
+the option was accepted and ignored, and discovery was permanently off."
+  (is-true (%discover-after))
+  (is-false (%discover-after "-proxy=127.0.0.1:9050"))
+  (is-true (%discover-after "-proxy=0"))
+  (is-false (%discover-after "-listen=0"))
+  (is-false (%discover-after "-connect=1.2.3.4") "-connect turns -listen off")
+  (is-false (%discover-after "-externalip=2.2.2.2"))
+  (is-true (%discover-after "-externalip=2.2.2.2" "-discover"))
+  (is-false (%discover-after "-discover=0")))
+
+(defun %listen-port-from-binds-after (&rest cli)
+  "Core GetListenPort's port from the bindings after applying CLI, or NIL."
+  (%with-net-config-globals
+    (apply-config-globals (bl.cfg:parse-cli-args cli))
+    bl:*listen-port-from-binds*))
+
+(test the-advertised-port-comes-from-a-bind-then-a-whitebind-then-port
+  "Core GetListenPort (net.cpp:138-162): the first -bind with a port, else the
+first -whitebind without noban, else -port. The rows are
+feature_bind_port_externalip.py's EXPECTED table (NIL = -port decides), plus
+the two exclusions: a noban -whitebind and an =onion -bind name no port."
+  (is (null (%listen-port-from-binds-after "-port=30001")))
+  (is (null (%listen-port-from-binds-after "-port=30002" "-bind=1.1.1.1")))
+  (is (eql 30004 (%listen-port-from-binds-after "-port=30003" "-bind=1.1.1.1:30004")))
+  (is (eql 30005 (%listen-port-from-binds-after "-bind=1.1.1.1:30005")))
+  (is (eql 30017 (%listen-port-from-binds-after "-port=30016" "-bind=1.1.1.1:30017"
+                                                "-whitebind=1.1.1.1:30018")))
+  (is (eql 30020 (%listen-port-from-binds-after "-port=30019" "-whitebind=1.1.1.1:30020")))
+  (is (null (%listen-port-from-binds-after "-port=30021" "-whitebind=noban@1.1.1.1:30022")))
+  (is (null (%listen-port-from-binds-after "-bind=127.0.0.1:30023=onion")))
+  ;; And GET-LISTEN-PORT falls through to -port when the bindings name none.
+  (let ((bl:*listen-port-from-binds* nil)
+        (bl:*p2p-port-override* 30009))
+    (is (= 30009 (bl:get-listen-port :regtest))))
+  (let ((bl:*listen-port-from-binds* 30020)
+        (bl:*p2p-port-override* 30019))
+    (is (= 30020 (bl:get-listen-port :regtest)))))
 
 (defun %dnsseed-after (&rest cli)
   "Value of *dns-seed-enabled* after applying CLI, from a clean t default."

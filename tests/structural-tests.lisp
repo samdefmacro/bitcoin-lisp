@@ -77,7 +77,6 @@
     "bitcoin-lisp.networking:clear-discouraged"
     "bitcoin-lisp.networking:compact-block-stats"
     "bitcoin-lisp.networking:last-checkpoint-height"
-    "bitcoin-lisp.networking:local-addresses"
     "bitcoin-lisp.networking:request-headers"
     "bitcoin-lisp.networking:tor-controller-service-id"
     "bitcoin-lisp.serialization:bip155-network-keyword"

@@ -78,6 +78,24 @@ GetListenPort, net.cpp:138-162). Dialing peers keeps the chain default —
 Core's -port only moves the listening/advertised side."
   (or *p2p-port-override* (network-port network)))
 
+(defvar *listen-port-from-binds* nil
+  "The port the bindings give Core's GetListenPort (net.cpp:138-158), or NIL
+when -port (or the chain default) decides it: see LISTEN-PORT-FROM-BINDS.
+Assigned once per run by APPLY-PARAMETER-INTERACTIONS.")
+
+(defvar *bind-on-any* t
+  "Core connOptions.bind_on_any (init.cpp:2163): no -bind and no -whitebind
+was given, so the node listens on the wildcard address -- the one case in
+which Discover adds the machine's interface addresses (init.cpp:2193-2197).
+Assigned once per run by APPLY-PARAMETER-INTERACTIONS.")
+
+(defun get-listen-port (network)
+  "The port this node ADVERTISES as its own (Core GetListenPort,
+net.cpp:138-162): a -bind port, else a non-noban -whitebind port, else -port
+or NETWORK's default. -externalip without a port of its own and every
+discovered interface address are added at it."
+  (or *listen-port-from-binds* (listen-port network)))
+
 (defvar *mainnet-relay-enabled* nil
   "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
 

@@ -247,6 +247,12 @@ headerssync.cpp. src/networking/.")
    #:dialable-network-p
    ;; Local addresses (Core mapLocalHost) + self-advertisement
    #:+local-manual+
+   #:+local-if+
+   #:+local-bind+
+   #:*discover*
+   #:interface-addresses
+   #:discover-local-addresses
+   #:add-bound-local-address
    #:local-address
    #:make-local-address
    #:local-address-network

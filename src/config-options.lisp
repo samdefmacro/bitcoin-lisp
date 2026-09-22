@@ -323,6 +323,9 @@
                        (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)))))))
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")
+;; -discover: its soft-sets read -proxy, -listen and -externalip, so it is
+;; decided in APPLY-PARAMETER-INTERACTIONS too (Core init.cpp:796-819).
+(define-option "discover" :type :bool)
 ;; -assumevalid: a block hash (up to 64 hex digits, Core FromUserHex
 ;; left-pads) below which block scripts are assumed valid, or 0 to disable
 ;; the skip entirely (Core chainstatemanager_args.cpp:40-46). Stored in WIRE
@@ -588,7 +591,6 @@ node's own address"))))
   "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
-  "discover"
   "help" "i2pacceptincoming"
   "ipcbind" "limitancestorsize"
   "limitdescendantsize"

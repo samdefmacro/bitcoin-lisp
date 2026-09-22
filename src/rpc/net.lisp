@@ -400,9 +400,9 @@ whatever the cadence is."
       ("networks" . ,(%networks-info))
       ("relayfee" . ,relayfee)
       ("incrementalfee" . ,incfee)
-      ;; We record no local addresses, so this is Core's empty VARR — [], not
-      ;; null (a bare NIL encodes as null).
-      ("localaddresses" . #())
+      ;; mapLocalHost, in its (address) order (rpc/net.cpp:721-733); an empty
+      ;; map is Core's empty VARR -- [], not null (a bare NIL encodes as null).
+      ("localaddresses" . ,(json-array (local-addresses-for-rpc)))
       ("warnings" . ,(bl.log:warnings-for-rpc)))))
 
 (defun %proxy-string (proxy)
@@ -432,6 +432,32 @@ counts table (bitcoin-cli.cpp:611-627) -- found a network in it."
                                       (t "")))
                     ("proxy_randomize_credentials"
                      . ,(json-bool (and proxy (bl.net:proxy-randomize-credentials proxy))))))))
+
+(defun %local-address< (a b)
+  "Core's CNetAddr operator< over two local-address records: network first,
+in Core's Network enum order, then the address bytes (netaddress.h)."
+  (flet ((rank (la)
+           (or (position (bl.net:local-address-network la)
+                         '(:ipv4 :ipv6 :torv3 :i2p :cjdns))
+               9)))
+    (let ((ra (rank a)) (rb (rank b))
+          (ba (bl.net:local-address-bytes a)) (bb (bl.net:local-address-bytes b)))
+      (if (/= ra rb)
+          (< ra rb)
+          (let ((m (mismatch ba bb)))
+            (and m (< m (length ba)) (< m (length bb))
+                 (< (aref ba m) (aref bb m))))))))
+
+(defun local-addresses-for-rpc ()
+  "getnetworkinfo's localaddresses: one {address, port, score} object per
+mapLocalHost entry (rpc/net.cpp:721-733), in the std::map's key order."
+  (mapcar (lambda (la)
+            `(("address" . ,(bl.net:network-address-to-string
+                             (bl.net:local-address-network la)
+                             (bl.net:local-address-bytes la)))
+              ("port" . ,(bl.net:local-address-port la))
+              ("score" . ,(bl.net:local-address-score la))))
+          (sort (bl.net:local-addresses) #'%local-address<)))
 
 (define-rpc "getconnectioncount" (node params)
   "Return the number of connected peers.

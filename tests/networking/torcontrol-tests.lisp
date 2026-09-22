@@ -351,8 +351,8 @@ file is owner-only (0600). Core stores the exact PrivateKey reply value."
   "A fixed 32-byte ed25519 pubkey for onion local-address tests.")
 
 (test tor-add-local-gates
-  "add-local (Core AddLocal): refuses scores below LOCAL_MANUAL (no discovery
-support), unreachable networks (e.g. onion without a Tor route), and
+  "add-local (Core AddLocal): refuses scores below LOCAL_MANUAL under
+-discover=0, unreachable networks (e.g. onion without a Tor route), and
 unroutable bytes; a re-add with >= score bumps the score by one."
   (with-tor-globals
     ;; :torv3 not reachable -> refused.
@@ -360,8 +360,9 @@ unroutable bytes; a re-add with >= score bumps the score by one."
                :torv3 +test-onion-pubkey+ 8333
                bl.net:+local-manual+))
     (push :torv3 bl.net:*reachable-networks*)
-    ;; Score below LOCAL_MANUAL -> refused (fDiscover is permanently false).
-    (is-false (bl.net:add-local :torv3 +test-onion-pubkey+ 8333 0))
+    ;; Score below LOCAL_MANUAL -> refused while -discover is off (net.cpp:283).
+    (let ((bl.net:*discover* nil))
+      (is-false (bl.net:add-local :torv3 +test-onion-pubkey+ 8333 0)))
     ;; All-zero bytes are unroutable.
     (is-false (bl.net:add-local
                :torv3 (make-array 32 :element-type '(unsigned-byte 8)
