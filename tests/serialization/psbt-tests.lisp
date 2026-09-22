@@ -1508,3 +1508,32 @@ change that simply refused any call carrying confTarget would fail them."
           (let ((answer (bump "bumpfee" key 123)))
             (is (not (search "should not both be set" (or (cdr answer) "")))
                 "~A alone must not be refused as a conflict: ~S" key answer)))))))
+
+(test bumpfee-refuses-an-empty-outputs-array
+  "bumpfee / psbtbumpfee: an `outputs' option given as [] is Core's -8
+\"Invalid parameter, output argument cannot be an empty array\"
+(wallet/rpc/spend.cpp:1073-1077), while outputs: null is simply not given.
+A nested [] reaches a handler as NIL, the same as null, so the check never
+fired and wallet_bumpfee.py:175 got no error at all. The request is parsed
+from its JSON text here, because that is the only place the two differ."
+  (with-wallet-chain-node (node "bumpfee-empty-outputs" :wallet "w")
+    (flet ((bump (method outputs-json)
+             (multiple-value-bind (kind m params)
+                 (bl.rpc:parse-json-rpc-request
+                  (format nil "{\"method\":\"~A\",\"params\":[\"~A\",{\"outputs\":~A}]}"
+                          method (make-string 64 :initial-element #\0) outputs-json))
+               (declare (ignore kind m))
+               (rpc-error-of
+                (lambda () (bl.rpc:dispatch-rpc-method node method params))))))
+      (dolist (method '("bumpfee" "psbtbumpfee"))
+        (let ((answer (bump method "[]")))
+          (is (equal -8 (car answer)) "~A outputs []: ~S" method answer)
+          (is (equal "Invalid parameter, output argument cannot be an empty array"
+                     (cdr answer))
+              "~A outputs []: ~S" method answer))
+        ;; Control: null is absent, and the call goes on to fail on the txid.
+        (let ((answer (bump method "null")))
+          (is (not (equal "Invalid parameter, output argument cannot be an empty array"
+                          (cdr answer)))
+              "~A outputs null must not be the empty-array refusal: ~S"
+              method answer))))))

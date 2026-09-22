@@ -324,6 +324,23 @@ cleared or a server started after one."
 
 ;;; --- JSON-RPC Request/Response Handling ---
 
+(defvar *object-empty-array-members*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "Request OBJECT (hash table) -> the member names that arrived as `[]'.
+
+A nested empty array folds to NIL like null does (see %NORMALIZE-JSON-VALUE),
+and nearly every nested reader wants exactly that. The few that Core splits on
+the difference -- bumpfee's `outputs' is -8 \"output argument cannot be an
+empty array\" for [] and ignored for null (wallet/rpc/spend.cpp:1073-1077) --
+ask JSON-MEMBER-EMPTY-ARRAY-P instead of changing what every other reader sees.
+Weak on the object, so the table forgets a request once it is garbage.")
+
+(defun json-member-empty-array-p (object key)
+  "True when OBJECT, a request JSON object, carried KEY as an explicit `[]'."
+  (and (hash-table-p object)
+       (member key (gethash object *object-empty-array-members*) :test #'equal)
+       t))
+
 (defun %normalize-json-value (value top-level &optional in-array)
   "Boolean normalization of a parsed request value (booleans arrive as
 'yason:true / 'yason:false from the symbols parse mode): true -> T
@@ -346,6 +363,8 @@ boolean one, and no handler reads an inner array by identity."
         ((eq value 'yason:false) (if (or top-level in-array) +json-false+ nil))
         ((hash-table-p value)
          (maphash (lambda (key v)
+                    (when (and (vectorp v) (not (stringp v)) (zerop (length v)))
+                      (push key (gethash value *object-empty-array-members*)))
                     (setf (gethash key value) (%normalize-json-value v nil)))
                   value)
          value)

@@ -2261,8 +2261,13 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
   "The `outputs' option of bumpfee / psbtbumpfee as Core reads it
 (wallet/rpc/spend.cpp:1073-1080): AddOutputs over a temporary transaction, whose
 vout becomes the replacement's output set. A JSON null is simply absent
-(`!options[\"outputs\"].isNull()'); an empty ARRAY is Core's own -8 (:1075-1077)."
+(`!options[\"outputs\"].isNull()'); an empty ARRAY is Core's own -8 (:1075-1077).
+A nested [] reaches us as NIL, the same as null, so the request parser's
+record of which members were `[]' tells them apart (wallet_bumpfee.py:175)."
   (multiple-value-bind (outs present) (%opt options "outputs")
+    (when (and present (null outs) (bl.rpc:json-member-empty-array-p options "outputs"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                        :message "Invalid parameter, output argument cannot be an empty array"))
     (when (and present outs)
       (when (null (bl.rpc:positional-array outs))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
