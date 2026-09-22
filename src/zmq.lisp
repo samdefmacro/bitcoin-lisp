@@ -133,9 +133,12 @@ EINVAL for the other, so every unix-socket publisher failed to bind and the
 node published nothing at all: interface_zmq's ipc half never received a
 single notification and timed out.
 
-Only the PREFIX is rewritten; the address is kept as configured everywhere
-else, so the log line and getzmqnotifications report what the operator wrote,
-as Core's do."
+Only the PREFIX is rewritten, and it is rewritten BEFORE the address is
+recorded: Core replaces it in the -zmqpub* value itself and hands the result
+to SetAddress (zmq/zmqnotificationinterface.cpp:60-67), so the log line and
+getzmqnotifications report `ipc://<path>' -- interface_zmq.py:254 compares
+getzmqnotifications with that spelling. ZMQ-START-PUBLISHERS applies it.
+Idempotent: an `ipc://' address is returned unchanged."
   (if (and (stringp address)
            (>= (length address) 5)
            (string= "unix:" (subseq address 0 5)))
@@ -161,8 +164,9 @@ SPECS nothing is loaded at all, which is the whole point of the lazy load."
         ;; one endpoint shares one socket (Core's mapPublishNotifiers).
         (bound (make-hash-table :test 'equal)))
     (dolist (spec specs started)
-      (destructuring-bind (topic address &optional (hwm +default-zmq-sndhwm+)) spec
-        (let ((pub (%zmq-open-publisher topic address hwm
+      (destructuring-bind (topic configured &optional (hwm +default-zmq-sndhwm+)) spec
+        (let* ((address (%zmq-bind-endpoint configured))
+               (pub (%zmq-open-publisher topic address hwm
                                         (gethash address bound))))
           (when pub
             (setf (gethash address bound) (zmq-publisher-socket pub))

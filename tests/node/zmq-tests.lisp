@@ -347,8 +347,10 @@ libzmq binds only the `ipc://' spelling here and answers EINVAL for the other,
 so every unix-socket publisher failed to bind: the node published nothing and
 the test's ipc half received no notification at all.
 
-Only the prefix is rewritten, and only for the bind: the configured address is
-what the log line and getzmqnotifications report, as in Core."
+Only the prefix is rewritten, and it is rewritten where Core rewrites it: in
+the address the notifier is given (zmq/zmqnotificationinterface.cpp:60-67), so
+getzmqnotifications reports `ipc://<path>', which interface_zmq.py:254 reads.
+An earlier version of this test pinned the configured spelling instead."
   (multiple-value-bind (address path) (%zmq-test-address "unix-spelling")
     (declare (ignore address))
     (let ((configured (format nil "unix:~A" path)))
@@ -356,8 +358,8 @@ what the log line and getzmqnotifications report, as in Core."
            (progn
              (is (= 1 (bl:zmq-start-publishers (list (list "hashblock" configured 1000))))
                  "a unix:<path> publisher must bind")
-             ;; Reported as configured, not as rewritten.
-             (is (equal (list (list "pubhashblock" configured 1000))
+             ;; Reported as rewritten, as Core reports it.
+             (is (equal (list (list "pubhashblock" (format nil "ipc://~A" path) 1000))
                         (bl:zmq-notifications-info)))
              ;; And it really publishes: an independent subscriber on the
              ;; ipc:// spelling of the same path reads the frame.
