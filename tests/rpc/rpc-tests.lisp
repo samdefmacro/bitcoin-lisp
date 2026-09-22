@@ -9832,6 +9832,26 @@ different port stay distinct."
           (is (eql -1 (bl.rpc:rpc-error-code e)))
           (is (search "addnode \"node\" \"command\"" (bl.rpc:rpc-error-message e))))))))
 
+(test getnetworkinfo-lists-the-local-addresses
+  "Core's getnetworkinfo reports mapLocalHost as localaddresses, one
+{address, port, score} per entry (rpc/net.cpp:721-733);
+p2p_addr_selfannouncement.py:103 reads the -externalip port from it. Ours
+always answered []."
+  (let ((node (make-test-node)))
+    (bl.net:clear-local-addresses)
+    (unwind-protect
+         (multiple-value-bind (net bytes) (bl.net:parse-network-address "42.42.42.42")
+           (bl.net:add-local net bytes 18444 bl.net:+local-manual+)
+           (let ((la (cdr (assoc "localaddresses"
+                                 (bl.rpc:dispatch-rpc-method node "getnetworkinfo" nil)
+                                 :test #'string=))))
+             (is (= 1 (length la)))
+             (let ((rec (elt la 0)))
+               (is (equal "42.42.42.42" (cdr (assoc "address" rec :test #'string=))))
+               (is (eql 18444 (cdr (assoc "port" rec :test #'string=))))
+               (is (eql bl.net:+local-manual+ (cdr (assoc "score" rec :test #'string=)))))))
+      (bl.net:clear-local-addresses))))
+
 (test rpc-getaddednodeinfo-reports-state
   "getaddednodeinfo reports each added node + whether a matching peer is live."
   (let ((node (make-test-node)))
