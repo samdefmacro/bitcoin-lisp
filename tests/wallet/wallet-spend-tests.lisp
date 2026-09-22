@@ -2185,7 +2185,10 @@ was present, and wrong, which no assertion about presence can see."
                                         (bl.rpc:format-money 50000000))
                                   h)))
                  (created (rpc nil "createpsbt" (list input) outputs))
-                 (processed (rpc "tr" "walletprocesspsbt" created))
+                 ;; finalize=false: a FINALIZED input is written with none of
+                 ;; its derivations (psbt.h:312), which is what Core returns
+                 ;; for a key-path input the wallet can finish.
+                 (processed (rpc "tr" "walletprocesspsbt" created t "DEFAULT" t bl.rpc:+json-false+))
                  (decoded (rpc nil "decodepsbt" (%aval "psbt" processed)))
                  (psbt-input (first (coerce (%aval "inputs" decoded) 'list)))
                  (derivs (coerce (or (%aval "taproot_bip32_derivs" psbt-input) '())
@@ -2419,7 +2422,7 @@ every input carrying a script-path signature; the root was never written."
                                         (bl.rpc:format-money 50000000))
                                   h)))
                  (created (rpc nil "createpsbt" (list input) outputs))
-                 (processed (rpc "tr" "walletprocesspsbt" created t "ALL" t nil))
+                 (processed (rpc "tr" "walletprocesspsbt" created t "ALL" t bl.rpc:+json-false+))
                  (decoded (rpc nil "decodepsbt" (%aval "psbt" processed)))
                  (psbt-input (first (coerce (%aval "inputs" decoded) 'list)))
                  (psbt-output (first (coerce (%aval "outputs" decoded) 'list)))
