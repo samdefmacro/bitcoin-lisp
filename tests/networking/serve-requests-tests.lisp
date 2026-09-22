@@ -264,17 +264,32 @@ stale, are not fetched."
             (is (equalp (list (bl.store:block-index-entry-hash equal-work))
                         (getdata-hashes
                          (captured-sends
-                          (lambda () (bl.net:headers-direct-fetch peer cs equal-work))))))
-            (is (null (getdata-hashes
-                       (captured-sends
-                        (lambda () (bl.net:headers-direct-fetch peer cs equal-work)))))
-                "a block already in flight is not asked for twice")))
+                          (lambda () (bl.net:headers-direct-fetch peer cs equal-work))))))))
         (with-ibd-context
-          (let ((bl.ser:*mock-time* (+ 1700000100 (* 60 60 24))))
+          (let ((bl.ser:*mock-time* 1700000100))
             (is (null (getdata-hashes
                        (captured-sends
                         (lambda () (bl.net:headers-direct-fetch peer cs equal-work)))))
-                "our tip is stale: no direct fetch")))))))
+                "a block already in flight is not asked for twice, even from a
+fresh pass context")))
+        ;; The request dies with its peer; a stale tip then still refuses.
+        (setf (bl.net:peer-state peer) :disconnected)
+        (let ((other (bl.net:make-peer :address "test2" :state :ready
+                                       :services bl.ser:+node-witness+)))
+          (with-ibd-context
+            (let ((bl.ser:*mock-time* (+ 1700000100 (* 60 60 24))))
+              (is (null (getdata-hashes
+                         (captured-sends
+                          (lambda () (bl.net:headers-direct-fetch other cs equal-work)))))
+                  "our tip is stale: no direct fetch"))
+            ;; Positive control for the line above: the same call with a
+            ;; recent tip does fetch it from the new peer.
+            (let ((bl.ser:*mock-time* 1700000100))
+              (is (equalp (list (bl.store:block-index-entry-hash equal-work))
+                          (getdata-hashes
+                           (captured-sends
+                            (lambda () (bl.net:headers-direct-fetch other cs equal-work)))))))
+            (setf (bl.net:peer-state other) :disconnected)))))))
 
 (test getheaders-null-locator-returns-stop-header
   (multiple-value-bind (cs entries) (%make-served-chain 5)

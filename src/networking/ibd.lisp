@@ -1303,6 +1303,9 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                    ((gethash hash in-flight)
                     (unless waiting-for
                       (setf waiting-for (car (gethash hash in-flight)))))
+                   ;; Asked for by HEADERS-DIRECT-FETCH, whose requests outlive
+                   ;; this pass's context: not ours to ask for again.
+                   ((direct-fetch-in-flight-p hash))
                    ;; Core (:1524-1531): the end of the window, with nothing
                    ;; collected for this peer -- we could fetch if the window
                    ;; were one larger, so whoever holds its first missing block
@@ -2167,6 +2170,7 @@ handler. Shared by the block-download drain and the at-tip reap pass."
          (let ((requested (and ctx (or (gethash hash (ibd-context-in-flight ctx))
                                        (gethash hash (ibd-context-pending-blocks ctx))))))
            (mark-block-received hash)
+           (remhash hash *direct-fetch-in-flight*)
            (record-block-received-from-peer peer)
            (let ((connected
                    (process-received-block block route-cs route-view block-store
@@ -3827,6 +3831,44 @@ that path sends its own follow-up from the sync's locator."
   (when (and peer full-batch last-entry (null (peer-headers-sync peer)))
     (%maybe-send-getheaders peer (%locator-from-entry last-entry chain-state))))
 
+(defconstant +direct-fetch-expiry-seconds+ 120
+  "How long a direct-fetch request counts as in flight without its block
+arriving. Core's entry lives until delivery or disconnect, with the download
+timeout disconnecting a peer that sits on it; here an expired entry merely
+stops blocking a re-request.")
+
+(defvar *direct-fetch-in-flight* (make-block-hash-table :synchronized t)
+  "block-hash -> (peer . internal-real-time) for the blocks HEADERS-DIRECT-FETCH
+asked for. The steady-state pump builds a fresh IBD context every tick, so its
+in-flight table forgets a request before the block can arrive; Core's
+mapBlocksInFlight is one process-wide map, and this is the part of it the
+direct fetch needs to survive between ticks -- so that a second headers
+message neither re-requests those blocks nor forgets they count against the
+peer's MAX_BLOCKS_IN_TRANSIT_PER_PEER (p2p_sendheaders.py:497-504).")
+
+(defun %live-direct-fetch-entry (hash)
+  "The (peer . time) direct-fetch entry for HASH while it still counts: its
+peer is connected and it has not expired. A dead entry is dropped."
+  (let ((entry (gethash hash *direct-fetch-in-flight*)))
+    (when entry
+      (if (and (not (eq (peer-state (car entry)) :disconnected))
+               (< (- (get-internal-real-time) (cdr entry))
+                  (* +direct-fetch-expiry-seconds+ internal-time-units-per-second)))
+          entry
+          (progn (remhash hash *direct-fetch-in-flight*) nil)))))
+
+(defun direct-fetch-in-flight-p (hash)
+  "T while a live direct-fetch request for HASH is outstanding."
+  (and (%live-direct-fetch-entry hash) t))
+
+(defun %direct-fetch-count (peer)
+  "How many live direct-fetch requests PEER holds."
+  (let ((n 0))
+    (dolist (hash (loop for h being the hash-keys of *direct-fetch-in-flight* collect h) n)
+      (let ((entry (%live-direct-fetch-entry hash)))
+        (when (and entry (eq (car entry) peer))
+          (incf n))))))
+
 (defun headers-direct-fetch (peer chain-state last-entry)
   "Core HeadersDirectFetchBlocks (net_processing.cpp:2844-2902): once PEER's
 headers end at LAST-ENTRY, a valid header with at least our tip's work, ask
@@ -3858,6 +3900,7 @@ requested by anyone. Returns the hashes requested."
                  (unless (or (%block-body-present-p chain-state nil walk)
                              (and *ibd-context*
                                   (gethash hash (ibd-context-in-flight *ibd-context*)))
+                             (direct-fetch-in-flight-p hash)
                              (fetch-block-requested-p hash))
                    (push walk to-fetch)))
                (setf walk (bl.store:block-index-entry-prev-entry walk)))
@@ -3866,11 +3909,14 @@ requested by anyone. Returns the hashes requested."
       (when (and walk (bl.store:entry-on-active-chain-p chain-state walk))
         ;; TO-FETCH is oldest first already (pushed while walking down).
         (let ((hashes (loop for entry in to-fetch
-                            for n from (count-peer-in-flight peer)
+                            for n from (+ (count-peer-in-flight peer)
+                                          (%direct-fetch-count peer))
                             while (< n +max-blocks-in-transit-per-peer+)
                             collect (bl.store:block-index-entry-hash entry))))
           (when hashes
-            (dolist (hash hashes) (mark-block-in-flight hash peer))
+            (dolist (hash hashes)
+              (setf (gethash hash *direct-fetch-in-flight*)
+                    (cons peer (get-internal-real-time))))
             (send-message peer
                           (bl.ser:make-getdata-message
                            (mapcar (lambda (hash)
