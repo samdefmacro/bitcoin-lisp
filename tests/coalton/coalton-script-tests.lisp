@@ -207,6 +207,29 @@ x-only pubkey isolate it: a 5-byte n fails with SE-NumberOverflow."
                    (call-execute-script (checksigadd-script #(#x05 1 2 3 4 5)))))
       (bl.interop:set-script-flags nil))))
 
+(test checksigadd-with-two-operands-is-an-invalid-stack-operation
+  "OP_CHECKSIGADD needs three stack elements and says so BEFORE it reads any
+(Core interpreter.cpp:1090). With two, the element in n's place is the
+signature; we decoded it as a CScriptNum first and answered the number error
+where Core answers INVALID_STACK_OPERATION (feature_taproot.py:1067
+tapscript/checksigadd3args). Control: the same 65-byte first element with
+three operands still fails, but on the number (Core :1093)."
+  (let ((sig (coerce (cons #x41 (make-list 65 :initial-element 7)) 'vector))
+        (pub (coerce (cons #x20 (make-list 32 :initial-element 2)) 'vector)))
+    (bl.interop:set-script-flags "TAPSCRIPT")
+    (unwind-protect
+         (flet ((err-name (script)
+                  (let ((r (call-execute-script script)))
+                    (and (script-err-p r)
+                         (bl.interop:script-error-name
+                          (bl.script:script-result-error r))))))
+           (let ((control (err-name (concatenate 'vector #(#x00) sig pub #(#xba)))))
+             (is (and control (not (equal control "INVALID_STACK_OPERATION")))
+                 "control: a 65-byte n is refused on the number, as in Core"))
+           (is (equal "INVALID_STACK_OPERATION"
+                      (err-name (concatenate 'vector sig pub #(#xba))))))
+      (bl.interop:set-script-flags nil))))
+
 (test execute-script-op-0
   "OP_0 pushes empty vector."
   (let ((result (call-execute-script #(0))))

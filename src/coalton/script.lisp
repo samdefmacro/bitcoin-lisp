@@ -2207,9 +2207,19 @@ else. Wiring either of them here rejects scripts Core accepts."
        (let ((is-tapscript (lisp Boolean ()
                              (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
                                          "TAPSCRIPT"))))
-         (if (not is-tapscript)
+         (cond
+           ((not is-tapscript)
              ;; In non-Tapscript context, this is an unknown opcode
-             (ScriptErr SE-UnknownOpcode)
+             (ScriptErr SE-UnknownOpcode))
+           ;; Three operands or nothing, BEFORE any of them is read (Core
+           ;; interpreter.cpp:1090): with two on the stack the one in n's
+           ;; place is the SIGNATURE, and reading it as a CScriptNum answered
+           ;; the number-encoding error instead of Core's
+           ;; SCRIPT_ERR_INVALID_STACK_OPERATION
+           ;; (feature_taproot.py:1067 tapscript/checksigadd3args).
+           ((< (stack-depth (context-main-stack ctx)) 3)
+            (ScriptErr SE-StackUnderflow))
+           (True
              ;; Tapscript: Pop pubkey, n, sig; verify; push n+valid
              (match (stack-pop (context-main-stack ctx))
                ((None) (ScriptErr SE-StackUnderflow))
@@ -2244,7 +2254,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                                                       (ScriptNum (+ (script-num-value num) 1)))
                                                      new-stack)
                                          ctx)))
-                             (True (ScriptErr (tapscript-sig-status-error result))))))))))))))))
+                             (True (ScriptErr (tapscript-sig-status-error result)))))))))))))))))
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops unless DISCOURAGE_UPGRADABLE_NOPS flag is set
