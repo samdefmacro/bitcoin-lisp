@@ -623,7 +623,7 @@ P2SH whose redeem script the provider knows and which is one."
            (let ((redeem (%psbt-provider-sub-scripts spk expansions)))
              (and redeem (bl.val:output-witness-program-p redeem))))))
 
-(defun %psbt-update-input-from-provider (map tx-in expansions)
+(defun %psbt-update-input-from-provider (map tx-in expansions &optional (bip32derivs t))
   "SignPSBTInput with no key to sign with (ProcessPSBT's hidden-secret
 provider, rpc/rawtransaction.cpp:190-205): ProduceSignature finds what it can
 -- the redeem and witness scripts, the key derivations -- FromSignatureData
@@ -659,11 +659,46 @@ script is a witness program whose own script is known (sign.cpp:757-789)."
           (when (and witness-p (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-utxo+)))
             (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
                                  (%serialize-txout-bytes out)))
-          (let ((exp (gethash spk expansions)))
+          (let ((exp (and bip32derivs (gethash spk expansions))))
             (when exp
               (destructuring-bind (desc pos pairs) exp
                 (declare (ignore desc))
                 (%psbt-add-map-derivs map spk pos pairs)))))))))
+
+(defun %psbt-fetch-utxos (psbt node expansions bip32derivs)
+  "ProcessPSBT's input half (rpc/rawtransaction.cpp:143-205) for PSBT with the
+descriptor EXPANSIONS as its provider: each input's non_witness_utxo from the
+txindex, else the mempool; for inputs still without one, the coin from the
+UTXO/mempool view kept as witness_utxo for a segwit output; then the keyless
+SignPSBTInput on every unsigned input (%PSBT-UPDATE-INPUT-FROM-PROVIDER), its
+derivations only when BIP32DERIVS (HidingSigningProvider's hide_origin)."
+  (let ((tx (bl.ser:psbt-tx psbt))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          unless (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+)
+            do (let ((prev (bl.rpc:find-transaction
+                            node (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in)))))
+                 (when prev
+                   (bl.ser:psbt-map-set map bl.ser:+psbt-in-non-witness-utxo+ empty
+                                        (bl.ser:serialize-transaction prev)))))
+    (let ((coins (bl.rpc:find-coins node tx)))
+      (loop for map across (bl.ser:psbt-inputs psbt)
+            for in across (bl.ser:transaction-inputs tx)
+            for op = (bl.ser:tx-in-previous-output in)
+            for coin = (gethash (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op))
+                                coins)
+            when (and coin
+                      (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+))
+                      (%psbt-segwit-output-p (first coin) expansions))
+              do (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
+                                      (%serialize-txout-bytes
+                                       (bl.ser:make-tx-out :value (second coin)
+                                                           :script-pubkey (first coin))))))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          unless (%psbt-input-signed-p map)
+            do (%psbt-update-input-from-provider map in expansions bip32derivs))))
 
 (bl.rpc:define-rpc "utxoupdatepsbt" (node params)
   "Core utxoupdatepsbt = ProcessPSBT with a provider built from the optional
@@ -691,31 +726,7 @@ a P2SH-P2WPKH never its redeem script -- rpc_psbt.py:895-905."
                            (bl.bytes:make-octets-hash-table)))
            (tx (bl.ser:psbt-tx psbt))
            (empty (make-array 0 :element-type '(unsigned-byte 8))))
-      (loop for map across (bl.ser:psbt-inputs psbt)
-            for in across (bl.ser:transaction-inputs tx)
-            unless (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+)
-              do (let ((prev (bl.rpc:find-transaction
-                              node (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in)))))
-                   (when prev
-                     (bl.ser:psbt-map-set map bl.ser:+psbt-in-non-witness-utxo+ empty
-                                          (bl.ser:serialize-transaction prev)))))
-      (let ((coins (bl.rpc:find-coins node tx)))
-        (loop for map across (bl.ser:psbt-inputs psbt)
-              for in across (bl.ser:transaction-inputs tx)
-              for op = (bl.ser:tx-in-previous-output in)
-              for coin = (gethash (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op))
-                                  coins)
-              when (and coin
-                        (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-non-witness-utxo+))
-                        (%psbt-segwit-output-p (first coin) expansions))
-                do (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
-                                        (%serialize-txout-bytes
-                                         (bl.ser:make-tx-out :value (second coin)
-                                                             :script-pubkey (first coin))))))
-      (loop for map across (bl.ser:psbt-inputs psbt)
-            for in across (bl.ser:transaction-inputs tx)
-            unless (%psbt-input-signed-p map)
-              do (%psbt-update-input-from-provider map in expansions))
+      (%psbt-fetch-utxos psbt node expansions t)
       (loop for map across (bl.ser:psbt-outputs psbt)
             for out across (bl.ser:transaction-outputs tx)
             for spk = (bl.ser:tx-out-script-pubkey out)
@@ -1314,35 +1325,6 @@ signature is produced (psbt.cpp:495-501)."
                     map bl.ser:+psbt-in-non-witness-utxo+ empty
                     (bl.ser:transaction-wire-bytes
                      (wallet-tx-tx wtx)))))))))
-
-(defun %psbt-fill-node-utxos (psbt node)
-  "For witness inputs with no UTXO field, add witness_utxo from the node's UTXO
-set (descriptorprocesspsbt updates segwit inputs from the UTXO set / mempool)."
-  (let ((tx (bl.ser:psbt-tx psbt))
-        (utxo-set (bl.rpc:rpc-get-utxo-set node)))
-    (when utxo-set
-      (loop for map across (bl.ser:psbt-inputs psbt)
-            for in across (bl.ser:transaction-inputs tx)
-            for op = (bl.ser:tx-in-previous-output in)
-            do (unless (or (bl.ser:psbt-map-find
-                            map bl.ser:+psbt-in-witness-utxo+)
-                           (bl.ser:psbt-map-find
-                            map bl.ser:+psbt-in-non-witness-utxo+))
-                 (let ((entry (bl.store:get-utxo
-                               utxo-set
-                               (bl.ser:outpoint-hash op)
-                               (bl.ser:outpoint-index op))))
-                   (when (and entry (%psbt-witness-spk-p
-                                     (bl.store:utxo-entry-script-pubkey entry)))
-                     (let ((bb (bl.ser:make-byte-buf)))
-                       (bl.ser:bb-write-tx-out
-                        bb (bl.ser:make-tx-out
-                            :value (bl.store:utxo-entry-value entry)
-                            :script-pubkey (bl.store:utxo-entry-script-pubkey entry)))
-                       (bl.ser:psbt-map-set
-                        map bl.ser:+psbt-in-witness-utxo+
-                        (make-array 0 :element-type '(unsigned-byte 8))
-                        (bl.ser:bb-finish bb))))))))))
 
 ;;; --- Recording signatures + derivations ---
 
@@ -2285,21 +2267,6 @@ through the shared %sign-map-add-key!."
                                            key pubkey priv pos)))))))
     (values keymap pubmap tr-keymap)))
 
-(defun %psbt-add-descriptor-input-derivs (psbt coins expansions)
-  (let ((tx (bl.ser:psbt-tx psbt)))
-    (loop for map across (bl.ser:psbt-inputs psbt)
-          for in across (bl.ser:transaction-inputs tx)
-          for op = (bl.ser:tx-in-previous-output in)
-          for entry = (gethash (cons (bl.ser:outpoint-hash op)
-                                     (bl.ser:outpoint-index op))
-                               coins)
-          for spk = (and entry (first entry))
-          for exp = (and spk (gethash spk expansions))
-          do (when exp
-               (destructuring-bind (desc pos pairs) exp
-                 (declare (ignore desc))
-                 (%psbt-add-map-derivs map spk pos pairs))))))
-
 (bl.rpc:define-rpc "descriptorprocesspsbt" (node params)
   "Update a PSBT's segwit inputs from output descriptors + the UTXO set, then
 sign the inputs the descriptors can (Bitcoin Core descriptorprocesspsbt).
@@ -2313,13 +2280,18 @@ PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
                            (if default-p nil byte)))
            (bip32derivs (bl.rpc:positional-bool-or (fourth params) t))
            (finalize (bl.rpc:positional-bool-or (fifth params) t)))
-      (%psbt-fill-node-utxos psbt node)
+      ;; ProcessPSBT's input half, the provider hiding origins unless
+      ;; BIP32DERIVS (rpc/rawtransaction.cpp:143-205, :2044): the previous
+      ;; transaction from the txindex or the mempool, a segwit coin's
+      ;; witness_utxo, what the descriptors solve. Only the UTXO set's
+      ;; witness_utxo used to be filled, so a coin still in the mempool got
+      ;; nothing (rpc_psbt.py:1219-1230).
+      (%psbt-fetch-utxos psbt node expansions bip32derivs)
       (let ((coins (%psbt-coins-map psbt)))
-        (when bip32derivs
-          (%psbt-add-descriptor-input-derivs psbt coins expansions))
         (multiple-value-bind (keymap pubmap tr-keymap)
             (%descriptor-sign-maps expansions (bl.ser:psbt-tx psbt) coins)
           (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash))
+        (%psbt-remove-unnecessary-transactions psbt)
         (%psbt-signer-result psbt finalize nil)))))
 
 ;;; --- The PSBT-from-wallet path (shared by walletcreatefundedpsbt +

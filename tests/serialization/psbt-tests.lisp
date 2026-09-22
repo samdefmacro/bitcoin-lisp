@@ -1895,3 +1895,49 @@ called it incomplete. An OP_FALSE output stays incomplete (the control)."
                    ("complete" . t))
                  (finalize #x51)))
       (is (not (eq t (%aval "complete" (finalize #x00))))))))
+
+(test descriptorprocesspsbt-is-cores-processpsbt
+  "descriptorprocesspsbt is ProcessPSBT with the descriptors as its provider
+(rpc/rawtransaction.cpp:2044 over :128-212): the previous transaction from
+the txindex or the MEMPOOL, the witness_utxo a witness solution gets even
+from a descriptor that holds the wrong key, derivations only when bip32derivs,
+then signing. Ours filled a witness_utxo from the UTXO set alone, so a coin
+still in the mempool got nothing (rpc_psbt.py:1219-1242 lists the keys each
+call must leave)."
+  (with-wallet-chain-node (node "descriptorprocesspsbt")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (keys-of (psbt)
+             (let ((in (first (coerce (%aval "inputs" (bl.rpc:dispatch-rpc-method
+                                                        node "decodepsbt" (list psbt)))
+                                     'list))))
+               (unless (hash-table-p in) (sort (mapcar #'car in) #'string<)))))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (wif (lambda (b) (bl.crypto:private-key-to-wif
+                               (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)
+                               :network :regtest :compressed t)))
+             (desc (bl.rpc:descriptor-add-checksum (format nil "wpkh(~A)" (funcall wif 61))))
+             (alt (bl.rpc:descriptor-add-checksum (format nil "wpkh(~A)" (funcall wif 62)))))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((address (first (rpc nil "deriveaddresses" desc)))
+               (txid (with-wallet-rng (141)
+                       (rpc "fund" "sendtoaddress" address (bl.rpc:format-money 100000000)
+                            nil nil nil nil nil nil nil 10)))
+               (vout (%aval "vout" (find address (coerce (%aval "details" (rpc "fund" "gettransaction" txid)) 'list)
+                                         :key (lambda (d) (%aval "address" d)) :test #'equal)))
+               (psbt (rpc nil "createpsbt" (list (%ht "txid" txid "vout" vout))
+                          (list (%ht optrue "0.99999")))))
+          (is (null (keys-of psbt)) "the control: createpsbt fills nothing")
+          (is (equal '("non_witness_utxo" "witness_utxo")
+                     (keys-of (%aval "psbt" (rpc nil "descriptorprocesspsbt" psbt (list alt) "ALL")))))
+          (let ((unfinal (rpc nil "descriptorprocesspsbt" psbt (list desc) "ALL" t bl.rpc:+json-false+)))
+            (is (equal '("bip32_derivs" "non_witness_utxo" "partial_signatures" "witness_utxo")
+                       (keys-of (%aval "psbt" unfinal))))
+            (is (null (assoc "hex" unfinal :test #'equal))))
+          (let ((final (rpc nil "descriptorprocesspsbt" psbt (list desc) "ALL" bl.rpc:+json-false+ t)))
+            (is (equal '("final_scriptwitness" "non_witness_utxo" "witness_utxo")
+                       (keys-of (%aval "psbt" final))))
+            (is (eq t (%aval "complete" final)))))))))
