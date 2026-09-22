@@ -189,6 +189,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:positional-array
    #:json-member-empty-array-p
    #:sign-errors-json
+   #:*solving-pubkeys*
    #:positional-bool
    #:positional-bool-or
    #:pubkey-lessp

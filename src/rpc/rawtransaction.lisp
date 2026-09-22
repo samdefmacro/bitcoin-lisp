@@ -555,6 +555,14 @@ the caller -- the sighash commits to all of them."
                             best-sigs (reverse signed-by)))))))))))
     (values best best-sigs best-leaf)))
 
+(defvar *solving-pubkeys* nil
+  "HASH160 -> pubkey for keys the signer KNOWS but may not hold, or NIL: the
+rest of Core's signing provider. A descriptor wallet's provider for a script
+carries every pubkey of the descriptor's expansion (DescriptorScriptPubKeyMan::
+GetSigningProvider), and a PSBT signer adds the input's listed keys
+(FillSignatureData's misc pubkeys) -- which is what lets a pkh() branch whose
+key belongs to someone else be inferred at all. The wallet signer binds it.")
+
 (defun %wsh-pkh-resolver (keymap)
   "Core's WshSatisfier::FromPKHBytes (sign.cpp:428-436) as MS-FROM-SCRIPT wants
 it: a pkh() branch commits to HASH160 of a key rather than to the key, so the
@@ -562,7 +570,9 @@ key comes back out of the signing provider -- here KEYMAP, which the P2PKH and
 P2WPKH arms already index by exactly that hash. Without it the inferred node
 carries no key at all, the satisfier's sign-fn is called with NIL, and a policy
 this node holds every private key for is reported unsignable."
-  (lambda (hash) (cdr (gethash hash keymap))))
+  (lambda (hash)
+    (or (cdr (gethash hash keymap))
+        (and *solving-pubkeys* (gethash hash *solving-pubkeys*)))))
 
 (defun %bip143-sig (script-code amount key sighash-byte)
   "A BIP143 (segwit v0) signature over SCRIPT-CODE and AMOUNT, DER || the

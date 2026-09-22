@@ -1746,6 +1746,18 @@ empty -- walletprocesspsbt answered complete false with no `hex'
                 wallet (%psbt-input-listed-pubkeys map spk)
                 keymap pubmap tr-keymap)))))
 
+(defun %psbt-listed-pubkeys-table (psbt)
+  "HASH160 -> pubkey over every PSBT_IN_BIP32_DERIVATION and partial-signature
+key the inputs of PSBT list -- what FillSignatureData hands the signer as
+misc pubkeys (psbt.cpp:111-160), for BL.RPC:*SOLVING-PUBKEYS*. A pkh() branch
+of a miniscript whose key is another cosigner's resolves through it."
+  (let ((table (bl.bytes:make-octets-hash-table)))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          do (dolist (type (list bl.ser:+psbt-in-bip32+ bl.ser:+psbt-in-partial-sig+))
+               (loop for (pubkey) in (bl.ser:psbt-map-collect map type)
+                     do (setf (gethash (bl.crypto:hash160 pubkey) table) pubkey))))
+    table))
+
 (defun %psbt-add-input-tr-scripts (psbt coins tr-scripts)
   "Core SignPSBTInput's input.FillSignatureData (psbt.cpp:111-160): the leaf
 scripts a taproot input CARRIES (PSBT_IN_TAP_LEAF_SCRIPT) join
@@ -1819,13 +1831,14 @@ Returns {psbt, complete, hex?}."
               (%psbt-add-wallet-input-derivs psbt coins wallet)
               (%psbt-add-wallet-output-derivs psbt wallet))
             (when sign
-              (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
-                  (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
-                (%psbt-add-foreign-pubkey-keys psbt wallet coins
-                                               keymap pubmap tr-keymap)
-                (%psbt-add-input-tr-scripts psbt coins tr-scripts)
-                (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
-                                         tr-scripts)))
+              (let ((bl.rpc:*solving-pubkeys* (%psbt-listed-pubkeys-table psbt)))
+                (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
+                    (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
+                  (%psbt-add-foreign-pubkey-keys psbt wallet coins
+                                                 keymap pubmap tr-keymap)
+                  (%psbt-add-input-tr-scripts psbt coins tr-scripts)
+                  (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
+                                           tr-scripts))))
             (%psbt-signer-result psbt finalize t)))))))
 
 ;;; --- descriptorprocesspsbt (rpc/rawtransaction.cpp:1992) ---

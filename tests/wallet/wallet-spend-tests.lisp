@@ -2767,3 +2767,51 @@ validation (the control that the tweak is the right one)."
             (is (null sent) "the tree output spends by its key path: ~S" sent)
             (is (= 1 (length (coerce (rpc nil "getrawmempool") 'list)))
                 "and the node's own validation accepted it")))))))
+
+(test a-pkh-branch-with-someone-elses-key-still-infers
+  "A pkh() fragment commits to HASH160 of its key, so inferring the miniscript
+back out of the witness script needs the key from the signing provider
+(WshSatisfier::FromPKHBytes, script/sign.cpp:428-436) -- and a descriptor
+wallet's provider carries EVERY pubkey of the expansion, held or not
+(DescriptorScriptPubKeyMan::GetSigningProvider). We resolved pkh() only
+against keys we hold private keys for, so wsh(thresh(2,pkh(A),a:pkh(B),
+a:pkh(C))) with A and B ours could not even be parsed and nothing was signed
+(wallet_miniscript.py:302, the federated-pegin vector). The finished
+transaction must pass testmempoolaccept."
+  (with-wallet-chain-node (node "pkh-foreign-key")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (keys (loop for b in '(21 22 23)
+                         collect (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
+             (wif (lambda (sk) (bl.crypto:private-key-to-wif sk :network :regtest :compressed t)))
+             (desc (bl.rpc:descriptor-add-checksum
+                    (format nil "wsh(thresh(2,pkh(~A),a:pkh(~A),a:pkh(~A)))"
+                            (funcall wif (first keys)) (funcall wif (second keys))
+                            (bl.crypto:bytes-to-hex
+                             (bl.crypto:derive-public-key (third keys) :compressed t))))))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "ms" nil t)
+        (is (eq t (%aval "success" (first (rpc "ms" "importdescriptors"
+                                               (list (obj "desc" desc "timestamp" "now")))))))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let ((txid (with-wallet-rng (79)
+                      (rpc "fund" "sendtoaddress" (first (rpc nil "deriveaddresses" desc))
+                           (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))))
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((coin (find txid (coerce (rpc "ms" "listunspent") 'list)
+                             :key (lambda (c) (%aval "txid" c)) :test #'equal))
+                 (psbt (rpc nil "createpsbt"
+                            (list (obj "txid" txid "vout" (%aval "vout" coin)))
+                            (list (obj optrue (bl.rpc:format-money 99990000)))))
+                 (res (rpc "ms" "walletprocesspsbt" psbt)))
+            (is (eq t (%aval "complete" res)) "thresh 2 of our two keys: ~S" res)
+            (is-true (and (%aval "hex" res)
+                          (eq t (%aval "allowed" (first (rpc nil "testmempoolaccept"
+                                                             (list (%aval "hex" res))))))))))))))

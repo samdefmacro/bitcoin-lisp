@@ -2032,6 +2032,10 @@ GetSigningProvider(index, /*include_private=*/true) followed by
 FlatSigningProvider::Merge (scriptpubkeyman.cpp:1228, :1339)."
   (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
     (declare (ignore scripts))
+    ;; The provider knows every pubkey of the expansion, held or not.
+    (when bl.rpc:*solving-pubkeys*
+      (loop for (nil . pubkey) in pairs
+            do (setf (gethash (bl.crypto:hash160 pubkey) bl.rpc:*solving-pubkeys*) pubkey)))
     (let ((provider (spkm-privkey-provider wallet spkm)))
       (loop for (key . pubkey) in pairs
             for priv = (%desc-key-priv-at key pos provider)
@@ -2057,9 +2061,10 @@ pubkeys reach the signer."
 from the wallet's SPKMs. COINS: (txid . vout) -> (script-pubkey amount
 redeem-script witness-script). Returns the (index . message) error list;
 NIL = complete."
-  (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
-      (%wallet-sign-maps wallet tx coins)
-    (bl.rpc:sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte tr-scripts)))
+  (let ((bl.rpc:*solving-pubkeys* (bl.bytes:make-octets-hash-table)))
+    (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
+        (%wallet-sign-maps wallet tx coins)
+      (bl.rpc:sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte tr-scripts))))
 
 (defun %wallet-input-coins (node wallet tx &optional cc)
   "The signing/verification coins map for TX: (txid . vout) ->
