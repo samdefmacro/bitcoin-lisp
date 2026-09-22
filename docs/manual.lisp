@@ -932,7 +932,10 @@
   not connections: hunchentoot is thread-per-connection, so handing it to
   the taskmaster as :max-thread-count stops the accept loop once that many
   connections are held -- idle keep-alive ones included -- and Core's own
-  framework configures `rpcthreads=2`. The JSON-RPC handler claims exactly
+  framework configures `rpcthreads=2`. `-rpcworkqueue` bounds how many
+  requests may WAIT for a worker: one more is Core's 503 `Work queue depth
+  exceeded` (CALL-WITH-RPC-WORKER). Both are `max(atoi(value), 1)` with
+  Core's defaults 16 and 64, never an init error. The JSON-RPC handler claims exactly
   `/` and the `/wallet/` prefix, as Core registers them; anything else is
   Core's bare 404, and headers over 8,192 bytes are 400 before any routing.
   Every reply ends in a NEWLINE, and its `id` key is present only once the

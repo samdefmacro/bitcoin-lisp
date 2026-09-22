@@ -447,6 +447,7 @@
 (define-option "rpccookiefile")
 (define-option "rpccookieperms")
 (define-option "rpcthreads")
+(define-option "rpcworkqueue")
 (define-option "rpcservertimeout")
 (define-option "mintxfee")
 (define-option "discardfee")
@@ -583,7 +584,6 @@ node's own address"))))
   "logtimestamps" "maxreceivebuffer"
   "natpmp" "peerbloomfilters" "printpriority"
   "rpcdoccheck"
-  "rpcworkqueue"
   "signer"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"

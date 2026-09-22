@@ -31,6 +31,10 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:*rpc-rate-limit*
    #:+max-rpc-body-size+
    #:*rpc-threads*
+   #:*rpc-work-queue*
+   #:+default-http-threads+
+   #:+default-http-workqueue+
+   #:call-with-rpc-worker
    #:*rpc-server-timeout*
    #:*rpc-cookie-file*
    #:*rpc-cookie-perms*

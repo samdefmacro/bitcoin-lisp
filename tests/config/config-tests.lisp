@@ -1662,12 +1662,51 @@ there is a READ error, not a link error."
   (is-false (bl.rpc:parse-rpc-cookie-perms "everyone"))
   ;; Loosening who may read the cookie is loosening who may drive the RPC, so
   ;; an unrecognised audience is an error rather than a silent default.
-  (dolist (bad '((("rpccookieperms" . "everyone")) (("rpcthreads" . "0"))
+  (dolist (bad '((("rpccookieperms" . "everyone"))
                  (("rpcservertimeout" . "-1"))))
     (signals error (bl:apply-rpc-config-globals bad)))
   (dolist (name '("rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
+
+(test rpcthreads-and-rpcworkqueue-are-at-least-one-never-an-error
+  "Core reads -rpcthreads and -rpcworkqueue as
+std::max(gArgs.GetArg(name, DEFAULT), 1) (httpserver.cpp:419, :440), and
+GetArg's integer is LocaleIndependentAtoi: `0', `-3' and `abc' start the HTTP
+server with one worker or a queue of one, and nothing is an init error. We
+refused -rpcthreads=0 with an error of our own (a test pinned it), and
+-rpcworkqueue was accepted and ignored. Absent, each takes Core's default:
+DEFAULT_HTTP_THREADS 16 and DEFAULT_HTTP_WORKQUEUE 64 (httpserver.h:20, :26)."
+  (let ((saved-threads bl.rpc:*rpc-threads*)
+        (saved-queue bl.rpc:*rpc-work-queue*))
+    (flet ((threads-for (value)
+             (handler-case
+                 (progn (bl:apply-rpc-config-globals (list (cons "rpcthreads" value)))
+                        bl.rpc:*rpc-threads*)
+               (error (e) (format nil "refused: ~A" e))))
+           (queue-for (value)
+             (handler-case
+                 (progn (bl:apply-rpc-config-globals (list (cons "rpcworkqueue" value)))
+                        bl.rpc:*rpc-work-queue*)
+               (error (e) (format nil "refused: ~A" e)))))
+      (unwind-protect
+           (progn
+             (is (eql 8 (threads-for "8")))
+             (dolist (value '("0" "-3" "abc"))
+               (is (eql 1 (threads-for value))
+                   "-rpcthreads=~A is Core's max(atoi, 1) = 1" value))
+             (is (eql 5 (queue-for "5")))
+             (dolist (value '("0" "-1" "x"))
+               (is (eql 1 (queue-for value))
+                   "-rpcworkqueue=~A is Core's max(atoi, 1) = 1" value))
+             (bl:apply-rpc-config-globals '())
+             (is (eql 16 bl.rpc:*rpc-threads*) "Core DEFAULT_HTTP_THREADS")
+             (is (eql 64 bl.rpc:*rpc-work-queue*) "Core DEFAULT_HTTP_WORKQUEUE")
+             (is-true (bl:known-config-option-p "rpcworkqueue"))
+             (is-false (bl.cfg:core-only-option-p "rpcworkqueue")
+                       "-rpcworkqueue is still accepted and ignored"))
+        (setf bl.rpc:*rpc-threads* saved-threads
+              bl.rpc:*rpc-work-queue* saved-queue)))))
 
 (test notify-commands-shell-escape-a-value-that-is-not-plain
   "Core replaces %s (and, for -walletnotify, %w/%b/%h) in a notify command and

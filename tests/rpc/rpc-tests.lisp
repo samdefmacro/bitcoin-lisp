@@ -3451,6 +3451,68 @@ semaphore taken around request execution."
         (is (null (%rpc-worker-semaphore))
             "no -rpcthreads, no bound")))))
 
+(test rpcworkqueue-refuses-a-request-once-that-many-are-waiting
+  "Core -rpcworkqueue (g_max_queue_depth, httpserver.cpp:419): with every
+worker busy and that many requests already queued, http_request_cb answers
+the next one 503 `Work queue depth exceeded' instead of queueing it
+(:255-258). interface_rpc.py:229-240 restarts with -rpcworkqueue=1
+-rpcthreads=1 and loops waitfornewblock calls from three threads until
+bitcoin-cli prints `error: Server response: Work queue depth exceeded'.
+
+The option was accepted and ignored: every request waited on the worker
+semaphore however many were waiting already, so that loop never ended. Here
+the one worker permit is held, two requests arrive, and exactly one of them --
+whichever is second -- must come back 503 at once; the other waits for the
+permit and is served when it is released."
+  (bl.rpc:stop-rpc-server)
+  (let ((saved-threads bl.rpc:*rpc-threads*)
+        (saved-queue bl.rpc:*rpc-work-queue*)
+        (port 19984)
+        (lock (bt:make-lock))
+        (results '())
+        (callers '())
+        (semaphore nil))
+    (with-temp-directory (dir)
+      (let ((node (make-test-node)))
+        (setf (bl:node-data-directory node) dir)
+        (unwind-protect
+             (progn
+               ;; Globals, not bindings: the acceptor's threads read them.
+               (setf bl.rpc:*rpc-threads* 1
+                     bl.rpc:*rpc-work-queue* 1
+                     semaphore (%rpc-worker-semaphore))
+               (is-true (bl.rpc:start-rpc-server node :port port))
+               ;; The one worker is busy.
+               (is-true (bt:wait-on-semaphore semaphore :timeout 5))
+               (dotimes (i 2)
+                 (push (bt:make-thread
+                        (lambda ()
+                          (let ((r (handler-case
+                                       (%http-post-rpc
+                                        port "{\"method\":\"getblockcount\",\"id\":1}")
+                                     (error (e) (format nil "error: ~A" e)))))
+                            (bt:with-lock-held (lock) (push r results))))
+                        :name "rpcworkqueue-test-caller")
+                       callers))
+               (let ((first-back (loop repeat 200
+                                       for r = (bt:with-lock-held (lock) (first results))
+                                       when r return r
+                                       do (sleep 0.05))))
+                 (is (eql 503 (and first-back (%http-status first-back)))
+                     "with the worker busy and one request queued, another was not refused: ~S"
+                     first-back)
+                 (is-true (and first-back (search "Work queue depth exceeded" first-back))
+                          "the 503 does not carry Core's body: ~S" first-back)))
+          (when semaphore (bt:signal-semaphore semaphore))
+          (mapc #'bt:join-thread callers)
+          (bl.rpc:stop-rpc-server)
+          (setf bl.rpc:*rpc-threads* saved-threads
+                bl.rpc:*rpc-work-queue* saved-queue))
+        ;; The queued one was served once the worker came free.
+        (is (= 2 (length results)))
+        (is (= 1 (count 503 results :key #'%http-status))
+            "exactly one request is refused: ~S" results)))))
+
 (test json-rpc-claims-only-the-paths-core-registers
   "Core registers the JSON-RPC handler at the EXACT path `/' and at the prefix
 `/wallet/' (httprpc.cpp:338-341). A path no handler claims gets 404

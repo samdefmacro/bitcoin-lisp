@@ -23,14 +23,19 @@ APPLY-CONFIG-GLOBALS."
           (unless perms
             (config-error "Invalid -rpccookieperms=~A (must be owner, group or all)" v))
           (setf bl.rpc:*rpc-cookie-perms* perms))))
-    ;; -rpcthreads: cap on concurrent RPC handler threads (Core
-    ;; DEFAULT_HTTP_THREADS = 16).
-    (let ((v (lk "rpcthreads")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (and n (plusp n))
-            (config-error "Invalid value for -rpcthreads=~A (must be a positive integer)" v))
-          (setf bl.rpc:*rpc-threads* n))))
+    ;; -rpcthreads / -rpcworkqueue: the HTTP worker pool and the depth of the
+    ;; queue in front of it. Core reads both as
+    ;; std::max(gArgs.GetArg(name, DEFAULT), 1) (httpserver.cpp:419, :440):
+    ;; GetArg's integer is LocaleIndependentAtoi, so `0', `-3' and `abc' all
+    ;; start the server with ONE, and nothing is refused. Set every time,
+    ;; absent included, so the value never depends on an earlier call.
+    (flet ((at-least-one (name default)
+             (let ((v (lk name)))
+               (max 1 (if v (bl.cfg:locale-independent-atoi v) default)))))
+      (setf bl.rpc:*rpc-threads*
+            (at-least-one "rpcthreads" bl.rpc:+default-http-threads+)
+            bl.rpc:*rpc-work-queue*
+            (at-least-one "rpcworkqueue" bl.rpc:+default-http-workqueue+)))
     ;; -rpcservertimeout: seconds an idle RPC connection is held (Core
     ;; DEFAULT_HTTP_SERVER_TIMEOUT). 0 means no timeout, as in Core.
     (let ((v (lk "rpcservertimeout")))

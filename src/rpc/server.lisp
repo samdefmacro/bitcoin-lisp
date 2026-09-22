@@ -954,9 +954,16 @@ written through and then renamed target-and-all over .cookie."
       ;; CLOSE on an fd-stream closes the fd, so close exactly one of them.
       (if stream (close stream) (sb-posix:close fd)))))
 
-(defvar *rpc-threads* nil
+(defconstant +default-http-threads+ 16
+  "Core DEFAULT_HTTP_THREADS (httpserver.h:20), -rpcthreads' default.")
+
+(defconstant +default-http-workqueue+ 64
+  "Core DEFAULT_HTTP_WORKQUEUE (httpserver.h:26), -rpcworkqueue's default.")
+
+(defvar *rpc-threads* +default-http-threads+
   "Maximum requests this server EXECUTES at once, or NIL for no bound (Core
--rpcthreads, DEFAULT_HTTP_THREADS = 16).
+-rpcthreads, DEFAULT_HTTP_THREADS = 16). The default is Core's; NIL is left
+for tests that want no bound at all.
 
 Core services requests from a fixed worker pool while one event loop accepts
 connections, so an idle keep-alive connection costs no worker. Hunchentoot is
@@ -988,6 +995,51 @@ handler, not the JSON-RPC one alone. NIL when unbounded.")
           ((eql n *rpc-worker-permits*) *rpc-worker-semaphore*)
           (t (setf *rpc-worker-permits* n
                    *rpc-worker-semaphore* (bt:make-semaphore :count n))))))
+
+(defvar *rpc-work-queue* +default-http-workqueue+
+  "How many requests may WAIT for a worker before the next one is refused
+(Core -rpcworkqueue, g_max_queue_depth, httpserver.cpp:419). Core checks it
+in http_request_cb before handing a request to the pool: when
+WorkQueueSize() >= g_max_queue_depth it logs a warning and answers 503 `Work
+queue depth exceeded' (:255-258), which interface_rpc.py:229-240 drives with
+-rpcworkqueue=1 -rpcthreads=1 and three concurrent waitfornewblock calls.
+
+Before this the option was accepted and ignored, and a request with every
+worker busy waited on the semaphore however many were already waiting, so
+that test looped until its timeout: no request was ever refused.")
+
+(defvar *rpc-work-queue-lock* (bt:make-lock "rpc-work-queue")
+  "Guards *RPC-WORK-QUEUE-WAITING*.")
+
+(defvar *rpc-work-queue-waiting* 0
+  "Requests currently waiting for a worker permit: Core's WorkQueueSize().")
+
+(defun call-with-rpc-worker (thunk)
+  "Run THUNK holding one of the -rpcthreads worker permits, as Core's pool runs
+a queued request on a worker (httpserver.cpp:253-276). Returns (values result
+T), or (values NIL NIL) WITHOUT running THUNK when every worker is busy and
+-rpcworkqueue requests are already waiting -- Core's `Work queue depth
+exceeded' (:255-258), which the caller answers with 503.
+
+A request that finds a free worker never counts as queued, the way Core's
+queue is empty while a worker is idle; one that has to wait counts until it
+gets its permit."
+  (let ((semaphore (rpc-worker-semaphore)))
+    (flet ((run ()
+             (unwind-protect (values (funcall thunk) t)
+               (bt:signal-semaphore semaphore))))
+      (cond ((null semaphore) (values (funcall thunk) t))
+            ((sb-thread:try-semaphore semaphore) (run))
+            ((not (bt:with-lock-held (*rpc-work-queue-lock*)
+                    (when (< *rpc-work-queue-waiting* (max 1 (or *rpc-work-queue* 1)))
+                      (incf *rpc-work-queue-waiting*)
+                      t)))
+             (bl.log:node-log :warn "Request rejected because http work queue depth exceeded, it can be increased with the -rpcworkqueue= setting")
+             (values nil nil))
+            (t (unwind-protect (bt:wait-on-semaphore semaphore)
+                 (bt:with-lock-held (*rpc-work-queue-lock*)
+                   (decf *rpc-work-queue-waiting*)))
+               (run))))))
 
 (defvar *rpc-server-timeout* 30
   "Seconds an idle RPC connection is held before it is closed (Core
@@ -1686,13 +1738,15 @@ evhttp_set_max_headers_size: `METHOD URI PROTOCOL\\r\\n', one
       ;; connections exist (Core's worker pool, httpserver.cpp:411-421). Taken
       ;; here because this one acceptor serves all three surfaces, exactly as
       ;; Core's pool services every registered path handler.
-      (let ((semaphore (rpc-worker-semaphore)))
-        (if semaphore
+      ;; -rpcworkqueue bounds how many wait for one (httpserver.cpp:255-258).
+      (multiple-value-bind (result ran)
+          (call-with-rpc-worker (lambda () (call-next-method)))
+        (if ran
+            result
             (progn
-              (bt:wait-on-semaphore semaphore)
-              (unwind-protect (call-next-method)
-                (bt:signal-semaphore semaphore)))
-            (call-next-method)))
+              (setf (hunchentoot:return-code*) hunchentoot:+http-service-unavailable+
+                    (hunchentoot:content-type*) "text/plain")
+              "Work queue depth exceeded")))
       ;; Core answers a bare 403 and reveals nothing else — not the method it
       ;; would have refused, not whether a handler exists at this path.
       (rpc-json-error hunchentoot:+http-forbidden+ +rpc-misc-error+
@@ -2069,8 +2123,9 @@ its own from OPTIONS; an option nobody reads is an error."
               ;; the pool that will execute requests (StartHTTPServer,
               ;; httpserver.cpp:441). feature_init.py:69 interrupts start-up
               ;; on it. *RPC-THREADS* is that pool here (the semaphore around
-              ;; request execution); NIL is this node's unbounded default, and
-              ;; says so rather than quoting a number it does not enforce.
+              ;; request execution), Core's 16 by default; NIL (tests only)
+              ;; says it is unbounded rather than quoting a number it does
+              ;; not enforce.
               (if *rpc-threads*
                   (bl.log:node-log :info "Starting HTTP server with ~D worker threads"
                                    *rpc-threads*)
