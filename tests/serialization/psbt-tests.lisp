@@ -1767,3 +1767,53 @@ survive (the control)."
           "the control: the input's other records survive")
       (is (< 1 (length (remove-duplicates joins :test #'string=)))
           "ten joins of four PSBTs all came out in one order"))))
+
+(test analyzepsbt-is-cores-analyzepsbt
+  "analyzepsbt reports, per input, what a keyless signer finds MISSING --
+pubkeys, a redeem or witness script, signatures -- and `signer' as the next
+role only when signatures are all that is missing; the fee and, from dummy
+signatures, the estimated vsize and feerate; and for a PSBT that cannot be
+valid only next=creator and Core's sentence (node/psbt.cpp:16-150,
+rpc/rawtransaction.cpp:1882-1971). rpc_psbt.py:945-970's vectors and its
+p2sh-segwit case: one wallet input updated but unsigned needs exactly the
+signature of the key behind its witness program; 0.001 fee over 134 vbytes."
+  (let ((node (make-test-node :network :regtest)))
+    (flet ((analyze (b64) (bl.rpc:dispatch-rpc-method node "analyzepsbt" (list b64))))
+      (loop for (b64 error) in
+            '(("cHNidP8BAJoCAAAAAljoeiG1ba8MI76OcHBFbDNvfLqlyHV5JPVFiHuyq911AAAAAAD/////g40EJ9DsZQpoqka7CwmK6kQiwHGyyng1Kgd5WdB86h0BAAAAAP////8CcKrwCAAAAAAWAEHYXCtx0AYLCcmIauuBXlCZHdoSTQDh9QUAAAAAFv8/wADXYP/7//////8JxOh0LR2HAI8AAAAAAAEBIADC6wsAAAAAF2oUt/X69ELjeX2nTof+fZ10l+OyAokDAQcJAwEHEAABAACAAAEBIADC6wsAAAAAF2oUt/X69ELjeX2nTof+fZ10l+OyAokDAQcJAwEHENkMak8AAAAA"
+               "PSBT is not valid. Input 0 spends unspendable output")
+              ("cHNidP8BAHECAAAAAfA00BFgAm6tp86RowwH6BMImQNL5zXUcTT97XoLGz0BAAAAAAD/////AgD5ApUAAAAAFgAUKNw0x8HRctAgmvoevm4u1SbN7XL87QKVAAAAABYAFPck4gF7iL4NL4wtfRAKgQbghiTUAAAAAAABAR8AgIFq49AHABYAFJUDtxf2PHo641HEOBOAIvFMNTr2AAAA"
+               "PSBT is not valid. Input 0 has invalid value")
+              ("cHNidP8BAHECAAAAAfA00BFgAm6tp86RowwH6BMImQNL5zXUcTT97XoLGz0BAAAAAAD/////AgCAgWrj0AcAFgAUKNw0x8HRctAgmvoevm4u1SbN7XL87QKVAAAAABYAFPck4gF7iL4NL4wtfRAKgQbghiTUAAAAAAABAR8A8gUqAQAAABYAFJUDtxf2PHo641HEOBOAIvFMNTr2AAAA"
+               "PSBT is not valid. Output amount invalid"))
+            do (is (equal `(("next" . "creator") ("error" . ,error)) (analyze b64))))
+      (is (equal "finalizer"
+                 (%aval "next" (analyze "cHNidP8BAHECAAAAAZYezcxdnbXoQCmrD79t/LzDgtUo9ERqixk8wgioAobrAAAAAAD9////AlDDAAAAAAAAFgAUy/UxxZuzZswcmFnN/E9DGSiHLUsuGPUFAAAAABYAFLsH5o0R38wXx+X2cCosTMCZnQ4baAAAAAABAR8A4fUFAAAAABYAFOBI2h5thf3+Lflb2LGCsVSZwsltIgIC/i4dtVARCRWtROG0HHoGcaVklzJUcwo5homgGkSNAnJHMEQCIGx7zKcMIGr7cEES9BR4Kdt/pzPTK3fKWcGyCJXb7MVnAiALOBgqlMH4GbC1HDh/HmylmO54fyEy4lKde7/BT/PWxwEBAwQBAAAAIgYC/i4dtVARCRWtROG0HHoGcaVklzJUcwo5homgGkSNAnIYDwVpQ1QAAIABAACAAAAAgAAAAAAAAAAAAAAiAgL+CIiB59NSCssOJRGiMYQK1chahgAaaJpIXE41Cyir+xgPBWlDVAAAgAEAAIAAAACAAQAAAAAAAAAA"))))))
+  (with-wallet-chain-node (node "analyzepsbt" :wallet "w")
+    (let* ((rpc (lambda (method &rest params) (bl.rpc:dispatch-rpc-method node method params)))
+           (optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+      (funcall rpc "generatetoaddress" 1 (funcall rpc "getnewaddress" "" "bech32"))
+      (funcall rpc "generatetoaddress" 101 optrue)
+      (let* ((address (funcall rpc "getnewaddress" "" "p2sh-segwit"))
+             (txid (with-wallet-rng (127)
+                     (funcall rpc "sendtoaddress" address (bl.rpc:format-money 700000000)
+                              nil nil nil nil nil nil nil 10)))
+             (vout (%aval "vout" (find address (coerce (%aval "details" (funcall rpc "gettransaction" txid)) 'list)
+                                       :key (lambda (d) (%aval "address" d)) :test #'equal)))
+             (psbt (progn (funcall rpc "generatetoaddress" 1 optrue)
+                          (funcall rpc "createpsbt" (list (%ht "txid" txid "vout" vout))
+                                   (list (%ht (funcall rpc "getnewaddress" "" "p2sh-segwit") "6.999")))))
+             (fresh (funcall rpc "analyzepsbt" psbt))
+             (updated (%aval "psbt" (funcall rpc "walletprocesspsbt" psbt bl.rpc:+json-false+ "ALL" t)))
+             (analyzed (funcall rpc "analyzepsbt" updated))
+             (in (first (coerce (%aval "inputs" analyzed) 'list))))
+        (is (equal '("updater" "updater")
+                   (list (%aval "next" fresh) (%aval "next" (first (coerce (%aval "inputs" fresh) 'list)))))
+            "the control: a fresh PSBT needs its utxos")
+        (is (equal "signer" (%aval "next" analyzed)))
+        (is (equal (list (%aval "witness_program"
+                                (%aval "embedded" (funcall rpc "getaddressinfo" address))))
+                   (coerce (%aval "signatures" (%aval "missing" in)) 'list)))
+        (is (eql 134 (%aval "estimated_vsize" analyzed)))
+        (is (< (abs (- (btc-amount (%aval "estimated_feerate" analyzed)) 0.00746268d0)) 1d-10))
+        (is (< (abs (- (btc-amount (%aval "fee" analyzed)) 0.001d0)) 1d-10))))))

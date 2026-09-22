@@ -726,48 +726,186 @@ a P2SH-P2WPKH never its redeem script -- rpc_psbt.py:895-905."
 
 ;;; --- analyzepsbt ---
 
+(defun %psbt-known-pubkeys (map)
+  "HASH160 -> pubkey over the keys MAP lists (partial signatures and BIP32
+derivations): what FillSignatureData gives a keyless signer."
+  (let ((table (bl.bytes:make-octets-hash-table)))
+    (dolist (type (list bl.ser:+psbt-in-partial-sig+ bl.ser:+psbt-in-bip32+) table)
+      (loop for (pubkey) in (bl.ser:psbt-map-collect map type)
+            do (setf (gethash (bl.crypto:hash160 pubkey) table) pubkey)))))
+
+(defun %psbt-input-missing (map spk)
+  "What ProduceSignature with the DUMMY provider reports missing for an input
+spending SPK (script/sign.cpp SignStep): (values pubkeys redeem witness sigs)
+-- key hashes whose pubkey is unknown, the hash of an unknown redeem script,
+the program of an unknown witness script, key hashes with no signature. The
+walk stops where SignStep does: at the first key or script it cannot find."
+  (let ((known (%psbt-known-pubkeys map))
+        (pubkeys '()) (redeem nil) (witness nil) (sigs '()))
+    (labels ((need-key (hash pubkey)
+               (cond ((null pubkey) (push hash pubkeys) nil)
+                     ((%psbt-sig-for map pubkey) t)
+                     (t (push hash sigs) nil)))
+             (solve (script)
+               (multiple-value-bind (type data) (bl.val:classify-script script)
+                 (case type
+                   (:pubkey (let ((pk (getf data :pubkey)))
+                              (need-key (bl.crypto:hash160 pk) pk)))
+                   (:pubkeyhash (need-key (getf data :hash) (gethash (getf data :hash) known)))
+                   (:witness-v0-keyhash
+                    (let ((h (getf data :witness-program)))
+                      (need-key h (gethash h known))))
+                   (:multisig
+                    (loop with have = 0
+                          for pk in (getf data :pubkeys)
+                          while (< have (getf data :m))
+                          do (if (%psbt-sig-for map pk)
+                                 (incf have)
+                                 (push (bl.crypto:hash160 pk) sigs))))
+                   (:scripthash
+                    (let ((rs (bl.ser:psbt-map-find map bl.ser:+psbt-in-redeem-script+)))
+                      (if rs (solve rs) (setf redeem (getf data :hash)))))
+                   (:witness-v0-scripthash
+                    (let ((ws (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-script+)))
+                      (if ws (solve ws) (setf witness (getf data :witness-program)))))))))
+      (solve spk))
+    (values (nreverse pubkeys) redeem witness (nreverse sigs))))
+
+(defun %psbt-estimated-weight (psbt)
+  "The weight of PSBT's transaction as Core's AnalyzePSBT estimates it
+(node/psbt.cpp:117-146): every input either final, or completable by the
+DUMMY signature creator from what the PSBT carries -- keys from its partial
+signatures and derivations, scripts from its redeem/witness records -- and
+sized with 71-byte dummy signatures; NIL when one cannot be."
+  (let* ((tx (bl.ser:psbt-tx psbt))
+         (inputs (bl.ser:transaction-inputs tx))
+         (outputs (bl.ser:transaction-outputs tx))
+         (cc (make-wcc))
+         (spks (loop for map across (bl.ser:psbt-inputs psbt)
+                     for in across inputs
+                     collect (%psbt-input-spk map in))))
+    (when (some #'null spks) (return-from %psbt-estimated-weight nil))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          do (maphash (lambda (h pk) (setf (gethash h (wcc-external-pubkeys cc)) pk))
+                      (%psbt-known-pubkeys map))
+             (dolist (type (list bl.ser:+psbt-in-redeem-script+ bl.ser:+psbt-in-witness-script+))
+               (let ((script (bl.ser:psbt-map-find map type)))
+                 (when script (%wcc-add-external-script cc script)))))
+    (let* ((finals (loop for map across (bl.ser:psbt-inputs psbt)
+                         collect (cons (bl.ser:psbt-map-find map bl.ser:+psbt-in-final-scriptsig+)
+                                       (bl.ser:psbt-map-find map bl.ser:+psbt-in-final-scriptwitness+))))
+           (segwit (loop for spk in spks for (nil . wit) in finals
+                         thereis (or wit (%txout-script-segwit-p nil cc spk))))
+           (weight (+ (* 4 (+ 4 4 (bl.ser:compact-size-length (length inputs))
+                              (bl.ser:compact-size-length (length outputs))
+                              (loop for o across outputs
+                                    sum (bl.rpc:txout-serialize-size
+                                         (bl.ser:tx-out-script-pubkey o)))))
+                      (if segwit 2 0))))
+      (loop for spk in spks
+            for (ss . wit) in finals
+            do (incf weight
+                     (or (if (or ss wit)
+                             (+ (* 4 (+ 40 (bl.ser:compact-size-length (length ss)) (length ss)))
+                                (cond (wit (length wit)) (segwit 1) (t 0)))
+                             (%max-input-weight nil cc spk nil :tx-is-segwit segwit))
+                         (return-from %psbt-estimated-weight nil))))
+      weight)))
+
+(defun %psbt-invalid-analysis (psbt)
+  "AnalyzePSBT's SetInvalid sentence for PSBT, or NIL (node/psbt.cpp:39-59,
+:99-111): an input whose value is outside MoneyRange, an input spending an
+unspendable output, an output sum outside it."
+  (let ((tx (bl.ser:psbt-tx psbt)) (in-total 0))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for i from 0
+          for out = (%psbt-input-prevout map in)
+          when out
+            do (let ((v (bl.ser:tx-out-value out)))
+                 (unless (and (<= 0 v bl.val:+max-money+)
+                              (<= (+ in-total v) bl.val:+max-money+))
+                   (return-from %psbt-invalid-analysis
+                     (format nil "PSBT is not valid. Input ~D has invalid value" i)))
+                 (incf in-total v)
+                 (when (bl.store:script-unspendable-p (bl.ser:tx-out-script-pubkey out))
+                   (return-from %psbt-invalid-analysis
+                     (format nil "PSBT is not valid. Input ~D spends unspendable output" i)))))
+    (let ((out-total 0))
+      (loop for o across (bl.ser:transaction-outputs tx)
+            do (incf out-total (bl.ser:tx-out-value o))
+               (unless (and (<= 0 (bl.ser:tx-out-value o) bl.val:+max-money+)
+                            (<= out-total bl.val:+max-money+))
+                 (return-from %psbt-invalid-analysis
+                   "PSBT is not valid. Output amount invalid"))))
+    nil))
+
+(defun %psbt-input-analysis (map in tx i)
+  "One element of analyzepsbt's `inputs' (node/psbt.cpp:29-88, rendered at
+rpc/rawtransaction.cpp:1925-1956), and its next role."
+  (let* ((spk (%psbt-input-spk map in))
+         (final (or (bl.ser:psbt-map-find map bl.ser:+psbt-in-final-scriptsig+)
+                    (bl.ser:psbt-map-find map bl.ser:+psbt-in-final-scriptwitness+)))
+         (next (cond ((null spk) "updater")
+                     (final "extractor")
+                     (t (multiple-value-bind (ss wit) (%psbt-finalize map spk tx i)
+                          (when (or wit (plusp (length ss))) "finalizer")))))
+         (missing '()))
+    (when (and spk (not final) (null next))
+      (multiple-value-bind (pubkeys redeem witness sigs) (%psbt-input-missing map spk)
+        (flet ((hexes (l) (mapcar #'bl.crypto:bytes-to-hex l)))
+          (when pubkeys (push (cons "pubkeys" (hexes pubkeys)) missing))
+          (when redeem (push (cons "redeemscript" (bl.crypto:bytes-to-hex redeem)) missing))
+          (when witness (push (cons "witnessscript" (bl.crypto:bytes-to-hex witness)) missing))
+          (when sigs (push (cons "signatures" (hexes sigs)) missing)))
+        (setf next (if (and sigs (null pubkeys) (null redeem) (null witness))
+                       "signer"
+                       "updater"))))
+    (values `(("has_utxo" . ,(bl.rpc:json-bool spk))
+              ("is_final" . ,(bl.rpc:json-bool (and spk final)))
+              ("next" . ,next)
+              ,@(when missing `(("missing" . ,(nreverse missing)))))
+            next)))
+
 (bl.rpc:define-rpc "analyzepsbt" (node params)
-  "Analyze a PSBT: per-input has_utxo/is_final/next, overall next role, and the
-fee when all input amounts are known. PARAMS: (psbt). Note: missing pubkey/sig
-lists and vsize estimation are not computed (no script solving here)."
+  "Core analyzepsbt (rpc/rawtransaction.cpp:1882-1971 over AnalyzePSBT,
+node/psbt.cpp:16-150): per input has_utxo / is_final / next and what is
+MISSING -- pubkeys, redeem or witness script, signatures -- as a keyless
+signer finds it; the fee when every input has its utxo, and then the
+transaction's estimated vsize and feerate with dummy signatures; the lowest
+next role; or, for a PSBT that cannot be valid, only next=creator and the
+error. Ours reported no `missing', no estimate and no invalid-PSBT errors, and
+called a PSBT with only signatures left `signer' whether or not the keys were
+known (rpc_psbt.py:945-970)."
   (declare (ignore node))
   (let* ((psbt (%psbt-decode-arg (first params)))
          (tx (bl.ser:psbt-tx psbt))
          (order '("creator" "updater" "signer" "finalizer" "extractor"))
-         (inputs-json '())
-         (overall "extractor"))
-    (flet ((rank (r) (position r order :test #'string=)))
+         (invalid (%psbt-invalid-analysis psbt)))
+    (if invalid
+      `(("next" . "creator") ("error" . ,invalid))
+    (let ((inputs-json '()) (overall "extractor") (all-utxos t) (in-total 0))
       (loop for map across (bl.ser:psbt-inputs psbt)
-            do (let* ((final (or (bl.ser:psbt-map-find
-                                  map bl.ser:+psbt-in-final-scriptsig+)
-                                 (bl.ser:psbt-map-find
-                                  map bl.ser:+psbt-in-final-scriptwitness+)))
-                      (has-utxo (or (bl.ser:psbt-map-find
-                                     map bl.ser:+psbt-in-witness-utxo+)
-                                    (bl.ser:psbt-map-find
-                                     map bl.ser:+psbt-in-non-witness-utxo+)))
-                      (has-sigs (bl.ser:psbt-map-collect
-                                 map bl.ser:+psbt-in-partial-sig+))
-                      (next (cond (final "extractor")
-                                  ((not has-utxo) "updater")
-                                  (has-sigs "finalizer")
-                                  (t "signer"))))
-                 (push `(("has_utxo" . ,(bl.rpc:json-bool has-utxo))
-                         ("is_final" . ,(bl.rpc:json-bool final))
-                         ("next" . ,next))
-                       inputs-json)
-                 (when (< (rank next) (rank overall)) (setf overall next)))))
-    (let ((result `(("inputs" . ,(nreverse inputs-json))))
-          (in-total 0) (all t))
-      (loop for map across (bl.ser:psbt-inputs psbt)
+            for in across (bl.ser:transaction-inputs tx)
             for i from 0
-            for amt = (%psbt-input-amount map (aref (bl.ser:transaction-inputs tx) i))
-            do (if amt (incf in-total amt) (setf all nil)))
-      (when all
-        (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
-                               sum (bl.ser:tx-out-value o))))
-          (setf result (append result `(("fee" . ,(bl.rpc:satoshi->btc (- in-total out-total))))))))
-      (append result `(("next" . ,overall))))))
+            do (multiple-value-bind (json next) (%psbt-input-analysis map in tx i)
+                 (push json inputs-json)
+                 (when (< (position next order :test #'string=)
+                          (position overall order :test #'string=))
+                   (setf overall next)))
+               (let ((amt (%psbt-input-amount map in)))
+                 (if amt (incf in-total amt) (setf all-utxos nil))))
+      (let* ((fee (and all-utxos
+                       (- in-total (loop for o across (bl.ser:transaction-outputs tx)
+                                         sum (bl.ser:tx-out-value o)))))
+             (weight (and fee (%psbt-estimated-weight psbt)))
+             (vsize (and weight (ceiling weight 4))))
+        `(,@(when inputs-json `(("inputs" . ,(nreverse inputs-json))))
+          ,@(when vsize
+              `(("estimated_vsize" . ,vsize)
+                ("estimated_feerate" . ,(bl.rpc:satoshi->btc (truncate (* fee 1000) vsize)))))
+          ,@(when fee `(("fee" . ,(bl.rpc:satoshi->btc fee))))
+          ("next" . ,overall)))))))
 
 ;;; --- finalizepsbt (input finalizer + extractor) ---
 
@@ -1622,6 +1760,37 @@ sigdata.witness after ProduceSignature."
            (let ((redeem (%spkm-sub-scripts spkm spk)))
              (and redeem (bl.val:output-witness-program-p redeem) t)))))
 
+(defun %psbt-add-wallet-input-scripts (psbt coins wallet)
+  "What SignPSBTInput records for a wallet-owned input even when nothing is
+signed (CWallet::FillPSBT runs it for every input, sign or not,
+wallet.cpp:2190-2226): the redeem and witness scripts the provider holds, and
+-- when the solution is a witness -- the witness_utxo (psbt.cpp:487-500). We
+wrote them only beside a signature, so walletprocesspsbt(sign=false) left a
+P2SH-P2WPKH input without its redeem script and analyzepsbt had to call it
+`updater' where Core says `signer' (rpc_psbt.py:945)."
+  (let ((tx (bl.ser:psbt-tx psbt))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
+          for entry = (gethash (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op))
+                               coins)
+          for spk = (and entry (first entry))
+          do (when (and spk (not (%psbt-input-signed-p map)))
+               (let ((spkm (%wallet-owning-spkm wallet spk)))
+                 (when spkm
+                   (multiple-value-bind (redeem witness) (%spkm-sub-scripts spkm spk)
+                     (when (and redeem (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-redeem-script+)))
+                       (bl.ser:psbt-map-set map bl.ser:+psbt-in-redeem-script+ empty redeem))
+                     (when (and witness (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-script+)))
+                       (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-script+ empty witness))
+                     (when (and (%spkm-spends-by-witness-p spkm spk)
+                                (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-utxo+)))
+                       (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
+                                            (%serialize-txout-bytes
+                                             (bl.ser:make-tx-out :value (second entry)
+                                                                 :script-pubkey spk)))))))))))
+
 (defun %psbt-add-wallet-input-derivs (psbt coins wallet)
   "Add input bip32 derivations / taproot internal keys for wallet-owned inputs
 (Core FillPSBT bip32derivs). Metadata only — helps offline signers.
@@ -1932,6 +2101,7 @@ carries a final scriptSig/witness. Returns the PSBT."
   (let ((psbt (bl.ser:make-empty-psbt tx)))
     (%psbt-fill-wallet-utxos psbt wallet)
     (let ((coins (%psbt-coins-map psbt wallet nil)))
+      (%psbt-add-wallet-input-scripts psbt coins wallet)
       (%psbt-add-wallet-input-derivs psbt coins wallet)
       (%psbt-add-wallet-output-derivs psbt wallet)
       (%psbt-wallet-sign psbt wallet coins nil))
@@ -1965,6 +2135,7 @@ Returns {psbt, complete, hex?}."
           (when sign (wallet-ensure-unlocked wallet))
           (%psbt-fill-wallet-utxos psbt wallet)
           (let ((coins (%psbt-coins-map psbt wallet nil)))
+            (%psbt-add-wallet-input-scripts psbt coins wallet)
             (when bip32derivs
               (%psbt-add-wallet-input-derivs psbt coins wallet)
               (%psbt-add-wallet-output-derivs psbt wallet))
