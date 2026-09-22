@@ -922,3 +922,55 @@ together here, but Core reports them apart."
     ;; nothing, and must not be refused.
     (is-false (refuse (bl.store:make-blockfilterindex) 0 1800)
               "a node with an empty chain refused to start its index")))
+
+(test reindex-with-prune-keeps-only-the-contiguous-block-files
+  "Core's CleanupBlockRevFiles (node/blockstorage.cpp:654-687), run when
+-reindex meets -prune: every rev file goes, and every blk file after the first
+gap in the run from blk00000.dat -- all of them when blk00000.dat itself was
+pruned, which is feature_remove_pruned_files_on_startup.py:64-66's datadir.
+Other files in the directory (xor.dat) are left alone."
+  (flet ((touch-all (dir names)
+           (dolist (n names)
+             (with-open-file (s (merge-pathnames n dir) :direction :output
+                                                        :if-exists :supersede)
+               (write-string "x" s))))
+         (left (dir)
+           (sort (mapcar #'file-namestring (directory (merge-pathnames "*.*" dir)))
+                 #'string<)))
+    (with-temp-directory (dir)
+      (touch-all dir '("blk00002.dat" "blk00003.dat" "rev00002.dat" "rev00003.dat" "xor.dat"))
+      (is (= 4 (bl:cleanup-block-rev-files dir)))
+      (is (equal '("xor.dat") (left dir))))
+    (with-temp-directory (dir)
+      (touch-all dir '("blk00000.dat" "blk00001.dat" "blk00003.dat" "rev00000.dat" "rev00001.dat"))
+      (is (= 3 (bl:cleanup-block-rev-files dir)))
+      (is (equal '("blk00000.dat" "blk00001.dat") (left dir))))))
+
+(test reindex-with-prune-wipes-what-core-rebuilds
+  "-reindex on a pruned node rebuilds from nothing, as Core's does: the block
+index (wipe_data), the coins database and chain state (wipe_chainstate_db) and
+every optional index (f_wipe) go, and the unusable block files with them
+(init.cpp:1344, :1386, :1905-1920; blockstorage.cpp:1234-1240). Ours kept all
+of it, so feature_remove_pruned_files_on_startup.py:66 read the old tip."
+  (with-temp-directory (dir)
+    (let ((blocks (merge-pathnames "blocks/" dir))
+          (made '("blocks/blk00002.dat" "blocks/rev00002.dat" "blocks/xor.dat"
+                  "blocks/index/headerindex.dat" "chainstate.dat"
+                  "chainstate/CURRENT" "indexes/txindex/CURRENT"
+                  "indexes/blockfilter/basic/db/CURRENT" "wallets/w/CURRENT"
+                  "peers.dat")))
+      (dolist (rel made)
+        (let ((path (merge-pathnames rel dir)))
+          (ensure-directories-exist path)
+          (with-open-file (s path :direction :output :if-exists :supersede)
+            (write-string "x" s))))
+      (bl:wipe-for-pruned-reindex dir blocks)
+      (flet ((there-p (rel) (and (probe-file (merge-pathnames rel dir)) t)))
+        (dolist (gone '("blocks/blk00002.dat" "blocks/rev00002.dat"
+                        "blocks/index/headerindex.dat" "chainstate.dat"
+                        "chainstate/" "indexes/txindex/"
+                        "indexes/blockfilter/basic/db/"))
+          (is-false (there-p gone) "~A survived the wipe" gone))
+        ;; Control: what Core's reindex keeps is kept.
+        (dolist (kept '("blocks/xor.dat" "wallets/w/CURRENT" "peers.dat"))
+          (is-true (there-p kept) "~A was wiped" kept))))))

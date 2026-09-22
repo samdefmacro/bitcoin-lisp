@@ -68,6 +68,8 @@ init.cpp, node/. src/node/.")
    #:*dns-seed-enabled*
    #:*fixed-seeds-enabled*
    #:*capture-messages*
+   #:cleanup-block-rev-files
+   #:wipe-for-pruned-reindex
    #:check-cli-args
    #:cli-parse-error
    #:unknown-config-file-keys

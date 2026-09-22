@@ -814,6 +814,61 @@ or the node is riding an assumevalid point, and which one."
                   (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes av)))
         (log-info "Validating signatures for all blocks."))))
 
+(defun cleanup-block-rev-files (blocks-dir)
+  "Core BlockManager::CleanupBlockRevFiles (node/blockstorage.cpp:654-687), run
+when -reindex meets -prune: every rev?????.dat goes, and so does every
+blk?????.dat that is not part of the contiguous run starting at blk00000.dat --
+a pruned node's surviving files cannot be replayed from genesis, and the
+reindex will download what it needs. Returns the number of files removed."
+  (bl.log:log-info "Removing unusable blk?????.dat and rev?????.dat files for -reindex with -prune")
+  (let ((blocks '())
+        (removed 0))
+    (dolist (file (directory (merge-pathnames "*.dat" blocks-dir)))
+      (let ((name (file-namestring file)))
+        (when (= (length name) 12)
+          (cond ((alexandria:starts-with-subseq "blk" name)
+                 (let ((n (parse-integer name :start 3 :end 8 :junk-allowed t)))
+                   (push (cons (or n -1) file) blocks)))
+                ((alexandria:starts-with-subseq "rev" name)
+                 (delete-file file)
+                 (incf removed))))))
+    (let ((next 0))
+      (dolist (entry (sort blocks #'< :key #'car))
+        (if (eql (car entry) next)
+            (incf next)
+            (progn (delete-file (cdr entry))
+                   (incf removed)))))
+    removed))
+
+(defun wipe-for-pruned-reindex (data-dir blocks-dir)
+  "What Core's -reindex throws away before it rebuilds, on a PRUNED node: the
+block tree database (wipe_data, init.cpp:1344), the coins database
+(wipe_chainstate_db, :1386), every optional index (f_wipe = do_reindex,
+:1905-1920) and, because the node prunes, the block and undo files the rebuild
+cannot use (CLEANUP-BLOCK-REV-FILES, blockstorage.cpp:1234-1240).
+
+Our -reindex is otherwise ADDITIVE -- it extends an intact block index from the
+block files and keeps the chainstate (see %REBUILD-BLOCK-INDEX-FROM-BLOCK-FILES)
+-- and on a pruned node that answers nothing: the files that would rebuild the
+chain from genesis are gone, so the node came back at its old tip with its old
+indexes, and feature_remove_pruned_files_on_startup.py:66 read 1000 blocks
+where Core reads 0, and feature_index_prune.py:190's restart with -reindex
+refused its indexes as beyond pruned data where Core rebuilds them. After this
+the start is a fresh one over whatever contiguous files remain."
+  (cleanup-block-rev-files blocks-dir)
+  (flet ((drop-file (path)
+           (when (and path (probe-file path)) (delete-file path)))
+         (drop-dir (path)
+           (when (and path (uiop:directory-exists-p path))
+             (uiop:delete-directory-tree path :validate t))))
+    (drop-file (bl.kv:datadir-header-index-file data-dir))
+    (drop-file (merge-pathnames "chainstate.dat" data-dir))
+    (drop-dir (merge-pathnames "chainstate/" data-dir))
+    (drop-dir (merge-pathnames "undo/" data-dir))
+    (dolist (which '(:txindex :blockfilter :coinstats :txospenderindex))
+      (drop-dir (bl.kv:datadir-index-path data-dir which))))
+  (log-info "Reindex with -prune: block index, chainstate and indexes wiped"))
+
 (defun %init-load-chain (network reindex reindex-chainstate blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
 index, -reindex, and the block-store <-> header-index position map.
@@ -826,6 +881,12 @@ startup refusal rather than a directory we create somewhere else."
   ;; single-chainstate node wrote). A persisted snapshot chainstate would be
   ;; detected and appended here (Core LoadAssumeutxoChainstate) — future work.
   (log-assumevalid-decision network)
+  ;; -reindex on a pruned node rebuilds from nothing, as Core's does.
+  (when (and reindex (pruning-enabled-p))
+    (wipe-for-pruned-reindex (node-data-directory *node*)
+                              (blocks-dir-path blocks-directory
+                                               (node-data-directory *node*)
+                                               network)))
   (log-info "Loading chain state...")
   (setf (node-chainstates *node*)
         (list (bl.store:init-chain-state (node-data-directory *node*))))
