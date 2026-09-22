@@ -1195,3 +1195,28 @@ disconnects its sender."
           (is (eq :ready (bl.net:peer-state asked))
               "the peer that answered our getdata is not rate-limited")
           (is-true (bl.mp:mempool-has mempool txid)))))))
+
+(test a-tx-request-expires-at-its-expiry-not-a-second-later
+  "Core stamps a tx request's expiry as request time + GETDATA_TX_INTERVAL
+(txdownloadman_impl.cpp:278) and expires it when `m_time <= now'
+(txrequest.cpp:494). p2p_tx_download.py:280-284 bumps mocktime by exactly
+GETDATA_TX_INTERVAL in total and waits for the preferred peer's getdata; ours
+expired only once MORE than sixty seconds had passed, so the re-route never
+came. Control: one second before the expiry nothing is re-routed."
+  (bl.net:reset-tx-requests)
+  (let* ((t0 1780000000)
+         (bl.ser:*mock-time* t0)
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 77))
+         (first-peer (%pr-peer))
+         (second-peer (%pr-peer)))
+    (unwind-protect
+         (progn
+           (is-true (bl.net:tx-request-wanted-p hash first-peer t) "requested at once")
+           (is-false (bl.net:tx-request-wanted-p hash second-peer t) "a candidate behind it")
+           (setf bl.ser:*mock-time* (+ t0 59))
+           (is (= 0 (bl.net:retry-timed-out-tx-requests)) "control: not yet expired")
+           (setf bl.ser:*mock-time* (+ t0 60))
+           (is (= 1 (bl.net:retry-timed-out-tx-requests))
+               "at request time + 60 s the request expires and is re-routed")
+           (is (eq second-peer (tx-request-in-flight-peer hash))))
+      (bl.net:reset-tx-requests))))

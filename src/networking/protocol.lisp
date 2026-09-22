@@ -974,7 +974,11 @@ belt-and-suspenders re-check PROCESS-TX-REQUESTS takes it for."
     (bt:with-lock-held (*tx-request-lock*)
       (let ((timed-out '()))
         (maphash (lambda (txid entry)
-                   (when (> (- now (cdr entry)) +tx-request-timeout-seconds+)
+                   ;; Expired AT the expiry, not a second after it: Core
+                   ;; stamps expiry = request time + GETDATA_TX_INTERVAL
+                   ;; (txdownloadman_impl.cpp:278) and SetTimePoint expires
+                   ;; `m_time <= now' (txrequest.cpp:494).
+                   (when (>= (- now (cdr entry)) +tx-request-timeout-seconds+)
                      (push (cons txid (car entry)) timed-out)))
                  *tx-in-flight*)
         (dolist (item timed-out)
