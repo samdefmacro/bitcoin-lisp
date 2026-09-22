@@ -2981,8 +2981,10 @@ sigdata.taproot_script_sigs as it goes (script/sign.cpp:355-395), and
 SignTaproot tries every leaf, so a wallet holding ONE key of each two-key
 leaf signs both leaves and cannot finalize -- two tapscript signatures; with
 the two leaves identical it is one signature valid for both
-(wallet_miniscript.py:152-167, failing at :302). We kept signatures only from
-a leaf we could satisfy, so the PSBT came back with none."
+(wallet_miniscript.py:152-167, failing at :302). And the signatures of a leaf
+that could NOT be finished stay in the PSBT beside the leaf that was: one key
+of the first leaf plus both keys of a pkh() second leaf is three
+(:168-174). We kept signatures only from the leaf we satisfied."
   (with-wallet-chain-node (node "tapscript-partial")
     (flet ((rpc (wallet method &rest params)
              (with-rpc-wallet (wallet)
@@ -2992,7 +2994,7 @@ a leaf we could satisfy, so the PSBT came back with none."
                (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
                h)))
       (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
-             (sks (loop for b from 41 to 44
+             (sks (loop for b from 41 to 45
                         collect (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
              (wif (lambda (i) (bl.crypto:private-key-to-wif (nth i sks) :network :regtest :compressed t)))
              (pub (lambda (i) (bl.crypto:bytes-to-hex (bl.crypto:derive-public-key (nth i sks) :compressed t))))
@@ -3006,7 +3008,10 @@ a leaf we could satisfy, so the PSBT came back with none."
                           2 101)
                     (list "same" (format nil "tr(~A,{and_v(v:pk(~A),pk(~A)),and_v(v:pk(~A),pk(~A))})"
                                          h (funcall wif 0) (funcall pub 1) (funcall wif 0) (funcall pub 1))
-                          1 103))
+                          1 103)
+                    (list "three" (format nil "tr(~A,{and_v(v:pk(~A),pk(~A)),and_v(v:pkh(~A),pk(~A))})"
+                                          h (funcall wif 0) (funcall pub 1) (funcall wif 2) (funcall wif 4))
+                          3 105))
               do (let ((desc (bl.rpc:descriptor-add-checksum desc)))
                    (rpc nil "createwallet" name nil t)
                    (rpc name "importdescriptors" (list (obj "desc" desc "timestamp" "now")))
@@ -3019,10 +3024,10 @@ a leaf we could satisfy, so the PSBT came back with none."
                             (psbt (rpc nil "createpsbt"
                                        (list (obj "txid" txid "vout" (%aval "vout" coin)))
                                        (list (obj optrue (bl.rpc:format-money 99990000)))))
-                            (res (rpc name "walletprocesspsbt" psbt))
+                            (res (rpc name "walletprocesspsbt" psbt t "DEFAULT" t
+                                      bl.rpc:+json-false+))
                             (in (first (coerce (%aval "inputs" (rpc nil "decodepsbt" (%aval "psbt" res)))
                                                'list))))
-                       (is (not (eq t (%aval "complete" res))) "~A: cannot finalize" name)
                        (is (= want (length (coerce (or (%aval "taproot_script_path_sigs" in) '())
                                                    'list)))
                            "~A: ~D tapscript signature(s) in ~S" name want in)))))))))

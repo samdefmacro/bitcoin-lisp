@@ -505,12 +505,10 @@ its script and its merkle depth and neither dominates.
 
 *current-tx* / *current-spent-utxos* / *current-input-index* must be bound by
 the caller -- the sighash commits to all of them."
-  (let ((best nil) (best-size nil) (best-leaf nil) (best-sigs nil) (signed-by nil)
-        (all-sigs '()))
+  (let ((best nil) (best-size nil) (best-leaf nil) (all-sigs '()))
     (dolist (entry leaves)
       (destructuring-bind (script leaf-hash control pubkeys) entry
         (progn
-          (setf signed-by nil)
           (let* (;; BIP341 script-path tail: the tapleaf hash, key version 0,
                  ;; and the codeseparator position. Signing always commits to
                  ;; "no codeseparator executed" -- our tapscript leaves contain
@@ -536,7 +534,6 @@ the caller -- the sighash commits to all of them."
                                                 pubmap))))
                            (when sk
                              (let ((sig (%tap-sig sk sighash tap-sighash-type)))
-                               (push (list xonly leaf-hash sig) signed-by)
                                (unless (find-if (lambda (e) (and (equalp (first e) xonly)
                                                                  (equalp (second e) leaf-hash)))
                                                 all-sigs)
@@ -556,14 +553,15 @@ the caller -- the sighash commits to all of them."
                     (when (or (null best-size) (< size best-size))
                       (setf best stack
                             best-size size
-                            best-leaf (cons script control)
-                            best-sigs (reverse signed-by)))))))))))
-    ;; With no satisfiable leaf, every signature made on the way is still
-    ;; returned: Core's CreateTaprootScriptSig records each one in
-    ;; sigdata.taproot_script_sigs as it is made (script/sign.cpp:355-395),
-    ;; so a cosigner holding one key of a two-key leaf contributes it
-    ;; (wallet_miniscript.py:302's "will sign both but can't finalize").
-    (values best (if best best-sigs (reverse all-sigs)) best-leaf)))
+                            best-leaf (cons script control)))))))))))
+    ;; Every signature made on the way is returned, whether or not its leaf
+    ;; was satisfied and whether or not another leaf won: Core's
+    ;; CreateTaprootScriptSig records each one in sigdata.taproot_script_sigs
+    ;; as it is made, for every leaf SignTaproot tries (script/sign.cpp:
+    ;; 355-395, :599-612), and the PSBT carries them all -- so a cosigner
+    ;; holding one key of a two-key leaf contributes it
+    ;; (wallet_miniscript.py:152-174 counts them).
+    (values best (reverse all-sigs) best-leaf)))
 
 (defvar *solving-pubkeys* nil
   "HASH160 -> pubkey for keys the signer KNOWS but may not hold, or NIL: the
