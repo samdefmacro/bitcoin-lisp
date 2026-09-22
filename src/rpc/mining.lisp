@@ -482,7 +482,9 @@ cache above wraps exactly the expensive part and nothing else."
       `(("capabilities" . ("proposal"))
         ("version" . ,version)
         ("previousblockhash" . ,(hash-to-hex (bl.mining:block-template-prev-hash template)))
-        ("transactions" . ,(%gbt-transactions template pre-segwit-p))
+        ;; A VARR (rpc/mining.cpp:896): an empty mempool is [], not
+        ;; null -- contrib/signet/miner iterates it (tool_signet_miner.py).
+        ("transactions" . ,(json-array (%gbt-transactions template pre-segwit-p)))
         ("coinbaseaux" . ,(make-hash-table :test 'equal))
         ("coinbasevalue" . ,(bl.mining:block-template-coinbase-value template))
         ("target" . ,(%bits-to-target-hex bits))

@@ -422,7 +422,11 @@ chunk feerate diagram, not boundary knapsack optimality."
             (is (member "!segwit" rules :test #'string=))
             (is (member "taproot" rules :test #'string=)))
           (is (= 0 (cdr (assoc "vbrequired" r :test #'string=))))
-          (is (stringp (cdr (assoc "longpollid" r :test #'string=)))))))))
+          (is (stringp (cdr (assoc "longpollid" r :test #'string=))))
+          ;; An empty mempool's template has NO transactions, which Core
+          ;; writes as [] (a VARR, rpc/mining.cpp:896) -- null made
+          ;; contrib/signet/miner's `for t in tmpl["transactions"]' raise.
+          (is (equalp #() (cdr (assoc "transactions" r :test #'string=)))))))))
 
 (test gbt-states-its-limits-in-pre-bip141-units-before-segwit
   "Core's getblocktemplate states sigoplimit and sizelimit in the units the
