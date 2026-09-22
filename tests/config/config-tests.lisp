@@ -710,7 +710,13 @@ silent override — the user asked for two incompatible things."
   (is-true (%dnsseed-after "-onlynet=ipv4" "-dnsseed=1"))
   (is-true (%dnsseed-after "-dnsseed=1"))
   ;; Explicit 0 with clearnet reachable stays off.
-  (is-false (%dnsseed-after "-dnsseed=0")))
+  (is-false (%dnsseed-after "-dnsseed=0"))
+  ;; The contradiction is reported before any transport is judged, as Core
+  ;; orders it (init.cpp:1688-1693 ahead of :1760-1800 and :2240):
+  ;; feature_config_args.py:336 names I2P, which this node refuses on its
+  ;; own account, and expects this sentence.
+  (is (equal "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6"
+             (%config-globals-refusal "-dnsseed=1" "-onlynet=i2p" "-i2psam=127.0.0.1:7656"))))
 
 (test reachable-seed-addresses-filter
   "G7-03 (dial side): seed lists are clearnet by construction, so under an
