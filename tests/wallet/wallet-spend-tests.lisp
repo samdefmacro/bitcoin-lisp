@@ -2894,3 +2894,31 @@ five make it the costlier one; the -maxapsfee default is 0."
                                             (search "using non-grouped" l)))
                            lines)
                      "no non-grouped line in ~S" lines)))))))
+
+(test spendzeroconfchange-off-leaves-unconfirmed-change-untrusted
+  "CachedTxIsTrusted trusts an unconfirmed transaction only when
+-spendzeroconfchange is on AND it is from us (wallet/receive.cpp:215). We
+tested only the second, so with -spendzeroconfchange=0 a self-send's
+unconfirmed output still counted as TRUSTED balance -- wallet_basic.py:652
+wants it all in untrusted_pending. The default (on) is the control."
+  (with-wallet-chain-node (node "zeroconf-change")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "z")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (with-wallet-rng (93)
+          (rpc "fund" "sendtoaddress" (rpc "z" "getnewaddress" "" "bech32")
+               (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))
+        (rpc nil "generatetoaddress" 1 optrue)
+        (with-wallet-rng (95)
+          (rpc "z" "sendall" (list (rpc "z" "getnewaddress" "" "bech32"))
+               nil nil nil (%ht "fee_rate" 10)))
+        (flet ((mine (key) (btc-amount (%aval key (%aval "mine" (rpc "z" "getbalances"))))))
+          (is (plusp (mine "trusted")) "the control: by default the self-send is trusted")
+          (let ((bl.wallet:*wallet-spend-zero-conf-change* nil))
+            (is (zerop (mine "trusted")))
+            (is (plusp (mine "untrusted_pending")))))))))

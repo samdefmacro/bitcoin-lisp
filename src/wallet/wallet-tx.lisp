@@ -644,12 +644,18 @@ paying one of TX-DESTINATIONS (address-string set)."
 
 (defun %wallet-tx-trusted-p (wallet wtx &optional (trusted-parents
                                                    (make-hash-table :test 'equalp)))
-  "receive.cpp CachedTxIsTrusted (m_spend_zero_conf_change defaults true)."
+  "receive.cpp CachedTxIsTrusted (receive.cpp:205-236). An unconfirmed
+transaction is trusted only when -spendzeroconfchange is on AND it is from
+us (:215); we tested only the second, so a wallet started with
+-spendzeroconfchange=0 still counted its own unconfirmed change as trusted
+balance (wallet_basic.py:652)."
+  (declare (special *wallet-spend-zero-conf-change*))
   (let ((txid (wallet-tx-txid wtx)))
     (cond
       ((gethash txid trusted-parents) t)
       ((eq (wallet-tx-state wtx) :confirmed) t)
       ((eq (wallet-tx-state wtx) :block-conflicted) nil)
+      ((not *wallet-spend-zero-conf-change*) nil)
       ((not (wallet-tx-from-me-cached wallet wtx)) nil)
       ((not (eq (wallet-tx-state wtx) :in-mempool)) nil)
       (t
