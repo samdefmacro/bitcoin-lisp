@@ -1499,18 +1499,25 @@ each conflict and all its in-mempool descendants (Core GetEntriesForConflicts
       (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
                (mempool-descendants mempool ctxid)))))
 
-(defun %rbf-cluster-caps (mempool direct-conflicts)
+(defun %rbf-cluster-caps (mempool direct-conflicts &optional txid
+                                                      (verdict :too-many-clusters))
   "Rule 5 (redefined for cluster mempool, Core GetEntriesForConflicts,
 rbf.cpp:58-83): NIL when DIRECT-CONFLICTS touch at most 100 distinct
-CLUSTERS, else :too-many-clusters. There is no transaction-count bound —
+CLUSTERS, else (VERDICT DEBUG) with Core's sentence naming TXID and the count
+(rbf.cpp:71-74) -- the debug half beside `too many potential replacements'
+(validation.cpp:994-997) or its package form (:1079-1082), which
+mempool_package_rbf.py:219 reads back in full. There is no transaction-count bound —
 the cluster count alone bounds the relinearization work (Core's comment at
 rbf.cpp:65-68); the 500-tx GatherClusters cap belongs to the mini-miner
 fee estimator, not replacement."
-  (let ((graph (mempool-graph mempool))
-        (conflict-handles (%rbf-entry-handles mempool direct-conflicts)))
-    (when (> (txgraph-count-distinct-clusters graph conflict-handles)
-             +max-rbf-replacement-candidates+)
-      :too-many-clusters)))
+  (let* ((graph (mempool-graph mempool))
+         (conflict-handles (%rbf-entry-handles mempool direct-conflicts))
+         (clusters (txgraph-count-distinct-clusters graph conflict-handles)))
+    (when (> clusters +max-rbf-replacement-candidates+)
+      (list verdict
+            (format nil "rejecting replacement ~A; too many conflicting clusters (~D > ~D)"
+                    (if txid (%hash-display-name txid) "")
+                    clusters +max-rbf-replacement-candidates+)))))
 
 (defun %rbf-replaced-fees (mempool replaced)
   "Total prioritisation-modified fees of the REPLACED txid hash-set's entries."
@@ -1600,7 +1607,8 @@ in terms of clusters; and the old feerate-superiority test
   ;; nothing the expansion produces. A LET binding is not a statement that runs
   ;; where the guard reads it -- the verdict is identical either way, and only
   ;; the work done before the rejection differs.
-  (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
+  (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts
+                                        (bl.ser:transaction-hash tx))))
     (when cap-failure
       (return-from check-rbf-rules (values nil cap-failure nil))))
   (let ((graph (mempool-graph mempool))
@@ -1670,7 +1678,8 @@ transactions (validation.cpp:1113-1121)."
   ;; a package RBF", validation.cpp:1076-1082) and, as in the single-tx path,
   ;; before the descendant expansion it is there to bound (Core
   ;; GetEntriesForConflicts, rbf.cpp:58-83).
-  (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
+  (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts child-txid
+                                        :package-rbf-too-many-clusters)))
     (when cap-failure
       (return-from check-package-rbf-rules (values nil cap-failure nil))))
   (let ((graph (mempool-graph mempool))

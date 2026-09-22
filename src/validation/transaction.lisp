@@ -878,7 +878,11 @@ transaction is refused even on a node told to relay non-standard ones."
     (:package-feerate-not-above-parent
      . "package RBF failed: package feerate is less than or equal to parent feerate")
     (:package-rbf-diagram-failed
-     . "package RBF failed: insufficient feerate: does not improve feerate diagram"))
+     . "package RBF failed: insufficient feerate: does not improve feerate diagram")
+    ;; Rule 5, both forms (validation.cpp:994-997, :1079-1082).
+    (:too-many-clusters . "too many potential replacements")
+    (:package-rbf-too-many-clusters
+     . "package RBF failed: too many potential replacements"))
   "Our validation keywords in Core's reject-reason vocabulary.")
 
 (defparameter *tx-reject-debug-messages*

@@ -668,7 +668,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
     ;; PackageRBFChecks (validation.cpp:1049-1119).
     :package-rbf-not-1p1c :package-rbf-mempool-ancestors
     :package-rbf-insufficient-fee :package-feerate-not-above-parent
-    :package-rbf-diagram-failed
+    :package-rbf-diagram-failed :package-rbf-too-many-clusters
     ;; The changeset's cluster limits (:1518) and the package dust sweep
     ;; (:1527), both judged over the whole subset.
     :too-large-cluster :unspent-dust)

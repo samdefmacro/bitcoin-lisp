@@ -2251,7 +2251,13 @@ CANDIDATES, rbf.cpp:69-74). 100 distinct clusters is allowed."
            mempool cand 100000000 (bl.ser:transaction-vsize cand)
            (bl.ser:transaction-weight cand) conflicts)
         (is-false ok)
-        (is (eq reason :too-many-clusters)))
+        (is (eq (bl.val:tx-reject-keyword reason) :too-many-clusters))
+        ;; Core's reason and GetEntriesForConflicts' sentence (validation.cpp
+        ;; :994-997, rbf.cpp:71-74); mempool_package_rbf.py:219 reads it whole.
+        (is (string= (format nil "too many potential replacements, rejecting replacement ~A; too many conflicting clusters (101 > 100)"
+                             (bl.crypto:bytes-to-hex
+                              (bl.crypto:reverse-bytes (bl.ser:transaction-hash cand))))
+                     (bl.val:tx-reject-reason-string reason))))
       ;; Dropping one leaves exactly 100 => the cluster cap is satisfied (and,
       ;; paying a huge fee over singletons, the replacement is accepted).
       (multiple-value-bind (ok reason)
@@ -2295,7 +2301,8 @@ single-transaction and the package entry point are checked."
                                       (bl.ser:transaction-weight cand)
                                       conflicts)
              (is-false ok)
-             (is (eq reason :too-many-clusters)))
+             (is (eq (bl.val:tx-reject-keyword reason)
+                     :too-many-clusters)))
            (is (zerop walks)
                "rule 5 rejected the replacement after ~D descendant walks had already run"
                walks)
@@ -2316,7 +2323,8 @@ single-transaction and the package entry point are checked."
                (bl.mp:check-package-rbf-rules mempool 1000 100 400
                                               100000000 100 400 conflicts)
              (is-false ok)
-             (is (eq reason :too-many-clusters)))
+             (is (eq (bl.val:tx-reject-keyword reason)
+                     :package-rbf-too-many-clusters)))
            (is (zerop walks)
                "package rule 5 rejected after ~D descendant walks had already run"
                walks)
@@ -3147,7 +3155,7 @@ diagram does NOT strictly improve — rejected with Core's package sentence."
         (bl.mp:check-package-rbf-rules
          mempool 1000 100 400 100000000 100 400 conflicts)
       (is-false ok)
-      (is (eq reason :too-many-clusters)))))
+      (is (eq (bl.val:tx-reject-keyword reason) :package-rbf-too-many-clusters)))))
 
 (test package-rbf-rules-too-large-cluster
   "A package member breaching the cluster size limit in staging is rejected
