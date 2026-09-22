@@ -467,6 +467,17 @@ member it had just collected, with no error."
                     (setf (gethash (car kv) h) (cdr kv))))))))
     remaining))
 
+(defun %repeated-object-key (params)
+  "The first key PARAMS names a second time, when PARAMS is a JSON object kept
+as its alist because it repeats a key (%JSON-OBJECTS-AS-TABLES); NIL for
+anything else -- a hash table, a positional list, an array."
+  (when (and (consp params)
+             (every (lambda (member) (and (consp member) (stringp (car member)))) params))
+    (loop with seen = '()
+          for (key . nil) in params
+          when (member key seen :test #'string=) return key
+          do (push key seen))))
+
 (defun %named-params-to-positional (method params)
   "PARAMS as a positional list, mapping a JSON object onto METHOD's argument
 names (Core transformNamedArguments, rpc/server.cpp:368-470). A params ARRAY is
@@ -479,7 +490,18 @@ framework's own client sends whenever a call mixes the two
 (authproxy.py:122-125).
 
 Unfilled slots before a filled one become NIL, which is how an omitted optional
-argument already reaches every handler."
+argument already reaches every handler.
+
+An object that names a key twice arrives as its alist (%PARSE-JSON-BODY keeps
+both members) and is refused here, as Core refuses it before looking at a
+single name (rpc/server.cpp:374-382): bitcoin-cli -named sends a second
+`args' whenever an explicit args= meets positional arguments
+(rpc/client.cpp:509-514, pushKVEnd), and interface_bitcoin_cli.py:130 expects
+this refusal for it."
+  (let ((repeated (%repeated-object-key params)))
+    (when repeated
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "Parameter ~A specified multiple times" repeated))))
   (if (not (hash-table-p params))
       params
       (let ((names (cdr (assoc (string-downcase method) *rpc-named-arg-names*

@@ -5597,6 +5597,24 @@ positional ones. The names come from Core's RPCHelpMan declarations."
   (is (equal '() (bl.rpc::%named-params-to-positional
                   "getblockcount" '()))))
 
+(test named-params-refuse-a-repeated-key
+  "Core puts every member of a named-params object into a map and refuses a key
+that is already there, before it looks at a single name (rpc/server.cpp:374-382).
+bitcoin-cli -named sends exactly that when an explicit args= meets positional
+arguments -- pushKVEnd appends a second args (rpc/client.cpp:509-514) -- and
+interface_bitcoin_cli.py:130 expects the refusal. The body used to reach the
+transform as an alist that was taken for a POSITIONAL list, so the answer was
+whatever the first handler made of it."
+  (signals-rpc-error (:code -8 :exact-message "Parameter args specified multiple times")
+    (bl.rpc:parse-json-rpc-request
+     "{\"method\":\"echo\",\"params\":{\"args\":\"[0,1,2,3]\",\"args\":[\"4\",\"5\",\"6\"]},\"id\":1}"))
+  (signals-rpc-error (:code -8 :exact-message "Parameter arg1 specified multiple times")
+    (bl.rpc:parse-json-rpc-request
+     "{\"method\":\"echo\",\"params\":{\"arg0\":\"a\",\"arg1\":\"b\",\"arg1\":\"c\"},\"id\":1}"))
+  ;; The positive control: the same request with the key once is answered.
+  (is (equal '("0" "1") (nth-value 2 (bl.rpc:parse-json-rpc-request
+                                     "{\"method\":\"echo\",\"params\":{\"args\":[\"0\",\"1\"]},\"id\":1}")))))
+
 (test named-params-honour-core-s-alias-slots
   "Core stores an argument name pattern and splits it on #\\| , so one slot can
 have two spellings (rpc/server.cpp:396). getblock is the case that matters:
