@@ -12374,3 +12374,29 @@ decoderawtransaction. getrawtransaction verbose keeps it (the control)."
     (is (null (assoc "hex" (cdr (assoc "tx" psbt :test #'string=)) :test #'string=)))
     (is-true (assoc "hex" (bl.rpc:tx-to-json tx :regtest) :test #'string=)
              "the default still carries it, for getrawtransaction verbose")))
+
+(test an-input-that-already-verifies-is-complete-and-left-alone
+  "Core starts each input from DataFromTransaction, which marks it complete
+when its existing solution verifies, and ProduceSignature returns at once for
+a complete input (script/sign.cpp:504-535, :705-707). So a P2SH input whose
+redeem script (OP_1NEGATE OP_NUMEQUAL) no signer can solve, but whose
+scriptSig is already there, signs COMPLETE -- the vector of
+wallet_signrawtransactionwithwallet.py:161-178 -- and we reported it as an
+error. The control: the same transaction with its scriptSig emptied is still
+incomplete."
+  (let* ((node (make-test-node :network :regtest))
+         (hex "0200000001FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000044F024F9CFDFFFFFF01F0B9F505000000002321027777777777777777777777777777777777777777777777777777777777777777AC66030000")
+         (bare "0200000001FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0000000000FDFFFFFF01F0B9F505000000002321027777777777777777777777777777777777777777777777777777777777777777AC66030000")
+         (prevtxs (list (list (cons "txid" (make-string 64 :initial-element #\f))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" "a914ae44ab6e9aa0b71f1cd2b453b69340e9bfbaef6087")
+                              (cons "redeemScript" "4f9c")
+                              (cons "amount" 1)))))
+    (flet ((sign (h)
+             (bl.rpc:dispatch-rpc-method node "signrawtransactionwithkey"
+                                         (wire-params (list h #() prevtxs)))))
+      (let ((done (sign hex)))
+        (is (eq t (cdr (assoc "complete" done :test #'string=)))
+            "the finished input is complete: ~S" done)
+        (is (string-equal hex (cdr (assoc "hex" done :test #'string=)))))
+      (is (not (eq t (cdr (assoc "complete" (sign bare) :test #'string=))))))))

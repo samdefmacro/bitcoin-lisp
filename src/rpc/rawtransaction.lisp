@@ -982,6 +982,27 @@ if any input lacks a prevout-with-amount."
                :value (second prev)
                :script-pubkey (coerce (first prev) '(simple-array (unsigned-byte 8) (*)))))))))
 
+(defun %input-already-complete-p (tx i spent-utxos)
+  "Whether input I of TX already carries a scriptSig or witness that VERIFIES.
+Core's SignTransaction starts each input from DataFromTransaction, which marks
+it complete when the existing solution passes VerifyScript, and
+ProduceSignature returns straight away for a complete input
+(script/sign.cpp:504-535, :705-707): nothing is re-signed and nothing is
+reported. An input whose script we cannot solve but whose solution is already
+there -- wallet_signrawtransactionwithwallet.py:178, a P2SH OP_1NEGATE
+OP_NUMEQUAL spend -- is therefore complete, and signing a finished input
+again is a no-op (the same test's :154-158 compares the two hex strings)."
+  (let ((in (aref (bl.ser:transaction-inputs tx) i))
+        (witness (bl.ser:transaction-witness tx)))
+    (and spent-utxos
+         (or (plusp (length (bl.ser:tx-in-script-sig in)))
+             (and witness (< i (length witness)) (aref witness i)))
+         (handler-case
+             (let ((bl.interop:*script-flags* bl.val:+standard-script-verify-flags+))
+               (bl.val:validate-input-script tx i (aref spent-utxos i)))
+           (error () nil))
+         t)))
+
 (defun sign-tx-inputs (tx prevmap keymap pubmap tr-keymap sighash-byte
                         &optional tr-scripts)
   "Sign every input of TX the key maps can satisfy, in place: scriptSigs are
@@ -1017,9 +1038,9 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                                     (bl.ser:outpoint-index op))
                               prevmap)))
           ;; Compute the input's signature material then finalize it into
-          ;; scriptSig/witness. Taproot signs SIGHASH_DEFAULT (tap-sighash 0),
-          ;; the historical spend-path behavior.
-          (if prev
+          ;; scriptSig/witness (taproot: SIGHASH_DEFAULT) -- unless the input
+          ;; is already complete (%INPUT-ALREADY-COMPLETE-P).
+          (if (and prev (not (%input-already-complete-p tx i spent-utxos)))
               (multiple-value-bind (sig err)
                   (compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              sighash-byte precomp spent-utxos
@@ -1045,7 +1066,7 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                       (when wit
                         (setf (aref witness i) wit)
                         (setf any-witness t)))))
-              (push (cons i "no prevtx scriptPubKey provided") errors))))
+              (unless prev (push (cons i "no prevtx scriptPubKey provided") errors)))))
       (when (or any-witness (bl.ser:transaction-witness tx))
         (setf (bl.ser:transaction-witness tx) witness)
         (bl.ser:invalidate-transaction-caches tx))
