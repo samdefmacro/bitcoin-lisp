@@ -317,24 +317,16 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
       ;; torcontrol GETINFO-discovered onion proxy re-admits :torv3 iff
       ;; -onlynet allows it — Core get_socks_cb).
       (setf bl.net:*onlynet-networks* onlynets)
-      (unless bl.net:*onion-proxy*
-        (when (member :torv3 onlynets)
-          ;; Core init.cpp:1769-1773 / 1788-1798: -onion=0 explicitly forbids
-          ;; the Tor route; otherwise -listenonion may still deliver a proxy
-          ;; later via the torcontrol connection.
-          (cond ((lk "onion")
-                 (config-error "-onlynet=onion given but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
-                ((not listenonion-p)
-                 (config-error "-onlynet=onion given but no Tor route is configured: none of -proxy, -onion or -listenonion is given"))))
-        (setf nets (remove :torv3 nets)))
-      (when (member :i2p onlynets)
-        (config-error "-onlynet=i2p given but I2P (SAM) is not supported"))
-      (setf nets (remove :i2p nets))
+      ;; Core's order (init.cpp): the CJDNS refusal (:1539-1545), then the
+      ;; -dnsseed test (:1688-1693), then onion (:1760-1800) and I2P
+      ;; (:2240-2245) -- so `-dnsseed=1 -onlynet=i2p' reports the dnsseed
+      ;; conflict, not the missing transport (feature_config_args.py:336).
+      ;; Only IPv4/IPv6 membership matters to the dnsseed test, and no later
+      ;; step removes either.
       (unless bl.net:*cjdns-reachable*
         (when (member :cjdns onlynets)
           (config-error "-onlynet=cjdns given without -cjdnsreachable"))
         (setf nets (remove :cjdns nets)))
-      (setf bl.net:*reachable-networks* nets)
       ;; PRIVACY: requesting DNS seeds entails clearnet. Resolving a seed
       ;; hostname is a plaintext DNS query to the local resolver, and the
       ;; addresses it returns are dialed directly over IPv4/IPv6 — so a
@@ -349,7 +341,21 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
         (cond ((not (lk "dnsseed"))
                (setf *dns-seed-enabled* nil))
               (*dns-seed-enabled*
-               (config-error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))
+               (config-error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6"))))
+      (unless bl.net:*onion-proxy*
+        (when (member :torv3 onlynets)
+          ;; Core init.cpp:1769-1773 / 1788-1798: -onion=0 explicitly forbids
+          ;; the Tor route; otherwise -listenonion may still deliver a proxy
+          ;; later via the torcontrol connection.
+          (cond ((lk "onion")
+                 (config-error "-onlynet=onion given but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
+                ((not listenonion-p)
+                 (config-error "-onlynet=onion given but no Tor route is configured: none of -proxy, -onion or -listenonion is given"))))
+        (setf nets (remove :torv3 nets)))
+      (when (member :i2p onlynets)
+        (config-error "-onlynet=i2p given but I2P (SAM) is not supported"))
+      (setf nets (remove :i2p nets))
+      (setf bl.net:*reachable-networks* nets))
     ;; -forcednsseed with seeding off is a contradiction Core refuses to start
     ;; on (init.cpp:1010-1013), and it reads the EFFECTIVE -dnsseed, so it also
     ;; fires for the soft-set forms: -connect, -maxconnections<=0

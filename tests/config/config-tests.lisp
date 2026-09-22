@@ -554,6 +554,26 @@ without -cjdnsreachable."
     (signals error (apply-config-globals '(("onlynet" . "i2p"))))
     (signals error (apply-config-globals '(("onlynet" . "cjdns"))))))
 
+(test config-dnsseed-conflict-is-reported-before-the-i2p-transport
+  "Core checks an explicit -dnsseed=1 against a clearnet-free -onlynet at
+init.cpp:1688-1693, long before it looks for -i2psam (:2240-2245), so
+`-dnsseed=1 -onlynet=i2p' fails with the dnsseed conflict
+(feature_config_args.py:336). Ours checked the I2P transport first."
+  (let ((bl.net:*reachable-networks* bl.net:*reachable-networks*)
+        (bl.net:*cjdns-reachable* bl.net:*cjdns-reachable*)
+        (bl.net:*onlynet-networks* bl.net:*onlynet-networks*)
+        (bl.net:*onion-proxy-explicit* nil)
+        (bl.net:*proxy* nil)
+        (bl.net:*onion-proxy* nil)
+        (bl:*dns-seed-enabled* bl:*dns-seed-enabled*))
+    (flet ((message (alist)
+             (handler-case (progn (apply-config-globals alist) nil)
+               (error (e) (princ-to-string e)))))
+      (is (search "Incompatible options: -dnsseed=1 was explicitly specified"
+                  (or (message '(("dnsseed" . "1") ("onlynet" . "i2p"))) "")))
+      ;; Without the explicit -dnsseed=1 the I2P refusal is still the answer.
+      (is (search "I2P" (or (message '(("onlynet" . "i2p"))) ""))))))
+
 ;;; --- G7-03: -onlynet clearnet exclusion must disable DNS seeding ------------
 ;;;
 ;;; A Tor-only node (-onlynet=onion) that still queries DNS seeds resolves a
