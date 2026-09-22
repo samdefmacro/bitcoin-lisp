@@ -1598,3 +1598,14 @@ control)."
         (is (equal '(-1 . "JSON integer out of range") (bump -1)))
         (is (equal '(-1 . "JSON integer out of range") (bump (expt 2 32))))
         (is (equal -3 (car (bump "x"))))))))
+
+(test combinepsbt-refuses-an-empty-array-in-cores-words
+  "combinepsbt([]) is -8 \"Parameter 'txs' cannot be empty\"
+(rpc/rawtransaction.cpp:1540-1543), the sentence rpc_psbt.py:844 asserts; we
+answered -8 with words of our own."
+  (let ((node (make-test-node :network :regtest)))
+    (is (equal '(-8 . "Parameter 'txs' cannot be empty")
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method node "combinepsbt"
+                                              (wire-params (list #())))))))))

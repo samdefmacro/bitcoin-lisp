@@ -493,9 +493,13 @@ key hash-set + a single append."
   "Combine PSBTs for the same unsigned tx into one. PARAMS: (txs). Mirrors Core."
   (declare (ignore node))
   (let ((b64s (bl.rpc:positional-array (first params))))
-    (unless (and (listp b64s) (>= (length b64s) 1))
+    (unless (listp b64s)
+      (bl.rpc:json-type-error b64s "array"))
+    ;; Core's own sentence (rpc/rawtransaction.cpp:1540-1543), which
+    ;; rpc_psbt.py:844 asserts.
+    (when (null b64s)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                        :message "txs must be an array of base64 PSBTs"))
+                        :message "Parameter 'txs' cannot be empty"))
     (let* ((psbts (mapcar #'%psbt-decode-arg b64s))
            (base (first psbts))
            (base-tx (bl.ser:serialize-transaction
