@@ -1459,6 +1459,15 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
                    map bl.ser:+psbt-in-tap-bip32+ xonly
                    (%psbt-tap-bip32-value leaf-hashes fpr path))))))))
 
+(defun %spkm-spends-by-witness-p (spkm spk)
+  "Whether SPK, which SPKM owns, is spent through a witness program -- a
+native segwit output, or a P2SH whose redeem script is one: Core's
+sigdata.witness after ProduceSignature."
+  (or (bl.val:output-witness-program-p spk)
+      (and (eq (bl.val:classify-script spk) :scripthash)
+           (let ((redeem (%spkm-sub-scripts spkm spk)))
+             (and redeem (bl.val:output-witness-program-p redeem) t)))))
+
 (defun %psbt-add-wallet-input-derivs (psbt coins wallet)
   "Add input bip32 derivations / taproot internal keys for wallet-owned inputs
 (Core FillPSBT bip32derivs). Metadata only — helps offline signers.
@@ -1471,7 +1480,14 @@ what makes walletprocesspsbt IDEMPOTENT: finalizing an input drops its
 derivation records (%PSBT-SET-FINAL, as Core's FromSignatureData clears
 hd_keypaths on the complete branch), so an updater that ran over every input
 put them straight back and a second pass over a finished PSBT returned a
-different one -- rpc_psbt.py:780-782 compares the two."
+different one -- rpc_psbt.py:780-782 compares the two.
+
+An input sourced from its witness_utxo ALONE whose script is not spent by
+witness gets nothing either: SignPSBTInput returns on `require_witness_sig &&
+!sigdata.witness' BEFORE input.FromSignatureData (psbt.cpp:399-402), so none of
+what ProduceSignature gathered -- derivations included -- reaches the PSBT.
+rpc_psbt.json's third signer vector is a P2PKH input carried that way, and
+Core's answer is the PSBT unchanged."
   (let ((tx (bl.ser:psbt-tx psbt)))
     (loop for map across (bl.ser:psbt-inputs psbt)
           for in across (bl.ser:transaction-inputs tx)
@@ -1482,7 +1498,9 @@ different one -- rpc_psbt.py:780-782 compares the two."
           for spk = (and entry (first entry))
           do (when (and spk (not (%psbt-input-signed-p map)))
                (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet spk)
-                 (when spkm
+                 (when (and spkm
+                            (or (not (%psbt-require-witness-sig-p map))
+                                (%spkm-spends-by-witness-p spkm spk)))
                    (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                      (declare (ignore scripts))
                      (%psbt-add-map-derivs map spk pos pairs spkm))))))))
