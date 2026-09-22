@@ -866,7 +866,13 @@ per-wtxid object. Status drives which fields are present."
                  `(("other-wtxid"
                     . ,(let ((ow (bl.val:package-tx-result-other-wtxid r)))
                          (if ow (hash-to-hex ow) ""))))))
-        ((:invalid :not-validated)
+        ;; A member the package never reached has NO per-tx result in Core,
+        ;; and the RPC fills the fixed word in for it (rpc/mempool.cpp:
+        ;; 1455-1463); the package's own reason is package_msg's.
+        ;; rpc_packages.py:271.
+        (:not-validated
+         (append base '(("error" . "package-not-validated"))))
+        (:invalid
          (append base
                  `(("error" . ,(let ((e (bl.val:package-tx-result-error r)))
                                  (if e
@@ -952,8 +958,10 @@ member may send to a script that can never spend it."
                         (cons (hash-to-hex (bl.val:package-tx-result-wtxid r))
                               (%package-tx-result-fields r)))
                       results))
-          ,@(when replaced
-              `(("replaced-transactions" . ,(mapcar #'hash-to-hex replaced)))))))))
+          ;; Always present, [] when nothing was replaced (rpc/mempool.cpp
+          ;; :1496-1498).
+          ("replaced-transactions"
+           . ,(json-array (mapcar #'hash-to-hex replaced))))))))
 
 ;;; --- Mempool persistence (Bitcoin Core savemempool) ---
 

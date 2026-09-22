@@ -448,6 +448,38 @@ four-transaction chain came back as an ordinary reply
                      (cdr (assoc "package_msg" result :test #'string=)))))
       (is (= 2 (bl.mp:mempool-count mempool))))))
 
+(test rpc-submitpackage-names-an-unreached-member-package-not-validated
+  "A package refused before any member is processed has NO per-tx results in
+Core, and submitpackage fills the fixed word in for each member: error
+`package-not-validated' (rpc/mempool.cpp:1455-1463); the package's reason is
+package_msg's. `replaced-transactions' is always present, [] when empty
+(:1496-1498). rpc_packages.py:271 compares the whole object. Ours repeated
+the package reason on every member and left the array out."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((node (bl:make-node :network :testnet3))
+           ;; Two parents double-spending one outpoint, and a child of both.
+           (tx1 (pkg-tx funding-txid 0 (- 100000000 500)))
+           (tx2 (pkg-tx funding-txid 0 (- 100000000 600)))
+           (child (pkg-tx-2in (bl.ser:transaction-hash tx1) 0
+                              (bl.ser:transaction-hash tx2) 0
+                              (- 200000000 3000)))
+           (hex (lambda (tx) (bl.crypto:bytes-to-hex
+                              (bl.ser:serialize-transaction tx)))))
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool)
+      (let* ((result (bl.rpc:dispatch-rpc-method
+                      node "submitpackage"
+                      (list (mapcar hex (list tx1 tx2 child)))))
+             (field (lambda (k) (cdr (assoc k result :test #'string=)))))
+        (is (string= "conflict-in-package" (funcall field "package_msg"))
+            "control: the package's own reason")
+        (is (equalp #() (funcall field "replaced-transactions")))
+        (is (= 3 (length (funcall field "tx-results"))))
+        (dolist (entry (funcall field "tx-results"))
+          (is (string= "package-not-validated"
+                       (cdr (assoc "error" (cdr entry) :test #'string=)))))))))
+
 (test rpc-submitpackage-broadcasts-accepted-members
   "submitpackage queues an announcement for every package member that made
 it into the mempool (Core rpc/mempool.cpp:1423-1444 runs
