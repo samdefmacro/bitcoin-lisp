@@ -409,8 +409,109 @@ like, was read as an ECDSA derivation."
 
 ;;; --- serialize ---
 
-(defun %psbt-write-map (bb map)
-  (dolist (rec (psbt-map-records map))
+(defparameter *psbt-field-order*
+  '((:global #x00 #x01 #xfb #xfc)
+    (:input #x00 #x01 #x02 #x03 #x04 #x05 #x06 #x0a #x0b #x0c #x0d
+     #x13 #x14 #x15 #x16 #x17 #x18 #x1a #x1b #x1c #x07 #x08 #xfc)
+    (:output #x00 #x01 #x02 #xfc #x05 #x06 #x07 #x08))
+  "The order Core's Serialize methods write each map's fields in
+(PartiallySignedTransaction psbt.h:1170-1212, PSBTInput :302-462, PSBTOutput
+:896-962); anything else is `unknown' and goes last. Note the output map
+writes its proprietary records BEFORE the taproot fields.")
+
+(defun %psbt-le32-list (bytes start)
+  (loop for i from start below (- (length bytes) 3) by 4
+        collect (logior (aref bytes i) (ash (aref bytes (+ i 1)) 8)
+                        (ash (aref bytes (+ i 2)) 16) (ash (aref bytes (+ i 3)) 24))))
+
+(defun %psbt-record-sort-key (context rec)
+  "Where Core's std::map / std::set iteration puts REC among the records of its
+own field: a list of integers and byte vectors, compared element by element."
+  (multiple-value-bind (kt off) (psbt-key-type (car rec))
+    (let* ((key (car rec))
+           (kd (subseq key off))
+           (value (cdr rec))
+           (order (cdr (assoc context *psbt-field-order*)))
+           (rank (or (position kt order) (length order))))
+      (cons rank
+            (cond
+              ((or (= kt #xfc) (= rank (length order))) (list key))
+              ((eq context :global)
+               (if (and (= kt #x01) (= (length kd) 78) (>= (length value) 4))
+                   ;; map<KeyOriginInfo, set<CExtPubKey>> (keyorigin.h:21-37,
+                   ;; pubkey.h:353-361): fingerprint, path length, path, then
+                   ;; the xpub's key and chaincode.
+                   (list (subseq value 0 4)
+                         (floor (- (length value) 4) 4)
+                         (%psbt-le32-list value 4)
+                         (subseq kd 45 78) (subseq kd 13 45))
+                   (list kd)))
+              ((and (eq context :input) (= kt #x02))
+               (list (bl.crypto:hash160 kd)))   ; map<CKeyID, SigPair>
+              ((and (eq context :input) (= kt #x15) (plusp (length value)))
+               ;; map<pair<CScript, int>, set<control block>>; a CScript
+               ;; (prevector) compares by SIZE first (prevector.h:446-461).
+               (list (1- (length value))
+                     (subseq value 0 (1- (length value)))
+                     (aref value (1- (length value)))
+                     kd))
+              ((and (eq context :input) (member kt '(#x1b #x1c)) (>= (length kd) 66))
+               ;; map<pair<aggregate, leaf hash>, map<participant, ...>>
+               (list (subseq kd 33 66)
+                     (if (= (length kd) 98)
+                         (subseq kd 66 98)
+                         (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 0))
+                     (subseq kd 0 33)))
+              (t (list kd)))))))
+
+(defun %psbt-sort-key< (a b)
+  (loop for x in a for y in b
+        do (cond ((and (integerp x) (integerp y))
+                  (unless (= x y) (return (< x y))))
+                 ((and (listp x) (listp y))
+                  (unless (equal x y)
+                    (return (%psbt-sort-key< (append x '(-1)) (append y '(-1))))))
+                 (t
+                  (let ((m (mismatch x y)))
+                    (when m
+                      (return (cond ((>= m (length x)) t)
+                                    ((>= m (length y)) nil)
+                                    (t (< (aref x m) (aref y m)))))))))
+        finally (return (< (length a) (length b)))))
+
+(defun %psbt-canonical-records (context map)
+  "MAP's records in the order Core serializes them. A finalized input writes
+only its utxos, its final scriptSig/witness, proprietary and unknown records
+(psbt.h:312, the `final_script_sig.empty() && final_script_witness.IsNull()'
+gate), and a PSBT_GLOBAL_VERSION of 0 is not written at all (:1188-1191)."
+  (let* ((records (psbt-map-records map))
+         (final (and (eq context :input)
+                     (find-if (lambda (r) (member (psbt-key-type (car r)) '(#x07 #x08)))
+                              records)))
+         (kept (remove-if
+                (lambda (r)
+                  (let ((kt (psbt-key-type (car r))))
+                    (or (and final
+                             (member kt '(#x02 #x03 #x04 #x05 #x06 #x0a #x0b #x0c #x0d
+                                          #x13 #x14 #x15 #x16 #x17 #x18 #x1a #x1b #x1c)))
+                        (and (eq context :global) (= kt #xfb)
+                             (every #'zerop (cdr r))))))
+                records)))
+    (stable-sort (mapcar (lambda (r) (cons (%psbt-record-sort-key context r) r)) kept)
+                 #'%psbt-sort-key< :key #'car)))
+
+(defun %psbt-write-map (bb map &optional (context :unordered))
+  "Write MAP's records and its separator -- in Core's canonical order when
+CONTEXT is :global/:input/:output. Core never writes the records it READ: it
+parses them into typed fields and writes the fields back field by field, each
+keyed field in its container's order, so a PSBT that came in with its records
+in another order goes out in Core's. rpc_psbt.py:836 compares walletprocesspsbt's
+answer with Core's own bytes, and ours carried the input's new partial
+signature after its bip32 derivations."
+  (dolist (rec (if (eq context :unordered)
+                   (psbt-map-records map)
+                   (mapcar #'cdr (%psbt-canonical-records context map))))
     (bb-write-varint bb (length (car rec)))
     (bb-write-bytes bb (car rec))
     (bb-write-varint bb (length (cdr rec)))
@@ -421,9 +522,9 @@ like, was read as an ECDSA derivation."
   "Serialize PSBT to binary bytes."
   (let ((bb (make-byte-buf)))
     (bb-write-bytes bb *psbt-magic*)
-    (%psbt-write-map bb (psbt-global psbt))
-    (loop for m across (psbt-inputs psbt) do (%psbt-write-map bb m))
-    (loop for m across (psbt-outputs psbt) do (%psbt-write-map bb m))
+    (%psbt-write-map bb (psbt-global psbt) :global)
+    (loop for m across (psbt-inputs psbt) do (%psbt-write-map bb m :input))
+    (loop for m across (psbt-outputs psbt) do (%psbt-write-map bb m :output))
     (bb-finish bb)))
 
 ;;; --- base64 wrapping ---

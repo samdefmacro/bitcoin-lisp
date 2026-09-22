@@ -24,7 +24,11 @@
           '(simple-array (unsigned-byte 8) (*))))
 
 (test psbt-valid-roundtrip
-  "Every Core 'valid' PSBT parses and re-serializes byte-for-byte."
+  "Every Core 'valid' PSBT parses and re-serializes as Core's writer would:
+byte-for-byte, except #6, which declares PSBT_GLOBAL_VERSION 0 AHEAD of the
+unsigned transaction. Core writes its fields in a fixed order and a version
+only when it is above 0 (psbt.h:1170-1191), so its bytes for #6 are the input
+without that leading 01 fb 04 00000000 record."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
@@ -32,8 +36,12 @@
           (dolist (b64 (gethash "valid" data))
             (let* ((raw (%psbt-b64->bytes b64))
                    (psbt (bl.ser:parse-psbt raw))
-                   (out (bl.ser:serialize-psbt psbt)))
-              (is (equalp raw out) "valid PSBT #~D did not round-trip" n)
+                   (out (bl.ser:serialize-psbt psbt))
+                   (want (if (= n 6)
+                             (concatenate '(vector (unsigned-byte 8))
+                                          (subseq raw 0 5) (subseq raw 12))
+                             raw)))
+              (is (equalp want out) "valid PSBT #~D did not round-trip" n)
               (incf n)))
           (is (>= n 30) "expected many valid vectors, got ~D" n)))))
 
@@ -1537,3 +1545,34 @@ from its JSON text here, because that is the only place the two differ."
                           (cdr answer)))
               "~A outputs null must not be the empty-array refusal: ~S"
               method answer))))))
+
+(test walletprocesspsbt-answers-cores-signer-vectors-byte-for-byte
+  "rpc_psbt.py:830-836 imports each signer vector's keys as combo()
+descriptors and compares walletprocesspsbt's PSBT with Core's own bytes.
+Core never writes the records it read: it parses them into typed fields and
+writes those back in a fixed order, each keyed field in its container's order
+(PSBTInput::Serialize, psbt.h:302-462) -- so a new partial signature (a
+std::map<CKeyID, ...>) lands right after the utxos, before the sighash and the
+scripts. We appended it after the bip32 derivations, and four of the six
+vectors came back with the right records in the wrong order."
+  (let ((data (%psbt-vectors)))
+    (if (null data)
+        (skip "refs/bitcoin rpc_psbt.json not present")
+        (with-wallet-chain-node (node "signer-bytes")
+          (flet ((rpc (wallet method &rest params)
+                   (with-rpc-wallet (wallet)
+                     (bl.rpc:dispatch-rpc-method node method params))))
+            (loop for e in (gethash "signer" data)
+                  for i from 0
+                  do (let ((name (format nil "w~D" i)))
+                       (rpc nil "createwallet" name)
+                       (dolist (k (gethash "privkeys" e))
+                         (let ((h (make-hash-table :test 'equal)))
+                           (setf (gethash "desc" h)
+                                 (bl.rpc:descriptor-add-checksum (format nil "combo(~A)" k))
+                                 (gethash "timestamp" h) "now")
+                           (rpc name "importdescriptors" (list h))))
+                       (is (equal (gethash "result" e)
+                                  (%aval "psbt" (rpc name "walletprocesspsbt"
+                                                     (gethash "psbt" e) t "ALL")))
+                           "signer vector #~D" i))))))))
