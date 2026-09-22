@@ -2631,9 +2631,14 @@ VNUM in Core's option block (:1058) and read with getInt<uint32_t>."
                         (%bump-precondition-checks node wallet old-wtx nil)
                       (unless ok (error 'bl.rpc:rpc-error :code code2 :message msg2)))
                     (let ((new-txid (bl.ser:transaction-hash mtx)))
+                      ;; The original's whole mapValue travels -- comment,
+                      ;; to, ... -- plus replaces_txid (feebumper.cpp:370-373;
+                      ;; wallet_bumpfee.py:726 reads the comment back).
                       (%wallet-commit-transaction
                        node wallet mtx
-                       (list (cons "replaces_txid" (bl.rpc:hash-to-hex txid))))
+                       (append (remove "replaces_txid" (wallet-tx-map-value old-wtx)
+                                       :key #'car :test #'string=)
+                               (list (cons "replaces_txid" (bl.rpc:hash-to-hex txid)))))
                       ;; MarkReplaced: record the bump on the original tx.
                       (setf (wallet-tx-map-value old-wtx)
                             (append (remove "replaced_by_txid" (wallet-tx-map-value old-wtx)

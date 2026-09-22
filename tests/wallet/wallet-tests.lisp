@@ -2976,3 +2976,22 @@ the spend, and answered the depth check's \"Transaction has been mined\"."
                                     (bl.ser:outpoint-index spent)))
                    (rpc-error-of
                     (lambda () (funcall rpc "bumpfee" txid (%ht "fee_rate" 20))))))))))
+
+(test bumpfee-carries-the-comment-to-the-replacement
+  "feebumper::CommitTransaction commits the replacement with the ORIGINAL's
+whole mapValue plus replaces_txid (wallet/feebumper.cpp:370-373), so the
+comment and to of a sendtoaddress survive a bump (wallet_bumpfee.py:726). We
+committed replaces_txid alone. The original keeps its own (the control)."
+  (%with-pp-node (node "pp-bump-metadata")
+    (%pp-fund-wallet node :blocks 5)
+    (with-wallet-rng (33)
+      (let* ((rpc (lambda (method &rest params)
+                    (bl.rpc:dispatch-rpc-method node method params)))
+             (txid (funcall rpc "sendtoaddress" (%pp-optrue-address) 1
+                            "comment value" "to value" nil nil nil nil nil 5))
+             (bumped (%aval "txid" (funcall rpc "bumpfee" txid (%ht "fee_rate" 20))))
+             (orig (funcall rpc "gettransaction" txid))
+             (new (funcall rpc "gettransaction" bumped)))
+        (is (equal "comment value" (%aval "comment" orig)))
+        (is (equal "comment value" (%aval "comment" new)))
+        (is (equal "to value" (%aval "to" new)))))))
