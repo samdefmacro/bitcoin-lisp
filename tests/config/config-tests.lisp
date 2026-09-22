@@ -1105,7 +1105,14 @@ port overrides -port for the listener, as it does in Core."
                   "-bind=127.0.0.1:18448=onion") nil)))
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
     (is (= 18447 (getf plist :port)))
-    (is (equal '("127.0.0.1" . 18448) (getf plist :onion-bind)))))
+    (is (equal '("127.0.0.1" . 18448) (getf plist :onion-bind))))
+  ;; Two =onion binds: the first is the Tor target, and the second is bound
+  ;; as well (Core binds every entry of onion_binds, CConnman::InitBinds;
+  ;; p2p_getaddr_caching.py:47-51 connects to both).
+  (let ((plist (start-node-plist
+                '("-regtest" "-bind=127.0.0.1:18449=onion" "-bind=127.0.0.1:18450=onion") nil)))
+    (is (equal '("127.0.0.1" . 18449) (getf plist :onion-bind)))
+    (is (equal '(("127.0.0.1" . 18450)) (getf plist :extra-onion-binds)))))
 
 (defun %start-node-plist-refusal (&rest args)
   "The message ARGS->START-NODE-PLIST refuses the command line ARGS with, or

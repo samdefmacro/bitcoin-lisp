@@ -67,7 +67,7 @@ peertimeout=999999999."
     (bt:with-lock-held (*inbound-handshake-lock*)
       (decf *inbound-handshakes-in-flight*))))
 
-(defun admit-inbound-connection (node conn onion)
+(defun admit-inbound-connection (node conn onion &optional local-port)
   "Turn an accepted CONN into a peer, publish it, and start its handshake off
 the accept loop. Returns the peer, or NIL when the connection was refused.
 
@@ -95,7 +95,7 @@ it flips that state or disconnects the peer."
       (t
        (let ((peer (bl.net:make-inbound-peer
                     conn (bl.net:connection-host conn)
-                    :inbound-onion onion)))
+                    :inbound-onion onion :local-port local-port)))
          (bt:with-recursive-lock-held ((node-lock node))
            (push peer (node-pending-inbound-peers node)))
          (bt:with-lock-held (*inbound-handshake-lock*)
@@ -114,7 +114,8 @@ The accept loop does NOT wait for a handshake: Core's does not either
 previous peer's whole handshake timeout. ONION marks this as the onion-service
 listener: its connections arrive from the local Tor daemon, so the peers are
 tagged inbound-onion (their true network is :torv3, Core CNode::m_inbound_onion)."
-  (loop while (node-running node)
+  (loop with local-port = (ignore-errors (usocket:get-local-port socket))
+        while (node-running node)
         do (handler-case
                ;; setnetworkactive off: don't accept inbound connections.
                (if (not (node-network-active node))
@@ -127,7 +128,7 @@ tagged inbound-onion (their true network is :torv3, Core CNode::m_inbound_onion)
                        ;; ONION travels with it because the permission lookup
                        ;; those drops consult must ignore the address of a Tor
                        ;; inbound (net.cpp:1770-1772).
-                       (admit-inbound-connection node conn onion))))
+                       (admit-inbound-connection node conn onion local-port))))
              (error (c)
                (log-debug "Inbound accept/handshake error: ~A" c)))))
 
@@ -164,6 +165,32 @@ port can't be bound."
 port + 1 (Core's default_bind_port_onion, init.cpp:2118 — -port shifts it
 too — and DefaultOnionServiceTarget)."
   (1+ (listen-port (node-network node))))
+
+(defvar *extra-onion-listeners* '()
+  "Listening sockets and accept threads, as (socket . thread), of the =onion
+binds after the first (the first lives in the node's own onion-listener
+slots). Closed and joined by STOP-EXTRA-ONION-LISTENERS at shutdown.")
+
+(defun start-extra-onion-listener (node bind port)
+  "Bind one further -bind=<addr>:<port>=onion target and accept on it as an
+onion listener. No-op (logged) if it cannot be bound."
+  (let ((sock (bl.net:open-listener bind port)))
+    (if sock
+        (let ((thread (bt:make-thread
+                       (lambda () (run-inbound-listener node :socket sock :onion t))
+                       :name "bitcoin-onion-listener")))
+          (push (cons sock thread) *extra-onion-listeners*)
+          (log-info "Bound to ~A:~D" bind port)
+          (log-info "Listening for inbound onion peers on ~A:~D" bind port))
+        (log-warn "Onion inbound listening disabled: could not bind ~A:~D" bind port))))
+
+(defun stop-extra-onion-listeners (deadline)
+  "Close every extra onion listener and join its accept thread by DEADLINE."
+  (let ((listeners *extra-onion-listeners*))
+    (setf *extra-onion-listeners* '())
+    (dolist (l listeners) (ignore-errors (bl.net:close-listener (car l))))
+    (dolist (l listeners)
+      (bl.net:join-thread-or-destroy (cdr l) :deadline deadline))))
 
 (defun start-onion-listener (node &key (bind "127.0.0.1") port)
   "Open the onion-service target listener and spawn its accept thread.

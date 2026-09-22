@@ -198,6 +198,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; this flag is what makes ConnectedThroughNetwork() answer :torv3 — the
   ;; network used for the self-advertisement privacy rule.
   (inbound-onion nil :type boolean)
+  ;; The local port of the listening socket that accepted this inbound peer,
+  ;; or NIL (outbound, or unknown). Core keys the getaddr response cache by
+  ;; the accepting socket (net.cpp:1832-1836), so two binds on one network
+  ;; answer from two caches.
+  (local-port nil :type (or null (unsigned-byte 16)))
   ;; Mockable Unix-time deadline of the next local-address self-announcement
   ;; to this peer; 0 = none sent yet, due immediately (Core Peer::
   ;; m_next_local_addr_send, net_processing.cpp:376).
@@ -1613,16 +1618,18 @@ stall. Returns T on success."
                    (send-message peer (bl.ser:make-verack-message))
                    (%await-verack peer :timeout timeout))))))
 
-(defun make-inbound-peer (connection address &key inbound-onion)
+(defun make-inbound-peer (connection address &key inbound-onion local-port)
   "Build a peer for an accepted inbound CONNECTION from ADDRESS (state :connected,
 inbound t, rate limiters initialized). INBOUND-ONION marks a connection accepted
 on the local onion-service listener (Tor forwarding), whose true network is
-:torv3 even though the socket peer is 127.0.0.1."
+:torv3 even though the socket peer is 127.0.0.1. LOCAL-PORT is the accepting
+listener's own port."
   (let ((peer (make-peer :connection connection
                          :state :connected
                          :address address
                          :inbound t
                          :inbound-onion (and inbound-onion t)
+                         :local-port local-port
                          :connect-time (get-internal-real-time))))
     (init-peer-rate-limiters peer)
     ;; Core's inbound branch has no address in the line (net.cpp:4009).

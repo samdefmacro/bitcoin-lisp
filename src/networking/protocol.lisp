@@ -3386,14 +3386,13 @@ net_processing.cpp:1117-1136). Returns NIL when nothing remains to announce."
   "Random extra lifetime on top of the base (Core's rand(6h)), so the refresh
 instant is not predictable.")
 
-(defvar *addr-response-caches* (make-hash-table :test 'eq)
-  "Requestor network keyword -> (ADDRS . EXPIRY-UNIX). Core keys by
-(network, local listening socket) — H(RANDOMIZER_ID_NETWORKKEY, netclass,
-bind addr, bind port), net.cpp:1832-1836. We key by network ALONE. That is a
-deliberate simplification, not byte parity: our two listeners (clearnet and
-onion, node/listen.lisp) already map to distinct network keywords through
-peer-connected-through-network, so the multi-bind case Core's key exists to
-separate is covered. Two binds on the SAME network would share a cache here.")
+(defvar *addr-response-caches* (make-hash-table :test 'equal)
+  "(requestor network . local listening port) -> (ADDRS . EXPIRY-UNIX). Core
+keys by (network, local listening socket) -- H(RANDOMIZER_ID_NETWORKKEY,
+netclass, bind addr, bind port), net.cpp:1832-1836 -- so a requestor arriving
+through a different bind gets a different snapshot. p2p_getaddr_caching.py
+binds two onion targets and checks each answers from its own cache. The port
+stands for the socket: our listeners are all on loopback or one address.")
 
 (defun clear-addr-response-caches ()
   "Drop every cached getaddr response (tests; also a reset point if the
@@ -3408,7 +3407,7 @@ addresses are dropped HERE, at fill time."
              (address-book-get-addr book :max +addrman-getaddr-max+
                                          :pct +addrman-getaddr-pct+)))
 
-(defun cached-getaddr-response (book network now)
+(defun cached-getaddr-response (book network now &optional local-port)
   "The cached response for a requestor on NETWORK, refilling if absent or
 expired.
 
@@ -3418,11 +3417,12 @@ hit would make responses differ between requestors inside one window whenever a
 ban landed mid-window, which is precisely the fingerprinting signal the cache
 exists to erase. The visible consequence is that we keep gossiping an address
 for up to 27h after banning it; that is Core-identical and intended."
-  (let ((entry (gethash network *addr-response-caches*)))
+  (let* ((key (cons network local-port))
+         (entry (gethash key *addr-response-caches*)))
     (if (and entry (< now (cdr entry)))
         (car entry)
         (let ((addrs (%sample-addr-response book)))
-          (setf (gethash network *addr-response-caches*)
+          (setf (gethash key *addr-response-caches*)
                 (cons addrs (+ now +addr-response-cache-base-seconds+
                                (random (1+ +addr-response-cache-jitter-seconds+)))))
           addrs))))
@@ -3474,7 +3474,8 @@ elicit more than one reply regardless of whether we had addresses to send."
         (dolist (pa (cached-getaddr-response
                      book
                      (peer-connected-through-network peer)
-                     (bl.ser:get-unix-time)))
+                     (bl.ser:get-unix-time)
+                     (peer-local-port peer)))
           (push-address peer pa)))))))
 
 ;;; Local-address self-advertisement (Core MaybeSendAddr's local-address half,

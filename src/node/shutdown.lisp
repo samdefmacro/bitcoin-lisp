@@ -442,7 +442,8 @@ thread; see the shutdown-coordination section above."
     (bl.net:join-thread-or-destroy
      (node-listener-thread *node*) :deadline deadline)
     (bl.net:join-thread-or-destroy
-     (node-onion-listener-thread *node*) :deadline deadline))
+     (node-onion-listener-thread *node*) :deadline deadline)
+    (stop-extra-onion-listeners deadline))
   (setf (node-listener-thread *node*) nil
         (node-onion-listener-thread *node*) nil)
   ;; Disconnect any inbound peers not yet merged into the peer list. The listener

@@ -1881,7 +1881,8 @@ localaddresses for twelve combinations of -externalip, -port, -bind and
                             bl.net:+local-manual+))))))
 
 (defun %start-network-services (network sync listen listen-bind listen-bind-supplied-p
-                               listen-onion tor-control tor-password onion-bind)
+                               listen-onion tor-control tor-password onion-bind
+                               &optional extra-onion-binds)
   "Core Step 12, start node: DNS seeding into the address book, the inbound
 listener, the onion listener with its Tor control connection, and
 -externalip's AddLocal entries."
@@ -1936,7 +1937,12 @@ listener, the onion listener with its Tor control connection, and
                                  :bind (car onion-bind)
                                  :port (cdr onion-bind)))
           ((not listen-bind-supplied-p)
-           (start-onion-listener *node*))))
+           (start-onion-listener *node*)))
+    ;; The other =onion binds (Core binds every entry of onion_binds,
+    ;; CConnman::InitBinds): p2p_getaddr_caching.py:47-51 gives two and
+    ;; connects to both.
+    (dolist (extra extra-onion-binds)
+      (start-extra-onion-listener *node* (car extra) (cdr extra))))
   ;; The torcontrol client that registers the v3 onion service and AddLocal()s
   ;; the .onion address is what -listenonion actually governs. Gated on LISTEN
   ;; as well (Core: -listen=0 soft-disables -listenonion; the config layer
@@ -2043,6 +2049,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (listen t)
                         (listen-bind "0.0.0.0" listen-bind-supplied-p)
                         (onion-bind nil)
+                        (extra-onion-binds nil)
                         (listen-onion t)
                         (tor-control nil)
                         (tor-password nil)
@@ -2201,7 +2208,8 @@ Returns the node instance."
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 
   (%start-network-services network sync listen listen-bind listen-bind-supplied-p
-                           listen-onion tor-control tor-password onion-bind)
+                           listen-onion tor-control tor-password onion-bind
+                           extra-onion-binds)
   ;; -loadblock=<file>: import external block files before declaring the node
   ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
   ;; on it). A file that cannot be opened warns and the rest still run.

@@ -823,6 +823,11 @@ these tests never assert an exact count (a standing rule in this project)."
              :port (+ 18333 i) :services 1 :last-seen now)))
     book))
 
+(defun %cached-addrs (&rest args)
+  "The getaddr response cache lookup (BL.NET's CACHED-GETADDR-RESPONSE), the
+one reach into it for this file."
+  (apply #'bl.net::cached-getaddr-response args))
+
 (test g7-20-getaddr-response-is-cached-per-network
   "G7-20: re-sampling addrman on every getaddr let an attacker reconnect
 repeatedly and harvest many independent samples — enough to reconstruct the
@@ -832,18 +837,27 @@ reconnecting pointless."
   (bl.net::clear-addr-response-caches)
   (let* ((book (%g720-book 200))
          (now 1700000000))
-    (let ((r1 (bl.net::cached-getaddr-response book :ipv4 now))
-          (r2 (bl.net::cached-getaddr-response book :ipv4 (+ now 60)))
-          (r3 (bl.net::cached-getaddr-response
+    (let ((r1 (%cached-addrs book :ipv4 now))
+          (r2 (%cached-addrs book :ipv4 (+ now 60)))
+          (r3 (%cached-addrs
                book :ipv4 (+ now (* 3 60 60)))))
       (is (eq r1 r2) "a second requestor inside the window gets the SAME snapshot")
       (is (eq r1 r3) "still the same snapshot hours later"))
     ;; A different requestor network gets its own snapshot and its own expiry.
-    (let ((v4 (bl.net::cached-getaddr-response book :ipv4 now))
-          (onion (bl.net::cached-getaddr-response book :torv3 now)))
+    (let ((v4 (%cached-addrs book :ipv4 now))
+          (onion (%cached-addrs book :torv3 now)))
       (is (not (eq v4 onion))
           "networks must not share a cache entry"))
-    (is (= 2 (hash-table-count bl.net::*addr-response-caches*)))))
+    (is (= 2 (hash-table-count bl.net::*addr-response-caches*)))
+    ;; ...and so does each accepting SOCKET on one network (Core's key is
+    ;; (network, local bind), net.cpp:1832-1836): p2p_getaddr_caching.py binds
+    ;; two onion targets and expects two snapshots.
+    (let ((onion1 (%cached-addrs book :torv3 now 21001))
+          (onion2 (%cached-addrs book :torv3 now 21002)))
+      (is (eq onion1 (%cached-addrs book :torv3 (+ now 60) 21001))
+          "control: one socket keeps its own snapshot")
+      (is (not (eq onion1 onion2))
+          "two sockets on one network must not share a cache entry"))))
 
 (test g7-20-cache-expires-between-21h-and-27h
   "Expiry is 21h + rand(6h) (Core's m_cache_entry_expiration), so the refresh
@@ -851,18 +865,18 @@ instant is not predictable and cannot itself be used as a clock signal."
   (bl.net::clear-addr-response-caches)
   (let ((book (%g720-book 60))
         (now 1700000000))
-    (let ((first (bl.net::cached-getaddr-response book :ipv4 now)))
+    (let ((first (%cached-addrs book :ipv4 now)))
       ;; Just under the minimum lifetime: still the same object.
-      (is (eq first (bl.net::cached-getaddr-response
+      (is (eq first (%cached-addrs
                      book :ipv4 (+ now (* 21 60 60) -60))))
       ;; Past the maximum lifetime: refilled.
-      (let ((refreshed (bl.net::cached-getaddr-response
+      (let ((refreshed (%cached-addrs
                         book :ipv4 (+ now (* 27 60 60) 60))))
         (is (not (eq first refreshed)) "must refill after the maximum lifetime")))
     ;; The stored expiry must sit inside [21h, 27h].
     (bl.net::clear-addr-response-caches)
-    (bl.net::cached-getaddr-response book :ipv4 now)
-    (let ((expiry (cdr (gethash :ipv4 bl.net::*addr-response-caches*))))
+    (%cached-addrs book :ipv4 now)
+    (let ((expiry (cdr (gethash (cons :ipv4 nil) bl.net::*addr-response-caches*))))
       (is (>= expiry (+ now (* 21 60 60))))
       (is (<= expiry (+ now (* 27 60 60)))))))
 
@@ -878,16 +892,16 @@ Core-identical and intended, so it is asserted here rather than 'fixed'."
   (bl.net:clear-discouraged)
   (let* ((book (%g720-book 40))
          (now 1700000000)
-         (filled (bl.net::cached-getaddr-response book :ipv4 now)))
+         (filled (%cached-addrs book :ipv4 now)))
     (is (plusp (length filled)) "precondition: the cache filled with something")
     ;; Discourage an address that IS in the cached snapshot.
     (let ((victim (bl.net:peer-address-string (first filled))))
       (bl.net:discourage-peer victim)
-      (let ((hit (bl.net::cached-getaddr-response book :ipv4 (+ now 60))))
+      (let ((hit (%cached-addrs book :ipv4 (+ now 60))))
         (is (eq filled hit)
             "a cache HIT must be returned verbatim, not re-filtered"))
       ;; ...but a refill after expiry drops it.
-      (let ((refilled (bl.net::cached-getaddr-response
+      (let ((refilled (%cached-addrs
                        book :ipv4 (+ now (* 28 60 60)))))
         (is (notany (lambda (pa)
                       (string= victim (bl.net:peer-address-string pa)))

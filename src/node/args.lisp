@@ -99,7 +99,8 @@ resolved network. Honors -server (enable RPC on the default port when no
              (parsed (loop for spec in specs
                            collect (multiple-value-list (parse-bind-option spec))))
              (plain (remove-if (lambda (p) (or (null (first p)) (third p))) parsed))
-             (onion (find-if (lambda (p) (and (first p) (third p))) parsed))
+             (onions (remove-if-not (lambda (p) (and (first p) (third p))) parsed))
+             (onion (first onions))
              ;; Core's default_bind_port is -port when given, the chain's port
              ;; otherwise, and default_bind_port_onion is that plus one
              ;; (init.cpp:2117-2118). Read before a plain -bind's own port
@@ -119,6 +120,12 @@ resolved network. Honors -server (enable RPC on the default port when no
           (setf (getf plist :onion-bind)
                 (cons (first onion)
                       (or (second onion) (1+ default-port)))))
+        ;; Every further =onion bind is bound too (Core binds all of
+        ;; onion_binds, CConnman::InitBinds); only the first is the Tor target.
+        (when (rest onions)
+          (setf (getf plist :extra-onion-binds)
+                (loop for (host port) in (rest onions)
+                      collect (cons host (or port (1+ default-port))))))
         (when (and specs (null plain))
           ;; Every -bind was =onion or unparseable. Core binds NO ordinary
           ;; listening socket then: bind_on_any is false as soon as any -bind
