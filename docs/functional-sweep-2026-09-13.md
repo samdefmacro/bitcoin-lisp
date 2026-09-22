@@ -602,4 +602,291 @@ After the sweep, commit messages record six more oracle runs going FAIL → PASS
 (`749d15d4`), `p2p_mutated_blocks` (`5e380b1c`), `p2p_ibd_stalling`
 (`ff43ea04`), `rpc_getblockfrompeer` (`74155cca`) and `feature_notifications`
 (`bdf40a7f`). The sweep of `2a7074c4`, which carries all of round 5, is
-running; its row goes in the table above.
+the last row of the table above.
+
+## Round 6
+
+Nine worktree batches merged onto `main` on 2026-09-23, from `2a7074c4`
+through `bdfd8434`: 188 commits, 14 of them `tests:` commits; seven are
+seams where one batch met another on `main` (`a4024ada`, `40003bad`,
+`c8b0147f`, `9335fe3a`, `e4c68bdc`, `0dab093c`, `bdfd8434`). Each batch ran
+its own green battery on a fresh FASL volume, and the merged battery ran
+before every push (40,290 → 41,577 passing checks, plus four skips: the
+Core-binary lane below, which skips where `/releases` is not mounted); the
+`::` ceiling fell from 3,813 to 3,780. The batches, in merge order: the GA12
+backlog audit
+([gap-analysis-12-backlog.md](gap-analysis-12-backlog.md), 7 commits),
+bitcoin-cli (6), previous-releases compatibility and the Core-binary
+differential lane (8), mempool3 (28), net4 (27), tools and the external signer
+(5), init3 (30), p2p5 (23) and wallet7 (54). The behaviour changes that
+mattered most, by area:
+
+**GA12 audit.** Every item `gap-analysis-11.md` had closed for GA12 was
+re-verified against its commit and test; all fourteen hold, two only partly,
+and both were finished here: a restore source with no newline is refused at a
+64 MiB line instead of buffered until the image dies (`f020f81e`), and a
+pay-to-anchor input is a non-witness signature instead of an ECASE failure
+(`932d8735`). `-rpcworkqueue` stopped being accepted and ignored: a request
+past its depth is Core's 503 `Work queue depth exceeded`, and both HTTP pool
+knobs are `max(atoi, 1)` with Core's 16 and 64 as defaults (`7b468384`,
+httpserver.cpp:255-258, :419, :440).
+
+**bitcoin-cli.** `src/cli/` is Core's `bitcoin-cli.cpp` as its own layer on
+the config layer: SetupCliArgs and ParseParameters' refusals, all 331 rows of
+`vRPCConvertParams`, UniValue's number-preserving printer, CallRPC's port,
+cookie and `-rpcwallet` rules and texts, `-rpcwait`, `-stdin*`, `-getinfo`,
+`-netinfo`, `-generate` and `-addrinfo` (`9ee1a70d`). One saved image serves
+both programs, dispatching on `argv[0]`. Getting the functional tests through
+it took three server changes: a named-params object that repeats a key is
+Core's -8 (`08d01e96`, which is how `-named` with `args=` is refused);
+getnetworkinfo's `networks` lists Core's five networks and the proxy that
+reaches each, where ours had one entry named after the chain (`6ef33f1f`); and
+the RPC server binds `::1` itself, because glibc's `AI_ADDRCONFIG` refuses the
+literal in any container whose only IPv6 address is the loopback -- the Round-5
+note that "the socket library cannot listen on `::1`" is this (`74ce1d07`).
+
+**Previous releases and the differential lane.** Core's own old binaries now
+run inside the container: `scripts/get-previous-releases.sh` fetches and
+SHA256-checks the archives on the host, and `scripts/previous-releases-volume.sh`
+extracts them into a per-checkout volume mounted read-only at `/releases`
+(`f789ecf1`, `5b831e92`; host security software deleted two extracted
+`bitcoind`s within seconds, so they never exist outside the volume). With them,
+a v0.20.1 `mempool.dat` without its unbroadcast set keeps what Core would
+already have loaded (`cf3c8182`), and a pre-0.15 coins database is refused in
+Core's words (`6757d280`). The GA11 harness lane that stayed open is closed:
+`:core-binary-differential-tests` (`tests/rpc/core-binary-differential-tests.lisp`,
+run by `scripts/interop-test.sh`) drives v28.2's `bitcoin-tx` and
+`bitcoin-util` over Core's own vectors -- all 672 decodes agree, 13 creates and
+4 signs are byte-identical, and a ground header passes our proof-of-work check
+(`5b831e92`). Its first catch: a transaction's version is unsigned and
+"coinbase" is decided per transaction; 278 of the 672 decodes disagreed
+before `5ba2aca7`. The `-discover` port (below) and the two `-bind` tests'
+container addresses (`f2ace578`) came from this batch too.
+
+**Mempool and validation.** `mockscheduler` forwards a scheduler clock and no
+longer freezes the node clock, which since the trickle moved onto the
+mockable clock had left every Poisson deadline in a future that never came
+(`0a74a3ff`); the unbroadcast re-announcement is armed at start as Core's is
+(`d9c7161d`). A peer's first trickle pass sends (`a405ecf6`, the round-5
+`p2p_leak_tx` regression), and a noban peer trickles on every pass
+(`fe10ca3c`). The reorg re-filter judges BIP68 and finality below the CSV
+height, finality against median-time-past (`4bc57e9d`). CheckBlock reads the
+mutation flag before the coinbase rules (`b06a8fc6`), a tip block that fails
+AcceptBlock is marked and its sender punished (`4bfe6271`), and the header
+locator never starts at an invalid header (`ba32578d`). Package RBF, Rule 5,
+TRUC sibling eviction and the conflicting-spend refusal carry Core's reasons
+and sentences (`26bd3324`, `76e87987`, `a0aa2835`, `f321bda5`); maxfeerate is
+a per-member PreChecks verdict (`f959ade7`); getrawmempool lists the pool in
+mining order (`4e15f94f`); `OP_CHECKSIGADD` refuses a short stack before it
+reads an operand (`75275cde`).
+
+**Net.** The header tip is Core's `m_best_header`, the most-work header not
+marked invalid (`9fdd65d8`). Headers ending at a block with at least our tip's
+work fetch it directly from the announcer, which is what lets an equal-work
+sibling be downloaded at all (`89324647`, net_processing.cpp:2844-2902). A
+block that fails validation for good punishes the peer that sent it, through
+Core's `mapBlockSource` (`7f9d39fa`), and a reorg announces every new block,
+oldest first (`038232ba`). A getheaders answer records the peer's best header
+sent (`e7fdcb2b`). The addr flush, the self-announcement and the addr token
+bucket run on the mockable clock (`455942dd`, `733b43a3`); a getaddr reply is
+queued for the addr flush (`128206ea`); an addr-fetch connection is dropped
+after 300 s (`e11e1417`). A refused dial fails at once instead of waiting out
+the 10 s timeout on the sync thread (`a3b51ce9`). Core's fixed-seed fallback
+is ported (`dc6893d6`), `-capturemessages` writes Core's capture files
+(`c11a8d8d`), and getnetworkinfo lists `localaddresses` (`4fbc5713`,
+`e171a8b0`). `-discover` is on by default as in Core, adding routable bind and
+interface addresses, and under it a peer's view of our address is advertised
+(`fb1e04d4`, `f253e179`, from the compatibility batch).
+
+**Tools and the external signer.** `src/tools/` carries `bitcoin-util` and
+`bitcoin-tx`, run from the node executable by name and checked in-process
+against Core's 107-vector `bitcoin-util-test.json` (`65deefba`), and
+`bitcoin-wallet` with info, create, dump and createfromdump over our LevelDB
+wallets (`f89ed2f7`; the database format is the documented divergence).
+External signers are ported: `-signer`, `enumeratesigners`,
+`walletdisplayaddress`, a keyless wallet whose descriptors come from the
+device, and send, sendall and bumpfee signing through it (`a7c09ba4`); the
+child runs through temporary files and its stderr is logged (`4bd7fe4b`).
+getblocktemplate's `transactions` is `[]` for an empty mempool, which the
+signet miner iterates (`a54a663b`).
+
+**Init, storage, REST and ZMQ.** A disconnect that cannot run aborts the node
+through `bl.log:fatal-error`, Core's AbortNode (`390765a6`); VerifyDB level 2
+fails a block whose rev file is gone or does not read (`7016c308`,
+`287d4917`); a full flush creates the current block file's rev file
+(`ccb27a2c`); a disconnect moves the prune locks back (`24c67b2a`). `-reindex`
+on a pruned node wipes and rebuilds from nothing, as Core's does
+(`4b0e3cf4`). A startup wallet another process holds stops startup in Core's
+words (`8320ff61`). Every `-rpcbind` is bound at its own port (`fc49e582`), a
+bracketed IPv6 `-rpcallowip` is a subnet (`212bdf47`), a refused address gets
+Core's bare 403 (`739e2b45`), and a `=onion` bind with no port takes `-port`
++ 1 (`801a7de7`, the round-5 `feature_port` regression). REST answers each
+failure with Core's status and bytes (`c60737d6`, `e2be8281`, `2e872421`,
+`acf39ab0`, `b03e990f`, `85db8503`, `7b74d735`, `2cf84441`). ZMQ: a removal
+takes the next mempool sequence (`d418ee3d`), a block's conflicts leave in
+block order (`42fe6610`), hashblock and rawblock announce the new tip once per
+step (`bfa14981`), and a reorg signals its new blocks after the disconnected
+transactions return (`1015f7be`). A snapshot base has a chain transaction
+count and no nTx (`f147d9e2`); the anchors load logs Core's lines, 0 included
+(`38023205`).
+
+**P2P.** The node keeps one IBD context and the receive pump works in it
+(`6921eb25`), which closes the second Round-3 live-node hazard; the net4
+batch's side table for direct fetches then went, and the direct fetch files its
+requests in the one in-flight table (`e4c68bdc`). Per connection, addconnection
+and addnode onetry dial the transport the caller asked for (`3d6841e2`). An
+unfinished handshake times out on the mockable clock, on every tick, with
+Core's V2 and version lines (`19b2737e`); BIP324 errors and messages before
+VERSION or VERACK are logged in Core's words (`e6462ee0`, `7da2b55a`).
+ConsiderEviction runs after each message and on every tick, and only once
+header sync has started (`02b11e8b`, `b6932306`). A `-whitebind` address is
+listened on beside an `=onion` bind (`7cc8f3ba`, the round-5
+`p2p_permissions` regression), every `=onion` bind is listened on and the
+getaddr cache is per socket (`77e0cfdd`). An outbound peer is published when
+its socket opens and addconnection returns then (`37407c11`); a feeler is
+dropped once its handshake is done (`e1e700e0`). A requested transaction is
+never charged to the tx rate limit (`dddbe06d`), a noban peer is spared the
+bucket (`685dc0f4`, `0dab093c`), and a relay-permission peer lifts the
+announcement cap (`252e5382`).
+
+**Wallet and PSBT.** A PSBT is written in Core's field order
+(`5fc266c7`) with a legacy-serialized `non_witness_utxo` (`a5b1c888`), and the
+taproot-derivation, taproot-tree and MuSig2 records are validated as Core
+reads them, so all twenty of `rpc_psbt.py`'s `invalid_with_msg` vectors carry
+Core's sentence (`04ffaf49`). `analyzepsbt` is Core's AnalyzePSBT
+(`5b77c3ec`); `utxoupdatepsbt` and `descriptorprocesspsbt` are ProcessPSBT,
+mempool and descriptors included (`e22cac70`, `2019db8b`); `joinpsbts` clears
+signatures and shuffles (`1511d6e1`); an input whose signatures do not use its
+sighash type does not finalize (`e3984d38`). Non-multisig witness scripts and
+tapscript leaves are signed and finalized through miniscript (`17684e87`,
+`d4b9a78e`), every tapscript signature made reaches the PSBT (`c072db06`,
+`8396a0b1`), and taproot key paths are signed tweaked by the merkle root or,
+for `rawtr()`, untweaked (`67520106`, `90c0793a`, `902fde34`). A `musig()`
+PSBT names its participants and their derivations (`c79de2b1`, `a00db955`).
+send and sendall build their PSBT as FinishTransaction does, so an unsigned
+input is no longer "final" (`443f332c`). bumpfee replaces a non-signaling
+transaction, prices a given rate against the replacement's outputs, carries
+the original's comment, and is not blocked by an abandoned descendant
+(`f03abeb6`, `b31adbab`, `308cb422`, `dd875a75`).
+
+### Round-6 sweep
+
+Binary `bdfd8434` (the whole round; four staggered batches of the harness, the
+flips and time-outs rerun serially with a 900-second cap), classification in
+`docs/functional-sweep-2026-09-13/after-bdfd8434.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
+| `bdfd8434` round 6 | **193** | **59** | **2** | **9** |
+
+Fifty-one tests went from FAIL to PASS (`feature_abortnode`,
+`feature_bip68_sequence`, `feature_cltv`, `feature_dersig`,
+`feature_fee_estimation`, `feature_filelock`, `feature_index_prune`,
+`feature_port`, `feature_remove_pruned_files_on_startup`, `feature_taproot`,
+`interface_rest`, `mempool_limit`, `mempool_packages`, `mempool_persist`,
+`mempool_reorg`, `mempool_truc`, `mempool_unbroadcast`,
+`mining_template_verification`, `p2p_addr_relay`, `p2p_addr_selfannouncement`,
+`p2p_addrfetch`, `p2p_addrv2_relay`, `p2p_getaddr_caching`, `p2p_handshake`,
+`p2p_ibd_stalling`, `p2p_ibd_txrelay`, `p2p_invalid_block`, `p2p_leak_tx`,
+`p2p_message_capture`, `p2p_outbound_eviction`, `p2p_permissions`,
+`p2p_timeouts`, `p2p_v2_encrypted`, `p2p_v2_misbehaving`, `p2p_v2_transport`,
+`rpc_bind`, `rpc_getdescriptoractivity`, `rpc_packages`, `rpc_psbt`,
+`wallet_basic`, `wallet_bumpfee`, `wallet_fundrawtransaction`,
+`wallet_groups`, `wallet_importdescriptors`, `wallet_labels`,
+`wallet_miniscript`, `wallet_miniscript_decaying_multisig_descriptor_psbt`,
+`wallet_multisig_descriptor_psbt`, `wallet_send`,
+`wallet_signrawtransactionwithwallet`, `wallet_taproot`), all three round-5
+regressions among them, and seven from SKIP to PASS (`interface_bitcoin_cli`,
+`mempool_compatibility`, `rpc_signer`, `tool_signet_miner`, `tool_utils`,
+`wallet_listreceivedby`, `wallet_signer`).
+
+Seven former SKIPs now run and fail, each for a stated reason:
+
+- `feature_bind_port_discover` (`:66`) and `feature_bind_port_externalip`
+  fail on Core v28.2's own `bitcoind` at the pin too
+  (`BL_CONFORMANCE_REFERENCE=v28.2`): `test_node.py` adds `-bind` to every node
+  without one, so Core never calls Discover, and nodes bound to 1.1.1.1 are
+  unreachable for `setup_network` (`fb1e04d4`). Broken upstream.
+- `feature_coinstatsindex_compatibility` (`:34`) and
+  `feature_unsupported_utxo_db` (`:56`) need Core's `blocks/index` LevelDB
+  block index, which this node does not read.
+- `tool_wallet` (`:46`), `wallet_backwards_compatibility` (`:278`) and
+  `wallet_migration` (`:139`) assert on SQLite or BDB wallet files, out of
+  scope per [wallet-plan.md](wallet-plan.md).
+
+Nine SKIPs remain: the five `interface_usdt_*` tests need USDT tracepoints,
+bcc and root BPF, which the container policy forbids; `interface_ipc` and
+`interface_ipc_mining` need Cap'n Proto multiprocess; `tool_bench_sanity_check`
+and `tool_bitcoin_chainstate` need binaries only Core builds.
+
+One test left PASS: `rpc_dumptxoutset` `:84`, where the node exits 1 on the
+stop after the test's last step. `feature_pruning` went from a time-out to a
+failure at `:223` (disk usage above the 550 MiB target after 220 large
+blocks), and `feature_block` from a failure at its `send_blocks` helper
+(`:1450`) to a time-out at 900 seconds; `feature_proxy` still times out. The
+first two are handed to a follow-up batch. Eleven failure points moved later
+(`p2p_segwit` 200 → 826, `feature_rbf` 288 → 507, `rpc_rawtransaction` 81 →
+304, `rpc_net` 255 → 343, `feature_config_args` 320 → 388,
+`feature_assumeutxo` 585 → 676, ...), five earlier; those five were not
+checked against their step logs here, and `interface_zmq`'s new `:57` is the
+subscriber's receive helper, so only the step log can compare it.
+
+Deployed: both live nodes to `bdfd8434` -- testnet4 at 04:59 UTC with a
+15-minute soak, then mainnet at 05:17 UTC; both clean. Under `-discover`,
+testnet4's getnetworkinfo `localaddresses` now lists its onion service.
+
+### Decisions recorded in Round 6
+
+- **`-rpcthreads` and `-rpcworkqueue` default to Core's 16 and 64** --
+  `7b468384`, [src/rpc/server.lisp](../src/rpc/server.lisp) (the two
+  default constants). The unbounded pool is gone.
+- **`-discover` is on by default, as in Core**, soft-set off by a real
+  `-proxy`, `-listen=0` or `-externalip`; only fully routable addresses are
+  advertised, so a container or LAN address never is. The live nodes now
+  advertise their routable addresses. `fb1e04d4`, the manual's net section.
+- **NET_ADMIN is granted by `scripts/conformance.sh` only to a run that
+  includes one of the two `-bind` tests**, for `/32` aliases in the
+  container's own network namespace; never `--privileged`, host networking or
+  a published port (`f2ace578`, `scripts/conformance.sh`).
+- **The per-peer tx rate-limit bucket stays**, though Core has no
+  per-message-type disconnect: a noban peer and a transaction we requested are
+  exempt (`685dc0f4`, `dddbe06d`, `0dab093c`). Whether it should exist at 10/s
+  is left open; a mainnet peer can exceed it in a fee spike.
+- **The per-pass getheaders to the sync peer (ours, not Core's) is skipped
+  when that peer is caught up** (`89820698`); a peer we know nothing about is
+  still asked.
+- **Mempool finality below the CSV height uses median-time-past**, as Core's
+  CheckFinalTxAtTip always does; the pre-BIP113 wall-clock rule is gone from
+  both acceptance and the reorg re-filter (`4bc57e9d`).
+- **The `addcon`, `scheduler`, `msghand` and index `thread start` lines are
+  not logged**, because those threads do not exist here; only threads that
+  exist are traced (`TRACE-THREAD`, [src/logging.lisp](../src/logging.lisp)).
+  `feature_init` `:93` and `feature_config_args` `:388` wait for them and stay
+  red.
+- **`peers.dat` stays our bucket format** (`feature_addrman` `:65`,
+  `feature_asmap` `:89` stay red), and **`anchors.dat` stays the
+  network-typed format** of `SAVE-ANCHORS`
+  ([src/node/peers.lisp](../src/node/peers.lisp)).
+- **The equal-work first-seen tie-break needs the per-block receive order**,
+  which the index does not keep; `feature_chain_tiebreaks` now fetches the
+  sibling (`89324647`) and stops at `:94`.
+- **`-reindex` without `-prune` stays additive**; a pruned `-reindex` now wipes
+  as Core's does (`4b0e3cf4`). See "Known divergence" above.
+- **The external signer is always compiled in** (`a7c09ba4`, the manual's
+  wallet section): Core's `ENABLE_EXTERNAL_SIGNER` is advertised
+  unconditionally. [wallet-plan.md](wallet-plan.md) §1 still lists external
+  signers as out of scope and needs updating.
+- **MuSig2 signing is out of scope**: a `musig()` aggregate has no private key
+  of its own here, so it yields none; participants and derivations are
+  written, nonces and partial signatures are not (`f6bedebb`).
+- **`wallet.dat` as a file, and absolute wallet paths, stay documented
+  divergences** ("Wallet files by name" above; Round 5's decision on absolute
+  paths).
+- **`tool_wallet`'s SQLite-file assertions stay red**: our wallet database is
+  a LevelDB directory, so `Format:` reads `leveldb` and the lock sentence
+  names it; a copy of the test with only those assertions adapted passes end
+  to end (`f89ed2f7`, the manual's tools section).
