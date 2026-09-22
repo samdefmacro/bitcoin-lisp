@@ -729,12 +729,15 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
     ;; Check timestamp > median-time-past of previous 11 blocks. PREV-ENTRY is
     ;; preferred over the hash: a hash lookup cannot see a parent that is not in
-    ;; the index.
-    (when (or prev-entry (and chain-state prev-hash))
-      (when (header-time-too-old-p
-             header (or prev-entry
-                        (bl.store:get-block-index-entry
-                         chain-state prev-hash)))
+    ;; the index. With NO parent there is no MTP to judge against: Core's
+    ;; time-too-old is ContextualCheckBlockHeader's, reached only after the
+    ;; parent lookup (validation.cpp:4247-4257), so a block on an unknown
+    ;; parent is prev-blk-not-found, never time-too-old
+    ;; (mining_template_verification.py:152 submits one).
+    (let ((parent (or prev-entry
+                      (and chain-state prev-hash
+                           (bl.store:get-block-index-entry chain-state prev-hash)))))
+      (when (and parent (header-time-too-old-p header parent))
         (return-from validate-block-header
           (values nil :time-too-old))))
 
@@ -3643,6 +3646,9 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     ;; ScriptError beside it.
     (:block-script-verify-flag-failed . "block-script-verify-flag-failed") ; :2119
     (:bad-proof-of-work          . "high-hash")                          ; :3864 CheckBlockHeader
+    ;; AcceptBlockHeader's parent lookup (validation.cpp:4249), which
+    ;; ProcessNewBlock hands to BlockChecked and so to submitblock.
+    (:unknown-parent             . "prev-blk-not-found")
     ;; mining_template_verification.py:125 reads it from a proposal.
     (:bad-difficulty             . "bad-diffbits")                       ; :4121 ContextualCheckBlockHeader
     (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot

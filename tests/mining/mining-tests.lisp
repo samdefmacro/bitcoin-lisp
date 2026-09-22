@@ -1101,6 +1101,30 @@ few whose Core reject reason is spelled differently, so it is rendered through
                                (bl.ser:serialize-witness-block good))))))
         (is (= 1 (bl.store:current-height (bl:node-chain-state node))))))))
 
+(test submitblock-on-an-unknown-parent-is-prev-blk-not-found
+  "A mined block whose parent is not in the index passes CheckBlock and is
+refused by AcceptBlockHeader's parent lookup, `prev-blk-not-found'
+(validation.cpp:4247-4249), which ProcessNewBlock hands to BlockChecked and so
+to submitblock. time-too-old is ContextualCheckBlockHeader's and is reached
+only AFTER that lookup; ours judged the timestamp against a missing parent's
+MTP -- treated as infinitely late -- and answered time-too-old, then would
+have said unknown-parent. mining_template_verification.py:152."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "submit-unknown-parent"))
+           (good (bl.mining:assemble-full-block
+                  (bl:node-chain-state node) (bl:node-mempool node)
+                  :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+           (header (bl.ser:bitcoin-block-header good)))
+      (setf (bl.ser:block-header-prev-block header)
+            (make-array 32 :element-type '(unsigned-byte 8) :initial-element 123)
+            (bl.ser:block-header-cached-hash header) nil)
+      (bl.mining:mine-block good)
+      (is (string= "prev-blk-not-found"
+                   (bl.rpc:dispatch-rpc-method
+                    node "submitblock"
+                    (list (bl.crypto:bytes-to-hex
+                           (bl.ser:serialize-witness-block good)))))))))
+
 (test submitblock-header-only-entry-proceeds
   ;; Standard pool flow: submitheader, then submitblock. The header-only index
   ;; entry must NOT short-circuit as "duplicate" (Core returns "duplicate" only
