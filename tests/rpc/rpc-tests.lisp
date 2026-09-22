@@ -9878,7 +9878,12 @@ always answered []."
              (let ((rec (elt la 0)))
                (is (equal "42.42.42.42" (cdr (assoc "address" rec :test #'string=))))
                (is (eql 18444 (cdr (assoc "port" rec :test #'string=))))
-               (is (eql bl.net:+local-manual+ (cdr (assoc "score" rec :test #'string=)))))))
+               (is (eql bl.net:+local-manual+ (cdr (assoc "score" rec :test #'string=)))))
+             ;; And it ENCODES: a vector of alists passed the Lisp-level checks
+             ;; above and still failed on the wire with -32603.
+             (is (search "\"localaddresses\":[{\"address\":\"42.42.42.42\",\"port\":18444"
+                         (%encode-rpc-result
+                          (bl.rpc:dispatch-rpc-method node "getnetworkinfo" nil))))))
       (bl.net:clear-local-addresses))))
 
 (test rpc-getaddednodeinfo-reports-state
