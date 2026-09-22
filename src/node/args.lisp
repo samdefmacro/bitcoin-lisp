@@ -78,6 +78,17 @@ resolved network. Honors -server (enable RPC on the default port when no
         (when (and b (conf-parse-bool (cdr b)) (not (lookup "walletbroadcast")))
           (setf (getf plist :wallet-broadcast) nil)
           (defer-log :info "Parameter interaction: -blocksonly=1 -> setting -walletbroadcast=0")))
+      ;; The listen chain, applied once, for both flags -- and BEFORE the -bind
+      ;; checks below, because Core refuses -bind/-whitebind with -listen=0 in
+      ;; AppInitParameterInteraction (init.cpp:1016-1020), long before
+      ;; CConnman::Init reports a duplicate binding (:2252);
+      ;; p2p_permissions.py:102 passes both faults at once and expects the
+      ;; -listen=0 one.
+      (multiple-value-bind (listen-p listen-onion-p)
+          (conf-effective-listen-flags alist)
+        (setf (getf plist :listen) listen-p)
+        (unless listen-onion-p
+          (setf (getf plist :listen-onion) nil)))
       ;; -bind=<addr>[:<port>][=onion] (Core init.cpp; the functional framework
       ;; passes both forms, test_node.py:272-276). The scalar scan above already
       ;; took the last plain value into :listen-bind; re-derive it here so the
@@ -93,7 +104,8 @@ resolved network. Honors -server (enable RPC on the default port when no
              ;; otherwise, and default_bind_port_onion is that plus one
              ;; (init.cpp:2117-2118). Read before a plain -bind's own port
              ;; overwrites :PORT below: that port is the listener's, not -port.
-             (default-port (or (getf plist :port) (network-port network))))
+             (default-port (or (getf plist :port) (network-port network)))
+             (whitebind (%first-whitebind-address alist)))
         ;; An =onion entry names the onion-service TARGET this node listens on
         ;; (init.cpp:2141-2147 pushes it into onion_binds, and :2175 makes the
         ;; first one the Tor target). Its port defaults to
@@ -113,7 +125,16 @@ resolved network. Honors -server (enable RPC on the default port when no
           ;; is given (init.cpp:2162), and vBinds is empty, so the onion target
           ;; is the only socket. Ours dropped the raw spec and fell back to the
           ;; 0.0.0.0 default, i.e. it listened on a port nobody asked for.
-          (setf (getf plist :listen-bind) nil))
+          ;;
+          ;; ... except a -whitebind, which Core binds too (vWhiteBinds,
+          ;; init.cpp:2154-2158): p2p_permissions.py:61-66 swaps node1's
+          ;; `bind' for `whitebind=...@127.0.0.1:<p2p port>' and adds an
+          ;; =onion bind, then dials the whitebind address. We run one
+          ;; listener, so the first whitebind address is it; its permissions
+          ;; stay the inbound grant *WHITEBIND-FLAGS* already applies.
+          (setf (getf plist :listen-bind) (first whitebind))
+          (when (second whitebind)
+            (setf (getf plist :port) (second whitebind))))
         (when plain
           (destructuring-bind (host port onion-p) (first plain)
             (declare (ignore onion-p))
@@ -149,12 +170,6 @@ resolved network. Honors -server (enable RPC on the default port when no
         (when (and server (conf-parse-bool (cdr server))
                    (not (getf plist :rpc-port)))
           (setf (getf plist :rpc-port) (network-rpc-port network))))
-      ;; The listen chain, applied once, for both flags.
-      (multiple-value-bind (listen-p listen-onion-p)
-          (conf-effective-listen-flags alist)
-        (setf (getf plist :listen) listen-p)
-        (unless listen-onion-p
-          (setf (getf plist :listen-onion) nil)))
       ;; -maxconnections: Core refuses a negative value outright
       ;; (init.cpp:1032-1036), AFTER the listen chain above has read it -- a
       ;; -maxconnections<=0 still soft-sets -listen=0 and -dnsseed=0, which is
@@ -409,6 +424,16 @@ and this error exist."
                collect (format nil "Config setting for -~A only applied on ~A ~
                                     network when in [~A] section."
                                name chain chain)))))))
+
+(defun %first-whitebind-address (alist)
+  "The first -whitebind's ADDRESS half as (host port), or NIL: `perms@addr:port'
+with the permissions stripped, parsed as a -bind value."
+  (loop for (k . v) in alist
+        when (and (string= k "whitebind") (stringp v))
+          do (let* ((at (position #\@ v))
+                    (address (if at (subseq v (1+ at)) v)))
+               (multiple-value-bind (host port) (parse-bind-option address)
+                 (when host (return (list host port)))))))
 
 (defun %check-binding-conflicts (alist parsed default-port whitebinds)
   "Core CheckBindingConflicts (init.cpp:1271-1297), run over the three binding

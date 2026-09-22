@@ -1096,7 +1096,16 @@ port overrides -port for the listener, as it does in Core."
   (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18445" "-bind=127.0.0.2:18446") nil)))
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
-    (is (= 18445 (getf plist :port)))))
+    (is (= 18445 (getf plist :port))))
+  ;; A -whitebind is bound too (Core vWhiteBinds, init.cpp:2154-2158), so an
+  ;; =onion bind beside it still leaves its address listening:
+  ;; p2p_permissions.py:61-66 dials exactly that address.
+  (let ((plist (start-node-plist
+                '("-regtest" "-whitebind=bloomfilter,forcerelay@127.0.0.1:18447"
+                  "-bind=127.0.0.1:18448=onion") nil)))
+    (is (string= "127.0.0.1" (getf plist :listen-bind)))
+    (is (= 18447 (getf plist :port)))
+    (is (equal '("127.0.0.1" . 18448) (getf plist :onion-bind)))))
 
 (defun %start-node-plist-refusal (&rest args)
   "The message ARGS->START-NODE-PLIST refuses the command line ARGS with, or
@@ -1160,7 +1169,17 @@ twice. We used to record the bind address and start deaf on it, discarding the
     ;; Core sums the two lists, so either one alone is enough.
     (is (string= message (%start-node-plist-refusal
                           "-regtest" "-bind=127.0.0.1" "-whitebind=noban@127.0.0.1:19444"
-                          "-listen=0"))))
+                          "-listen=0")))
+    ;; And it is refused BEFORE the duplicate-binding check, as in Core
+    ;; (init.cpp:1016-1020 runs long before :2252): p2p_permissions.py:102
+    ;; passes -bind=127.0.0.1 to a node whose bitcoin.conf already says
+    ;; bind=127.0.0.1 -- the same socket twice -- and expects the -listen=0
+    ;; refusal.
+    (is (string= message
+                 (%config-refusal
+                  (start-node-plist
+                   '("-regtest" "-whitebind=noban@127.0.0.1" "-bind=127.0.0.1" "-listen=0")
+                   (format nil "[regtest]~%bind=127.0.0.1~%"))))))
   ;; The soft-set side is untouched: -bind still WINS over -connect and
   ;; -proxy, and a bind with no -listen at all listens.
   (is-false (%start-node-plist-refusal "-regtest" "-bind=127.0.0.1"))
