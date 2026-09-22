@@ -521,12 +521,16 @@ key hash-set + a single append."
 
 (bl.rpc:define-rpc "joinpsbts" (node params)
   "Join distinct PSBTs (different inputs/outputs) into one. PARAMS: (txs).
-Mirrors Core joinpsbts (version=max, locktime=min, concatenated inputs/outputs;
-we do not shuffle indices)."
+Core joinpsbts (rpc/rawtransaction.cpp:1780-1880): version the highest,
+locktime the lowest; each input goes in through AddInput, which CLEARS its
+partial signatures and final scriptSig/witness (psbt.cpp:52-63) -- the joined
+transaction is a different one, so no signature over the old one survives
+(rpc_psbt.py:921); and the inputs and outputs are SHUFFLED (:1850-1870), which
+rpc_psbt.py:923-930 checks by joining ten times."
   (declare (ignore node))
   (let ((b64s (bl.rpc:positional-array (first params))))
     (unless (and (listp b64s) (>= (length b64s) 2))
-      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "At least two PSBTs are required"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "At least two PSBTs are required to join PSBTs."))
     (let ((psbts (mapcar #'%psbt-decode-arg b64s))
           (version 1) (locktime #xffffffff)
           (ins '()) (outs '()) (in-maps '()) (out-maps '())
@@ -543,25 +547,33 @@ we do not shuffle indices)."
                                          (bl.ser:outpoint-index op))
                 do (when (gethash key seen)
                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                       :message "Input exists in multiple PSBTs"))
+                                       :message (format nil "Input ~A:~D exists in multiple PSBTs"
+                                                        (bl.rpc:hash-to-hex (bl.ser:outpoint-hash op))
+                                                        (bl.ser:outpoint-index op))))
                    (setf (gethash key seen) t)
                    (push in ins)
-                   (push (aref (bl.ser:psbt-inputs p) i) in-maps))
+                   (let ((map (aref (bl.ser:psbt-inputs p) i)))
+                     (dolist (type (list bl.ser:+psbt-in-partial-sig+
+                                         bl.ser:+psbt-in-final-scriptsig+
+                                         bl.ser:+psbt-in-final-scriptwitness+))
+                       (bl.ser:psbt-map-remove-type map type))
+                     (push map in-maps)))
           (loop for out across (bl.ser:transaction-outputs tx)
                 for i from 0
                 do (push out outs)
                    (push (aref (bl.ser:psbt-outputs p) i) out-maps))
           (%psbt-merge-map! merged-global (bl.ser:psbt-global p))))
-      (let* ((tx (bl.ser:make-transaction
+      (let* ((rng (%rng))
+             (in-pairs (wrng-shuffle rng (mapcar #'cons (nreverse ins) (nreverse in-maps))))
+             (out-pairs (wrng-shuffle rng (mapcar #'cons (nreverse outs) (nreverse out-maps))))
+             (tx (bl.ser:make-transaction
                   :version version
-                  :inputs (coerce (nreverse ins) 'simple-vector)
-                  :outputs (coerce (nreverse outs) 'simple-vector)
+                  :inputs (map 'simple-vector #'car in-pairs)
+                  :outputs (map 'simple-vector #'car out-pairs)
                   :lock-time locktime))
              (result (bl.ser:make-empty-psbt tx)))
-        (setf (bl.ser:psbt-inputs result)
-              (coerce (nreverse in-maps) 'simple-vector))
-        (setf (bl.ser:psbt-outputs result)
-              (coerce (nreverse out-maps) 'simple-vector))
+        (setf (bl.ser:psbt-inputs result) (map 'simple-vector #'cdr in-pairs))
+        (setf (bl.ser:psbt-outputs result) (map 'simple-vector #'cdr out-pairs))
         ;; carry over non-tx global records (xpubs / version / proprietary)
         (dolist (rec (bl.ser:psbt-map-records merged-global))
           (unless (= (bl.ser:psbt-key-type (car rec))

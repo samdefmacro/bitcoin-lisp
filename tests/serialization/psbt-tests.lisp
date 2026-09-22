@@ -1727,3 +1727,43 @@ the UTXO set, so these unconfirmed coins got nothing at all."
                      (keys-of (rpc nil "utxoupdatepsbt" psbt
                                    (mapcar (lambda (a) (%aval "desc" (rpc "w" "getaddressinfo" a)))
                                            addrs))))))))))
+
+(test joinpsbts-clears-signatures-and-shuffles
+  "joinpsbts adds each input through AddInput, which clears its partial
+signatures and final scriptSig/witness (psbt.cpp:52-63) -- a signature over
+the old transaction is worthless in the joined one (rpc_psbt.py:921) -- and
+shuffles the joined inputs and outputs (rpc/rawtransaction.cpp:1850-1870;
+rpc_psbt.py:923-930 joins ten times looking for a different order). Ours kept
+the final witness and concatenated in order. The other records of an input
+survive (the control)."
+  (let* ((node (bl:make-node :network :regtest))
+         (mk (lambda (ch n)
+               (%psbt-createpsbt
+                node (list (list (list (cons "txid" (make-string 64 :initial-element ch))
+                                       (cons "vout" 0)))
+                           (list (list (cons (bl.crypto:encode-p2sh-address
+                                              (bl.crypto:hash160 +optrue-redeem+) :regtest)
+                                             n)))))))
+         (a (bl.ser:decode-psbt (funcall mk #\a 0.1d0)))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (b64s nil))
+    (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs a) 0)
+                         bl.ser:+psbt-in-final-scriptwitness+ empty
+                         (coerce #(1 1 1) '(simple-array (unsigned-byte 8) (*))))
+    ;; A final input is written with none of its other signing records
+    ;; (psbt.h:312), so the control's record sits on another PSBT's input.
+    (let ((b (bl.ser:decode-psbt (funcall mk #\b 0.2d0))))
+      (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs b) 0) bl.ser:+psbt-in-sighash+ empty
+                           (coerce #(1 0 0 0) '(simple-array (unsigned-byte 8) (*))))
+      (setf b64s (list (bl.ser:encode-psbt a) (bl.ser:encode-psbt b)
+                       (funcall mk #\c 0.3d0) (funcall mk #\d 0.4d0))))
+    (let* ((joins (loop repeat 10
+                        collect (bl.rpc:dispatch-rpc-method node "joinpsbts" (list b64s))))
+           (joined (bl.ser:decode-psbt (first joins))))
+      (is (notany (lambda (m) (bl.ser:psbt-map-find m bl.ser:+psbt-in-final-scriptwitness+))
+                  (bl.ser:psbt-inputs joined)))
+      (is (some (lambda (m) (bl.ser:psbt-map-find m bl.ser:+psbt-in-sighash+))
+                (bl.ser:psbt-inputs joined))
+          "the control: the input's other records survive")
+      (is (< 1 (length (remove-duplicates joins :test #'string=)))
+          "ten joins of four PSBTs all came out in one order"))))
