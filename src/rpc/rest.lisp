@@ -96,8 +96,26 @@ response. Caller has already validated EXT is one of those."
       (%rest-json (rpc-getblockchaininfo node nil))
       (%rest-format-not-found "json")))
 
+(defun %rest-parse-height (text)
+  "TEXT as Core's ToIntegral<int32_t> reads it (util/strencodings.h:
+std::from_chars over the whole string): an optional minus sign and decimal
+digits, nothing else -- no `+', no whitespace, no trailing junk -- and inside
+int32 range. NIL otherwise."
+  (let* ((digits (if (and (plusp (length text)) (char= (char text 0) #\-))
+                     (subseq text 1)
+                     text)))
+    (when (and (plusp (length digits)) (every #'digit-char-p digits))
+      (let ((value (parse-integer text)))
+        (when (<= (- (expt 2 31)) value (1- (expt 2 31)))
+          value)))))
+
 (defun %rest-blockhashbyheight (node body ext)
-  (let ((height (parse-integer body :junk-allowed t)))
+  "/rest/blockhashbyheight/<height> (Core rest_blockhash_by_height,
+rest.cpp:1017-1058). The .bin answer is the hash as it is serialized -- the
+uint256 streamed in internal byte order (`ss_blockhash << GetBlockHash()') --
+while .hex and .json carry GetHex's display order, the byte reverse of it;
+interface_rest.py:270-272 reverses the .bin bytes to compare them."
+  (let ((height (%rest-parse-height body)))
     (unless (and height (>= height 0))
       (return-from %rest-blockhashbyheight
         (%rest-error 400 (format nil "Invalid height: ~A" body))))
@@ -108,7 +126,11 @@ response. Caller has already validated EXT is one of those."
           (%rest-error 404 "Block height out of range")))
       (%rest-by-ext ext
         :json (%rest-json `(("blockhash" . ,hash-hex)))
-        :hex/bin (%rest-hex-or-bin ext hash-hex)))))
+        :hex/bin (if (string= ext "bin")
+                     (%rest-respond 200 "application/octet-stream"
+                                    (bl.crypto:reverse-bytes
+                                     (bl.crypto:hex-to-bytes hash-hex)))
+                     (%rest-hex-or-bin ext hash-hex))))))
 
 (defun %rest-block (node body ext &key notxdetails)
   "/rest/block/<hash> and /rest/block/notxdetails/<hash>.

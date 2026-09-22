@@ -5969,6 +5969,31 @@ compares the whole line against `Invalid hash: abc'."
                       (search "Header count is invalid or out of acceptable range (1-2000): 0" b))
                  "count=0: ~S" b)))))
 
+(test rest-blockhashbyheight-bin-is-the-serialized-hash
+  "Core's /rest/blockhashbyheight .bin streams the uint256 as serialized
+(internal byte order), .hex and .json its GetHex display order
+(rest.cpp:1017-1058); interface_rest.py:270-272 reverses the .bin bytes and
+compares them with the display hash. The height is read by ToIntegral, which
+takes digits and nothing else, so `+1' and `0x' are `Invalid height' (:276)."
+  (with-network (:regtest)
+   (let ((node (regtest-node-fixture "rest-hashbyheight")))
+    (flet ((body-of (uri)
+             (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+               (handler-case (rest-request node uri)
+                 (error (e) (princ-to-string e))))))
+      (let ((display (string-trim '(#\Newline)
+                                  (body-of "/rest/blockhashbyheight/0.hex")))
+            (bin (body-of "/rest/blockhashbyheight/0.bin")))
+        (is (= 64 (length display)))
+        (is (equalp (reverse (bl.crypto:hex-to-bytes display))
+                    (coerce bin '(vector (unsigned-byte 8))))
+            "the .bin bytes must be the display hash reversed"))
+      (dolist (bad '("+1" "0x" " 1" "1 "))
+        (let ((b (body-of (format nil "/rest/blockhashbyheight/~A.json" bad))))
+          (is-true (and (stringp b)
+                        (search (format nil "Invalid height: ~A" bad) b))
+                   "~S: ~S" bad b)))))))
+
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
 serving something wrong or signalling out of the handler."
