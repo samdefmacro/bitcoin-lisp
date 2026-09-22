@@ -1963,48 +1963,67 @@ ignored."
 
 (defun read-core-mempool-file-bytes (data)
   "Parse DATA as a Core mempool.dat. Returns
-(values entries residual-deltas ok-p unbroadcast-txids), the same shape
+(values entries residual-deltas ok-p unbroadcast-txids failed-at), the shape
 READ-MEMPOOL-FILE returns, or (values nil nil nil nil) when DATA is not one.
 
 Core returns false for any version it does not know (mempool_persist.cpp:69)
-and starts with an empty mempool; so do we."
-  (handler-case
-      (let* ((br (bl.ser:make-byte-reader-from data))
-             (version (bl.ser:br-read-u64-le br))
-             (payload-offset 8)
-             (key nil))
-        (cond
-          ((= version +core-mempool-dump-version-no-xor-key+))
-          ((= version +core-mempool-dump-version+)
-           (let ((n (bl.ser:br-read-compact-size br)))
-             (unless (= n +core-mempool-obfuscation-key-size+)
-               (return-from read-core-mempool-file-bytes (values nil nil nil nil)))
-             (setf key (bl.ser:br-read-bytes br n)
-                   ;; 8 for the version, 1 for the compact size, 8 for the key.
-                   payload-offset +core-mempool-payload-offset+)))
-          (t (return-from read-core-mempool-file-bytes (values nil nil nil nil))))
-        (let ((payload (subseq data payload-offset)))
-          (when key
-            (bl.store:obfuscate! payload key :key-offset payload-offset))
-          (let* ((pr (bl.ser:make-byte-reader-from payload))
-                 (count (bl.ser:br-read-u64-le pr))
-                 (entries '()))
-            (dotimes (i count)
-              (let* ((tx (bl.ser:br-read-transaction pr))
-                     (time (bl.ser:br-read-i64-le pr))
-                     (delta (bl.ser:br-read-i64-le pr)))
-                (push (list tx time delta) entries)))
-            (let ((residual '())
-                  (unbroadcast '()))
-              (dotimes (i (bl.ser:br-read-compact-size pr))
-                (let ((txid (bl.ser:br-read-bytes pr 32)))
-                  (push (cons txid (bl.ser:br-read-i64-le pr))
-                        residual)))
-              (dotimes (i (bl.ser:br-read-compact-size pr))
-                (push (bl.ser:br-read-bytes pr 32) unbroadcast))
-              (values (nreverse entries) (nreverse residual) t
-                      (nreverse unbroadcast))))))
-    (error () (values nil nil nil nil))))
+and starts with an empty mempool; so do we.
+
+A file whose HEADER is good but whose body stops short is not all-or-nothing
+in Core: LoadMempool accepts each transaction as soon as it has read it, then
+reads the delta map, applies it, and only then reads the unbroadcast set
+(node/mempool_persist.cpp:88-145), so whatever was read before the exception
+has already taken effect when it returns false. That is what lets a 0.20.1
+dump load: it is a version-1 file that ENDS after the delta map (the
+unbroadcast set arrived in 0.21), and mempool_compatibility.py:64 asserts the
+old node's transaction reaches the new node's pool. So OK-P is NIL for such a
+file as it is for Core, but ENTRIES (and RESIDUAL-DELTAS, when the map was
+read whole) hold what was read, and FAILED-AT names the section that was cut
+short -- :transactions, :deltas or :unbroadcast -- for the loader to apply
+exactly what Core would have applied. FAILED-AT is NIL for a complete file."
+  (let ((entries '()) (residual '()) (unbroadcast '()) (stage :header))
+    (handler-case
+        (let* ((br (bl.ser:make-byte-reader-from data))
+               (version (bl.ser:br-read-u64-le br))
+               (payload-offset 8)
+               (key nil))
+          (cond
+            ((= version +core-mempool-dump-version-no-xor-key+))
+            ((= version +core-mempool-dump-version+)
+             (let ((n (bl.ser:br-read-compact-size br)))
+               (unless (= n +core-mempool-obfuscation-key-size+)
+                 (return-from read-core-mempool-file-bytes (values nil nil nil nil)))
+               (setf key (bl.ser:br-read-bytes br n)
+                     ;; 8 for the version, 1 for the compact size, 8 for the key.
+                     payload-offset +core-mempool-payload-offset+)))
+            (t (return-from read-core-mempool-file-bytes (values nil nil nil nil))))
+          (let ((payload (subseq data payload-offset)))
+            (when key
+              (bl.store:obfuscate! payload key :key-offset payload-offset))
+            (let* ((pr (bl.ser:make-byte-reader-from payload))
+                   (count (bl.ser:br-read-u64-le pr)))
+              (setf stage :transactions)
+              (dotimes (i count)
+                (let* ((tx (bl.ser:br-read-transaction pr))
+                       (time (bl.ser:br-read-i64-le pr))
+                       (delta (bl.ser:br-read-i64-le pr)))
+                  (push (list tx time delta) entries)))
+              (setf stage :deltas)
+              (let ((deltas '()))
+                (dotimes (i (bl.ser:br-read-compact-size pr))
+                  (let ((txid (bl.ser:br-read-bytes pr 32)))
+                    (push (cons txid (bl.ser:br-read-i64-le pr)) deltas)))
+                (setf residual (nreverse deltas)))
+              (setf stage :unbroadcast)
+              (let ((ids '()))
+                (dotimes (i (bl.ser:br-read-compact-size pr))
+                  (push (bl.ser:br-read-bytes pr 32) ids))
+                (setf unbroadcast (nreverse ids)))
+              (values (nreverse entries) residual t unbroadcast nil))))
+      (error ()
+        (if (eq stage :header)
+            (values nil nil nil nil)
+            (values (nreverse entries) residual nil nil stage))))))
 
 (defun %save-bytes-atomically (path bytes)
   "Write BYTES to PATH via a temp file, fsync and rename — the same crash-safe
@@ -2090,7 +2109,9 @@ list of (tx entry-time fee-delta) in file (parents-first) order,
 RESIDUAL-DELTAS is an alist of (txid . delta), and UNBROADCAST-TXIDS is a
 list of txids awaiting initial broadcast. OK-P is NIL when the file is
 missing, corrupt, or an unknown version — callers continue with an empty
-mempool, like Core.
+mempool, like Core. A Core-format file whose body stops short also answers
+OK-P NIL, with a fifth value naming the section that was cut short and the
+entries read before it (READ-CORE-MEMPOOL-FILE-BYTES).
 
 BOTH formats are accepted: Core's, which we now write, and the legacy one this
 node used to write. The two are told apart by their first four bytes — the

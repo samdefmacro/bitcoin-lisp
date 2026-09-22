@@ -3060,6 +3060,47 @@ the total and reports every 10% (mempool_persist.cpp:77-86)."
              (is (search "Imported mempool" logged))))
       (ignore-errors (delete-file path)))))
 
+(test a-mempool-dat-without-the-unbroadcast-set-keeps-what-it-loaded
+  "Core 0.20.1 writes a version-1 mempool.dat that ENDS after the fee-delta map:
+the unbroadcast set arrived in 0.21. Core's LoadMempool accepts each
+transaction as it reads it, so when the read of the missing set throws, the
+transactions are already in the pool and stay there; the load reports failure
+and the node carries on (node/mempool_persist.cpp:105-145).
+mempool_compatibility.py:64 moves such a file under a new node and asserts the
+old node's transaction is in its mempool. Ours parsed the whole file before
+accepting anything, so the missing tail threw every transaction away."
+  (let ((path (merge-pathnames (format nil "bl-mempool-v0201-~D.dat" (get-universal-time))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (let ((txids (let ((bl.mp:*persist-mempool-v1* t))
+                        (%write-mempool-file path))))
+           ;; Cut the unbroadcast set off: a compact-size 1 and one txid. What
+           ;; is left is byte for byte the layout 0.20.1 writes.
+           (let ((bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                          (let ((v (make-array (file-length in)
+                                               :element-type '(unsigned-byte 8))))
+                            (read-sequence v in)
+                            v))))
+             (is (= 1 (aref bytes (- (length bytes) 33)))
+                 "the fixture's last 33 bytes are not the one-txid unbroadcast set")
+             (with-open-file (out path :direction :output :if-exists :supersede
+                                       :element-type '(unsigned-byte 8))
+               (write-sequence bytes out :end (- (length bytes) 33))))
+           (let* ((node (%mempool-node 3))
+                  (mempool (bl:node-mempool node))
+                  (result :unset)
+                  (logged (with-output-to-string (out)
+                            (let ((bl:*log-stream* out))
+                              (setf result (bl:load-mempool-from-disk node path))))))
+             (is (= 3 (bl.mp:mempool-count mempool))
+                 "the transactions read before the missing tail are kept")
+             (dolist (txid txids)
+               (is-true (bl.mp:mempool-has mempool txid)))
+             (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))
+             (is (null result) "the load still reports that the file was short")
+             (is (search "Failed to deserialize mempool data on file" logged))))
+      (ignore-errors (delete-file path)))))
+
 (test rpc-importmempool-unbroadcast-option
   "The saved unbroadcast set is restored by the startup load
 (load-mempool-from-disk defaults apply-unbroadcast on, Core

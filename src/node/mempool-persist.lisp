@@ -111,9 +111,9 @@ Returns
 (values accepted failed residual-count) on success, or NIL if the file is
 missing or corrupt."
   (when (and path (probe-file path))
-      (multiple-value-bind (entries residual ok unbroadcast)
+      (multiple-value-bind (entries residual ok unbroadcast failed-at)
           (bl.mp:read-mempool-file path)
-        (unless ok
+        (unless (or ok failed-at)
           (log-warn "mempool file ~A unreadable or corrupt" path)
           (return-from load-mempool-from-disk nil))
         (let ((mempool (node-mempool node))
@@ -195,9 +195,19 @@ missing or corrupt."
           ;; The residual map is gated on the same option as the per-entry
           ;; deltas (mempool_persist.cpp:128-132) — importmempool must not
           ;; import a foreign node's prioritisation by either route.
-          (when apply-fee-delta-priority
+          ;; A file cut short keeps what Core would already have applied when
+          ;; its read threw (mempool_persist.cpp:88-145): the transactions
+          ;; above, the delta map only when it was read whole, the
+          ;; unbroadcast set only from a complete file -- and the load
+          ;; reports failure, as LoadMempool returns false. A 0.20.1 dump
+          ;; ends before the unbroadcast set (mempool_compatibility.py:64).
+          (when (and apply-fee-delta-priority
+                     (not (member failed-at '(:transactions :deltas))))
             (dolist (pair residual)
               (bl.mp:mempool-prioritise mempool (car pair) (cdr pair))))
+          (when failed-at
+            (log-info "Failed to deserialize mempool data on file: the ~(~A~) section is cut short. Continuing anyway." failed-at)
+            (return-from load-mempool-from-disk nil))
           ;; Restore the unbroadcast set for txs that were re-accepted; ids
           ;; whose tx failed to reload are dropped (mempool-add-unbroadcast's
           ;; membership gate) — Core node/mempool_persist.cpp:136-142.
