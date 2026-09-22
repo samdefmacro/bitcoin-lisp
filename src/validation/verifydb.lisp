@@ -67,13 +67,13 @@ cache) has no base to stand on and no clean/unclean answer to give, so levels
   "T when BLOCK spends anything, i.e. it has a non-coinbase transaction with
 inputs -- so it MUST have a readable undo record.
 
-A block that spends nothing has an EMPTY undo record, and GET-UNDO-DATA
-answers NIL for an empty record and for an unreadable one alike. Core tells
-them apart because ReadBlockUndo returns a bool separate from the record's
-contents; ours cannot, so levels 2 and 3 assert the undo record only where
-its absence is unambiguous. Every block with a spend is covered; a corrupt
-EMPTY record on a coinbase-only block is the gap, and its CRC is checked by
-the reader either way."
+A block that spends nothing has an EMPTY undo record. GET-UNDO-DATA's second
+value -- READABLE-P, Core's ReadBlockUndo verdict -- catches a rev file that
+is gone for every block, coinbase-only ones included (feature_abortnode.py:41
+restarts a node whose rev00000.dat was deleted and expects the start to fail);
+this predicate covers the remaining case, an empty record where the block
+spends. A corrupt EMPTY record inside a present rev file is caught by the
+reader's checksum."
   (loop for tx in (rest (bl.ser:bitcoin-block-transactions block))
         thereis (plusp (length (bl.ser:transaction-inputs tx)))))
 
@@ -100,8 +100,12 @@ entry claims one, exactly as Core gates it on !GetUndoPos().IsNull()
       (return-from %verify-db-block-checks :corrupted-block-db))
     (when (and (>= check-level 2)
                (bl.store:block-index-entry-undo-pos entry)
-               (%verify-db-block-spends-p block)
-               (null (get-undo-data hash)))
+               (multiple-value-bind (undo readable) (get-undo-data hash)
+                 ;; READABLE-P NIL is Core's failed ReadBlockUndo whatever
+                 ;; the block holds: its rev record is gone. An empty record
+                 ;; for a block that spends is the other way to be unreadable.
+                 (or (not readable)
+                     (and (null undo) (%verify-db-block-spends-p block)))))
       (bl:log-error "Verification error: found bad undo data at ~D, hash=~A"
                     height (%hash-hex hash))
       (return-from %verify-db-block-checks :corrupted-block-db))
@@ -122,8 +126,9 @@ block, or the view is not standing on this block at all)."
       (bl:log-error "Verification error: the UTXO set is at ~A, not at the block being disconnected (~A)"
                     (if best (%hash-hex best) "no recorded block") (%hash-hex hash))
       (return-from %verify-db-disconnect :failed))
-    (let ((undo (get-undo-data hash)))
-      (when (and (null undo) (%verify-db-block-spends-p block))
+    (multiple-value-bind (undo readable) (get-undo-data hash)
+      (when (or (not readable)
+                (and (null undo) (%verify-db-block-spends-p block)))
         (bl:log-error "Verification error: irrecoverable inconsistency in block data at ~D, hash=~A"
                       height (%hash-hex hash))
         (return-from %verify-db-disconnect :failed))

@@ -127,6 +127,38 @@ just level 0 answering for everything."
         (setf (bl:node-block-store node) (bl.store:init-block-store base))
         (is (eq 'yason:false (%verifychain node (list 0 4))))))))
 
+(test verify-db-level-2-fails-when-the-rev-file-is-gone
+  "Core's level 2 fails a block whose index entry names an undo record that
+ReadBlockUndo cannot read (validation.cpp:4703-4712), coinbase-only blocks
+included: feature_abortnode.py:30 deletes rev00000.dat and :41 expects the
+next start to refuse. Ours exempted every block that spends nothing, so a
+chain of coinbase-only blocks with no rev file verified clean at every level."
+  (with-network (:regtest)
+    (multiple-value-bind (node cspath base)
+        (coins-db-node-fixture (format nil "vdbrev~D" (get-internal-real-time)))
+      (declare (ignore cspath))
+      (let ((bl:*node* node)
+            (cs (bl:node-chain-state node))
+            (store (bl:node-block-store node))
+            (undo (merge-pathnames "undo/" base)))
+        ;; Core's rev files, as the live node writes them (init.lisp), not
+        ;; the fixture's legacy per-block undo files.
+        (bl.val:initialize-undo-storage undo :block-store store :chain-state cs)
+        (unwind-protect
+             (progn
+               (generate-regtest-blocks node 3)
+               (bl.store:coins-view-cache-flush (bl:node-utxo-set node) :sync t)
+               ;; Control: intact, every level passes.
+               (is (eq :success (bl.val:verify-db cs store :check-level 3)))
+               (let ((revs (directory (merge-pathnames "blocks/rev*.dat" base))))
+                 (is-true revs "the fixture wrote no rev file to delete")
+                 (mapc #'delete-file revs))
+               ;; Level 1 reads no undo and still passes; level 2 does not.
+               (is (eq :success (bl.val:verify-db cs store :check-level 1)))
+               (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 2)))
+               (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 3))))
+          (bl.val:initialize-undo-storage undo))))))
+
 (test checkblocks-and-checklevel-are-real-options
   "-checkblocks and -checklevel left the accept-and-drop list for the option
 table with Core's defaults (init.cpp:1388-1389, GetIntArg 6 and 3), so they
