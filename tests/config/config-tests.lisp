@@ -1062,6 +1062,19 @@ port overrides -port for the listener, as it does in Core."
   ;; default_bind_port_onion (init.cpp:2118).
   (let ((plist (start-node-plist '("-regtest" "-bind=127.0.0.1=onion") nil)))
     (is (equal '("127.0.0.1" . 18445) (getf plist :onion-bind))))
+  ;; ... and -port moves it: default_bind_port_onion is -port + 1
+  ;; (init.cpp:2117-2118). feature_port.py:48 expects `Bound to
+  ;; 127.0.0.1:{P+1}' from -port=P -bind=127.0.0.1=onion.
+  (let ((plist (start-node-plist
+                '("-regtest" "-port=12345" "-bind=127.0.0.1=onion") nil)))
+    (is (equal '("127.0.0.1" . 12346) (getf plist :onion-bind))))
+  ;; A plain -bind's own port is the listener's, not -port: the onion target
+  ;; still follows -port.
+  (let ((plist (start-node-plist
+                '("-regtest" "-port=12345" "-bind=127.0.0.1:20000"
+                  "-bind=127.0.0.1=onion") nil)))
+    (is (= 20000 (getf plist :port)))
+    (is (equal '("127.0.0.1" . 12346) (getf plist :onion-bind))))
   ;; Both forms together: the plain one binds, the =onion one is the target.
   (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18455" "-bind=127.0.0.1:18456=onion") nil)))

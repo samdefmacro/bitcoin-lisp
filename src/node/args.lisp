@@ -88,11 +88,17 @@ resolved network. Honors -server (enable RPC on the default port when no
              (parsed (loop for spec in specs
                            collect (multiple-value-list (parse-bind-option spec))))
              (plain (remove-if (lambda (p) (or (null (first p)) (third p))) parsed))
-             (onion (find-if (lambda (p) (and (first p) (third p))) parsed)))
+             (onion (find-if (lambda (p) (and (first p) (third p))) parsed))
+             ;; Core's default_bind_port is -port when given, the chain's port
+             ;; otherwise, and default_bind_port_onion is that plus one
+             ;; (init.cpp:2117-2118). Read before a plain -bind's own port
+             ;; overwrites :PORT below: that port is the listener's, not -port.
+             (default-port (or (getf plist :port) (network-port network))))
         ;; An =onion entry names the onion-service TARGET this node listens on
         ;; (init.cpp:2141-2147 pushes it into onion_binds, and :2175 makes the
         ;; first one the Tor target). Its port defaults to
-        ;; default_bind_port_onion, the chain's port + 1 (init.cpp:2118).
+        ;; default_bind_port_onion, -port (or the chain's port) + 1
+        ;; (init.cpp:2118); feature_port.py:48 binds -port + 1.
         ;; Ours parsed the suffix and then threw the address away, so an
         ;; explicit -bind=127.0.0.1:P=onion listened on the DEFAULT port+1
         ;; instead of on P -- feature_bind_extra.py:94 compares the process's
@@ -100,7 +106,7 @@ resolved network. Honors -server (enable RPC on the default port when no
         (when onion
           (setf (getf plist :onion-bind)
                 (cons (first onion)
-                      (or (second onion) (1+ (network-port network))))))
+                      (or (second onion) (1+ default-port)))))
         (when (and specs (null plain))
           ;; Every -bind was =onion or unparseable. Core binds NO ordinary
           ;; listening socket then: bind_on_any is false as soon as any -bind
@@ -116,7 +122,7 @@ resolved network. Honors -server (enable RPC on the default port when no
             ;; Core, where the bind address carries its own port.
             (when port (setf (getf plist :port) port))))
         (%check-binding-conflicts
-         alist parsed network
+         alist parsed default-port
          (loop for (k . v) in alist when (string= k "whitebind") collect v)))
       ;; -listen is decided in exactly one place: CONF-EFFECTIVE-LISTEN-FLAGS,
       ;; which replays Core's soft-set chain in Core's order (-bind beats
@@ -404,7 +410,7 @@ and this error exist."
                                     network when in [~A] section."
                                name chain chain)))))))
 
-(defun %check-binding-conflicts (alist parsed network whitebinds)
+(defun %check-binding-conflicts (alist parsed default-port whitebinds)
   "Core CheckBindingConflicts (init.cpp:1271-1297), run over the three binding
 lists once they are parsed: whitebinds first, then plain -binds, then the
 =onion ones, all into ONE set. The first address:port that is already there is
@@ -415,6 +421,9 @@ second bind fails at the socket, or -- with SO_REUSEADDR -- one of the two
 permission sets silently wins. Core refuses instead of starting half of what
 was asked for, and feature_bind_extra.py:100 asks for each of the six
 combinations of -bind, -bind=...=onion and -whitebind on one address.
+
+DEFAULT-PORT is Core's default_bind_port: -port, or the chain's port
+(init.cpp:2117); an =onion bind without a port takes it plus one.
 
 A whitebind's permissions prefix is not part of the address: `noban@1.2.3.4:1'
 binds 1.2.3.4:1 (NetWhitebindPermissions::TryParse, net_permissions.cpp)."
@@ -436,11 +445,11 @@ Please check your -bind, -bind=...=onion and -whitebind settings." key))
       (dolist (p parsed)
         (destructuring-bind (&optional host port onion-p) p
           (unless onion-p
-            (note host (or port (network-port network))))))
+            (note host (or port default-port)))))
       (dolist (p parsed)
         (destructuring-bind (&optional host port onion-p) p
           (when onion-p
-            (note host (or port (1+ (network-port network))))))))))
+            (note host (or port (1+ default-port)))))))))
 
 (defun args->start-node-plist (args &optional conf-text settings-rows)
   ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf
