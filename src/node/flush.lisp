@@ -250,6 +250,10 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
   (handler-case
       (#+sbcl sb-sys:without-interrupts
        #-sbcl progn
+        ;; Block and undo data first, as FlushStateToDisk commits them before
+        ;; it writes the coins (validation.cpp:2780-2786).
+        (when (and *node* (node-block-store *node*))
+          (bl.store:flush-chainstate-block-file (node-block-store *node*)))
         ;; Phase 1: mark the chainstate as in-transition.
         (when chainstate
           (bl.store:save-state chainstate :in-transition t)

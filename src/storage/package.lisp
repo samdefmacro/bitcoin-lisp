@@ -28,6 +28,7 @@ src/storage/.")
    #:register-prune-lock
    #:clear-prune-locks
    #:move-prune-locks-back
+   #:flush-chainstate-block-file
    #:prune-lock-ceiling
    #:*fast-prune*
    #:*blocks-xor*

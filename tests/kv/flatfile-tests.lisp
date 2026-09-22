@@ -1929,3 +1929,24 @@ the two could delete the blocks its rewind needs."
       ;; ... up as well as down, once the cap is gone.
       (setf index-height 2600)
       (is (= (- 2600 bl.store:+prune-lock-buffer+ 1) (bl.store:prune-lock-ceiling 3000))))))
+
+(test a-full-flush-leaves-the-current-block-file-its-rev-file
+  "FlushStateToDisk's full flush commits the current block file and its undo
+file through FlatFileSeq::Flush, which OPENS -- and so creates -- the file it
+commits (validation.cpp:2784, node/blockstorage.cpp:742-790,
+flatfile.cpp:87-107). A node that has written only genesis therefore stops
+with blk00000.dat AND rev00000.dat, which is what
+feature_remove_pruned_files_on_startup.py:68 lists after a pruned -reindex.
+Ours created a rev file only when an undo record was written."
+  (with-network (:regtest)
+    (with-temp-directory (dir)
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (rev (merge-pathnames "blocks/rev00000.dat" dir)))
+        ;; Nothing written yet: nothing to flush, and no file conjured.
+        (is-false (bl.store:flush-chainstate-block-file store))
+        (bl.store:ensure-genesis-on-disk store)
+        (is-true (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+        (is-false (probe-file rev) "control: genesis alone writes no undo")
+        (is-true (bl.store:flush-chainstate-block-file store))
+        (is-true (probe-file rev))))))

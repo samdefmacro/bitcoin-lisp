@@ -220,6 +220,33 @@ the record is missing, mis-framed, or unreadable."
             (make-flat-file-seq (ensure-directories store) "rev"
                                 +undofile-chunk-size+))))
 
+(defun flush-chainstate-block-file (store)
+  "Core BlockManager::FlushChainstateBlockFile -> FlushBlockFile(cursor, false,
+false) (node/blockstorage.cpp:742-790), which FlushStateToDisk runs on every
+full flush (validation.cpp:2784): commit the current blk file and its rev file.
+FlatFileSeq::Flush OPENS the file it commits, creating it when it is missing
+(flatfile.cpp:87-107), so after the first full flush the current block file
+always has its rev file beside it, empty or not -- which is what
+feature_remove_pruned_files_on_startup.py:68 lists after the stop that follows
+a pruned -reindex: blk00000.dat AND rev00000.dat. A store that has written no
+block file yet has nothing to flush (Core's m_blockfile_info.size() < 1)."
+  (let* ((file (block-store-cursor-file store))
+         (blk-seq (block-store-blk-seq store))
+         (blk-pos (make-flat-file-pos file (block-store-cursor-pos store))))
+    (when (and blk-seq (probe-file (flat-file-name blk-seq blk-pos)))
+      (flat-file-flush blk-seq blk-pos)
+      (let* ((rev-seq (%rev-seq store))
+             (rev-pos (make-flat-file-pos file 0))
+             (rev-path (flat-file-name rev-seq rev-pos)))
+        (unless (probe-file rev-path)
+          (with-open-file (s rev-path :direction :output
+                                      :element-type '(unsigned-byte 8)
+                                      :if-does-not-exist :create
+                                      :if-exists :append)
+            (declare (ignore s))))
+        (flat-file-flush rev-seq rev-pos))
+      t)))
+
 (defun block-flat-file-number (store hash)
   "The blk file number HASH's body is in, or NIL when it is not in a flat file.
 
