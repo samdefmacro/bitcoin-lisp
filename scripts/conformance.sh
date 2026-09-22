@@ -84,6 +84,36 @@ fi
 
 TTY_FLAGS="-i"; [ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
 
+# Previous releases (Core test/get_previous_releases.py): the tests that
+# add_nodes(versions=[...]) an old bitcoind skip with "previous releases not
+# available" unless the framework finds them under PREVIOUS_RELEASES_DIR
+# (test_framework.py:167-182). scripts/get-previous-releases.sh leaves the
+# verified archives in refs/bitcoin/releases-archives/; they are extracted
+# HERE, inside the container, into a per-checkout volume -- never onto the
+# host, whose security software deletes some old bitcoind binaries on sight
+# (see that script). The volume is mounted read-only for the run.
+RELEASE_FLAGS=""
+ARCHIVES="$REPO/refs/bitcoin/releases-archives"
+if ls "$ARCHIVES"/bitcoin-*.tar.gz >/dev/null 2>&1; then
+  RELEASES_VOL="bitcoin-lisp-releases-$CHECKOUT_SHORT"
+  docker volume inspect "$RELEASES_VOL" >/dev/null 2>&1 \
+    || docker volume create --label "agent=bitcoin-lisp-conformance-$CHECKOUT_SHORT" \
+         --label "io.common-lisp-workbench.checkout=$CHECKOUT_SHORT" "$RELEASES_VOL" >/dev/null
+  docker run --rm -v "$ARCHIVES:/archives:ro" -v "$RELEASES_VOL:/releases" \
+    --label "agent=$SLUG-releases" "$IMAGE" bash -c '
+      set -e
+      for a in /archives/bitcoin-*.tar.gz; do
+        ver=$(basename "$a" | sed -E "s/^bitcoin-([^-]+)-.*/\1/"); tag=v$ver
+        [ -f "/releases/$tag/.complete" ] && continue
+        rm -rf "/releases/$tag" "/releases/.$tag"; mkdir -p "/releases/.$tag"
+        tar -zxf "$a" -C "/releases/.$tag" --strip-components=1 \
+          --exclude="*/bin/bitcoin-qt" --exclude="*/bin/test_bitcoin" "bitcoin-$ver/bin"
+        touch "/releases/.$tag/.complete"; mv "/releases/.$tag" "/releases/$tag"
+        echo "previous release $tag extracted" >&2
+      done'
+  RELEASE_FLAGS="-v $RELEASES_VOL:/releases:ro -e PREVIOUS_RELEASES_DIR=/releases"
+fi
+
 echo "conformance run $RUN_ID -> $OUT" >&2
 docker run --rm $TTY_FLAGS \
   -v "$REPO:/workspace" \
@@ -91,4 +121,5 @@ docker run --rm $TTY_FLAGS \
   --label "io.common-lisp-workbench.checkout=$CHECKOUT_SHORT" \
   -w /workspace \
   -e HOME=/tmp \
+  $RELEASE_FLAGS \
   "$IMAGE" bash -lc "$CMD"
