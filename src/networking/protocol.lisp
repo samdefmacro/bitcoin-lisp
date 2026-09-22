@@ -543,8 +543,9 @@ computes in AddTxAnnouncement (txdownloadman_impl.cpp:210-219)."
   (+ (if (tx-request-preferred-p peer) 0 +nonpref-peer-tx-delay-seconds+)
      (if (and (not wtxidp) (plusp num-wtxid-peers))
          +txid-relay-delay-seconds+ 0)
-     (if (>= (gethash peer *tx-peer-in-flight* 0)
-             +max-peer-tx-request-in-flight+)
+     (if (and (not (peer-has-permission-p peer +perm-relay+))
+              (>= (gethash peer *tx-peer-in-flight* 0)
+                  +max-peer-tx-request-in-flight+))
          +overloaded-peer-tx-delay-seconds+ 0)))
 
 (defun %tx-request-mark-in-flight (hash peer now)
@@ -679,9 +680,13 @@ count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
     (when (%tx-announcement-for hash peer)
       (return-from tx-request-wanted-p nil))
     ;; MAX_PEER_TX_ANNOUNCEMENTS: drop, don't record
-    ;; (txdownloadman_impl.cpp:204-207).
-    (when (>= (gethash peer *tx-peer-announcements* 0)
-              +max-peer-tx-announcements+)
+    ;; (txdownloadman_impl.cpp:204-207) -- unless the peer holds the relay
+    ;; permission, which lifts both this cap and the overloaded delay
+    ;; (:204, :218; p2p_tx_download.py:307-310 sends 5001 invs from a
+    ;; relay-whitelisted peer and expects 5001 getdatas).
+    (when (and (not (peer-has-permission-p peer +perm-relay+))
+               (>= (gethash peer *tx-peer-announcements* 0)
+                   +max-peer-tx-announcements+))
       (return-from tx-request-wanted-p nil))
     (let* ((now (%tx-request-now))
            (ready (+ now (%tx-announcement-delay-seconds peer wtxidp

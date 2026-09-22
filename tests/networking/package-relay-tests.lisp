@@ -1245,3 +1245,31 @@ announcement waits out the delay."
                        (inbound-peer) t)
                       "a noban inbound peer is preferred: requested at once")))
       (bl.net:reset-tx-requests))))
+
+(test a-relay-permission-lifts-the-announcement-cap
+  "Core drops announcements past MAX_PEER_TX_ANNOUNCEMENTS only for a peer
+WITHOUT the relay permission (txdownloadman_impl.cpp:204), and spares such a
+peer the overloaded delay too (:218). p2p_tx_download.py:307-310 whitelists
+relay@127.0.0.1, sends 5001 invs and waits for 5001 getdatas. Control: a peer
+without the grant is capped at 5000."
+  (flet ((announce-all (peer)
+           (dotimes (i 5001)
+             (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref hash 0) (ldb (byte 8 0) i) (aref hash 1) (ldb (byte 8 8) i)
+                     (aref hash 2) 91)
+               (bl.net:tx-request-wanted-p hash peer t)))
+           (bl.net:tx-request-count peer)))
+    (unwind-protect
+         (progn
+           (bl.net:reset-tx-requests)
+           (let ((bl.net:*whitelist-entries* '()))
+             (is (= 5000 (announce-all (bl.net:make-peer :address "127.0.0.1" :state :ready
+                                                         :inbound t)))
+                 "control: capped at MAX_PEER_TX_ANNOUNCEMENTS"))
+           (bl.net:reset-tx-requests)
+           (let ((bl.net:*whitelist-entries*
+                   (list (bl.net:parse-whitelist-entry "relay@127.0.0.1"))))
+             (is (= 5001 (announce-all (bl.net:make-peer :address "127.0.0.1" :state :ready
+                                                         :inbound t)))
+                 "a relay-permission peer's every announcement is tracked")))
+      (bl.net:reset-tx-requests))))
