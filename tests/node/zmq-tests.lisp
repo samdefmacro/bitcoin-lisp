@@ -67,7 +67,7 @@ block explorer would otherwise see a mirrored hash and match nothing."
              (is (= 1 (bl:zmq-start-publishers
                        (list (list "hashblock" address 1000)))))
              (let ((lines (%zmq-collect address "hashblock" 1
-                                        (lambda () (bl::zmq-notify-hash-block hash)))))
+                                        (lambda () (bl:zmq-notify-hash-block hash)))))
                (is (= 1 (length lines)) "an independent subscriber must receive the message")
                (let ((parts (uiop:split-string (first lines) :separator " ")))
                  (is (string= "OK" (first parts)))
@@ -88,7 +88,7 @@ something; if it never advanced, a dropped message would be invisible."
            (progn
              (bl:zmq-start-publishers (list (list "hashtx" address 1000)))
              (let ((lines (%zmq-collect address "hashtx" 3
-                                        (lambda () (bl::zmq-notify-hash-tx hash)))))
+                                        (lambda () (bl:zmq-notify-hash-tx hash)))))
                (is (<= 3 (length lines)))
                (when (<= 3 (length lines))
                  (let ((seqs (mapcar (lambda (l)
@@ -115,7 +115,7 @@ them by length."
              ;; Block connected: label C, no counter -> 33 bytes.
              (let ((lines (%zmq-collect address "sequence" 1
                                         (lambda ()
-                                          (bl::zmq-notify-sequence hash #\C)))))
+                                          (bl:zmq-notify-sequence hash #\C)))))
                (is (= 1 (length lines)))
                (when lines
                  (let ((body (third (uiop:split-string (first lines) :separator " "))))
@@ -124,7 +124,7 @@ them by length."
              ;; Tx added: label A with a mempool counter -> 41 bytes.
              (let ((lines (%zmq-collect address "sequence" 1
                                         (lambda ()
-                                          (bl::zmq-notify-sequence hash #\A 258)))))
+                                          (bl:zmq-notify-sequence hash #\A 258)))))
                (is (= 1 (length lines)))
                (when lines
                  (let ((body (third (uiop:split-string (first lines) :separator " "))))
@@ -221,7 +221,7 @@ so without this the tests below would be coin flips rather than tests."
     (let ((mempool (bl.mp:make-mempool))
           (warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
       (is-true (%zmq-await-attached
-                sub (lambda () (bl::zmq-notify-sequence warm #\C))))
+                sub (lambda () (bl:zmq-notify-sequence warm #\C))))
       ;; The real path.
       (let* ((tx (make-mempool-test-tx :input-id 150))
              (txid (bl.ser:transaction-hash tx)))
@@ -250,7 +250,7 @@ non-block inclusion reasons\")."
     (let ((mempool (bl.mp:make-mempool))
           (warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
       (is-true (%zmq-await-attached
-                sub (lambda () (bl::zmq-notify-sequence warm #\C))))
+                sub (lambda () (bl:zmq-notify-sequence warm #\C))))
       (flet ((removal-labels-for (tx reason)
                (let ((txid (bl.ser:transaction-hash tx)))
                  (bl.mp:accept-validated-tx mempool txid tx 5000 300)
@@ -287,7 +287,7 @@ stands outside IBD here."
      (%with-zmq-hook-test (address "hashblock" sub)
        (let ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
          (is-true (%zmq-await-attached
-                   sub (lambda () (bl::zmq-notify-hash-block warm))))
+                   sub (lambda () (bl:zmq-notify-hash-block warm))))
          (let* ((hash (first (make-test-chain-hashes #xD0 1)))
                 (block1 (make-reorg-test-block genesis-hash hash 1)))
            (bl.val:connect-block block1 chain-state block-store utxo-set)
@@ -314,7 +314,7 @@ executed it."
      (%with-zmq-hook-test (address "hashtx" sub)
        (let ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
          (is-true (%zmq-await-attached
-                   sub (lambda () (bl::zmq-notify-hash-tx warm))))
+                   sub (lambda () (bl:zmq-notify-hash-tx warm))))
          (let* ((hash (first (make-test-chain-hashes #xD4 1)))
                 (block1 (make-reorg-test-block genesis-hash hash 1))
                 (coinbase (first (bl.ser:bitcoin-block-transactions
@@ -371,7 +371,7 @@ An earlier version of this test pinned the configured spelling instead."
              (let* ((hash (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element #xcd))
                     (lines (%zmq-collect (format nil "ipc://~A" path) "hashblock" 1
-                                         (lambda () (bl::zmq-notify-hash-block hash)))))
+                                         (lambda () (bl:zmq-notify-hash-block hash)))))
                (is (= 1 (length lines))
                    "nothing arrived on the socket the operator named")))
         (bl:zmq-stop-publishers)
@@ -467,7 +467,7 @@ notification and timed out."
            (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
                                       :initial-element #xab)))
              (let ((lines (%zmq-collect address "hashtx" 1
-                                        (lambda () (bl::zmq-notify-hash-tx hash)))))
+                                        (lambda () (bl:zmq-notify-hash-tx hash)))))
                (is (= 1 (length lines))
                    "a topic bound after the first must still publish"))))
       (bl:zmq-stop-publishers)
@@ -486,7 +486,7 @@ two-block reorg; ours published one per connected block."
                                            (first (make-test-chain-hashes #xE1 1)) 1))
            (tip (first (make-test-chain-hashes #xE2 1)))
            (no-block (lambda () nil)))
-      (is-true (%zmq-await-attached sub (lambda () (bl::zmq-notify-hash-block warm))))
+      (is-true (%zmq-await-attached sub (lambda () (bl:zmq-notify-hash-block warm))))
       (%zmq-drain sub)
       (flet ((heard ()
                (sleep 0.4)

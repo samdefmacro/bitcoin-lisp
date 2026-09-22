@@ -186,6 +186,9 @@ init.cpp, node/. src/node/.")
    #:zmq-notify-block-connected
    #:zmq-notify-block-disconnected
    #:zmq-notify-updated-block-tip
+   #:zmq-notify-hash-block
+   #:zmq-notify-hash-tx
+   #:zmq-notify-sequence
    #:zmq-notify-tx-accepted
    #:zmq-notify-tx-removed
    #:zmq-start-publishers

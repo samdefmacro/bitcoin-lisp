@@ -1508,20 +1508,14 @@ liveness signal; SECOND is the whole second (1..30) this tick falls in, and
 only gates the behind-known-work exit. Returns T when the wait should end
 now: new headers arrived, a peer was admitted or dialed this tick, or the
 node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
-  ;; Admit the peers that arrived during
-  ;; the wait BEFORE the pump reads, or
-  ;; they sit in the hand-off list until
-  ;; the next cycle merges them: the
-  ;; listener's handshaked inbound peers,
-  ;; and the addnode-onetry / addconnection
-  ;; dials. Core has no such gap -- an
-  ;; accepted socket joins m_nodes at once
-  ;; (net.cpp:1854-1858) and ProcessMessages
-  ;; runs on it continuously. Measured
-  ;; before this: every functional test's
-  ;; python peer waited up to 30 s for its
-  ;; first reply, and each addconnection
-  ;; took a whole cycle.
+  ;; Admit the peers that arrived during the wait BEFORE the pump reads, or
+  ;; they sit in the hand-off list until the next cycle merges them: the
+  ;; listener's handshaked inbound peers, and the addnode-onetry /
+  ;; addconnection dials. Core has no such gap -- an accepted socket joins
+  ;; m_nodes at once (net.cpp:1854-1858) and ProcessMessages runs on it
+  ;; continuously. Measured before this: every functional test's python peer
+  ;; waited up to 30 s for its first reply, and each addconnection took a
+  ;; whole cycle.
   (let* ((peers-before (length (node-peers *node*)))
          (admitted (progn
                      (merge-inbound-peers *node*)
