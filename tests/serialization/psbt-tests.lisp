@@ -24,24 +24,52 @@
           '(simple-array (unsigned-byte 8) (*))))
 
 (test psbt-valid-roundtrip
-  "Every Core 'valid' PSBT parses and re-serializes as Core's writer would:
-byte-for-byte, except #6, which declares PSBT_GLOBAL_VERSION 0 AHEAD of the
-unsigned transaction. Core writes its fields in a fixed order and a version
-only when it is above 0 (psbt.h:1170-1191), so its bytes for #6 are the input
-without that leading 01 fb 04 00000000 record."
+  "Every Core 'valid' PSBT parses and re-serializes as Core's writer would.
+Two of Core's writing rules show up in the corpus (psbt.h:302-305,
+:1170-1191):
+
+  - #6 declares PSBT_GLOBAL_VERSION 0 ahead of the unsigned transaction, and
+    Core writes a version only when it is above 0, so its bytes are the input
+    without that leading 01 fb 04 00000000 record;
+  - a non_witness_utxo is READ with its witness and WRITTEN without it, so a
+    vector whose previous transaction carries a witness comes back with the
+    same transaction, same txid, in legacy serialization.
+
+Everything else is byte-for-byte."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let ((n 0))
           (dolist (b64 (gethash "valid" data))
             (let* ((raw (%psbt-b64->bytes b64))
-                   (psbt (bl.ser:parse-psbt raw))
-                   (out (bl.ser:serialize-psbt psbt))
-                   (want (if (= n 6)
-                             (concatenate '(vector (unsigned-byte 8))
-                                          (subseq raw 0 5) (subseq raw 12))
-                             raw)))
-              (is (equalp want out) "valid PSBT #~D did not round-trip" n)
+                   (in (bl.ser:parse-psbt raw))
+                   (want-raw (if (= n 6)
+                                 (concatenate '(vector (unsigned-byte 8))
+                                              (subseq raw 0 5) (subseq raw 12))
+                                 raw))
+                   (want (bl.ser:parse-psbt want-raw))
+                   (out (bl.ser:serialize-psbt in))
+                   (got (bl.ser:parse-psbt out))
+                   (legacy-utxos nil))
+              ;; Map by map, record by record: the same keys in the same order,
+              ;; and the same values -- except a non_witness_utxo, which must be
+              ;; the same transaction written without its witness.
+              (loop for wm across (bl.ser:psbt-inputs want)
+                    for gm across (bl.ser:psbt-inputs got)
+                    do (loop for (wk . wv) in (bl.ser:psbt-map-records wm)
+                             for (gk . gv) in (bl.ser:psbt-map-records gm)
+                             do (is (equalp wk gk) "valid PSBT #~D: key order" n)
+                                (if (equalp wk #(0))
+                                    (let ((tx (bl.ser:br-read-transaction
+                                               (bl.ser:make-byte-reader-from wv))))
+                                      (unless (equalp wv gv) (setf legacy-utxos t))
+                                      (is (equalp (bl.ser:serialize-transaction tx) gv)
+                                          "valid PSBT #~D: non_witness_utxo not legacy" n))
+                                    (is (equalp wv gv) "valid PSBT #~D: a value changed" n))))
+              (unless legacy-utxos
+                (is (equalp want-raw out) "valid PSBT #~D did not round-trip" n))
+              (is (equalp out (bl.ser:serialize-psbt got))
+                  "valid PSBT #~D: writing is not idempotent" n)
               (incf n)))
           (is (>= n 30) "expected many valid vectors, got ~D" n)))))
 

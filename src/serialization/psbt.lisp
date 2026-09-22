@@ -498,8 +498,23 @@ gate), and a PSBT_GLOBAL_VERSION of 0 is not written at all (:1188-1191)."
                         (and (eq context :global) (= kt #xfb)
                              (every #'zerop (cdr r))))))
                 records)))
-    (stable-sort (mapcar (lambda (r) (cons (%psbt-record-sort-key context r) r)) kept)
+    (stable-sort (mapcar (lambda (r)
+                           (let ((r (if (and (eq context :input)
+                                             (= (psbt-key-type (car r)) #x00))
+                                        (%psbt-no-witness-utxo r)
+                                        r)))
+                             (cons (%psbt-record-sort-key context r) r)))
+                         kept)
                  #'%psbt-sort-key< :key #'car)))
+
+(defun %psbt-no-witness-utxo (rec)
+  "A PSBT_IN_NON_WITNESS_UTXO record whose transaction is written WITHOUT its
+witness. Core reads the record with witness (psbt.h:512-513) and writes it
+back TX_NO_WITNESS (:303-305); the witness is not part of what the record
+authenticates, the txid. Our updaters stored the full wire bytes, which a
+Core reader accepts but never produces."
+  (let ((tx (br-read-transaction (make-byte-reader-from (cdr rec)))))
+    (cons (car rec) (serialize-transaction tx))))
 
 (defun %psbt-write-map (bb map &optional (context :unordered))
   "Write MAP's records and its separator -- in Core's canonical order when
