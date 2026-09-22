@@ -6041,6 +6041,47 @@ handler runs. Control: a well-formed escape is routed normally."
                  (is-false (search "URI parsing failed" reply) "~A" reply)))
           (bl.rpc:stop-rpc-server))))))
 
+(test rpc-server-listens-on-the-ipv6-loopback-too
+  "With no -rpcbind Core binds both loopback endpoints, 127.0.0.1 and ::1
+(httpserver.cpp:317-320), and rpc_bind.py:46 lists the process's listening
+sockets expecting both. usocket's SOCKET-LISTEN cannot resolve `::1' (SBCL's
+GET-HOST-BY-NAME is AF_INET only), so ours logged `Unable to bind RPC on
+address ::1' and listened on IPv4 alone. Driven through a real inet6 client
+socket; the IPv4 endpoint is the control."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19971))
+      (setf (bl:node-data-directory node) dir)
+      (flet ((http-status (socket-class address)
+               (let ((sock (make-instance socket-class :type :stream :protocol :tcp)))
+                 (unwind-protect
+                      (handler-case
+                          (progn
+                            (sb-bsd-sockets:socket-connect sock address port)
+                            (let ((stream (sb-bsd-sockets:socket-make-stream
+                                           sock :input t :output t
+                                                :element-type 'character
+                                                :external-format :latin-1)))
+                              (format stream "GET / HTTP/1.0~C~C~C~C"
+                                      #\Return #\Newline #\Return #\Newline)
+                              (finish-output stream)
+                              (read-line stream nil "")))
+                        (error (e) (princ-to-string e)))
+                   (sb-bsd-sockets:socket-close sock)))))
+        (unwind-protect
+             (progn
+               (is-true (bl.rpc:start-rpc-server node :port port :user "u" :password "p"))
+               (is-true (search "HTTP/1.1"
+                                (http-status 'sb-bsd-sockets:inet-socket #(127 0 0 1)))
+                        "control: the IPv4 loopback answers")
+               (let ((line (http-status 'sb-bsd-sockets:inet6-socket
+                                        (make-array 16 :element-type '(unsigned-byte 8)
+                                                       :initial-contents
+                                                       '(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)))))
+                 (is-true (search "HTTP/1.1" line) "::1 must answer: ~A" line)))
+          (bl.rpc:stop-rpc-server))))))
+
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
 serving something wrong or signalling out of the handler."
