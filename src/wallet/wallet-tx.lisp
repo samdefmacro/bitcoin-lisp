@@ -2006,6 +2006,28 @@ push order."
                       entries))))))
       (nreverse entries))))
 
+(defun %gettransaction-decoded (wallet tx)
+  "gettransaction's `decoded' object: Core's TxToUniv without the hex, with an
+is_change_func that is OutputIsChange (wallet/rpc/transactions.cpp:757-770),
+so every vout the wallet counts as change carries ischange: true after its
+scriptPubKey (core_io.cpp:509-511) and no other vout has the key.
+wallet_basic.py:550 reads it for both sides of a sendtoaddress."
+  (let ((json (remove "hex" (bl.rpc:tx-to-json tx (wallet-network wallet))
+                      :key #'car :test #'equal))
+        (outputs (bl.ser:transaction-outputs tx)))
+    (mapcar (lambda (field)
+              (if (equal (car field) "vout")
+                  (cons "vout"
+                        (loop for out in (coerce (cdr field) 'list)
+                              for i from 0
+                              collect (if (%output-is-change
+                                           wallet (bl.ser:tx-out-script-pubkey
+                                                   (aref outputs i)))
+                                          (append out '(("ischange" . t)))
+                                          out)))
+                  field))
+            json)))
+
 (bl.rpc:define-rpc "gettransaction" (node params)
   "Detailed information about an in-wallet transaction (Bitcoin Core
 gettransaction). PARAMS: (txid include_watchonly verbose)."
@@ -2034,8 +2056,7 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
               ("hex" . ,(bl.crypto:bytes-to-hex
                          (bl.ser:transaction-wire-bytes tx)))
               ,@(when verbose
-                  `(("decoded" . ,(remove "hex" (bl.rpc:tx-to-json tx (wallet-network wallet))
-                                          :key #'car :test #'equal))))
+                  `(("decoded" . ,(%gettransaction-decoded wallet tx))))
               ("lastprocessedblock"
                . (("hash" . ,(if (wallet-last-block-hash wallet)
                                  (bl.rpc:hash-to-hex (wallet-last-block-hash wallet))

@@ -2343,3 +2343,37 @@ did, txid and all."
                 (let ((bl.wallet:*wallet-reject-long-chains* nil))
                   (is (stringp (send))
                       "with -walletrejectlongchains off the build must succeed"))))))))))
+
+(test gettransaction-decoded-marks-the-change-output
+  "gettransaction(verbose=true)'s `decoded' is TxToUniv with OutputIsChange as
+its is_change_func (wallet/rpc/transactions.cpp:757-770): the change vout
+carries ischange: true after its scriptPubKey (core_io.cpp:509-511) and the
+payment vout has no such key. wallet_basic.py:550 reads both sides; the key
+was missing everywhere."
+  (with-wallet-chain-node (node "decoded-change")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "w")
+        (rpc nil "generatetoaddress" 1 (rpc "w" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((txid (with-wallet-rng (43)
+                       (rpc "w" "sendtoaddress" optrue
+                            (bl.rpc:format-money 12300000)
+                            nil nil nil nil nil nil nil 10)))
+               (vouts (coerce (%aval "vout" (%aval "decoded"
+                                                   (rpc "w" "gettransaction" txid nil t)))
+                              'list))
+               (payment (find optrue vouts
+                              :key (lambda (v) (%aval "address" (%aval "scriptPubKey" v)))
+                              :test #'equal))
+               (change (find optrue vouts
+                             :key (lambda (v) (%aval "address" (%aval "scriptPubKey" v)))
+                             :test-not #'equal)))
+          (is (= 2 (length vouts)))
+          (is-true payment)
+          (is (null (assoc "ischange" payment :test #'equal)))
+          (is-true change)
+          (is (eq t (%aval "ischange" change))))))))
