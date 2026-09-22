@@ -55,6 +55,9 @@ Commands:
   test-all           Run the full :bitcoin-lisp-tests suite (long)
   docs-check         Verify PAX documentation transcripts in a cold container
   ui-test [PATH...]  Run the web UI node harness (default tests/ui/)
+  interop            Run the differential lane against Core's bitcoin-tx and
+                     bitcoin-util (scripts/interop-test.sh; needs
+                     scripts/get-previous-releases.sh first)
   logs               Show the dev container's output
   help               Show this help
 
@@ -188,12 +191,20 @@ start_server() {
   esac
   ensure_image
   ensure_volume
+  # Core's previous releases, read-only at /releases when this checkout has
+  # them (scripts/get-previous-releases.sh): the bitcoin-tx / bitcoin-util
+  # differential suite runs against them in the warm image too, and skips
+  # without them.
+  local releases_vol releases_args=()
+  releases_vol="$("$ROOT/scripts/previous-releases-volume.sh")"
+  [ -n "$releases_vol" ] && releases_args=(--volume "$releases_vol:/releases:ro")
   "$DOCKER" run --detach --init --name "$CONTAINER" \
     --label "$PROJECT_LABEL=$PROJECT_ID" \
     --label "$CHECKOUT_LABEL=$CHECKOUT_ID" \
     --label "$MANAGED_LABEL=true" \
     --volume "$ROOT:/workspace" \
     --volume "$FASL_VOLUME:/fasl-cache" \
+    ${releases_args[@]+"${releases_args[@]}"} \
     --workdir /workspace \
     --env DEV_SWANK_PORT="$PORT" \
     "$IMAGE" \
@@ -481,6 +492,7 @@ case "$cmd" in
   test-all) test_all ;;
   docs-check) docs_check ;;
   ui-test) ui_test "$@" ;;
+  interop) exec "$ROOT/scripts/interop-test.sh" ;;
   logs) show_logs "$@" ;;
   help|-h|--help) usage ;;
   *) echo "Unknown command: $cmd" >&2; usage >&2; exit 2 ;;

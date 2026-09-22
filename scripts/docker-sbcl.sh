@@ -67,9 +67,14 @@ fi
 TTY_FLAGS="-i"
 [ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
 
+# BITCOIN_LISP_DOCKER_EXTRA: further `docker run' arguments, word-split -- a
+# lane that needs one more read-only mount or environment variable
+# (scripts/interop-test.sh mounts Core's previous releases). Unset for every
+# other caller.
 exec docker run --rm $TTY_FLAGS \
   -v "$REPO:/workspace" \
   -v "$FASL_VOLUME":/fasl-cache \
+  ${BITCOIN_LISP_DOCKER_EXTRA:-} \
   --label "io.common-lisp-workbench.checkout=$CHECKOUT_SHORT" \
   -w /workspace \
   "$IMAGE" sbcl "$@"

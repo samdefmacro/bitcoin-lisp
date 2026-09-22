@@ -54,7 +54,8 @@
   `dev.sh test SUITE`) for the edit loop, the from-scratch cold build
   (`cl-workbench validation run cold-unit`, `cold-unit-fresh` after a
   macro or defstruct change) as the verification of record, and
-  `dev.sh docs-check` for this manual."
+  `dev.sh docs-check` for this manual. Two more compare the node with
+  Bitcoin Core itself; see the interop section."
   (@util section)
   (@crypto section)
   (@logging section)
@@ -73,7 +74,8 @@
   (@rpc-methods section)
   (@wallet section)
   (@zmq section)
-  (@node section))
+  (@node section)
+  (@interop section))
 
 (defsection @util (:title "util: the chain-agnostic base")
   "Seven small packages every other layer can name. Core: `util/`,
@@ -683,9 +685,27 @@
   does NOT gate the DNS seeds; those are `-dnsseed`, which Core queries
   with a hardcoded fAllowLookup.
 
+  Our own addresses are Core's mapLocalHost (`ADD-LOCAL`,
+  `LOCAL-ADDRESSES`, read by getnetworkinfo's localaddresses). Writers:
+  -externalip (LOCAL_MANUAL, at its own port or GetListenPort), the Tor
+  onion service, and under `*DISCOVER*` -- Core's fDiscover, on unless a
+  real -proxy, -listen=0 or -externalip soft-sets it off -- the bound
+  address (`ADD-BOUND-LOCAL-ADDRESS`, LOCAL_BIND) and, when listening on
+  the wildcard, every interface address getifaddrs reports
+  (`DISCOVER-LOCAL-ADDRESSES`, LOCAL_IF). Both learned kinds use Core's full
+  IsRoutable (`ADDRESS-PUBLICLY-ROUTABLE-P`), never the dial predicate that
+  keeps RFC1918 dialable: a container or LAN address is not advertised.
+
   Trap: a test that drives two real connections without a pump hangs
   until its timeout, because nothing ever sends; drain the send queue."
   (bitcoin-lisp.networking package)
+  (bitcoin-lisp.networking:add-local function)
+  (bitcoin-lisp.networking:local-addresses function)
+  (bitcoin-lisp.networking:*discover* variable)
+  (bitcoin-lisp.networking:add-bound-local-address function)
+  (bitcoin-lisp.networking:discover-local-addresses function)
+  (bitcoin-lisp.networking:interface-addresses function)
+  (bitcoin-lisp.networking:address-publicly-routable-p function)
   (bitcoin-lisp.networking:connection class)
   (bitcoin-lisp.networking:make-tcp-connection function)
   (bitcoin-lisp.networking:close-connection function)
@@ -1659,6 +1679,55 @@
   (bitcoin-lisp:*wallet-broadcast* variable)
   (bitcoin-lisp:*p2p-port-override* variable)
   (bitcoin-lisp:*assumevalid-override* variable))
+
+(defsection @interop (:title "interop: Core's own binaries as oracles")
+  "Two lanes run Bitcoin Core's released binaries against this node, inside
+  the project container. `scripts/get-previous-releases.sh` fetches the
+  aarch64-linux-gnu archives the functional tests name (v0.14.3 ... v28.2)
+  with curl and checks each against the SHA256 table in Core's own
+  `test/get_previous_releases.py` at the pin; the archives stay in
+  `refs/bitcoin/releases-archives/` and are unpacked only inside the image,
+  by `scripts/previous-releases-volume.sh`, into a per-checkout Docker volume
+  mounted read-only at `/releases` -- host security software deletes some
+  old `bitcoind` binaries on sight.
+
+  The FUNCTIONAL lane is `scripts/conformance.sh <test>.py`: with the archives
+  present the framework's --previous-releases default is on, so the tests
+  that start an old node (mempool_compatibility, feature_unsupported_utxo_db,
+  feature_coinstatsindex_compatibility, wallet_backwards_compatibility,
+  wallet_migration) run instead of skipping. `BL_CONFORMANCE_REFERENCE=v28.2`
+  runs a test against Core's own bitcoind instead of ours -- the first
+  question to ask of a failure is whether Core passes it at the pin -- and
+  the two -bind tests get 1.1.1.1 and 2.2.2.2 on eth0 through NET_ADMIN in
+  the run's own network namespace.
+
+  The DIFFERENTIAL lane is `scripts/dev.sh interop` (= `cl-workbench
+  validation run interop`, `scripts/interop-test.sh`): the fiveam suite
+  `:core-binary-differential-tests` compares `bitcoin-tx -json` with
+  decoderawtransaction over every transaction in Core's tx_valid.json,
+  tx_invalid.json, sighash.json and util/*.hex vectors (JSON compared with
+  numbers as TEXT and keys in any order), `bitcoin-tx -create` with
+  createrawtransaction, `bitcoin-tx ... sign=ALL` with
+  signrawtransactionwithkey (RFC6979 and low-R grinding make a correct
+  signature unique, so the transactions must match to the byte), and a
+  header `bitcoin-util grind` solves with our proof-of-work check. In the
+  ordinary battery the suite SKIPS when `/releases` is absent; the lane sets
+  BL_REQUIRE_CORE_BINARIES=1 so that an absent binary fails instead.
+
+  Invariants the lane pinned: TxToUniv reports the version as the uint32_t
+  it is (`TX-VERSION-FOR-JSON`) and decides \"coinbase\" per TRANSACTION
+  (tx.IsCoinBase(), core_io.cpp:454), not per input.
+
+  Traps: bitcoin-tx applies its arguments IN ORDER, and Core's own sign rows
+  put sign=ALL before the output they add, so their signatures commit to a
+  transaction without it -- the lane moves sign= last. bitcoin-tx defaults
+  an input's sequence to SEQUENCE_FINAL where createrawtransaction derives
+  one, so the lane always passes it. bitcoin-util grind's nonce depends on
+  the thread count; compare verdicts, not nonces. A 1-in-2 regtest target
+  makes any nonce-0 control pass by chance half the time."
+  (bitcoin-lisp.rpc:decode-hex-tx function)
+  (bitcoin-lisp.rpc:tx-to-json function)
+  (bitcoin-lisp.rpc::tx-version-for-json function))
 
 (defsection @docs-check-selftest (:title "docs-check red self-test")
   "Deliberately broken transcript: the recorded value below is wrong, so

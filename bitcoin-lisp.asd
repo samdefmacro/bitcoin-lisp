@@ -437,6 +437,9 @@ bitcoin-cli (node-main)."
                              (:file "storage/persistence-tests")
                              ;; RPC tests
                              (:file "rpc/rpc-tests")
+                             ;; Differential lane against Core's bitcoin-tx / bitcoin-util
+                             ;; (skips without them; scripts/interop-test.sh requires them)
+                             (:file "rpc/core-binary-differential-tests")
                              ;; Output descriptor engine (Core descriptor_tests.cpp vectors)
                              (:file "wallet/descriptor-tests")
                              ;; Web UI serving + Origin-check tests (gui-plan P0)
