@@ -2974,3 +2974,55 @@ false."
           (is (eq t (%aval "complete" fin)) "the offline signature completes it")
           (is (eq t (%aval "allowed" (first (rpc nil "testmempoolaccept" (list (%aval "hex" fin))))))
               "and the finished transaction is valid"))))))
+
+(test a-cosigner-records-its-tapscript-signatures-without-finishing-a-leaf
+  "Core's CreateTaprootScriptSig records every signature it makes in
+sigdata.taproot_script_sigs as it goes (script/sign.cpp:355-395), and
+SignTaproot tries every leaf, so a wallet holding ONE key of each two-key
+leaf signs both leaves and cannot finalize -- two tapscript signatures; with
+the two leaves identical it is one signature valid for both
+(wallet_miniscript.py:152-167, failing at :302). We kept signatures only from
+a leaf we could satisfy, so the PSBT came back with none."
+  (with-wallet-chain-node (node "tapscript-partial")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (sks (loop for b from 41 to 44
+                        collect (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
+             (wif (lambda (i) (bl.crypto:private-key-to-wif (nth i sks) :network :regtest :compressed t)))
+             (pub (lambda (i) (bl.crypto:bytes-to-hex (bl.crypto:derive-public-key (nth i sks) :compressed t))))
+             (h "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (loop for (name desc want seed) in
+              (list (list "two" (format nil "tr(~A,{and_v(v:pk(~A),pk(~A)),and_v(v:pk(~A),pk(~A))})"
+                                        h (funcall wif 0) (funcall pub 1) (funcall wif 2) (funcall pub 3))
+                          2 101)
+                    (list "same" (format nil "tr(~A,{and_v(v:pk(~A),pk(~A)),and_v(v:pk(~A),pk(~A))})"
+                                         h (funcall wif 0) (funcall pub 1) (funcall wif 0) (funcall pub 1))
+                          1 103))
+              do (let ((desc (bl.rpc:descriptor-add-checksum desc)))
+                   (rpc nil "createwallet" name nil t)
+                   (rpc name "importdescriptors" (list (obj "desc" desc "timestamp" "now")))
+                   (let ((txid (with-wallet-rng (seed)
+                                 (rpc "fund" "sendtoaddress" (first (rpc nil "deriveaddresses" desc))
+                                      (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))))
+                     (rpc nil "generatetoaddress" 1 optrue)
+                     (let* ((coin (find txid (coerce (rpc name "listunspent") 'list)
+                                        :key (lambda (c) (%aval "txid" c)) :test #'equal))
+                            (psbt (rpc nil "createpsbt"
+                                       (list (obj "txid" txid "vout" (%aval "vout" coin)))
+                                       (list (obj optrue (bl.rpc:format-money 99990000)))))
+                            (res (rpc name "walletprocesspsbt" psbt))
+                            (in (first (coerce (%aval "inputs" (rpc nil "decodepsbt" (%aval "psbt" res)))
+                                               'list))))
+                       (is (not (eq t (%aval "complete" res))) "~A: cannot finalize" name)
+                       (is (= want (length (coerce (or (%aval "taproot_script_path_sigs" in) '())
+                                                   'list)))
+                           "~A: ~D tapscript signature(s) in ~S" name want in)))))))))

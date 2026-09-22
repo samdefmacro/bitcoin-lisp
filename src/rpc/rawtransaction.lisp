@@ -505,7 +505,8 @@ its script and its merkle depth and neither dominates.
 
 *current-tx* / *current-spent-utxos* / *current-input-index* must be bound by
 the caller -- the sighash commits to all of them."
-  (let ((best nil) (best-size nil) (best-leaf nil) (best-sigs nil) (signed-by nil))
+  (let ((best nil) (best-size nil) (best-leaf nil) (best-sigs nil) (signed-by nil)
+        (all-sigs '()))
     (dolist (entry leaves)
       (destructuring-bind (script leaf-hash control pubkeys) entry
         (progn
@@ -536,6 +537,10 @@ the caller -- the sighash commits to all of them."
                            (when sk
                              (let ((sig (%tap-sig sk sighash tap-sighash-type)))
                                (push (list xonly leaf-hash sig) signed-by)
+                               (unless (find-if (lambda (e) (and (equalp (first e) xonly)
+                                                                 (equalp (second e) leaf-hash)))
+                                                all-sigs)
+                                 (push (list xonly leaf-hash sig) all-sigs))
                                sig))))
                        :check-older-fn
                        (lambda (v) (bl.val:ms-check-older
@@ -553,7 +558,12 @@ the caller -- the sighash commits to all of them."
                             best-size size
                             best-leaf (cons script control)
                             best-sigs (reverse signed-by)))))))))))
-    (values best best-sigs best-leaf)))
+    ;; With no satisfiable leaf, every signature made on the way is still
+    ;; returned: Core's CreateTaprootScriptSig records each one in
+    ;; sigdata.taproot_script_sigs as it is made (script/sign.cpp:355-395),
+    ;; so a cosigner holding one key of a two-key leaf contributes it
+    ;; (wallet_miniscript.py:302's "will sign both but can't finalize").
+    (values best (if best best-sigs (reverse all-sigs)) best-leaf)))
 
 (defvar *solving-pubkeys* nil
   "HASH160 -> pubkey for keys the signer KNOWS but may not hold, or NIL: the
@@ -664,7 +674,7 @@ the BIP341 sighash commits to all of them."
       (t
        (multiple-value-bind (stack leaf-sigs leaf)
            (%tr-script-path-witness leaves amount tap-sighash-type pubmap)
-         (if (null stack)
+         (if (and (null stack) (null leaf-sigs))
              (values nil "no satisfiable script path for P2TR")
              (values (%make-input-sig :kind :p2tr-script :needed 1
                                       :stack stack
@@ -937,7 +947,9 @@ the second one saw."
         ;; A script-path spend: the satisfaction, then the leaf script, then
         ;; the control block (BIP341). %TR-SCRIPT-PATH-WITNESS already appended
         ;; the last two, so there is nothing to assemble here.
-        (:p2tr-script (values nil (input-sig-stack sig) nil))
+        (:p2tr-script (if (input-sig-stack sig)
+                          (values nil (input-sig-stack sig) nil)
+                          (values nil nil "no satisfiable script path for P2TR")))
         (:p2sh-p2wpkh (values (bl.ser:script-push-data (input-sig-redeem sig))
                               (list (cdr s) (car s)) nil))
         (:p2wsh (values nil (concatenate 'list (list empty) (sigs)
