@@ -1,0 +1,263 @@
+PASS	example_test	-	PASS
+PASS	feature_abortnode	-	PASS
+FAIL	feature_addrman	feature_addrman.py:65	AssertionError(self._node_msg(msg))
+FAIL	feature_anchors	feature_anchors.py:107	AssertionError(self._node_msg(msg))
+FAIL	feature_asmap	feature_asmap.py:89	AssertionError(self._node_msg(msg))
+FAIL	feature_assumeutxo	feature_assumeutxo.py:676	AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
+FAIL	feature_assumevalid	feature_assumevalid.py:181	AssertionError(self._node_msg(msg))
+PASS	feature_bind_extra	-	PASS
+FAIL	feature_bind_port_discover	feature_bind_port_discover.py:66	AssertionError
+FAIL	feature_bind_port_externalip	-	AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
+PASS	feature_bip68_sequence	-	PASS
+TIMEOUT	feature_block	-	TIMEOUT
+PASS	feature_blocksdir	-	PASS
+PASS	feature_blocksxor	-	PASS
+FAIL	feature_chain_tiebreaks	feature_chain_tiebreaks.py:94	AssertionError(f"Both values are {thing1}{f', {error_message}' if error_message else ''}")
+PASS	feature_cltv	-	PASS
+PASS	feature_coinstatsindex	-	PASS
+FAIL	feature_coinstatsindex_compatibility	feature_coinstatsindex_compatibility.py:34	FailedToStartError(self._node_msg(
+FAIL	feature_config_args	feature_config_args.py:388	AssertionError(self._node_msg(msg))
+PASS	feature_csv_activation	-	PASS
+FAIL	feature_dbcrash	feature_dbcrash.py:73	FailedToStartError(self._node_msg(
+PASS	feature_dersig	-	PASS
+PASS	feature_dirsymlinks	-	PASS
+PASS	feature_discover	-	PASS
+PASS	feature_fastprune	-	PASS
+PASS	feature_fee_estimation	-	PASS
+PASS	feature_filelock	-	PASS
+PASS	feature_framework_miniwallet	-	PASS
+PASS	feature_framework_startup_failures	-	PASS
+PASS	feature_framework_testshell	-	PASS
+PASS	feature_framework_unit_tests	-	PASS
+PASS	feature_help	-	PASS
+PASS	feature_includeconf	-	PASS
+PASS	feature_index_prune	-	PASS
+FAIL	feature_init	feature_init.py:93	AssertionError(self._node_msg(msg))
+PASS	feature_loadblock	-	PASS
+PASS	feature_logging	-	PASS
+PASS	feature_maxtipage	-	PASS
+FAIL	feature_maxuploadtarget	feature_maxuploadtarget.py:177	AssertionError
+PASS	feature_minchainwork	-	PASS
+PASS	feature_notifications	-	PASS
+PASS	feature_nulldummy	-	PASS
+PASS	feature_port	-	PASS
+PASS	feature_posix_fs_permissions	-	PASS
+FAIL	feature_presegwit_node_upgrade	feature_presegwit_node_upgrade.py:39	AssertionError(self._node_msg(msg))
+TIMEOUT	feature_proxy	-	TIMEOUT
+FAIL	feature_pruning	feature_pruning.py:223	AssertionError("%s <= %s" % (str(thing1), str(thing2)))
+FAIL	feature_rbf	feature_rbf.py:507	AssertionError("%s < %s" % (str(thing1), str(thing2)))
+PASS	feature_reindex	-	PASS
+PASS	feature_reindex_init	-	PASS
+PASS	feature_reindex_readonly	-	PASS
+PASS	feature_remove_pruned_files_on_startup	-	PASS
+PASS	feature_segwit	-	PASS
+PASS	feature_settings	-	PASS
+PASS	feature_shutdown	-	PASS
+PASS	feature_signet	-	PASS
+PASS	feature_startupnotify	-	PASS
+PASS	feature_taproot	-	PASS
+PASS	feature_uacomment	-	PASS
+FAIL	feature_unsupported_utxo_db	feature_unsupported_utxo_db.py:56	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+PASS	feature_utxo_set_hash	-	PASS
+PASS	feature_versionbits_warning	-	PASS
+PASS	interface_bitcoin_cli	-	PASS
+PASS	interface_http	-	PASS
+SKIP	interface_ipc	-	SKIP
+SKIP	interface_ipc_mining	-	SKIP
+PASS	interface_rest	-	PASS
+PASS	interface_rpc	-	PASS
+SKIP	interface_usdt_coinselection	-	SKIP
+SKIP	interface_usdt_mempool	-	SKIP
+SKIP	interface_usdt_net	-	SKIP
+SKIP	interface_usdt_utxocache	-	SKIP
+SKIP	interface_usdt_validation	-	SKIP
+FAIL	interface_zmq	interface_zmq.py:57	FAIL
+PASS	mempool_accept	-	PASS
+PASS	mempool_accept_wtxid	-	PASS
+PASS	mempool_cluster	-	PASS
+PASS	mempool_compatibility	-	PASS
+PASS	mempool_datacarrier	-	PASS
+PASS	mempool_dust	-	PASS
+PASS	mempool_ephemeral_dust	-	PASS
+PASS	mempool_expiry	-	PASS
+PASS	mempool_limit	-	PASS
+PASS	mempool_package_limits	-	PASS
+FAIL	mempool_package_rbf	mempool_package_rbf.py:106	AssertionError("Mempool sync timed out after {}s:{}".format(
+PASS	mempool_packages	-	PASS
+PASS	mempool_persist	-	PASS
+PASS	mempool_reorg	-	PASS
+PASS	mempool_resurrect	-	PASS
+PASS	mempool_sigoplimit	-	PASS
+PASS	mempool_spend_coinbase	-	PASS
+PASS	mempool_truc	-	PASS
+PASS	mempool_unbroadcast	-	PASS
+PASS	mempool_updatefromblock	-	PASS
+PASS	mining_basic	-	PASS
+PASS	mining_getblocktemplate_longpoll	-	PASS
+PASS	mining_mainnet	-	PASS
+PASS	mining_prioritisetransaction	-	PASS
+PASS	mining_template_verification	-	PASS
+PASS	p2p_1p1c_network	-	PASS
+PASS	p2p_add_connections	-	PASS
+PASS	p2p_addr_relay	-	PASS
+PASS	p2p_addr_selfannouncement	-	PASS
+PASS	p2p_addrfetch	-	PASS
+PASS	p2p_addrv2_relay	-	PASS
+PASS	p2p_block_sync	-	PASS
+FAIL	p2p_blockfilters	p2p_blockfilters.py:67	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+PASS	p2p_blocksonly	-	PASS
+FAIL	p2p_compactblocks	p2p_compactblocks.py:210	AssertionError: block_hash=3975307419681205496091183499978098080056741645928258193904074416971540376479, cmpctblock=None, inv=msg_inv(inv=[CInv(type=Block hash=
+FAIL	p2p_compactblocks_blocksonly	p2p_compactblocks_blocksonly.py:99	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+PASS	p2p_compactblocks_hb	-	PASS
+PASS	p2p_disconnect_ban	-	PASS
+FAIL	p2p_dns_seeds	p2p_dns_seeds.py:36	AssertionError(self._node_msg(msg))
+PASS	p2p_eviction	-	PASS
+PASS	p2p_feefilter	-	PASS
+FAIL	p2p_filter	p2p_filter.py:110	AssertionError
+PASS	p2p_fingerprint	-	PASS
+PASS	p2p_getaddr_caching	-	PASS
+PASS	p2p_getdata	-	PASS
+PASS	p2p_handshake	-	PASS
+FAIL	p2p_headers_sync_with_minchainwork	p2p_headers_sync_with_minchainwork.py:62	AssertionError(self._node_msg(msg))
+FAIL	p2p_i2p_ports	p2p_i2p_ports.py:26	Error connecting to {addr}, connection refused due to arbitrary port 8333"]):
+FAIL	p2p_i2p_sessions	p2p_i2p_sessions.py:26	AssertionError(self._node_msg(msg))
+PASS	p2p_ibd_stalling	-	PASS
+PASS	p2p_ibd_txrelay	-	PASS
+PASS	p2p_initial_headers_sync	-	PASS
+PASS	p2p_invalid_block	-	PASS
+PASS	p2p_invalid_locator	-	PASS
+FAIL	p2p_invalid_messages	p2p_invalid_messages.py:96	AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
+FAIL	p2p_invalid_tx	p2p_invalid_tx.py:122	AssertionError(self._node_msg(msg))
+PASS	p2p_leak	-	PASS
+PASS	p2p_leak_tx	-	PASS
+PASS	p2p_message_capture	-	PASS
+PASS	p2p_mutated_blocks	-	PASS
+PASS	p2p_net_deadlock	-	PASS
+PASS	p2p_nobloomfilter_messages	-	PASS
+PASS	p2p_node_network_limited	-	PASS
+FAIL	p2p_opportunistic_1p1c	p2p_opportunistic_1p1c.py:557	AssertionError
+FAIL	p2p_orphan_handling	p2p_orphan_handling.py:271	JSONRPCException(response['error'], status)
+PASS	p2p_outbound_eviction	-	PASS
+PASS	p2p_permissions	-	PASS
+FAIL	p2p_ping	p2p_ping.py:43	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+FAIL	p2p_private_broadcast	p2p_private_broadcast.py:293	FailedToStartError(self._node_msg(
+FAIL	p2p_seednode	p2p_seednode.py:33	AssertionError(self._node_msg(msg))
+FAIL	p2p_segwit	p2p_segwit.py:826	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+FAIL	p2p_sendheaders	p2p_sendheaders.py:169	AssertionError("Predicate {} not true after {} seconds".format(predicate_source, timeout))
+FAIL	p2p_sendtxrcncl	p2p_sendtxrcncl.py:125	AssertionError(f"Both values are {thing1}{f', {error_message}' if error_message else ''}")
+PASS	p2p_timeouts	-	PASS
+FAIL	p2p_tx_download	p2p_tx_download.py:130	AssertionError("Mempool sync timed out after {}s:{}".format(
+PASS	p2p_tx_privacy	-	PASS
+FAIL	p2p_unrequested_blocks	p2p_unrequested_blocks.py:100	AssertionError(self._node_msg(msg))
+PASS	p2p_v2_encrypted	-	PASS
+PASS	p2p_v2_misbehaving	-	PASS
+PASS	p2p_v2_transport	-	PASS
+PASS	rpc_bind	-	PASS
+FAIL	rpc_blockchain	rpc_blockchain.py:597	TimeoutError: timed out
+PASS	rpc_createmultisig	-	PASS
+PASS	rpc_decodescript	-	PASS
+PASS	rpc_deprecated	-	PASS
+PASS	rpc_deriveaddresses	-	PASS
+FAIL	rpc_dumptxoutset	rpc_dumptxoutset.py:84	AssertionError: [node 0] Node returned unexpected exit code (1) vs ((0,)) when stopping
+PASS	rpc_estimatefee	-	PASS
+FAIL	rpc_generate	rpc_generate.py:114	JSONRPCException(response['error'], status)
+PASS	rpc_getblockfilter	-	PASS
+PASS	rpc_getblockfrompeer	-	PASS
+PASS	rpc_getblockstats	-	PASS
+PASS	rpc_getchaintips	-	PASS
+PASS	rpc_getdescriptoractivity	-	PASS
+PASS	rpc_getdescriptorinfo	-	PASS
+PASS	rpc_gettxspendingprevout	-	PASS
+PASS	rpc_help	-	PASS
+PASS	rpc_invalid_address_message	-	PASS
+PASS	rpc_invalidateblock	-	PASS
+PASS	rpc_misc	-	PASS
+PASS	rpc_named_arguments	-	PASS
+FAIL	rpc_net	rpc_net.py:343	AssertionError(self._node_msg(msg))
+PASS	rpc_orphans	-	PASS
+PASS	rpc_packages	-	PASS
+PASS	rpc_preciousblock	-	PASS
+PASS	rpc_psbt	-	PASS
+FAIL	rpc_rawtransaction	rpc_rawtransaction.py:304	JSONRPCException(response['error'], status)
+PASS	rpc_scanblocks	-	PASS
+PASS	rpc_scantxoutset	-	PASS
+PASS	rpc_setban	-	PASS
+PASS	rpc_signer	-	PASS
+PASS	rpc_signmessagewithprivkey	-	PASS
+PASS	rpc_signrawtransactionwithkey	-	PASS
+PASS	rpc_txoutproof	-	PASS
+PASS	rpc_uptime	-	PASS
+PASS	rpc_users	-	PASS
+PASS	rpc_validateaddress	-	PASS
+PASS	rpc_whitelist	-	PASS
+SKIP	tool_bench_sanity_check	-	SKIP
+FAIL	tool_bitcoin	tool_bitcoin.py:54	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/bin/bitcoin'
+SKIP	tool_bitcoin_chainstate	-	SKIP
+PASS	tool_rpcauth	-	PASS
+PASS	tool_signet_miner	-	PASS
+PASS	tool_utils	-	PASS
+PASS	tool_utxo_to_sqlite	-	PASS
+FAIL	tool_wallet	tool_wallet.py:46	AssertionError
+PASS	wallet_abandonconflict	-	PASS
+PASS	wallet_address_types	-	PASS
+PASS	wallet_anchor	-	PASS
+FAIL	wallet_assumeutxo	wallet_assumeutxo.py:82	AssertionError("%s <= %s" % (str(thing1), str(thing2)))
+PASS	wallet_avoid_mixing_output_types	-	PASS
+PASS	wallet_avoidreuse	-	PASS
+FAIL	wallet_backup	wallet_backup.py:118	JSONRPCException(response['error'], status)
+FAIL	wallet_backwards_compatibility	wallet_backwards_compatibility.py:278	JSONRPCException(response['error'], status)
+PASS	wallet_balance	-	PASS
+PASS	wallet_basic	-	PASS
+PASS	wallet_blank	-	PASS
+PASS	wallet_bumpfee	-	PASS
+PASS	wallet_change_address	-	PASS
+PASS	wallet_coinbase_category	-	PASS
+PASS	wallet_conflicts	-	PASS
+PASS	wallet_create_tx	-	PASS
+PASS	wallet_createwallet	-	PASS
+PASS	wallet_createwalletdescriptor	-	PASS
+FAIL	wallet_crosschain	wallet_crosschain.py:32	JSONRPCException(response['error'], status)
+FAIL	wallet_descriptor	wallet_descriptor.py:93	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+PASS	wallet_disable	-	PASS
+PASS	wallet_encryption	-	PASS
+PASS	wallet_fallbackfee	-	PASS
+PASS	wallet_fast_rescan	-	PASS
+PASS	wallet_fundrawtransaction	-	PASS
+PASS	wallet_gethdkeys	-	PASS
+PASS	wallet_groups	-	PASS
+FAIL	wallet_hd	wallet_hd.py:84	JSONRPCException(response['error'], status)
+PASS	wallet_importdescriptors	-	PASS
+PASS	wallet_importprunedfunds	-	PASS
+PASS	wallet_keypool	-	PASS
+FAIL	wallet_keypool_topup	wallet_keypool_topup.py:40	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260922T205215-55239/wallet_keypool_topup/node1/regtest/wallets/defau
+PASS	wallet_labels	-	PASS
+PASS	wallet_listdescriptors	-	PASS
+PASS	wallet_listreceivedby	-	PASS
+PASS	wallet_listsinceblock	-	PASS
+FAIL	wallet_listtransactions	wallet_listtransactions.py:229	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260922T205215-55239/wallet_listtransactions/node0/regtest/default_wa
+FAIL	wallet_migration	wallet_migration.py:139	JSONRPCException(response['error'], status)
+PASS	wallet_miniscript	-	PASS
+PASS	wallet_miniscript_decaying_multisig_descriptor_psbt	-	PASS
+PASS	wallet_multisig_descriptor_psbt	-	PASS
+FAIL	wallet_multiwallet	wallet_multiwallet.py:78	AssertionError("not(%s)" % " == ".join(str(arg) for arg in (thing1, thing2) + args))
+FAIL	wallet_musig	wallet_musig.py:262	KeyError: 'musig2_pubnonces'
+PASS	wallet_orphanedreward	-	PASS
+PASS	wallet_reindex	-	PASS
+FAIL	wallet_reorgsrestore	wallet_reorgsrestore.py:203	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260922T205215-55239/wallet_reorgsrestore/node1/regtest/default_walle
+PASS	wallet_rescan_unconfirmed	-	PASS
+PASS	wallet_resendwallettransactions	-	PASS
+PASS	wallet_send	-	PASS
+PASS	wallet_sendall	-	PASS
+PASS	wallet_sendmany	-	PASS
+PASS	wallet_signer	-	PASS
+PASS	wallet_signmessagewithaddress	-	PASS
+PASS	wallet_signrawtransactionwithwallet	-	PASS
+PASS	wallet_simulaterawtx	-	PASS
+PASS	wallet_spend_unconfirmed	-	PASS
+FAIL	wallet_startup	wallet_startup.py:38	FileNotFoundError: [Errno 2] No such file or directory: '/workspace/build/conformance-tmp/20260922T205215-55239/wallet_startup/node0/regtest/wallets/10be9309398
+PASS	wallet_taproot	-	PASS
+PASS	wallet_timelock	-	PASS
+PASS	wallet_transactiontime_rescan	-	PASS
+PASS	wallet_txn_clone	-	PASS
+PASS	wallet_txn_doublespend	-	PASS
+PASS	wallet_v3_txs	-	PASS
