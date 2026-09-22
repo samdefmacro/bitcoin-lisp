@@ -4768,7 +4768,11 @@ above the tip does lead the locator."
       (let* ((tip-hash (bl.store:block-index-entry-hash tip-entry))
              (h (first (make-test-chain-hashes #xB8 1)))
              (blk (make-reorg-test-block tip-hash h 3)))
-        (%index-header cs blk h 3 tip-entry 900000)
+        ;; MORE work than the tip: the best header is Core's most-work entry
+        ;; (m_best_header), not the highest one, so a header the fixture gave
+        ;; less work than the tip would never lead the locator.
+        (%index-header cs blk h 3 tip-entry
+                       (1+ (bl.store:block-index-entry-chain-work tip-entry)))
         (is (equalp h (first (bl.net::build-header-locator cs)))
             "control: a valid header above the tip leads the locator")
         (setf (bl.store:block-index-entry-status
