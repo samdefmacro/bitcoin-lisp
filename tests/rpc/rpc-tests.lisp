@@ -4355,13 +4355,11 @@ client reach them at all."
   (let ((acceptor (make-instance 'bl.rpc::rpc-acceptor :port 0))
         (bl.rpc::*rpc-allow-subnets*
           (bl.rpc::%parse-rpc-acl '("10.0.0.0/8"))))
-    (flet ((acl-refusal-p (body)
-             ;; A helper, not an inline (and (stringp body) (search ...)): the
-             ;; `is` macro evaluates the argument forms of a compound predicate
-             ;; eagerly, so the stringp guard would not protect the search.
-             (and (stringp body)
-                  (search "not allowed RPC access" body)
-                  t))
+    (flet ((acl-refusal-p (status body)
+             ;; Core's refusal is a BARE 403: no body at all, not even a JSON
+             ;; error (httpserver.cpp:217-222).
+             (and (eql status hunchentoot:+http-forbidden+)
+                  (equal body "")))
            (dispatch (uri remote-addr)
              (let* ((hunchentoot:*acceptor* nil)
                     (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
@@ -4387,14 +4385,13 @@ client reach them at all."
           (multiple-value-bind (status body) (dispatch uri blocked)
             (is-true (eql hunchentoot:+http-forbidden+ status)
                      "~A from ~A must be refused by the ACL, got ~S" uri blocked status)
-            (is-true (acl-refusal-p body)
+            (is-true (acl-refusal-p status body)
                      "~A from ~A leaked a non-ACL response: ~S" uri blocked body)))
         ;; inside the ACL — the -rpcallowip entry and the loopback floor alike —
         ;; the request reaches routing, whatever routing then says
         (dolist (allowed '("10.1.2.3" "127.0.0.2"))
           (multiple-value-bind (status body) (dispatch uri allowed)
-            (declare (ignore status))
-            (is-false (acl-refusal-p body)
+            (is-false (acl-refusal-p status body)
                       "~A from ~A was refused by the ACL and should not have been"
                       uri allowed))))
       ;; 127.0.0.2 above is admitted by the floor, not by 10.0.0.0/8 — so it
@@ -4402,8 +4399,7 @@ client reach them at all."
       (let ((bl.rpc::*rpc-allow-subnets*
               (bl.rpc::%parse-rpc-acl '())))
         (multiple-value-bind (status body) (dispatch "/rest/chaininfo.json" "127.0.0.2")
-          (declare (ignore status))
-          (is-false (acl-refusal-p body)
+          (is-false (acl-refusal-p status body)
                     "loopback must reach routing with no -rpcallowip at all"))))))
 
 ;;; --- Test-harness control RPCs (track B P0) ---

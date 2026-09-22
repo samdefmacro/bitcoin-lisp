@@ -1825,9 +1825,17 @@ evhttp_set_max_headers_size: `METHOD URI PROTOCOL\\r\\n', one
                     (hunchentoot:content-type*) "text/plain")
               "Work queue depth exceeded")))
       ;; Core answers a bare 403 and reveals nothing else — not the method it
-      ;; would have refused, not whether a handler exists at this path.
-      (rpc-json-error hunchentoot:+http-forbidden+ +rpc-misc-error+
-                      "Client network is not allowed RPC access")))
+      ;; would have refused, not whether a handler exists at this path, not
+      ;; even a JSON error: WriteReply(HTTP_FORBIDDEN) with no body
+      ;; (httpserver.cpp:217-222), which a JSON-RPC client reports as a
+      ;; non-JSON 403 (rpc_bind.py:165 expects exactly that). The reason goes
+      ;; to the log, under the http category, as Core's does.
+      (progn
+        (bl.log:log-cat "http" "HTTP request from ~A rejected: Client network is not allowed RPC access"
+                        (hunchentoot:remote-addr request))
+        (setf (hunchentoot:return-code*) hunchentoot:+http-forbidden+
+              (hunchentoot:content-type*) "text/plain")
+        "")))
 
 (defun make-json-rpc-dispatcher ()
   "Dispatch-table entry matching exactly what Core registers for JSON-RPC:
