@@ -9832,6 +9832,35 @@ different port stay distinct."
           (is (eql -1 (bl.rpc:rpc-error-code e)))
           (is (search "addnode \"node\" \"command\"" (bl.rpc:rpc-error-message e))))))))
 
+(test getnodeaddresses-filters-by-network
+  "Core's getnodeaddresses takes a NETWORK argument and returns only that
+network's addresses; a negative count is -8 `Address count out of range' and
+an unknown network -8 `Network not recognized' (rpc/net.cpp:947-955). Ours
+ignored the argument: rpc_net.py:319 got an IPv6 address back from
+getnodeaddresses(0, \"ipv4\"), and p2p_addrv2_relay.py:102 non-I2P
+addresses from network=\"i2p\"."
+  (let ((node (make-test-node))
+        (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
+    (setf (bl:node-address-book node) (bl.net:make-address-book))
+    (dolist (spec '(("1.2.3.4" . :ipv4) ("5.6.7.8" . :ipv4)
+                    ("2600:1::1" . :ipv6)))
+      (bl.net:address-book-add (bl:node-address-book node)
+                               (bl.net:make-peer-address
+                                :net (cdr spec) :ip (bl.net:string-to-ip-bytes (car spec))
+                                :port 8333 :services 1
+                                :last-seen (bl.ser:get-unix-time))))
+    (flet ((call (&rest params) (bl.rpc:dispatch-rpc-method node "getnodeaddresses" params))
+           (nets (rows) (mapcar (lambda (r) (cdr (assoc "network" r :test #'string=)))
+                                (coerce rows 'list)))
+           (code (thunk) (handler-case (progn (funcall thunk) nil)
+                           (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e)))))
+      (is (equal '("ipv4" "ipv4") (nets (call 0 "ipv4"))))
+      (is (equal '("ipv6") (nets (call 0 "IPv6"))) "the name is case-insensitive")
+      (is (zerop (length (call 0 "i2p"))))
+      (is (= 3 (length (call 0))) "no network: every address")
+      (is (eql -8 (code (lambda () (call -1)))))
+      (is (eql -8 (code (lambda () (call 1 "Foo"))))))))
+
 (test getnetworkinfo-lists-the-local-addresses
   "Core's getnetworkinfo reports mapLocalHost as localaddresses, one
 {address, port, score} per entry (rpc/net.cpp:721-733);

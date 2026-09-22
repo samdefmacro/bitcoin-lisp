@@ -626,9 +626,13 @@ name a destination. Returns a peer-address or NIL after TRIES draws."
             (return pa)))))))
 
 (defun address-book-get-addr (book &key (max +addrman-getaddr-max+)
-                                         (pct +addrman-getaddr-pct+) (now (ab-now)))
+                                         (pct +addrman-getaddr-pct+) (now (ab-now))
+                                         network)
   "Return a random sample of non-terrible addresses (Core GetAddr). MAX 0 = no
-count cap; PCT >= 100 = no percentage cap (used by getnodeaddresses count=0)."
+count cap; PCT >= 100 = no percentage cap (used by getnodeaddresses count=0).
+NETWORK, when given, keeps only addresses on that network; the cap is still
+computed over the whole table, as Core's GetAddr_ does
+(addrman.cpp:812-848)."
   (let* ((v (address-book-random-ids book))
          (n (fill-pointer v))
          (limit (cond ((and (zerop max) (>= pct 100)) n)
@@ -644,7 +648,10 @@ count cap; PCT >= 100 = no percentage cap (used by getnodeaddresses count=0)."
           do (let ((j (+ i (random (- n i)))))
                (rotatef (aref ids i) (aref ids j))
                (let ((pa (gethash (aref ids i) (address-book-info book))))
-                 (when (and pa (not (addr-info-terrible-p pa now)))
+                 (when (and pa
+                            (or (null network)
+                                (eq network (peer-address-network pa)))
+                            (not (addr-info-terrible-p pa now)))
                    (push pa result)))))
     (nreverse result)))
 

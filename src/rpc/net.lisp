@@ -485,12 +485,28 @@ peer disconnecting mid-send."
 
 (define-rpc "getnodeaddresses" (node params)
   "Return known peer addresses from the address book (Bitcoin Core
-getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
+getnodeaddresses). PARAMS: ([count] [network]) — max addresses (default 1;
+0 = all), and only addresses of NETWORK (ipv4, ipv6, onion, i2p, cjdns) when
+given (rpc/net.cpp:947-955). A negative count and an unknown network are -8,
+as in Core."
   (let* ((count (if (integerp (first params)) (first params) 1))
-         (book (bl:node-address-book node))
-         ;; count=0 => all known addresses; count>0 => up to that many.
-         (limited (and book (bl.net:address-book-get-addr
-                             book :max (max count 0) :pct 100))))
+         (network-name (second params))
+         (network (and (stringp network-name)
+                       (cdr (assoc (string-downcase network-name)
+                                   '(("ipv4" . :ipv4) ("ipv6" . :ipv6)
+                                     ("onion" . :torv3) ("i2p" . :i2p)
+                                     ("cjdns" . :cjdns))
+                                   :test #'string=))))
+         (book (bl:node-address-book node)))
+    (when (minusp count)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Address count out of range"))
+    (when (and (stringp network-name) (null network))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "Network not recognized: ~A" network-name)))
+  (let (;; count=0 => all known addresses; count>0 => up to that many.
+        (limited (and book (bl.net:address-book-get-addr
+                            book :max count :pct 100 :network network))))
     ;; Core pushes a VARR: an empty address book is [], not null.
     (json-array
      (mapcar
@@ -500,7 +516,7 @@ getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
           ("address" . ,(bl.net:peer-address-string pa))
           ("port" . ,(bl.net:peer-address-port pa))
           ("network" . ,(or (%addrman-network-name pa) "unroutable"))))
-      limited))))
+      limited)))))
 
 (defun %addrman-network-name (pa)
   "Network bucket name (Bitcoin Core GetNetworkName) for a peer-address PA, or
