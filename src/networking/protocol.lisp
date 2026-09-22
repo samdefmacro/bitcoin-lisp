@@ -897,6 +897,13 @@ per-peer index of CANDIDATE_BEST announcements (txrequest.cpp:595-624)."
         (setf to-send (%tx-request-schedule hash now to-send))))
     (%send-tx-getdatas to-send)))
 
+(defvar *cached-is-ibd* t
+  "Latched IBD status: starts true; initial-block-download-p latches it
+to false once the tip has enough work and is recent, and it never flips
+back for the life of the node (Core m_cached_is_ibd, validation.h:1049,
+latched by UpdateIBDStatus, validation.cpp:3314-3322). Re-set to T by
+reset-ibd-stop at node start.")
+
 (bl.vi:define-validation-hook :block-connected tx-request-block-connected
     (chainstate block block-hash height spent-utxos)
   "Core BlockConnected's tx-download half (txdownloadman_impl.cpp:98-110): a
@@ -907,16 +914,25 @@ peer answers it in full out of m_most_recent_block_txs -- a whole redundant
 transaction body that handle-tx then discards on its recently-confirmed
 check.
 
-The recently-confirmed FILTER half of the same Core function lives in
-NOTE-BLOCK-CONNECTED, in the validation layer that owns the filter; this half
-is here because the tracker is, and the hook is what lets validation drive it
-without naming networking."
+The recently-confirmed FILTER half of the same Core function is
+NOTE-BLOCK-TXS-CONFIRMED, in the validation layer that owns the filter, driven
+from here; the hook is what lets validation reach both without naming
+networking.
+
+Core runs the whole of it only for the active chainstate and only OUTSIDE
+initial block download (PeerManagerImpl::BlockConnected,
+net_processing.cpp:2086-2092), reading the latched IsInitialBlockDownload --
+*CACHED-IS-IBD* here. The filter used to be filled during IBD too, which made a
+transaction confirmed then unrequestable once the node was out:
+p2p_ibd_txrelay.py:93-96 announces the coinbase of a block mined in IBD and
+waits for the getdata."
   (declare (ignore block-hash height spent-utxos))
-  ;; An assumeutxo TARGETED chainstate re-derives ancient history; Core wires
-  ;; the tx-download callbacks to the ACTIVE chainstate only
-  ;; (net_processing.cpp:2086-2092), and its blocks would otherwise release
-  ;; announcements of transactions that are still unconfirmed for us.
-  (unless (bl.store:chain-state-target-blockhash chainstate)
+  ;; An assumeutxo TARGETED chainstate re-derives ancient history; its blocks
+  ;; would otherwise release announcements of transactions that are still
+  ;; unconfirmed for us.
+  (unless (or *cached-is-ibd*
+              (bl.store:chain-state-target-blockhash chainstate))
+    (bl.val:note-block-txs-confirmed block)
     (map nil (lambda (tx)
                (tx-request-forget-tx (bl.ser:transaction-hash tx)
                                      (bl.ser:transaction-wtxid tx)))
@@ -1005,13 +1021,6 @@ with -maxtipage.
 
 A DEFPARAMETER because Core exposes the knob; the +NAME+ spelling is kept
 because every caller reads it as a constant.")
-
-(defvar *cached-is-ibd* t
-  "Latched IBD status: starts true; initial-block-download-p latches it
-to false once the tip has enough work and is recent, and it never flips
-back for the life of the node (Core m_cached_is_ibd, validation.h:1049,
-latched by UpdateIBDStatus, validation.cpp:3314-3322). Re-set to T by
-reset-ibd-stop at node start.")
 
 (defun near-tip-p (chain-state)
   "Core's near-tip test for accepting NODE_NETWORK_LIMITED peers as automatic

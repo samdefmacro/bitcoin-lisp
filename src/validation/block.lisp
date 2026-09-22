@@ -2906,11 +2906,24 @@ txdownloadman_impl.cpp:91-95): a new block changes both the fee floor and
 which parents exist, so every cached fee failure is stale."
   (bl:clear-recent-rejects *recent-rejects-reconsiderable*))
 
+(defun note-block-txs-confirmed (block)
+  "Add every transaction of BLOCK, txid and distinct wtxid, to the
+recent-confirmed filter (Core TxDownloadManagerImpl::BlockConnected,
+txdownloadman_impl.cpp:98-110). The networking layer's BlockConnected
+subscriber (TX-REQUEST-BLOCK-CONNECTED) calls it, and -- as Core's
+PeerManagerImpl::BlockConnected does -- only outside initial block download
+and never for a targeted chainstate (net_processing.cpp:2086-2092)."
+  (dolist (tx (coerce (bl.ser:bitcoin-block-transactions block) 'list))
+    (let ((txid (bl.ser:transaction-hash tx))
+          (wtxid (bl.ser:transaction-wtxid tx)))
+      (bl:add-recent-reject *recent-confirmed-txs* txid)
+      (unless (equalp wtxid txid)
+        (bl:add-recent-reject *recent-confirmed-txs* wtxid)))))
+
 (defun note-block-connected (block)
   "Record BLOCK as the new most-recent block: rebuild the getdata-servable
-tx map and add every transaction's txid (and distinct wtxid) to the
-recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
-+ NewPoWValidBlock's most_recent_block_txs rebuild)."
+tx map (Core NewPoWValidBlock's most_recent_block_txs rebuild). The
+recent-confirmed filter is NOTE-BLOCK-TXS-CONFIRMED's, which is gated on IBD."
   (let ((map (make-hash-table :test 'equalp)))
     (dolist (tx (coerce (bl.ser:bitcoin-block-transactions
                          block)
@@ -2918,10 +2931,8 @@ recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
       (let ((txid (bl.ser:transaction-hash tx))
             (wtxid (bl.ser:transaction-wtxid tx)))
         (setf (gethash txid map) tx)
-        (bl:add-recent-reject *recent-confirmed-txs* txid)
         (unless (equalp wtxid txid)
-          (setf (gethash wtxid map) tx)
-          (bl:add-recent-reject *recent-confirmed-txs* wtxid))))
+          (setf (gethash wtxid map) tx))))
     (setf *most-recent-block-txs* map
           ;; Keep the block itself too, and drop any compact form built for
           ;; the block this one replaces (most-recent-cmpctblock rebuilds on

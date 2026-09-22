@@ -963,12 +963,15 @@ asserts the marker, which is the thing that was wrong."
   "Run a reorg on a chainstate that is targeted (the assumeutxo background
 chainstate) or not, and report what it did to the tx-relay structures.
 
-Seeded with a MARKER block through the exported NOTE-BLOCK-CONNECTED, so both
+Seeded with a MARKER block through the exported NOTE-BLOCK-CONNECTED and
+NOTE-BLOCK-TXS-CONFIRMED, so both
 structures start non-empty and the two outcomes are distinguishable in BOTH
 directions: an active chainstate must reset the recent-confirmed filter (the
 marker goes) and publish the fork tip (its coinbase arrives); a targeted one
-must do neither."
+must do neither. Run out of IBD, where Core's BlockConnected feeds the
+filter at all (net_processing.cpp:2089)."
   (with-network (:mainnet)
+   (let ((bl.net:*cached-is-ibd* nil))
     (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
         (make-activate-block-fixture suffix)
       (build-and-connect chain-state block-store utxo-set genesis-hash
@@ -990,6 +993,7 @@ must do neither."
                          (first (bl.ser:bitcoin-block-transactions marker)))))
         (bl.val:reset-recent-confirmed)
         (bl.val:note-block-connected marker)
+        (bl.val:note-block-txs-confirmed marker)
         (when targeted
           (bl.store:set-chainstate-target chain-state fork-tip))
         (let ((reorged (bl.val:perform-reorg chain-state block-store utxo-set
@@ -998,7 +1002,7 @@ must do neither."
                 :height (bl.store:current-height chain-state)
                 :filter-reset (not (bl.val:recently-confirmed-p marker-cb))
                 :fork-tip-confirmed (and (bl.val:recently-confirmed-p fork-cb) t)
-                :fork-tip-servable (and (bl.val:most-recent-block-tx fork-cb) t)))))))
+                :fork-tip-servable (and (bl.val:most-recent-block-tx fork-cb) t))))))))
 
 (test reorg-commit-carries-the-background-chainstate-guard
   "%REORG-COMMIT's tx-relay side effects must ask the question CONNECT-BLOCK

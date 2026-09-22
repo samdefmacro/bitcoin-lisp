@@ -3542,6 +3542,7 @@ confirmed (Core BlockConnected) and rebuilds the most-recent-block tx map
     (unwind-protect
         (progn
           (bl.val:note-block-connected (%w9-block-with-tx tx))
+          (bl.val:note-block-txs-confirmed (%w9-block-with-tx tx))
           (is-true (bl.val:recently-confirmed-p txid))
           (is-true (bl.val:recently-confirmed-p wtxid))
           (is (eq tx (bl.val:most-recent-block-tx txid)))
@@ -3565,7 +3566,8 @@ redundant transaction body and threw it away on the recently-confirmed check.
 Driven through the shipped validation-interface signal, which is how
 validation reaches the tracker without naming networking."
   (bl.net:reset-tx-requests)
-  (let* ((tx (%witness-tx-for-relay))
+  (let* ((bl.net:*cached-is-ibd* nil)   ; out of IBD, where Core runs it
+         (tx (%witness-tx-for-relay))
          (txid (bl.ser:transaction-hash tx))
          (wtxid (bl.ser:transaction-wtxid tx))
          (other (%w9-hash 600001))
@@ -3619,6 +3621,35 @@ of transactions that are still unconfirmed for us."
       (clear-recent-block-txs)
       (bl.net:reset-tx-requests))))
 
+(test a-block-connected-in-ibd-leaves-the-recent-confirmed-filter-alone
+  "Core's PeerManagerImpl::BlockConnected skips the whole tx-download half
+while in initial block download (net_processing.cpp:2086-2092): nothing a block
+confirms then enters the recently-confirmed filter. p2p_ibd_txrelay.py:93-96
+mines a block during IBD, leaves IBD, announces that block's coinbase and
+waits for the getdata; ours had filed it as recently confirmed and never
+asked. Control: the same signal out of IBD fills the filter."
+  (let* ((tx (%witness-tx-for-relay))
+         (txid (bl.ser:transaction-hash tx))
+         (state (bl.store:make-chain-state))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+    (unwind-protect
+         (progn
+           (bl.val:reset-recent-confirmed)
+           (let ((bl.net:*cached-is-ibd* nil))
+             (bl.vi:notify-block-connected state (%w9-block-with-tx tx) hash 101 nil))
+           (is-true (bl.val:recently-confirmed-p txid) "control: out of IBD it is filed")
+           (bl.val:reset-recent-confirmed)
+           ;; What the connect path runs for a block: the most-recent-block
+           ;; bookkeeping, then the BlockConnected signal.
+           (let ((bl.net:*cached-is-ibd* t))
+             (bl.val:note-block-connected (%w9-block-with-tx tx))
+             (bl.vi:notify-block-connected state (%w9-block-with-tx tx) hash 101 nil))
+           (is-false (bl.val:recently-confirmed-p txid)
+                     "a block connected during IBD files nothing"))
+      (bl.val:reset-recent-confirmed)
+      (clear-recent-block-txs)
+      (bl.net:reset-tx-requests))))
+
 (test handle-inv-skips-recently-confirmed
   "A tx announcement for a recently-confirmed tx is not requested (Core
 AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
@@ -3640,7 +3671,7 @@ AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
     (unwind-protect
         (progn
           (bl.net:reset-tx-requests)
-          (bl.val:note-block-connected (%w9-block-with-tx tx))
+          (bl.val:note-block-txs-confirmed (%w9-block-with-tx tx))
           (finishes (deliver-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
           ;; Nothing recorded: a fresh probe still gets an immediate request.
           (is-true (bl.net:tx-request-wanted-p wtxid probe t)))
