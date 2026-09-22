@@ -176,6 +176,7 @@ headerssync.cpp. src/networking/.")
    #:headers-direct-fetch
    #:*capture-messages-directory*
    #:capture-message
+   #:addr-token-clock
    #:header-sync-candidate-p
    #:consider-headers-sync-timeouts
    #:header-sync-peer

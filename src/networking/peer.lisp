@@ -234,8 +234,9 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; beyond the bucket are DROPPED. Sending a getaddr bumps it by 1000 so
   ;; the solicited response is exempt.
   (addr-token-bucket 1.0d0 :type double-float)
-  ;; internal-real-time when the bucket was last refilled (m_addr_token_timestamp).
-  (addr-token-timestamp (get-internal-real-time) :type integer)
+  ;; Mockable microseconds when the bucket was last refilled
+  ;; (m_addr_token_timestamp); 0 = never, i.e. the first refill adds nothing.
+  (addr-token-timestamp 0 :type integer)
   ;; Lifetime counters surfaced in getpeerinfo (m_addr_processed /
   ;; m_addr_rate_limited).
   (addr-processed 0 :type integer)

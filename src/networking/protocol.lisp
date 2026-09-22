@@ -1853,17 +1853,32 @@ Core counts it in neither num_proc nor num_rate_limit."
               (cons pa reachable))
             t)))
 
-(defun %refill-addr-token-bucket (peer &optional (now (get-internal-real-time)))
+(defun addr-token-clock ()
+  "Now in MOCKABLE microseconds, the clock of the addr token bucket: Core
+refills m_addr_token_bucket from GetTime<std::chrono::microseconds>()
+(net_processing.cpp:4057), so setmocktime moves it.
+p2p_addr_relay.py:427-439 advances the mock clock a day between one-address
+messages and expects every message processed; on the process clock the
+bucket saw a few real seconds a day, 0.1 token each, and ran dry."
+  (if bl.ser:*mock-time*
+      (* (bl.ser:get-unix-time) 1000000)
+      #+sbcl (multiple-value-bind (seconds microseconds) (sb-ext:get-time-of-day)
+               (+ (* seconds 1000000) microseconds))
+      #-sbcl (* (bl.ser:get-unix-time) 1000000)))
+
+(defun %refill-addr-token-bucket (peer &optional (now (addr-token-clock)))
   "Refill PEER's addr token bucket from elapsed time, once per addr/addrv2
 message (Core net_processing.cpp:4056-4064): only while below the soft cap,
 at +max-addr-rate-per-second+, clamped to the cap — so the getaddr-response
 bump above the cap is never refilled further but also not clawed back. The
-timestamp always advances."
+timestamp always advances. NOW is ADDR-TOKEN-CLOCK microseconds; a peer whose
+timestamp is still 0 has never been refilled and gains nothing (Core stamps
+m_addr_token_timestamp when the Peer is created, :386)."
   (let ((cap (coerce +max-addr-processing-token-bucket+ 'double-float)))
     (when (< (peer-addr-token-bucket peer) cap)
-      (let* ((elapsed (max 0 (- now (peer-addr-token-timestamp peer))))
-             (increment (* (/ (coerce elapsed 'double-float)
-                              internal-time-units-per-second)
+      (let* ((last (peer-addr-token-timestamp peer))
+             (elapsed (if (zerop last) 0 (max 0 (- now last))))
+             (increment (* (/ (coerce elapsed 'double-float) 1000000)
                            +max-addr-rate-per-second+)))
         (setf (peer-addr-token-bucket peer)
               (min (+ (peer-addr-token-bucket peer) increment) cap))))

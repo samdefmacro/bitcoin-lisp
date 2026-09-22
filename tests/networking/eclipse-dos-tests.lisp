@@ -401,7 +401,7 @@ the 1000-token soft cap."
   (let ((p (bl.net:make-peer)))
     (setf (bl.net::peer-addr-token-bucket p) 0.0d0
           (bl.net::peer-addr-token-timestamp p)
-          (- (get-internal-real-time) (* 100 internal-time-units-per-second)))
+          (- (bl.net:addr-token-clock) (* 100 1000000)))
     (bl.net::%refill-addr-token-bucket p)
     ;; 100s * 0.1/s = 10 tokens.
     (is (< 9.9d0 (bl.net::peer-addr-token-bucket p) 10.1d0)))
@@ -409,10 +409,29 @@ the 1000-token soft cap."
   (let ((p (bl.net:make-peer)))
     (setf (bl.net::peer-addr-token-bucket p) 0.0d0
           (bl.net::peer-addr-token-timestamp p)
-          (- (get-internal-real-time) (* 10000000 internal-time-units-per-second)))
+          (- (bl.net:addr-token-clock) (* 10000000 1000000)))
     (bl.net::%refill-addr-token-bucket p)
     (is (= (coerce bl.net::+max-addr-processing-token-bucket+ 'double-float)
            (bl.net::peer-addr-token-bucket p)))))
+
+(test addr-token-bucket-refills-on-the-mockable-clock
+  "Core refills the addr token bucket from GetTime<microseconds>(), the
+MOCKABLE clock (net_processing.cpp:4057-4064): p2p_addr_relay.py:427-439 sends
+one address a (mock) day and expects each processed and relayed. Ours
+refilled from the process clock, which moved seconds per mock day. The first
+refill of a never-stamped peer adds nothing."
+  (let ((p (bl.net:make-peer))
+        (bl.ser:*mock-time* 1700000000))
+    (setf (bl.net::peer-addr-token-bucket p) 0.0d0)
+    (let ((ingest (lambda ()
+                    (ingest-gossiped-addresses p (%addr-entries 1 :base 11) 1
+                                               (bl.net:make-address-book) nil))))
+      (funcall ingest)                  ; stamps the clock; nothing to spend
+      (is (= 1 (bl.net:peer-addr-rate-limited p)) "an empty bucket drops it")
+      (setf bl.ser:*mock-time* (+ 1700000000 (* 24 60 60)))
+      (funcall ingest)
+      (is (= 1 (bl.net:peer-addr-processed p))
+          "a mock day later the bucket has refilled"))))
 
 (defun %addr-entries (n &key (base 10))
   "N distinct routable IPv4 net-addr / timestamp conses (fresh timestamps)."
@@ -448,7 +467,7 @@ m_addr_rate_limited)."
     ;; Depleted-ish bucket, timestamp now so refill is ~0.
     (setf (bl.net::peer-addr-token-bucket p) 5.0d0
           (bl.net::peer-addr-token-timestamp p)
-          (get-internal-real-time))
+          (bl.net:addr-token-clock))
     (let ((added (ingest-gossiped-addresses
                   p (%addr-entries 20) 20 book nil)))
       (is (= 5 added) "only 5 addresses fit the bucket")
@@ -471,7 +490,7 @@ nothing is rate-limited."
         (p (bl.net:make-peer :conn-type :outbound-full-relay)))
     (setf (bl.net::peer-addr-token-bucket p) 1000.0d0
           (bl.net::peer-addr-token-timestamp p)
-          (get-internal-real-time))
+          (bl.net:addr-token-clock))
     (let ((added (ingest-gossiped-addresses
                   p (%addr-entries 10) 10 book nil)))
       (is (= 10 added))
@@ -505,7 +524,7 @@ net_processing.cpp:3772)."
     ;; send-post-handshake-messages does).
     (setf (bl.net::peer-addr-token-bucket p) 1.0d0
           (bl.net::peer-addr-token-timestamp p)
-          (get-internal-real-time))
+          (bl.net:addr-token-clock))
     (incf (bl.net::peer-addr-token-bucket p)
           (coerce bl.ser:+max-addr-count+ 'double-float))
     (let ((added (ingest-gossiped-addresses
