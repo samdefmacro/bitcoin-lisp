@@ -4334,7 +4334,13 @@ a subnet is allowed when it is not."
     (is (not (bl.net:parse-subnet bad)) "accepted ~S" bad)
     (is-false (bl.rpc::%parse-rpc-acl (list bad)) "%parse-rpc-acl accepted ~S" bad))
   ;; a good list still parses, on top of the loopback floor
-  (is-true (bl.rpc::%parse-rpc-acl '("10.0.0.0/8" "::/0"))))
+  (is-true (bl.rpc::%parse-rpc-acl '("10.0.0.0/8" "::/0")))
+  ;; A bracketed IPv6 address is an address: LookupSubNet reads it through
+  ;; LookupHost, which drops the brackets (netbase.cpp:178-180), and
+  ;; rpc_bind.py:44 starts a node with -rpcallowip=[::1]. One pair only.
+  (is (equalp (bl.net:parse-subnet "::1") (bl.net:parse-subnet "[::1]")))
+  (is (equalp (bl.net:parse-subnet "2001:db8::/32") (bl.net:parse-subnet "[2001:db8::]/32")))
+  (is (not (bl.net:parse-subnet "[[::1]]"))))
 
 (test rpc-acl-gates-every-surface-not-just-jsonrpc
   "The ACL runs in the ACCEPTOR, so it covers /rest/ and /ui/ as well as \"/\".

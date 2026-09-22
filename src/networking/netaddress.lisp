@@ -426,7 +426,8 @@ retagged :cjdns when CJDNS is reachable, this being a string-ingress point
   "Parse STRING as a subnet, or NIL when it names none. Core accepts a bare
 address, a network/CIDR and (for IPv4) a network/netmask, and masks the network
 at construction so 1.2.3.4/24 names 1.2.3.0/24 (LookupSubNet, netbase.cpp:743-772;
-CSubNet::CSubNet, netaddress.cpp).
+CSubNet::CSubNet, netaddress.cpp). A bracketed IPv6 address is accepted, as
+LookupHost accepts one.
 
 IPv4 is held in its 16-byte mapped form, so an IPv4 /N covers 96+N bits: the
 ::ffff: prefix is part of the network, which is what keeps 0.0.0.0/0 an
@@ -439,6 +440,13 @@ needs that."
     (let* ((slash (position #\/ string))
            (host (if slash (subseq string 0 slash) string))
            (suffix (and slash (subseq string (1+ slash)))))
+      ;; LookupSubNet reads the address with LookupHost, which drops one pair
+      ;; of enclosing brackets first (netbase.cpp:178-180): -rpcallowip=[::1]
+      ;; is ::1, and rpc_bind.py:44 starts a node with exactly that.
+      (when (and (>= (length host) 2)
+                 (char= (char host 0) #\[)
+                 (char= (char host (1- (length host))) #\]))
+        (setf host (subseq host 1 (1- (length host)))))
       (multiple-value-bind (network address) (parse-network-address host)
         ;; Only the 16-byte networks are subnettable; a .onion or .b32.i2p host
         ;; parses fine and is 32 bytes, so test the length rather than the tag.
