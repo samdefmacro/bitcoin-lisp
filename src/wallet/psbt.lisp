@@ -1411,7 +1411,8 @@ input and an output alike (psbt.cpp:206, :299). Keydata is the 33-byte
 aggregate, the value the participants back to back (psbt.h:412-420).
 wallet_musig.py:229-231 counts them on the input and on the change output."
   (loop for (aggregate . participants)
-          in (bl.rpc:descriptor-musig2-participants (desc-spkm-desc spkm) pos)
+          in (bl.rpc:descriptor-musig2-participants (desc-spkm-desc spkm) pos
+                                                    (desc-spkm-cache spkm))
         do (unless (%psbt-record-present-p map keytype aggregate)
              (bl.ser:psbt-map-set
               map keytype aggregate

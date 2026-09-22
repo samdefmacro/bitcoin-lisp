@@ -1792,7 +1792,16 @@ inputs, in selection order. Caller holds node + wallet locks."
 (defun %desc-key-priv-at (key pos provider)
   "The 32-byte private key a descriptor key expression yields at range
 position POS, or NIL. BIP32 keys derive from the root xprv along the fixed
-path plus the ranged step; const keys come from the parse or PROVIDER."
+path plus the ranged step; const keys come from the parse or PROVIDER.
+
+A musig() key expression is NIL: the aggregate has no private key of its own
+(Core signs it through the MuSig2 nonce/partial-signature protocol, which this
+node does not implement), and it has neither an xpub nor a pubkey slot, so
+the const-key path below died on it with a sequence error -- any
+walletprocesspsbt with sign=true on a wallet holding a musig() participant's
+xprv answered an internal error."
+  (when (bl.rpc:desc-key-musig-participants key)
+    (return-from %desc-key-priv-at nil))
   (if (bl.rpc:desc-key-extkey key)
       (let ((xprv (bl.rpc:desc-key-root-xprv key provider)))
         (when xprv

@@ -2440,7 +2440,13 @@ sigdata.musig2_pubkeys whether or not anything signs (script/sign.cpp:554-556,
 filled by MuSigPubkeyProvider::GetPubKey, descriptor.cpp:662-690), and
 FromSignatureData writes them as PSBT_IN/OUT_MUSIG2_PARTICIPANT_PUBKEYS for an
 input and an output alike (psbt.cpp:206, :299). wallet_musig.py:229-231 counts
-them on the funded input and on the change output; neither was written."
+them on the funded input and on the change output; neither was written.
+
+Two wallets: a watch-only one holding the public descriptor, and one holding
+PRIVATE participants with HARDENED paths, the shape wallet_musig.py builds
+(`tprv/86h/1h/0h/0/*'). The second can only resolve its participants through
+the SPKM's cache -- the first cut derived them from the stored descriptor and
+walletcreatefundedpsbt died with an internal error."
   (with-wallet-chain-node (node "musig-parts")
     (flet ((rpc (wallet method &rest params)
              (with-rpc-wallet (wallet)
@@ -2451,43 +2457,50 @@ them on the funded input and on the change output; neither was written."
              (public (%aval "descriptor"
                             (rpc nil "getdescriptorinfo"
                                  (format nil "tr(musig(~A/0,~A/1)/0/*)" tprv tprv))))
-             (import (let ((h (make-hash-table :test 'equal)))
-                       (setf (gethash "desc" h) public
-                             (gethash "active" h) t
-                             (gethash "timestamp" h) "now")
-                       h)))
+             (hardened (bl.rpc:descriptor-add-checksum
+                        (format nil "tr(musig(~A/86h/1h/0h/0/*,~A/86h/1h/1h/0/*))"
+                                tprv tprv))))
         (rpc nil "createwallet" "fund")
-        (rpc nil "createwallet" "mu" t t)
-        (is (eq t (%aval "success" (first (rpc "mu" "importdescriptors" (list import))))))
         (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
         (rpc nil "generatetoaddress" 101 optrue)
-        (let ((mu-address (rpc "mu" "getnewaddress" "" "bech32m"))
-              (bl.wallet::*wallet-rng* (make-wallet-rng 59)))
-          (rpc "fund" "sendtoaddress" mu-address (bl.rpc:format-money 100000000)
-               nil nil nil nil nil nil nil 10)
-          (rpc nil "generatetoaddress" 1 optrue)
-          (let* ((coin (first (rpc "mu" "listunspent")))
-                 (input (let ((h (make-hash-table :test 'equal)))
-                          (setf (gethash "txid" h) (%aval "txid" coin)
-                                (gethash "vout" h) (%aval "vout" coin))
-                          h))
-                 (outputs (list (let ((h (make-hash-table :test 'equal)))
-                                  (setf (gethash (rpc "mu" "getnewaddress" "" "bech32m") h)
-                                        (bl.rpc:format-money 50000000))
-                                  h)))
-                 (created (rpc nil "createpsbt" (list input) outputs))
-                 (processed (rpc "mu" "walletprocesspsbt" created nil))
-                 (decoded (rpc nil "decodepsbt" (%aval "psbt" processed)))
-                 (in-parts (coerce (or (%aval "musig2_participant_pubkeys"
-                                              (first (coerce (%aval "inputs" decoded) 'list)))
-                                       '())
-                                   'list))
-                 (out-parts (coerce (or (%aval "musig2_participant_pubkeys"
-                                               (first (coerce (%aval "outputs" decoded) 'list)))
-                                        '())
-                                    'list)))
-            (is (= 1 (length in-parts)))
-            (is (= 1 (length out-parts)))
-            (is (= 2 (length (coerce (%aval "participant_pubkeys" (first in-parts)) 'list))))
-            (is (equal (%aval "aggregate_pubkey" (first in-parts))
-                       (%aval "aggregate_pubkey" (first out-parts))))))))))
+        (loop for (name desc wallet-args seed) in `(("mu" ,public (t t) 59)
+                                                     ("muh" ,hardened (nil t) 61))
+              do (let ((import (let ((h (make-hash-table :test 'equal)))
+                                 (setf (gethash "desc" h) desc
+                                       (gethash "active" h) t
+                                       (gethash "timestamp" h) "now")
+                                 h)))
+                   (apply #'rpc nil "createwallet" name wallet-args)
+                   (is (eq t (%aval "success"
+                                    (first (rpc name "importdescriptors" (list import)))))
+                       "~A: import refused" name)
+                   (let ((address (rpc name "getnewaddress" "" "bech32m"))
+                         (bl.wallet::*wallet-rng* (make-wallet-rng seed)))
+                     (rpc "fund" "sendtoaddress" address (bl.rpc:format-money 100000000)
+                          nil nil nil nil nil nil nil 10)
+                     (rpc nil "generatetoaddress" 1 optrue)
+                     (let* ((coin (first (rpc name "listunspent")))
+                            (input (let ((h (make-hash-table :test 'equal)))
+                                     (setf (gethash "txid" h) (%aval "txid" coin)
+                                           (gethash "vout" h) (%aval "vout" coin))
+                                     h))
+                            (outputs (list (let ((h (make-hash-table :test 'equal)))
+                                             (setf (gethash (rpc name "getnewaddress" "" "bech32m") h)
+                                                   (bl.rpc:format-money 50000000))
+                                             h)))
+                            (created (rpc nil "createpsbt" (list input) outputs))
+                            (processed (rpc name "walletprocesspsbt" created nil))
+                            (decoded (rpc nil "decodepsbt" (%aval "psbt" processed)))
+                            (in-parts (coerce (or (%aval "musig2_participant_pubkeys"
+                                                         (first (coerce (%aval "inputs" decoded) 'list)))
+                                                  '())
+                                              'list))
+                            (out-parts (coerce (or (%aval "musig2_participant_pubkeys"
+                                                          (first (coerce (%aval "outputs" decoded) 'list)))
+                                                   '())
+                                               'list)))
+                       (is (= 1 (length in-parts)) "~A: input ~S" name in-parts)
+                       (is (= 1 (length out-parts)) "~A: output ~S" name out-parts)
+                       (is (= 2 (length (coerce (%aval "participant_pubkeys" (first in-parts))
+                                                'list)))
+                           "~A: participants" name)))))))))

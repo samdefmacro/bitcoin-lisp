@@ -706,26 +706,35 @@ same descriptor written two ways would be two different ADDRESSES."
          (sort (copy-list pubkeys) #'pubkey-lessp))
         (error 'descriptor-derivation-error))))
 
-(defun descriptor-musig2-participants (desc pos)
+(defun descriptor-musig2-participants (desc pos &optional cache)
   "The (AGGREGATE . PARTICIPANTS) pairs DESC's musig() key expressions record
 at POS -- Core's FlatSigningProvider::aggregate_pubkeys, which
 MuSigPubkeyProvider::GetPubKey fills (descriptor.cpp:662-690) and SignTaproot
 hands to the PSBT as sigdata.musig2_pubkeys (script/sign.cpp:554-556). The
 AGGREGATE is the 33-byte key of the SORTED participants BEFORE any BIP328
 derivation; PARTICIPANTS are their 33-byte pubkeys at POS, sorted. One pair
-per distinct aggregate, first occurrence kept (a std::map emplace)."
-  (let ((pairs '()))
-    (dolist (key (out-desc-ordered-keys desc) (nreverse pairs))
-      (let ((participants (desc-key-musig-participants key)))
-        (when participants
-          (let ((aggregate (%musig-aggregate-at key pos)))
-            (unless (find aggregate pairs :key #'car :test #'equalp)
-              (push (cons aggregate
-                          (sort (mapcar (lambda (p)
-                                          (%musig-participant-pubkey-at p pos nil nil))
-                                        participants)
-                                #'pubkey-lessp))
-                    pairs))))))))
+per distinct aggregate, first occurrence kept (a std::map emplace).
+
+CACHE is a wallet SPKM's descriptor cache. A participant written as an xprv
+with a HARDENED path (wallet_musig.py writes `tprv.../86h/1h/0h/0/*') can only
+be derived through it once the descriptor is stored without its secrets, so
+the participants resolve the way the SPKM's own expansion does; NIL when even
+the cache cannot produce one, as ExpandFromCache would fail."
+  (let ((pairs '())
+        (ctx (and cache (list (out-desc-key-indexes desc) cache nil))))
+    (handler-case
+        (dolist (key (out-desc-ordered-keys desc) (nreverse pairs))
+          (let ((participants (desc-key-musig-participants key)))
+            (when participants
+              (let ((aggregate (%musig-aggregate-at key pos nil ctx)))
+                (unless (find aggregate pairs :key #'car :test #'equalp)
+                  (push (cons aggregate
+                              (sort (mapcar (lambda (p)
+                                              (%musig-participant-pubkey-at p pos nil ctx))
+                                            participants)
+                                    #'pubkey-lessp))
+                        pairs))))))
+      (descriptor-derivation-error () nil))))
 
 (defun %musig-derivation-root (key pos &optional privkey-provider cache-ctx)
   "The BIP328 synthetic xpub a non-flat musig() KEY derives from, on the network
