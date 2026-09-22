@@ -839,3 +839,54 @@ budget)."
     (let ((bl:*node* nil))
       (bl:rebalance-caches-on-ibd-exit))
     (is (null (bl.store:chain-state-coins-cache-bytes snap)))))
+
+(test assumeutxo-base-has-a-chain-count-and-no-ntx
+  "Core fakes the snapshot base's m_chain_tx_count from the commitment
+(validation.cpp:5966) and leaves its nTx 0 until the body arrives, so after
+loadtxoutset getblockheader(base).nTx is 0, getchaintxstats at the base
+reports the commitment's txcount, and its one-block window count is unknown
+(feature_assumeutxo.py:560-593). Ours wrote the chain count INTO the base's
+nTx, so nTx read 334 on the functional test's chain and every per-block sum
+above the base counted it again."
+  (with-temp-directory (src-dir)
+    (with-temp-directory (dir)
+      (let* ((bl:*prune-target-mib* nil)
+             (h5 (%snap-fill 32 5))
+             (txid (%snap-fill 32 #x33))
+             (spk (%snap-cat #(#x51)))
+             (src (%snap-node src-dir h5 5))
+             (snap-path (namestring (merge-pathnames "utxo.dat" src-dir))))
+        (bl.store:update-chain-tip (bl:node-chain-state src) h5 5)
+        (bl.store:add-utxo (bl:node-utxo-set src) txid 0 1000 spk 1)
+        (bl.rpc:dispatch-rpc-method src "dumptxoutset" (list snap-path "latest"))
+        (let* ((hash (bl.store:compute-utxo-set-hash (bl:node-utxo-set src)))
+               (node (%snap-node dir h5 5))
+               (bl:*assumeutxo-data-override* (list (%snap-au 5 h5 hash 7)))
+               (base-hex (bl.rpc:hash-to-hex h5)))
+          ;; The RPCs read header fields (time, MTP); %SNAP-NODE's entries
+          ;; carry none, so give the two a plain header each.
+          (let ((cs (bl:node-chain-state node)))
+            (loop for (hash time) in (list (list (bl.store:best-block-hash cs) 1600000000)
+                                           (list h5 1600003000))
+                  do (setf (bl.store:block-index-entry-header
+                            (bl.store:get-block-index-entry cs hash))
+                           (bl.ser:make-block-header
+                            :version 1
+                            :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                       :initial-element 0)
+                            :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)
+                            :timestamp time :bits #x207fffff :nonce 0))))
+          (unwind-protect
+               (progn
+                 (bl.rpc:dispatch-rpc-method node "loadtxoutset" (list snap-path))
+                 (let ((header (bl.rpc:dispatch-rpc-method node "getblockheader"
+                                                           (list base-hex))))
+                   (is (eql 0 (cdr (assoc "nTx" header :test #'string=)))
+                       "the base's nTx is unknown until its body arrives"))
+                 (let ((stats (bl.rpc:dispatch-rpc-method node "getchaintxstats"
+                                                          (list 1 base-hex))))
+                   (is (eql 7 (cdr (assoc "txcount" stats :test #'string=)))
+                       "the base's chain count is the commitment's")
+                   (is (null (assoc "window_tx_count" stats :test #'string=)))))
+            (%au-close-chainstate-dbs node)))))))

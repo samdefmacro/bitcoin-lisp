@@ -220,7 +220,8 @@ expected bytes are assembled by hand from the format spec."
 gate: an injected assumeutxo-data entry carrying the real hash_serialized_3
 accepts the snapshot into a NEW snapshot chainstate that becomes the current
 chainstate at the base height, while the previous chainstate is retargeted
-at the base (historical). The base entry's tx-count is seeded from nChainTx."
+at the base (historical). The base entry's nTx stays unknown; its chain count
+is the commitment's."
   (with-temp-directory (src-dir)
     (with-temp-directory (dst-dir)
       (let* ((bl:*prune-target-mib* nil) ; deterministic: pruning off
@@ -277,12 +278,15 @@ at the base (historical). The base entry's tx-count is seeded from nChainTx."
                 ;; Both chainstates share ONE block index (Core m_blockman).
                 (is (eq (bl.store:chain-state-block-index primary)
                         (bl.store:chain-state-block-index current)))
-                ;; Tip fast-forwarded; nChainTx seeded on the base entry.
+                ;; Tip fast-forwarded. The base's nTx is NOT faked: Core fakes
+                ;; its m_chain_tx_count (validation.cpp:5966), which
+                ;; getchaintxstats reads from the commitment, and leaves nTx
+                ;; 0 until the body arrives (feature_assumeutxo.py:584).
                 (is (= 5 (bl.store:current-height current)))
                 (is (equalp h5 (bl.store:best-block-hash current)))
                 (is (= 0 (bl.store:current-height primary)))
-                (is (= 4242 (bl.store:block-index-entry-tx-count
-                             (bl.store:get-block-index-entry current h5))))
+                (is (= 0 (bl.store:block-index-entry-tx-count
+                          (bl.store:get-block-index-entry current h5))))
                 ;; The persistent base_blockhash marker exists and is exact.
                 (let ((marker (bl.store:read-snapshot-base-blockhash
                                (bl.store:find-assumeutxo-chainstate-dir

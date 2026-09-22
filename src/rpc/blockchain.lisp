@@ -1077,10 +1077,22 @@ FILENAME).is_file()' -- is exactly that check."
 (defun %chain-tx-count (tip-entry block-store)
   "Number of transactions in the chain up to and including TIP-ENTRY (Core
 CBlockIndex::m_chain_tx_count), or NIL when any block's count is unknown
-(header-only or pruned). Walks back to genesis summing per-block counts."
+(header-only or pruned). Walks back to genesis summing per-block counts.
+
+An assumeutxo base block answers with its commitment's m_chain_tx_count and
+the walk stops there: Core gives the snapshot base that number whether or not
+its body is on disk (validation.cpp:5966, and LoadBlockIndex on restart), so
+the chain above a loaded snapshot has a count while the unvalidated range
+below it -- no bodies, nTx 0 -- does not (feature_assumeutxo.py:560-593). The
+base's own nTx is NOT touched: it stays 0 until its body arrives."
   (let ((total 0) (entry tip-entry))
     (loop while entry
-          do (let ((n (%entry-tx-count entry block-store)))
+          do (let ((au (bl:assumeutxo-data-for-blockhash
+                        bl.chain:*network* (bl.store:block-index-entry-hash entry))))
+               (when au
+                 (return-from %chain-tx-count
+                   (+ total (bl:assumeutxo-data-chain-tx-count au)))))
+             (let ((n (%entry-tx-count entry block-store)))
                (unless n (return-from %chain-tx-count nil))
                (incf total n)
                (when (zerop (bl.store:block-index-entry-height entry))
@@ -1420,9 +1432,10 @@ chainstate's own LevelDB in durable batches with Core's per-coin checks
 (validation.cpp:5834-5845); the commitment hash is then computed over the
 POPULATED set (Core hashes the new DB), so even a snapshot whose stream
 order differs from cursor order verifies correctly. On success the tip is
-set to the base, the base_blockhash marker and state file are written, the
-base entry's tx-count is seeded from the commitment's nChainTx (Core
-validation.cpp:5938-5967), and the chainstate is adopted as current. Any
+set to the base, the base_blockhash marker and state file are written, and
+the chainstate is adopted as current. The base's chain transaction count is
+the commitment's (Core validation.cpp:5966), read by %CHAIN-TX-COUNT; its nTx
+stays unknown until its body arrives. Any
 failure tears the snapshot chainstate down (dir deleted) via FAIL, a
 function of (format-string &rest args) that must signal."
   (let ((snap (bl:create-snapshot-chainstate node base-hash))
@@ -1490,8 +1503,6 @@ function of (format-string &rest args) that must signal."
            (bl.store:update-chain-tip snap base-hash base-height)
            (bl.store:write-snapshot-base-blockhash snap)
            (bl.store:save-state snap)
-           (setf (bl.store:block-index-entry-tx-count base-entry)
-                 (bl:assumeutxo-data-chain-tx-count au))
            (bl:add-snapshot-chainstate node snap)
            (setf adopted t)
            (bl:node-log
@@ -1515,8 +1526,9 @@ base_blockhash marker is written (the only persistent snapshot-exists
 marker, re-detected at startup), the snapshot chainstate becomes the
 CURRENT chainstate following the network tip, and the previous chainstate is
 retargeted at the base — it keeps validating history in the background. The
-base entry's tx-count is seeded from the commitment's nChainTx, mirroring
-Core's faked m_chain_tx_count (validation.cpp:5966).
+base's chain transaction count is the commitment's nChainTx, Core's faked
+m_chain_tx_count (validation.cpp:5966), which %CHAIN-TX-COUNT reads; its nTx
+is not faked.
 
 The sync thread is paused for the duration (our stand-in for Core holding
 cs_main), so the chainstates list never changes under a running IBD pass.
@@ -1840,18 +1852,23 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
                    bc)
                  ;; Core default: one month of blocks (600s spacing) bounded by height.
                  (max 0 (min 4320 (1- final-height))))))
-      ;; One backward walk from FINAL to genesis: total txcount, the window sum
-      ;; over the first BLOCKCOUNT entries, and the window-start ancestor for
-      ;; the MTP interval.
-      (let ((txcount 0) (window-tx 0) (txcount-known t) (window-known t)
-            (past nil) (entry final) (i 0))
-        (loop while entry
+      ;; txcount is FINAL's m_chain_tx_count (%CHAIN-TX-COUNT, which knows an
+      ;; assumeutxo base's), and the window is summed over the first
+      ;; BLOCKCOUNT entries walking back, whose last parent is the window-start
+      ;; ancestor for the MTP interval. Core's window count is a difference of
+      ;; two m_chain_tx_count values and is unknown when either is
+      ;; (rpc/blockchain.cpp:1855-1870); a window whose every block has its
+      ;; nTx is the same number, and one that crosses an unvalidated range is
+      ;; unknown either way.
+      (let* ((chain-count (%chain-tx-count final block-store))
+             (txcount (or chain-count 0)) (window-tx 0)
+             (txcount-known (and chain-count t)) (window-known t)
+             (past nil) (entry final) (i 0))
+        (loop while (and entry (< i blockcount))
               do (let ((n (%entry-tx-count entry block-store)))
                    (if n
-                       (progn (incf txcount n)
-                              (when (< i blockcount) (incf window-tx n)))
-                       (progn (setf txcount-known nil)
-                              (when (< i blockcount) (setf window-known nil)))))
+                       (incf window-tx n)
+                       (setf window-known nil)))
                  (incf i)
                  (when (= i blockcount)
                    (setf past (bl.store:block-index-entry-prev-entry entry)))
