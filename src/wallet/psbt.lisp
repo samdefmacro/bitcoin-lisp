@@ -2270,13 +2270,24 @@ is a lower bound and -- unlike transaction-vsize -- caches nothing."
 (defun %bump-select-original-inputs (node wallet cc inputs)
   "Retrieve every original input's coin and Select it on the coin control, an
 external input getting its txout preset (feebumper.cpp:190-206). Returns the
-summed input value, or (values NIL message) when one is already spent."
-  (let ((input-value 0))
+summed input value, or (values NIL message) when one is already spent.
+
+The coin comes from the chain's view -- findCoins, the mempool over the UTXO
+set (:191-199) -- not from the wallet's record of the output, which outlives
+the spend: a transaction already MINED still had its inputs here, so bumping
+it went on to the depth check instead of Core's -1 \"<txid>:<n> is already
+spent\" (wallet_bumpfee.py:670)."
+  (let ((input-value 0)
+        (coins (bl.rpc:find-coins node (bl.ser:make-transaction
+                                        :version 2 :inputs inputs :outputs #()
+                                        :lock-time 0))))
     (bl.ser:dovector (in inputs)
       (let* ((op (bl.ser:tx-in-previous-output in))
              (thash (bl.ser:outpoint-hash op))
              (n (bl.ser:outpoint-index op))
-             (txout (%wallet-input-txout node wallet thash n)))
+             (coin (gethash (cons thash n) coins))
+             (txout (and coin (bl.ser:make-tx-out :value (second coin)
+                                                  :script-pubkey (first coin)))))
         (unless txout
           (return-from %bump-select-original-inputs
             (values nil (format nil "~A:~D is already spent"

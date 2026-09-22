@@ -2951,3 +2951,28 @@ mempool and evict the original (the control that full RBF really takes it)."
         (is (not (member txid (coerce (funcall rpc "getrawmempool") 'list)
                          :test #'equal))
             "the original left the mempool")))))
+
+(test bumpfee-of-a-mined-transaction-says-its-input-is-spent
+  "CreateRateBumpTransaction looks every original input up in the chain's
+view (findCoins: the mempool over the UTXO set) BEFORE the precondition
+checks, and a coin that is gone is -1 \"<txid>:<n> is already spent\"
+(wallet/feebumper.cpp:187-199) -- wallet_bumpfee.py:670 bumps a transaction
+already mined. We read the wallet's own record of the output, which outlives
+the spend, and answered the depth check's \"Transaction has been mined\"."
+  (%with-pp-node (node "pp-bump-mined")
+    (%pp-fund-wallet node :blocks 5)
+    (with-wallet-rng (31)
+      (let* ((rpc (lambda (method &rest params)
+                    (bl.rpc:dispatch-rpc-method node method params)))
+             (txid (funcall rpc "sendtoaddress" (%pp-optrue-address) 1
+                            nil nil nil nil nil nil nil 5))
+             (spent (bl.ser:tx-in-previous-output
+                     (aref (bl.ser:transaction-inputs
+                            (%pp-mempool-tx node (bl.rpc:parse-hex-hash txid)))
+                           0))))
+        (%pp-mine node 1 (%pp-optrue-address))
+        (is (equal (cons -1 (format nil "~A:~D is already spent"
+                                    (bl.rpc:hash-to-hex (bl.ser:outpoint-hash spent))
+                                    (bl.ser:outpoint-index spent)))
+                   (rpc-error-of
+                    (lambda () (funcall rpc "bumpfee" txid (%ht "fee_rate" 20))))))))))
