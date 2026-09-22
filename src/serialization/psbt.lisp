@@ -533,10 +533,43 @@ signature after its bip32 derivations."
   "Serialize PSBT and base64-encode it (the RPC wire form)."
   (cl-base64:usb8-array-to-base64-string (serialize-psbt psbt)))
 
+(defun %core-decode-base64 (string)
+  "Core's DecodeBase64 (util/strencodings.cpp:109-142), or NIL where it
+answers nullopt: a length that is not a multiple of four, anything but the
+64-character alphabet once at most two trailing `=' are dropped, or leftover
+bits that are not zero (ConvertBits<6, 8, false>)."
+  (let ((end (length string)))
+    (when (zerop (mod end 4))
+      (loop repeat 2
+            while (and (plusp end) (char= (char string (1- end)) #\=))
+            do (decf end))
+      (let ((out (make-array (floor (* end 3) 4) :element-type '(unsigned-byte 8)
+                                                  :fill-pointer 0))
+            (acc 0) (bits 0))
+        (dotimes (i end)
+          (let* ((c (char string i))
+                 (v (cond ((char<= #\A c #\Z) (- (char-code c) 65))
+                          ((char<= #\a c #\z) (+ 26 (- (char-code c) 97)))
+                          ((char<= #\0 c #\9) (+ 52 (- (char-code c) 48)))
+                          ((char= c #\+) 62)
+                          ((char= c #\/) 63))))
+            (unless v (return-from %core-decode-base64 nil))
+            (setf acc (logior (ash (logand acc #xffff) 6) v))
+            (incf bits 6)
+            (when (>= bits 8)
+              (decf bits 8)
+              (vector-push (ldb (byte 8 bits) acc) out))))
+        (when (and (< bits 6) (zerop (ldb (byte bits 0) acc)))
+          (coerce out '(simple-array (unsigned-byte 8) (*))))))))
+
 (defun decode-psbt (base64-string)
-  "Decode a base64 PSBT string into a psbt struct."
-  (parse-psbt (coerce (cl-base64:base64-string-to-usb8-array base64-string)
-                      '(simple-array (unsigned-byte 8) (*)))))
+  "Decode a base64 PSBT string into a psbt struct. Undecodable base64 is
+Core's \"invalid base64\" (DecodeBase64PSBT, psbt.cpp:607-616) --
+rpc_psbt.py:871 reads it after the \"TX decode failed \" prefix; ours was
+cl-base64's own complaint about the character it tripped on."
+  (let ((bytes (%core-decode-base64 base64-string)))
+    (unless bytes (serialization-error "invalid base64"))
+    (parse-psbt bytes)))
 
 ;;; --- constructing an empty PSBT from an unsigned transaction ---
 

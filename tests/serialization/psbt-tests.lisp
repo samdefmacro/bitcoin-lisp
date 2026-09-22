@@ -1632,3 +1632,21 @@ same call fails later, on the unknown input (the control)."
         (is (equal want (call "walletcreatefundedpsbt" (list input) outputs 0
                               (%ht "input_weights" weights))))
         (is (not (equal want (call "send" outputs nil nil nil (%ht "inputs" (list input))))))))))
+
+(test a-psbt-that-is-not-base64-is-cores-invalid-base64
+  "DecodeBase64PSBT answers \"invalid base64\" when DecodeBase64 refuses the
+string (psbt.cpp:607-616): a length that is not a multiple of four, a
+character outside the alphabet, bits left over (util/strencodings.cpp:
+109-142). decodepsbt then throws -22 \"TX decode failed invalid base64\",
+which rpc_psbt.py:871 asserts; ours carried cl-base64's own complaint about
+the character it tripped on. Every valid vector still decodes (the control)."
+  (let ((node (make-test-node :network :regtest))
+        (data (%psbt-vectors)))
+    (flet ((decode (s)
+             (rpc-error-of (lambda () (bl.rpc:dispatch-rpc-method node "decodepsbt" (list s))))))
+      (is (equal '(-22 . "TX decode failed invalid base64") (decode ";definitely not base64;")))
+      (when data
+        (let ((valid (first (gethash "valid" data))))
+          (is (null (decode valid)))
+          (is (equal '(-22 . "TX decode failed invalid base64")
+                     (decode (subseq valid 0 (1- (length valid)))))))))))
