@@ -197,10 +197,11 @@ the record is missing, mis-framed, or unreadable."
   (or (gethash file (block-store-file-info store))
       (setf (gethash file (block-store-file-info store)) (make-block-file-info))))
 
-(defun %note-block-in-file (store file height bytes)
-  "Fold one stored block into FILE's accounting."
+(defun %note-block-in-file (store file height bytes &key (count t))
+  "Fold one stored block into FILE's accounting; COUNT NIL folds only HEIGHT
+into the range, for a block the file already holds."
   (let ((info (%store-file-info store file)))
-    (incf (block-file-info-blocks info))
+    (when count (incf (block-file-info-blocks info)))
     (incf (block-file-info-size info) bytes)
     ;; A file with a block of unknown height has an unknown range, and an
     ;; unknown range can never be shown to lie inside the prunable window — so
@@ -429,8 +430,27 @@ file (see *FLAT-BLOCK-FILES*).
 
 HEIGHT is what lets the block's file be pruned later: pruning a flat file is
 all-or-nothing, so the decision needs the file's height range. Omitting it
-stores the block correctly and makes its file unprunable."
+stores the block correctly and makes its file unprunable.
+
+A block already held in a blk file is not written again: Core AcceptBlock
+returns before writing (validation.cpp:4350 fAlreadyHave, :4367). Writing it
+again appended a second record the running total never counted (OLD-SIZE
+replaces rather than adds), so disk usage outgrew the prune target while the
+total said it was under (feature_pruning.py:223). A record that failed to read
+back was dropped from the index by GET-BLOCK, so a damaged body still gets a
+fresh copy."
   (ensure-directories store)
+  (let* ((hash (bl.ser:block-header-hash
+                (bl.ser:bitcoin-block-header block)))
+         (have (gethash hash (block-store-index store))))
+    (when (and *flat-block-files*
+               (flat-file-pos-p have)
+               (probe-file (flat-file-name (%blk-seq store) have)))
+      ;; A body first stored without its height (header not yet indexed)
+      ;; gets it now, so its file's range covers it.
+      (when height
+        (%note-block-in-file store (flat-file-pos-file have) height 0 :count nil))
+      (return-from store-block (values hash have))))
   (let* ((hash (bl.ser:block-header-hash
                 (bl.ser:bitcoin-block-header block)))
          (path (block-file-path store hash))

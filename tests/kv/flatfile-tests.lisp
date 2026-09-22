@@ -1950,3 +1950,54 @@ Ours created a rev file only when an undo record was written."
         (is-false (probe-file rev) "control: genesis alone writes no undo")
         (is-true (bl.store:flush-chainstate-block-file store))
         (is-true (probe-file rev))))))
+
+(test a-block-already-on-disk-is-not-written-again
+  "Core AcceptBlock returns early for a block it already has
+(validation.cpp:4350 fAlreadyHave, :4367), so a body is written to a blk file
+once. Ours appended a second record every time a stored block was stored again
+(an out-of-order or competing-fork body that connect-block later re-stores),
+and the running total -- which replaced the old record's size rather than
+adding the new one -- never counted the copy. feature_pruning.py:223 measured
+725 MiB on disk (173 MiB of it duplicate records) against a total that said
+the node was under its 550 MiB target, so pruning stopped."
+  (with-network (:regtest)
+    (with-temp-directory (dir)
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (block (%ff-chain-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 7)
+                                     41 1)))
+        (multiple-value-bind (hash first-pos)
+            (bl.store:store-block store block :height 1)
+          (let ((total (bl.store:block-store-total-bytes store)))
+            (multiple-value-bind (hash2 second-pos)
+                (bl.store:store-block store block :height 1)
+              (is (equalp hash hash2))
+              (is (equalp first-pos second-pos)
+                  "the block keeps the record it already has")
+              (is (= total (bl.store:block-store-total-bytes store))))
+            (is (= 1 (bl.store:block-file-info-blocks
+                      (gethash 0 (bl.store:block-store-file-info store)))))
+            ;; What pruning is measured against: the files on disk hold no
+            ;; more than the running total says.
+            (is (= total (bl.store:block-store-total-bytes
+                          (bl.store:init-block-store dir))))
+            (is-true (bl.store:get-block store hash))))))))
+
+(test a-block-stored-without-its-height-gets-it-when-stored-again
+  "A body stored before its header was indexed has no height, so its blk
+file's range does not cover it; when the block is stored again with its height
+the range takes it, without a second record."
+  (with-network (:regtest)
+    (with-temp-directory (dir)
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (block (%ff-chain-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 8)
+                                     42 5)))
+        (bl.store:store-block store block)
+        (bl.store:store-block store block :height 5)
+        (let ((info (gethash 0 (bl.store:block-store-file-info store))))
+          (is (= 1 (bl.store:block-file-info-blocks info)))
+          (is (eql 5 (bl.store:block-file-info-height-first info)))
+          (is (eql 5 (bl.store:block-file-info-height-last info))))))))
