@@ -4614,18 +4614,47 @@ backstop against a candidate that reorgs away and reappears."
              (return))))))
     (values switched missing)))
 
+(defun %best-reachable-tip (chain-state block-store tip)
+  "The most-work non-invalid entry with more work than TIP whose every block
+back to the active chain is in BLOCK-STORE, or NIL -- Core FindMostWorkChain
+(validation.cpp:3158-3196): a candidate whose path holds a block without data
+is dropped with its whole path, and the next candidate is tried, because \"we
+can't switch to a chain unless we have all the non-active-chain parent
+blocks\". A pruned node that invalidates its tip has such candidates: the
+more-work chain it once forked from, pruned below its tip.
+
+Every entry on a failed path is remembered, so a walk stops at the first entry
+already shown unreachable and each entry is probed at most once."
+  (let ((tip-work (bl.store:block-index-entry-chain-work tip))
+        (candidates '())
+        (unreachable (make-hash-table :test 'eq)))
+    (maphash (lambda (h e) (declare (ignore h))
+               (when (and (> (bl.store:block-index-entry-chain-work e) tip-work)
+                          (not (eq (bl.store:block-index-entry-status e) :invalid)))
+                 (push e candidates)))
+             (bl.store:chain-state-block-index chain-state))
+    (dolist (candidate (sort candidates #'>
+                             :key #'bl.store:block-index-entry-chain-work))
+      (let ((path '()))
+        (if (loop for e = candidate then (bl.store:block-index-entry-prev-entry e)
+                  while (and e (not (bl.store:entry-on-active-chain-p chain-state e)))
+                  do (push e path)
+                  thereis (or (gethash e unreachable)
+                              (not (bl.store:block-exists-p
+                                    block-store (bl.store:block-index-entry-hash e)))))
+            (dolist (e path) (setf (gethash e unreachable) t))
+            (return candidate))))))
+
 (defun %activate-best-valid-chain (chain-state block-store utxo-set
                                    &key fee-estimator recent-rejects mempool)
   "Core ActivateBestChain, run after a chain-control RPC has changed which
-blocks are eligible: switch to the most-work valid tip whose body we hold, if
-it now outweighs the active one. Returns (VALUES T NIL) -- including when
+blocks are eligible: switch to the most-work valid tip whose blocks back to
+the active chain we hold (%BEST-REACHABLE-TIP), if it outweighs the active one. Returns (VALUES T NIL) -- including when
 there is nothing better to switch to -- or (VALUES NIL REASON)."
-  (let ((tip (bl.store:get-block-index-entry
-              chain-state (bl.store:best-block-hash chain-state)))
-        (target (best-valid-tip chain-state block-store)))
-    (if (and target tip
-             (> (bl.store:block-index-entry-chain-work target)
-                (bl.store:block-index-entry-chain-work tip)))
+  (let* ((tip (bl.store:get-block-index-entry
+               chain-state (bl.store:best-block-hash chain-state)))
+         (target (and tip (%best-reachable-tip chain-state block-store tip))))
+    (if target
         ;; perform-reorg validates the reactivated chain and rolls back
         ;; (returning NIL) if one of its blocks is invalid -- in which case the
         ;; chain correctly stays on TIP. Surface that rather than reporting

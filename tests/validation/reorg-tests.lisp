@@ -1099,6 +1099,44 @@ empty undo is legitimate)."
     (bl.ser:make-bitcoin-block
      :header hdr :transactions (list coinbase dummy))))
 
+(test invalidate-block-skips-a-candidate-chain-with-missing-data
+  "After invalidateblock, Core's ActivateBestChain picks the most-work chain it
+can actually switch to: FindMostWorkChain walks each candidate back to the
+active chain and drops it when a block on that path has no data -- \"we can't
+switch to a chain unless we have all the non-active-chain parent blocks\"
+(validation.cpp:3158-3196) -- and moves on to the next. Ours named the
+most-work tip whatever its ancestry held, the reorg to it was refused for the
+missing body, and invalidateblock failed with reorg-failed:
+feature_pruning.py:240, whose pruned node invalidates its tip while the more
+work chain it forked from has been pruned away."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture "invalidate-missing-data")
+      (let ((a-hashes (make-test-chain-hashes #xA0 3))
+            (b-hashes (make-test-chain-hashes #xB0 3)))
+        ;; A1..A3 active; B1..B3 a stored, weaker (equal-work) fork.
+        (build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
+        (let ((prev genesis-hash))
+          (loop for h from 1 to 3
+                for block-hash in b-hashes
+                do (let ((block (make-reorg-test-block prev block-hash h)))
+                     (bl.store:store-block block-store block)
+                     (bl.val:connect-block block chain-state block-store utxo-set)
+                     (setf prev block-hash))))
+        (is (equalp (third a-hashes) (bl.store:best-block-hash chain-state)))
+        ;; B2's body is gone: B3 outweighs everything left after A1 is
+        ;; invalidated, but it cannot be reached.
+        (is-true (bl.store:forget-block-body block-store (second b-hashes)))
+        (multiple-value-bind (ok reason)
+            (bl.val:invalidate-block chain-state block-store utxo-set
+                                     (first a-hashes))
+          (is (eq t ok))
+          (is (null reason)))
+        ;; B1 is the best chain whose blocks are all here.
+        (is (equalp (first b-hashes) (bl.store:best-block-hash chain-state)))
+        (is (= 1 (bl.store:current-height chain-state))))
+      (clear-undo-cache))))
+
 (test perform-reorg-refuses-on-corrupt-disconnect-undo
   "A to-DISCONNECT spending block (tx-count > 1) whose undo is missing/corrupt
 must make perform-reorg REFUSE with :corrupt-undo — not disconnect with empty
