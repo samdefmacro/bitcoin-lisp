@@ -23,6 +23,7 @@ through the lower packages; the node reaches it only through these exports.")
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
    #:*wallet-confirm-target*
+   #:*wallet-dump-max-line-bytes*
    #:*wallet-avoid-partial-spends*
    #:*wallet-default-address-type*
    #:*wallet-default-change-type*

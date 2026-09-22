@@ -1799,6 +1799,34 @@ somewhere else, under another sentence."
         (is (= -18 code) "the over-cap dump was answered ~S" code)
         (is (eql 0 (search "Wallet file verification failed" message)) "~A" message)))))
 
+(test wenc-restore-refuses-a-line-over-the-byte-cap
+  "+WALLET-DUMP-MAX-LINES+ counts newlines, so a restore source with NONE --
+/dev/zero, which its docstring names, or any big file without a line break
+-- was a single line whose buffer grew until the image died.
+*WALLET-DUMP-MAX-LINE-BYTES* bounds the line instead. Lowered to 64 KiB here,
+a 16 MiB file with no newline is refused (-18, the verification sentence)
+having consed a small fraction of itself; before the cap the line buffer
+doubled its way to the whole file and consed 128 MiB doing it."
+  (with-wallet-test-node (node)
+    (let ((big (%wenc-backup-path node "noline"))
+          (consed 0))
+      (with-open-file (out big :direction :output :if-exists :supersede
+                               :element-type '(unsigned-byte 8))
+        (let ((chunk (make-array (* 1024 1024) :element-type '(unsigned-byte 8)
+                                               :initial-element 48)))
+          (dotimes (i 16) (write-sequence chunk out))))
+      (sb-ext:gc :full t)
+      (let ((base (sb-ext:get-bytes-consed)))
+        (multiple-value-bind (code message)
+            (let ((bl.wallet:*wallet-dump-max-line-bytes* (* 64 1024)))
+              (%wenc-restore-verdict node "noline" big))
+          (setf consed (%wenc-consed-mib base))
+          (is (eql -18 code) "the newline-free file was answered ~S" code)
+          (is (eql 0 (search "Wallet file verification failed" (or message "")))
+              "~A" message)))
+      (is (< consed 8)
+          "a 16 MiB line consed ~D MiB: the reader buffered it" consed))))
+
 (test wenc-restore-does-not-buffer-the-whole-dump
   "%PARSE-WALLET-DUMP reads the file as a stream of lines, hashing each one as
 it goes and holding one line at a time. The whole-file shape it replaced --

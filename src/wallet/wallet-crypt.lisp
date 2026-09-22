@@ -746,12 +746,24 @@ The path is caller-supplied and only has to exist, so without a bound
 until the image dies. A real wallet dump is a few records per key plus one
 line per transaction; four million lines is far beyond any of ours.")
 
+(defparameter *wallet-dump-max-line-bytes* (* 64 1024 1024)
+  "Refuse a restore source with a line longer than this many bytes.
+
++WALLET-DUMP-MAX-LINES+ counts NEWLINES, so a source that has none -- the
+character device that docstring names, /dev/zero, or any large file without a
+line break -- was one line, and %MAP-DUMP-LINES grew that line's buffer until
+the image died. The longest line a dump of ours writes is one record: the hex
+of a key and a value, and the largest value is a wallet transaction, which
+consensus holds under 4,000,000 bytes (8 MB of hex). 64 MiB is far past that.
+A special rather than a constant so a test can lower it.")
+
 (defun %map-dump-lines (path fn)
   "Call FN with (BUFFER LENGTH) for each line of the file at PATH, as bytes,
 with READ-LINE's notion of a line: split on LF, the terminator not included,
 a last line without one still a line. BUFFER is reused from call to call and
 valid only for the call. The reader holds one 64 KiB chunk and one line,
-whatever the file's size. Returns the number of lines."
+whatever the file's size, and a line past *WALLET-DUMP-MAX-LINE-BYTES* is a
+WALLET-ERROR. Returns the number of lines."
   (let ((chunk (make-array 65536 :element-type '(unsigned-byte 8)))
         (line (make-array 256 :element-type '(unsigned-byte 8)))
         (len 0)
@@ -767,7 +779,10 @@ whatever the file's size. Returns the number of lines."
               do (loop for i from 0 below end
                        for byte = (aref chunk i)
                        do (cond ((= byte 10) (deliver))
-                                (t (when (= len (length line))
+                                (t (when (>= len *wallet-dump-max-line-bytes*)
+                                     (wallet-error "wallet dump line over ~D bytes"
+                                                   *wallet-dump-max-line-bytes*))
+                                   (when (= len (length line))
                                      (let ((grown (make-array (* 2 len)
                                                               :element-type '(unsigned-byte 8))))
                                        (replace grown line)
