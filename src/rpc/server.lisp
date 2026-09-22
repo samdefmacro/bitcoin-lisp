@@ -1874,10 +1874,11 @@ them claims the request."
         "")))
 
 (defun rpc-bind-loopback-p (address)
-  "T when ADDRESS names a loopback interface. NIL and \"\" mean bind-any and
-are not loopback."
+  "T when ADDRESS -- a -rpcbind value, optionally with its port -- names a
+loopback interface. NIL and \"\" mean bind-any and are not loopback."
   (and (stringp address)
-       (let ((a (string-trim '(#\Space #\Tab #\[ #\]) address)))
+       (let ((a (string-trim '(#\Space #\Tab #\[ #\])
+                             (values (bl.net:split-host-port address nil)))))
          (or (string-equal a "localhost")
              (string= a "::1")
              (and (> (length a) 4) (string= (subseq a 0 4) "127."))))))
@@ -1899,23 +1900,27 @@ letting one flag expose the RPC port; it warns about whichever one was supplied
 alone (HTTPBindAddresses, httpserver.cpp:316-327). With neither in force the
 answer is both loopback addresses (+RPC-DEFAULT-LOOPBACK-BINDS+); rpc_bind.py:46
 compares the process's bound sockets against exactly that pair."
-  (cond ((rpc-bind-loopback-p bind)
-         ;; Core's warning here is about -rpcallowip given with no -rpcbind at
-         ;; all; an explicit -rpcbind=127.0.0.1 alongside -rpcallowip takes its
-         ;; else branch and warns about nothing. BIND-SUPPLIED-P is what keeps
-         ;; the two apart, since BIND arrives already defaulted to 127.0.0.1.
-         (when (and allow-ip (not bind-supplied-p))
-           (bl.log:node-log
-            :warn "Option -rpcallowip was specified without -rpcbind; this ~
+  ;; BIND is every -rpcbind given (Core binds each of them,
+  ;; httpserver.cpp:328-337), or one address.
+  (let ((binds (if (listp bind) bind (list bind))))
+    (cond ((and binds (every #'rpc-bind-loopback-p binds))
+           ;; Core's warning here is about -rpcallowip given with no -rpcbind
+           ;; at all; an explicit -rpcbind=127.0.0.1 alongside -rpcallowip
+           ;; takes its else branch and warns about nothing. BIND-SUPPLIED-P
+           ;; is what keeps the two apart, since BIND arrives already
+           ;; defaulted to 127.0.0.1.
+           (when (and allow-ip (not bind-supplied-p))
+             (bl.log:node-log
+              :warn "Option -rpcallowip was specified without -rpcbind; this ~
 doesn't usually make sense, as the RPC port stays on loopback"))
-         (if bind-supplied-p (list bind) +rpc-default-loopback-binds+))
-        (allow-ip (list bind))
-        (t
-         (bl.log:node-log
-          :warn "-rpcbind=~A ignored because -rpcallowip was not specified, ~
-refusing to allow everyone to connect; the RPC port stays on loopback"
-          (or bind "<any>"))
-         +rpc-default-loopback-binds+)))
+           (if bind-supplied-p binds +rpc-default-loopback-binds+))
+          ((and allow-ip binds) binds)
+          (t
+           (bl.log:node-log
+            :warn "-rpcbind=~{~A~^, ~} ignored because -rpcallowip was not ~
+specified, refusing to allow everyone to connect; the RPC port stays on loopback"
+            (or (remove nil binds) (list "<any>")))
+           +rpc-default-loopback-binds+))))
 
 (defvar *rpc-extra-servers* '()
   "The acceptors beyond *RPC-SERVER* that this node bound, one per further
@@ -1970,14 +1975,18 @@ report it exactly as they did when there was one socket."
           ;; `[::1]' is how Core's documentation and its own tests spell an
           ;; IPv6 literal with a port; the brackets are the SEPARATOR, never
           ;; part of the address a socket is bound to.
-          (let ((acceptor (apply #'make-instance 'rpc-acceptor
-                                 :port port
-                                 :address (string-trim "[]" address)
-                                 initargs)))
-            (hunchentoot:start acceptor)
-            (funcall collect acceptor)
-            (unless primary (setf primary acceptor))
-            (bl.log:node-log :info "Binding RPC on address ~A port ~D" address port))
+          ;; Each -rpcbind may carry its own port (SplitHostPort,
+          ;; httpserver.cpp:330-335); PORT is -rpcport for the rest.
+          (multiple-value-bind (host bind-port)
+              (bl.net:split-host-port address port)
+            (let ((acceptor (apply #'make-instance 'rpc-acceptor
+                                   :port bind-port
+                                   :address (string-trim "[]" host)
+                                   initargs)))
+              (hunchentoot:start acceptor)
+              (funcall collect acceptor)
+              (unless primary (setf primary acceptor))
+              (bl.log:node-log :info "Binding RPC on address ~A port ~D" host bind-port)))
         (error (e)
           (setf last-error e)
           (bl.log:node-log :warn "Unable to bind RPC on address ~A port ~D: ~A"

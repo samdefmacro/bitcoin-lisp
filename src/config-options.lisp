@@ -82,7 +82,9 @@
 (define-option "logips" :key :log-ips :type :bool)
 (define-option "maxconnections" :key :max-connections :type :int)
 (define-option "rpcport" :key :rpc-port :type :int :network-only t)
-(define-option "rpcbind" :key :rpc-bind :type :string :network-only t)
+;; -rpcbind is repeatable: Core binds every one it is given, each with its
+;; own optional port (HTTPBindAddresses, httpserver.cpp:328-337).
+(define-option "rpcbind" :collect :rpc-bind :repeatable t :network-only t)
 (define-option "rpcuser" :key :rpc-user :type :string :sensitive t)
 (define-option "rpcpassword" :key :rpc-password :type :string :sensitive t)
 ;; -rpcwhitelistdefault: what a user named by no -rpcwhitelist may call. Core

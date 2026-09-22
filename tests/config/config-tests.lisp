@@ -1068,6 +1068,11 @@ port overrides -port for the listener, as it does in Core."
   ;; default_bind_port_onion (init.cpp:2118).
   (let ((plist (start-node-plist '("-regtest" "-bind=127.0.0.1=onion") nil)))
     (is (equal '("127.0.0.1" . 18445) (getf plist :onion-bind))))
+  ;; -rpcbind is repeatable: every value reaches the RPC server, in order
+  ;; (httpserver.cpp:328-337).
+  (is (equal '("127.0.0.1" "[::1]")
+             (getf (start-node-plist '("-regtest" "-rpcbind=127.0.0.1" "-rpcbind=[::1]") nil)
+                   :rpc-bind)))
   ;; ... and -port moves it: default_bind_port_onion is -port + 1
   ;; (init.cpp:2117-2118). feature_port.py:48 expects `Bound to
   ;; 127.0.0.1:{P+1}' from -port=P -bind=127.0.0.1=onion.

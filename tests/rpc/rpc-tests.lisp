@@ -6088,6 +6088,35 @@ socket; the IPv4 endpoint is the control."
                  (is-true (search "HTTP/1.1" line) "::1 must answer: ~A" line)))
           (bl.rpc:stop-rpc-server))))))
 
+(test rpc-server-binds-every-rpcbind-at-its-own-port
+  "Each -rpcbind is bound, at the port it names (SplitHostPort,
+httpserver.cpp:328-337): rpc_bind.py's `127.0.0.1:32171 127.0.0.1:32172' case
+lists the process's sockets and expects both. Ours bound the one address it
+was given and handed hunchentoot the whole `host:port' as a host."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node)))
+      (setf (bl:node-data-directory node) dir)
+      (flet ((answers-p (port)
+               (let ((sock (make-instance 'sb-bsd-sockets:inet-socket
+                                          :type :stream :protocol :tcp)))
+                 (unwind-protect
+                      (handler-case
+                          (progn (sb-bsd-sockets:socket-connect sock #(127 0 0 1) port) t)
+                        (error () nil))
+                   (sb-bsd-sockets:socket-close sock)))))
+        (unwind-protect
+             (progn
+               (is-true (bl.rpc:start-rpc-server
+                         node :port 19961 :user "u" :password "p"
+                              :bind '("127.0.0.1:19962" "127.0.0.1:19963")
+                              :bind-supplied-p t
+                              :allow-ip '("127.0.0.1")))
+               (is-true (answers-p 19962))
+               (is-true (answers-p 19963))
+               (is-false (answers-p 19961) "-rpcport is not bound when every bind names a port"))
+          (bl.rpc:stop-rpc-server))))))
+
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
 serving something wrong or signalling out of the handler."
@@ -8658,7 +8687,17 @@ rpc_bind.py:46 compares the process's bound sockets against the pair."
           "~S is not loopback and must fall back" exposed))
     ;; with -rpcallowip the operator's address is used as given
     (is (equal '("10.0.0.5") (binds "10.0.0.5" '("10.0.0.0/8") t)))
-    (is (equal '("0.0.0.0") (binds "0.0.0.0" '("0.0.0.0/0") t)))))
+    (is (equal '("0.0.0.0") (binds "0.0.0.0" '("0.0.0.0/0") t)))
+    ;; -rpcbind is repeatable and Core binds EVERY value, each with its own
+    ;; optional port (httpserver.cpp:328-337); rpc_bind.py's explicit
+    ;; 127.0.0.1 + [::1] case expects both sockets.
+    (is (equal '("127.0.0.1" "[::1]")
+               (binds '("127.0.0.1" "[::1]") '("127.0.0.1") t)))
+    (is (equal '("127.0.0.1:32171" "127.0.0.1:32172")
+               (binds '("127.0.0.1:32171" "127.0.0.1:32172") '("127.0.0.1") t)))
+    ;; A port does not make a loopback address anything else.
+    (is (equal '("[::1]:32171") (binds '("[::1]:32171") nil t)))
+    (is (equal '("::1" "127.0.0.1") (binds '("10.0.0.5:32171") nil t)))))
 
 ;;;; tx JSON field completeness (T3c)
 
