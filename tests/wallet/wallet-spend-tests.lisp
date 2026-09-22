@@ -2504,3 +2504,68 @@ walletcreatefundedpsbt died with an internal error."
                        (is (= 2 (length (coerce (%aval "participant_pubkeys" (first in-parts))
                                                 'list)))
                            "~A: participants" name)))))))))
+
+(test fundrawtransaction-solves-nested-external-inputs-from-solving-data
+  "An external pre-selected input is sized by InferDescriptor over the coin
+control's solving data and MaxInputWeight (wallet/spend.cpp:92-103, :305):
+sh(pkh(K)) is SHDescriptor over PKHDescriptor and sh(wsh(pkh(K))) SH over WSH
+over PKH (script/descriptor.cpp:1195-1204, :1390-1406, :1431-1446). Our
+estimator knew sh(wpkh), sh(wsh(multi)) and sh(multi) by shape and nothing
+else, so wallet_fundrawtransaction.py:1066 and wallet_send.py:483 -- which
+fund exactly these two from solving_data -- were -4 \"Not solvable pre-selected
+input\". Without the solving data the refusal stays (the control)."
+  (with-wallet-chain-node (node "nested-external")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address
+                      (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+             (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+             (pub (bl.crypto:bytes-to-hex (bl.crypto:derive-public-key sk :compressed t)))
+             (pkh-script (format nil "76a914~A88ac"
+                                 (bl.crypto:bytes-to-hex
+                                  (bl.crypto:hash160 (bl.crypto:hex-to-bytes pub))))))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "ext")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (loop for (shape scripts seed) in
+              `(("sh(pkh(~A))" (,pkh-script) 63)
+                ("sh(wsh(pkh(~A)))"
+                 (,(format nil "0020~A" (bl.crypto:bytes-to-hex
+                                         (bl.crypto:sha256 (bl.crypto:hex-to-bytes pkh-script))))
+                  ,pkh-script)
+                 65))
+              do (let* ((desc (bl.rpc:descriptor-add-checksum (format nil shape wif)))
+                        (address (first (rpc nil "deriveaddresses" desc)))
+                        (txid (let ((bl.wallet::*wallet-rng* (make-wallet-rng seed)))
+                                (rpc "fund" "sendtoaddress" address
+                                     (bl.rpc:format-money 100000000)
+                                     nil nil nil nil nil nil nil 10))))
+                   (rpc nil "generatetoaddress" 1 optrue)
+                   (let* ((spk (nth-value 1 (bl.crypto:decode-address address :regtest)))
+                          (funding (bl.ser:parse-tx-payload
+                                    (bl.crypto:hex-to-bytes
+                                     (%aval "hex" (rpc "fund" "gettransaction" txid)))))
+                          (vout (position-if (lambda (o) (equalp (bl.ser:tx-out-script-pubkey o) spk))
+                                             (bl.ser:transaction-outputs funding)))
+                          (raw (rpc nil "createrawtransaction"
+                                    (list (obj "txid" txid "vout" vout))
+                                    (list (obj optrue (bl.rpc:format-money 50000000)))))
+                          (bare (rpc-error-of
+                                 (lambda ()
+                                   (rpc "ext" "fundrawtransaction" raw (obj "fee_rate" 10)))))
+                          (solved (rpc-error-of
+                                   (lambda ()
+                                     (rpc "ext" "fundrawtransaction" raw
+                                          (obj "fee_rate" 10
+                                               "solving_data"
+                                               (obj "pubkeys" (list pub) "scripts" scripts)))))))
+                     (is (eql 0 (search "Not solvable pre-selected input" (or (cdr bare) "")))
+                         "~A without solving data: ~S" shape bare)
+                     (is (null solved) "~A with solving data: ~S" shape solved))))))))

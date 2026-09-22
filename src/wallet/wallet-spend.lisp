@@ -503,75 +503,83 @@ GetWitnessSize deliberately excludes."
         (when (and bytes stack)
           (values bytes (1+ stack)))))))
 
+(defun %inner-sat-size (wallet cc script use-max-sig)
+  "(values size elems) -- Core's MaxSatSize and MaxSatisfactionElems for the
+descriptor InferDescriptor gives SCRIPT when it sits INSIDE sh()/wsh(): pk()
+1+sig (descriptor.cpp:1162-1171), pkh() 1+sig+1+pubkey (:1195-1204), wpkh()
+the same with a 33-byte key (:1228-1237), multi() (:1298-1307), wsh() the
+witness script's compact-size length and bytes plus its own inner size
+(:1431-1446), and a miniscript witness script through its own satisfier. NIL
+when the wallet or the coin control's solving data cannot solve it."
+  (multiple-value-bind (type data) (bl.val:classify-script script)
+    (let ((sig (%ecdsa-sig-size use-max-sig)))
+      (case type
+        (:pubkey (values (+ 1 sig) 1))
+        (:pubkeyhash
+         (let ((pub (%known-pubkey-for-script wallet cc script (getf data :hash))))
+           (when pub (values (+ 1 sig 1 (length pub)) 2))))
+        (:witness-v0-keyhash (values (+ 1 sig 1 33) 2))
+        (:multisig
+         (let ((sat (%multisig-sat-size script use-max-sig)))
+           (when sat (values sat (+ 1 (getf data :m))))))
+        (:witness-v0-scripthash
+         (let ((witness (nth-value 1 (%known-sub-scripts wallet cc script))))
+           (when witness (%wsh-sat-size wallet cc witness use-max-sig))))))))
+
+(defun %wsh-sat-size (wallet cc witness use-max-sig)
+  "WSHDescriptor::MaxSatSize/Elems over a known WITNESS script
+(descriptor.cpp:1431-1446): its compact-size length and bytes plus what
+satisfies it -- pk/pkh/multi first, as InferScript tries them, then miniscript."
+  (multiple-value-bind (size elems) (%inner-sat-size wallet cc witness use-max-sig)
+    (unless size
+      (multiple-value-setq (size elems) (%miniscript-sat-size-and-elems witness)))
+    (when size
+      (values (+ (bl.ser:compact-size-length (length witness)) (length witness) size)
+              (1+ elems)))))
+
 (defun %script-sat-weight (wallet cc script use-max-sig)
   "(values sat-weight segwit-p elems) for the maximum satisfaction of
 SCRIPT, mirroring the descriptor MaxSatisfactionWeight arithmetic on the
 descriptor InferDescriptor would produce; NIL when not solvable.
-USE-MAX-SIG is Core's flag of the same name (see the section header)."
-  (multiple-value-bind (type data)
-      (bl.val:classify-script script)
-    (let ((sig (%ecdsa-sig-size use-max-sig)))
-      (case type
-        (:pubkey (values (* 4 (+ 1 sig)) nil 1))
-        (:pubkeyhash
-         (let ((pub (%known-pubkey-for-script wallet cc script (getf data :hash))))
-           (when pub
-             (values (* 4 (+ 1 sig 1 (length pub))) nil 2))))
-        (:witness-v0-keyhash
-         (values (+ 1 sig 1 33) t 2))
-        (:witness-v1-taproot
-         ;; Keypath spend assumed, like Core's TRDescriptor (FIXME parity).
-         (values (+ 1 65) t 1))
-        (:multisig
-         (let ((sat (%multisig-sat-size script use-max-sig)))
-           (when sat (values (* 4 sat) nil (+ 1 (getf data :m))))))
-        (:scripthash
-         (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
-           (when redeem
-             (cond
-               ;; sh(wpkh(...))
-               ((and (= (length redeem) 22)
-                     (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
-                (values (+ (* 4 (+ 1 (length redeem)))
-                           (+ 1 sig 1 33))
-                        t 3))
-               ;; sh(wsh(multi(...)))
-               ((and (= (length redeem) 34)
-                     (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
-                (let ((sat (and witness (%multisig-sat-size witness use-max-sig))))
-                  (when sat
-                    (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
-                      (values (+ (* 4 (+ 1 (length redeem)))
-                                 (+ (bl.ser:compact-size-length (length witness))
-                                    (length witness) sat))
-                              t (+ 3 m))))))
-               ;; sh(multi(...)) — legacy
-               (t
-                (let ((sat (%multisig-sat-size redeem use-max-sig)))
-                  (when sat
-                    (multiple-value-bind (m) (bl.rpc:parse-multisig redeem)
-                      (values (* 4 (+ (+ 1 (length redeem)) sat))
-                              nil (+ 2 m))))))))))
-        (:witness-v0-scripthash
-         (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
-           (declare (ignore redeem))
-           (when witness
-             (let ((sat (%multisig-sat-size witness use-max-sig)))
-               (if sat
-                   (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
-                     (values (+ (bl.ser:compact-size-length (length witness))
-                                (length witness) sat)
-                             t (+ 2 m)))
-                   ;; Not multisig: try miniscript, or the coin looks unsolvable
-                   ;; and coin selection silently skips it — which is what kept a
-                   ;; funded policy descriptor unspendable through the wallet's
-                   ;; own send path even once signing worked.
-                   (multiple-value-bind (msat elems)
-                       (%miniscript-sat-size-and-elems witness)
-                     (when msat
-                       (values (+ (bl.ser:compact-size-length (length witness))
-                                  (length witness) msat)
-                               t elems))))))))))))
+USE-MAX-SIG is Core's flag of the same name (see the section header).
+
+The nested shapes come from %INNER-SAT-SIZE, so sh(pkh()), sh(pk()),
+sh(wsh(pkh())) and wsh(pk()) solve like the multisig and wpkh cases always
+did. SHDescriptor::MaxSatisfactionWeight (descriptor.cpp:1390-1400) charges
+the redeem script as (1 + its size) non-witness bytes and the inner
+satisfaction as witness bytes when the inner descriptor is segwit, as
+scriptSig bytes otherwise; its elems are 1 + the inner's (:1403-1406).
+wallet_fundrawtransaction.py:1066 and wallet_send.py:483 fund an external
+sh(pkh()) and sh(wsh(pkh())) input from solving_data and were -4 \"Not
+solvable pre-selected input\"."
+  (case (bl.val:classify-script script)
+    ((:pubkey :pubkeyhash :multisig)
+     (multiple-value-bind (size elems) (%inner-sat-size wallet cc script use-max-sig)
+       (when size (values (* 4 size) nil elems))))
+    ((:witness-v0-keyhash :witness-v0-scripthash)
+     (multiple-value-bind (size elems) (%inner-sat-size wallet cc script use-max-sig)
+       (when size (values size t elems))))
+    (:witness-v1-taproot
+     ;; Keypath spend assumed, like Core's TRDescriptor (FIXME parity).
+     (values (+ 1 65) t 1))
+    (:scripthash
+     (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
+       (when redeem
+         (let* ((segwit (bl.val:output-witness-program-p redeem))
+                ;; A P2SH-P2WSH's witness script comes from THIS output's
+                ;; lookup, which follows the redeem script to it.
+                (size-elems
+                  (multiple-value-list
+                   (if (and segwit witness
+                            (eq (bl.val:classify-script redeem) :witness-v0-scripthash))
+                       (%wsh-sat-size wallet cc witness use-max-sig)
+                       (%inner-sat-size wallet cc redeem use-max-sig)))))
+           (destructuring-bind (&optional size elems) size-elems
+             (when size
+               (values (+ (* 4 (+ 1 (length redeem)))
+                          (if segwit size (* 4 size)))
+                       segwit
+                       (1+ elems))))))))))
 
 (defun %max-input-weight (wallet cc script use-max-sig &key (tx-is-segwit t))
   "Core MaxInputWeight (spend.cpp:69-90): full weight of the signed input
