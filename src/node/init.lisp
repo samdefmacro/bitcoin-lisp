@@ -2419,6 +2419,12 @@ Core's behaviour and what assert_start_raises_init_error reads."
   ;; single argument (bitcoind.cpp:269): the mask has to be in place before
   ;; ANYTHING is created, datadir included.
   (setup-environment)
+  ;; AbortNode's shutdown request (node/abort.cpp:23): a fatal internal error
+  ;; stops the process non-clean. Only the executable installs it; an image
+  ;; that runs start-node from a test keeps running.
+  (setf bl.log:*fatal-error-shutdown-function*
+        (lambda (message)
+          (request-node-shutdown message :exit-code +node-exit-error+)))
   (let ((args (rest sb-ext:*posix-argv*)))
     (handler-case
         (cond

@@ -49,6 +49,8 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:reset-warnings
    #:run-notify-command
    #:report-init-error
+   #:*fatal-error-shutdown-function*
+   #:fatal-error
    #:set-kernel-warning
    #:set-warning
    #:trace-thread
@@ -810,6 +812,34 @@ is running now."
     (set-warning :pre-release-test-build
                  "This is a pre-release test build - use at your own risk - do not use for mining or merchant applications"))
   t)
+
+;;; --- AbortNode (Core node/abort.cpp) ---------------------------------------
+
+(defvar *fatal-error-shutdown-function* nil
+  "Called with the message by FATAL-ERROR to stop the node -- the
+shutdown_request half of Core's AbortNode (node/abort.cpp:23-25). NODE-MAIN
+installs a request for a non-clean shutdown; everywhere else (tests, a REPL)
+it stays NIL and a fatal error is reported without stopping the image, which
+is Core's own m_shutdown_on_fatal_error = false (kernel_notifications.h).")
+
+(defun fatal-error (message)
+  "Core FatalError -> KernelNotifications::fatalError -> AbortNode
+(validation.cpp:2133-2137, node/kernel_notifications.cpp:97-101,
+node/abort.cpp:18-26): record the FATAL_INTERNAL_ERROR warning, report
+MESSAGE the way InitError does -- logged, and on stderr under Core's caption
+`A fatal internal error occurred, see debug.log for details: ' -- and ask
+the node to stop with a failing exit status.
+
+Reported once: Core stops the node after the first, and a caller that meets
+the same fault again before the shutdown lands (the sync loop retrying the
+same reorg) must not add a second line to stderr, which
+feature_abortnode.py:39 compares whole. Returns MESSAGE."
+  (when (set-warning :fatal-internal-error message)
+    (report-init-error
+     "A fatal internal error occurred, see debug.log for details: ~A" message)
+    (let ((shutdown *fatal-error-shutdown-function*))
+      (when shutdown (funcall shutdown message))))
+  message)
 
 (defvar *alert-notify-command* nil
   "Core -alertnotify: a shell command run when a KERNEL warning appears, with

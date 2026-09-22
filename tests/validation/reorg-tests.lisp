@@ -1143,14 +1143,30 @@ missing-block list."
          (bl.store:update-chain-tip chain-state a2-hash 2)
          ;; Ensure no undo exists for A2 (the corruption).
          (clear-undo-cache)
-         (multiple-value-bind (ok detail)
-             (bl.val:perform-reorg
-              chain-state block-store utxo-set a2-entry b2-entry)
-           (is (null ok))                                   ; refused
-           (is (eq detail :corrupt-undo))                   ; distinct keyword, NOT a missing list
-           ;; No mutation on a refused reorg — tip still A2.
-           (is (= 2 (bl.store:current-height chain-state)))
-           (is (equalp a2-hash (bl.store:best-block-hash chain-state))))))
+         (bl.log:reset-warnings)
+         (let* ((stderr (make-string-output-stream))
+                (requested '())
+                (bl.log:*fatal-error-shutdown-function*
+                  (lambda (message) (push message requested))))
+           (multiple-value-bind (ok detail)
+               (let ((*error-output* stderr))
+                 (bl.val:perform-reorg
+                  chain-state block-store utxo-set a2-entry b2-entry))
+             (is (null ok))                                   ; refused
+             (is (eq detail :corrupt-undo))                   ; distinct keyword, NOT a missing list
+             ;; No mutation on a refused reorg — tip still A2.
+             (is (= 2 (bl.store:current-height chain-state)))
+             (is (equalp a2-hash (bl.store:best-block-hash chain-state)))
+             ;; Core aborts the node on a disconnect it cannot run
+             ;; (validation.cpp:3242 FatalError -> node/abort.cpp AbortNode):
+             ;; the InitError-captioned line on stderr, the fatal warning in
+             ;; the RPC warnings, and one shutdown request.
+             (is (equal (format nil "Error: A fatal internal error occurred, see debug.log for details: Failed to disconnect block.~%")
+                        (get-output-stream-string stderr)))
+             (is (equal '("Failed to disconnect block.") requested))
+             (is (equalp #("Failed to disconnect block.")
+                         (coerce (bl.log:warnings-for-rpc) 'vector)))))
+         (bl.log:reset-warnings)))
      (clear-undo-cache))))
 
 ;;;; Reorg mempool bulk re-add (cluster mempool P8 — Core

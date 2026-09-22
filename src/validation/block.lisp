@@ -4349,6 +4349,10 @@ comment above."
                    "REORG REFUSED: corrupt/missing undo for block ~A at height ~D — refusing rather than corrupting the UTXO set"
                    (bl.crypto:bytes-to-hex block-hash)
                    (bl.store:block-index-entry-height entry))
+                  ;; A disconnect that cannot run is a failure of the local
+                  ;; system, and Core aborts the node rather than stay on the
+                  ;; less-work chain (validation.cpp:3234-3243).
+                  (bl.log:fatal-error "Failed to disconnect block.")
                   (return-from perform-reorg (values nil :corrupt-undo)))))))
 
         (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
