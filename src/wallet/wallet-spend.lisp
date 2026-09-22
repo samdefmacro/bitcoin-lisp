@@ -2627,11 +2627,16 @@ Caller holds node + wallet locks."
           (multiple-value-bind (aps-tx aps-fee aps-change-pos aps-reason)
               (%create-transaction-internal node wallet recipients change-pos
                                             aps-cc sign rng)
-            (when (and aps-tx (<= aps-fee (+ fee *wallet-max-aps-fee*)))
-              (bl:log-info
-               "Fee non-grouped = ~D, grouped = ~D, using grouped" fee aps-fee)
-              (setf tx aps-tx fee aps-fee tx-change-pos aps-change-pos
-                    fee-reason aps-reason)))))
+            ;; Core logs the comparison whenever the grouped attempt
+            ;; succeeded, whichever it then uses (spend.cpp:1485-1489) --
+            ;; wallet_groups.py:137 waits for the `using non-grouped' line.
+            (when aps-tx
+              (let ((use-aps (<= aps-fee (+ fee *wallet-max-aps-fee*))))
+                (bl:log-info "Fee non-grouped = ~D, grouped = ~D, using ~A"
+                             fee aps-fee (if use-aps "grouped" "non-grouped"))
+                (when use-aps
+                  (setf tx aps-tx fee aps-fee tx-change-pos aps-change-pos
+                        fee-reason aps-reason)))))))
       (values tx fee tx-change-pos fee-reason))))
 
 ;;; --- FundTransaction core (spend.cpp:1494-1546) ---

@@ -2862,3 +2862,35 @@ every send with -6 \"Missing solving data for estimating transaction size\"
                      (is-true (member txid (coerce (rpc nil "getrawmempool") 'list)
                                       :test #'equal)
                               "~A: the spend reached the mempool" shape))))))))
+
+(test the-avoid-partial-spends-retry-logs-its-choice-either-way
+  "CreateTransaction retries with avoid_partial_spends and logs the comparison
+whenever that attempt succeeded, naming the result it USES -- `using grouped'
+or `using non-grouped' (wallet/spend.cpp:1485-1489). We logged only when the
+grouped result won, and wallet_groups.py:137 waits for the non-grouped line.
+Five coins on one address and a send the grouped attempt must pay for with all
+five make it the costlier one; the -maxapsfee default is 0."
+  (with-wallet-chain-node (node "aps-log")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "w")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let ((address (rpc "w" "getnewaddress" "" "bech32")))
+          (dotimes (i 5)
+            (with-wallet-rng ((+ 85 i))
+              (rpc "fund" "sendtoaddress" address (bl.rpc:format-money 100000000)
+                   nil nil nil nil nil nil nil 10)))
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let ((lines (capture-log-lines
+                        (lambda ()
+                          (with-wallet-rng (91)
+                            (rpc "w" "sendtoaddress" optrue (bl.rpc:format-money 295000000)
+                                 nil nil nil nil nil nil nil 10))))))
+            (is-true (some (lambda (l) (and (search "Fee non-grouped = " l)
+                                            (search "using non-grouped" l)))
+                           lines)
+                     "no non-grouped line in ~S" lines)))))))
