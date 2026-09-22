@@ -12274,3 +12274,20 @@ marks it after 0.3 s."
                       "and returned once it was marked done")))
       (setf bl:*pending-test-connections* saved)
       (when worker (ignore-errors (bt:join-thread worker))))))
+
+(test fee-rpcs-are-disabled-in-blocksonly
+  "Core creates no fee estimator for a node that ignores incoming transactions
+(init.cpp:1650-1658), and both fee RPCs start with EnsureAnyFeeEstimator
+(rpc/fees.cpp:65, :154), which answers RPC_INTERNAL_ERROR \"Fee estimation
+disabled\" (rpc/server_util.cpp:87-91). feature_fee_estimation.py:500-503
+restarts with -blocksonly and expects exactly that. Control: without
+-blocksonly estimatesmartfee answers normally."
+  (let ((node (bl:make-node :network :regtest)))
+    (let ((bl:*blocksonly* nil))
+      (is-true (bl.rpc:dispatch-rpc-method node "estimatesmartfee" (list 2))
+               "control: an ordinary node answers"))
+    (let ((bl:*blocksonly* t))
+      (dolist (method '("estimatesmartfee" "estimaterawfee"))
+        (signals-rpc-error (:code bl.rpc:+rpc-internal-error+
+                            :exact-message "Fee estimation disabled")
+          (bl.rpc:dispatch-rpc-method node method (list 2)))))))

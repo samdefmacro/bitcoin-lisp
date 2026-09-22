@@ -199,6 +199,17 @@ and NO time fields; an unknown block gets blockhash only."
                        ("blocktime" . ,block-time))))
                   (t '(("confirmations" . 0)))))))
 
+(defun %ensure-fee-estimator ()
+  "Core EnsureAnyFeeEstimator (rpc/server_util.cpp:87-91), the first thing both
+fee RPCs do (rpc/fees.cpp:65, :154): a -blocksonly node has no fee estimator
+at all -- init.cpp:1650-1658 creates it only when incoming transactions are
+relayed -- so it answers RPC_INTERNAL_ERROR \"Fee estimation disabled\"
+(feature_fee_estimation.py:500-503). Only an explicit -blocksonly counts here:
+the mainnet relay posture is this project's own default, not Core's
+ignore_incoming_txs, and the live node's estimator stays up."
+  (when bl:*blocksonly*
+    (error 'rpc-error :code +rpc-internal-error+ :message "Fee estimation disabled")))
+
 (define-rpc "estimatesmartfee" (node (conf-target mode-str))
   "Estimate fee rate for confirmation in conf_target blocks.
 PARAMS: [conf_target, estimate_mode]
@@ -223,6 +234,7 @@ all of them silently:
   - \"blocks\" is feeCalc.returnedTarget, the target the answer is actually
     for, not the one requested. The estimator substitutes 2 for a 1-block
     target and clamps to what its history can justify."
+  (%ensure-fee-estimator)
   (let* ((mode (cond
                  ((null mode-str) :economical)
                  ((string-equal mode-str "unset") :economical)
@@ -1579,6 +1591,7 @@ makes it a debugging tool and why Core documents it as such. A horizon that
 does not track CONF-TARGET is OMITTED, not reported as zero: absence and \"no
 answer\" mean different things to whoever is reading this."
   (declare (ignore node))
+  (%ensure-fee-estimator)
   (let ((conf-target (first params))
         (threshold (if (second params) (second params) 0.95d0)))
     (unless (integerp conf-target)
