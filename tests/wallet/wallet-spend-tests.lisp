@@ -2815,3 +2815,50 @@ transaction must pass testmempoolaccept."
             (is-true (and (%aval "hex" res)
                           (eq t (%aval "allowed" (first (rpc nil "testmempoolaccept"
                                                              (list (%aval "hex" res))))))))))))))
+
+(test a-wallet-sizes-its-own-nested-pkh-coins
+  "The wallet's provider for an output it owns knows every pubkey of the
+owning descriptor, so a pkh() inside sh() or wsh() is sized with that key
+(CalculateMaximumSignedInputSize over GetSolvingProvider, wallet/spend.cpp:
+105-109). Our estimator asked for the pubkey with the bare pkh script, which
+no SPKM outputs, and a wallet holding sh(pkh(K)) or wsh(pkh(K)) coins failed
+every send with -6 \"Missing solving data for estimating transaction size\"
+(wallet_fundrawtransaction.py:1402). The sends must also reach the mempool."
+  (with-wallet-chain-node (node "own-nested-pkh")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (loop for (shape byte seed) in '(("sh(pkh(~A))" 31 81) ("wsh(pkh(~A))" 32 83))
+              for name = (format nil "own~D" byte)
+              do (let ((desc (bl.rpc:descriptor-add-checksum
+                              (format nil shape (bl.crypto:private-key-to-wif
+                                                 (make-array 32 :element-type '(unsigned-byte 8)
+                                                                :initial-element byte)
+                                                 :network :regtest :compressed t)))))
+                   (rpc nil "createwallet" name nil t)
+                   (rpc name "importdescriptors" (list (obj "desc" desc "timestamp" "now")))
+                   (with-wallet-rng (seed)
+                     (rpc "fund" "sendtoaddress" (first (rpc nil "deriveaddresses" desc))
+                          (bl.rpc:format-money 100000000) nil nil nil nil nil nil nil 10))
+                   (rpc nil "generatetoaddress" 1 optrue)
+                   (let* ((txid nil)
+                          (sent (rpc-error-of
+                                 (lambda ()
+                                   (with-wallet-rng ((1+ seed))
+                                     ;; subtractfeefromamount: the wallet has no
+                                     ;; change descriptor, and needs none then.
+                                     (setf txid (rpc name "sendtoaddress" optrue
+                                                     (bl.rpc:format-money 100000000)
+                                                     nil nil t nil nil nil nil 10)))))))
+                     (is (null sent) "~A: ~S" shape sent)
+                     (is-true (member txid (coerce (rpc nil "getrawmempool") 'list)
+                                      :test #'equal)
+                              "~A: the spend reached the mempool" shape))))))))

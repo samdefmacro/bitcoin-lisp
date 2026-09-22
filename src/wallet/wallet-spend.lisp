@@ -521,20 +521,27 @@ GetWitnessSize deliberately excludes."
         (when (and bytes stack)
           (values bytes (1+ stack)))))))
 
-(defun %inner-sat-size (wallet cc script use-max-sig)
+(defun %inner-sat-size (wallet cc script use-max-sig &optional (outer script))
   "(values size elems) -- Core's MaxSatSize and MaxSatisfactionElems for the
 descriptor InferDescriptor gives SCRIPT when it sits INSIDE sh()/wsh(): pk()
 1+sig (descriptor.cpp:1162-1171), pkh() 1+sig+1+pubkey (:1195-1204), wpkh()
 the same with a 33-byte key (:1228-1237), multi() (:1298-1307), wsh() the
 witness script's compact-size length and bytes plus its own inner size
 (:1431-1446), and a miniscript witness script through its own satisfier. NIL
-when the wallet or the coin control's solving data cannot solve it."
+when the wallet or the coin control's solving data cannot solve it.
+
+OUTER is the output script being spent. The wallet's provider for it knows
+every pubkey of the owning descriptor, so a pkh() inside sh()/wsh() finds its
+key through the OUTER script's SPKM -- the bare pkh script is no output of
+any SPKM and asking with it finds nothing (wallet_fundrawtransaction.py:1402,
+a wallet holding sh(pkh(K)) could size none of its coins)."
   (multiple-value-bind (type data) (bl.val:classify-script script)
     (let ((sig (%ecdsa-sig-size use-max-sig)))
       (case type
         (:pubkey (values (+ 1 sig) 1))
         (:pubkeyhash
-         (let ((pub (%known-pubkey-for-script wallet cc script (getf data :hash))))
+         (let ((pub (or (%known-pubkey-for-script wallet cc script (getf data :hash))
+                        (%known-pubkey-for-script wallet cc outer (getf data :hash)))))
            (when pub (values (+ 1 sig 1 (length pub)) 2))))
         (:witness-v0-keyhash (values (+ 1 sig 1 33) 2))
         (:multisig
@@ -542,13 +549,13 @@ when the wallet or the coin control's solving data cannot solve it."
            (when sat (values sat (+ 1 (getf data :m))))))
         (:witness-v0-scripthash
          (let ((witness (nth-value 1 (%known-sub-scripts wallet cc script))))
-           (when witness (%wsh-sat-size wallet cc witness use-max-sig))))))))
+           (when witness (%wsh-sat-size wallet cc witness use-max-sig outer))))))))
 
-(defun %wsh-sat-size (wallet cc witness use-max-sig)
+(defun %wsh-sat-size (wallet cc witness use-max-sig &optional (outer witness))
   "WSHDescriptor::MaxSatSize/Elems over a known WITNESS script
 (descriptor.cpp:1431-1446): its compact-size length and bytes plus what
 satisfies it -- pk/pkh/multi first, as InferScript tries them, then miniscript."
-  (multiple-value-bind (size elems) (%inner-sat-size wallet cc witness use-max-sig)
+  (multiple-value-bind (size elems) (%inner-sat-size wallet cc witness use-max-sig outer)
     (unless size
       (multiple-value-setq (size elems) (%miniscript-sat-size-and-elems witness)))
     (when size
@@ -590,8 +597,8 @@ solvable pre-selected input\"."
                   (multiple-value-list
                    (if (and segwit witness
                             (eq (bl.val:classify-script redeem) :witness-v0-scripthash))
-                       (%wsh-sat-size wallet cc witness use-max-sig)
-                       (%inner-sat-size wallet cc redeem use-max-sig)))))
+                       (%wsh-sat-size wallet cc witness use-max-sig script)
+                       (%inner-sat-size wallet cc redeem use-max-sig script)))))
            (destructuring-bind (&optional size elems) size-elems
              (when size
                (values (+ (* 4 (+ 1 (length redeem)))
