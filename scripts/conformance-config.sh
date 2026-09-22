@@ -37,9 +37,16 @@ mkdir -p "$ROOT/build/bin"
 # started under that name (src/cli/), so the framework finds the client where
 # it looks for it, BUILDDIR/bin/bitcoin-cli (util.py:317-343), with no second
 # image to build.
+# A link that already names the binary is left alone: every run calls this,
+# and a run whose links had just been replaced (atomically, with no other run
+# active) still got EINVAL exec'ing build/bin/bitcoin-cli through the Docker
+# bind mount -- observed 2026-09-23, one run in three.
 for name in bitcoind bitcoin-cli; do
-  ln -sfn "../$(basename "$BIN")" "$ROOT/build/bin/.$name.$$"
-  mv -f "$ROOT/build/bin/.$name.$$" "$ROOT/build/bin/$name"
+  target="../$(basename "$BIN")"
+  if [ "$(readlink "$ROOT/build/bin/$name" 2>/dev/null || true)" != "$target" ]; then
+    ln -sfn "$target" "$ROOT/build/bin/.$name.$$"
+    mv -f "$ROOT/build/bin/.$name.$$" "$ROOT/build/bin/$name"
+  fi
 done
 
 # Paths written INTO config.ini are resolved by whoever reads it, which is
