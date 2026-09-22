@@ -928,22 +928,13 @@ the second one saw."
                              (concatenate 'list (list empty) (sigs)
                                           (list (input-sig-witness-script sig)))
                              (threshold-error "")))
-        ;; Miniscript: the satisfier already produced the whole stack, and there
-        ;; is no CHECKMULTISIG dummy to prepend. Core appends the witnessScript
-        ;; after the satisfaction unconditionally (sign.cpp:777).
-        ;; A satisfaction that did not complete carries only the signatures
-        ;; made on the way (for a PSBT), and is incomplete here.
-        (:p2wsh-miniscript
+        ;; Miniscript: the satisfier produced the whole stack (no CHECKMULTISIG
+        ;; dummy); Core appends the witnessScript unconditionally (sign.cpp:777).
+        ;; No stack = only the signatures made on the way, for a PSBT.
+        ((:p2wsh-miniscript :p2sh-p2wsh-miniscript)
          (if (input-sig-stack sig)
-             (values nil (append (input-sig-stack sig)
-                                 (list (input-sig-witness-script sig)))
-                     nil)
-             (values nil nil "witnessScript is not multisig")))
-        (:p2sh-p2wsh-miniscript
-         (if (input-sig-stack sig)
-             (values (bl.ser:script-push-data (input-sig-redeem sig))
-                     (append (input-sig-stack sig)
-                             (list (input-sig-witness-script sig)))
+             (values (and (input-sig-redeem sig) (bl.ser:script-push-data (input-sig-redeem sig)))
+                     (append (input-sig-stack sig) (list (input-sig-witness-script sig)))
                      nil)
              (values nil nil "witnessScript is not multisig")))
         (:multisig (values (apply #'concatenate '(vector (unsigned-byte 8))
