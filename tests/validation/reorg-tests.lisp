@@ -3634,3 +3634,78 @@ assertion that the array is non-empty cannot pass by the field being broken."
                    "the warning must clear when the chain catches up")))
         (progn (bl.log:reset-warnings)
                (bl.val:reset-fork-warning-state))))))
+
+(defvar *captured-validation-events* :off
+  "While a list, the capture hooks below push (event hash) for every block
+connect/disconnect and mempool addition; :OFF (the default) records nothing.")
+
+(bl.vi:define-validation-hook :block-connected capture-block-connected
+    (chainstate block block-hash height spent-utxos)
+  (declare (ignore chainstate block height spent-utxos))
+  (unless (eq *captured-validation-events* :off)
+    (push (list :connected block-hash) *captured-validation-events*)))
+
+(bl.vi:define-validation-hook :block-disconnected capture-block-disconnected
+    (chainstate block block-hash height)
+  (declare (ignore chainstate block height))
+  (unless (eq *captured-validation-events* :off)
+    (push (list :disconnected block-hash) *captured-validation-events*)))
+
+(bl.vi:define-validation-hook :transaction-added capture-transaction-added
+    (tx txid sequence)
+  (declare (ignore tx sequence))
+  (unless (eq *captured-validation-events* :off)
+    (push (list :added txid) *captured-validation-events*)))
+
+(test a-reorg-signals-the-returning-transactions-before-the-new-blocks
+  "Core signals BlockDisconnected from inside DisconnectTip, re-adds the
+disconnected transactions (MaybeUpdateMempoolForReorg) before
+ActivateBestChainStep returns, and only then signals the step's
+BlockConnected (validation.cpp:3298, :3427-3433). A subscriber therefore
+hears the old block leave, its transactions return to the mempool, and then
+the new blocks -- interface_zmq.py:293-302 reads exactly that on hashtx. Ours
+signalled the new blocks before the re-add."
+  (with-network (:mainnet)
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (make-activate-block-fixture "reorg-signal-order")
+     (let* ((mempool (bl.mp:make-mempool))
+            (u-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xED))
+            ;; Standard (P2SH(OP_TRUE) in and out), so the re-add's policy
+            ;; checks accept it.
+            (tx-t (pkg-tx u-txid 0 99000))
+            (t-txid (bl.ser:transaction-hash tx-t))
+            (a-hashes (make-test-chain-hashes #xA7 2))
+            (b-hashes (make-test-chain-hashes #xB7 3)))
+       (bl.store:add-utxo utxo-set u-txid 0 100000 (p2sh-optrue-script-pubkey) 1)
+       (unwind-protect
+            (progn
+              (let ((a1 (make-reorg-test-block genesis-hash (first a-hashes) 1))
+                    (a2 (%make-txindex-test-block (first a-hashes) (second a-hashes)
+                                                  2 (list tx-t))))
+                (bl.val:connect-block a1 chain-state block-store utxo-set :mempool mempool)
+                (bl.val:connect-block a2 chain-state block-store utxo-set :mempool mempool))
+              (let ((*captured-validation-events* '()))
+                (let ((b1 (make-reorg-test-block genesis-hash (first b-hashes) 1))
+                      (b2 (make-reorg-test-block (first b-hashes) (second b-hashes) 2))
+                      (b3 (make-reorg-test-block (second b-hashes) (third b-hashes) 3)))
+                  (dolist (b (list b1 b2 b3))
+                    (bl.val:connect-block b chain-state block-store utxo-set
+                                          :mempool mempool)))
+                (let* ((events (reverse *captured-validation-events*))
+                       (position-of
+                         (lambda (kind hash)
+                           (position-if (lambda (e) (and (eq (first e) kind)
+                                                         (equalp (second e) hash)))
+                                        events)))
+                       ;; The disconnect names the block by its RECOMPUTED
+                       ;; header hash (the body is re-read from disk), not the
+                       ;; synthetic index hash, so any disconnect will do.
+                       (gone (position :disconnected events :key #'first))
+                       (back (funcall position-of :added t-txid))
+                       (new (funcall position-of :connected (first b-hashes))))
+                  (is (= 3 (bl.store:current-height chain-state)))
+                  (is-true (bl.mp:mempool-has mempool t-txid)
+                           "the disconnected transaction is back in the mempool")
+                  (is-true (and gone back new (< gone back new))
+                           "disconnect, re-add, connect -- got ~S" events))))
+         (clear-undo-cache))))))

@@ -4117,6 +4117,7 @@ relay filters."
    chain-state (car pair)
    (bl.ser:block-header-hash (bl.ser:bitcoin-block-header (car pair)))
    (cdr pair)))
+(let ((connected-signals '()))
 (dolist (item (reverse (reorg-connected r)))
   (destructuring-bind (entry block height spent-utxos) item
     (when fee-estimator
@@ -4140,12 +4141,13 @@ relay filters."
         (note-block-connected block))
       ;; The fork's blocks connect oldest-to-newest, after that block's
       ;; mempool conflict removals (Core order): the indexes, ZMQ and the
-      ;; wallet hear it here. Reconnected in order, so a filter header
-      ;; chains off its already-indexed parent and each coinstats record
-      ;; loads its parent's running state; the spender erase for the
-      ;; disconnected side already ran earlier in this phase, so these
-      ;; writes cannot be undone by it.
-      (bl.vi:notify-block-connected chain-state block hash height spent-utxos))))
+      ;; wallet hear it below, once the disconnected transactions are back
+      ;; in the mempool. Reconnected in order, so a filter header chains off
+      ;; its already-indexed parent and each coinstats record loads its
+      ;; parent's running state; the spender erase for the disconnected side
+      ;; already ran earlier in this phase, so these writes cannot be undone
+      ;; by it.
+      (push (list block hash height spent-utxos) connected-signals))))
 ;; The disconnected old chain's txs stay in the tx-index: Core never
 ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
 ;; defaults to a no-op; index/txindex.cpp has no override). Txs
@@ -4183,6 +4185,17 @@ relay filters."
        :skipped-txs (loop for entry in (subseq groups 0 skipped)
                           append (car entry)))))
 
+  ;; BlockConnected for the fork's blocks, oldest first, AFTER the re-add:
+  ;; Core's ActivateBestChainStep runs MaybeUpdateMempoolForReorg before it
+  ;; returns, and ActivateBestChain signals the step's connected blocks only
+  ;; then (validation.cpp:3298, :3427-3433), while BlockDisconnected is
+  ;; signalled from inside DisconnectTip. So a subscriber hears the
+  ;; disconnect, then the transactions returning to the mempool, then the new
+  ;; blocks -- the order interface_zmq.py:293-302 reads on its hashtx topic.
+  (dolist (signal (reverse connected-signals))
+    (destructuring-bind (block hash height spent-utxos) signal
+      (bl.vi:notify-block-connected chain-state block hash height spent-utxos)))
+
   ;; Core CheckForkWarningConditions after every activation step
   ;; (validation.cpp:3302). A reorg is the step that most often clears the
   ;; warning -- our chain has just outgrown the invalid one -- and %REORG-CONNECT
@@ -4204,7 +4217,7 @@ relay filters."
     (t
      (bl:log-info "REORG complete: disconnected ~D, connected ~D blocks"
                             (length (reorg-to-disconnect r)) (length (reorg-to-connect r)))
-               t))))
+               t)))))
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
                       &key fee-estimator recent-rejects mempool skip-scripts
