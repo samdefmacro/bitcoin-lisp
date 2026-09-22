@@ -4133,9 +4133,16 @@ unbroadcast set.")
   (+ +initial-broadcast-interval+ (random +initial-broadcast-jitter+)))
 
 (defun reset-initial-broadcast-schedule ()
-  "Clear the re-announcement deadline (called at node start, alongside
-reset-tx-requests) so the first pass re-arms fresh."
-  (setf *next-initial-broadcast-time* 0))
+  "ARM the re-announcement deadline a full interval out (called at node
+start, alongside reset-tx-requests), as Core's PeerManager schedules the
+first pass from StartScheduledTasks (net_processing.cpp:2036-2038) -- before
+any RPC can run. Left to the first idle tick, as it was, a mockscheduler that
+reached the node before that tick found nothing armed, and the tick then armed
+the deadline 10-15 minutes past the ALREADY-forwarded scheduler clock:
+mempool_persist.py:219 restarts the node and forwards 16 minutes at once, and
+the pass never came."
+  (setf *next-initial-broadcast-time*
+        (+ (bl.ser:get-scheduler-time) (%next-initial-broadcast-seconds))))
 
 (defun reattempt-initial-broadcast (peers mempool)
   "Re-announce every unbroadcast tx still in the mempool to the current

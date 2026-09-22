@@ -296,7 +296,7 @@ startup, init.cpp:1662). Called from init rather than left to the first idle
 tick: a node still inside its first sync pass has not ticked yet, and
 `mockscheduler\' forwards the clock from wherever it is -- so a late arm puts
 the deadline an hour PAST the forwarded time and the flush never comes."
-  (setf *last-fee-estimate-flush-time* (bl.ser:get-unix-time)))
+  (setf *last-fee-estimate-flush-time* (bl.ser:get-scheduler-time)))
 
 (defun maybe-flush-fee-estimates (estimator)
   "Flush fee estimates on Core's hourly cadence (init.cpp:1662).

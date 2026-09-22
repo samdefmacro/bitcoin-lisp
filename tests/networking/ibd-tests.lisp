@@ -2599,7 +2599,8 @@ scheduler.cpp:82-97, from rpc/node.cpp:86-99) and leaves GetTime alone. Ours
 set the node's mock clock to now+DELTA, which froze it there: every tx-inv
 trickle deadline armed after the call lay in a future that never came, so the
 re-announcement mempool_persist.py:220 and mempool_unbroadcast.py:70 wait for
-was queued and never sent."
+was queued and never sent. And the node start ARMS the pass: armed by the first
+idle tick instead, it landed a full interval past an already-forwarded clock."
   (let* ((bl:*network* :regtest)
          (base 1700000000)
          (bl.ser:*mock-time* base)
@@ -2613,8 +2614,12 @@ was queued and never sent."
     (bl.net:reset-initial-broadcast-schedule)
     (unwind-protect
          (progn
-           (bl.net:maybe-reattempt-initial-broadcast (list peer) mempool)
-           (is (null (bl.net:peer-tx-inv-queue peer)) "the arming pass")
+           ;; No idle tick between the node's start and the RPC: the first
+           ;; pass must already be scheduled, as Core's is from
+           ;; StartScheduledTasks (net_processing.cpp:2036-2038), or the
+           ;; forward reaches nothing (mempool_persist.py:215-219 restarts
+           ;; the node and forwards at once).
+           (is (null (bl.net:peer-tx-inv-queue peer)))
            (bl.rpc:dispatch-rpc-method nil "mockscheduler" (list (* 16 60)))
            (is (= base (bl.ser:get-unix-time))
                "the node clock did not move")
