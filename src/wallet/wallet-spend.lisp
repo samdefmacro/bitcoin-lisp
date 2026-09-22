@@ -4021,4 +4021,4 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                             (bl.ser:transaction-wire-bytes tx)))
                  ("complete" . ,(bl.rpc:json-bool (null sign-errors))))
                (when sign-errors
-                 `(("errors" . ,(bl.rpc:sign-errors-json tx sign-errors)))))))))))))
+                 `(("errors" . ,(bl.rpc:sign-errors-json tx sign-errors coins)))))))))))))

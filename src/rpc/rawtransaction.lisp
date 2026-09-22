@@ -741,7 +741,10 @@ must be bound by the caller."
                                                  (vector #x88 #xac))))
                    (cond
                      ((null entry) (fail (format nil "no key for ~A" label)))
-                     ((null amount) (fail (format nil "~A requires amount" label)))
+                     ;; Core's own input error for a witness signature with
+                     ;; no amount (sign.cpp:1052-1055), which
+                     ;; SIGN-ERRORS-JSON turns into its -3 exception.
+                     ((null amount) (fail "Missing amount"))
                      (t (values (%make-input-sig
                                  :kind (if wrapped :p2sh-p2wpkh :p2wpkh)
                                  :needed 1 :redeem wrapped
@@ -797,7 +800,7 @@ must be bound by the caller."
                     (fail (if wrapped
                               "witnessScript hash mismatch (P2SH-P2WSH)"
                               "witnessScript hash mismatch")))
-                   ((null amount) (fail "P2WSH requires amount"))
+                   ((null amount) (fail "Missing amount"))
                    ;; Not multisig: Core's fallback is miniscript, not a refusal.
                    ((not (parse-multisig witness-script))
                     (multiple-value-bind (stack pairs) (miniscript-stack witness-script)
@@ -1428,9 +1431,9 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
            `(("hex" . ,(bl.crypto:bytes-to-hex bytes))
              ("complete" . ,(json-bool (null sign-errors))))
            (when sign-errors
-             `(("errors" . ,(sign-errors-json tx sign-errors))))))))))
+             `(("errors" . ,(sign-errors-json tx sign-errors prevmap))))))))))
 
-(defun sign-errors-json (tx sign-errors)
+(defun sign-errors-json (tx sign-errors &optional prevmap)
   "The `errors' array of signrawtransactionwithkey / signrawtransactionwithwallet
 for SIGN-ERRORS, (input-index . message) pairs: Core's TxInErrorToJSON
 (rpc/rawtransaction_util.cpp:174-188) per failed input, in input order (the
@@ -1438,7 +1441,25 @@ errors are a std::map<int, ...>, :333-335) -- txid, vout, the input's witness
 stack as hex, scriptSig hex, sequence and the error. signrawtransactionwithkey
 used to answer only {error: \"Input N: ...\"}, so wallet_signrawtransaction
 withwallet.py:110 found no `witness' and :118-121 no txid/vout to name the
-failing inputs by."
+failing inputs by.
+
+One input error is not an entry but an exception: \"Missing amount\" -- a
+witness signature needs the spent amount -- is RPC_TYPE_ERROR -3 \"Missing
+amount for <CTxOut::ToString()>\" (:328-333, CTxOut::ToString in
+primitives/transaction.cpp:61-64, with nValue MAX_MONEY as Core's ParsePrevouts
+leaves it); wallet_signrawtransactionwithwallet.py:268 asserts it. PREVMAP
+supplies the scriptPubKey it names."
+  (let ((missing (find "Missing amount" sign-errors :key #'cdr :test #'equal)))
+    (when missing
+      (let* ((op (bl.ser:tx-in-previous-output
+                  (aref (bl.ser:transaction-inputs tx) (car missing))))
+             (spk (first (and prevmap (gethash (cons (bl.ser:outpoint-hash op)
+                                                     (bl.ser:outpoint-index op))
+                                               prevmap))))
+             (hex (bl.crypto:bytes-to-hex (or spk #()))))
+        (error 'rpc-error :code +rpc-type-error+
+                          :message (format nil "Missing amount for CTxOut(nValue=21000000.00000000, scriptPubKey=~A)"
+                                           (subseq hex 0 (min 30 (length hex))))))))
   (let ((inputs (bl.ser:transaction-inputs tx))
         (witnesses (bl.ser:transaction-witness tx)))
     (mapcar (lambda (entry)

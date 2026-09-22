@@ -12400,3 +12400,43 @@ incomplete."
             "the finished input is complete: ~S" done)
         (is (string-equal hex (cdr (assoc "hex" done :test #'string=)))))
       (is (not (eq t (cdr (assoc "complete" (sign bare) :test #'string=))))))))
+
+(test a-witness-input-with-no-amount-is-cores-missing-amount-exception
+  "A witness signature commits to the spent amount, so SignTransaction flags
+an input whose prevtx gave none (sign.cpp:1052-1055) and
+SignTransactionResultToJSON turns that one input error into an exception:
+-3 \"Missing amount for CTxOut(nValue=21000000.00000000, scriptPubKey=...)\"
+(rpc/rawtransaction_util.cpp:328-333) -- wallet_signrawtransactionwithwallet
+.py:268. We reported \"P2WPKH requires amount\" as an ordinary error entry.
+The same input WITH its amount signs (the control)."
+  (let* ((node (make-test-node :network :regtest))
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 3) k))
+         (wif (bl.crypto:private-key-to-wif k1 :network :regtest :compressed t))
+         (spk (concatenate '(vector (unsigned-byte 8)) (vector 0 20)
+                           (bl.crypto:hash160 (bl.crypto:derive-public-key k1 :compressed t))))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 50))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 10000 :script-pubkey spk))
+              :lock-time 0))
+         (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))))
+    (flet ((sign (&optional amount)
+             (rpc-error-of
+              (lambda ()
+                (bl.rpc:dispatch-rpc-method
+                 node "signrawtransactionwithkey"
+                 (list hex (list wif)
+                       (list `(("txid" . ,(bl.rpc:hash-to-hex txid)) ("vout" . 0)
+                               ("scriptPubKey" . ,(bl.crypto:bytes-to-hex spk))
+                               ,@(when amount `(("amount" . ,amount)))))))))))
+      (is (null (sign 0.001d0)) "the control: with its amount the input signs")
+      (let ((err (sign)))
+        (is (equal -3 (car err)))
+        (is (equal (format nil "Missing amount for CTxOut(nValue=21000000.00000000, scriptPubKey=~A)"
+                           (subseq (bl.crypto:bytes-to-hex spk) 0 30))
+                   (cdr err)))))))
