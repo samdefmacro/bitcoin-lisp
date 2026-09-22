@@ -557,13 +557,24 @@ against the tip."
       ((not (valid-hex-hash-p hash)) (%rest-error 400 (format nil "Invalid hash: ~A" hash)))
       (t
        (handler-case
-           (let ((result (rpc-getblockfilter node (list hash filtertype))))
+           (let* ((result (rpc-getblockfilter node (list hash filtertype)))
+                  (filter-hex (cdr (assoc "filter" result :test #'string=))))
              (%rest-by-ext ext
-               :json (%rest-json result)
-               ;; The hex/bin forms carry the FILTER itself, not the wrapper
-               ;; object — Core serializes the filter (rest.cpp).
-               :hex/bin (%rest-hex-or-bin
-                         ext (cdr (assoc "filter" result :test #'string=)))))
+               ;; Core's object holds the filter alone (rest.cpp:698-702).
+               :json (%rest-json `(("filter" . ,filter-hex)))
+               ;; .hex/.bin stream the BlockFilter (`ssResp << filter',
+               ;; rest.cpp:682-693; blockfilter.h:151-155): its type byte, the
+               ;; block hash as serialized, then the encoded filter as a
+               ;; length-prefixed vector.
+               :hex/bin
+               (%rest-hex-or-bin
+                ext (bl.crypto:bytes-to-hex
+                     (flexi-streams:with-output-to-sequence (s)
+                       (write-byte 0 s) ; BlockFilterType::BASIC
+                       (write-sequence (parse-hex-hash hash) s)
+                       (let ((encoded (bl.crypto:hex-to-bytes filter-hex)))
+                         (bl.ser:write-compact-size s (length encoded))
+                         (write-sequence encoded s)))))))
          (rpc-error (e) (%rest-error 404 (rpc-error-message e))))))))
 
 (defun %rest-blockfilterheaders (node body ext)
@@ -607,21 +618,32 @@ sequence that never existed."
                                  for e = start then (bl.store:get-block-at-height
                                                      chain-state (+ h i))
                                  while e collect e)))
+                       ;; getblockfilter takes the hash in DISPLAY order, as
+                       ;; every RPC hash argument is (ParseHashV); handing it
+                       ;; the internal-order hex made every block `not found'
+                       ;; (interface_rest.py:308).
                        (headers
                          (mapcar
                           (lambda (e)
                             (let ((result (rpc-getblockfilter
                                            node
-                                           (list (bl.crypto:bytes-to-hex
+                                           (list (hash-to-hex
                                                   (bl.store:block-index-entry-hash e))
                                                  filtertype))))
                               (cdr (assoc "header" result :test #'string=))))
                           entries)))
                   (%rest-by-ext ext
                     :json (%rest-json (json-array headers))
-                    ;; Core concatenates the raw 32-byte headers.
+                    ;; Core streams each uint256 (`ssHeader << header',
+                    ;; rest.cpp:584-599): the headers' INTERNAL bytes, where
+                    ;; the JSON carries GetHex's display order.
                     :hex/bin (%rest-hex-or-bin
-                              ext (apply #'concatenate 'string headers))))
+                              ext (apply #'concatenate 'string
+                                         (mapcar (lambda (display)
+                                                   (bl.crypto:bytes-to-hex
+                                                    (bl.crypto:reverse-bytes
+                                                     (bl.crypto:hex-to-bytes display))))
+                                                 headers)))))
               (rpc-error (e) (%rest-error 404 (rpc-error-message e)))))))))))
 
 (defun %rest-spent-txouts-bytes (tx-undos)

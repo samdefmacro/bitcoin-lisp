@@ -785,3 +785,57 @@ no parent filter header, which BLOCKFILTERINDEX-ADD-BLOCK refuses as
                  (is (equalp (%bfi-hash #x2B) hash)))
                (is (= 2 (bl.store:index-height bfi cs))))
           (bl.store:close-blockfilterindex bfi))))))
+
+(test rest-blockfilterheaders-serves-the-index-s-headers
+  "/rest/blockfilterheaders/basic/<hash>?count=N (Core rest_filter_header,
+rest.cpp:540-610) walks the active chain from HASH and answers each block's
+filter header: GetHex display order in JSON, the uint256 as streamed
+(internal order) in .bin. Ours handed getblockfilter the INTERNAL-order hex of
+each block hash, which it reads as a display hash, so every block was `Block
+not found' and interface_rest.py:308 got a 404."
+  (with-network (:regtest)
+    (let ((node (%bfi-regtest-node)))
+      (let ((bl:*node* node))
+        (let* ((hashes (generate-regtest-blocks node 3))
+               (expected
+                 (mapcar (lambda (h)
+                           (cdr (assoc "header"
+                                       (bl.rpc:dispatch-rpc-method
+                                        node "getblockfilter" (list h))
+                                       :test #'equal)))
+                         hashes)))
+          (multiple-value-bind (body status)
+              (rest-request node (format nil "/rest/blockfilterheaders/basic/~A.json?count=3"
+                                         (first hashes)))
+            (is (eql 200 status) "~A" body)
+            (is (equal expected (and (eql 200 status) (yason:parse body)))))
+          (multiple-value-bind (body status)
+              (rest-request node (format nil "/rest/blockfilterheaders/basic/~A.bin?count=3"
+                                         (first hashes)))
+            (is (eql 200 status))
+            (is (equalp (apply #'concatenate '(vector (unsigned-byte 8))
+                               (mapcar (lambda (display)
+                                         (reverse (bl.crypto:hex-to-bytes display)))
+                                       expected))
+                        (coerce body '(vector (unsigned-byte 8))))))
+          ;; /rest/blockfilter: Core's object is the filter alone
+          ;; (rest.cpp:698-702), and .bin streams the BlockFilter -- type
+          ;; byte, block hash as serialized, length-prefixed encoded filter
+          ;; (rest.cpp:682-693, blockfilter.h:151-155).
+          (let* ((h (first hashes))
+                 (filter (cdr (assoc "filter"
+                                     (bl.rpc:dispatch-rpc-method
+                                      node "getblockfilter" (list h))
+                                     :test #'equal)))
+                 (json (yason:parse
+                        (rest-request node (format nil "/rest/blockfilter/basic/~A.json" h))))
+                 (bin (rest-request node (format nil "/rest/blockfilter/basic/~A.bin" h)))
+                 (encoded (bl.crypto:hex-to-bytes filter)))
+            (is (equal (list "filter") (alexandria:hash-table-keys json)))
+            (is (equal filter (gethash "filter" json)))
+            (is (equalp (concatenate '(vector (unsigned-byte 8))
+                                     #(0)
+                                     (reverse (bl.crypto:hex-to-bytes h))
+                                     (vector (length encoded))
+                                     encoded)
+                        (coerce bin '(vector (unsigned-byte 8)))))))))))
