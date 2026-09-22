@@ -2036,6 +2036,35 @@ policy/feerate.cpp:33). mempool_limit.py:92 waits for it."
                                           (aref s 23) #x88 (aref s 24) #xac) s)))
    :lock-time 0))
 
+(test rbf-spending-a-conflict-is-cores-verdict
+  "A replacement that spends an output of a transaction it conflicts with is
+Core's bad-txns-spends-conflicting-tx, debug `<txid> spends conflicting
+transaction <conflict>' (validation.cpp:1356, rbf.cpp:85-98);
+feature_rbf.py:288 reads both halves. Ours answered the downcased keyword
+alone."
+  (let* ((mempool (bl.mp:make-mempool))
+         (a (%rbf-tx 190))
+         (aid (bl.ser:transaction-hash a))
+         (b (bl.ser:make-transaction
+             :version 1
+             :inputs (vector (aref (bl.ser:transaction-inputs a) 0)
+                             (bl.ser:make-tx-in
+                              :previous-output (bl.ser:make-outpoint :hash aid :index 0)
+                              :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)
+                              :sequence #xfffffffd))
+             :outputs (bl.ser:transaction-outputs a)
+             :lock-time 0)))
+    (%add-tx mempool a :fee 1000)
+    (multiple-value-bind (ok reason)
+        (bl.mp:check-rbf-rules mempool b 100000000 (bl.ser:transaction-vsize b)
+                               (bl.ser:transaction-weight b) (list aid))
+      (is-false ok)
+      (is (string= (format nil "bad-txns-spends-conflicting-tx, ~A spends conflicting transaction ~A"
+                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes (bl.ser:transaction-hash b)))
+                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes aid)))
+                   (bl.val:tx-reject-reason-string reason))))))
+
 (test rbf-signaling-detection
   "tx-signals-rbf-p reads the BIP125 opt-in sequence."
   (is-true (bl.mp:tx-signals-rbf-p (%rbf-tx 1 :sequence #xfffffffd)))

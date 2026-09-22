@@ -879,6 +879,7 @@ transaction is refused even on a node told to relay non-standard ones."
      . "package RBF failed: package feerate is less than or equal to parent feerate")
     (:package-rbf-diagram-failed
      . "package RBF failed: insufficient feerate: does not improve feerate diagram")
+    (:spends-conflicting-tx . "bad-txns-spends-conflicting-tx")    ; validation.cpp:1356
     ;; Rule 5, both forms (validation.cpp:994-997, :1079-1082).
     (:too-many-clusters . "too many potential replacements")
     (:package-rbf-too-many-clusters

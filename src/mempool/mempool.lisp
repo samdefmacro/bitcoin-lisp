@@ -1578,6 +1578,19 @@ exactly that half of the -26 message."
          (list :replacement-failed
                "insufficient feerate: does not improve feerate diagram"))))
 
+(defun %spends-conflicting-verdict (mempool tx direct-conflicts)
+  "Core EntriesAndTxidsDisjoint's sentence (rbf.cpp:85-98): `<txid> spends
+conflicting transaction <conflict>', naming a direct conflict found among TX's
+in-mempool ANCESTORS -- beside the reason bad-txns-spends-conflicting-tx
+(validation.cpp:1356). feature_rbf.py:288 reads both halves."
+  (let* ((ancestors (%walk-mempool-graph mempool (mempool-find-parents mempool tx)
+                                         #'mempool-entry-parents))
+         (named (find-if (lambda (c) (gethash c ancestors)) direct-conflicts)))
+    (list :spends-conflicting-tx
+          (format nil "~A spends conflicting transaction ~A"
+                  (%hash-display-name (bl.ser:transaction-hash tx))
+                  (if named (%hash-display-name named) "")))))
+
 (defun check-rbf-rules (mempool tx new-fee new-vsize new-weight direct-conflicts)
   "Apply the cluster-mempool replacement rules for TX (paying NEW-FEE — the
 prioritisation-MODIFIED fee, like the replaced entries' fees below) against
@@ -1621,7 +1634,9 @@ in terms of clusters; and the old feerate-superiority test
       (when (gethash (bl.ser:outpoint-hash
                       (bl.ser:tx-in-previous-output in))
                      replaced)
-        (return-from check-rbf-rules (values nil :spends-conflicting-tx nil))))
+        (return-from check-rbf-rules
+          (values nil (%spends-conflicting-verdict mempool tx direct-conflicts)
+                  nil))))
     ;; Rules 3 and 4 against the total fees of everything being replaced.
     ;; Core's reject reason here is "insufficient fee" (validation.cpp:
     ;; 1009-1011), NOT CheckFeeRate's "min relay fee not met": two different
