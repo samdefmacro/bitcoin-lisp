@@ -1204,6 +1204,10 @@ signer."
       (is (eq t (cdr (assoc "complete" signed :test #'equal)))
           "control: the same P2PKH input does not sign with its non_witness_utxo"))))
 
+;;; INPUT-SIG-WITNESS-P over a bare signature of KIND.
+(defun %input-sig-kind-witness-p (kind)
+  (bl.rpc:input-sig-witness-p (bl.rpc::%make-input-sig :kind kind)))
+
 (test input-sig-witness-p-answers-for-every-kind
   "INPUT-SIG-WITNESS-P is an ECASE over the whole kind vocabulary
 COMPUTE-INPUT-SIGNATURES produces, so a kind it does not know signals rather
@@ -1212,14 +1216,77 @@ solution ProduceSignature marks sigdata.witness (script/sign.cpp:757-789) is
 true, the six legacy shapes false, and the three kinds the hand-written list
 left out -- the taproot script path and both miniscript wrappings -- are
 witness ones."
-  (flet ((witness-p (kind)
-           (bl.rpc:input-sig-witness-p (bl.rpc::%make-input-sig :kind kind))))
+  (flet ((witness-p (kind) (%input-sig-kind-witness-p kind)))
     (dolist (kind '(:p2pk :p2pkh :p2sh-p2pk :p2sh-p2pkh :multisig :p2sh-multisig))
       (is-false (witness-p kind) "~S is a legacy kind" kind))
     (dolist (kind '(:p2wpkh :p2sh-p2wpkh :p2wsh :p2sh-p2wsh :p2tr
                     :p2tr-script :p2wsh-miniscript :p2sh-p2wsh-miniscript))
       (is-true (witness-p kind) "~S is a witness kind" kind))
     (signals error (witness-p :not-a-kind))))
+
+;;; The kinds COMPUTE-INPUT-SIGNATURES can build, read off its source: every
+;;; keyword in the :KIND argument of a %MAKE-INPUT-SIG call in the file.
+(defun %input-sig-kinds-in-source ()
+  (let ((kinds '())
+        (path (asdf:system-relative-pathname "bitcoin-lisp"
+                                             "src/rpc/rawtransaction.lisp")))
+    (labels ((keywords (form)
+               (cond ((keywordp form) (pushnew form kinds))
+                     ((consp form) (keywords (car form)) (keywords (cdr form)))))
+             (walk (form)
+               (when (consp form)
+                 (when (and (symbolp (car form))
+                            (string= (symbol-name (car form)) "%MAKE-INPUT-SIG"))
+                   (loop for (key value) on (cdr form) by #'cddr
+                         when (eq key :kind) do (keywords value)))
+                 (loop for tail on form
+                       while (consp tail)
+                       do (walk (car tail))))))
+      (with-open-file (in path)
+        (let ((*package* (find-package :bl.rpc)))
+          (loop for form = (read in nil in)
+                until (eq form in)
+                do (walk form)))))
+    kinds))
+
+(test input-sig-witness-p-covers-every-kind-the-signer-builds
+  "Every kind COMPUTE-INPUT-SIGNATURES builds has an answer in
+INPUT-SIG-WITNESS-P, read off the signer's own source so a new kind cannot be
+left out of the ECASE unnoticed. :ANCHOR was: the P2A arm (Core SignStep
+answers TxoutType::ANCHOR with an empty solution, script/sign.cpp:706-707)
+builds an :ANCHOR sig, and the ECASE signalled on it, so descriptorprocesspsbt
+over a PSBT holding a P2A input carried by its witness_utxo died with a case
+failure. Core leaves sigdata.witness false for ANCHOR (none of the witness
+branches at sign.cpp:757-789 names it) and SignPSBTInput answers INCOMPLETE
+for it (psbt.cpp:488): the call succeeds and that input stays unsigned."
+  (let ((kinds (%input-sig-kinds-in-source)))
+    ;; Positive control: the sweep finds the signer's kinds, legacy and witness.
+    (is-true (member :p2pkh kinds))
+    (is-true (member :p2tr-script kinds))
+    (is-true (member :anchor kinds))
+    (dolist (kind kinds)
+      (is (eq :answered
+              (handler-case
+                  (progn (%input-sig-kind-witness-p kind) :answered)
+                (error () :signalled)))
+          "INPUT-SIG-WITNESS-P has no answer for the signer's kind ~S" kind)))
+  (is-false (handler-case (%input-sig-kind-witness-p :anchor)
+              (error () :signalled))
+            "an anchor is not a witness signature (sign.cpp:706-707, :757-789)")
+  ;; End to end: a P2A input known only by its witness_utxo leaves the call
+  ;; standing and the PSBT incomplete.
+  (let* ((node (bl:make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 34))
+         (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (p2a (coerce #(#x51 #x02 #x4e #x73) '(simple-array (unsigned-byte 8) (*))))
+         (result (handler-case
+                     (%psbt-process-with-descriptors
+                      node (%psbt-spending p2a 240)
+                      (list (format nil "wpkh(~A)" wif)))
+                   (error (e) (princ-to-string e)))))
+    (is (listp result) "descriptorprocesspsbt over a P2A input signalled: ~A" result)
+    (when (listp result)
+      (is (eq yason:false (cdr (assoc "complete" result :test #'equal)))))))
 
 (test psbt-process-without-finalize-reports-the-psbt-it-returns
   "Core's two process RPCs read `complete' -- and the optional `hex' it gates

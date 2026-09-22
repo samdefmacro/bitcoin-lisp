@@ -454,9 +454,17 @@ An ECASE over the whole kind vocabulary rather than a list of the witness
 kinds: a kind added below and left out of a positive list is silently a
 legacy signature, refused wherever the witness_utxo is the only prevout --
 which is how :p2tr-script and the two miniscript kinds were refused for as
-long as the list was written by hand. A kind missing here signals instead."
+long as the list was written by hand. A kind missing here signals instead.
+
+:ANCHOR is a NON-witness kind, as in Core: SignStep answers TxoutType::ANCHOR
+with an empty solution (sign.cpp:706-707) and none of ProduceSignature's
+witness branches (:757-789) names ANCHOR -- only WITNESS_UNKNOWN, which a P2A
+output is not -- so sigdata.witness stays false and SignPSBTInput answers a P2A
+input carried by its witness_utxo alone with INCOMPLETE (psbt.cpp:488). It was
+missing from this ECASE, so any process-PSBT call over a P2A input signalled a
+case failure instead of leaving that input unsigned."
   (ecase (input-sig-kind sig)
-    ((:p2pk :p2pkh :p2sh-p2pk :p2sh-p2pkh :multisig :p2sh-multisig) nil)
+    ((:p2pk :p2pkh :p2sh-p2pk :p2sh-p2pkh :multisig :p2sh-multisig :anchor) nil)
     ((:p2wpkh :p2sh-p2wpkh :p2wsh :p2sh-p2wsh :p2wsh-miniscript
       :p2sh-p2wsh-miniscript :p2tr :p2tr-script)
      t)))
