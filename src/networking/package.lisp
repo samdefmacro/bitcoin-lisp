@@ -173,6 +173,7 @@ headerssync.cpp. src/networking/.")
    ;; Protocol
    #:handle-message
    #:ingest-headers-from-peer
+   #:headers-direct-fetch
    #:header-sync-candidate-p
    #:consider-headers-sync-timeouts
    #:header-sync-peer

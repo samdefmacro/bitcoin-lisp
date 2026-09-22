@@ -3827,6 +3827,62 @@ that path sends its own follow-up from the sync's locator."
   (when (and peer full-batch last-entry (null (peer-headers-sync peer)))
     (%maybe-send-getheaders peer (%locator-from-entry last-entry chain-state))))
 
+(defun headers-direct-fetch (peer chain-state last-entry)
+  "Core HeadersDirectFetchBlocks (net_processing.cpp:2844-2902): once PEER's
+headers end at LAST-ENTRY, a valid header with at least our tip's work, ask
+PEER at once for every block between it and the active chain that we have no
+body for and nobody is fetching -- oldest first, while the walk stays within
+MAX_BLOCKS_IN_TRANSIT_PER_PEER and ends on the active chain, and only while our
+tip is recent (CanDirectFetch).
+
+`At least' is Core's `<=', and it is what makes an EQUAL-work competitor get
+downloaded: feature_chain_tiebreaks.py:76 announces B1, a sibling of our tip B2
+whose header we already hold, and waits for the getdata. Our block download
+walks heights above the tip, so a block at the tip's own height was never
+requested by anyone. Returns the hashes requested."
+  (when (and peer last-entry
+             (%can-direct-fetch-p chain-state)
+             (not (member (bl.store:block-index-entry-status last-entry)
+                          '(:invalid :failed-child)))
+             (let ((tip (bl.store:get-block-index-entry
+                         chain-state (bl.store:best-block-hash chain-state))))
+               (and tip
+                    (<= (bl.store:block-index-entry-chain-work tip)
+                        (bl.store:block-index-entry-chain-work last-entry)))))
+    (let ((to-fetch '())
+          (walk last-entry))
+      (loop while (and walk
+                       (not (bl.store:entry-on-active-chain-p chain-state walk))
+                       (<= (length to-fetch) +max-blocks-in-transit-per-peer+))
+            do (let ((hash (bl.store:block-index-entry-hash walk)))
+                 (unless (or (%block-body-present-p chain-state nil walk)
+                             (and *ibd-context*
+                                  (gethash hash (ibd-context-in-flight *ibd-context*)))
+                             (fetch-block-requested-p hash))
+                   (push walk to-fetch)))
+               (setf walk (bl.store:block-index-entry-prev-entry walk)))
+      ;; A walk that never reached the active chain is a reorg too large to
+      ;; fetch this way; the ordinary download handles it (:2862-2869).
+      (when (and walk (bl.store:entry-on-active-chain-p chain-state walk))
+        ;; TO-FETCH is oldest first already (pushed while walking down).
+        (let ((hashes (loop for entry in to-fetch
+                            for n from (count-peer-in-flight peer)
+                            while (< n +max-blocks-in-transit-per-peer+)
+                            collect (bl.store:block-index-entry-hash entry))))
+          (when hashes
+            (dolist (hash hashes) (mark-block-in-flight hash peer))
+            (send-message peer
+                          (bl.ser:make-getdata-message
+                           (mapcar (lambda (hash)
+                                     (bl.ser:make-inv-vector
+                                      :type (if (logtest (peer-services peer)
+                                                         bl.ser:+node-witness+)
+                                                bl.ser:+inv-type-witness-block+
+                                                bl.ser:+inv-type-block+)
+                                      :hash hash))
+                                   hashes))))
+          hashes)))))
+
 (defun ingest-headers-from-peer (peer headers chain-state &key count-fn)
   "Generic-path headers ingestion — BIP130 sendheaders announcements,
 unsolicited batches, and the at-tip/block-download message drains
@@ -3923,6 +3979,7 @@ of headers added to the index."
            (%store-validated-headers peer chain-state headers full-batch
                                      count-fn "Received")
          (%maybe-request-more-headers peer chain-state last-entry full-batch)
+         (headers-direct-fetch peer chain-state last-entry)
          added))
 
       ;; Connecting batch with new headers: anti-DoS work gate, then store.
@@ -3943,6 +4000,7 @@ of headers added to the index."
               (%store-validated-headers peer chain-state headers full-batch
                                         count-fn "Received")
             (%maybe-request-more-headers peer chain-state last-entry full-batch)
+            (headers-direct-fetch peer chain-state last-entry)
             added)))))))
 
 (defconstant +header-sync-silent-passes+ 50

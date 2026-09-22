@@ -222,6 +222,60 @@ the announcement fell back to an inv (p2p_sendheaders.py:371-375 mines a
       (is (equalp (list (funcall hash-of (nth 6 branch)))
                   (bl:blocks-to-announce cs (nth 6 branch) nil))))))
 
+(test headers-for-an-equal-work-sibling-of-the-tip-fetch-its-block
+  "Core's HeadersDirectFetchBlocks (net_processing.cpp:2844-2902) asks the
+announcing peer at once for the blocks between the active chain and its last
+header when that header has AT LEAST our tip's work (`<='), our tip is recent
+(CanDirectFetch) and the walk reaches the active chain.
+feature_chain_tiebreaks.py:76 announces B1, an equal-work sibling of our tip
+whose header we already hold, and waits for the getdata; our download walk
+only looks above the tip, so nobody ever asked for it.
+
+Controls: a sibling with LESS work, and the same sibling while our tip is
+stale, are not fetched."
+  (multiple-value-bind (cs entries) (%make-served-chain 2)   ; tip at height 2
+    (flet ((sibling (work nonce)
+             (let* ((parent (nth 1 entries))
+                    (header (bl.ser:make-block-header
+                             :version 1 :prev-block (bl.store:block-index-entry-hash parent)
+                             :merkle-root (%uniq-hash (+ 7000 nonce))
+                             :timestamp 1700000002 :bits #x1d00ffff :nonce nonce))
+                    (entry (bl.store:make-block-index-entry
+                            :hash (bl.ser:block-header-hash header) :height 2
+                            :header header :prev-entry parent
+                            :chain-work work :status :header-valid)))
+               (bl.store:add-block-index-entry cs entry)
+               entry))
+           (getdata-hashes (sent)
+             (loop for msg in sent
+                   when (string= "getdata" (%message-command msg))
+                     append (mapcar #'bl.ser:inv-vector-hash
+                                    (bl.ser:parse-inv-payload (%message-payload msg))))))
+      (let ((peer (bl.net:make-peer :address "test" :state :ready
+                                    :services bl.ser:+node-witness+))
+            (equal-work (sibling 3 1))       ; the tip's chain-work is 3
+            (less-work (sibling 2 2)))
+        (with-ibd-context
+          (let ((bl.ser:*mock-time* 1700000100))
+            (is (null (getdata-hashes
+                       (captured-sends
+                        (lambda () (bl.net:headers-direct-fetch peer cs less-work)))))
+                "less work than the tip: not fetched")
+            (is (equalp (list (bl.store:block-index-entry-hash equal-work))
+                        (getdata-hashes
+                         (captured-sends
+                          (lambda () (bl.net:headers-direct-fetch peer cs equal-work))))))
+            (is (null (getdata-hashes
+                       (captured-sends
+                        (lambda () (bl.net:headers-direct-fetch peer cs equal-work)))))
+                "a block already in flight is not asked for twice")))
+        (with-ibd-context
+          (let ((bl.ser:*mock-time* (+ 1700000100 (* 60 60 24))))
+            (is (null (getdata-hashes
+                       (captured-sends
+                        (lambda () (bl.net:headers-direct-fetch peer cs equal-work)))))
+                "our tip is stale: no direct fetch")))))))
+
 (test getheaders-null-locator-returns-stop-header
   (multiple-value-bind (cs entries) (%make-served-chain 5)
     (let* ((payload (%getheaders-payload '() (%entry-hash entries 3)))
