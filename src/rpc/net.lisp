@@ -364,8 +364,7 @@ whatever the cadence is."
 (define-rpc "getnetworkinfo" (node params)
   "Return network state information (Bitcoin Core getnetworkinfo)."
   (declare (ignore params))
-  (let* ((network (rpc-get-network node))
-         ;; Live peers only, as getpeerinfo already lists: Core counts m_nodes
+  (let* (;; Live peers only, as getpeerinfo already lists: Core counts m_nodes
          ;; (GetNodeCount, net.cpp:3769-3781), and DisconnectNodes erases a
          ;; closed connection from m_nodes on the next socket round
          ;; (net.cpp:1909-1939). Ours keeps a :disconnected peer in node-peers
@@ -398,20 +397,41 @@ whatever the cadence is."
       ("connections" . ,(length peers))
       ("connections_in" . ,in)
       ("connections_out" . ,(- (length peers) in))
-      ("networks" . ((("name" . ,(case network
-                                   (:testnet3 "testnet")
-                                   (:testnet4 "testnet4")
-                                   (:signet "signet")
-                                   (:regtest "regtest")
-                                   (:mainnet "mainnet")
-                                   (t "unknown")))
-                      ("reachable" . t))))
+      ("networks" . ,(%networks-info))
       ("relayfee" . ,relayfee)
       ("incrementalfee" . ,incfee)
       ;; We record no local addresses, so this is Core's empty VARR — [], not
       ;; null (a bare NIL encodes as null).
       ("localaddresses" . #())
       ("warnings" . ,(bl.log:warnings-for-rpc)))))
+
+(defun %proxy-string (proxy)
+  "Core Proxy::ToString for an IP proxy: host:port, an IPv6 host bracketed."
+  (let ((host (bl.net:proxy-host proxy)))
+    (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host (bl.net:proxy-port proxy))))
+
+(defun %networks-info ()
+  "Core GetNetworksInfo (rpc/net.cpp:614-631): one entry per network a peer
+can be on -- ipv4, ipv6, onion, i2p, cjdns, in Core's enum order -- with its
+reachability and the proxy that reaches it. -proxy serves ipv4, ipv6 and cjdns
+(init.cpp:1734-1757), the onion proxy (-onion, or -proxy) serves onion, and
+-i2psam is i2p's. The list used to hold ONE entry named after the CHAIN, so
+nothing reading it -- bitcoin-cli -getinfo's Proxies line, -netinfo's
+counts table (bitcoin-cli.cpp:611-627) -- found a network in it."
+  (loop for (network name) in '((:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
+                                (:i2p "i2p") (:cjdns "cjdns"))
+        collect (let ((proxy (case network
+                               ((:ipv4 :ipv6 :cjdns) bl.net:*proxy*)
+                               (:torv3 bl.net:*onion-proxy*)))
+                      (reachable (bl.net:reachable-network-p network)))
+                  `(("name" . ,name)
+                    ("limited" . ,(json-bool (not reachable)))
+                    ("reachable" . ,(json-bool reachable))
+                    ("proxy" . ,(cond (proxy (%proxy-string proxy))
+                                      ((eq network :i2p) (or bl.net:*i2p-sam-proxy* ""))
+                                      (t "")))
+                    ("proxy_randomize_credentials"
+                     . ,(json-bool (and proxy (bl.net:proxy-randomize-credentials proxy))))))))
 
 (define-rpc "getconnectioncount" (node params)
   "Return the number of connected peers.

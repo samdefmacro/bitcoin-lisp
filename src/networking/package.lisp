@@ -47,6 +47,7 @@ headerssync.cpp. src/networking/.")
    ;; SOCKS5 outbound proxy (Core netbase.cpp Socks5)
    #:*proxy*
    #:*onion-proxy*
+   #:*i2p-sam-proxy*
    #:proxy
    #:make-proxy
    #:proxy-host

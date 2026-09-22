@@ -309,6 +309,18 @@
 (define-option "proxy")
 (define-option "onion")
 (define-option "proxyrandomize")
+;; -i2psam is accepted and NOT implemented -- a core-only row, so startup still
+;; names it -- but Core reports the address it names as the i2p proxy
+;; (init.cpp:2232-2238, rpc/net.cpp:626), so the value is recorded. Repeatable
+;; only so its function runs on every start, clearing a value an earlier start
+;; in the same image left; the LAST occurrence wins, as GetArg's does.
+(define-option "i2psam" :kind :core-only :repeatable t
+  :apply (lambda (values)
+           (setf bl.net:*i2p-sam-proxy*
+                 (let ((v (car (last values))))
+                   (when (and v (plusp (length v)))
+                     (multiple-value-bind (host port) (bl.net:split-host-port v 7656)
+                       (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)))))))
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")
 ;; -assumevalid: a block hash (up to 64 hex digits, Core FromUserHex
@@ -577,7 +589,7 @@ node's own address"))))
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
   "discover"
-  "help" "i2pacceptincoming" "i2psam"
+  "help" "i2pacceptincoming"
   "ipcbind" "limitancestorsize"
   "limitdescendantsize"
   "loglevelalways" "logsourcelocations"

@@ -1925,6 +1925,36 @@ used to emit it verbatim, which yason cannot encode."
     (is (assoc "networkactive" result :test #'string=))))
 
 
+(test getnetworkinfo-lists-core-s-networks-and-their-proxies
+  "Core GetNetworksInfo (rpc/net.cpp:614-631): ipv4, ipv6, onion, i2p and cjdns,
+in that order, each with limited/reachable and the proxy that reaches it --
+-proxy for ipv4, ipv6 and cjdns, the onion proxy for onion, -i2psam for i2p.
+bitcoin-cli -getinfo prints its Proxies line from these (bitcoin-cli.cpp:1123-1139)
+and interface_bitcoin_cli.py:238 expects `127.0.0.1:9050 (ipv4, ipv6, onion,
+cjdns), 127.0.0.1:7656 (i2p)'. The list used to be one entry named after the
+chain, with no proxy at all."
+  (let* ((bl.net:*proxy* (bl.net:make-proxy :host "127.0.0.1" :port 9050))
+         (bl.net:*onion-proxy* bl.net:*proxy*)
+         (bl.net:*i2p-sam-proxy* "127.0.0.1:7656")
+         (bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3))
+         (networks (cdr (assoc "networks" (bl.rpc:dispatch-rpc-method (make-test-node) "getnetworkinfo" nil)
+                               :test #'string=))))
+    (flet ((field (entry key) (cdr (assoc key entry :test #'string=))))
+      (is (equal '("ipv4" "ipv6" "onion" "i2p" "cjdns")
+                 (mapcar (lambda (e) (field e "name")) networks)))
+      (is (equal '("127.0.0.1:9050" "127.0.0.1:9050" "127.0.0.1:9050" "127.0.0.1:7656" "127.0.0.1:9050")
+                 (mapcar (lambda (e) (field e "proxy")) networks)))
+      (is (equal (list t t t nil nil)
+                 (mapcar (lambda (e) (eq t (field e "reachable"))) networks)))
+      (is (equal (list nil nil nil t t)
+                 (mapcar (lambda (e) (eq t (field e "limited"))) networks)))))
+  ;; Without a proxy every proxy is the empty string, as in Core.
+  (let* ((bl.net:*proxy* nil) (bl.net:*onion-proxy* nil) (bl.net:*i2p-sam-proxy* nil)
+         (networks (cdr (assoc "networks" (bl.rpc:dispatch-rpc-method (make-test-node) "getnetworkinfo" nil)
+                               :test #'string=))))
+    (is (every (lambda (e) (equal "" (cdr (assoc "proxy" e :test #'string=)))) networks))
+    (is (= 5 (length networks)))))
+
 (test rpc-getnetworkinfo-counts-live-peers-only
   "connections / connections_in / connections_out count the peers getpeerinfo
 lists. Core counts m_nodes (GetNodeCount, net.cpp:3769-3781) and erases a

@@ -3359,3 +3359,18 @@ having no effect."
     (declare (ignore plist))
     (is (null (bl.cfg:supplied-core-only-options merged)))
     (is (equal "1" (cfg "allowignoredconf" merged)))))
+
+(test i2psam-is-recorded-for-reporting-and-still-core-only
+  "-i2psam names the I2P SAM proxy Core reports as the i2p network's proxy
+(init.cpp:2232-2238 SetProxy(NET_I2P, ...), default port 7656; rpc/net.cpp:626),
+so its value is kept -- but this node does not speak I2P, and the option stays
+one startup names as accepted-and-unimplemented. A start without it clears
+what an earlier start in the same image left."
+  (let ((bl.net:*i2p-sam-proxy* :unset))
+    (apply-config-globals '(("i2psam" . "127.0.0.1")))
+    (is (equal "127.0.0.1:7656" bl.net:*i2p-sam-proxy*))
+    (apply-config-globals '(("i2psam" . "127.0.0.1:7000")))
+    (is (equal "127.0.0.1:7000" bl.net:*i2p-sam-proxy*))
+    (apply-config-globals '())
+    (is (null bl.net:*i2p-sam-proxy*)))
+  (is (equal '("i2psam") (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1"))))))
