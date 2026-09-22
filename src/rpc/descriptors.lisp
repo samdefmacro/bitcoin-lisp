@@ -1215,9 +1215,15 @@ which is why the context travels with the node rather than being assumed."
                              ;; its rules (descriptor.cpp:2600); an unparseable
                              ;; one falls through to the generic message, which
                              ;; is far more useful for the common typo.
+                             ;; Only P2SH and P2WSH have a sentence of their
+                             ;; own; a TAPROOT leaf falls to the generic one
+                             ;; (descriptor.cpp:2664-2672) -- which is also what
+                             ;; a tapscript miniscript over the size limit gets
+                             ;; (wallet_miniscript.py:385-396).
                              (bl.val:miniscript-parse-error ()
-                               (%desc-error "A function is needed within ~A"
-                                            (if (eq ms-ctx :tapscript) "P2TR" "P2WSH"))))))
+                               (if (eq ms-ctx :tapscript)
+                                   (%desc-error "'~A' is not a valid descriptor function" expr)
+                                   (%desc-error "A function is needed within P2WSH"))))))
                  (values node (nreverse keys))))))
       (multiple-value-bind (node keys)
           (parse-node (lambda (text)

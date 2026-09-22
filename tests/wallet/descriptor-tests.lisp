@@ -2193,3 +2193,20 @@ whose keys straddle the parity."
                  (desc (%aval "desc" (rpc "g" "getaddressinfo" address))))
             (is (equal (list address) (coerce (rpc nil "deriveaddresses" desc) 'list))
                 "address ~D: ~A does not rederive from ~A" i address desc)))))))
+
+(test a-taproot-leaf-that-is-no-miniscript-is-not-a-valid-descriptor-function
+  "Core's ParseScript has a sentence of its own only for P2SH and P2WSH (\"A
+function is needed within ...\"); a taproot leaf that does not parse as a
+miniscript -- a word it does not know, or a tapscript miniscript one byte over
+the size limit -- falls to \"'<expr>' is not a valid descriptor function\"
+(script/descriptor.cpp:2664-2672; wallet_miniscript.py:385-396). We answered
+\"A function is needed within P2TR\", a sentence Core never writes. wsh()
+keeps its own (the control)."
+  (flet ((err (desc)
+           (handler-case (progn (bl.rpc:parse-descriptors desc :regtest) nil)
+             (error (e) (princ-to-string e)))))
+    (let ((pk "02cc24adfed5a481b000192042b2399087437d8eb16095c3dda1d45a4fbf868017"))
+      (is-true (search "'bogus(1)' is not a valid descriptor function"
+                       (or (err (format nil "tr(~A,bogus(1))" pk)) "")))
+      (is-true (search "A function is needed within P2WSH"
+                       (or (err "wsh(bogus(1))") ""))))))
