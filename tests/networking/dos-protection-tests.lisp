@@ -166,6 +166,28 @@ what this node told it about."
       (dotimes (i 2) (bl.net:check-peer-rate-limit limited "addr"))
       (is-false (bl.net:check-peer-rate-limit limited "addr")))))
 
+(test a-noban-peer-is-not-cut-off-by-the-message-buckets
+  "The per-command token buckets are ours, not Core's: Core has no
+per-message-type disconnect, and a noban peer is never disconnected for its
+conduct (NetPermissionFlags::NoBan, net_permissions.h:34-36). The functional
+framework whitelists its peers noban and relays whole chains at once;
+mempool_packages.py:173 lost its only peer to `Rate limit exceeded on tx
+messages' after a 25-transaction chain. Control: an ordinary peer with the
+same drained bucket is still refused."
+  (with-whitelist (:entries '("noban@198.51.100.21/32"))
+    (let ((bl:*rate-limit-tx* '(1.0 . 2.0))
+          (ctx (bl.ctx:make-node-context))
+          (noban (bl.net:make-peer :inbound t :address "198.51.100.21"))
+          (ordinary (bl.net:make-peer :inbound t :address "198.51.100.22")))
+      (bl.net:init-peer-rate-limiters noban)
+      (bl.net:init-peer-rate-limiters ordinary)
+      (is (= 2 (loop repeat 10
+                     count (bl.net:handle-message ordinary "tx" #() ctx)))
+          "control: the ordinary peer's bucket admits its burst of two only")
+      (is (= 10 (loop repeat 10
+                      count (bl.net:handle-message noban "tx" #() ctx)))
+          "a noban peer's tx flood is taken in, not cut off"))))
+
 (test check-peer-rate-limit-rejects-flood
   "Rate limit check should reject when burst is exceeded."
   (let ((peer (bl.net:make-peer)))

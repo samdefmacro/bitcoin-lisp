@@ -164,8 +164,15 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
                 (bl.bytes:sanitize-string command) (length payload) (peer-id peer))
     (let ((handler (p2p-handler-for command)))
-      ;; Check per-peer rate limit before processing
-      (unless (check-peer-rate-limit peer command handler)
+      ;; Check per-peer rate limit before processing. The buckets are ours,
+      ;; not Core's -- Core has no per-command disconnect -- so they must at
+      ;; least spare a noban peer, which Core never disconnects for its
+      ;; conduct (NetPermissionFlags::NoBan, net_permissions.h:34-36; the same
+      ;; exemption RECORD-MISBEHAVIOR makes). The functional framework's
+      ;; -whitelist=noban peers relay chains of 25+ transactions at once
+      ;; (mempool_packages.py:28), which a 50-message tx burst cut off.
+      (unless (or (peer-has-permission-p peer +perm-noban+)
+                  (check-peer-rate-limit peer command handler))
         (bl:log-warn "Rate limit exceeded on ~A messages, ~A"
                      command (disconnect-msg peer))
         (disconnect-peer peer)
