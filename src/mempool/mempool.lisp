@@ -2348,41 +2348,38 @@ removeConflicts -> removeRecursive, txmempool.cpp:388-424: a conflicted
 tx's descendants spend outputs that no longer exist). Both the confirmed
 and the conflicting transaction lose their prioritisation delta."
   (%with-graph-verify-batch (mempool)
-    (let ((block-outpoints (make-hash-table :test 'equalp)))
-      ;; Collect all outpoints spent by block transactions
+    (progn
+      ;; Transaction by transaction, as Core walks vtx: the confirmed tx
+      ;; leaves (reason BLOCK), THEN whatever in the pool spends one of its
+      ;; inputs leaves with its descendants (CONFLICT), then the tx's
+      ;; prioritisation delta goes (txmempool.cpp:405-422, removeConflicts
+      ;; :388-402). The order is observable: every removal takes the next
+      ;; mempool sequence number, so the ZMQ `sequence' stream numbers a
+      ;; conflict by where its block transaction sits in the block --
+      ;; interface_zmq.py:446-448 reads the replaced tx's R right after the
+      ;; bump's A, before the block's other transactions leave. Ours removed
+      ;; every block tx first and every conflict after.
+      ;;
+      ;; A mined tx's prioritisation delta is spent ballast
+      ;; (ClearPrioritisation); so is a conflicting tx's, which can never come
+      ;; back -- but only that one: removeRecursive drops the descendants
+      ;; without touching mapDeltas, and they can be resubmitted. Reason
+      ;; :block never reaches the wallet hook (blockConnected covers those).
       (dolist (tx (bl.ser:bitcoin-block-transactions block))
-        (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
-          (let* ((prevout (bl.ser:tx-in-previous-output input))
-                 (key (make-outpoint-key
-                       (bl.ser:outpoint-hash prevout)
-                       (bl.ser:outpoint-index prevout))))
-            (setf (gethash key block-outpoints) t))))
-
-      ;; Remove confirmed transactions; a mined tx's prioritisation delta is
-      ;; spent ballast (Core removeForBlock -> ClearPrioritisation). Reason
-      ;; :block never reaches the wallet hook (blockConnected covers these).
-      (let ((*mempool-removal-reason* :block))
-        (dolist (tx (bl.ser:bitcoin-block-transactions block))
-          (let ((txid (bl.ser:transaction-hash tx)))
-            (remhash txid (mempool-deltas mempool))
-            (mempool-remove mempool txid))))
-
-      ;; Remove conflicting transactions (mempool txs that spend same outpoints
-      ;; as block txs), recursively: their descendants are conflicted too
-      ;; (Core removeConflicts, MemPoolRemovalReason::CONFLICT). The delta of
-      ;; the conflicting tx goes with it — ClearPrioritisation before
-      ;; removeRecursive (txmempool.cpp:395-401), since a double-spent txid
-      ;; can never come back — and only that one: removeRecursive drops the
-      ;; descendants without touching mapDeltas, and they can be resubmitted.
-      (let ((to-remove '())
-            (*mempool-removal-reason* :conflict))
-        (maphash (lambda (outpoint-key spending-txid)
-                   (when (gethash outpoint-key block-outpoints)
-                     (pushnew spending-txid to-remove :test #'equalp)))
-                 (mempool-spent-outpoints mempool))
-        (dolist (txid to-remove)
-          (remhash txid (mempool-deltas mempool))
-          (mempool-remove-recursive mempool txid)))
+        (let ((txid (bl.ser:transaction-hash tx)))
+          (let ((*mempool-removal-reason* :block))
+            (mempool-remove mempool txid))
+          (let ((*mempool-removal-reason* :conflict))
+            (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+              (let* ((prevout (bl.ser:tx-in-previous-output input))
+                     (spender (gethash (make-outpoint-key
+                                        (bl.ser:outpoint-hash prevout)
+                                        (bl.ser:outpoint-index prevout))
+                                       (mempool-spent-outpoints mempool))))
+                (when (and spender (not (equalp spender txid)))
+                  (remhash spender (mempool-deltas mempool))
+                  (mempool-remove-recursive mempool spender)))))
+          (remhash txid (mempool-deltas mempool))))
 
       ;; A connected block restarts the rolling minimum's decay clock, and it
       ;; is the only thing that does: Core's removeForBlock sets both

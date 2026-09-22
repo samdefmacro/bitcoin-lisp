@@ -4257,3 +4257,43 @@ being reported as accepted-and-ignored."
     (declare (ignore merged))
     (is (not (member :persist-mempool plist))
         "an absent option must leave START-NODE's own default in force")))
+
+(defvar *captured-removals* :off
+  "While a list, TRANSACTION-REMOVED-CAPTURE pushes (txid sequence reason)
+onto it for every mempool removal; :OFF (the default) captures nothing, so the
+hook costs one comparison everywhere else in the battery.")
+
+(bl.vi:define-validation-hook :transaction-removed transaction-removed-capture
+    (tx txid sequence reason)
+  (declare (ignore tx))
+  (unless (eq *captured-removals* :off)
+    (push (list txid sequence reason) *captured-removals*)))
+
+(test mempool-remove-for-block-interleaves-conflicts-as-core-does
+  "Core's removeForBlock walks the block transaction by transaction: the
+confirmed tx leaves (BLOCK), then whatever spends one of its inputs
+(CONFLICT), then the next block transaction (txmempool.cpp:405-422). Every
+removal takes the next mempool sequence, so the order is what a ZMQ
+`sequence' subscriber reads; interface_zmq.py:448 expects the conflict of the
+block's FIRST transaction numbered before the block's later transactions.
+Ours removed every block transaction first and the conflicts after."
+  (let* ((mempool (bl.mp:make-mempool))
+         (conflict (make-mempool-test-tx :input-id 60))
+         (later (make-mempool-test-tx :input-id 61))
+         (miner (make-mempool-test-tx :input-id 60 :value 30000000)))
+    (dolist (tx (list conflict later))
+      (bl.mp:mempool-add mempool (bl.ser:transaction-hash tx)
+                         (make-mempool-entry-for-tx tx)))
+    (let ((*captured-removals* '()))
+      ;; The block's first transaction double-spends CONFLICT; its second is
+      ;; LATER itself.
+      (bl.mp:mempool-remove-for-block mempool (%mp-block (list miner later)))
+      (let ((order (reverse *captured-removals*)))
+        (is (equal (list (bl.ser:transaction-hash conflict)
+                         (bl.ser:transaction-hash later))
+                   (mapcar #'first order))
+            "the conflict leaves before the block's later transaction")
+        (is (equal '(:conflict :block) (mapcar #'third order)))
+        (is (= 1 (- (second (second order)) (second (first order))))
+            "consecutive sequence numbers")))
+    (is (= 0 (bl.mp:mempool-count mempool)))))
