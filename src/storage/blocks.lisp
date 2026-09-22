@@ -849,9 +849,44 @@ after every connected block.")
   "Register HEIGHT-FN under NAME as a prune lock. Re-registering replaces."
   (setf (gethash name *prune-locks*) height-fn))
 
+(defvar *prune-lock-caps* (make-hash-table :test 'equal :synchronized t)
+  "Name -> the height a disconnect MOVED that prune lock back to, while its
+index still reports a best block above it. Core lowers height_first in place
+(validation.cpp:2954-2962) and the next SetBestBlockIndex raises it again once
+the index has rewound (index/base.cpp:489-497); our lock is a thunk over the
+index's height, so the lowered value lives here until the index's own height
+has come down to it.")
+
 (defun clear-prune-locks ()
   "Forget every registered prune lock."
-  (clrhash *prune-locks*))
+  (clrhash *prune-locks*)
+  (clrhash *prune-lock-caps*))
+
+(defun %prune-lock-height (name)
+  "NAME's effective height_first: its index's height, held down to a
+moved-back cap until the index itself is no higher than the cap."
+  (let* ((height-fn (gethash name *prune-locks*))
+         (height (and height-fn (ignore-errors (funcall height-fn))))
+         (cap (gethash name *prune-lock-caps*)))
+    (cond ((null cap) height)
+          ((and height (<= height cap))
+           (remhash name *prune-lock-caps*)
+           height)
+          (t cap))))
+
+(defun move-prune-locks-back (max-height-first)
+  "Core DisconnectTip's prune-lock step (validation.cpp:2954-2962): every lock
+that began above MAX-HEIGHT-FIRST (the disconnected block's height minus one)
+moves back to it, so pruning cannot delete the blocks its index needs to
+rewind through; each move is logged in Core's words under the prune category
+(feature_index_prune.py:201)."
+  (dolist (name (sort (loop for k being the hash-keys of *prune-locks* collect k)
+                      #'string<))
+    (let ((height (%prune-lock-height name)))
+      (when (and height (> height max-height-first))
+        (setf (gethash name *prune-lock-caps*) max-height-first)
+        (bl.log:log-cat "prune" "~A prune lock moved back to ~D"
+                        name max-height-first)))))
 
 (defun prune-lock-ceiling (chain-height)
   "The highest block pruning may delete, given the registered locks.
@@ -879,8 +914,7 @@ here rather than whichever the table happened to hold first."
     (dolist (name (sort (loop for k being the hash-keys of *prune-locks*
                               collect k)
                         #'string<))
-      (let* ((height-fn (gethash name *prune-locks*))
-             (height (and height-fn (ignore-errors (funcall height-fn)))))
+      (let ((height (%prune-lock-height name)))
         (when height
           (let ((lock-height (- height +prune-lock-buffer+ 1)))
             (setf ceiling (max 1 (min ceiling lock-height)))

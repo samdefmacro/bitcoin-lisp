@@ -23,9 +23,11 @@ src/storage/.")
    #:init-block-store
    #:*flat-block-files*
    #:*prune-locks*
+   #:*prune-lock-caps*
    #:+prune-lock-buffer+
    #:register-prune-lock
    #:clear-prune-locks
+   #:move-prune-locks-back
    #:prune-lock-ceiling
    #:*fast-prune*
    #:*blocks-xor*

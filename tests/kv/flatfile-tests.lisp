@@ -1611,6 +1611,8 @@ behind for the next one.
 be exercising what production runs, and the synchronization is the whole reason
 that variable is allowed to be global."
   `(let ((bl.store:*prune-locks*
+           (make-hash-table :test 'equal :synchronized t))
+         (bl.store:*prune-lock-caps*
            (make-hash-table :test 'equal :synchronized t)))
      ,@body))
 
@@ -1898,3 +1900,32 @@ start (blockstorage.cpp:1306)."
      (is (= 0 (bl.store:map-external-block-file
                (merge-pathnames "no-such-file.dat" dir)
                (lambda (b) (declare (ignore b)) (error "must not be called"))))))))
+
+(test a-disconnect-moves-a-prune-lock-back-until-its-index-rewinds
+  "Core's DisconnectTip moves every prune lock that began above the new tip
+back to it, and logs `<name> prune lock moved back to <h>' under the prune
+category (validation.cpp:2954-2962; feature_index_prune.py:201). The lock then
+follows the index again once SetBestBlockIndex has run on the rewound index
+(index/base.cpp:489-497). Ours reads the index's height at prune time, and the
+index rewinds only on the next connect, so without the move a prune between
+the two could delete the blocks its rewind needs."
+  (%with-clean-prune-locks
+    (let ((index-height 2500)
+          (bl.log:*current-log-level* :debug))
+      (bl.store:register-prune-lock "basic block filter index" (lambda () index-height))
+      (bl.store:register-prune-lock "behind" (lambda () 100))
+      (let ((lines (capture-log-lines
+                    (lambda () (bl.store:move-prune-locks-back 2479)))))
+        (is-true (find "basic block filter index prune lock moved back to 2479"
+                       lines :test #'search))
+        ;; A lock already below the new tip does not move.
+        (is-false (find "behind prune lock moved back" lines :test #'search)))
+      ;; Held at the new tip while the index still reads 2500.
+      (setf (gethash "behind" bl.store:*prune-locks*) (lambda () nil))
+      (is (= (- 2479 bl.store:+prune-lock-buffer+ 1) (bl.store:prune-lock-ceiling 3000)))
+      ;; The index rewinds to the fork point: the lock follows it again ...
+      (setf index-height 2470)
+      (is (= (- 2470 bl.store:+prune-lock-buffer+ 1) (bl.store:prune-lock-ceiling 3000)))
+      ;; ... up as well as down, once the cap is gone.
+      (setf index-height 2600)
+      (is (= (- 2600 bl.store:+prune-lock-buffer+ 1) (bl.store:prune-lock-ceiling 3000))))))

@@ -553,8 +553,16 @@ Erasing here answered UNSPENT in that window -- Core's shape for `nothing ever
 spent it', and so indistinguishable from a real answer -- and made a reorg
 that re-connects the same block rebuild what it had just thrown away. The hook
 stays declared because the disconnect signal is part of the interface and a
-reader looking for the index's half of it should find this."
-  (declare (ignore chainstate block block-hash height))
+reader looking for the index's half of it should find this.
+
+What DOES happen at disconnect is the prune locks' half: Core's DisconnectTip
+moves every lock that began above the new tip back to it
+(validation.cpp:2954-2962), so pruning keeps the blocks an index still has to
+rewind through. Active chainstate only -- a background chainstate's blocks
+are not what the indexes read."
+  (declare (ignore block block-hash))
+  (unless (bl.store:chain-state-target-blockhash chainstate)
+    (bl.store:move-prune-locks-back (1- height)))
   nil)
 
 (defmethod bl.store:index-write-block ((csi bl.store:coinstatsindex) chainstate block block-hash height spent-utxos)
