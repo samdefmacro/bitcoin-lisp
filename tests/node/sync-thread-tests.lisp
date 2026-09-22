@@ -209,3 +209,18 @@ address book (feature_config_args.py:320-366)."
              (lines (capture-log-lines #'bl:start-fixed-seed-fallback)))
         (is (logged-p lines "Fixed seeds are disabled"))
         (is (null (bl:maybe-add-fixed-seeds node)))))))
+
+(test start-up-logs-set-network-active-either-way
+  "Core's CConnman constructor calls SetNetworkActive(-networkactive), which
+logs `SetNetworkActive: true' or `: false' before anything else
+(net.cpp:3356, :3387); feature_config_args.py:270-290 waits for the line at
+every start. Ours logged only the disabled case, in words of its own."
+  (dolist (active '(t nil))
+    (let* ((node (make-test-node :network :regtest))
+           (lines (capture-log-lines
+                   (lambda () (bl:apply-initial-network-active node active)))))
+      (is (eq active (bl:node-network-active node)))
+      (is (some (lambda (l)
+                  (search (format nil "SetNetworkActive: ~:[false~;true~]" active)
+                          (princ-to-string l)))
+                lines)))))

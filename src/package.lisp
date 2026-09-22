@@ -231,6 +231,7 @@ init.cpp, node/. src/node/.")
    #:node-added-nodes
    #:added-node-duplicate-p
    #:start-fixed-seed-fallback
+   #:apply-initial-network-active
    #:maybe-add-fixed-seeds
    #:*seed-nodes*
    #:*use-addrman-outgoing*

@@ -492,11 +492,7 @@ nobody, where Core refuses to start at all (p2p_permissions.py:101)."
   (setf *blocksonly* (and blocksonly t))
   (when *blocksonly*
     (log-info "Blocksonly mode: transactions from network peers are rejected (-blocksonly)"))
-  ;; -networkactive=0: start with all P2P activity disabled (Core passes the
-  ;; flag to the CConnman ctor, init.cpp:1648); setnetworkactive re-enables.
-  (setf (node-network-active *node*) (and network-active t))
-  (unless (node-network-active *node*)
-    (log-warn "P2P network activity DISABLED (-networkactive=0)"))
+  (apply-initial-network-active *node* network-active)
   ;; -addnode: seed the manually-added peer list the addnode RPC manages
   ;; (Core m_added_node_params from GetArgs(\"-addnode\"), init.cpp:2107).
   (when addnode
@@ -1392,6 +1388,17 @@ recorded for startup."
       ;; not started, so no block can connect underneath the catch-up.
       (bl.wallet:load-wallets-on-startup *node* wallet-names))))
 
+
+(defun apply-initial-network-active (node network-active)
+  "-networkactive: Core hands the flag to the CConnman constructor, which calls
+SetNetworkActive with it (init.cpp:1648, net.cpp:3387) -- and SetNetworkActive
+opens with `SetNetworkActive: <flag>' whatever the value (net.cpp:3356), which
+is the line feature_config_args.py:270-290 waits for at every start.
+setnetworkactive re-enables a node started with it off."
+  (setf (node-network-active node) (and network-active t))
+  (log-info "SetNetworkActive: ~:[false~;true~]" (node-network-active node))
+  (unless (node-network-active node)
+    (log-warn "P2P network activity DISABLED (-networkactive=0)")))
 
 (defun %sync-thread-connect (max-peers)
   "The sync thread's startup dial: -seednode first (its whole purpose is to
