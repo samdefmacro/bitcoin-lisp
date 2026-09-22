@@ -1756,6 +1756,16 @@ because a proposal is by definition unmined."
               (list (pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                             :initial-element #x55)
                              0 1000)))
+        ;; With the root recomputed, as mining_template_verification.py's
+        ;; assert_template does: Core checks the merkle root BEFORE the
+        ;; coinbase rules (validation.cpp:3960-3987), so a stale root would
+        ;; answer bad-txnmrklroot instead.
+        (let ((header (bl.ser:bitcoin-block-header block)))
+          (setf (bl.ser:block-header-merkle-root header)
+                (bl.val:compute-merkle-root
+                 (mapcar #'bl.ser:transaction-hash
+                         (bl.ser:bitcoin-block-transactions block)))
+                (bl.ser:block-header-cached-hash header) nil))
         (is (equal "bad-cb-missing"
                    (propose (bl.crypto:bytes-to-hex
                              (bl.ser:serialize-witness-block block))))))))))
