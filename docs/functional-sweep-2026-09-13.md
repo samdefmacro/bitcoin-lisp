@@ -828,7 +828,21 @@ stop after the test's last step. `feature_pruning` went from a time-out to a
 failure at `:223` (disk usage above the 550 MiB target after 220 large
 blocks), and `feature_block` from a failure at its `send_blocks` helper
 (`:1450`) to a time-out at 900 seconds; `feature_proxy` still times out. The
-first two are handed to a follow-up batch. Eleven failure points moved later
+first two went to a follow-up batch the same day. `rpc_dumptxoutset` was
+`390765a6`'s doing: the FatalError port sat inside the reorg helper every
+caller shares, so a failed `invalidateblock` disconnect (the test removes a
+rev file) asked the node to shut down with exit code 1, where Core's
+InvalidateBlock only returns false (validation.cpp:3614-3622); `94ce5c97`
+makes the abort the caller's choice. `feature_pruning` was older: since the
+flat block files, a block stored a second time (a fork or out-of-order block
+connect-block stores again) was written to the blk file again and never
+counted, 173 MiB of duplicates on the test's node 2; `d26627e8` returns early
+for a block already on disk, as AcceptBlock does (validation.cpp:4350), and
+`5698a802` makes invalidateblock's reactivation skip a candidate chain with
+missing data (FindMostWorkChain). The test now reaches `:263`, where a pruned
+node must re-download the blocks of the chain it switches to; ours refuses
+the reorg below its pruned height, which Core never does. That is the next
+item. Eleven failure points moved later
 (`p2p_segwit` 200 → 826, `feature_rbf` 288 → 507, `rpc_rawtransaction` 81 →
 304, `rpc_net` 255 → 343, `feature_config_args` 320 → 388,
 `feature_assumeutxo` 585 → 676, ...), five earlier; those five were not
