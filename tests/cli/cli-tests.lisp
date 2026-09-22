@@ -387,3 +387,51 @@ it was started from, and the node for any other name."
   (is-false (bl.cli:cli-program-name-p "/workspace/build/bin/bitcoind"))
   (is-false (bl.cli:cli-program-name-p "bitcoin-cli-old"))
   (is (string= "abc-._~%2F%C3%A9" (bl.cli:uri-encode (format nil "abc-._~~/~C" (code-char #xe9))))))
+
+;;; --- Against a live server ---
+
+(defun %ipv6-loopback-available-p ()
+  "Whether this host can bind ::1 at all -- the environment check the live
+test below is conditional on, made with a raw socket so it cannot share a
+defect with the code under test."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet6-socket :type :stream :protocol :tcp)))
+    (unwind-protect
+         (handler-case (progn (sb-bsd-sockets:socket-bind
+                               socket (sb-bsd-sockets:make-inet6-address "::1") 0)
+                              t)
+           (error () nil))
+      (sb-bsd-sockets:socket-close socket))))
+
+(test the-client-reaches-a-live-server-on-both-loopbacks
+  "End to end: the RPC server binds Core's two default loopbacks, ::1 and
+127.0.0.1 (httpserver.cpp:320-321), and the client reaches it on each with the
+cookie the server wrote. The ::1 half never bound in a container before:
+usocket resolved the literal through getaddrinfo with AI_ADDRCONFIG, which
+refuses ::1 where the loopback is the only IPv6 address, and
+interface_bitcoin_cli.py:185 asks for -rpcconnect=[::1]."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19977))
+      (setf (bl:node-data-directory node) dir)
+      (unwind-protect
+           (let ((lines (capture-log-lines
+                         (lambda ()
+                           (let ((bl.rpc:*rpc-cookie-file* nil))
+                             (is-true (bl.rpc:start-rpc-server node :port port)))))))
+             (flet ((echo (connect)
+                      (bl.cli:run-cli (list (format nil "-datadir=~A" (namestring dir))
+                                            (format nil "-rpcconnect=~A" connect)
+                                            (format nil "-rpcport=~D" port)
+                                            "echo" "x"))))
+               (is (equal (list (format nil "[~%  \"x\"~%]~%") "" 0)
+                          (multiple-value-list (echo "127.0.0.1"))))
+               (if (%ipv6-loopback-available-p)
+                   (progn
+                     (is-true (find (format nil "Binding RPC on address ::1 port ~D" port)
+                                    lines :test #'search)
+                              "the ::1 default bind came up")
+                     (is (equal (list (format nil "[~%  \"x\"~%]~%") "" 0)
+                                (multiple-value-list (echo "[::1]")))))
+                   (skip "this host cannot bind ::1"))))
+        (bl.rpc:stop-rpc-server)))))

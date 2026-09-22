@@ -1722,6 +1722,61 @@ pathHandlers lookup (:235-250), so /rest/ (rest.cpp:1160-1164) inherits the ACL
 without doing anything itself. Putting the check in one handler would leave
 /rest/ and /ui/ reachable from any address the moment -rpcbind is honoured."))
 
+(defun %ipv6-literal-address (address)
+  "ADDRESS as a 16-octet vector when it is a numeric IPv6 literal, else NIL."
+  (and (stringp address) (find #\: address)
+       (ignore-errors (sb-bsd-sockets:make-inet6-address address))))
+
+(defmethod hunchentoot:start-listening ((acceptor rpc-acceptor))
+  "Listen on an IPv6 LITERAL without asking the resolver about it.
+
+Hunchentoot hands the address to usocket, and usocket resolves even a numeric
+one through getaddrinfo with AI_ADDRCONFIG; glibc then refuses `::1' with
+EAI_ADDRFAMILY on any host whose only IPv6 address is the loopback -- every
+Docker container. So the ::1 half of Core's default binds
+(+RPC-DEFAULT-LOOPBACK-BINDS+) never came up there, and a client that asked
+for [::1] (interface_bitcoin_cli.py:185, -rpcconnect=[::1]:port) found nothing
+listening. Core parses a numeric host without the resolver
+(netbase.cpp LookupIntern), and so does this method: the socket is bound
+directly and handed to usocket as the server socket it would have made. Any
+other address takes Hunchentoot's own path."
+  (let ((v6 (%ipv6-literal-address (hunchentoot:acceptor-address acceptor))))
+    (if (null v6)
+        (call-next-method)
+        (let ((socket (make-instance 'sb-bsd-sockets:inet6-socket :type :stream :protocol :tcp)))
+          (handler-bind ((error (lambda (e) (declare (ignore e))
+                                  (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+            (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
+            (sb-bsd-sockets:socket-bind socket v6 (hunchentoot:acceptor-port acceptor))
+            (sb-bsd-sockets:socket-listen socket (hunchentoot:acceptor-listen-backlog acceptor)))
+          ;; Both names are internal to their libraries: the slot Hunchentoot
+          ;; keeps its listener in, and the wrapper usocket builds for one.
+          (setf (hunchentoot::acceptor-listen-socket acceptor)
+                (usocket::make-stream-server-socket socket :element-type '(unsigned-byte 8)))
+          (values)))))
+
+(defmethod hunchentoot:stop :before ((acceptor rpc-acceptor) &key soft)
+  "Wake an IPv6-literal listener the way Hunchentoot cannot.
+
+HUNCHENTOOT:STOP raises the shutdown flag and then connects to the listener so
+its accept loop, blocked waiting for a client, sees the flag -- but it makes
+that connection through usocket, which fails on ::1 for the same resolver
+reason START-LISTENING above works around, and it swallows the failure. The
+accept thread then never wakes and STOP waits on it forever. So for such a
+listener the flag is raised and the wake-up connection made here, first, with
+a raw socket; STOP's own attempt that follows finds nothing left to do."
+  (declare (ignore soft))
+  (let ((listener (hunchentoot::acceptor-listen-socket acceptor))
+        (v6 (%ipv6-literal-address (hunchentoot:acceptor-address acceptor))))
+    (when (and listener v6)
+      (bt:with-lock-held ((hunchentoot::acceptor-shutdown-lock acceptor))
+        (setf (hunchentoot::acceptor-shutdown-p acceptor) t))
+      (let ((socket (make-instance 'sb-bsd-sockets:inet6-socket :type :stream :protocol :tcp)))
+        (unwind-protect
+             (ignore-errors
+              (sb-bsd-sockets:socket-connect socket v6 (usocket:get-local-port listener)))
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
 (defconstant +max-http-headers-size+ 8192
   "Core MAX_HEADERS_SIZE (httpserver.cpp:51), handed to libevent as
 evhttp_set_max_headers_size (:409): a request whose start line and headers
