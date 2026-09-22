@@ -533,7 +533,7 @@ in `docs/functional-sweep-2026-09-13/after-3a337f7e.tsv`:
 | `67b724d2` round 3 | 69 | 166 | 5 | 23 |
 | `bc65804a` round 4 | 100 | 137 | 3 | 23 |
 | `3a337f7e` round 5, first half | **117** | **119** | **4** | 23 |
-<!-- sweep9: 2a7074c4 row -->
+| `2a7074c4` round 5 | **136** | **102** | **2** | 23 |
 
 Nineteen tests went to PASS (`feature_minchainwork`, `feature_utxo_set_hash`,
 `mempool_package_limits`, `mempool_sigoplimit`, `mining_prioritisetransaction`,
@@ -572,6 +572,30 @@ compare them (`p2p_sendheaders` failed at `:309` on `749d15d4`'s oracle runs;
 Two are real retreats inside one sub-test, not bisected: `mempool_reorg`
 106 → 87 (three invs where, with no mocked time elapsed, the test expects none)
 and `p2p_opportunistic_1p1c` 557 → 514 (`test_orphanage_dos_many`).
+
+Binary `2a7074c4` (the whole round; four staggered batches of the harness,
+the flips and time-outs rerun serially), classification in
+`docs/functional-sweep-2026-09-13/after-2a7074c4.tsv`. Twenty-two tests went
+to PASS (`feature_bind_extra`, `feature_coinstatsindex`,
+`feature_csv_activation`, `feature_includeconf`, `feature_notifications`,
+`feature_reindex`, `mining_basic`, `p2p_compactblocks_hb`,
+`p2p_initial_headers_sync`, `p2p_mutated_blocks`, `rpc_createmultisig`,
+`rpc_dumptxoutset`, `rpc_getblockfrompeer`, `rpc_help`,
+`rpc_invalid_address_message`, `rpc_invalidateblock`, `rpc_scantxoutset`,
+`rpc_signrawtransactionwithkey`, `wallet_abandonconflict`,
+`wallet_address_types`, `wallet_conflicts`, `wallet_spend_unconfirmed`).
+Three left it, and each fails serially too, so they are regressions of the
+round's second half, handed to the batches that own the area:
+`feature_port` `:48` (an onion `-bind` with no port must take `-port` + 1),
+`p2p_leak_tx` `:51` (the queued inv does not go out when mock time advances)
+and `p2p_permissions` `:149` (the peer is not in `getpeerinfo` after a
+restart and reconnect). `feature_maxuploadtarget` and `interface_zmq` went
+from a time-out to a failure (`:177`, `:254`). `feature_proxy` and
+`feature_pruning` still time out at 600 seconds alone.
+
+Deployed: both live nodes to `2a7074c4` (testnet4 first with a 15-minute
+soak, then mainnet; neither needed the index migration, the pre-Core layout
+notice is logged and `-migratedatadir` stays optional).
 
 After the sweep, commit messages record six more oracle runs going FAIL → PASS:
 `feature_csv_activation` (`6121e4a8`), `p2p_initial_headers_sync`
