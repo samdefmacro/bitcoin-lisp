@@ -251,6 +251,42 @@ removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
     (is (null (bl.mp:mempool-get mempool txid)))
     (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))))
 
+(test mempool-unbroadcast-removal-is-logged
+  "Every erase from the unbroadcast set is a mempool-category line, and one
+that is not a peer's getdata says so (Core CTxMemPool::RemoveUnbroadcastTx,
+txmempool.cpp:789; removeUnchecked passes unchecked=true, txmempool.cpp:287).
+mempool_unbroadcast.py:106 waits for the unchecked line when the tx confirms."
+  (let* ((mempool (bl.mp:make-mempool))
+         (tx (make-mempool-test-tx :input-id 73))
+         (txid (bl.ser:transaction-hash tx))
+         (hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
+    (is (eq :ok (bl.mp:mempool-add
+                 mempool txid (make-mempool-entry-for-tx tx))))
+    (bl.mp:mempool-add-unbroadcast mempool txid)
+    (let ((text (nth-value 1 (log-text-of
+                              "mempool"
+                              (lambda ()
+                                (bl.mp:mempool-remove-for-block
+                                 mempool (%mp-block (list tx))))))))
+      (is-true (search (format nil "Removed ~A from set of unbroadcast txns before confirmation that txn was sent out" hex)
+                       text)
+               "a confirmed tx leaves the set with Core's unchecked line"))
+    ;; A getdata (checked) removal logs the plain sentence, and nothing when
+    ;; the txid was not in the set.
+    (is (eq :ok (bl.mp:mempool-add
+                 mempool txid (make-mempool-entry-for-tx tx))))
+    (bl.mp:mempool-add-unbroadcast mempool txid)
+    (let ((text (nth-value 1 (log-text-of
+                              "mempool"
+                              (lambda ()
+                                (bl.mp:mempool-remove-unbroadcast mempool txid)
+                                (bl.mp:mempool-remove-unbroadcast mempool txid))))))
+      (is (= 1 (loop with needle = "from set of unbroadcast txns"
+                     for start = 0 then (+ pos 1)
+                     for pos = (search needle text :start2 start)
+                     while pos count t)))
+      (is-false (search "before confirmation" text)))))
+
 ;;;; Mempool core tests
 
 (test mempool-add-and-get

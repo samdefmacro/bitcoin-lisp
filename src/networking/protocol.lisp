@@ -4133,7 +4133,7 @@ Because each peer's known filter suppresses re-queueing, this mostly
 reaches peers connected since the original announcement."
   (dolist (txid (bl.mp:mempool-unbroadcast-txids mempool))
     (unless (announce-mempool-tx peers mempool txid)
-      (bl.mp:mempool-remove-unbroadcast mempool txid))))
+      (bl.mp:mempool-remove-unbroadcast mempool txid t))))
 
 (defun maybe-reattempt-initial-broadcast (peers mempool)
   "Run the unbroadcast re-announcement pass when due (call ~1x/second from

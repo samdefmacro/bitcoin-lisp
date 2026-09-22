@@ -415,11 +415,18 @@ recorded."
   (when (mempool-has mempool txid)
     (setf (gethash txid (mempool-unbroadcast mempool)) t)))
 
-(defun mempool-remove-unbroadcast (mempool txid)
+(defun mempool-remove-unbroadcast (mempool txid &optional unchecked)
   "Drop TXID from the unbroadcast set (Core CTxMemPool::RemoveUnbroadcastTx,
 txmempool.cpp:784-790): a peer requested the tx via getdata, or the tx left
-the mempool. Returns T when it was present."
-  (remhash txid (mempool-unbroadcast mempool)))
+the mempool. UNCHECKED is Core's flag for a removal that is NOT a peer's
+getdata (the tx left the pool, or the re-announcement pass found it gone);
+it only changes the mempool-category line, which Core writes on every
+erase (txmempool.cpp:789). Returns T when it was present."
+  (when (remhash txid (mempool-unbroadcast mempool))
+    (bl:log-cat "mempool" "Removed ~A from set of unbroadcast txns~A"
+                (%hash-display-name txid)
+                (if unchecked " before confirmation that txn was sent out" ""))
+    t))
 
 (defun mempool-unbroadcast-txids (mempool)
   "The txids awaiting initial broadcast, as a fresh list (Core
@@ -1375,7 +1382,7 @@ shadow checks report as divergence."
           (remhash wtxid (mempool-by-wtxid mempool))))
       ;; A tx leaving the pool leaves the unbroadcast set with it (Core
       ;; removeUnchecked -> RemoveUnbroadcastTx, txmempool.cpp:287).
-      (mempool-remove-unbroadcast mempool txid)
+      (mempool-remove-unbroadcast mempool txid t)
       ;; Drop ancestor/descendant links to/from this entry
       (%unlink-entry mempool txid entry)
       ;; Remove from entries
