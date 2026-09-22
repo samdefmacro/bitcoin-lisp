@@ -1041,25 +1041,6 @@ it passes %COUNT-ADDRMAN-FAILURES-P."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
-(defun %numeric-endpoint (node spec)
-  "Core LookupNumeric(SPEC, default port): (ip-bytes . port) when SPEC's host
-is a numeric address, else NIL."
-  (multiple-value-bind (host port) (parse-node-endpoint node spec)
-    (let ((ip (bl.net:numeric-host-ip-bytes host)))
-      (and ip (cons ip port)))))
-
-(defun added-node-duplicate-p (node spec)
-  "Whether SPEC names a node already on NODE's added-node list: the same
-string, or -- when SPEC is numeric -- the same address and port however it is
-spelled (Core CConnman::AddNode, net.cpp:3732-3744: \"127.1:18444\" is
-\"127.0.0.1:18444\")."
-  (let ((resolved (%numeric-endpoint node spec)))
-    (some (lambda (added)
-            (or (string= spec added)
-                (and resolved
-                     (equalp resolved (%numeric-endpoint node added)))))
-          (node-added-nodes node))))
-
 (defun connect-seed-nodes (node)
   "Dial each -seednode once as an addr-fetch peer (Core ProcessAddrFetch,
 net.cpp). The handshake already sends GETADDR for any non-block-relay outbound

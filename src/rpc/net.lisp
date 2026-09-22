@@ -629,6 +629,25 @@ capacity check runs synchronously, because that is the answer the caller needs."
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 
+(defun %numeric-endpoint (node spec)
+  "Core LookupNumeric(SPEC, default port): (ip-bytes . port) when SPEC's host
+is a numeric address, else NIL."
+  (multiple-value-bind (host port) (bl:parse-node-endpoint node spec)
+    (let ((ip (bl.net:numeric-host-ip-bytes host)))
+      (and ip (cons ip port)))))
+
+(defun %added-node-duplicate-p (node spec)
+  "Whether SPEC names a node already on NODE's added-node list: the same
+string, or -- when SPEC is numeric -- the same address and port however it is
+spelled (Core CConnman::AddNode, net.cpp:3732-3744: \"127.1:18444\" is
+\"127.0.0.1:18444\")."
+  (let ((resolved (%numeric-endpoint node spec)))
+    (some (lambda (added)
+            (or (string= spec added)
+                (and resolved
+                     (equalp resolved (%numeric-endpoint node added)))))
+          (bl:node-added-nodes node))))
+
 (define-rpc "addnode" (node (spec command))
   "Manage manually-added peers (Bitcoin Core addnode). PARAMS:
 (node command [v2transport]). COMMAND is \"add\" (remember the peer and keep it
@@ -649,7 +668,7 @@ transport is not implemented."
       ((equal command "onetry")
        (push spec (bl:node-pending-onetry node)))
       ((equal command "add")
-       (when (bl:added-node-duplicate-p node spec)
+       (when (%added-node-duplicate-p node spec)
          (error 'rpc-error :code +rpc-client-node-already-added+
                            :message "Error: Node already added"))
        (setf (bl:node-added-nodes node)

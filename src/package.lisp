@@ -230,7 +230,6 @@ init.cpp, node/. src/node/.")
    #:load-mempool-from-disk
    #:make-node
    #:node-added-nodes
-   #:added-node-duplicate-p
    #:start-fixed-seed-fallback
    #:apply-initial-network-active
    #:blocks-to-announce

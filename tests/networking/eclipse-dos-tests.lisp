@@ -420,9 +420,8 @@ MOCKABLE clock (net_processing.cpp:4057-4064): p2p_addr_relay.py:427-439 sends
 one address a (mock) day and expects each processed and relayed. Ours
 refilled from the process clock, which moved seconds per mock day. The first
 refill of a never-stamped peer adds nothing."
-  (let ((p (bl.net:make-peer))
+  (let ((p (bl.net:make-peer :addr-token-bucket 0.0d0))
         (bl.ser:*mock-time* 1700000000))
-    (setf (bl.net::peer-addr-token-bucket p) 0.0d0)
     (let ((ingest (lambda ()
                     (ingest-gossiped-addresses p (%addr-entries 1 :base 11) 1
                                                (bl.net:make-address-book) nil))))

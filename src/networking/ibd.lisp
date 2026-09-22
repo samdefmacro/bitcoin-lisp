@@ -528,7 +528,7 @@ Its recorded source goes too: the block was checked, and valid."
   "Hard cap on *BLOCK-SOURCES*; cleared wholesale on overflow, which can only
 spare a peer one punishment.")
 
-(defvar *block-sources* (make-hash-table :test 'equalp :synchronized t)
+(defvar *block-sources* (bl.bytes:make-octets-hash-table :synchronized t)
   "block-hash -> the peer that delivered the body, until the block is checked.")
 
 (defun note-block-source (hash peer)
@@ -1736,6 +1736,21 @@ reads; passing it lets a test place a peer's clock without waiting."
 
 ;;;; Multi-Peer Request Distribution
 
+(defun %fold-direct-fetches-into-pass ()
+  "Copy the live HEADERS-DIRECT-FETCH requests into this pass's in-flight
+table. Core has ONE mapBlocksInFlight; the direct fetch's requests outlive the
+pass context they were made in, so without this the walk asks for them again
+from whichever peer it picks (p2p_sendheaders.py:504 sees the second getdata).
+Folded in, they are in flight exactly as the pass's own are: not re-requested,
+their holder is the one the window waits on, and the ordinary timeout
+re-routes one that never arrives. (Merely SKIPPING them in the walk instead
+left the pass spinning with the node lock contended.)"
+  (let ((in-flight (ibd-context-in-flight *ibd-context*)))
+    (dolist (hash (loop for h being the hash-keys of *direct-fetch-in-flight* collect h))
+      (let ((entry (%live-direct-fetch-entry hash)))
+        (when (and entry (not (gethash hash in-flight)))
+          (setf (gethash hash in-flight) entry))))))
+
 (defun request-blocks-from-peers (peers chain-state block-store)
   "Request blocks from multiple peers, distributing the load.
 Enforces per-peer in-flight limits (like Bitcoin Core's
@@ -1746,16 +1761,7 @@ new requests are paused so peers do not deliver blocks we'd just drop +
 re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
-  ;; Core has ONE mapBlocksInFlight. The direct fetch's requests outlive the
-  ;; pass context they were made in, so fold the live ones into this pass's
-  ;; table first: the walk then treats them exactly as in flight (not asked
-  ;; for again, their holder counted as the one the window waits on) and the
-  ;; ordinary timeout re-routes one that never arrives.
-  (let ((in-flight (ibd-context-in-flight *ibd-context*)))
-    (dolist (hash (loop for h being the hash-keys of *direct-fetch-in-flight* collect h))
-      (let ((entry (%live-direct-fetch-entry hash)))
-        (when (and entry (not (gethash hash in-flight)))
-          (setf (gethash hash in-flight) entry)))))
+  (%fold-direct-fetches-into-pass)
 
   ;; Reassign blocks held by peers that have since disconnected — they'd
   ;; otherwise sit in-flight until the per-hash timeout before any live
@@ -2180,6 +2186,8 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                                        (gethash hash (ibd-context-pending-blocks ctx))))))
            (mark-block-received hash)
            (remhash hash *direct-fetch-in-flight*)
+           ;; Core mapBlockSource.emplace (net_processing.cpp:4893).
+           (note-block-source hash peer)
            (record-block-received-from-peer peer)
            (let ((connected
                    (process-received-block block route-cs route-view block-store
@@ -4795,8 +4803,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
       (bl:log-warn "Received unknown block ~A"
                              (bl.crypto:bytes-to-hex hash))
       (return-from process-received-block nil))
-    (when peer
-      (note-block-source hash peer))
 
     (let ((height (bl.store:block-index-entry-height entry))
           (current-height (bl.store:current-height chain-state)))

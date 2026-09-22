@@ -1466,7 +1466,6 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
                      (merge-inbound-peers *node*)
                      (dial-queued-nodes *node*)
                      (> (length (node-peers *node*)) peers-before))))
-  (maybe-add-fixed-seeds *node*)    ; Core ThreadOpenConnections, every pass
   (run-header-sync-duties *node*)   ; Core SendMessages, headers half
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the
@@ -1682,6 +1681,8 @@ block is noticed within a tick, ended early by new headers or known work."
         for second = (ceiling tick +sync-ticks-per-second+)
         while (node-running *node*)
         do (sleep (/ 1 +sync-ticks-per-second+))
+           ;; Core ThreadOpenConnections' fixed-seed check, every pass.
+           (maybe-add-fixed-seeds *node*)
            (when (%sync-idle-tick second)
              (return))))
 
