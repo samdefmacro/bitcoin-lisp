@@ -185,6 +185,7 @@ init.cpp, node/. src/node/.")
    ;; ZMQ notifications (G7-23)
    #:zmq-notify-block-connected
    #:zmq-notify-block-disconnected
+   #:zmq-notify-updated-block-tip
    #:zmq-notify-tx-accepted
    #:zmq-notify-tx-removed
    #:zmq-start-publishers

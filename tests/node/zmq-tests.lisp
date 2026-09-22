@@ -275,8 +275,13 @@ non-block inclusion reasons\")."
             "a removal by a block must NOT publish a removal")))))
 
 (test zmq-connect-block-is-wired-to-the-publisher
-  "connect-block must publish hashblock. Drives the real validation path."
+  "connect-block must publish hashblock. Drives the real validation path.
+
+hashblock is Core's UpdatedBlockTip notification, which says nothing during
+initial block download (zmqnotificationinterface.cpp:151-159), so the node
+stands outside IBD here."
   (with-network (:mainnet)
+   (with-tx-relay-out-of-ibd
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "zmq-connect")
      (%with-zmq-hook-test (address "hashblock" sub)
@@ -293,7 +298,7 @@ non-block inclusion reasons\")."
                               (string= wanted (third (uiop:split-string l :separator " "))))
                             (%zmq-drain sub))
                       "connect-block must publish the connected block's hash")))))
-     (clear-undo-cache))))
+     (clear-undo-cache)))))
 
 (test zmq-connect-block-publishes-each-transaction-in-the-block
   "The per-transaction half of BlockConnected, which the hashblock test above
@@ -467,3 +472,38 @@ notification and timed out."
                    "a topic bound after the first must still publish"))))
       (bl:zmq-stop-publishers)
       (ignore-errors (delete-file path)))))
+
+(test zmq-hashblock-announces-the-tip-once-per-step
+  "Core publishes hashblock/rawblock from UpdatedBlockTip, not BlockConnected
+(zmqnotificationinterface.cpp:151-159, :180-196): once per activation step,
+for the new tip, and not at all during initial block download or for a step
+that connected nothing. interface_zmq.py:291 reads ONE hashblock across a
+two-block reorg; ours published one per connected block."
+  (%with-zmq-hook-test (address "hashblock" sub)
+    (let* ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+           (a-block (make-reorg-test-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element 0)
+                                           (first (make-test-chain-hashes #xE1 1)) 1))
+           (tip (first (make-test-chain-hashes #xE2 1)))
+           (no-block (lambda () nil)))
+      (is-true (%zmq-await-attached sub (lambda () (bl::zmq-notify-hash-block warm))))
+      (%zmq-drain sub)
+      (flet ((heard ()
+               (sleep 0.4)
+               (let ((wanted (string-downcase
+                              (bl.crypto:bytes-to-hex (reverse (copy-seq tip))))))
+                 (count-if (lambda (l) (search wanted l)) (%zmq-drain sub)))))
+        ;; Two blocks connect in one step: no hashblock until the tip moves,
+        ;; then exactly one, for the tip.
+        (bl:zmq-notify-block-connected a-block (first (make-test-chain-hashes #xE1 1)))
+        (bl:zmq-notify-block-connected a-block tip)
+        (is (= 0 (heard)) "a connected block is not a hashblock")
+        (bl:zmq-notify-updated-block-tip tip nil no-block)
+        (is (= 1 (heard)))
+        ;; A step that connected nothing (a pure disconnect) says nothing.
+        (bl:zmq-notify-updated-block-tip tip nil no-block)
+        (is (= 0 (heard)))
+        ;; Nor does one during initial block download.
+        (bl:zmq-notify-block-connected a-block tip)
+        (bl:zmq-notify-updated-block-tip tip t no-block)
+        (is (= 0 (heard)))))))

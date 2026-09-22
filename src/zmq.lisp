@@ -332,21 +332,42 @@ A mined transaction is reported by the block notification instead."
   (when (zmq-topic-active-p "sequence")
     (zmq-notify-sequence txid #\R mempool-sequence)))
 
+(defvar *zmq-block-connected-since-tip* nil
+  "T once a block has connected since the last tip notification: Core's
+UpdatedBlockTip publishes nothing for a step that only DISCONNECTED blocks
+(pindexNew == pindexFork, zmqnotificationinterface.cpp:127-133).")
+
 (defun zmq-notify-block-connected (block hash)
-  "Core BlockConnected: every transaction in the block first, then the block
-itself and a sequence 'C'."
+  "Core BlockConnected: every transaction in the block, then a sequence 'C'
+(zmqnotificationinterface.cpp:180-196). hashblock and rawblock are NOT
+published here -- see ZMQ-NOTIFY-UPDATED-BLOCK-TIP."
+  (setf *zmq-block-connected-since-tip* t)
   (when *zmq-publishers*
     (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
       ;; BITCOIN-BLOCK-TRANSACTIONS is a LIST (types.lisp:534), not a vector.
       (loop for tx in (bl.ser:bitcoin-block-transactions block)
             do (zmq-notify-transaction
                 tx (bl.ser:transaction-hash tx))))
-    (when (zmq-topic-active-p "hashblock")
-      (zmq-notify-hash-block hash))
-    (when (zmq-topic-active-p "rawblock")
-      (zmq-notify-raw-block (bl.ser:serialize-witness-block block)))
     (when (zmq-topic-active-p "sequence")
       (zmq-notify-sequence hash #\C))))
+
+(defun zmq-notify-updated-block-tip (hash initial-download-p block-fn)
+  "Core UpdatedBlockTip -> NotifyBlock (zmqnotificationinterface.cpp:151-159):
+hashblock and rawblock announce the NEW TIP, once per activation step, and
+nothing at all during initial block download or for a step that connected no
+block. A reorg therefore announces its new tip and none of the blocks under
+it; interface_zmq.py:291 reads exactly one hashblock across a two-block reorg,
+and ours sent one per connected block. BLOCK-FN returns the tip block, read
+only when rawblock is subscribed (Core reads it from disk the same way)."
+  (let ((connected *zmq-block-connected-since-tip*))
+    (setf *zmq-block-connected-since-tip* nil)
+    (when (and *zmq-publishers* connected (not initial-download-p))
+      (when (zmq-topic-active-p "hashblock")
+        (zmq-notify-hash-block hash))
+      (when (zmq-topic-active-p "rawblock")
+        (let ((block (funcall block-fn)))
+          (when block
+            (zmq-notify-raw-block (bl.ser:serialize-witness-block block))))))))
 
 (defun zmq-notify-block-disconnected (block hash)
   "Core BlockDisconnected: every transaction in the block, then a sequence 'D'.
@@ -368,6 +389,16 @@ No rawblock/hashblock — those announce the tip moving FORWARD."
   (declare (ignore height spent-utxos))
   (unless (bl.store:chain-state-target-blockhash chainstate)
     (zmq-notify-block-connected block block-hash)))
+
+(bl.vi:define-validation-hook :updated-block-tip zmq-updated-block-tip (chainstate block-hash height)
+  (declare (ignore height))
+  (unless (and chainstate (bl.store:chain-state-target-blockhash chainstate))
+    (zmq-notify-updated-block-tip
+     block-hash
+     (and chainstate (bl.net:initial-block-download-p chainstate))
+     (lambda ()
+       (and *node* (node-block-store *node*)
+            (bl.store:get-block (node-block-store *node*) block-hash))))))
 
 (bl.vi:define-validation-hook :block-disconnected zmq-block-disconnected (chainstate block block-hash height)
   (declare (ignore height))
