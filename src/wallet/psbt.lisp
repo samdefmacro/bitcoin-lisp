@@ -2554,6 +2554,26 @@ inputs."
    :lock-time (bl.ser:transaction-lock-time orig)
    :witness nil))
 
+(defun %bump-fee-rate-too-low (node wallet cc orig txouts old-fee)
+  "CheckFeeRate's minTotalFee arm for a USER-GIVEN feerate (wallet/
+feebumper.cpp:86-99), asked BEFORE the replacement is built: the fee that
+rate pays over the maximum signed size of temp_mtx -- the original inputs
+with the replacement's OUTPUTS -- against the old fee plus one incremental
+relay fee over that size. Returns Core's -8 sentence, or NIL. Our only check
+ran after the build and measured the built transaction, whose change output
+made a too-low rate look sufficient: wallet_bumpfee.py:804 (`outputs'
+replacing fifty outputs by one, the rate one sat/vB under the minimum) got no
+error."
+  (let* ((max-size (%bump-max-signed-size node wallet cc
+                                          (%bump-temp-transaction orig txouts)))
+         (new-total (bl.rpc:feerate-fee (wcc-feerate cc) max-size))
+         (incremental (bl.rpc:feerate-fee bl.mp:*incremental-relay-fee-rate* max-size))
+         (min-total (+ old-fee incremental)))
+    (when (< new-total min-total)
+      (format nil "Insufficient total fee ~A, must be at least ~A (oldFee ~A + incrementalFee ~A)"
+              (bl.rpc:format-money new-total) (bl.rpc:format-money min-total)
+              (bl.rpc:format-money old-fee) (bl.rpc:format-money incremental)))))
+
 (defun %bump-fee-rate-too-high (node wallet cc orig txouts)
   "Core feebumper CheckFeeRate's -maxtxfee arm (feebumper.cpp:105-113): the
 total fee the USER-GIVEN feerate would pay over the replacement's maximum
@@ -2659,6 +2679,10 @@ and an index past the end (:180-183)."
         (if (wcc-feerate cc)
             (progn
               (setf (wcc-override-feerate cc) t)
+              (let ((too-low (%bump-fee-rate-too-low node wallet cc orig txouts old-fee)))
+                (when too-low
+                  (return-from %create-rate-bump
+                    (values nil bl.rpc:+rpc-invalid-parameter+ too-low))))
               (let ((too-high (%bump-fee-rate-too-high node wallet cc orig txouts)))
                 (when too-high
                   (return-from %create-rate-bump

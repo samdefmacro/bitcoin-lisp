@@ -2995,3 +2995,39 @@ committed replaces_txid alone. The original keeps its own (the control)."
         (is (equal "comment value" (%aval "comment" orig)))
         (is (equal "comment value" (%aval "comment" new)))
         (is (equal "to value" (%aval "to" new)))))))
+
+(test bumpfee-checks-a-given-rate-against-the-replacement-outputs
+  "CheckFeeRate prices a USER-GIVEN feerate over the maximum signed size of
+temp_mtx -- the original inputs with the replacement's outputs -- against the
+old fee plus one incremental relay fee over that size, BEFORE building
+(wallet/feebumper.cpp:278-292, :86-99). wallet_bumpfee.py:785-808 replaces
+fifty outputs by one and bumps at one sat/vB under the minimum that
+arithmetic gives: -8 \"Insufficient total fee\". Ours checked only the BUILT
+replacement, whose change output made the rate look sufficient. At the minimum
+itself the bump goes through (the control)."
+  (%with-pp-node (node "pp-bump-replaced-outputs")
+    (%pp-fund-wallet node :blocks 5)
+    (with-wallet-rng (37)
+      (let* ((rpc (lambda (method &rest params)
+                    (bl.rpc:dispatch-rpc-method node method params)))
+             (outputs (loop repeat 20
+                            collect (%ht (funcall rpc "getnewaddress" "" "bech32") "1")))
+             (txid (%aval "txid" (funcall rpc "send" outputs nil nil 5)))
+             (decoded (%aval "decoded" (funcall rpc "gettransaction" txid nil t)))
+             (est (- (%aval "vsize" decoded)
+                     (* 31 (1- (length (coerce (%aval "vout" decoded) 'list))))))
+             (old-fee (- (btc-amount (%aval "fee" (funcall rpc "gettransaction" txid)))))
+             ;; get_fee(est, 0.00000100 BTC/kvB) in BTC, as the Python test has it
+             (min-fee (* (+ old-fee (/ (ceiling (* est 100) 1000) 100000000)) 100000000))
+             (min-rate (/ (round (* 1000 (/ min-fee est))) 1000))
+             (new-outputs (list (%ht (funcall rpc "getnewaddress" "" "bech32") "19"))))
+        (flet ((bump (rate)
+                 (rpc-error-of
+                  (lambda ()
+                    (funcall rpc "bumpfee" txid
+                             (%ht "fee_rate" (coerce rate 'double-float)
+                                  "outputs" new-outputs))))))
+          (let ((low (bump (- min-rate 1))))
+            (is (equal -8 (car low)) "one under the minimum: ~S" low)
+            (is (eql 0 (search "Insufficient total fee" (or (cdr low) "")))))
+          (is (null (bump min-rate)) "the minimum itself bumps"))))))
