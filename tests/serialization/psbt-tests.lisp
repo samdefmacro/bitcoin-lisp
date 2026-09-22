@@ -1576,3 +1576,25 @@ vectors came back with the right records in the wrong order."
                                   (%aval "psbt" (rpc name "walletprocesspsbt"
                                                      (gethash "psbt" e) t "ALL")))
                            "signer vector #~D" i))))))))
+
+(test bumpfee-original-change-index-out-of-range-is-cores-misc-error
+  "original_change_index is read with getInt<uint32_t>
+(wallet/rpc/spend.cpp:1083-1085). A number that is no whole uint32 makes
+UniValue throw a plain std::runtime_error, which the server answers -1 \"JSON
+integer out of range\" (univalue.h:138-149, rpc/server.cpp:512-515);
+wallet_bumpfee.py:183 passes -1 and we answered -3 \"JSON value of type number
+is not of expected type number\". A string stays the -3 type error (the
+control)."
+  (with-wallet-chain-node (node "bumpfee-change-index" :wallet "w")
+    (let ((txid (make-string 64 :initial-element #\0)))
+      (flet ((bump (value)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "bumpfee"
+                   (wire-params (list txid (let ((h (make-hash-table :test 'equal)))
+                                             (setf (gethash "original_change_index" h) value)
+                                             h))))))))
+        (is (equal '(-1 . "JSON integer out of range") (bump -1)))
+        (is (equal '(-1 . "JSON integer out of range") (bump (expt 2 32))))
+        (is (equal -3 (car (bump "x"))))))))

@@ -2301,8 +2301,15 @@ record of which members were `[]' tells them apart (wallet_bumpfee.py:175)."
 VNUM in Core's option block (:1058) and read with getInt<uint32_t>."
   (multiple-value-bind (idx present) (%opt options "original_change_index")
     (when present
-      (unless (and (integerp idx) (not (minusp idx)))
+      (unless (realp idx)
         (bl.rpc:json-type-error idx "number"))
+      ;; getInt<uint32_t> on a number that is no whole uint32 throws a plain
+      ;; std::runtime_error, which the server answers -1 "JSON integer out of
+      ;; range" (univalue.h:138-149, rpc/server.cpp:512-515) --
+      ;; wallet_bumpfee.py:183 passes -1.
+      (unless (typep idx '(unsigned-byte 32))
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
+                                 :message "JSON integer out of range"))
       idx)))
 
 (defun %bumpfee-helper (node params want-psbt)
