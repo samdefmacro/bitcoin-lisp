@@ -6117,6 +6117,32 @@ was given and handed hunchentoot the whole `host:port' as a host."
                (is-false (answers-p 19961) "-rpcport is not bound when every bind names a port"))
           (bl.rpc:stop-rpc-server))))))
 
+(test rest-count-is-tointegral-and-errors-end-in-crlf
+  "Core reads a REST `count' with ToIntegral<size_t> -- digits only -- and
+refuses anything else, or anything outside 1-2000, with RESTERR, whose reply is
+the message and a CRLF (rest.cpp:70-75, :205-209). interface_rest.py:324-327
+compares the reply BYTES for 5a, -5, 0, 2001 and a 35-digit number; ours read
+`5a' as 5 and ended every error with a bare newline."
+  (with-network (:regtest)
+    (let ((node (regtest-node-fixture "rest-count"))
+          (genesis nil))
+      (flet ((body-of (uri)
+               (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+                 (multiple-value-list (rest-request node uri)))))
+        (setf genesis (string-trim '(#\Return #\Newline)
+                                   (first (body-of "/rest/blockhashbyheight/0.hex"))))
+        (dolist (num '("5a" "-5" "0" "2001" "99999999999999999999999999999999999"))
+          (destructuring-bind (body status &rest ignore)
+              (body-of (format nil "/rest/headers/~A.json?count=~A" genesis num))
+            (declare (ignore ignore))
+            (is (eql 400 status) "~A: ~A" num status)
+            (is (equal (format nil "Header count is invalid or out of acceptable range (1-2000): ~A~C~C"
+                               num #\Return #\Newline)
+                       body)
+                "~A: ~S" num body)))
+        ;; Control: a count in range answers.
+        (is (eql 200 (second (body-of (format nil "/rest/headers/~A.json?count=5" genesis)))))))))
+
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
 serving something wrong or signalling out of the handler."
@@ -6176,7 +6202,7 @@ an order of magnitude larger on a full mempool."
           (rest-request node (format nil "/rest/mempool/contents.json?~A" (car probe)))
         (is (= 400 status) "~A was accepted" (car probe))
         (is (string= (format nil "The \"~A\" query parameter must be either ~
-\"true\" or \"false\".~%" (cdr probe))
+\"true\" or \"false\".~C~C" (cdr probe) #\Return #\Newline)
                      body))))
     ;; The two together are Core's 400 with its hint, verbatim.
     (multiple-value-bind (body status)
@@ -6184,7 +6210,7 @@ an order of magnitude larger on a full mempool."
                       "/rest/mempool/contents.json?verbose=true&mempool_sequence=true")
       (is (= 400 status))
       (is (string= (format nil "Verbose results cannot contain mempool sequence ~
-values. (hint: set \"verbose=false\")~%")
+values. (hint: set \"verbose=false\")~C~C" #\Return #\Newline)
                    body)))
     ;; CONTROL: the same pair with verbose=false is allowed through (its
     ;; sequence field comes from getrawmempool).

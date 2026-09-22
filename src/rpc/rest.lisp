@@ -39,9 +39,17 @@
   body)
 
 (defun %rest-error (status message)
-  "Plain-text error, mirroring Core's RESTERR."
+  "Plain-text error, mirroring Core's RESTERR: the message and a CRLF
+(rest.cpp:70-75). interface_rest.py:324-327 compares the reply BYTES,
+`\\r\\n' included."
   (%rest-respond status "text/plain"
-                 (format nil "~A~%" message)))
+                 (format nil "~A~C~C" message #\Return #\Newline)))
+
+(defun %rest-parse-count (text)
+  "A `count' as Core's ToIntegral<size_t> reads it (rest.cpp:205-209): decimal
+digits and nothing else -- no sign, no trailing junk -- or NIL."
+  (and (stringp text) (plusp (length text)) (every #'digit-char-p text)
+       (parse-integer text)))
 
 (defun %rest-json (alist-or-value)
   "Encode an RPC-shaped result as a JSON string (200 application/json)."
@@ -184,7 +192,7 @@ interface_rest.py:231 asks for the unknown hash and compares against []."
   (unless (valid-hex-hash-p body)
     (return-from %rest-headers (%rest-error 400 (format nil "Invalid hash: ~A" body))))
   (let* ((raw-count (or (hunchentoot:get-parameter "count") "5"))
-         (count (parse-integer raw-count :junk-allowed t))
+         (count (%rest-parse-count raw-count))
          (chain-state (rpc-get-chain-state node))
          (start (bl.store:get-block-index-entry
                  chain-state (parse-hex-hash body))))
@@ -610,7 +618,7 @@ sequence that never existed."
          (raw-count (if deprecated
                         (second parts)
                         (or (hunchentoot:get-parameter "count") "5")))
-         (count (and raw-count (parse-integer raw-count :junk-allowed t))))
+         (count (%rest-parse-count raw-count)))
     (cond
       ((not (member (length parts) '(2 3)))
        (%rest-error 400 "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>"))
