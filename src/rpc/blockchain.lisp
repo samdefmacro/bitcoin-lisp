@@ -2689,7 +2689,11 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
             (unless (bl.store:entry-on-active-chain-p chain-state entry)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Block is not in main chain"))
-            (push entry entries)))
+            ;; Core keeps them in a std::set ordered by height
+            ;; (blockchain.cpp:2755-2775), so a block named twice is scanned
+            ;; ONCE -- rpc_getdescriptoractivity.py:204 names one twice and
+            ;; wants the single-scan answer.
+            (pushnew entry entries :key #'bl.store:block-index-entry-height)))
         (dolist (entry (sort entries #'< :key #'bl.store:block-index-entry-height))
           (let* ((hash (bl.store:block-index-entry-hash entry))
                  (height (bl.store:block-index-entry-height entry))

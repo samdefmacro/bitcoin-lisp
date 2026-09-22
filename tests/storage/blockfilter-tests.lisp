@@ -459,6 +459,27 @@ the tree already; this one was not using it."
           ;; which was spelled without one.
           (is (string= "raw(51)#8lvh9jxk" (cdr (assoc "desc" spk :test #'equal)))))))))
 
+(test getdescriptoractivity-scans-a-block-named-twice-once
+  "Core collects the requested blocks in a std::set ordered by height
+(rpc/blockchain.cpp:2755-2775), so naming one twice scans it once and the
+order given does not matter. rpc_getdescriptoractivity.py:204 names a block
+twice and compares with the single-scan answer; ours reported every activity
+of that block twice."
+  (with-network (:regtest)
+    (let ((node (%bfi-regtest-node)))
+      (let ((bl:*node* node))
+        (let* ((hashes (generate-regtest-blocks node 2))
+               (once (bl.rpc:dispatch-rpc-method
+                      node "getdescriptoractivity" (list hashes (list "raw(51)") nil)))
+               (twice (bl.rpc:dispatch-rpc-method
+                       node "getdescriptoractivity"
+                       (list (append (reverse hashes) hashes) (list "raw(51)") nil))))
+          (is (= 2 (length (cdr (assoc "activity" once :test #'equal))))
+              "the control: two blocks, one receive each")
+          ;; EQUALP: the amounts are JSON-NUMBER tokens, which EQUAL compares by
+          ;; identity.
+          (is (equalp once twice)))))))
+
 (test bip157-serving-request-validation-and-messages
   "BIP157 serving: %cf-request-stop-height enforces active-chain stop hash +
 range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
