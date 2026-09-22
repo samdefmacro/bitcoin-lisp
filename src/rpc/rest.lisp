@@ -555,6 +555,8 @@ against the tip."
       ((null slash)
        (%rest-error 400 "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>"))
       ((not (valid-hex-hash-p hash)) (%rest-error 400 (format nil "Invalid hash: ~A" hash)))
+      ((not (string= filtertype "basic"))
+       (%rest-error 400 (format nil "Unknown filtertype ~A" filtertype)))
       (t
        (handler-case
            (let* ((result (rpc-getblockfilter node (list hash filtertype)))
@@ -575,7 +577,20 @@ against the tip."
                        (let ((encoded (bl.crypto:hex-to-bytes filter-hex)))
                          (bl.ser:write-compact-size s (length encoded))
                          (write-sequence encoded s)))))))
-         (rpc-error (e) (%rest-error 404 (rpc-error-message e))))))))
+         (rpc-error (e) (%rest-filter-error e)))))))
+
+(defun %rest-filter-error (condition)
+  "A getblockfilter refusal as the two filter endpoints answer it: Core
+checks the filter type and the index BEFORE looking the block up and answers
+both with 400 -- `Unknown filtertype <t>' and `Index is not enabled for
+filtertype <t>' (rest.cpp:533-543, :638-647) -- while a block it cannot find
+is a 404. interface_rest.py:318 asks for filter type `abc' and expects 400."
+  (let ((message (rpc-error-message condition)))
+    (%rest-error (if (or (alexandria:starts-with-subseq "Unknown filtertype" message)
+                         (alexandria:starts-with-subseq "Index is not enabled" message))
+                     400
+                     404)
+                 message)))
 
 (defun %rest-blockfilterheaders (node body ext)
   "/rest/blockfilterheaders/<filtertype>/<blockhash>?count=<n>, and Core's
@@ -602,6 +617,8 @@ sequence that never existed."
       ((or (null count) (< count 1) (> count +rest-max-headers+))
        (%rest-error 400 (%rest-bad-count-message (or raw-count ""))))
       ((not (valid-hex-hash-p hash)) (%rest-error 400 (format nil "Invalid hash: ~A" hash)))
+      ((not (string= filtertype "basic"))
+       (%rest-error 400 (format nil "Unknown filtertype ~A" filtertype)))
       (t
        (let* ((chain-state (rpc-get-chain-state node))
               (start (bl.store:get-block-index-entry
@@ -644,7 +661,7 @@ sequence that never existed."
                                                     (bl.crypto:reverse-bytes
                                                      (bl.crypto:hex-to-bytes display))))
                                                  headers)))))
-              (rpc-error (e) (%rest-error 404 (rpc-error-message e)))))))))))
+              (rpc-error (e) (%rest-filter-error e))))))))))
 
 (defun %rest-spent-txouts-bytes (tx-undos)
   "TX-UNDOS as Core's SerializeBlockUndo (rest.cpp:277-289): CompactSize of the

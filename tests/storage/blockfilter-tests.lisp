@@ -833,6 +833,13 @@ not found' and interface_rest.py:308 got a 404."
                  (encoded (bl.crypto:hex-to-bytes filter)))
             (is (equal (list "filter") (alexandria:hash-table-keys json)))
             (is (equal filter (gethash "filter" json)))
+            ;; An unknown filter type is Core's 400, before any block lookup
+            ;; (rest.cpp:533-543, :638-647; interface_rest.py:318).
+            (dolist (uri (list (format nil "/rest/blockfilterheaders/abc/~A.json" h)
+                               (format nil "/rest/blockfilter/abc/~A.json" h)))
+              (multiple-value-bind (body status) (rest-request node uri)
+                (is (eql 400 status) "~A: ~A" uri status)
+                (is-true (search "Unknown filtertype abc" body) "~A: ~A" uri body)))
             (is (equalp (concatenate '(vector (unsigned-byte 8))
                                      #(0)
                                      (reverse (bl.crypto:hex-to-bytes h))
