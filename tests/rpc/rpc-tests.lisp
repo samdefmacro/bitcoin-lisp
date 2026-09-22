@@ -5493,7 +5493,7 @@ just that something connected."
                        node (list "1.2.3.4:1" (car pair) nil))))
           (is (equal (car pair) (cdr (assoc "connection_type" result :test #'string=))))
           (is (equal "1.2.3.4:1" (cdr (assoc "address" result :test #'string=))))
-          (is (equal (list (list "1.2.3.4:1" (cdr pair) nil))
+          (is (equal (list (list "1.2.3.4:1" (cdr pair) nil (list nil)))
                      bl:*pending-test-connections*)
               "~A did not queue its own connection type" (car pair))))
       (setf bl:*pending-test-connections* '())
@@ -12239,3 +12239,38 @@ Ours rendered the empty list as JSON `null', which is not a length."
                                 (bl.crypto:hex-to-bytes "6a0474657374"))))))
            (ins (cdr (assoc "vin" with-input :test #'string=))))
       (is (= 1 (length ins))))))
+
+(test addconnection-returns-once-its-dial-is-made
+  "Core's AddConnection opens the connection before the RPC returns
+(net.cpp:1871-1907), so the new peer is already in getpeerinfo.
+p2p_handshake.py:100-104 asks a node to connect to itself, waits for
+getpeerinfo to EMPTY and only then reads the log for \"connected to self\" --
+against an RPC that returned before the dial, the wait passed at once and the
+line was not there yet. With a live sync thread the RPC now waits, bounded,
+for that thread to mark the queued dial done. Here a stand-in sync thread
+marks it after 0.3 s."
+  (let* ((bl:*network* :regtest)
+         (node (bl:make-node :network :regtest))
+         (saved bl:*pending-test-connections*)
+         (worker nil))
+    (unwind-protect
+         (progn
+           (setf bl:*pending-test-connections* '()
+                 worker (bt:make-thread
+                         (lambda ()
+                           (sleep 0.3)
+                           (ignore-errors
+                            (setf (car (fourth (first bl:*pending-test-connections*))) t))
+                           (sleep 2))
+                         :name "stand-in-sync-thread")
+                 (bl:node-sync-thread node) worker)
+           (let ((started (get-internal-real-time)))
+             (is-true (bl.rpc:dispatch-rpc-method
+                       node "addconnection" (list "1.2.3.4:1" "feeler" bl.rpc:+json-false+)))
+             (is (>= (- (get-internal-real-time) started)
+                     (* 0.25 internal-time-units-per-second))
+                 "the RPC waited for the sync thread's dial")
+             (is-true (car (fourth (first bl:*pending-test-connections*)))
+                      "and returned once it was marked done")))
+      (setf bl:*pending-test-connections* saved)
+      (when worker (ignore-errors (bt:join-thread worker))))))

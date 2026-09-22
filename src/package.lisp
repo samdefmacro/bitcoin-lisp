@@ -262,6 +262,7 @@ init.cpp, node/. src/node/.")
    #:node-peers
    #:node-pending-inbound-peers
    #:node-pending-onetry
+   #:node-sync-thread
    #:node-running
    #:run-inbound-listener
    #:consider-outbound-evictions

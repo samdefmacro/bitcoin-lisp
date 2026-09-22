@@ -615,7 +615,8 @@ capacity check runs synchronously, because that is the answer the caller needs."
       (error 'rpc-error :code +rpc-type-error+
                         :message "Expected type string for connection_type"))
     (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) type-string))
-           (conn-type (cdr (assoc trimmed %addconnection-types :test #'string=))))
+           (conn-type (cdr (assoc trimmed %addconnection-types :test #'string=)))
+           (done (list nil)))          ; set by the sync thread once dialed
       (unless conn-type
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "Type of connection to open (\"outbound-full-relay\", \"block-relay-only\", \"addr-fetch\" or \"feeler\")."))
@@ -633,8 +634,19 @@ capacity check runs synchronously, because that is the answer the caller needs."
         ;; dials with exactly the v2transport the caller named
         ;; (rpc/net.cpp:405-417, net.cpp:1905), which is how
         ;; p2p_v2_encrypted.py:67 gets a v1 connection out of a v2 node.
-        (push (list address conn-type (positional-bool v2transport))
+        (push (list address conn-type (positional-bool v2transport) done)
               bl:*pending-test-connections*))
+      ;; Core's AddConnection opens the connection before the RPC returns
+      ;; (net.cpp:1871-1907): the new peer is in getpeerinfo at once, and
+      ;; p2p_handshake.py:100-104 relies on it -- it waits for getpeerinfo
+      ;; to EMPTY after asking a node to connect to itself, and only then
+      ;; reads the log for "connected to self". So wait, bounded, for the
+      ;; sync thread to have made the dial.
+      (let ((sync (bl:node-sync-thread node)))
+        (when (and sync (bt:thread-alive-p sync))
+          (loop repeat 200
+                until (car done)
+                do (sleep 0.05))))
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 

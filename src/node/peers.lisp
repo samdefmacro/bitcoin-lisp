@@ -1197,10 +1197,14 @@ sat on getpeerinfo for most of that cycle, once per connection."
     (let ((queued (bt:with-recursive-lock-held ((node-lock node))
                     (prog1 (nreverse *pending-test-connections*)
                       (setf *pending-test-connections* nil)))))
-      (loop for (address conn-type use-v2) in queued
-            do (multiple-value-bind (host port) (parse-node-endpoint node address)
-                 (establish-outbound-peer node host port :conn-type conn-type
-                                                         :use-v2 use-v2))))))
+      (loop for (address conn-type use-v2 done) in queued
+            do (unwind-protect
+                    (multiple-value-bind (host port) (parse-node-endpoint node address)
+                      (establish-outbound-peer node host port :conn-type conn-type
+                                                              :use-v2 use-v2))
+                 ;; The RPC waits on this: Core's AddConnection returns with
+                 ;; the connection already open (net.cpp:1871-1907).
+                 (when done (setf (car done) t)))))))
 
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain the queued dials

@@ -44,10 +44,12 @@ getaddednodeinfo reports -addnode and not -connect, exactly as Core's does —
 both are nonetheless dialed as MANUAL connections.")
 
 (defvar *pending-test-connections* '()
-  "Connections the addconnection RPC has asked for, as (address conn-type use-v2),
+  "Connections the addconnection RPC has asked for, as (address conn-type use-v2
+done), DONE being a cons the sync thread sets once it has made the dial,
 drained by the sync thread. A queue rather than a direct dial because node-peers
-is single-writer by design; Core's own AddConnection likewise returns before the
-connection completes. Regtest-only, like the RPC.")
+is single-writer by design; the RPC waits (bounded) for DONE, since Core's own
+AddConnection returns with the connection already open. Regtest-only, like
+the RPC.")
 
 (defvar *seed-nodes* '()
   "-seednode targets (Core connOptions.vSeedNodes): peers dialed once, purely to
