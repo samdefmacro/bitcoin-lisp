@@ -850,10 +850,16 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
         (error 'rpc-error :code +rpc-deserialization-error+
                           :message (format nil "TX decode failed: ~A" e))))))
 
-(defun %package-tx-result-fields (r)
+(defun %package-tx-result-fields (r &optional package-aborted)
   "Field alist for one package-tx-result, mirroring Bitcoin Core submitpackage's
-per-wtxid object. Status drives which fields are present."
-  (let ((status (bl.val:package-tx-result-status r))
+per-wtxid object. Status drives which fields are present. PACKAGE-ABORTED is T
+when NO member was processed -- Core's empty m_tx_results -- and only then is
+a :not-validated member Core's `package-not-validated'; a placeholder beside
+real results carries its own reason, as Core's per-tx evaluation would."
+  (let ((status (if (and (eq (bl.val:package-tx-result-status r) :not-validated)
+                         (not package-aborted))
+                    :invalid
+                    (bl.val:package-tx-result-status r)))
         (base (list (cons "txid" (hash-to-hex
                                   (bl.val:package-tx-result-txid r))))))
     (flet ((btc (sat) (satoshi->btc (or sat 0)))
@@ -972,10 +978,14 @@ member may send to a script that can never spend it."
           ;; mempool_ephemeral_dust.py:160 reads "transaction failed".
           ("package_msg" . ,package-msg)
           ("tx-results"
-           . ,(mapcar (lambda (r)
-                        (cons (hash-to-hex (bl.val:package-tx-result-wtxid r))
-                              (%package-tx-result-fields r)))
-                      results))
+           . ,(let ((aborted (every (lambda (r)
+                                      (eq (bl.val:package-tx-result-status r)
+                                          :not-validated))
+                                    results)))
+                (mapcar (lambda (r)
+                          (cons (hash-to-hex (bl.val:package-tx-result-wtxid r))
+                                (%package-tx-result-fields r aborted)))
+                        results)))
           ;; Always present, [] when nothing was replaced (rpc/mempool.cpp
           ;; :1496-1498).
           ("replaced-transactions"

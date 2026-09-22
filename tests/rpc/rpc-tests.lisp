@@ -2799,9 +2799,12 @@ make."
         (is (= 1 (bl.mp:mempool-count mempool)))))))
 
 (test package-client-maxfeerate-aborts-package
-  "A member over submitpackage's maxfeerate aborts the WHOLE package before
-submission: that member is invalid with :max-feerate-exceeded, later members
-are :not-validated, and nothing enters the mempool (validation.cpp:1365-1368)."
+  "A member over submitpackage's maxfeerate fails in PreChecks
+(validation.cpp:1365-1368) like any TX_MEMPOOL_POLICY verdict: the package
+phase is skipped, but AcceptPackage goes on judging the later members on
+their own (:1694-1708), so the child reports its own missing inputs -- it was
+a :not-validated placeholder here, and rpc_packages.py:447 reads
+bad-txns-inputs-missingorspent -- and nothing enters the mempool."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((parent (pkg-tx funding-txid 0 1000000))
            (child (pkg-tx (bl.ser:transaction-hash parent) 0 900000)))
@@ -2809,19 +2812,46 @@ are :not-validated, and nothing enters the mempool (validation.cpp:1365-1368)."
           (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state
            :client-maxfeerate 10000000)
-        (is (eq :transaction-failed msg))
+        ;; The first failing member's verdict, as for any per-tx failure;
+        ;; package_msg is still "transaction failed".
+        (is (eq :max-feerate-exceeded msg))
         (is (eq :invalid (bl.val:package-tx-result-status
                           (%result-for results parent))))
         (is (eq :max-feerate-exceeded (bl.val:package-tx-result-error
                                        (%result-for results parent))))
-        (is (eq :not-validated (bl.val:package-tx-result-status
-                                (%result-for results child)))))
+        (is (eq :invalid (bl.val:package-tx-result-status
+                          (%result-for results child))))
+        (is (eq :missing-input (bl.val:tx-reject-keyword
+                                (bl.val:package-tx-result-error
+                                 (%result-for results child))))))
       (is (= 0 (bl.mp:mempool-count mempool)))
       ;; NIL cap (what maxfeerate=0 becomes) leaves the package alone.
       (multiple-value-bind (msg2) (bl.val:validate-package-for-mempool
                                    (list parent child) utxo-set mempool chain-state)
         (is (eq :success msg2)))
       (is (= 2 (bl.mp:mempool-count mempool))))))
+
+(test package-client-maxfeerate-applies-in-the-package-phase
+  "maxfeerate is a PreChecks rule (validation.cpp:1365-1368), so it applies in
+the package phase too, where a child that could only be judged beside its
+parent meets it: rpc_packages.py:472-478 pairs a parent below the floor with
+a child over the cap, and reads `max feerate exceeded' on the child while the
+parent keeps its own fee verdict. Ours checked the cap in the individual pass
+alone, so the package phase admitted both."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((parent (pkg-tx funding-txid 0 100000000))          ; zero fee
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0 99000000)))
+      (multiple-value-bind (msg results)
+          (bl.val:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state
+           :client-maxfeerate 100000)
+        (declare (ignore msg))
+        (is (eq :max-feerate-exceeded (bl.val:package-tx-result-error
+                                       (%result-for results child))))
+        (is (not (eq :max-feerate-exceeded
+                     (bl.val:package-tx-result-error
+                      (%result-for results parent))))))
+      (is (= 0 (bl.mp:mempool-count mempool))))))
 
 (test script-has-valid-ops-p-matches-core
   "CScript::HasValidOps: a truncated push, an over-long push, and an undefined

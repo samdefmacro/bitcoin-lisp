@@ -481,7 +481,8 @@ passed and REPLACED-SET (a txid hash-set) is what the package evicts."
              (values reason nil)))))))
 
 (defun %accept-package-subset (txns utxo-set mempool chain-state height
-                               pkg-coins now results replaced)
+                               pkg-coins now results replaced
+                               &key client-maxfeerate)
   "Validate the deferred TXNS (topologically ordered) as a unit at the package
 feerate and, once EVERY check has passed, submit them all parents-first.
 Updates the RESULTS table (wtxid -> package-tx-result) and the REPLACED
@@ -543,6 +544,14 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
           ;; like Core's ws.m_vsize totals (validation.cpp:1494-1496).
           (let ((vsize (bl.mp:sigop-adjusted-vsize
                         (bl.ser:transaction-weight tx) sigops)))
+            ;; CLIENT-MAXFEERATE is PreChecks' too (validation.cpp:1365-1368),
+            ;; on the member's own modified feerate, in the package phase as
+            ;; in the individual one: rpc_packages.py:478 reads it on a child
+            ;; that could only be judged beside its parent.
+            (when (and client-maxfeerate
+                       (> (* modified-fee 1000) (* client-maxfeerate vsize)))
+              (%mark-result-invalid (gethash wtxid results) :max-feerate-exceeded)
+              (return-from %accept-package-subset :max-feerate-exceeded))
             (incf total-fee modified-fee)
             (incf total-vsize vsize)
             (push (%make-pkg-val tx (bl.ser:transaction-hash tx)
@@ -947,25 +956,21 @@ mempool, exactly as in Core's early return.
                  (validate-transaction-for-mempool tx utxo-set mempool height
                                                    :chain-state chain-state)
                ;; The caller's feerate cap is checked in PreChecks, i.e. BEFORE
-               ;; submission, and aborts the whole package on the first breach
-               ;; (validation.cpp:1365-1368). Compare exactly, by
-               ;; cross-multiplication: modified-fee/vsize > rate/1000. Core
-               ;; compares CFeeRate(m_modified_fees, m_vsize), so the
-               ;; prioritised fee against the sigop-adjusted size.
-               (when (and valid client-maxfeerate)
-                 (let ((vsize (bl.mp:sigop-adjusted-vsize
-                               (bl.ser:transaction-weight tx)
-                               sigops)))
-                   (when (> (* (or modified-fee fee) 1000)
-                            (* client-maxfeerate vsize))
-                     (%mark-result-invalid res :max-feerate-exceeded)
-                     (return-from validate-package-for-mempool
-                       (values :transaction-failed
-                               (%finalize-package-results package results
-                                                          :max-feerate-exceeded)
-                               (loop for k being the hash-keys of replaced
-                                     collect k)
-                               "transaction failed")))))
+               ;; submission (validation.cpp:1365-1368): a TX_MEMPOOL_POLICY
+               ;; failure of THIS member like any other, so it quits the
+               ;; package phase and the loop goes on judging the rest
+               ;; individually (:1694-1708) -- rpc_packages.py:447 reads the
+               ;; child's own missing-inputs verdict beside the parent's. Ours
+               ;; returned at once with placeholders for the rest. Compare
+               ;; exactly, by cross-multiplication: modified-fee/vsize >
+               ;; rate/1000. Core compares CFeeRate(m_modified_fees, m_vsize),
+               ;; so the prioritised fee against the sigop-adjusted size.
+               (when (and valid client-maxfeerate
+                          (> (* (or modified-fee fee) 1000)
+                             (* client-maxfeerate
+                                (bl.mp:sigop-adjusted-vsize
+                                 (bl.ser:transaction-weight tx) sigops))))
+                 (setf valid nil err :max-feerate-exceeded))
                (cond
                  (valid
                   (let ((add-result (%accept-into-mempool tx txid fee sigops
@@ -1026,7 +1031,8 @@ mempool, exactly as in Core's early return.
         (let ((msg (%accept-package-subset deferred utxo-set mempool chain-state
                                            height
                                            (%build-package-coins package (1+ height))
-                                           now results replaced)))
+                                           now results replaced
+                                           :client-maxfeerate client-maxfeerate)))
           (unless (eq msg :success)
             (when (null fail-reason)
               (setf package-level-failure (%package-level-reject-p msg)))
