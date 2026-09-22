@@ -140,6 +140,37 @@ interface_rest.py:270-272 reverses the .bin bytes to compare them."
                                      (bl.crypto:hex-to-bytes hash-hex)))
                      (%rest-hex-or-bin ext hash-hex))))))
 
+(defun %rest-read-block (node hash-text)
+  "HASH-TEXT's block, or NIL and the refusal Core's rest_block answers
+(rest.cpp:405-437): no index entry is 404 `<hash> not found'; an entry
+whose body this node does not have is 404 `not available (pruned data)' or
+`(not fully downloaded)'; a body the index says is here but that does not
+read is 500 `I/O error reading <hash>' -- interface_rest.py:500-505 renames
+the blk files away and expects 500 from /block and /blockpart."
+  (let* ((hash (parse-hex-hash hash-text))
+         (chain-state (rpc-get-chain-state node))
+         (store (rpc-get-block-store node))
+         (entry (and chain-state (bl.store:get-block-index-entry chain-state hash))))
+    (cond
+      ((null entry)
+       (values nil (%rest-error 404 (format nil "~A not found" hash-text))))
+      ((not (and store (bl.store:block-exists-p store hash)))
+       (values nil (%rest-error 404
+                                (format nil "~A not available (~A)" hash-text
+                                        (if (let ((pruned (bl.store:chain-state-pruned-height
+                                                           chain-state)))
+                                              (and pruned (plusp pruned)
+                                                   (<= (bl.store:block-index-entry-height entry)
+                                                       pruned)))
+                                            "pruned data"
+                                            "not fully downloaded")))))
+      (t
+       (let ((block (ignore-errors (bl.store:get-block store hash))))
+         (if block
+             (values block nil)
+             (values nil (%rest-error 500 (format nil "I/O error reading ~A"
+                                                  hash-text)))))))))
+
 (defun %rest-block (node body ext &key notxdetails)
   "/rest/block/<hash> and /rest/block/notxdetails/<hash>.
 
@@ -152,6 +183,9 @@ here answered without any prevout, so a block explorer had to fetch every
 spent output itself."
   (unless (valid-hex-hash-p body)
     (return-from %rest-block (%rest-error 400 (format nil "Invalid hash: ~A" body))))
+  (multiple-value-bind (block refusal) (%rest-read-block node body)
+    (declare (ignore block))
+    (when refusal (return-from %rest-block refusal)))
   (handler-case
       (%rest-by-ext ext
         :json (%rest-json (rpc-getblock node (list body (if notxdetails 1 3))))
@@ -530,15 +564,17 @@ not wrap, so a plain + is already the safe version."
       ((null offset) (%rest-error 400 "Block part offset missing or invalid"))
       ((null size) (%rest-error 400 "Block part size missing or invalid"))
       ((not (valid-hex-hash-p body)) (%rest-error 400 (format nil "Invalid hash: ~A" body)))
-      ((string= ext "json") (%rest-format-not-found ".bin, .hex"))
-      ((not (or (string= ext "hex") (string= ext "bin")))
-       (%rest-format-not-found ".bin, .hex"))
       (t
-       (let* ((hash (parse-hex-hash body))
-              (store (rpc-get-block-store node))
-              (block (and store (bl.store:get-block store hash))))
+       ;; rest_block reads the block first and judges the format after
+       ;; (rest.cpp:405-452): JSON is a 400 with its own sentence here, since
+       ;; blockpart passes no tx verbosity (:450-452; interface_rest.py:495).
+       (multiple-value-bind (block refusal) (%rest-read-block node body)
          (cond
-           ((null block) (%rest-error 404 (format nil "~A not found" body)))
+           (refusal refusal)
+           ((string= ext "json")
+            (%rest-error 400 "JSON output is not supported for this request type"))
+           ((not (or (string= ext "hex") (string= ext "bin")))
+            (%rest-format-not-found ".bin, .hex, .json"))
            (t
             (let ((bytes (bl.ser:serialize-witness-block block)))
               (if (or (zerop size) (> (+ offset size) (length bytes)))

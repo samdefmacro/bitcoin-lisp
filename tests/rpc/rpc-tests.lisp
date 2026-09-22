@@ -6454,10 +6454,11 @@ shorter route would swallow every blockpart request and try to read
                        (req "/rest/blockpart/00.bin" '(("offset" . "-1") ("size" . "1")))))
       (is-true (search "Block part size missing or invalid"
                        (req "/rest/blockpart/00.bin" '(("offset" . "0") ("size" . "x")))))
-      ;; JSON is refused for this endpoint. A full-length hash is needed to
-      ;; reach the format check at all, since the hash is validated first once
-      ;; the parameters are good.
-      (is-true (search "output format not found"
+      ;; Core reads the block BEFORE it judges the format (rest.cpp:405-452),
+      ;; so a well-formed hash nothing knows is `not found' whatever the
+      ;; extension; the JSON refusal for a known block is asserted in
+      ;; rest-block-reads-in-core-s-order-and-says-so.
+      (is-true (search "not found"
                        (req (format nil "/rest/blockpart/~64,'0D.json" 0)
                             '(("offset" . "0") ("size" . "1")))))
       ;; A bad hash is still a bad hash — but only once the parameters are

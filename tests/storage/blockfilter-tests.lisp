@@ -846,3 +846,37 @@ not found' and interface_rest.py:308 got a 404."
                                      (vector (length encoded))
                                      encoded)
                         (coerce bin '(vector (unsigned-byte 8)))))))))))
+
+(test rest-block-reads-in-core-s-order-and-says-so
+  "Core's rest_block reads the block before it judges the format and answers
+each failure its own way (rest.cpp:405-452): /blockpart as JSON is 400 `JSON
+output is not supported for this request type' (interface_rest.py:495), and a
+body the index says is here but that will not read is 500 `I/O error reading
+<hash>' from /block and /blockpart alike (:500-505, which renames the blk
+files away). Ours answered the JSON request 404 and the unreadable body 404."
+  (with-network (:regtest)
+    (let ((node (%bfi-regtest-node)))
+      (let ((bl:*node* node))
+        (let* ((hashes (generate-regtest-blocks node 2))
+               (tip (second hashes)))
+          (multiple-value-bind (body status)
+              (rest-request node (format nil "/rest/blockpart/~A.json?offset=0&size=1" tip))
+            (is (eql 400 status))
+            (is-true (search "JSON output is not supported for this request type" body)))
+          ;; Control: the bin form answers while the files are there.
+          (is (eql 200 (nth-value 1 (rest-request
+                                     node (format nil "/rest/blockpart/~A.bin?offset=0&size=1" tip)))))
+          (let ((files (directory (merge-pathnames "blk*.dat"
+                                                   (bl.store:store-blocks-path
+                                                    (bl:node-block-store node))))))
+            (unwind-protect
+                 (progn
+                   (dolist (f files) (rename-file f (make-pathname :type "bkp" :defaults f)))
+                   (dolist (uri (list (format nil "/rest/block/~A.bin" tip)
+                                      (format nil "/rest/blockpart/~A.bin?offset=0&size=1" tip)))
+                     (multiple-value-bind (body status) (rest-request node uri)
+                       (is (eql 500 status) "~A: ~A ~S" uri status body)
+                       (is-true (and (stringp body) (search "I/O error reading" body))))))
+              (dolist (f files)
+                (ignore-errors
+                 (rename-file (make-pathname :type "bkp" :defaults f) f))))))))))
