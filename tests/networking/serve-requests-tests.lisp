@@ -150,6 +150,40 @@ Returns (VALUES chain-state entries) with ENTRIES ascending (genesis first)."
                   (bl.ser:block-header-hash
                    (car (last headers))))))))
 
+(test a-getheaders-at-our-tip-makes-the-next-block-a-headers-announcement
+  "Core's GETHEADERS handler RESETS the peer's pindexBestHeaderSent to the last
+header it sent, or to our tip when the answer is empty
+(net_processing.cpp:4455-4468), and PeerHasHeader reads it (:1352-1359). So a
+sendheaders peer that asked for headers at our tip already has the next
+block's parent, and that block is announced as a header, not an inv
+(p2p_sendheaders.py:300-309). Ours never recorded what a getheaders sent."
+  (multiple-value-bind (cs entries) (%make-served-chain 6)
+    (let ((bl:*network* :regtest)
+          (peer (bl.net:make-peer :address "test" :state :ready))
+          (tip5 (%entry-hash entries 5))
+          (tip6 (%entry-hash entries 6)))
+      (bl.net:init-peer-rate-limiters peer)
+      (setf (bl.net:peer-prefers-headers peer) t)
+      ;; Our tip is block 5 when the peer asks.
+      (bl.store:update-chain-tip cs tip5 5)
+      (with-ibd-context
+        (captured-sends
+         (lambda ()
+           (deliver-ibd-message peer "getheaders" (%getheaders-payload (list tip5))
+                                (bl.ctx:make-node-context :chain-state cs)))))
+      (is (equalp tip5 (bl.net:peer-best-header-sent-hash peer))
+          "an empty answer records our tip")
+      ;; Block 6 connects and is announced.
+      (bl.store:update-chain-tip cs tip6 6)
+      (bl.net:queue-block-announcement peer tip6)
+      (let ((sent (captured-sends
+                   (lambda () (bl.net:flush-block-announcements (list peer) cs)))))
+        (is (equal '("headers") (mapcar #'%message-command sent)))
+        (is (equalp (list tip6)
+                    (mapcar #'bl.ser:block-header-hash
+                            (bl.ser:parse-headers-payload
+                             (%message-payload (first sent))))))))))
+
 (test getheaders-null-locator-returns-stop-header
   (multiple-value-bind (cs entries) (%make-served-chain 5)
     (let* ((payload (%getheaders-payload '() (%entry-hash entries 3)))

@@ -3178,8 +3178,11 @@ returning ENTRIES whole; a STOP-HASH not present in ENTRIES also returns all."
 +max-headers-count+ headers from our active chain just after the locator's fork
 point — or just the stop block's header when the locator is empty. Returns a
 serialized headers message (empty when we have nothing to add), or NIL when
-Core sends nothing at all.
-Mirrors Bitcoin Core's GETHEADERS handler (net_processing.cpp:4426-4437)."
+Core sends nothing at all. The second value is what Core then records as the
+peer's pindexBestHeaderSent (net_processing.cpp:4455-4468): the last header
+sent, or our tip when the answer is empty -- \"we might have announced the
+block being connected with a compact block\", so it is RESET, never maxed.
+Mirrors Bitcoin Core's GETHEADERS handler (net_processing.cpp:4426-4470)."
   (multiple-value-bind (locator-hashes stop-hash)
       (bl.ser:parse-block-locator-payload payload)
     (when (null locator-hashes)
@@ -3195,18 +3198,22 @@ Mirrors Bitcoin Core's GETHEADERS handler (net_processing.cpp:4426-4437)."
           (when (and entry
                      (%block-request-allowed-p
                       chain-state entry (bl.store:best-header-entry chain-state)))
-            (bl.ser:make-headers-message
-             (list (bl.store:block-index-entry-header entry)))))))
+            (values (bl.ser:make-headers-message
+                     (list (bl.store:block-index-entry-header entry)))
+                    stop-hash)))))
     ;; Walk forward from the fork point, stop hash inclusive.
     (let* ((fork (bl.store:find-fork-in-active-chain
                   chain-state locator-hashes))
            (entries (bl.store:active-chain-entries-from
                      chain-state
                      (1+ (bl.store:block-index-entry-height fork))
-                     bl.ser:+max-headers-count+)))
-      (bl.ser:make-headers-message
-       (mapcar #'bl.store:block-index-entry-header
-               (truncate-entries-at-stop entries stop-hash t))))))
+                     bl.ser:+max-headers-count+))
+           (sent (truncate-entries-at-stop entries stop-hash t)))
+      (values (bl.ser:make-headers-message
+               (mapcar #'bl.store:block-index-entry-header sent))
+              (if sent
+                  (bl.store:block-index-entry-hash (car (last sent)))
+                  (bl.store:best-block-hash chain-state))))))
 
 (define-p2p-handler ("getheaders" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
   "Serve a peer's getheaders by sending the headers message built from PAYLOAD
@@ -3214,8 +3221,13 @@ against our active chain (see getheaders-response-message). NIL means Core
 sends nothing at all -- a null-locator request for a block we do not know or
 may not serve."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((msg (getheaders-response-message payload chain-state)))
+  (multiple-value-bind (msg best-sent)
+      (getheaders-response-message payload chain-state)
     (when msg
+      ;; PeerHasHeader reads this: after a getheaders at our tip, the next
+      ;; block's parent is known to the peer, so it is announced as a header
+      ;; (p2p_sendheaders.py:300-309).
+      (setf (peer-best-header-sent-hash peer) best-sent)
       (send-message peer msg)))))
 
 (defun getblocks-response-message (payload chain-state)
