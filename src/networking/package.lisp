@@ -72,6 +72,7 @@ headerssync.cpp. src/networking/.")
    ;; Shutdown
    #:request-ibd-stop
    #:reset-ibd-stop
+   #:reset-ibd-context
    #:ibd-stop-requested-p
    #:join-thread-or-destroy
    ;; Tx-request tracking

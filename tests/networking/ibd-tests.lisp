@@ -5822,3 +5822,20 @@ that reads it also drops it. Runs over a loopback socket pair."
                  (ignore-errors (bl.net:disconnect-peer server-peer))
                  (ignore-errors (bl.net:disconnect-peer client)))))
         (bl.net:close-listener srv)))))
+
+(test the-receive-pump-keeps-the-nodes-ibd-context
+  "The between-cycles receive pump works in the NODE's IBD context, the one
+*IBD-CONTEXT* names for every thread. It used to build a fresh context on
+every tick and bind it thread-locally for the drain, so a block one tick's
+pump put in flight was not in flight for the next tick, and an RPC thread
+(getpeerinfo's inflight) never saw anything the pump recorded. Core keeps that
+state (mapBlocksInFlight) for the life of the node."
+  (let ((bl.net:*ibd-context* nil)
+        (node-ctx (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state))))
+    (let* ((first-pass (bl.net:pump-peer-messages '() node-ctx nil))
+           (second-pass (bl.net:pump-peer-messages '() node-ctx nil)))
+      (is (eq first-pass second-pass) "one context across ticks")
+      (is (eq first-pass bl.net:*ibd-context*)
+          "and it is the one every other thread reads")
+      (is (zerop (bl.net:ibd-context-headers-received second-pass))
+          "control: each pass still reports only its own headers"))))

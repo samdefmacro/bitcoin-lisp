@@ -1980,6 +1980,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
   ;; CheckForStaleTipAndEvictPeers (net_processing.cpp:5460)
   (when sync
     (bl.net:reset-ibd-stop)
+    (bl.net:reset-ibd-context)          ; one IBD context per node
     (bl.net:reset-tx-requests)
     (bl.net:reset-initial-broadcast-schedule)
     ;; Fresh recent-confirmed filter (Core builds it per process; covers

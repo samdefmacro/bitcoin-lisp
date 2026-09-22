@@ -246,7 +246,26 @@ cells and `delivery-samples` (time peer-address latency-ms) lists."
   (delete-if (lambda (s) (< (first s) cutoff-ticks)) samples))
 
 (defvar *ibd-context* nil
-  "Current IBD context.")
+  "The node's IBD context -- ONE for the life of the node, created by the first
+sync pass or receive pump that needs it (ENSURE-IBD-CONTEXT) and dropped only by
+RESET-IBD-CONTEXT at node start. Every thread reads this binding: the sync
+pass, the between-cycles receive pump and the RPC threads (getpeerinfo's
+inflight, the MEM log line). Core's counterpart is PeerManagerImpl's own
+state (mapBlocksInFlight and friends), which lives as long as the node.
+
+Until 2026-09-23 START-IBD made a new one per sync pass and set this to NIL
+when the pass ended, and the pump built a FRESH context on every tick and bound
+it thread-locally for the drain: a block requested by one tick's pump was not
+in flight for the next tick, and no RPC thread ever saw anything the pump
+recorded.")
+
+(defun ensure-ibd-context ()
+  "The node's IBD context, created on first use."
+  (or *ibd-context* (setf *ibd-context* (make-ibd))))
+
+(defun reset-ibd-context ()
+  "Drop the node's IBD context (node start; also covers in-image restarts)."
+  (setf *ibd-context* nil))
 
 ;;; *ibd-stop-requested* is defined in connection.lisp (the first-loaded
 ;;; networking file) so the low-level socket read can poll it; the IBD inner
@@ -413,10 +432,10 @@ files a plain getdata download (net_processing.cpp:6189) and a compact-block
 getblocktxn round trip (:4668) in the same mapBlocksInFlight, and
 GetNodeStateStats reads it. We keep the compact-block half on the PEER as well
 — PEER-PENDING-COMPACT-BLOCK — and that half is the only one an RPC thread can
-be sure of seeing: PUMP-PEER-MESSAGES binds *IBD-CONTEXT* thread-locally to a
-context of its own for the drain, so a mark the pump made is not in the context
-this function reads here. Reporting the union is what makes the answer true
-from any thread, which is the whole point of the field
+be sure of seeing while a caller drains with a context of its own (a test, or
+any PUMP-PEER-MESSAGES given one explicitly, which binds it thread-locally).
+Reporting the union is what makes the answer true from any thread, which is
+the whole point of the field
 (p2p_mutated_blocks.py:76-78 reads it over RPC while a getblocktxn is
 outstanding)."
   (let ((result '()))
@@ -2575,15 +2594,20 @@ ProcessMessages/SendMessages runs continuously). Returns the pump's
 ibd-context so the caller can inspect counters (e.g. headers-received > 0
 means a new block was announced and a sync cycle should start now)."
   (bl.ctx:with-node-context (mempool address-book) node-ctx
-  (let ((ctx (or ctx (make-ibd))))
+  (let ((own (null ctx))
+        (ctx (or ctx (ensure-ibd-context))))
     (setf (ibd-context-mempool ctx) mempool
           (ibd-context-peers ctx) peers
           (ibd-context-address-book ctx) address-book
           ;; the handlers relay through node-ctx's peers: keep it the live list
           (bl.ctx:node-context-peers node-ctx) peers)
+    ;; The idle tick reads HEADERS-RECEIVED as \"did THIS pass bring headers\",
+    ;; so the node's context starts the pass at zero.
+    (when own
+      (setf (ibd-context-headers-received ctx) 0))
     ;; process-received-block and the block-activation path read the ambient
-    ;; *ibd-context*; bind it to the pump's context for the drain (thread-
-    ;; local, so concurrent RPC readers are unaffected).
+    ;; *ibd-context*: a caller's own context is bound for the drain; the
+    ;; node's context already IS the binding every thread reads.
     (let ((*ibd-context* ctx))
       (dolist (peer peers)
         (drain-and-reap-peer peer node-ctx ctx)))
@@ -2594,7 +2618,15 @@ means a new block was announced and a sync cycle should start now)."
 Returns the number of blocks downloaded. NODE-CTX's historical-chainstate, when
 non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
 a second download cursor for its [tip .. snapshot-base] range."
-    (setf *ibd-context* (make-ibd))
+  ;; A fresh cycle's bookkeeping, but the node's in-flight table carries over:
+  ;; those requests are outstanding at our peers whatever pass made them
+  ;; (Core's mapBlocksInFlight outlives every loop). The timeout and
+  ;; disconnected-peer sweeps (GET-TIMED-OUT-REQUESTS,
+  ;; RELEASE-ORPHANED-IN-FLIGHT) retire the stale ones.
+  (let ((fresh (make-ibd)))
+    (when *ibd-context*
+      (setf (ibd-context-in-flight fresh) (ibd-context-in-flight *ibd-context*)))
+    (setf *ibd-context* fresh))
   ;; TARGET-HEIGHT arrives as a peer's advertised start height, which is a
   ;; SIGNED int32 on the wire and whose "unknown" value is -1 (Core's
   ;; CNode::nStartingHeight initialises to -1, and its own P2PInterface test
@@ -2616,9 +2648,7 @@ a second download cursor for its [tip .. snapshot-base] range."
   (setf (ibd-context-request-timeout *ibd-context*)
         (compute-block-download-timeout (length peers)))
 
-  (unwind-protect
-       (run-ibd peers node-ctx)
-    (setf *ibd-context* nil)))
+  (run-ibd peers node-ctx))
 
 (defun %headers-already-ahead-p (chain-state ctx)
   "T when the header chain already reaches past the block tip, so Phase 1 has
