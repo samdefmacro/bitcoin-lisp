@@ -691,17 +691,57 @@ than m are present."
                            when s collect s)))
         (when (>= (length ordered) m) (subseq ordered 0 m))))))
 
-(defun %psbt-finalize (map spk)
+(defun %psbt-preimage (map kind hash)
+  "The preimage MAP carries for a KIND (:ripemd160 :sha256 :hash160 :hash256)
+hash fragment, or NIL (PSBT_IN_RIPEMD160 .. PSBT_IN_HASH256, BIP174)."
+  (let ((keytype (ecase kind (:ripemd160 #x0a) (:sha256 #x0b) (:hash160 #x0c) (:hash256 #x0d))))
+    (cdr (assoc hash (bl.ser:psbt-map-collect map keytype) :test #'equalp))))
+
+(defun %psbt-miniscript-witness (script map tx index)
+  "The witness for a P2WSH WITNESS script that is not multisig, finalized from
+what MAP carries: Core's finalizer runs ProduceSignature over the PSBT's own
+signing data (SignPSBTInput with finalize, psbt.cpp:440-500), whose P2WSH arm
+satisfies the inferred miniscript from the partial signatures, the hash
+preimages and the transaction's own timelocks (script/sign.cpp:772-777;
+FillSignatureData supplies the rest, psbt.cpp:111-160). pk() and pkh() are
+miniscripts too, so wsh(pkh(K)) comes out as <sig> <pubkey> <script>. NIL when
+the satisfaction is incomplete or malleable (Core's Satisfy default)."
+  (let* ((by-hash (bl.bytes:make-octets-hash-table))
+         (node (progn
+                 (dolist (pk (append (mapcar #'car (bl.ser:psbt-map-collect
+                                                    map bl.ser:+psbt-in-partial-sig+))
+                                     (mapcar #'car (bl.ser:psbt-map-collect
+                                                    map bl.ser:+psbt-in-bip32+))))
+                   (setf (gethash (bl.crypto:hash160 pk) by-hash) pk))
+                 (bl.val:ms-from-script
+                  script :pkh-resolver (lambda (h) (gethash h by-hash))))))
+    (when node
+      (multiple-value-bind (stack malleable)
+          (bl.val:ms-satisfy
+           node
+           (bl.val:make-ms-satisfier
+            :sign-fn (lambda (pubkey) (%psbt-sig-for map pubkey))
+            :preimage-fn (lambda (kind hash) (%psbt-preimage map kind hash))
+            :check-older-fn (lambda (v) (and tx (bl.val:ms-check-older tx index v)))
+            :check-after-fn (lambda (v) (and tx (bl.val:ms-check-after tx index v)))))
+        (when (and stack (not malleable))
+          (append stack (list script)))))))
+
+(defun %psbt-finalize (map spk &optional tx index)
   "Try to finalize the input MAP spending SPK. Returns (values scriptsig
-witness-stack) on success (either may be nil/empty), or (values nil nil)."
+witness-stack) on success (either may be nil/empty), or (values nil nil).
+TX and INDEX are the unsigned transaction and the input's position, which a
+miniscript timelock is checked against."
   (let ((rs (bl.ser:psbt-map-find
              map bl.ser:+psbt-in-redeem-script+))
         (ws (bl.ser:psbt-map-find
              map bl.ser:+psbt-in-witness-script+))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (labels ((ms-witness (script)
-               (let ((sigs (%psbt-multisig-sigs script map)))
-                 (when sigs (append (list empty) sigs (list script)))))
+               (if (bl.rpc:parse-multisig script)
+                   (let ((sigs (%psbt-multisig-sigs script map)))
+                     (when sigs (append (list empty) sigs (list script))))
+                   (%psbt-miniscript-witness script map tx index)))
              (ms-scriptsig (script)
                (let ((sigs (%psbt-multisig-sigs script map)))
                  (when sigs (apply #'%psbt-concat #(#x00)
@@ -856,7 +896,7 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
                  map bl.ser:+psbt-in-final-scriptwitness+))
             nil                          ; already final
             (let ((spk (%psbt-input-spk map (aref ins i))))
-              (multiple-value-bind (ss wit) (if spk (%psbt-finalize map spk) (values nil nil))
+              (multiple-value-bind (ss wit) (if spk (%psbt-finalize map spk tx i) (values nil nil))
                 (if (or (and ss (plusp (length ss))) wit)
                     (%psbt-set-final map ss wit)
                     (setf complete nil)))))))
@@ -1572,7 +1612,7 @@ Returns T when EVERY input is final."
             nil
             (let ((spk (%psbt-input-spk map (aref ins i))))
               (multiple-value-bind (ss wit)
-                  (if spk (%psbt-finalize map spk) (values nil nil))
+                  (if spk (%psbt-finalize map spk tx i) (values nil nil))
                 (if (or (and ss (plusp (length ss))) wit)
                     (%psbt-set-final map ss wit)
                     (setf complete nil)))))))

@@ -2644,3 +2644,79 @@ nothing)."
             (is (= 1 (length (coerce (or (%aval "taproot_script_path_sigs" in-signed) '())
                                      'list)))
                 "the key-only wallet signs the leaf: ~S" in-signed)))))))
+
+(test walletprocesspsbt-signs-and-finalizes-wsh-scripts-that-are-not-multisig
+  "Core signs a P2WSH (or P2SH-P2WSH) witness script that is not multisig by
+satisfying the inferred miniscript (script/sign.cpp:772-777), records every
+signature it makes as a PSBT partial signature (CreateSig -> sigdata.signatures,
+sign.cpp:83-98; FromSignatureData, psbt.cpp:178), and its finalizer satisfies
+the same miniscript from the PSBT's partial signatures and preimages
+(SignPSBTInput with finalize, psbt.cpp:440-500).
+
+Ours recorded nothing for a miniscript witness script -- only the finished
+stack of a COMPLETE satisfaction, which a PSBT cannot hold -- and its
+finalizer knew multisig alone. So sh(wsh(pkh(K))) was never signed
+(wallet_send.py:486), and a cosigner holding one key of wsh(and_v(v:pk(A),
+pk(B))) contributed nothing (wallet_miniscript.py:302 reads
+partial_signatures). The finished transaction must pass testmempoolaccept."
+  (with-wallet-chain-node (node "wsh-miniscript-psbt")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (keys (loop for b in '(7 8)
+                         collect (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
+             (wifs (mapcar (lambda (sk) (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+                           keys))
+             (pubs (mapcar (lambda (sk) (bl.crypto:bytes-to-hex (bl.crypto:derive-public-key sk :compressed t)))
+                           keys)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (labels ((fund-and-psbt (name desc seed)
+                   (let* ((address (first (rpc nil "deriveaddresses" desc)))
+                          (txid (let ((bl.wallet::*wallet-rng* (make-wallet-rng seed)))
+                                  (rpc "fund" "sendtoaddress" address (bl.rpc:format-money 100000000)
+                                       nil nil nil nil nil nil nil 10))))
+                     (rpc nil "generatetoaddress" 1 optrue)
+                     (let ((coin (find txid (coerce (rpc name "listunspent") 'list)
+                                       :key (lambda (c) (%aval "txid" c)) :test #'equal)))
+                       (rpc nil "createpsbt"
+                            (list (obj "txid" txid "vout" (%aval "vout" coin)))
+                            (list (obj optrue (bl.rpc:format-money 99990000)))))))
+                 (import-into (name desc)
+                   (rpc nil "createwallet" name nil t)
+                   (rpc name "importdescriptors" (list (obj "desc" desc "timestamp" "now"))))
+                 (sig-count (psbt)
+                   (length (coerce (or (%aval "partial_signatures"
+                                              (first (coerce (%aval "inputs" (rpc nil "decodepsbt" psbt))
+                                                             'list)))
+                                       '())
+                                   'list)))
+                 (accepted-p (hex)
+                   (eq t (%aval "allowed" (first (rpc nil "testmempoolaccept" (list hex)))))))
+          ;; sh(wsh(pkh(K))): one wallet, one key, complete.
+          (let ((desc (bl.rpc:descriptor-add-checksum
+                       (format nil "sh(wsh(pkh(~A)))" (first wifs)))))
+            (import-into "nested" desc)
+            (let ((res (rpc "nested" "walletprocesspsbt" (fund-and-psbt "nested" desc 71))))
+              (is (eq t (%aval "complete" res)) "sh(wsh(pkh())): ~S" res)
+              (is-true (and (%aval "hex" res) (accepted-p (%aval "hex" res))))))
+          ;; wsh(and_v(v:pk(A),pk(B))): two cosigners, one key each.
+          (let ((desc-a (bl.rpc:descriptor-add-checksum
+                         (format nil "wsh(and_v(v:pk(~A),pk(~A)))" (first wifs) (second pubs))))
+                (desc-b (bl.rpc:descriptor-add-checksum
+                         (format nil "wsh(and_v(v:pk(~A),pk(~A)))" (first pubs) (second wifs)))))
+            (import-into "cosign-a" desc-a)
+            (import-into "cosign-b" desc-b)
+            (let* ((psbt (fund-and-psbt "cosign-a" desc-a 73))
+                   (half (rpc "cosign-a" "walletprocesspsbt" psbt))
+                   (full (rpc "cosign-b" "walletprocesspsbt" (%aval "psbt" half))))
+              (is (not (eq t (%aval "complete" half))))
+              (is (= 1 (sig-count (%aval "psbt" half))) "A's signature is recorded")
+              (is (eq t (%aval "complete" full)) "B completes it: ~S" full)
+              (is-true (and (%aval "hex" full) (accepted-p (%aval "hex" full)))))))))))

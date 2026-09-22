@@ -584,9 +584,17 @@ unspendable one.
 
 A malleable satisfaction is refused outright. MS-SATISFY's second value says a
 third party could rewrite the witness into another equally valid one, which
-changes the txid of a transaction already in flight."
+changes the txid of a transaction already in flight.
+
+Second value: every (pubkey . signature) the satisfier made on the way, whether
+or not the satisfaction completed -- Core's CreateSig records each signature in
+sigdata.signatures as it is made (sign.cpp:83-98), and FromSignatureData turns
+them into PSBT partial signatures (psbt.cpp:178). A cosigner holding one key
+of a policy that needs two contributes its signature that way;
+wallet_miniscript.py:302 counts them."
   (let ((node (bl.val:ms-from-script
-               witness-script :pkh-resolver (%wsh-pkh-resolver keymap))))
+               witness-script :pkh-resolver (%wsh-pkh-resolver keymap)))
+        (pairs '()))
     (when node
       (multiple-value-bind (stack malleable)
           (bl.val:ms-satisfy
@@ -595,12 +603,17 @@ changes the txid of a transaction already in flight."
             :sign-fn
             (lambda (pubkey)
               (let ((sk (gethash pubkey pubmap)))
-                (when sk (%bip143-sig witness-script amount sk sighash-byte))))
+                (when sk
+                  (let ((sig (%bip143-sig witness-script amount sk sighash-byte)))
+                    (unless (assoc pubkey pairs :test #'equalp)
+                      (push (cons pubkey sig) pairs))
+                    sig))))
             ;; No preimage source exists on this path; a hash branch is simply
             ;; unavailable rather than faked.
             :check-older-fn (lambda (v) (bl.val:ms-check-older tx i v))
             :check-after-fn (lambda (v) (bl.val:ms-check-after tx i v))))
-        (and stack (not malleable) stack)))))
+        (values (and stack (not malleable) stack)
+                (nreverse pairs))))))
 
 (defun %p2tr-input (spk amount tap-sighash-type tr-keymap tr-scripts pubmap
                     spent-utxos)
@@ -771,12 +784,12 @@ must be bound by the caller."
                    ((null amount) (fail "P2WSH requires amount"))
                    ;; Not multisig: Core's fallback is miniscript, not a refusal.
                    ((not (parse-multisig witness-script))
-                    (let ((stack (miniscript-stack witness-script)))
-                      (unless stack (fail "witnessScript is not multisig"))
+                    (multiple-value-bind (stack pairs) (miniscript-stack witness-script)
+                      (unless (or stack pairs) (fail "witnessScript is not multisig"))
                       (values (%make-input-sig
                                :kind (if wrapped :p2sh-p2wsh-miniscript :p2wsh-miniscript)
                                :redeem wrapped :witness-script witness-script
-                               :stack stack))))
+                               :stack stack :ecdsa pairs))))
                    (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
                         (values (%make-input-sig
                                  :kind (if wrapped :p2sh-p2wsh :p2wsh)
@@ -918,15 +931,21 @@ the second one saw."
         ;; Miniscript: the satisfier already produced the whole stack, and there
         ;; is no CHECKMULTISIG dummy to prepend. Core appends the witnessScript
         ;; after the satisfaction unconditionally (sign.cpp:777).
+        ;; A satisfaction that did not complete carries only the signatures
+        ;; made on the way (for a PSBT), and is incomplete here.
         (:p2wsh-miniscript
-         (values nil (append (input-sig-stack sig)
-                             (list (input-sig-witness-script sig)))
-                 nil))
+         (if (input-sig-stack sig)
+             (values nil (append (input-sig-stack sig)
+                                 (list (input-sig-witness-script sig)))
+                     nil)
+             (values nil nil "witnessScript is not multisig")))
         (:p2sh-p2wsh-miniscript
-         (values (bl.ser:script-push-data (input-sig-redeem sig))
-                 (append (input-sig-stack sig)
-                         (list (input-sig-witness-script sig)))
-                 nil))
+         (if (input-sig-stack sig)
+             (values (bl.ser:script-push-data (input-sig-redeem sig))
+                     (append (input-sig-stack sig)
+                             (list (input-sig-witness-script sig)))
+                     nil)
+             (values nil nil "witnessScript is not multisig")))
         (:multisig (values (apply #'concatenate '(vector (unsigned-byte 8))
                                   (vector 0) (mapcar #'bl.ser:script-push-data (sigs)))
                            nil (threshold-error "")))
