@@ -1941,3 +1941,42 @@ call must leave)."
             (is (equal '("final_scriptwitness" "non_witness_utxo" "witness_utxo")
                        (keys-of (%aval "psbt" final))))
             (is (eq t (%aval "complete" final)))))))))
+
+(test a-psbt-whose-sighash-field-changed-after-signing-does-not-finalize
+  "FinalizePSBT signs each input with the sighash its own PSBT_IN_SIGHASH_TYPE
+names (psbt.cpp:561) and SignPSBTInput first checks that every signature the
+input carries uses that type (:440-477): a PSBT signed ALL|ANYONECANPAY
+finalizes, and the same PSBT with its sighash fields changed to ALL does not
+(rpc_psbt.py:330-357, over one P2WPKH and one P2TR input). We finalized both."
+  (with-wallet-chain-node (node "sighash-field")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params))))
+      (let ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "w")
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (with-wallet-rng (151)
+          (rpc "fund" "send" (list (%ht (rpc "w" "getnewaddress" "" "bech32") "1")
+                                   (%ht (rpc "w" "getnewaddress" "" "bech32m") "1"))
+               nil nil 10))
+        (rpc nil "generatetoaddress" 1 optrue)
+        (let* ((utxos (mapcar (lambda (u) (%ht "txid" (%aval "txid" u) "vout" (%aval "vout" u)))
+                              (coerce (rpc "w" "listunspent") 'list)))
+               (psbt (with-wallet-rng (153)
+                       (%aval "psbt" (rpc "w" "walletcreatefundedpsbt" utxos
+                                          (list (%ht optrue "0.5")) 0 (%ht "fee_rate" 10)))))
+               (signed (%aval "psbt" (rpc "w" "walletprocesspsbt" psbt t "ALL|ANYONECANPAY"
+                                          t bl.rpc:+json-false+)))
+               (changed (let ((p (bl.ser:decode-psbt signed)))
+                          (loop for map across (bl.ser:psbt-inputs p)
+                                do (bl.ser:psbt-map-set
+                                    map bl.ser:+psbt-in-sighash+
+                                    (make-array 0 :element-type '(unsigned-byte 8))
+                                    (coerce #(1 0 0 0) '(simple-array (unsigned-byte 8) (*)))))
+                          (bl.ser:encode-psbt p))))
+          (is (= 2 (length utxos)))
+          (is (eq t (%aval "complete" (rpc nil "finalizepsbt" signed)))
+              "the control: signed ALL|ANYONECANPAY, it finalizes")
+          (is (not (eq t (%aval "complete" (rpc nil "finalizepsbt" changed))))))))))

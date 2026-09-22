@@ -997,11 +997,40 @@ the satisfaction is incomplete or malleable (Core's Satisfy default)."
         (when (and stack (not malleable))
           (append stack (list script)))))))
 
+(defun %psbt-signatures-match-sighash-p (map spk)
+  "SignPSBTInput's check that every signature an input already carries uses
+the sighash type it is being finalized with (psbt.cpp:440-477), which
+FinalizePSBT takes from the input's own PSBT_IN_SIGHASH_TYPE, defaulting to
+SIGHASH_DEFAULT for a taproot output and SIGHASH_ALL otherwise (:561, :445).
+DEFAULT means 64-byte taproot signatures; any other type, taproot signatures
+of 65 bytes ending in it and ECDSA signatures ending in it. A PSBT whose
+sighash field was changed after signing therefore does not finalize --
+rpc_psbt.py:350-357 changes it to ALL over ALL|ANYONECANPAY signatures and
+expects complete=false; we finalized it."
+  (let* ((field (%psbt-input-sighash-stored map))
+         (taproot (eq (bl.val:classify-script spk) :witness-v1-taproot))
+         (sighash (or field (if taproot 0 1)))
+         (key-sig (bl.ser:psbt-map-find map bl.ser:+psbt-in-tap-key-sig+))
+         (script-sigs (mapcar #'cdr (bl.ser:psbt-map-collect map bl.ser:+psbt-in-tap-script-sig+)))
+         (partial (mapcar #'cdr (bl.ser:psbt-map-collect map bl.ser:+psbt-in-partial-sig+))))
+    (flet ((tap-ok (sig)
+             (if (zerop sighash)
+                 (= (length sig) 64)
+                 (and (= (length sig) 65) (= (aref sig 64) sighash)))))
+      (and (or (null key-sig) (tap-ok key-sig))
+           (every #'tap-ok script-sigs)
+           (or (zerop sighash)
+               (every (lambda (sig) (and (plusp (length sig))
+                                         (= (aref sig (1- (length sig))) sighash)))
+                      partial))))))
+
 (defun %psbt-finalize (map spk &optional tx index)
   "Try to finalize the input MAP spending SPK. Returns (values scriptsig
 witness-stack) on success (either may be nil/empty), or (values nil nil).
 TX and INDEX are the unsigned transaction and the input's position, which a
 miniscript timelock is checked against."
+  (unless (%psbt-signatures-match-sighash-p map spk)
+    (return-from %psbt-finalize (values nil nil)))
   (let ((rs (bl.ser:psbt-map-find
              map bl.ser:+psbt-in-redeem-script+))
         (ws (bl.ser:psbt-map-find
