@@ -1529,5 +1529,6 @@ node0 connected ten pushed blocks and node1 heard about one of them."
             ;; made a 400-block `generate' send 400 separate invs to every peer.
             (bt:with-recursive-lock-held ((node-lock *node*))
               (dolist (peer (node-peers *node*))
-                (dolist (h hashes)
-                  (bl.net:queue-block-announcement peer h))))))))))
+                ;; Oldest first; HASH is each announced block in turn.
+                (dolist (hash hashes)
+                  (bl.net:queue-block-announcement peer hash))))))))))
