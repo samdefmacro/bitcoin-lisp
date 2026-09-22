@@ -294,7 +294,8 @@ ONE idle tick, with Core's line."
          (peer (bl.net:make-peer :state :ready :address "203.0.113.10"
                                  :conn-type :outbound-full-relay
                                  :chain-sync-timeout 1
-                                 :chain-sync-sent-getheaders t)))
+                                 :chain-sync-sent-getheaders t
+                                 :headers-sync-started t)))
     (unwind-protect
          (progn
            (setf (bl:node-running node) t)

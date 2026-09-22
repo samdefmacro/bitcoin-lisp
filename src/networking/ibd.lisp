@@ -3225,7 +3225,13 @@ Silent throughout — no misbehaviour score, no discouragement. A peer on a wors
 chain is useless to us, not malicious."
   (when (and (not (peer-chain-sync-protect peer))
              (peer-outbound-or-block-relay-p peer)
-             (eq (peer-state peer) :ready))
+             (eq (peer-state peer) :ready)
+             ;; Core's third term, `state.fSyncStarted' (:5298): a peer we
+             ;; have not opened header sync with is not judged. It stayed
+             ;; hidden while the sweep ran once per pass; run per tick, it
+             ;; probed a peer p2p_initial_headers_sync.py:177 expects to have
+             ;; received no getheaders at all.
+             (peer-headers-sync-started peer))
     (let* ((tip-hash (bl.store:best-block-hash chain-state))
            (tip (and tip-hash (bl.store:get-block-index-entry
                                chain-state tip-hash)))

@@ -1634,13 +1634,33 @@ claim as its best-known."
 
 (defun %g708-peer (&key (conn-type :outbound-full-relay) inbound best-hash protect
                         (address "test"))
-  (let ((p (bl.net:make-peer :inbound inbound :address address)))
+  ;; Header sync opened: Core judges only a peer with fSyncStarted
+  ;; (net_processing.cpp:5298).
+  (let ((p (bl.net:make-peer :inbound inbound :address address
+                             :headers-sync-started t)))
     (setf (bl.net:peer-conn-type p) conn-type
           (bl.net:peer-state p) :ready
           (bl.net::peer-chain-sync-protect p) protect)
     (when best-hash
       (setf (bl.net:peer-best-known-block-hash p) best-hash))
     p))
+
+(test chain-sync-eviction-waits-for-header-sync-to-start
+  "Core's ConsiderEviction judges an outbound peer only once header sync with
+it has started -- `state.fSyncStarted' (net_processing.cpp:5298). Run on
+every tick, ours probed a peer p2p_initial_headers_sync.py:177 expects never
+to have been sent a getheaders. Control: the same peer with sync started is
+armed."
+  (multiple-value-bind (state tip-hash low-hash) (%g708-chain 1000)
+    (declare (ignore tip-hash))
+    (let ((fresh (bl.net:make-peer :address "test" :state :ready
+                                   :conn-type :outbound-full-relay
+                                   :best-known-block-hash low-hash)))
+      (is (null (bl.net:consider-chain-sync-eviction fresh state 1000))
+          "no header sync yet: not a candidate"))
+    (is (eq :armed (bl.net:consider-chain-sync-eviction
+                    (%g708-peer :best-hash low-hash) state 1000))
+        "control: sync started, the ladder arms")))
 
 (test g7-08-chain-sync-arms-probes-then-disconnects
   "G7-08 P1 (Core ConsiderEviction): a live-but-SILENT outbound peer sitting

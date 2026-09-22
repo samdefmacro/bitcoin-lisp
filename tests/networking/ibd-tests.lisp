@@ -5830,7 +5830,8 @@ that reads it also drops it. Runs over a loopback socket pair."
                                           :state :ready
                                           :conn-type :outbound-full-relay
                                           :chain-sync-timeout 1
-                                          :chain-sync-sent-getheaders t))))
+                                          :chain-sync-sent-getheaders t
+                                          :headers-sync-started t))))
              (is-true server-peer)
              (when server-peer
                (unwind-protect
