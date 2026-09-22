@@ -295,6 +295,43 @@ any socket closed again."
     (when conn (bl.net:close-connection conn))
     (values (and conn t) proxy-failed)))
 
+(test a-refused-dial-fails-at-once-not-at-the-timeout
+  "A connect to a closed port is refused by the kernel at once, and Core's
+ConnectToSocket sees it at once: it waits for the socket to become writable
+and reads SO_ERROR (netbase.cpp:590-643). usocket's SBCL connect polls
+getpeername(2) until its deadline instead, and a refused socket never gets a
+peer name, so each such dial took the whole 10 s timeout -- on the sync
+thread, which does nothing else meanwhile (feature_config_args.py:362 dials an
+-addnode through -proxy=127.0.0.1:1 and gives the node 2 s). Both the direct
+dial and the dial to an unreachable proxy must come back within a second;
+the positive control is that a listening port still connects."
+  (let ((old-proxy bl.net:*proxy*))
+    (unwind-protect
+         (flet ((seconds (thunk)
+                  (let ((t0 (get-internal-real-time)))
+                    (funcall thunk)
+                    (/ (- (get-internal-real-time) t0)
+                       internal-time-units-per-second))))
+           (setf bl.net:*proxy* nil)
+           (is (< (seconds (lambda ()
+                             (is-false (%dial-verdict "127.0.0.1"
+                                                      (%closed-loopback-port)))))
+                  1))
+           (setf bl.net:*proxy* (bl.net:make-proxy :host "127.0.0.1"
+                                                   :port (%closed-loopback-port)
+                                                   :randomize-credentials nil))
+           (is (< (seconds (lambda ()
+                             (is-true (nth-value 1 (%dial-verdict "fakenodeaddr" 18444)))))
+                  1))
+           (setf bl.net:*proxy* nil)
+           (let* ((srv (usocket:socket-listen "127.0.0.1" 0
+                                              :element-type '(unsigned-byte 8)
+                                              :reuse-address t)))
+             (unwind-protect
+                  (is-true (%dial-verdict "127.0.0.1" (usocket:get-local-port srv)))
+               (usocket:socket-close srv))))
+      (setf bl.net:*proxy* old-proxy))))
+
 (test make-tcp-connection-flags-only-an-unreachable-proxy
   "MAKE-TCP-CONNECTION's second value is Core's `proxy_connection_failed', and
 Core raises it in exactly one place: ConnectThroughProxy sets it when

@@ -309,6 +309,69 @@ address literal is never a lookup, in Core (Lookup parses it first) or here."
              (not (string-to-ip-bytes host)))
     "-dns=0 forbids resolving a name locally"))
 
+(defun %socket-connect (host port timeout)
+  "Open a TCP stream socket to HOST:PORT within TIMEOUT seconds, returning a
+usocket STREAM-USOCKET, or signalling a USOCKET:SOCKET-ERROR (a refusal is
+USOCKET:CONNECTION-REFUSED-ERROR, a deadline USOCKET:TIMEOUT-ERROR).
+
+Why not USOCKET:SOCKET-CONNECT: with a :TIMEOUT on SBCL it starts a
+non-blocking connect and then polls getpeername(2) until the deadline, and a
+REFUSED connect never gets a peer name -- so every dial to a closed port cost
+the whole timeout (10 s, measured against 127.0.0.1:1) instead of failing at
+once. A dial is one step of the sync thread, so each such dial froze
+everything else that thread does for those 10 s: feature_config_args.py:362
+-addnode's a name through -proxy=127.0.0.1:1 and gives the fixed-seed line
+two seconds. Core's ConnectToSocket (netbase.cpp:590-643) instead waits
+for the socket to become WRITABLE and then reads SO_ERROR, which is what this
+does: poll(2) for output, and a writable socket without a peer name is a
+failed connect."
+  #-sbcl (usocket:socket-connect host port :element-type '(unsigned-byte 8)
+                                           :timeout timeout)
+  #+sbcl
+  (let* ((remote (car (usocket:get-hosts-by-name (usocket:host-to-hostname host))))
+         (sock (make-instance (if (= 16 (length remote))
+                                  'sb-bsd-sockets:inet6-socket
+                                  'sb-bsd-sockets:inet-socket)
+                              :type :stream :protocol :tcp))
+         (done nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (setf (sb-bsd-sockets:non-blocking-mode sock) t)
+               (handler-case (sb-bsd-sockets:socket-connect sock remote port)
+                 (sb-bsd-sockets:operation-in-progress () nil))
+               (let ((fd (sb-bsd-sockets:socket-file-descriptor sock))
+                     (deadline (+ (get-internal-real-time)
+                                  (round (* timeout internal-time-units-per-second)))))
+                 (loop
+                   (let ((ms (max 0 (round (* 1000 (- deadline (get-internal-real-time)))
+                                           internal-time-units-per-second))))
+                     (when (sb-unix:unix-simple-poll fd :output ms)
+                       (return))
+                     (when (zerop ms)
+                       (error 'usocket:timeout-error :socket nil)))))
+               ;; Writable: connected iff the socket has a peer.
+               (handler-case (sb-bsd-sockets:socket-peername sock)
+                 (sb-bsd-sockets:socket-error ()
+                   (error 'usocket:connection-refused-error :socket nil)))
+               (setf (sb-bsd-sockets:non-blocking-mode sock) nil)
+               (prog1 (make-instance
+                       'usocket:stream-usocket
+                       :socket sock
+                       ;; usocket's own stream arguments, the read timeout
+                       ;; included (the SOCKS5 handshake reads through it).
+                       :stream (sb-bsd-sockets:socket-make-stream
+                                sock :input t :output t :buffering :full
+                                     :element-type '(unsigned-byte 8)
+                                     :timeout timeout :serve-events nil))
+                 (setf done t)))
+           (sb-bsd-sockets:connection-refused-error ()
+             (error 'usocket:connection-refused-error :socket nil))
+           (sb-bsd-sockets:socket-error ()
+             (error 'usocket:socket-error :socket nil)))
+      (unless done
+        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
 Returns (VALUES CONNECTION PROXY-CONNECTION-FAILED-P): the connection, or NIL
@@ -351,10 +414,9 @@ local machine must not be charged to the address (net.cpp:494-497)."
         (bl.log:log-debug "Not dialing ~A:~D: ~A" host port name-refusal)
         (return-from make-tcp-connection nil))
       (let ((socket (handler-case
-                        (usocket:socket-connect dial-host
-                                                (if proxy (proxy-port proxy) port)
-                                                :element-type '(unsigned-byte 8)
-                                                :timeout timeout)
+                        (%socket-connect dial-host
+                                         (if proxy (proxy-port proxy) port)
+                                         timeout)
                       ((or usocket:socket-error usocket:timeout-error) () nil))))
         (unless socket
           (when proxy
