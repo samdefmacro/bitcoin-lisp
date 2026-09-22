@@ -656,7 +656,13 @@ TRUC error surfaces unchanged."
           (bl.val:validate-transaction-for-mempool
            poor utxo-set mempool 200)
         (is-false valid)
-        (is (eq :rbf-insufficient-fee (first err))))
+        (is (eq :rbf-insufficient-fee (first err)))
+        ;; And the reason says a sibling was in play (Core validation.cpp
+        ;; :1011, m_sibling_eviction); mempool_truc.py:519 matches it.
+        (is-true (search (format nil "insufficient fee (including sibling eviction), rejecting replacement ~A"
+                                 (bl.crypto:bytes-to-hex
+                                  (bl.crypto:reverse-bytes (bl.ser:transaction-hash poor))))
+                         (bl.val:tx-reject-reason-string err))))
       ;; With sibling eviction disabled (the multi-tx package context), the
       ;; TRUC descendant-limit error surfaces instead.
       (multiple-value-bind (valid err)

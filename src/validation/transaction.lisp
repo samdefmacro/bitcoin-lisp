@@ -922,7 +922,8 @@ The two script passes are the exception Core builds INTO the reason: their
 reject reason is `<prefix> (<ScriptErrorString>)' (validation.cpp:2117-2119),
 with the failing input in the debug message.
 
-REASON is a keyword, (KEYWORD DEBUG-STRING), (KEYWORD SCRIPT-ERROR) or
+REASON is a keyword, (KEYWORD DEBUG-STRING), (KEYWORD DEBUG-STRING
+:SIBLING-EVICTION), (KEYWORD SCRIPT-ERROR) or
 (KEYWORD SCRIPT-ERROR DEBUG-STRING); a STRING second element is a debug
 message, anything else is a script error. An unmapped keyword falls back to
 its downcased name and is caught by test rather than by a client: see
@@ -936,10 +937,15 @@ TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
       ;; error, NIL included -- Core builds the parenthetical unconditionally
       ;; at both script sites and ScriptErrorString's own fallback for an
       ;; error it does not know is "unknown error".
-      (if (and (consp reason) (not (stringp (second reason))))
-          (format nil "~A (~A)" (base)
-                  (bl.interop:script-error-message (second reason)))
-          (base)))))
+      (cond ((and (consp reason) (not (stringp (second reason))))
+             (format nil "~A (~A)" (base)
+                     (bl.interop:script-error-message (second reason))))
+            ;; ReplacementChecks spells a replacement that evicts a TRUC
+            ;; sibling into its reason (validation.cpp:997, :1011); the
+            ;; verdict and its class stay the plain one's.
+            ((and (consp reason) (member :sibling-eviction (cddr reason)))
+             (format nil "~A (including sibling eviction)" (base)))
+            (t (base))))))
 
 (defun tx-reject-debug-string (reason)
   "REASON as Core's state.GetDebugMessage() spells it, or NIL where Core
@@ -1430,7 +1436,9 @@ pass a member failed decides what the caller is told about the others."
                        (bl.ser:transaction-weight tx)
                        sigops-cost))
                (direct-conflicts (bl.mp:find-rbf-conflicts mempool tx))
-               (replaced-set nil))
+               (replaced-set nil)
+               ;; Core ws.m_sibling_eviction (validation.cpp:966).
+               (sibling-eviction nil))
 
           ;; EPHEMERAL DUST, part 2 (Core PreCheckEphemeralTx,
           ;; ephemeral_policy.cpp:23-27, at validation.cpp:933 — after the fees
@@ -1476,7 +1484,9 @@ pass a member failed decides what the caller is told about the others."
                 (bl.mp:single-truc-checks mempool tx vsize direct-conflicts)
               (unless truc-ok
                 (if (and sibling allow-sibling-eviction (not skip-rbf-check))
-                    (pushnew sibling direct-conflicts :test #'equalp)
+                    (progn
+                      (setf sibling-eviction t)
+                      (pushnew sibling direct-conflicts :test #'equalp))
                     (return-from validate-transaction-for-mempool
                       (values nil truc-reason nil))))))
 
@@ -1490,7 +1500,19 @@ pass a member failed decides what the caller is told about the others."
                 (%replacement-checks mempool tx modified-fee-value vsize
                                      sigops-cost direct-conflicts)
               (unless ok
-                (return-from validate-transaction-for-mempool (values nil reason nil)))
+                (return-from validate-transaction-for-mempool
+                  (values nil
+                          ;; Core's m_sibling_eviction suffix on the two
+                          ;; reasons ReplacementChecks writes with it
+                          ;; (validation.cpp:997, :1011); mempool_truc.py:519.
+                          (if (and sibling-eviction (consp reason)
+                                   (member (first reason)
+                                           '(:rbf-insufficient-fee
+                                             :too-many-clusters)))
+                              (list (first reason) (second reason)
+                                    :sibling-eviction)
+                              reason)
+                          nil)))
               (setf replaced-set rset)))
 
           ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends,
