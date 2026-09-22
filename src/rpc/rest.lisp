@@ -810,6 +810,38 @@ reached the handler."
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)
         "")))
 
+;;; A /rest/ URI with a malformed percent-escape never reaches the router:
+;;; Hunchentoot's request initializer decodes the path and the query while it
+;;; builds the request, fails, and marks the reply 400, and process-request then
+;;; answers with ACCEPTOR-STATUS-MESSAGE instead of dispatching. Core parses the
+;;; same URI with evhttp_uri_parse when a handler reads a query parameter and
+;;; answers RESTERR 400 with the parser's own sentence (httpserver.cpp:661-666,
+;;; rest.cpp:198-200); interface_rest.py:291-294 sends `%' at the end of three
+;;; URIs and compares the body with that sentence.
+
+(defun %malformed-percent-escape-p (uri)
+  "T when URI has a `%' not followed by two hex digits -- the RFC 3986
+pct-encoded form evhttp_uri_parse refuses."
+  (loop for i from 0 below (length uri)
+        thereis (and (char= (char uri i) #\%)
+                     (not (and (< (+ i 2) (length uri))
+                               (digit-char-p (char uri (+ i 1)) 16)
+                               (digit-char-p (char uri (+ i 2)) 16))))))
+
+(defmethod hunchentoot:acceptor-status-message ((acceptor rpc-acceptor)
+                                                (http-status-code (eql 400))
+                                                &key)
+  (let ((uri (and (boundp 'hunchentoot:*request*)
+                  hunchentoot:*request*
+                  (hunchentoot:request-uri hunchentoot:*request*))))
+    (if (and uri
+             (alexandria:starts-with-subseq "/rest/" uri)
+             (%malformed-percent-escape-p uri))
+        (progn
+          (setf (hunchentoot:content-type*) "text/plain")
+          (format nil "URI parsing failed, it likely contained RFC 3986 invalid characters~%"))
+        (call-next-method))))
+
 ;;; The surface itself. Off unless -rest is given (Core StartREST gate,
 ;;; init.cpp:758; DEFAULT_REST_ENABLE = false, init.cpp:153 -- we once
 ;;; registered it unconditionally).

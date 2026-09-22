@@ -5994,6 +5994,53 @@ takes digits and nothing else, so `+1' and `0x' are `Invalid height' (:276)."
                         (search (format nil "Invalid height: ~A" bad) b))
                    "~S: ~S" bad b)))))))
 
+(test rest-a-malformed-percent-escape-is-core-s-uri-parse-error
+  "interface_rest.py:291-294 sends three /rest/ URIs ending in a bare `%' and
+compares the body with evhttp_uri_parse's sentence, which Core's handlers
+return as RESTERR 400 (httpserver.cpp:661-666, rest.cpp:198-200). Hunchentoot
+refuses such a URI while building the request and answered with its own HTML
+400 page. Driven over a real socket, because the refusal happens before any
+handler runs. Control: a well-formed escape is routed normally."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19973)
+          (zeros (make-string 64 :initial-element #\0)))
+      (setf (bl:node-data-directory node) dir)
+      (flet ((get-raw (path)
+               (let ((sock (usocket:socket-connect "127.0.0.1" port
+                                                   :element-type '(unsigned-byte 8))))
+                 (unwind-protect
+                      (let ((out (usocket:socket-stream sock)))
+                        (write-sequence
+                         (map '(vector (unsigned-byte 8)) #'char-code
+                              (format nil "GET ~A HTTP/1.0~C~CHost: 127.0.0.1~C~C~C~C"
+                                      path #\Return #\Newline #\Return #\Newline
+                                      #\Return #\Newline))
+                         out)
+                        (finish-output out)
+                        (map 'string #'code-char
+                             (loop for b = (read-byte out nil nil)
+                                   while b collect b)))
+                   (usocket:socket-close sock)))))
+        (unwind-protect
+             (progn
+               (is-true (bl.rpc:start-rpc-server node :port port :user "u"
+                                                      :password "p"
+                                                      :rest-enabled t))
+               (dolist (path (list (format nil "/rest/headers/~A%" zeros)
+                                   (format nil "/rest/blockfilterheaders/basic/~A%" zeros)
+                                   "/rest/mempool/contents.json?%"))
+                 (let ((reply (get-raw path)))
+                   (is-true (search " 400 " reply) "~A: ~A" path reply)
+                   (is-true (search "URI parsing failed, it likely contained RFC 3986 invalid characters"
+                                    reply)
+                            "~A: ~A" path reply)))
+               ;; Control: a valid escape is not this error.
+               (let ((reply (get-raw "/rest/mempool/info.json?x=%41")))
+                 (is-false (search "URI parsing failed" reply) "~A" reply)))
+          (bl.rpc:stop-rpc-server))))))
+
 (test rest-new-endpoints-validate-their-input
   "Each new endpoint refuses a malformed request with a 400 rather than
 serving something wrong or signalling out of the handler."
