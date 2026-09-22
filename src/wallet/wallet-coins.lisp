@@ -703,30 +703,33 @@ per destination class."
   (find hash pairs :test #'equalp
                    :key (lambda (pair) (bl.crypto:hash160 (cdr pair)))))
 
-(defun %process-sub-script (wallet sub-script pairs)
-  "Core DescribeWalletAddressVisitor::ProcessSubScript: fields describing a
-known redeem/witness script. Returns (values fields hoisted-pubkey-hex)."
+(defun %process-sub-script (wallet sub-script pairs witness)
+  "Core DescribeWalletAddressVisitor::ProcessSubScript (wallet/rpc/
+addresses.cpp:266-297): fields describing a known redeem/witness script.
+WITNESS is the witness script, for a P2SH whose redeem script is itself a
+P2WSH.
+
+The embedded object's wallet detail is the SAME visitor run on the embedded
+destination (:280), so it recurses: sh(pkh(K)) reports K under embedded, and
+sh(wsh(pkh(K))) nests a second embedded object. A pubkey found anywhere below
+is hoisted to each level (:284-285, \"so that getnewaddress()['pubkey'] always
+works\") -- wallet_fundrawtransaction.py:1066 and wallet_send.py:483 read
+getaddressinfo(addr)['pubkey'] for exactly those two shapes. Only a P2WPKH
+sub-script used to get its detail, so both were a KeyError."
   (multiple-value-bind (type data)
       (bl.val:classify-script sub-script)
     (let ((fields
             `(("script" . ,(bl.val:script-type-to-string type))
               ("hex" . ,(bl.crypto:bytes-to-hex sub-script))))
-          (sub-address (bl.rpc:script->address sub-script (wallet-network wallet)))
-          (hoisted nil))
+          (sub-address (bl.rpc:script->address sub-script (wallet-network wallet))))
       (cond
         (sub-address
          (multiple-value-bind (sub-type sub-spk sub-wv sub-wp)
              (bl.crypto:decode-address sub-address (wallet-network wallet))
-           (declare (ignore sub-spk))
-           (let ((detail (%describe-address-fields sub-type sub-wv sub-wp))
-                 (wallet-detail
-                   (when (and (eq sub-type :p2wpkh) pairs)
-                     (let ((pair (%expansion-pubkey-by-hash160 pairs sub-wp)))
-                       (when pair
-                         `(("pubkey" . ,(bl.crypto:bytes-to-hex
-                                         (cdr pair)))))))))
-             (when wallet-detail
-               (setf hoisted (cdr (assoc "pubkey" wallet-detail :test #'equal))))
+           (let* ((detail (%describe-address-fields sub-type sub-wv sub-wp))
+                  (wallet-detail (%address-wallet-detail
+                                  wallet sub-type sub-spk sub-wp pairs nil witness))
+                  (hoisted (cdr (assoc "pubkey" wallet-detail :test #'equal))))
              (setf fields
                    (append fields
                            `(,@(when hoisted `(("pubkey" . ,hoisted)))
@@ -743,29 +746,34 @@ known redeem/witness script. Returns (values fields hoisted-pubkey-hex)."
                        `(("sigsrequired" . ,(getf data :m))
                          ("pubkeys" . ,(mapcar #'bl.crypto:bytes-to-hex
                                                (getf data :pubkeys))))))))
-      (values fields hoisted))))
+      fields)))
+
+(defun %address-wallet-detail (wallet type script wit-prog pairs redeem witness)
+  "Core DescribeWalletAddressVisitor's operator() per destination class
+(wallet/rpc/addresses.cpp:304-349): pubkey/iscompressed for a key hash, and
+ProcessSubScript over the REDEEM (P2SH) or WITNESS (P2WSH) script the wallet
+knows. PAIRS are the (key . pubkey) pairs of the expansion, the provider's
+GetPubKey."
+  (case type
+    (:p2pkh
+     (let ((pair (and pairs (%expansion-pubkey-by-hash160
+                             pairs (subseq script 3 23)))))
+       (when pair
+         `(("pubkey" . ,(bl.crypto:bytes-to-hex (cdr pair)))
+           ("iscompressed" . ,(bl.rpc:json-bool (= (length (cdr pair)) 33)))))))
+    (:p2wpkh
+     (let ((pair (and pairs (%expansion-pubkey-by-hash160 pairs wit-prog))))
+       (when pair
+         `(("pubkey" . ,(bl.crypto:bytes-to-hex (cdr pair)))))))
+    (:p2sh (when redeem (%process-sub-script wallet redeem pairs witness)))
+    (:p2wsh (when witness (%process-sub-script wallet witness pairs nil)))))
 
 (defun %wallet-address-detail (wallet type script wit-prog spkm pos)
-  "Core DescribeWalletAddress's visitor: pubkey/iscompressed/embedded fields
-for a wallet-solvable destination."
+  "Core DescribeWalletAddress's visitor for a destination SPKM owns at POS."
   (let ((pairs (and spkm (nth-value 1 (%spkm-expansion-pairs spkm pos)))))
-    (case type
-      (:p2pkh
-       (let ((pair (and pairs (%expansion-pubkey-by-hash160
-                               pairs (subseq script 3 23)))))
-         (when pair
-           `(("pubkey" . ,(bl.crypto:bytes-to-hex (cdr pair)))
-             ("iscompressed" . ,(bl.rpc:json-bool (= (length (cdr pair)) 33)))))))
-      (:p2wpkh
-       (let ((pair (and pairs (%expansion-pubkey-by-hash160 pairs wit-prog))))
-         (when pair
-           `(("pubkey" . ,(bl.crypto:bytes-to-hex (cdr pair)))))))
-      ((:p2sh :p2wsh)
-       (multiple-value-bind (redeem witness)
-           (and spkm (%spkm-sub-scripts spkm script))
-         (let ((sub (if (eq type :p2sh) redeem witness)))
-           (when sub
-             (%process-sub-script wallet sub pairs))))))))
+    (multiple-value-bind (redeem witness)
+        (and spkm (member type '(:p2sh :p2wsh)) (%spkm-sub-scripts spkm script))
+      (%address-wallet-detail wallet type script wit-prog pairs redeem witness))))
 
 (defun %wallet-dest-key-origin (spkm script type)
   "(values desc-key pubkey pos) for single-key destinations —

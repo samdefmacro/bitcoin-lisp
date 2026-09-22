@@ -1054,6 +1054,46 @@ report, not a refusal."
       (is (equal '("height-based relative locktime: older(100000) > 65535 blocks is unsafe")
                  (import-warnings (policy "older(100000)")))))))
 
+(test getaddressinfo-describes-every-embedded-level
+  "Core's DescribeWalletAddressVisitor::ProcessSubScript runs the SAME visitor
+on the embedded destination and hoists any pubkey it finds (wallet/rpc/
+addresses.cpp:266-297), so sh(pkh(K)) reports K at the top and under
+embedded, and sh(wsh(pkh(K))) nests a second embedded object whose
+scriptPubKey is the pkh script. wallet_fundrawtransaction.py:1066 and
+wallet_send.py:483 read addr_info['pubkey'] and
+addr_info['embedded']['embedded']['scriptPubKey'] for these shapes; only a
+P2WPKH sub-script used to get its detail, so both were a KeyError."
+  (with-wallet-chain-node (node "gaiembed")
+    (let ((pk "0379e45b3cf75f9c5f9befd8e9506fb962f6a9d185ac87001ec44a8d3df8d4a9e3"))
+      (labels ((rpc (method &rest params)
+                 (with-rpc-wallet (nil)
+                   (bl.rpc:dispatch-rpc-method node method params)))
+               (aval (key alist) (cdr (assoc key alist :test #'string=)))
+               (info-for (desc)
+                 (let ((h (make-hash-table :test 'equal))
+                       (full (bl.rpc:descriptor-add-checksum desc)))
+                   (setf (gethash "desc" h) full (gethash "timestamp" h) "now")
+                   (is (eq t (aval "success" (first (rpc "importdescriptors" (list h))))))
+                   (rpc "getaddressinfo" (first (rpc "deriveaddresses" full))))))
+        (rpc "createwallet" "wo" t)
+        (let* ((i (info-for (format nil "sh(pkh(~A))" pk)))
+               (e (aval "embedded" i)))
+          (is (equal pk (aval "pubkey" i)))
+          (is (equal "pubkeyhash" (aval "script" i)))
+          (is (equal pk (aval "pubkey" e)))
+          (is (eq t (aval "iscompressed" e))))
+        (let* ((i (info-for (format nil "sh(wsh(pkh(~A)))" pk)))
+               (e (aval "embedded" i))
+               (ee (aval "embedded" e)))
+          (is (equal pk (aval "pubkey" i)))
+          (is (equal "witness_v0_scripthash" (aval "script" i)))
+          (is (equal pk (aval "pubkey" e)))
+          (is (equal "pubkeyhash" (aval "script" e)))
+          (is (equal (format nil "76a914~A88ac"
+                             (bl.crypto:bytes-to-hex
+                              (bl.crypto:hash160 (bl.crypto:hex-to-bytes pk))))
+                     (aval "scriptPubKey" ee))))))))
+
 ;;;; --- Key expression order, and inference of wsh(<miniscript>) ------------
 
 (defun %dt-expand-pairs (desc-string)
