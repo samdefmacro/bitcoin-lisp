@@ -2555,24 +2555,32 @@ twice."
              (undo-pos (and entry
                             (bl.store:block-index-entry-undo-pos entry))))
         (when undo-pos
+          ;; The second value says whether a record the index NAMES could be
+          ;; read (Core's ReadBlockUndo verdict): an empty rev file -- Core's
+          ;; own FlushUndoFile recreates one after rev00000.dat is deleted --
+          ;; is present and holds nothing, which is a failed read, not an
+          ;; empty record (feature_abortnode.py:41).
           (handler-case
               (let ((block (or block
                                (bl.store:get-block
                                 *undo-block-store* block-hash))))
-                (when block
-                  (let* ((pos (bl.store:make-flat-file-pos file undo-pos))
-                         (prev-hash (bl.ser:block-header-prev-block
-                                     (bl.ser:bitcoin-block-header block)))
-                         (bytes (bl.store:read-undo-flat
-                                 *undo-block-store* pos prev-hash)))
-                    (when bytes
-                      (bl.store:spent-utxos-from-block-undo
-                       block
-                       (bl.store:deserialize-block-undo bytes))))))
+                (if (null block)
+                    (values nil :failed)
+                    (let* ((pos (bl.store:make-flat-file-pos file undo-pos))
+                           (prev-hash (bl.ser:block-header-prev-block
+                                       (bl.ser:bitcoin-block-header block)))
+                           (bytes (bl.store:read-undo-flat
+                                   *undo-block-store* pos prev-hash)))
+                      (if bytes
+                          (values (bl.store:spent-utxos-from-block-undo
+                                   block
+                                   (bl.store:deserialize-block-undo bytes))
+                                  :ok)
+                          (values nil :failed)))))
             (error (e)
               (bl:log-warn "Failed to load flat undo record for ~A: ~A"
                                      (bl.crypto:bytes-to-hex block-hash) e)
-              nil)))))))
+              (values nil :failed))))))))
 
 (defun %load-undo-legacy (block-hash)
   "Read BLOCK-HASH's legacy one-file-per-block undo file, or NIL.
@@ -2774,9 +2782,17 @@ of undo lists that way and exhausted the 6 GiB heap at ~72k blocks. Only
 store-undo-data (the connect path, which does the height bookkeeping) caches."
   (if (%named-undo-record-missing-p block-hash)
       (values nil nil)
-      (values (or (gethash block-hash *block-undo-data*)
-                  (load-undo-data-from-disk block-hash))
-              t)))
+      (multiple-value-bind (cached found) (gethash block-hash *block-undo-data*)
+        (if (and found cached)
+            (values cached t)
+            ;; Off the cache, the flat reader's verdict is the answer: a record
+            ;; the index names but that does not read is unreadable, whatever
+            ;; the block holds.
+            (multiple-value-bind (flat status) (%load-undo-flat block-hash)
+              (case status
+                (:ok (values flat t))
+                (:failed (values nil nil))
+                (t (values (%load-undo-legacy block-hash) t))))))))
 
 ;;;; Recently-confirmed transactions + most-recent-block tx set
 ;;;;

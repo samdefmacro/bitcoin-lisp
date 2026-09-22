@@ -156,7 +156,15 @@ chain of coinbase-only blocks with no rev file verified clean at every level."
                ;; Level 1 reads no undo and still passes; level 2 does not.
                (is (eq :success (bl.val:verify-db cs store :check-level 1)))
                (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 2)))
-               (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 3))))
+               (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 3)))
+               ;; A full flush recreates the CURRENT rev file empty, as Core's
+               ;; FlushUndoFile does (flatfile.cpp:87-107) -- present, and
+               ;; holding no record: still a failed read.
+               (with-open-file (s (merge-pathnames "blocks/rev00000.dat" base)
+                                  :direction :output :if-does-not-exist :create)
+                 (declare (ignore s)))
+               (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 2))
+                   "an empty rev file is not a readable undo record"))
           (bl.val:initialize-undo-storage undo))))))
 
 (test checkblocks-and-checklevel-are-real-options
