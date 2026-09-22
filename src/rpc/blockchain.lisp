@@ -526,13 +526,20 @@ stack item (the segwit reserved value, BIP141)."
   (let* ((vin0 (aref (bl.ser:transaction-inputs coinbase-tx) 0))
          (witness (tx-input-witness coinbase-tx 0)))
     (append
-     `(("version" . ,(bl.ser:transaction-version coinbase-tx))
+     `(("version" . ,(tx-version-for-json coinbase-tx))
        ("locktime" . ,(bl.ser:transaction-lock-time coinbase-tx))
        ("sequence" . ,(bl.ser:tx-in-sequence vin0))
        ("coinbase" . ,(bl.crypto:bytes-to-hex
                        (bl.ser:tx-in-script-sig vin0))))
      (when (and witness (plusp (length witness)))
        `(("witness" . ,(bl.crypto:bytes-to-hex (elt witness 0))))))))
+
+(defun tx-version-for-json (tx)
+  "TX's version as Core reports it: CTransaction::version is a uint32_t
+(primitives/transaction.h:293) and TxToUniv pushes it as it is
+(core_io.cpp:436), so 0xce56a2fe is 3461784318. Our slot holds the signed
+int32 the wire field used to be read as."
+  (ldb (byte 32 0) (bl.ser:transaction-version tx)))
 
 (defun tx-to-txid (tx)
   "Get transaction ID as hex string."
@@ -556,12 +563,17 @@ order — which unlocks Core's two extra fields (TxToUniv, core_io.cpp:455-525):
 
 Those two are gated separately in Core, so they are gated separately here: a
 verbosity-2 caller gets the fee and no prevout objects."
-  (let ((inputs (bl.ser:transaction-inputs tx))
-        (outputs (bl.ser:transaction-outputs tx))
-        (wire (bl.ser:transaction-wire-bytes tx)))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
+         (outputs (bl.ser:transaction-outputs tx))
+         (wire (bl.ser:transaction-wire-bytes tx))
+         ;; tx.IsCoinBase() -- one input, and it names the null outpoint
+         ;; (primitives/transaction.h:341-344) -- decides every input's shape
+         ;; (core_io.cpp:454), not each input's own prevout.
+         (coinbase-p (and (= 1 (length inputs))
+                          (bl.ser:coinbase-input-p (aref inputs 0)))))
     `(("txid" . ,(tx-to-txid tx))
       ("hash" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
-      ("version" . ,(bl.ser:transaction-version tx))
+      ("version" . ,(tx-version-for-json tx))
       ("size" . ,(length wire))
       ("vsize" . ,(bl.ser:transaction-vsize tx))
       ("weight" . ,(bl.ser:transaction-weight tx))
@@ -575,6 +587,7 @@ verbosity-2 caller gets the fee and no prevout objects."
                  (loop for input across inputs
                        for i from 0
                        collect (input-to-json input (tx-input-witness tx i)
+                                              :coinbase-tx-p coinbase-p
                                               :prevout (and prevouts
                                                             (nth i spent-coins))
                                               :network network))))
@@ -593,14 +606,16 @@ verbosity-2 caller gets the fee and no prevout objects."
             `(("fee" . ,(satoshi->btc (- in-total out-total))))))
       ("hex" . ,(bl.crypto:bytes-to-hex wire)))))
 
-(defun input-to-json (input &optional witness-stack &key prevout network)
+(defun input-to-json (input &optional witness-stack &key coinbase-tx-p prevout network)
   "Convert transaction input to JSON, including sequence and (when present) the
-witness stack; coinbase inputs emit a coinbase field instead of txid/vout.
+witness stack; the input of a coinbase transaction (COINBASE-TX-P, which is
+Core's tx.IsCoinBase(), core_io.cpp:454) emits a coinbase field instead of
+txid/vout.
 
 PREVOUT is the UTXO-ENTRY this input spent; supplying it adds Core's
 verbosity-3 prevout object (core_io.cpp:478-488)."
   (let ((base
-          (if (bl.ser:coinbase-input-p input)
+          (if coinbase-tx-p
               `(("coinbase" . ,(bl.crypto:bytes-to-hex
                                 (bl.ser:tx-in-script-sig input))))
               (let ((outpoint (bl.ser:tx-in-previous-output input)))
@@ -613,7 +628,7 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
                                              :sighash-decode t))
                                   ("hex" . ,(bl.crypto:bytes-to-hex
                                              (bl.ser:tx-in-script-sig input))))))))))
-    (when (and prevout (not (bl.ser:coinbase-input-p input)))
+    (when (and prevout (not coinbase-tx-p))
       (let ((spk (bl.store:utxo-entry-script-pubkey prevout)))
         (setf base
               (append base

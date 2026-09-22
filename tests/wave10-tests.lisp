@@ -20,8 +20,7 @@
 
 (defun wave10-encode (result)
   "Encode an RPC result alist exactly like the server does."
-  (with-output-to-string (s)
-    (yason:encode (bl.rpc::rpc-result->json result) s)))
+  (rpc-result-json result))
 
 ;;; ---------------------------------------------------------------------
 ;;; A. JSON booleans

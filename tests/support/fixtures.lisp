@@ -174,6 +174,16 @@ so the log line is part of the behaviour under test."
     (funcall thunk)
     (remove nil (coerce bl.log:*log-buffer* 'list))))
 
+(defun rpc-result-json (result)
+  "The exact JSON text an RPC handler's RESULT goes out as: the server's own
+normalizer (rpc-result->json, object alists to objects, amounts as number
+tokens) and then yason, as %WRITE-JSON-REPLY writes a reply. Asserting on the
+Lisp value alone misses what only the encoder decides -- NIL as null rather
+than [], an amount's digits -- and the differential lane against Core's
+binaries compares this text with theirs."
+  (with-output-to-string (s)
+    (yason:encode (bl.rpc::rpc-result->json result) s)))
+
 (defun wire-params (values)
   "VALUES (a list or vector of JSON values) as the positional parameter list a
 handler receives OVER THE WIRE: through the server's own normalizer, so a

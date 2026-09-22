@@ -1235,12 +1235,9 @@ as Decimal, which is exactly why they could not see it."
             "~D satoshis encode as ~S, Core writes ~S" satoshis encoded text))))
   ;; A whole reply, so the token is not quoted and not re-wrapped on the way
   ;; through rpc-result->json.
-  (let ((json (with-output-to-string (out)
-                (yason:encode
-                 (bl.rpc::rpc-result->json
-                  (list (cons "amount" (bl.rpc:satoshi->btc 100000000))
-                        (cons "fee" (bl.rpc:satoshi->btc -1))))
-                 out))))
+  (let ((json (rpc-result-json
+               (list (cons "amount" (bl.rpc:satoshi->btc 100000000))
+                     (cons "fee" (bl.rpc:satoshi->btc -1))))))
     (is (search "\"amount\":1.00000000" json) "amount token: ~A" json)
     (is (search "\"fee\":-0.00000001" json) "fee token: ~A" json)
     (is-false (search "\"1.00000000\"" json)
@@ -1771,8 +1768,7 @@ out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
 encoder the RPC server uses (rpc-result->json, then yason). Asserting on the
 Lisp value alone would not catch this bug: NIL is a perfectly good empty list
 in CL and only becomes wrong at the encoder."
-  (with-output-to-string (s)
-    (yason:encode (bl.rpc::rpc-result->json result) s)))
+  (rpc-result-json result))
 
 (test rpc-empty-collections-encode-as-array-or-object
   "Core builds every collection as a UniValue VARR/VOBJ, so an EMPTY one
@@ -6394,6 +6390,43 @@ arguments, through the dispatcher and the request normalizer."
 
 (defun decode-raw-tx-field (hex key &rest more)
   (cdr (assoc key (apply #'decode-raw-tx hex more) :test #'string=)))
+
+(test decoderawtransaction-reports-the-version-unsigned-and-coinbase-per-transaction
+  "Two things TxToUniv decides that ours decided differently, both found by
+the differential lane against bitcoin-tx (tests/rpc/core-binary-differential-tests.lisp)
+over Core's own sighash.json and tx_valid.json vectors:
+
+- the version is CTransaction::version, a uint32_t (primitives/transaction.h:293),
+  pushed as it is (core_io.cpp:436): 0xce56a2fe is 3461784318, not the
+  -833182978 we printed -- 276 of Core's 672 vector transactions have the top
+  bit set;
+- \"coinbase\" replaces txid/vout/scriptSig for every input of a COINBASE
+  TRANSACTION -- one input with a null prevout, tx.IsCoinBase()
+  (core_io.cpp:454) -- and never for an input of an ordinary transaction that
+  merely names the null outpoint, which ours rendered as a coinbase input."
+  (is (= 3461784318
+         (decode-raw-tx-field
+          "fea256ce01272d125e577c0a09570a71366898280dda279b021000db1325f27edda41a53460100000002ab53c752c21c013c2b3a01000000000000000000"
+          "version")))
+  (let* ((vin (decode-raw-tx-field
+               "010000000200010000000000000000000000000000000000000000000000000000000000000000000000ffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffff00ffffffff010000000000000000015100000000"
+               "vin"))
+         (second-in (second vin)))
+    (is (= 2 (length vin)))
+    (is (null (assoc "coinbase" second-in :test #'string=))
+        "an ordinary transaction has no coinbase input")
+    (is (string= (make-string 64 :initial-element #\0)
+                 (cdr (assoc "txid" second-in :test #'string=))))
+    (is (eql 4294967295 (cdr (assoc "vout" second-in :test #'string=)))))
+  ;; Control: a real coinbase transaction still reports its input as one.
+  (let ((coinbase (bl.store:make-genesis-block :regtest)))
+    (is (assoc "coinbase"
+               (first (decode-raw-tx-field
+                       (bl.crypto:bytes-to-hex
+                        (bl.ser:transaction-wire-bytes
+                         (first (bl.ser:bitcoin-block-transactions coinbase))))
+                       "vin"))
+               :test #'string=))))
 
 (test rpc-decoderawtransaction-refuses-trailing-bytes
   "Core's DecodeTx ignores any serialization that does not consume the WHOLE
