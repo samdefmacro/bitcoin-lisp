@@ -1122,6 +1122,11 @@ feature_taproot.py:1433 read off submitblock."
   ;; ONE reason (validation.cpp:3979), so our two keywords share Core's word.
   (is (string= "bad-blk-length" (bl.val:block-reject-reason :no-transactions)))
   (is (string= "bad-blk-length" (bl.val:block-reject-reason :bad-blk-length)))
+  ;; ContextualCheckBlockHeader's nBits verdict (validation.cpp:4121);
+  ;; mining_template_verification.py:125 proposes a block with wrong bits.
+  (is (string= "bad-diffbits" (bl.val:block-reject-reason :bad-difficulty)))
+  ;; CheckBlock relays CheckTransaction's word (validation.cpp:3992-3996).
+  (is (string= "bad-txns-vout-empty" (bl.val:block-reject-reason :no-outputs)))
   (let ((verdict (list :block-script-verify-flag-failed :sig-nulldummy
                        "input 0 of aa (wtxid bb), spending cc:0")))
     (is (string= "block-script-verify-flag-failed (Dummy CHECKMULTISIG argument must be zero)"

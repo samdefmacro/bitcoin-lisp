@@ -3643,6 +3643,8 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     ;; ScriptError beside it.
     (:block-script-verify-flag-failed . "block-script-verify-flag-failed") ; :2119
     (:bad-proof-of-work          . "high-hash")                          ; :3864 CheckBlockHeader
+    ;; mining_template_verification.py:125 reads it from a proposal.
+    (:bad-difficulty             . "bad-diffbits")                       ; :4121 ContextualCheckBlockHeader
     (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot
     (:non-final-tx               . "bad-txns-nonfinal")                  ; :4179 ContextualCheckBlock
     (:bad-signet-solution        . "bad-signet-blksig")                  ; :3964 CheckSignetBlockSolution
