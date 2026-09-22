@@ -4232,7 +4232,7 @@ relay filters."
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
                       &key fee-estimator recent-rejects mempool skip-scripts
-                           max-readd-blocks)
+                           max-readd-blocks (abort-on-disconnect-failure t))
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
 
@@ -4255,6 +4255,11 @@ disconnected blocks' txs (best-effort, re-validated against the new tip).
 MAX-READD-BLOCKS caps how many disconnected blocks, counted from the OLD TIP,
 may give their txs back -- Core's InvalidateBlock cap (validation.cpp:3621);
 NIL, the default, is ActivateBestChainStep's unconditional re-add (:3298).
+ABORT-ON-DISCONNECT-FAILURE, T by default, makes a disconnect that cannot run
+(:corrupt-undo) abort the node as ActivateBestChainStep's FatalError does
+(validation.cpp:3234-3243); InvalidateBlock passes NIL, because Core's
+InvalidateBlock returns false on a failed DisconnectTip and nothing more
+(validation.cpp:3614-3622).
 Side effects (indexes / fee-estimator / mempool / recent-rejects) are applied
 only after the whole fork validates, so a rolled-back reorg leaves them untouched.
 
@@ -4392,7 +4397,8 @@ comment above."
                   ;; A disconnect that cannot run is a failure of the local
                   ;; system, and Core aborts the node rather than stay on the
                   ;; less-work chain (validation.cpp:3234-3243).
-                  (bl.log:fatal-error "Failed to disconnect block.")
+                  (when abort-on-disconnect-failure
+                    (bl.log:fatal-error "Failed to disconnect block."))
                   (return-from perform-reorg (values nil :corrupt-undo)))))))
 
         (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
@@ -4670,7 +4676,11 @@ on its OWN four-block chain; we left it at height 1."
                               ;; Core InvalidateBlock's fAddToMempool
                               ;; (validation.cpp:3621): only the ten blocks
                               ;; nearest the old tip come back.
-                              :max-readd-blocks +max-invalidate-readd-blocks+)
+                              :max-readd-blocks +max-invalidate-readd-blocks+
+                              ;; A failed DisconnectTip fails the RPC and
+                              ;; leaves the node running (validation.cpp:
+                              ;; 3614-3622); only ActivateBestChainStep aborts.
+                              :abort-on-disconnect-failure nil)
              ;; Surface :interrupted as itself — the node is stopping, the reorg
              ;; did not fail — so the RPC reports why nothing was invalidated.
              (unless ok

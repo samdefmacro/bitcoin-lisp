@@ -1173,6 +1173,53 @@ missing-block list."
          (bl.log:reset-warnings)))
      (clear-undo-cache))))
 
+;; rpc_dumptxoutset.py:84 renames rev00000.dat, asks for a rollback and then
+;; stops the node, which must exit 0: the failed rollback is an RPC error only.
+(test invalidate-block-corrupt-undo-fails-without-aborting
+  "invalidateblock over a block whose undo is missing FAILS, and the node keeps
+running: Core's InvalidateBlock returns false on a failed DisconnectTip
+(validation.cpp:3614-3622); only ActivateBestChainStep's FatalError
+(:3234-3243) aborts. A failed dumptxoutset rollback made the node exit 1."
+  (with-network (:mainnet)
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (make-activate-block-fixture "invalidate-corrupt-undo")
+     (let* ((genesis-entry (bl.store:get-block-index-entry chain-state genesis-hash))
+            (a-hashes (make-test-chain-hashes #xC0 2))
+            (a1-hash (first a-hashes)) (a2-hash (second a-hashes))
+            (a1-block (make-reorg-test-block genesis-hash a1-hash 1))
+            (a2-block (%make-2tx-reorg-block a1-hash a2-hash 2)))
+       (dolist (blk (list a1-block a2-block))
+         (bl.store:store-block block-store blk))
+       (let* ((a1-entry (bl.store:make-block-index-entry
+                         :hash a1-hash :height 1 :prev-entry genesis-entry :chain-work 100
+                         :status :valid
+                         :header (bl.ser:bitcoin-block-header a1-block)))
+              (a2-entry (bl.store:make-block-index-entry
+                         :hash a2-hash :height 2 :prev-entry a1-entry :chain-work 200
+                         :status :valid
+                         :header (bl.ser:bitcoin-block-header a2-block))))
+         (bl.store:add-block-index-entry chain-state a1-entry)
+         (bl.store:add-block-index-entry chain-state a2-entry)
+         (bl.store:update-chain-tip chain-state a2-hash 2)
+         (clear-undo-cache)
+         (bl.log:reset-warnings)
+         (let* ((stderr (make-string-output-stream))
+                (requested '())
+                (bl.log:*fatal-error-shutdown-function*
+                  (lambda (message) (push message requested))))
+           (multiple-value-bind (ok detail)
+               (let ((*error-output* stderr))
+                 (bl.val:invalidate-block chain-state block-store utxo-set a2-hash))
+             (is (null ok))
+             (is (eq detail :reorg-failed))
+             (is (equalp a2-hash (bl.store:best-block-hash chain-state)))
+             ;; No abort: no shutdown request, no fatal line, no warning.
+             (is (null requested))
+             (is (equal "" (get-output-stream-string stderr)))
+             (is (zerop (length (bl.log:warnings-for-rpc))))))
+         (bl.log:reset-warnings)))
+     (clear-undo-cache))))
+
 ;;;; Reorg mempool bulk re-add (cluster mempool P8 — Core
 ;;;; MaybeUpdateMempoolForReorg, validation.cpp:294-389)
 
