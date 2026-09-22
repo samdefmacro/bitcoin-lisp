@@ -9823,7 +9823,14 @@ different port stay distinct."
       (is (null (code (lambda () (add "127.1:18445")))))
       (is (null (code (lambda () (add "127.256.1:18444")))))
       (is (equal '("127.0.0.1:18444" "10.0.0.1" "127.1:18445" "127.256.1:18444")
-                 (bl:node-added-nodes node))))))
+                 (bl:node-added-nodes node)))
+      ;; An unknown command is Core's runtime_error carrying the help text,
+      ;; i.e. -1 (rpc/net.cpp:339-342, rpc_net.py:273).
+      (handler-case (progn (bl.rpc:dispatch-rpc-method node "addnode" (list "1.2.3.4" "abc"))
+                           (fail "an unknown command must be refused"))
+        (bl.rpc:rpc-error (e)
+          (is (eql -1 (bl.rpc:rpc-error-code e)))
+          (is (search "addnode \"node\" \"command\"" (bl.rpc:rpc-error-message e))))))))
 
 (test rpc-getaddednodeinfo-reports-state
   "getaddednodeinfo reports each added node + whether a matching peer is live."

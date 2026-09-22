@@ -622,9 +622,12 @@ single-writer. Returns null. v2transport is accepted and ignored — BIP324 v2
 transport is not implemented."
   (unless (and (stringp spec) (plusp (length spec)))
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
+  ;; An unknown command is answered with the method's help document as a
+  ;; plain runtime_error, i.e. -1 (Core rpc/net.cpp:339-342;
+  ;; rpc_net.py:273 matches `addnode "node" "command"').
   (unless (member command '("add" "remove" "onetry") :test #'equal)
-    (error 'rpc-error :code +rpc-invalid-parameter+
-                      :message "command must be \"add\", \"remove\", or \"onetry\""))
+    (error 'rpc-error :code +rpc-misc-error+
+                      :message (rpc-help-document "addnode")))
   (bt:with-recursive-lock-held ((bl:node-lock node))
     (cond
       ((equal command "onetry")
