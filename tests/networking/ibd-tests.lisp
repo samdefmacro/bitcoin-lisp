@@ -2325,6 +2325,41 @@ control is the same peer with the clock left where it was."
     (is (null (bl.net:peer-tx-inv-queue peer))
         "the trickle did not fire after the mock clock moved past its deadline")))
 
+(test a-noban-peer-trickles-on-every-pass
+  "Core seeds fSendTrickle with HasPermission(NoBan) (net_processing.cpp:5981),
+so a noban peer's queue drains on every SendMessages pass whatever its timer
+says. mempool_reorg.py:38 whitelists noban@127.0.0.1 for `immediate tx relay'
+and freezes the clock with setmocktime, then sync_all (:201) waits for three
+transactions ours never trickled: the frozen clock never reached the timer.
+Control: an inbound peer from an address the whitelist does not name, at the
+same frozen time, keeps its queue."
+  (with-whitelist (:entries '("noban,in,out@198.51.100.9/32"))
+    (let* ((bl:*network* :regtest)
+           (bl.ser:*mock-time* 1810000000)
+           (noban (bl.net:make-peer :state :ready :inbound t
+                                    :address "198.51.100.9"))
+           (ordinary (bl.net:make-peer :state :ready :inbound t
+                                       :address "198.51.100.10"))
+           (out (bl.net:make-peer :state :ready :address "198.51.100.9"
+                                  :conn-type :manual))
+           (txid (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 41)))
+      ;; A mocked instant no other test uses: whatever inbound deadline an
+      ;; earlier test left is unreachable from here and re-arms.
+      (progn
+        ;; Arm pass for all three timers.
+        (bl.net:flush-tx-announcements (list noban ordinary out) nil)
+        (bl.net:relay-transaction txid nil (list noban ordinary out)
+                                  :fee-rate-per-kvb 2)
+        ;; Same frozen instant: no timer is due.
+        (bl.net:flush-tx-announcements (list noban ordinary out) nil)
+        (is (= 1 (length (bl.net:peer-tx-inv-queue ordinary)))
+            "control: an ordinary inbound peer waits for the rotation")
+        (is (null (bl.net:peer-tx-inv-queue noban))
+            "a noban inbound peer is trickled at once")
+        (is (null (bl.net:peer-tx-inv-queue out))
+            "and so is a noban outbound (manual) peer")))))
+
 (test flush-drops-feefiltered-entries
   "A queued announcement below the peer's BIP133 feefilter is dropped at
 flush time — neither sent nor marked announced (Core skips it out of

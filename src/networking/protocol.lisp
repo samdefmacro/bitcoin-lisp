@@ -4053,21 +4053,32 @@ lock from RPC handler threads."
                    ;; and no last-inv-sequence advance either (their getdata
                    ;; is ignored outright anyway).
                    (peer-tx-relay-p peer))
-          (if (peer-inbound peer)
-              (when inbound-due
-                (%flush-peer-tx-invs peer mempool))
-              (cond ((or (zerop (peer-next-inv-send-time peer))
-                         (%inv-deadline-unreachable-p
-                          (peer-next-inv-send-time peer) now
-                          +outbound-inv-broadcast-interval+))
-                     (setf (peer-next-inv-send-time peer)
-                           (+ now (%next-exp-interval-seconds
-                                   +outbound-inv-broadcast-interval+))))
-                    ((>= now (peer-next-inv-send-time peer))
-                     (setf (peer-next-inv-send-time peer)
-                           (+ now (%next-exp-interval-seconds
-                                   +outbound-inv-broadcast-interval+)))
-                     (%flush-peer-tx-invs peer mempool)))))))))
+          ;; A noban peer trickles on EVERY pass (Core SendMessages seeds
+          ;; fSendTrickle with HasPermission(NoBan), net_processing.cpp:5981);
+          ;; its timer still runs, but no longer gates it. The functional
+          ;; framework's `-whitelist=noban@127.0.0.1  # immediate tx relay'
+          ;; relies on it with the clock frozen by setmocktime
+          ;; (mempool_reorg.py:38 then :201's sync_all).
+          (let ((trickle (peer-has-permission-p peer +perm-noban+)))
+            (if (peer-inbound peer)
+                (when (or inbound-due trickle)
+                  (%flush-peer-tx-invs peer mempool))
+                (cond ((or (zerop (peer-next-inv-send-time peer))
+                           (%inv-deadline-unreachable-p
+                            (peer-next-inv-send-time peer) now
+                            +outbound-inv-broadcast-interval+))
+                       (setf (peer-next-inv-send-time peer)
+                             (+ now (%next-exp-interval-seconds
+                                     +outbound-inv-broadcast-interval+)))
+                       (when trickle
+                         (%flush-peer-tx-invs peer mempool)))
+                      ((>= now (peer-next-inv-send-time peer))
+                       (setf (peer-next-inv-send-time peer)
+                             (+ now (%next-exp-interval-seconds
+                                     +outbound-inv-broadcast-interval+)))
+                       (%flush-peer-tx-invs peer mempool))
+                      (trickle
+                       (%flush-peer-tx-invs peer mempool))))))))))
 
 ;;; Initial broadcast of locally-submitted transactions (Core
 ;;; BroadcastTransaction -> InitiateTxBroadcastToAll + the scheduled
