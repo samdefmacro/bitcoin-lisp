@@ -564,6 +564,12 @@ nobody, where Core refuses to start at all (p2p_permissions.py:101)."
               (or (bl.net:permission-flag-names
                    bl.net:*whitebind-flags*)
                   "none")))
+  ;; -capturemessages (Core CaptureMessageToFile, net.cpp:4199): under the
+  ;; network's datadir. Always assigned, so an in-image restart never inherits
+  ;; a previous run's directory.
+  (setf bl.net:*capture-messages-directory*
+        (and *capture-messages*
+             (merge-pathnames "message_capture/" (node-data-directory *node*))))
   (setf *use-addrman-outgoing* t *connect-nodes* '() *seed-nodes* '())
   ;; -seednode: address sources, not peers (Core connOptions.vSeedNodes).
   (when seednode

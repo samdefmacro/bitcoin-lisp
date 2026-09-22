@@ -510,6 +510,8 @@
 ;; no clearnet) is in APPLY-PARAMETER-INTERACTIONS.
 (define-option "dnsseed" :type :bool :global *dns-seed-enabled*)
 (define-option "fixedseeds" :type :bool :global *fixed-seeds-enabled*)
+;; -capturemessages: Core's debug capture of every P2P message (net.cpp:4184).
+(define-option "capturemessages" :type :bool :global *capture-messages*)
 ;; -forcednsseed: query the DNS seeds even with a full address book. It does
 ;; NOT override -dnsseed=0, which is Core's precedence too.
 (define-option "forcednsseed" :type :bool :global *force-dns-seed*)
@@ -587,7 +589,6 @@ node's own address"))))
 
 (define-core-only-options
   "blockreconstructionextratxn"
-  "capturemessages"
   "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"

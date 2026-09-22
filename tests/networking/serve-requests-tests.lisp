@@ -934,3 +934,37 @@ total; inbound = total - (full-relay + block-relay-only + feeler), floored at 0.
   (is (= 114 (bl::automatic-inbound-capacity 125 8)))
   (is (= 5 (bl::automatic-inbound-capacity 16 8)))
   (is (= 0 (bl::automatic-inbound-capacity 8 8))))
+
+(test capturemessages-writes-cores-record-format
+  "-capturemessages appends every sent and received message to
+<datadir>/message_capture/<addr with : as _>/msgs_{sent,recv}.dat as Core's
+CaptureMessageToFile writes it: 8-byte LE microseconds, the type NUL-padded to
+12 bytes, a 4-byte LE length and the payload (net.cpp:4184-4218).
+p2p_message_capture.py:60-65 globs for those files; we accepted the option
+and wrote nothing."
+  (let* ((dir (merge-pathnames (format nil "bl-capture-~D/" (random 1000000000))
+                               (uiop:temporary-directory)))
+         (bl.net:*capture-messages-directory* dir)
+         (bl.ser:*mock-time* 1700000000)
+         (peer (bl.net:make-peer
+                :address "127.0.0.1"
+                :connection (make-test-connection :host "127.0.0.1" :port 18444
+                                                  :connected t :socket nil))))
+    (unwind-protect
+         (progn
+           (bl.net:capture-message peer "ping" #(1 2 3 4 5 6 7 8) t)
+           (bl.net:capture-message peer "verack" #() nil)
+           (let ((recv (merge-pathnames "127.0.0.1_18444/msgs_recv.dat" dir))
+                 (sent (merge-pathnames "127.0.0.1_18444/msgs_sent.dat" dir)))
+             (is-true (probe-file recv))
+             (is-true (probe-file sent))
+             (with-open-file (in recv :element-type '(unsigned-byte 8))
+               (let ((bytes (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                 (read-sequence bytes in)
+                 (is (= (+ 8 12 4 8) (length bytes)))
+                 (is (= (* 1700000000 1000000)
+                        (loop for i below 8 sum (ash (aref bytes i) (* 8 i)))))
+                 (is (string= "ping" (map 'string #'code-char
+                                          (remove 0 (subseq bytes 8 20)))))
+                 (is (= 8 (loop for i below 4 sum (ash (aref bytes (+ 20 i)) (* 8 i)))))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))

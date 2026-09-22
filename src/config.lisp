@@ -99,6 +99,10 @@ config.lisp compiles first — the same reason *dns-seed-enabled* is here.")
   "Query DNS seeds for peer addresses when the address book is low (Core
 -dnsseed, DEFAULT_DNSSEED = true, net.h:96).")
 
+(defvar *capture-messages* nil
+  "-capturemessages: write every P2P message sent and received to
+<datadir>/message_capture/<addr>/ (Core, net.cpp:4184-4224; off by default).")
+
 (defvar *fixed-seeds-enabled* t
   "Allow the hardcoded fixed-seed fallback when DNS/addrman leave the
 candidate pool thin (Core -fixedseeds, DEFAULT_FIXEDSEEDS = true, net.h:97).")

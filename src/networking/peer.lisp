@@ -668,6 +668,50 @@ table is written by the sync/RPC sender threads while getpeerinfo reads."
       #-sbcl (copy-all))
     copy))
 
+(defvar *capture-messages-directory* nil
+  "-capturemessages: the datadir's message_capture/ directory while message
+capture is on, NIL otherwise (Core CaptureMessageToFile, net.cpp:4184-4218).
+Set at start-up from the option.")
+
+(defun %capture-address-string (peer)
+  "Core's addr.ToStringAddrPort() with every ':' replaced by '_', the per-peer
+directory name (net.cpp:4195-4197)."
+  (let* ((conn (peer-connection peer))
+         (host (or (and conn (connection-host conn)) (peer-address peer) "unknown"))
+         (port (or (and conn (connection-port conn)) 0))
+         (text (if (find #\: host)
+                   (format nil "[~A]:~D" host port)
+                   (format nil "~A:~D" host port))))
+    (substitute #\_ #\: text)))
+
+(defun capture-message (peer command payload incomingp)
+  "Append one message to PEER's msgs_recv.dat or msgs_sent.dat under
+*CAPTURE-MESSAGES-DIRECTORY*, in Core's record format: the mockable time in
+microseconds (8 bytes LE), the message type NUL-padded to 12 bytes, the
+payload length (4 bytes LE) and the payload (net.cpp:4193-4212;
+p2p_message_capture.py:23-51 parses exactly that). A no-op while capture is
+off. A write failure is logged and never reaches the connection."
+  (when *capture-messages-directory*
+    (handler-case
+        (let* ((dir (merge-pathnames
+                     (make-pathname :directory (list :relative (%capture-address-string peer)))
+                     *capture-messages-directory*))
+               (path (merge-pathnames (if incomingp "msgs_recv.dat" "msgs_sent.dat") dir))
+               (type-bytes (make-array 12 :element-type '(unsigned-byte 8)
+                                          :initial-element 0)))
+          (loop for ch across command
+                for i below 12
+                do (setf (aref type-bytes i) (logand (char-code ch) #xff)))
+          (ensure-directories-exist dir)
+          (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                    :if-exists :append :if-does-not-exist :create)
+            (write-sequence (int-to-le-bytes (* (bl.ser:get-unix-time) 1000000) 8) out)
+            (write-sequence type-bytes out)
+            (write-sequence (int-to-le-bytes (length payload) 4) out)
+            (write-sequence payload out)))
+      (error (e)
+        (bl:log-warn "Capturing a ~A message failed: ~A" command e)))))
+
 (defun send-message (peer message-bytes)
   "Send a raw (v1-framed) message to a peer; a connection with a v2 transport
 re-frames it as an encrypted BIP324 packet. Returns T on success, NIL on
@@ -682,6 +726,8 @@ failure."
       ;; one thing a debug.log cannot show.
       (bl:log-cat "net" "sending ~A (~D bytes) peer=~A"
                   command (- (length message-bytes) 24) (peer-id peer))
+      ;; Core captures a sent message in PushMessage (net.cpp:4077).
+      (capture-message peer command (subseq message-bytes 24) nil)
       ;; Per-command send accounting (Core CConnman::PushMessage's
       ;; mapSendBytesPerMsgType, counted when the message is handed to the
       ;; transport). The command sits at bytes 4-15 of the v1 frame.
@@ -715,7 +761,8 @@ RECEIVE-MESSAGE-BLOCKING instead."
                                   :timeout timeout)
             (when command
               (%account-message (peer-recv-per-msg peer) t command
-                                (length payload)))
+                                (length payload))
+              (capture-message peer command payload t))
             (values command payload))))
       ;; Parse the 24-byte header, unless a previous pass already did.
       ;;
@@ -808,6 +855,10 @@ RECEIVE-MESSAGE-BLOCKING instead."
                     (let ((command (bl.ser:message-header-command header)))
                       (%account-message (peer-recv-per-msg peer) nil
                                         command payload-len)
+                      ;; Core captures a received message as it is processed
+                      ;; (net_processing.cpp:5266); ours are processed in the
+                      ;; order they are read, so the record order is the same.
+                      (capture-message peer command payload t)
                       (values command payload)))))))))
 
 (defun receive-message-blocking (peer &key (timeout 30))

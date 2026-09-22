@@ -174,6 +174,8 @@ headerssync.cpp. src/networking/.")
    #:handle-message
    #:ingest-headers-from-peer
    #:headers-direct-fetch
+   #:*capture-messages-directory*
+   #:capture-message
    #:header-sync-candidate-p
    #:consider-headers-sync-timeouts
    #:header-sync-peer

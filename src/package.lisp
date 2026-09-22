@@ -67,6 +67,7 @@ init.cpp, node/. src/node/.")
    #:*stop-at-height*
    #:*dns-seed-enabled*
    #:*fixed-seeds-enabled*
+   #:*capture-messages*
    #:check-cli-args
    #:cli-parse-error
    #:unknown-config-file-keys
