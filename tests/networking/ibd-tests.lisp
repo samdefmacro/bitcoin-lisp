@@ -2543,6 +2543,37 @@ the pass runs and the timer re-arms."
             "moving the mock clock past the interval must run the pass")))
     (bl.net:reset-initial-broadcast-schedule)))
 
+(test mockscheduler-moves-the-scheduler-not-the-node-clock
+  "`mockscheduler' forwards the SCHEDULER (Core CScheduler::MockForward,
+scheduler.cpp:82-97, from rpc/node.cpp:86-99) and leaves GetTime alone. Ours
+set the node's mock clock to now+DELTA, which froze it there: every tx-inv
+trickle deadline armed after the call lay in a future that never came, so the
+re-announcement mempool_persist.py:220 and mempool_unbroadcast.py:70 wait for
+was queued and never sent."
+  (let* ((bl:*network* :regtest)
+         (base 1700000000)
+         (bl.ser:*mock-time* base)
+         (bl.ser:*scheduler-offset* 0)
+         (mempool (bl.mp:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bl.ser:transaction-hash tx))
+         (peer (bl.net:make-peer :state :ready)))
+    (%add-tx mempool tx)
+    (bl.mp:mempool-add-unbroadcast mempool txid)
+    (bl.net:reset-initial-broadcast-schedule)
+    (unwind-protect
+         (progn
+           (bl.net:maybe-reattempt-initial-broadcast (list peer) mempool)
+           (is (null (bl.net:peer-tx-inv-queue peer)) "the arming pass")
+           (bl.rpc:dispatch-rpc-method nil "mockscheduler" (list (* 16 60)))
+           (is (= base (bl.ser:get-unix-time))
+               "the node clock did not move")
+           (bl.net:maybe-reattempt-initial-broadcast (list peer) mempool)
+           (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
+               "the scheduled pass came due all the same")
+           (is (= (+ base (* 16 60)) (bl.ser:get-scheduler-time))))
+      (bl.net:reset-initial-broadcast-schedule))))
+
 ;;;; Erlay P1: BIP330 sendtxrcncl handshake (Core-parity: handshake only)
 
 (defun %recon-test-peer (&key (relay t) (inbound nil)

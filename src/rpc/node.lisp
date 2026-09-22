@@ -152,10 +152,11 @@ whether it is currently enabled. Errors on an unknown category."
   "Advance the scheduler by DELTA_TIME seconds (Core mockscheduler,
 rpc/node.cpp:86-99). Regtest only.
 
-Our scheduled work is driven off GET-UNIX-TIME rather than a separate scheduler
-thread, so advancing the mock clock IS advancing the scheduler — which is what
-the tests using this actually depend on (mempool_unbroadcast.py forwards past
-the unbroadcast re-announce interval and then asserts the re-announce happened)."
+Our scheduled work is cadence-gated on BL.SER:GET-SCHEDULER-TIME rather than
+run by a scheduler thread, so this moves that clock and nothing else: the node
+clock (GetTime) stays where it is, as Core's does (mempool_unbroadcast.py
+forwards past the unbroadcast re-announce interval and then waits for the
+re-announcement to be TRICKLED out, on the unmoved clock)."
   (declare (ignore node))
   (unless (eq bl:*network* :regtest)
     (error 'rpc-error :code +rpc-misc-error+
@@ -168,11 +169,13 @@ the unbroadcast re-announce interval and then asserts the re-announce happened).
     (when (or (<= delta 0) (> delta 3600))
       (error 'rpc-error :code +rpc-misc-error+
                         :message "delta_time must be between 1 and 3600 seconds (1 hr)"))
-    ;; NB the base is GET-UNIX-TIME, not *MOCK-TIME*: Core forwards from "now"
-    ;; whether or not the clock is already mocked, and a test that calls
-    ;; mockscheduler without a prior setmocktime relies on that.
-    (setf bl.ser:*mock-time*
-          (+ (bl.ser:get-unix-time) delta))
+    ;; The SCHEDULER's clock moves, and only it (CScheduler::MockForward,
+    ;; scheduler.cpp:82-97). This used to set the node's mock clock to
+    ;; now+DELTA, which froze GetTime for the whole node: every tx-inv
+    ;; trickle deadline armed afterwards sat in a future that never came, so
+    ;; mempool_persist.py:220 and mempool_unbroadcast.py:70 re-announced into
+    ;; a queue that was never flushed.
+    (bl.ser:mock-scheduler-forward delta)
     ;; Core's MockForward moves every scheduled task's deadline back by DELTA
     ;; and the scheduler THREAD then runs whatever has come due
     ;; (scheduler.cpp; rpc/node.cpp:86-99). Our periodic work has no thread of

@@ -304,10 +304,10 @@ the deadline an hour PAST the forwarded time and the flush never comes."
 Ours only ever wrote fee_estimates.dat at shutdown and after a block count,
 so a node that ran for days and was killed lost every estimate it had
 learned -- the file exists precisely so a restart does not start blind.
-Driven off GET-UNIX-TIME rather than a separate scheduler thread, which is
-what makes Core's `mockscheduler' RPC advance it: feature_fee_estimation.py:
+Driven off GET-SCHEDULER-TIME rather than a separate scheduler thread, which
+is what makes Core's `mockscheduler' RPC advance it: feature_fee_estimation.py:
 345 forwards an hour and then waits ONE second for the log line."
-  (let ((now (bl.ser:get-unix-time)))
+  (let ((now (bl.ser:get-scheduler-time)))
     (cond
       ((null *last-fee-estimate-flush-time*)
        (setf *last-fee-estimate-flush-time* now)

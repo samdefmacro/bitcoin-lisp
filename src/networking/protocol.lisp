@@ -4109,7 +4109,8 @@ randrange(5min) each cycle so the cadence can't fingerprint the node
 0 = not yet scheduled (armed on the first maybe- call, matching Core's
 initial scheduleFromNow a full interval out, net_processing.cpp:2036-2038).
 
-On the MOCKABLE clock (BL.SER:GET-UNIX-TIME), because Core runs this pass on
+On the SCHEDULER's clock (BL.SER:GET-SCHEDULER-TIME: the mockable clock plus
+every mockscheduler forward), because Core runs this pass on
 its CScheduler and `mockscheduler' exists to move that scheduler forward:
 mempool_unbroadcast.py:66 and mempool_persist.py:219 both call it and then
 wait for the re-announcement. Measured from GET-INTERNAL-REAL-TIME, as this
@@ -4140,7 +4141,7 @@ reaches peers connected since the original announcement."
 the sync loop, our stand-in for Core's scheduler). Each cycle — including
 the first — is scheduled 10min + rand(5min) out, on the mockable clock."
   (when mempool
-    (let ((now (bl.ser:get-unix-time)))
+    (let ((now (bl.ser:get-scheduler-time)))
       (cond ((zerop *next-initial-broadcast-time*)
              (setf *next-initial-broadcast-time*
                    (+ now (%next-initial-broadcast-seconds))))

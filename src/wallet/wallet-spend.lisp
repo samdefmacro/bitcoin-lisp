@@ -2807,9 +2807,14 @@ node-lock hold) and this thread is idle between 1s housekeeping ticks."
         ;; Core CWallet::ShouldResend's first line: "Don't attempt to resubmit
         ;; if the wallet is configured to not broadcast" (wallet.cpp:2062-2064).
         (when (and bl:*wallet-broadcast* manager (wallet-manager-has-wallets-p manager))
-          (let ((now (bl.ser:get-unix-time)))
-            (when (>= (- now *last-resend-check*) +resend-check-interval+)
-              (setf *last-resend-check* now)
+          ;; The once-a-minute cadence is the SCHEDULER's (Core schedules
+          ;; MaybeResendWalletTxs every minute, wallet/load.cpp:170-175, and
+          ;; wallet_resendwallettransactions.py:66 drives it with
+          ;; mockscheduler(60)); each wallet's own deadline is GetTime's.
+          (let ((now (bl.ser:get-unix-time))
+                (tick (bl.ser:get-scheduler-time)))
+            (when (>= (- tick *last-resend-check*) +resend-check-interval+)
+              (setf *last-resend-check* tick)
               (let ((chain-state (bl:node-chain-state node)))
                 (unless (or (null chain-state)
                             (bl.net:initial-block-download-p

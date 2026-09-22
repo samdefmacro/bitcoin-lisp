@@ -151,6 +151,31 @@ GetUptime uses SteadyClock rather than the mockable GetTime
 (Core GetTime, util/time.cpp)."
   (or *mock-time* (get-real-unix-time)))
 
+;;; Core's CScheduler runs on its own clock and `mockscheduler' moves only
+;;; that clock (CScheduler::MockForward, scheduler.cpp:82-97, reached from
+;;; rpc/node.cpp:86-99): every queued task's deadline comes DELTA closer, and
+;;; GetTime -- what the tx-inv trickle, the ping timer, the resend deadlines
+;;; read -- does not move at all. Our scheduled tasks are cadence gates in the
+;;; sync thread's tick, so the scheduler's clock is the node clock plus the
+;;; sum of every mockscheduler DELTA.
+
+(defvar *scheduler-offset* 0
+  "Seconds `mockscheduler' has moved the scheduler's clock ahead of the node
+clock (Core CScheduler::MockForward). Zero outside regtest tests.")
+
+(defun get-scheduler-time ()
+  "The Unix time the node's SCHEDULED tasks read for their cadence (the
+unbroadcast re-announcement, the hourly fee-estimate flush, the wallet resend
+pass): GET-UNIX-TIME plus *SCHEDULER-OFFSET*. Everything else reads
+GET-UNIX-TIME, so `mockscheduler' no longer freezes the whole node's clock ten
+or sixty minutes in the future -- which parked every Poisson trickle deadline
+armed after it forever, and no tx inv left the node again."
+  (+ (get-unix-time) *scheduler-offset*))
+
+(defun mock-scheduler-forward (delta)
+  "Move the scheduler's clock DELTA seconds ahead (Core MockForward)."
+  (incf *scheduler-offset* delta))
+
 (defun get-node-time ()
   "Current CL universal time, or the mocked one when setmocktime is in effect.
 
