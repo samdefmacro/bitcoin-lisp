@@ -2609,6 +2609,35 @@ the broken entry is listed FIRST here, so this fails if the loop aborts."
     (is (equal '("good") (%loaded-wallet-names node))
         "a wallet listed before a broken one must still load")))
 
+(test startup-refuses-a-wallet-another-instance-holds
+  "Core's VerifyWallets stops startup when a -wallet cannot be opened
+(load.cpp:106-110), and a database another process holds is SQLiteDatabase's
+exclusive-lock failure (wallet/sqlite.cpp:276-283), which feature_filelock.py:51
+reads off stderr. The skip-and-log divergence above is for a wallet that is
+broken; a wallet that is BUSY means two nodes point at it, which is the
+datadir lock's situation one directory down."
+  (with-wallet-test-node (node)
+    (bl.rpc:dispatch-rpc-method node "createwallet" '("held"))
+    (let ((second (%make-wallet-test-node (%wallet-settings-dir node))))
+      (unwind-protect
+           (let ((refusal (handler-case
+                              (progn (bl.wallet:load-wallets-on-startup
+                                      second '("held"))
+                                     :started)
+                            (bl.err:init-error (e) (princ-to-string e)))))
+             (is (equal "SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of bitcoin-lisp?"
+                        refusal)))
+        (ignore-errors
+         (bl.wallet:close-wallet-manager (%node-manager second)))))
+    ;; Control: once the holder lets go, the same startup load succeeds.
+    (bl.wallet:close-wallet-manager (%node-manager node))
+    (let ((second (%make-wallet-test-node (%wallet-settings-dir node))))
+      (unwind-protect
+           (progn (bl.wallet:load-wallets-on-startup second '("held"))
+                  (is (equal '("held") (%loaded-wallet-names second))))
+        (ignore-errors
+         (bl.wallet:close-wallet-manager (%node-manager second)))))))
+
 ;;;; --- tr() script trees through the WALLET signer -------------------------
 
 (test wallet-signs-a-tr-script-path

@@ -1511,6 +1511,19 @@ Wallet::Verify prefixes them."
                                          "Data is not in recognized format."
                                          "Path does not exist."))))
 
+(define-condition wallet-database-locked (bl.rpc:rpc-error) ()
+  (:documentation "The wallet database is held by another process: Core's
+SQLiteDatabase exclusive-lock failure (wallet/sqlite.cpp:276-283), which a
+startup load turns into an InitError and loadwallet into -4. A subclass so
+that the startup loader can tell it from a wallet it merely cannot read."))
+
+(defun %wallet-database-lock-conflict-p (condition)
+  "T when CONDITION is the engine refusing to open a database whose lock
+another holder has. LevelDB reports a held LOCK file as an IOError whose text
+begins `lock <path>: ' (env_posix.cc LockFile, both for another process's
+fcntl lock and for a second open in this one)."
+  (and (search "IO error: lock " (princ-to-string condition)) t))
+
 (defun %wallet-database-open-error (path condition)
   "Core's FAILED_LOAD for a database that passed the format probe and still
 could not be opened. MakeSQLiteDatabase catches the engine's own runtime_error
@@ -1521,8 +1534,19 @@ CreateWallet both prefix \"Wallet file verification failed. \"
 in ours, with a log line that keeps the path beside it."
   (bl:log-warn "wallet database at ~A could not be opened: ~A"
                (wallet-path-string path) condition)
-  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                    :message (format nil "Wallet file verification failed. ~A" condition)))
+  ;; A held lock is reported in Core's sentence: it is the one this failure
+  ;; has in every client and log that talks about a second instance, and
+  ;; feature_filelock.py:51, wallet_multiwallet.py:208/:395 and
+  ;; tool_wallet.py:140 match on it. It names Core's SQLite engine; the
+  ;; condition that raises it here is the same one -- another process holds
+  ;; the database -- on our LevelDB one.
+  (if (%wallet-database-lock-conflict-p condition)
+      (error 'wallet-database-locked
+             :code bl.rpc:+rpc-wallet-error+
+             :message (format nil "Wallet file verification failed. SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of ~A?"
+                              bl.cfg:+client-name+))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                               :message (format nil "Wallet file verification failed. ~A" condition))))
 
 (defun %wallet-corrupt-error (path condition)
   "Signal Core's DBErrors::CORRUPT as the client sees it: `Error loading %s:
@@ -2082,7 +2106,9 @@ DELIBERATE DIVERGENCE from Core: Core aborts startup with an init error when a
 listed wallet fails to load. We log it and skip to the next one. The node runs
 under a respawn supervisor, so aborting would turn one corrupt wallet into an
 endless restart loop with no node at all — strictly worse than a running node
-whose wallet is missing and loudly logged."
+whose wallet is missing and loudly logged. The exception is a wallet another
+process holds (WALLET-DATABASE-LOCKED): that is Core's refusal, since two
+nodes on one wallet is the fault, not the wallet."
   (let ((manager (bl:node-wallet-manager node)))
     (when manager
       ;; -wallet=<name> FIRST, then what settings.json recorded, duplicates
@@ -2111,9 +2137,26 @@ whose wallet is missing and loudly logged."
                 (dolist (warning warnings)
                   (bl:log-warn "Wallet ~S: ~A" name warning))
                 (bl:log-info "Loaded wallet ~S" name))
+            ;; The one refusal that stops startup, as every refusal does in
+            ;; Core (VerifyWallets -> chain.initError, load.cpp:106-110):
+            ;; another process holds this wallet, which is the datadir lock's
+            ;; situation one directory down, and loading on without it would
+            ;; hide that two nodes are pointed at one wallet.
+            (wallet-database-locked (e)
+              (init-error "~A" (%strip-verification-prefix
+                                (bl.rpc:rpc-error-message e))))
             (error (e)
               (bl:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
                                      name e))))))))
+
+(defun %strip-verification-prefix (message)
+  "MESSAGE without LoadWalletInternal's `Wallet file verification failed. '
+prefix (wallet.cpp:280-284): VerifyWallets reports MakeWalletDatabase's own
+error string, which has none."
+  (let ((prefix "Wallet file verification failed. "))
+    (if (alexandria:starts-with-subseq prefix message)
+        (subseq message (length prefix))
+        message)))
 
 (bl.rpc:define-rpc "loadwallet" (node params)
   "Load a wallet from the wallet directory (Bitcoin Core loadwallet).
