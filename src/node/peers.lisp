@@ -1415,6 +1415,27 @@ peer to open one with."
            chain-state (bl.ser:get-unix-time))
         (error (e) (log-warn "Headers-sync timeout sweep failed: ~A" e))))))
 
+(defun consider-chain-sync-evictions (node &optional (now (bl.ser:get-unix-time)))
+  "Core's per-peer ConsiderEviction over every peer, on the MOCKABLE clock.
+Core calls it from SendMessages on every message-handler pass
+(net_processing.cpp:6157-6159), so the sync thread's sub-second idle tick runs
+it too, not only the once-per-pass MAINTAIN-PEERS sweep: p2p_outbound_eviction.py
+:46-56 jumps the clock past CHAIN_SYNC_TIMEOUT, pings, and at once jumps it
+past HEADERS_RESPONSE_TIME, so the getheaders probe has to go out between the
+two jumps or its deadline is measured from the second one and never passes."
+  (let ((chain-state (node-current-chainstate node)))
+    (when chain-state
+      (dolist (peer (node-peers node))
+        (handler-case
+            (bl.net:consider-chain-sync-eviction peer chain-state now)
+          (error (e)
+            ;; Per-peer, so one unhappy peer cannot stop the sweep — but
+            ;; LOGGED, not swallowed. A silent error here exempts that peer
+            ;; from eviction forever, which is indistinguishable from the
+            ;; eclipse this code exists to prevent.
+            (log-warn "Chain-sync eviction failed for ~A: ~A"
+                      (bl.net:peer-log-name peer) e)))))))
+
 (defun consider-outbound-evictions (node)
   "Core's two outbound-eviction sweeps, on Core's two cadences.
 
@@ -1433,19 +1454,7 @@ disconnect; node0's log shows the ladder never being walked at all.
 Driven from here rather than from run-ibd's block-download loop, which does not
 run at tip — exactly where eclipse resistance matters."
   (let ((now (bl.ser:get-unix-time)))
-    (let ((chain-state (node-current-chainstate node)))
-      (when chain-state
-        (dolist (peer (node-peers node))
-          (handler-case
-              (bl.net:consider-chain-sync-eviction
-               peer chain-state now)
-            (error (e)
-              ;; Per-peer, so one unhappy peer cannot stop the sweep — but
-              ;; LOGGED, not swallowed. A silent error here exempts that peer
-              ;; from eviction forever, which is indistinguishable from the
-              ;; eclipse this code exists to prevent.
-              (log-warn "Chain-sync eviction failed for ~A: ~A"
-                        (bl.net:peer-log-name peer) e))))))
+    (consider-chain-sync-evictions node now)
     ;; The 45-second half. A clock that moved BACKWARDS (setmocktime) re-arms
     ;; the cadence instead of stalling it forever.
     (when (or (>= (- now *last-chain-sync-check*)

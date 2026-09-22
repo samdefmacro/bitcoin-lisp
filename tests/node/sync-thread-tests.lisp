@@ -276,3 +276,32 @@ Control: with the clock left at the connect time the same tick keeps the peer."
                      "one tick after the mock clock passes -peertimeout the unfinished handshake is dropped")
            (is (eq :disconnected (bl.net:peer-state peer))))
       (setf (bl:node-running node) nil))))
+
+(test idle-tick-walks-the-chain-sync-eviction-ladder
+  "Core calls ConsiderEviction from SendMessages on every message-handler pass
+(net_processing.cpp:6157-6159). p2p_outbound_eviction.py:46-56 jumps mocktime
+past CHAIN_SYNC_TIMEOUT, pings, and immediately jumps it past
+HEADERS_RESPONSE_TIME: the probe must go out between the two jumps, and the
+disconnect must follow the second within the framework's wait. Ours walked
+the ladder only from MAINTAIN-PEERS, once per 30-second sync pass, so the probe
+was stamped after the second jump and its deadline never passed.
+
+A peer whose probe has already gone unanswered past its deadline is dropped by
+ONE idle tick, with Core's line."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (peer (bl.net:make-peer :state :ready :address "203.0.113.10"
+                                 :conn-type :outbound-full-relay
+                                 :chain-sync-timeout 1
+                                 :chain-sync-sent-getheaders t)))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t)
+           (push peer (bl:node-peers node))
+           (is-true (bl.net:peer-outbound-or-block-relay-p peer)
+                    "control: an automatic outbound peer is a candidate")
+           (let ((lines (capture-log-lines #'%idle-tick)))
+             (is-true (find "Outbound peer has old chain" lines :test #'search)
+                      "one idle tick must walk the ladder to the disconnect: ~S" lines)))
+      (setf (bl:node-running node) nil))))

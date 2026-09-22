@@ -2354,13 +2354,28 @@ net_processing.cpp:5244-5245).
 
 A non-empty parked queue parks too, whatever the pause says: read order is
 dispatch order, and %DISPATCH-PARKED-MESSAGES can leave a remainder behind when
-it hits its own per-pass message budget."
+it hits its own per-pass message budget.
+
+A dispatched message is followed by this peer's ConsiderEviction, as Core's
+ProcessMessages is followed by SendMessages for the same peer before its next
+message is taken (net_processing.cpp:6157-6159): a headers message that
+catches the peer up to the benchmark re-arms the timer against the tip AS IT
+IS NOW, before the ping behind it is answered. p2p_outbound_eviction.py:90-103
+mines the next block 25 ms after that pong."
   (let ((conn (peer-connection peer)))
     (if (and conn
              (or (connection-send-paused-p conn)
                  (connection-parked-messages-p conn)))
         (park-received-message conn command payload)
-        (safely-dispatch-peer-message peer command payload node-ctx ctx))))
+        (progn
+          (safely-dispatch-peer-message peer command payload node-ctx ctx)
+          (let ((chain-state (bl.ctx:node-context-chain-state node-ctx)))
+            (when (and chain-state (eq (peer-state peer) :ready))
+              (handler-case
+                  (consider-chain-sync-eviction peer chain-state (bl.ser:get-unix-time))
+                (error (e)
+                  (bl:log-warn "Chain-sync eviction failed for ~A: ~A"
+                               (peer-log-name peer) e)))))))))
 
 (defconstant +addr-fetch-timeout-seconds+ (* 10 30)
   "Core's addr-fetch lifetime, 10 * AVG_ADDRESS_BROADCAST_INTERVAL (30 s,

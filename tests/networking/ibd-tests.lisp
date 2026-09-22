@@ -5775,3 +5775,50 @@ dropped, and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
       (flush-peer-invs filtered)
       (is-false (bl:recent-reject-p (bl.net:peer-announced-txs filtered) below)
                 "one satoshi per kvB under it is still withheld"))))
+
+(test pump-considers-eviction-after-each-message
+  "Core follows each message it processes for a peer with SendMessages for
+that peer, whose ConsiderEviction (net_processing.cpp:6157-6159) judges the
+chain-sync timer against the tip as it stands right then.
+p2p_outbound_eviction.py:90-103 has its peer send headers and a ping, and mines
+the next block 25 ms after the pong: a verdict deferred to the next sync-thread
+tick is measured against the wrong tip. Here an outbound peer whose probe
+already went unanswered past its deadline sends one ping, and the pump pass
+that reads it also drops it. Runs over a loopback socket pair."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (unwind-protect
+           (let* ((bl:*network* :regtest)
+                  (port (usocket:get-local-port srv))
+                  (client (bl.net:connect-peer "127.0.0.1" port))
+                  (conn (and client (bl.net:accept-connection srv :timeout 10)))
+                  ;; An automatic outbound peer whose probe went unanswered.
+                  (server-peer (and conn (bl.net:make-peer
+                                          :connection conn :address "127.0.0.1"
+                                          :state :ready
+                                          :conn-type :outbound-full-relay
+                                          :chain-sync-timeout 1
+                                          :chain-sync-sent-getheaders t))))
+             (is-true server-peer)
+             (when server-peer
+               (unwind-protect
+                    (progn
+                      (bl.net:init-peer-rate-limiters server-peer)
+                      (setf (bl.net:peer-state client) :ready)
+                      (is-true (bl.net:peer-outbound-or-block-relay-p server-peer)
+                               "control: the peer is an eviction candidate")
+                      (bl.net:send-message client (bl.ser:make-ping-message 9))
+                      (sleep 0.2)
+                      (bl.net:pump-peer-messages
+                       (list server-peer)
+                       (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state)
+                                                 :utxo-set (bl.store:make-utxo-set)
+                                                 :mempool (bl.mp:make-mempool)
+                                                 :peers (list server-peer))
+                       nil)
+                      (is (eq :disconnected (bl.net:peer-state server-peer))
+                          "the pass that read the ping must also walk the ladder"))
+                 (ignore-errors (bl.net:disconnect-peer server-peer))
+                 (ignore-errors (bl.net:disconnect-peer client)))))
+        (bl.net:close-listener srv)))))

@@ -1500,8 +1500,12 @@ sync thread with node-running still T is a socket-reading zombie)."
 (defun %sync-tick-liveness (node)
   "The per-tick liveness verdicts, on the MOCKABLE clock: InactivityCheck for
 the handshakes still in flight (Core runs it on every socket-handler pass,
-net.cpp:2218)."
-  (check-handshaking-peers node))
+net.cpp:2218) and ConsiderEviction for every outbound peer (Core
+SendMessages, net_processing.cpp:6159). Run BEFORE the pump answers anything,
+so a peer whose ping is answered this tick has seen the verdict for the clock
+it set before pinging (p2p_outbound_eviction.py:46-56)."
+  (check-handshaking-peers node)
+  (consider-chain-sync-evictions node))
 
 (defun %sync-idle-tick (second)
   "One sub-second tick of the sync thread's wait between sync passes (Core's
@@ -1526,7 +1530,7 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
                      (merge-inbound-peers *node*)
                      (dial-queued-nodes *node*)
                      (> (length (node-peers *node*)) peers-before))))
-  (%sync-tick-liveness *node*)      ; InactivityCheck
+  (%sync-tick-liveness *node*)      ; InactivityCheck + ConsiderEviction
   (run-header-sync-duties *node*)   ; Core SendMessages, headers half
   ;; Retry buffered unsent bytes on
   ;; every peer (non-blocking) — the
