@@ -4729,6 +4729,29 @@ waits for `bad-txns-vout-empty' and the disconnect."
           (is (eq :disconnected (bl.net:peer-state peer))
               "the sender was not punished (MaybePunishNodeForBlock)"))))))
 
+(test the-header-locator-never-starts-at-an-invalid-header
+  "Core's m_best_header is moved off a block found invalid (InvalidChainFound,
+validation.cpp:1960-1983), so the locators built from it start at the best
+VALID header. Ours took the highest entry in the index whatever its status:
+after a block above the tip was refused, every getheaders started at the
+refused header, and p2p_segwit.py:376 (test_block_relay) never saw the
+getheaders naming the real tip it waits for. Control: an unmarked header
+above the tip does lead the locator."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash tip-entry)
+        (%forged-body-fixture "locator-skips-invalid")
+      (declare (ignore utxo store genesis-hash))
+      (let* ((tip-hash (bl.store:block-index-entry-hash tip-entry))
+             (h (first (make-test-chain-hashes #xB8 1)))
+             (blk (make-reorg-test-block tip-hash h 3)))
+        (%index-header cs blk h 3 tip-entry 900000)
+        (is (equalp h (first (bl.net::build-header-locator cs)))
+            "control: a valid header above the tip leads the locator")
+        (setf (bl.store:block-index-entry-status
+               (bl.store:get-block-index-entry cs h))
+              :invalid)
+        (is (equalp tip-hash (first (bl.net::build-header-locator cs))))))))
+
 ;;;; The block-download drain indexes an unseen header before judging the body
 
 (test drain-accepts-an-unsolicited-block-whose-header-it-has-never-seen

@@ -2856,12 +2856,23 @@ The floor is -1, not 0: a node that has only loaded genesis has exactly ONE
 entry, at height 0, and a floor of 0 answered NIL for it -- so every caller
 (the two locators, the 24-hour carve-out, the headers-download timeout) treated
 a fresh node as having no header chain at all. Core's m_best_header is the
-genesis index entry at that point, never null (validation.cpp LoadBlockIndex)."
+genesis index entry at that point, never null (validation.cpp LoadBlockIndex).
+
+An entry marked :invalid is never the header tip: Core's m_best_header is
+moved off a block the moment it is found invalid (InvalidChainFound,
+validation.cpp:1960-1983) and AcceptBlockHeader never raises it onto a
+failed header. Counted here, the header of a block refused in AcceptBlock
+became the start of every locator we sent, and a peer answering the next
+announcement's getheaders from our REAL tip never matched it:
+p2p_segwit.py:376 (test_block_relay) waits for a getheaders naming the tip
+after test_v0_outputs_arent_spendable left two refused blocks above it."
   (let ((best-entry nil)
         (best-height -1))
     (maphash (lambda (hash entry)
                (declare (ignore hash))
-               (when (> (bl.store:block-index-entry-height entry) best-height)
+               (when (and (> (bl.store:block-index-entry-height entry) best-height)
+                          (not (eq (bl.store:block-index-entry-status entry)
+                                   :invalid)))
                  (setf best-height (bl.store:block-index-entry-height entry))
                  (setf best-entry entry)))
              (bl.store:chain-state-block-index chain-state))
