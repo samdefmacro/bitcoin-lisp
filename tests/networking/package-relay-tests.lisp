@@ -1194,7 +1194,18 @@ disconnects its sender."
                                  (%pr-ctx state utxo mempool rejects))
           (is (eq :ready (bl.net:peer-state asked))
               "the peer that answered our getdata is not rate-limited")
-          (is-true (bl.mp:mempool-has mempool txid)))))))
+          (is-true (bl.mp:mempool-has mempool txid))
+          ;; A noban peer is spared the bucket even for an unsolicited
+          ;; transaction (NetPermissionFlags::NoBan, net_permissions.h:34-36).
+          (with-whitelist (:whitebind bl.net:+perm-noban+)
+            (let ((noban (bl.net:init-peer-rate-limiters
+                          (bl.net:make-peer :address "198.51.100.23" :inbound t
+                                            :state :ready
+                                            :services bl.ser:+node-witness+))))
+              (bl.net:handle-message noban "tx" (%pr-payload tx)
+                                     (%pr-ctx state utxo mempool rejects))
+              (is (eq :ready (bl.net:peer-state noban))
+                  "a noban peer's unsolicited tx is not rate-limited"))))))))
 
 (test a-tx-request-expires-at-its-expiry-not-a-second-later
   "Core stamps a tx request's expiry as request time + GETDATA_TX_INTERVAL

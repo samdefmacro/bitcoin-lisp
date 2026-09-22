@@ -748,8 +748,13 @@ is sending is one we asked it for (Core's REQUESTED state for the
 (defun %unsolicited-tx-over-limit-p (peer txid wtxid)
   "T when PEER sent a transaction we did NOT request from it and its tx token
 bucket is empty. A requested transaction is never charged: its rate is ours,
-set by the getdatas we chose to send."
-  (and (not (tx-request-in-flight-to-p txid peer))
+set by the getdatas we chose to send. A noban peer is never charged either,
+as HANDLE-MESSAGE spares it every other bucket: Core never disconnects it for
+its conduct (NetPermissionFlags::NoBan, net_permissions.h:34-36), and the
+functional framework's -whitelist=noban peers relay chains of 25+
+transactions at once (mempool_packages.py:173)."
+  (and (not (peer-has-permission-p peer +perm-noban+))
+       (not (tx-request-in-flight-to-p txid peer))
        (not (tx-request-in-flight-to-p wtxid peer))
        (peer-rate-limit-tx peer)
        (not (bl:token-bucket-allow-p (peer-rate-limit-tx peer)))))

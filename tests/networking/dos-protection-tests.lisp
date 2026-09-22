@@ -173,20 +173,27 @@ conduct (NetPermissionFlags::NoBan, net_permissions.h:34-36). The functional
 framework whitelists its peers noban and relays whole chains at once;
 mempool_packages.py:173 lost its only peer to `Rate limit exceeded on tx
 messages' after a 25-transaction chain. Control: an ordinary peer with the
-same drained bucket is still refused."
+same drained bucket is still refused.
+
+The tx bucket itself is charged in the tx handler, for unsolicited
+transactions only, and spares a noban peer there
+(a-requested-tx-is-never-charged-to-the-tx-rate-limit); this test meters the
+dispatcher's buckets through inv, with an empty inventory."
   (with-whitelist (:entries '("noban@198.51.100.21/32"))
-    (let ((bl:*rate-limit-tx* '(1.0 . 2.0))
+    (let ((bl:*rate-limit-inv* '(1.0 . 2.0))
           (ctx (bl.ctx:make-node-context))
           (noban (bl.net:make-peer :inbound t :address "198.51.100.21"))
-          (ordinary (bl.net:make-peer :inbound t :address "198.51.100.22")))
+          (ordinary (bl.net:make-peer :inbound t :address "198.51.100.22"))
+          (empty-inv (make-array 1 :element-type '(unsigned-byte 8)
+                                   :initial-element 0)))
       (bl.net:init-peer-rate-limiters noban)
       (bl.net:init-peer-rate-limiters ordinary)
       (is (= 2 (loop repeat 10
-                     count (bl.net:handle-message ordinary "tx" #() ctx)))
+                     count (bl.net:handle-message ordinary "inv" empty-inv ctx)))
           "control: the ordinary peer's bucket admits its burst of two only")
       (is (= 10 (loop repeat 10
-                      count (bl.net:handle-message noban "tx" #() ctx)))
-          "a noban peer's tx flood is taken in, not cut off"))))
+                      count (bl.net:handle-message noban "inv" empty-inv ctx)))
+          "a noban peer's inv flood is taken in, not cut off"))))
 
 (test check-peer-rate-limit-rejects-flood
   "Rate limit check should reject when burst is exceeded."
