@@ -525,9 +525,17 @@ that names more items than that is answering nothing we asked for
 
 (defun tx-request-preferred-p (peer)
   "Preferred announcers are requested first and without the non-preferred
-delay: outbound connections (Core's fPreferredDownload — outbound or NoBan
-permission; we have no permission flags)."
-  (not (peer-inbound peer)))
+delay (Core's m_preferred = fPreferredDownload, net_processing.cpp:3750 and
+:3892): an outbound connection, or an inbound one holding the noban
+permission, and never an addr-fetch connection. p2p_tx_download.py:231-234
+whitelists noban@127.0.0.1 and expects an inbound peer's inv to be fetched at
+once. Core's third term, CanServeBlocks, is left out here: it is about BLOCK
+download, every peer the tx tests make advertises NODE_NETWORK anyway, and
+the synthetic peers of our own suites do not (PEER-PREFERRED-DOWNLOAD-P keeps
+it for the headers timeout, where it matters)."
+  (and (or (not (peer-inbound peer))
+           (peer-has-permission-p peer +perm-noban+))
+       (not (eq (peer-conn-type peer) :addr-fetch))))
 
 (defun %tx-announcement-delay-seconds (peer wtxidp num-wtxid-peers)
   "The announcement's request delay in %TX-REQUEST-NOW seconds — the sum Core

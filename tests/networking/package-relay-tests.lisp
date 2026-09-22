@@ -1220,3 +1220,28 @@ came. Control: one second before the expiry nothing is re-routed."
                "at request time + 60 s the request expires and is re-routed")
            (is (eq second-peer (tx-request-in-flight-peer hash))))
       (bl.net:reset-tx-requests))))
+
+(test a-noban-inbound-peers-announcement-is-requested-at-once
+  "Core's tx-request preference is fPreferredDownload (net_processing.cpp:3750,
+:3892): outbound, OR inbound with the noban permission. p2p_tx_download.py
+:231-234 restarts the node with -whitelist=noban@127.0.0.1 and expects an
+inbound peer's inv to be fetched without NONPREF_PEER_TX_DELAY; ours treated
+every inbound peer as non-preferred. Control: without the grant the same
+announcement waits out the delay."
+  (flet ((inbound-peer ()
+           (bl.net:make-peer :address "127.0.0.1" :state :ready :inbound t)))
+    (bl.net:reset-tx-requests)
+    (unwind-protect
+         (progn
+           (let ((bl.net:*whitelist-entries* '()))
+             (is-false (bl.net:tx-request-wanted-p
+                        (make-array 32 :element-type '(unsigned-byte 8) :initial-element 81)
+                        (inbound-peer) t)
+                       "control: a plain inbound announcement is delayed"))
+           (let ((bl.net:*whitelist-entries*
+                   (list (bl.net:parse-whitelist-entry "noban@127.0.0.1"))))
+             (is-true (bl.net:tx-request-wanted-p
+                       (make-array 32 :element-type '(unsigned-byte 8) :initial-element 82)
+                       (inbound-peer) t)
+                      "a noban inbound peer is preferred: requested at once")))
+      (bl.net:reset-tx-requests))))
