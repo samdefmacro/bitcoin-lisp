@@ -1800,6 +1800,34 @@ leaf resolves its hash against."
                  (when leaves
                    (setf (gethash (subseq spk 2 34) tr-scripts) (nreverse leaves))))))))
 
+(defun %psbt-wallet-sign (psbt wallet coins user-sighash)
+  "The signing half of Core's CWallet::FillPSBT with sign=true: every key and
+script the wallet has for the inputs -- its own SPKMs, the keys the inputs
+list, the leaves they carry -- and the partial signatures recorded. Never
+finalizes."
+  (let ((bl.rpc:*solving-pubkeys* (%psbt-listed-pubkeys-table psbt)))
+    (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
+        (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
+      (%psbt-add-foreign-pubkey-keys psbt wallet coins keymap pubmap tr-keymap)
+      (%psbt-add-input-tr-scripts psbt coins tr-scripts)
+      (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
+                               tr-scripts))))
+
+(defun wallet-fill-psbt (wallet tx)
+  "Core FinishTransaction's PSBT (wallet/rpc/spend.cpp:111-124) for the
+UNSIGNED transaction TX: FillPSBT without signing (utxos, derivations), then
+with signing, then FinalizePSBT -- so an input the wallet could not finish
+carries its partial signatures and derivations, and only a complete input
+carries a final scriptSig/witness. Returns the PSBT."
+  (let ((psbt (bl.ser:make-empty-psbt tx)))
+    (%psbt-fill-wallet-utxos psbt wallet)
+    (let ((coins (%psbt-coins-map psbt wallet nil)))
+      (%psbt-add-wallet-input-derivs psbt coins wallet)
+      (%psbt-add-wallet-output-derivs psbt wallet)
+      (%psbt-wallet-sign psbt wallet coins nil))
+    (%psbt-finalize-in-place psbt)
+    psbt))
+
 (bl.rpc:define-rpc "walletprocesspsbt" (node params)
   "Update a PSBT with wallet input info and sign the inputs we can (Bitcoin Core
 walletprocesspsbt). PARAMS: (psbt [sign] [sighashtype] [bip32derivs] [finalize]).
@@ -1831,14 +1859,7 @@ Returns {psbt, complete, hex?}."
               (%psbt-add-wallet-input-derivs psbt coins wallet)
               (%psbt-add-wallet-output-derivs psbt wallet))
             (when sign
-              (let ((bl.rpc:*solving-pubkeys* (%psbt-listed-pubkeys-table psbt)))
-                (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
-                    (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
-                  (%psbt-add-foreign-pubkey-keys psbt wallet coins
-                                                 keymap pubmap tr-keymap)
-                  (%psbt-add-input-tr-scripts psbt coins tr-scripts)
-                  (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
-                                           tr-scripts))))
+              (%psbt-wallet-sign psbt wallet coins user-sighash))
             (%psbt-signer-result psbt finalize t)))))))
 
 ;;; --- descriptorprocesspsbt (rpc/rawtransaction.cpp:1992) ---

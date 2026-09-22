@@ -2922,3 +2922,55 @@ wants it all in untrusted_pending. The default (on) is the control."
           (let ((bl.wallet:*wallet-spend-zero-conf-change* nil))
             (is (zerop (mine "trusted")))
             (is (plusp (mine "untrusted_pending")))))))))
+
+(test a-watch-only-send-psbt-leaves-unsigned-inputs-unfinalized
+  "send/sendall build their PSBT through FillPSBT without and then with
+signing and FinalizePSBT (FinishTransaction, wallet/rpc/spend.cpp:111-124), so
+an input the wallet could not complete carries its derivations and scripts and
+NO final fields. Ours copied the signed transaction's witness into
+final_scriptwitness input by input, including the half-built
+[<empty>, <empty>, script] the signer leaves on a watch-only 1-of-2 multisig
+-- a `finished' input no one had signed; the offline signer then had nothing
+to do and wallet_taproot.py:379's cleanup broadcast a script that evaluates
+false."
+
+  (with-wallet-chain-node (node "watch-only-send-psbt")
+    (flet ((rpc (wallet method &rest params)
+             (with-rpc-wallet (wallet)
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (obj (&rest kv)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+               h)))
+      (let* ((optrue (bl.crypto:encode-p2sh-address (bl.crypto:hash160 +optrue-redeem+) :regtest))
+             (a "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
+             (b "tprv8ZgxMBicQKsPeNLUGrbv3b7qhUk1LQJZAGMuk9gVuKh9sd4BWGp1eMsehUni6qGb8bjkdwBxCbgNGdh2bYGACK5C5dRTaif9KBKGVnSezxV")
+             (priv (lambda (br) (bl.rpc:descriptor-add-checksum
+                                  (format nil "wsh(multi(1,~A/~D/*,~A/~D/*))" a br
+                                          (let ((d (%aval "descriptor" (rpc nil "getdescriptorinfo" (format nil "pk(~A/~D/*)" b br)))))
+                                            (subseq d 3 (position #\/ d)))
+                                          br))))
+             (pub (lambda (br) (%aval "descriptor" (rpc nil "getdescriptorinfo" (funcall priv br))))))
+        (rpc nil "createwallet" "fund")
+        (rpc nil "createwallet" "online" t t)
+        (rpc nil "createwallet" "offline" nil t)
+        (rpc "online" "importdescriptors" (list (obj "desc" (funcall pub 0) "active" t "timestamp" "now")
+                                                (obj "desc" (funcall pub 1) "active" t "internal" t "timestamp" "now")))
+        (rpc "offline" "importdescriptors" (list (obj "desc" (funcall priv 0) "active" t "timestamp" "now")
+                                                 (obj "desc" (funcall priv 1) "active" t "internal" t "timestamp" "now")))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (dotimes (i 3)
+          (with-wallet-rng ((+ 100 i))
+            (rpc "fund" "sendtoaddress" (rpc "online" "getnewaddress" "" "bech32")
+                 (bl.rpc:format-money 50000000) nil nil nil nil nil nil nil 10)))
+        (rpc nil "generatetoaddress" 1 optrue)
+        (let* ((psbt (%aval "psbt" (with-wallet-rng (7) (rpc "online" "sendall" (list optrue) nil nil nil (obj "psbt" t "fee_rate" 10)))))
+               (res (rpc "offline" "walletprocesspsbt" psbt t "ALL" t bl.rpc:+json-false+))
+               (fin (rpc nil "finalizepsbt" (%aval "psbt" res))))
+          (is (null (%aval "final_scriptwitness"
+                           (first (coerce (%aval "inputs" (rpc nil "decodepsbt" psbt)) 'list))))
+              "the watch-only wallet's PSBT claims a finished input")
+          (is (eq t (%aval "complete" fin)) "the offline signature completes it")
+          (is (eq t (%aval "allowed" (first (rpc nil "testmempoolaccept" (list (%aval "hex" fin))))))
+              "and the finished transaction is valid"))))))

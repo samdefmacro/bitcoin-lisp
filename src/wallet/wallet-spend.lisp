@@ -3324,69 +3324,32 @@ ConstructTransaction sequence defaults."
 (defun %serialize-txout-bytes (txout)
   (%wser (s) (bl.ser:write-tx-out s txout)))
 
-(defun %serialize-witness-stack (stack)
-  (%wser (s)
-    (bl.ser:write-compact-size s (length stack))
-    (dolist (element stack)
-      (bl.ser:write-compact-size s (length element))
-      (bl.ser:write-bytes s element))))
-
 (defun %tx-to-finalized-psbt (node wallet signed-tx coins)
-  "A PSBT for SIGNED-TX: the unsigned skeleton plus, per input, the known
-UTXO (witness_utxo always; non_witness_utxo when the full previous tx is in
-the wallet) and — for inputs that carry signatures — the finalized
-final_scriptSig / final_scriptWitness, i.e. the state Core's
-FillPSBT(sign)+FinalizePSBT leaves behind. DIVERGENCE (wallet P5 closes
-it): no partial_sig records for UNSIGNED inputs and no bip32_derivs
-metadata yet."
-  (declare (ignorable node))
-  (let* ((inputs (bl.ser:transaction-inputs signed-tx))
-         (n (length inputs))
-         (unsigned (bl.ser:make-transaction
-                    :version (bl.ser:transaction-version signed-tx)
-                    :inputs (map 'simple-vector
-                                 (lambda (input)
-                                   (bl.ser:make-tx-in
-                                    :previous-output (bl.ser:tx-in-previous-output input)
-                                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                                    :sequence (bl.ser:tx-in-sequence input)))
-                                 inputs)
-                    :outputs (bl.ser:transaction-outputs signed-tx)
-                    :lock-time (bl.ser:transaction-lock-time signed-tx)))
-         (psbt (bl.ser:make-empty-psbt unsigned))
-         (witnesses (bl.ser:transaction-witness signed-tx))
-         (empty-key (make-array 0 :element-type '(unsigned-byte 8))))
-    (dotimes (i n)
-      (let* ((input (aref inputs i))
-             (prevout (bl.ser:tx-in-previous-output input))
-             (txid (bl.ser:outpoint-hash prevout))
-             (vout (bl.ser:outpoint-index prevout))
-             (entry (gethash (cons txid vout) coins))
-             (map (aref (bl.ser:psbt-inputs psbt) i)))
-        (when entry
-          (bl.ser:psbt-map-set
-           map bl.ser:+psbt-in-witness-utxo+ empty-key
-           (%serialize-txout-bytes
-            (bl.ser:make-tx-out
-             :value (second entry) :script-pubkey (first entry))))
-          (let ((wtx (wallet-get-wallet-tx wallet txid)))
-            (when wtx
-              (bl.ser:psbt-map-set
-               map bl.ser:+psbt-in-non-witness-utxo+
-               empty-key
-               (bl.ser:transaction-wire-bytes
-                (wallet-tx-tx wtx))))))
-        (let ((script-sig (bl.ser:tx-in-script-sig input))
-              (stack (and witnesses (< i (length witnesses)) (aref witnesses i))))
-          (when (plusp (length script-sig))
-            (bl.ser:psbt-map-set
-             map bl.ser:+psbt-in-final-scriptsig+ empty-key
-             script-sig))
-          (when stack
-            (bl.ser:psbt-map-set
-             map bl.ser:+psbt-in-final-scriptwitness+
-             empty-key (%serialize-witness-stack stack))))))
-    (bl.ser:encode-psbt psbt)))
+  "The PSBT send / sendall / FinishTransaction return for SIGNED-TX: its
+unsigned skeleton run through WALLET-FILL-PSBT, which is Core's
+FillPSBT(sign=false) + FillPSBT(sign=true) + FinalizePSBT
+(wallet/rpc/spend.cpp:111-124).
+
+This used to copy SIGNED-TX's scriptSigs and witnesses into final fields
+input by input -- including the half-built witness the signer leaves on an
+input it could NOT complete (a watch-only 1-of-2 multisig got
+[<empty>, <empty>, script] as its `final' witness), so the PSBT claimed a
+finished input no one had signed, and the offline signer that should have
+completed it could not: wallet_taproot.py:379's cleanup sendall broadcast a
+script that evaluates false."
+  (declare (ignore node coins))
+  (let ((unsigned (bl.ser:make-transaction
+                   :version (bl.ser:transaction-version signed-tx)
+                   :inputs (map 'simple-vector
+                                (lambda (input)
+                                  (bl.ser:make-tx-in
+                                   :previous-output (bl.ser:tx-in-previous-output input)
+                                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                   :sequence (bl.ser:tx-in-sequence input)))
+                                (bl.ser:transaction-inputs signed-tx))
+                   :outputs (bl.ser:transaction-outputs signed-tx)
+                   :lock-time (bl.ser:transaction-lock-time signed-tx))))
+    (bl.ser:encode-psbt (wallet-fill-psbt wallet unsigned))))
 
 (defun %finish-transaction (node wallet options tx)
   "Core FinishTransaction: optional anti-fee-sniping, wallet signing, then
