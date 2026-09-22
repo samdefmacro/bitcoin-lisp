@@ -451,6 +451,24 @@ SCRIPT's position, or the coin control's external solving data."
               (and pair (cdr pair))))))
       (and cc (gethash keyhash (wcc-external-pubkeys cc)))))
 
+(defun %desc-inner-scripts (desc)
+  "The redeem and witness scripts DESC's expansion at position 0 records --
+what Core's SHDescriptor/WSHDescriptor MakeScripts put in the provider's
+`scripts' next to the output script (script/descriptor.cpp, the
+out.scripts.emplace(CScriptID(scripts[0]), ...) of each), which is how a
+solving_data descriptor makes a nested input solvable. Our expansion hands
+back only the output scripts, so solving_data {descriptors: [sh(pkh(K))]}
+left the redeem script unknown and wallet_fundrawtransaction.py:1072 was -4
+\"Not solvable pre-selected input\"."
+  (when (member (bl.rpc:out-desc-kind desc) '(:sh :wsh))
+    (let* ((sub (bl.rpc:out-desc-sub desc))
+           (inner (handler-case
+                      (first (bl.rpc:out-desc-expand-with-provider
+                              sub 0 (constantly nil) (bl.rpc:make-descriptor-cache)))
+                    (bl.rpc:descriptor-derivation-error () nil))))
+      (when inner
+        (cons inner (%desc-inner-scripts sub))))))
+
 (defun %known-sub-scripts (wallet cc script)
   "(values redeem-script witness-script) known for the P2SH/P2WSH SCRIPT."
   (multiple-value-bind (spkm) (and wallet (%wallet-owning-spkm wallet script))
@@ -3168,7 +3186,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
                           (bl.rpc:out-desc-expand-with-provider
                            desc 0 (constantly nil) (bl.rpc:make-descriptor-cache))
                         (bl.rpc:descriptor-derivation-error () (values nil nil)))
-                    (dolist (script scripts)
+                    (dolist (script (append scripts (%desc-inner-scripts desc)))
                       (%wcc-add-external-script cc script))
                     (dolist (pubkey pubkeys)
                       (setf (gethash (bl.crypto:hash160 pubkey)

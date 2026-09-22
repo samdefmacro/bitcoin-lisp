@@ -2516,7 +2516,9 @@ over PKH (script/descriptor.cpp:1195-1204, :1390-1406, :1431-1446). Our
 estimator knew sh(wpkh), sh(wsh(multi)) and sh(multi) by shape and nothing
 else, so wallet_fundrawtransaction.py:1066 and wallet_send.py:483 -- which
 fund exactly these two from solving_data -- were -4 \"Not solvable pre-selected
-input\". Without the solving data the refusal stays (the control)."
+input\". Without the solving data the refusal stays (the control). The
+descriptor form of solving_data must carry the redeem and witness scripts as
+well (wallet_fundrawtransaction.py:1072)."
   (with-wallet-chain-node (node "nested-external")
     (flet ((rpc (wallet method &rest params)
              (with-rpc-wallet (wallet)
@@ -2571,7 +2573,16 @@ input\". Without the solving data the refusal stays (the control)."
                                                (obj "pubkeys" (list pub) "scripts" scripts)))))))
                      (is (eql 0 (search "Not solvable pre-selected input" (or (cdr bare) "")))
                          "~A without solving data: ~S" shape bare)
-                     (is (null solved) "~A with solving data: ~S" shape solved))))))))
+                     (is (null solved) "~A with solving data: ~S" shape solved)
+                     ;; The same input solved from the DESCRIPTOR alone: its
+                     ;; redeem and witness scripts must reach the provider too.
+                     (let ((by-desc (rpc-error-of
+                                     (lambda ()
+                                       (rpc "ext" "fundrawtransaction" raw
+                                            (obj "fee_rate" 10
+                                                 "solving_data"
+                                                 (obj "descriptors" (list desc))))))))
+                       (is (null by-desc) "~A from its descriptor: ~S" shape by-desc)))))))))
 
 (test a-key-only-wallet-signs-a-script-path-from-the-psbts-own-leaves
   "SignPSBTInput's FillSignatureData hands the input's PSBT_IN_TAP_LEAF_SCRIPT
