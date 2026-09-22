@@ -1031,7 +1031,8 @@ talking to."
 
 (defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay)
                                                     count-failure
-                                                    (use-v2 t))
+                                                    (use-v2 t)
+                                                    on-dialed)
   "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
 node-peers. CONN-TYPE sets the peer's connection type: :outbound-full-relay,
 :block-relay, :addr-fetch, :feeler, or :manual for an operator-named
@@ -1055,29 +1056,49 @@ it passes %COUNT-ADDRMAN-FAILURES-P.
 USE-V2 NIL dials plain v1 even on a v2 node: Core's OpenNetworkConnection takes
 use_v2transport per call (net.cpp:1905, 2541, 2986), and the addconnection and
 `addnode onetry' RPCs pass the caller's own choice. T means v2 when this node
-speaks it."
+speaks it.
+
+ON-DIALED, when given, is called once the socket is open and the peer is
+published, before the handshake: the addconnection RPC returns then, as Core's
+AddConnection returns once OpenNetworkConnection has made the connection
+(net.cpp:1871-1907) -- not after the handshake, which the functional
+framework's own network thread (the one blocked in that RPC call) must answer."
   (when (node-network-active node)
     (handler-case
-        (let ((peer (%dial-outbound-peer node host port count-failure)))
+        (let ((peer (%dial-outbound-peer node host port count-failure))
+              (kept nil))
           (when peer
-            (setf (bl.net:peer-address peer) host)
-            (if (bl.net:perform-handshake peer :conn-type conn-type
-                                               :try-v2 (and use-v2 (bl.net:v2-available-p))
-                                               :near-tip (bl.net:near-tip-p (node-chain-state node)))
-                (if (eq conn-type :feeler)
-                    ;; A feeler has done its job once the version is in: Core's
-                    ;; VERSION handler disconnects it (net_processing.cpp:
-                    ;; 3807-3811); the addconnection RPC is how a test asks for
-                    ;; one (p2p_handshake.py:97-98).
-                    (progn (%feeler-completed peer) nil)
-                (progn
-                  (bl.net:send-post-handshake-messages peer)
-                  (bl.net:send-compact-block-negotiation peer)
-                  (bt:with-recursive-lock-held ((node-lock node))
-                    (push peer (node-peers node)))
-                  (log-info "Added-node peer connected: ~A" host)
-                  peer))
-                (progn (bl.net:disconnect-peer peer) nil))))
+            (setf (bl.net:peer-address peer) host
+                  (bl.net:peer-conn-type peer) conn-type)
+            ;; Published BEFORE the handshake, as Core's CNode joins m_nodes
+            ;; in OpenNetworkConnection (net.cpp:2981-2986) and getpeerinfo
+            ;; reports it from then on; the pump leaves a peer that is not
+            ;; :READY alone. Withdrawn below unless the handshake admits it.
+            (bt:with-recursive-lock-held ((node-lock node))
+              (push peer (node-peers node)))
+            (when on-dialed (funcall on-dialed))
+            (unwind-protect
+                 (if (bl.net:perform-handshake peer :conn-type conn-type
+                                                    :try-v2 (and use-v2 (bl.net:v2-available-p))
+                                                    :near-tip (bl.net:near-tip-p (node-chain-state node)))
+                     (if (eq conn-type :feeler)
+                         ;; A feeler has done its job once the version is in:
+                         ;; Core's VERSION handler disconnects it
+                         ;; (net_processing.cpp:3807-3811); the addconnection
+                         ;; RPC is how a test asks for one
+                         ;; (p2p_handshake.py:97-98).
+                         (progn (%feeler-completed peer) nil)
+                         (progn
+                           (bl.net:send-post-handshake-messages peer)
+                           (bl.net:send-compact-block-negotiation peer)
+                           (setf kept t)
+                           (log-info "Added-node peer connected: ~A" host)
+                           peer))
+                     (progn (bl.net:disconnect-peer peer) nil))
+              (unless kept
+                (ignore-errors (bl.net:disconnect-peer peer))
+                (bt:with-recursive-lock-held ((node-lock node))
+                  (setf (node-peers node) (remove peer (node-peers node))))))))
       (error (c)
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
@@ -1200,8 +1221,9 @@ sat on getpeerinfo for most of that cycle, once per connection."
       (loop for (address conn-type use-v2 done) in queued
             do (unwind-protect
                     (multiple-value-bind (host port) (parse-node-endpoint node address)
-                      (establish-outbound-peer node host port :conn-type conn-type
-                                                              :use-v2 use-v2))
+                      (establish-outbound-peer
+                       node host port :conn-type conn-type :use-v2 use-v2
+                       :on-dialed (and done (lambda () (setf (car done) t)))))
                  ;; The RPC waits on this: Core's AddConnection returns with
                  ;; the connection already open (net.cpp:1871-1907).
                  (when done (setf (car done) t)))))))

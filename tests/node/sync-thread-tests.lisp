@@ -382,3 +382,43 @@ PERFORM-HANDSHAKE are stubbed so the dial completes."
     (is (< (- (get-internal-real-time) started)
            (* 4 internal-time-units-per-second))
         "within the wait, not after it")))
+
+(test an-outbound-peer-is-published-while-it-handshakes
+  "Core's CNode joins m_nodes when OpenNetworkConnection opens the socket
+(net.cpp:2981-2986), before any version is exchanged, and AddConnection returns
+then (net.cpp:1871-1907). The functional framework calls addconnection FROM its
+own network thread, which must then answer our version: an RPC that waited for
+the whole handshake deadlocked against it until its bound ran out (ten seconds
+per p2p_add_connections.py connection). So the dial publishes the peer and
+marks the RPC's request done BEFORE the handshake, and withdraws the peer if
+the handshake fails. PERFORM-HANDSHAKE is stubbed to observe that moment and
+then refuse."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (done (list nil))
+         (bl:*pending-test-connections*
+           (list (list "203.0.113.22:18444" :outbound-full-relay nil done)))
+         (real-connect (fdefinition 'bl.net:connect-peer))
+         (real-handshake (fdefinition 'bl.net:perform-handshake))
+         (seen nil))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t
+                 (fdefinition 'bl.net:connect-peer)
+                 (lambda (host &optional port &rest more)
+                   (declare (ignore port more))
+                   (bl.net:make-peer :address host :state :connected))
+                 (fdefinition 'bl.net:perform-handshake)
+                 (lambda (peer &rest args)
+                   (declare (ignore args))
+                   (setf seen (list (and (member peer (bl:node-peers node)) t)
+                                    (car done)))
+                   nil))
+           (%idle-tick))
+      (setf (fdefinition 'bl.net:connect-peer) real-connect
+            (fdefinition 'bl.net:perform-handshake) real-handshake
+            (bl:node-running node) nil))
+    (is (equal '(t t) seen)
+        "during the handshake the peer is listed and the RPC already released: ~S" seen)
+    (is (null (bl:node-peers node)) "a failed handshake withdraws it")))
