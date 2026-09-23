@@ -489,7 +489,7 @@ well under the two seconds ten ticks cost. Control: every pong arrives."
 
 ;;;; The threads Core names in its log (util/thread.cpp TraceThread)
 
-(defun %wait-until (predicate seconds)
+(defun %poll-until (predicate seconds)
   "Poll PREDICATE every tenth of a second for up to SECONDS; its last value."
   (loop repeat (round (* seconds 10))
         thereis (funcall predicate)
@@ -541,7 +541,7 @@ needed to trigger it, and stops when asked."
            (bl:start-scheduler-thread node)
            (let ((thread bl:*scheduler-thread*))
              (is (equal "bitcoin-scheduler" (bt:thread-name thread)))
-             (is-true (%wait-until (lambda () (plusp bl.log:*log-rate-window-start*)) 3)
+             (is-true (%poll-until (lambda () (plusp bl.log:*log-rate-window-start*)) 3)
                       "the scheduler closed the elapsed window by itself")
              (bl:stop-scheduler-thread)
              (is-false (bt:thread-alive-p thread))))
@@ -562,7 +562,7 @@ the thread ends when the node stops running."
            (bl:start-addcon-thread node)
            (let ((thread bl:*addcon-thread*))
              (is (equal "bitcoin-addcon" (bt:thread-name thread)))
-             (is-true (%wait-until (lambda () (bl:node-pending-onetry node)) 3))
+             (is-true (%poll-until (lambda () (bl:node-pending-onetry node)) 3))
              (is (equal '(("203.0.113.9:18444" . t)) (bl:node-pending-onetry node))
                  "queued once, as a v2-capable manual dial")
              (setf (bl:node-running node) nil)
