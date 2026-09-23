@@ -1099,6 +1099,67 @@ empty undo is legitimate)."
     (bl.ser:make-bitcoin-block
      :header hdr :transactions (list coinbase dummy))))
 
+(test activate-block-passes-a-fork-verdict-with-a-debug-message-up-as-a-verdict
+  "PERFORM-REORG's refusal detail is EITHER the missing (hash . height) list to
+re-download OR the failing fork block's verdict, and a verdict carrying Core's
+debug message is itself a list: (:missing-input \"CheckTxInputs: ...\").
+ACTIVATE-BLOCK told them apart with KEYWORDP, so that verdict came back as
+:reorg-refused with the verdict as its missing list, the block handler died
+queueing :MISSING-INPUT for download (a TYPE-ERROR), and the peer that sent
+the invalid chain was never punished: feature_block.py:248 waited out its
+timeout for the disconnect after b8 built on the double-spending b7."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "fork-verdict-list")
+      (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+      (destructuring-bind (b1-hash b2-hash) (make-test-chain-hashes #xB7 2)
+        (let* ((tip-hash (bl.store:best-block-hash cs))
+               (genesis (bl.store:get-block-index-entry cs genesis-hash))
+               (base (%make-2tx-reorg-block genesis-hash b1-hash 1))
+               (txs (bl.ser:bitcoin-block-transactions base))
+               (hdr (bl.ser:bitcoin-block-header base))
+               ;; The merkle root commits to both transactions, so the body
+               ;; passes CheckBlock and fails only at its spend of an outpoint
+               ;; nobody holds.
+               (b1 (bl.ser:make-bitcoin-block
+                    :header (bl.ser:make-block-header
+                             :version (bl.ser:block-header-version hdr)
+                             :prev-block genesis-hash
+                             :merkle-root (bl.val:compute-merkle-root
+                                           (mapcar #'bl.ser:transaction-hash txs))
+                             :timestamp (bl.ser:block-header-timestamp hdr)
+                             :bits (bl.ser:block-header-bits hdr)
+                             :nonce 0
+                             :cached-hash b1-hash)
+                    :transactions txs))
+               (b2 (make-reorg-test-block b1-hash b2-hash 2))
+               (b1-entry (bl.store:make-block-index-entry
+                          :hash b1-hash :height 1 :prev-entry genesis
+                          :chain-work (bl.store:calculate-chain-work
+                                       (bl.ser:block-header-bits hdr)
+                                       (bl.store:block-index-entry-chain-work genesis))
+                          :status :header-valid :header (bl.ser:bitcoin-block-header b1))))
+          (bl.store:add-block-index-entry cs b1-entry)
+          (bl.store:add-block-index-entry
+           cs (bl.store:make-block-index-entry
+               :hash b2-hash :height 2 :prev-entry b1-entry
+               :chain-work (bl.store:calculate-chain-work
+                            (bl.ser:block-header-bits (bl.ser:bitcoin-block-header b2))
+                            (bl.store:block-index-entry-chain-work b1-entry))
+               :status :header-valid :header (bl.ser:bitcoin-block-header b2)))
+          (bl.store:store-block store b1)
+          (multiple-value-bind (ok error missing)
+              (bl.val:activate-block b2 cs store utxo)
+            (is (null ok))
+            (is (eq :missing-input (if (consp error) (first error) error))
+                "the fork block's own verdict, got ~S" error)
+            (is (null missing) "a verdict is not a list of blocks to download"))
+          (is (equalp tip-hash (bl.store:best-block-hash cs))
+              "rolled back to the original tip")
+          (is-false (bl.val:reorg-missing-blocks-p '(:missing-input "CheckTxInputs")))
+          (is-true (bl.val:reorg-missing-blocks-p (list (cons b1-hash 1)))))))
+    (clear-undo-cache)))
+
 (test invalidate-block-skips-a-candidate-chain-with-missing-data
   "After invalidateblock, Core's ActivateBestChain picks the most-work chain it
 can actually switch to: FindMostWorkChain walks each candidate back to the

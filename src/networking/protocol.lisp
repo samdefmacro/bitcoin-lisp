@@ -1427,11 +1427,11 @@ never received the branch's blocks."
                ;; but a winning block arriving via the compact/relay path lands
                ;; here instead — without re-queuing, the sub-tip fork blocks the
                ;; reorg needs are never requested and the node wedges (the
-               ;; testnet4 deep-reorg wedge). A KEYWORD detail means an invalid
+               ;; testnet4 deep-reorg wedge). A VERDICT detail means an invalid
                ;; fork block (rolled back) — do not re-download.
                (when (and (consp reorg-outcome)
                           (null (first reorg-outcome))
-                          (consp (second reorg-outcome)))
+                          (bl.val:reorg-missing-blocks-p (second reorg-outcome)))
                  (queue-missing-fork-blocks (second reorg-outcome))))))
       ;; Core's two AcceptBlockHeader gates, which this path had neither of --
       ;; it branched only on whether the parent is the tip.

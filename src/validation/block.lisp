@@ -4249,6 +4249,17 @@ relay filters."
                             (length (reorg-to-disconnect r)) (length (reorg-to-connect r)))
                t)))))
 
+(defun reorg-missing-blocks-p (detail)
+  "T when DETAIL, PERFORM-REORG's second value on a refusal, is the list of
+missing (hash . height) fork blocks to re-download -- and NIL for a VERDICT,
+which is a keyword or, carrying Core's debug message, the list (REASON DETAIL)
+(a fork block failing CheckTxInputs is `(:missing-input \"CheckTxInputs:
+...\")'). Telling the two apart by CONSP alone handed such a verdict to the
+re-download queue as if it were the missing list: the block handler died on a
+TYPE-ERROR, the peer that sent an invalid chain was never punished, and
+feature_block.py:248 waited out its timeout for the disconnect."
+  (and (consp detail) (consp (first detail))))
+
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
                       &key fee-estimator recent-rejects mempool skip-scripts
                            max-readd-blocks (abort-on-disconnect-failure t))
@@ -4628,7 +4639,7 @@ backstop against a candidate that reorgs away and reappears."
             (t
              ;; :interrupted means the node is stopping — not a refusal to
              ;; re-queue against.
-             (unless (eq detail :interrupted)
+             (when (reorg-missing-blocks-p detail)
                (setf missing detail))
              (return))))))
     (values switched missing)))
@@ -4994,13 +5005,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
                                :mempool mempool
                                :skip-scripts skip-scripts)
               (cond
-                ;; perform-reorg refused with a keyword DETAIL: either a fork
-                ;; block failed validation (chain rolled back to the original
-                ;; tip), or a pre-mutation refusal (:corrupt-undo — our own
-                ;; disconnect-side undo is missing/corrupt, nothing mutated).
+                ;; perform-reorg refused with a VERDICT: a fork block failed
+                ;; validation (rolled back), or :corrupt-undo (nothing mutated).
                 ;; Either way don't re-queue: the fork is invalid or the fault
                 ;; is local, not an incomplete download.
-                ((and (null reorg-ok) (keywordp detail))
+                ((and (null reorg-ok) detail (not (reorg-missing-blocks-p detail)))
                  (values nil detail))
                 ;; Reorg refused for missing fork blocks. chain-state and
                 ;; utxo-set are unchanged. DETAIL is the list of missing

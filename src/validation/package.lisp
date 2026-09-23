@@ -109,6 +109,7 @@ can. src/validation/.")
    #:clear-reconsiderable-rejects
    #:perform-reorg
    #:activate-best-chain
+   #:reorg-missing-blocks-p
    #:best-valid-tip
    #:get-undo-data
    #:store-undo-data
