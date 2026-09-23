@@ -935,6 +935,69 @@ by exactly 12; ours counted a read only once it completed, so it never moved."
       (ignore-errors (usocket:socket-close server))
       (ignore-errors (usocket:socket-close listener)))))
 
+(defun %raw-v1-message (&key (magic bl.ser:*network-magic*) (type-bytes #(98 97 100 109 115 103))
+                             (payload #(1 100)) (length nil) (checksum nil))
+  "A v1 message built byte by byte, so a test can corrupt any field: MAGIC,
+the 12-byte type field from TYPE-BYTES (NUL-padded), the declared LENGTH
+(default the payload's), CHECKSUM (default the right one), then PAYLOAD."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+        (len (or length (length payload))))
+    (loop for b across magic do (vector-push-extend b out))
+    (dotimes (i 12) (vector-push-extend (if (< i (length type-bytes)) (aref type-bytes i) 0) out))
+    (dotimes (i 4) (vector-push-extend (ldb (byte 8 (* 8 i)) len) out))
+    (loop for b across (or checksum
+                           (bl.ser:compute-checksum
+                            (coerce payload '(simple-array (unsigned-byte 8) (*)))))
+          repeat 4 do (vector-push-extend b out))
+    (loop for b across payload do (vector-push-extend b out))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(test a-malformed-v1-header-is-reported-in-cores-words
+  "p2p_invalid_messages.py:108-175 greps for V1Transport's own lines
+(net.cpp:747-762, :819-830): `Header error: Wrong MessageStart ffffffff
+received', `Header error: Size too large (badmsg, 4000001 bytes)' -- both
+disconnect -- and `Header error: Wrong checksum (badmsg, 2 bytes), expected
+78df0a04 was ffffffff' and `Header error: Invalid message type', which DROP the
+message, keep the peer, and account its 26 bytes under *other*. The type
+field is judged whole (IsMessageTypeValid): `bad<NUL>sg' is invalid, where
+ours read it as the command `bad'."
+  (with-network (:regtest)
+    (flet ((deliver (bytes)
+             (multiple-value-bind (conn client server listener) (%silent-peer-connection 0 0)
+               (let ((peer (bl.net:make-peer :connection conn :state :ready)))
+                 (unwind-protect
+                      (progn
+                        (write-sequence bytes (usocket:socket-stream client))
+                        (force-output (usocket:socket-stream client))
+                        (sleep 0.2)
+                        (let ((text (nth-value 1 (log-text-of
+                                                  "net"
+                                                  (lambda ()
+                                                    (loop repeat 3
+                                                          do (bl.net:receive-message peer)))))))
+                          (values text peer)))
+                   (ignore-errors (usocket:socket-close client))
+                   (ignore-errors (usocket:socket-close server))
+                   (ignore-errors (usocket:socket-close listener)))))))
+      (multiple-value-bind (text peer)
+          (deliver (%raw-v1-message :checksum #(255 255 255 255)))
+        (is-true (search "Header error: Wrong checksum (badmsg, 2 bytes), expected 78df0a04 was ffffffff" text) "~S" text)
+        (is (eq :ready (bl.net:peer-state peer)))
+        (is (= 26 (gethash "*other*" (bl.net:peer-recv-per-msg peer) 0))))
+      (multiple-value-bind (text peer)
+          (deliver (%raw-v1-message :type-bytes #(98 97 100 0 115 103)))
+        (is-true (search "Header error: Invalid message type (bad, 2 bytes)" text) "~S" text)
+        (is (eq :ready (bl.net:peer-state peer)))
+        (is (= 26 (gethash "*other*" (bl.net:peer-recv-per-msg peer) 0))))
+      (multiple-value-bind (text peer)
+          (deliver (%raw-v1-message :magic #(255 255 255 255)))
+        (is-true (search "Header error: Wrong MessageStart ffffffff received" text) "~S" text)
+        (is (eq :disconnected (bl.net:peer-state peer))))
+      (multiple-value-bind (text peer)
+          (deliver (subseq (%raw-v1-message :length 4000001) 0 24))
+        (is-true (search "Header error: Size too large (badmsg, 4000001 bytes)" text) "~S" text)
+        (is (eq :disconnected (bl.net:peer-state peer)))))))
+
 (defun %message-header-bytes (header)
   "HEADER on the wire. Five tests in this file frame a message by hand, and the
 serializer is internal, so the reach into it lives here once."

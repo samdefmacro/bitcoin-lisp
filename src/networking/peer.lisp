@@ -767,6 +767,11 @@ RECEIVE-MESSAGE-BLOCKING instead."
               (return-from receive-message nil))
             (setf header (bl.bytes:with-byte-reader (stream bytes)
                            (bl.ser:read-message-header stream)))
+            ;; Keep the WHOLE 12-byte type field (trailing NULs aside), not the
+            ;; part before its first NUL: Core judges the field as a whole once
+            ;; the message is complete (IsMessageTypeValid, protocol.cpp:26-43),
+            ;; and `bad<NUL>sg' must not pass as `bad'.
+            (setf (bl.ser:message-header-command header) (%raw-message-type bytes))
             ;; Nothing is parked yet, so these two rejections leave no framing
             ;; state behind — but the 24 bytes ARE consumed, so both must drop
             ;; the connection (see %abandon-receive for why).
@@ -779,18 +784,19 @@ RECEIVE-MESSAGE-BLOCKING instead."
               ;; and a desynchronised read and a wrong-network peer produce
               ;; exactly the same line.
               (bl:log-cat "net"
-                          "Bad message magic ~A from ~A, disconnecting"
+                          "Header error: Wrong MessageStart ~A received, peer=~D"
                           (bl.crypto:bytes-to-hex
                            (bl.ser:message-header-magic header))
-                          (peer-log-name peer))
+                          (peer-id peer))
               (disconnect-peer peer)
               (return-from receive-message nil))
             (when (> (bl.ser:message-header-payload-length header)
                      bl:+max-message-payload+)
-              (bl:log-cat "net" "Oversized message from ~A: ~D bytes (max ~D), disconnecting"
-                          (peer-log-name peer)
+              ;; Core's words (net.cpp:760-762).
+              (bl:log-cat "net" "Header error: Size too large (~A, ~D bytes), peer=~D"
+                          (%message-type-for-log (bl.ser:message-header-command header))
                           (bl.ser:message-header-payload-length header)
-                          bl:+max-message-payload+)
+                          (peer-id peer))
               (disconnect-peer peer)
               (return-from receive-message nil))
             ;; Park it: the payload read below may span several more passes and
@@ -836,9 +842,25 @@ RECEIVE-MESSAGE-BLOCKING instead."
                       ;; our own payload handling into node-wide peer churn.
                       ;; Bad MAGIC is the opposite case and does disconnect
                       ;; above, matching net.cpp:752-755.
-                      (bl:log-cat "net" "Bad checksum on ~A from ~A, dropping message"
-                                  (bl.ser:message-header-command header)
-                                  (peer-log-name peer))
+                      ;; Core's words (net.cpp:819-825), and the bytes are
+                      ;; still accounted, under *other* (net.cpp:678-683).
+                      (bl:log-cat "net" "Header error: Wrong checksum (~A, ~D bytes), expected ~A was ~A, peer=~D"
+                                  (%message-type-for-log (bl.ser:message-header-command header))
+                                  payload-len
+                                  (bl.crypto:bytes-to-hex (subseq computed-checksum 0 4))
+                                  (bl.crypto:bytes-to-hex (bl.ser:message-header-checksum header))
+                                  (peer-id peer))
+                      (%account-message (peer-recv-per-msg peer) nil
+                                        +other-message-command+ payload-len)
+                      (return-from receive-message nil))
+                    ;; Then the type field (net.cpp:826-830): printable ASCII,
+                    ;; NUL-padded. The message is dropped, the peer kept.
+                    (unless (%message-type-valid-p (bl.ser:message-header-command header))
+                      (bl:log-cat "net" "Header error: Invalid message type (~A, ~D bytes), peer=~D"
+                                  (%message-type-for-log (bl.ser:message-header-command header))
+                                  payload-len (peer-id peer))
+                      (%account-message (peer-recv-per-msg peer) nil
+                                        +other-message-command+ payload-len)
                       (return-from receive-message nil))
                     (let ((command (bl.ser:message-header-command header)))
                       (%account-message (peer-recv-per-msg peer) nil
@@ -848,6 +870,25 @@ RECEIVE-MESSAGE-BLOCKING instead."
                       ;; order they are read, so the record order is the same.
                       (capture-message peer command payload t)
                       (values command payload)))))))))
+
+(defun %raw-message-type (header-bytes)
+  "The 12-byte message-type field of the 24 HEADER-BYTES as a string, trailing
+NULs removed and any inner NUL KEPT (see %MESSAGE-TYPE-VALID-P)."
+  (let* ((field (subseq header-bytes 4 16))
+         (end (1+ (or (position 0 field :test-not #'eql :from-end t) -1))))
+    (map 'string #'code-char (subseq field 0 end))))
+
+(defun %message-type-valid-p (type)
+  "Core CMessageHeader::IsMessageTypeValid (protocol.cpp:26-43) over TYPE as
+%RAW-MESSAGE-TYPE keeps it: every character printable ASCII -- an inner NUL,
+which Core rejects as a non-zero byte after the first zero, fails here too."
+  (every (lambda (c) (<= #x20 (char-code c) #x7e)) type))
+
+(defun %message-type-for-log (type)
+  "TYPE as Core logs a header's type: GetMessageType stops at the first NUL,
+then SanitizeString."
+  (bl.bytes:sanitize-string (subseq type 0 (or (position (code-char 0) type)
+                                               (length type)))))
 
 (defun receive-message-blocking (peer &key (timeout 30))
   "WAIT for the next complete message from PEER; (VALUES COMMAND PAYLOAD), or
