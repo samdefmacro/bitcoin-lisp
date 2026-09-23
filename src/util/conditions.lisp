@@ -100,14 +100,6 @@ inside the handler -- Misbehaving for inv (:4128), getdata (:4219), headers
 and addr, a straight fDisconnect for a getblocks/getheaders locator -- so the
 peer is punished. SAFELY-DISPATCH-PEER-MESSAGE is where the two part."))
 
-(declaim (ftype (function (t &rest t) nil) protocol-limit-error))
-(defun protocol-limit-error (control &rest args)
-  "Signal a PROTOCOL-LIMIT-ERROR whose message is CONTROL formatted with ARGS.
-When the first of ARGS after the field name is the declared count -- the
-shape BR-READ-BOUNDED-COUNT signals -- use SIGNAL-PROTOCOL-LIMIT instead so
-the count travels as data."
-  (error 'protocol-limit-error :format-control control :format-arguments args))
-
 (declaim (ftype (function (t t &rest t) nil) signal-protocol-limit))
 (defun signal-protocol-limit (count control &rest args)
   "Signal a PROTOCOL-LIMIT-ERROR for a vector that declared COUNT elements,
