@@ -1236,3 +1236,42 @@ whose locator is ABOVE the gap loads, the one below it is refused."
                      (rpc-error-of
                       (lambda ()
                         (bl.rpc:dispatch-rpc-method node "loadwallet" (list "below")))))))))))
+
+
+(defun %wc-assumeutxo-gap-node-refusal (node)
+  "With NODE's wallet `below' unloaded, open a gap the way a background sync
+does -- a historical chainstate, two more blocks, the body above `below''s
+last block forgotten -- and return a thunk that tries to load `below' and
+answers the refusal's message, or NIL when it loaded."
+  (%wc-mine node 3 (%wc-optrue-address))
+  (push (bl.store:make-chain-state
+         :target-blockhash (bl.store:best-block-hash (bl:node-chain-state node)))
+        (bl:node-chainstates node))
+  (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "below"))
+  (let ((below-height (bl.store:current-height (bl:node-chain-state node))))
+    (%wc-mine node 4 (%wc-optrue-address))
+    (let ((missing (bl.store:get-block-at-height (bl:node-chain-state node)
+                                                 (1+ below-height))))
+      (bl.store:forget-block-body (bl:node-block-store node)
+                                  (bl.store:block-index-entry-hash missing))))
+  (lambda ()
+    (cdr (rpc-error-of
+          (lambda ()
+            (bl.rpc:dispatch-rpc-method node "loadwallet" (list "below")))))))
+
+(test a-refused-wallet-load-leaves-the-wallet-where-it-was
+  "Core's failed AttachChain sets the last processed block IN MEMORY only
+(SetLastBlockProcessedInMem, wallet.cpp:3213-3218) and returns false; the
+wallet instance is dropped without RemoveWallet's WriteBestBlock
+(wallet.cpp:163-169), so its stored locator still names where it stopped and
+the next load is refused again. Ours unloaded the half-loaded wallet through
+UNLOAD-WALLET, which writes the best block -- the tip, set before the check
+-- so the SECOND attempt found nothing to rescan and loaded a wallet that had
+never seen the missing blocks."
+  (with-wallet-chain-node (node "refused-stays-refused" :wallet "below")
+    (let ((refusal (%wc-assumeutxo-gap-node-refusal node)))
+      (let ((first (funcall refusal))
+            (second (funcall refusal)))
+        (is (search "when using assumeutxo snapshots" (or first "")))
+        (is (equal first second) "the second attempt answered ~S" second)))))
+

@@ -1720,10 +1720,14 @@ reports the keypool it finds and writes no keys into the file."
         (%refresh-wallet-snapshot manager)
         (values wallet (nreverse warnings) rescan-required)))))
 
-(defun unload-wallet (manager wallet &key force)
+(defun unload-wallet (manager wallet &key force (write-best-block t))
   "Write the best-block marker, close the database, and deregister. Refuses
 while a rescan is running (the scan thread holds the DB) unless FORCE — the
-shutdown path — which flags the scan to abort and proceeds."
+shutdown path — which flags the scan to abort and proceeds.
+
+WRITE-BEST-BLOCK NIL is the refused load's unload: Core drops a wallet whose
+AttachChain failed without RemoveWallet's WriteBestBlock (wallet.cpp:163-169),
+so its stored locator is left where it was."
   (when (wallet-scanning-since wallet)
     (if force
         (setf (wallet-abort-rescan wallet) t)
@@ -1731,7 +1735,8 @@ shutdown path — which flags the scan to abort and proceeds."
                           :message "Wallet is currently rescanning. Abort existing rescan or wait.")))
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (with-wallet-lock (wallet)
-      (wallet-write-best-block wallet)
+      (when write-best-block
+        (wallet-write-best-block wallet))
       (bl.store:leveldb-close (wallet-db wallet))
       (setf (wallet-db wallet) nil)
       ;; Every unload path funnels through here, so this is the one place
@@ -2079,7 +2084,11 @@ sequence has exactly one definition."
     (let ((error-message (wallet-attach-chain node wallet
                                               :rescan-required rescan-required)))
       (when error-message
-        (ignore-errors (unload-wallet manager wallet :force t))
+        ;; Core's failed AttachChain moved the last processed block IN MEMORY
+        ;; only (wallet.cpp:3213-3218) and the instance is dropped without
+        ;; WriteBestBlock: writing it here stored the TIP, and the next load
+        ;; of the same wallet skipped the rescan it had just been refused.
+        (ignore-errors (unload-wallet manager wallet :force t :write-best-block nil))
         ;; Core's LoadWalletInternal prefixes EVERY LoadExisting failure --
         ;; AttachChain's among them -- with "Wallet loading failed. "
         ;; (wallet.cpp:286-291), so loadwallet and restorewallet both report
