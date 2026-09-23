@@ -4683,8 +4683,10 @@ its connection. InvalidBlockFound does NOT: it skips BLOCK_FAILED_VALID for
 BLOCK_MUTATED (validation.cpp:1985-1993), because the block hash does not
 commit to what the mutated checks read -- marking one would let a peer that
 mangles a body in transit poison an honest header permanently. So a forged body
-leaves its entry downloadable, while two coinbases -- which the merkle root
-authenticates -- poison the entry and its indexed descendants."
+leaves its entry downloadable, while a non-final coinbase -- a ContextualCheckBlock
+verdict the merkle root authenticates -- poisons the entry and its indexed
+descendants. (A CheckBlock verdict marks nothing at all: ProcessNewBlock skips
+AcceptBlock when CheckBlock fails, validation.cpp:4442-4451.)"
   (with-network (:mainnet)
     (multiple-value-bind (cs utxo store genesis-hash tip-entry)
         (%forged-body-fixture "s1-refused-body")
@@ -4693,7 +4695,8 @@ authenticates -- poison the entry and its indexed descendants."
           (make-test-chain-hashes #xB2 3)
         (let* ((tip-hash (bl.store:block-index-entry-hash tip-entry))
                (mutated (make-forged-body-block tip-hash mutated-h 5))
-               (consensus (make-two-coinbase-block tip-hash consensus-h 5))
+               (consensus (make-reorg-test-block tip-hash consensus-h 5
+                                                 :lock-time 500000 :sequence 0))
                (child (make-reorg-test-block consensus-h child-h 6))
                (mutated-peer (bl.net:make-peer))
                (consensus-peer (bl.net:make-peer)))
@@ -4727,11 +4730,12 @@ authenticates -- poison the entry and its indexed descendants."
                      (bl.store:get-block-index-entry cs child-h)))
                 "the doomed subtree was not marked (Core BLOCK_FAILED_CHILD)")))))))
 
-(test a-tip-block-failing-checkblock-is-marked-and-its-sender-punished
-  "A block at tip+1 that fails CheckBlock is refused by Core's AcceptBlock
-BEFORE any connect: its entry is marked BLOCK_FAILED_VALID (the verdict is not
-BLOCK_MUTATED; validation.cpp:4381-4389) and MaybePunishNodeForBlock
-disconnects the sender (net_processing.cpp:1908-1926). The reason is the
+(test a-tip-block-failing-checkblock-is-refused-and-its-sender-punished
+  "A block at tip+1 that fails CheckBlock is refused BEFORE any connect, and
+MaybePunishNodeForBlock disconnects the sender (net_processing.cpp:1908-1926).
+Its entry is NOT marked: ProcessNewBlock runs CheckBlock first and skips
+AcceptBlock, the only place that would mark it, when CheckBlock fails
+(validation.cpp:4442-4451). The reason is the
 transaction's own word, which CheckBlock relays (validation.cpp:3992-3996).
 Ours validated inside ACTIVATE-BLOCK, logged `no-outputs', re-requested the
 block three times from the same peer and kept the peer: feature_block.py:199
@@ -4777,10 +4781,11 @@ waits for `bad-txns-vout-empty' and the disconnect."
                                                      :requested t :peer peer)))))))
           (is (search "bad-txns-vout-empty" text)
               "Core's reason, relayed from CheckTransaction")
-          (is (eq :invalid
+          (is (eq :header-valid
                   (bl.store:block-index-entry-status
                    (bl.store:get-block-index-entry cs h)))
-              "the entry was not marked (Core AcceptBlock)")
+              "a CheckBlock verdict marked the entry: Core's ProcessNewBlock
+               skips AcceptBlock when CheckBlock fails (validation.cpp:4442-4451)")
           (is (eq :disconnected (bl.net:peer-state peer))
               "the sender was not punished (MaybePunishNodeForBlock)"))))))
 

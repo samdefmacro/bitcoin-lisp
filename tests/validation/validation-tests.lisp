@@ -2500,9 +2500,11 @@ the write are CheckBlock and ContextualCheckBlock (validation.cpp:4381-4389).
 ACCEPT-BLOCK-BODY is that pair, so every persist path can run it instead of
 remembering both. It accepts an honest body; it rejects a forged one
 (bad-txnmrklroot) without touching the honest header's index entry, a
-consensus-invalid one (bad-cb-multiple) with the entry marked :invalid, and a
-non-final coinbase -- which no context-free check can see, so that case is what
-proves the CONTEXTUAL half runs here too."
+consensus-invalid one (bad-cb-multiple) also without marking it -- Core's
+ProcessNewBlock never reaches AcceptBlock when CheckBlock fails
+(validation.cpp:4442-4451) -- and a non-final coinbase, which no context-free
+check can see, with the entry marked :invalid: that case is what proves the
+CONTEXTUAL half runs here too."
   (with-network (:mainnet)
     (multiple-value-bind (cs utxo store genesis-hash)
         (make-activate-block-fixture "accept-block-body-gate")
@@ -2540,14 +2542,14 @@ proves the CONTEXTUAL half runs here too."
                      (bl.store:get-block-index-entry cs forged-h)))
                 "a mutated verdict poisoned the honest header (Core keeps
                  BLOCK_MUTATED off BLOCK_FAILED_VALID)")
-            ;; CheckBlock, consensus class: refused AND the entry marked.
+            ;; CheckBlock, consensus class: refused, the entry left alone.
             (is (eq :multiple-coinbase
                     (nth-value 1 (bl.val:accept-block-body consensus cs)))
                 "a two-coinbase body was accepted")
-            (is (eq :invalid
+            (is (eq :header-valid
                     (bl.store:block-index-entry-status
                      (bl.store:get-block-index-entry cs consensus-h)))
-                "a consensus verdict did not mark the entry invalid")
+                "a CheckBlock verdict marked the entry invalid")
             ;; ContextualCheckBlock: invisible to any context-free check.
             (is-true (bl.val:validate-block nonfinal cs utxo 3
                                             (bl.ser:get-unix-time)
@@ -2555,7 +2557,11 @@ proves the CONTEXTUAL half runs here too."
                      "control: CheckBlock alone cannot see a non-final coinbase")
             (is (eq :non-final-tx
                     (nth-value 1 (bl.val:accept-block-body nonfinal cs)))
-                "the gate skipped Core's ContextualCheckBlock half")))))))
+                "the gate skipped Core's ContextualCheckBlock half")
+            (is (eq :invalid
+                    (bl.store:block-index-entry-status
+                     (bl.store:get-block-index-entry cs nonfinal-h)))
+                "a ContextualCheckBlock verdict did not mark the entry invalid")))))))
 
 (test check-block-reads-the-mutation-flag-before-the-coinbase-rules
   "Core CheckBlock checks the merkle root AND its CVE-2012-2459 mutation flag

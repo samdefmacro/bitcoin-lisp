@@ -3776,10 +3776,10 @@ question."
   "Bitcoin Core ChainstateManager::AcceptBlock's validity gate
 (validation.cpp:4381-4389), run by every path that is about to write BLOCK's
 body to disk: %CHECK-BLOCK (Core CheckBlock -- header, coinbase structure,
-signet solution, merkle root and the CVE-2012-2459 mutation flag, weight,
-legacy size, CheckTransaction per transaction, the legacy sigop budget) and
-then %CONTEXTUAL-CHECK-BLOCK-NO-UTXO (Core ContextualCheckBlock -- finality,
-the BIP34 coinbase height, the BIP141 witness commitment). Neither reads the
+signet solution, merkle root and the CVE-2012-2459 mutation flag, the size
+gate, CheckTransaction per transaction, the legacy sigop budget) and then
+%CONTEXTUAL-CHECK-BLOCK-NO-UTXO (Core ContextualCheckBlock -- finality, the
+BIP34 coinbase height, the BIP141 witness commitment, the weight). Neither reads the
 UTXO set, so the gate is correct for a block on ANY branch, which is what makes
 it usable everywhere a body is stored.
 
@@ -3789,9 +3789,15 @@ since AcceptBlockHeader always creates the entry first -- there is no chain to
 place the block on, so only the structural (SKIP-HEADER) half of CheckBlock
 runs; that still rejects the forged bodies this gate exists for.
 
-On failure the block-index entry is marked :invalid, and its descendants with
-it, unless the verdict is mutation-class (see *MUTATED-BLOCK-ERRORS*) -- Core
-InvalidBlockFound, which makes the same exception for BLOCK_MUTATED. Punishing
+When ContextualCheckBlock fails the block-index entry is marked :invalid, and
+its descendants with it, unless the verdict is mutation-class (see
+*MUTATED-BLOCK-ERRORS*) -- Core InvalidBlockFound, which makes the same
+exception for BLOCK_MUTATED. A CheckBlock failure marks nothing: Core's
+ProcessNewBlock runs CheckBlock BEFORE AcceptBlock and skips AcceptBlock when it
+fails, so "we will never mark a block as invalid if CheckBlock() fails"
+(validation.cpp:4442-4451) -- CheckBlock reads what a relaying peer can mangle.
+feature_block.py:377 sends b25 on top of b24, refused bad-blk-length, and waits
+for the node to fetch it; a marked b24 made b25's header bad-prevblk. Punishing
 the peer that sent the body is the caller's job (Core MaybePunishNodeForBlock,
 at the caller too); a caller with no peer to punish simply does not.
 
@@ -3806,17 +3812,19 @@ when it may not."
                                   (bl.ser:block-header-prev-block header))))
                        (and prev (1+ (bl.store:block-index-entry-height prev))))))
          (now (or current-time (bl.ser:get-unix-time))))
-    (multiple-value-bind (valid error)
+    (multiple-value-bind (valid error contextual)
         (multiple-value-bind (checked check-error)
             (%check-block block chain-state height now :skip-header (null height))
-          (cond ((not checked) (values nil check-error))
-                ((null height) (values t nil))
-                (t (%contextual-check-block-no-utxo block chain-state height))))
+          (cond ((not checked) (values nil check-error nil))
+                ((null height) (values t nil nil))
+                (t (multiple-value-bind (ok err)
+                       (%contextual-check-block-no-utxo block chain-state height)
+                     (values ok err t)))))
       (when valid
         (return-from accept-block-body (values t nil)))
       (bl:log-warn "Block ~A rejected before storage: ~A"
                    (bl.crypto:bytes-to-hex hash) (block-reject-reason-string error))
-      (when (and entry (not (%mutated-block-error-p error)))
+      (when (and entry contextual (not (%mutated-block-error-p error)))
         (%mark-block-subtree-invalid chain-state entry))
       (values nil error))))
 
