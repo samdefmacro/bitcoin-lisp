@@ -901,6 +901,31 @@ magic. Both directions, and both nodes in a connect_nodes pair
         (is (= 24 (bl.net:connection-bytes-received conn))
             "the 24 bytes are accounted, so the next read starts after them")))))
 
+(test received-bytes-are-counted-as-they-arrive-not-when-the-read-completes
+  "Core counts received bytes per recv() chunk -- CNode::nRecvBytes in
+ReceiveMsgBytes (net.cpp:666) and the getnettotals total in RecordBytesRecv
+(:2190) -- whether or not a message is complete yet. p2p_invalid_messages.py
+:94-97 sends 12 bytes of a 24-byte header and waits for totalbytesrecv to move
+by exactly 12; ours counted a read only once it completed, so it never moved."
+  (multiple-value-bind (conn client server listener) (%silent-peer-connection 24 12)
+    (unwind-protect
+         (let ((before bl.net:*total-bytes-received*))
+           (is (eq :incomplete (%resumable-read conn 24)))
+           (is (= 12 (bl.net:connection-bytes-received conn)))
+           (is (= 12 (- bl.net:*total-bytes-received* before)))
+           (write-sequence (make-array 12 :element-type '(unsigned-byte 8)
+                                          :initial-element 7)
+                           (usocket:socket-stream client))
+           (force-output (usocket:socket-stream client))
+           (sleep 0.2)
+           (is (= 24 (length (%resumable-read conn 24))))
+           (is (= 24 (bl.net:connection-bytes-received conn))
+               "the rest is counted once, not the whole read again")
+           (is (= 24 (- bl.net:*total-bytes-received* before))))
+      (ignore-errors (usocket:socket-close client))
+      (ignore-errors (usocket:socket-close server))
+      (ignore-errors (usocket:socket-close listener)))))
+
 (defun %message-header-bytes (header)
   "HEADER on the wire. Five tests in this file frame a message by hand, and the
 serializer is internal, so the reach into it lives here once."

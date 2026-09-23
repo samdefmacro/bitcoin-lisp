@@ -1020,8 +1020,9 @@ healthy peers whenever a pump cycle ran long."
                             :element-type '(unsigned-byte 8))
                 (connection-recv-filled conn) 0
                 (connection-recv-last-progress conn) now))
-        (let ((buffer (connection-recv-buffer conn))
-              (filled (connection-recv-filled conn)))
+        (let* ((buffer (connection-recv-buffer conn))
+               (filled (connection-recv-filled conn))
+               (filled-at-entry filled))
           ;; More bytes in hand than the caller now says it wants means two reads
           ;; got mixed — a framing bug here, not a peer fault.
           (when (> filled count)
@@ -1080,10 +1081,17 @@ healthy peers whenever a pump cycle ran long."
                 (setf (connection-recv-last-progress conn) now))
               (setf filled n)))
           (setf (connection-recv-filled conn) filled)
+          ;; Bytes are counted as they ARRIVE, not when the read they belong
+          ;; to completes: Core's SocketHandler records every recv() chunk
+          ;; (ReceiveMsgBytes' nRecvBytes, net.cpp:666, and RecordBytesRecv,
+          ;; :2190), so getnettotals moves by 12 when half a
+          ;; header has come in, which p2p_invalid_messages.py:94-97 waits for.
+          (let ((arrived (- filled filled-at-entry)))
+            (when (plusp arrived)
+              (incf (connection-bytes-received conn) arrived)
+              (incf *total-bytes-received* arrived)))
           (cond
             ((= filled count)
-             (incf (connection-bytes-received conn) count)
-             (incf *total-bytes-received* count)
              ;; Read finished: clear the accumulator so the next one starts
              ;; clean. RECV-HEADER belongs to the caller's framing and is
              ;; cleared there, so %END-RECEIVE is not what we want here.
