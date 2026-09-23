@@ -20,6 +20,8 @@ consensus / policy errors that carry Core's reject reason.")
    #:chainstate-load-error
    #:serialization-error
    #:protocol-limit-error
+   #:protocol-limit-count
+   #:signal-protocol-limit
    #:storage-error
    #:net-error
    #:crypto-error

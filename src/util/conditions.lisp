@@ -82,7 +82,10 @@ keys, libsecp256k1 returning failure.")
 cannot read -- which the client prints after `error: ' and exits 1 for
 (bitcoin-cli.cpp CommandLineRPC's catch).")
 
-(define-condition protocol-limit-error (serialization-error) ()
+(define-condition protocol-limit-error (serialization-error)
+  ((count :initarg :count :initform nil :reader protocol-limit-count
+          :documentation "The element count the message declared, which Core's
+own log line names (`inv message size = 50001')."))
   (:documentation "A peer message declared more elements than the protocol
 allows -- an inv/getdata over MAX_INV_SZ, a headers message over
 MAX_HEADERS_RESULTS, an addr over MAX_ADDR_TO_SEND, a block locator over
@@ -99,8 +102,18 @@ peer is punished. SAFELY-DISPATCH-PEER-MESSAGE is where the two part."))
 
 (declaim (ftype (function (t &rest t) nil) protocol-limit-error))
 (defun protocol-limit-error (control &rest args)
-  "Signal a PROTOCOL-LIMIT-ERROR whose message is CONTROL formatted with ARGS."
+  "Signal a PROTOCOL-LIMIT-ERROR whose message is CONTROL formatted with ARGS.
+When the first of ARGS after the field name is the declared count -- the
+shape BR-READ-BOUNDED-COUNT signals -- use SIGNAL-PROTOCOL-LIMIT instead so
+the count travels as data."
   (error 'protocol-limit-error :format-control control :format-arguments args))
+
+(declaim (ftype (function (t t &rest t) nil) signal-protocol-limit))
+(defun signal-protocol-limit (count control &rest args)
+  "Signal a PROTOCOL-LIMIT-ERROR for a vector that declared COUNT elements,
+its message CONTROL formatted with ARGS."
+  (error 'protocol-limit-error :count count
+                               :format-control control :format-arguments args))
 
 (define-condition consensus-error (bitcoin-lisp-error simple-error)
   ((reason :initarg :reason :initform nil :reader error-reason))

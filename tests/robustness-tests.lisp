@@ -197,6 +197,39 @@ the peer is disconnected -- Core checks the same limits in the handler itself."
         (is (eq :disconnected (bl.net:peer-state peer))
             "~A: an over-limit count must disconnect the peer" (car case))))))
 
+(test an-over-limit-vector-is-punished-in-cores-words
+  "Core's words for an over-limit vector are behaviour: p2p_invalid_messages.py
+:262 waits for `Misbehaving' and `inv message size = 50001' (likewise getdata
+and headers, net_processing.cpp:4130, :4221, :4829), and a getheaders or
+getblocks locator over MAX_LOCATOR_SZ is NOT Misbehaving at all but a plain
+disconnect logged `getheaders locator size 102 > 101' (:4399-4402, :4272-4275)
+-- the address is not discouraged. Ours wrote the parser's text for all of
+them and discouraged the locator sender too."
+  (dolist (case (list (list "inv" (%bytes #xfd #x51 #xc3) "inv message size = 50001")
+                      (list "getdata" (%bytes #xfd #x51 #xc3) "getdata message size = 50001")
+                      (list "headers" (%bytes #xfd #xd1 #x07) "headers message size = 2001")))
+    (destructuring-bind (command payload expected) case
+      (let ((text (nth-value 1 (log-text-of "net" (lambda ()
+                                                    (%dispatch-to-fake-peer command payload))))))
+        (is-true (search "Misbehaving" text) "~A: not Misbehaving: ~A" command text)
+        (is-true (search expected text) "~A: ~A not in ~A" command expected text))))
+  (dolist (command '("getheaders" "getblocks"))
+    (bl.net:clear-discouraged)
+    ;; version, then a locator count of 102
+    (multiple-value-bind (result text)
+        (log-text-of "net" (lambda ()
+                             (multiple-value-list
+                              (%dispatch-to-fake-peer command (%bytes 0 0 0 0 102)))))
+      (destructuring-bind (still-connected peer) result
+        (is (null still-connected))
+        (is (eq :disconnected (bl.net:peer-state peer)))
+        (is-true (search (format nil "~A locator size 102 > 101" command) text)
+                 "~A: ~A" command text)
+        (is-false (search "Misbehaving" text))
+        (is-false (bl.net:peer-discouraged-p "127.0.0.1")
+                  "~A: a long locator disconnects, it does not discourage" command))))
+  (bl.net:clear-discouraged))
+
 (test undecodable-payload-keeps-the-peer
   "A payload that merely fails to decode is caught and forgiven, the way Core's
 ProcessMessages catch does -- it logs and never sets fDisconnect."

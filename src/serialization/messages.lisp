@@ -532,7 +532,7 @@ themselves and call Misbehaving, while every other malformed payload is caught
 and forgiven. See PROTOCOL-LIMIT-ERROR and SAFELY-DISPATCH-PEER-MESSAGE."
   (let ((count (br-read-compact-size br)))
     (when (> count max)
-      (protocol-limit-error "~A count ~D exceeds maximum ~D" name count max))
+      (signal-protocol-limit count "~A count ~D exceeds maximum ~D" name count max))
     count))
 
 (defconstant +max-inv-count+ 50000

@@ -2351,11 +2351,29 @@ clause and is likewise untouched."
       ;; which is what the separate condition type is for. RECORD-MISBEHAVIOR is
       ;; Misbehaving, noban exemption included.
       (bl.err:protocol-limit-error (c)
-        (record-misbehavior peer (format nil "~A message: ~A" command c))
+        (%punish-protocol-limit peer command c)
         (still-connected-p))
       (error (c)
         (%note-message-handler-error peer command payload c)
         (still-connected-p)))))
+
+(defun %punish-protocol-limit (peer command condition)
+  "What Core does, in its words, with a message whose vector is over its
+limit (CONDITION, a PROTOCOL-LIMIT-ERROR). An inv, getdata, headers, addr or
+addrv2 is Misbehaving `<command> message size = <count>' (net_processing.cpp
+:4130, :4221, :4829, :4048); a getheaders or getblocks locator over
+MAX_LOCATOR_SZ is a plain disconnect with Core's NET line (:4272-4275,
+:4399-4402), no discouragement; anything else keeps the parser's text.
+p2p_invalid_messages.py:262 waits for `inv message size = 50001'."
+  (let ((count (bl.err:protocol-limit-count condition)))
+    (cond ((and count (member command '("inv" "getdata" "headers" "addr" "addrv2")
+                              :test #'string=))
+           (record-misbehavior peer (format nil "~A message size = ~D" command count)))
+          ((and count (member command '("getheaders" "getblocks") :test #'string=))
+           (bl:log-cat "net" "~A locator size ~D > ~D, ~A" command count
+                       bl.ser:+max-locator-count+ (disconnect-msg peer))
+           (disconnect-peer peer))
+          (t (record-misbehavior peer (format nil "~A message: ~A" command condition))))))
 
 (defun %dispatch-parked-messages (peer node-ctx ctx)
   "Dispatch the messages PEER's connection parked while it was send-paused,
