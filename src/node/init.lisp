@@ -383,22 +383,26 @@ txindex ~D MiB, per-index ~D MiB"
   ;; config-validation error must not leave *prune-target-mib* set (a failed
   ;; start-node previously leaked the half-applied prune setting into the
   ;; process, making e.g. a later loadtxoutset believe the node is pruned).
+  ;; Core's checks and words, in Core's order: the incompatible options first
+  ;; (AppInitParameterInteraction, init.cpp:1001-1008), then the value itself
+  ;; (ApplyArgsManOptions, node/blockmanager_args.cpp:22-33). -prune=0 is
+  ;; pruning off, as Core's `if (nPruneTarget)' reads it.
+  (when (eql prune 0)
+    (setf prune nil))
   (when prune
+    ;; A pruned node cannot read back the blocks these answer from: the
+    ;; transaction index and the spender index look a transaction up in its
+    ;; block, and -reindex-chainstate replays the UTXO set from stored blocks.
+    (when txindex
+      (config-error "Prune mode is incompatible with -txindex."))
+    (when txospenderindex
+      (config-error "Prune mode is incompatible with -txospenderindex."))
+    (when reindex-chainstate
+      (config-error "Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."))
+    (when (minusp prune)
+      (config-error "Prune cannot be configured with a negative value."))
     (unless (or (= prune 1) (>= prune 550))
-      (config-error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
-    (when (and prune txindex)
-      (config-error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up."))
-    ;; Core refuses the same pair for the spender index, and for the same
-    ;; reason: answering a lookup means READING the spending transaction back
-    ;; from its block, which a pruned node no longer has (init.cpp, the
-    ;; -txospenderindex prune check).
-    (when (and prune txospenderindex)
-      (config-error "Cannot enable both pruning and txospenderindex. Pruned blocks cannot be looked up."))
-    ;; Bitcoin Core init.cpp: -prune is incompatible with -reindex-chainstate --
-    ;; the wipe leaves the UTXO set to be replayed from stored blocks, but early
-    ;; blocks are pruned, so a pruned reindex-chainstate wedges at the first gap.
-    (when (and prune reindex-chainstate)
-      (config-error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
+      (config-error "Prune configured below the minimum of 550 MiB.  Please use a higher number.")))
   (setf *prune-target-mib* prune)
 
   ;; -port: validate, then make it the single global listen-port override.

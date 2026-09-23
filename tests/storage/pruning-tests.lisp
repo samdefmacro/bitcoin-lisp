@@ -290,33 +290,6 @@ but prune-old-blocks should not."
             (is (= 100 (bl.store:current-height state)))))
       (cleanup-test-dir base-path))))
 
-;;;; Test 5.6: txindex/prune incompatibility
-
-(test txindex-prune-incompatibility
-  "Starting with both txindex and prune should signal an error."
-  (signals error
-    (bl:start-node :data-directory "/tmp/btc-prune-incompat-test/"
-                             :network :testnet
-                             :sync nil
-                             :txindex t
-                             :prune 550)))
-
-;;;; Test 5.7: prune target validation
-
-(test prune-target-validation
-  "Invalid prune targets should signal an error."
-  ;; Values between 2 and 549 are invalid
-  (signals error
-    (bl:start-node :data-directory "/tmp/btc-prune-val-test/"
-                             :network :testnet
-                             :sync nil
-                             :prune 100))
-  (signals error
-    (bl:start-node :data-directory "/tmp/btc-prune-val-test/"
-                             :network :testnet
-                             :sync nil
-                             :prune 549)))
-
 ;;;; Test 5.8: pruneblockchain RPC return value
 
 (test prune-blocks-to-height-return

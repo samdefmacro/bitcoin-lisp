@@ -1430,6 +1430,40 @@ ratchet asks of a second copy."
                           coinstatsindex txospenderindex reindex-chainstate
                           peer-block-filters port)))
 
+(test prune-refusals-are-cores
+  "An invalid -prune stops start-up in Core's words and order: first the
+options a pruned node cannot serve (AppInitParameterInteraction,
+init.cpp:1001-1008), then the value itself -- negative, or between 2 and 549
+(ApplyArgsManOptions, node/blockmanager_args.cpp:22-33). -prune=0 is pruning
+off. feature_pruning.py:118-133 asserts each sentence exactly; ours had its
+own wording for every one. Two start-node tests in the pruning suite claimed
+this and passed vacuously: they named the network :TESTNET, which has no
+chain parameters, so start-up signalled before any prune check ran."
+  (flet ((refusal (prune &key txindex txospenderindex reindex-chainstate)
+           (%init-parameters-refusal :regtest txindex nil prune nil nil nil nil
+                                     nil nil txospenderindex reindex-chainstate
+                                     nil nil)))
+    (is (equal "Prune configured below the minimum of 550 MiB.  Please use a higher number."
+               (refusal 100)))
+    (is (equal "Prune configured below the minimum of 550 MiB.  Please use a higher number."
+               (refusal 549)))
+    (is (equal "Prune cannot be configured with a negative value." (refusal -1)))
+    (is (equal "Prune mode is incompatible with -txindex." (refusal 550 :txindex t)))
+    (is (equal "Prune mode is incompatible with -txospenderindex."
+               (refusal 550 :txospenderindex t)))
+    (is (equal "Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."
+               (refusal 550 :reindex-chainstate t)))
+    ;; The incompatibility comes first, as Core's parameter interaction runs
+    ;; before the block manager reads the value.
+    (is (equal "Prune mode is incompatible with -txindex." (refusal -1 :txindex t)))
+    ;; CONTROLS: manual, automatic and off are accepted. The global is put
+    ;; back, since an accepted start-up assigns it.
+    (let ((bl:*prune-target-mib* bl:*prune-target-mib*))
+      (is (null (refusal 1)))
+      (is (null (refusal 550)))
+      (is (null (refusal 0)))
+      (is (null bl:*prune-target-mib*) "-prune=0 is pruning off"))))
+
 (test maxmempool-must-hold-one-cluster
   "Core refuses a -maxmempool below limits.cluster_size_vbytes * 40 -- the
 size of one maximum cluster, which the pool could not otherwise admit --
