@@ -265,15 +265,22 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
       (let ((b (lk "blocksonly")))
         (when (and b (conf-parse-bool b))
           (setf bl.mp:*max-mempool-bytes* (* 5 1000 1000)))))
-    ;; -dnsseed under -connect / -maxconnections<=0: with only trusted nodes
-    ;; to dial (or connections disabled outright) there is nothing for a DNS
-    ;; seed to feed. Soft -- an explicit -dnsseed=1 was applied by its row
-    ;; and still wins.
-    (unless (lk "dnsseed")
-      (when (or (lk "connect")
-                (let ((m (lk "maxconnections")))
-                  (and m (<= (conf-parse-int m) 0))))
-        (setf *dns-seed-enabled* nil)))
+    ;; -dnsseed and -listen under -connect / -maxconnections<=0: with only
+    ;; trusted nodes to dial (or connections disabled outright) there is
+    ;; nothing for a DNS seed to feed, and no reason to listen by default.
+    ;; Soft -- an explicit -dnsseed / -listen, or a -bind / -whitebind that
+    ;; soft-set -listen=1 first, still wins -- and each soft-set that takes
+    ;; says so in Core's words (init.cpp:777-784), which
+    ;; feature_config_args.py:400-405 waits for under -connect=0 and
+    ;; -noconnect. The -listen value itself is CONF-EFFECTIVE-LISTEN-FLAGS'.
+    (when (or (lk "connect")
+              (let ((m (lk "maxconnections")))
+                (and m (<= (conf-parse-int m) 0))))
+      (unless (lk "dnsseed")
+        (setf *dns-seed-enabled* nil)
+        (defer-log :info "parameter interaction: -connect or -maxconnections=0 set -> setting -dnsseed=0"))
+      (unless (or (lk "listen") (lk "bind") (lk "whitebind"))
+        (defer-log :info "parameter interaction: -connect or -maxconnections=0 set -> setting -listen=0")))
     ;; -proxy: run ALL outbound P2P connections through a SOCKS5 proxy
     ;; (Bitcoin Core init.cpp:1698-1762 sets it for every network).
     ;; -noproxy / -proxy=0 clears it. -proxyrandomize (default on) enables

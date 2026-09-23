@@ -656,6 +656,35 @@ the two exclusions: a noban -whitebind and an =onion -bind name no port."
     (apply-config-globals (bl.cfg:parse-cli-args cli))
     bl:*dns-seed-enabled*))
 
+(defun %interaction-lines-after (&rest cli)
+  "The deferred log lines applying CLI queues."
+  (let ((bl:*deferred-log-lines* nil))
+    (%with-net-config-globals
+      (apply-config-globals (bl.cfg:parse-cli-args cli)))
+    (mapcar #'second bl:*deferred-log-lines*)))
+
+(test connect-soft-disables-dnsseed-and-listen-in-cores-words
+  "Core's -connect interaction (init.cpp:777-784) logs each soft-set that
+takes: `parameter interaction: -connect or -maxconnections=0 set -> setting
+-dnsseed=0' and `... -> setting -listen=0'; feature_config_args.py:400-405
+waits for both under -connect=0 and -noconnect. An explicit -dnsseed or
+-listen, or a -bind that soft-set -listen=1 first (:768-775), keeps its line
+out; without -connect neither is said."
+  (let ((dnsseed "parameter interaction: -connect or -maxconnections=0 set -> setting -dnsseed=0")
+        (listen "parameter interaction: -connect or -maxconnections=0 set -> setting -listen=0"))
+    (dolist (args '(("-noconnect") ("-connect=0") ("-connect=1.2.3.4") ("-maxconnections=0")))
+      (let ((lines (apply #'%interaction-lines-after args)))
+        (is (member dnsseed lines :test #'string=) "~A: no -dnsseed line" args)
+        (is (member listen lines :test #'string=) "~A: no -listen line" args)))
+    (let ((lines (%interaction-lines-after "-noconnect" "-dnsseed=1" "-bind=127.0.0.1")))
+      (is-false (member dnsseed lines :test #'string=))
+      (is-false (member listen lines :test #'string=)))
+    (let ((lines (%interaction-lines-after "-noconnect" "-listen=1")))
+      (is-false (member listen lines :test #'string=)))
+    (let ((lines (%interaction-lines-after)))
+      (is-false (member dnsseed lines :test #'string=))
+      (is-false (member listen lines :test #'string=)))))
+
 (defun %force-dns-seed-after (&rest cli)
   "Value of *force-dns-seed* after applying CLI, from a clean NIL default."
   (%with-net-config-globals
