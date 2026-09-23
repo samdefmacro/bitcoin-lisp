@@ -69,7 +69,8 @@ negation happened — `nolisten=1` is the string \"0\" to an option reader and
 tests read back.
 
 Signals CONFIG-PARSE-ERROR on the three lines Core refuses:
-a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
+a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword;
+and, once every line has parsed, on a `conf' key (IsConfSupported)."
   (let ((rows nil)
         (prefix "")
         (linenr 0))
@@ -121,6 +122,13 @@ option, use ~A=1 instead" line))))
                              "parse error on line ~D, using # in rpcpassword can be ~
 ambiguous and should be avoided" linenr))
                           (push (list section key value json) rows)))))))))
+    ;; IsConfSupported (common/config.cpp:79-83), which ReadConfigStream runs
+    ;; over every option once the whole file has parsed (:96-103): `conf'
+    ;; cannot be set from a config file, in any section or negated -- it
+    ;; would name the very file being read.
+    (when (find "conf" rows :key #'second :test #'string=)
+      (config-file-read-error "conf cannot be set in the configuration file; use ~
+includeconf= if you want to include additional config files"))
     (nreverse rows)))
 
 (defun parse-bitcoin-conf-sections (text &optional network)

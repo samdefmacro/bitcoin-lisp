@@ -142,6 +142,22 @@ configuration value` warning: a config Core reads and applies, discarded."
   (is (equal '(("main" "test.rpcport" "1" "\"1\""))
              (bl.cfg:conf-settings-rows (format nil "[main]~%test.rpcport=1~%")))))
 
+(test conf-cannot-be-set-in-a-configuration-file
+  "Core's IsConfSupported (common/config.cpp:79-83) refuses a `conf' key in a
+config file, in any section and negated alike, once the whole file has parsed
+(ReadConfigStream, :96-103) -- so a garbage line anywhere still reports its own
+parse error first. feature_config_args.py:103-106 starts a node with
+-conf=<a file holding conf=some.conf> and expects this error, not the
+ignored-bitcoin.conf refusal that runs later."
+  (let ((refused "Error reading configuration file: conf cannot be set in the configuration file; use includeconf= if you want to include additional config files"))
+    (is (equal refused (%config-refusal (bl.cfg:conf-settings-rows (format nil "regtest=1~%conf=some.conf~%")))))
+    (is (equal refused (%config-refusal (bl.cfg:conf-settings-rows (format nil "[regtest]~%conf=some.conf~%")))))
+    (is (equal refused (%config-refusal (bl.cfg:conf-settings-rows (format nil "noconf=1~%")))))
+    (is (equal "Error reading configuration file: parse error on line 2: garbage"
+               (%config-refusal (bl.cfg:conf-settings-rows (format nil "conf=x~%garbage~%")))))
+    ;; Control: includeconf is how a file names another, and is accepted.
+    (is (null (%config-refusal (bl.cfg:conf-settings-rows (format nil "includeconf=other.conf~%")))))))
+
 (test a-dotted-key-is-not-a-command-line-option
   "Core refuses any command-line key that InterpretKey split into a section:
 `Invalid parameter` (args.cpp:232-237). The refusal is CHECK-CLI-ARGS' job, and
