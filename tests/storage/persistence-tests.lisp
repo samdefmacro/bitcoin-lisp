@@ -2021,6 +2021,41 @@ every global stop-node mutates restored afterwards."
        (bl.net:reset-ibd-stop)
        (uiop:delete-directory-tree ,base-var :validate t :if-does-not-exist :ignore))))
 
+(test a-stop-during-start-up-waits-for-start-up-to-return
+  "A SIGTERM during start-up is only registered; the teardown runs once
+START-NODE has returned (Core: AppInitMain returns, then Shutdown runs,
+bitcoind.cpp:180-193). The servicer used to run stop-node at once, closing the
+index databases under the index threads start-up was still starting -- a
+memory fault and exit code 1 at feature_init.py:73's `scheduler thread start'.
+It now waits while *NODE-STARTING* is set, and stops waiting when start-up
+ends or a watchdog takes over."
+  (let* ((starting 'bl::*node-starting*)
+         (watchdog 'bl::*shutdown-watchdog-running*)
+         (await 'bl::%await-start-up-end)
+         (saved (list (symbol-value starting) (symbol-value watchdog))))
+    (flet ((waiter ()
+             (bt:make-thread (lambda () (funcall await :poll-seconds 0.01))
+                             :name "await-start-up-test"))
+           (ends-p (thread)
+             (loop repeat 50 while (bt:thread-alive-p thread) do (sleep 0.1))
+             (not (bt:thread-alive-p thread))))
+      (unwind-protect
+           (progn
+             (setf (symbol-value starting) t
+                   (symbol-value watchdog) nil)
+             (let ((thread (waiter)))
+               (sleep 0.3)
+               (is-true (bt:thread-alive-p thread) "still waiting while start-up runs")
+               (setf (symbol-value starting) nil)
+               (is-true (ends-p thread) "start-up's end releases it"))
+             ;; A watchdog taking over releases it too.
+             (setf (symbol-value starting) t)
+             (let ((thread (waiter)))
+               (setf (symbol-value watchdog) t)
+               (is-true (ends-p thread))))
+        (setf (symbol-value starting) (first saved)
+              (symbol-value watchdog) (second saved))))))
+
 (test shutdown-request-completes-teardown-before-exit
   "An internal stop request (driven through the real `stop` RPC entry point)
 must not stop the node on its own thread: it registers the request, and the

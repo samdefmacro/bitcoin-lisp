@@ -248,6 +248,19 @@ one is running (Core's WaitForShutdown), else the servicer thread."
     (%write-shutdown-token))
   t)
 
+(defun %await-start-up-end (&key (poll-seconds 0.05))
+  "Wait while START-NODE is still building the node and no watchdog has taken
+over. A stop that arrives during start-up is only REGISTERED (see
+*NODE-STARTING*): start-up's long loops poll interrupt-requested-p and give up
+at their next boundary, and the teardown runs once start-up has returned --
+Core's order too, where AppInitMain returns before Shutdown runs
+(bitcoind.cpp:180-193). Tearing down WHILE start-up still runs closed the
+index databases under the index threads it was still starting: SIGTERM right
+after `scheduler thread start' (feature_init.py:73) freed a LevelDB handle a
+block filter index sync was reading, a memory fault and exit code 1."
+  (loop while (and *node-starting* (not *shutdown-watchdog-running*))
+        do (sleep poll-seconds)))
+
 (defun %run-shutdown-servicer ()
   "Block on the token pipe and service whatever shutdown request wakes us.
 Core's WaitForShutdown, moved off the signal path.
@@ -255,12 +268,14 @@ Core's WaitForShutdown, moved off the signal path.
 When a main-thread watchdog is running it owns the teardown, so this only has
 to not interfere: the watchdog's poll sees the same flag. Otherwise — a REPL or
 embedded start-node — nobody else would ever run stop-node, so this thread does
-it, which is where the old signal handler ran it from."
+it, which is where the old signal handler ran it from. Either way not while
+start-up is still running (%AWAIT-START-UP-END)."
   (%await-shutdown-token)
   (let ((reason (node-shutdown-requested-p)))
     (when reason
       ;; Logging is safe HERE: an ordinary thread, not a signal context.
       (log-info "Shutdown requested: ~A" reason))
+    (%await-start-up-end)
     (unless *shutdown-watchdog-running*
       (ignore-errors (stop-node))
       ;; Per-block script-check worker threads (bt:make-thread :name
