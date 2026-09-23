@@ -2150,9 +2150,17 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        ;; because Core's AcceptBlockHeader does: CheckBlockHeader runs before
        ;; the prev lookup, so a header that does not meet its own target is
        ;; high-hash, not prev-blk-not-found.
-       (when (and (bl.val:check-proof-of-work header)
-                  (not (bl.store:get-block-index-entry
-                        chain-state (bl.ser:block-header-prev-block header))))
+       ;;
+       ;; A header that misses its own target is CheckBlockHeader's high-hash,
+       ;; BLOCK_INVALID_HEADER (validation.cpp:3864), inside the CheckBlock
+       ;; ProcessNewBlock runs first; BlockChecked punishes that too
+       ;; (net_processing.cpp:1917-1919). The header ingest above already
+       ;; logged the verdict; feature_block.py:666 waits for the disconnect.
+       (unless (bl.val:check-proof-of-work header)
+         (record-misbehavior peer "high-hash")
+         (return-from dispatch-ibd-message nil))
+       (unless (bl.store:get-block-index-entry
+                chain-state (bl.ser:block-header-prev-block header))
          (bl:log-info "AcceptBlock FAILED (prev-blk-not-found)")
          (record-misbehavior peer "prev-blk-not-found")
          (return-from dispatch-ibd-message nil))

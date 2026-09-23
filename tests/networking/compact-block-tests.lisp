@@ -1357,6 +1357,39 @@ free -- p2p_mutated_blocks.py:109-112 sends one and waits for the disconnect."
                "a block on a parent we have never seen costs the sender the connection")
            (is (= 0 (bl.store:current-height cs)))))))))
 
+(test a-block-failing-its-own-proof-of-work-costs-the-sender-the-connection
+  "Core's ProcessNewBlock runs CheckBlock first, and its CheckBlockHeader
+refuses a header above its own target as high-hash, BLOCK_INVALID_HEADER
+(validation.cpp:3864); BlockChecked then punishes the sender
+(MaybePunishNodeForBlock, net_processing.cpp:1917-1919). Ours logged the
+high-hash header verdict, dropped the body as `Received unknown block' and
+kept the peer: feature_block.py:666 force-sends b47 and waits for the
+disconnect."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "high-hash-block"))
+           (cs (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
+           (store (bl:node-block-store node))
+           (mp (bl:node-mempool node))
+           (block (%g716-mine-on node (p2sh-optrue-script-pubkey)))
+           (header (bl.ser:bitcoin-block-header block)))
+      ;; feature_block.py:662-665: bump the nonce until the hash misses.
+      (loop while (bl.val:check-proof-of-work header)
+            do (setf (bl.ser:block-header-nonce header)
+                     (1+ (bl.ser:block-header-nonce header))
+                     (bl.ser:block-header-cached-hash header) nil))
+      (is-false (bl.val:check-proof-of-work header)
+                "control: the block misses its own target")
+      (%g716-quiet
+       (with-ibd-context
+         (let ((attacker (%g716-delivering-peer "198.51.100.33"))
+               (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                              :block-store store :mempool mp)))
+           (deliver-ibd-message attacker "block" (%g716-block-payload block) ctx)
+           (is (eq :disconnected (bl.net:peer-state attacker))
+               "a block failing its own proof of work costs the sender the connection")
+           (is (= 0 (bl.store:current-height cs)))))))))
+
 (defun %g716-delivering-peer (address)
   (let ((p (%g716-peer)))
     (setf (bl.net:peer-address p) address)
