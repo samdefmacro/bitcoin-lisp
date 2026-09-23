@@ -1275,3 +1275,22 @@ never seen the missing blocks."
         (is (search "when using assumeutxo snapshots" (or first "")))
         (is (equal first second) "the second attempt answered ~S" second)))))
 
+(test a-prune-mode-node-that-has-pruned-nothing-gives-the-assumeutxo-refusal
+  "Core picks AttachChain's refusal by chain.havePruned() -- whether block files
+HAVE been pruned, BlockManager::m_have_pruned -- not by whether the node is in
+prune mode (wallet.cpp:3255-3262). A -prune node that loaded a snapshot and
+pruned nothing yet refuses a wallet below the gap with the assumeutxo
+sentence, which wallet_assumeutxo.py:90 reads; ours gave the prune one to
+every prune-mode node."
+  (with-wallet-chain-node (node "assumeutxo-prune-mode" :wallet "below")
+    (let ((refusal (%wc-assumeutxo-gap-node-refusal node))
+          (bl:*prune-target-mib* 550))
+      (let ((unpruned (funcall refusal)))
+        (is (search "when using assumeutxo snapshots" (or unpruned ""))
+            "a prune-mode node with nothing pruned gave: ~S" unpruned))
+      ;; Control: once block files HAVE been pruned, the prune sentence.
+      (setf (bl.store:chain-state-pruned-height (bl:node-chain-state node)) 1)
+      (let ((pruned (funcall refusal)))
+        (is (search "Prune: last wallet synchronisation goes beyond pruned data"
+                    (or pruned ""))
+            "a node that pruned gave: ~S" pruned)))))

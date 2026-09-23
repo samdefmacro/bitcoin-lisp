@@ -1774,8 +1774,13 @@ was loaded and then rescanned over blocks the node does not have
                          (on-disk-p (1- block-height))
                          (/= rescan-height block-height))
               do (decf block-height)))
+      ;; The sentence is chosen by chain.havePruned() -- whether block files
+      ;; HAVE been pruned (BlockManager::m_have_pruned) -- not by prune mode
+      ;; (wallet.cpp:3255): a -prune node that loaded a snapshot and pruned
+      ;; nothing yet gives the assumeutxo refusal (wallet_assumeutxo.py:90).
       (when (/= rescan-height block-height)
-        (if (bl:pruning-enabled-p)
+        (if (some (lambda (cs) (plusp (bl.store:chain-state-pruned-height cs)))
+                  (bl:node-chainstates node))
             "Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)"
             (format nil "Error loading wallet. Wallet requires blocks to be downloaded, and software does not currently support loading wallets while blocks are being downloaded out of order when using assumeutxo snapshots. Wallet should be able to load successfully after node sync reaches height ~D"
                     block-height))))))
