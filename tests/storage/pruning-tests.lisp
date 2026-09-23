@@ -674,6 +674,33 @@ so a syncing node does not prune, and flush, after every block."
                      block-store chain-state :initial-block-download-p t))))
       (cleanup-test-dir base-path))))
 
+(test a-pruned-restart-prunes-before-the-first-block
+  "Core prunes every chainstate at startup, after the wallets' rescans
+(init.cpp:1936-1945, Chainstate::PruneAndFlush, validation.cpp:2846-2853), so
+a node restarted with -prune=550 over an unpruned datadir is already pruned
+when its RPC answers: feature_pruning.py:138 then expects rescanblockchain
+from genesis to be refused. Ours pruned only after the next connected block.
+Manual mode (-prune=1) prunes nothing at startup."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (unwind-protect
+         (let ((node (make-test-node))
+               (bl:*prune-after-height* 0))
+           (setf (bl:node-chain-state node) chain-state
+                 (bl:node-block-store node) block-store
+                 (bl.store:block-store-total-bytes block-store) (* 600 1048576))
+           (let ((bl:*prune-target-mib* 1))
+             (is (= 0 (bl:prune-blockstore-at-startup node))))
+           (let ((bl:*prune-target-mib* 550))
+             (is (= 12 (bl:prune-blockstore-at-startup node))))
+           (is (= 12 (bl.store:chain-state-pruned-height chain-state)))
+           (is (null (bl.store:block-exists-p block-store (nth 12 block-hashes))))
+           ;; The seam: START-NODE runs it.
+           (is (member 'bl:start-node
+                       (mapcar #'car (sb-introspect:who-calls
+                                      'bl:prune-blockstore-at-startup)))))
+      (cleanup-test-dir base-path))))
+
 ;;;; Test: prune-blocks-to-height respects min-blocks-to-keep
 
 (test prune-respects-min-blocks-retention

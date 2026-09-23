@@ -143,6 +143,30 @@ at +min-disk-space-for-block-files+ (550 MiB, validation.h:87)."
   (bl.store:prune-target-bytes
    (if (and *node* (node-historical-chainstate *node*)) 2 1)))
 
+(defun prune-blockstore-at-startup (node)
+  "Core init.cpp:1936-1945, Step 10 `data directory maintenance': in prune
+mode, once any wallet rescan has run, every chainstate is pruned and flushed
+(Chainstate::PruneAndFlush, validation.cpp:2846-2853, which sets
+m_check_for_pruning and lets FlushStateToDisk call FindFilesToPrune). Without
+it a node restarted with -prune kept every block it already had until the
+next block connected: feature_pruning.py:138 restarts an unpruned node with
+-prune=550 and expects rescanblockchain from genesis to be refused as beyond
+pruned data. Manual mode (-prune=1) prunes nothing here, as Core's
+PRUNE_TARGET_MANUAL target never triggers. Returns the blocks pruned."
+  (let ((store (node-block-store node))
+        (pruned 0))
+    (when (and store (bl.store:automatic-pruning-p))
+      (init-message "Pruning blockstore…")
+      (dolist (cs (node-chainstates node))
+        (incf pruned (bl.store:prune-old-blocks
+                      store cs
+                      :on-prune #'bl.val:delete-undo-file
+                      :target-bytes (effective-prune-target-bytes)
+                      :initial-block-download-p bl.net:*cached-is-ibd*)))
+      (when (plusp pruned)
+        (log-info "Pruned ~D old block~:P at startup" pruned)))
+    pruned))
+
 (defvar *blocks-since-flush* 0
   "Counter incremented per connected block; reset to 0 when a flush runs.")
 

@@ -52,6 +52,7 @@ init.cpp, node/. src/node/.")
    #:+min-blocks-to-keep+
    #:+min-disk-space-for-block-files+
    #:effective-prune-target-bytes
+   #:prune-blockstore-at-startup
    #:*accept-datacarrier*
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*

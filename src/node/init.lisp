@@ -2257,6 +2257,7 @@ Returns the node instance."
   (%init-chain-tip reindex)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p (if wallet-names-supplied-p wallet-names :settings))
+  (prune-blockstore-at-startup *node*)   ; Step 10, after the wallets' rescans
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 
   (%start-network-services network sync listen listen-bind listen-bind-supplied-p
