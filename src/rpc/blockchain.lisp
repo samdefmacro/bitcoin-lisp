@@ -106,8 +106,36 @@ removed, and we prune whole files from the bottom. Core's walk starts at
 chain[1] rather than at genesis, for the same reason our horizon starts at 0
 and means `nothing pruned' -- genesis has no undo data and is never counted as
 pruned."
-  (let ((pruned (bl.store:chain-state-pruned-height chain-state)))
-    (when (plusp pruned) pruned)))
+  (if (bl.store:chain-state-from-snapshot-blockhash chain-state)
+      (%snapshot-chain-prune-height chain-state)
+      (let ((pruned (bl.store:chain-state-pruned-height chain-state)))
+        (when (plusp pruned) pruned))))
+
+(defun %snapshot-chain-prune-height (chain-state)
+  "Core GetPruneHeight (rpc/blockchain.cpp:882-906) walked as Core walks it,
+for a SNAPSHOT chainstate, where the prune horizon says nothing: the blocks
+between what the node held and the snapshot base were never downloaded, and
+neither was the base. A tip without its body means everything is pruned and
+answers the tip's height (:896); otherwise the answer is the parent of the
+lowest block of the unbroken run with data that ends at the tip, or NIL when
+that run reaches height 1 (:898-905). wallet_assumeutxo.py:82 prunes right
+after loadtxoutset and expects a positive height; the horizon answered -1.
+
+Only a snapshot chainstate is walked: an ordinary one keeps the horizon,
+because its entries record a flat-file position and a body in a legacy
+per-block file has none."
+  (let ((tip (bl.store:get-block-index-entry
+              chain-state (bl.store:best-block-hash chain-state))))
+    (flet ((has-data-p (e) (bl.store:block-index-entry-data-pos e)))
+      (cond ((or (null tip) (< (bl.store:block-index-entry-height tip) 1)) nil)
+            ((not (has-data-p tip)) (bl.store:block-index-entry-height tip))
+            (t (loop for e = tip then prev
+                     for prev = (bl.store:block-index-entry-prev-entry e)
+                     while (and prev (>= (bl.store:block-index-entry-height prev) 1)
+                                (has-data-p prev))
+                     finally (return
+                               (when (> (bl.store:block-index-entry-height e) 1)
+                                 (1- (bl.store:block-index-entry-height e))))))))))
 
 (defun %first-stored-block-height (chain-state)
   "getblockchaininfo's `pruneheight': the height of the lowest block of the

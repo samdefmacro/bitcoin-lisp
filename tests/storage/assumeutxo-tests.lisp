@@ -533,6 +533,67 @@ sync in progress)."
       (is (string= (bl.rpc:hash-to-hex base-hash)
                    (cdr (assoc "snapshot_blockhash" cur-entry :test #'string=)))))))
 
+(test assumeutxo-snapshot-chain-prune-height-walks-the-data
+  "Core GetPruneHeight (rpc/blockchain.cpp:882-906) walks the ACTIVE chain for
+block data: a snapshot chainstate's tip -- the base, never downloaded --
+lacks its body, so everything counts as pruned and the answer is the tip's
+height (:896), and getblockchaininfo reports pruneheight = that + 1. Ours read
+the prune horizon, which a snapshot load never moves, so pruneblockchain
+answered -1 and wallet_assumeutxo.py:82 stopped."
+  (let* ((base-hash (%au-hash 5))
+         (g (%au-entry (%au-hash 0) 0 nil :status :valid :chain-work 1))
+         (e1 (%au-entry (%au-hash 1) 1 g :status :valid :chain-work 10))
+         (e2 (%au-entry (%au-hash 2) 2 e1 :status :valid :chain-work 20))
+         (e3 (%au-entry (%au-hash 3) 3 e2 :chain-work 30))
+         (e4 (%au-entry (%au-hash 4) 4 e3 :chain-work 40))
+         (e5 (%au-entry base-hash 5 e4 :status :valid :chain-work 500))
+         (primary (bl.store:make-chain-state
+                   :best-block-hash (%au-hash 2) :best-height 2))
+         (snap (bl.store:make-chain-state
+                :best-block-hash base-hash :best-height 5
+                :block-index (bl.store:chain-state-block-index primary)
+                :from-snapshot-blockhash base-hash
+                :assumeutxo-status :unvalidated
+                :storage-suffix "_snapshot"))
+         (node (bl:make-node :network :regtest)))
+    (dolist (e (list g e1 e2 e3 e4 e5))
+      ;; getblockchaininfo reads the tip's time and bits.
+      (setf (bl.store:block-index-entry-header e)
+            (bl.ser:make-block-header :timestamp (+ 1296688602 (bl.store:block-index-entry-height e))
+                                      :bits #x207fffff))
+      (bl.store:add-block-index-entry primary e))
+    ;; The node held bodies 1 and 2 before the load; the base has none.
+    (setf (bl.store:block-index-entry-file e1) 0
+          (bl.store:block-index-entry-data-pos e1) 8
+          (bl.store:block-index-entry-file e2) 0
+          (bl.store:block-index-entry-data-pos e2) 300)
+    ;; The primary re-derives history toward the base, so the snapshot
+    ;; chainstate is the current one.
+    (bl.store:set-chainstate-target primary e5)
+    (setf (bl:node-chainstates node) (list primary snap))
+    (flet ((pruneheight ()
+             (let ((bl:*prune-target-mib* 1))
+               (cdr (assoc "pruneheight"
+                           (bl.rpc:dispatch-rpc-method node "getblockchaininfo" nil)
+                           :test #'string=)))))
+      (is (eql 6 (pruneheight)) "a tip without its body is all pruned")
+      ;; Once the base's body is here, the unbroken run with data ending at
+      ;; the tip is the base alone -- heights 3 and 4 were never downloaded --
+      ;; so the last pruned block is 4 and pruneheight 5 (:898-905).
+      (setf (bl.store:block-index-entry-file e5) 0
+            (bl.store:block-index-entry-data-pos e5) 600)
+      (is (eql 5 (pruneheight)))
+      ;; And once 3 and 4 arrive the run reaches height 1: nothing pruned.
+      (setf (bl.store:block-index-entry-file e3) 0
+            (bl.store:block-index-entry-data-pos e3) 400
+            (bl.store:block-index-entry-file e4) 0
+            (bl.store:block-index-entry-data-pos e4) 500)
+      (is (eql 0 (pruneheight)))
+      ;; Control: an ordinary chainstate still reads the horizon, which is 0.
+      (bl.store:set-chainstate-target primary nil)
+      (setf (bl:node-chainstates node) (list primary))
+      (is (eql 0 (pruneheight))))))
+
 ;;;; P5: background-validation completion + promotion
 ;;;;
 ;;;; MaybeValidateSnapshot (Core validation.cpp:5986-6096) at the connect-tip
