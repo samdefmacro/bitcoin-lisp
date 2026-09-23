@@ -4040,6 +4040,39 @@ outbound block-relay-only peers, which never announce txs to us anyway."
        (%g715-peer) mempool state 1000)
       (is (= 1 (length sent)) "a normal peer must receive one"))))
 
+(test feefilter-skips-a-forcerelay-peer
+  "Core MaybeSendFeefilter (net_processing.cpp:5633) returns before anything
+else for a peer holding ForceRelay: that peer's transactions are relayed
+regardless of fee, so it must not be asked to filter them.
+p2p_feefilter.py:72 connects under -whitelist=forcerelay@127.0.0.1 and asserts
+no feefilter arrives. Relay alone (which forcerelay implies) does not skip it:
+HasFlag is (flags & f) == f."
+  (let* ((bl:*network* :regtest)
+         (bl.net:*cached-is-ibd* nil)
+         (mempool (bl.mp:make-mempool))
+         (state (bl.store:make-chain-state)))
+    (flet ((inbound-loopback-peer ()
+             (let ((p (%g715-peer)))
+               (setf (bl.net:peer-address p) "127.0.0.1"
+                     (bl.net:peer-inbound p) t)
+               p)))
+      (with-whitelist (:entries '("relay@127.0.0.1"))
+        (%g715-capturing (sent)
+          (bl.net:maybe-send-feefilter (inbound-loopback-peer) mempool state 1000)
+          (is (= 1 (length sent)) "a relay-only peer still receives one")))
+      (with-whitelist (:entries '("forcerelay@127.0.0.1"))
+        (let ((p (inbound-loopback-peer)))
+          (is-true (bl.net:peer-has-permission-p p bl.net:+perm-force-relay+)
+                   "control: the range does grant this peer forcerelay")
+          (%g715-capturing (sent)
+            (bl.net:maybe-send-feefilter p mempool state 1000)
+            (is (null sent) "a forcerelay peer must not receive feefilter")))
+        (%g715-capturing (sent)
+          (let ((bl.net:*cached-is-ibd* t))
+            (bl.net:maybe-send-feefilter (inbound-loopback-peer) mempool state 1000))
+          (is (null sent)
+              "not even the IBD sentinel goes to a forcerelay peer"))))))
+
 (test g7-15-rolling-min-excludes-relay-floor
   "Core rounds CTxMemPool::GetMinFee, which EXCLUDES -minrelaytxfee; the max()
 with the floor is applied AFTER rounding. Feeding the already-floored value to

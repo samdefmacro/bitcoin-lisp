@@ -1750,6 +1750,9 @@ periodic tick rather than once at handshake."
              (let ((v (peer-version peer)))
                (and v (>= (bl.ser:version-message-version v)
                           +feefilter-version+)))
+             ;; A ForceRelay peer's txs are relayed whatever their fee, so it
+             ;; is never asked to filter them (net_processing.cpp:5632-5633).
+             (not (peer-has-permission-p peer +perm-force-relay+))
              (not (eq (peer-conn-type peer) :block-relay)))
     (let ((current (if (initial-block-download-p chain-state)
                        ;; Tx invs are discarded during IBD, so ask for none.
