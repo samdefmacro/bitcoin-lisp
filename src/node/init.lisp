@@ -1459,29 +1459,36 @@ recorded for startup."
   (log-info "Initializing cryptographic context...")
   (bl.crypto:ensure-secp256k1-loaded)
 
-  ;; Wallet support (wallet P1). Default: enabled everywhere except mainnet,
-  ;; where holding keys on an internet-facing node is the operator's explicit
-  ;; opt-in (-wallet), mirroring the relay/-webui safety pattern.
-  (let ((wallet-enabled (if wallet-supplied-p
-                            (and wallet t)
-                            (not (eq network :mainnet)))))
-    (when wallet-enabled
-      (setf (node-wallet-manager *node*)
-            (bl.wallet:init-wallet-manager (node-data-directory *node*)
-                                                  network))
-      (log-info "Wallet support enabled (descriptor wallets under ~A)"
-                (merge-pathnames "wallets/" (node-data-directory *node*)))
-      ;; Core LoadWallets (load.cpp:118): load every wallet recorded for
-      ;; startup in settings.json. Runs here because the chainstate (%INIT-LOAD-CHAIN)
-      ;; and the mempool (load-mempool-from-disk) are both up, so each wallet
-      ;; can catch up from its locator and fold in the mempool; networking has
-      ;; not started, so no block can connect underneath the catch-up.
-      ;; WALLET-NAMES is the merged settings list when the node was started
-      ;; from arguments (CONFIG-ALIST->START-NODE-PLIST always supplies it),
-      ;; and :SETTINGS when it was not, meaning settings.json's own list.
-      (if (eq wallet-names :settings)
-          (bl.wallet:load-wallets-on-startup *node*)
-          (bl.wallet:load-wallets-on-startup *node* wallet-names)))))
+  (start-wallets *node* network wallet wallet-supplied-p wallet-names))
+
+(defun start-wallets (node network wallet wallet-supplied-p wallet-names)
+  "Core Steps 5 and 9 for the wallet (WalletInit's verify and load): make
+NODE's wallet manager and load the wallets start-up names. Wallet support is
+default-ON except on mainnet, where holding keys on an internet-facing node is
+the operator's explicit opt-in (-wallet), mirroring the relay/-webui safety
+pattern.
+
+Core announces `Verifying wallet(s)…' before it opens any wallet database
+(VerifyWallets, wallet/load.cpp:57), which feature_init.py:88 interrupts
+start-up on. Opening each database IS our verification -- it is the same step
+as the load -- so the message comes immediately before the load, and only when
+the wallet is enabled, as Core calls VerifyWallets only then.
+
+Runs once the chainstate and the mempool are both up, so each wallet can
+catch up from its locator and fold in the mempool, and before networking, so
+no block can connect underneath the catch-up. WALLET-NAMES is the merged
+settings list when the node was started from arguments (CONFIG-ALIST->START-
+NODE-PLIST always supplies it), and :SETTINGS when it was not, meaning
+settings.json's own list (Core LoadWallets, load.cpp:118)."
+  (when (if wallet-supplied-p (and wallet t) (not (eq network :mainnet)))
+    (setf (node-wallet-manager node)
+          (bl.wallet:init-wallet-manager (node-data-directory node) network))
+    (log-info "Wallet support enabled (descriptor wallets under ~A)"
+              (merge-pathnames "wallets/" (node-data-directory node)))
+    (init-message "Verifying wallet(s)…")
+    (if (eq wallet-names :settings)
+        (bl.wallet:load-wallets-on-startup node)
+        (bl.wallet:load-wallets-on-startup node wallet-names))))
 
 
 (defun apply-initial-network-active (node network-active)

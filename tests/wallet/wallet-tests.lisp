@@ -2638,6 +2638,29 @@ top of the merged list, loaded both wallets, and getwalletinfo then answered
       (bl.wallet:load-wallets-on-startup node plain)
       (is (equal '("foo" "keeper") (%loaded-wallet-names node))))))
 
+(test start-up-says-verifying-wallets-when-the-wallet-runs
+  "Core's VerifyWallets announces `Verifying wallet(s)' before it opens any
+wallet database (wallet/load.cpp:57), and feature_init.py:88 interrupts
+start-up on that line; VerifyWallets runs only when the wallet does."
+  (let ((dir (ensure-directories-exist
+              (merge-pathnames (format nil "test-verify-wallets-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory))))
+        (node (bl:make-node)))
+    (setf (bl:node-data-directory node) dir)
+    (unwind-protect
+         (flet ((said-p (lines) (find "init message: Verifying wallet(s)" lines :test #'search)))
+           (is-true (said-p (capture-log-lines
+                             (lambda () (bl:start-wallets node :regtest nil nil '())))))
+           (is-true (bl:node-wallet-manager node) "the wallet runs by default on regtest")
+           (bl.wallet:close-wallet-manager (bl:node-wallet-manager node))
+           (setf (bl:node-wallet-manager node) nil)
+           (is-false (said-p (capture-log-lines
+                              (lambda () (bl:start-wallets node :regtest nil t '()))))
+                     "-disablewallet: no wallet, nothing to verify"))
+      (when (bl:node-wallet-manager node)
+        (ignore-errors (bl.wallet:close-wallet-manager (bl:node-wallet-manager node))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 (test startup-refuses-a-wallet-another-instance-holds
   "Core's VerifyWallets stops startup when a -wallet cannot be opened
 (load.cpp:106-110), and a database another process holds is SQLiteDatabase's
