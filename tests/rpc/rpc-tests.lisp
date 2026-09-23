@@ -4565,6 +4565,32 @@ bytes were not JSON -- they were -- and hid the answer the caller asked for."
         (is (hash-table-p (second (params-of (format nil "{\"~A\":1}" addr)))))
         (is (stringp (create (format nil "{\"~A\":1}" addr))))))))
 
+(test createrawtransaction-array-members-are-single-key-objects
+  "Core NormalizeOutputs (rawtransaction_util.cpp:84-96) translates an ARRAY of
+outputs member by member: a member that is not an object is -8 \"Invalid
+parameter, key-value pair not an object as expected\", and one with other than
+exactly one key is -8 \"Invalid parameter, key-value pair must contain exactly
+one key\" (rpc_rawtransaction.py:304-305). Ours had no key-count check, so
+[{a:1,b:2}] went on to judge `a' as an address, and it read an array of
+ARRAYS as an object with duplicated keys, answering -5 \"Invalid Bitcoin
+address: key-value pair1\"."
+  (let* ((bl:*network* :regtest)
+         (node (bl:make-node :network :regtest))
+         (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy"))
+    (flet ((create (outputs)
+             (multiple-value-bind (kind method params)
+                 (bl.rpc:parse-json-rpc-request
+                  (format nil "{\"method\":\"createrawtransaction\",\"params\":[[],~A],\"id\":1}"
+                          outputs))
+               (declare (ignore kind))
+               (rpc-error-of (lambda () (bl.rpc:dispatch-rpc-method node method params))))))
+      ;; Control: a well-formed single-key member builds a transaction.
+      (is (null (create (format nil "[{\"~A\":1}]" addr))))
+      (is (equal '(-8 . "Invalid parameter, key-value pair must contain exactly one key")
+                 (create "[{\"a\":1,\"b\":2}]")))
+      (is (equal '(-8 . "Invalid parameter, key-value pair not an object as expected")
+                 (create "[[\"key-value pair1\"],[\"2\"]]"))))))
+
 (test createrawtransaction-takes-cores-outputs-forms
   "Core parses this argument in ONE place and accepts TWO spellings.
 NormalizeOutputs (rawtransaction_util.cpp:74-99) takes either an object

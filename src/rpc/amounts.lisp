@@ -313,24 +313,24 @@ whose key order is NOT preserved (yason); the array-of-objects form
 preserves order exactly — DIVERGENCE (cosmetic ordering only) noted in the
 send/walletcreatefundedpsbt docstrings."
   (let ((pairs '()))
-    (labels ((collect-object (obj &optional in-array)
-               (cond
-                 ((hash-table-p obj)
-                  (maphash (lambda (k v) (push (cons k v) pairs)) obj))
-                 ((and (listp obj) (every #'consp obj))
-                  (dolist (pair obj) (push (cons (car pair) (cdr pair)) pairs)))
-                 ;; Core NormalizeOutputs judges the two positions apart
-                 ;; (rawtransaction_util.cpp:74-97): a MEMBER of the array
-                 ;; that is not an object is -8, while the argument itself
-                 ;; goes through get_array() and so answers UniValue's own
-                 ;; type error. Ours said "Invalid parameter, outputs must be
-                 ;; objects" for both, a sentence in no implementation;
-                 ;; rpc_rawtransaction.py:293 passes the string "foo" and
-                 ;; expects the type error.
-                 (in-array
-                  (error 'rpc-error :code +rpc-invalid-parameter+
-                                    :message "Invalid parameter, key-value pair not an object as expected"))
-                 (t (json-type-error obj "array")))))
+    (labels ((object-p (x)
+               ;; An object is a hash table, or -- when the body repeated a key
+               ;; (%PARSE-JSON-BODY) or a Lisp caller built it -- an alist of
+               ;; (key . value) pairs. An output's value is an amount or a hex
+               ;; string, never a list, which is what tells such a pair from a
+               ;; JSON ARRAY member like ["key-value pair1"].
+               (or (hash-table-p x)
+                   (and (consp x)
+                        (every (lambda (p)
+                                 (and (consp p) (stringp (car p))
+                                      (cdr p) (atom (cdr p))))
+                               x))))
+             (object-size (obj)
+               (if (hash-table-p obj) (hash-table-count obj) (length obj)))
+             (collect-object (obj)
+               (if (hash-table-p obj)
+                   (maphash (lambda (k v) (push (cons k v) pairs)) obj)
+                   (dolist (pair obj) (push (cons (car pair) (cdr pair)) pairs)))))
       (cond
         ;; A top-level `[]' arrives as the empty-array sentinel, which is
         ;; TRUTHY and is not a list: Core's get_array() accepts it and
@@ -338,13 +338,22 @@ send/walletcreatefundedpsbt docstrings."
         ;; builds a transaction with no outputs rather than erroring
         ;; (rpc_rawtransaction.py:295).
         ((eq outputs-param +json-empty-array+))
-        ((and (listp outputs-param) outputs-param
-              (or (hash-table-p (first outputs-param))
-                  (and (consp (first outputs-param))
-                       (consp (car (first outputs-param))))))
-         ;; Array of single-entry objects (order-preserving).
-         (dolist (obj outputs-param) (collect-object obj t)))
-        (t (collect-object outputs-param))))
+        ((object-p outputs-param) (collect-object outputs-param))
+        ;; Core NormalizeOutputs (rawtransaction_util.cpp:84-96): an ARRAY is
+        ;; translated member by member, and each must be an object with
+        ;; exactly one key (rpc_rawtransaction.py:304-305). The argument
+        ;; itself goes through get_array(), so anything else is UniValue's
+        ;; own type error (rpc_rawtransaction.py:293 passes "foo").
+        ((listp outputs-param)
+         (dolist (obj outputs-param)
+           (unless (object-p obj)
+             (error 'rpc-error :code +rpc-invalid-parameter+
+                               :message "Invalid parameter, key-value pair not an object as expected"))
+           (unless (= 1 (object-size obj))
+             (error 'rpc-error :code +rpc-invalid-parameter+
+                               :message "Invalid parameter, key-value pair must contain exactly one key"))
+           (collect-object obj)))
+        (t (json-type-error outputs-param "array"))))
     (setf pairs (nreverse pairs))
     ;; The duplicate checks are Core's, in Core's positions
     ;; (rawtransaction_util.cpp:101-127). Two of them, because a repeated
