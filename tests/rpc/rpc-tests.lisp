@@ -12625,6 +12625,40 @@ network, and the source, which is the address itself for addpeeraddress."
                 "ipv6" "1233:3432:2434:2343:3234:2345:6546:4534" "ipv6"))
              (table "tried")))))))
 
+(test getrawaddrman-empty-tables-are-objects-and-a-gossiped-entry-names-its-sender
+  "Core AddrmanTableToJSON builds each table as a UniValue OBJ
+(rpc/net.cpp:1141-1155), so an empty addrman answers {\"new\": {}, \"tried\":
+{}}, never null; and an address learned from a peer reports THAT peer as its
+source (AddrInfo::source, set by AddrMan::Add from the gossiping peer), where
+addpeeraddress's entry is its own source. Adapted from batch AQ's test of the
+same RPC (its commit 648699e3), on main's persisted source slot."
+  (let ((node (make-test-node))
+        (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
+    (setf (bl:node-address-book node) (bl.net:make-address-book))
+    (flet ((entries (table)
+             (let ((h (cdr (assoc table (bl.rpc:dispatch-rpc-method node "getrawaddrman" nil)
+                                  :test #'string=))))
+               (if (hash-table-p h)
+                   (loop for v being the hash-values of h collect v)
+                   (mapcar #'cdr h))))
+           (field (entry key) (cdr (assoc key entry :test #'string=))))
+      (let ((empty (bl.rpc:dispatch-rpc-method node "getrawaddrman" nil)))
+        (is (hash-table-p (cdr (assoc "new" empty :test #'string=))))
+        (is (hash-table-p (cdr (assoc "tried" empty :test #'string=)))))
+      (bl.rpc:dispatch-rpc-method node "addpeeraddress" (list "1.0.0.0" 8333))
+      (is (equal "1.0.0.0" (field (first (entries "new")) "source")))
+      (bl.net:address-book-add
+       (bl:node-address-book node)
+       (bl.net:make-peer-address :net :ipv4 :ip (bl.net:string-to-ip-bytes "5.6.7.8")
+                                 :port 8333 :services 1
+                                 :last-seen (bl.ser:get-unix-time)
+                                 :source (cons :ipv4 (bl.net:string-to-ip-bytes "2.0.0.0"))))
+      (let ((gossiped (find "5.6.7.8" (entries "new")
+                            :key (lambda (e) (field e "address")) :test #'string=)))
+        (is-true gossiped)
+        (is (equal "2.0.0.0" (field gossiped "source")))
+        (is (equal "ipv4" (field gossiped "source_network")))))))
+
 (test ipv6-addresses-print-compressed-as-cores-tostringaddr
   "Core IPv6ToString (netaddress.cpp:514-563): hex groups without leading
 zeros, the LONGEST run of two or more zero groups -- the first of equal runs
