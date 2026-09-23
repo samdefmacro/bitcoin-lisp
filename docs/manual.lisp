@@ -19,6 +19,13 @@
            #:@docs-check-selftest
            #:@docs-check-dangling-selftest))
 
+;; This package is made after the system has loaded, so no package file's
+;; INSTALL-PACKAGE-NICKNAMES call reached it: without this one the reader
+;; knows no bl.* prefix here, and the first `bl.tools:' is a READ error
+;; ("Package BL.TOOLS does not exist") that fails the whole docs check.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))
+
 (in-package :bitcoin-lisp.docs)
 
 (defsection @bitcoin-lisp-manual (:title "bitcoin-lisp developer manual")
