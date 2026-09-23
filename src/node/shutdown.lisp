@@ -269,13 +269,23 @@ When a main-thread watchdog is running it owns the teardown, so this only has
 to not interfere: the watchdog's poll sees the same flag. Otherwise — a REPL or
 embedded start-node — nobody else would ever run stop-node, so this thread does
 it, which is where the old signal handler ran it from. Either way not while
-start-up is still running (%AWAIT-START-UP-END)."
+start-up is still running (%AWAIT-START-UP-END).
+
+What it does itself, at once and whoever tears down, is Core's Interrupt(node)
+(init.cpp:268-286; bitcoind.cpp:283-286 runs it the moment the shutdown
+signal's wait returns): the sync thread's message and block-connect loops stop
+at their next check point. The watchdog polls once a second, and until its stop-node set the flag
+the sync thread kept pumping: 40 blocks past -stopatheight, and an assumeutxo
+background chainstate validated and promoted in a node that had been told to
+stop (feature_assumeutxo.py:695 then found no snapshot chainstate to clean up)."
   (%await-shutdown-token)
   (let ((reason (node-shutdown-requested-p)))
     (when reason
       ;; Logging is safe HERE: an ordinary thread, not a signal context.
       (log-info "Shutdown requested: ~A" reason))
     (%await-start-up-end)
+    (when reason
+      (bl.net:request-ibd-stop))
     (unless *shutdown-watchdog-running*
       (ignore-errors (stop-node))
       ;; Per-block script-check worker threads (bt:make-thread :name

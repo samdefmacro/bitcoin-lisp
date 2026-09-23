@@ -2276,6 +2276,34 @@ running means neither path makes a thread of its own."
           (ignore-errors (bt:destroy-thread bl::*shutdown-servicer-thread*)))
         (setf bl::*shutdown-servicer-thread* saved-servicer)))))
 
+(test a-serviced-shutdown-request-interrupts-the-sync-loops-at-once
+  "Core runs Interrupt(node) the moment the shutdown signal's wait returns
+(bitcoind.cpp:283-286, init.cpp:268-286): the message handler stops at its
+next message. Ours waited for the watchdog's once-a-second poll to reach
+stop-node, and the sync thread meanwhile connected 40 blocks past -stopatheight
+and validated an assumeutxo background chainstate in a node told to stop
+(feature_assumeutxo.py:695). The servicer now sets the sync loops' stop flag
+itself when it wakes, even while a watchdog owns the teardown."
+  (%with-shutdown-node (node base)
+    (is-true node) (is-true base)
+    (bl::%open-shutdown-pipe)
+    (let ((servicer nil))
+      (unwind-protect
+           (progn
+             ;; A watchdog owns the teardown, so the servicer runs no stop-node.
+             (setf bl::*shutdown-watchdog-running* t
+                   bl::*shutdown-request* (cons "-stopatheight=1 reached" 0))
+             (is-false (bl.net:ibd-stop-requested-p) "the flag was already set")
+             (setf servicer (bt:make-thread #'bl::%run-shutdown-servicer
+                                            :name "servicer-under-test"))
+             (bl::%write-shutdown-token)
+             (loop repeat 100 while (bt:thread-alive-p servicer) do (sleep 0.05))
+             (is-false (bt:thread-alive-p servicer) "the servicer never woke")
+             (is-true (bl.net:ibd-stop-requested-p)
+                      "the sync loops were not interrupted until stop-node"))
+        (when (and servicer (bt:thread-alive-p servicer))
+          (ignore-errors (bt:destroy-thread servicer)))))))
+
 (test the-watchdog-releases-the-servicer-before-exiting
   "The servicer is a real thread blocked in read(2), and SB-EXT:EXIT joins
 threads. On the exit-7 path — the node stopped running unasked — nobody ever
