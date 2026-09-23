@@ -623,6 +623,18 @@ exactly like Core. Returns T if the address is (now) present."
                 *local-addresses*))))
   t)
 
+(defun seen-local (network bytes)
+  "A peer told us it sees us at NETWORK/BYTES: when that address is one of our
+local addresses, raise its score by one (Core SeenLocal, net.cpp:318-325; the
+map is keyed by the address alone, so the port the peer saw does not matter).
+The score is what BEST-LOCAL-ADDRESS ranks by, so the address inbound peers
+keep reaching us at is the one we advertise. Returns T when it was known."
+  (bt:with-lock-held (*local-addresses-lock*)
+    (let ((la (%find-local-address network bytes)))
+      (when la
+        (incf (local-address-score la))
+        t))))
+
 (defun remove-local (network bytes)
   "Forget a local address (Core RemoveLocal, net.cpp:310-315; keyed by
 address only, like the map)."

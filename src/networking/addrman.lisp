@@ -220,6 +220,25 @@ and the fixtures in tests/ that depend on them."
            (:ipv6 (not (%ipv6-unroutable-p ip)))
            (t t)))))
 
+(defun address-valid-p (ip &optional net)
+  "Core CNetAddr::IsValid (netaddress.cpp:424-451) for a 16-byte IP address:
+not the unspecified IPv6 address, not RFC3849 documentation (2001:db8::/32),
+not Core's internal range (fd6b:88c0:8724::/48, what a legacy address of a
+non-IP network decodes to), and for IPv4 neither INADDR_ANY nor INADDR_NONE.
+Weaker than routability on purpose: getpeerinfo's addrlocal is reported
+whenever the peer's report of our address is merely VALID
+(CNode::CopyStats, net.cpp:652-654), loopback included."
+  (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
+    (and (member net '(:ipv4 :ipv6))
+         (= (length ip) 16)
+         (not (every #'zerop ip))
+         (not (%ipv6-prefix-p ip '(#x20 #x01 #x0D #xB8)))
+         (not (%ipv6-prefix-p ip '(#xFD #x6B #x88 #xC0 #x87 #x24)))
+         (or (not (eq net :ipv4))
+             (let ((v4 (subseq ip 12)))
+               (not (or (every #'zerop v4)
+                        (every (lambda (b) (= b 255)) v4))))))))
+
 (defun %ipv4-unroutable-p (ip)
   "The IPv4 exclusions Core's IsRoutable applies (netaddress.cpp:462-465), which
 ADDRESS-ROUTABLE-P deliberately does not: IsLocal (127.0.0.0/8 and 0.0.0.0/8,

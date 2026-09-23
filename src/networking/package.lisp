@@ -151,6 +151,7 @@ headerssync.cpp. src/networking/.")
    #:receive-message-blocking
    #:perform-handshake
    #:perform-inbound-handshake
+   #:note-inbound-addr-me
    #:send-post-handshake-messages
    #:send-ping
    ;; Compact block peer state (BIP 152)
@@ -236,6 +237,7 @@ headerssync.cpp. src/networking/.")
    #:make-address-key
    #:address-routable-p
    #:address-publicly-routable-p
+   #:address-valid-p
    #:network-key-id
    #:key-id-network
    #:save-address-book
@@ -271,6 +273,7 @@ headerssync.cpp. src/networking/.")
    #:local-address-score
    #:add-local
    #:remove-local
+   #:seen-local
    #:clear-local-addresses
    #:local-addresses
    #:best-local-address

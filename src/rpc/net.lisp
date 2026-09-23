@@ -104,19 +104,19 @@ accepted socket."
           (t (format nil "~A:~D" host port)))))
 
 (defun %peer-addrlocal (peer)
-  "Our address as the peer reported it in its version message's addr_recv
-(Core addrLocal, set from the version addrMe for outbound peers when
-routable, net_processing.cpp:3651-3654). Returns \"ip:port\" or NIL — the
-field is optional in Core and omitted when unknown."
-  (let ((vmsg (bl.net:peer-version peer)))
-    (when (and vmsg (not (bl.net:peer-inbound peer)))
-      (let* ((addr-me (bl.ser:version-message-addr-recv vmsg))
-             (ip (bl.ser:net-addr-ip addr-me))
-             (net (and (= (length ip) 16) (bl.net:ip-network ip))))
-        (when (and net (bl.net:address-routable-p ip net))
-          (format nil "~A:~D"
-                  (bl.net:network-address-to-string net ip)
-                  (bl.ser:net-addr-port addr-me)))))))
+  "Our address as PEER reported it in its version message's addr_recv, as
+\"ip:port\" -- for EVERY peer, inbound or outbound, whenever the report is a
+valid address (Core CopyStats, net.cpp:652-654, over the m_addr_local the
+VERSION handler sets for every peer, net_processing.cpp:3674). NIL before a
+version or for an invalid report, where Core leaves the field out. Ours
+reported outbound peers only, and only routable reports."
+  (multiple-value-bind (net ip port) (bl.net:peer-addr-local peer)
+    (when (and net (bl.net:address-valid-p ip net))
+      (let ((host (bl.net:network-address-to-string net ip)))
+        ;; CService::ToStringAddrPort brackets an IPv6 literal.
+        (if (eq net :ipv6)
+            (format nil "[~A]:~D" host port)
+            (format nil "~A:~D" host port))))))
 
 (defun %universal-to-unix (universal)
   "Universal-time -> unix time, preserving 0 as \"never\" (Core reports 0)."

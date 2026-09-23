@@ -714,6 +714,97 @@ advertised listen port -- a -bind port, a non-noban -whitebind port, then
                                  :ip (bl.net:ipv4-to-mapped-ipv6 a b c d) :port port)))
               (bl.ser:read-version-message in))))
 
+(test getpeerinfo-reports-addrlocal-for-every-peer
+  "Core's getpeerinfo `addrlocal' is the address the peer's VERSION says it
+reached us at (m_addr_local, set for EVERY peer by the VERSION handler,
+net_processing.cpp:3674), reported whenever it is a VALID address
+(CopyStats, net.cpp:652-654) -- inbound and outbound alike, loopback included.
+Ours reported it for outbound peers only, and only when routable, so a
+functional-test peer (always inbound, always 127.0.0.1) never had one."
+  (let* ((node (make-test-node))
+         (inbound (%peer-reporting-our-address "127.0.0.1" t 127 0 0 1 18444))
+         (outbound (%peer-reporting-our-address "8.8.8.8" nil 1 2 3 4 8333))
+         (unspecified (%peer-reporting-our-address "127.0.0.1" t 0 0 0 0 0))
+         (broadcast (%peer-reporting-our-address "127.0.0.1" t 255 255 255 255 1)))
+    (setf (bl:node-peers node) (list inbound outbound unspecified broadcast))
+    (flet ((addrlocal (peer)
+             (let ((row (find (bl.net:peer-id peer)
+                              (bl.rpc:dispatch-rpc-method node "getpeerinfo" nil)
+                              :key (lambda (r) (cdr (assoc "id" r :test #'string=))))))
+               (is-true row)
+               (cdr (assoc "addrlocal" row :test #'string=)))))
+      (is (equal "127.0.0.1:18444" (addrlocal inbound))
+          "an inbound peer's report of our address is reported")
+      (is (equal "1.2.3.4:8333" (addrlocal outbound))
+          "control: an outbound peer's still is")
+      (is (null (addrlocal unspecified)) "0.0.0.0 is not a valid address")
+      (is (null (addrlocal broadcast)) "neither is INADDR_NONE"))))
+
+(test an-inbound-peer-that-reached-us-at-a-local-address-raises-its-score
+  "Core's VERSION handler credits the address an inbound peer says it reached
+us at: `if (pfrom.IsInboundConn() && addrMe.IsRoutable()) SeenLocal(addrMe)'
+(net_processing.cpp:3656-3659), and SeenLocal bumps that mapLocalHost entry's
+score (net.cpp:318-325), which is what GetLocal ranks our advertised address
+by. Ours never did. Driven through a real inbound handshake over loopback: the
+dialer's VERSION names 8.8.8.8 as the address it reached, and the listener's
+local 8.8.8.8 entry must gain one point."
+  (%with-local-address-table
+    (multiple-value-bind (net bytes) (bl.net:parse-network-address "8.8.8.8")
+      (bl.net:add-local net bytes 8333 bl.net:+local-manual+)
+      (flet ((score ()
+               (bl.net:local-address-score
+                (find bytes (bl.net:local-addresses)
+                      :key #'bl.net:local-address-bytes :test #'equalp))))
+        (let ((before (score))
+              (srv (bl.net:open-listener "127.0.0.1" 0))
+              (done nil))
+          (is-true srv)
+          (when srv
+            (unwind-protect
+                 (let ((server-thread
+                         (bt:make-thread
+                          (lambda ()
+                            (ignore-errors
+                             (with-private-outbound-nonces
+                               (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                                 (when conn
+                                   (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
+                                     (setf done (bl.net:perform-inbound-handshake p))
+                                     (ignore-errors (bl.net:disconnect-peer p))))))))
+                          :name "test-seenlocal-accept")))
+                   (sleep 0.3)
+                   (let ((client (bl.net:connect-peer "127.0.0.1"
+                                                      (usocket:get-local-port srv))))
+                     (is-true client)
+                     (when client
+                       ;; The address this dialer believes it reached: it goes
+                       ;; out as the VERSION's addr_recv.
+                       (setf (bl.net:peer-address client) "8.8.8.8")
+                       (ignore-errors (bl.net:perform-handshake client))
+                       (bt:join-thread server-thread)
+                       (ignore-errors (bl.net:disconnect-peer client))))
+                   (is-true done "control: the inbound handshake completed")
+                   (is (= (1+ before) (score))
+                       "the local address the inbound peer reached us at gained a point"))
+              (bl.net:close-listener srv))))
+        ;; An OUTBOUND peer's report, and a report that is not routable, count
+        ;; for nothing (the IsInboundConn and IsRoutable halves of the guard).
+        (let ((before (score)))
+          (bl.net:note-inbound-addr-me
+           (%peer-reporting-our-address "8.8.4.4" nil 8 8 8 8 8333))
+          (is (= before (score)) "an outbound peer's report is not credited")))
+      (multiple-value-bind (lnet lbytes) (bl.net:parse-network-address "127.0.0.1")
+        (bl.net:add-local lnet lbytes 8333 bl.net:+local-manual+)
+        (let ((before (bl.net:local-address-score
+                       (find lbytes (bl.net:local-addresses)
+                             :key #'bl.net:local-address-bytes :test #'equalp))))
+          (is-false (bl.net:note-inbound-addr-me
+                     (%peer-reporting-our-address "8.8.4.4" t 127 0 0 1 8333))
+                    "loopback is not routable, so it is not credited")
+          (is (= before (bl.net:local-address-score
+                         (find lbytes (bl.net:local-addresses)
+                               :key #'bl.net:local-address-bytes :test #'equalp)))))))))
+
 (test under-discover-a-peer-s-view-of-our-address-is-advertised
   "GetLocalAddrForPeer's discovery branch (net.cpp:240-267): under -discover,
 when a routable peer reports a routable address for us and we have no routable

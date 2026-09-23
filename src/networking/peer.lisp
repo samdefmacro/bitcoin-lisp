@@ -1566,6 +1566,20 @@ turns out not to speak it. Returns T on success."
             (%await-verack peer))
     (%release-outbound-nonce (peer-local-nonce peer))))
 
+(defun note-inbound-addr-me (peer)
+  "An inbound PEER's version names the address it reached us at: when that is
+publicly routable, credit it to our local address (Core's
+`if (pfrom.IsInboundConn() && addrMe.IsRoutable()) SeenLocal(addrMe)',
+net_processing.cpp:3656-3659 -- after the self-connection check, before we
+answer with our own version). Only an inbound peer counts: it dialed an
+address it believes is ours, while an outbound peer's report is of a
+connection we opened. Returns T when a local address was credited."
+  (when (peer-inbound peer)
+    (multiple-value-bind (net bytes) (peer-addr-local peer)
+      (and net
+           (address-publicly-routable-p bytes net)
+           (seen-local net bytes)))))
+
 (defun perform-inbound-handshake (peer &key (timeout 15))
   "Inbound version handshake (the peer dialed us, so it sends VERSION first):
 receive their version, send ours+caps, send verack, await theirs. When v2
@@ -1607,6 +1621,7 @@ stall. Returns T on success."
                                      (peer-address peer))
               nil)
              (t
+              (note-inbound-addr-me peer)
               (and (%send-version-and-capabilities peer)
                    ;; BIP330 offer: their VERSION is already in hand on the
                    ;; inbound path; ordering matches Core (wtxidrelay →
