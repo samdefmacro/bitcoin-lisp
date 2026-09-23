@@ -758,16 +758,17 @@
 
   Invariants: every message handler is a DEFINE-P2P-HANDLER row -- the
   function HANDLE-<command> of (peer payload ctx) and its dispatch facts
-  (the token bucket it drains, whether it needs a mempool) in one form, so
-  a handler cannot exist without being dispatched (HANDLE-MESSAGE was a
-  31-branch STRING= COND, and the command names were spelled out again
-  in the rate limiter). Every handler runs under the node lock and acts on
+  (whether it needs a mempool, and the like) in one form, so a handler
+  cannot exist without being dispatched (HANDLE-MESSAGE was a 31-branch
+  STRING= COND). Every handler runs under the node lock and acts on
   a NODE-CONTEXT, one value, so a dispatch cannot forget an argument (a
   dispatch that passed two of eight once disabled tx relay, addr gossip
-  and compact blocks outside unit tests). A peer's traffic is metered by
-  the token bucket per message class, then discouraged, then
-  disconnected -- unless it is a NoBan peer or a MANUAL one, two
-  independent exemptions Core applies before punishing anyone. Every
+  and compact blocks outside unit tests). A peer is punished only as Core
+  punishes: Misbehaving points for an oversized message or an invalid
+  block, the addr token bucket that drops the excess rather than the peer,
+  never a per-command message count (the project's own buckets were
+  retired in Round 7) -- and never when it is a NoBan peer or a MANUAL
+  one, two independent exemptions Core applies before punishing anyone. Every
   retirement path ends in DISCONNECT-PEER, which is Core's single
   FinalizeNode: the tx-request tracker's announcements, the orphanage
   entries and the headers-sync buffer are released there and nowhere
