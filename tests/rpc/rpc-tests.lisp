@@ -12566,3 +12566,75 @@ our -3 type error."
       (is (equal '(2 1) (counts)) "the colliding address stays in the new table")
       (is (eq t (field (add "2.0.0.0" nil) "success")))
       (is (equal '(3 1) (counts))))))
+
+(test getrawaddrman-reports-cores-bucket-positions-and-fields
+  "rpc_net.py:470-583: under -test=addrman and -cjdnsreachable, the eight
+addresses seed_addrman adds sit at the bucket/position Core's deterministic
+addrman gives them, and each entry carries Core AddrmanEntryToJSON's fields
+(rpc/net.cpp:1120-1139): the address as ToStringAddr prints it -- IPv6
+COMPRESSED (netaddress.cpp:514-563) -- port, services, the mocked time, the
+network, and the source, which is the address itself for addpeeraddress."
+  (let* ((bl.net:*deterministic-addrman* t)
+         (bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3 :i2p :cjdns))
+         (bl.ser:*mock-time* 1700000000)
+         (node (make-test-node)))
+    (setf (bl:node-address-book node) (bl.net:make-address-book))
+    (loop for (address port tried) in
+          '(("1.2.3.4" 8333 t) ("2.0.0.0" 8333 nil)
+            ("1233:3432:2434:2343:3234:2345:6546:4534" 8333 t)
+            ("2803:0:1234:abcd::1" 45324 nil)
+            ("fc00:1:2:3:4:5:6:7" 8333 nil)
+            ("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" 8333 t)
+            ("nrfj6inpyf73gpkyool35hcmne5zwfmse3jl3aw23vk7chdemalyaqad.onion" 45324 t)
+            ("c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p" 8333 nil))
+          do (is (eq t (cdr (assoc "success"
+                                   (bl.rpc:dispatch-rpc-method
+                                    node "addpeeraddress" (list address port tried))
+                                   :test #'string=)))
+                 "seed ~A" address))
+    (let ((raw (bl.rpc:dispatch-rpc-method node "getrawaddrman" nil)))
+      (flet ((table (name)
+               (loop for (key . entry) in (cdr (assoc name raw :test #'string=))
+                     collect (list key
+                                   (cdr (assoc "address" entry :test #'string=))
+                                   (cdr (assoc "port" entry :test #'string=))
+                                   (cdr (assoc "services" entry :test #'string=))
+                                   (cdr (assoc "time" entry :test #'string=))
+                                   (cdr (assoc "network" entry :test #'string=))
+                                   (cdr (assoc "source" entry :test #'string=))
+                                   (cdr (assoc "source_network" entry :test #'string=))))))
+        (is (equal
+             '(("82/8" "2.0.0.0" 8333 9 1700000000 "ipv4" "2.0.0.0" "ipv4")
+               ("336/24" "fc00:1:2:3:4:5:6:7" 8333 9 1700000000 "cjdns"
+                "fc00:1:2:3:4:5:6:7" "cjdns")
+               ("613/6" "2803:0:1234:abcd::1" 45324 9 1700000000 "ipv6"
+                "2803:0:1234:abcd::1" "ipv6")
+               ("963/46" "c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p"
+                8333 9 1700000000 "i2p"
+                "c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p" "i2p"))
+             (table "new")))
+        (is (equal
+             '(("6/33" "1.2.3.4" 8333 9 1700000000 "ipv4" "1.2.3.4" "ipv4")
+               ("72/61" "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+                8333 9 1700000000 "onion"
+                "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" "onion")
+               ("139/46" "nrfj6inpyf73gpkyool35hcmne5zwfmse3jl3aw23vk7chdemalyaqad.onion"
+                45324 9 1700000000 "onion"
+                "nrfj6inpyf73gpkyool35hcmne5zwfmse3jl3aw23vk7chdemalyaqad.onion" "onion")
+               ("197/34" "1233:3432:2434:2343:3234:2345:6546:4534" 8333 9 1700000000
+                "ipv6" "1233:3432:2434:2343:3234:2345:6546:4534" "ipv6"))
+             (table "tried")))))))
+
+(test ipv6-addresses-print-compressed-as-cores-tostringaddr
+  "Core IPv6ToString (netaddress.cpp:514-563): hex groups without leading
+zeros, the LONGEST run of two or more zero groups -- the first of equal runs
+-- as `::', and a lone zero group written 0."
+  (flet ((s (text) (bl.net:ip-bytes-to-string (bl.net:string-to-ip-bytes text))))
+    (is (equal "2803:0:1234:abcd::1" (s "2803:0000:1234:abcd:0000:0000:0000:0001")))
+    (is (equal "::1" (s "0:0:0:0:0:0:0:1")))
+    (is (equal "::" (s "0:0:0:0:0:0:0:0")))
+    (is (equal "fe80::" (s "fe80:0:0:0:0:0:0:0")))
+    (is (equal "1:0:0:2::3" (s "1:0:0:2:0:0:0:3")) "the longer run wins")
+    (is (equal "1::2:0:0:3:4" (s "1:0:0:2:0:0:3:4")) "the first of equal runs wins")
+    (is (equal "1:0:2:3:4:5:6:7" (s "1:0:2:3:4:5:6:7")) "a single zero group stays")
+    (is (equal "1.2.3.4" (s "::ffff:1.2.3.4")))))

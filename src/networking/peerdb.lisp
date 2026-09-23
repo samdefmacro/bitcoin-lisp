@@ -110,15 +110,39 @@ with identical bytes (e.g. a TORv3 pubkey equal to an I2P hash)."
        (= (aref ip 11) #xFF)))
 
 (defun ip-bytes-to-string (ip)
-  "Convert 16-byte IP address to a string.
-IPv4-mapped addresses (::ffff:a.b.c.d) are rendered as dotted quad."
+  "Convert a 16-byte IP address to a string, as Core's CNetAddr::ToStringAddr
+does. IPv4-mapped addresses (::ffff:a.b.c.d) are rendered as a dotted quad;
+anything else is IPv6ToString (netaddress.cpp:514-563): lower-case hex groups
+without leading zeros, and the LONGEST run of two or more all-zero groups (the
+first, on a tie) written as `::'. rpc_net.py:531 expects 2803:0:1234:abcd::1
+where the fixed-width form printed 2803:0000:1234:abcd:0000:0000:0000:0001."
   (if (ipv4-mapped-p ip)
       ;; IPv4-mapped
       (format nil "~D.~D.~D.~D" (aref ip 12) (aref ip 13) (aref ip 14) (aref ip 15))
-      ;; Full IPv6
-      (format nil "~{~(~4,'0X~)~^:~}"
-              (loop for i from 0 below 16 by 2
-                    collect (logior (ash (aref ip i) 8) (aref ip (1+ i)))))))
+      (let* ((groups (loop for i from 0 below 16 by 2
+                           collect (logior (ash (aref ip i) 8) (aref ip (1+ i)))))
+             (best-start 0) (best-len 0) (cur-start 0) (cur-len 0))
+        ;; Core's ZeroSpan scan: a run only replaces the best when STRICTLY
+        ;; longer, so the first of two equal runs wins.
+        (loop for g in groups for i from 0
+              do (if (/= g 0)
+                     (setf cur-start (1+ i) cur-len 0)
+                     (progn (incf cur-len)
+                            (when (> cur-len best-len)
+                              (setf best-start cur-start best-len cur-len)))))
+        (with-output-to-string (out)
+          (let ((last nil))           ; the last character written, if any
+            (loop for g in groups for i from 0
+                  do (cond ((and (>= best-len 2) (<= best-start i)
+                                 (< i (+ best-start best-len)))
+                            (when (= i best-start)
+                              (write-string "::" out)
+                              (setf last #\:)))
+                           (t
+                            (when (and last (char/= last #\:))
+                              (write-char #\: out))
+                            (format out "~(~X~)" g)
+                            (setf last #\0)))))))))
 
 (defun %parse-ipv4-string (string)
   "Parse a dotted-quad IPv4 STRING to its 16-byte IPv4-mapped form, or NIL.

@@ -239,6 +239,8 @@ headerssync.cpp. src/networking/.")
    #:make-address-key
    #:address-routable-p
    #:address-publicly-routable-p
+   #:address-net-class
+   #:address-book-entries
    #:address-valid-p
    #:network-key-id
    #:key-id-network

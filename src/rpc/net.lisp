@@ -566,6 +566,56 @@ authoritative running counts."
             (nt (if book (bl.net:address-book-n-tried book) 0)))
         (append result (list (cons "all_networks" (entry nn nt))))))))
 
+(defun %net-class-network-name (net bytes)
+  "Core GetNetworkName(addr.GetNetClass()) (netbase.cpp:106-120 over
+netaddress.cpp:674-690) for an address on NET with BYTES."
+  (ecase (bl.net:address-net-class net bytes)
+    (:unroutable "not_publicly_routable")
+    (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion") (:i2p "i2p") (:cjdns "cjdns")))
+
+(defun %addrman-entry-json (pa)
+  "One getrawaddrman entry: Core AddrmanEntryToJSON (rpc/net.cpp:1120-1139),
+fields in Core's order. The source is the address that relayed PA to us, which
+is PA itself when it announced itself (a NIL source slot, as addpeeraddress
+records it: rpc/net.cpp's Add({address}, address)). mapped_as and
+source_mapped_as appear only when -asmap maps the address, as in Core."
+  (let* ((net (bl.net:peer-address-network pa))
+         (ip (bl.net:peer-address-ip pa))
+         (source (bl.net:peer-address-source pa))
+         (source-net (if source (car source) net))
+         (source-ip (if source (cdr source) ip))
+         (mapped-as (bl.net:asmap-asn ip net))
+         (source-mapped-as (bl.net:asmap-asn source-ip source-net)))
+    `(("address" . ,(bl.net:network-address-to-string net ip))
+      ,@(when mapped-as `(("mapped_as" . ,mapped-as)))
+      ("port" . ,(bl.net:peer-address-port pa))
+      ("services" . ,(bl.net:peer-address-services pa))
+      ("time" . ,(bl.net:peer-address-last-seen pa))
+      ("network" . ,(%net-class-network-name net ip))
+      ("source" . ,(bl.net:network-address-to-string source-net source-ip))
+      ("source_network" . ,(%net-class-network-name source-net source-ip))
+      ,@(when source-mapped-as `(("source_mapped_as" . ,source-mapped-as))))))
+
+(defun %addrman-table-json (book from-tried)
+  "Core AddrmanTableToJSON (rpc/net.cpp:1141-1155): an object keyed
+\"<bucket>/<position>\" over GetEntries' walk. An empty table is {}."
+  (json-object
+   (when book
+     (mapcar (lambda (entry)
+               (destructuring-bind (bucket position pa) entry
+                 (cons (format nil "~D/~D" bucket position)
+                       (%addrman-entry-json pa))))
+             (bl.net:address-book-entries book from-tried)))))
+
+(define-rpc "getrawaddrman" (node params)
+  "Every address-manager entry of the new and tried tables, keyed by its
+bucket/position (Core getrawaddrman, rpc/net.cpp:1157-1195). Hidden, like
+Core's: it exists for tests (rpc_net.py:470, feature_asmap.py:118)."
+  (declare (ignore params))
+  (let ((book (bl:node-address-book node)))
+    `(("new" . ,(%addrman-table-json book nil))
+      ("tried" . ,(%addrman-table-json book t)))))
+
 (defparameter %addconnection-types
   '(("outbound-full-relay" . :outbound-full-relay)
     ("block-relay-only"    . :block-relay)

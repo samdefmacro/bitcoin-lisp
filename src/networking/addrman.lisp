@@ -495,6 +495,36 @@ incumbent back to a new bucket."
   "Total addresses tracked (new + tried)."
   (+ (address-book-n-new book) (address-book-n-tried book)))
 
+(defun address-book-entries (book from-tried)
+  "Every entry of BOOK's TRIED table (FROM-TRIED true) or NEW table, as a list
+of (bucket position record) in bucket-major, position-minor order -- Core
+AddrManImpl::GetEntries_ (addrman.cpp:853-875), the walk getrawaddrman reports.
+A new-table entry referenced from several buckets appears once per bucket, as
+in Core, which walks the table and not the records."
+  (let ((table (if from-tried
+                   (address-book-tried-table book)
+                   (address-book-new-table book)))
+        (info (address-book-info book))
+        (entries '()))
+    (dotimes (bucket (if from-tried
+                         +addrman-tried-bucket-count+
+                         +addrman-new-bucket-count+))
+      (dotimes (position +addrman-bucket-size+)
+        (let ((id (aref table (bucket-slot bucket position))))
+          (when (>= id 0)
+            (push (list bucket position (gethash id info)) entries)))))
+    (nreverse entries)))
+
+(defun address-net-class (net ip)
+  "Core CNetAddr::GetNetClass (netaddress.cpp:674-690) for an address on
+network NET with bytes IP: :unroutable when it is not publicly routable, :ipv4
+for an IPv6 address carrying an IPv4 one (6to4, Teredo, NAT64), else NET.
+NET_INTERNAL has no counterpart here."
+  (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
+    (cond ((not (address-publicly-routable-p ip net)) :unroutable)
+          ((and (eq net :ipv6) (ipv6-linked-ipv4-group ip)) :ipv4)
+          (t net))))
+
 (defun address-book-empty-networks (book networks)
   "The members of NETWORKS for which BOOK holds no address (Core
 CConnman::GetReachableEmptyNetworks over g_reachable_nets, net.cpp:2490-2501,
