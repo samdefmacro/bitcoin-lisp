@@ -804,7 +804,18 @@ chainstate whose coins view is the (formerly snapshot) promoted set."
                     (bl.store:chain-state-coins-view historical)))
              (bl:*assumeutxo-data-override*
                (list (%snap-au 5 base-hash hash 7))))
-        (is (eq :success (bl::finalize-snapshot-validation-at-startup node))))
+        ;; Core names the step before it moves anything
+        ;; (node/chainstate.cpp:211); feature_assumeutxo.py:389 waits for it.
+        (let* ((result nil)
+               (lines (capture-log-lines
+                       (lambda ()
+                         (setf result
+                               (bl::finalize-snapshot-validation-at-startup node))))))
+          (is (eq :success result))
+          (is-true (find-if (lambda (line)
+                              (search "[snapshot] cleaning up unneeded background chainstate, then reinitializing"
+                                      line))
+                            lines))))
       ;; A single fully-validated chainstate remains.
       (is (= 1 (length (bl:node-chainstates node))))
       (is (null (bl:node-historical-chainstate node)))

@@ -393,6 +393,8 @@ keyword, or :skipped when there is nothing to finalize."
             (%validate-snapshot-against-commitment node historical snap)
           (case result
             (:success
+             ;; Core's words, before anything moves (node/chainstate.cpp:211).
+             (log-info "[snapshot] cleaning up unneeded background chainstate, then reinitializing")
              (validated-snapshot-cleanup node)
              :success)
             (t
