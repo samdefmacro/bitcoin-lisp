@@ -2096,11 +2096,20 @@ sequence has exactly one definition."
     (wallet-post-load-resubmit node wallet)
     (values wallet warnings)))
 
-(defun load-wallets-on-startup (node &optional cli-names)
-  "Load every wallet recorded for auto-load in settings.json (Core LoadWallets,
-load.cpp:118-160). Called from start-node once the chainstate and mempool are
-up, so each wallet catches up and folds in the mempool exactly as loadwallet
-does.
+(defun load-wallets-on-startup (node &optional (names nil names-p))
+  "Load the wallets Core's LoadWallets loads (load.cpp:118-160). Called from
+start-node once the chainstate and mempool are up, so each wallet catches up
+and folds in the mempool exactly as loadwallet does.
+
+NAMES, when given, is Core's chain.getSettingsList(\"wallet\") ALREADY
+RESOLVED -- the command line, settings.json and the config file merged by
+MERGE-SETTINGS-LIST (common/settings.cpp:203-246) -- and it is the whole list:
+settings.json is not read again. Reading it again is what made `-nowallet
+-wallet=foo' load settings.json's wallets as well, where a negated command-line
+value hides every lower-precedence source (settings.cpp:238-240), so
+getwalletinfo answered -19 \"Multiple wallets are loaded\" (tool_wallet.py:227).
+Without NAMES (a node started from the REPL rather than from arguments), the
+list is what settings.json records.
 
 DELIBERATE DIVERGENCE from Core: Core aborts startup with an init error when a
 listed wallet fails to load. We log it and skip to the next one. The node runs
@@ -2111,16 +2120,14 @@ process holds (WALLET-DATABASE-LOCKED): that is Core's refusal, since two
 nodes on one wallet is the fault, not the wallet."
   (let ((manager (bl:node-wallet-manager node)))
     (when manager
-      ;; -wallet=<name> FIRST, then what settings.json recorded, duplicates
-      ;; dropped. Core merges the two through one settings list
-      ;; (chain.getSettingsList("wallet"), wallet/load.cpp:81), so a wallet
-      ;; named on the command line and also recorded for auto-load is loaded
-      ;; once — and a second load raises "already loaded", which the caller
-      ;; would have reported as a broken wallet.
+      ;; Duplicates dropped, keeping the first: Core loads a wallet once
+      ;; (wallet_paths is a set, load.cpp:81-97), and a second load raises
+      ;; "already loaded", which the caller would report as a broken wallet.
       (let ((names (remove-duplicates
-                    (append (remove-if-not #'stringp cli-names)
-                            (wallet-startup-names
-                             (wallet-manager-data-directory manager)))
+                    (if names-p
+                        (remove-if-not #'stringp names)
+                        (wallet-startup-names
+                         (wallet-manager-data-directory manager)))
                     :test #'string= :from-end t)))
         (when names
           (bl:log-info "Loading ~D wallet~:P at startup: ~{~S~^, ~}"

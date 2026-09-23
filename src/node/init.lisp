@@ -1472,7 +1472,12 @@ recorded for startup."
       ;; and the mempool (load-mempool-from-disk) are both up, so each wallet
       ;; can catch up from its locator and fold in the mempool; networking has
       ;; not started, so no block can connect underneath the catch-up.
-      (bl.wallet:load-wallets-on-startup *node* wallet-names))))
+      ;; WALLET-NAMES is the merged settings list when the node was started
+      ;; from arguments (CONFIG-ALIST->START-NODE-PLIST always supplies it),
+      ;; and :SETTINGS when it was not, meaning settings.json's own list.
+      (if (eq wallet-names :settings)
+          (bl.wallet:load-wallets-on-startup *node*)
+          (bl.wallet:load-wallets-on-startup *node* wallet-names)))))
 
 
 (defun apply-initial-network-active (node network-active)
@@ -2095,7 +2100,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (webui-path nil)
                         (webui-open nil)
                         (wallet nil wallet-supplied-p)
-                        (wallet-names nil)
+                        (wallet-names nil wallet-names-supplied-p)
                         (log-level-specs nil)
                         (port nil)
                         (network-active t)
@@ -2211,7 +2216,8 @@ Returns the node instance."
   ;; the chainstate-load failure Core offers a reindex for.
   (%init-chain-tip reindex)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
-  (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
+  (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p
+                                  (if wallet-names-supplied-p wallet-names :settings))
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 
   (%start-network-services network sync listen listen-bind listen-bind-supplied-p

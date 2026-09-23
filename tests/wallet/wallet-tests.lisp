@@ -2609,6 +2609,35 @@ the broken entry is listed FIRST here, so this fails if the loop aborts."
     (is (equal '("good") (%loaded-wallet-names node))
         "a wallet listed before a broken one must still load")))
 
+(test negated-wallet-on-the-command-line-hides-the-settings-list
+  "Core GetSettingsList (common/settings.cpp:238-240): a negated command-line
+value ends the merge, so `-nowallet -wallet=foo' loads foo ALONE, whatever
+settings.json records. The startup loader used to read settings.json again on
+top of the merged list, loaded both wallets, and getwalletinfo then answered
+-19 \"Multiple wallets are loaded\" (tool_wallet.py:224-227)."
+  (with-wallet-test-node (node)
+    (bl.wallet::rpc-createwallet node (list "keeper" nil nil nil nil nil t))
+    (bl.wallet::rpc-createwallet node '("foo"))
+    (%restart-wallet-manager node)
+    (let* ((rows (bl:settings-config-rows '(("wallet" . #("keeper")))))
+           (negated (getf (start-node-plist '("-regtest" "-nowallet" "-wallet=foo")
+                                            nil rows)
+                          :wallet-names))
+           (plain (getf (start-node-plist '("-regtest" "-wallet=foo") nil rows)
+                        :wallet-names)))
+      ;; The merged list itself is Core's, both ways.
+      (is (equal '("foo") negated))
+      (is (equal '("foo" "keeper") plain)
+          "without the negation settings.json's list follows the command line")
+      ;; The loader takes the merged list as the whole list.
+      (bl.wallet:load-wallets-on-startup node negated)
+      (is (equal '("foo") (%loaded-wallet-names node))
+          "-nowallet -wallet=foo must not load settings.json's wallets too")
+      ;; Control: the list with keeper in it loads keeper.
+      (%restart-wallet-manager node)
+      (bl.wallet:load-wallets-on-startup node plain)
+      (is (equal '("foo" "keeper") (%loaded-wallet-names node))))))
+
 (test startup-refuses-a-wallet-another-instance-holds
   "Core's VerifyWallets stops startup when a -wallet cannot be opened
 (load.cpp:106-110), and a database another process holds is SQLiteDatabase's
