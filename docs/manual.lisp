@@ -585,7 +585,13 @@
 
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage
-  never reads the node. An index whose startup catch-up is not wired is
+  never reads the node. It prunes while usage PLUS Core's buffer (one blk
+  and one rev chunk, 17 MiB, and 1 MB per missing block during initial
+  download) is at or over that target, and it picks a blk file by the
+  file's height range alone: the pruned-height cursor is a HEIGHT, not a
+  chain, so it bounds only the legacy per-block walk, and a reorg whose
+  fork lies below it is not refused -- its missing bodies are downloaded
+  again, as Core's FindMostWorkChain asks only for BLOCK_HAVE_DATA. An index whose startup catch-up is not wired is
   silently empty forever (it happened to txospenderindex; a structural
   test now checks every index is caught up). A defstruct slot added here
   breaks even a fresh container, because the FASL volume persists --
@@ -774,7 +780,15 @@
   clock, whose timeout DOUBLES from 2s toward 64s after each use so our
   own bandwidth cannot evict a fleet) or for going silent past
   nPowTargetSpacing * (1 + 0.5 * other downloading peers) measured from
-  its LAST DELIVERY, never from when we asked. -peertimeout is the GATE in
+  its LAST DELIVERY, never from when we asked. An assumeutxo background
+  chainstate is driven two ways, as Core's is:
+  FIND-HISTORICAL-BLOCKS-TO-DOWNLOAD walks the target path from the LAST
+  COMMON ANCESTOR of its tip and the snapshot base (a snapshot loaded over
+  a divergent chain), and ACTIVATE-HISTORICAL-CHAINSTATE, once per sync
+  pass, reorgs it onto that path and connects every body already on disk
+  -- the download walk skips a block it holds, so nothing else would
+  (a snapshot base that came in through submitblock waited forever).
+  -peertimeout is the GATE in
   front of every liveness verdict, not one timeout among several: Core's
   ShouldRunInactivityChecks guards all four InactivityCheck rules and, on
   its own first line, MaybeSendPing's ping timeout, which is how raising
@@ -937,7 +951,9 @@
   (bitcoin-lisp.networking:discourage-peer function)
   (bitcoin-lisp.networking:ban-address function)
   (bitcoin-lisp.networking:*default-ban-time-seconds* variable)
-  (bitcoin-lisp.networking:*max-tip-age-seconds* variable))
+  (bitcoin-lisp.networking:*max-tip-age-seconds* variable)
+  (bitcoin-lisp.networking:find-historical-blocks-to-download function)
+  (bitcoin-lisp.networking:activate-historical-chainstate function))
 
 (defsection @rpc-server (:title "rpc-server: JSON-RPC over HTTP")
   "Compiled as `bitcoin-lisp/rpc-server`, without a single method. Core:

@@ -14,6 +14,21 @@ deletion of an assumeutxo snapshot chainstate under either reindex flag
 be attempted before the three earlier functional failures in §3 are fixed and a local
 block-connect rate has actually been measured.
 
+**Re-checked 2026-09-23 (batch AM): the unpruned wipe stays deferred.** Round 6 ported the
+pruned half (`4b0e3cf4`, WIPE-FOR-PRUNED-REINDEX: Core's `CleanupBlockRevFiles`, header
+index, chainstate, coins db, indexes). All three §3 tests now get past their reindex
+assertions: `feature_remove_pruned_files_on_startup` and `feature_index_prune` pass, and
+`feature_assumeutxo` -- once batch AM let its background validation finish -- runs through
+`:725-728` and `:791-794` and fails later, at `:799` (an IBD node downloading from a
+NETWORK_LIMITED peer). So no functional test in the sweep needs the UNPRUNED wipe: the pieces
+they exercise (the snapshot chainstate deleted, the indexes wiped, the pruned files cleaned
+up) are all ported. What the unpruned wipe would add is Core's operator semantics -- a
+`-reindex` that discards `headerindex.dat` and the chainstate and reconnects every block --
+and §6's second condition for it still does not hold: no local block-connect rate has been
+measured, and the node that would pay is the unpruned testnet4 node with three indexes. The
+additive rebuild therefore remains the stated divergence for the unpruned case; measure a
+from-disk connect rate first, then revisit.
+
 Decision memo for the maintainer, 2026-09-18. Read-only analysis (functional sweep batch V):
 nothing was built, run or changed; Core citations are `refs/bitcoin` at the project pin
 `d3056bc1`. Question: our `-reindex` is *additive* — it extends the block index from the
