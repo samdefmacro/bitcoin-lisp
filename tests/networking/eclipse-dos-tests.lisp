@@ -998,8 +998,16 @@ ONCE. Ours gated the noban peer too and logged `(14 headers)', twice."
                              while at count t))
                   "Core's line, once: ~S" text)))
           (is (null (bl.store:get-block-index-entry state h1-hash)))
-          (is (= 1 (bl.net:ingest-headers-from-peer noban (list h1) state))
-              "a noban peer's low-work header is stored")
+          ;; In IBD (the tip is below the work floor) it is reported as Core
+          ;; reports header progress (validation.cpp:4292-4298), whatever our
+          ;; own sync state machine is doing.
+          (let ((lines (let ((bl.net:*cached-is-ibd* t))
+                         (capture-log-lines
+                          (lambda ()
+                            (is (= 1 (bl.net:ingest-headers-from-peer noban (list h1) state))
+                                "a noban peer's low-work header is stored"))))))
+            (is-true (find "Synchronizing blockheaders, height: 1 " lines :test #'search)
+                     "~S" lines))
           (is-true (bl.store:get-block-index-entry state h1-hash)))))))
 
 (test generic-path-stores-above-threshold-headers

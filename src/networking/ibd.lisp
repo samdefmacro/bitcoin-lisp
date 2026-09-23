@@ -3696,9 +3696,13 @@ threads read/write under the same lock."
         ;; improved: blocks_left is how many target-spacings the header's own
         ;; timestamp is behind now, so progress is height/(height+left).
         ;; feature_* tests grep for it to tell header sync from block sync.
+        ;; Core asks IsInitialBlockDownload() (:4293), not where our own
+        ;; sync state machine happens to be: a node whose tip is below
+        ;; -minimumchainwork is in IBD while that machine sits IDLE, and
+        ;; p2p_headers_sync_with_minchainwork.py:62 waits for this line there.
         (when (and last-entry
                    (bl.store:block-index-entry-header last-entry)
-                   (member (ibd-state) '(:syncing-headers :syncing-blocks)))
+                   (initial-block-download-p chain-state))
           (let* ((height (bl.store:block-index-entry-height last-entry))
                  (stamp (bl.ser:block-header-timestamp
                          (bl.store:block-index-entry-header last-entry)))
