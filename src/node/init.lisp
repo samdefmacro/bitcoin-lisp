@@ -2020,6 +2020,13 @@ per-process sync state and the at-tip liveness signal reset for this run."
             (node-last-tip-height *node*)
             (if cs (bl.store:current-height cs) 0)))
     (init-message "Starting network threads…")     ; net.cpp:3495
+    ;; CConnman::Start runs the ASMap health check once when an -asmap is in
+    ;; use (net.cpp:3562-3566), before the networking threads touch the
+    ;; address book. Core repeats it every 24 hours from its scheduler; that
+    ;; repeat is not ported: the address book has no lock, and its writer is
+    ;; the sync thread.
+    (when bl.net:*asmap*
+      (asmap-health-check *node*))
     (setf (node-sync-thread *node*)
           (bt:make-thread
            ;; Traced as Core's "opencon": this thread OPENS this node's

@@ -134,6 +134,28 @@ dialed."
                    (incf dialed)))))
     dialed))
 
+(defun asmap-health-check (node)
+  "Core CConnman::ASMapHealthCheck over NetGroupManager's (net.cpp:4170-4181,
+netgroup.cpp:109-123): every IPv4 and IPv6 address in the address book,
+terrible ones included and banned or discouraged ones left out
+(GetAddressesUnsafe with filtered=false, net.cpp:3683-3692), counted by the
+AS the loaded -asmap maps it to. Returns the three counts."
+  (let ((book (node-address-book node))
+        (count 0) (unmapped 0)
+        (asns (make-hash-table)))
+    (when book
+      (loop for pa being the hash-values of (bl.net:address-book-info book)
+            when (and (member (bl.net:peer-address-network pa) '(:ipv4 :ipv6))
+                      (not (bl.net:address-banned-or-discouraged-p pa)))
+              do (incf count)
+                 (let ((asn (bl.net:asmap-asn (bl.net:peer-address-ip pa))))
+                   (if asn
+                       (setf (gethash asn asns) t)
+                       (incf unmapped)))))
+    (log-info "ASMap Health Check: ~D clearnet peers are mapped to ~D ASNs with ~D peers being unmapped"
+              count (hash-table-count asns) unmapped)
+    (values count (hash-table-count asns) unmapped)))
+
 (defun %reachable-seed-addresses (addresses)
   "Keep only the seed-derived ADDRESSES (strings) we may actually dial.
 

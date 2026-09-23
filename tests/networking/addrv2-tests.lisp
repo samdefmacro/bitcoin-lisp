@@ -271,9 +271,21 @@ returns 0."
 (test asmap-file-loading-is-fatal-on-failure
   "Core aborts startup on a missing or empty asmap file (init.cpp:1587-1600).
 Silently keeping /16 bucketing would leave exactly the eclipse exposure the
-operator was trying to close."
-  (signals error (bl.net:load-asmap-file
-                  #p"/nonexistent/asmap.dat"))
+operator was trying to close. The path is quoted, as Core's fs::quoted
+prints it (init.cpp:1598, :1605) and feature_asmap.py:98-110 matches."
+  (flet ((refusal (path)
+           (handler-case (progn (bl.net:load-asmap-file path) :loaded)
+             (error (e) (princ-to-string e)))))
+    (is (equal "Could not find asmap file \"/nonexistent/asmap.dat\""
+               (refusal #p"/nonexistent/asmap.dat")))
+    (let ((path (merge-pathnames "bl-empty-asmap-quoted" (uiop:temporary-directory))))
+      (unwind-protect
+           (progn
+             (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede))
+             (is (equal (format nil "Could not parse asmap file \"~A\"" (namestring path))
+                        (refusal path))))
+        (ignore-errors (delete-file path)))))
   (let ((path (merge-pathnames (format nil "bl-empty-asmap-~D"
                                        (get-internal-real-time))
                                (uiop:temporary-directory))))
@@ -661,3 +673,32 @@ zero bytes (Core SerializeV1Array), never garbage."
           (declare (ignore ts))
           (is (= bl.ser:+addrv2-net-torv3+ nid))
           (is (eq :torv3 (bl.ser:net-addr-network addr))))))))
+
+(test asmap-health-check-counts-clearnet-addresses-by-as
+  "Core NetGroupManager::ASMapHealthCheck (netgroup.cpp:109-123), run once at
+CConnman::Start under -asmap (net.cpp:3562-3566): every IPv4/IPv6 address in
+the address book counted, the distinct ASes they map to, and how many the map
+does not cover; an onion address is not clearnet. feature_asmap.py:113-116
+waits for the line."
+  (let* ((data (bl.crypto:hex-to-bytes +core-asmap-test-data+))
+         (node (bl:make-node))
+         (book (bl.net:make-address-book)))
+    (setf (bl:node-address-book node) book)
+    (dolist (host '("c49f:9cc6:86ad:ba08:4580:315e:dbd1:8a62"   ; AS 969411
+                    "dff5:8021:61d:b17d:406d:7888:fdac:4a20"    ; AS 969411
+                    "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f"     ; AS 693761
+                    "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38"))  ; unmapped
+      (multiple-value-bind (net bytes) (bl.net:parse-network-address host)
+        (bl.net:address-book-add book (bl.net:make-peer-address
+                                       :net net :ip bytes :port 8333 :services 9
+                                       :last-seen (bl.ser:get-unix-time)))))
+    (bl.net:address-book-add
+     book (bl.net:make-peer-address
+           :net :torv3 :port 8333 :services 9 :last-seen (bl.ser:get-unix-time)
+           :ip (bl.crypto:hex-to-bytes
+                "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f")))
+    (is (= 5 (bl.net:address-book-count book)) "control: all five were stored")
+    (let ((lines (capture-log-lines
+                  (lambda () (let ((bl.net:*asmap* data)) (bl::asmap-health-check node))))))
+      (is-true (find "ASMap Health Check: 4 clearnet peers are mapped to 2 ASNs with 1 peers being unmapped"
+                     lines :test #'search)))))

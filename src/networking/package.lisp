@@ -251,6 +251,7 @@ headerssync.cpp. src/networking/.")
    #:decode-anchors-dat
    #:write-db-file
    #:has-all-desirable-service-flags-p
+   #:address-banned-or-discouraged-p
    #:decode-peers-dat
    #:check-address-book
    #:*addrman-check-ratio*
