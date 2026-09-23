@@ -148,7 +148,8 @@ AS the loaded -asmap maps it to. Returns the three counts."
             when (and (member (bl.net:peer-address-network pa) '(:ipv4 :ipv6))
                       (not (bl.net:address-banned-or-discouraged-p pa)))
               do (incf count)
-                 (let ((asn (bl.net:asmap-asn (bl.net:peer-address-ip pa))))
+                 (let ((asn (bl.net:asmap-asn (bl.net:peer-address-ip pa)
+                                              (bl.net:peer-address-network pa))))
                    (if asn
                        (setf (gethash asn asns) t)
                        (incf unmapped)))))

@@ -179,14 +179,15 @@ returns 0."
   (flet ((group (&rest bytes)
            (make-array (length bytes) :element-type '(unsigned-byte 8)
                                       :initial-contents bytes)))
-    (let ((asn (and *asmap* (= (length ip) 16) (asmap-asn ip))))
+    (let ((asn (and *asmap* (= (length ip) 16) (asmap-asn ip net))))
       (when asn
-        ;; Core prefixes the network class byte and then the ASN, so two
-        ;; addresses in one AS share a group and nothing else does.
+        ;; Core prefixes NET_IPV6 -- for IPv4 too, so an IPv4 and an IPv6
+        ;; address in one AS share a group -- and then the ASN least
+        ;; significant byte first (netgroup.cpp:24-31).
         (return-from net-group-key
-          (group 1
-                 (logand #xff (ash asn -24)) (logand #xff (ash asn -16))
-                 (logand #xff (ash asn -8))  (logand #xff asn)))))
+          (group 2
+                 (ldb (byte 8 0) asn) (ldb (byte 8 8) asn)
+                 (ldb (byte 8 16) asn) (ldb (byte 8 24) asn)))))
     (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
       (case net
         (:ipv4

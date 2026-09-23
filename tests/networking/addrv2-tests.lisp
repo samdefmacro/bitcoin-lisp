@@ -703,3 +703,23 @@ waits for the line."
       (is-true (find "ASMap Health Check: 4 clearnet peers are mapped to 2 ASNs with 1 peers being unmapped"
                      lines :test #'search)))))
 
+(defparameter +core-functional-asmap-raw+
+  "fb03ec0fb03fc0fe00fb03ec0fb03fc0fe00fb03ec0fb0fffffeffedb0ffd486e628290000400000400040990100800180040000050006001cf039"
+  "Core's src/test/data/asmap.raw, the map feature_asmap.py runs with.")
+
+(test asmap-maps-ipv4-through-its-mapped-form
+  "Core GetMappedAS (netgroup.cpp:82-106) looks every address up on 128 bits,
+an IPv4 one as ::ffff:a.b.c.d; feature_asmap.py:113-116 expects 101.0.0.0 to
+101.3.0.0 in three ASes under Core's asmap.raw, none unmapped. GetGroup then
+names the AS behind NET_IPV6 with the ASN least significant byte first
+(netgroup.cpp:24-31), so an IPv4 address's group starts with 2."
+  (let* ((bl.net:*asmap* (bl.crypto:hex-to-bytes +core-functional-asmap-raw+))
+         (asns (loop for b below 4
+                     collect (bl.net:asmap-asn (bl.net:ipv4-to-mapped-ipv6 101 b 0 0) :ipv4))))
+    (is (notany #'null asns) "every one of the four is mapped: ~S" asns)
+    (is (= 3 (length (remove-duplicates asns))) "three ASes: ~S" asns)
+    (let ((asn (first asns))
+          (group (bl.net:net-group-key (bl.net:ipv4-to-mapped-ipv6 101 0 0 0) :ipv4)))
+      (is (equalp (vector 2 (ldb (byte 8 0) asn) (ldb (byte 8 8) asn)
+                          (ldb (byte 8 16) asn) (ldb (byte 8 24) asn))
+                  group)))))

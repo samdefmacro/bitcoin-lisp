@@ -1168,20 +1168,37 @@ rather than die mid-connection."
     ;; Ran off the end without a RETURN. Core asserts; we report "unmapped".
     0))
 
-(defun asmap-asn (ip-bytes)
-  "The ASN for a 16-byte address under the loaded -asmap, or NIL when no map is
-loaded or the map does not cover it.
+(defun %linked-ipv4-bytes (ip)
+  "The IPv4 address a 16-byte IP carries, as 4 bytes, or NIL (Core
+HasLinkedIPv4/GetLinkedIPv4, netaddress.cpp:652-673): IPv4-mapped and
+RFC6145 (::ffff:0:0:0/96) and RFC6052 (64:ff9b::/96) in the last 4 bytes,
+6to4 (2002::/16) in bytes 2-5, Teredo (2001::/32) bit-flipped in the last 4."
+  (flet ((prefix-p (bytes) (loop for b in bytes for i from 0 always (= (aref ip i) b))))
+    (cond ((or (prefix-p '(0 0 0 0 0 0 0 0 0 0 #xFF #xFF))
+               (prefix-p '(0 0 0 0 0 0 0 0 #xFF #xFF 0 0))
+               (prefix-p '(0 #x64 #xFF #x9B 0 0 0 0 0 0 0 0)))
+           (subseq ip 12 16))
+          ((prefix-p '(#x20 #x02)) (subseq ip 2 6))
+          ((prefix-p '(#x20 #x01 0 0))
+           (map '(vector (unsigned-byte 8)) (lambda (b) (logxor #xFF b)) (subseq ip 12 16))))))
 
-IPv4 is looked up on its 4 native bytes, not the 16-byte mapped form: Core
-builds the lookup key from CNetAddr::GetAddrBytes, which for IPv4 is 4 bytes,
-and an asmap built for 32-bit IPv4 keys would walk into nonsense given 128 bits
-of ::ffff: prefix."
-  (when (and *asmap* (= 16 (length ip-bytes)))
-    (let* ((v4 (and (loop for i below 10 always (zerop (aref ip-bytes i)))
-                    (= #xff (aref ip-bytes 10))
-                    (= #xff (aref ip-bytes 11))))
+(defun asmap-asn (ip-bytes &optional net)
+  "The ASN for a 16-byte IP address under the loaded -asmap, or NIL when no
+map is loaded, NET is not IPv4/IPv6, or the map does not cover it -- Core
+NetGroupManager::GetMappedAS (netgroup.cpp:82-106). The lookup key is always
+128 bits: an address carrying an IPv4 one (mapped, or a 6to4/Teredo/NAT64
+carrier) is looked up as ::ffff:a.b.c.d, anything else on its own 16 bytes.
+Keying IPv4 on its 4 native bytes walked the trie with the wrong bits, so
+every IPv4 address came back unmapped (feature_asmap.py:113-116 expects
+101.0.0.0-101.3.0.0 in three ASes)."
+  (when (and *asmap* (= 16 (length ip-bytes))
+             (member (or net (if (ipv4-mapped-p ip-bytes) :ipv4 :ipv6)) '(:ipv4 :ipv6)))
+    (let* ((v4 (%linked-ipv4-bytes ip-bytes))
            (key (if v4
-                    (subseq ip-bytes 12 16)
+                    (let ((k (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref k 10) #xFF (aref k 11) #xFF)
+                      (replace k v4 :start1 12)
+                      k)
                     ip-bytes))
            (asn (asmap-interpret *asmap* key)))
       (and (plusp asn) asn))))
