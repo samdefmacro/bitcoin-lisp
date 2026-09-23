@@ -12452,7 +12452,8 @@ every bucket hash serializes its inputs as Core's HashWriter does
 the 64-bit modulus, the 32-bit bucket). Ours hashed a network byte plus the raw
 bytes, so no Core-ground collision could ever reproduce. A repeat address is
 refused with Core's `failed-adding-to-new' (rpc/net.cpp:1023-1025), which ours
-left out."
+left out; and an empty address or an out-of-range port take Core's codes, not
+our -3 type error."
   (let* ((bl.net:*deterministic-addrman* t)
          (node (make-test-node)))
     (setf (bl:node-address-book node) (bl.net:make-address-book))
@@ -12466,6 +12467,17 @@ left out."
                                     :test #'string=))))
                (list (cdr (assoc "new" all :test #'string=))
                      (cdr (assoc "tried" all :test #'string=))))))
+      ;; The argument checks rpc_net.py:350-362 walks first: an empty or
+      ;; non-IP address is Core's -30 (LookupHost fails, rpc/net.cpp:1002-1005)
+      ;; and a port outside uint16 is getInt's -1 (univalue.h:139-149).
+      (flet ((err (address port)
+               (rpc-error-of (lambda ()
+                               (bl.rpc:dispatch-rpc-method node "addpeeraddress"
+                                                           (list address port))))))
+        (is (equal '(-30 . "Invalid IP address") (err "" 8333)))
+        (is (equal '(-30 . "Invalid IP address") (err "not_an_ip" 8333)))
+        (is (equal '(-1 . "JSON integer out of range") (err "1.2.3.4" -1)))
+        (is (equal '(-1 . "JSON integer out of range") (err "1.2.3.4" 65536))))
       (is (eq t (field (add "1.0.0.0" nil) "success")))
       (let ((again (add "1.0.0.0" nil)))
         (is (eq (bl.rpc:json-bool nil) (field again "success")))

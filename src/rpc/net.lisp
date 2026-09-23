@@ -972,10 +972,17 @@ PARAMS: (address port [tried]). Returns {\"success\": bool} and, when TRIED was
 asked for and refused, Core's \"error\" string alongside it — the promotion can
 legitimately fail (the tried bucket position may be occupied and queued for a
 collision test), and reporting success for that would misinform the test."
-  (unless (and (stringp address) (plusp (length address)))
+  ;; An EMPTY string is still a string: Core's LookupHost fails on it and the
+  ;; answer is -30 "Invalid IP address" (rpc/net.cpp:1002-1005), below.
+  (unless (stringp address)
     (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for address"))
-  (unless (and (integerp port) (<= 0 port 65535))
+  (unless (numberp port)
     (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for port"))
+  ;; Core reads the port as getInt<uint16_t> (rpc/net.cpp:998); a number that
+  ;; is no uint16 throws "JSON integer out of range" (univalue.h:139-149),
+  ;; which the server reports as -1 (rpc_net.py:361-362).
+  (unless (typep port '(unsigned-byte 16))
+    (error 'rpc-error :code +rpc-misc-error+ :message "JSON integer out of range"))
   (multiple-value-bind (net bytes)
       (bl.net:parse-network-address address)
     (unless (and net bytes)
