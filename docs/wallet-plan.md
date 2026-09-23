@@ -20,9 +20,16 @@ This reverses the long-standing "no wallet functionality in scope" line in CLAUD
   Same porting discipline as consensus code: read Core, port faithfully.
 - **Deployment posture:** wallet available on testnet4 first; on mainnet default-disabled
   (config flag, like relay). The server nodes hold keys only if the user explicitly opts in.
-- Out of scope for this plan: external signers / hardware wallets (headless server),
-  MuSig2, miniscript, ZMQ notifications, Core wallet.dat (SQLite) file-format
-  interop (see Open decisions §7).
+- Out of scope for this plan: MuSig2 signing (a `musig()` descriptor parses, and its
+  PSBT names the participants and their derivations, but no nonce or partial signature is
+  made), and Core wallet.dat (SQLite) file-format interop (see Open decisions §7).
+- **External signers / hardware wallets** were out of scope while the nodes were headless
+  servers; they are ported now (src/wallet/external-signer.lisp, wallet-signer.lisp; Round 6,
+  `a7c09ba4`): `-signer`, `enumeratesigners`, `walletdisplayaddress`, a keyless wallet whose
+  public descriptors come from the device, and send/sendall/bumpfee signing through it
+  (external_signer.cpp, wallet/external_signer_scriptpubkeyman.cpp, rpc/external_signer.cpp).
+  Core compiles them behind ENABLE_EXTERNAL_SIGNER; ours are always compiled in. Miniscript and
+  ZMQ notifications, also once listed here, are implemented too.
 
 ## 2. Head start — what already exists (inventory verified 2026-07-15)
 
@@ -266,3 +273,5 @@ indexes are unchanged, so an existing wallet's cache still resolves as it did.
 - Storage/encryption: walletdb.{h:192-306,cpp:32-63,182,560+}; db.h:167,206; sqlite.cpp;
   crypter.h:14-48; wallet.cpp:808 (EncryptWallet),2061-2142 (resend)
 - Multiwallet/RPC: httprpc.cpp:340; rpc/util.cpp:19-85; rpc/wallet.cpp:346-408,844-902
+- External signer: external_signer.cpp; common/run_command.cpp;
+  wallet/external_signer_scriptpubkeyman.cpp; rpc/external_signer.cpp
