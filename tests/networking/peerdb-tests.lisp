@@ -324,6 +324,28 @@ SHA256d."
             (is (equalp (cons :ipv4 (bl.net:ipv4-to-mapped-ipv6 5 6 7 8))
                         (bl.net:peer-address-source back)))))))))
 
+(test core-peers-dat-we-write-is-one-we-can-read
+  "On the next start a peers.dat that fails CheckAddrman refuses start-up
+(addrman.cpp:393-398), so the writer must never produce one: a tried entry
+without a recorded success (CheckAddrman -1) is written with its last-seen time
+as one, and the file reads back with the entry still tried."
+  (let ((book (make-test-address-book))
+        (ip (bl.net:ipv4-to-mapped-ipv6 8 8 8 8)))
+    (bl.net:address-book-add book (bl.net:make-peer-address :ip ip :port 8333 :services 9
+                                                            :last-seen 1700000000))
+    (bl.net:address-book-good book ip 8333 1700000100)
+    (let ((pa (bl.net:address-book-lookup book ip 8333)))
+      (is-true (bl.net:peer-address-in-tried pa))
+      (setf (bl.net:peer-address-last-success pa) 0))
+    (let ((book2 (bl.net:make-address-book)))
+      (is (null (nth-value 1 (ignore-errors
+                              (bl.net:decode-peers-dat (bl.net:encode-peers-dat book :regtest)
+                                                       book2 :regtest))))
+          "the file this node wrote must read back")
+      (let ((back (bl.net:address-book-lookup book2 ip 8333)))
+        (is-true (and back (bl.net:peer-address-in-tried back)))
+        (is (= 1700000000 (and back (bl.net:peer-address-last-success back))))))))
+
 (test checkaddrman-logs-core-lines
   "CheckAddrman's timer lines (addrman.cpp:1067-1068, logging/timer.h):
 feature_asmap.py:89-95 waits for `CheckAddrman: new 2, tried 2, total 4

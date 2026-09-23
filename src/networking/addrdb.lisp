@@ -194,7 +194,10 @@ part of it, in Core or here."
     (if source
         (%write-netaddr-v2 bb (car source) (cdr source))
         (%write-netaddr-v2 bb (peer-address-network pa) (peer-address-ip pa)))
-    (bl.bytes:bb-write-i64-le bb (peer-address-last-success pa))
+    (bl.bytes:bb-write-i64-le bb (if (and (peer-address-in-tried pa)
+                                          (zerop (peer-address-last-success pa)))
+                                     (max 1 (peer-address-last-seen pa))
+                                     (peer-address-last-success pa)))
     (bl.bytes:bb-write-i32-le bb (min (peer-address-n-attempts pa) #x7FFFFFFF))))
 
 (defun %read-caddress-disk (rd v2-stream)
@@ -341,9 +344,19 @@ loaded -asmap, or 32 zero bytes without one (netgroup.cpp:13-17)."
 format byte, INCOMPATIBILITY_BASE + V4_MULTIPORT, nKey, nNew, nTried, the new
 bucket count XOR 2^30, every new entry, every tried entry, then per new bucket
 its occupancy and the index of each occupant among the new entries, and the
-asmap version. Entries go out in id order so the bytes are reproducible."
-  (let* ((entries (sort (loop for pa being the hash-values of (address-book-info book)
-                              collect pa)
+asmap version. Entries go out in id order so the bytes are reproducible.
+
+Only what the reader can take back is written, because on the next start a
+file that fails Core's consistency check refuses start-up: an entry that the
+address map does not name (a duplicate of another entry's address, which a
+file in the old format could carry) is left out, as it is unreachable anyway
+(-5), and a tried entry is written with a last-success time, its last-seen time
+standing in when none was recorded (-1)."
+  (let* ((addr-map (address-book-addr-map book))
+         (entries (sort (loop for pa being the hash-values of (address-book-info book)
+                              when (eql (peer-address-id pa)
+                                        (gethash (peer-address-key pa) addr-map))
+                                collect pa)
                         #'< :key #'peer-address-id))
          (new (remove-if (lambda (pa) (or (peer-address-in-tried pa)
                                           (zerop (peer-address-ref-count pa))))
