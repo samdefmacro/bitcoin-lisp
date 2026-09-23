@@ -3001,6 +3001,13 @@ zmq.lisp), as Core's do by ChainstateRole."
 
 ;;;; Block connection
 
+(defun %ibd-latch ()
+  "Core's IsInitialBlockDownload as FindFilesToPrune asks it
+(node/blockstorage.cpp:356): the latch's current value, READ and not updated.
+SYMBOL-VALUE because protocol.lisp, which defines the latch, compiles after
+this file."
+  (symbol-value 'bl.net:*cached-is-ibd*))
+
 (defun connect-block (block chain-state block-store utxo-set
                       &key fee-estimator recent-rejects mempool)
   "Connect a validated block to the chain.
@@ -3182,12 +3189,7 @@ Handles chain reorganizations when a competing chain has more work."
                             block-store chain-state
                             :on-prune #'delete-undo-file
                             :target-bytes (bl:effective-prune-target-bytes)
-                            ;; FindFilesToPrune asks IsInitialBlockDownload,
-                            ;; which only READS the latch (blockstorage.cpp:356);
-                            ;; SYMBOL-VALUE because protocol.lisp, which
-                            ;; defines it, compiles after this file.
-                            :initial-block-download-p
-                            (symbol-value 'bl.net:*cached-is-ibd*))))
+                            :initial-block-download-p (%ibd-latch))))
                (when (> pruned 0)
                  (bl:log-info "Pruned ~D old block~:P" pruned))))))
 
