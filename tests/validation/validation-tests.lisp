@@ -360,37 +360,81 @@ oversize, as Core does, not duplicate inputs"))
       (is (eq :duplicate-inputs
               (nth-value 1 (bl.val:validate-transaction-structure small)))))))
 
+(defun %reject-keywords-in-text (text)
+  "Every keyword TEXT returns as a rejection: the KW of each `(values nil :KW'
+and `(values nil (list :KW', whitespace and line breaks included, since a
+site that carries a debug message puts the keyword on the line after."
+  (let ((found '()) (at 0))
+    (flet ((skip-space (i)
+             (or (position-if-not (lambda (c) (member c '(#\Space #\Tab #\Newline #\Return)))
+                                  text :start i)
+                 (length text))))
+      (loop
+        (let ((hit (search "(values nil" text :start2 at)))
+          (unless hit (return))
+          (setf at (+ hit (length "(values nil")))
+          (let ((i (skip-space at)))
+            (when (and (<= (+ i 5) (length text))
+                       (string= "(list" text :start2 i :end2 (+ i 5)))
+              (setf i (skip-space (+ i 5))))
+            (when (and (< i (length text)) (char= (char text i) #\:))
+              (let ((end (or (position-if-not
+                              (lambda (c) (or (alphanumericp c) (char= c #\-)))
+                              text :start (1+ i))
+                             (length text))))
+                (pushnew (intern (string-upcase (subseq text (1+ i) end)) :keyword)
+                         found)))))))
+    found))
+
+(defun %tx-reject-keyword-sources ()
+  "The files whose rejections are transaction verdicts rendered through
+TX-REJECT-REASON-STRING: every file of src/validation/ and src/mempool/
+except block.lisp, whose block verdicts have their own table
+(*BLOCK-REJECT-REASONS*, BLOCK-REJECT-REASON)."
+  (remove "src/validation/block.lisp"
+          (append (%module-source-files "validation")
+                  (%module-source-files "mempool"))
+          :test #'string=))
+
 (test tx-reject-reasons-cover-every-keyword
   "Every reject keyword a validation site can return has a Core string.
 TX-REJECT-REASON-STRING falls back to the downcased keyword name, which is how
-this codebase used to render ALL of them — a fallback that silently invents a
+this codebase used to render ALL of them -- a fallback that silently invents a
 vocabulary Core does not speak. Rather than trust the table to stay complete,
 scan the source for the keywords the sites actually return, the same way
-RPC-ARG-CONVERSIONS-MATCH-CORE re-parses Core's client.cpp every battery."
-  (let ((path (merge-pathnames "src/validation/transaction.lisp"
-                               (asdf:system-source-directory :bitcoin-lisp)))
+RPC-ARG-CONVERSIONS-MATCH-CORE re-parses Core's client.cpp every battery.
+
+The scan read src/validation/transaction.lisp alone, one line at a time, so
+the verdicts of src/mempool/mempool.lisp (TRUC, RBF: the keyword on the line
+after `(values nil') and of src/validation/packages.lisp escaped it; the
+second held six package reasons with no row and two keywords no Core
+rejection spells."
+  (let ((root (asdf:system-source-directory :bitcoin-lisp))
         (found '())
         (missing '()))
-    (with-open-file (in path :if-does-not-exist nil)
-      (is-true in "src/validation/transaction.lisp is unreadable")
-      (when in
-        (loop for line = (read-line in nil) while line
-              do (let* ((composed (search "(values nil (list :" line))
-                        (at (or composed (search "(values nil :" line))))
-                   (when at
-                     (let* ((start (+ at (length (if composed
-                                                     "(values nil (list :"
-                                                     "(values nil :"))))
-                            (end (or (position-if-not
-                                      (lambda (c) (or (alphanumericp c) (char= c #\-)))
-                                      line :start start)
-                                     (length line))))
-                       (pushnew (intern (string-upcase (subseq line start end)) :keyword)
-                                found)))))))
-    ;; The scan must actually find things, or an empty result would pass.
-    (is (> (length found) 20)
+    ;; Positive controls: the scanner reads a keyword split from its
+    ;; `(values nil' by a line break, and an unmapped one is reported.
+    (is (equal '(:truc-tx-too-big)
+               (%reject-keywords-in-text
+                (format nil "(values nil~%    (list :truc-tx-too-big~%  \"x\"))"))))
+    (is (not (assoc :no-such-reject-keyword bl.val:*tx-reject-reasons*)))
+    (is (equal '(:no-such-reject-keyword)
+               (%reject-keywords-in-text "(values nil :no-such-reject-keyword)")))
+    (let ((files (%tx-reject-keyword-sources)))
+      (dolist (f '("src/validation/transaction.lisp" "src/validation/packages.lisp"
+                   "src/mempool/mempool.lisp"))
+        (is (member f files :test #'string=) "~A is not in the scanned files" f))
+      (dolist (rel files)
+        (dolist (kw (%reject-keywords-in-text
+                     (uiop:read-file-string (merge-pathnames rel root))))
+          (pushnew kw found))))
+    ;; The scan must actually find things, or an empty result would pass --
+    ;; and it must see the multi-line mempool sites.
+    (is (> (length found) 40)
         "the scan found ~D keywords, which is too few to be the real set"
         (length found))
+    (is (member :rbf-insufficient-fee found))
+    (is (member :conflict-in-package found))
     (dolist (kw found)
       (unless (assoc kw bl.val:*tx-reject-reasons*)
         (push kw missing)))

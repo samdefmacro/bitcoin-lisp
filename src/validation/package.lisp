@@ -38,6 +38,7 @@ can. src/validation/.")
    #:package-hash
    #:package-truc-checks
    #:package-well-formed
+   #:package-child-with-parents-p
    #:package-child-with-parents-tree-p
    #:+max-package-count+
    #:+max-package-weight+

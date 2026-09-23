@@ -93,10 +93,11 @@ fields Bitcoin Core's submitpackage reports per wtxid."
 Returns (values ok-p reason): count within bounds, total weight within bounds,
 no duplicate txids, topologically sorted (no tx spends an output of a tx that
 appears later), no member with an empty vin, and no two txs spend the same
-prevout."
+prevout. An EMPTY package is well-formed, as in Core (packages.cpp:79-116
+has no floor on the count); both package RPCs refuse one before it gets
+here."
   (let ((n (length package)))
     (cond
-      ((zerop n) (values nil :package-empty))
       ((> n +max-package-count+) (values nil :package-too-many-transactions))
       (t
        ;; Total weight — only meaningful for a multi-tx package (a single tx is
@@ -154,37 +155,41 @@ prevout."
                (setf (gethash key spent) t)))))
        (values t nil)))))
 
+(defun package-child-with-parents-p (package)
+  "Core IsChildWithParents (policy/packages.cpp:119-134): PACKAGE has at least
+two transactions and the last one, the child, spends an output of every other
+one. This is the topology ProcessNewPackage admits (validation.cpp:1636-1641);
+whether the parents also depend on EACH OTHER is the RPC's question, not its.
+A boolean, as Core's is: the caller that rejects on it names the reason."
+  (and (>= (length package) 2)
+       (let ((child-spends (bl.bytes:make-octets-hash-table)))
+         (bl.ser:dovector (in (bl.ser:transaction-inputs (car (last package))))
+           (setf (gethash (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in))
+                          child-spends)
+                 t))
+         (every (lambda (tx) (gethash (bl.ser:transaction-hash tx) child-spends))
+                (butlast package)))))
+
 (defun package-child-with-parents-tree-p (package)
-  "Mirror Bitcoin Core IsChildWithParentsTree. The last tx is the child; every
-other tx must be a parent of the child (the child spends one of its outputs),
-and no parent may spend another parent's output (the parents form a tree, not a
-DAG). Returns (values ok-p reason)."
-  (let ((child (car (last package)))
-        (parents (butlast package))
-        (parent-txids (make-hash-table :test 'equalp))
-        (child-spends (make-hash-table :test 'equalp)))
-    ;; The txids the child spends from.
-    (bl.ser:dovector (in (bl.ser:transaction-inputs child))
-      (setf (gethash (bl.ser:outpoint-hash
-                      (bl.ser:tx-in-previous-output in))
-                     child-spends)
-            t))
-    ;; Every parent must be spent by the child.
-    (dolist (tx parents)
-      (let ((txid (bl.ser:transaction-hash tx)))
-        (setf (gethash txid parent-txids) t)
-        (unless (gethash txid child-spends)
-          (return-from package-child-with-parents-tree-p
-            (values nil :package-not-child-with-parents)))))
-    ;; No parent may depend on another parent.
-    (dolist (tx parents)
-      (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
-        (when (gethash (bl.ser:outpoint-hash
-                        (bl.ser:tx-in-previous-output in))
-                       parent-txids)
-          (return-from package-child-with-parents-tree-p
-            (values nil :package-parent-depends-on-parent)))))
-    (values t nil)))
+  "Core IsChildWithParentsTree (policy/packages.cpp:136-150):
+PACKAGE-CHILD-WITH-PARENTS-P, and no parent spends another parent's output
+(the parents form a tree, not a DAG). submitpackage refuses a package that
+fails it (rpc/mempool.cpp:1385-1387) and PackageRBFChecks requires it
+(validation.cpp:1047). A boolean, as Core's is.
+
+It used to return a reason too, and :PACKAGE-PARENT-DEPENDS-ON-PARENT was
+one no Core rejection spells: validate-package-for-mempool gated on this TREE
+check where ProcessNewPackage gates on IsChildWithParents alone."
+  (and (package-child-with-parents-p package)
+       (let ((parent-txids (bl.bytes:make-octets-hash-table)))
+         (dolist (tx (butlast package))
+           (setf (gethash (bl.ser:transaction-hash tx) parent-txids) t))
+         (notany (lambda (tx)
+                   (some (lambda (in)
+                           (gethash (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in))
+                                    parent-txids))
+                         (bl.ser:transaction-inputs tx)))
+                 (butlast package)))))
 
 ;;;; Package acceptance
 
@@ -662,15 +667,13 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
 
 (defparameter *package-level-reject-reasons*
   '(;; policy/packages.cpp IsWellFormedPackage
-    :package-empty
     :package-too-many-transactions                ; packages.cpp:84
     :package-too-large                            ; :91
     :package-contains-duplicates                  ; :101
     :package-not-sorted                           ; :109
     :conflict-in-package                          ; :114
-    ;; The topology gate (validation.cpp:1640) and our second half of it.
+    ;; The topology gate (validation.cpp:1640).
     :package-not-child-with-parents
-    :package-parent-depends-on-parent
     ;; PackageTRUCChecks (validation.cpp:1480), one reason for all six.
     :truc-tx-too-big :truc-child-too-big :truc-too-many-ancestors
     :truc-descendant-limit :truc-nonv3-spends-v3 :truc-v3-spends-nonv3
@@ -904,12 +907,14 @@ mempool, exactly as in Core's early return.
         (return-from validate-package-for-mempool
           (values reason (%results-not-validated package reason) nil
                   (%package-msg reason)))))
-    (when (> (length package) 1)
-      (multiple-value-bind (ok reason) (package-child-with-parents-tree-p package)
-        (unless ok
-          (return-from validate-package-for-mempool
-            (values reason (%results-not-validated package reason) nil
-                    (%package-msg reason))))))
+    ;; Core's topology gate is IsChildWithParents, not the tree check
+    ;; submitpackage runs first (validation.cpp:1636-1641).
+    (when (and (> (length package) 1)
+               (not (package-child-with-parents-p package)))
+      (let ((reason :package-not-child-with-parents))
+        (return-from validate-package-for-mempool
+          (values reason (%results-not-validated package reason) nil
+                  (%package-msg reason)))))
     ;; 1. Per-tx individual acceptance. No package coins — each tx must stand on
     ;;    its own against confirmed UTXOs + the current mempool. Txs that fail
     ;;    only for low feerate or a missing (in-package) input are deferred to

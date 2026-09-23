@@ -24,8 +24,12 @@
            (child (pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
       (is (eq t (bl.val:package-well-formed (list parent child)))))))
 
-(test package-well-formed-rejects-empty
-  (is (eq nil (bl.val:package-well-formed '()))))
+(test package-well-formed-accepts-empty-as-core-does
+  "Core's IsWellFormedPackage has no floor on the count
+(policy/packages.cpp:79-116): both package RPCs refuse an empty array before
+it gets there. Ours refused it with :PACKAGE-EMPTY, a reason no Core
+rejection spells, which this test used to pin."
+  (is (eq t (bl.val:package-well-formed '()))))
 
 (test package-well-formed-rejects-too-many
   ;; 26 standalone txs spending distinct funding outpoints.
@@ -143,10 +147,8 @@ either. IsWellFormedPackage maps that to the package-level \"conflict-in-package
     (let* ((stray (pkg-tx funding-txid 0 99990000))
            (child (pkg-tx (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
                            0 50000)))
-      (multiple-value-bind (ok reason)
-          (bl.val:package-child-with-parents-tree-p (list stray child))
-        (is (eq nil ok))
-        (is (eq :package-not-child-with-parents reason))))))
+      (is (null (bl.val:package-child-with-parents-tree-p (list stray child))))
+      (is (null (bl.val:package-child-with-parents-p (list stray child)))))))
 
 (test package-child-with-parents-tree-rejects-parent-chain
   ;; parent2 spends parent1's output → parents depend on each other (a chain, not
@@ -177,10 +179,11 @@ either. IsWellFormedPackage maps that to the package-level \"conflict-in-package
                    :outputs (vector (bl.ser:make-tx-out
                                    :value 50000 :script-pubkey (p2sh-optrue-script-pubkey)))
                    :lock-time 0)))
-      (multiple-value-bind (ok reason)
-          (bl.val:package-child-with-parents-tree-p (list p1 p2 child))
-        (is (eq nil ok))
-        (is (eq :package-parent-depends-on-parent reason))))))
+      (is (null (bl.val:package-child-with-parents-tree-p (list p1 p2 child))))
+      ;; Core's ProcessNewPackage gates on IsChildWithParents alone
+      ;; (validation.cpp:1636), which this package satisfies: only the RPC's
+      ;; tree check refuses it (rpc/mempool.cpp:1385).
+      (is-true (bl.val:package-child-with-parents-p (list p1 p2 child))))))
 
 ;;;; End-to-end acceptance
 

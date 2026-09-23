@@ -784,7 +784,8 @@ transaction is refused even on a node told to relay non-standard ones."
 ;;;
 ;;; The table is explicit for that reason: a rename here is visible, and the
 ;;; structural test TX-REJECT-REASONS-COVER-EVERY-KEYWORD fails when a
-;;; validation site introduces a keyword nothing maps.
+;;; validation site -- here, in packages.lisp or in src/mempool/ -- introduces
+;;; a keyword nothing maps.
 
 (defparameter *tx-reject-reasons*
   ;; keyword -> Core's state.GetRejectReason(), with the site Core sets it at.
@@ -883,7 +884,15 @@ transaction is refused even on a node told to relay non-standard ones."
     ;; Rule 5, both forms (validation.cpp:994-997, :1079-1082).
     (:too-many-clusters . "too many potential replacements")
     (:package-rbf-too-many-clusters
-     . "package RBF failed: too many potential replacements"))
+     . "package RBF failed: too many potential replacements")
+    ;; The package-wide verdicts of IsWellFormedPackage and the topology
+    ;; gate, which submitpackage reports as package_msg (%PACKAGE-MSG).
+    (:package-too-many-transactions . "package-too-many-transactions") ; packages.cpp:84
+    (:package-too-large            . "package-too-large")             ; :91
+    (:package-contains-duplicates  . "package-contains-duplicates")   ; :101
+    (:package-not-sorted           . "package-not-sorted")            ; :109
+    (:conflict-in-package          . "conflict-in-package")           ; :114
+    (:package-not-child-with-parents . "package-not-child-with-parents")) ; validation.cpp:1640
   "Our validation keywords in Core's reject-reason vocabulary.")
 
 (defparameter *tx-reject-debug-messages*
