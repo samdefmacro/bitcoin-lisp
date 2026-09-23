@@ -379,11 +379,24 @@ index alone, and our entry records the flat-file position rather than a
 HAVE_DATA bit -- NIL there also means a legacy per-block file or a pruned
 body. So the read is attempted first and only its FAILURE is classified: a
 recorded position that did not read back is `not found on disk', and no
-recorded position is the pruned / not-downloaded pair as before."
+recorded position is the pruned / not-downloaded pair as before.
+
+One availability question IS asked first: a block at or below the prune point
+that the store does not hold is pruned data before anything is read, because
+GET-BLOCK rebuilds GENESIS from the chain parameters when its body is not
+stored -- and on a node that has pruned blk00000.dat Core's genesis is gone
+(feature_pruning.py:502 scans from genesis and expects the pruned-data error)."
   (let ((entry (bl.store:get-block-index-entry chain-state hash)))
     (unless entry
       (error 'rpc-error :code +rpc-invalid-address-or-key+
                         :message "Block not found"))
+    (when (and (bl:pruning-enabled-p)
+               (plusp (bl.store:chain-state-pruned-height chain-state))
+               (<= (bl.store:block-index-entry-height entry)
+                   (bl.store:chain-state-pruned-height chain-state))
+               (not (and block-store (bl.store:block-exists-p block-store hash))))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Block not available (pruned data)"))
     (or (and block-store (bl.store:get-block block-store hash))
         (error 'rpc-error
                :code +rpc-misc-error+

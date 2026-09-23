@@ -301,8 +301,16 @@ the pruned-data error from a pruned node."
                   (bl.rpc:dispatch-rpc-method
                    node "scanblocks"
                    (wire-params (list "start" (list "raw(51)") 0 3 "basic" opts)))))
-           ;; CONTROL: every body here, every block verified and returned.
+           ;; CONTROL: every body here, every block verified and returned,
+           ;; and genesis readable.
            (is (= 3 (length (cdr (assoc "relevant_blocks" (scan) :test #'equal)))))
+           (is-true (bl.rpc:dispatch-rpc-method
+                     node "getblock"
+                     (wire-params
+                      (list (bl.rpc:hash-to-hex
+                             (bl.store:block-index-entry-hash
+                              (bl.store:get-block-at-height
+                               (bl:node-chain-state node) 0)))))))
            ;; Block 2's body goes the way a prune takes it: out of the store,
            ;; and its index entry loses the data position (Core's HAVE_DATA,
            ;; which PruneOneBlockFile clears, blockstorage.cpp:264-270).
@@ -317,9 +325,23 @@ the pruned-data error from a pruned node."
            (let ((bl:*prune-target-mib* 550))
              (setf (bl.store:chain-state-pruned-height (bl:node-chain-state node)) 2)
              (unwind-protect
-                  (signals-rpc-error
-                      (:code -1 :exact-message "Block not available (pruned data)")
-                    (scan))
+                  (progn
+                    (signals-rpc-error
+                        (:code -1 :exact-message "Block not available (pruned data)")
+                      (scan))
+                    ;; Genesis too: its body is rebuilt from the chain
+                    ;; parameters when not stored, but a node that has pruned
+                    ;; past it has no genesis to serve (feature_pruning.py:502
+                    ;; scans from genesis).
+                    (signals-rpc-error
+                        (:code -1 :exact-message "Block not available (pruned data)")
+                      (bl.rpc:dispatch-rpc-method
+                       node "getblock"
+                       (wire-params
+                        (list (bl.rpc:hash-to-hex
+                               (bl.store:block-index-entry-hash
+                                (bl.store:get-block-at-height
+                                 (bl:node-chain-state node) 0))))))))
                (setf (bl.store:chain-state-pruned-height
                       (bl:node-chain-state node))
                      0)))))))))
