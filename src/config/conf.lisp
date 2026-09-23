@@ -129,6 +129,15 @@ ambiguous and should be avoided" linenr))
     (when (find "conf" rows :key #'second :test #'string=)
       (config-file-read-error "conf cannot be set in the configuration file; use ~
 includeconf= if you want to include additional config files"))
+    ;; The same function's other arm (:84-89): `reindex' is allowed but
+    ;; warned about, since the node would reindex on every start. Deferred,
+    ;; as debug.log is not open yet; identical lines from repeated parses of
+    ;; the same text are emitted once.
+    (when (find "reindex" rows :key #'second :test #'string=)
+      (bl.log:defer-log :warn "reindex=1 is set in the configuration file, which will ~
+significantly slow down startup. Consider removing or commenting out this option for ~
+better performance, unless there is currently a condition which makes rebuilding the ~
+indexes necessary"))
     (nreverse rows)))
 
 (defun parse-bitcoin-conf-sections (text &optional network)

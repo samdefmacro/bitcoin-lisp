@@ -156,7 +156,15 @@ ignored-bitcoin.conf refusal that runs later."
     (is (equal "Error reading configuration file: parse error on line 2: garbage"
                (%config-refusal (bl.cfg:conf-settings-rows (format nil "conf=x~%garbage~%")))))
     ;; Control: includeconf is how a file names another, and is accepted.
-    (is (null (%config-refusal (bl.cfg:conf-settings-rows (format nil "includeconf=other.conf~%")))))))
+    (is (null (%config-refusal (bl.cfg:conf-settings-rows (format nil "includeconf=other.conf~%"))))))
+  ;; IsConfSupported's other arm (:84-89): reindex is accepted with Core's
+  ;; warning (feature_config_args.py:128-132), and nothing else draws it.
+  (let ((bl:*deferred-log-lines* nil))
+    (bl.cfg:conf-settings-rows (format nil "includeconf=other.conf~%"))
+    (is (null bl:*deferred-log-lines*))
+    (bl.cfg:conf-settings-rows (format nil "reindex=1~%"))
+    (is (equal '((:warn "reindex=1 is set in the configuration file, which will significantly slow down startup. Consider removing or commenting out this option for better performance, unless there is currently a condition which makes rebuilding the indexes necessary"))
+               bl:*deferred-log-lines*))))
 
 (test a-dotted-key-is-not-a-command-line-option
   "Core refuses any command-line key that InterpretKey split into a section:
