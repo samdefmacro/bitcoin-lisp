@@ -633,7 +633,7 @@ connection.
 
 We used the raw wire command as the key, so every distinct command string a
 peer sent created a permanent new entry. An unrecognised command is otherwise a
-complete no-op here -- no rate-limit bucket, and handle-message falls through
+complete no-op here -- handle-message falls through
 to (t nil) -- so nothing disconnected the peer or even noticed. A 24-byte
 message with a fresh random type field cost the attacker 24 bytes and cost us a
 hash entry plus a string key, never reclaimed while the peer stayed connected.

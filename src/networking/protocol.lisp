@@ -259,6 +259,14 @@ connection to close."
   (declare (ignore payload ctx))
   (%refuse-bloom-filter-message peer "filterclear"))
 
+(define-p2p-handler "version" (peer payload ctx)
+  "A second version, after the handshake already took the first. Core ignores
+it with this line (net_processing.cpp:3585-3589) -- `redundant version message
+from peer=N' -- and p2p_invalid_messages.py:105-106 greps the log for it. The
+handshake's own version never reaches this table (%AWAIT-VERACK reads it)."
+  (declare (ignore payload ctx))
+  (bl:log-cat "net" "redundant version message from peer=~A" (peer-id peer)))
+
 (define-p2p-handler "verack" (peer payload ctx)
   "A second verack, after the handshake already completed. Core ignores it
 with this exact line rather than disconnecting (net_processing.cpp:3822)

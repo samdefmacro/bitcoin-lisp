@@ -69,6 +69,7 @@ run on a loaded machine (2026-09-05)."
     "getcfheaders" "getcfcheckpt" "verack" "sendaddrv2" "wtxidrelay"
     "sendtxrcncl" "reqrecon" "sketch" "reqsketchext" "reconcildiff"
     "sendheaders" "feefilter" "sendcmpct" "cmpctblock" "blocktxn" "getblocktxn"
+    "version"
     ;; BIP37, refused rather than served: this node advertises no NODE_BLOOM.
     "filterload" "filteradd" "filterclear")
   "The commands HANDLE-MESSAGE dispatched as a COND before the table
@@ -86,8 +87,16 @@ and the row's function is the HANDLE-<command> the tests call directly."
         (is (fboundp (bl.net:p2p-handler-function row))
             "~S's row names ~S, which is not a function"
             command (bl.net:p2p-handler-function row)))))
-  (is (null (bl.net:p2p-handler-for "version"))
-      "version is handshake-only and must not be in the post-verack table"))
+  ;; A version AFTER the handshake has a row: Core logs it as redundant and
+  ;; ignores it (net_processing.cpp:3585-3589).
+  (let ((text (nth-value 1 (log-text-of
+                            "net"
+                            (lambda ()
+                              (bl.net:handle-message (bl.net:make-peer :id 7 :state :ready)
+                                                     "version" #()
+                                                     (bl.ctx:make-node-context)))))))
+    (is-true (search "redundant version message from peer=7" text)
+             "a post-handshake version is logged as Core logs it: ~S" text)))
 
 (test define-p2p-handler-registers-what-it-defines
   "Positive control for the table: a probe definition is dispatched by
