@@ -97,7 +97,6 @@
     "bitcoin-lisp.storage:save-utxo-set"
     "bitcoin-lisp.storage:txindex-contains-p"
     "bitcoin-lisp.storage:txindex-remove-block"
-    "bitcoin-lisp.storage:utxo-exists-p"
     "bitcoin-lisp.storage:write-utxo-entry-fields"
     "bitcoin-lisp.validation:decode-coinbase-height"
     "bitcoin-lisp.validation:execute-script"

@@ -751,6 +751,17 @@ equals the members' individual answers (rpc_packages.py:100)."
                                      chain-state height))))
             (%testmempoolaccept-rows results max-fee-rate package-error)))))))
 
+(defun %refuse-if-already-in-utxo-set (tx txid utxo-set)
+  "Core BroadcastTransaction's first question (node/transaction.cpp:52-61): an
+output of TX already in the coins view means TX is confirmed, and the answer
+is TransactionError::ALREADY_IN_UTXO_SET -- -27 with common/messages.cpp:
+134-135's sentence (rpc/util.cpp:396-397). rpc_rawtransaction.py:445 read -26
+txn-already-known from us."
+  (dotimes (o (length (bl.ser:transaction-outputs tx)))
+    (when (bl.store:utxo-exists-p utxo-set txid o)
+      (error 'rpc-error :code +rpc-verify-already-in-utxo-set+
+                        :message "Transaction outputs already in utxo set"))))
+
 (define-rpc "sendrawtransaction" (node (hex-str))
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
 txid joins the mempool's unbroadcast set and an announcement is queued to every
@@ -786,15 +797,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                   (max-fee (feerate-fee
                             (%parse-max-fee-rate params 1)
                             (bl.ser:transaction-vsize tx))))
-            ;; A transaction whose outputs are in the coins view is already
-            ;; confirmed: Core answers ALREADY_IN_UTXO_SET before anything
-            ;; else (node/transaction.cpp:52-61), -27 with
-            ;; common/messages.cpp:134-135's sentence (rpc/util.cpp:396-397).
-            ;; rpc_rawtransaction.py:445 read -26 txn-already-known from us.
-            (dotimes (o (length (bl.ser:transaction-outputs tx)))
-              (when (bl.store:utxo-exists-p utxo-set txid o)
-                (error 'rpc-error :code +rpc-verify-already-in-utxo-set+
-                                  :message "Transaction outputs already in utxo set")))
+            (%refuse-if-already-in-utxo-set tx txid utxo-set)
             ;; Core checks the mempool by TXID before validating at all
             ;; (node/transaction.cpp:63-72), skips submission and only
             ;; re-announces, with the POOL entry's wtxid. Asking VALIDATE
