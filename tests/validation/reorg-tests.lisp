@@ -2374,6 +2374,85 @@ post-persist without the fallback, stranded on disk forever)."
                       4 (bl.net::ibd-context-disk-blocks-above-tip
                          ctx))))))))))
 
+(defun %historical-disk-fixture (suffix)
+  "(values NODE BLOCKS): a regtest node at height 1 whose chain state is
+TARGETED at height 4 -- an assumeutxo historical chainstate whose snapshot
+base is the fourth block -- with the headers of blocks 2-4 indexed and no
+bodies. BLOCKS are the four mined blocks, oldest first."
+  (let* ((spk (p2sh-optrue-script-pubkey))
+         (miner (regtest-node-fixture (format nil "~A-miner" suffix)))
+         (blocks (loop repeat 4 for b = (%dr-mine-on miner spk)
+                       do (%dr-connect miner b) collect b))
+         (node (regtest-node-fixture suffix))
+         (cs (bl:node-chain-state node)))
+    (%dr-connect node (first blocks))
+    (let ((prev (bl.store:get-block-index-entry cs (bl.store:best-block-hash cs))))
+      (dolist (blk (rest blocks))
+        (let* ((hdr (bl.ser:bitcoin-block-header blk))
+               (e (bl.store:make-block-index-entry
+                   :hash (bl.ser:block-header-hash hdr)
+                   :height (1+ (bl.store:block-index-entry-height prev))
+                   :header hdr :prev-entry prev
+                   :chain-work (bl.store:calculate-chain-work
+                                (bl.ser:block-header-bits hdr)
+                                (bl.store:block-index-entry-chain-work prev))
+                   :status :header-valid)))
+          (bl.store:add-block-index-entry cs e)
+          (setf prev e)))
+      (bl.store:set-chainstate-target cs prev))
+    (values node blocks)))
+
+(test historical-drain-connects-a-target-block-already-on-disk
+  "A historical (assumeutxo background) chainstate connects the next block of
+its target path whenever the body is on disk, as Core's ActivateBestChain on
+that chainstate does for any block with BLOCK_HAVE_DATA on the path to the
+snapshot base (validation.cpp:3158-3196). Ours looked only in the map of
+blocks above the ACTIVE tip, so a body stored another way -- the snapshot base
+through submitblock -- was never connected, and never requested either, since
+the download walk skips a block it holds: feature_assumeutxo.py:676 waited for
+one chainstate with the background one parked a block below the base."
+  (with-network (:regtest)
+    (multiple-value-bind (node blocks) (%historical-disk-fixture "hist-drain")
+      (let ((cs (bl:node-historical-chainstate node))
+            (store (bl:node-block-store node))
+            (utxo (bl.store:chain-state-coins-view
+                   (bl:node-historical-chainstate node))))
+        ;; Block 3 reaches the disk without passing the receive path.
+        (bl.store:store-block store (third blocks) :height 3)
+        (with-ibd-context
+          ;; Block 2 arrives at tip+1 and connects; the drain that follows
+          ;; must pick up block 3 from disk. Block 4 is nowhere: it stops.
+          (deliver-block (second blocks) cs utxo store :requested t)
+          (is (= 3 (bl.store:current-height cs)))
+          (is (equalp (bl.ser:block-header-hash
+                       (bl.ser:bitcoin-block-header (third blocks)))
+                      (bl.store:best-block-hash cs))))))))
+
+(test the-historical-chainstate-activates-from-disk-without-an-arrival
+  "Core runs ActivateBestChain on every chainstate from ProcessNewBlock and at
+startup (validation.cpp:4430-4478), so a background chainstate whose next
+bodies are already on disk -- after a restart, or a submitblock -- advances
+without any block arriving. RUN-IBD's activation pass did this for the active
+chainstate only; ACTIVATE-HISTORICAL-CHAINSTATE is its historical half, and
+RUN-IBD must call it."
+  (with-network (:regtest)
+    (multiple-value-bind (node blocks) (%historical-disk-fixture "hist-activate")
+      (let ((hist (bl:node-historical-chainstate node))
+            (store (bl:node-block-store node))
+            (base-hash (bl.ser:block-header-hash
+                        (bl.ser:bitcoin-block-header (fourth blocks)))))
+        (loop for blk in (rest blocks) for h from 2
+              do (bl.store:store-block store blk :height h))
+        (with-ibd-context
+          (is (= 3 (bl.net:activate-historical-chainstate hist store))))
+        (is (= 4 (bl.store:current-height hist)))
+        (is (equalp base-hash (bl.store:best-block-hash hist)))))
+    ;; The seam: the sync pass calls it.
+    (is (member (find-symbol "RUN-IBD" "BITCOIN-LISP.NETWORKING")
+                (mapcar #'car (sb-introspect:who-calls
+                               'bl.net:activate-historical-chainstate))
+                :key (lambda (name) (if (consp name) (second name) name))))))
+
 (test out-of-order-persist-gated-by-acceptblock
   "Case-C persist DoS gate (Core AcceptBlock, safety review Lens 3): an
 UNSOLICITED out-of-order block is kept only if it outweighs the tip, sits

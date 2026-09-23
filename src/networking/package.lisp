@@ -392,6 +392,7 @@ headerssync.cpp. src/networking/.")
    #:*cached-is-ibd*
    #:sync-headers
    #:*ibd-context*
+   #:activate-historical-chainstate
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*

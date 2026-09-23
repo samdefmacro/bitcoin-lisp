@@ -3035,6 +3035,13 @@ Asking a peer for headers here returns zero and costs a full round trip."
         (when (consp missing)
           (queue-missing-fork-blocks missing))))
 
+    ;; The same for the historical (assumeutxo background) chainstate.
+    (let ((hist (and ctx (ibd-context-historical-chain-state ctx))))
+      (when (and hist block-store (not (bl:interrupt-requested-p)))
+        (activate-historical-chainstate hist block-store
+                                        :fee-estimator fee-estimator
+                                        :recent-rejects recent-rejects)))
+
     ;; Done — distinguish "actually finished" from "paused due to no peers".
     ;; Either: pending+in-flight both zero (we drained), OR
     ;; current-height ≥ header-tip-height (we caught up; any leftover
@@ -5177,7 +5184,8 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
 (defun %next-disk-block-for-drain (next-height chain-state block-store)
   "Drain's disk fallback: a persisted block at NEXT-HEIGHT whose parent is
 the current tip, located via disk-blocks-above-tip (blocks that missed the
-RAM queue through a cap-drop, a same-height fork collision, or a restart).
+RAM queue through a cap-drop, a same-height fork collision, or a restart) or,
+for a targeted (historical) chainstate, the target's ancestor at NEXT-HEIGHT.
 Consumes the map entry it returns; sweeps map keys below NEXT-HEIGHT (the
 tip has passed them — their blocks remain on disk for any later reorg).
 NIL when no persisted child of the tip exists at that height."
@@ -5205,7 +5213,42 @@ NIL when no persisted child of the tip exists at that height."
                       (remove bh (gethash next-height map) :test #'equalp))
                 (unless (gethash next-height map)
                   (remhash next-height map))
-                (return-from %next-disk-block-for-drain blk)))))))))
+                (return-from %next-disk-block-for-drain blk))))))
+      ;; A targeted (historical) chainstate has exactly one candidate at each
+      ;; height -- the target's ancestor -- and connects it whenever its body
+      ;; is on disk, however the body got there: Core's ActivateBestChain on
+      ;; the background chainstate picks any block with BLOCK_HAVE_DATA on the
+      ;; path to the snapshot base (validation.cpp:3158-3196,
+      ;; TryAddBlockIndexCandidate), and the download walk
+      ;; (FIND-HISTORICAL-BLOCKS-TO-DOWNLOAD, Core FindNextBlocks) skips such a
+      ;; block for the same reason. The map above only records blocks above
+      ;; the ACTIVE tip, so a base block that came in through submitblock, or
+      ;; a body left on disk by a restart, was never connected and never
+      ;; requested: feature_assumeutxo.py:676 kept two chainstates forever.
+      (let ((entry (bl.store:target-ancestor-entry chain-state next-height)))
+        (when (and entry
+                   (bl.store:block-index-entry-prev-entry entry)
+                   (equalp (bl.store:block-index-entry-hash
+                            (bl.store:block-index-entry-prev-entry entry))
+                           tip-hash))
+          (bl.store:get-block block-store
+                              (bl.store:block-index-entry-hash entry)))))))
+
+(defun activate-historical-chainstate (historical block-store
+                                       &key fee-estimator recent-rejects)
+  "Connect every body of HISTORICAL's target path that is already on disk,
+from its tip upward; returns how many connected. Core's ProcessNewBlock and
+startup run ActivateBestChain on EVERY chainstate (validation.cpp:4430-4478),
+so an assumeutxo background chainstate whose next bodies are already here --
+after a restart, or when the snapshot base came in through submitblock --
+advances without any block arriving. Ours advanced it only on an arrival, and
+the download walk (FIND-HISTORICAL-BLOCKS-TO-DOWNLOAD) skips a block it holds,
+so such a chainstate waited forever: feature_assumeutxo.py:676. RUN-IBD calls
+this once per pass, next to the active chainstate's activation."
+  (drain-block-queue historical (bl.store:chain-state-coins-view historical)
+                     block-store
+                     :fee-estimator fee-estimator
+                     :recent-rejects recent-rejects))
 
 (defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
   "Process queued blocks whose parents are now connected.
