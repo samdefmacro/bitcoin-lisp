@@ -626,11 +626,15 @@ named -torcontrol from becoming a DNS query too."
       (return-from %tor-connect nil)))
   (handler-case
       (progn
+        ;; %SOCKET-CONNECT, not usocket's: a refused control port must fail
+        ;; at once, as Core's evbuffer connect does, rather than hold this
+        ;; thread -- and a STOP-TOR-CONTROL waiting on it -- for the whole
+        ;; 10 s timeout (usocket polls getpeername, which a refusal never
+        ;; satisfies).
         (setf (tor-controller-socket ctl)
-              (usocket:socket-connect (tor-controller-control-host ctl)
-                                      (tor-controller-control-port ctl)
-                                      :element-type '(unsigned-byte 8)
-                                      :timeout 10))
+              (%socket-connect (tor-controller-control-host ctl)
+                               (tor-controller-control-port ctl)
+                               10))
         (bl.log:log-cat "tor" "Successfully connected to Tor control port ~A:~D"
                               (tor-controller-control-host ctl)
                               (tor-controller-control-port ctl))

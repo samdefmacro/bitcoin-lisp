@@ -595,6 +595,17 @@ instead of one per test."
 
 ;;;; A handshake fixture for loopback dials
 
+(defun closed-loopback-port ()
+  "A loopback port with nothing listening on it: bound only to learn the
+number, then released. A dial to it is refused immediately and never leaves
+this machine."
+  (let* ((srv (usocket:socket-listen "127.0.0.1" 0
+                                     :element-type '(unsigned-byte 8)
+                                     :reuse-address t))
+         (port (usocket:get-local-port srv)))
+    (usocket:socket-close srv)
+    port))
+
 (defmacro with-private-outbound-nonces (&body body)
   "Run BODY with a FRESH self-connection nonce registry, so a loopback dial is
 not (correctly) refused as a self-connection. A real dial to our own listener

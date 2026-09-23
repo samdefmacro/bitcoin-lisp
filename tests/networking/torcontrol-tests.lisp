@@ -850,3 +850,24 @@ was never lifted, so our address could never have ridden the queue at all."
           (is (= 1 (length (%addr-queue peer)))
               "the addr-known filter is reset first, so a peer that already ~
                knows our address is still told again"))))))
+
+(test a-refused-tor-control-port-does-not-hold-the-thread
+  "Core connects to the control port with bufferevent_socket_connect
+(torcontrol.cpp:180), non-blocking: a refused connection is reported by the
+event callback at once and the reconnect timer takes over. Ours dialed through
+usocket's SOCKET-CONNECT, which on SBCL polls getpeername until its 10 s
+deadline and so waits out every refusal -- the control thread sat in the dial,
+and STOP-TOR-CONTROL (join, then destroy after 5 s) waited on it. Measured by
+the stop: against a closed port the thread must already be in its
+interruptible backoff and stop within a second."
+  (with-tor-globals
+    (let ((ctl (bl.net:start-tor-control
+                :control-spec (format nil "127.0.0.1:~D" (closed-loopback-port))
+                :data-directory (%torcontrol-temp-dir)
+                :virtual-port 48333
+                :target-port 48334)))
+      (sleep 1)
+      (let ((t0 (get-internal-real-time)))
+        (bl.net:stop-tor-control ctl)
+        (is (< (/ (- (get-internal-real-time) t0) internal-time-units-per-second) 1)
+            "stopping the controller did not wait out a dial to a refused port")))))

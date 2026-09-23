@@ -125,6 +125,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:descriptor-spend-e2e
    ;; fixtures.lisp (handshake)
    #:with-private-outbound-nonces
+   #:closed-loopback-port
    ;; fixtures.lisp (net permissions)
    #:with-whitelist
    ;; fixtures.lisp (logging)

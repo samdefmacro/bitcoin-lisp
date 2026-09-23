@@ -277,17 +277,6 @@ contract (no condition escapes to the dial loop)."
         (setf bl.net:*proxy* old-proxy)))
     (bt:join-thread thread)))
 
-(defun %closed-loopback-port ()
-  "A loopback port with nothing listening on it: bound only to learn the
-number, then released. A dial to it is refused immediately and never leaves
-this machine."
-  (let* ((srv (usocket:socket-listen "127.0.0.1" 0
-                                     :element-type '(unsigned-byte 8)
-                                     :reuse-address t))
-         (port (usocket:get-local-port srv)))
-    (usocket:socket-close srv)
-    port))
-
 (defun %dial-verdict (host port)
   "(VALUES CONNECTED-P PROXY-FAILED-P) for one MAKE-TCP-CONNECTION dial, with
 any socket closed again."
@@ -315,10 +304,10 @@ the positive control is that a listening port still connects."
            (setf bl.net:*proxy* nil)
            (is (< (seconds (lambda ()
                              (is-false (%dial-verdict "127.0.0.1"
-                                                      (%closed-loopback-port)))))
+                                                      (closed-loopback-port)))))
                   1))
            (setf bl.net:*proxy* (bl.net:make-proxy :host "127.0.0.1"
-                                                   :port (%closed-loopback-port)
+                                                   :port (closed-loopback-port)
                                                    :randomize-credentials nil))
            (is (< (seconds (lambda ()
                              (is-true (nth-value 1 (%dial-verdict "fakenodeaddr" 18444)))))
@@ -354,7 +343,7 @@ proxy at all."
            ;; dialed.
            (setf bl.net:*proxy*
                  (bl.net:make-proxy :host "127.0.0.1"
-                                    :port (%closed-loopback-port)
+                                    :port (closed-loopback-port)
                                     :randomize-credentials nil))
            (multiple-value-bind (connected proxy-failed)
                (%dial-verdict "example.com" 8333)
@@ -382,7 +371,7 @@ proxy at all."
            ;; directly whatever -proxy says (Core registers no proxy for
            ;; NET_UNROUTABLE) — so an ordinary refused connect stays NIL.
            (multiple-value-bind (connected proxy-failed)
-               (%dial-verdict "127.0.0.1" (%closed-loopback-port))
+               (%dial-verdict "127.0.0.1" (closed-loopback-port))
              (is-false connected)
              (is-false proxy-failed
                        "a direct dial can never be a proxy failure"))
@@ -390,7 +379,7 @@ proxy at all."
            ;; dial sweeps call, and it is where the addrman recorder reads it.
            (setf bl.net:*proxy*
                  (bl.net:make-proxy :host "127.0.0.1"
-                                    :port (%closed-loopback-port)
+                                    :port (closed-loopback-port)
                                     :randomize-credentials nil))
            (is (equal '(nil t)
                       (multiple-value-list
