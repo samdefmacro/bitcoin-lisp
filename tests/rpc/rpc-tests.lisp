@@ -2313,6 +2313,31 @@ txn-same-nonwitness-data-in-mempool."
         (is (equalp (bl.ser:transaction-wtxid tx)
                     (bl.mp:mempool-entry-wtxid (bl.mp:mempool-get mempool txid)))))))))
 
+(test rpc-sendrawtransaction-refuses-a-transaction-already-in-the-utxo-set
+  "Core's BroadcastTransaction looks for the transaction's OUTPUTS in the coins
+view before anything else, and one that exists means the transaction is
+already confirmed: TransactionError::ALREADY_IN_UTXO_SET, -27 \"Transaction
+outputs already in utxo set\" (node/transaction.cpp:52-61,
+common/messages.cpp:134-135, rpc/util.cpp:396-397). Ours went straight to
+validation and threw -26 txn-already-known (rpc_rawtransaction.py:445)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((peer (bl.net:make-peer :state :ready))
+           (node (%broadcast-test-node utxo-set mempool chain-state peer))
+           (tx (pkg-tx funding-txid 0 (- 100000000 10000)))
+           (txid (bl.ser:transaction-hash tx))
+           (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))))
+      (flet ((send () (rpc-error-of
+                       (lambda ()
+                         (bl.rpc:dispatch-rpc-method
+                          node "sendrawtransaction" (wire-params (list hex)))))))
+        ;; Control: while only its input exists, the transaction is accepted.
+        (is (null (send)))
+        ;; Now as if confirmed: out of the pool, its output in the coins view.
+        (bl.mp:mempool-remove mempool txid)
+        (bl.store:add-utxo utxo-set txid 0 (- 100000000 10000)
+                           (p2sh-optrue-script-pubkey) 1 :coinbase nil)
+        (is (equal '(-27 . "Transaction outputs already in utxo set") (send)))))))
+
 (test rpc-sendrawtransaction-rejection-speaks-cores-vocabulary
   "A rejection raised by the INSERTION step -- after every check passed --
 must report Core's own reject reason like any other. BroadcastTransaction

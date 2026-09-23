@@ -786,6 +786,15 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                   (max-fee (feerate-fee
                             (%parse-max-fee-rate params 1)
                             (bl.ser:transaction-vsize tx))))
+            ;; A transaction whose outputs are in the coins view is already
+            ;; confirmed: Core answers ALREADY_IN_UTXO_SET before anything
+            ;; else (node/transaction.cpp:52-61), -27 with
+            ;; common/messages.cpp:134-135's sentence (rpc/util.cpp:396-397).
+            ;; rpc_rawtransaction.py:445 read -26 txn-already-known from us.
+            (dotimes (o (length (bl.ser:transaction-outputs tx)))
+              (when (bl.store:utxo-exists-p utxo-set txid o)
+                (error 'rpc-error :code +rpc-verify-already-in-utxo-set+
+                                  :message "Transaction outputs already in utxo set")))
             ;; Core checks the mempool by TXID before validating at all
             ;; (node/transaction.cpp:63-72), skips submission and only
             ;; re-announces, with the POOL entry's wtxid. Asking VALIDATE
