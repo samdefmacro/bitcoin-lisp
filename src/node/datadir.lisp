@@ -206,6 +206,15 @@ ReadConfigFiles has already refused."
         (tb (ignore-errors (truename b))))
     (and ta tb (equal (namestring ta) (namestring tb)))))
 
+(defun %datadir-string (directory)
+  "DIRECTORY as Core's fs::PathToString prints a data directory: no trailing
+separator. A Lisp directory namestring ends in `/', and feature_config_args.py
+:86 and :443 compare the quoted path exactly."
+  (let ((text (namestring (uiop:ensure-directory-pathname directory))))
+    (if (and (> (length text) 1) (char= #\/ (char text (1- (length text)))))
+        (subseq text 0 (1- (length text)))
+        text)))
+
 (defun check-ignored-config-file (orig-datadir conf-path effective-datadir cli
                                   &key allow-ignored)
   "Refuse to start when the EFFECTIVE data directory holds a bitcoin.conf that
@@ -230,7 +239,7 @@ warning and is the only way past it."
         ((null conf-path)
          (defer-log :info "Data directory \"~A\" contains a \"~A\" file which is ~
 explicitly ignored using -noconf."
-                    (namestring base) +bitcoin-conf-filename+))
+                    (%datadir-string base) +bitcoin-conf-filename+))
         ;; The ordinary case: the file we read IS the datadir's own.
         ((%same-file-p conf-path base-config))
         (t
@@ -238,8 +247,7 @@ explicitly ignored using -noconf."
                 (source (if (and cli-conf (plusp (length cli-conf)))
                             (format nil "command line argument \"-conf=~A\"" cli-conf)
                             (format nil "data directory \"~A\""
-                                    (namestring (uiop:ensure-directory-pathname
-                                                 orig-datadir)))))
+                                    (%datadir-string orig-datadir))))
                 (text (format nil
                               "Data directory \"~A\" contains a \"~A\" file which is ignored, ~
 because a different configuration file \"~A\" from ~A is being used instead. ~
@@ -247,9 +255,9 @@ Possible ways to address this would be to:~%~
 - Delete or rename the \"~A\" file in data directory \"~A\".~%~
 - Change datadir= or conf= options to specify one configuration file, not two, ~
 and use includeconf= to include any other configuration files."
-                              (namestring base) +bitcoin-conf-filename+
+                              (%datadir-string base) +bitcoin-conf-filename+
                               (namestring conf-path) source
-                              +bitcoin-conf-filename+ (namestring base))))
+                              +bitcoin-conf-filename+ (%datadir-string base))))
            (if allow-ignored
                (defer-log :warn "~A" text)
                (error 'bl.cfg:config-parse-error

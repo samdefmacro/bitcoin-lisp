@@ -3531,7 +3531,10 @@ sized for a pruned one."
                         (bl::check-ignored-config-file
                          a (merge-pathnames "bitcoin.conf" a) b '()))))
           (is (search "which is ignored" refusal))
-          (is (search (namestring b) refusal) "the ignored file must be named")
+          (is (search (format nil "Data directory \"~A\" contains"
+                              (string-right-trim "/" (namestring b)))
+                      refusal)
+              "the ignored file's directory must be named as Core quotes it")
           (is (search "data directory" refusal)
               "with no -conf, Core attributes the override to the data directory")
           (is (search "allowignoredconf" refusal)))
@@ -3556,7 +3559,12 @@ sized for a pruned one."
         (is (null (%config-refusal
                    (bl::check-ignored-config-file c nil c '()))))
         (is (= 1 (length bl:*deferred-log-lines*)))
-        (is (eq :info (first (first bl:*deferred-log-lines*)))))
+        (is (eq :info (first (first bl:*deferred-log-lines*))))
+        ;; Core's words, the directory quoted WITHOUT a trailing separator
+        ;; (common/init.cpp:70-73, feature_config_args.py:86).
+        (is (equal (format nil "Data directory \"~A\" contains a \"bitcoin.conf\" file which is explicitly ignored using -noconf."
+                           (string-right-trim "/" (namestring c)))
+                   (second (first bl:*deferred-log-lines*)))))
       ;; (4) POSITIVE CONTROL: the ordinary case -- the datadir's own file IS
       ;; the one we read -- must stay silent, or the check would refuse every
       ;; node that ever starts.
