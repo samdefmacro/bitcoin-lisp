@@ -3378,6 +3378,19 @@ option without a :type has no parser in the scalar scan."
     (macroexpand-1 '(bl.cfg:define-option "probe" :key :probe)))
   (finishes (macroexpand-1 '(bl.cfg:define-option "probe" :key :probe :type :bool))))
 
+(test acceptnonstdtxn-refusal-names-the-chain-as-core-does
+  "Core: `acceptnonstdtxn is not currently supported for %s chain' over
+GetChainTypeString (mempool_args.cpp:102-104) -- `main', which
+feature_config_args.py:149 compares whole. Ours printed our keyword,
+`mainnet'. Control: a test chain accepts the option."
+  (let ((bl:*network* :mainnet)
+        (bl.val:*require-standard* bl.val:*require-standard*))
+    (is (equal "acceptnonstdtxn is not currently supported for main chain"
+               (%config-refusal (apply-config-globals '(("acceptnonstdtxn" . "1")))))))
+  (let ((bl:*network* :regtest)
+        (bl.val:*require-standard* bl.val:*require-standard*))
+    (is (null (%config-refusal (apply-config-globals '(("acceptnonstdtxn" . "1"))))))))
+
 (test network-is-set-before-the-config-globals-are-applied
   "-acceptnonstdtxn on mainnet is an init error (Core mempool_args.cpp:102-104,
 asserted by feature_config_args.py); the check reads *NETWORK*. start-node-

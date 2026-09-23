@@ -539,8 +539,11 @@
 (define-option "acceptnonstdtxn" :type :bool
   :apply (lambda (accept)
            (when (and accept (member *network* '(:mainnet)))
-             (config-error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
-                    *network*))
+             ;; Core names the chain by GetChainTypeString (`main', not our
+             ;; keyword); feature_config_args.py:149 compares the whole line.
+             (config-error "acceptnonstdtxn is not currently supported for ~A chain"
+                           (bl.chain:chain-params-core-name
+                            (bl.chain:find-chain-params *network*))))
            (setf bl.val:*require-standard* (not accept))))
 ;; -par: how many script-check worker threads. Core's semantics -- 0 means
 ;; one per core, a NEGATIVE value leaves that many cores free, and the
