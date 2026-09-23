@@ -2890,26 +2890,25 @@ CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons).
 way Core's InvalidBlockFound marks every result but BLOCK_MUTATED
 (validation.cpp:1985-1994). This test previously asserted the opposite, which
 pinned a divergence: %CONTEXTUAL-CHECK-BLOCK runs the BIP141 witness commitment
-(block.lisp :2154) BEFORE script verification (:2173), so by the time the
-interpreter reads a witness byte that byte is committed. :TOO-MANY-SIGOPS stays
-transient because OUR order puts it at :2137, i.e. BEFORE that commitment check,
-unlike Core's."
+BEFORE script verification, so by the time the interpreter reads a witness byte
+that byte is committed. Since the commitment check moved to the top of
+%CONTEXTUAL-CHECK-BLOCK (Core's AcceptBlock-before-ConnectBlock order), the same
+holds for the sigop budget and the block weight, which Core marks too."
   ;; Every allowlisted keyword classifies as deterministic-invalid.
   (dolist (k '(:duplicate-txid :missing-input :coinbase-not-mature
                :insufficient-funds :non-final-tx :bad-sequence-lock
-               :bad-coinbase-height :coinbase-too-large
-               :block-script-verify-flag-failed))
+               :bad-coinbase-height :coinbase-too-large :block-too-heavy
+               :too-many-sigops :block-script-verify-flag-failed))
     (is-true (bl.val::%deterministic-consensus-failure-p k)
              "~A must be deterministic-invalid" k))
   ;; Everything else must be TRANSIENT (recoverable) — must NOT poison. Includes
-  ;; the mutation class (witness-commitment / merkle), the sigop budget our own
-  ;; check order still reaches before that commitment check,
+  ;; the mutation class (witness-commitment / merkle),
   ;; CheckBlock/structural failures, header keywords, the reorg control
   ;; keywords, an unknown keyword, and NIL.
   (dolist (k '(:bad-witness-merkle-match :bad-witness-nonce-size
-               :unexpected-witness :too-many-sigops
+               :unexpected-witness
                :bad-merkle-root :bad-txns-duplicate :no-transactions
-               :first-tx-not-coinbase :multiple-coinbase :block-too-heavy
+               :first-tx-not-coinbase :multiple-coinbase
                :block-too-large :bad-blk-sigops :no-inputs :no-outputs
                :duplicate-inputs :negative-output :bad-prevout-null
                :corrupt-undo :reorg-refused :weaker-chain :unknown-parent

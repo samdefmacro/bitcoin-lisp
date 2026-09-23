@@ -1897,6 +1897,25 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
       (return-from %check-block
         (values nil :no-transactions)))
 
+    ;; The rest of Core's size gate, before the coinbase checks as there
+    ;; (validation.cpp:3977-3979): the transaction count and the witness-
+    ;; STRIPPED serialization, each scaled by WITNESS_SCALE_FACTOR, within
+    ;; MAX_BLOCK_WEIGHT -- bad-blk-length. The block WEIGHT is not checked
+    ;; here: it reads the witnesses, which the block hash does not commit to
+    ;; until the witness commitment is checked, so Core checks it after that,
+    ;; in ContextualCheckBlock (%CONTEXTUAL-CHECK-BLOCK-NO-UTXO).
+    (let ((base-size (+ 80  ; header
+                        (bl.ser:compact-size-length
+                         (length transactions))
+                        (loop for tx in transactions
+                              sum (length
+                                   (bl.ser:serialize-transaction tx))))))
+      (when (or (> (* (length transactions) +witness-scale-factor+)
+                   +max-block-weight+)
+                (> (* base-size +witness-scale-factor+) +max-block-weight+))
+        (return-from %check-block
+          (values nil :block-too-large))))
+
     ;; First transaction must be coinbase
     (let ((first-tx (first transactions)))
       (unless (is-coinbase-tx first-tx)
@@ -1908,23 +1927,6 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
           when (is-coinbase-tx tx)
             do (return-from %check-block
                  (values nil :multiple-coinbase)))
-
-    ;; Validate block weight (BIP 141)
-    (let ((weight (calculate-block-weight transactions)))
-      (when (> weight +max-block-weight+)
-        (return-from %check-block
-          (values nil :block-too-heavy))))
-
-    ;; Legacy block size limit (non-witness serialization must fit in 1 MB)
-    (let ((base-size (+ 80  ; header
-                        (bl.ser:compact-size-length
-                         (length transactions))
-                        (loop for tx in transactions
-                              sum (length
-                                   (bl.ser:serialize-transaction tx))))))
-      (when (> base-size +max-block-size+)
-        (return-from %check-block
-          (values nil :block-too-large))))
 
     ;; Per-transaction context-free checks (Core CheckBlock: CheckTransaction
     ;; per tx — CVE-2018-17144 duplicate inputs, empty vin/vout, value
@@ -1979,10 +1981,10 @@ checks skipped that block was accepted outright."
                       :coinbase coinbase)))))
 
 (defun %contextual-check-block-no-utxo (block chain-state current-height)
-  "Core ContextualCheckBlock (validation.cpp:4161-4216) minus the block-weight
-limit, which %CHECK-BLOCK already applies: transaction finality against the
-BIP113 cutoff, the BIP34 coinbase height, and the BIP141 witness commitment /
-malleation checks, in Core's order.
+  "Core ContextualCheckBlock (validation.cpp:4161-4216): transaction finality
+against the BIP113 cutoff, the BIP34 coinbase height, the BIP141 witness
+commitment / malleation checks and then the block-weight limit, in Core's
+order.
 
 Every check here reads only the block, its parent's median time past and the
 block's own height -- never the UTXO set -- so it is correct for a block on ANY
@@ -2023,9 +2025,22 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
     ;; Witness commitment / malleation (BIP 141), gated on segwit activation
     ;; for this height — Core's expect_witness_commitment =
     ;; DeploymentActiveAfter(prev, SEGWIT).
-    (validate-witness-commitment
-     block
-     (segwit-active-at-height-p current-height))))
+    (multiple-value-bind (valid error)
+        (validate-witness-commitment
+         block
+         (segwit-active-at-height-p current-height))
+      (unless valid
+        (return-from %contextual-check-block-no-utxo (values nil error))))
+    ;; Block weight (BIP 141) AFTER the witness commitment, as Core orders them
+    ;; (validation.cpp:4201-4213): until the commitment is checked a relaying
+    ;; peer can stuff the coinbase witness without changing the block hash, so
+    ;; only past it is an overweight block overweight for good. A 5 MB coinbase
+    ;; witness therefore answers bad-witness-nonce-size, not the weight
+    ;; (p2p_segwit.py:826).
+    (when (> (calculate-block-weight transactions) +max-block-weight+)
+      (return-from %contextual-check-block-no-utxo
+        (values nil :block-too-heavy)))
+    (values t nil)))
 
 (defun %contextual-check-block (block chain-state utxo-set current-height
                                &key skip-scripts)
@@ -2040,6 +2055,18 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (transactions (bl.ser:bitcoin-block-transactions block)))
     (declare (ignorable header transactions))
+    ;; Core's ContextualCheckBlock -- finality, the BIP34 coinbase height, the
+    ;; BIP141 witness commitment and the block weight -- FIRST: Core runs it in
+    ;; AcceptBlock, before ConnectBlock reads a single coin (validation.cpp:
+    ;; 4381-4389, then ConnectBlock from ConnectTip). After the per-transaction
+    ;; loop, a block failing both answered the UTXO verdict: missing-input
+    ;; (marked invalid for good) for a body whose witness a peer had mangled.
+    ;; Shared verbatim with ACCEPT-BLOCK-BODY, the pre-write gate, so the two
+    ;; can never drift.
+    (multiple-value-bind (valid error)
+        (%contextual-check-block-no-utxo block chain-state current-height)
+      (unless valid
+        (return-from %contextual-check-block (values nil error nil))))
     ;; BIP 30: reject a block that re-creates a still-unspent txid.
     ;; Per-output point lookups, exactly Core's HaveCoin loop
     ;; (validation.cpp:2444): a duplicate txid implies an identical tx
@@ -2166,14 +2193,6 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                            t)))
                  (%stage-block-outputs tx pending-utxos current-height)))
 
-      ;; Core's ContextualCheckBlock: finality, the BIP34 coinbase height and
-      ;; the BIP141 witness commitment. Shared verbatim with ACCEPT-BLOCK-BODY,
-      ;; the pre-write gate, so the two can never drift.
-      (multiple-value-bind (valid error)
-          (%contextual-check-block-no-utxo block chain-state current-height)
-        (unless valid
-          (return-from %contextual-check-block (values nil error nil))))
-
       ;; BIP 68 sequence lock enforcement (Core ConnectBlock's
       ;; CheckSequenceLocks, validation.cpp:2528 — only at or above CSV
       ;; activation, and never for the coinbase).
@@ -2216,7 +2235,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
   "Fully validate a block including all transactions.
 When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
 the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
-solution, merkle root / CVE-2012-2459, weight, size) and RETURN SUCCESS before
+solution, merkle root / CVE-2012-2459, size) and RETURN SUCCESS before
 the UTXO-dependent contextual checks (BIP30, per-input validation, sequence
 locks, scripts, BIP34 coinbase height, coinbase value — Core ContextualCheck
 Block + ConnectBlock). Used when accepting a downloaded block that does NOT
@@ -3446,9 +3465,9 @@ perform-reorg's success phase, so there is nothing to undo here."
 ;;;;
 ;;;; DELIBERATELY EXCLUDED (kept TRANSIENT), each because it could fire on a
 ;;;; RECOVERABLE block:
-;;;;   * Every CheckBlock / structural / header / merkle / weight / size / legacy-
+;;;;   * Every CheckBlock / structural / header / merkle / size / legacy-
 ;;;;     sigops failure (:bad-merkle-root, :bad-txns-duplicate, :no-transactions,
-;;;;     :first-tx-not-coinbase, :multiple-coinbase, :block-too-heavy,
+;;;;     :first-tx-not-coinbase, :multiple-coinbase,
 ;;;;     :block-too-large, :bad-blk-sigops, the validate-transaction-structure
 ;;;;     keywords, every validate-block-header keyword, ...). A fork block ALREADY
 ;;;;     PASSED these when it was stored; failing one now means the on-disk bytes
@@ -3459,20 +3478,20 @@ perform-reorg's success phase, so there is nothing to undo here."
 ;;;;     :bad-witness-merkle-match, :unexpected-witness) — these ARE Core's
 ;;;;     BLOCK_MUTATED (*MUTATED-BLOCK-ERRORS*), and InvalidBlockFound skips
 ;;;;     BLOCK_FAILED_VALID for exactly that class (validation.cpp:1988).
-;;;;   * The CONTEXTUAL sigop budget (:too-many-sigops). In Core this is a
-;;;;     ConnectBlock verdict past ContextualCheckBlock, so Core marks it; OURS
-;;;;     runs INSIDE %contextual-check-block's per-transaction loop (:2135-2137),
-;;;;     i.e. BEFORE the BIP141 witness-commitment check at :2154. Witness bytes
-;;;;     count toward GetTransactionSigOpCost, so at OUR position a
-;;;;     corrupt-but-present witness can raise this verdict with nothing having
-;;;;     checked that the witness is the committed one. It stays transient until
-;;;;     the check order matches Core's.
 ;;;;
 ;;;; DELIBERATELY INCLUDED, where the pre-2026-09-18 list excluded it:
+;;;;   * The CONTEXTUAL sigop budget (:too-many-sigops) and the block weight
+;;;;     (:block-too-heavy). Both read witness bytes, and both now run only
+;;;;     after %CONTEXTUAL-CHECK-BLOCK-NO-UTXO has checked the BIP141 witness
+;;;;     commitment -- %CONTEXTUAL-CHECK-BLOCK calls it first, as Core runs
+;;;;     ContextualCheckBlock in AcceptBlock before ConnectBlock -- so every byte
+;;;;     they count is committed, and Core marks both (bad-blk-sigops is a
+;;;;     ConnectBlock BLOCK_CONSENSUS, bad-blk-weight a ContextualCheckBlock
+;;;;     one, validation.cpp:2567, :4211-4213).
 ;;;;   * Script failures (:block-script-verify-flag-failed). Every path that can
 ;;;;     raise this has already run %CHECK-BLOCK's merkle root + CVE-2012-2459
 ;;;;     mutation check AND %CONTEXTUAL-CHECK-BLOCK-NO-UTXO's BIP141 witness
-;;;;     commitment (:2154 runs before the script check at :2173, and no keyword
+;;;;     commitment (it runs first in %CONTEXTUAL-CHECK-BLOCK, and no keyword
 ;;;;     can skip the former while running the latter — CONTEXT-FREE-ONLY returns
 ;;;;     before both, SKIP-SCRIPTS disables only the latter). Past those two every
 ;;;;     byte the interpreter reads is committed: the witness merkle root in the
@@ -3499,6 +3518,12 @@ perform-reorg's success phase, so there is nothing to undo here."
     :bad-sequence-lock    ; BIP68 relative locktime not satisfied
     :bad-coinbase-height  ; BIP34 coinbase-height prefix mismatch
     :coinbase-too-large   ; coinbase pays more than subsidy + fees
+    ;; The block weight, which %CONTEXTUAL-CHECK-BLOCK-NO-UTXO checks only past
+    ;; the BIP141 witness commitment -- so every witness byte it counts is
+    ;; committed, and Core's BLOCK_CONSENSUS bad-blk-weight is permanent
+    ;; (validation.cpp:4205-4213).
+    :block-too-heavy
+    :too-many-sigops      ; ConnectBlock's bad-blk-sigops, also past the commitment
     ;; Script verification, which runs only after the merkle root and the BIP141
     ;; witness commitment have both been checked -- so the witness bytes it
     ;; reads are committed too. Core InvalidBlockFound marks every result but
@@ -3624,16 +3649,7 @@ than theirs was rejected -- a probable consensus split."
     :bad-txns-duplicate       ; CVE-2012-2459, Core bad-txns-duplicate
     :bad-witness-nonce-size   ; Core CheckWitnessMalleation
     :bad-witness-merkle-match ;   "
-    :unexpected-witness       ;   "
-    ;; Core checks the block weight AFTER CheckWitnessMalleation precisely so
-    ;; the verdict can be permanent (validation.cpp:4210-4214: "before we've
-    ;; checked the coinbase witness, it would be possible for the weight to be
-    ;; too large by filling up the coinbase witness, which doesn't change the
-    ;; block hash"). Ours is in %CHECK-BLOCK, i.e. BEFORE it, so an honest
-    ;; block whose coinbase witness a relaying peer stuffed would fail weight
-    ;; first. Keeping the verdict transient restores Core's guarantee without
-    ;; splitting the weight check out of the shared CheckBlock.
-    :block-too-heavy)
+    :unexpected-witness)      ;   "
   "VALIDATE-BLOCK error keywords that correspond to Core's BLOCK_MUTATED: the
 block hash does NOT commit to what they read, so a clean re-download of the
 same hash can succeed. Core's InvalidBlockFound (validation.cpp:1985-1993)
@@ -3671,6 +3687,9 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     ;; the first of them (mining_template_verification.py:44 proposes an empty
     ;; block and reads bad-blk-length).
     (:no-transactions            . "bad-blk-length")                     ; :3977
+    (:block-too-large            . "bad-blk-length")                     ; :3977
+    ;; ContextualCheckBlock's weight limit, past the witness commitment.
+    (:block-too-heavy            . "bad-blk-weight")                     ; :4212
     (:first-tx-not-coinbase      . "bad-cb-missing")                     ; :3984 CheckBlock
     (:multiple-coinbase          . "bad-cb-multiple")                    ; :3987
     ;; ConnectBlock relays the script pass's own reason, parenthetical and

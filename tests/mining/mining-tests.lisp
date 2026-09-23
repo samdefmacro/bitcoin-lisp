@@ -990,6 +990,125 @@ accepted as a header instead of refused with bad-prevblk (:486)."
        (is (= 1 (bl.store:current-height
                  (bl:node-chain-state node))))))))
 
+(defun %submit-hex (node block)
+  "submitblock BLOCK on NODE, the way a miner submits it: the witness
+serialization, hex-encoded."
+  (bl.rpc:dispatch-rpc-method
+   node "submitblock"
+   (list (bl.crypto:bytes-to-hex (bl.ser:serialize-witness-block block)))))
+
+(defun %reseal-block (block transactions)
+  "Give BLOCK the TRANSACTIONS, recommit the header to them and mine it again."
+  (let ((header (bl.ser:bitcoin-block-header block)))
+    (setf (bl.ser:bitcoin-block-transactions block) transactions
+          (bl.ser:block-header-merkle-root header)
+          (bl.val:compute-merkle-root (mapcar #'bl.ser:transaction-hash transactions))
+          (bl.ser:block-header-cached-hash header) nil)
+    (bl.mining:mine-block block)
+    block))
+
+(defun %filler-transaction (&key (witness-bytes 0) (output-bytes 1))
+  "A transaction spending an outpoint nobody holds, with one output script of
+OUTPUT-BYTES and, when WITNESS-BYTES is positive, one witness item that long.
+It only has to reach the block-level size and weight checks."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element #x77)
+                                      :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+   :outputs (vector (bl.ser:make-tx-out
+                     :value 1000
+                     :script-pubkey (make-array output-bytes
+                                                :element-type '(unsigned-byte 8)
+                                                :initial-element #x6a)))
+   :lock-time 0
+   :witness (and (plusp witness-bytes)
+                 (vector (list (make-array witness-bytes
+                                           :element-type '(unsigned-byte 8)
+                                           :initial-element #xCC))))))
+
+(defun %recommit-coinbase (coinbase transactions)
+  "A copy of COINBASE whose witness-commitment output commits to TRANSACTIONS
+(COINBASE first), with the all-zero reserved value (Core
+GenerateCoinbaseCommitment)."
+  (let* ((reserved (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (combined (make-array 64 :element-type '(unsigned-byte 8))))
+    (replace combined (bl.val:compute-witness-merkle-root (cons coinbase transactions)))
+    (replace combined reserved :start1 32)
+    (bl.ser:make-transaction
+     :version (bl.ser:transaction-version coinbase)
+     :inputs (bl.ser:transaction-inputs coinbase)
+     :outputs (map 'simple-vector
+                   (lambda (out)
+                     (if (bl.val:find-witness-commitment
+                          (bl.ser:make-transaction
+                           :version 1 :inputs (bl.ser:transaction-inputs coinbase)
+                           :outputs (vector out) :lock-time 0))
+                         (bl.ser:make-tx-out
+                          :value 0
+                          :script-pubkey (bl.mining:build-witness-commitment-script
+                                          (bl.crypto:hash256 combined)))
+                         out))
+                   (bl.ser:transaction-outputs coinbase))
+     :lock-time (bl.ser:transaction-lock-time coinbase)
+     :witness (vector (list reserved)))))
+
+(test submitblock-checks-the-witness-commitment-before-the-block-weight
+  "p2p_segwit.py:813-834. A coinbase witness stuffed with 5 MB leaves the block
+hash unchanged, so Core checks the witness commitment BEFORE the weight
+(ContextualCheckBlock, validation.cpp:4201-4213) and answers
+bad-witness-nonce-size -- a BLOCK_MUTATED verdict, so the same block with the
+stuffing removed is then accepted. Ours checked the weight in CheckBlock and
+answered block-too-heavy, a word Core never uses."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "submit-weight-order"))
+           (cs (bl:node-chain-state node))
+           (block (bl.mining:assemble-full-block
+                   cs (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+           (cb (first (bl.ser:bitcoin-block-transactions block)))
+           (stack (aref (bl.ser:transaction-witness cb) 0)))
+      (bl.mining:mine-block block)
+      (setf (aref (bl.ser:transaction-witness cb) 0)
+            (append stack (list (make-array 5000000 :element-type '(unsigned-byte 8)
+                                                    :initial-element #x61))))
+      (is (> (length (bl.ser:serialize-witness-block block)) 4000000)
+          "positive control: the stuffed block is over the weight limit")
+      (is (equal "bad-witness-nonce-size" (%submit-hex node block)))
+      (is (= 0 (bl.store:current-height cs)))
+      (setf (aref (bl.ser:transaction-witness cb) 0) stack)
+      (is (null (%submit-hex node block))
+          "the verdict was not permanent: the unstuffed block connects")
+      (is (= 1 (bl.store:current-height cs))))))
+
+(test submitblock-reports-core-words-for-the-size-and-weight-limits
+  "Core's two limits have two reject reasons and two places: CheckBlock's size
+gate is bad-blk-length for a witness-stripped block over MAX_BLOCK_WEIGHT/4
+(validation.cpp:3977-3979, before the coinbase checks), and ContextualCheckBlock's
+weight limit is bad-blk-weight, past a VALID witness commitment (:4211-4213).
+Ours answered block-too-heavy for both."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "submit-size-words"))
+           (cs (bl:node-chain-state node)))
+      (flet ((fresh ()
+               (let ((b (bl.mining:assemble-full-block
+                         cs (bl:node-mempool node)
+                         :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+                 (values b (first (bl.ser:bitcoin-block-transactions b))))))
+        ;; Over 1 MB without witnesses: CheckBlock's size gate.
+        (multiple-value-bind (block cb) (fresh)
+          (%reseal-block block (list cb (%filler-transaction :output-bytes 1000001)))
+          (is (equal "bad-blk-length" (%submit-hex node block))))
+        ;; Under 1 MB without witnesses but over the weight, commitment valid.
+        (multiple-value-bind (block cb) (fresh)
+          (let ((heavy (%filler-transaction :witness-bytes 4000000)))
+            (%reseal-block block (list (%recommit-coinbase cb (list heavy)) heavy))
+            (is (equal "bad-blk-weight" (%submit-hex node block)))))
+        (is (= 0 (bl.store:current-height cs)))))))
+
 (test submitblock-side-chain-block-is-inconclusive
   ;; Two valid blocks on the genesis tip. The first becomes the tip (null);
   ;; the second is stored on a side chain and never connected, which Core's
