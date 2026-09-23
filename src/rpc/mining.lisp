@@ -908,16 +908,24 @@ out or the node is stopping."
        (%generate-to-script-pubkey node script-pubkey nblocks maxtries)))))
 
 (defun %resolve-coinbase-output-script (output network)
-  "scriptPubKey for generateblock's OUTPUT — a descriptor (tried first, like
-Core's getScriptFromDescriptor) or an address. Signals rpc-error if neither."
-  (or (handler-case (%script-from-descriptor output network)
+  "scriptPubKey for generateblock's OUTPUT -- a descriptor (tried first, like
+Core's getScriptFromDescriptor) or an address. Signals rpc-error if neither.
+
+Only a descriptor that does not PARSE falls through to the address: Core's
+getScriptFromDescriptor returns false for that alone (rpc/mining.cpp:187),
+and THROWS for a multipath or ranged descriptor and for one that cannot be
+expanded without private keys (:189-201), so those errors reach the caller
+as they are. Ours swallowed every descriptor error, and rpc_generate.py:114
+and :118 got the address error instead."
+  (if (handler-case (parse-descriptors output network)
         (rpc-error () nil))
-      (handler-case
-          (multiple-value-bind (type spk) (bl.crypto:decode-address output network)
-            (and type spk))
-        (error () nil))
-      (error 'rpc-error :code +rpc-invalid-address-or-key+
-                        :message "Error: Invalid address or descriptor")))
+      (%script-from-descriptor output network)
+      (or (handler-case
+              (multiple-value-bind (type spk) (bl.crypto:decode-address output network)
+                (and type spk))
+            (error () nil))
+          (error 'rpc-error :code +rpc-invalid-address-or-key+
+                            :message "Error: Invalid address or descriptor"))))
 
 (defun %resolve-generateblock-tx (node s)
   "Resolve a generateblock tx entry S: a 64-hex txid is looked up in the mempool,

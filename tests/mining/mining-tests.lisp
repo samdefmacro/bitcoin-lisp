@@ -1483,6 +1483,30 @@ mkc9STceoCcjoXEXe6cm66iJbmjM6zR9B2."
                     (coinbase-spk (format nil "combo(~A)" uncompressed) "combo-u"))
             "an uncompressed combo() coinbase pays P2PKH, the second script")))))
 
+(test generateblock-reports-a-descriptor-error-and-not-the-address-one
+  "Core's generateblock falls back to an address only when the descriptor does
+not PARSE (getScriptFromDescriptor returns false, rpc/mining.cpp:187); a
+ranged descriptor and one that cannot be expanded without private keys parse,
+so their own errors propagate: -8 `Ranged descriptor not accepted. Maybe pass
+through deriveaddresses first?' and -5 `Cannot derive script without private
+keys' (rpc/mining.cpp:193-201, rpc_generate.py:114 and :118). Ours swallowed
+every descriptor error and answered -5 `Error: Invalid address or descriptor'
+for both. The two descriptors are rpc_generate.py's own."
+  (with-network (:regtest)
+    (let ((node (regtest-node-fixture "genblk-descerr"))
+          (xpub "tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp"))
+      (flet ((answer (output)
+               (rpc-error-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "generateblock" (wire-params (list output (vector))))))))
+        ;; Control: neither an address nor a descriptor is still the address error.
+        (is (equal (cons -5 "Error: Invalid address or descriptor") (answer "1234")))
+        (is (equal (cons -8 "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?")
+                   (answer (format nil "pkh(~A/0/*)" xpub))))
+        (is (equal (cons -5 "Cannot derive script without private keys")
+                   (answer (format nil "pkh(~A/0'/0)" xpub))))))))
+
 (test generateblock-includes-raw-tx-and-rejects-bad-output
   ;; A consensus-valid raw (non-coinbase) tx is included and the witness
   ;; commitment is computed over it (submit=false). The block is dry-run
