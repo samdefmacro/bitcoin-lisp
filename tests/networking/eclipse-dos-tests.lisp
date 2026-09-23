@@ -970,6 +970,38 @@ to the index because the validated-tip work gate was off during IBD."
           (is (null (bl.store:get-block-index-entry state h1-hash))
               "the low-work header must not enter the block index"))))))
 
+(test a-noban-peer-bypasses-the-low-work-gate-and-others-are-ignored-in-cores-words
+  "Core skips the anti-DoS work gate for a NoBan peer (net_processing.cpp
+:3056-3061), so p2p_headers_sync_with_minchainwork.py:62 expects node3, whose
+peers are noban, to take a low-work chain's headers (`Synchronizing
+blockheaders, height: 14') where nodes 1 and 2 log `Ignoring low-work chain
+(height=14)' -- Core's line (:2801), the height the chain would reach, logged
+ONCE. Ours gated the noban peer too and logged `(14 headers)', twice."
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+))
+    (with-whitelist (:entries '("noban@198.51.100.41/32"))
+      (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-noban/")
+        (let* ((bl:*minimum-chain-work-override* (expt 2 240))
+               (ordinary (bl.net:make-peer :inbound t :address "198.51.100.42"))
+               (noban (bl.net:make-peer :inbound t :address "198.51.100.41"))
+               (h1 (%pow-header genesis-hash))
+               (h1-hash (bl.ser:block-header-hash h1)))
+          (let ((text (nth-value 1 (log-text-of
+                                    "net"
+                                    (lambda ()
+                                      (is (= 0 (bl.net:ingest-headers-from-peer
+                                                ordinary (list h1) state))))))))
+            (let ((line (format nil "Ignoring low-work chain (height=1) from peer=~D"
+                                (bl.net:peer-id ordinary))))
+              (is (= 1 (loop for start = 0 then (1+ at)
+                             for at = (search line text :start2 start)
+                             while at count t))
+                  "Core's line, once: ~S" text)))
+          (is (null (bl.store:get-block-index-entry state h1-hash)))
+          (is (= 1 (bl.net:ingest-headers-from-peer noban (list h1) state))
+              "a noban peer's low-work header is stored")
+          (is-true (bl.store:get-block-index-entry state h1-hash)))))))
+
 (test generic-path-stores-above-threshold-headers
   "Above the work threshold, the generic path validates and stores normally —
 steady-state tip announcements are unaffected by the anti-DoS gate."

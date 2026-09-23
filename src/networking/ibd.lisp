@@ -3850,9 +3850,17 @@ NIL the sync is over (complete or aborted) and the slot is cleared."
        ;; Core ignores such batches entirely — storing them would let an
        ;; attacker grow the index with arbitrarily many cheap sub-2000-header
        ;; forks (net_processing.cpp:2802-2804).
-       (bl:log-cat "net" "Ignoring low-work chain (~D headers) from ~A"
-                   (length headers)
-                   (if peer (peer-log-name peer) "an unnamed peer"))
+       ;; Core's line (net_processing.cpp:2801): the height the chain would
+       ;; reach -- the start header's height plus the batch -- and the peer.
+       (let ((start-entry (bl.store:get-block-index-entry
+                           chain-state
+                           (bl.ser:block-header-prev-block (first headers)))))
+         (bl:log-cat "net" "Ignoring low-work chain (height=~D) from peer=~A"
+                     (+ (if start-entry
+                            (bl.store:block-index-entry-height start-entry)
+                            0)
+                        (length headers))
+                     (if peer (peer-id peer) -1)))
        :ignore)
       (t :store))))
 
@@ -4106,7 +4114,12 @@ very block it is delivering is what p2p_sendheaders.py:567 catches."
       ;; last_received_header / IsAncestorOfBestHeaderOrTip skip,
       ;; net_processing.cpp:3046-3054). A batch we hold only on a fork is not
       ;; this case and falls through to the gate below, as in Core.
-      ((%batch-already-validated-work-p chain-state headers)
+      ;; A noban peer bypasses the anti-DoS work gate altogether (Core
+      ;; net_processing.cpp:3056-3061: "this saves bandwidth when we connect
+      ;; to a trusted peer on startup"); p2p_headers_sync_with_minchainwork.py
+      ;; :62 expects such a node to take a low-work chain's headers at once.
+      ((or (%batch-already-validated-work-p chain-state headers)
+           (and peer (peer-has-permission-p peer +perm-noban+)))
        (multiple-value-bind (added last-entry)
            (%store-validated-headers peer chain-state headers full-batch
                                      count-fn "Received")
@@ -4122,10 +4135,8 @@ very block it is delivering is what p2p_sendheaders.py:567 catches."
                               (hss-locator-hashes (peer-headers-sync peer))))
           0)
          (:ignore
-          ;; Core: `Ignoring low-work chain (height=%u) from peer=%d`
-          ;; (net_processing.cpp:2767).
-          (bl:log-cat "net" "Ignoring low-work chain (~D headers) from ~A"
-                      (length headers) (if peer (peer-log-name peer) "no peer"))
+          ;; Logged, once and in Core's words, by %MAYBE-DIVERT-TO-PRESYNC for
+          ;; the one arm Core logs (net_processing.cpp:2801).
           0)
          (:store
           (multiple-value-bind (added last-entry)
