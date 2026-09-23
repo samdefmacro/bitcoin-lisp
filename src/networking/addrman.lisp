@@ -531,6 +531,7 @@ since only it knows the source address. The stored timestamp never moves
 backwards and never goes negative.
 
 Returns T if newly inserted into a new bucket."
+  (maybe-check-address-book book)
   (let ((ip (peer-address-ip pa))
         (net (peer-address-network pa)))
     (unless (address-routable-p ip net)
@@ -560,6 +561,7 @@ Returns T if newly inserted into a new bucket."
           (progn
             (setf info (ab-create book ip port services time source-group
                                   (peer-address-net pa)))
+            (setf (peer-address-source info) (peer-address-source pa))
             (incf (address-book-n-new book))))
       (let* ((bucket (new-bucket book info source-group))
              (pos (bucket-position book info t bucket))
@@ -589,6 +591,7 @@ Returns T if newly inserted into a new bucket."
 (defun address-book-good (book ip port &optional (now (ab-now)) net)
   "Record a successful connection to IP:PORT and promote it new -> tried
 (test-before-evict). Returns T if promoted, NIL if queued for collision test."
+  (maybe-check-address-book book)
   (setf (address-book-last-good book) now)
   (let ((pa (ab-find book ip port net)))
     (when pa
@@ -610,6 +613,7 @@ Returns T if newly inserted into a new bucket."
 
 (defun address-book-attempt (book ip port &key (count-failure t) (now (ab-now)) net)
   "Record a connection attempt to IP:PORT (Core Attempt)."
+  (maybe-check-address-book book)
   (let ((pa (ab-find book ip port net)))
     (when pa
       (setf (peer-address-last-attempt pa) now)
@@ -621,6 +625,7 @@ Returns T if newly inserted into a new bucket."
 (defun address-book-connected (book ip port &optional (now (ab-now)) net)
   "Refresh nTime after a working connection, throttled to avoid topology leaks
 (Core Connected — only bumps if >20 min stale)."
+  (maybe-check-address-book book)
   (let ((pa (ab-find book ip port net)))
     (when (and pa (> (- now (peer-address-last-seen pa)) 1200))
       (setf (peer-address-last-seen pa) now))))
@@ -629,6 +634,7 @@ Returns T if newly inserted into a new bucket."
   "Choose an address for a new outbound connection (Core Select). Returns a
 peer-address or NIL. Picks a random bucket+position, biased toward higher-quality
 entries via GetChance; alternates new/tried roughly 50/50 when both are present."
+  (maybe-check-address-book book)
   (when (zerop (fill-pointer (address-book-random-ids book)))
     (return-from address-book-select nil))
   (let ((have-new (> (address-book-n-new book) 0))
@@ -696,6 +702,7 @@ count cap; PCT >= 100 = no percentage cap (used by getnodeaddresses count=0).
 NETWORK, when given, keeps only addresses on that network; the cap is still
 computed over the whole table, as Core's GetAddr_ does
 (addrman.cpp:812-848)."
+  (maybe-check-address-book book)
   (let* ((v (address-book-random-ids book))
          (n (fill-pointer v))
          (limit (cond ((and (zerop max) (>= pct 100)) n)
@@ -729,6 +736,7 @@ a typical entry is the 40-minute \"unable to test\" fallback, and any
 challenger evicts any incumbent we simply have not dialed lately. Feeling out
 the incumbent instead lets its own success (address-book-good -> drop the
 challenger) or failure (attempted, no success -> replace) decide."
+  (maybe-check-address-book book)
   (let ((ids (address-book-tried-collisions book)))
     (when ids
       (let* ((id (nth (random (length ids)) ids))
@@ -753,6 +761,7 @@ failed within that window promotes the challenger once the incumbent has had
 unresolved for +addrman-test-window-seconds+ promotes anyway, because we
 evidently cannot test the incumbent. select-tried-collision is what produces
 the attempt the second branch reads."
+  (maybe-check-address-book book)
   (let ((remaining '()))
     (dolist (id (address-book-tried-collisions book))
       (let ((pa (gethash id (address-book-info book))))
@@ -783,204 +792,3 @@ the attempt the second branch reads."
                       (ab-make-tried book pa))                      ; untestable -> force
                      (t (push id remaining)))))))))) ; keep waiting
     (setf (address-book-tried-collisions book) remaining)))
-
-;;;; Persistence (rename-to-.bak + fresh on mismatch, Core LoadAddrman)
-
-(alexandria:define-constant +addrman-magic+ #(#x41 #x44 #x52 #x4D)  ; "ADRM"
-  :test #'equalp :documentation "Magic bytes for the bucket-format peers.dat.")
-(defconstant +addrman-format-version+ 4
-  "v4 makes entries network-typed (BIP155): a net-id byte and a
-variable-length address replace the fixed 16-byte IP, so torv3/i2p/cjdns
-records persist. v2/v3 files still load — their 16-byte IPs migrate in
-place (net derived from the mapped form) and the file is rewritten as v4
-on the next save. v3 added each new-table entry's bucket numbers so
-multi-source placements (ref-count > 1) survive restart; v2 files load
-with each address reconstructed into the single bucket its source-group
-implies.")
-
-(defun %new-table-buckets (book)
-  "Map id -> list of new-bucket numbers currently referencing it (one scan
-over the new table; an address added from several source groups appears in
-up to +addrman-new-buckets-per-address+ buckets)."
-  (let ((m (make-hash-table))
-        (nt (address-book-new-table book)))
-    (dotimes (slot (length nt))
-      (let ((id (aref nt slot)))
-        (when (>= id 0)
-          (push (floor slot +addrman-bucket-size+) (gethash id m)))))
-    m))
-
-(defun save-address-book (book path)
-  "Persist BOOK to PATH (atomic write, CRC32-checked, bucket format)."
-  (ensure-directories-exist path)
-  (let* ((tmp-path (make-pathname
-                    :defaults path
-                    :type (concatenate 'string (or (pathname-type path) "dat") ".tmp")))
-         (all-bytes
-           (coerce
-            (flexi-streams:with-output-to-sequence (s)
-              (write-sequence +addrman-magic+ s)
-              (bl.ser:write-uint32-le s +addrman-format-version+)
-              (write-sequence (address-book-key book) s)
-              (bl.ser:write-uint32-le s (address-book-n-new book))
-              (bl.ser:write-uint32-le s (address-book-n-tried book))
-              (bl.ser:write-uint32-le
-               s (hash-table-count (address-book-info book)))
-              (let ((id-buckets (%new-table-buckets book)))
-              (maphash
-               (lambda (id pa)
-                 (write-byte (if (peer-address-in-tried pa) 1 0) s)
-                 ;; v4: BIP155 net id + length-prefixed address bytes.
-                 (write-byte (network-key-id (peer-address-network pa)) s)
-                 (write-byte (length (peer-address-ip pa)) s)
-                 (write-sequence (peer-address-ip pa) s)
-                 (write-byte (ldb (byte 8 8) (peer-address-port pa)) s)
-                 (write-byte (ldb (byte 8 0) (peer-address-port pa)) s)
-                 (bl.ser:write-uint64-le s (peer-address-services pa))
-                 (bl.ser:write-uint32-le s (peer-address-last-seen pa))
-                 (bl.ser:write-uint32-le s (peer-address-last-attempt pa))
-                 (bl.ser:write-uint32-le s (peer-address-last-success pa))
-                 (bl.ser:write-uint32-le s (peer-address-n-attempts pa))
-                 (let ((sg (or (peer-address-source-group pa) #())))
-                   (write-byte (length sg) s)
-                   (write-sequence sg s))
-                 ;; v3: this entry's new-bucket numbers (empty for tried).
-                 (let ((buckets (gethash id id-buckets)))
-                   (write-byte (length buckets) s)
-                   (dolist (b buckets)
-                     (bl.ser:write-uint16-le s b))))
-               (address-book-info book))))
-            '(simple-array (unsigned-byte 8) (*)))))
-    (with-open-file (out tmp-path :direction :output :if-exists :supersede
-                                  :element-type '(unsigned-byte 8))
-      (write-sequence all-bytes out)
-      (write-sequence (bl.kv:compute-crc32 all-bytes) out))
-    (rename-file tmp-path path))
-  (setf (address-book-dirty book) nil)
-  t)
-
-(defun ab-load-entry (book tried-p net ip port services last-seen last-attempt
-                      last-success n-attempts source-group
-                      &optional new-buckets)
-  "Reconstruct one saved entry into BOOK, preserving its stats. NET is the
-network keyword (v4 files), or NIL to derive IPv4/IPv6 from the 16-byte
-mapped IP (v2/v3 migration). NEW-BUCKETS, when supplied (v3+ files), is the
-saved list of new-bucket numbers — the entry is placed back into each,
-restoring multi-source ref-counts. Without it (v2), the single bucket
-implied by the source-group is used. Positions within buckets re-derive
-from the address-book key, which load-address-book reads before any entry;
-only bucket NUMBERS need persisting."
-  (let ((pa (ab-create book ip port services last-seen
-                       (if (plusp (length source-group)) source-group nil)
-                       net)))
-    (incf (address-book-n-new book))
-    (setf (peer-address-last-attempt pa) last-attempt
-          (peer-address-last-success pa) last-success
-          (peer-address-n-attempts pa) n-attempts)
-    ;; Place into new bucket(s); positions re-derive from the persisted key.
-    (let ((buckets (or (remove-duplicates new-buckets)
-                       (list (new-bucket book pa
-                                         (or (peer-address-source-group pa)
-                                             (peer-address-group pa)))))))
-      (setf (peer-address-ref-count pa) 0)
-      (dolist (b buckets)
-        (let ((p (bucket-position book pa t b)))
-          (ab-clear-new book b p)
-          (incf (peer-address-ref-count pa))
-          (setf (aref (address-book-new-table book) (bucket-slot b p))
-                (peer-address-id pa)))))
-    (when tried-p (ab-make-tried book pa))))
-
-(defun load-address-book (book path)
-  "Load BOOK from PATH. On a missing/corrupt/incompatible file, rename it to
-PATH.bak and leave BOOK empty (Bitcoin Core LoadAddrman). Returns T if entries
-were loaded, NIL otherwise."
-  ;; A missing file is not an empty load: Core's DeserializeFileDB throws
-  ;; DbNotFoundError, LoadAddrman says so in its own words and writes the
-  ;; (empty) address book out at once (addrdb.cpp:208-212), and the functional
-  ;; framework waits for exactly that line whenever it deletes peers.dat
-  ;; (test_framework.py:540-544, rpc_net.py:343). "Loaded 0 addresses" is what
-  ;; Core logs on the NEXT start, reading the file this one wrote
-  ;; (feature_addrman.py:65, feature_config_args.py:307).
-  (unless (probe-file path)
-    (bl.log:log-info "Creating peers.dat because the file was not found (\"~A\")"
-                     (namestring path))
-    (handler-case (save-address-book book path)
-      (error (c)
-        (bl.log:log-warn "Failed to write a new peers.dat: ~A" c)))
-    (return-from load-address-book nil))
-  (flet ((backup ()
-           (ignore-errors
-            (rename-file path (make-pathname
-                               :defaults path
-                               :type (concatenate 'string
-                                                  (or (pathname-type path) "dat") ".bak"))))))
-    (handler-case
-        (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
-          (let* ((file-size (file-length in))
-                 (data (make-array file-size :element-type '(unsigned-byte 8))))
-            (read-sequence data in)
-            (when (< file-size 48)              ; magic+ver+key+counts minimum
-              (backup) (return-from load-address-book nil))
-            (let ((payload (subseq data 0 (- file-size 4)))
-                  (stored-crc (subseq data (- file-size 4))))
-              (unless (equalp (bl.kv:compute-crc32 payload) stored-crc)
-                (bl.log:log-warn "peers.dat CRC32 mismatch; backing up to .bak")
-                (backup) (return-from load-address-book nil))
-              (flexi-streams:with-input-from-sequence (s payload)
-                (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
-                  (read-sequence magic s)
-                  (unless (equalp magic +addrman-magic+)
-                    (bl.log:log-warn "peers.dat unknown format; backing up to .bak")
-                    (backup) (return-from load-address-book nil)))
-                (let ((version (bl.ser:read-uint32-le s)))
-                  (unless (member version '(2 3 4))
-                    (bl.log:log-warn "peers.dat version ~D unsupported; backing up to .bak"
-                                           version)
-                    (backup) (return-from load-address-book nil))
-                (read-sequence (address-book-key book) s)
-                (bl.ser:read-uint32-le s)  ; n-new (recomputed)
-                (bl.ser:read-uint32-le s)  ; n-tried (recomputed)
-                (let ((count (bl.ser:read-uint32-le s)))
-                  (dotimes (i count)
-                    (let* ((tried-p (= 1 (read-byte s)))
-                           ;; v4: net-id + length-prefixed address; v2/v3:
-                           ;; fixed 16-byte IP, net derived (migrate-on-load;
-                           ;; the next save rewrites the file as v4).
-                           (net (when (>= version 4)
-                                  (or (key-id-network (read-byte s))
-                                      (net-error "peers.dat: unknown network id"))))
-                           (ip-len (if (>= version 4) (read-byte s) 16))
-                           (ip (make-array ip-len :element-type '(unsigned-byte 8))))
-                      (read-sequence ip s)
-                      (let* ((port (logior (ash (read-byte s) 8) (read-byte s)))
-                             (services (bl.ser:read-uint64-le s))
-                             (last-seen (bl.ser:read-uint32-le s))
-                             (last-attempt (bl.ser:read-uint32-le s))
-                             (last-success (bl.ser:read-uint32-le s))
-                             (n-attempts (bl.ser:read-uint32-le s))
-                             (sg-len (read-byte s))
-                             (sg (make-array sg-len :element-type '(unsigned-byte 8))))
-                        (read-sequence sg s)
-                        (let ((new-buckets
-                                (when (>= version 3)
-                                  (loop repeat (read-byte s)
-                                        collect (bl.ser:read-uint16-le s)))))
-                          (ab-load-entry book tried-p net ip port services last-seen
-                                         last-attempt last-success n-attempts sg
-                                         new-buckets)))))
-                  ;; ⚠️ Core's wording exactly: "Loaded %i addresses from
-                  ;; peers.dat" (addrdb.cpp:207). Core's tests match this as a
-                  ;; SUBSTRING, and our extra word "peer" broke the match — the
-                  ;; count is the same, the sentence was not. The tried count
-                  ;; moves to its own line rather than being dropped: it is
-                  ;; genuinely useful and Core simply does not report it.
-                  (bl.log:log-info "Loaded ~D addresses from peers.dat"
-                                         (address-book-count book))
-                  (bl.log:log-cat "net" "  (~D of them tried)"
-                                         (address-book-n-tried book))
-                  (> count 0)))))))
-      (error (c)
-        (bl.log:log-warn "Failed to load peers.dat (~A); backing up to .bak" c)
-        (backup)
-        nil))))

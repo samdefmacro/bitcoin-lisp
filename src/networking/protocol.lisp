@@ -1845,7 +1845,9 @@ Core counts it in neither num_proc nor num_rate_limit."
               :ip (bl.ser:net-addr-ip net-addr)
               :port (bl.ser:net-addr-port net-addr)
               :services (bl.ser:net-addr-services net-addr)
-              :last-seen time))
+              :last-seen time
+              ;; Core AddrInfo::source, which peers.dat keeps.
+              :source (and source-net (cons source-net source-ip))))
          (network (peer-address-network pa))
          (reachable (reachable-network-p network))
          ;; Core: "Do not set a penalty for a source's self-announcement"

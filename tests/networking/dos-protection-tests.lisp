@@ -468,144 +468,102 @@ with its own NODE silently read the global instead."
    :address addr :inbound t :state :ready
    :ping-latency ping :connect-time connect-time))
 
-(test anchors-save-load-roundtrip
-  "save-anchors persists up to +max-anchors+ ready outbound peers; load-anchors
-restores them (in order) for priority reconnection. Inbound peers excluded."
-  (let* ((dir (ensure-directories-exist
-               (merge-pathnames "test-anchors/" (uiop:temporary-directory))))
-         (node (bl:make-node)))
-    (setf (bl:node-data-directory node) dir)
-    (setf (bl:node-peers node)
-          (list (bl.net:make-peer :address "1.2.3.4" :inbound nil :state :ready)
-                (bl.net:make-peer :address "5.6.7.8" :inbound nil :state :ready)
-                (bl.net:make-peer :address "9.9.9.9" :inbound nil :state :ready)
-                (bl.net:make-peer :address "7.7.7.7" :inbound t   :state :ready)))
-    (bl::save-anchors node)        ; saves the first 2 ready outbound
-    (let ((bl::*pending-anchor-addresses* nil)
-          ;; Connection-less test peers save the network default port; load
-          ;; yields (host . stored-port) dial candidates.
-          (dp (bl:network-port (bl:node-network node))))
-      (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
-        (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
-                   bl::*pending-anchor-addresses*))
-        ;; Core's two lines: ReadAnchors' count and CConnman::Start's
-        ;; (addrdb.cpp:239, net.cpp:3491).
-        (is-true (find "Loaded 2 addresses from \"anchors.dat\"" lines :test #'search))
-        (is-true (find "2 block-relay-only anchors will be tried for connections."
-                       lines :test #'search)))
-      ;; Core ReadAnchors removes the file unconditionally (addrdb.cpp:244):
-      ;; anchors are one-shot, so a crash loop cannot re-dial the same two
-      ;; peers on every start.
-      (is-false (probe-file (bl::anchors-dat-path
-                             (bl:node-data-directory node))))
-      ;; No file, or one that does not read, is 0 anchors -- said all the
-      ;; same, which is what feature_anchors.py:78 waits for after
-      ;; perturbing the file.
-      (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
-        (is (null bl::*pending-anchor-addresses*))
-        (is-true (find "0 block-relay-only anchors will be tried for connections."
-                       lines :test #'search))))))
+(defun %anchor-caddress-bytes (a b c d port services time)
+  "One CAddress in Core's V2_DISK form, assembled by hand (protocol.h:413-454):
+disk version 220000|2^29, nTime, CompactSize services, BIP155 IPv4, big-endian
+port."
+  (append '(#x60 #x5B #x03 #x20)
+          (loop for i below 4 collect (ldb (byte 8 (* 8 i)) time))
+          (list services #x01 #x04 a b c d (ldb (byte 8 8) port) (ldb (byte 8 0) port))))
 
-(test anchors-v1-file-migrates-on-load
-  "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
-entries parse to typed addresses and become dial candidates; the next save
-writes the v2 network-typed format."
+(test anchors-dat-is-core-format-and-block-relay-only
+  "Core StopNodes/DumpAnchors (net.cpp:3637-3649, addrdb.cpp:230-234): the
+anchors are the block-relay-only connections, in connection order, whether
+or not their handshake has finished (GetCurrentBlockRelayOnlyConns walks all of
+m_nodes) -- never a full-relay or inbound peer -- written as Core's file:
+message start, CompactSize count, CAddress V2_DISK each, SHA256d. A dial that
+named its own target carries NODE_NONE and CAddress's TIME_INIT. ReadAnchors
+reads it back and deletes it (addrdb.cpp:236-246)."
   (let* ((dir (ensure-directories-exist
-               (merge-pathnames "test-anchors-v1/" (uiop:temporary-directory))))
+               (merge-pathnames "test-anchors-core/" (uiop:temporary-directory))))
          (node (bl:make-node))
-         (path (bl::anchors-dat-path dir)))
+         (path (merge-pathnames "anchors.dat" dir)))
     (setf (bl:node-data-directory node) dir)
-    ;; Byte-faithful ANC1 writer (the pre-P1 save-anchors format): magic,
-    ;; count, then len-prefixed address strings — via the same CRC32 wrapper.
-    (bl.store:save-file-with-crc32
-     path
-     (lambda (stream)
-       (loop for shift in '(24 16 8 0)
-             do (write-byte (ldb (byte 8 shift) bl::+anchors-magic-v1+) stream))
-       (write-byte 3 stream)
-       (dolist (a '("203.0.113.7" "2001:db8::7" "not-an-address.example"))
-         (let ((bytes (map '(vector (unsigned-byte 8)) #'char-code a)))
-           (write-byte (length bytes) stream)
-           (write-sequence bytes stream)))))
-    (let ((bl::*pending-anchor-addresses* nil)
-          (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
-      (bl::load-anchors node)
-      ;; IP entries survive (the hostname is dropped — never representable).
-      ;; Our IPv6 rendering is the full uncompressed form (no RFC5952 "::").
-      ;; Migrated v1 entries carry port NIL (dial at the network default).
-      (is (equal '(("203.0.113.7" . nil)
-                   ("2001:0db8:0000:0000:0000:0000:0000:0007" . nil))
-                 bl::*pending-anchor-addresses*)))
-    ;; Re-save from live peers: the file is rewritten as v2.
+    (ignore-errors (delete-file path))
+    ;; node-peers is newest first: its LAST element, 1.2.3.4, is the oldest
+    ;; connection, and m_nodes order is oldest first.
     (setf (bl:node-peers node)
-          (list (bl.net:make-peer :address "203.0.113.7"
-                                                   :inbound nil :state :ready)))
+          (list (bl.net:make-peer :address "7.7.7.7" :inbound t :state :ready)
+                (bl.net:make-peer :address "9.9.9.9" :inbound nil :state :ready
+                                  :conn-type :outbound-full-relay)
+                (bl.net:make-peer :address "5.6.7.8" :inbound nil :state :connected
+                                  :conn-type :block-relay)
+                (bl.net:make-peer :address "1.2.3.4" :inbound nil :state :ready
+                                  :conn-type :block-relay)))
+    (let* ((lines (capture-log-lines (lambda () (bl::save-anchors node))))
+           (bytes (alexandria:read-file-into-byte-vector path))
+           (port (bl:network-port (bl:node-network node)))
+           (body (append (coerce (bl.chain:network-magic (bl:node-network node)) 'list)
+                         (list 2)
+                         (%anchor-caddress-bytes 1 2 3 4 port 0 100000000)
+                         (%anchor-caddress-bytes 5 6 7 8 port 0 100000000))))
+      (is (equal body (coerce (subseq bytes 0 (- (length bytes) 32)) 'list))
+          "the not-yet-handshaken block-relay peer is an anchor too")
+      (is (equalp (bl.crypto:hash256 (coerce body '(vector (unsigned-byte 8))))
+                  (subseq bytes (- (length bytes) 32))))
+      (is-true (find "DumpAnchors: Flush 2 outbound block-relay-only peer addresses to anchors.dat started"
+                     lines :test #'search)))
+    (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
+      (is (equal '("1.2.3.4" "5.6.7.8")
+                 (mapcar #'bl.net:peer-address-string bl::*pending-anchor-addresses*)))
+      (is-true (find "Loaded 2 addresses from \"anchors.dat\"" lines :test #'search))
+      (is-true (find "2 block-relay-only anchors will be tried for connections."
+                     lines :test #'search)))
+    (is-false (probe-file path) "ReadAnchors removes the file")
+    ;; feature_anchors.py:74-81: a perturbed file is no anchors, said all the
+    ;; same, and it is removed too.
     (bl::save-anchors node)
-    (let ((bytes (bl.store:load-file-with-crc32 path 6)))
-      (is (= bl::+anchors-magic-v2+
-             (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
-                     (ash (aref bytes 2) 8) (aref bytes 3)))))))
+    (let ((bytes (alexandria:read-file-into-byte-vector path)))
+      (with-open-file (out path :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+        (write-sequence (concatenate '(vector (unsigned-byte 8))
+                                     (subseq bytes 0 20) #(49) (subseq bytes 20))
+                        out)))
+    (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
+      (is (null bl::*pending-anchor-addresses*))
+      (is-true (find "0 block-relay-only anchors will be tried for connections."
+                     lines :test #'search)))
+    (is-false (probe-file path))))
 
-(test anchors-v2-round-trip-typed-and-filtered
-  "The v2 anchors format round-trips (net, bytes, port); on load only
-networks dialable under the current config (and reachable) become dial
-candidates, and each is dialed at its STORED port — an onion anchor yields
-a dial target iff a Tor proxy is configured."
-  (let* ((dir (ensure-directories-exist
-               (merge-pathnames "test-anchors-v2/" (uiop:temporary-directory))))
-         (node (bl:make-node))
-         (path (bl::anchors-dat-path dir))
-         (onion-pk (bl.crypto:hex-to-bytes
-                    "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"))
-         (onion-str (bl.net:onion-address-string onion-pk))
-         ;; Distinct non-default ports prove the STORED port is what loads.
-         (entries (list (list :ipv4 (bl.net:ipv4-to-mapped-ipv6 9 9 9 9) 4567)
-                        (list :torv3 onion-pk 8333))))
-    (setf (bl:node-data-directory node) dir)
-    (bl::save-anchor-entries path entries)
-    ;; Byte-level round trip.
-    (let ((parsed (bl::parse-anchor-entries
-                   (bl.store:load-file-with-crc32 path 6))))
-      (is (= 2 (length parsed)))
-      (destructuring-bind (net bytes port) (first parsed)
-        (is (eq :ipv4 net))
-        (is (equalp (bl.net:ipv4-to-mapped-ipv6 9 9 9 9) bytes))
-        (is (= 4567 port)))
-      (destructuring-bind (net bytes port) (second parsed)
-        (is (eq :torv3 net))
-        (is (equalp onion-pk bytes))
-        (is (= 8333 port))))
-    ;; No Tor proxy: only the IPv4 anchor comes back, at its stored port.
-    (let ((bl::*pending-anchor-addresses* nil)
-          (bl.net:*onion-proxy* nil)
-          (bl.net:*reachable-networks*
-            (copy-list bl.net:+bip155-networks+)))
-      (bl::load-anchors node)
-      (is (equal '(("9.9.9.9" . 4567)) bl::*pending-anchor-addresses*)))
-    ;; load-anchors consumes the file (Core ReadAnchors), so re-save before
-    ;; the second load.
-    (bl::save-anchor-entries path entries)
-    ;; With a Tor proxy the onion anchor becomes a dial candidate too —
-    ;; formatted .onion string + stored port (the P2 anchors redial path).
-    (let ((bl::*pending-anchor-addresses* nil)
-          (bl.net:*onion-proxy*
-            (bl.net:make-proxy :host "127.0.0.1" :port 9050))
-          (bl.net:*reachable-networks*
-            (copy-list bl.net:+bip155-networks+)))
-      (bl::load-anchors node)
-      (is (equal (list '("9.9.9.9" . 4567) (cons onion-str 8333))
-                 bl::*pending-anchor-addresses*)))))
-
-(test anchors-load-missing-file-noop
-  "load-anchors on a directory with no anchors.dat doesn't crash or set anchors."
-  (let* ((dir (ensure-directories-exist
-               (merge-pathnames "test-anchors-empty/" (uiop:temporary-directory))))
-         (node (bl:make-node)))
-    (setf (bl:node-data-directory node) dir)
-    (ignore-errors (delete-file (bl::anchors-dat-path dir)))
-    (let ((bl::*pending-anchor-addresses* nil))
-      (bl::load-anchors node)
-      (is (null bl::*pending-anchor-addresses*)))))
+(test anchors-are-dialed-block-relay-with-desirable-services
+  "Core ThreadOpenConnections' anchor branch (net.cpp:2775-2784): the last
+anchor first, skipped unless it offers the services we want of an outbound
+peer, and dialed as BLOCK_RELAY after `Trying to make an anchor connection
+to <addr:port>' (feature_anchors.py:139-140)."
+  (let* ((node (bl:make-node))
+         (dials '())
+         (real (fdefinition 'bl::establish-outbound-peer)))
+    (setf bl::*pending-anchor-addresses*
+          (list (bl.net:make-peer-address :ip (bl.net:ipv4-to-mapped-ipv6 9 9 9 9)
+                                          :port 4567 :services (logior 1 8))
+                (bl.net:make-peer-address :ip (bl.net:ipv4-to-mapped-ipv6 8 8 8 8)
+                                          :port 4568 :services 0)))
+    (unwind-protect
+         (let ((text (nth-value 1 (log-text-of
+                                   "net"
+                                   (lambda ()
+                                     (setf (fdefinition 'bl::establish-outbound-peer)
+                                           (lambda (node host port &key conn-type &allow-other-keys)
+                                             (declare (ignore node))
+                                             (push (list host port conn-type) dials)
+                                             nil))
+                                     (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6)))
+                                       (bl::dial-anchors node)))))))
+           (is (equal '(("9.9.9.9" 4567 :block-relay)) dials)
+               "only the anchor offering NODE_NETWORK|NODE_WITNESS is dialed")
+           (is-true (search "Trying to make an anchor connection to 9.9.9.9:4567" text))
+           (is (null bl::*pending-anchor-addresses*)))
+      (setf (fdefinition 'bl::establish-outbound-peer) real))))
 
 (defun %evict-one (node)
   "Drive the shipped inbound eviction (Core AttemptToEvictConnection); T if a

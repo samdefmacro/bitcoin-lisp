@@ -37,6 +37,10 @@ slot."
   (n-attempts 0 :type (unsigned-byte 32))
   ;; Net-group of the source peer that told us about this address (Core: source).
   (source-group nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; The address itself of that source, as (network . address-bytes): Core
+  ;; AddrInfo::source, which peers.dat stores (addrman_impl.h:73-76) and the
+  ;; group above is derived from. NIL when the entry names itself.
+  (source nil :type (or null cons))
   ;; How many NEW buckets reference this entry (0 once it lives in TRIED).
   (ref-count 0 :type (unsigned-byte 8))
   ;; T when the entry lives in the TRIED table.

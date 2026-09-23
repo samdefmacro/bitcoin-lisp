@@ -245,6 +245,16 @@ headerssync.cpp. src/networking/.")
    #:save-address-book
    #:load-address-book
    #:*deterministic-addrman*
+   ;; peers.dat in Core's format and CheckAddrman (addrdb.lisp)
+   #:encode-peers-dat
+   #:encode-anchors-dat
+   #:decode-anchors-dat
+   #:write-db-file
+   #:has-all-desirable-service-flags-p
+   #:decode-peers-dat
+   #:check-address-book
+   #:*addrman-check-ratio*
+   #:peer-address-source
    #:peers-dat-path
    #:ipv4-to-mapped-ipv6
    #:ip-bytes-to-string

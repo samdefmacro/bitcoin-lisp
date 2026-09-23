@@ -154,6 +154,7 @@ system, in this same package, because it drives validation and the mempool."
                              (:file "peerdb")
                              (:file "netaddress") ; BIP155 codecs/reachability; before addrman (netgroups)
                              (:file "addrman")
+                             (:file "addrdb")     ; peers.dat in Core's format (addrdb.cpp)
                              (:file "torcontrol")))))
 
 (defsystem "bitcoin-lisp/rpc-server"

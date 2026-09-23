@@ -347,8 +347,12 @@ save-address-book before the network-typed change): three entries —
 [2001:db8::1]:8333 services 1033 — under a fixed all-07 bucket key.")
 
 (test peers-dat-v3-migrates-on-load
-  "A v3 (fixed 16-byte IP) file loads with networks derived from the mapped
-form, and the next save rewrites it as v4 with everything intact."
+  "A file in this node's former format (here its v3, fixed 16-byte IPs) loads
+with networks derived from the mapped form, and is rewritten in Core's format
+at once. The documentation-space entry does not survive the Core-format
+reload: Core's CNetAddr::IsValid refuses RFC3849 (netaddress.cpp), and our
+address-book-add refuses it too, so only a file from before that rule holds
+one."
   (let ((tmp-dir (merge-pathnames "test-addrman-migrate/" (uiop:temporary-directory))))
     (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
     (unwind-protect
@@ -373,16 +377,17 @@ form, and the next save rewrites it as v4 with everything intact."
                (is (not (null c)))
                (is (eq :ipv6 (bl.net:peer-address-network c)))
                (is (= 1033 (bl.net:peer-address-services c))))
-             ;; Migration completes on the next save: file becomes v4 and
-             ;; still round-trips.
-             (is (eq t (bl.net:save-address-book book path)))
+             ;; The load already rewrote the file in Core's format: the
+             ;; network's message start, then format 4.
              (with-open-file (in path :element-type '(unsigned-byte 8))
                (let ((head (make-array 8 :element-type '(unsigned-byte 8))))
                  (read-sequence head in)
+                 (is (equalp (bl.chain:network-magic bl.chain:*network*)
+                             (subseq head 0 4)))
                  (is (= 4 (aref head 4)))))
              (let ((book2 (bl.net:make-address-book)))
                (is (eq t (bl.net:load-address-book book2 path)))
-               (is (= 3 (bl.net:address-book-count book2)))
+               (is (= 2 (bl.net:address-book-count book2)))
                (is (= 1 (bl.net:address-book-n-tried book2))))))
       (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
 

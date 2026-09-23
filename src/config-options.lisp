@@ -132,6 +132,10 @@
 ;; -asmap=<file>: ASN-based netgroup bucketing. A relative path hangs off the
 ;; datadir, as Core's does.
 (define-option "asmap" :key :asmap :type :string)
+;; -checkaddrman=<n>: CheckAddrman on one in N address-book operations,
+;; clamped to [0, 1000000] as LoadAddrman clamps it (addrdb.cpp:199).
+(define-option "checkaddrman" :type :int
+  :apply (lambda (n) (setf bl.net:*addrman-check-ratio* (max 0 (min n 1000000)))))
 ;; -migratedatadir: move a pre-Core datadir to Core's layout at startup,
 ;; before any database is opened. No Core counterpart -- Core has only ever
 ;; had this layout, so it has never needed a migration.
@@ -601,7 +605,7 @@ node's own address"))))
 
 (define-core-only-options
   "blockreconstructionextratxn"
-  "checkaddrman" "checkblockindex"
+  "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
   "help" "i2pacceptincoming"

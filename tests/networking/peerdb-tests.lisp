@@ -39,8 +39,9 @@ already takes :key, so nothing in the production path changes."
 iteration order cannot affect a comparison. The fields are exactly what
 save/load is contracted to preserve: identity (network + address bytes +
 port), the advertised/attempt statistics, the tried flag, and the new-table
-placement (ref-count + the bucket numbers themselves). LAST-COUNT-ATTEMPT is
-deliberately absent — like Core's m_last_count_attempt it is not persisted."
+placement (ref-count + the bucket numbers themselves). LAST-ATTEMPT and
+LAST-COUNT-ATTEMPT are deliberately absent -- like Core's m_last_try and
+m_last_count_attempt, peers.dat does not carry them (addrman_impl.h:73-76)."
   (let ((rows '())
         (id-buckets (bl.net::%new-table-buckets book)))
     (maphash
@@ -50,7 +51,6 @@ deliberately absent — like Core's m_last_count_attempt it is not persisted."
                    (bl.net:peer-address-port pa)
                    (bl.net:peer-address-services pa)
                    (bl.net:peer-address-last-seen pa)
-                   (bl.net:peer-address-last-attempt pa)
                    (bl.net:peer-address-last-success pa)
                    (bl.net:peer-address-n-attempts pa)
                    (if (bl.net:peer-address-in-tried pa) :tried :new)
@@ -167,24 +167,184 @@ source groups) keeps all its placements and its ref-count across save/load
                    (is (= refs (length buckets))))))))
       (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
 
-(test reject-corrupted-file
-  "A peers.dat with a bad CRC32 is rejected (and backed up to .bak)."
-  (let ((book (make-test-address-book))
-        (tmp-dir (merge-pathnames "test-peerdb-corrupt/" (uiop:temporary-directory))))
+;;;; peers.dat in Core's format (addrdb.cpp, addrman.cpp Serialize/Unserialize)
+
+(defun %core-peers-dat (&key (format 1) (lowest-compatible 4) (network :regtest)
+                             (bucket-key 1) (len-new 0) (len-tried 0) mock-checksum)
+  "feature_addrman.py's serialize_addrman (:16-41), byte for byte: an EMPTY
+addrman in Core's layout -- message start, format, INCOMPATIBILITY_BASE +
+lowest compatible, nKey, nNew, nTried, 1024 XOR 2^30 and 1024 empty buckets --
+then SHA256d over all of it, or MOCK-CHECKSUM."
+  (flet ((le (n bytes)
+           (loop for i below bytes collect (ldb (byte 8 (* 8 i)) n))))
+    (let* ((body (coerce (append (coerce (bl.chain:network-magic network) 'list)
+                                 (list format (ldb (byte 8 0) (+ 32 lowest-compatible)))
+                                 (le bucket-key 32)
+                                 (le len-new 4) (le len-tried 4)
+                                 (le (logxor 1024 (ash 1 30)) 4)
+                                 (loop repeat 1024 append (le 0 4)))
+                         '(simple-array (unsigned-byte 8) (*)))))
+      (concatenate '(simple-array (unsigned-byte 8) (*))
+                   body (or mock-checksum (bl.crypto:hash256 body))))))
+
+(defun %write-octets (path bytes)
+  (with-open-file (out path :direction :output :if-exists :supersede
+                            :element-type '(unsigned-byte 8))
+    (write-sequence bytes out)))
+
+(defun %peers-dat-refusal (tmp-dir bytes)
+  "Write BYTES as peers.dat under TMP-DIR and load it for regtest; the
+INIT-ERROR's text, or :LOADED."
+  (let ((path (merge-pathnames "peers.dat" tmp-dir)))
+    (%write-octets path bytes)
+    (handler-case (progn (bl.net:load-address-book (bl.net:make-address-book) path :regtest)
+                         :loaded)
+      (bl.err:init-error (e) (princ-to-string e)))))
+
+(defun %peers-dat-sentence (reason path)
+  "LoadAddrman's refusal (addrdb.cpp:224-226), without the Error: caption the
+init reporter adds."
+  (format nil "Invalid or corrupt peers.dat (~A). If you believe this is a bug, please report it to https://github.com/samdefmacro/bitcoin-lisp/issues. As a workaround, you can move the file (\"~A\") out of the way (rename, move, or delete) to have a new one created on the next start."
+          reason (namestring path)))
+
+(test core-peers-dat-mock-loads
+  "feature_addrman.py:61-65: Core's own empty peers.dat loads -- it is not
+backed up as an unknown format -- and its key is the one in the file."
+  (let ((tmp-dir (merge-pathnames "test-peerdb-core-mock/" (uiop:temporary-directory))))
     (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
     (unwind-protect
-         (let ((path (merge-pathnames "peers.dat" tmp-dir)))
-           (bl.net:address-book-add book (make-test-peer-addr :d 1))
-           (bl.net:save-address-book book path)
-           (let ((data (alexandria:read-file-into-byte-vector path)))
-             (setf (aref data 15) (logxor (aref data 15) #xFF))   ; corrupt a key byte
-             (with-open-file (out path :direction :output :if-exists :supersede
-                                       :element-type '(unsigned-byte 8))
-               (write-sequence data out)))
-           (let ((book2 (bl.net:make-address-book)))
-             (is (null (bl.net:load-address-book book2 path)))
-             (is (= 0 (bl.net:address-book-count book2)))))
+         (let ((path (merge-pathnames "peers.dat" tmp-dir))
+               (book (bl.net:make-address-book)))
+           (%write-octets path (%core-peers-dat))
+           (is (null (bl.net:load-address-book book path :regtest)))
+           (is-false (probe-file (concatenate 'string (namestring path) ".bak"))
+                     "a valid Core file must not be moved aside")
+           (is (= 0 (bl.net:address-book-count book)))
+           ;; nKey = uint256{1}: 01 then 31 zero bytes, at offset 6 of our own
+           ;; encoding of the loaded book.
+           (is (equalp (cons 1 (make-list 31 :initial-element 0))
+                       (coerce (subseq (bl.net:encode-peers-dat book :regtest) 6 38)
+                               'list))))
       (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
+(test core-peers-dat-refusals-are-core-sentences
+  "Every corrupt-file case of feature_addrman.py:67-146 refuses startup with
+Core's sentence and Core's reason: ios_base::failure reasons carry libstdc++'s
+': iostream error', runtime_error ones do not."
+  (let ((tmp-dir (merge-pathnames "test-peerdb-core-refusals/" (uiop:temporary-directory))))
+    (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
+    (unwind-protect
+         (let ((path (merge-pathnames "peers.dat" tmp-dir))
+               (whole (%core-peers-dat)))
+           (loop for (bytes reason) in
+                 `((,(%core-peers-dat :lowest-compatible -32)
+                    "Corrupted addrman database: The compat value (0) is lower than the expected minimum value 32.: iostream error")
+                   (,(subseq whole 0 (1- (length whole)))
+                    "AutoFile::read: end of file: iostream error")
+                   (,(%core-peers-dat :network :signet)
+                    "Invalid network magic number")
+                   (,(%core-peers-dat :mock-checksum
+                                      (make-array 64 :element-type '(unsigned-byte 8)
+                                                     :initial-contents
+                                                     (loop repeat 32 append (list 97 98))))
+                    "Checksum mismatch, data corrupted")
+                   (,(%core-peers-dat :len-tried -1)
+                    "Corrupt AddrMan serialization: nTried=-1, should be in [0, 16384]: iostream error")
+                   (,(%core-peers-dat :len-tried 16385)
+                    "Corrupt AddrMan serialization: nTried=16385, should be in [0, 16384]: iostream error")
+                   (,(%core-peers-dat :len-new -1)
+                    "Corrupt AddrMan serialization: nNew=-1, should be in [0, 65536]: iostream error")
+                   (,(%core-peers-dat :len-new 65537)
+                    "Corrupt AddrMan serialization: nNew=65537, should be in [0, 65536]: iostream error")
+                   (,(%core-peers-dat :bucket-key 0)
+                    "Corrupt data. Consistency check failed with code -16: iostream error"))
+                 do (is (equal (%peers-dat-sentence reason path)
+                               (%peers-dat-refusal tmp-dir bytes)))))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
+(test core-peers-dat-from-the-future-is-replaced
+  "feature_addrman.py:78-87: a file whose lowest compatible format is newer
+than ours is backed up to peers.dat.bak, and a fresh Core-format file takes
+its place; startup goes on."
+  (let ((tmp-dir (merge-pathnames "test-peerdb-core-future/" (uiop:temporary-directory))))
+    (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
+    (unwind-protect
+         (let* ((path (merge-pathnames "peers.dat" tmp-dir))
+                (bak (concatenate 'string (namestring path) ".bak")))
+           (is (eq :loaded (%peers-dat-refusal tmp-dir (%core-peers-dat :lowest-compatible 111))))
+           (is-true (probe-file bak))
+           (is-true (probe-file path))
+           (is (eq :loaded (%peers-dat-refusal
+                            tmp-dir (alexandria:read-file-into-byte-vector path)))
+               "the replacement is itself a valid Core peers.dat"))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
+(test core-peers-dat-entry-bytes
+  "One new entry written in Core's V2_DISK AddrInfo layout (protocol.h:413-454,
+addrman_impl.h:73-76), assembled here by hand: disk version 220000|2^29,
+nTime, CompactSize services, BIP155 IPv4 (net 1, 4 bytes), big-endian port,
+the source CNetAddr, int64 m_last_success, int32 nAttempts. Then 1024 bucket
+counts holding the one reference, the asmap version (none: zeros) and the
+SHA256d."
+  (let* ((book (make-test-address-book))
+         (pa (bl.net:make-peer-address :ip (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)
+                                       :port 8333 :services 9 :last-seen #x65000000
+                                       :source (cons :ipv4 (bl.net:ipv4-to-mapped-ipv6 5 6 7 8)))))
+    (bl.net:address-book-add book pa)
+    (let* ((bytes (bl.net:encode-peers-dat book :regtest))
+           (entry '(#x60 #x5B #x03 #x20  #x00 #x00 #x00 #x65  #x09
+                    #x01 #x04 1 2 3 4  #x20 #x8D
+                    #x01 #x04 5 6 7 8
+                    0 0 0 0 0 0 0 0  0 0 0 0))
+           (head (append (coerce (bl.chain:network-magic :regtest) 'list)
+                         (list 4 36)))
+           (after-key 38)
+           (buckets-at (+ after-key 12 (length entry)))
+           (counts (loop with pos = buckets-at
+                         repeat 1024
+                         collect (let ((n (logior (aref bytes pos) (ash (aref bytes (1+ pos)) 8))))
+                                   (incf pos (* 4 (1+ n)))
+                                   n))))
+      (is (equal head (coerce (subseq bytes 0 6) 'list)))
+      (is (equal '(1 0 0 0  0 0 0 0  #x00 #x04 #x00 #x40)
+                 (coerce (subseq bytes after-key (+ after-key 12)) 'list))
+          "nNew 1, nTried 0, 1024 XOR 2^30")
+      (is (equal entry (coerce (subseq bytes (+ after-key 12) buckets-at) 'list)))
+      (is (= 1 (reduce #'+ counts)) "one bucket names the one entry")
+      (is (= (length bytes) (+ buckets-at (* 4 1024) 4 32 32)))
+      (is (equalp (bl.crypto:hash256 (subseq bytes 0 (- (length bytes) 32)))
+                  (subseq bytes (- (length bytes) 32))))
+      ;; And it reads back, source and all.
+      (let ((book2 (bl.net:make-address-book)))
+        (bl.net:decode-peers-dat bytes book2 :regtest)
+        (let ((back (bl.net:address-book-lookup book2 (bl.net:ipv4-to-mapped-ipv6 1 2 3 4) 8333)))
+          (is-true back)
+          (when back
+            (is (= 9 (bl.net:peer-address-services back)))
+            (is (equalp (cons :ipv4 (bl.net:ipv4-to-mapped-ipv6 5 6 7 8))
+                        (bl.net:peer-address-source back)))))))))
+
+(test checkaddrman-logs-core-lines
+  "CheckAddrman's timer lines (addrman.cpp:1067-1068, logging/timer.h):
+feature_asmap.py:89-95 waits for `CheckAddrman: new 2, tried 2, total 4
+started' and `CheckAddrman: completed' when -checkaddrman=1 runs the check on
+getnodeaddresses' GetAddr."
+  (let ((book (make-test-address-book)))
+    (loop for a from 0 below 4
+          do (bl.net:address-book-add
+              book (bl.net:make-peer-address :ip (bl.net:ipv4-to-mapped-ipv6 101 a 0 0)
+                                             :port 8333 :services 9
+                                             :last-seen (bl.ser:get-unix-time)))
+          when (< a 2)
+            do (bl.net:address-book-good book (bl.net:ipv4-to-mapped-ipv6 101 a 0 0) 8333))
+    (is (= 0 (bl.net:check-address-book book)) "a book built by the operations is consistent")
+    (let ((text (nth-value 1 (log-text-of
+                              "addrman"
+                              (lambda ()
+                                (let ((bl.net:*addrman-check-ratio* 1))
+                                  (bl.net:address-book-get-addr book)))))))
+      (is-true (search "CheckAddrman: new 2, tried 2, total 4 started" text))
+      (is-true (search "CheckAddrman: completed" text)))))
 
 (test handle-missing-file
   "Loading a non-existent peers.dat returns NIL gracefully."

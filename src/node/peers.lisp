@@ -4,170 +4,135 @@
 
 ;;;; Anchor connections (Bitcoin Core anchors.dat)
 ;;;;
-;;;; On shutdown we persist a couple of currently-connected outbound peers and
-;;;; reconnect to them first on the next start, BEFORE consulting DNS seeds.
-;;;; This closes the across-restart eclipse window: a freshly-started node that
-;;;; relied only on DNS seeds (or a poisoned addrman) could be fed an attacker's
-;;;; peer set, but a known-good anchor it was just connected to cannot be
-;;;; substituted by the attacker. (Core anchors are block-relay-only peers;
-;;;; dedicated block-relay-only outbound slots are a separate follow-up — these
-;;;; anchors are drawn from the regular outbound pool.)
+;;;; On a clean shutdown Core writes the addresses of its block-relay-only
+;;;; peers to anchors.dat and, on the next start, dials them first as
+;;;; block-relay-only connections before anything addrman offers. An attacker
+;;;; who poisoned addrman meanwhile cannot substitute the peers we were just
+;;;; block-relay-connected to. The file is Core's: message start, a vector of
+;;;; CAddress in ADDRv2 disk form, SHA256d (addrdb.cpp:230-246).
 
 (defconstant +max-anchors+ 2
-  "How many outbound peers to persist as reconnection anchors (Core saves 2).")
-
-(defconstant +anchors-magic-v1+ #x414e4331)  ; "ANC1" — bare IP strings, no port
-(defconstant +anchors-magic-v2+ #x414e4332)  ; "ANC2" — network-typed + port
+  "Core MAX_BLOCK_RELAY_ONLY_ANCHORS (net.cpp:57).")
 
 (defvar *pending-anchor-addresses* nil
-  "Anchor dial candidates — (host-string . port) conses, port NIL meaning the
-network default — loaded at startup and consumed (and cleared) by the first
-connect-to-peers so they are attempted before DNS-seed candidates.")
+  "The anchors read at startup and not yet dialed, as peer-address records
+(Core CConnman::m_anchors), consumed by the first outbound fill.")
 
 (defun anchors-dat-path (data-directory)
   "Path to anchors.dat in DATA-DIRECTORY."
   (merge-pathnames "anchors.dat" data-directory))
 
-(defun save-anchor-entries (path entries)
-  "Write anchor ENTRIES — a list of (network bytes port) — to PATH in the v2
-format: magic \"ANC2\", count byte, then per entry a BIP155-style net id,
-length-prefixed address bytes and a big-endian port (crash-safe: temp +
-fsync + atomic rename, CRC32-protected)."
-  (bl.store:save-file-with-crc32
-   path
-   (lambda (stream)
-     (loop for shift in '(24 16 8 0)
-           do (write-byte (ldb (byte 8 shift) +anchors-magic-v2+) stream))
-     (write-byte (length entries) stream)
-     (dolist (e entries)
-       (destructuring-bind (net bytes port) e
-         (write-byte (bl.net:network-key-id net) stream)
-         (write-byte (length bytes) stream)
-         (write-sequence bytes stream)
-         (write-byte (ldb (byte 8 8) port) stream)
-         (write-byte (ldb (byte 8 0) port) stream))))))
-
-(defun parse-anchor-entries (bytes)
-  "Parse anchors.dat payload BYTES (CRC already verified) into a list of
-(network bytes port). Reads the v2 network-typed format; a v1 file (bare IP
-strings without port) is MIGRATED: each string is parsed to a typed address,
-with the port NIL (caller substitutes the network default — all v1-era
-anchors were dialed at the default port anyway). Unparseable v1 entries
-(e.g. a hostname from addnode) are dropped. Returns NIL for unknown magic."
-  (let ((end (- (length bytes) 4))              ; stay inside payload (before CRC)
-        (magic (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
-                       (ash (aref bytes 2) 8) (aref bytes 3)))
-        (entries '()))
-    (cond
-      ((= magic +anchors-magic-v2+)
-       (let ((count (aref bytes 4)) (pos 5))
-         (dotimes (i count)
-           (when (< (+ pos 2) end)
-             (let ((net (bl.net:key-id-network (aref bytes pos)))
-                   (len (aref bytes (1+ pos))))
-               (incf pos 2)
-               (when (and net (<= (+ pos len 2) end))
-                 (push (list net
-                             (coerce (subseq bytes pos (+ pos len))
-                                     '(simple-array (unsigned-byte 8) (*)))
-                             (logior (ash (aref bytes (+ pos len)) 8)
-                                     (aref bytes (+ pos len 1))))
-                       entries))
-               (incf pos (+ len 2)))))))
-      ((= magic +anchors-magic-v1+)
-       (let ((count (aref bytes 4)) (pos 5))
-         (dotimes (i count)
-           (when (< pos end)
-             (let ((len (aref bytes pos)))
-               (incf pos)
-               (when (<= (+ pos len) end)
-                 (multiple-value-bind (net addr-bytes)
-                     (bl.net:parse-network-address
-                      (map 'string #'code-char (subseq bytes pos (+ pos len))))
-                   (when net
-                     (push (list net addr-bytes nil) entries)))
-                 (incf pos len)))))))
-      (t (return-from parse-anchor-entries nil)))
-    (nreverse entries)))
+(defun %peer-anchor-address (node peer)
+  "PEER's CNode::addr as Core would write it to anchors.dat: the address and
+port dialed, with the services and nTime of the addrman record it came from,
+or NODE_NONE and CAddress::TIME_INIT when the dial named its target itself
+(addconnection, an anchor redial of an unknown address). NIL for a peer dialed
+by hostname, which has no CAddress."
+  (multiple-value-bind (net bytes) (bl.net:parse-network-address (bl.net:peer-address peer))
+    (when net
+      (let* ((conn (bl.net:peer-connection peer))
+             (port (if conn
+                       (bl.net:connection-port conn)
+                       (network-port (node-network node))))
+             (book (node-address-book node))
+             (known (and book (bl.net:address-book-lookup book bytes port net))))
+        (bl.net:make-peer-address
+         :net net :ip bytes :port port
+         :services (if known (bl.net:peer-address-services known) 0)
+         :last-seen (if known (bl.net:peer-address-last-seen known) 100000000))))))
 
 (defun save-anchors (node)
-  "Persist up to +max-anchors+ currently-connected outbound peers to
-anchors.dat in the network-typed v2 format (net + address + port)."
-  (let* ((ready-outbound
-           (remove-if-not
-            (lambda (p) (and (not (bl.net:peer-inbound p))
-                             (eq (bl.net:peer-state p) :ready)))
-            (node-peers node)))
-         ;; Prefer block-relay-only peers as anchors (Core anchors are
-         ;; block-relay: an attacker who fed us a poisoned addrman can't
-         ;; substitute a peer we were just block-relay-connected to). Fall back
-         ;; to full-relay outbound if we have no block-relay peers.
-         (block-relay (remove-if-not
-                       (lambda (p) (eq (bl.net:peer-conn-type p)
-                                       :block-relay))
-                       ready-outbound))
-         (ready (or block-relay ready-outbound))
-         (default-port (network-port (node-network node)))
-         (entries
-           (loop for p in (subseq ready 0 (min +max-anchors+ (length ready)))
-                 for (net bytes) = (multiple-value-list
-                                    (bl.net:parse-network-address
-                                     (bl.net:peer-address p)))
-                 when net                        ; hostname peers (addnode) skipped
-                   collect (list net bytes
-                                 (let ((conn (bl.net:peer-connection p)))
-                                   (if conn
-                                       (bl.net:connection-port conn)
-                                       default-port))))))
-    (when entries
+  "Core StopNodes' anchor dump (net.cpp:3637-3649): for a node that picks its
+own outbound peers, the first +MAX-ANCHORS+ block-relay-only connections --
+whether or not their handshake finished, since GetCurrentBlockRelayOnlyConns
+walks every CNode in m_nodes (net.cpp:2896-2907) -- written to anchors.dat,
+an empty list included. Timed as DumpAnchors' LOG_TIME_SECONDS
+(addrdb.cpp:232), which feature_anchors.py:106-107 waits for."
+  (when (addrman-outgoing-enabled-p)
+    (let* ((anchors
+             (loop for p in (reverse (node-peers node)) ; m_nodes order: oldest first
+                   when (and (eq (bl.net:peer-conn-type p) :block-relay)
+                             (not (bl.net:peer-inbound p))
+                             (not (eq (bl.net:peer-state p) :disconnected)))
+                     do (setf p (%peer-anchor-address node p))
+                     and when p collect p))
+           (anchors (subseq anchors 0 (min +max-anchors+ (length anchors))))
+           (title (format nil "Flush ~D outbound block-relay-only peer addresses to anchors.dat"
+                          (length anchors)))
+           (start (get-internal-real-time)))
+      (log-info "DumpAnchors: ~A started" title)
       (handler-case
-          (save-anchor-entries (anchors-dat-path (node-data-directory node)) entries)
-        (error (e) (log-warn "Failed to save anchors: ~A" e)))
-      (log-info "Saved ~D anchor peer~:P" (length entries)))))
+          (bl.net:write-db-file (anchors-dat-path (node-data-directory node))
+                                (bl.net:encode-anchors-dat anchors (node-network node)))
+        (error (e) (log-error "DumpAnchors: ~A" e)))
+      (log-info "DumpAnchors: ~A completed (~,2Fs)" title
+                (/ (- (get-internal-real-time) start)
+                   (float internal-time-units-per-second 1d0))))))
 
 (defun load-anchors (node)
-  "Read anchors.dat into *pending-anchor-addresses* — (host . port) dial
-candidates, dialed at the STORED port (migrated v1 entries carry port NIL and
-fall back to the network default) — so the next connect attempts them first.
-Reading CONSUMES the file, as Core's ReadAnchors does (addrdb.cpp:234-246):
-anchors are one-shot, so a crash loop cannot re-dial the same two block-relay
-peers on every start and pin an already-eclipsed node to them. The next clean
-shutdown rewrites it. Missing/corrupt file is ignored; a v1-era file migrates
-(see parse-anchor-entries) and the next save rewrites it as v2. Only networks that
-are dialable under the current config (dialable-network-p: onion needs a Tor
-proxy, cjdns needs -cjdnsreachable) and reachable (-onlynet) become dial
-candidates."
-  (let* ((path (anchors-dat-path (node-data-directory node)))
-         (bytes (bl.store:load-file-with-crc32 path 6)))
-    ;; Unconditionally, parse failure included (Core ReadAnchors). A failure
-    ;; here leaves the anchors in place, which silently restores the pinning
-    ;; this prevents — so say so rather than swallowing it.
-    (handler-case (delete-file path)
-      (file-error () )
-      (error (c) (log-debug "Could not consume ~A: ~A" path c)))
+  "Core ReadAnchors and CConnman::Start's use of it (addrdb.cpp:236-246,
+net.cpp:3485-3492): read anchors.dat into *PENDING-ANCHOR-ADDRESSES* and
+delete the file whatever it held -- anchors are one-shot, so a crash loop
+cannot re-dial the same two block-relay peers on every start and pin an
+already-eclipsed node to them. A file that does not read (a wrong network, a
+short file, a bad checksum) is no anchors at all. At most +MAX-ANCHORS+ are
+kept."
+  (let ((path (anchors-dat-path (node-data-directory node))))
     (setf *pending-anchor-addresses* nil)
-    (when bytes
-      (let ((entries (parse-anchor-entries bytes)))
-        ;; Core ReadAnchors' own line for a file it could read
-        ;; (addrdb.cpp:239).
-        (log-info "Loaded ~D addresses from \"anchors.dat\"" (length entries))
-        (setf *pending-anchor-addresses*
-              (loop for (net addr-bytes port) in entries
-                    when (and (bl.net:dialable-network-p net)
-                              (bl.net:reachable-network-p net))
-                      collect (cons (bl.net:network-address-to-string
-                                     net addr-bytes)
-                                    port)))))
-    ;; CConnman::Start's line, written whatever the file held -- a missing or
-    ;; unreadable anchors.dat is 0 -- and only for a node that picks its own
-    ;; outbound peers (net.cpp:3485-3492). feature_anchors.py:78 perturbs the
-    ;; file and waits for `0 block-relay-only anchors will be tried'.
+    (when (probe-file path)
+      (handler-case
+          (progn
+            (setf *pending-anchor-addresses*
+                  (bl.net:decode-anchors-dat (alexandria:read-file-into-byte-vector path)
+                                             (node-network node)))
+            (log-info "Loaded ~D addresses from \"anchors.dat\""
+                      (length *pending-anchor-addresses*)))
+        (error () (setf *pending-anchor-addresses* nil)))
+      (handler-case (delete-file path)
+        (error (c) (log-debug "Could not consume ~A: ~A" path c))))
     (when (> (length *pending-anchor-addresses*) +max-anchors+)
       (setf *pending-anchor-addresses*
             (subseq *pending-anchor-addresses* 0 +max-anchors+)))
+    ;; Only a node that picks its own outbound peers says it (net.cpp:3485);
+    ;; feature_anchors.py:78 perturbs the file and waits for the 0.
     (when (addrman-outgoing-enabled-p)
       (log-info "~D block-relay-only anchors will be tried for connections."
                 (length *pending-anchor-addresses*)))))
+
+(defun dial-anchors (node)
+  "Core ThreadOpenConnections' anchor branch (net.cpp:2715-2718, 2775-2784):
+while anchors remain, take the LAST one, skip it unless it is dialable and
+reachable here, offers every service we want of an outbound peer
+(HasAllDesirableServiceFlags) and shares no netgroup with an outbound peer we
+have, and dial it as a block-relay-only connection. Returns the number
+dialed."
+  (let ((dialed 0))
+    (loop while *pending-anchor-addresses*
+          do (let* ((pa (car (last *pending-anchor-addresses*)))
+                    (net (bl.net:peer-address-network pa))
+                    (host (bl.net:network-address-to-string net (bl.net:peer-address-ip pa)))
+                    (port (bl.net:peer-address-port pa)))
+               (setf *pending-anchor-addresses* (butlast *pending-anchor-addresses*))
+               (when (and (bl.net:dialable-network-p net)
+                          (bl.net:reachable-network-p net)
+                          (bl.net:has-all-desirable-service-flags-p
+                           (bl.net:peer-address-services pa)
+                           (and (node-chain-state node)
+                                (bl.net:near-tip-p (node-chain-state node))))
+                          (let ((group (bl.net:ip-netgroup host)))
+                            (notany (lambda (p)
+                                      (and group
+                                           (not (bl.net:peer-inbound p))
+                                           (equal group (bl.net:ip-netgroup
+                                                         (bl.net:peer-address p)))))
+                                    (node-peers node))))
+                 (log-cat "net" "Trying to make an anchor connection to ~A"
+                          (if (eq net :ipv6)
+                              (format nil "[~A]:~D" host port)
+                              (format nil "~A:~D" host port)))
+                 (when (establish-outbound-peer node host port :conn-type :block-relay)
+                   (incf dialed)))))
+    dialed))
 
 (defun %reachable-seed-addresses (addresses)
   "Keep only the seed-derived ADDRESSES (strings) we may actually dial.
@@ -457,8 +422,9 @@ resets nAttempts to 0 anyway."
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
   "Connect to Bitcoin network peers.
 Uses address book for warm starts, falls back to DNS seeds. Dial candidates
-are (host . port) conses (port NIL = network default): addrman picks and
-anchors carry their STORED ports, DNS/fixed seeds the default. Onion default
+are (host . port) conses (port NIL = network default): addrman picks carry
+their STORED ports, DNS/fixed seeds the default; anchors are dialed first, by
+DIAL-ANCHORS. Onion default
 port = chain default port (Core net.cpp:3395-3404 GetDefaultPort), so the
 same fallback covers .onion candidates.
 MAX-PEERS: Target number of peers to connect
@@ -475,6 +441,10 @@ Returns the number of peers connected."
   (unless (addrman-outgoing-enabled-p)
     (connect-specified-nodes node)
     (return-from connect-to-peers (length (node-peers node))))
+  ;; Anchors before anything else, as block-relay-only connections: the
+  ;; first branch of Core's ThreadOpenConnections (net.cpp:2715-2718).
+  (handler-case (dial-anchors node)
+    (error (c) (log-debug "Anchor connection failed: ~A" c)))
   (let ((address-book (node-address-book node))
         (addresses '()))
     ;; Warm start: select peers from the addrman (new/tried buckets,
@@ -554,14 +524,6 @@ Returns the number of peers connected."
     ;; (netaddress.cpp CNetAddr::GetGroup).
     (setf addresses (bl.net:diversify-by-netgroup addresses
                                                                    :key #'car))
-
-    ;; Anchors first (Core anchors.dat): reconnect to the peers we persisted at
-    ;; last shutdown before any DNS/addrman candidate, then consume them so
-    ;; later reconnect cycles use the normal pool.
-    (when *pending-anchor-addresses*
-      (setf addresses (remove-duplicates (append *pending-anchor-addresses* addresses)
-                                         :key #'car :test #'string= :from-end t))
-      (setf *pending-anchor-addresses* nil))
 
     (log-info "~D candidate peers available" (length addresses))
 
