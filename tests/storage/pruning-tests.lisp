@@ -577,6 +577,57 @@ tip - min-blocks-to-keep in one call, advancing pruned-height."
                             block-store (nth 13 block-hashes)))))))
       (cleanup-test-dir base-path))))
 
+(test automatic-prune-keeps-cores-buffer-under-the-target
+  "Core FindFilesToPrune (node/blockstorage.cpp:340-374): nothing is pruned
+while the tip is AT or below PruneAfterHeight, and pruning runs while usage
+plus a buffer of one blk and one rev chunk (17 MiB) is at or over the target,
+stopping only once the buffer fits. Ours pruned at PruneAfterHeight itself and
+stopped at the target, so the next allocated chunk took usage over it again."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (unwind-protect
+        (let ((bl:*prune-target-mib* 550)
+              (target (* 550 1048576)))
+          ;; Tip 300 == PruneAfterHeight: Core returns before looking.
+          (let ((bl:*prune-after-height* 300))
+            (setf (bl.store:block-store-total-bytes block-store) (* 600 1048576))
+            (is (= 0 (bl.store:prune-old-blocks block-store chain-state))))
+          (let ((bl:*prune-after-height* 0))
+            ;; 20 MiB under the target: the 17 MiB buffer fits, nothing goes.
+            (setf (bl.store:block-store-total-bytes block-store)
+                  (- target (* 20 1048576)))
+            (is (= 0 (bl.store:prune-old-blocks block-store chain-state)))
+            ;; 10 MiB under: it does not, and the window (heights 1-12) goes.
+            (setf (bl.store:block-store-total-bytes block-store)
+                  (- target (* 10 1048576)))
+            (is (= 12 (bl.store:prune-old-blocks block-store chain-state)))
+            (is (null (bl.store:block-exists-p block-store (nth 12 block-hashes))))
+            (is-true (bl.store:block-exists-p block-store (nth 13 block-hashes)))))
+      (cleanup-test-dir base-path))))
+
+(test automatic-prune-widens-the-buffer-during-initial-download
+  "During initial block download, with the best header ahead of the tip, Core
+adds 1 MB per block still to come to the buffer (node/blockstorage.cpp:352-363)
+so a syncing node does not prune, and flush, after every block."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (declare (ignore block-hashes))
+    (unwind-protect
+        (let ((bl:*prune-target-mib* 550)
+              (bl:*prune-after-height* 0))
+          ;; A header 10 blocks past the tip.
+          (bl.store:add-block-index-entry
+           chain-state (bl.store:make-block-index-entry
+                        :hash (make-test-hash #xAB 310) :height 310
+                        :chain-work 400 :status :header-valid))
+          ;; 20 MiB under the target: 17 MiB + 10 MB of buffer does not fit.
+          (setf (bl.store:block-store-total-bytes block-store)
+                (- (* 550 1048576) (* 20 1048576)))
+          (is (= 0 (bl.store:prune-old-blocks block-store chain-state)))
+          (is (= 12 (bl.store:prune-old-blocks
+                     block-store chain-state :initial-block-download-p t))))
+      (cleanup-test-dir base-path))))
+
 ;;;; Test: prune-blocks-to-height respects min-blocks-to-keep
 
 (test prune-respects-min-blocks-retention

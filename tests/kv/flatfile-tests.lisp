@@ -760,6 +760,56 @@ require the file to be gone."
            (is (= 3 (bl.store:chain-state-pruned-height cs))
                "the prune horizon advances to the file's last height")))))))
 
+(defun %ff-store-under-a-high-prune-cursor (dir)
+  "(values STORE CHAIN-STATE): blocks 1-3 in blk00000.dat, the tip claimed at
++min-blocks-to-keep+ + 40 so the prune window's top is 40, and the pruned-height
+cursor at 100 -- where a prune done while the tip was higher left it."
+  (let* ((store (bl.store:init-block-store dir))
+         (cs (bl.store:init-chain-state dir))
+         (prev (bl.store:make-block-index-entry
+                :hash (bl.store:best-block-hash cs) :height 0
+                :chain-work 1 :status :valid)))
+    (bl.store:add-block-index-entry cs prev)
+    (loop for h from 1 to 3
+          do (let* ((hash (bl.store:store-block
+                           store (%ff-test-block (+ 210 h)) :height h))
+                    (entry (bl.store:make-block-index-entry
+                            :hash hash :height h :chain-work (1+ h)
+                            :status :valid :prev-entry prev)))
+               (bl.store:add-block-index-entry cs entry)
+               (setf prev entry)))
+    (bl.store:update-chain-tip
+     cs (bl.store:block-index-entry-hash prev) (+ bl:+min-blocks-to-keep+ 40))
+    (setf (bl.store:chain-state-pruned-height cs) 100)
+    (values store cs)))
+
+(test the-pruned-height-cursor-does-not-stop-the-file-pass
+  "Core FindFilesToPrune and FindFilesToPruneManual select a file by the
+height range it holds and the chainstate's prune range, nothing else
+(node/blockstorage.cpp:305-310, :364-374, over GetPruneRange,
+validation.cpp:6366-6391); Core keeps no pruned-height marker. Ours returned
+before the file pass whenever the range's top was at or below that marker --
+which it is after a reorg or an invalidateblock onto a LOWER tip, since the
+marker only rises -- and the node then stopped pruning: feature_pruning.py:223
+found usage over the target."
+  (with-network (:mainnet)
+    (with-temp-directory (dir)
+      (let ((bl.store:*flat-block-files* t)
+            (bl:*prune-target-mib* 550)
+            (bl:*prune-after-height* 0))
+        (multiple-value-bind (store cs) (%ff-store-under-a-high-prune-cursor dir)
+          (setf (bl.store:block-store-total-bytes store) (* 600 1024 1024))
+          (is (= 3 (bl.store:prune-old-blocks store cs)))
+          (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+          (is (= 100 (bl.store:chain-state-pruned-height cs))
+              "the cursor never moves backwards"))))
+    (with-temp-directory (dir)
+      (let ((bl.store:*flat-block-files* t)
+            (bl:*prune-target-mib* 1))
+        (multiple-value-bind (store cs) (%ff-store-under-a-high-prune-cursor dir)
+          (is (= 3 (bl.store:prune-blocks-to-height store cs 40)))
+          (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir))))))))
+
 (test the-flat-prune-window-starts-at-genesis-as-cores-does
   "Core's GetPruneRange returns prune_start = 0 for an ordinary chainstate
 (validation.cpp:6366-6379) and FindFilesToPrune skips a file only when

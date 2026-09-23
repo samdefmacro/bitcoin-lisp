@@ -1006,104 +1006,119 @@ callback keeps storage from having to reach into the chain state."
 maintained by store-block/prune-block (initialized by init-block-store)."
   (/ (block-store-total-bytes store) 1048576.0))  ; 1024 * 1024
 
-(defun prune-old-blocks (store chain-state &key on-prune target-bytes)
-  "Prune old blocks when storage exceeds target.
-Deletes oldest block files until storage is at or below the effective prune
-target (halved while an assumeutxo historical chainstate exists — Core
-BlockManager::FindFilesToPrune, node/blockstorage.cpp:330-338), respecting
-+min-blocks-to-keep+, *prune-after-height*, and CHAIN-STATE's per-chainstate
-prune floor (an unvalidated snapshot chainstate never prunes at or below its
-base — Core Chainstate::GetPruneRange). TARGET-BYTES is the automatic target,
-defaulting to the single-chainstate PRUNE-TARGET-BYTES; the node passes
-(effective-prune-target-bytes), which halves it while an assumeutxo
-historical chainstate exists -- a fact only the node knows.
-Only runs in automatic pruning mode.
-Returns the number of blocks pruned."
+(defun prune-buffer-bytes (chain-state &key initial-block-download-p)
+  "The headroom Core FindFilesToPrune keeps under the target
+(node/blockstorage.cpp:348-363): one blk and one rev allocation chunk
+(BLOCKFILE_CHUNK_SIZE + UNDOFILE_CHUNK_SIZE, 17 MiB), because the check for
+pruning runs only after new space has been allocated. During initial block
+download, while the best header is ahead of CHAIN-STATE's tip, 1 MB more per
+block still to come -- Core's `average_block_size' -- so a syncing node does not
+re-prune, and re-flush, after every block."
+  (let ((buffer (+ +blockfile-chunk-size+ +undofile-chunk-size+)))
+    (when initial-block-download-p
+      (let ((best (best-header-entry chain-state))
+            (tip-height (chain-state-best-height chain-state)))
+        (when (and best (> (block-index-entry-height best) tip-height))
+          (incf buffer (* 1000000 (- (block-index-entry-height best)
+                                     tip-height))))))
+    buffer))
+
+(defun prune-old-blocks (store chain-state &key on-prune target-bytes
+                                                initial-block-download-p)
+  "Prune old blocks while storage is over the target -- Core
+BlockManager::FindFilesToPrune (node/blockstorage.cpp:321-398).
+
+Nothing happens at or below *prune-after-height* (Core returns when the tip
+height is <= PruneAfterHeight, :340-342). Otherwise pruning runs while usage
+PLUS PRUNE-BUFFER-BYTES is at or over the target (:344-374): Core stops only
+once the buffer fits under it, so a node pruned just to the target would have
+to prune again as soon as the next file chunk is allocated.
+INITIAL-BLOCK-DOWNLOAD-P is Core's IsInitialBlockDownload, which widens the
+buffer (see PRUNE-BUFFER-BYTES).
+
+Whole blk/rev pairs go first, in file order, each only when its ENTIRE height
+range lies in CHAIN-STATE's prune range: Core GetPruneRange's prune_start --
+an unvalidated snapshot chainstate never prunes at or below its base -- up to
+the tip minus +min-blocks-to-keep+, capped by every prune lock. The range is
+all Core consults; the pruned-height cursor is not, because it is a HEIGHT and
+not a chain: a reorg or invalidateblock onto a lower tip left it above the
+range's top, and the file pass then stopped for good. The cursor bounds only
+the legacy per-block walk that follows, as the place that walk resumes.
+
+TARGET-BYTES defaults to PRUNE-TARGET-BYTES; the node passes
+(effective-prune-target-bytes), halved while an assumeutxo historical
+chainstate exists. Automatic pruning mode only. Returns the blocks pruned."
   (unless (automatic-pruning-p)
     (return-from prune-old-blocks 0))
   (let ((current-height (chain-state-best-height chain-state))
         (prune-after (or *prune-after-height* 0)))
-    ;; Don't prune until chain reaches prune-after-height
-    (when (< current-height prune-after)
+    (when (<= current-height prune-after)
       (return-from prune-old-blocks 0))
-    ;; Computed here, after the mode and height guards: with pruning off there
-    ;; is no target to compute (*prune-target-mib* is NIL).
-    (let ((target-bytes (or target-bytes (prune-target-bytes))))
-      (when (<= (block-store-total-bytes store) target-bytes)
-        (return-from prune-old-blocks 0))
-      ;; Calculate the allowed prune window: (floor, min-keep-height].
-      ;; MIN of the retention window and the prune-lock ceiling: an index that
-      ;; still needs a block's undo data holds the horizon down until it has
-      ;; caught up (Core caps last_prune by every lock before calling
-      ;; FindFilesToPrune, validation.cpp:2722-2732).
-      (let* ((min-keep-height (min (max 0 (- current-height
-                                             +min-blocks-to-keep+))
-                                   (prune-lock-ceiling current-height)))
-             (start (chain-state-prune-walk-start chain-state))
-             (pruned 0))
-        ;; Nothing left in the window. PRUNE-BLOCKS-TO-HEIGHT has always had
-        ;; this guard; without it here a prune lock that drives MIN-KEEP-HEIGHT
-        ;; below START — an index parked near genesis on a node that has
-        ;; already pruned far — hands ACTIVE-CHAIN-ENTRIES-FROM a NEGATIVE
-        ;; count, and that walks prev-entry from the tip all the way down
-        ;; before returning nothing. Once per connected block.
-        (when (<= min-keep-height start)
+    (let* ((target-bytes (or target-bytes (prune-target-bytes)))
+           (buffer (prune-buffer-bytes
+                    chain-state
+                    :initial-block-download-p initial-block-download-p)))
+      (flet ((under-target-p ()
+               (< (+ (block-store-total-bytes store) buffer) target-bytes)))
+        (when (under-target-p)
           (return-from prune-old-blocks 0))
-        ;; Flat files first, whole pairs at a time (Core FindFilesToPrune).
-        ;; A blk file cannot have a block cut out of it, so the unit is the
-        ;; file and the test is that its ENTIRE height range sits inside the
-        ;; window. Legacy per-block files are handled by the walk below; a
-        ;; store mid-transition holds both.
-        ;;
-        ;; The floor is Core's prune_start, NOT the walk cursor: a file is
-        ;; selected by the range it holds, so a cursor that has already marched
-        ;; past a retained file's first height would exclude that file forever.
-        (dolist (file (%prunable-flat-files
-                       store (chain-state-prune-range-start chain-state)
-                       min-keep-height))
-          (when (<= (block-store-total-bytes store) target-bytes)
-            (return))
-          (let ((info (gethash file (block-store-file-info store))))
-            (let ((last (and info (block-file-info-height-last info)))
-                  (blocks (if info (block-file-info-blocks info) 0)))
+        ;; The prune range's top: MIN of the retention window and the
+        ;; prune-lock ceiling. An index that still needs a block's undo data
+        ;; holds the horizon down until it has caught up (Core caps last_prune
+        ;; by every lock before calling FindFilesToPrune,
+        ;; validation.cpp:2722-2732).
+        (let* ((min-keep-height (min (max 0 (- current-height
+                                               +min-blocks-to-keep+))
+                                     (prune-lock-ceiling current-height)))
+               (start (chain-state-prune-walk-start chain-state))
+               (pruned 0))
+          ;; Flat files first, whole pairs. The floor is Core's prune_start,
+          ;; NOT the walk cursor, which would exclude a retained file whose
+          ;; first height it has marched past forever.
+          (dolist (file (%prunable-flat-files
+                         store (chain-state-prune-range-start chain-state)
+                         min-keep-height))
+            (when (under-target-p)
+              (return))
+            (let* ((info (gethash file (block-store-file-info store)))
+                   (last (and info (block-file-info-height-last info)))
+                   (blocks (if info (block-file-info-blocks info) 0)))
               (prune-flat-block-file store file :on-prune on-prune)
               (incf pruned blocks)
               (when last
                 (setf (chain-state-pruned-height chain-state)
-                      (max (chain-state-pruned-height chain-state) last))))))
-        ;; Walk from start+1 upward, deleting blocks until the running
-        ;; total (maintained by prune-block) is back under target.
-        ;; One active-chain walk for the whole range — get-block-at-height
-        ;; per height would re-walk from the tip each time, quadratic for
-        ;; the initial catch-up prune that deletes a large range at once.
-        (loop for entry in (active-chain-entries-from
-                            chain-state (1+ start)
-                            (- min-keep-height start))
-              while (> (block-store-total-bytes store) target-bytes)
-              ;; A block inside a blk file is the FLAT pass's business and
-              ;; nobody else's. Letting it through here would call PRUNE-BLOCK,
-              ;; which refuses for a flat record — and the horizon below would
-              ;; then advance PAST a block that is still on disk. On a store in
-              ;; the flat format (the default) that is every block: the walk
-              ;; start marches up, the file's own first height falls below it,
-              ;; %PRUNABLE-FLAT-FILES stops offering the file, and the node
-              ;; silently stops reclaiming space for good while reporting a
-              ;; prune height it never reached.
-              unless (flat-file-pos-p (gethash (block-index-entry-hash entry)
-                                               (block-store-index store)))
-                do (when (prune-block store (block-index-entry-hash entry))
-                     (incf pruned))
-                   ;; The undo file goes with the block (Core deletes rev
-                   ;; files alongside blk files): a pruned node can't reorg
-                   ;; below its window, so undo there is dead weight.
-                   (when on-prune
-                     (funcall on-prune (block-index-entry-hash entry)))
-                   ;; Advance even when the file was already gone — the block
-                   ;; is off disk either way, and a permanent gap would force
-                   ;; every later call to re-walk from the same height.
-                   (setf (chain-state-pruned-height chain-state)
-                         (block-index-entry-height entry)))
-        pruned))))
+                      (max (chain-state-pruned-height chain-state) last)))))
+          ;; Then legacy per-block files, walking from the cursor upward -- a
+          ;; store mid-transition holds both forms. Nothing left in the window
+          ;; means no walk: a count at or below zero would hand
+          ;; ACTIVE-CHAIN-ENTRIES-FROM a NEGATIVE count, which walks prev-entry
+          ;; from the tip all the way down before returning nothing. One
+          ;; active-chain walk for the whole range -- get-block-at-height per
+          ;; height would re-walk from the tip each time, quadratic for the
+          ;; initial catch-up prune that deletes a large range at once.
+          (when (> min-keep-height start)
+            (loop for entry in (active-chain-entries-from
+                                chain-state (1+ start)
+                                (- min-keep-height start))
+                  until (under-target-p)
+                  ;; A block inside a blk file is the FLAT pass's business:
+                  ;; PRUNE-BLOCK refuses a flat record, and the cursor would
+                  ;; then advance past a block still on disk.
+                  unless (flat-file-pos-p (gethash (block-index-entry-hash entry)
+                                                   (block-store-index store)))
+                    do (when (prune-block store (block-index-entry-hash entry))
+                         (incf pruned))
+                       ;; The undo file goes with the block (Core deletes rev
+                       ;; files alongside blk files).
+                       (when on-prune
+                         (funcall on-prune (block-index-entry-hash entry)))
+                       ;; Advance even when the file was already gone -- the
+                       ;; block is off disk either way, and a permanent gap
+                       ;; would force every later call to re-walk from the
+                       ;; same height.
+                       (setf (chain-state-pruned-height chain-state)
+                             (block-index-entry-height entry))))
+          pruned)))))
 
 (defun prune-blocks-to-height (store chain-state target-height &key on-prune)
   "Prune all block files below TARGET-HEIGHT.
@@ -1121,8 +1136,6 @@ Returns the number of blocks pruned."
                                 (prune-lock-ceiling current-height)))
          (start (chain-state-prune-walk-start chain-state))
          (pruned 0))
-    (when (<= effective-target start)
-      (return-from prune-blocks-to-height 0))
     ;; Flat files first, whole pairs at a time — Core's FindFilesToPruneManual
     ;; selects FILES whose last height is at or below the manual target
     ;; (node/blockstorage.cpp:292-319), because a blk file cannot have a block
@@ -1144,10 +1157,12 @@ Returns the number of blocks pruned."
           (setf (chain-state-pruned-height chain-state)
                 (max (chain-state-pruned-height chain-state) last)))))
     ;; Then any legacy per-block files in the range; a store mid-transition
-    ;; holds both forms.
-    (dolist (entry (active-chain-entries-from
-                    chain-state (1+ start)
-                    (- effective-target start 1)))
+    ;; holds both forms. The cursor bounds only this walk: Core keeps no such
+    ;; marker, and returning early on it skipped the file pass above too.
+    (dolist (entry (and (> effective-target start)
+                        (active-chain-entries-from
+                         chain-state (1+ start)
+                         (- effective-target start 1))))
       ;; Same guard as PRUNE-OLD-BLOCKS: a block in a blk file belongs to the
       ;; flat pass, and the flat pass may deliberately have LEFT its file alone
       ;; (its range reaches above the target, or a prune lock capped it).

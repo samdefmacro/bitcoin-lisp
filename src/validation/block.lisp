@@ -3181,7 +3181,13 @@ Handles chain reorganizations when a competing chain has more work."
              (let ((pruned (bl.store:prune-old-blocks
                             block-store chain-state
                             :on-prune #'delete-undo-file
-                            :target-bytes (bl:effective-prune-target-bytes))))
+                            :target-bytes (bl:effective-prune-target-bytes)
+                            ;; FindFilesToPrune asks IsInitialBlockDownload,
+                            ;; which only READS the latch (blockstorage.cpp:356);
+                            ;; SYMBOL-VALUE because protocol.lisp, which
+                            ;; defines it, compiles after this file.
+                            :initial-block-download-p
+                            (symbol-value 'bl.net:*cached-is-ibd*))))
                (when (> pruned 0)
                  (bl:log-info "Pruned ~D old block~:P" pruned))))))
 
