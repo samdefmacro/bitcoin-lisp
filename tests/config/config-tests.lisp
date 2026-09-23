@@ -1497,17 +1497,23 @@ silently a no-op and the BIP94 rule had no way to be turned on."
        (let ((bl.chain:*enforce-bip94-on-regtest* nil))
          (bl::%apply-test-options :regtest '("bip94"))
          (is-true bl.chain:*enforce-bip94-on-regtest*)
+         (is-false bl.net:*deterministic-addrman*)
          ;; An unknown value warns and is otherwise ignored -- the node starts.
-         (bl::%apply-test-options :regtest '("nosuch" "bip94"))
+         ;; `addrman' is Core's third option: a deterministic address book
+         ;; (addrdb.cpp:199).
+         (bl::%apply-test-options :regtest '("nosuch" "bip94" "addrman"))
          (is-true bl.chain:*enforce-bip94-on-regtest*)
+         (is-true bl.net:*deterministic-addrman*)
          ;; Absent, the flag is cleared: a previous run must not leak into this
          ;; one, and nothing else ever sets it back.
          (bl::%apply-test-options :regtest nil)
          (is-false bl.chain:*enforce-bip94-on-regtest*)
+         (is-false bl.net:*deterministic-addrman*)
          ;; Off regtest the option is refused outright, on every other chain.
          (dolist (net '(:mainnet :testnet3 :testnet4 :signet))
            (signals error (bl::%apply-test-options net '("bip94")))))
-    (setf bl.chain:*enforce-bip94-on-regtest* nil)))
+    (setf bl.chain:*enforce-bip94-on-regtest* nil
+          bl.net:*deterministic-addrman* nil)))
 
 (test blockversion-is-a-known-option-that-sets-the-template-override
   "-blockversion is Core's forking-scenario knob (miner.cpp:141-145,

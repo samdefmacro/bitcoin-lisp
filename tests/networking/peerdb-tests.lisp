@@ -204,3 +204,36 @@ source groups) keeps all its placements and its ref-count across save/load
     (is (= 168 (aref ip 13)))
     (is (= 1 (aref ip 14)))
     (is (= 100 (aref ip 15)))))
+
+(test a-missing-peers-dat-is-created-and-says-so
+  "Core's LoadAddrman meets a missing peers.dat as DbNotFoundError: it logs
+`Creating peers.dat because the file was not found (\"<path>\")' and writes
+the empty address book out at once (addrdb.cpp:208-212). The functional
+framework waits for that line whenever it deletes the file
+(test_framework.py:540-544; rpc_net.py:343 is the first to do it), and the
+next start then reports `Loaded 0 addresses from peers.dat' reading the file
+this one wrote (feature_addrman.py:65). Ours logged the Loaded line for a file
+that was not there and wrote nothing."
+  (let* ((tmp-dir (merge-pathnames (format nil "test-peerdb-missing-~D/" (random 1000000))
+                                   (uiop:temporary-directory)))
+         (path (merge-pathnames "peers.dat" tmp-dir)))
+    (ensure-directories-exist tmp-dir)
+    (unwind-protect
+         (let ((lines (capture-log-lines
+                       (lambda ()
+                         (is-false (bl.net:load-address-book (bl.net:make-address-book) path)
+                                   "control: nothing was loaded")))))
+           (is-true (some (lambda (l)
+                            (search (format nil "Creating peers.dat because the file was not found (\"~A\")"
+                                            (namestring path))
+                                    (princ-to-string l)))
+                          lines))
+           (is-false (some (lambda (l) (search "Loaded 0 addresses" (princ-to-string l))) lines))
+           (is-true (probe-file path) "the empty address book is written out at once")
+           (let ((lines (capture-log-lines
+                         (lambda () (bl.net:load-address-book (bl.net:make-address-book) path)))))
+             (is-true (some (lambda (l) (search "Loaded 0 addresses from peers.dat"
+                                                (princ-to-string l)))
+                            lines)
+                      "the next start reads the file this one wrote")))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))

@@ -48,6 +48,25 @@ specific buckets); falls back to the Lisp PRNG only if /dev/urandom is absent."
         (dotimes (i 32) (setf (aref k i) (random 256))))
     k))
 
+(defvar *deterministic-addrman* nil
+  "Core's `-test=addrman' (HasTestOption(args, \"addrman\"), addrdb.cpp:199):
+an address book made while this is true is keyed by uint256{1} instead of a
+random secret (AddrManImpl's nKey, addrman.cpp:108-110), so its bucket
+placement is reproducible -- Core's functional tests assert exact
+bucket/position pairs and grind addresses that collide under that key
+(rpc_net.py:343-397, :471-600). A test-only option: a predictable key lets
+anyone target our buckets.")
+
+(defun initial-addrman-key ()
+  "The key a new address book is made with: uint256{1} -- a 1 in the first,
+least significant byte -- under *DETERMINISTIC-ADDRMAN*, a fresh random
+secret otherwise (Core AddrManImpl, addrman.cpp:108-110)."
+  (if *deterministic-addrman*
+      (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (setf (aref k 0) 1)
+        k)
+      (make-addrman-key)))
+
 (defun random-siphash-key ()
   "A fresh per-process SipHash key as (K0 . K1), two 64-bit words drawn from
 the OS CSPRNG -- Core's `CSipHasher(m_k0, m_k1)' salts, each drawn once from a
@@ -69,7 +88,7 @@ from that binary would share one 'per-process secret'."
 (defstruct address-book
   "Bitcoin Core-style address manager: new/tried buckets keyed by a per-node
 secret, source-group spreading, and test-before-evict tried promotion."
-  (key (make-addrman-key) :type (simple-array (unsigned-byte 8) (32)))
+  (key (initial-addrman-key) :type (simple-array (unsigned-byte 8) (32)))
   (next-id 0 :type fixnum)
   (info (make-hash-table :test 'eql) :type hash-table)         ; id -> peer-address
   (addr-map (make-hash-table :test 'equalp) :type hash-table)  ; 18-byte key -> id
@@ -101,8 +120,9 @@ secret, source-group spreading, and test-before-evict tried promotion."
 
 (defun addrman-cheap-hash (&rest parts)
   "First 8 bytes (little-endian uint64) of hash256 over the concatenation of
-PARTS (byte vectors). Bitcoin Core's HashWriter().GetCheapHash(); only internal
-consistency matters (the key is a per-node secret), not byte-compat with Core."
+PARTS (byte vectors). Bitcoin Core's HashWriter().GetCheapHash() (hash.h),
+byte-compatible when PARTS are serialized as Core's are: with a deterministic
+key (-test=addrman) Core's functional tests assert exact bucket positions."
   (let* ((total (reduce #'+ parts :key #'length))
          (buf (make-array total :element-type '(unsigned-byte 8)))
          (off 0))
@@ -289,11 +309,31 @@ Asking the dial predicate there answered `ipv4'."
   "The netgroup key for record PA (network-typed)."
   (net-group-key (peer-address-ip pa) (peer-address-network pa)))
 
+(defun %ser-vector (bytes)
+  "BYTES as Core serializes a std::vector<unsigned char> into a HashWriter:
+a CompactSize length, then the bytes (serialize.h). Every group and address
+key below is such a vector, so the hash commits to its length too."
+  (let ((n (length bytes)))
+    (concatenate '(simple-array (unsigned-byte 8) (*))
+                 (cond ((< n 253) (vector n))
+                       (t (vector 253 (ldb (byte 8 0) n) (ldb (byte 8 8) n))))
+                 bytes)))
+
+(defun peer-address-hash-key (pa)
+  "Core CService::GetKey for PA (netaddress.cpp:895-901) as the vector the
+bucket hashes serialize: GetAddrBytes -- the 16-byte V1 form for IPv4/IPv6,
+the raw address for every other network -- then the port, most significant
+byte first. PEER-ADDRESS-KEY is the same with our network-id byte in front,
+which Core's key does not have."
+  (%ser-vector (subseq (peer-address-key pa) 1)))
+
 (defun tried-bucket (book pa)
-  "Tried-table bucket for PA (Core GetTriedBucket)."
+  "Tried-table bucket for PA (Core AddrInfo::GetTriedBucket, addrman.cpp:48-53):
+every input serialized as Core's HashWriter does, so a deterministic addrman
+(-test=addrman) places an address where Core's does."
   (let* ((key (address-book-key book))
-         (akey (peer-address-key pa))
-         (group (peer-address-group pa))
+         (akey (peer-address-hash-key pa))
+         (group (%ser-vector (peer-address-group pa)))
          (h1 (addrman-cheap-hash key akey))
          (h2 (addrman-cheap-hash
               key group (int-to-le-bytes
@@ -301,9 +341,11 @@ Asking the dial predicate there answered `ipv4'."
     (mod h2 +addrman-tried-bucket-count+)))
 
 (defun new-bucket (book pa source-group)
-  "New-table bucket for PA learned from SOURCE-GROUP (Core GetNewBucket)."
+  "New-table bucket for PA learned from SOURCE-GROUP (Core
+AddrInfo::GetNewBucket, addrman.cpp:55-61), serialized as Core's HashWriter."
   (let* ((key (address-book-key book))
-         (group (peer-address-group pa))
+         (group (%ser-vector (peer-address-group pa)))
+         (source-group (%ser-vector source-group))
          (h1 (addrman-cheap-hash key group source-group))
          (h2 (addrman-cheap-hash
               key source-group (int-to-le-bytes
@@ -311,8 +353,10 @@ Asking the dial predicate there answered `ipv4'."
     (mod h2 +addrman-new-bucket-count+)))
 
 (defun bucket-position-akey (book akey new-p bucket)
-  "Slot within BUCKET for the address whose 18-byte key is AKEY. Split out so a
-scan over all buckets (MakeTried) computes AKEY once instead of per bucket."
+  "Slot within BUCKET for the address whose serialized Core key is AKEY
+(PEER-ADDRESS-HASH-KEY; Core AddrInfo::GetBucketPosition, addrman.cpp:63-67).
+Split out so a scan over all buckets (MakeTried) computes AKEY once instead of
+per bucket."
   (let ((marker (make-array 1 :element-type '(unsigned-byte 8)
                               :initial-element (if new-p 78 75))))  ; 'N' / 'K'
     (mod (addrman-cheap-hash (address-book-key book) marker
@@ -322,7 +366,7 @@ scan over all buckets (MakeTried) computes AKEY once instead of per bucket."
 (defun bucket-position (book pa new-p bucket)
   "Slot within BUCKET for PA (Core GetBucketPosition). Depends only on the
 address + bucket + table, so MakeTried can scan all buckets at this position."
-  (bucket-position-akey book (peer-address-key pa) new-p bucket))
+  (bucket-position-akey book (peer-address-hash-key pa) new-p bucket))
 
 ;;;; Quality (Core IsTerrible / GetChance)
 
@@ -410,7 +454,7 @@ IPv4/IPv6 from the 16-byte form), or NIL."
 incumbent back to a new bucket."
   (let ((nt (address-book-new-table book))
         (id (peer-address-id pa))
-        (akey (peer-address-key pa)))
+        (akey (peer-address-hash-key pa)))
     ;; Remove from every new bucket (scan by position — independent of source;
     ;; AKEY is computed once and reused across all 1024 buckets).
     (dotimes (b +addrman-new-bucket-count+)
@@ -851,13 +895,19 @@ only bucket NUMBERS need persisting."
   "Load BOOK from PATH. On a missing/corrupt/incompatible file, rename it to
 PATH.bak and leave BOOK empty (Bitcoin Core LoadAddrman). Returns T if entries
 were loaded, NIL otherwise."
-  ;; ⚠️ Core reports a count even when there is nothing to load: DeserializeFileDB
-  ;; throwing DbNotFoundError leaves an empty addrman and the line still says
-  ;; "Loaded 0 addresses from peers.dat" (addrdb.cpp:207-211). A fresh datadir is
-  ;; the ordinary case and feature_addrman.py greps for exactly that. Same shape
-  ;; as the banlist gap: absence is a RESULT, not a reason to say nothing.
+  ;; A missing file is not an empty load: Core's DeserializeFileDB throws
+  ;; DbNotFoundError, LoadAddrman says so in its own words and writes the
+  ;; (empty) address book out at once (addrdb.cpp:208-212), and the functional
+  ;; framework waits for exactly that line whenever it deletes peers.dat
+  ;; (test_framework.py:540-544, rpc_net.py:343). "Loaded 0 addresses" is what
+  ;; Core logs on the NEXT start, reading the file this one wrote
+  ;; (feature_addrman.py:65, feature_config_args.py:307).
   (unless (probe-file path)
-    (bl.log:log-info "Loaded 0 addresses from peers.dat")
+    (bl.log:log-info "Creating peers.dat because the file was not found (\"~A\")"
+                     (namestring path))
+    (handler-case (save-address-book book path)
+      (error (c)
+        (bl.log:log-warn "Failed to write a new peers.dat: ~A" c)))
     (return-from load-address-book nil))
   (flet ((backup ()
            (ignore-errors

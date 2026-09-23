@@ -244,6 +244,7 @@ headerssync.cpp. src/networking/.")
    #:key-id-network
    #:save-address-book
    #:load-address-book
+   #:*deterministic-addrman*
    #:peers-dat-path
    #:ipv4-to-mapped-ipv6
    #:ip-bytes-to-string

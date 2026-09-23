@@ -12440,3 +12440,41 @@ The same input WITH its amount signs (the control)."
         (is (equal (format nil "Missing amount for CTxOut(nValue=21000000.00000000, scriptPubKey=~A)"
                            (subseq (bl.crypto:bytes-to-hex spk) 0 30))
                    (cdr err)))))))
+
+(test addpeeraddress-under-a-deterministic-addrman-collides-where-cores-does
+  "rpc_net.py:339-397 restarts a node with -test=addrman -- Core keys its
+addrman with uint256{1} (AddrManImpl, addrman.cpp:108-110) -- and replays
+addresses Core's own bucketing places: 1.2.5.45 is GROUND to land in the tried
+slot 1.2.3.4 holds, so its promotion must fail with Core's
+`failed-adding-to-tried' and leave it in the new table. That only happens when
+every bucket hash serializes its inputs as Core's HashWriter does
+(addrman.cpp:48-67: the CompactSize-prefixed address key and group vectors,
+the 64-bit modulus, the 32-bit bucket). Ours hashed a network byte plus the raw
+bytes, so no Core-ground collision could ever reproduce. A repeat address is
+refused with Core's `failed-adding-to-new' (rpc/net.cpp:1023-1025), which ours
+left out."
+  (let* ((bl.net:*deterministic-addrman* t)
+         (node (make-test-node)))
+    (setf (bl:node-address-book node) (bl.net:make-address-book))
+    (flet ((add (address tried)
+             (bl.rpc:dispatch-rpc-method node "addpeeraddress"
+                                         (list address 8333 tried)))
+           (field (reply key) (cdr (assoc key reply :test #'string=)))
+           (counts ()
+             (let ((all (cdr (assoc "all_networks"
+                                    (bl.rpc:dispatch-rpc-method node "getaddrmaninfo" nil)
+                                    :test #'string=))))
+               (list (cdr (assoc "new" all :test #'string=))
+                     (cdr (assoc "tried" all :test #'string=))))))
+      (is (eq t (field (add "1.0.0.0" nil) "success")))
+      (let ((again (add "1.0.0.0" nil)))
+        (is (eq (bl.rpc:json-bool nil) (field again "success")))
+        (is (equal "failed-adding-to-new" (field again "error"))))
+      (is (eq t (field (add "1.2.3.4" t) "success")) "control: a free tried slot")
+      (let ((collision (add "1.2.5.45" t)))
+        (is (equal "failed-adding-to-tried" (field collision "error"))
+            "the address Core grinds to collide in the tried table collides here too")
+        (is (eq (bl.rpc:json-bool nil) (field collision "success"))))
+      (is (equal '(2 1) (counts)) "the colliding address stays in the new table")
+      (is (eq t (field (add "2.0.0.0" nil) "success")))
+      (is (equal '(3 1) (counts))))))

@@ -991,7 +991,9 @@ collision test), and reporting success for that would misinform the test."
                   :last-seen (bl.ser:get-unix-time)))
              (added (bl.net:address-book-add book pa)))
         (cond
-          ((not added) `(("success" . ,(json-bool nil))))
+          ;; Core pushes the reason for either refusal (rpc/net.cpp:1014-1025).
+          ((not added) `(("success" . ,(json-bool nil))
+                         ("error" . "failed-adding-to-new")))
           ((not tried) `(("success" . ,(json-bool t))))
           ((bl.net:address-book-good
             book bytes port (bl.ser:get-unix-time) net)

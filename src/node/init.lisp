@@ -234,13 +234,12 @@ directory lock (see %INIT-LOCK-AND-BANNER)."
 
 
 (alexandria:define-constant +test-options+
-    '("bip94" "reindex_after_failure_noninteractive_yes")
+    '("addrman" "bip94" "reindex_after_failure_noninteractive_yes")
   :test #'equal
-  :documentation "The values -test=<option> is honoured for, a subset of Core's
-TEST_OPTIONS_DOC (common/args.cpp:743-747). Core's remaining one -- `addrman'
- (a deterministic addrman) -- is deliberately absent: an option we cannot honour
-must warn like any other unrecognised one rather than be accepted and silently
-ignored, which is what makes -test=bip94 mean something.")
+  :documentation "The values -test=<option> is honoured for: all of Core's
+TEST_OPTIONS_DOC (common/args.cpp:743-747). Any other value warns like any
+unrecognised option rather than being accepted and silently ignored, which is
+what makes -test=bip94 mean something.")
 
 (defvar *test-options* '()
   "The -test=<option> values this run was given (Core's ArgsManager -test list,
@@ -259,7 +258,14 @@ ReadRegTestArgs). Core reads -test with GetArgs, so it is a LIST and every
 value is a separate switch; it is an ERROR off regtest and a WARNING for a
 value the node does not know."
   (setf bl.chain:*enforce-bip94-on-regtest* nil
-        *test-options* options)
+        *test-options* options
+        ;; -test=addrman: the address book is keyed by uint256{1} (Core
+        ;; LoadAddrman's HasTestOption(args, "addrman"), addrdb.cpp:199).
+        ;; Assigned on every start, so a restart in the same image returns to
+        ;; a random key.
+        bl.net:*deterministic-addrman* (and (member "addrman" options
+                                                    :test #'string=)
+                                            t))
   (when options
     (unless (eq network :regtest)
       (config-error "-test=<option> can only be used with regtest"))
