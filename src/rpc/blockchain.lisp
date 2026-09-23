@@ -438,14 +438,16 @@ the FIRST real transaction's coins."
 (defun %block-tx-undos (block)
   "BLOCK's undo data grouped per non-coinbase transaction, or NIL when it is not
 available. Never signals: a pruned or missing undo record means the fee and
-prevout fields are absent, which is what Core reports for a pruned block."
+prevout fields are absent, which is what Core reports for a pruned block.
+The second value is Core's ReadBlockUndo verdict -- NIL when the record could
+not be read -- which a coinbase-only block's empty record does not share."
   (handler-case
-      (let* ((hash (bl.ser:block-header-hash
-                    (bl.ser:bitcoin-block-header block)))
-             (undo (bl.val:get-undo-data hash)))
-        (and undo
-             (bl.store:block-undo-from-spent-utxos block undo)))
-    (error () nil)))
+      (let ((hash (bl.ser:block-header-hash
+                   (bl.ser:bitcoin-block-header block))))
+        (multiple-value-bind (undo readable) (bl.val:get-undo-data hash)
+          (values (and undo (bl.store:block-undo-from-spent-utxos block undo))
+                  readable)))
+    (error () (values nil nil))))
 
 (defun %block-on-active-chain-p (entry chain-state)
   "T if ENTRY is the block at its height on the active chain."
@@ -532,8 +534,18 @@ prevout object per input."
      ;; blockheaderToJSON, so genesis omits previousblockhash here too.
      (%previousblockhash-field entry header)
      `(("tx" . ,(if include-tx-details
-                    (let ((undo (and include-tx-details
-                                     (%block-tx-undos block))))
+                    (multiple-value-bind (undo readable) (%block-tx-undos block)
+                      ;; Core reads the undo only where the index says it is
+                      ;; there (BLOCK_HAVE_UNDO on a block not pruned) and
+                      ;; THROWS when that read fails (rpc/blockchain.cpp:
+                      ;; 225-230); only a block without undo data renders
+                      ;; without fees. Ours rendered a read failure the same
+                      ;; way, and rpc_blockchain.py:742 -- rev00000.dat moved
+                      ;; away -- got a block where Core raises.
+                      (when (and entry (bl.store:block-index-entry-undo-pos entry)
+                                 (not readable))
+                        (error 'rpc-error :code +rpc-internal-error+
+                                          :message "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."))
                       (loop for tx in txs
                             for i from 0
                             collect (tx-to-json tx network

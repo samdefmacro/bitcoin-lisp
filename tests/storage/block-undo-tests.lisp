@@ -320,6 +320,39 @@ GET-UNDO-DATA answers it as a second value."
           (is-false (nth-value 0 (bl.val:get-undo-data spender-hash))
                     "the undo cache served a record that is no longer on disk"))))))
 
+(test getblock-with-details-fails-when-the-undo-cannot-be-read
+  "Core's getblock at verbosity 2 and 3 reads the undo wherever the index says
+it is there (BLOCK_HAVE_UNDO on a block not pruned) and THROWS -32603 `Undo
+data expected but can't be read. ...' when that read fails
+(rpc/blockchain.cpp:225-230). Ours rendered a failed read like a block without
+undo data -- no fees -- and rpc_blockchain.py:742, which moves rev00000.dat
+away, got a block where Core raises."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (bl.ser:make-bitcoin-block
+                   :header (bl.ser:make-block-header :nonce 7 :bits #x207fffff)
+                   :transactions (bl.ser:bitcoin-block-transactions (%bu-test-block '(2)))))
+           (hash (%undo-store-block store chain-state block 5))
+           (hex (bl.rpc:hash-to-hex hash))
+           (node (bl:make-node :network :regtest)))
+      (bl.val:store-undo-data hash (%bu-spent-for block) 5 :block block)
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-block-store node) store)
+      (flet ((getblock (verbosity)
+               (rpc-error-of (lambda ()
+                               (bl.rpc:dispatch-rpc-method
+                                node "getblock" (list hex verbosity))))))
+        ;; Control: with the rev file in place both verbosities answer.
+        (is (null (getblock 2)))
+        (is (null (getblock 3)))
+        (let ((rev (first (directory (merge-pathnames "**/rev*.dat" dir)))))
+          (is-true rev "no rev file was written")
+          (rename-file rev (make-pathname :name "bogus" :type "dat" :defaults rev))
+          (dolist (v '(2 3))
+            (is (equal '(-32603 . "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event.")
+                       (getblock v))))
+          ;; Verbosity 1 does not read the undo at all.
+          (is (null (getblock 1))))))))
+
 (test undo-round-trips-through-a-rev-file
   "The connect path writes Core's CBlockUndo into the rev file paired with the
 block's blk file, and the disconnect path reads the same triples back.
