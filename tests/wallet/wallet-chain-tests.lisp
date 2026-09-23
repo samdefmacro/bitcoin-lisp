@@ -1294,3 +1294,50 @@ every prune-mode node."
         (is (search "Prune: last wallet synchronisation goes beyond pruned data"
                     (or pruned ""))
             "a node that pruned gave: ~S" pruned)))))
+
+(test importdescriptors-rescan-failure-names-its-cause-and-the-last-failed-block
+  "Core's importdescriptors replaces a request's result when the rescan failed
+to reach its timestamp (wallet/rpc/backup.cpp:417-452). The sentence names the
+request's RAW timestamp (GetImportTimestamp, not the clamped one), the max
+time of the LAST block the scan could not read (RescanFromTime,
+wallet.cpp:1826-1830), and a cause: pruning when blocks have been pruned, an
+in-progress assumeutxo background sync, else corruption. Ours printed the
+clamped timestamp 1, the scan's START block time, and always the corruption
+sentence; wallet_assumeutxo.py:223 reads all three."
+  (with-wallet-chain-node (node "import-rescan-cause")
+    (%wc-mine node 3 (%wc-optrue-address))
+    (bl.rpc:dispatch-rpc-method node "createwallet" (list "wo" t))
+    (let* ((cs (bl:node-chain-state node))
+           (b2 (bl.store:get-block-at-height cs 2))
+           (b2-time-max (loop for e = b2 then (bl.store:block-index-entry-prev-entry e)
+                              while e
+                              maximize (bl.ser:block-header-timestamp
+                                        (bl.store:block-index-entry-header e)))))
+      (bl.store:forget-block-body (bl:node-block-store node)
+                                  (bl.store:block-index-entry-hash b2))
+      (flet ((import-message ()
+               (let* ((req (make-hash-table :test 'equal)))
+                 (setf (gethash "desc" req)
+                       (bl.rpc:dispatch-rpc-method
+                        node "getdescriptorinfo"
+                        (list (format nil "addr(~A)" (%wc-optrue-address))))
+                       (gethash "desc" req) (cdr (assoc "descriptor" (gethash "desc" req)
+                                                       :test #'string=))
+                       (gethash "timestamp" req) 0)
+                 (with-rpc-wallet ("wo")
+                   (let ((row (first (coerce (bl.rpc:dispatch-rpc-method
+                                              node "importdescriptors" (list (list req)))
+                                             'list))))
+                     (cdr (assoc "message" (cdr (assoc "error" row :test #'string=))
+                                 :test #'string=)))))))
+        ;; No background sync, nothing pruned: the corruption sentence.
+        (let ((m (import-message)))
+          (is (search "timestamp 0. There was an error reading a block from time " (or m "")) "got ~S" m)
+          (is (search (format nil "from time ~D," b2-time-max) (or m "")) "got ~S" m)
+          (is (search "could potentially caused by data corruption" (or m ""))))
+        ;; During a background sync: the assumeutxo sentence.
+        (push (bl.store:make-chain-state :target-blockhash (bl.store:best-block-hash cs))
+              (bl:node-chainstates node))
+        (let ((m (import-message)))
+          (is (search "likely caused by an in-progress assumeutxo background sync" (or m ""))
+              "got ~S" m))))))

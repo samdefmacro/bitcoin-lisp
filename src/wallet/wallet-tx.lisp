@@ -1520,12 +1520,15 @@ deserialized (Core's fast variant, wallet.cpp:1868-1914) — the difference
 between hours and minutes on a birthday import. Results are identical; a block
 with no stored filter is read as before.
 
-Returns (values status last-scanned-height last-scanned-hash skipped-count),
-STATUS one of :success / :failure (a block was unreadable or the chain moved
-away) / :user-abort."
+Returns (values status last-scanned-height last-scanned-hash skipped-count
+last-failed-hash), STATUS one of :success / :failure (a block was unreadable
+or the chain moved away) / :user-abort. LAST-FAILED-HASH is Core's
+ScanResult::last_failed_block: the MOST RECENT block that could not be
+scanned, which RescanFromTime reports (wallet.cpp:1826-1830, :1935-1957)."
   (let ((status :success)
         (last-scanned-height nil)
         (last-scanned-hash nil)
+        (last-failed-hash nil)
         (height start-height)
         (block-hash start-hash)
         ;; Gate ONLY on the index existing and being enabled, exactly as Core
@@ -1567,7 +1570,7 @@ away) / :user-abort."
                            chain-state entry)))
                  ;; Segment start reorged away (or no chain): abort as
                  ;; failure so no tx is marked confirmed in a stale block.
-                 (setf status :failure done t))
+                 (setf status :failure done t last-failed-hash block-hash))
                 (t
                  (let* ((tip-height (bl.store:current-height chain-state))
                         (end-height (min tip-height
@@ -1609,7 +1612,7 @@ away) / :user-abort."
                                ((null blk)
                                 ;; Unreadable block: record failure, keep
                                 ;; scanning (Core's could-not-scan branch).
-                                (setf status :failure))
+                                (setf status :failure last-failed-hash ehash))
                                (t
                                 (let ((block-time
                                         (bl.ser:block-header-timestamp
@@ -1661,7 +1664,7 @@ away) / :user-abort."
     ;; SKIPPED is a 4th value so tests (and operators) can confirm the fast
     ;; path actually fired rather than inferring it; all existing callers
     ;; destructure at most three values.
-    (values status last-scanned-height last-scanned-hash skipped)))
+    (values status last-scanned-height last-scanned-hash skipped last-failed-hash)))
 
 (defun request-mempool-transactions (node wallet)
   "Core Chain::requestMempoolTransactions (node/interfaces.cpp:845-852): send
@@ -1705,16 +1708,19 @@ caller holds the rescan reservation."
           (setf start-entry-hash (bl.store:block-index-entry-hash entry)
                 start-entry-height (bl.store:block-index-entry-height entry)))))
     (if start-entry-hash
-        (multiple-value-bind (status last-height last-hash)
+        (multiple-value-bind (status last-height last-hash skipped last-failed)
             (scan-for-wallet-transactions node wallet start-entry-hash
                                           start-entry-height :update update)
-          (declare (ignore last-height last-hash))
+          (declare (ignore last-height last-hash skipped))
           (if (eq status :failure)
-              ;; Core reads the last FAILED block's max time; our scan aborts
-              ;; the segment on failure, so the segment start bounds it.
+              ;; Core reads the LAST failed block's max time
+              ;; (wallet.cpp:1826-1830). Ours read the scan's START block,
+              ;; so wallet_assumeutxo.py:223 got the genesis time where Core
+              ;; names the last block the background sync has not reached.
               (bl.rpc:with-node-lock (node)
                 (let ((chain-state (bl:node-current-chainstate node)))
-                  (+ (%entry-chain-time-max chain-state start-entry-hash)
+                  (+ (%entry-chain-time-max chain-state
+                                            (or last-failed start-entry-hash))
                      +wallet-timestamp-window+ 1)))
               start-time))
         start-time)))
@@ -1748,6 +1754,13 @@ blocks stay in the index, and find-fork-in-active-chain handles them."
                    (bl.store:get-block-index-entry chain-state hash))
                  locator))))
 
+(defun wallet-chain-have-pruned-p (node)
+  "Core interfaces::Chain::havePruned -- BlockManager::m_have_pruned, whether
+block files HAVE been pruned (not whether the node is in prune mode): any
+chainstate with a prune horizon."
+  (some (lambda (cs) (plusp (bl.store:chain-state-pruned-height cs)))
+        (bl:node-chainstates node)))
+
 (defun %attach-chain-missing-data-error (node chain-state tip-height rescan-height)
   "Core's block-data walk in AttachChain (wallet.cpp:3237-3264), run only when
 block data can be MISSING at all -- a pruned node, or one following an
@@ -1779,8 +1792,7 @@ was loaded and then rescanned over blocks the node does not have
       ;; (wallet.cpp:3255): a -prune node that loaded a snapshot and pruned
       ;; nothing yet gives the assumeutxo refusal (wallet_assumeutxo.py:90).
       (when (/= rescan-height block-height)
-        (if (some (lambda (cs) (plusp (bl.store:chain-state-pruned-height cs)))
-                  (bl:node-chainstates node))
+        (if (wallet-chain-have-pruned-p node)
             "Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)"
             (format nil "Error loading wallet. Wallet requires blocks to be downloaded, and software does not currently support loading wallets while blocks are being downloaded out of order when using assumeutxo snapshots. Wallet should be able to load successfully after node sync reaches height ~D"
                     block-height))))))

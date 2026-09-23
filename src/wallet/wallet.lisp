@@ -2753,6 +2753,18 @@ pubkey providers. Now in-session state matches post-reload state."
     (wallet-maybe-update-birth-time wallet timestamp)
     spkm))
 
+(defun %rescan-failure-cause (node)
+  "The sentence importdescriptors appends to a rescan failure, by cause
+(wallet/rpc/backup.cpp:437-448): pruning when block files HAVE been pruned, an
+in-progress assumeutxo background sync, else corruption. Ours always said
+corruption; wallet_assumeutxo.py:223 reads the assumeutxo one."
+  (cond ((wallet-chain-have-pruned-p node)
+         " This error could be caused by pruning or data corruption (see bitcoind log for details) and could be dealt with by downloading and rescanning the relevant blocks (see -reindex option and rescanblockchain RPC).")
+        ((bl:node-historical-chainstate node)
+         " This error is likely caused by an in-progress assumeutxo background sync. Check logs or getchainstates RPC for assumeutxo background sync progress and try again later.")
+        (t
+         " This error could potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option).")))
+
 (defun %import-timestamp (data now)
   "Core GetImportTimestamp: a number, or the string \"now\" meaning the tip's
 median-time-past."
@@ -2981,8 +2993,11 @@ rescan-failed error."
                               ;; A bad timestamp throws out of the whole RPC —
                               ;; Core runs GetImportTimestamp outside the
                               ;; per-request try block (backup.cpp:392).
-                              (let ((timestamp (max (%import-timestamp request now) 1)))
-                                (push timestamp timestamps)
+                              (let* ((raw (%import-timestamp request now))
+                                     (timestamp (max raw 1)))
+                                ;; The RAW value is what Core's response
+                                ;; compares and prints (backup.cpp:427-436).
+                                (push raw timestamps)
                                 (when (< timestamp lowest-timestamp)
                                   (setf lowest-timestamp timestamp))
                                 (let ((result (%process-descriptor-import
@@ -3021,8 +3036,9 @@ rescan-failed error."
                                   ("error"
                                    . (("code" . ,bl.rpc:+rpc-misc-error+)
                                       ("message"
-                                       . ,(format nil "Rescan failed for descriptor with timestamp ~D. There was an error reading a block from time ~D, which is after or within ~D seconds of key creation, and could contain transactions pertaining to the desc. As a result, transactions and coins using this desc may not appear in the wallet. This error could potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."
+                                       . ,(format nil "Rescan failed for descriptor with timestamp ~D. There was an error reading a block from time ~D, which is after or within ~D seconds of key creation, and could contain transactions pertaining to the desc. As a result, transactions and coins using this desc may not appear in the wallet.~A"
                                                   timestamp
                                                   (- scanned-time +wallet-timestamp-window+ 1)
-                                                  +wallet-timestamp-window+))))))))))))
+                                                  +wallet-timestamp-window+
+                                                  (%rescan-failure-cause node)))))))))))))
       (wallet-release-rescan wallet))))
