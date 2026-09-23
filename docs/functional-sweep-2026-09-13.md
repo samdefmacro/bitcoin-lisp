@@ -1069,13 +1069,30 @@ Binary `632abe24` (the whole round), classification in
 | `bc65804a` round 4 | 100 | 137 | 3 | 23 |
 | `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
 | `bdfd8434` round 6 | 193 | 59 | 2 | 9 |
-<!-- sweep11: 632abe24 row -->
+| `632abe24` round 7 | **204** | **48** | **2** | 9 |
 
-The batches' oracle runs recorded nine tests going FAIL → PASS:
-`p2p_opportunistic_1p1c`, `p2p_tx_download`, `feature_addrman`,
-`feature_anchors`, `rpc_generate`, `feature_chain_tiebreaks`, `rpc_net`,
-`feature_asmap` and `feature_pruning`; the sweep is the verification of
-record, and the placeholder row above is filled when it finishes.
+Binary `632abe24` (four staggered batches, the flips and time-outs rerun
+serially with a 900 s cap), classification in
+`docs/functional-sweep-2026-09-13/after-632abe24.tsv`. Twelve tests went to
+PASS (`feature_addrman`, `feature_asmap`, `feature_chain_tiebreaks`,
+`feature_pruning`, `mempool_package_rbf`, `p2p_headers_sync_with_minchainwork`,
+`p2p_opportunistic_1p1c`, `p2p_sendheaders`, `p2p_tx_download`,
+`rpc_dumptxoutset`, `rpc_generate`, `rpc_net`; `feature_anchors` had passed
+in a batch's oracle run and passed here too, so it is not a flip). One left
+it: `p2p_feefilter` `:72`, a forcerelay peer receiving a feefilter. The gate
+had never existed (Core's MaybeSendFeefilter returns for ForceRelay,
+net_processing.cpp:5632); the faster pump of `4484d829` sent the message
+before the test's poll instead of after, which is how an absence assertion
+had passed for a year. `57c75404` adds the gate, on the binary after this
+sweep. `interface_zmq` went from a failure at `:57` to a time-out at 900 s,
+and `feature_block` from a time-out to a failure at its `send_blocks` helper
+(`:1450`), the shape it had in Round 6; `feature_proxy` still times out.
+
+Deployed: both live nodes to `632abe24` (testnet4, a 15-minute soak, then
+mainnet). Each migrated its peers.dat to Core's format on the first start
+(testnet4 kept 35,153 of 49,219 entries, mainnet 42,466 of 66,513: entries
+Core's CheckAddrman would refuse are dropped), and testnet4 now enforces
+BIP 30 at every height.
 
 ### Decisions recorded in Round 7
 
@@ -1084,9 +1101,8 @@ record, and the placeholder row above is filled when it finishes.
   headers and serve buckets (`0eb2b5e5`) are removed, reversing Round 6's
   "the per-peer tx rate-limit bucket stays". The per-message limits, the
   addr token bucket that drops addresses and the send-buffer pause remain.
-  The rationale lives in the two commit bodies; the manual's p2p section
-  still says a peer's traffic is "metered by the token bucket per message
-  class" and needs updating.
+  The rationale lives in the two commit bodies, and the manual's p2p
+  invariants say the same since `88d96f06`.
 - **`-privatebroadcast` refuses sendrawtransaction rather than queueing** --
   the private-broadcast mechanism is not ported, and the ordinary path would
   announce from this node's own address, the act the option exists to
