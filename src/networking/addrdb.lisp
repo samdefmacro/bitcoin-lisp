@@ -68,21 +68,14 @@ and starts afresh instead of refusing to start."))
 (defun %addrdb-fail (ios control &rest args)
   (error 'addrdb-read-error :message (apply #'format nil control args) :ios ios))
 
-;;;; A bounds-checked reader over the file's bytes
-
-(defstruct (%addrdb-reader (:constructor %make-addrdb-reader (data)))
-  (data #() :type (simple-array (unsigned-byte 8) (*)))
-  (pos 0 :type fixnum))
+;;;; Reading the file's bytes: the shared byte-reader, with Core's EOF wording
 
 (defun %rd-bytes (rd n)
-  (let* ((data (%addrdb-reader-data rd))
-         (pos (%addrdb-reader-pos rd))
-         (end (+ pos n)))
-    (when (> end (length data))
-      ;; AutoFile::read (streams.cpp:30-33).
-      (%addrdb-fail t "AutoFile::read: end of file"))
-    (setf (%addrdb-reader-pos rd) end)
-    (subseq data pos end)))
+  "N bytes from byte-reader RD, or AutoFile::read's end-of-file failure
+(streams.cpp:30-33) when fewer remain."
+  (when (> (+ (bl.bytes:br-pos rd) n) (length (bl.bytes:br-data rd)))
+    (%addrdb-fail t "AutoFile::read: end of file"))
+  (bl.bytes:br-read-bytes rd n))
 
 (defun %rd-uint (rd n)
   "An N-byte little-endian unsigned integer."
@@ -94,25 +87,21 @@ and starts afresh instead of refusing to start."))
   (let ((u (%rd-uint rd n)))
     (if (logbitp (1- (* 8 n)) u) (- u (ash 1 (* 8 n))) u)))
 
-(defun %rd-compact-size (rd &key (range-check t))
-  "Core ReadCompactSize (serialize.h:330-360)."
-  (let* ((first (%rd-uint rd 1))
-         (value (cond ((< first 253) first)
-                      ((= first 253)
-                       (let ((v (%rd-uint rd 2)))
-                         (when (< v 253) (%addrdb-fail t "non-canonical ReadCompactSize()"))
-                         v))
-                      ((= first 254)
-                       (let ((v (%rd-uint rd 4)))
-                         (when (< v #x10000) (%addrdb-fail t "non-canonical ReadCompactSize()"))
-                         v))
-                      (t
-                       (let ((v (%rd-uint rd 8)))
-                         (when (< v #x100000000) (%addrdb-fail t "non-canonical ReadCompactSize()"))
-                         v)))))
-    (when (and range-check (> value #x02000000))
-      (%addrdb-fail t "ReadCompactSize(): size too large"))
-    value))
+(defun %rd-count (rd &key (range-check t))
+  "A CompactSize through BR-READ-COMPACT-SIZE (Core ReadCompactSize,
+serialize.h:330-360), its failures in Core's words."
+  (let* ((pos (bl.bytes:br-pos rd))
+         (data (bl.bytes:br-data rd))
+         (first (and (< pos (length data)) (aref data pos)))
+         (width (cond ((null first) 1) ((< first 253) 1) ((= first 253) 3)
+                      ((= first 254) 5) (t 9))))
+    (when (> (+ pos width) (length data))
+      (%addrdb-fail t "AutoFile::read: end of file"))
+    (handler-case (bl.bytes:br-read-compact-size rd :range-check range-check)
+      (error (e)
+        (if (search "non-canonical" (princ-to-string e))
+            (%addrdb-fail t "non-canonical ReadCompactSize()")
+            (%addrdb-fail t "ReadCompactSize(): size too large"))))))
 
 ;;;; CNetAddr / CService / CAddress / AddrInfo codecs
 
@@ -149,7 +138,7 @@ address this book cannot hold (an unknown network, an embedded encoding, an
 unspecified address) -- Core reads such an address as invalid and its entry
 is dropped on load rather than failing the file."
   (let* ((id (%rd-uint rd 1))
-         (len (%rd-compact-size rd :range-check nil)))
+         (len (%rd-count rd :range-check nil)))
     (when (> len +max-addrv2-size+)
       (%addrdb-fail t "Address too long: ~D > ~D" len +max-addrv2-size+))
     (let ((net (key-id-network id))
@@ -219,7 +208,7 @@ ser_params: whether ADDRv2 is permitted at all."
                        (t (%addrdb-fail t "Unsupported CAddress disk format version"))))
          (time (%rd-uint rd 4))
          (services (if use-v2
-                       (%rd-compact-size rd :range-check nil)
+                       (%rd-count rd :range-check nil)
                        (%rd-uint rd 8))))
     (multiple-value-bind (net ip) (if use-v2 (%read-netaddr-v2 rd) (%read-netaddr-v1 rd))
       (let ((port (let ((b (%rd-bytes rd 2))) (logior (ash (aref b 0) 8) (aref b 1)))))
@@ -517,11 +506,11 @@ both (addrdb.cpp:38-50)."
   "Core DeserializeDB (addrdb.cpp:101-124) over the file's BYTES into the empty
 BOOK: the network's message start, the AddrMan, and the checksum over what was
 read."
-  (let ((rd (%make-addrdb-reader bytes)))
+  (let ((rd (bl.bytes:make-byte-reader-from bytes)))
     (unless (equalp (%rd-bytes rd 4) (bl.chain:network-magic network))
       (%addrdb-fail nil "Invalid network magic number"))
     (unserialize-address-book rd book)
-    (let* ((consumed (%addrdb-reader-pos rd))
+    (let* ((consumed (bl.bytes:br-pos rd))
            (expected (bl.crypto:hash256 (subseq bytes 0 consumed))))
       (unless (equalp (%rd-bytes rd 32) expected)
         (%addrdb-fail nil "Checksum mismatch, data corrupted")))
@@ -586,7 +575,7 @@ entry count, or signals an ADDRDB-READ-ERROR."
     (let ((payload (subseq data 0 (- file-size 4))))
       (unless (equalp (bl.kv:compute-crc32 payload) (subseq data (- file-size 4)))
         (%addrdb-fail nil "legacy peers.dat CRC32 mismatch"))
-      (let* ((rd (%make-addrdb-reader payload))
+      (let* ((rd (bl.bytes:make-byte-reader-from payload))
              (magic (%rd-bytes rd 4))
              (version (%rd-uint rd 4)))
         (declare (ignore magic))
@@ -756,11 +745,11 @@ SerializeDB)."
 peer-address records, an address this node cannot hold left out. Signals
 ADDRDB-READ-ERROR for a wrong network, a short file or a bad checksum -- which
 ReadAnchors turns into no anchors at all."
-  (let ((rd (%make-addrdb-reader bytes)))
+  (let ((rd (bl.bytes:make-byte-reader-from bytes)))
     (unless (equalp (%rd-bytes rd 4) (bl.chain:network-magic network))
       (%addrdb-fail nil "Invalid network magic number"))
     (let ((anchors
-            (loop repeat (%rd-compact-size rd)
+            (loop repeat (%rd-count rd)
                   for (net ip port services time)
                     = (multiple-value-list (%read-caddress-disk rd t))
                   when (%addrinfo-valid-p net ip)
@@ -768,7 +757,7 @@ ReadAnchors turns into no anchors at all."
                                                :services services :last-seen time))))
       ;; The hash covers what was read, so take it BEFORE reading the
       ;; checksum itself.
-      (let ((expected (bl.crypto:hash256 (subseq bytes 0 (%addrdb-reader-pos rd)))))
+      (let ((expected (bl.crypto:hash256 (subseq bytes 0 (bl.bytes:br-pos rd)))))
         (unless (equalp (%rd-bytes rd 32) expected)
           (%addrdb-fail nil "Checksum mismatch, data corrupted")))
       anchors)))
