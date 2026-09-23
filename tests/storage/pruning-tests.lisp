@@ -674,6 +674,17 @@ Manual mode (-prune=1) prunes nothing at startup."
                                       'bl:prune-blockstore-at-startup)))))
       (cleanup-test-dir base-path))))
 
+(test fastprune-lowers-the-regtest-prune-after-height
+  "Core's regtest parameters take -fastprune: nPruneAfterHeight is 100 with it
+and 1000 without (kernel/chainparams.cpp:604); no other network's does.
+feature_index_prune.py:100 prunes a -fastprune chain at height 700, which
+pruneblockchain refused as too short while ours kept 1000."
+  (let ((bl.store:*fast-prune* nil))
+    (is (= 1000 (bl.store:prune-after-height :regtest))))
+  (let ((bl.store:*fast-prune* t))
+    (is (= 100 (bl.store:prune-after-height :regtest)))
+    (is (= 100000 (bl.store:prune-after-height :mainnet)))))
+
 ;;;; Test: prune-blocks-to-height respects min-blocks-to-keep
 
 (test prune-respects-min-blocks-retention

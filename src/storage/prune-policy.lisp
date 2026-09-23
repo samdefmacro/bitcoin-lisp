@@ -37,8 +37,13 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
   (and *prune-target-mib* (>= *prune-target-mib* 550)))
 
 (defun prune-after-height (network)
-  "Return the minimum chain height before pruning begins for NETWORK."
-  (bl.chain:chain-params-prune-after-height (bl.chain:find-chain-params network)))
+  "Return the minimum chain height before pruning begins for NETWORK. On
+regtest -fastprune lowers it from 1000 to 100, as Core's regtest parameters
+do (nPruneAfterHeight = opts.fastprune ? 100 : 1000,
+kernel/chainparams.cpp:604); no other network takes the option."
+  (if (and (eq network :regtest) *fast-prune*)
+      100
+      (bl.chain:chain-params-prune-after-height (bl.chain:find-chain-params network))))
 
 (defun prune-target-bytes (&optional (chainstates 1))
   "The automatic-prune target in bytes shared by CHAINSTATES chainstates
