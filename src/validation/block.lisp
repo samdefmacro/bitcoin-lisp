@@ -3794,7 +3794,7 @@ its descendants with it, unless the verdict is mutation-class (see
 *MUTATED-BLOCK-ERRORS*) -- Core InvalidBlockFound, which makes the same
 exception for BLOCK_MUTATED. A CheckBlock failure marks nothing: Core's
 ProcessNewBlock runs CheckBlock BEFORE AcceptBlock and skips AcceptBlock when it
-fails, so "we will never mark a block as invalid if CheckBlock() fails"
+fails, so `we will never mark a block as invalid if CheckBlock() fails'
 (validation.cpp:4442-4451) -- CheckBlock reads what a relaying peer can mangle.
 feature_block.py:377 sends b25 on top of b24, refused bad-blk-length, and waits
 for the node to fetch it; a marked b24 made b25's header bad-prevblk. Punishing
