@@ -296,9 +296,6 @@ wipe a 50k-slot ring per block for nothing."
 (defvar *rate-limit-inv* '(50.0 . 200.0)
   "Rate limit for INV messages: (rate-per-sec . burst).")
 
-(defvar *rate-limit-tx* '(10.0 . 50.0)
-  "Rate limit for TX messages: (rate-per-sec . burst).")
-
 (defvar *rate-limit-addr* '(1.0 . 10.0)
   "Rate limit for ADDR/ADDRV2 messages: (rate-per-sec . burst).")
 

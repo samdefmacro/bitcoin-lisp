@@ -318,7 +318,6 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (recon-last-round 0 :type integer)
   ;; DoS protection: per-peer rate limiters
   (rate-limit-inv nil)
-  (rate-limit-tx nil)
   (rate-limit-addr nil)
   (rate-limit-headers nil)
   ;; Shared bucket for serve requests: getheaders/getblocks/getaddr.
@@ -410,7 +409,6 @@ PEER-LOG-NAME. A caller with a reason of its own writes it as Core does,
   "Initialize per-peer rate limiters from global configuration."
   (flet ((rl (config) (bl:make-rate-limiter (car config) (cdr config))))
     (setf (peer-rate-limit-inv peer) (rl bl:*rate-limit-inv*))
-    (setf (peer-rate-limit-tx peer) (rl bl:*rate-limit-tx*))
     (setf (peer-rate-limit-addr peer) (rl bl:*rate-limit-addr*))
     (setf (peer-rate-limit-headers peer) (rl bl:*rate-limit-headers*))
     (setf (peer-rate-limit-serve peer) (rl bl:*rate-limit-serve*)))

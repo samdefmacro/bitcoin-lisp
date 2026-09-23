@@ -1166,46 +1166,50 @@ dropped and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
               (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) txid)
                        "the transaction clears a filter below its real rate"))))))))
 
-(test a-requested-tx-is-never-charged-to-the-tx-rate-limit
-  "Core never disconnects a peer for how MANY transactions it sends. Our tx
-token bucket used to be charged for every tx message before dispatch, so a
-peer answering our own getdatas was dropped once a relay burst passed the
-bucket: feature_fee_estimation.py:283-291 relays 250 transactions between its
-nodes, one logged \"Rate limit exceeded on tx messages\" against the relaying
-peer, and sync_blocks then found a node with no peers at all. The bucket is
-now charged for UNSOLICITED transactions only.
+(test an-unsolicited-transaction-flood-keeps-its-sender-connected
+  "Core never disconnects a peer for how MANY transactions it sends, asked for
+or not: its TX handler (net_processing.cpp:4473-4552) has no count limit, and
+an unsolicited flood is bounded by the orphanage's per-peer DoS scores
+(LimitOrphans, txorphanage.cpp:436-525). Ours disconnected the sender of the
+51st unsolicited transaction, and with it every orphan it had announced:
+p2p_opportunistic_1p1c.py:557 floods from one peer (100 orphans), and its
+sync_with_ping found the peer gone.
 
-Control: with the same empty bucket an unsolicited transaction still
-disconnects its sender."
-  (let ((bl:*rate-limit-tx* '(0.0 . 0.0)))  ; an empty bucket from the start
-    (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
-      (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
-             (txid (bl.ser:transaction-hash tx))
-             (asked (%pr-peer))
-             (stranger (%pr-peer)))
-        (%with-fresh-rejects (rejects)
-          (bl.net:handle-message stranger "tx" (%pr-payload tx)
-                                 (%pr-ctx state utxo mempool rejects))
-          (is (eq :disconnected (bl.net:peer-state stranger))
-              "control: an unsolicited tx on an empty bucket still disconnects")
-          (is-false (bl.mp:mempool-has mempool txid))
-          (is-true (bl.net:tx-request-wanted-p txid asked) "we request it from ASKED")
-          (bl.net:handle-message asked "tx" (%pr-payload tx)
-                                 (%pr-ctx state utxo mempool rejects))
-          (is (eq :ready (bl.net:peer-state asked))
-              "the peer that answered our getdata is not rate-limited")
-          (is-true (bl.mp:mempool-has mempool txid))
-          ;; A noban peer is spared the bucket even for an unsolicited
-          ;; transaction (NetPermissionFlags::NoBan, net_permissions.h:34-36).
-          (with-whitelist (:whitebind bl.net:+perm-noban+)
-            (let ((noban (bl.net:init-peer-rate-limiters
-                          (bl.net:make-peer :address "198.51.100.23" :inbound t
-                                            :state :ready
-                                            :services bl.ser:+node-witness+))))
-              (bl.net:handle-message noban "tx" (%pr-payload tx)
-                                     (%pr-ctx state utxo mempool rejects))
-              (is (eq :ready (bl.net:peer-state noban))
-                  "a noban peer's unsolicited tx is not rate-limited"))))))))
+The flood's orphans stay announced by their sender, and a second peer's
+orphan survives the flood; the transaction a peer answered our getdata with
+is accepted too."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let ((flooder (%pr-peer))
+          (honest (%pr-peer))
+          (pool (bl.mp:mempool-orphan-pool mempool))
+          (flood '()))
+      (%with-fresh-rejects (rejects)
+        (let ((ctx (%pr-ctx state utxo mempool rejects)))
+          (dotimes (i 100)
+            (let* ((missing (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element (1+ (mod i 250))))
+                   (tx (progn (setf (aref missing 0) (floor i 250)
+                                    (aref missing 31) 200)
+                              (%pr-tx (list (cons missing 0)) 1000))))
+              (push tx flood)
+              (bl.net:handle-message flooder "tx" (%pr-payload tx) ctx)))
+          (is (eq :ready (bl.net:peer-state flooder))
+              "a peer that sent 100 unsolicited transactions is still connected")
+          (is (= 100 (bl.mp:orphan-announcements-from-peer pool flooder))
+              "every flooded orphan is held, announced by its sender")
+          (let* ((missing (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element 222))
+                 (child (%pr-tx (list (cons missing 0)) 2000)))
+            (bl.net:handle-message honest "tx" (%pr-payload child) ctx)
+            (dolist (tx flood)
+              (bl.net:handle-message flooder "tx" (%pr-payload tx) ctx))
+            (is-true (bl.mp:orphan-have pool (bl.ser:transaction-wtxid child))
+                     "the honest peer's orphan survives the flood"))
+          ;; Control: a transaction that spends a real coin enters the pool.
+          (let ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000))))
+            (bl.net:handle-message flooder "tx" (%pr-payload tx) ctx)
+            (is-true (bl.mp:mempool-has mempool (bl.ser:transaction-hash tx)))
+            (is (eq :ready (bl.net:peer-state flooder)))))))))
 
 (test a-tx-request-expires-at-its-expiry-not-a-second-later
   "Core stamps a tx request's expiry as request time + GETDATA_TX_INTERVAL

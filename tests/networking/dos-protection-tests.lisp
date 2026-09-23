@@ -69,7 +69,6 @@ run on a loaded machine (2026-09-05)."
     (bl.net:init-peer-rate-limiters peer)
     ;; All rate limiters should be non-nil
     (is (not (null (bl.net::peer-rate-limit-inv peer))))
-    (is (not (null (bl.net::peer-rate-limit-tx peer))))
     (is (not (null (bl.net::peer-rate-limit-addr peer))))
     (is (not (null (bl.net::peer-rate-limit-headers peer))))))
 
@@ -368,7 +367,6 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
   "Default DoS configuration values should be reasonable."
   ;; Rate limits are (rate . burst) cons cells
   (is (consp bl:*rate-limit-inv*))
-  (is (consp bl:*rate-limit-tx*))
   (is (consp bl:*rate-limit-addr*))
   (is (consp bl:*rate-limit-headers*))
   (is (consp bl:*rpc-rate-limit*))
