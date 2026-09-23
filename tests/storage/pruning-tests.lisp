@@ -353,7 +353,8 @@ from pruneblockchain and 0 from getblockchaininfo."
     (declare (ignore block-hashes))
     (unwind-protect
          (let ((node (make-test-node))
-               (bl:*prune-target-mib* 1))
+               (bl:*prune-target-mib* 1)
+               (bl:*prune-after-height* 0))
            (setf (bl:node-chain-state node) chain-state
                  (bl:node-block-store node) block-store)
            (flet ((pruneheight ()
@@ -375,6 +376,51 @@ from pruneblockchain and 0 from getblockchaininfo."
                (is (= (1+ answer) (pruneheight))
                    "and pruneheight is the first block still held, one more"))))
       (cleanup-test-dir base-path))))
+
+(test pruneblockchain-answers-in-cores-words
+  "pruneblockchain's refusals are Core's, in Core's order and words
+(rpc/blockchain.cpp:926-958): not in prune mode, a negative height, a chain
+at or below PruneAfterHeight, a height past the tip; and an argument over a
+billion is a block TIME, resolved to the earliest block whose running maximum
+time reaches it less the two-hour TIMESTAMP_WINDOW (FindEarliestAtLeast).
+feature_pruning.py:273-309 asserts each sentence; ours had its own wording
+for the first and none of the others. Mainnet, so genesis is older than
+the fixture's blocks and the running maximum time follows their heights."
+  (with-network (:mainnet)
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (declare (ignore block-hashes))
+    (unwind-protect
+         (let ((node (make-test-node)))
+           (setf (bl:node-chain-state node) chain-state
+                 (bl:node-block-store node) block-store)
+           (flet ((prune (height)
+                    (bl.rpc:dispatch-rpc-method
+                     node "pruneblockchain" (wire-params (list height)))))
+             (let ((bl:*prune-target-mib* nil))
+               (signals-rpc-error
+                   (:code -1 :exact-message "Cannot prune blocks because node is not in prune mode.")
+                 (prune 10)))
+             (let ((bl:*prune-target-mib* 1)
+                   (bl:*prune-after-height* 1000))
+               (signals-rpc-error (:code -8 :exact-message "Negative block height.")
+                 (prune -10))
+               (signals-rpc-error (:code -1 :exact-message "Blockchain is too short for pruning.")
+                 (prune 10)))
+             (let ((bl:*prune-target-mib* 1)
+                   (bl:*prune-after-height* 0))
+               (signals-rpc-error
+                   (:code -8 :exact-message "Blockchain is shorter than the attempted prune height.")
+                 (prune 301))
+               ;; Block h's time is 1231006505 + 600h: a time past the tip's
+               ;; plus the window names no block ...
+               (signals-rpc-error
+                   (:code -8 :exact-message "Could not find block with at least the specified timestamp.")
+                 (prune (+ 1231006505 (* 600 300) 7200 1)))
+               ;; ... and block 10's time plus the window names block 10, so
+               ;; the prune runs to it (the per-block walk deletes 1-9).
+               (is (= 9 (prune (+ 1231006505 (* 600 10) 7200)))))))
+      (cleanup-test-dir base-path)))))
 
 ;;;; Test 5.9: getblockchaininfo pruning fields
 

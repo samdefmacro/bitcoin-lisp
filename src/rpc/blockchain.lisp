@@ -2439,26 +2439,66 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
 
 ;;; --- Pruning Methods ---
 
+(defun %prune-height-parameter (chain-state value)
+  "pruneblockchain's height argument as a height. A value over a billion is
+too high to be a height and is read as a block TIME: the earliest active-chain
+block whose running maximum time reaches VALUE minus Core's two-hour
+TIMESTAMP_WINDOW (rpc/blockchain.cpp:939-948, CChain::FindEarliestAtLeast,
+chain.cpp:59-68)."
+  (if (<= value 1000000000)
+      value
+      (let ((min-time (- value 7200))
+            (entries '())
+            (time-max 0))
+        (loop for e = (bl.store:get-block-index-entry
+                       chain-state (bl.store:best-block-hash chain-state))
+                then (bl.store:block-index-entry-prev-entry e)
+              while e do (push e entries))
+        (dolist (e entries
+                   (error 'rpc-error :code +rpc-invalid-parameter+
+                                     :message "Could not find block with at least the specified timestamp."))
+          (setf time-max (max time-max (bl.ser:block-header-timestamp
+                                        (bl.store:block-index-entry-header e))))
+          (when (>= time-max min-time)
+            (return (bl.store:block-index-entry-height e)))))))
+
 (define-rpc "pruneblockchain" (node params)
   "Prune the blockchain up to a given block height.
 PARAMS: [height]
 Returns the height of the last pruned block."
+  ;; Core's checks and words, in Core's order (rpc/blockchain.cpp:926-958).
   (unless (bl:pruning-enabled-p)
     (error 'rpc-error :code +rpc-misc-error+
-                      :message "Cannot prune: pruning is not enabled. Start with :prune 1 or :prune 550+"))
+                      :message "Cannot prune blocks because node is not in prune mode."))
   (let ((target-height (first params)))
-    (unless (and (integerp target-height) (>= target-height 0))
+    (unless (integerp target-height)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid height parameter"))
+    (when (minusp target-height)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Negative block height."))
     ;; Node lock: pruning rewrites the block store + pruned-height cursor
     ;; the sync thread reads when serving/connecting blocks (Core
     ;; pruneblockchain holds cs_main).
     (with-node-lock (node)
      (let* ((chain-state (rpc-get-chain-state node))
-           (block-store (rpc-get-block-store node))
-           (pruned (bl.store:prune-blocks-to-height
-                    block-store chain-state target-height
-                    :on-prune #'bl.val:delete-undo-file)))
+            (block-store (rpc-get-block-store node))
+            (chain-height (bl.store:current-height chain-state))
+            (target-height (%prune-height-parameter chain-state target-height))
+            (pruned
+              (cond
+                ((< chain-height (or bl:*prune-after-height* 0))
+                 (error 'rpc-error :code +rpc-misc-error+
+                                   :message "Blockchain is too short for pruning."))
+                ((> target-height chain-height)
+                 (error 'rpc-error :code +rpc-invalid-parameter+
+                                   :message "Blockchain is shorter than the attempted prune height."))
+                (t
+                 ;; A height inside the last +min-blocks-to-keep+ is clamped
+                 ;; below them, which PRUNE-BLOCKS-TO-HEIGHT does itself.
+                 (bl.store:prune-blocks-to-height
+                  block-store chain-state target-height
+                  :on-prune #'bl.val:delete-undo-file)))))
       (bl:node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
                               pruned target-height)
       ;; Core returns GetPruneHeight(...).value_or(-1) -- the height of the
