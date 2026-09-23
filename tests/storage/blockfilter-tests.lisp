@@ -283,6 +283,47 @@ filter_false_positives keeps the true matches; idle status is null."
          (signals bl.rpc:rpc-error
            (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 3 1))))))))
 
+(test scanblocks-false-positive-check-refuses-a-missing-block
+  "With filter_false_positives, Core re-reads each matching block through
+GetBlockChecked and GetUndoChecked (CheckBlockFilterMatches,
+rpc/blockchain.cpp:2484-2504), so a block whose body is gone is an error in
+CheckBlockDataAvailability's words (:671-684): `Block not available (pruned
+data)' when pruning removed it, `(not fully downloaded)' otherwise. Ours kept
+the filter match unverified and returned it: feature_pruning.py:502 expects
+the pruned-data error from a pruned node."
+  (with-network (:regtest)
+   (let ((node (%bfi-regtest-node)))
+     (let ((bl:*node* node))
+       (let* ((hashes (generate-regtest-blocks node 3))
+              (opts (make-hash-table :test 'equal)))
+         (setf (gethash "filter_false_positives" opts) t)
+         (flet ((scan ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "scanblocks"
+                   (wire-params (list "start" (list "raw(51)") 0 3 "basic" opts)))))
+           ;; CONTROL: every body here, every block verified and returned.
+           (is (= 3 (length (cdr (assoc "relevant_blocks" (scan) :test #'equal)))))
+           ;; Block 2's body goes the way a prune takes it: out of the store,
+           ;; and its index entry loses the data position (Core's HAVE_DATA,
+           ;; which PruneOneBlockFile clears, blockstorage.cpp:264-270).
+           (let ((hash (bl.rpc:parse-hex-hash (second hashes))))
+             (is-true (bl.store:forget-block-body (bl:node-block-store node) hash))
+             (setf (bl.store:block-index-entry-data-pos
+                    (bl.store:get-block-index-entry (bl:node-chain-state node) hash))
+                   nil))
+           (signals-rpc-error
+               (:code -1 :exact-message "Block not available (not fully downloaded)")
+             (scan))
+           (let ((bl:*prune-target-mib* 550))
+             (setf (bl.store:chain-state-pruned-height (bl:node-chain-state node)) 2)
+             (unwind-protect
+                  (signals-rpc-error
+                      (:code -1 :exact-message "Block not available (pruned data)")
+                    (scan))
+               (setf (bl.store:chain-state-pruned-height
+                      (bl:node-chain-state node))
+                     0)))))))))
+
 (test blockfilterindex-backfill-seeks-first-indexable
   "Backfilling an empty index over an UNPRUNED chain first indexes GENESIS from
 chain parameters (its body is never stored), anchoring the header chain per

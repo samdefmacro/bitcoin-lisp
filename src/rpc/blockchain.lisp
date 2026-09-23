@@ -2659,9 +2659,15 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
                             (bl.store:block-filter-siphash-keys hash)
                           (when (bl.store:gcs-filter-match-any
                                  filter k0 k1 needle-list)
+                            ;; Core re-reads the block through GetBlockChecked
+                            ;; (CheckBlockFilterMatches, rpc/blockchain.cpp:
+                            ;; 2484-2504): a missing body is an ERROR in
+                            ;; CheckBlockDataAvailability's words, not a match
+                            ;; kept unverified.
                             (when (or (not fp-check)
                                       (%block-matches-needles-p
-                                       (bl.store:get-block block-store hash)
+                                       (block-body-checked chain-state
+                                                           block-store hash)
                                        hash needles))
                               (push (hash-to-hex hash) relevant))))))))
                 ;; Last fully-scanned height; on abort this is where we stopped.
@@ -2682,9 +2688,9 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
 (defun %block-matches-needles-p (block block-hash needles)
   "T if BLOCK genuinely touches any script in NEEDLES (false-positive check).
 Re-derives the block's basic-filter element set (outputs + spent prevouts, the
-latter from undo data when available). When the block body is unavailable
-(pruned), returns T -- we can't verify, so we keep the filter match rather than
-risk a false negative."
+latter from undo data when available). The caller reads BLOCK through
+BLOCK-BODY-CHECKED, which refuses a missing body in Core's words; a NIL here
+is kept as a match rather than risk a false negative."
   (if block
       (let* ((undo (bl.val:get-undo-data block-hash))
              (spent (mapcar (lambda (e) (bl.store:utxo-entry-script-pubkey (third e)))
