@@ -762,6 +762,20 @@ txn-already-known from us."
       (error 'rpc-error :code +rpc-verify-already-in-utxo-set+
                         :message "Transaction outputs already in utxo set"))))
 
+(defun %refuse-private-broadcast ()
+  "sendrawtransaction under -privatebroadcast. Core first refuses when neither
+Tor nor I2P is reachable NOW (rpc/mempool.cpp:115-124, the proxy may have been
+expected from the Tor daemon at start-up), in its words; otherwise it hands
+the transaction to the private-broadcast queue WITHOUT the mempool. That queue
+does not exist here, and the ordinary path would announce the transaction to
+every peer from this node's own address -- what the operator asked us not to
+do -- so the transaction is refused, not broadcast."
+  (unless (or (bl.net:reachable-network-p :torv3) (bl.net:reachable-network-p :i2p))
+    (error 'rpc-error :code +rpc-misc-error+
+                      :message "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly."))
+  (error 'rpc-error :code +rpc-misc-error+
+                    :message "-privatebroadcast is enabled, but this node does not implement private broadcast; the transaction was neither added to the mempool nor broadcast"))
+
 (define-rpc "sendrawtransaction" (node (hex-str))
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
 txid joins the mempool's unbroadcast set and an announcement is queued to every
@@ -797,6 +811,10 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                   (max-fee (feerate-fee
                             (%parse-max-fee-rate params 1)
                             (bl.ser:transaction-vsize tx))))
+            ;; Core's order: the -privatebroadcast gate (rpc/mempool.cpp:115-124)
+            ;; runs before BroadcastTransaction's first question.
+            (when bl:*private-broadcast*
+              (%refuse-private-broadcast))
             (%refuse-if-already-in-utxo-set tx txid utxo-set)
             ;; Core checks the mempool by TXID before validating at all
             ;; (node/transaction.cpp:63-72), skips submission and only

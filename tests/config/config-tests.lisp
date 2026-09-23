@@ -2564,32 +2564,84 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
-(test privatebroadcast-is-refused-rather-than-ignored
-  "-privatebroadcast left the accept-and-drop list (GA11 3be511c4). Core
-reserves a pool of short-lived Tor/I2P connections for transactions submitted
-through sendrawtransaction and keeps them out of the mempool entirely
-(net.h:77,89, rpc/mempool.cpp:115-126), and it REFUSES TO START when the option
-is set and neither network is reachable (init.cpp:2257-2265). None of that
-exists here, so that condition can never be satisfied and Core's refusal is the
-honest answer: accepting the flag let a node announce the operator's own
-transactions to its ordinary peers from its own address, which is the
-deanonymisation the option exists to prevent and cannot be undone."
-  (signals error (apply-config-globals '(("privatebroadcast" . "1"))))
-  (let ((reported (handler-case
-                      (progn (apply-config-globals '(("privatebroadcast" . "1")))
-                             "")
-                    (error (e) (princ-to-string e)))))
-    (is-true (search "(-privatebroadcast)" reported)
-             "the refusal must name the option: ~A" reported)
-    (is-true (search "Private broadcast of own transactions requested" reported)
-             "Core's own opening clause, so an operator can grep for it: ~A"
-             reported))
-  ;; Core's default is false, and that case must start normally -- the positive
-  ;; control for a refusal that simply fired on every node.
-  (finishes (apply-config-globals '(("privatebroadcast" . "0"))))
-  (finishes (apply-config-globals '(("regtest" . "1"))))
-  (is-true (bl:known-config-option-p "privatebroadcast"))
-  (is-false (bl.cfg:core-only-option-p "privatebroadcast")))
+(defmacro %with-private-broadcast-globals (&body body)
+  "Run BODY with the specials a -privatebroadcast start-up check writes bound,
+so a test's configuration does not leak into the next suite."
+  `(let ((bl:*private-broadcast* nil)
+         (bl.net:*reachable-networks* bl.net:*reachable-networks*)
+         (bl.net:*proxy* nil)
+         (bl.net:*onion-proxy* nil)
+         (bl.net:*onion-proxy-explicit* nil)
+         (bl.net:*discover* bl.net:*discover*)
+         (bl:*deferred-log-lines* nil)
+         (*error-output* (make-string-output-stream)))
+     ,@body))
+
+(test privatebroadcast-start-up-checks-are-cores
+  "feature_config_args.py:414-435 over Core's -privatebroadcast checks
+(init.cpp:2257-2280), in Core's order and words: with neither Tor nor I2P
+reachable the node refuses to start; with a Tor route but -connect it refuses
+again; with a Tor route and -proxyrandomize=0 it starts and says
+`Warning: ...' on stderr. The broadcast mechanism is not implemented, so the
+option is accepted only where Core accepts it and sendrawtransaction then
+refuses (PRIVATEBROADCAST-SENDRAWTRANSACTION-REFUSES-RATHER-THAN-BROADCASTS)."
+  (flet ((refusal (merged)
+           (%with-private-broadcast-globals
+             (handler-case (progn (apply-config-globals merged) nil)
+               (error (e) (princ-to-string e))))))
+    (is (equal "Private broadcast of own transactions requested (-privatebroadcast), but none of Tor or I2P networks is reachable"
+               (refusal '(("privatebroadcast" . "1") ("listenonion" . "0")))))
+    (is (equal "Private broadcast of own transactions requested (-privatebroadcast), but -connect is also configured. They are incompatible because the private broadcast needs to open new connections to randomly chosen Tor or I2P peers. Consider using -maxconnections=0 -addnode=... instead"
+               (refusal '(("privatebroadcast" . "1") ("connect" . "127.0.0.1:8333")
+                          ("onion" . "127.0.0.1:9050") ("listenonion" . "0")))))
+    ;; -listenonion may still deliver a Tor route later, so Core does not
+    ;; refuse then (init.cpp:2261).
+    (is (null (refusal '(("privatebroadcast" . "1") ("listenonion" . "1")))))
+    (%with-private-broadcast-globals
+      (apply-config-globals '(("privatebroadcast" . "1") ("onion" . "127.0.0.1:9050")
+                              ("proxyrandomize" . "0") ("listenonion" . "0")))
+      (is (eq t bl:*private-broadcast*))
+      (is (equal (format nil "Warning: Private broadcast of own transactions requested (-privatebroadcast) and -proxyrandomize is disabled. Tor circuits for private broadcast connections may be correlated to other connections over Tor. For maximum privacy set -proxyrandomize=1.~%")
+                 (get-output-stream-string *error-output*))))
+    ;; Control: -proxyrandomize left on starts without a word on stderr.
+    (%with-private-broadcast-globals
+      (apply-config-globals '(("privatebroadcast" . "1") ("onion" . "127.0.0.1:9050")
+                              ("listenonion" . "0")))
+      (is (equal "" (get-output-stream-string *error-output*))))
+    (%with-private-broadcast-globals
+      (finishes (apply-config-globals '(("privatebroadcast" . "0"))))
+      (is (null bl:*private-broadcast*)))
+    (is-true (bl:known-config-option-p "privatebroadcast"))
+    (is-false (bl.cfg:core-only-option-p "privatebroadcast"))))
+
+(test privatebroadcast-sendrawtransaction-refuses-rather-than-broadcasts
+  "Under -privatebroadcast Core hands a sendrawtransaction to its private
+Tor/I2P queue and never to the mempool (rpc/mempool.cpp:115-131). That queue
+does not exist here, and the ordinary path would announce the transaction to
+every peer from this node's own address, so the RPC refuses: Core's own error
+when no Tor/I2P network is reachable, ours otherwise. The transaction reaches
+neither the mempool nor a peer."
+  (let* ((node (make-test-node))
+         ;; One input spending an outpoint nobody has, one OP_TRUE output.
+         (hex (concatenate 'string "0200000001"
+                           (make-string 64 :initial-element #\1)
+                           "0000000000ffffffff01e8030000000000000151"
+                           "00000000")))
+    (flet ((send () (rpc-error-of (lambda ()
+                                    (bl.rpc:dispatch-rpc-method
+                                     node "sendrawtransaction" (list hex))))))
+      (let ((bl:*private-broadcast* t)
+            (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
+        (is (equal '(-1 . "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly.")
+                   (send))))
+      (let ((bl:*private-broadcast* t)
+            (bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3)))
+        (let ((err (send)))
+          (is (eql -1 (car err)))
+          (is-true (search "does not implement private broadcast" (cdr err)))))
+      ;; Control: without the option the same call reaches validation.
+      (let ((bl:*private-broadcast* nil))
+        (is (not (equal -1 (car (send)))))))))
 
 (test dns-is-a-real-option
   "-dns left the accept-and-drop list (GA11 1f1f28b7). Core reads it into

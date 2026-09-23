@@ -65,6 +65,7 @@ init.cpp, node/. src/node/.")
    #:network-assumevalid
    #:*p2p-port-override*
    #:*stop-at-height*
+   #:*private-broadcast*
    #:*dns-seed-enabled*
    #:*fixed-seeds-enabled*
    #:*capture-messages*

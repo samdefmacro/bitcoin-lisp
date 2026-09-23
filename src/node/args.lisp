@@ -225,6 +225,39 @@ checks in getnetworkinfo's localaddresses."
                      (multiple-value-bind (host port onion-p) (parse-bind-option rest)
                        (when (and host port (not onion-p)) (return port))))))))
 
+(defun init-warning (text)
+  "Core InitWarning as the non-GUI build shows it (noui.cpp:33-45): `Warning:
+<TEXT>' on stderr, and the text logged as a warning. The functional framework
+compares a stopped node's whole stderr against such lines
+(feature_config_args.py:432)."
+  (ignore-errors
+   (format *error-output* "Warning: ~A~%" text)
+   (finish-output *error-output*))
+  (defer-log :warn "~A" text))
+
+(defun %check-private-broadcast-option (&key reachable onion-may-become-reachable
+                                             connect proxy-randomize)
+  "Core's -privatebroadcast start-up checks (init.cpp:2257-2280), in Core's
+order: Tor or I2P must be REACHABLE, or Tor may still become so through
+-listenonion; -connect (any form) is refused, private broadcast needing fresh
+connections to random peers; and with -proxyrandomize off a Tor route draws
+Core's privacy warning. Core runs these just before CConnman::Start; here they
+run where the reachable set is decided, which is the same set Core reads."
+  (unless (or (member :i2p reachable) (member :torv3 reachable)
+              onion-may-become-reachable)
+    (config-error "Private broadcast of own transactions requested (-privatebroadcast), ~
+but none of Tor or I2P networks is reachable"))
+  (when connect
+    (config-error "Private broadcast of own transactions requested (-privatebroadcast), ~
+but -connect is also configured. They are incompatible because the private broadcast ~
+needs to open new connections to randomly chosen Tor or I2P peers. Consider using ~
+-maxconnections=0 -addnode=... instead"))
+  (when (and (not proxy-randomize)
+             (or (member :torv3 reachable) onion-may-become-reachable))
+    (init-warning (format nil "Private broadcast of own transactions requested (-privatebroadcast) and ~
+-proxyrandomize is disabled. Tor circuits for private broadcast connections may be ~
+correlated to other connections over Tor. For maximum privacy set -proxyrandomize=1."))))
+
 (defun apply-parameter-interactions (merged)
   "The options whose value depends on ANOTHER option (Core init.cpp Step 2
 \"parameter interactions\" and the proxy / reachability block of Step 6),
@@ -390,7 +423,19 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
       (when (member :i2p onlynets)
         (config-error "-onlynet=i2p given but I2P (SAM) is not supported"))
       (setf nets (remove :i2p nets))
-      (setf bl.net:*reachable-networks* nets))
+      (setf bl.net:*reachable-networks* nets)
+      (setf *private-broadcast*
+            (let ((v (lk "privatebroadcast"))) (and v (conf-parse-bool v))))
+      (when *private-broadcast*
+        (%check-private-broadcast-option
+         :reachable nets
+         :onion-may-become-reachable
+         (and listenonion-p (or (null onlynets) (member :torv3 onlynets)))
+         ;; Core m_use_addrman_outgoing is false for ANY -connect, -connect=0
+         ;; and -noconnect included (init.cpp:2214-2218).
+         :connect (assoc "connect" merged :test #'string=)
+         :proxy-randomize (let ((v (lk "proxyrandomize")))
+                            (if v (conf-parse-bool v) t)))))
     ;; -forcednsseed with seeding off is a contradiction Core refuses to start
     ;; on (init.cpp:1010-1013), and it reads the EFFECTIVE -dnsseed, so it also
     ;; fires for the soft-set forms: -connect, -maxconnections<=0

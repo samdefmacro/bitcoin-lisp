@@ -84,6 +84,14 @@ and -externalip advertisements carry it (Core GetListenPort, net.cpp:138-162).
 The DEFAULT port used to dial peers is unaffected — Core dials
 chainparams GetDefaultPort regardless of -port.")
 
+(defvar *private-broadcast* nil
+  "Core -privatebroadcast (DEFAULT_PRIVATE_BROADCAST = false, init.cpp:687):
+broadcast sendrawtransaction's transactions over short-lived Tor/I2P
+connections without entering the mempool. Validated at start-up as Core does
+(%CHECK-PRIVATE-BROADCAST-OPTION); the mechanism itself is not implemented, so
+sendrawtransaction refuses while it is on. Assigned on every start by
+APPLY-PARAMETER-INTERACTIONS.")
+
 (defvar *stop-at-height* 0
   "Stop the node once the active tip reaches this height; 0 = disabled (Core
 -stopatheight, DEFAULT_STOPATHEIGHT = 0, node/kernel_notifications.cpp:61-66:
