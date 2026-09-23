@@ -3063,9 +3063,10 @@ Handles chain reorganizations when a competing chain has more work."
         (unless (eq (bl.store:block-index-entry-status entry) :invalid)
           (setf (bl.store:block-index-entry-status entry) :valid)))
       (bl.store:add-block-index-entry chain-state entry)
-      ;; nFile/nDataPos, now that the entry is in the index (Core
-      ;; ReceivedBlockTransactions).
+      ;; nFile/nDataPos and nSequenceId, now that the entry is in the index
+      ;; (Core ReceivedBlockTransactions, validation.cpp:3829-3853).
       (bl.store:%record-block-position entry stored-at)
+      (bl.store:note-block-received chain-state entry)
 
       ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
       ;; result so callers can act on a refused reorg: NIL for a tip extension or
@@ -3842,6 +3843,7 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
                          :height (and entry
                                       (bl.store:block-index-entry-height
                                        entry)))))
+          (bl.store:note-block-received chain-state entry)
           (values t nil)))))
 
 ;;;; Cooperative shutdown inside a reorg (plan phase 3b).
@@ -4483,33 +4485,75 @@ comparison is what the block index is keyed by anyway."
              (bl.store:chain-state-block-index chain-state))
     result))
 
-(defun best-valid-tip (chain-state block-store &optional (min-work 0))
-  "The highest-chain-work block-index entry that is not :invalid, carries MORE
-than MIN-WORK, AND whose block is present in BLOCK-STORE — the target the active
-chain can actually reorg to. The block-presence filter excludes header-only
-entries (status :header-valid with no downloaded block), which on a live node
-routinely outrank everything; without it best-valid-tip would name an
+(defun %tip-candidates (chain-state block-store better-p)
+  "Every non-invalid entry BETTER-P accepts whose body BLOCK-STORE holds, best
+first by Core's CBlockIndexWorkComparator (BL.STORE:ENTRY-BETTER-P: chain
+work, then the earlier sequence id). BETTER-P runs first because it is an
+in-memory compare and BLOCK-EXISTS-P is a filesystem probe."
+  (let ((candidates '()))
+    (maphash (lambda (h e) (declare (ignore h))
+               (when (and (funcall better-p e)
+                          (not (eq (bl.store:block-index-entry-status e) :invalid))
+                          (bl.store:block-exists-p
+                           block-store (bl.store:block-index-entry-hash e)))
+                 (push e candidates)))
+             (bl.store:chain-state-block-index chain-state))
+    (stable-sort candidates #'bl.store:entry-better-p)))
+
+(defun %first-reachable-candidate (chain-state block-store candidates)
+  "The first of CANDIDATES whose every block back to the active chain is in
+BLOCK-STORE, or NIL -- Core FindMostWorkChain (validation.cpp:3158-3196): a
+candidate whose path holds a block without data is dropped with its whole
+path, and the next candidate is tried, because \"we can't switch to a chain
+unless we have all the non-active-chain parent blocks\".
+
+Every entry on a failed path is remembered, so a walk stops at the first entry
+already shown unreachable and each entry is probed at most once."
+  (let ((unreachable (make-hash-table :test 'eq)))
+    (dolist (candidate candidates)
+      (let ((path '()))
+        (if (loop for e = candidate then (bl.store:block-index-entry-prev-entry e)
+                  while (and e (not (bl.store:entry-on-active-chain-p chain-state e)))
+                  do (push e path)
+                  thereis (or (gethash e unreachable)
+                              (not (bl.store:block-exists-p
+                                    block-store (bl.store:block-index-entry-hash e)))))
+            (dolist (e path) (setf (gethash e unreachable) t))
+            (return candidate))))))
+
+(defun best-valid-tip (chain-state block-store &optional (min-work 0) tip)
+  "The best block-index entry that is not :invalid, carries MORE than MIN-WORK
+(or, given TIP, beats TIP by Core's comparator: more work, or equal work and an
+earlier sequence id), AND whose block is present in BLOCK-STORE -- the target
+the active chain can actually reorg to. The block-presence filter excludes
+header-only entries (status :header-valid with no downloaded block), which on a
+live node routinely outrank everything; without it best-valid-tip would name an
 unreachable header and the reorg would no-op.
+
+Of those, the first in comparator order whose path back to the active chain
+holds every body wins, as Core's FindMostWorkChain chooses: feature_chain_
+tiebreaks.py:94 holds B7 (parent missing) and B9 (complete) at equal work, and
+Core takes B9 however early B7's own body arrived. When no candidate is
+complete the best one is returned anyway, so PERFORM-REORG's refusal names the
+missing bodies and ACTIVATE-BEST-CHAIN re-queues them.
 
 Test order matters for cost, not just correctness. BLOCK-EXISTS-P is a
 filesystem probe, so testing it per entry is ~1M syscalls on a mainnet-sized
-index — which is why this was previously only affordable from the
-reconsiderblock RPC. Chain-work is an in-memory integer compare, so it goes
-first, and MIN-WORK (the caller's current tip work) prunes the probe down to
-the handful of entries that could actually beat the tip. On a synced node that
-is zero probes."
-  (let ((best nil)
-        (best-work min-work))
-    (maphash (lambda (h e) (declare (ignore h))
-               (let ((w (bl.store:block-index-entry-chain-work e)))
-                 (when (and (> w best-work)
-                            (not (eq (bl.store:block-index-entry-status e) :invalid))
-                            (bl.store:block-exists-p
-                             block-store (bl.store:block-index-entry-hash e)))
-                   (setf best e
-                         best-work w))))
-             (bl.store:chain-state-block-index chain-state))
-    best))
+index. Chain-work is an in-memory integer compare, so it goes first, and
+MIN-WORK (the caller's current tip work) prunes the probe down to the handful
+of entries that could actually beat the tip. On a synced node that is zero
+probes."
+  (let ((candidates
+          (%tip-candidates
+           chain-state block-store
+           (if tip
+               (lambda (e) (and (>= (bl.store:block-index-entry-chain-work e)
+                                    min-work)
+                                (bl.store:entry-better-p e tip)))
+               (lambda (e) (> (bl.store:block-index-entry-chain-work e)
+                              min-work))))))
+    (or (%first-reachable-candidate chain-state block-store candidates)
+        (first candidates))))
 
 (defconstant +activation-step-blocks+ 1000
   "How many blocks one ACTIVATE-BEST-CHAIN step will connect at most.
@@ -4577,7 +4621,8 @@ backstop against a candidate that reorgs away and reappears."
              (tip-work (if tip
                            (bl.store:block-index-entry-chain-work tip)
                            0))
-             (best (best-valid-tip chain-state block-store tip-work))
+             (best (and tip (best-valid-tip chain-state block-store
+                                            tip-work tip)))
              ;; Bounded step, not the absolute best tip: see
              ;; +ACTIVATION-STEP-BLOCKS+. On a synced node the best tip is
              ;; within the step and this is the identity.
@@ -4645,35 +4690,18 @@ backstop against a candidate that reorgs away and reappears."
     (values switched missing)))
 
 (defun %best-reachable-tip (chain-state block-store tip)
-  "The most-work non-invalid entry with more work than TIP whose every block
-back to the active chain is in BLOCK-STORE, or NIL -- Core FindMostWorkChain
-(validation.cpp:3158-3196): a candidate whose path holds a block without data
-is dropped with its whole path, and the next candidate is tried, because \"we
-can't switch to a chain unless we have all the non-active-chain parent
-blocks\". A pruned node that invalidates its tip has such candidates: the
-more-work chain it once forked from, pruned below its tip.
-
-Every entry on a failed path is remembered, so a walk stops at the first entry
-already shown unreachable and each entry is probed at most once."
-  (let ((tip-work (bl.store:block-index-entry-chain-work tip))
-        (candidates '())
-        (unreachable (make-hash-table :test 'eq)))
-    (maphash (lambda (h e) (declare (ignore h))
-               (when (and (> (bl.store:block-index-entry-chain-work e) tip-work)
-                          (not (eq (bl.store:block-index-entry-status e) :invalid)))
-                 (push e candidates)))
-             (bl.store:chain-state-block-index chain-state))
-    (dolist (candidate (sort candidates #'>
-                             :key #'bl.store:block-index-entry-chain-work))
-      (let ((path '()))
-        (if (loop for e = candidate then (bl.store:block-index-entry-prev-entry e)
-                  while (and e (not (bl.store:entry-on-active-chain-p chain-state e)))
-                  do (push e path)
-                  thereis (or (gethash e unreachable)
-                              (not (bl.store:block-exists-p
-                                    block-store (bl.store:block-index-entry-hash e)))))
-            (dolist (e path) (setf (gethash e unreachable) t))
-            (return candidate))))))
+  "The best non-invalid entry that beats TIP by Core's comparator (more work, or
+equal work and an earlier sequence id) and whose every block back to the active
+chain is in BLOCK-STORE, or NIL -- Core FindMostWorkChain (validation.cpp:
+3158-3196) over the candidates InvalidateBlock re-adds, which include the
+EQUAL-work ones (:3637-3661). A pruned node that invalidates its tip has
+unreachable candidates: the more-work chain it once forked from, pruned below
+its tip. An equal-work chain whose data arrived first is the reachable one
+interface_zmq.py:308 expects the node to go back to."
+  (%first-reachable-candidate
+   chain-state block-store
+   (%tip-candidates chain-state block-store
+                    (lambda (e) (bl.store:entry-better-p e tip)))))
 
 (defun %activate-best-valid-chain (chain-state block-store utxo-set
                                    &key fee-estimator recent-rejects mempool)
@@ -4787,18 +4815,22 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
 (defun precious-block (chain-state block-store utxo-set block-hash
                        &key fee-estimator recent-rejects mempool)
   "Treat BLOCK-HASH as preferred (Bitcoin Core preciousblock): if its chain has at
-least as much work as the active tip and it isn't already the tip, reorganize to
-it. Fork choice here is strict greater-than on chain-work, so an equal-work
-competitor that arrives later cannot displace it — which is exactly what
-preciousblock guarantees, with no persistent sequence-id needed (unlike Core's
-candidate-set model). Returns (values t nil) on success (including the no-ops
-where the block is already the tip or weaker), (values nil reason) on failure."
+least as much work as the active tip, give it the next NEGATIVE sequence id
+(Core PreciousBlock, validation.cpp:3522-3547) and, unless it already is the
+tip, reorganize to it. The id is what keeps it there: the best-chain comparator
+breaks an equal-work tie on the sequence id, so without it the next
+ACTIVATE-BEST-CHAIN would hand the tip back to the chain whose data arrived
+first. Returns (values t nil) on success (including the no-ops where the block
+is already the tip or weaker), (values nil reason) on failure."
   (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
     (cond
       ((null entry) (values nil :block-not-found))
       (t
        (let ((tip (bl.store:get-block-index-entry
                    chain-state (bl.store:best-block-hash chain-state))))
+         (when (and tip (>= (bl.store:block-index-entry-chain-work entry)
+                            (bl.store:block-index-entry-chain-work tip)))
+           (bl.store:precious-block-sequence chain-state entry))
          (cond
            ;; Already the tip, or weaker than it — nothing to do.
            ((or (null tip)
@@ -4897,6 +4929,20 @@ for a block submitted on top of a header-only parent."
   (if (block-witness-stripped-p block)
       (values t nil)
       (%store-accepted-block-body block chain-state block-store :current-time now)))
+
+(defun %activate-best-after-refused-reorg (chain-state block-store utxo-set
+                                           fee-estimator recent-rejects mempool)
+  "ACTIVATE-BLOCK's pre-reorg toward a block was refused for want of fork
+bodies, but the index may hold a better tip than the active one that IS
+complete: Core's ProcessNewBlock ends in ActivateBestChain whatever this
+block's own chain lacks (validation.cpp:4463), and FindMostWorkChain skips the
+incomplete candidate for the next one. feature_chain_tiebreaks.py:94 hands B7
+(parent B3 missing) to this arm right after B4 completed B9, and reads B9 as
+the tip."
+  (activate-best-chain chain-state block-store utxo-set
+                       :fee-estimator fee-estimator
+                       :recent-rejects recent-rejects
+                       :mempool mempool))
 
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts fee-estimator
@@ -5019,9 +5065,13 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 ;; The block is still STORED, as AcceptBlock stores it
                 ;; (validation.cpp:4330-4405, rpc_blockchain.py:759-766).
                 ((and (null reorg-ok) detail)
+                 ;; Stored first (AcceptBlock), then the best COMPLETE chain is
+                 ;; activated (ProcessNewBlock's closing ActivateBestChain).
                  (multiple-value-bind (stored error)
                      (%store-block-for-later block chain-state block-store now)
                    (unless stored (return-from activate-block (values nil error))))
+                 (%activate-best-after-refused-reorg
+                  chain-state block-store utxo-set fee-estimator recent-rejects mempool)
                  (values nil :reorg-refused detail))
                 ;; Refused for another reason (no common ancestor, fork below
                 ;; pruned height). State unchanged.

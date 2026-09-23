@@ -120,6 +120,12 @@ src/storage/.")
    #:block-index-entry-undo-pos
    #:note-block-position
    #:%record-block-position
+   #:block-index-entry-sequence-id
+   #:note-block-received
+   #:entry-better-p
+   #:mark-best-chain-from-disk
+   #:precious-block-sequence
+   #:reset-block-sequence-state
    #:get-block-index-entry
    #:add-block-index-entry
    #:get-block-at-height

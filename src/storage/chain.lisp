@@ -33,7 +33,17 @@
   ;; written to disk; 0 = never written. Comparing it against the entry's
   ;; current packing is what lets a flush write only what changed, instead of
   ;; rewriting the whole index. See %ENTRY-PERSIST-KEY.
-  (persisted-key 0 :type (unsigned-byte 64)))
+  (persisted-key 0 :type (unsigned-byte 64))
+  ;; Core CBlockIndex::nSequenceId (chain.h:147-149): the order in which this
+  ;; block became a candidate for the active chain -- its body stored with every
+  ;; ancestor's body already held. CBlockIndexWorkComparator breaks an
+  ;; equal-work tie on it, lower first (node/blockstorage.cpp:180-182), so of
+  ;; two equal-work chains the one whose data was COMPLETE first wins. IN MEMORY
+  ;; ONLY, never written to the index: an entry starts at
+  ;; +SEQ-ID-INIT-FROM-DISK+ and the best chain loaded from disk is lowered to
+  ;; +SEQ-ID-BEST-CHAIN-FROM-DISK+ (validation.cpp:4598-4609); preciousblock
+  ;; hands out negative values (:3538). See NOTE-BLOCK-RECEIVED.
+  (sequence-id 1 :type (signed-byte 32)))
 
 (defstruct chain-state
   "Current blockchain state. One chain-state per chainstate role (Bitcoin
@@ -432,8 +442,120 @@ exactly what NIL means here — not in a flat file, so no rev file to pair with.
 
 No entry yet is not an error: the caller that adds the entry afterwards notes
 the position once it exists."
-  (%record-block-position (and chain-state (get-block-index-entry chain-state hash))
-                          located))
+  (let ((entry (and chain-state (get-block-index-entry chain-state hash))))
+    (%record-block-position entry located)
+    (when located (note-block-received chain-state entry))
+    entry))
+
+;;; Block sequence ids (Core nSequenceId / nBlockSequenceId / m_blocks_unlinked).
+
+(defconstant +seq-id-best-chain-from-disk+ 0
+  "Core SEQ_ID_BEST_CHAIN_FROM_DISK (chain.h:39).")
+
+(defconstant +seq-id-init-from-disk+ 1
+  "Core SEQ_ID_INIT_FROM_DISK (chain.h:40): what every entry starts with, and
+what an entry keeps until its body arrives with all its ancestors' bodies.")
+
+(defvar *next-block-sequence-id* (1+ +seq-id-init-from-disk+)
+  "Core ChainstateManager::nBlockSequenceId (validation.h:1058): the next id
+NOTE-BLOCK-RECEIVED hands out. Only the ORDER matters, so one counter serves
+every chain-state in the process.")
+
+(defvar *blocks-unlinked* (make-hash-table :test 'equalp :synchronized t)
+  "Core BlockManager::m_blocks_unlinked (validation.cpp:3849-3853): parent hash
+-> the entries, in arrival order, whose body arrived while that parent's chain
+still lacked a body. NOTE-BLOCK-RECEIVED on the parent drains them.")
+
+(defvar *block-reverse-sequence-id* -1
+  "Core nBlockReverseSequenceId (validation.cpp:3538): the next id
+preciousblock hands out, counting down from -1.")
+
+(defvar *last-precious-chainwork* 0
+  "Core nLastPreciousChainwork (validation.cpp:3533-3536).")
+
+(defun reset-block-sequence-state ()
+  "Forget every unlinked body and restart the preciousblock counter -- the
+part of Core's ChainstateManager reset that concerns sequence ids."
+  (clrhash *blocks-unlinked*)
+  (setf *block-reverse-sequence-id* -1
+        *last-precious-chainwork* 0))
+
+(defun %entry-have-chain-txs-p (chain-state entry)
+  "Core CBlockIndex::HaveNumChainTxs: ENTRY and every ancestor hold a body. An
+entry with an assigned sequence id, or on the active chain, answers at once;
+one still at +SEQ-ID-INIT-FROM-DISK+ (a block loaded from disk off the active
+chain) walks down while each entry has a recorded position."
+  (loop for e = entry then (block-index-entry-prev-entry e)
+        do (cond ((null e) (return t))
+                 ((/= (block-index-entry-sequence-id e) +seq-id-init-from-disk+)
+                  (return t))
+                 ((and chain-state (entry-on-active-chain-p chain-state e))
+                  (return t))
+                 ((null (block-index-entry-data-pos e)) (return nil)))))
+
+(defun note-block-received (chain-state entry)
+  "Core ReceivedBlockTransactions' candidate half (validation.cpp:3829-3853):
+ENTRY's body has just been stored. When its parent's chain holds every body,
+ENTRY takes the next sequence id and so does every body that was waiting on
+it, breadth first in arrival order; otherwise ENTRY waits in *BLOCKS-UNLINKED*
+under its parent. An entry that already has an id keeps it -- Core does not
+re-run this for a body it already holds (validation.cpp:4350)."
+  (when (and entry
+             (= (block-index-entry-sequence-id entry) +seq-id-init-from-disk+)
+             (not (and chain-state (entry-on-active-chain-p chain-state entry))))
+    (let ((parent (block-index-entry-prev-entry entry)))
+      (if (or (null parent) (%entry-have-chain-txs-p chain-state parent))
+          (let ((queue (list entry)))
+            (loop while queue
+                  do (let* ((e (pop queue))
+                            (hash (block-index-entry-hash e)))
+                       (setf (block-index-entry-sequence-id e)
+                             *next-block-sequence-id*)
+                       (incf *next-block-sequence-id*)
+                       (let ((waiting (gethash hash *blocks-unlinked*)))
+                         (when waiting
+                           (remhash hash *blocks-unlinked*)
+                           (setf queue (append queue waiting)))))))
+          (let ((key (block-index-entry-hash parent)))
+            (unless (member entry (gethash key *blocks-unlinked*))
+              (setf (gethash key *blocks-unlinked*)
+                    (append (gethash key *blocks-unlinked*) (list entry))))))))
+  entry)
+
+(defun entry-better-p (a b)
+  "T when A beats B as a chain tip -- Core CBlockIndexWorkComparator
+(node/blockstorage.cpp:174-192) turned round: more chain work, then the lower
+sequence id. Two entries equal on both are not better than each other, so a
+tip is never displaced by an entry it ties with."
+  (let ((wa (block-index-entry-chain-work a))
+        (wb (block-index-entry-chain-work b)))
+    (or (> wa wb)
+        (and (= wa wb)
+             (< (block-index-entry-sequence-id a)
+                (block-index-entry-sequence-id b))))))
+
+(defun mark-best-chain-from-disk (chain-state)
+  "Core LoadChainTip (validation.cpp:4598-4609): the active chain as loaded
+takes +SEQ-ID-BEST-CHAIN-FROM-DISK+, so the tip this node shut down on stays
+the tip across a restart when another chain ties it on work."
+  (loop for e = (get-block-index-entry chain-state (best-block-hash chain-state))
+          then (block-index-entry-prev-entry e)
+        while e
+        do (setf (block-index-entry-sequence-id e) +seq-id-best-chain-from-disk+)))
+
+(defun precious-block-sequence (chain-state entry)
+  "Core PreciousBlock's sequence step (validation.cpp:3530-3542): ENTRY takes
+the next NEGATIVE id, so it beats every equal-work entry -- the counter restarts
+at -1 whenever the tip has gained work since the last call."
+  (let* ((tip (get-block-index-entry chain-state (best-block-hash chain-state)))
+         (tip-work (if tip (block-index-entry-chain-work tip) 0)))
+    (when (> tip-work *last-precious-chainwork*)
+      (setf *block-reverse-sequence-id* -1))
+    (setf *last-precious-chainwork* tip-work)
+    (setf (block-index-entry-sequence-id entry) *block-reverse-sequence-id*)
+    (when (> *block-reverse-sequence-id* (- (expt 2 31)))
+      (decf *block-reverse-sequence-id*))
+    entry))
 
 (defun get-block-index-entry (state hash)
   "Get the block index entry for HASH."

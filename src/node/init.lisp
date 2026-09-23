@@ -1211,8 +1211,12 @@ a -reindex, which is Core's `!do_reindex' guard: one retry, never a loop."
            (when (eq result :unresolvable)
              (log-error "Refusing to start: the rebuilt block index still cannot place the UTXO set.")
              (chainstate-load-error "Error initializing block database")))))
-      ;; The tip is settled: say which block this node came up on, where Core's
-      ;; LoadChainTip says it (validation.cpp:4612).
+      ;; The tip is settled: it outranks every equal-work chain across the
+      ;; restart (Core LoadChainTip, validation.cpp:4598-4609), and say which
+      ;; block this node came up on, where Core's LoadChainTip says it (:4612).
+      (when (node-chain-state *node*)
+        (bl.store:reset-block-sequence-state)
+        (bl.store:mark-best-chain-from-disk (node-chain-state *node*)))
       (log-loaded-best-chain (node-chain-state *node*))
       result)))
 

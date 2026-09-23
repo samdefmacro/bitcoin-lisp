@@ -5893,3 +5893,164 @@ that has shown us nothing is still kicked (the throttle stamp moves)."
     (ignore-errors (bl.net:sync-headers unknown state))
     (is (plusp (bl.net:peer-last-getheaders-time unknown))
         "control: a peer we know nothing about is still asked")))
+
+;;;; Equal-work tie-break: the chain whose data was complete first
+;;;;
+;;;; Core's CBlockIndexWorkComparator breaks an equal-work tie on nSequenceId
+;;;; (node/blockstorage.cpp:180-182), which ReceivedBlockTransactions hands out
+;;;; when a body arrives with every ancestor's body already held, and hands to
+;;;; the bodies that were waiting on it in arrival order (validation.cpp:
+;;;; 3829-3853). FindMostWorkChain takes the best candidate whose whole path has
+;;;; data (:3158-3196), and InvalidateBlock re-admits the EQUAL-work candidates
+;;;; (:3637-3661).
+
+(defun %tiebreak-tree (chain-state prefix parents heights)
+  "Synthetic blocks B1..Bn above CHAIN-STATE's tip B0, each with its header
+indexed and no body: PARENTS names every block's parent by index (0 = B0),
+HEIGHTS its height. Returns the vector of (block . hash), B0 first."
+  (let* ((b0-hash (bl.store:best-block-hash chain-state))
+         (hashes (make-test-chain-hashes prefix (length parents)))
+         (out (make-array (1+ (length parents)))))
+    (setf (aref out 0) (cons nil b0-hash))
+    (loop for i from 1
+          for parent in parents
+          for height in heights
+          for hash in hashes
+          do (let* ((prev-hash (cdr (aref out parent)))
+                    (prev-entry (bl.store:get-block-index-entry chain-state prev-hash))
+                    (block (make-reorg-test-block prev-hash hash height
+                                                  :timestamp (+ 1231006505 (* height 600) i))))
+               (%index-header chain-state block hash height prev-entry
+                              (bl.store:calculate-chain-work
+                               (bl.ser:block-header-bits (bl.ser:bitcoin-block-header block))
+                               (bl.store:block-index-entry-chain-work prev-entry)))
+               (setf (aref out i) (cons block hash))))
+    out))
+
+(test equal-work-tie-goes-to-the-chain-whose-data-completed-first
+  "feature_chain_tiebreaks.py:66-104. B1..B10 hang off B0 as a binary tree
+(B1,B2 on B0; B3,B4 on B1; B5,B6 on B2; B7,B8 on B3; B9,B10 on B4). B2's body
+arrives first, then B1's, then B7-B10 (parents missing), then B4, then B3.
+B9 must become the tip: B4 completes B9 and B10 before B3 completes B7 and B8,
+so B9 has the lowest sequence id of the four equal-work tips however early B7's
+own body arrived. Ours connected B4, then drained B7 (queued for height 4) into
+a pre-reorg refused for want of B3, and left the tip on B4; and the best-chain
+scan, run later, picked B7 too -- the first equal-work entry in the index.
+Invalidating B9 and then B10 lands on B7, the earlier of the two B3 children."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "tiebreak-seq")
+      (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xC0 1))
+      (let ((b (%tiebreak-tree cs #xC1
+                               '(0 0 1 1 2 2 3 3 4 4)
+                               '(2 2 3 3 3 3 4 4 4 4))))
+        ;; No ActivateBestChain between deliveries: Core runs it INSIDE
+        ;; ProcessNewBlock, and the functional test reads the tip right after
+        ;; a ping, before our pump's own pass would have run it.
+        (flet ((deliver (i)
+                 (deliver-block (car (aref b i)) cs utxo store :requested t))
+               (tip-is (i)
+                 (equalp (cdr (aref b i)) (bl.store:best-block-hash cs))))
+          (with-ibd-context
+            (deliver 2)
+            (is-true (tip-is 2) "B2 extends B0")
+            (deliver 1)
+            (is-true (tip-is 2) "B1 ties B2 and arrived later")
+            (dolist (i '(7 8 9 10)) (deliver i))
+            (is-true (tip-is 2) "B7-B10 have no parent body yet")
+            (deliver 4)
+            (is-true (tip-is 9)
+                     "B9 is the first equal-work tip whose chain was complete")
+            (deliver 3)
+            (is-true (tip-is 9) "B7 and B8 completed after B9")
+            (is-true (bl.val:invalidate-block cs store utxo (cdr (aref b 9))))
+            (is-true (tip-is 10))
+            (is-true (bl.val:invalidate-block cs store utxo (cdr (aref b 10))))
+            (is-true (tip-is 7) "B7 completed before B8")))))
+    (clear-undo-cache)))
+
+(test invalidateblock-returns-to-the-equal-work-chain-received-first
+  "interface_zmq.py:303-308. The node holds A1 (its own block), reorgs onto a
+peer's heavier B1-B2, and invalidateblock B2 leaves B1 and A1 at equal work.
+Core re-admits A1 as a candidate and, its data having arrived first, switches
+back to it (validation.cpp:3637-3661 then FindMostWorkChain); ours stayed on B1."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "tiebreak-invalidate")
+      (let* ((genesis (bl.store:get-block-index-entry cs genesis-hash))
+             (a1-hash (first (make-test-chain-hashes #xD0 1)))
+             (b-hashes (make-test-chain-hashes #xD1 2))
+             (a1 (make-reorg-test-block genesis-hash a1-hash 1))
+             (b1 (make-reorg-test-block genesis-hash (first b-hashes) 1
+                                        :timestamp (+ 1231006505 600 7)))
+             (b2 (make-reorg-test-block (first b-hashes) (second b-hashes) 2)))
+        (%index-header cs a1 a1-hash 1 genesis
+                       (bl.store:calculate-chain-work
+                        (bl.ser:block-header-bits (bl.ser:bitcoin-block-header a1))
+                        (bl.store:block-index-entry-chain-work genesis)))
+        (with-ibd-context
+          (deliver-block a1 cs utxo store :requested t)
+          (is (equalp a1-hash (bl.store:best-block-hash cs)))
+          (%index-header cs b1 (first b-hashes) 1 genesis
+                         (bl.store:block-index-entry-chain-work
+                          (bl.store:get-block-index-entry cs a1-hash)))
+          (%index-header cs b2 (second b-hashes) 2
+                         (bl.store:get-block-index-entry cs (first b-hashes))
+                         (bl.store:calculate-chain-work
+                          (bl.ser:block-header-bits (bl.ser:bitcoin-block-header b2))
+                          (bl.store:block-index-entry-chain-work
+                           (bl.store:get-block-index-entry cs a1-hash))))
+          (deliver-block b1 cs utxo store :requested t)
+          (deliver-block b2 cs utxo store :requested t)
+          (bl.val:activate-best-chain cs store utxo)
+          (is (equalp (second b-hashes) (bl.store:best-block-hash cs))
+              "positive control: the heavier B chain became the tip")
+          (is-true (bl.val:invalidate-block cs store utxo (second b-hashes)))
+          (is (equalp a1-hash (bl.store:best-block-hash cs))
+              "after invalidating B2, A1 (data first) beats B1 at equal work"))))
+    (clear-undo-cache)))
+
+(test preciousblock-outranks-the-equal-work-chain-received-first
+  "Core PreciousBlock gives the block a NEGATIVE sequence id (validation.cpp:
+3530-3542), so it beats every equal-work tip at the comparator. Once equal-work
+ties are broken on the receive order, that is what keeps a preciousblock'd tip
+from being handed back to the chain whose data arrived first by the next
+ActivateBestChain -- and a restart keeps the tip it shut down on, because the
+loaded best chain takes sequence 0 (LoadChainTip, :4598-4609)."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "tiebreak-precious")
+      (let* ((genesis (bl.store:get-block-index-entry cs genesis-hash))
+             (hashes (make-test-chain-hashes #xD4 2))
+             (a1 (make-reorg-test-block genesis-hash (first hashes) 1))
+             (b1 (make-reorg-test-block genesis-hash (second hashes) 1
+                                        :timestamp (+ 1231006505 600 9))))
+        (dolist (pair (list (cons a1 (first hashes)) (cons b1 (second hashes))))
+          (%index-header cs (car pair) (cdr pair) 1 genesis
+                         (bl.store:calculate-chain-work
+                          (bl.ser:block-header-bits
+                           (bl.ser:bitcoin-block-header (car pair)))
+                          (bl.store:block-index-entry-chain-work genesis))))
+        (with-ibd-context
+          (deliver-block a1 cs utxo store :requested t)
+          (deliver-block b1 cs utxo store :requested t)
+          (bl.val:activate-best-chain cs store utxo)
+          (is (equalp (first hashes) (bl.store:best-block-hash cs))
+              "A1's data arrived first")
+          (is-true (bl.val:precious-block cs store utxo (second hashes)))
+          (is (equalp (second hashes) (bl.store:best-block-hash cs)))
+          (bl.val:activate-best-chain cs store utxo)
+          (is (equalp (second hashes) (bl.store:best-block-hash cs))
+              "ActivateBestChain handed the precious tip back")
+          ;; A restart: every id is back to its from-disk value, and the tip
+          ;; it came up on is the best chain from disk.
+          (maphash (lambda (h e) (declare (ignore h))
+                     (setf (bl.store:block-index-entry-sequence-id e) 1))
+                   (bl.store:chain-state-block-index cs))
+          (bl.store:mark-best-chain-from-disk cs)
+          (is (= 0 (bl.store:block-index-entry-sequence-id
+                    (bl.store:get-block-index-entry cs (second hashes)))))
+          (bl.val:activate-best-chain cs store utxo)
+          (is (equalp (second hashes) (bl.store:best-block-hash cs))
+              "the tip loaded from disk keeps an equal-work tie"))))
+    (clear-undo-cache)))
