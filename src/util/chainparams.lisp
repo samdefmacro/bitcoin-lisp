@@ -37,6 +37,7 @@
   (genesis-timestamp-message "" :type string) ; pszTimestamp
   (pow-limit-bits 0)                        ; powLimit, as compact bits
   (bip34-height 0)                          ; consensus.BIP34Height
+  (bip34-hash nil)                          ; consensus.BIP34Hash, display hex; NIL for uint256{}
   (bip65-height 0)                          ; consensus.BIP65Height
   (bip66-height 0)                          ; consensus.BIP66Height
   (csv-height 0)                            ; consensus.CSVHeight
@@ -177,6 +178,7 @@ option instantiates from."
   :genesis-timestamp-message "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
   :pow-limit-bits #x1d00ffff
   :bip34-height 227931
+  :bip34-hash "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
   :bip65-height 388381
   :bip66-height 363725
   :csv-height 419328
@@ -239,6 +241,7 @@ option instantiates from."
   :genesis-timestamp-message "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
   :pow-limit-bits #x1d00ffff
   :bip34-height 21111
+  :bip34-hash "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
   :bip65-height 581885
   :bip66-height 330776
   :csv-height 770112

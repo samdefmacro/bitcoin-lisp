@@ -1787,45 +1787,52 @@ is not exactly one 32-byte item: :bad-witness-nonce-size."
   "Below BIP 34 activation, BIP 30 is enforced."
   (let ((bl:*network* :mainnet))
     ;; mainnet BIP34 activation = 227931
-    (is (bl.val::bip30-enforced-p 100000))
-    (is (bl.val::bip30-enforced-p 227930)))
+    (is (bl.val:bip30-enforced-p 100000))
+    (is (bl.val:bip30-enforced-p 227930))
+    ;; The BIP 34 block itself: Core asks pindex->pprev->GetAncestor(BIP34Height),
+    ;; which does not exist yet at that height, so BIP 30 still applies.
+    (is (bl.val:bip30-enforced-p 227931)))
   (let ((bl:*network* :testnet3))
-    (is (bl.val::bip30-enforced-p 20000))))
+    (is (bl.val:bip30-enforced-p 20000))))
 
 (test bip30-skipped-between-bip34-and-limit
   "Between BIP 34 activation and the 1,983,702 re-enable limit, BIP 30 is
 skipped (BIP 34 height-in-coinbase guarantees coinbase uniqueness)."
   (let ((bl:*network* :mainnet))
-    (is (not (bl.val::bip30-enforced-p 227931)))
-    (is (not (bl.val::bip30-enforced-p 500000)))
-    (is (not (bl.val::bip30-enforced-p 1983701)))))
+    (is (not (bl.val:bip30-enforced-p 227932)))
+    (is (not (bl.val:bip30-enforced-p 500000)))
+    (is (not (bl.val:bip30-enforced-p 1983701)))))
+
+(test bip30-is-always-enforced-where-the-bip34-hash-is-null
+  "testnet4, signet and regtest carry BIP34Hash = uint256{}
+(kernel/chainparams.cpp:328, :480, :569), which no block matches, so Core's
+ConnectBlock enforces BIP 30 at every height there (validation.cpp:2459).
+feature_block.py:860-861: `BIP30 is always checked on regtest, regardless of
+the BIP34 activation height'."
+  (dolist (net '(:testnet4 :signet :regtest))
+    (let ((bl:*network* net))
+      (is (bl.val:bip30-enforced-p 2) "~A at height 2" net)
+      (is (bl.val:bip30-enforced-p 500000) "~A at height 500000" net))))
 
 (test bip30-reenabled-at-limit
   "At or above height 1,983,702, BIP 30 is re-enforced unconditionally."
   (dolist (net '(:mainnet :testnet3 :testnet4))
     (let ((bl:*network* net))
-      (is (bl.val::bip30-enforced-p 1983702))
-      (is (bl.val::bip30-enforced-p 3000000)))))
+      (is (bl.val:bip30-enforced-p 1983702))
+      (is (bl.val:bip30-enforced-p 3000000)))))
 
 (test bip30-grandfathered-repeat-blocks-exempt
   "The two mainnet repeat blocks (91842, 91880) are NOT BIP 30-enforced,
 so their historical duplicate coinbases aren't wrongly rejected."
   (let ((bl:*network* :mainnet))
-    (is (not (bl.val::bip30-enforced-p 91842)))
-    (is (not (bl.val::bip30-enforced-p 91880)))
+    (is (not (bl.val:bip30-enforced-p 91842)))
+    (is (not (bl.val:bip30-enforced-p 91880)))
     ;; A neighbouring height is still enforced.
-    (is (bl.val::bip30-enforced-p 91841)))
+    (is (bl.val:bip30-enforced-p 91841)))
   ;; The exemption is mainnet-specific — no other network treats those
   ;; heights as repeat blocks.
   (let ((bl:*network* :testnet3))
     (is (not (bl.val:bip30-repeat-block-p 91842)))))
-
-(test bip30-testnet4-not-enforced-at-current-heights
-  "testnet4 has BIP 34 active from height 1, so BIP 30 is skipped for all
-normal heights until the 1,983,702 re-enable."
-  (let ((bl:*network* :testnet4))
-    (is (not (bl.val::bip30-enforced-p 136459)))
-    (is (not (bl.val::bip30-enforced-p 500000)))))
 
 ;;; ============================================================
 ;;; BIP 34 exact-prefix coinbase height (encode-bip34-height /

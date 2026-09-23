@@ -203,7 +203,8 @@ can. src/validation/.")
    #:money-range-p
    ;; Coinbase / subsidy (for the block assembler)
    #:calculate-block-subsidy
-   #:encode-bip34-height)
+   #:encode-bip34-height
+   #:bip30-enforced-p)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export

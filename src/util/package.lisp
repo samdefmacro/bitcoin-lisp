@@ -218,6 +218,7 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:chain-params-genesis-timestamp-message
    #:chain-params-pow-limit-bits
    #:chain-params-bip34-height
+   #:chain-params-bip34-hash
    #:chain-params-bip65-height
    #:chain-params-bip66-height
    #:chain-params-csv-height

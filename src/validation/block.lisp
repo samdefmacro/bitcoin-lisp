@@ -1444,15 +1444,29 @@ repeat blocks.)"
 
 (defun bip30-enforced-p (height)
   "Whether the BIP 30 duplicate-coinbase check must run for a block at
-HEIGHT: enforced below BIP 34 activation (except the grandfathered repeat
-blocks), and again unconditionally at or above +bip34-implies-bip30-limit+.
-Mirrors Bitcoin Core ConnectBlock (validation.cpp:2399-2464). Note: we
-approximate Core's BIP34Hash-ancestor test with a height comparison,
-omitting only the extra enforcement Core applies on a non-canonical fork
-past the BIP 34 height — infeasible to exploit given the PoW required."
-  (or (and (not (bip30-repeat-block-p height))
-           (< height (get-bip34-activation-height bl:*network*)))
-      (>= height +bip34-implies-bip30-limit+)))
+HEIGHT -- Bitcoin Core ConnectBlock (validation.cpp:2399-2464): enforced
+unless the block is a grandfathered repeat, or its chain's ancestor at the
+BIP 34 height is the network's BIP34Hash; and again unconditionally at or
+above +bip34-implies-bip30-limit+.
+
+A network whose BIP34Hash is uint256{} -- testnet4, signet, regtest
+(kernel/chainparams.cpp:328, :480, :569) -- never matches, so BIP 30 is
+ALWAYS enforced there; ours skipped it above the BIP 34 height on every
+network, and accepted a block re-creating an unspent coinbase that Core
+rejects bad-txns-BIP30 (feature_block.py:861). The ancestor exists only
+ABOVE the BIP 34 height (Core asks pindex->pprev->GetAncestor), so the
+BIP 34 block itself is still checked.
+
+Where a BIP34Hash is set (mainnet, testnet3) we approximate Core's ancestor
+test with the height, which is exact on the canonical chain and omits only
+the extra enforcement Core applies on a non-canonical fork past the BIP 34
+height -- infeasible to exploit given the PoW required."
+  (let ((bip34-hash (bl.chain:chain-params-bip34-hash
+                     (bl.chain:find-chain-params bl:*network*))))
+    (or (and (not (bip30-repeat-block-p height))
+             (or (null bip34-hash)
+                 (<= height (get-bip34-activation-height bl:*network*))))
+        (>= height +bip34-implies-bip30-limit+))))
 
 (defun encode-bip34-height (height)
   "The exact coinbase scriptSig prefix Bitcoin Core requires for a BIP 34
