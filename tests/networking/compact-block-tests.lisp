@@ -1390,6 +1390,35 @@ disconnect."
                "a block failing its own proof of work costs the sender the connection")
            (is (= 0 (bl.store:current-height cs)))))))))
 
+(test a-block-whose-header-breaks-a-contextual-rule-costs-the-sender-the-connection
+  "The same for a header that meets its own target but breaks a contextual
+rule: ContextualCheckBlockHeader's bad-diffbits (validation.cpp:4117-4122) is
+BLOCK_INVALID_HEADER, punished (net_processing.cpp:1917-1919).
+feature_block.py:688 force-sends b50 with nBits one lower and waits for the
+disconnect."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "bad-diffbits-block"))
+           (cs (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
+           (store (bl:node-block-store node))
+           (mp (bl:node-mempool node))
+           (block (%g716-mine-on node (p2sh-optrue-script-pubkey)))
+           (header (bl.ser:bitcoin-block-header block)))
+      (setf (bl.ser:block-header-bits header) (1- (bl.ser:block-header-bits header))
+            (bl.ser:block-header-cached-hash header) nil)
+      (bl.mining:mine-block block)
+      (is-true (bl.val:check-proof-of-work header)
+               "control: the block meets the target its own bits name")
+      (%g716-quiet
+       (with-ibd-context
+         (let ((attacker (%g716-delivering-peer "198.51.100.34"))
+               (ctx (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                              :block-store store :mempool mp)))
+           (deliver-ibd-message attacker "block" (%g716-block-payload block) ctx)
+           (is (eq :disconnected (bl.net:peer-state attacker))
+               "a block with the wrong difficulty bits costs the sender the connection")
+           (is (= 0 (bl.store:current-height cs)))))))))
+
 (defun %g716-delivering-peer (address)
   (let ((p (%g716-peer)))
     (setf (bl.net:peer-address p) address)

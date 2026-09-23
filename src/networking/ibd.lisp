@@ -780,6 +780,30 @@ whose nBits is negative / zero / overflowing / above the PoW limit is rejected
 (Core CheckBlockHeader), not silently decoded as an in-range target."
   (bl.val:check-proof-of-work header))
 
+(defun %refuse-block-with-invalid-header (peer header chain-state)
+  "The header of a block message PEER sent is not in the index after the
+ingest: T, with PEER punished, when that is Core's verdict on the header --
+AcceptBlock's AcceptBlockHeader, with CheckBlockHeader's proof of work asked
+FIRST, then the parent lookup (prev-blk-not-found, BLOCK_MISSING_PREV), then
+the contextual rules. Punished as MaybePunishNodeForBlock does
+(net_processing.cpp:1908-1946), which spares only time-too-new. NIL when the
+header is indexed, or was held back for a reason that is no verdict on it (the
+anti-DoS work floor)."
+  (unless (bl.store:get-block-index-entry
+           chain-state (bl.ser:block-header-hash header))
+    (let ((reason
+            (cond ((not (bl.val:check-proof-of-work header)) "high-hash")
+                  ((not (bl.store:get-block-index-entry
+                         chain-state (bl.ser:block-header-prev-block header)))
+                   (bl:log-info "AcceptBlock FAILED (prev-blk-not-found)")
+                   "prev-blk-not-found")
+                  (t (nth-value 2 (with-current-node-lock
+                                    (validate-header-chain (list header)
+                                                           chain-state)))))))
+      (when (and reason (not (equal reason "time-too-new")))
+        (record-misbehavior peer reason)
+        t))))
+
 (defun validate-header-chain (headers chain-state)
   "Validate a list of headers against the current chain state.
 Returns (VALUES valid-headers debug-message reject-reason rejected-hash);
@@ -2151,18 +2175,16 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        ;; the prev lookup, so a header that does not meet its own target is
        ;; high-hash, not prev-blk-not-found.
        ;;
-       ;; A header that misses its own target is CheckBlockHeader's high-hash,
-       ;; BLOCK_INVALID_HEADER (validation.cpp:3864), inside the CheckBlock
-       ;; ProcessNewBlock runs first; BlockChecked punishes that too
-       ;; (net_processing.cpp:1917-1919). The header ingest above already
-       ;; logged the verdict; feature_block.py:666 waits for the disconnect.
-       (unless (bl.val:check-proof-of-work header)
-         (record-misbehavior peer "high-hash")
-         (return-from dispatch-ibd-message nil))
-       (unless (bl.store:get-block-index-entry
-                chain-state (bl.ser:block-header-prev-block header))
-         (bl:log-info "AcceptBlock FAILED (prev-blk-not-found)")
-         (record-misbehavior peer "prev-blk-not-found")
+       ;; A header the ingest REFUSED is punished the same way: high-hash
+       ;; (CheckBlockHeader, validation.cpp:3864) and the contextual
+       ;; bad-diffbits, time-too-old, bad-version, bad-prevblk
+       ;; (ContextualCheckBlockHeader / AcceptBlockHeader, :4117-4150, :4254)
+       ;; are BLOCK_INVALID_HEADER / BLOCK_INVALID_PREV, which BlockChecked
+       ;; punishes (net_processing.cpp:1917-1919, :1935-1937); only
+       ;; time-too-new, BLOCK_TIME_FUTURE, is nobody's fault (:1945-1946). The
+       ;; ingest already logged the verdict; feature_block.py:666 and :688
+       ;; wait for the disconnect.
+       (when (%refuse-block-with-invalid-header peer header chain-state)
          (return-from dispatch-ibd-message nil))
        ;; Per-peer availability: receiving a block proves peer had it.
        (update-block-availability peer chain-state hash)
