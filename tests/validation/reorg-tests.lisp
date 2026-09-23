@@ -2548,6 +2548,47 @@ rejected set. The active tip is untouched until the bodies arrive."
            ;; Active tip untouched (all-or-nothing reorg refused cleanly).
            (is (= 3 (bl.store:current-height csa)))))))))
 
+(test a-winning-block-whose-fork-bodies-are-missing-is-still-stored
+  "Core's AcceptBlock writes a block to disk once it passes CheckBlock and its
+header chain is valid and has at least our tip's work (validation.cpp:4330-4405)
+-- whether or not ActivateBestChain can then connect it; a block whose
+ancestors' bodies are missing stays on disk until they arrive.
+rpc_blockchain.py:759-766 submits exactly that (a block on top of a
+header-only parent) and then reads it back with getblock. Ours refused the
+reorg for the missing bodies and never stored the block, so getblock answered
+`Block not available (not fully downloaded)'."
+  (with-network (:regtest)
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          (nb (regtest-node-fixture "fork-missing-b"))
+          (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          (na (regtest-node-fixture "fork-missing-a"))
+          (csa (bl:node-chain-state na))
+          (storea (bl:node-block-store na))
+          (genesis-hash (bl.store:best-block-hash csa)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))
+     ;; B1-B4 headers only, with their real chain work.
+     (let ((prev (bl.store:get-block-index-entry csa genesis-hash)))
+       (loop for blk in b-blocks for h from 1 to 4
+             do (let* ((hdr (bl.ser:bitcoin-block-header blk))
+                       (e (bl.store:make-block-index-entry
+                           :hash (bl.ser:block-header-hash hdr) :height h :header hdr
+                           :prev-entry prev :status :header-valid
+                           :chain-work (bl.store:calculate-chain-work
+                                        (bl.ser:block-header-bits hdr)
+                                        (bl.store:block-index-entry-chain-work prev)))))
+                  (bl.store:add-block-index-entry csa e)
+                  (setf prev e))))
+     (let* ((b4 (fourth b-blocks))
+            (b4-hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b4)))
+            (hex (bl.crypto:bytes-to-hex (bl.ser:serialize-witness-block b4))))
+       (bl.rpc:dispatch-rpc-method na "submitblock" (list hex))
+       ;; Control: the tip did not move, the reorg was refused.
+       (is (= 3 (bl.store:current-height csa)))
+       (is-true (bl.store:block-exists-p storea b4-hash)
+                "the submitted block was not stored")))))
+
 (test l5-witness-stripped-block-never-persisted
   "Item 12(2): a witness-stripped block is NEVER persisted at any chain position
 — below the tip (competing fork), at tip+1, or above tip (out-of-order) — since a

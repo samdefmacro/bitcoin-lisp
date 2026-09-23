@@ -4849,6 +4849,25 @@ resubmission as Core\'s BLOCK_MUTATED carve-out does."
       (when entry
         (%mark-block-subtree-invalid chain-state entry)))))
 
+(defun %store-block-for-later (block chain-state block-store now)
+  "Store BLOCK that ACTIVATE-BLOCK is not connecting now, through Core
+AcceptBlock's gate (no body reaches disk unchecked): (values T NIL), or
+(values NIL ERROR) when the checks refuse it. A witness-stripped copy is never
+written -- it would fail every later reorg that needs it (the original testnet4
+wedge) -- and answers T, since a witness-complete copy is re-fetched; this
+mirrors the target-filter guard in connect-block.
+
+Both of activate-block's not-now cases store: a block on a weaker or equal
+chain, and a winning block whose fork ancestors' bodies are missing -- Core's
+AcceptBlock writes a block with at least the tip's work once its checks pass,
+whether or not ActivateBestChain can connect it yet (validation.cpp:
+4330-4405). The second is new: ours returned :reorg-refused without storing,
+and rpc_blockchain.py:766 read `Block not available (not fully downloaded)'
+for a block submitted on top of a header-only parent."
+  (if (block-witness-stripped-p block)
+      (values t nil)
+      (%store-accepted-block-body block chain-state block-store :current-time now)))
+
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts fee-estimator
                             recent-rejects mempool)
@@ -4969,7 +4988,12 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 ;; (hash . height) — pass it up so process-received-block
                 ;; re-queues them. Without this, perform-reorg refuses on the
                 ;; same missing block forever and the tip is retried endlessly.
+                ;; The block is still STORED, as AcceptBlock stores it
+                ;; (validation.cpp:4330-4405, rpc_blockchain.py:759-766).
                 ((and (null reorg-ok) detail)
+                 (multiple-value-bind (stored error)
+                     (%store-block-for-later block chain-state block-store now)
+                   (unless stored (return-from activate-block (values nil error))))
                  (values nil :reorg-refused detail))
                 ;; Refused for another reason (no common ancestor, fork below
                 ;; pruned height). State unchanged.
@@ -5036,16 +5060,8 @@ can neither wedge on an equal-work sibling nor advance past the base."
            ;; Case 3: weaker / equal chain — store the block, don't
            ;; activate. Bitcoin Core does the same: blocks on weaker
            ;; tips sit in the block-store until their chain catches up.
-           ;; NEVER persist a witness-stripped block: it would sit on disk
-           ;; and fail every later reorg that needs it (the original testnet4
-           ;; wedge). Drop it; a witness-complete copy is re-fetched. Mirrors
-           ;; the target-filter guard above (block.lisp ~2428).
            (t
-            (unless (block-witness-stripped-p block)
-              ;; Core AcceptBlock's gate: no body reaches disk unchecked.
-              (multiple-value-bind (stored error)
-                  (%store-accepted-block-body block chain-state block-store
-                                              :current-time now)
-                (unless stored
-                  (return-from activate-block (values nil error)))))
+            (multiple-value-bind (stored error)
+                (%store-block-for-later block chain-state block-store now)
+              (unless stored (return-from activate-block (values nil error))))
             (values nil :weaker-chain))))))))
