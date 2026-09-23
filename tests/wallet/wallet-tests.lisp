@@ -2694,6 +2694,25 @@ start-up on that line; VerifyWallets runs only when the wallet does."
         (ignore-errors (bl.wallet:close-wallet-manager (bl:node-wallet-manager node))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
+(test start-up-says-loading-wallet-for-each-wallet-it-loads
+  "Core's LoadWallets announces `Loading wallet…' before EACH wallet it opens
+(wallet/load.cpp:149, the InitMessage the GUI's splash screen shows), after
+the one `Verifying wallet(s)…'. A name listed twice is loaded, and
+announced, once (wallet_paths is a set, load.cpp:129-131)."
+  (with-wallet-test-node (node :network :regtest)
+    (bl.rpc:dispatch-rpc-method node "createwallet" '("one"))
+    (bl.rpc:dispatch-rpc-method node "createwallet" '("two"))
+    (setf (bl:node-data-directory node) (%wallet-settings-dir node))
+    (bl.wallet:close-wallet-manager (%node-manager node))
+    (setf (bl:node-wallet-manager node) nil)
+    (let ((lines (capture-log-lines
+                  (lambda () (bl:start-wallets node :regtest nil nil '("one" "two" "one"))))))
+      (is (= 2 (count-if (lambda (l) (search "init message: Loading wallet…" l)) lines)))
+      (is (< (position-if (lambda (l) (search "init message: Verifying wallet(s)…" l)) lines)
+             (position-if (lambda (l) (search "init message: Loading wallet…" l)) lines))
+          "verification is announced first")
+      (is (equal '("one" "two") (sort (%loaded-wallet-names node) #'string<))))))
+
 (test startup-refuses-a-wallet-another-instance-holds
   "Core's VerifyWallets stops startup when a -wallet cannot be opened
 (load.cpp:106-110), and a database another process holds is SQLiteDatabase's

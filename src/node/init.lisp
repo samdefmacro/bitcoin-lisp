@@ -1476,7 +1476,10 @@ Core announces `Verifying wallet(s)…' before it opens any wallet database
 (VerifyWallets, wallet/load.cpp:57), which feature_init.py:88 interrupts
 start-up on. Opening each database IS our verification -- it is the same step
 as the load -- so the message comes immediately before the load, and only when
-the wallet is enabled, as Core calls VerifyWallets only then.
+the wallet is enabled, as Core calls VerifyWallets only then. Each wallet of an argument-started
+node is announced `Loading wallet…' as LoadWallets announces it
+(wallet/load.cpp:149); a REPL-started node's settings.json list is loaded in
+one call, unannounced.
 
 Runs once the chainstate and the mempool are both up, so each wallet can
 catch up from its locator and fold in the mempool, and before networking, so
@@ -1492,7 +1495,14 @@ settings.json's own list (Core LoadWallets, load.cpp:118)."
     (init-message "Verifying wallet(s)…")
     (if (eq wallet-names :settings)
         (bl.wallet:load-wallets-on-startup node)
-        (bl.wallet:load-wallets-on-startup node wallet-names))))
+        ;; Core's LoadWallets says `Loading wallet…' before EACH wallet it
+        ;; opens (wallet/load.cpp:149), so the list is walked here, one
+        ;; wallet per call; the loader keeps its own duplicate rule.
+        (let ((names (remove-duplicates (remove-if-not #'stringp wallet-names)
+                                        :test #'string= :from-end t)))
+          (dolist (name names)
+            (init-message "Loading wallet…")
+            (bl.wallet:load-wallets-on-startup node (list name)))))))
 
 
 (defun apply-initial-network-active (node network-active)
