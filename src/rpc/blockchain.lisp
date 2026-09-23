@@ -962,15 +962,24 @@ stopped at pruned history answers false too."
 ;;; --- waitfornewblock / dumptxoutset (Bitcoin Core rpc/blockchain.cpp) ---
 
 (define-rpc "waitfornewblock" (node params)
-  "Wait until the chain tip changes, then return it (Bitcoin Core
-waitfornewblock). PARAMS: ([timeout-ms]) — 0 (the default) waits indefinitely.
-Returns the current tip on change, timeout, or node shutdown. Polls the tip on
-the RPC worker thread."
+  "Wait until the chain tip differs from CURRENT_TIP, then return it (Bitcoin
+Core waitfornewblock). PARAMS: ([timeout-ms] [current_tip]) -- a timeout of 0
+(the default) waits indefinitely. Returns the current tip on change, timeout,
+or node shutdown. Polls the tip on the RPC worker thread.
+
+CURRENT_TIP is what the wait is measured against, and without it the tip at
+the call (rpc/blockchain.cpp:321-335): a caller that names a tip the chain
+has already left gets the current one back at once. Ours ignored the
+argument and waited for the NEXT block, so rpc_blockchain.py:597 -- which
+passes the tip from before a reconsiderblock that already moved the chain --
+waited until its socket timed out."
   (let ((timeout (if (integerp (first params)) (first params) 0)))
     (when (minusp timeout)
       (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
     (let* ((chain-state (rpc-get-chain-state node))
-           (start-hash (bl.store:best-block-hash chain-state))
+           (start-hash (if (second params)
+                           (parse-hash-v (second params) "current_tip")
+                           (bl.store:best-block-hash chain-state)))
            (deadline (when (plusp timeout)
                        (+ (get-internal-real-time)
                           (floor (* timeout internal-time-units-per-second) 1000)))))

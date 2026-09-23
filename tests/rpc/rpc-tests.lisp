@@ -8428,6 +8428,31 @@ early when the tip changes."
       (let ((r (bl.rpc::rpc-waitfornewblock node (list 5000))))
         (is (= 7 (cdr (assoc "height" r :test #'string=))))))))
 
+(test waitfornewblock-measures-against-the-given-current-tip
+  "Core waitfornewblock waits for the tip to differ from CURRENT_TIP when one
+is given (rpc/blockchain.cpp:321-335), so naming a tip the chain has already
+left returns the current one at once. Ours ignored the argument and waited
+for the next block; rpc_blockchain.py:597 timed out on it."
+  (let* ((node (make-test-node))
+         (cs (bl:node-chain-state node))
+         (tip (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (old (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)))
+    (setf (bl:node-running node) t)
+    (bl.store:update-chain-tip cs tip 7)
+    (let* ((start (get-internal-real-time))
+           (r (bl.rpc:dispatch-rpc-method
+               node "waitfornewblock" (list 3000 (bl.rpc:hash-to-hex old))))
+           (elapsed (/ (- (get-internal-real-time) start)
+                       internal-time-units-per-second)))
+      (is (string= (bl.rpc:hash-to-hex tip) (cdr (assoc "hash" r :test #'string=))))
+      (is (< elapsed 1.5) "waited ~,2Fs for a tip the chain had already left" elapsed))
+    ;; Control: naming the CURRENT tip still waits out the timeout.
+    (let ((start (get-internal-real-time)))
+      (bl.rpc:dispatch-rpc-method
+       node "waitfornewblock" (list 600 (bl.rpc:hash-to-hex tip)))
+      (is (>= (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+              0.5)))))
+
 (test rpc-dumptxoutset-writes-snapshot
   "dumptxoutset streams the UTXO set to a new file and refuses to overwrite."
   (let* ((node (make-test-node))
