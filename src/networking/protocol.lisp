@@ -163,20 +163,13 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     ;; "block" and a forged command name would reach a real handler.
     (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
                 (bl.bytes:sanitize-string command) (length payload) (peer-id peer))
+    ;; No per-command message count is checked here: Core disconnects a peer
+    ;; for how many messages of a kind it sends for none of them
+    ;; (net_processing.cpp ProcessMessage). Its bounds are per message, in the
+    ;; handlers -- MAX_INV_SZ, MAX_HEADERS_RESULTS, MAX_ADDR_TO_SEND,
+    ;; MAX_LOCATOR_SZ, the addr token bucket that drops excess addresses --
+    ;; and the send-buffer pause that bounds what serving a request costs.
     (let ((handler (p2p-handler-for command)))
-      ;; Check per-peer rate limit before processing. The buckets are ours,
-      ;; not Core's -- Core has no per-command disconnect -- so they must at
-      ;; least spare a noban peer, which Core never disconnects for its
-      ;; conduct (NetPermissionFlags::NoBan, net_permissions.h:34-36; the same
-      ;; exemption RECORD-MISBEHAVIOR makes). The functional framework's
-      ;; -whitelist=noban peers relay chains of 25+ transactions at once
-      ;; (mempool_packages.py:28), which a 50-message tx burst cut off.
-      (unless (or (peer-has-permission-p peer +perm-noban+)
-                  (check-peer-rate-limit peer command handler))
-        (bl:log-warn "Rate limit exceeded on ~A messages, ~A"
-                     command (disconnect-msg peer))
-        (disconnect-peer peer)
-        (return-from handle-message nil))
       (cond ((null handler) nil)          ; Unknown message
             ;; Acknowledged but not processed: the message needs a mempool
             ;; and this context has none (a header-only or IBD pump).
@@ -1181,7 +1174,7 @@ AddTxAnnouncement's orphan branch, txdownloadman_impl.cpp:172-190)."
           (%add-orphan-resolution-candidate peer otx parents mempool
                                             num-wtxid-peers))))))
 
-(define-p2p-handler ("inv" :rate-bucket peer-rate-limit-inv) (peer payload ctx)
+(define-p2p-handler "inv" (peer payload ctx)
   "Handle an inv message.
 
 For block invs we DO NOT request the block directly via getdata — under
@@ -1327,7 +1320,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
 
 ;;; Notfound handling
 
-(define-p2p-handler ("notfound" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
+(define-p2p-handler "notfound" (peer payload ctx)
   "Handle a notfound message: the peer is telling us it lacks one or
 more items we requested via getdata. For tx items, complete the peer's
 announcement in the tx-request tracker so the request fails over to
@@ -1366,7 +1359,7 @@ was the only uncharged command on this path."
 
 ;;; Headers handling
 
-(define-p2p-handler ("headers" :rate-bucket peer-rate-limit-headers) (peer payload ctx)
+(define-p2p-handler "headers" (peer payload ctx)
   "Handle a headers message: validate the announced headers (PoW, MTP,
 difficulty, checkpoint) and admit only the valid ones to the block index,
 queueing them for block download. This is the generic message-loop path (the
@@ -1989,7 +1982,7 @@ the number stored."
               do (relay-address pa peer peers :now now :reachable reachable)))
       added)))
 
-(define-p2p-handler ("addr" :rate-bucket peer-rate-limit-addr) (peer payload ctx)
+(define-p2p-handler "addr" (peer payload ctx)
   "Handle an addr message. When CTX carries an address-book, add the addresses on
 reachable networks to the address book regardless of age (absurd timestamps are
 rewritten, not dropped — see %ingest-gossiped-address), keyed to the gossiping
@@ -2027,7 +2020,7 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
 
 ;;; ADDRv2 handling (BIP 155)
 
-(define-p2p-handler ("addrv2" :rate-bucket peer-rate-limit-addr) (peer payload ctx)
+(define-p2p-handler "addrv2" (peer payload ctx)
   "Handle an addrv2 message (BIP 155). When CTX carries an address-book, add
 addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) to the
 address book regardless of age (absurd timestamps are rewritten, not dropped —
@@ -3278,7 +3271,7 @@ Mirrors Bitcoin Core's GETHEADERS handler (net_processing.cpp:4426-4470)."
                   (bl.store:block-index-entry-hash (car (last sent)))
                   (bl.store:best-block-hash chain-state))))))
 
-(define-p2p-handler ("getheaders" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
+(define-p2p-handler "getheaders" (peer payload ctx)
   "Serve a peer's getheaders by sending the headers message built from PAYLOAD
 against our active chain (see getheaders-response-message). NIL means Core
 sends nothing at all -- a null-locator request for a block we do not know or
@@ -3315,7 +3308,7 @@ announce. Mirrors Bitcoin Core's GETBLOCKS handler (legacy blocks-first peers)."
                     :hash (bl.store:block-index-entry-hash entry)))
                  chosen))))))
 
-(define-p2p-handler ("getblocks" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
+(define-p2p-handler "getblocks" (peer payload ctx)
   "Serve a peer's getblocks by sending the inv built from PAYLOAD, if any (see
 getblocks-response-message)."
   (bl.ctx:with-node-context (chain-state) ctx
@@ -3414,7 +3407,7 @@ for up to 27h after banning it; that is Core-identical and intended."
                                (random (1+ +addr-response-cache-jitter-seconds+)))))
           addrs))))
 
-(define-p2p-handler ("getaddr" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
+(define-p2p-handler "getaddr" (peer payload ctx)
   "Serve a peer's getaddr: reply once per connection, and only to inbound peers,
 with up to +max-addr-count+ known addresses from ADDRESS-BOOK (defaulting to the
 node's). The inbound-only + once-per-connection rules mirror Bitcoin Core's

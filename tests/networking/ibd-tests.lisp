@@ -3322,25 +3322,6 @@ however many rounds it ran and the cap never bound it at all."
                (tx-request-announcement-peers last-hash :completed t)))
     (bl.net:reset-tx-requests)))
 
-(test notfound-drains-the-serve-bucket
-  "An unsolicited response message must cost the sender something. The
-notfound handler declared no rate bucket, and check-peer-rate-limit lets any
-command whose row declares none straight through, so this was the one
-uncharged command on the tx-relay path."
-  (let ((peer (bl.net:init-peer-rate-limiters (bl.net:make-peer))))
-    ;; Positive control: the bucket starts full.
-    (is-true (bl.net:check-peer-rate-limit peer "notfound"))
-    (loop repeat 200 do (bl.net:check-peer-rate-limit peer "notfound"))
-    (is-false (bl.net:check-peer-rate-limit peer "notfound"))
-    ;; It is the SERVE bucket, shared with the other unsolicited-work
-    ;; commands, so draining it here also stops a getaddr flood.
-    (is-false (bl.net:check-peer-rate-limit peer "getaddr"))
-    ;; ...and not some other peer's, nor every bucket on this one.
-    (is-true (bl.net:check-peer-rate-limit peer "inv"))
-    (is-true (bl.net:check-peer-rate-limit
-              (bl.net:init-peer-rate-limiters (bl.net:make-peer))
-              "notfound"))))
-
 (test an-oversized-notfound-has-its-tx-items-ignored
   "Core's NOTFOUND arm discards the tx entries of a message carrying more than
 MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER invs
@@ -5841,7 +5822,6 @@ that reads it also drops it. Runs over a loopback socket pair."
              (when server-peer
                (unwind-protect
                     (progn
-                      (bl.net:init-peer-rate-limiters server-peer)
                       (setf (bl.net:peer-state client) :ready)
                       (is-true (bl.net:peer-outbound-or-block-relay-p server-peer)
                                "control: the peer is an eviction candidate")

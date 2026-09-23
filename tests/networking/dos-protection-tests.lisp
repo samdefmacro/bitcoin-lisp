@@ -63,15 +63,6 @@ run on a loaded machine (2026-09-05)."
 ;;;; 2. Per-Peer Rate Limiting Tests
 ;;;; ============================================================
 
-(test peer-rate-limiters-initialized
-  "Peer rate limiters should be initialized from config."
-  (let ((peer (bl.net:make-peer)))
-    (bl.net:init-peer-rate-limiters peer)
-    ;; All rate limiters should be non-nil
-    (is (not (null (bl.net::peer-rate-limit-inv peer))))
-    (is (not (null (bl.net::peer-rate-limit-addr peer))))
-    (is (not (null (bl.net::peer-rate-limit-headers peer))))))
-
 (defparameter +p2p-commands-this-node-handles+
   '("ping" "pong" "inv" "headers" "block" "tx" "getdata" "getheaders"
     "getblocks" "getaddr" "mempool" "notfound" "addr" "addrv2" "getcfilters"
@@ -108,7 +99,6 @@ HANDLE-MESSAGE, and an unknown command answers NIL."
              (declare (ignore peer ctx))
              (setf seen payload))
            (let ((peer (bl.net:make-peer)))
-             (bl.net:init-peer-rate-limiters peer)
              (let ((ctx (bl.ctx:make-node-context)))
                (is-true (bl.net:handle-message peer "probe-cmd" #(1 2 3) ctx))
                (is (equalp #(1 2 3) seen))
@@ -117,94 +107,43 @@ HANDLE-MESSAGE, and an unknown command answers NIL."
         (setf (bl.net:p2p-handler-for "probe-cmd") nil)
         (when row (fmakunbound (bl.net:p2p-handler-function row)))))))
 
-(test check-peer-rate-limit-allows-normal
-  "Rate limit check should allow messages within limits."
-  (let ((peer (bl.net:make-peer)))
-    (bl.net:init-peer-rate-limiters peer)
-    ;; Each message type should allow at least one message
-    (is (bl.net:check-peer-rate-limit peer "inv"))
-    (is (bl.net:check-peer-rate-limit peer "tx"))
-    (is (bl.net:check-peer-rate-limit peer "addr"))
-    (is (bl.net:check-peer-rate-limit peer "addrv2"))
-    (is (bl.net:check-peer-rate-limit peer "getdata"))
-    (is (bl.net:check-peer-rate-limit peer "headers"))))
-
-(test check-peer-rate-limit-unknown-command
-  "Rate limit check for unknown commands should always pass."
-  (let ((peer (bl.net:make-peer)))
-    (bl.net:init-peer-rate-limiters peer)
-    (is (bl.net:check-peer-rate-limit peer "ping"))
-    (is (bl.net:check-peer-rate-limit peer "pong"))
-    (is (bl.net:check-peer-rate-limit peer "version"))))
-
-(test getdata-is-never-rate-limited
-  "Core places NO limit on INCOMING getdata: MAX_GETDATA_SZ is 1000 and its own
-comment says it is `not used in processing incoming GETDATA for compatibility\'
-(net_processing.cpp:127-128). The bound Core relies on is the send buffer --
-ProcessGetData stops serving a peer whose queue is over -maxsendbuffer, which
-PROCESS-PEER-GETDATA already does.
-
-We also had a token bucket on top of it (20/s, burst 100) whose miss
-DISCONNECTS. A node that announces its own blocks is asked for them, one
-getdata per inv, and mining a few hundred blocks with a peer attached is enough
-to blow the burst: in the 2026-09-13 sweep, feature_csv_activation.py:181 and
-feature_versionbits_warning.py:54 both end with `Rate limit exceeded on getdata
-messages, disconnecting peer=0\' in the node log, the peer having asked only for
-what this node told it about."
-  (let ((peer (bl.net:make-peer)))
-    (bl.net:init-peer-rate-limiters peer)
-    ;; Far past any burst a bucket could have had.
-    (is (= 1000 (loop repeat 1000
-                      count (bl.net:check-peer-rate-limit peer "getdata")))
-        "a getdata was refused")
-    ;; Positive control: the mechanism still works for a command that HAS a
-    ;; bucket, so this test cannot pass by the limiter being gone entirely.
-    (let ((limited (bl.net:make-peer)))
-      (let ((bl:*rate-limit-addr* '(1.0 . 2.0)))
-        (bl.net:init-peer-rate-limiters limited))
-      (dotimes (i 2) (bl.net:check-peer-rate-limit limited "addr"))
-      (is-false (bl.net:check-peer-rate-limit limited "addr")))))
-
-(test a-noban-peer-is-not-cut-off-by-the-message-buckets
-  "The per-command token buckets are ours, not Core's: Core has no
-per-message-type disconnect, and a noban peer is never disconnected for its
-conduct (NetPermissionFlags::NoBan, net_permissions.h:34-36). The functional
-framework whitelists its peers noban and relays whole chains at once;
-mempool_packages.py:173 lost its only peer to `Rate limit exceeded on tx
-messages' after a 25-transaction chain. Control: an ordinary peer with the
-same drained bucket is still refused.
-
-The tx bucket itself is charged in the tx handler, for unsolicited
-transactions only, and spares a noban peer there
-(a-requested-tx-is-never-charged-to-the-tx-rate-limit); this test meters the
-dispatcher's buckets through inv, with an empty inventory."
-  (with-whitelist (:entries '("noban@198.51.100.21/32"))
-    (let ((bl:*rate-limit-inv* '(1.0 . 2.0))
-          (ctx (bl.ctx:make-node-context))
-          (noban (bl.net:make-peer :inbound t :address "198.51.100.21"))
-          (ordinary (bl.net:make-peer :inbound t :address "198.51.100.22"))
-          (empty-inv (make-array 1 :element-type '(unsigned-byte 8)
-                                   :initial-element 0)))
-      (bl.net:init-peer-rate-limiters noban)
-      (bl.net:init-peer-rate-limiters ordinary)
-      (is (= 2 (loop repeat 10
-                     count (bl.net:handle-message ordinary "inv" empty-inv ctx)))
-          "control: the ordinary peer's bucket admits its burst of two only")
-      (is (= 10 (loop repeat 10
-                      count (bl.net:handle-message noban "inv" empty-inv ctx)))
-          "a noban peer's inv flood is taken in, not cut off"))))
-
-(test check-peer-rate-limit-rejects-flood
-  "Rate limit check should reject when burst is exceeded."
-  (let ((peer (bl.net:make-peer)))
-    ;; Use a very low burst for testing
-    (let ((bl:*rate-limit-addr* '(1.0 . 2.0)))
-      (bl.net:init-peer-rate-limiters peer)
-      ;; Consume the burst
-      (dotimes (i 2)
-        (bl.net:check-peer-rate-limit peer "addr"))
-      ;; Next should fail
-      (is (not (bl.net:check-peer-rate-limit peer "addr"))))))
+(test a-message-flood-of-any-kind-keeps-its-sender-connected
+  "Core disconnects a peer for how MANY messages of a kind it sends for none
+of inv, addr/addrv2, headers, getheaders, getblocks, getaddr or notfound
+(net_processing.cpp ProcessMessage: no per-type counter anywhere). The bounds
+it does have are per MESSAGE -- MAX_INV_SZ (:4128, :4219), MAX_HEADERS_RESULTS
+(:4829), MAX_ADDR_TO_SEND (:4046) and MAX_LOCATOR_SZ (:4272, :4399) -- plus the
+addr token bucket, which DROPS the excess addresses (:4070-4083), and the
+send-buffer pause that bounds what serving a request can cost (:5244).
+Ours kept a token bucket per kind and DISCONNECTED the sender of the first
+message past its burst: 200 invs, 10 addrs, 50 headers, or 20 serve requests
+in a row. Every message below reaches its handler and the peer stays."
+  (let* ((ctx (bl.ctx:make-node-context))
+         (peer (bl.net:make-peer :inbound t :address "198.51.100.31" :state :ready))
+         (empty-vector (make-array 1 :element-type '(unsigned-byte 8)
+                                     :initial-element 0))
+         ;; version, an empty locator, a zero stop hash
+         (empty-locator (make-array 37 :element-type '(unsigned-byte 8)
+                                       :initial-element 0))
+         (flood '(("inv" 400) ("getdata" 400) ("addr" 60) ("addrv2" 60) ("headers" 120)
+                  ("notfound" 300) ("getheaders" 60) ("getblocks" 60)
+                  ("getaddr" 60))))
+    (loop for (command n) in flood
+          do (loop repeat n
+                   do (ignore-errors
+                       (bl.net:handle-message
+                        peer command
+                        (if (member command '("getheaders" "getblocks")
+                                    :test #'string=)
+                            empty-locator
+                            empty-vector)
+                        ctx)))
+             (is (eq :ready (bl.net:peer-state peer))
+                 "~D ~A messages disconnected their sender" n command))
+    ;; The inv handler ran every time: HANDLE-MESSAGE answers T for a message
+    ;; its handler took in, NIL for one refused before the handler.
+    (is (= 400 (loop repeat 400
+                     count (bl.net:handle-message peer "inv" empty-vector ctx))))))
 
 ;;;; ============================================================
 ;;;; 3. Handshake Timeout Tests
@@ -366,9 +305,6 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
 (test dos-config-defaults
   "Default DoS configuration values should be reasonable."
   ;; Rate limits are (rate . burst) cons cells
-  (is (consp bl:*rate-limit-inv*))
-  (is (consp bl:*rate-limit-addr*))
-  (is (consp bl:*rate-limit-headers*))
   (is (consp bl:*rpc-rate-limit*))
   ;; Constants
   (is (> bl:+max-message-payload+ 0))
@@ -408,34 +344,6 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
 ;;;; ============================================================
 ;;;; Serve-request rate limiting (getheaders/getblocks/getaddr)
 ;;;; ============================================================
-
-(test rate-limit-serve-config-present
-  "The shared serve-request rate-limit config is a (rate . burst) pair."
-  (is (consp bl:*rate-limit-serve*)))
-
-(test rate-limit-serve-throttles-getheaders-flood
-  "A flood of getheaders is throttled (eventually denied), and getblocks/getaddr
-share the same bucket — once it's drained, they are denied too."
-  (let ((peer (bl.net:make-peer)))
-    (bl.net:init-peer-rate-limiters peer)
-    ;; The first call is allowed (full burst); drive well past the burst rapidly.
-    (is-true (bl.net:check-peer-rate-limit peer "getheaders"))
-    (let ((denied nil))
-      (dotimes (i 100)
-        (unless (bl.net:check-peer-rate-limit peer "getheaders")
-          (setf denied t)))
-      (is-true denied))
-    ;; Bucket is shared: getblocks and getaddr are now denied as well.
-    (is-false (bl.net:check-peer-rate-limit peer "getblocks"))
-    (is-false (bl.net:check-peer-rate-limit peer "getaddr"))))
-
-(test rate-limit-unrelated-command-unaffected
-  "Draining the serve bucket does not throttle an unrelated command (ping)."
-  (let ((peer (bl.net:make-peer)))
-    (bl.net:init-peer-rate-limiters peer)
-    (dotimes (i 100) (bl.net:check-peer-rate-limit peer "getheaders"))
-    ;; ping has no bucket -> always allowed.
-    (is-true (bl.net:check-peer-rate-limit peer "ping"))))
 
 ;;;; ============================================================
 ;;;; Concurrency hardening (recursive node-lock, ban-lock, node-peers)

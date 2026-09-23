@@ -127,10 +127,6 @@ init.cpp, node/. src/node/.")
    #:add-recent-reject
    #:clear-recent-rejects
    ;; DoS protection configuration
-   #:*rate-limit-inv*
-   #:*rate-limit-addr*
-   #:*rate-limit-headers*
-   #:*rate-limit-serve*
    #:*rpc-rate-limit*
    #:+max-message-payload+
    #:+max-rpc-body-size+

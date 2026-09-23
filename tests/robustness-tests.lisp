@@ -145,19 +145,12 @@
 
 (defun %fake-ready-peer ()
   "A peer object in the :ready state with a socket-less (but 'connected')
-connection and its rate-limit buckets filled -- enough to drive dispatch +
-disconnect without a real socket.
-
-The buckets are not decoration. Without them the FIRST thing every dispatch
-touches is a NIL token bucket, so the handler TYPE-ERRORs before it reads a
-byte of the payload and any assertion about how the payload was judged is
-measuring the fixture."
+connection -- enough to drive dispatch + disconnect without a real socket."
   (let ((conn (make-test-connection
                :host "127.0.0.1" :port 48333 :connected t))
         (peer nil))
     (setf peer (bl.net:make-peer
                 :connection conn :state :ready :address "127.0.0.1"))
-    (bl.net:init-peer-rate-limiters peer)
     peer))
 
 (defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer)))

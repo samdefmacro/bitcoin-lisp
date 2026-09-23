@@ -162,7 +162,6 @@ block's parent, and that block is announced as a header, not an inv
           (peer (bl.net:make-peer :address "test" :state :ready))
           (tip5 (%entry-hash entries 5))
           (tip6 (%entry-hash entries 6)))
-      (bl.net:init-peer-rate-limiters peer)
       (setf (bl.net:peer-prefers-headers peer) t)
       ;; Our tip is block 5 when the peer asks.
       (bl.store:update-chain-tip cs tip5 5)
@@ -1008,9 +1007,8 @@ reply from the handler, ahead of everything."
   ;; earlier run of this test is just as non-empty.
   (let ((bl:*node* nil)
         (book (%g720-book 50))
-        (peer (bl.net:init-peer-rate-limiters
-               (bl.net:make-peer :state :ready :inbound t :address "2600::1"
-                                 :addr-relay-enabled t))))
+        (peer (bl.net:make-peer :state :ready :inbound t :address "2600::1"
+                                 :addr-relay-enabled t)))
     (%with-captured-sends (sends)
       (with-ibd-context
         (deliver-ibd-message peer "getaddr" #()
@@ -1033,9 +1031,8 @@ tip and waits for a getheaders whose locator starts at the tip."
                         :version 1 :prev-block (bl.store:block-index-entry-hash tip)
                         :merkle-root (%uniq-hash 8801) :timestamp 1700000004
                         :bits #x1d00ffff :nonce 1))
-           (peer (bl.net:init-peer-rate-limiters
-                  (bl.net:make-peer :address "test" :state :ready
-                                    :services bl.ser:+node-witness+)))
+           (peer (bl.net:make-peer :address "test" :state :ready
+                                    :services bl.ser:+node-witness+))
            ;; A FRESH hash each run: the inv handler remembers the last block
            ;; that triggered a pre-sync getheaders, process-wide, and a repeat
            ;; of it is (rightly) not asked about again.

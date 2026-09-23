@@ -316,12 +316,6 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; Universal time of the last round with this peer, so the timer can space
   ;; them out.
   (recon-last-round 0 :type integer)
-  ;; DoS protection: per-peer rate limiters
-  (rate-limit-inv nil)
-  (rate-limit-addr nil)
-  (rate-limit-headers nil)
-  ;; Shared bucket for serve requests: getheaders/getblocks/getaddr.
-  (rate-limit-serve nil)
   ;; Handshake timeout tracking
   (connect-time 0 :type integer)                     ; internal-real-time at connection
   ;; Per-peer block-availability tracking. Mirrors a subset of Bitcoin
@@ -405,15 +399,6 @@ PEER-LOG-NAME. A caller with a reason of its own writes it as Core does,
 
 ;;; Peer connection
 
-(defun init-peer-rate-limiters (peer)
-  "Initialize per-peer rate limiters from global configuration."
-  (flet ((rl (config) (bl:make-rate-limiter (car config) (cdr config))))
-    (setf (peer-rate-limit-inv peer) (rl bl:*rate-limit-inv*))
-    (setf (peer-rate-limit-addr peer) (rl bl:*rate-limit-addr*))
-    (setf (peer-rate-limit-headers peer) (rl bl:*rate-limit-headers*))
-    (setf (peer-rate-limit-serve peer) (rl bl:*rate-limit-serve*)))
-  peer)
-
 (defun connect-peer (host &optional (port *current-port*))
   "Connect to a peer at HOST:PORT.
 Returns (VALUES PEER PROXY-CONNECTION-FAILED-P): the peer, or NIL on failure.
@@ -432,7 +417,6 @@ to decide whether the address is charged an addrman attempt at all
                                :state :connected
                                :address host
                                :connect-time (get-internal-real-time))))
-          (init-peer-rate-limiters peer)
           ;; Core logs this on every CNode it constructs, outbound and inbound
           ;; alike (net.cpp:4005-4007), and p2p_add_connections.py greps for it.
           (if bl:*log-ips*
@@ -1644,7 +1628,6 @@ listener's own port."
                          :inbound-onion (and inbound-onion t)
                          :local-port local-port
                          :connect-time (get-internal-real-time))))
-    (init-peer-rate-limiters peer)
     ;; Core's inbound branch has no address in the line (net.cpp:4009).
     (bl:log-cat "net" "Added connection peer=~D" (peer-id peer))
     peer))
@@ -2485,14 +2468,3 @@ RECREATED before this returns."
         (save-banlist path)
         nil))))
 
-;;; Per-Peer Rate Limiting
-
-(defun check-peer-rate-limit (peer command &optional (handler (p2p-handler-for command)))
-  "Check if PEER is within rate limits for COMMAND: T if allowed, NIL if the
-command's token bucket (its DEFINE-P2P-HANDLER :rate-bucket) is empty. A
-command with no bucket, or none this node handles, is always allowed.
-HANDLER is COMMAND's table row; HANDLE-MESSAGE passes the one it already
-looked up."
-  (let ((bucket (and handler (p2p-handler-rate-bucket handler))))
-    (or (null bucket)
-        (bl:token-bucket-allow-p (funcall bucket peer)))))

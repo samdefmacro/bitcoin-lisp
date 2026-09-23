@@ -23,12 +23,10 @@
 (in-suite :package-relay-tests)
 
 (defun %pr-peer ()
-  "A :ready peer advertising NODE_WITNESS, like every modern Core peer, with
-its token buckets installed so the shipped dispatcher can meter it."
-  (bl.net:init-peer-rate-limiters
-   (bl.net:make-peer
+  "A :ready peer advertising NODE_WITNESS, like every modern Core peer."
+  (bl.net:make-peer
     :address "pkgrelay" :state :ready
-    :services bl.ser:+node-witness+)))
+    :services bl.ser:+node-witness+))
 
 (defun %pr-payload (tx &key witness)
   "The `tx` message payload for TX (header stripped), as handle-tx sees it.
@@ -870,10 +868,9 @@ the getdata."
   (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
            (txid (bl.ser:transaction-hash tx))
-           (inbound (bl.net:init-peer-rate-limiters
-                     (bl.net:make-peer :address "pkgrelay" :state :ready
+           (inbound (bl.net:make-peer :address "pkgrelay" :state :ready
                                                  :inbound t
-                                                 :services bl.ser:+node-witness+))))
+                                                 :services bl.ser:+node-witness+)))
       (%with-fresh-rejects (rejects)
         (let ((ctx (%pr-ctx state utxo mempool rejects)))
           ;; Control 1: with the transaction still unknown, the context does
