@@ -2241,6 +2241,39 @@ to cosign it. The v0 inputs here also pin RemoveUnnecessaryTransactions
                                 (bl.wallet::%psbt-input-prevout m in)))
                        "authenticated non_witness_utxo still wins")))))))
 
+(test pp-wallet-fill-psbt-stores-non-witness-utxo-without-witness
+  "A non_witness_utxo is the previous transaction WITHOUT its witness: Core
+writes it TX_NO_WITNESS (psbt.h:303-305), since the record authenticates a
+txid and the witness is no part of one. The wallet updaters (FillPSBT,
+wallet.cpp:2201-2212) stored the wallet transaction's full wire bytes, and
+only the PSBT writer's normalization (a5b1c888) kept them out of what we
+sent. The funding coins here are segwit coinbases, which carry a witness
+(the witness reserved value), so the difference is visible in the record."
+  (%with-pp-node (node "pp-nwnw")
+    (let* ((wallet (%pp-fund-wallet node))
+           (b64 (%aval "psbt" (bl.rpc:dispatch-rpc-method
+                               node "walletcreatefundedpsbt"
+                               (wire-params
+                                (list '() (list (%ht (%pp-optrue-address) 1)) 0
+                                      (%ht "fee_rate" 5))))))
+           (tx (bl.ser:psbt-tx (bl.ser:decode-psbt b64)))
+           (psbt (bl.wallet:wallet-fill-psbt wallet tx)))
+      (is (plusp (length (bl.ser:psbt-inputs psbt))))
+      (loop for m across (bl.ser:psbt-inputs psbt)
+            for in across (bl.ser:transaction-inputs tx)
+            do (let* ((txid (bl.rpc:hash-to-hex
+                             (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in))))
+                      (wire (bl.crypto:hex-to-bytes
+                             (%aval "hex" (bl.rpc:dispatch-rpc-method
+                                           node "gettransaction" (wire-params (list txid))))))
+                      (parent (bl.ser:br-read-transaction
+                               (bl.ser:make-byte-reader-from wire))))
+                 ;; Control: the parent has a witness, so the two forms differ.
+                 (is-true (bl.ser:transaction-has-witness-p parent))
+                 (is (equalp (bl.ser:serialize-transaction parent)
+                             (bl.ser:psbt-map-find m bl.ser:+psbt-in-non-witness-utxo+))
+                     "input ~A's non_witness_utxo is not the legacy serialization" txid))))))
+
 (test pp-bumpfee-rbf-chain
   "bumpfee rebuilds a higher-feerate replacement re-spending ALL original inputs,
 signs + broadcasts it (RBF-evicting the original), records replaced_by_txid, and

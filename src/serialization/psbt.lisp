@@ -511,8 +511,9 @@ gate), and a PSBT_GLOBAL_VERSION of 0 is not written at all (:1188-1191)."
   "A PSBT_IN_NON_WITNESS_UTXO record whose transaction is written WITHOUT its
 witness. Core reads the record with witness (psbt.h:512-513) and writes it
 back TX_NO_WITNESS (:303-305); the witness is not part of what the record
-authenticates, the txid. Our updaters stored the full wire bytes, which a
-Core reader accepts but never produces."
+authenticates, the txid. The wallet updaters store the record that way
+themselves; this rewrite is for a record we READ, which may carry the witness
+and which decodepsbt shows as it came, as Core's does."
   (let ((tx (br-read-transaction (make-byte-reader-from (cdr rec)))))
     (cons (car rec) (serialize-transaction tx))))
 

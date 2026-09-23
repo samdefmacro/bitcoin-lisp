@@ -18,7 +18,10 @@ through the lower packages; the node reaches it only through these exports.")
    #:wallets-block-disconnected
    #:wallets-maybe-resend
    #:wallets-mempool-tx-added
-   #:wallets-mempool-tx-removed)
+   #:wallets-mempool-tx-removed
+   ;; Core FillPSBT for an unsigned transaction (FinishTransaction's PSBT);
+   ;; send and sendall build theirs with it.
+   #:wallet-fill-psbt)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export

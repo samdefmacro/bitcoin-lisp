@@ -1350,10 +1350,11 @@ signature is produced (psbt.cpp:495-501)."
                (let ((wtx (wallet-get-wallet-tx
                            wallet (bl.ser:outpoint-hash op))))
                  (when wtx
+                   ;; WITHOUT the witness, as Core writes the record
+                   ;; (psbt.h:303-305): it authenticates a txid.
                    (bl.ser:psbt-map-set
                     map bl.ser:+psbt-in-non-witness-utxo+ empty
-                    (bl.ser:transaction-wire-bytes
-                     (wallet-tx-tx wtx)))))))))
+                    (bl.ser:serialize-transaction (wallet-tx-tx wtx)))))))))
 
 ;;; --- Recording signatures + derivations ---
 
@@ -2357,7 +2358,7 @@ input/output bip32 derivations. Mirrors Core FillPSBT(sign=false)."
             (when wtx
               (bl.ser:psbt-map-set
                map bl.ser:+psbt-in-non-witness-utxo+ empty
-               (bl.ser:transaction-wire-bytes (wallet-tx-tx wtx))))))))
+               (bl.ser:serialize-transaction (wallet-tx-tx wtx))))))))
     (when bip32derivs
       (%psbt-add-wallet-input-derivs psbt coins wallet)
       (%psbt-add-wallet-output-derivs psbt wallet))
