@@ -263,6 +263,7 @@ init.cpp, node/. src/node/.")
    #:node-pending-onetry
    #:node-sync-thread
    #:node-running
+   #:sync-idle-wait
    #:run-inbound-listener
    #:consider-outbound-evictions
    #:inbound-handshakes-in-flight

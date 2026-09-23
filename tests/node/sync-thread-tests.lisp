@@ -422,3 +422,67 @@ then refuse."
     (is (equal '(t t) seen)
         "during the handshake the peer is listed and the RPC already released: ~S" seen)
     (is (null (bl:node-peers node)) "a failed handshake withdraws it")))
+
+(test the-idle-wait-answers-a-ping-as-soon-as-it-arrives
+  "Core's message handler sleeps at most 100 ms and is woken the moment a
+message completes (condMsgProc.wait_until, net.cpp:3157, ended by
+WakeMessageHandler, :2246-2253), so a peer that waits for each reply gets it in
+milliseconds. Our idle wait slept a fixed 200 ms tick before every pump, so
+each request/reply round trip cost a tick: the functional framework's
+send_and_ping pays one per message, and twenty of them took four seconds in
+p2p_tx_download.py:130's announcement loop, which is what moved its fetch past
+the sync_mempools deadline.
+
+Ten sequential ping/pong round trips through the running idle wait must take
+well under the two seconds ten ticks cost. Control: every pong arrives."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (unwind-protect
+           (let* ((bl:*network* :regtest)
+                  (port (usocket:get-local-port srv))
+                  (node (make-test-node :network :regtest))
+                  (client (bl.net:connect-peer "127.0.0.1" port))
+                  (conn (and client (bl.net:accept-connection srv :timeout 10)))
+                  (server-peer (and conn (bl.net:make-inbound-peer conn "127.0.0.1")))
+                  (waiter nil))
+             (is-true server-peer)
+             (when server-peer
+               (unwind-protect
+                    (progn
+                      (setf (bl:node-running node) t
+                            (bl.net:peer-state server-peer) :ready
+                            (bl.net:peer-state client) :ready
+                            (bl:node-peers node) (list server-peer))
+                      (setf waiter
+                            (bt:make-thread
+                             (lambda ()
+                               (let ((bl:*node* node))
+                                 (ignore-errors
+                                  (loop while (bl:node-running node)
+                                        do (bl:sync-idle-wait)))))
+                             :name "test-idle-wait"))
+                      (sleep 0.3)
+                      (let ((pongs 0)
+                            (t0 (get-internal-real-time)))
+                        (dotimes (i 10)
+                          (bl.net:send-message client (bl.ser:make-ping-message (1+ i)))
+                          (loop with deadline = (+ (get-internal-real-time)
+                                                   (* 3 internal-time-units-per-second))
+                                while (< (get-internal-real-time) deadline)
+                                do (let ((command (bl.net:receive-message client)))
+                                     (when (equal command "pong")
+                                       (incf pongs)
+                                       (return)))
+                                   (sleep 0.001)))
+                        (let ((seconds (/ (- (get-internal-real-time) t0)
+                                          internal-time-units-per-second)))
+                          (is (= 10 pongs) "control: every ping was answered")
+                          (is (< seconds 1)
+                              "ten ping round trips through the idle wait took ~,2F s"
+                              (float seconds)))))
+                 (setf (bl:node-running node) nil)
+                 (when waiter (bt:join-thread waiter))
+                 (bl.net:disconnect-peer server-peer)
+                 (bl.net:disconnect-peer client))))
+        (bl.net:close-listener srv)))))

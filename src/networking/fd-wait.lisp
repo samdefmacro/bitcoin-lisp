@@ -51,3 +51,42 @@ reporting `never ready' -- which would be worse than the bug this replaces."
           #+sbcl (and (sb-unix:unix-simple-poll fd :input msec) t)
           #-sbcl (and (usocket:wait-for-input socket :timeout timeout :ready-only t) t))
         (and (usocket:wait-for-input socket :timeout timeout :ready-only t) t))))
+
+(defun wait-for-any-input (sockets timeout)
+  "Block until one of SOCKETS has input readable (or has hung up), or TIMEOUT
+seconds pass; T when one is ready. One poll(2) over every descriptor, so the
+caller wakes the moment ANY peer speaks rather than at the end of a fixed
+sleep -- Core's socket handler blocks in exactly this way
+(CConnman::SocketHandler's WaitMany over every node's socket, net.cpp:2092-2108,
+SELECT_TIMEOUT_MILLISECONDS = 50) and the message handler is woken at once
+by WakeMessageHandler when a message completes (net.cpp:2246-2253, the
+wait it ends at net.cpp:3157). A socket
+whose descriptor cannot be reached is ignored; with none left this is a
+plain sleep. An interrupted poll (EINTR) answers NIL early, which callers
+treat like a timeout."
+  (let* ((fds (loop for s in sockets
+                    for fd = (%socket-fd s)
+                    when fd collect fd))
+         (n (length fds))
+         (msec (max 0 (round (* 1000 timeout)))))
+    (cond
+      ((zerop n) (sleep timeout) nil)
+      (t
+       #+sbcl
+       ;; struct pollfd { int fd; short events; short revents; }: 8 bytes,
+       ;; native byte order, built in a pinned octet vector.
+       (let ((buf (make-array (* 8 n) :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+         (sb-sys:with-pinned-objects (buf)
+           (let ((sap (sb-sys:vector-sap buf)))
+             (loop for fd in fds
+                   for off from 0 by 8
+                   do (setf (sb-sys:signed-sap-ref-32 sap off) fd
+                            (sb-sys:sap-ref-16 sap (+ off 4)) sb-unix:pollin))
+             (plusp (sb-alien:alien-funcall
+                     (sb-alien:extern-alien
+                      "poll" (function sb-alien:int sb-sys:system-area-pointer
+                                       sb-alien:unsigned-long sb-alien:int))
+                     sap n msec)))))
+       #-sbcl
+       (and (usocket:wait-for-input sockets :timeout timeout :ready-only t) t)))))

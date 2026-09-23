@@ -92,6 +92,7 @@ headerssync.cpp. src/networking/.")
    #:+max-block-revalidation-attempts+
    ;; Steady-state message pump (post-IBD receive loop)
    #:pump-peer-messages
+   #:wait-for-peer-input
    #:ibd-context-headers-received
    #:*highest-header-seen*
    ;; Trickled tx announcement flushing
@@ -122,6 +123,7 @@ headerssync.cpp. src/networking/.")
    #:evict-extra-outbound-peers
    #:any-blocks-in-flight-p
    #:socket-input-ready-p
+   #:wait-for-any-input
    #:capture-recv-backtrace
    #:*recv-backtrace-budget*
    #:select-extra-block-relay-eviction

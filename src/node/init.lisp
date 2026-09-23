@@ -1702,6 +1702,27 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
   ;; push that request up to 30 s out.
   admitted))
 
+(defun sync-idle-wait ()
+  "The sync thread's wait between two sync passes: up to 30 seconds of
+%SYNC-IDLE-TICKs, ended early by new headers, known work or an admitted peer.
+Each tick waits for peer input (WAIT-FOR-PEER-INPUT) instead of sleeping a
+fixed slice, as Core's message handler is woken by WakeMessageHandler the
+moment a message completes (net.cpp:2246-2253, :3157): a fixed sleep made
+every request/reply round trip cost a tick. The 30 s ceiling is on the clock,
+so waking early does not shorten it."
+  (let ((start (get-internal-real-time)))
+    (loop for elapsed = (/ (- (get-internal-real-time) start)
+                           internal-time-units-per-second)
+          while (and (node-running *node*) (< elapsed 30))
+          do (bl.net:wait-for-peer-input (node-peers *node*)
+                                         (/ 1 +sync-ticks-per-second+))
+             ;; Core ThreadOpenConnections' fixed-seed check, every pass.
+             (maybe-add-fixed-seeds *node*)
+             (when (%sync-idle-tick
+                    (max 1 (ceiling (- (get-internal-real-time) start)
+                                    internal-time-units-per-second)))
+               (return)))))
+
 (defun %sync-pass ()
   "One sync pass with peers connected: IBD or follow-tip (SYNC-BLOCKCHAIN),
 the liveness signal, full peer maintenance, the periodic peers.dat dump, and
@@ -1726,30 +1747,10 @@ block is noticed within a tick, ended early by new headers or known work."
   ;; Periodic peers.dat dump (Core DumpAddresses
   ;; every 15 min); cadence-gated inside.
   (maybe-dump-peer-addresses *node*)
-  ;; ⚠️ The SLEEP runs BEFORE the pump in %SYNC-IDLE-TICK, so a message
-  ;; that arrives just after one pass waits out the
-  ;; whole tick before anything reads it. At one
-  ;; second a tick that is the floor on how fast an
-  ;; announced block can be noticed, and a
-  ;; propagation spans two of them — which is the
-  ;; flat 2s diag/propagation_probe.py still
-  ;; measures after the propagation work removed the header round
-  ;; trip.
-  ;;
-  ;; Sub-second ticks, with the same 30s ceiling: the
-  ;; once-per-second work in %SYNC-IDLE-TICK keeps its
-  ;; own clocks, so it keeps its period while the pump
-  ;; gets to run sooner.
-  ;; Core's ProcessMessages runs continuously; this
-  ;; is the same direction, bounded.
-  (loop for tick from 1 to (* 30 +sync-ticks-per-second+)
-        for second = (ceiling tick +sync-ticks-per-second+)
-        while (node-running *node*)
-        do (sleep (/ 1 +sync-ticks-per-second+))
-           ;; Core ThreadOpenConnections' fixed-seed check, every pass.
-           (maybe-add-fixed-seeds *node*)
-           (when (%sync-idle-tick second)
-             (return))))
+  ;; The idle wait: sub-second ticks with a 30 s ceiling, each ended as soon
+  ;; as a peer has input. The once-per-second duties in %SYNC-IDLE-TICK keep
+  ;; their own clocks, so running it sooner changes none of their periods.
+  (sync-idle-wait))
 
 (defun %sync-offline-activation (max-peers)
   "The sync pass with no peer connected: activate whatever is already on

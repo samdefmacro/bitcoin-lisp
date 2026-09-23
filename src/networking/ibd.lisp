@@ -2596,6 +2596,44 @@ means a new block was announced and a sync cycle should start now)."
         (drain-and-reap-peer peer node-ctx ctx)))
     ctx)))
 
+(defun %pump-readable-peer-p (peer)
+  "T when the pump would READ PEER this pass: the drain's own guard in
+DRAIN-AND-REAP-PEER -- handshake done, connection live, not receive-paused. A
+peer outside it must stay out of the wait, or its unread bytes would wake the
+wait on every call and spin the thread."
+  (let ((conn (peer-connection peer)))
+    (and conn
+         (eq (peer-state peer) :ready)
+         (connection-connected conn)
+         (connection-socket conn)
+         (not (connection-recv-paused-p conn)))))
+
+(defun wait-for-peer-input (peers timeout)
+  "Wait until one of PEERS the pump would read has input, at most TIMEOUT
+seconds; T when there is some. Core's message handler sleeps at most 100 ms
+and is woken the moment a message completes (condMsgProc.wait_until,
+net.cpp:3157, ended by WakeMessageHandler, :2246-2253), so a ping is answered
+as soon as it arrives. Ours slept a fixed 200 ms tick before every pump, and a
+peer that waits for each reply -- the functional framework's send_and_ping,
+one ping pair per message -- paid it on every round trip: twenty such round
+trips took four seconds against a node that answers in milliseconds, which is
+what moved p2p_tx_download.py:130 past its deadline.
+
+Input the connection already buffered in userspace (the Lisp stream's buffer,
+the v1/v2 sniff pushback) is invisible to poll(2), so it ends the wait at
+once without polling."
+  (let ((readable (remove-if-not #'%pump-readable-peer-p peers)))
+    (or (some (lambda (peer)
+                (let ((conn (peer-connection peer)))
+                  (or (and (connection-pushback conn) t)
+                      (let ((stream (connection-stream conn)))
+                        (and stream (ignore-errors (listen stream)) t)))))
+              readable)
+        (wait-for-any-input (mapcar (lambda (peer)
+                                      (connection-socket (peer-connection peer)))
+                                    readable)
+                            timeout))))
+
 (defun start-ibd (peers node-ctx target-height)
   "Start Initial Block Download.
 Returns the number of blocks downloaded. NODE-CTX's historical-chainstate, when
