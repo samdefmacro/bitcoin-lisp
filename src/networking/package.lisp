@@ -393,6 +393,7 @@ headerssync.cpp. src/networking/.")
    #:sync-headers
    #:*ibd-context*
    #:activate-historical-chainstate
+   #:find-historical-blocks-to-download
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*

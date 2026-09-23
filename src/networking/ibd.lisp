@@ -1372,6 +1372,17 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                       (return-from collect)))))))))
         (values (nreverse result) staller)))))
 
+(defun %historical-fork-height (hist target-height)
+  "The height of the last common ancestor of HIST's tip and its target -- the
+tip's own height when the tip is on the target path. Core
+LastCommonAncestor(historical_blocks->first, ->second)."
+  (let* ((tip (bl.store:get-block-index-entry hist (bl.store:best-block-hash hist)))
+         (target (bl.store:target-ancestor-entry hist target-height))
+         (fork (and tip target (bl.val:find-fork-point tip target))))
+    (if fork
+        (bl.store:block-index-entry-height fork)
+        (bl.store:current-height hist))))
+
 (defun find-historical-blocks-to-download (peer chain-state block-store count)
   "Bitcoin Core TryDownloadingHistoricalBlocks (net_processing.cpp:1445-1472):
 up to COUNT hashes on the assumeutxo background-validation range
@@ -1387,9 +1398,14 @@ partition the retired height-based scheduler used to provide."
         (base (ibd-context-snapshot-base-entry *ibd-context*)))
     (unless (and hist base (peer-chain-contains-base-p peer chain-state))
       (return-from find-historical-blocks-to-download nil))
-    (let* ((from-height (bl.store:current-height hist))
-           (target-height (or (bl.store:chain-state-target-height hist)
+    (let* ((target-height (or (bl.store:chain-state-target-height hist)
                               0))
+           ;; Core's from_tip is LastCommonAncestor(historical tip, target)
+           ;; (net_processing.cpp:6176-6179): a background chainstate that sits
+           ;; on a DIVERGENT chain -- a snapshot loaded over a node that had
+           ;; mined or synced a different branch -- must fetch the target path
+           ;; from the fork up, not from its own tip.
+           (from-height (%historical-fork-height hist target-height))
            ;; Core: min(from_tip->nHeight + BLOCK_DOWNLOAD_WINDOW, target->nHeight)
            (window-end (min (+ from-height +max-block-queue-size+) target-height))
            (in-flight (ibd-context-in-flight *ibd-context*))
@@ -5245,10 +5261,44 @@ advances without any block arriving. Ours advanced it only on an arrival, and
 the download walk (FIND-HISTORICAL-BLOCKS-TO-DOWNLOAD) skips a block it holds,
 so such a chainstate waited forever: feature_assumeutxo.py:676. RUN-IBD calls
 this once per pass, next to the active chainstate's activation."
+  (%reorg-historical-onto-target-path historical block-store
+                                      :fee-estimator fee-estimator
+                                      :recent-rejects recent-rejects)
   (drain-block-queue historical (bl.store:chain-state-coins-view historical)
                      block-store
                      :fee-estimator fee-estimator
                      :recent-rejects recent-rejects))
+
+(defun %reorg-historical-onto-target-path (historical block-store
+                                          &key fee-estimator recent-rejects)
+  "When HISTORICAL's tip is off its target path (a snapshot loaded over a
+divergent chain), reorg it onto the highest target-path block whose bodies
+from the fork up are all on disk, if that block outweighs the tip -- Core
+FindMostWorkChain on the background chainstate, whose candidates are the
+target's ancestors (TryAddBlockIndexCandidate, validation.cpp:3764-3794), and
+which switches only to a chain whose blocks it has (:3158-3196). Returns T
+when the chainstate moved."
+  (let* ((target-height (bl.store:chain-state-target-height historical))
+         (tip (bl.store:get-block-index-entry
+               historical (bl.store:best-block-hash historical)))
+         (fork-height (and target-height tip
+                           (%historical-fork-height historical target-height))))
+    (when (and fork-height
+               (< fork-height (bl.store:block-index-entry-height tip)))
+      (let ((best nil))
+        (loop for h from (1+ fork-height) to target-height
+              for e = (bl.store:target-ancestor-entry historical h)
+              while (and e (bl.store:block-exists-p
+                            block-store (bl.store:block-index-entry-hash e)))
+              do (setf best e))
+        (when (and best (> (bl.store:block-index-entry-chain-work best)
+                           (bl.store:block-index-entry-chain-work tip)))
+          (with-current-node-lock
+            (bl.val:perform-reorg historical block-store
+                                  (bl.store:chain-state-coins-view historical)
+                                  tip best
+                                  :fee-estimator fee-estimator
+                                  :recent-rejects recent-rejects)))))))
 
 (defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
   "Process queued blocks whose parents are now connected.

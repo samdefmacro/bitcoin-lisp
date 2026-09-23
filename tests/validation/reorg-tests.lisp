@@ -2453,6 +2453,38 @@ RUN-IBD must call it."
                                'bl.net:activate-historical-chainstate))
                 :key (lambda (name) (if (consp name) (second name) name))))))
 
+(test the-historical-chainstate-leaves-a-divergent-chain-for-the-target-path
+  "A snapshot loaded over a node that sits on a DIVERGENT chain leaves the
+background chainstate there; Core's FindMostWorkChain on that chainstate only
+considers the target's ancestors (TryAddBlockIndexCandidate,
+validation.cpp:3764-3794) and switches to them once their bodies are here
+(:3158-3196). feature_assumeutxo.py:260's node 3 mined 99 blocks of its own
+before loading the snapshot, and ours never left them."
+  (with-network (:regtest)
+    (multiple-value-bind (node blocks) (%historical-disk-fixture "hist-diverge")
+      (let* ((hist (bl:node-historical-chainstate node))
+             (store (bl:node-block-store node))
+             (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+             (base-hash (bl.ser:block-header-hash
+                         (bl.ser:bitcoin-block-header (fourth blocks)))))
+        ;; Two blocks of the node's own on block 1 -- a different payee, so a
+        ;; different chain -- make the divergent tip at height 3.
+        (bl.store:set-chainstate-target hist nil)
+        (dotimes (i 2) (%dr-connect node (%dr-mine-on node spk-b)))
+        (bl.store:set-chainstate-target
+         hist (bl.store:get-block-index-entry hist base-hash))
+        (is (= 3 (bl.store:current-height hist)))
+        (is (not (equalp (bl.ser:block-header-hash
+                          (bl.ser:bitcoin-block-header (third blocks)))
+                         (bl.store:best-block-hash hist)))
+            "the tip is the node's own block 3, not the target path's")
+        (loop for blk in (rest blocks) for h from 2
+              do (bl.store:store-block store blk :height h))
+        (with-ibd-context
+          (bl.net:activate-historical-chainstate hist store))
+        (is (= 4 (bl.store:current-height hist)))
+        (is (equalp base-hash (bl.store:best-block-hash hist)))))))
+
 (test out-of-order-persist-gated-by-acceptblock
   "Case-C persist DoS gate (Core AcceptBlock, safety review Lens 3): an
 UNSOLICITED out-of-order block is kept only if it outweighs the tip, sits
@@ -2995,7 +3027,7 @@ Bitcoin Core vectors."
          (let ((bl.net:*ibd-context* ctx))
            ;; Base-containing peer: the whole h1..h5 target-ancestor range,
            ;; oldest-first, none on disk.
-           (let ((got (bl.net::find-historical-blocks-to-download
+           (let ((got (bl.net:find-historical-blocks-to-download
                        base-peer cs store 16)))
              (is (= 5 (length got)))
              (is (equalp (bl.store:block-index-entry-hash (nth 1 chain))
@@ -3005,7 +3037,7 @@ Bitcoin Core vectors."
                                  (subseq chain 1))
                          got)))
            ;; A peer whose best chain does not contain the base: nothing.
-           (is (null (bl.net::find-historical-blocks-to-download
+           (is (null (bl.net:find-historical-blocks-to-download
                       fork-peer cs store 16)))))))))
 
 ;;;; ===========================================================================

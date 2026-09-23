@@ -323,15 +323,23 @@ TryDownloadingHistoricalBlocks)."
                 (%au-hash 5)
                 (bl.net:peer-best-known-block-hash p-fork)
                 (%au-hash 3 99))
-          (let ((got (bl.net::find-historical-blocks-to-download
+          (let ((got (bl.net:find-historical-blocks-to-download
                       p-base hist probe-store 10)))
             (is (equalp (list (%au-hash 2) (%au-hash 3) (%au-hash 4) (%au-hash 5))
                         got)))
           ;; Budget respected: only the first COUNT ascending hashes.
-          (is (= 2 (length (bl.net::find-historical-blocks-to-download
+          (is (= 2 (length (bl.net:find-historical-blocks-to-download
                             p-base hist probe-store 2))))
-          (is (null (bl.net::find-historical-blocks-to-download
-                     p-fork hist probe-store 10))))))))
+          (is (null (bl.net:find-historical-blocks-to-download
+                     p-fork hist probe-store 10)))
+          ;; A historical tip OFF the path (the snapshot was loaded over a
+          ;; divergent chain): Core starts the walk at LastCommonAncestor(tip,
+          ;; target) (net_processing.cpp:6176-6179), so e3 is fetched too --
+          ;; from the historical tip's own height the walk began above it.
+          (bl.store:update-chain-tip hist (%au-hash 3 99) 3)
+          (is (equalp (list (%au-hash 3) (%au-hash 4) (%au-hash 5))
+                      (bl.net:find-historical-blocks-to-download
+                       p-base hist probe-store 10))))))))
 
 (test assumeutxo-base-in-chain-peer-filter
   "peer-chain-contains-base-p admits only peers whose best-known chain
