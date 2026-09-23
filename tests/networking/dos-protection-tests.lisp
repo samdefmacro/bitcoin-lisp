@@ -500,7 +500,7 @@ reads it back and deletes it (addrdb.cpp:236-246)."
                                   :conn-type :block-relay)
                 (bl.net:make-peer :address "1.2.3.4" :inbound nil :state :ready
                                   :conn-type :block-relay)))
-    (let* ((lines (capture-log-lines (lambda () (bl::save-anchors node))))
+    (let* ((lines (capture-log-lines (lambda () (bl:save-anchors node))))
            (bytes (alexandria:read-file-into-byte-vector path))
            (port (bl:network-port (bl:node-network node)))
            (body (append (coerce (bl.chain:network-magic (bl:node-network node)) 'list)
@@ -513,24 +513,24 @@ reads it back and deletes it (addrdb.cpp:236-246)."
                   (subseq bytes (- (length bytes) 32))))
       (is-true (find "DumpAnchors: Flush 2 outbound block-relay-only peer addresses to anchors.dat started"
                      lines :test #'search)))
-    (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
+    (let ((lines (capture-log-lines (lambda () (bl:load-anchors node)))))
       (is (equal '("1.2.3.4" "5.6.7.8")
-                 (mapcar #'bl.net:peer-address-string bl::*pending-anchor-addresses*)))
+                 (mapcar #'bl.net:peer-address-string bl:*pending-anchor-addresses*)))
       (is-true (find "Loaded 2 addresses from \"anchors.dat\"" lines :test #'search))
       (is-true (find "2 block-relay-only anchors will be tried for connections."
                      lines :test #'search)))
     (is-false (probe-file path) "ReadAnchors removes the file")
     ;; feature_anchors.py:74-81: a perturbed file is no anchors, said all the
     ;; same, and it is removed too.
-    (bl::save-anchors node)
+    (bl:save-anchors node)
     (let ((bytes (alexandria:read-file-into-byte-vector path)))
       (with-open-file (out path :direction :output :if-exists :supersede
                                 :element-type '(unsigned-byte 8))
         (write-sequence (concatenate '(vector (unsigned-byte 8))
                                      (subseq bytes 0 20) #(49) (subseq bytes 20))
                         out)))
-    (let ((lines (capture-log-lines (lambda () (bl::load-anchors node)))))
-      (is (null bl::*pending-anchor-addresses*))
+    (let ((lines (capture-log-lines (lambda () (bl:load-anchors node)))))
+      (is (null bl:*pending-anchor-addresses*))
       (is-true (find "0 block-relay-only anchors will be tried for connections."
                      lines :test #'search)))
     (is-false (probe-file path))))
@@ -542,8 +542,9 @@ peer, and dialed as BLOCK_RELAY after `Trying to make an anchor connection
 to <addr:port>' (feature_anchors.py:139-140)."
   (let* ((node (bl:make-node))
          (dials '())
-         (real (fdefinition 'bl::establish-outbound-peer)))
-    (setf bl::*pending-anchor-addresses*
+         (dial-fn 'bl::establish-outbound-peer)
+         (real (fdefinition dial-fn)))
+    (setf bl:*pending-anchor-addresses*
           (list (bl.net:make-peer-address :ip (bl.net:ipv4-to-mapped-ipv6 9 9 9 9)
                                           :port 4567 :services (logior 1 8))
                 (bl.net:make-peer-address :ip (bl.net:ipv4-to-mapped-ipv6 8 8 8 8)
@@ -552,18 +553,18 @@ to <addr:port>' (feature_anchors.py:139-140)."
          (let ((text (nth-value 1 (log-text-of
                                    "net"
                                    (lambda ()
-                                     (setf (fdefinition 'bl::establish-outbound-peer)
+                                     (setf (fdefinition dial-fn)
                                            (lambda (node host port &key conn-type &allow-other-keys)
                                              (declare (ignore node))
                                              (push (list host port conn-type) dials)
                                              nil))
                                      (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6)))
-                                       (bl::dial-anchors node)))))))
+                                       (bl:dial-anchors node)))))))
            (is (equal '(("9.9.9.9" 4567 :block-relay)) dials)
                "only the anchor offering NODE_NETWORK|NODE_WITNESS is dialed")
            (is-true (search "Trying to make an anchor connection to 9.9.9.9:4567" text))
-           (is (null bl::*pending-anchor-addresses*)))
-      (setf (fdefinition 'bl::establish-outbound-peer) real))))
+           (is (null bl:*pending-anchor-addresses*)))
+      (setf (fdefinition dial-fn) real))))
 
 (defun %evict-one (node)
   "Drive the shipped inbound eviction (Core AttemptToEvictConnection); T if a

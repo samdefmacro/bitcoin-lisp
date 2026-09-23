@@ -171,6 +171,44 @@ below the pruned horizon; the index needs genesis-contiguous history)"
                     name (bl.store:index-height index cs) tip))
         n))))
 
+(defparameter +index-thread-specials+
+  '(*node* bl.chain:*network* bl.log:*log-stream* bl.log:*log-buffer*
+    bl.log:*log-buffer-index* bl.log:*log-buffer-count*)
+  "The specials an index's sync thread takes over from the thread that starts
+it: a thread sees only GLOBAL values, and a caller that binds the node or the
+log destination (a test, an in-image restart) means those.")
+
+(defun start-index-background-sync (node index)
+  "Core BaseIndex::StartBackgroundSync (index/base.cpp:453-459): INDEX's
+catch-up (CATCH-UP-INDEX) on a thread of its own, traced under the index's
+name -- `txindex thread start', `basic block filter index thread start',
+`coinstatsindex thread start', `txospenderindex thread start', which
+feature_init.py:79-82 interrupts on. Unlike Core's, start-up waits for it
+before going on: the connect-time index hooks assume an index that is already
+at the tip, where Core's BaseIndex ignores the blocks it is notified of until
+its own sync has caught up (BaseIndex::BlockConnected's m_synced guard). The
+thread is real; only the concurrency is not ported. What the catch-up
+signals is signalled again here, on the caller's thread."
+  (when *index-start-check*
+    (%refuse-index-beyond-pruned-data node index))
+  (let* ((specials +index-thread-specials+)
+         (values (mapcar #'symbol-value specials))
+         (result nil)
+         (failure nil)
+         (thread (bt:make-thread
+                  (lambda ()
+                    (progv specials values
+                      (handler-case
+                          (let ((*index-start-check* nil)) ; asked above
+                            (bl.log:trace-thread
+                             (bl.store:index-name index)
+                             (lambda () (setf result (catch-up-index node index)))))
+                        (error (c) (setf failure c)))))
+                  :name (format nil "bitcoin-~A" (bl.store:index-name index)))))
+    (bt:join-thread thread)
+    (when failure (error failure))
+    result))
+
 (defun restart-indexes-for-validated-chainstate (node)
   "Rebind every index onto the node's (now promoted) validated chainstate and
 catch it up to its tip (Core restarts all indexes on background-sync
@@ -604,7 +642,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
           (bl.store:init-tx-index (node-data-directory *node*) :enabled t
                                   :wipe reindex))
     (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
-    (catch-up-index *node* (node-tx-index *node*))
+    (start-index-background-sync *node* (node-tx-index *node*))
     (log-info "Transaction index loaded: ~D entries"
               (bl.store:txindex-count (node-tx-index *node*))))
   ;; Prune locks are re-registered from scratch on every start: registration is
@@ -641,7 +679,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
     ;; nodes have nothing to do; the connect-time hook then indexes forward.
     (bl.rpc:set-rpc-warmup-status "Catching up block filter index...")
-    (catch-up-index *node* (node-blockfilterindex *node*)))
+    (start-index-background-sync *node* (node-blockfilterindex *node*)))
 
   ;; Initialize txospenderindex (optional). Core starts every index's
   ;; background sync from init, so enabling -txospenderindex on a synced node
@@ -658,7 +696,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
       (log-info "Spender index loaded: best block ~A"
                 (if best (bl.crypto:bytes-to-hex best) "none")))
     (bl.rpc:set-rpc-warmup-status "Catching up txospender index...")
-    (catch-up-index *node* (node-txospenderindex *node*)))
+    (start-index-background-sync *node* (node-txospenderindex *node*)))
 
   ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
   ;; already-stored blocks before the sync thread starts, then the connect-time
@@ -687,4 +725,4 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
       (bl.store:coinstatsindex-clear-best (node-coinstatsindex *node*))
       (log-info "Coinstats index: rebuilding after chainstate reindex"))
     (bl.rpc:set-rpc-warmup-status "Catching up coinstats index...")
-    (catch-up-index *node* (node-coinstatsindex *node*))))
+    (start-index-background-sync *node* (node-coinstatsindex *node*))))

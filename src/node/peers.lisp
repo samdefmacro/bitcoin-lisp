@@ -1212,6 +1212,19 @@ sat on getpeerinfo for most of that cycle, once per connection."
                  ;; the connection already open (net.cpp:1871-1907).
                  (when done (setf (car done) t)))))))
 
+(defvar *addcon-thread* nil
+  "The running added-connections thread (threads.lisp), or NIL. While it runs
+it owns the added-node upkeep, and the sync thread only drains the dials it
+queues.")
+
+(defun service-added-nodes (node)
+  "The sync thread's part in the added nodes: drain the queued dials, and --
+only when no addcon thread is keeping them (a node run without networking
+threads, as the tests run one) -- redial the missing ones itself."
+  (if *addcon-thread*
+      (dial-queued-nodes node)
+      (connect-added-nodes node)))
+
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain the queued dials
 (DIAL-QUEUED-NODES), then keep every \"add\" peer connected. Honors
@@ -1520,7 +1533,7 @@ run at tip — exactly where eclipse resistance matters."
 block-relay-only slots, an occasional feeler probe, and the chain-sync
 eviction sweep."
   (check-peers-health node)
-  (connect-added-nodes node)
+  (service-added-nodes node)
   (connect-specified-nodes node)
   ;; Core resolves tried-table collisions once per ThreadOpenConnections
   ;; iteration (net.cpp:2768), not only at startup — otherwise, once the

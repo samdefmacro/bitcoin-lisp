@@ -394,6 +394,7 @@ bitcoin-cli (node-main)."
                                (:file "wallet-hooks")
                                (:file "peers")
                                (:file "sync")
+                               (:file "threads")   ; the scheduler and addcon threads
                                (:file "init"))))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
 

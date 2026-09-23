@@ -699,6 +699,7 @@ waits for the line."
                 "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f")))
     (is (= 5 (bl.net:address-book-count book)) "control: all five were stored")
     (let ((lines (capture-log-lines
-                  (lambda () (let ((bl.net:*asmap* data)) (bl::asmap-health-check node))))))
+                  (lambda () (let ((bl.net:*asmap* data)) (bl:asmap-health-check node))))))
       (is-true (find "ASMap Health Check: 4 clearnet peers are mapped to 2 ASNs with 1 peers being unmapped"
                      lines :test #'search)))))
+

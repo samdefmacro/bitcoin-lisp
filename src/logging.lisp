@@ -19,6 +19,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:*log-rate-limit*
    #:*log-rate-locations*
    #:*log-rate-window-start*
+   #:log-rate-limiter-tick
    #:*log-stream*
    #:*log-suppressions-active*
    #:*log-ips*
@@ -295,9 +296,10 @@ UTF-8 length would mean encoding every log line twice."
 (defun %log-maybe-reset-window ()
   "Close an elapsed window, reporting what each suppressed location dropped
 (Core LogRateLimiter::Reset). Core drives this from the scheduler on the
-window boundary; the logger here has no thread of its own, so the window closes
-lazily on the next emit. The only difference is WHEN the notices appear — the
-byte counts they carry are the same. Caller holds *LOG-LOCK*."
+window boundary, and so does a running node here (LOG-RATE-LIMITER-TICK from
+the scheduler thread); the next emit also closes an elapsed window, so an
+image without that thread loses only promptness -- the byte counts the notices
+carry are the same. Caller holds *LOG-LOCK*."
   (let ((now (get-universal-time)))
     (when (>= (- now *log-rate-window-start*) +log-ratelimit-window-seconds+)
       (let ((dropped '()))
@@ -315,6 +317,14 @@ byte counts they carry are the same. Caller holds *LOG-LOCK*."
            :warn "Restarting logging from ~S: ~D bytes were dropped during the last ~Ds."
            (list (car cell) (cdr cell) +log-ratelimit-window-seconds+)
            nil))))))
+
+(defun log-rate-limiter-tick ()
+  "The scheduler's call into the log rate limiter (Core schedules
+LogRateLimiter::Reset every window, init.cpp:1475-1479): close the window once
+it has elapsed."
+  (when *log-rate-limit*
+    (bt:with-lock-held (*log-lock*)
+      (%log-maybe-reset-window))))
 
 (defun %log-emit-locked (level format-string args ratelimit &optional category)
   "Emit one entry with *LOG-LOCK* held (Core LogPrintStr_, which is likewise the

@@ -261,6 +261,18 @@ init.cpp, node/. src/node/.")
    #:node-peers
    #:node-pending-inbound-peers
    #:node-pending-onetry
+   #:save-anchors
+   #:load-anchors
+   #:dial-anchors
+   #:*pending-anchor-addresses*
+   #:asmap-health-check
+   #:start-scheduler-thread
+   #:stop-scheduler-thread
+   #:*scheduler-thread*
+   #:start-addcon-thread
+   #:stop-addcon-thread
+   #:*addcon-thread*
+   #:start-index-background-sync
    #:node-sync-thread
    #:node-running
    #:sync-idle-wait

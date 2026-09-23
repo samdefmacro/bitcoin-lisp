@@ -698,6 +698,10 @@ pruning mode announcement (Step 3)."
   (let ((path (write-pid-file pid-file data-directory network)))
     (when path (log-info "PID file: ~A" path)))
 
+  ;; Step 4a: the lightweight task scheduler's thread, once the datadir is
+  ;; locked (init.cpp:1452-1457).
+  (start-scheduler-thread *node*)
+
   ;; SIGHUP reopens the log file, so an external logrotate can move it.
   (install-sighup-log-reopen)
 
@@ -1860,8 +1864,8 @@ thread."
                                            :stream s :count 50))))
                                 (log-error "Sync thread backtrace:~%~A" bt)))))
                        (merge-inbound-peers *node*)
-                 ;; Maintain manually-added peers each cycle (addnode).
-                 (connect-added-nodes *node*)
+                 ;; The dials the addcon thread queued (addnode).
+                 (service-added-nodes *node*)
                  (cond
                    ((>= (length (node-peers *node*)) 1)
                     (%sync-pass))
@@ -1983,6 +1987,23 @@ listener, the onion listener with its Tor control connection, and
   (when (and listen *bind-on-any*)
     (bl.net:discover-local-addresses (get-listen-port network))))
 
+(defun %sync-thread-main (max-peers)
+  "The sync thread's body, traced with the names of the two Core threads whose
+jobs it does. It is the MESSAGE HANDLER, always: it pumps every peer's
+messages and runs SendMessages' duties in %SYNC-IDLE-TICK, which is
+ThreadMessageHandler's job (net.cpp:3548). And when this node chooses
+outbound peers at all -- exactly when Core starts ThreadOpenConnections
+(net.cpp:3539-3544: addrman outgoing, or -connect targets) -- it OPENS them:
+%SYNC-THREAD-CONNECT first, then MAINTAIN-PEERS every pass.
+feature_config_args.py:305 waits for `opencon thread start' to know that has
+begun; feature_init.py:83 interrupts start-up on `msghand thread start'."
+  (bl.log:trace-thread
+   "msghand"
+   (lambda ()
+     (if (or (addrman-outgoing-enabled-p) *connect-nodes*)
+         (bl.log:trace-thread "opencon" (lambda () (%sync-thread-loop max-peers)))
+         (%sync-thread-loop max-peers)))))
+
 (defun %finish-init-and-start-sync (rpc-port startup-notify sync max-peers)
   "Core Step 13 (finished): mark the node running, end RPC warmup and fire
 -startupnotify; then Core Step 12's sync thread (%SYNC-THREAD-LOOP), with the
@@ -2028,19 +2049,10 @@ per-process sync state and the at-tip liveness signal reset for this run."
     (when bl.net:*asmap*
       (asmap-health-check *node*))
     (setf (node-sync-thread *node*)
-          (bt:make-thread
-           ;; Traced as Core's "opencon": this thread OPENS this node's
-           ;; automatic outbound connections -- %SYNC-THREAD-CONNECT first,
-           ;; then MAINTAIN-PEERS refilling slots every pass -- which is
-           ;; ThreadOpenConnections' job (net.cpp:3542) and exactly what
-           ;; feature_config_args.py:305 waits for the start line to know.
-           ;; It also carries the duties Core splits into the net, msghand
-           ;; and addcon threads (the receive pump, the send-buffer flush and
-           ;; -addnode maintenance in %SYNC-IDLE-TICK); those have no thread
-           ;; of their own here, so they get no start line of their own.
-           (lambda () (bl.log:trace-thread "opencon"
-                                           (lambda () (%sync-thread-loop max-peers))))
-           :name "bitcoin-sync-thread"))))
+          (bt:make-thread (lambda () (%sync-thread-main max-peers))
+                          :name "bitcoin-sync-thread"))
+    ;; -addnode upkeep on its own thread, as Core's addcon (net.cpp:3529-3530).
+    (start-addcon-thread *node*)))
 
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :mainnet)
@@ -2223,8 +2235,7 @@ Returns the node instance."
   ;; the chainstate-load failure Core offers a reindex for.
   (%init-chain-tip reindex)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
-  (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p
-                                  (if wallet-names-supplied-p wallet-names :settings))
+  (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p (if wallet-names-supplied-p wallet-names :settings))
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 
   (%start-network-services network sync listen listen-bind listen-bind-supplied-p

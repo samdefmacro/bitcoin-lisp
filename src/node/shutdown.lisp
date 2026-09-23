@@ -475,6 +475,11 @@ thread; see the shutdown-coordination section above."
         (log-warn "Sync thread did not stop gracefully, destroying...")
         (bt:destroy-thread (node-sync-thread *node*)))))
   (setf (node-sync-thread *node*) nil)
+  ;; The addcon thread returns once node-running is off; the scheduler once
+  ;; told to (Core stops the scheduler with the rest of the node,
+  ;; init.cpp:405-410).
+  (stop-addcon-thread)
+  (stop-scheduler-thread)
 
   ;; Disconnect all peers
   (log-info "Disconnecting peers...")

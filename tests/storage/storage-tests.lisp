@@ -2263,7 +2263,7 @@ Asserted structurally because the alternative is standing up a full node in a
 unit test. The property that matters is that start-node actually calls it —
 a complete, correct, unreachable function is exactly the shape of this bug."
   (let ((src (%node-source-text)))
-    (is (search "(catch-up-index *node* (node-tx-index *node*))" src)
+    (is (search "(start-index-background-sync *node* (node-tx-index *node*))" src)
         "start-node must catch the txindex up over stored blocks, or -txindex
          indexes nothing historical")))
 
@@ -2274,7 +2274,7 @@ turned the flag on indexed nothing historical and gettxspendingprevout knew
 only spends connected after the restart. Core starts every index's background
 sync from init (init.cpp StartIndexBackgroundSync)."
   (let ((src (%node-source-text)))
-    (is (search "(catch-up-index *node* (node-txospenderindex *node*))" src)
+    (is (search "(start-index-background-sync *node* (node-txospenderindex *node*))" src)
         "start-node must catch the txospenderindex up over stored blocks")))
 
 (defun %txresume-chain (n)

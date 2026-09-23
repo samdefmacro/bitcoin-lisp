@@ -486,3 +486,123 @@ well under the two seconds ten ticks cost. Control: every pong arrives."
                  (bl.net:disconnect-peer server-peer)
                  (bl.net:disconnect-peer client))))
         (bl.net:close-listener srv)))))
+
+;;;; The threads Core names in its log (util/thread.cpp TraceThread)
+
+(defun %wait-until (predicate seconds)
+  "Poll PREDICATE every tenth of a second for up to SECONDS; its last value."
+  (loop repeat (round (* seconds 10))
+        thereis (funcall predicate)
+        do (sleep 0.1)
+        finally (return (funcall predicate))))
+
+(test the-sync-thread-is-msghand-and-opencon-when-it-dials
+  "One thread does the jobs of Core's ThreadMessageHandler and, when the node
+picks its own outbound peers, ThreadOpenConnections (net.cpp:3539-3548), and
+logs both names: feature_init.py:83 interrupts start-up on `msghand thread
+start', feature_config_args.py:305 waits for `opencon thread start'. Under
+-connect=0 Core starts no opencon thread (net.cpp:3539), so no line either."
+  (let* ((loop-fn 'bl::%sync-thread-loop)
+         (main-fn 'bl::%sync-thread-main)
+         (outgoing 'bl::*use-addrman-outgoing*)
+         (real (fdefinition loop-fn))
+         (ran 0))
+    (unwind-protect
+         (progn
+           (setf (fdefinition loop-fn)
+                 (lambda (max-peers) (declare (ignore max-peers)) (incf ran)))
+           (let ((dialing (progv (list outgoing) '(t)
+                            (capture-log-lines (lambda () (funcall main-fn 8)))))
+                 (silent (progv (list outgoing 'bl::*connect-nodes*) '(nil nil)
+                           (capture-log-lines (lambda () (funcall main-fn 8))))))
+             (is (= 2 ran) "the loop runs either way")
+             (flet ((at (text lines) (position text lines :test #'search)))
+               (is-true (at "msghand thread start" dialing))
+               (is-true (at "opencon thread start" dialing))
+               (is (< (at "msghand thread start" dialing) (at "opencon thread start" dialing)))
+               (is-true (at "msghand thread exit" dialing))
+               (is-true (at "msghand thread start" silent))
+               (is-false (at "opencon thread start" silent)
+                         "-connect=0 opens nothing, so there is no opencon thread"))))
+      (setf (fdefinition loop-fn) real))))
+
+(test the-scheduler-thread-closes-the-log-rate-window
+  "Core's scheduler thread (init.cpp:1452-1457) runs the log rate limiter's
+reset every window (init.cpp:1475-1479): with the window already elapsed, the
+running scheduler reopens it within its one-second tick, with no log line
+needed to trigger it, and stops when asked."
+  (let ((saved-start bl.log:*log-rate-window-start*)
+        (saved-limit bl.log:*log-rate-limit*)
+        (node (bl:make-node)))
+    (unwind-protect
+         (progn
+           (setf bl.log:*log-rate-limit* t
+                 bl.log:*log-rate-window-start* 0)
+           (bl:start-scheduler-thread node)
+           (let ((thread bl:*scheduler-thread*))
+             (is (equal "bitcoin-scheduler" (bt:thread-name thread)))
+             (is-true (%wait-until (lambda () (plusp bl.log:*log-rate-window-start*)) 3)
+                      "the scheduler closed the elapsed window by itself")
+             (bl:stop-scheduler-thread)
+             (is-false (bt:thread-alive-p thread))))
+      (bl:stop-scheduler-thread)
+      (setf bl.log:*log-rate-window-start* saved-start
+            bl.log:*log-rate-limit* saved-limit))))
+
+(test the-addcon-thread-queues-a-missing-added-node
+  "Core's ThreadOpenAddedConnections (net.cpp:2969-2997) on a thread of its
+own, `addcon' (net.cpp:3529-3530): an added node that is not connected is
+handed to the sync thread's dial queue within Core's two-second pass, once, and
+the thread ends when the node stops running."
+  (let ((node (bl:make-node)))
+    (setf (bl:node-running node) t
+          (bl:node-added-nodes node) (list "203.0.113.9:18444"))
+    (unwind-protect
+         (progn
+           (bl:start-addcon-thread node)
+           (let ((thread bl:*addcon-thread*))
+             (is (equal "bitcoin-addcon" (bt:thread-name thread)))
+             (is-true (%wait-until (lambda () (bl:node-pending-onetry node)) 3))
+             (is (equal '(("203.0.113.9:18444" . t)) (bl:node-pending-onetry node))
+                 "queued once, as a v2-capable manual dial")
+             (setf (bl:node-running node) nil)
+             (bl:stop-addcon-thread)
+             (is-false (bt:thread-alive-p thread))))
+      (setf (bl:node-running node) nil)
+      (bl:stop-addcon-thread))))
+
+(defclass %named-test-index () ()
+  (:documentation "An index that is only its name, for the index-thread test."))
+
+(defmethod bl.store:index-name ((index %named-test-index)) "txindex")
+
+(test an-index-catches-up-on-a-thread-named-after-it
+  "Core BaseIndex::StartBackgroundSync (index/base.cpp:453-459) syncs each
+index on a thread named after it; feature_init.py:79-82 interrupts start-up on
+`txindex thread start' and its siblings. The catch-up's value comes back, and
+what it signals is signalled again on the caller's thread."
+  (let ((real (fdefinition 'bl:catch-up-index))
+        (index (make-instance '%named-test-index))
+        (where nil))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl:catch-up-index)
+                 (lambda (node index)
+                   (declare (ignore node index))
+                   (setf where (bt:thread-name (bt:current-thread)))
+                   7))
+           (let* ((value nil)
+                  (lines (capture-log-lines
+                          (lambda ()
+                            (setf value (bl:start-index-background-sync (bl:make-node) index))))))
+             (is (= 7 value))
+             (is (equal "bitcoin-txindex" where) "the catch-up ran on its own thread")
+             (is-true (find "txindex thread start" lines :test #'search))
+             (is-true (find "txindex thread exit" lines :test #'search)))
+           (setf (fdefinition 'bl:catch-up-index)
+                 (lambda (node index) (declare (ignore node index)) (error "index boom")))
+           (is (search "index boom"
+                       (handler-case (progn (bl:start-index-background-sync (bl:make-node) index)
+                                            "")
+                         (error (e) (princ-to-string e))))))
+      (setf (fdefinition 'bl:catch-up-index) real))))
