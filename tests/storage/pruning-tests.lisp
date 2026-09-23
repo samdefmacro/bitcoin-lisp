@@ -449,47 +449,60 @@ and exclude NODE_NETWORK_LIMITED."
           (is (null (bl.store:get-block block-store hash))))
       (cleanup-test-dir base-path))))
 
-;;;; Test 5.12: reorg past pruned height
+;;;; Test 5.12: a reorg below the pruned height
 
-(test reorg-past-pruned-height-fails
-  "perform-reorg should return NIL when fork point is below pruned height."
-  (multiple-value-bind (base-path block-store chain-state block-hashes)
-      (setup-pruning-test-store 10)
-    (declare (ignore block-hashes))
-    (unwind-protect
-        (let ((bl:*prune-target-mib* 550))
-          ;; Simulate pruned-height at 5
-          (setf (bl.store:chain-state-pruned-height chain-state) 5)
-          ;; Create old-tip at height 10 and new-tip with fork at height 3
-          ;; The fork is below pruned-height (5), so reorg should fail
-          (let* ((utxo-set (bl.store:make-utxo-set))
-                 ;; Build a fake old tip entry at height 10
-                 (fork-hash (make-test-hash #xF0 3))
-                 (fork-entry (bl.store:make-block-index-entry
-                              :hash fork-hash :height 3 :chain-work 4 :status :valid))
-                 ;; Old chain: fork -> ... -> old-tip (height 10)
-                 (old-mid-entry (bl.store:make-block-index-entry
-                                 :hash (make-test-hash #xF1 7) :height 7
-                                 :chain-work 8 :status :valid
-                                 :prev-entry fork-entry))
-                 (old-tip-entry (bl.store:make-block-index-entry
-                                 :hash (make-test-hash #xF1 10) :height 10
-                                 :chain-work 11 :status :valid
-                                 :prev-entry old-mid-entry))
-                 ;; New chain: fork -> ... -> new-tip (height 12, more work)
-                 (new-mid-entry (bl.store:make-block-index-entry
-                                 :hash (make-test-hash #xF2 8) :height 8
-                                 :chain-work 9 :status :valid
-                                 :prev-entry fork-entry))
-                 (new-tip-entry (bl.store:make-block-index-entry
-                                 :hash (make-test-hash #xF2 12) :height 12
-                                 :chain-work 15 :status :valid
-                                 :prev-entry new-mid-entry)))
-            ;; Reorg should fail (fork at height 3 < pruned-height 5)
-            (is (null (bl.val:perform-reorg
-                       chain-state block-store utxo-set
-                       old-tip-entry new-tip-entry)))))
-      (cleanup-test-dir base-path))))
+(test reorg-below-the-pruned-height-needs-only-the-bodies
+  "A pruned node reorgs onto a chain whose fork point lies below its pruned
+height as long as the blocks of that chain are here, and when they are not it
+names them so the download path fetches them again. Core keeps no pruned-height
+gate at all: ActivateBestChainStep connects whatever FindMostWorkChain chose,
+and FindMostWorkChain only asks each block for BLOCK_HAVE_DATA
+(validation.cpp:3158-3196), which a re-downloaded block has again. Ours refused
+every such reorg with \"REORG IMPOSSIBLE: fork point N is below pruned height
+M\" -- and the pruned height is a HEIGHT, so pruning a stale branch's file
+blocked the reorg onto a chain whose bodies were all on disk:
+feature_pruning.py:263 waited 900 s for a node that logged it every 9 s."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture "reorg-below-pruned-height")
+      (let ((bl:*prune-target-mib* 550)
+            (bl:*prune-after-height* 1000000)
+            (a-hashes (make-test-chain-hashes #xA4 3))
+            (b-hashes (make-test-chain-hashes #xB4 3))
+            (b-blocks '()))
+        ;; A1..A3 active; B1..B3 a stored, equal-work fork from genesis.
+        (build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
+        (let ((prev genesis-hash))
+          (loop for h from 1 to 3
+                for block-hash in b-hashes
+                do (let ((block (make-reorg-test-block prev block-hash h)))
+                     (bl.store:store-block block-store block)
+                     (bl.val:connect-block block chain-state block-store utxo-set)
+                     (push block b-blocks)
+                     (setf prev block-hash))))
+        (setf b-blocks (nreverse b-blocks))
+        (is (equalp (third a-hashes) (bl.store:best-block-hash chain-state)))
+        ;; Heights up to 2 were pruned once (a stale branch's file); the fork
+        ;; point, genesis, lies below that.
+        (setf (bl.store:chain-state-pruned-height chain-state) 2)
+        (let ((a3 (bl.store:get-block-index-entry chain-state (third a-hashes)))
+              (b3 (bl.store:get-block-index-entry chain-state (third b-hashes))))
+          ;; B2's body is gone: the reorg is refused and B2 is NAMED, which is
+          ;; what the caller re-queues for download.
+          (progn
+            (is-true (bl.store:forget-block-body block-store (second b-hashes)))
+            (multiple-value-bind (ok missing)
+                (bl.val:perform-reorg chain-state block-store utxo-set a3 b3)
+              (is (null ok))
+              (is (equal (list 2) (mapcar #'cdr missing)))
+              (is (equalp (second b-hashes) (car (first missing)))))
+            (is (equalp (third a-hashes) (bl.store:best-block-hash chain-state)))
+            ;; The body comes back (a peer served it): the reorg goes through.
+            (bl.store:store-block block-store (second b-blocks) :height 2)
+            (is-true (bl.val:perform-reorg chain-state block-store utxo-set a3 b3))
+            (is (equalp (third b-hashes) (bl.store:best-block-hash chain-state)))
+            (is (= 3 (bl.store:current-height chain-state))))))
+      (clear-undo-cache))))
 
 ;;;; Test: block-storage-size-mib
 

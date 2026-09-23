@@ -4330,14 +4330,15 @@ comment above."
           (new-height (bl.store:block-index-entry-height new-tip-entry))
           (fork-height (bl.store:block-index-entry-height fork-entry)))
 
-      ;; Check if reorg requires blocks that have been pruned
-      (when (bl:pruning-enabled-p)
-        (let ((pruned-height (bl.store:chain-state-pruned-height chain-state)))
-          (when (< fork-height pruned-height)
-            (bl:log-error
-             "REORG IMPOSSIBLE: fork point ~D is below pruned height ~D. Node must re-sync."
-             fork-height pruned-height)
-            (return-from perform-reorg nil))))
+      ;; No pruned-height gate: a fork point below the pruned height is not a
+      ;; reason to refuse. Core has none -- ActivateBestChainStep connects the
+      ;; chain FindMostWorkChain chose, and FindMostWorkChain asks each block
+      ;; only for BLOCK_HAVE_DATA (validation.cpp:3158-3196), which a pruned
+      ;; block regains when it is downloaded again. The pruned height is a
+      ;; HEIGHT, not a chain: pruning a stale branch's file raised it over the
+      ;; blocks of the chain we later had to return to, bodies and all
+      ;; (feature_pruning.py:263). The missing-body precondition below is the
+      ;; real test, and its list is what the caller re-queues for download.
 
       ;; Collect blocks to disconnect (old chain, tip to fork)
       ;; All the state the three phases share, as one value -- Core carries
@@ -5095,8 +5096,8 @@ can neither wedge on an equal-work sibling nor advance past the base."
                  (%activate-best-after-refused-reorg
                   chain-state block-store utxo-set fee-estimator recent-rejects mempool)
                  (values nil :reorg-refused detail))
-                ;; Refused for another reason (no common ancestor, fork below
-                ;; pruned height). State unchanged.
+                ;; Refused for another reason (no common ancestor). State
+                ;; unchanged.
                 ((null reorg-ok)
                  (values nil :reorg-refused))
                 (t

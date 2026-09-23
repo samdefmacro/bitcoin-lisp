@@ -4731,7 +4731,7 @@ candidate activated."
             ((member error '(:weaker-chain :reorg-refused :unknown-parent :corrupt-undo))
              ;; NOT a validation verdict on the CANDIDATE: the tip advanced under
              ;; us (raced :weaker-chain), the reorg is structurally impossible
-             ;; right now (no common ancestor / fork below pruned height, bare
+             ;; right now (no common ancestor, bare
              ;; :reorg-refused), or our own disconnect-side undo is corrupt
              ;; (:corrupt-undo — the candidate is fine, our local state isn't).
              ;; Drop from the candidate set but do NOT permanently reject — it
