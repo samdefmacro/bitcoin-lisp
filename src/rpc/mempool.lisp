@@ -776,6 +776,14 @@ do -- so the transaction is refused, not broadcast."
   (error 'rpc-error :code +rpc-misc-error+
                     :message "-privatebroadcast is enabled, but this node does not implement private broadcast; the transaction was neither added to the mempool nor broadcast"))
 
+(defun %refuse-before-broadcast (tx txid utxo-set)
+  "sendrawtransaction's two refusals in Core's order: the -privatebroadcast
+gate (rpc/mempool.cpp:115-124) runs before BroadcastTransaction's first
+question, the UTXO-set check (node/transaction.cpp:52-61)."
+  (when bl:*private-broadcast*
+    (%refuse-private-broadcast))
+  (%refuse-if-already-in-utxo-set tx txid utxo-set))
+
 (define-rpc "sendrawtransaction" (node (hex-str))
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
 txid joins the mempool's unbroadcast set and an announcement is queued to every
@@ -811,11 +819,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                   (max-fee (feerate-fee
                             (%parse-max-fee-rate params 1)
                             (bl.ser:transaction-vsize tx))))
-            ;; Core's order: the -privatebroadcast gate (rpc/mempool.cpp:115-124)
-            ;; runs before BroadcastTransaction's first question.
-            (when bl:*private-broadcast*
-              (%refuse-private-broadcast))
-            (%refuse-if-already-in-utxo-set tx txid utxo-set)
+            (%refuse-before-broadcast tx txid utxo-set)
             ;; Core checks the mempool by TXID before validating at all
             ;; (node/transaction.cpp:63-72), skips submission and only
             ;; re-announces, with the POOL entry's wtxid. Asking VALIDATE
