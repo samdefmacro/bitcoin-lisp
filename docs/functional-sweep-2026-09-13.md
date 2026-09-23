@@ -904,3 +904,254 @@ testnet4's getnetworkinfo `localaddresses` now lists its onion service.
   a LevelDB directory, so `Format:` reads `leveldb` and the lock sentence
   names it; a copy of the test with only those assertions adapted passes end
   to end (`f89ed2f7`, the manual's tools section).
+
+## Round 7
+
+Six worktree batches merged onto `main` on 2026-09-23, from `6e76cfb8`
+through `632abe24`: 73 commits, two of them `tests:` commits, in merge order
+p2p6 (6), init4 (12), wallet8 (15), blockdl (8), net7 (17) and prune (15).
+One is a seam where two batches met on `main`: wallet8's UTXO-set refusal and
+net7's `-privatebroadcast` gate took sendrawtransaction's handler to 104
+lines, one helper over the ratchet (`7d59179e`); and the prune batch's last
+commit closes a window its rebase onto p2p6's pump opened (`632abe24`, below).
+Each batch ran its own green battery on a fresh FASL volume -- three of the
+round's commits change a defstruct or a macro (`0cb79f36`, `021f8822`, `0eb2b5e5`) --
+and the merged battery ran before every push: 41,598 → 41,938 passing
+checks, plus the four skips of the Core-binary lane (the prune worktree's
+log at `632abe24`). The `::` ceiling fell from 3,780 to 3,761, paid by init4's
+anchors.dat tests and the thread entry points it exported. The behaviour
+changes that mattered most, by batch:
+
+**p2p6.** The sync thread's idle wait is Core's message handler's: one
+poll(2) over every peer the pump reads, ended at once by buffered input, with
+the 200 ms tick as its timeout instead of a fixed sleep before every pump; a
+request/reply round trip no longer costs a tick, and `p2p_tx_download`'s
+twenty-ping announce loop fell from 3.86 s to 1.09 s (`4484d829`,
+net.cpp:3157, :2246-2253). The per-peer tx token bucket that disconnected the
+sender of the 51st unsolicited transaction is gone -- Core's TX handler has
+no count limit, and an orphan flood is bounded by the orphanage's DoS scores
+(`dc7d8170`, the reversal of a Round-6 decision, below). `-test=addrman` keys
+the address book with Core's `uint256{1}`, and the bucket and position
+hashes are Core's bytes (the address key without a network byte,
+CompactSize-prefixed groups), so a collision ground by Core reproduces here;
+a missing `peers.dat` is created and logged in Core's words, and
+addpeeraddress answers with Core's codes (`a25ab0ce`, `2bc17ef0`).
+getpeerinfo reports `addrlocal` for every peer with a valid address, and an
+inbound peer's routable view of us raises that local address's score, Core's
+SeenLocal (`b3083257`). The Tor control dial goes through `%socket-connect`,
+so a refused control port fails at once instead of holding the thread for
+usocket's 10 s (`71e783ce`). `p2p_opportunistic_1p1c` and `p2p_tx_download`
+PASS in the batch's oracle runs.
+
+**init4.** `peers.dat` and `anchors.dat` are Bitcoin Core's files: SerializeDB
+around AddrManImpl's format 4 with each entry's source address, and
+Unserialize's range checks, re-bucketing and closing CheckAddrman; a file
+from a future format is backed up and replaced, a corrupt one refuses
+startup with Core's sentence (`8af8137d`). The former ADRM/CRC32 format is
+read once, rewritten in Core's format and the migration logged, and the
+writer never produces a file its own reader would refuse (`2d9184f4`) --
+the path the live nodes take on their first start with this round. The
+old ANC1/ANC2 anchors are not read; anchors are block-relay-only
+connections, dialed first and last-first. `-checkaddrman=<n>` runs the port
+of CheckAddrman with Core's timer lines. The scheduler, `addcon` and index
+catch-ups are real threads, and the sync thread is logged as `msghand` (and
+`opencon` only when Core would start ThreadOpenConnections) (`9b2180db`); a
+stop during start-up is torn down after start-up returns, where it had freed
+the filter index's LevelDB under the index thread (`d18f2ff9`). A negated
+`-wallet` on the command line hides settings.json's list, as GetSettingsList
+does (`a38ae63d`). A SOCKS5 reply already in the stream's buffer is read
+instead of waited for, which had failed every dial through a proxy that
+keeps the connection open (`383b3c90`). `-asmap` looks an IPv4 address up as
+`::ffff:a.b.c.d` and groups by AS as Core does -- before, every IPv4 address
+came back unmapped (`ecfe7591`) -- its errors quote the path and start-up
+logs Core's ASMap health check (`d7cdc6e8`). `feature_addrman` and
+`feature_anchors` PASS in the batch's oracle runs.
+
+**wallet8.** generateblock reports a ranged or keyless descriptor's own
+error, falling back to an address only when the descriptor does not parse
+(`2c9c7224`). The reject-keyword check now reads every transaction-verdict
+file across line breaks, with positive controls; it found six package-wide
+reasons without a row and two keywords no Core rejection spells, both
+removed (`6d03fa87`). The wallet's PSBT updaters store a `non_witness_utxo`
+without its witness (`e703605a`), and [wallet-plan.md](wallet-plan.md) §1
+now says external signers are ported (`81647cb4`, the Round-6 note).
+sendrawtransaction refuses a transaction whose outputs are already in the
+UTXO set, Core's -27 (`69da8e9f`, `44366a1d`); waitfornewblock waits against
+the `current_tip` it is given (`c7455f7b`); a snapshot chainstate's prune
+height is Core's GetPruneHeight walk (`8e83cfb6`); getblock with details
+fails when the undo the index names cannot be read (`f5450d73`); an outputs
+array member must be a one-key object (`69f67f6d`). A refused wallet load
+leaves the stored best block where it was, so the next load is refused
+again instead of skipping the blocks (`5384f8e2`); the refusal and the
+rescan errors name pruning only when blocks have been pruned, the
+assumeutxo background sync when that is the cause, and the timestamps Core
+names (`ae6c1418`, `2d58506f`, `e2948b81`). A winning block whose fork
+ancestors lack bodies is stored, as AcceptBlock stores it (`8b08d3ad`).
+`rpc_generate` PASSES in the batch's oracle run.
+
+**blockdl.** An equal-work tie goes to the chain whose data was complete
+first: Core's nSequenceId, kept in memory only, with preciousblock's
+negative ids and ActivateBestChain after a refusal for missing bodies
+(`0cb79f36`) -- the per-block receive order the Round-6 decision said the
+index lacked. The witness commitment is checked before the block weight,
+and ContextualCheckBlock before ConnectBlock, so a stuffed coinbase witness
+is `bad-witness-nonce-size` and the size and weight limits carry Core's
+`bad-blk-length` and `bad-blk-weight` (`6d780f9f`). A CheckBlock failure
+marks no block invalid, as ProcessNewBlock skips AcceptBlock for it
+(`b9a26904`); a fork verdict that carries a debug message is no longer
+mistaken for a list of blocks to download, the cause of Round 6's
+`feature_block` time-out (`b74633da`). A block message whose header fails its
+own proof of work, or a contextual header rule, costs the sender the
+connection, `time-too-new` excepted (`f7429eaf`, `b33adcc9`). BIP 30 is
+enforced at every height where the network's `BIP34Hash` is null -- testnet4,
+signet and regtest -- and at the BIP 34 block itself on mainnet
+(`021f8822`). That is a CONSENSUS change on testnet4: the live node would
+connect a block Core rejects as `bad-txns-BIP30`; the fix reaches it on its
+next deploy. `feature_chain_tiebreaks` PASSES in the batch's oracle
+run.
+
+**net7.** getrawaddrman is Core's bucket/position table, and every IPv6
+address prints compressed as IPv6ToString does (`2696a076`, `445994c6`).
+`-privatebroadcast` is validated in Core's three cases and words, and since
+the mechanism is not ported, sendrawtransaction refuses under it
+(`37b29646`). The inv, addr/addrv2, headers and serve token buckets that
+disconnected the sender of the first message past them are removed: Core
+bounds each message, never the count of a kind; the addr bucket that DROPS
+addresses and the send-buffer pause stay (`0eb2b5e5`). An over-limit vector
+is Core's `Misbehaving` line, and an over-long locator only disconnects
+(`2e903e27`). Received bytes are counted per chunk as they arrive
+(`db115194`); a version after the handshake is logged as redundant
+(`9e50379f`); a malformed v1 header is reported in V1Transport's words and
+its type field judged whole (`30b3e58a`). A noban peer's headers skip the
+low-work gate, a low-work chain is ignored once in Core's words, and header
+progress is reported while in IBD by Core's definition (`f2bff6bd`,
+`9af280ba`). Config: `conf=` in a configuration file is refused and
+`reindex=` warned about, as IsConfSupported does (`d10903f0`, `f607463f`);
+an ignored bitcoin.conf names its directory without a trailing separator
+(`737f0566`); the `-acceptnonstdtxn` refusal names the chain `main`
+(`a25e2027`). Start-up says `Loading wallet…` before each wallet
+(`4576225a`), after init4's `Verifying wallet(s)…` (`8cd020c4`). `rpc_net`
+and `feature_asmap` PASS in the batch's oracle runs.
+
+**prune.** A reorg below the pruned height waits for the bodies and
+re-downloads them instead of refusing ("Node must re-sync."): the pruned
+height is a height, not a chain, and FindMostWorkChain asks each block only
+for its data (`e675b547`). Automatic pruning keeps Core's buffer -- one blk
+and one rev chunk, 17 MiB, plus 1 MB per block still to come in IBD -- under
+the target, and no longer stops at the pruned-height cursor, which after a
+reorg onto a lower tip had stopped pruning for good (`9a63175b`); a pruned
+node prunes at startup after the wallets' rescans (`1178f6a9`). The
+assumeutxo background chainstate connects target-path bodies already on
+disk and, from a divergent chain, fetches from the last common ancestor
+and reorgs onto its target path (`33bd67a4`, `9d330f68`). pruneblockchain,
+`-prune`, scanblocks' false-positive check and a pruned genesis answer in
+Core's words and order (`dfc019f8`, `c4a3ff36`, `684aacbe`, `e6e626cf`), and
+`-fastprune` lowers regtest's prune-after height to 100 (`d9a1310d`), without
+which the new "too short" check had turned `feature_index_prune` and
+`rpc_getblockfrompeer` red inside the batch. A serviced shutdown request
+interrupts the sync loops at once, Core's Interrupt: with the pump waking
+on input, the 700 ms until the watchdog's poll let `feature_assumeutxo`'s
+`-stopatheight` restart connect 40 blocks past the stop and promote the
+background chainstate, moving its failure point from `:799` back to `:695`
+(`632abe24`). `scripts/dev.sh docs-check` is green again: the manual's own
+package, made after the system loads, never received the `bl.*` nicknames
+(`61f48c4d`). `feature_pruning` PASSES in the batch's oracle run.
+
+### Round-7 sweep
+
+Binary `632abe24` (the whole round), classification in
+`docs/functional-sweep-2026-09-13/after-632abe24.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
+| `bdfd8434` round 6 | 193 | 59 | 2 | 9 |
+<!-- sweep11: 632abe24 row -->
+
+The batches' oracle runs recorded nine tests going FAIL → PASS:
+`p2p_opportunistic_1p1c`, `p2p_tx_download`, `feature_addrman`,
+`feature_anchors`, `rpc_generate`, `feature_chain_tiebreaks`, `rpc_net`,
+`feature_asmap` and `feature_pruning`; the sweep is the verification of
+record, and the placeholder row above is filled when it finishes.
+
+### Decisions recorded in Round 7
+
+- **No message kind disconnects its sender for how many it sends**, as in
+  Core: the per-peer tx bucket (`dc7d8170`) and the inv, addr/addrv2,
+  headers and serve buckets (`0eb2b5e5`) are removed, reversing Round 6's
+  "the per-peer tx rate-limit bucket stays". The per-message limits, the
+  addr token bucket that drops addresses and the send-buffer pause remain.
+  The rationale lives in the two commit bodies; the manual's p2p section
+  still says a peer's traffic is "metered by the token bucket per message
+  class" and needs updating.
+- **`-privatebroadcast` refuses sendrawtransaction rather than queueing** --
+  the private-broadcast mechanism is not ported, and the ordinary path would
+  announce from this node's own address, the act the option exists to
+  prevent (`37b29646`; the comment at the option in
+  [src/config-options.lisp](../src/config-options.lisp),
+  `%CHECK-PRIVATE-BROADCAST-OPTION` in [src/node/args.lisp](../src/node/args.lisp)).
+- **`Checking all blk files are present` is not logged**: the block index
+  keeps no per-entry data flag or file number to check against, so the line
+  would describe a check that did not run; `feature_init` `:93` stays red
+  (`9b2180db`'s body).
+- **Start-up joins each index thread before it goes on**: the connect-time
+  index hooks assume an index at the tip, where Core's BaseIndex ignores
+  notifications until caught up; the thread is real, the concurrency is not
+  (`START-INDEX-BACKGROUND-SYNC`, [src/node/indexes.lisp](../src/node/indexes.lisp)).
+- **The scheduler thread runs only two tasks**, the disk-space check and
+  the log rate limiter's window; the peers.dat dump, fee-estimate flush,
+  stale-tip check and wallet resend stay on the sync thread, which owns
+  their state without a lock, and the 24-hour ASMap health-check repeat is
+  not ported (the header of [src/node/threads.lisp](../src/node/threads.lisp),
+  `d7cdc6e8`).
+- **A corrupt Core-format `peers.dat` refuses startup**, with Core's
+  sentence; only the former bitcoin-lisp format is still backed up and
+  replaced (`%LOAD-CORE-PEERS-DAT` and `%LOAD-LEGACY-PEERS-DAT`,
+  [src/networking/addrdb.lisp](../src/networking/addrdb.lisp)). This closes
+  Round 6's "`peers.dat` stays our bucket format".
+- **`-reindex` without `-prune` stays additive**: all three wipe-dependent
+  functional tests now pass their reindex assertions without the wipe, and
+  the memo's measured-connect-rate condition still does not hold
+  ([reindex-decision-2026-09-18.md](reindex-decision-2026-09-18.md),
+  "Re-checked 2026-09-23"; `ce2a6424`).
+- **getrawaddrman's source for a self-added entry is the entry itself**, as
+  Core's addpeeraddress records `Add({address}, address)`; a gossiped entry
+  names its sender (`%ADDRMAN-ENTRY-JSON`, [src/rpc/net.lisp](../src/rpc/net.lisp);
+  `2696a076`, `445994c6`).
+
+### Left open after Round 7
+
+From the batch reports and commit bodies; the round-7 sweep will confirm
+each failure point:
+
+- `feature_assumeutxo` `:799` (test_sync_from_assumeutxo_node, `:335`): the
+  IBD node downloads from a NETWORK_LIMITED snapshot node during its own IBD,
+  which Core's SendMessages never does (net_processing.cpp:6165; `9d330f68`,
+  `632abe24`).
+- `rpc_blockchain` `:106`: `verifychain(4, 0)` -- our level 4 runs
+  ContextualCheckBlock where Core's VerifyDB runs only ConnectBlock.
+- `wallet_assumeutxo` `:98`: after background sync, pruneblockchain must
+  return GetPruneHeight's walk (298), which needs the snapshot chain's blocks
+  in Core's separate block files.
+- `rpc_rawtransaction` `:246`: a pruned peer is asked for blocks below the
+  NODE_NETWORK_LIMITED window.
+- `p2p_invalid_messages` `:194`: the end-of-data condition text of
+  `bl.bytes` is not Core's `DataStream::read(): end of data`.
+- `p2p_segwit` `:1201`: the same text, expected in the debug log for
+  test_witness_input_length's block (`6d780f9f`).
+- `feature_block` `:947`: b64a, a block with a non-canonical CompactSize,
+  must be refused as `non-canonical ReadCompactSize()`.
+- `feature_config_args` `:176`: an unrecognised config-file section is a
+  warning on stderr in Core; ours writes it to the log only.
+- `p2p_headers_sync_with_minchainwork` `:148`: the 2000+-block reorg times
+  out.
+- `interface_zmq` `:563`: with several `-zmqpubhashblock` addresses only the
+  last one publishes.
+- `feature_init` `:93` (the blk-files line, decided above) and `:202`, where
+  the corruption rounds glob `blocks/index/*.ldb`, Core's LevelDB block
+  index.
+- The three large items still awaiting a decision: Core's `blocks/index`
+  LevelDB format, SQLite wallet files, and BerkeleyRO with migratewallet.
