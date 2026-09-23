@@ -1341,3 +1341,30 @@ sentence; wallet_assumeutxo.py:223 reads all three."
         (let ((m (import-message)))
           (is (search "likely caused by an in-progress assumeutxo background sync" (or m ""))
               "got ~S" m))))))
+
+(test rescanblockchain-refuses-a-range-with-missing-bodies-by-cause
+  "Core's rescanblockchain refuses up front unless every block of the range has
+its body (Chain::hasBlocks, node/interfaces.cpp:637-655), naming the cause:
+pruning, an in-progress assumeutxo background sync, or corruption
+(wallet/rpc/transactions.cpp:885-893). Ours checked only the prune horizon
+and the start block's index entry, scanned into the gap, and answered
+`Rescan failed. Potentially corrupted data files.' (wallet_assumeutxo.py:227)."
+  (with-wallet-chain-node (node "rescan-gap" :wallet "w")
+    (%wc-mine node 4 (%wc-optrue-address))
+    (let ((cs (bl:node-chain-state node)))
+      (flet ((rescan (&rest params)
+               (rpc-error-of (lambda ()
+                               (bl.rpc:dispatch-rpc-method node "rescanblockchain" params)))))
+        ;; Control: every body present, the rescan runs.
+        (is (null (rescan 0)))
+        (bl.store:forget-block-body (bl:node-block-store node)
+                                    (bl.store:block-index-entry-hash
+                                     (bl.store:get-block-at-height cs 2)))
+        ;; A range above the gap is still fine.
+        (is (null (rescan 3)))
+        (is (equal '(-1 . "Failed to rescan unavailable blocks, potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option).")
+                   (rescan 0)))
+        (push (bl.store:make-chain-state :target-blockhash (bl.store:best-block-hash cs))
+              (bl:node-chainstates node))
+        (is (equal '(-1 . "Failed to rescan unavailable blocks likely due to an in-progress assumeutxo background sync. Check logs or getchainstates RPC for assumeutxo background sync progress and try again later.")
+                   (rescan 0)))))))

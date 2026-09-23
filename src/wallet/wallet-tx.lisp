@@ -1754,6 +1754,39 @@ blocks stay in the index, and find-fork-in-active-chain handles them."
                    (bl.store:get-block-index-entry chain-state hash))
                  locator))))
 
+(defun %rescan-blocks-available-or-refuse (node chain-state start-height stop-height)
+  "Core rescanblockchain's guard (wallet/rpc/transactions.cpp:885-893): unless
+every block from STOP-HEIGHT down to START-HEIGHT has its body
+(Chain::hasBlocks, node/interfaces.cpp:637-655), refuse -- beyond pruned data
+when blocks have been pruned at or above START-HEIGHT, else because of an
+in-progress assumeutxo background sync, else as corruption.
+
+Ours asked only whether START-HEIGHT was below the prune horizon (and with
+`<', one short of Core's getPruneHeight() >= start_height) and whether the
+start block was in the index, so a gap the background sync had not filled
+was scanned into and reported as `Rescan failed. Potentially corrupted data
+files.' (wallet_assumeutxo.py:227)."
+  (let ((store (bl:node-block-store node)))
+    (unless (and chain-state store
+                 (loop for entry = (bl.store:get-block-at-height chain-state stop-height)
+                         then (bl.store:block-index-entry-prev-entry entry)
+                       while (and entry
+                                  (bl.store:block-exists-p
+                                   store (bl.store:block-index-entry-hash entry)))
+                       when (or (<= (bl.store:block-index-entry-height entry) start-height)
+                                (null (bl.store:block-index-entry-prev-entry entry)))
+                         return t))
+      (error 'bl.rpc:rpc-error
+             :code bl.rpc:+rpc-misc-error+
+             :message
+             (cond ((and (wallet-chain-have-pruned-p node)
+                         (>= (bl.store:chain-state-pruned-height chain-state) start-height))
+                    "Can't rescan beyond pruned data. Use RPC call getblockchaininfo to determine your pruned height.")
+                   ((bl:node-historical-chainstate node)
+                    "Failed to rescan unavailable blocks likely due to an in-progress assumeutxo background sync. Check logs or getchainstates RPC for assumeutxo background sync progress and try again later.")
+                   (t
+                    "Failed to rescan unavailable blocks, potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."))))))
+
 (defun wallet-chain-have-pruned-p (node)
   "Core interfaces::Chain::havePruned -- BlockManager::m_have_pruned, whether
 block files HAVE been pruned (not whether the node is in prune mode): any
@@ -2258,20 +2291,11 @@ rescanblockchain). PARAMS: (start_height stop_height)."
                  (when (< stop-height start-height)
                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                      :message "stop_height must be greater than start_height")))
-               (when (and (bl:pruning-enabled-p) chain-state
-                          (< start-height
-                             (bl.store:chain-state-pruned-height
-                              chain-state)))
-                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
-                                   :message "Can't rescan beyond pruned data. Use RPC call getblockchaininfo to determine your pruned height."))
-               (let ((entry (and chain-state
-                                 (bl.store:get-block-at-height
-                                  chain-state start-height))))
-                 (unless entry
-                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
-                                     :message "Failed to rescan unavailable blocks, potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."))
-                 (setf start-hash
-                       (bl.store:block-index-entry-hash entry)))))
+               (%rescan-blocks-available-or-refuse
+                node chain-state start-height (or stop-height tip-height))
+               (setf start-hash
+                     (bl.store:block-index-entry-hash
+                      (bl.store:get-block-at-height chain-state start-height)))))
            (multiple-value-bind (status last-height)
                (scan-for-wallet-transactions node wallet start-hash start-height
                                              :max-height stop-height :update t)
