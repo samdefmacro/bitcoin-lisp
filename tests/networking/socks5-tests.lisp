@@ -192,6 +192,27 @@ greeting phase (netbase.cpp:448-450)."
         (is (eq :greeting phase))))
     (bt:join-thread thread)))
 
+(test socks5-reply-read-from-the-stream-buffer-while-the-proxy-stays-open
+  "A proxy that answers CONNECT in ONE write and then keeps the connection
+open, as Tor does and as the functional framework's keep-alive proxy does
+(feature_anchors.py:88-100): the reply's first read pulls all ten bytes into
+the stream's buffer, so the BND.ADDR read must be served from that buffer --
+the socket itself has nothing more to report ready. Waiting on the socket
+instead sat out the whole deadline and failed every such dial with a
+bind-address timeout (Core reads with recv, whose bytes are in the kernel,
+netbase.cpp:462-512)."
+  (multiple-value-bind (port thread)
+      (%fake-socks5-server
+       `((:read 3) (:write #(#x05 #x00))
+         (:read 18)
+         (:write #(#x05 #x00 #x00 #x01 10 0 0 1 #x47 #x9D))
+         (:sleep 2)))
+    (with-socks5-client (sock port)
+      (is (null (%socks5-error-message
+                 (lambda () (bl.net:socks5-connect sock "example.com" 18333 :timeout 1))))
+          "the connect must complete from the buffered reply, not time out"))
+    (bt:join-thread thread)))
+
 (test socks5-reply-timeout
   "A proxy that goes silent trips the per-step read deadline (Core
 g_socks5_recv_timeout, netbase.cpp:40-41)."
