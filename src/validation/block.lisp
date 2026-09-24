@@ -2057,13 +2057,16 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
     (values t nil)))
 
 (defun %contextual-check-block (block chain-state utxo-set current-height
-                               &key skip-scripts)
+                               &key skip-scripts connect-only)
   "The UTXO-dependent half of ConnectBlock -- BIP30, per-input validation and
 fee accumulation, sequence locks, scripts and the coinbase value cap -- around
 %CONTEXTUAL-CHECK-BLOCK-NO-UTXO, which contributes Core's ContextualCheckBlock.
 Every check added here reads the ACTIVE UTXO set or the chain height, so it is
 only correct for a block that extends the tip -- a fork block gets these from
 PERFORM-REORG instead, fork-to-tip against the rewound set.
+
+CONNECT-ONLY leaves out the ContextualCheckBlock half: Core's ConnectBlock
+alone, as VerifyDB's level 4 calls it (validation.cpp:4760).
 
 Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
   (let* ((header (bl.ser:bitcoin-block-header block))
@@ -2077,10 +2080,11 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
     ;; (marked invalid for good) for a body whose witness a peer had mangled.
     ;; Shared verbatim with ACCEPT-BLOCK-BODY, the pre-write gate, so the two
     ;; can never drift.
-    (multiple-value-bind (valid error)
-        (%contextual-check-block-no-utxo block chain-state current-height)
-      (unless valid
-        (return-from %contextual-check-block (values nil error nil))))
+    (unless connect-only
+      (multiple-value-bind (valid error)
+          (%contextual-check-block-no-utxo block chain-state current-height)
+        (unless valid
+          (return-from %contextual-check-block (values nil error nil)))))
     ;; BIP 30: reject a block that re-creates a still-unspent txid.
     ;; Per-output point lookups, exactly Core's HaveCoin loop
     ;; (validation.cpp:2444): a duplicate txid implies an identical tx
@@ -2245,7 +2249,8 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
 
 
 (defun validate-block (block chain-state utxo-set current-height current-time
-                        &key skip-scripts skip-header skip-pow context-free-only)
+                        &key skip-scripts skip-header skip-pow context-free-only
+                          connect-only)
   "Fully validate a block including all transactions.
 When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
 the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
@@ -2270,6 +2275,11 @@ When SKIP-POW is true, only the PoW hash<=target check (and, on signet, the
 block-solution check — Core gates both on fCheckPOW) is skipped, while every
 contextual header check still runs: the TEST-BLOCK-VALIDITY dry-run of an
 unmined template (Core TestBlockValidity's check_pow=false).
+When CONNECT-ONLY is true, Core's ContextualCheckBlock (finality, the BIP34
+height, the witness commitment, the weight) is left out and only CheckBlock and
+ConnectBlock run: VerifyDB's level-4 reconnect (validation.cpp:4760), which
+re-checks blocks the node accepted under whatever deployment heights were in
+force then.
 Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
   (multiple-value-bind (ok error)
       (%check-block block chain-state current-height current-time
@@ -2286,7 +2296,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
   (multiple-value-bind (ok error fees)
       (%contextual-check-block block chain-state utxo-set current-height
-                               :skip-scripts skip-scripts)
+                               :skip-scripts skip-scripts
+                               :connect-only connect-only)
     (unless ok
       ;; Core's one line for a block that failed ConnectBlock:
       ;; `Block validation error: <state.ToString()>' (validation.cpp:2619).

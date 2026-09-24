@@ -1235,6 +1235,10 @@
   compares the two databases -- it disconnects the tail into a scratch
   coins view over the chainstate's own LevelDB, never flushed -- so it is
   what catches a UTXO set that lost its coins under an unchanged tip.
+  Level 4 reconnects with VALIDATE-BLOCK's CONNECT-ONLY: Core's ConnectBlock
+  without ContextualCheckBlock, which runs in AcceptBlock and never in
+  VerifyDB, so a block accepted under other deployment heights still
+  reconnects (rpc_blockchain.py:106).
 
   Traps: the P2SH-witness redeem script is the STACK TOP, not the last
   push (a consensus split when it was the latter). Block weight includes
