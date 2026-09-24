@@ -112,6 +112,41 @@ therefore still has to be validated under it."
           return t))
 
 ;;; nStatus <-> our entry
+;;;
+;;; Core keeps a block's validity LEVEL and its FAILURE bits apart in nStatus
+;;; (chain.h:42-86): InvalidateBlock and InvalidBlockFound set
+;;; BLOCK_FAILED_VALID, ResetBlockFailureFlags clears only BLOCK_FAILED_MASK
+;;; (validation.cpp:3754-3784), and a block that reached BLOCK_VALID_SCRIPTS is
+;;; SCRIPTS-valid again after reconsiderblock -- servable to peers
+;;; (BlockRequestAllowed) and connectable without re-validation. Our status is
+;;; one keyword, so an :invalid entry keeps the level it had in the
+;;; BLOCK_VALID_MASK bits of STATUS-FLAGS, which only an :invalid entry uses.
+
+(defun mark-entry-failed (entry)
+  "Core's `pindex->nStatus |= BLOCK_FAILED_VALID': ENTRY becomes :invalid,
+remembering whether it had reached BLOCK_VALID_SCRIPTS. Idempotent."
+  (unless (eq (block-index-entry-status entry) :invalid)
+    (setf (block-index-entry-status-flags entry)
+          (logior (logandc2 (block-index-entry-status-flags entry) +block-valid-mask+)
+                  (if (eq (block-index-entry-status entry) :valid)
+                      +block-valid-scripts+
+                      0))
+          (block-index-entry-status entry) :invalid))
+  entry)
+
+(defun clear-entry-failure (entry)
+  "Core ResetBlockFailureFlags for one entry (validation.cpp:3769-3772): the
+failure is cleared and the validity level it had comes back -- :valid for a
+block that had reached BLOCK_VALID_SCRIPTS, :header-valid otherwise."
+  (when (eq (block-index-entry-status entry) :invalid)
+    (let ((flags (block-index-entry-status-flags entry)))
+      (setf (block-index-entry-status entry)
+            (if (>= (logand flags +block-valid-mask+) +block-valid-scripts+)
+                :valid
+                :header-valid)
+            (block-index-entry-status-flags entry)
+            (logandc2 flags +block-valid-mask+))))
+  entry)
 
 (defun entry-disk-status (entry)
   "ENTRY's Core nStatus. The validity level comes from the status keyword and
@@ -120,16 +155,18 @@ BLOCK_VALID_TRANSACTIONS, validation.cpp:3829); HAVE_DATA and HAVE_UNDO are the
 positions' presence; FAILED_VALID is :invalid; the rest is STATUS-FLAGS."
   (let* ((data (block-index-entry-data-pos entry))
          (status (block-index-entry-status entry))
+         (flags (block-index-entry-status-flags entry))
          (level (ecase status
                   (:unknown 0)
                   (:valid +block-valid-scripts+)
-                  ((:header-valid :invalid)
-                   (if data +block-valid-transactions+ +block-valid-tree+)))))
+                  (:header-valid (if data +block-valid-transactions+ +block-valid-tree+))
+                  (:invalid (max (logand flags +block-valid-mask+)
+                                 (if data +block-valid-transactions+ +block-valid-tree+))))))
     (logior level
             (if data +block-have-data+ 0)
             (if (block-index-entry-undo-pos entry) +block-have-undo+ 0)
             (if (eq status :invalid) +block-failed-valid+ 0)
-            (block-index-entry-status-flags entry))))
+            (logandc2 flags +block-valid-mask+))))
 
 (defun %disk-status-keyword (nstatus)
   "The status keyword NSTATUS decodes to: failed (either failure bit) is
@@ -145,11 +182,16 @@ every level between is :header-valid."
 (defun %disk-status-extra-bits (nstatus)
   "The bits of NSTATUS the entry keeps verbatim in STATUS-FLAGS: everything but
 the validity level, HAVE_DATA/HAVE_UNDO and the two failure bits, which the
-status keyword and the positions already carry."
-  (logand nstatus
-          (lognot (logior +block-valid-mask+ +block-have-data+ +block-have-undo+
-                          +block-failed-valid+ +block-failed-child+))
-          #xFFFFFFFF))
+status keyword and the positions already carry -- except that a FAILED entry
+that had reached BLOCK_VALID_SCRIPTS keeps that level (MARK-ENTRY-FAILED)."
+  (logior (logand nstatus
+                  (lognot (logior +block-valid-mask+ +block-have-data+ +block-have-undo+
+                                  +block-failed-valid+ +block-failed-child+))
+                  #xFFFFFFFF)
+          (if (and (logtest nstatus (logior +block-failed-valid+ +block-failed-child+))
+                   (>= (logand nstatus +block-valid-mask+) +block-valid-scripts+))
+              +block-valid-scripts+
+              0)))
 
 ;;; CDiskBlockIndex (chain.h:316-376)
 
@@ -697,7 +739,7 @@ height with no entry below one that has."
                             (not (eq (block-index-entry-status entry) :invalid)))
                    ;; All descendants of invalid blocks are invalid too, and
                    ;; the change is written back at the next flush.
-                   (setf (block-index-entry-status entry) :invalid)))))
+                   (mark-entry-failed entry)))))
     (dolist (r records)
       ;; A deprecated FAILED_CHILD is rewritten as FAILED_VALID (:483-487).
       (when (logtest (third r) +block-failed-child+)

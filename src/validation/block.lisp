@@ -3785,7 +3785,7 @@ the fork warning, which is how an operator learns that a chain with more work
 than theirs was rejected -- a probable consensus split."
   (let ((most-work entry))
     (dolist (e (block-index-descendants chain-state entry))
-      (setf (bl.store:block-index-entry-status e) :invalid)
+      (bl.store:mark-entry-failed e)
       (when (> (bl.store:block-index-entry-chain-work e)
                (bl.store:block-index-entry-chain-work most-work))
         (setf most-work e)))
@@ -4981,18 +4981,22 @@ on its OWN four-block chain; we left it at height 1."
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
                          &key fee-estimator recent-rejects mempool)
-  "Clear :invalid from BLOCK-HASH plus its ancestors and descendants, then
-reorganize to the best valid chain if it now outweighs the active tip. Returns
+  "Clear :invalid from BLOCK-HASH plus its ancestors and descendants -- each
+back at the validity level it had, a SCRIPTS-valid block :valid again (Core
+ResetBlockFailureFlags) -- then reorganize to the best valid chain if it now
+outweighs the active tip. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
   (with-chainstate-mutex (reconsider-block)
     (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
       (if entry
           (progn
             (maphash (lambda (h e) (declare (ignore h))
+                       ;; Core ResetBlockFailureFlags: the failure goes, the
+                       ;; validity level stays (validation.cpp:3754-3784).
                        (when (and (eq (bl.store:block-index-entry-status e) :invalid)
                                   (or (block-descends-from-p e entry)
                                       (block-descends-from-p entry e)))
-                         (setf (bl.store:block-index-entry-status e) :header-valid)))
+                         (bl.store:clear-entry-failure e)))
                      (bl.store:chain-state-block-index chain-state))
             ;; Core's reconsiderblock recalculates m_best_header right after
             ;; ResetBlockFailureFlags (rpc/blockchain.cpp:1749-1750), so a
