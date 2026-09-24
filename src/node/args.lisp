@@ -233,7 +233,12 @@ compares a stopped node's whole stderr against such lines
   (ignore-errors
    (format *error-output* "Warning: ~A~%" text)
    (finish-output *error-output*))
-  (defer-log :warn "~A" text))
+  ;; Queued until debug.log opens; once it is open (a warning raised later in
+  ;; start-up, such as -test's), straight to it.
+  (let ((line (string-right-trim '(#\Newline) text)))
+    (if bl.log:*log-file-stream*
+        (log-warn "~A" line)
+        (defer-log :warn "~A" line))))
 
 (defun %check-private-broadcast-option (&key reachable onion-may-become-reachable
                                              connect proxy-randomize)

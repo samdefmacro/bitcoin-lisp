@@ -140,6 +140,63 @@ better performance, unless there is currently a condition which makes rebuilding
 indexes necessary"))
     (nreverse rows)))
 
+(defparameter +recognized-conf-sections+
+  '("regtest" "signet" "test" "testnet4" "main")
+  "The section names Core's GetUnrecognizedSections accepts
+(common/args.cpp:157-163): ChainTypeToString of each chain, compared exactly.")
+
+(defun conf-unrecognized-sections (text filepath)
+  "The sections TEXT names that Core does not recognize, as
+ (name filepath line) lists in file order -- Core's m_config_sections, filled
+by GetConfigOptions (common/config.cpp:48-66) and filtered by
+GetUnrecognizedSections (common/args.cpp:154-169). A section appears in two
+ways: a `[name]' header, and a key whose full name -- the current header's
+prefix plus the key -- has a dot at or past the end of that prefix, which
+makes the part before its LAST dot a section (`testnot.datadir=1' names
+`testnot'). FILEPATH is what Core prints: the main file's path, or an
+include as it was written. Lines Core refuses are CONF-SETTINGS-ROWS'
+business; they name no section here."
+  (let ((prefix "") (linenr 0) (found '()))
+    (with-input-from-string (in text)
+      (loop for raw = (read-line in nil nil)
+            while raw
+            do (incf linenr)
+               (let ((line (string-trim '(#\Space #\Tab #\Return #\Newline)
+                                        (%conf-strip-comment raw))))
+                 (flet ((note (name) (push (list name filepath linenr) found)))
+                   (cond
+                     ((zerop (length line)))
+                     ((and (char= (char line 0) #\[)
+                           (char= (char line (1- (length line))) #\]))
+                      (let ((section (subseq line 1 (1- (length line)))))
+                        (note section)
+                        (setf prefix (concatenate 'string section "."))))
+                     ((position #\= line)
+                      (let* ((name (concatenate
+                                    'string prefix
+                                    (string-trim '(#\Space #\Tab #\Return #\Newline)
+                                                 (subseq line 0 (position #\= line)))))
+                             (dot (position #\. name :from-end t)))
+                        (when (and dot (<= (length prefix) dot))
+                          (note (subseq name 0 dot))))))))))
+    (remove-if (lambda (s) (member (first s) +recognized-conf-sections+
+                                   :test #'string=))
+               (nreverse found))))
+
+(defun unrecognized-sections-warning (texts filepaths)
+  "Core's InitWarning text for the unrecognized sections of TEXTS, read from
+FILEPATHS in the same order (init.cpp:958-966): one `<file>:<line> Section
+[<name>] is not recognized.' line each, newline-terminated; NIL when there
+are none."
+  (let ((sections (loop for text in texts
+                        for path in filepaths
+                        append (conf-unrecognized-sections text path))))
+    (when sections
+      (with-output-to-string (out)
+        (loop for (name file line) in sections
+              do (format out "~A:~D Section [~A] is not recognized.~%"
+                         file line name))))))
+
 (defun parse-bitcoin-conf-sections (text &optional network)
   "Parse bitcoin.conf TEXT into (values section-entries global-entries
 section-json global-json). The first two are in-order alists of

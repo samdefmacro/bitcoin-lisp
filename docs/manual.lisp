@@ -351,7 +351,11 @@
   datadir, and CHECK-CONFIG-FILE-READABLE makes an explicit `-conf` that
   cannot be opened fatal instead of a silent start on defaults, and a
   DIRECTORY at the config path -- named or default -- fatal in Core's own
-  words (common/config.cpp:134-141) instead of a stream error in the read."
+  words (common/config.cpp:134-141) instead of a stream error in the read.
+  A section name that is no chain's (`[testnet]', `testnot.datadir=1') is
+  Core's InitWarning, on stderr and in the log: CONF-UNRECOGNIZED-SECTIONS
+  finds them the way GetConfigOptions records them, per file and line, and
+  UNRECOGNIZED-SECTIONS-WARNING words them (init.cpp:958-966)."
   (bitcoin-lisp.config package)
   (bitcoin-lisp.config:define-option macro)
   (bitcoin-lisp.config:define-core-only-options macro)
@@ -365,6 +369,8 @@
   (bitcoin-lisp.config:check-cli-args function)
   (bitcoin-lisp.config:interpret-arg function)
   (bitcoin-lisp.config:conf-settings-rows function)
+  (bitcoin-lisp.config:conf-unrecognized-sections function)
+  (bitcoin-lisp.config:unrecognized-sections-warning function)
   (bitcoin-lisp.config:parse-bitcoin-conf function)
   (bitcoin-lisp.config:settings-config-rows function)
   (bitcoin-lisp.config:merged-config-alist function)

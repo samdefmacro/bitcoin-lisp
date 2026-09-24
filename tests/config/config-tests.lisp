@@ -1588,7 +1588,12 @@ silently a no-op and the BIP94 rule had no way to be turned on."
          ;; An unknown value warns and is otherwise ignored -- the node starts.
          ;; `addrman' is Core's third option: a deterministic address book
          ;; (addrdb.cpp:199).
-         (bl::%apply-test-options :regtest '("nosuch" "bip94" "addrman"))
+         ;; The warning is Core's InitWarning (init.cpp:1118): on stderr too.
+         (let ((err (make-string-output-stream)))
+           (let ((*error-output* err) (bl:*deferred-log-lines* nil))
+             (bl::%apply-test-options :regtest '("nosuch" "bip94" "addrman")))
+           (is (equal (format nil "Warning: Unrecognised option \"nosuch\" provided in -test=<option>.~%")
+                      (get-output-stream-string err))))
          (is-true bl.chain:*enforce-bip94-on-regtest*)
          (is-true bl.net:*deterministic-addrman*)
          ;; Absent, the flag is cleared: a previous run must not leak into this
@@ -3671,3 +3676,28 @@ what an earlier start in the same image left."
     (apply-config-globals '())
     (is (null bl.net:*i2p-sam-proxy*)))
   (is (equal '("i2psam") (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1"))))))
+
+(test unrecognized-config-sections-are-cores-init-warning
+  "Core records every section a config file names -- a [header], or the part
+of a key before its last dot that lies past the header's prefix
+(common/config.cpp:48-66) -- and warns about each one that is not a chain's
+name (common/args.cpp:154-169, init.cpp:958-966), file and line first.
+feature_config_args.py:176 compares the stopped node's whole stderr against
+the two-file form of it. Ours read the sections and never said a word."
+  (is (equal '(("testnot" "include.conf" 1))
+             (bl.cfg:conf-unrecognized-sections
+              (format nil "testnot.datadir=1~%") "include.conf")))
+  (is (equal '(("testnet" "/x/include2.conf" 2) ("main.foo" "/x/include2.conf" 4))
+             (bl.cfg:conf-unrecognized-sections
+              (format nil "# a comment~%[testnet]~%[main]~%foo.bar=1~%") "/x/include2.conf")))
+  ;; Control: every chain name Core knows, as a header and as a key prefix,
+  ;; names nothing unrecognized; nor does a plain key in a known section.
+  (is (null (bl.cfg:conf-unrecognized-sections
+             (format nil "main.rpcport=1~%[main]~%[test]~%[testnet4]~%[signet]~%[regtest]~%port=1~%")
+             "bitcoin.conf")))
+  (is (equal (format nil "include.conf:1 Section [testnot] is not recognized.~%~
+include2.conf:1 Section [testnet] is not recognized.~%")
+             (bl.cfg:unrecognized-sections-warning
+              (list (format nil "testnot.datadir=1~%") (format nil "[testnet]~%"))
+              '("include.conf" "include2.conf"))))
+  (is (null (bl.cfg:unrecognized-sections-warning (list "regtest=1") '("bitcoin.conf")))))

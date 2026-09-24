@@ -252,6 +252,13 @@ pre-answered the rebuild question.")
 values. Regtest-only, because -test itself is."
   (member option *test-options* :test #'string=))
 
+(defparameter +no-effect-option-warnings+
+  '(("checkpoints" "Option '-checkpoints' is set but checkpoints were removed. This option has no effect.")
+    ("limitancestorsize" "Option '-limitancestorsize' is given but ancestor size limits have been replaced with cluster size limits (see -limitclustersize). This option has no effect.")
+    ("limitdescendantsize" "Option '-limitdescendantsize' is given but descendant size limits have been replaced with cluster size limits (see -limitclustersize). This option has no effect."))
+  "The options Core accepts only to warn that they do nothing, with its
+InitWarning texts (init.cpp:926-935), keyed by the IsArgSet name.")
+
 (defun %apply-test-options (network options)
   "Apply -test=<option> (Core init.cpp:1107-1121 plus chainparams.cpp
 ReadRegTestArgs). Core reads -test with GetArgs, so it is a LIST and every
@@ -271,7 +278,8 @@ value the node does not know."
       (config-error "-test=<option> can only be used with regtest"))
     (dolist (option options)
       (unless (member option +test-options+ :test #'string=)
-        (log-warn "Unrecognised option \"~A\" provided in -test=<option>." option)))
+        ;; An InitWarning in Core (init.cpp:1118): stderr and the log.
+        (init-warning (format nil "Unrecognised option \"~A\" provided in -test=<option>." option))))
     ;; -test=bip94 turns the BIP94 timewarp rule into consensus on regtest,
     ;; exactly as testnet4 has it (chainparams.cpp:47).
     (when (member "bip94" options :test #'string=)
@@ -2401,7 +2409,9 @@ file location."
                       (when (and conf-path (probe-file conf-path))
                         (defer-log :info "Reading config file ~A" conf-path)
                         (alexandria:read-file-into-string conf-path))))
-         (conf-texts (%read-config-includes conf-text cli datadir))
+         (conf-read (multiple-value-list
+                     (%read-config-includes conf-text cli datadir)))
+         (conf-texts (first conf-read))
          ;; The settings file lives inside the NETWORK directory, so the
          ;; network has to be resolved first — from the command line and the
          ;; config file's global area only, which is where Core reads its chain
@@ -2435,7 +2445,14 @@ file location."
       ;; accepted so an ordinary Core command line starts us at all, but every
       ;; one that was actually SUPPLIED is named here — an operator who passes
       ;; -asmap or -whitelist must not be left believing it took effect.
-      (let ((ignored (supplied-core-only-options merged)))
+      ;; Three options Core keeps only to say they do nothing -- InitWarnings
+      ;; (init.cpp:926-935), so on stderr as well as in the log.
+      (loop for (option text) in +no-effect-option-warnings+
+            when (assoc option merged :test #'string=)
+              do (init-warning text))
+      (let ((ignored (remove-if (lambda (o) (assoc o +no-effect-option-warnings+
+                                                   :test #'string=))
+                                (supplied-core-only-options merged))))
         (when ignored
           (defer-log :warn "Accepted but NOT implemented by this node, so ~
 ~:[this option has~;these options have~] no effect: ~{-~A~^ ~}"
@@ -2445,6 +2462,13 @@ file location."
       ;; back to check how an option was actually resolved, so both the wording
       ;; and the JSON rendering of the value are part of the contract.
       (%log-args args conf-texts settings-cells settings-network)
+      ;; Core's section warning (init.cpp:958-966): an InitWarning, so on
+      ;; stderr as well as in the log -- feature_config_args.py:176 compares
+      ;; the stopped node's whole stderr against it.
+      (let ((warning (unrecognized-sections-warning
+                      conf-texts (and conf-texts
+                                      (cons (namestring conf-path) (second conf-read))))))
+        (when warning (init-warning warning)))
       ;; The datadir the merged config settled on may not be the one the config
       ;; file was located from, and the bitcoin.conf sitting in it is then
       ;; silently ignored -- Core refuses to start on exactly this
