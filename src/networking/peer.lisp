@@ -1839,7 +1839,9 @@ The nonce is published, so BL.SER:MAKE-PING-MESSAGE's OS-CSPRNG default is
 what draws it -- named here because the pong has to match it."
   (let ((nonce (bl.crypto:rand-u64)))
     (setf (peer-ping-nonce peer) nonce)
-    (setf (peer-last-ping-time peer) (get-internal-real-time))
+    ;; Core's m_ping_start: the MOCKABLE microsecond clock
+    ;; (net_processing.cpp:5504), which p2p_ping.py moves with setmocktime.
+    (setf (peer-last-ping-time peer) (bl.ser:get-time-micros))
     (send-message peer (bl.ser:make-ping-message nonce))))
 
 (defun reply-to-ping (peer nonce)
@@ -1847,16 +1849,21 @@ what draws it -- named here because the pong has to match it."
   (send-message peer (bl.ser:make-pong-message nonce)))
 
 (defun record-pong (peer nonce)
-  "Record the round trip a pong carrying NONCE closes; HANDLE-PONG parses the wire."
+  "Record the round trip a pong carrying NONCE, the outstanding ping's, closes
+(Core PongReceived) and end the ping. Returns NIL, recording nothing, for a
+negative round trip (Core's `Timing mishap') or a NONCE that is not the
+outstanding one; the \"pong\" handler sorts out the other cases."
   (when (and (peer-ping-nonce peer)
              (= nonce (peer-ping-nonce peer)))
-    (let ((rtt (- (get-internal-real-time) (peer-last-ping-time peer))))
-      (setf (peer-ping-latency peer) rtt)
-      ;; Track the connection's best round trip (Core m_min_ping_time).
-      (when (or (zerop (peer-min-ping-latency peer))
-                (< rtt (peer-min-ping-latency peer)))
-        (setf (peer-min-ping-latency peer) rtt)))
-    (setf (peer-ping-nonce peer) nil)))
+    (let ((rtt (- (bl.ser:get-time-micros) (peer-last-ping-time peer))))
+      (setf (peer-ping-nonce peer) nil)
+      (when (>= rtt 0)
+        (setf (peer-ping-latency peer) rtt)
+        ;; Track the connection's best round trip (Core m_min_ping_time).
+        (when (or (zerop (peer-min-ping-latency peer))
+                  (< rtt (peer-min-ping-latency peer)))
+          (setf (peer-min-ping-latency peer) rtt))
+        t))))
 
 ;;; Peer Health Monitoring
 
@@ -1967,7 +1974,7 @@ for exactly these texts."
         :disconnect)
       :ok))
 
-(defun maybe-send-ping (peer &optional (now (get-internal-real-time)))
+(defun maybe-send-ping (peer &optional (now (bl.ser:get-time-micros)))
   "Core PeerManagerImpl::MaybeSendPing (net_processing.cpp:5487-5510). Returns
 :disconnect, :ping-sent or :ok.
 
@@ -1979,16 +1986,17 @@ a node started with a huge -peertimeout still pings and still measures latency,
 it just never disconnects for the answer.
 
 Both clocks are the send time of the last ping, so an outstanding ping is never
-overwritten and its age never reset."
+overwritten and its age never reset. NOW and the ping fields are Core's
+mockable microseconds (BL.SER:GET-TIME-MICROS)."
   (let* ((last (peer-last-ping-time peer))
          (age (and last (- now last))))
     (cond
       ((peer-ping-nonce peer)
        (cond
-         ((and (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
+         ((and (> age (* +ping-timeout-seconds+ 1000000))
                (should-run-inactivity-checks-p peer))
           (bl:log-cat "net" "ping timeout: ~,1Fs, disconnecting peer=~A"
-                      (/ (float age) (float internal-time-units-per-second))
+                      (/ (float age) 1000000.0)
                       (peer-id peer))
           :disconnect)
          (t :ok)))
@@ -2010,7 +2018,7 @@ overwritten and its age never reset."
       ((null last)
        (send-ping peer)
        :ping-sent)
-      ((> age (* +ping-interval-seconds+ internal-time-units-per-second))
+      ((> age (* +ping-interval-seconds+ 1000000))
        (send-ping peer)
        :ping-sent)
       (t :ok))))
@@ -2025,8 +2033,7 @@ Inside the gate the rules are Core's: the send-buffer backpressure signal, then
 InactivityCheck's timing rules (INACTIVITY-CHECK-REASON), then the unfinished
 handshake (CHECK-HANDSHAKE-TIMEOUT, which is InactivityCheck's fourth rule),
 then MaybeSendPing (MAYBE-SEND-PING)."
-  (let ((conn (peer-connection peer))
-        (now (get-internal-real-time)))
+  (let ((conn (peer-connection peer)))
     (when (and conn (connection-connected conn))
       ;; Upkeep, not a verdict, so it runs whether or not the gate is open:
       ;; retry buffered unsent bytes, non-blocking (Core's periodic
@@ -2049,7 +2056,7 @@ then MaybeSendPing (MAYBE-SEND-PING)."
     ;; handshake rule is behind the same gate, inside CHECK-HANDSHAKE-TIMEOUT.
     (unless (eq (peer-state peer) :ready)
       (return-from check-peer-health (check-handshake-timeout peer)))
-    (maybe-send-ping peer now)))
+    (maybe-send-ping peer)))
 
 (defun record-block-received-from-peer (peer)
   "Record that we received a block from PEER. Resets stalling state and

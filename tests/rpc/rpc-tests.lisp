@@ -9057,7 +9057,7 @@ through yason."
           (floor internal-time-units-per-second 2) ; 0.5s best
           (bl.net:peer-ping-nonce peer) 7
           (bl.net:peer-last-ping-time peer)
-          (get-internal-real-time)
+          (bl.ser:get-time-micros)
           (bl.net:peer-feefilter-rate peer) 1000
           (bl.net:peer-time-offset peer) -3
           (bl.net:peer-addr-relay-enabled peer) t

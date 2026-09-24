@@ -243,6 +243,7 @@ src/serialization/.")
    #:+psbt-out-tap-tree+ #:+psbt-out-tap-bip32+
    #:coinbase-input-p
    #:get-unix-time
+   #:get-time-micros
    #:get-scheduler-time
    #:mock-scheduler-forward
    #:*scheduler-offset*

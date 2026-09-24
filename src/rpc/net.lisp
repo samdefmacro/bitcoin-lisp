@@ -199,8 +199,7 @@ the reap cadence: reporting a peer we have closed the socket on is wrong
 whatever the cadence is."
   (let ((peers (sort (rpc-get-connected-peers node)
                      #'< :key #'bl.net:peer-id))
-        (chain-state (rpc-get-chain-state node))
-        (now (get-internal-real-time)))
+        (chain-state (rpc-get-chain-state node)))
     (mapcar
      (lambda (peer)
        ;; peer-version holds the received version *message* struct, not a
@@ -274,16 +273,18 @@ whatever the cadence is."
            ("conntime" . ,(bl.net:peer-connected-at peer))
            ;; Peer's version-message timestamp vs our clock at receipt.
            ("timeoffset" . ,(bl.net:peer-time-offset peer))
-           ;; ping stats are in internal-time units; report seconds. All
+           ;; ping stats are in microseconds; report seconds. All
            ;; three are optional in Core: pingtime/minping only once a pong
            ;; arrived, pingwait only while a ping is outstanding.
            ,@(when (plusp ping)
-               `(("pingtime" . ,(/ ping internal-time-units-per-second 1.0d0))))
+               `(("pingtime" . ,(/ ping 1000000 1.0d0))))
            ,@(when (plusp minping)
-               `(("minping" . ,(/ minping internal-time-units-per-second 1.0d0))))
+               `(("minping" . ,(/ minping 1000000 1.0d0))))
+           ;; Core GetNodeStateStats: the MOCKABLE clock less m_ping_start.
            ,@(when ping-nonce
-               `(("pingwait" . ,(/ (- now (bl.net:peer-last-ping-time peer))
-                                   internal-time-units-per-second 1.0d0))))
+               `(("pingwait" . ,(/ (- (bl.ser:get-time-micros)
+                                      (bl.net:peer-last-ping-time peer))
+                                   1000000 1.0d0))))
            ("version" . ,(if vmsg
                              (bl.ser:version-message-version vmsg)
                              0))

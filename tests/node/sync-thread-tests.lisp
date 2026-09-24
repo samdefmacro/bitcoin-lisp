@@ -679,3 +679,20 @@ wait for each; ours resolved every seed at once without any of them."
         (is (search "Waiting 11 seconds before querying DNS seeds." text))
         (is (search "P2P peers available. Skipped DNS seeding." text))
         (is (not (search "Loading addresses" text)))))))
+
+(test the-ping-clock-is-the-mockable-one
+  "Core stamps m_ping_start and measures pingwait, the round trip and the
+two-minute interval on GetTime<microseconds>(), the MOCKABLE clock
+(net_processing.cpp:5487-5510, GetNodeStateStats). p2p_ping.py:57 moves
+setmocktime three seconds and expects pingwait 3; ours measured on the real
+clock and reported milliseconds."
+  (let* ((t0 1700000000)
+         (bl.ser:*mock-time* t0)
+         (peer (bl.net:make-peer :state :ready)))
+    (bl.net:check-peer-health peer)       ; never pinged: pings now
+    (is-true (bl.net:peer-ping-nonce peer))
+    (is (= (* t0 1000000) (bl.net:peer-last-ping-time peer))
+        "the ping is stamped with the mock time, in microseconds")
+    (setf bl.ser:*mock-time* (+ t0 121))
+    (is (eq :ok (bl.net:check-peer-health peer))
+        "an outstanding ping is not replaced")))

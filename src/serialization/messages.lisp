@@ -151,6 +151,16 @@ GetUptime uses SteadyClock rather than the mockable GetTime
 (Core GetTime, util/time.cpp)."
   (or *mock-time* (get-real-unix-time)))
 
+(defun get-time-micros ()
+  "Core GetTime<std::chrono::microseconds>() (util/time.cpp): microseconds
+since the Unix epoch, or the mock time (whole seconds) as microseconds when
+setmocktime is in effect -- the clock of the ping timer and its getpeerinfo
+fields, which p2p_ping.py drives with setmocktime."
+  (if *mock-time*
+      (* *mock-time* 1000000)
+      (multiple-value-bind (sec usec) (sb-ext:get-time-of-day)
+        (+ (* sec 1000000) usec))))
+
 ;;; Core's CScheduler runs on its own clock and `mockscheduler' moves only
 ;;; that clock (CScheduler::MockForward, scheduler.cpp:82-97, reached from
 ;;; rpc/node.cpp:86-99): every queued task's deadline comes DELTA closer, and

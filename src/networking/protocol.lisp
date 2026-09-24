@@ -190,23 +190,37 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     (reply-to-ping peer nonce)))
 
 (define-p2p-handler "pong" (peer payload ctx)
-  "Close the round trip our last ping opened.
-
-Core hand-writes a forgiving branch for a pong that is too short to hold the
-nonce (net_processing.cpp:5030-5035): nAvail < sizeof(nonce) sets sProblem to
-`Short payload', cancels the outstanding ping (bPingFinished), logs at debug
-and returns - the peer is kept. It is the one message whose truncation Core
-names, because a short pong is most likely a bug in another implementation and
-costs us nothing. Reading the u64 unguarded here instead raised, and the
-dispatch turned that into a disconnect."
+  "Close the round trip our last ping opened: Core's PONG handler
+(net_processing.cpp:4990-5049), problem by problem. A pong too short to hold
+the nonce is `Short payload' and cancels the outstanding ping; with no ping
+outstanding it is `Unsolicited pong without ping'; a different nonce is
+`Nonce mismatch' and leaves the ping outstanding (pings overlap), except a
+zero one, `Nonce zero', which cancels it. Each problem is one debug line,
+`pong peer=<id>: <problem>, <sent> expected, <received> received, <n> bytes'
+in hex, which p2p_ping.py:60-83 waits for; the peer is kept. Ours cancelled
+the ping on any nonce and named only the short payload."
   (declare (ignore ctx))
-  (if (< (length payload) 8)
-      (progn
-        (bl:log-cat "net" "pong peer=~A: Short payload, ~X expected, ~D bytes"
-                    (peer-id peer) (or (peer-ping-nonce peer) 0) (length payload))
-        (setf (peer-ping-nonce peer) nil))
-      (record-pong peer (bl.bytes:with-byte-reader (s payload)
-                          (bl.bytes:br-read-u64-le s)))))
+  (let ((avail (length payload))
+        (sent (or (peer-ping-nonce peer) 0))
+        (nonce 0)
+        (finished nil)
+        (problem nil))
+    (cond ((< avail 8)
+           (setf finished t problem "Short payload"))
+          (t
+           (setf nonce (bl.bytes:with-byte-reader (s payload) (bl.bytes:br-read-u64-le s)))
+           (cond ((zerop sent) (setf problem "Unsolicited pong without ping"))
+                 ((= nonce sent)
+                  (setf finished t)
+                  (unless (record-pong peer nonce)
+                    (setf problem "Timing mishap")))
+                 ((zerop nonce) (setf finished t problem "Nonce zero"))
+                 (t (setf problem "Nonce mismatch")))))
+    (when problem
+      (bl:log-cat "net" "pong peer=~A: ~A, ~(~X~) expected, ~(~X~) received, ~D bytes"
+                  (peer-id peer) problem sent nonce avail))
+    (when finished
+      (setf (peer-ping-nonce peer) nil))))
 
 (define-p2p-handler "mempool" (peer payload ctx)
   "BIP35. Core honors this only when it advertises NODE_BLOOM or the peer

@@ -165,7 +165,7 @@ drain loop uses. Returns (values still-connected peer)."
 the nonce AND the send time, without which RECORD-PONG has no clock to
 subtract and raises for a reason that has nothing to do with the payload."
   (setf (bl.net:peer-ping-nonce peer) nonce
-        (bl.net:peer-last-ping-time peer) (get-internal-real-time))
+        (bl.net:peer-last-ping-time peer) (bl.ser:get-time-micros))
   peer)
 
 (defun %outstanding-ping (peer)
@@ -295,6 +295,25 @@ connected -- the isolation forgives on FAILURE, it does not simply never act."
     (is (eq :ready (bl.net:peer-state peer)))
     (is (null (%outstanding-ping peer))
         "a short pong cancels the ping instead of leaving it outstanding")))
+
+(test pong-problems-are-cores
+  "Core's PONG handler (net_processing.cpp:4990-5049): a pong with no ping
+outstanding is `Unsolicited pong without ping'; a different nonce is `Nonce
+mismatch' and leaves the ping outstanding; a zero nonce is `Nonce zero' and
+cancels it; each is one net-category line in hex, as p2p_ping.py:60-83 reads
+them. Ours cancelled the ping on any nonce and logged only the short case."
+  (flet ((pong-log (peer bytes)
+           (nth-value 1 (log-text-of "net" (lambda () (%dispatch-to-fake-peer "pong" bytes peer))))))
+    (let ((peer (%fake-ready-peer)))
+      (is (search "Unsolicited pong without ping, 0 expected, 0 received, 8 bytes"
+                  (pong-log peer (%bytes 0 0 0 0 0 0 0 0))))
+      (%arm-ping peer #x3039)
+      (is (search "Nonce mismatch, 3039 expected, 3038 received, 8 bytes"
+                  (pong-log peer (%bytes #x38 #x30 0 0 0 0 0 0))))
+      (is (eql #x3039 (%outstanding-ping peer)) "a mismatched pong leaves the ping outstanding")
+      (is (search "Nonce zero, 3039 expected, 0 received, 8 bytes"
+                  (pong-log peer (%bytes 0 0 0 0 0 0 0 0))))
+      (is (null (%outstanding-ping peer)) "a zero nonce cancels it"))))
 
 (test swallowed-handler-errors-are-counted
   "Forgiving a handler error hides OUR bugs too, so each one is counted per
