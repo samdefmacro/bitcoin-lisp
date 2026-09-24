@@ -216,6 +216,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:decode-tx
    #:iswitness-flags
    #:script->address
+   #:describe-address-fields
    #:script-to-json
    #:sign-tx-inputs
    #:tr-spend-data

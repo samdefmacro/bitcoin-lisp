@@ -68,10 +68,10 @@ this database's name."
         "LevelDB: Unable to obtain an exclusive lock on the database, is it being used by another instance of bitcoin-lisp?"
         text)))
 
-(defun %tool-require-existing (path)
+(defun %tool-require-existing (manager path)
   "MakeDatabase with require_existing (walletdb.cpp:1329-1382): NIL when PATH
-holds a wallet database, else Core's sentence."
-  (unless (wallet-db-format-recognized-p path)
+holds a wallet database of MANAGER's network, else Core's sentence."
+  (unless (wallet-db-format-recognized-p path (wallet-manager-network manager))
     (format nil "Failed to load database path '~A'. ~A"
             (wallet-path-string path)
             (if (uiop:directory-exists-p path)
@@ -85,7 +85,7 @@ holds a wallet database, else Core's sentence."
 ;;; --- info / create (wallettool.cpp:30-80, 97-140) ---
 
 (defun %wallet-tool-info (manager name out err)
-  (let ((missing (%tool-require-existing (wallet-path-for manager name))))
+  (let ((missing (%tool-require-existing manager (wallet-path-for manager name))))
     (when missing
       (format err "~A~%" missing)
       (return-from %wallet-tool-info nil)))
@@ -128,7 +128,7 @@ still succeeds -- Core's `if (wallet_instance)' falls through to
 
 (defun %wallet-tool-dump (manager name dumpfile out err)
   (let* ((path (wallet-path-for manager name))
-         (missing (%tool-require-existing path)))
+         (missing (%tool-require-existing manager path)))
     (when missing
       (format err "~A~%" missing)
       (return-from %wallet-tool-dump nil))
@@ -257,7 +257,8 @@ it (dump.cpp:208-259). NIL when everything verified, else the error text."
         (when (wallet-db-exists-p path)
           (fail (format nil "Failed to create database path '~A'. Database already exists."
                         (wallet-path-string path))))
-        (let ((db (wallet-db-open path :create t))
+        (let ((db (wallet-db-open path :create t
+                                  :network (wallet-manager-network manager)))
               (ok nil))
           (unwind-protect
                (bl.store:with-leveldb-writebatch (batch)

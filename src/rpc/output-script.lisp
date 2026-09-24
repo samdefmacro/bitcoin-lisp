@@ -148,6 +148,31 @@ positions that come with four of them."
       ("error_locations" . ,(coerce locations 'vector))
       ("error" . ,message))))
 
+(defun describe-address-fields (type wit-ver wit-prog)
+  "Core DescribeAddress (rpc/util.cpp:270-345): the isscript / iswitness /
+witness_version / witness_program fields of a decoded destination, TYPE and
+the witness version and program as DECODE-ADDRESS returns them. Shared by
+validateaddress and the wallet's getaddressinfo, which Core both build from
+this one visitor.
+
+A taproot output is a SCRIPT in Core's vocabulary (isscript true), as is a
+pay-to-anchor -- witness v1 with the two-byte program 4e73 (CScript::
+IsPayToAnchor) -- which carries no witness_version or witness_program at all;
+an unknown witness version has no isscript field."
+  (flet ((witness (version)
+           `(("witness_version" . ,version)
+             ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog)))))
+    (cond
+      ((eq type :p2pkh) `(("isscript" . ,+json-false+) ("iswitness" . ,+json-false+)))
+      ((eq type :p2sh) `(("isscript" . t) ("iswitness" . ,+json-false+)))
+      ((eq type :p2wpkh) `(("isscript" . ,+json-false+) ("iswitness" . t) ,@(witness 0)))
+      ((eq type :p2wsh) `(("isscript" . t) ("iswitness" . t) ,@(witness 0)))
+      ((eq type :p2tr) `(("isscript" . t) ("iswitness" . t) ,@(witness 1)))
+      ((and (eql wit-ver 1) (equalp wit-prog #(#x4e #x73)))
+       `(("isscript" . t) ("iswitness" . t)))
+      (wit-ver `(("iswitness" . t) ,@(witness wit-ver)))
+      (t '()))))
+
 ;; The description opens with Core's own sentence for this method
 ;; (validateaddress's RPCHelpMan, rpc/output_script.cpp): a docstring here IS
 ;; the help document a client reads, and IS what a call with the wrong number
@@ -165,16 +190,9 @@ error_locations like Core's."
     (multiple-value-bind (type script-pubkey wit-ver wit-prog)
         (bl.crypto:decode-address address network)
       (if type
-          (let ((result `(("isvalid" . t)
-                          ("address" . ,address)
-                          ("scriptPubKey" . ,(bl.crypto:bytes-to-hex script-pubkey))
-                          ("isscript" . ,(json-bool
-                                          (member type '(:p2sh :p2wsh :witness-v0-scripthash))))
-                          ("iswitness" . ,(json-bool wit-ver)))))
-            (when wit-ver
-              (setf result (append result
-                                   `(("witness_version" . ,wit-ver)
-                                     ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))))
-            result)
+          `(("isvalid" . t)
+            ("address" . ,address)
+            ("scriptPubKey" . ,(bl.crypto:bytes-to-hex script-pubkey))
+            ,@(describe-address-fields type wit-ver wit-prog))
           (%validateaddress-invalid address network)))))
 

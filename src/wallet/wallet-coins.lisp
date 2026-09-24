@@ -679,26 +679,6 @@ include_unsafe query_options)."
 
 ;;; --- getaddressinfo (wallet/rpc/addresses.cpp:368) ---
 
-(defun %describe-address-fields (type wit-ver wit-prog)
-  "Core DescribeAddress: isscript/iswitness/witness_version/witness_program
-per destination class."
-  (case type
-    (:p2pkh `(("isscript" . ,bl.rpc:+json-false+) ("iswitness" . ,bl.rpc:+json-false+)))
-    (:p2sh `(("isscript" . t) ("iswitness" . ,bl.rpc:+json-false+)))
-    (:p2wpkh `(("isscript" . ,bl.rpc:+json-false+) ("iswitness" . t)
-               ("witness_version" . 0)
-               ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))
-    (:p2wsh `(("isscript" . t) ("iswitness" . t)
-              ("witness_version" . 0)
-              ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))
-    (:p2tr `(("isscript" . t) ("iswitness" . t)
-             ("witness_version" . 1)
-             ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))
-    (t `(("iswitness" . ,(bl.rpc:json-bool wit-ver))
-         ,@(when wit-ver
-             `(("witness_version" . ,wit-ver)
-               ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))))))
-
 (defun %expansion-pubkey-by-hash160 (pairs hash)
   (find hash pairs :test #'equalp
                    :key (lambda (pair) (bl.crypto:hash160 (cdr pair)))))
@@ -726,7 +706,7 @@ sub-script used to get its detail, so both were a KeyError."
         (sub-address
          (multiple-value-bind (sub-type sub-spk sub-wv sub-wp)
              (bl.crypto:decode-address sub-address (wallet-network wallet))
-           (let* ((detail (%describe-address-fields sub-type sub-wv sub-wp))
+           (let* ((detail (bl.rpc:describe-address-fields sub-type sub-wv sub-wp))
                   (wallet-detail (%address-wallet-detail
                                   wallet sub-type sub-spk sub-wp pairs nil witness))
                   (hoisted (cdr (assoc "pubkey" wallet-detail :test #'equal))))
@@ -836,7 +816,7 @@ PARAMS: (address)."
               ,@(when spkm
                   `(("parent_desc" . ,(%spkm-descriptor-string wallet spkm nil))))
               ("iswatchonly" . ,bl.rpc:+json-false+)
-              ,@(%describe-address-fields type wit-ver wit-prog)
+              ,@(bl.rpc:describe-address-fields type wit-ver wit-prog)
               ,@(%wallet-address-detail wallet type script wit-prog spkm pos)
               ;; ScriptIsChange: IsMine without a (non-change) book entry.
               ("ischange" . ,(bl.rpc:json-bool

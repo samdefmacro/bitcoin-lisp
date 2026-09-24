@@ -532,7 +532,9 @@ half that must answer -4 rather than -18."
         (:garbage-manifest
          (ensure-directories-exist path)
          (write-file "MANIFEST-000999" "not a manifest")
-         (write-file "CURRENT" "MANIFEST-000999"))))
+         (write-file "CURRENT" "MANIFEST-000999")
+         ;; The id file too: this shape must pass the probe.
+         (bl.wallet:wallet-write-id path bl:*network*))))
     path))
 
 (test wallet-unreadable-database-answers-core-s-database-status
@@ -1486,7 +1488,8 @@ hook wired inside the branch."
   ;; string made a WILD pathname out of `w*t' and refused `a[b' outright with
   ;; "parse error in namestring: #\[ with no corresponding #\]" -- an RPC -32603
   ;; from createwallet, which is where feature_notifications.py:85 stopped.
-  (let ((manager (bl.wallet::make-wallet-manager :data-directory #p"/tmp/wdtest/")))
+  (let ((manager (bl.wallet::make-wallet-manager :data-directory #p"/tmp/wdtest/"))
+        (bl.wallet:*wallet-directory* "/tmp/wdtest/wallets/"))
     (dolist (name '("a[b]c" "star*" "quest?" "plain"))
       (let ((directory (bl.wallet::wallet-directory manager name)))
         (is (equal name (first (last (pathname-directory directory))))
@@ -1499,7 +1502,12 @@ hook wired inside the branch."
                    (bl.wallet::wallet-path-string directory))
             "~S must print unescaped" name))))
   (flet ((accepted-p (name) (and (bl.wallet::%valid-wallet-name-p name) t)))
-    (is-false (accepted-p "a;rm -rf /"))
+    ;; A trailing `/' is a relative path Core accepts (the directory
+    ;; `a;rm -rf '); what -walletnotify's %w then carries is the notify
+    ;; layer's shell-safety check's business, as ShellEscape is Core's
+    ;; (wallet.cpp:1146). A LEADING `/' is absolute and refused.
+    (is-true (accepted-p "a;rm -rf /"))
+    (is-false (accepted-p "/a;rm -rf"))
     (is-true (accepted-p (coerce (loop for i from 1 below 128
                                        unless (= i (char-code #\/))
                                          collect (code-char i))
@@ -2698,15 +2706,22 @@ start-up on that line; VerifyWallets runs only when the wallet does."
   "Core's LoadWallets announces `Loading wallet…' before EACH wallet it opens
 (wallet/load.cpp:149, the InitMessage the GUI's splash screen shows), after
 the one `Verifying wallet(s)…'. A name listed twice is loaded, and
-announced, once (wallet_paths is a set, load.cpp:129-131)."
+announced, once (wallet_paths is a set, load.cpp:129-131), and VerifyWallets
+says so on stderr (`Warning: Ignoring duplicate -wallet one.', load.cpp:90-93,
+wallet_multiwallet.py:148)."
   (with-wallet-test-node (node :network :regtest)
     (bl.rpc:dispatch-rpc-method node "createwallet" '("one"))
     (bl.rpc:dispatch-rpc-method node "createwallet" '("two"))
     (setf (bl:node-data-directory node) (%wallet-settings-dir node))
     (bl.wallet:close-wallet-manager (%node-manager node))
     (setf (bl:node-wallet-manager node) nil)
-    (let ((lines (capture-log-lines
-                  (lambda () (bl:start-wallets node :regtest nil nil '("one" "two" "one"))))))
+    (let* ((stderr (make-string-output-stream))
+           (lines (capture-log-lines
+                   (lambda ()
+                     (let ((*error-output* stderr))
+                       (bl:start-wallets node :regtest nil nil '("one" "two" "one")))))))
+      (is (equal (format nil "Warning: Ignoring duplicate -wallet one.~%")
+                 (get-output-stream-string stderr)))
       (is (= 2 (count-if (lambda (l) (search "init message: Loading wallet…" l)) lines)))
       (is (< (position-if (lambda (l) (search "init message: Verifying wallet(s)…" l)) lines)
              (position-if (lambda (l) (search "init message: Loading wallet…" l)) lines))
@@ -3135,3 +3150,102 @@ itself the bump goes through (the control)."
             (is (equal -8 (car low)) "one under the minimum: ~S" low)
             (is (eql 0 (search "Insufficient total fee" (or (cdr low) "")))))
           (is (null (bump min-rate)) "the minimum itself bumps"))))))
+
+;;; --- The wallet directory, as Core's GetWalletDir/ListDatabases see it ---
+
+(defun %listed-wallets (node)
+  "listwalletdir's names, sorted."
+  (sort (mapcar (lambda (entry) (cdr (assoc "name" entry :test #'string=)))
+                (coerce (cdr (assoc "wallets"
+                                    (bl.rpc:dispatch-rpc-method node "listwalletdir" '())
+                                    :test #'string=))
+                        'list))
+        #'string<))
+
+(test wallet-directory-falls-back-to-the-datadir-without-wallets
+  "Core GetWalletDir (wallet/walletutil.cpp:24-30): <datadir>/wallets when it
+IS a directory, the data directory itself when it is not. ListDatabases
+(wallet/db.cpp:23-72) then walks it and lists only wallet databases -- here a
+LevelDB carrying this network's id file -- so the node's own chainstate
+LevelDB beside them is not a wallet. Ours always used wallets/."
+  (with-wallet-test-node (node)
+    (let* ((data (uiop:ensure-directory-pathname
+                  (wallet-data-directory (%node-manager node))))
+           (wallets (merge-pathnames "wallets/" data)))
+      (uiop:delete-directory-tree wallets :validate t :if-does-not-exist :ignore)
+      ;; A LevelDB that is not a wallet, where the chainstate would be.
+      (let ((db (bl.store:leveldb-open
+                 (namestring (merge-pathnames "chainstate/" data))
+                 (bl.store:leveldb-make-options :create-if-missing t))))
+        (bl.store:leveldb-close db))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "top"))
+      (is-true (probe-file (merge-pathnames "top/CURRENT" data))
+               "without wallets/, the wallet lives in the data directory")
+      (is (equal '("top") (%listed-wallets node)))
+      ;; Once wallets/ exists it is the wallet directory again.
+      (ensure-directories-exist wallets)
+      (is (equal '() (%listed-wallets node)))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "inner"))
+      (is-true (probe-file (merge-pathnames "inner/CURRENT" wallets)))
+      (is (equal '("inner") (%listed-wallets node))))))
+
+(test wallet-names-may-be-relative-paths-but-not-escape
+  "Core joins a wallet name onto the wallet directory (AbsPathJoin,
+wallet/wallet.cpp:2926), so `sub/w5' is a wallet in a subdirectory and
+listwalletdir walks into it (wallet_multiwallet.py:128). An absolute path
+and a `..' segment stay refused (the Round-5 containment decision)."
+  (flet ((accepted-p (name) (and (bl.wallet::%valid-wallet-name-p name) t)))
+    (is-true (accepted-p "sub/w5"))
+    (is-true (accepted-p "a/./b"))
+    (is-false (accepted-p "/abs/w"))
+    (is-false (accepted-p "sub/../../w"))
+    (is-false (accepted-p "./"))
+    (is-false (accepted-p ".")))
+  (with-wallet-test-node (node)
+    (bl.rpc:dispatch-rpc-method node "createwallet" (list "sub/w5"))
+    (bl.rpc:dispatch-rpc-method node "createwallet" (list "plain"))
+    (is (equal '("plain" "sub/w5") (%listed-wallets node)))
+    (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "sub/w5"))
+    (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "sub/w5")))
+    (signals-rpc-error (:code -8)
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "../escape")))))
+
+(test wallet-from-another-network-is-not-a-database-here
+  "Core refuses another network's wallet at the FORMAT PROBE: IsSQLiteFile
+compares the file's application_id with this network's magic
+(wallet/db.cpp:149-150), so MakeDatabase finds no database -- FAILED_BAD_FORMAT,
+-18 behind `Wallet file verification failed.' (walletdb.cpp:1340-1344,
+wallet.cpp:281) -- and ListDatabases does not list it. wallet_crosschain.py:42-45
+asserts the -18. Ours opened it and refused it later, at -4, from AttachChain."
+  (with-wallet-test-node (node)
+    (let ((manager (%node-manager node)))
+      (bl.rpc:dispatch-rpc-method node "createwallet" (list "w"))
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "w"))
+      ;; Control: this network's id loads.
+      (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "w")))
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "w"))
+      (bl.wallet:wallet-write-id (wallet-directory-of manager "w") :signet)
+      (signals-rpc-error (:code -18 :message "Wallet file verification failed. Failed to load database path")
+        (bl.rpc:dispatch-rpc-method node "loadwallet" (list "w")))
+      (is (equal '() (%listed-wallets node))))))
+
+(test wallets-written-before-the-id-file-are-stamped-at-start-up
+  "A wallet directory written before the id file existed is a LevelDB with no
+BITCOIN_LISP_WALLET. Every LevelDB directly under a dedicated wallet directory
+was a wallet then, so the manager's start-up stamps those with its network
+and they keep loading."
+  (let* ((dir (make-temp-directory))
+         (wallets (merge-pathnames "wallets/" dir)))
+    (unwind-protect
+         (let ((db (bl.store:leveldb-open
+                    (namestring (ensure-directories-exist
+                                 (merge-pathnames "old/" wallets)))
+                    (bl.store:leveldb-make-options :create-if-missing t))))
+           (bl.store:leveldb-close db)
+           (is-false (bl.wallet::wallet-db-format-recognized-p
+                      (merge-pathnames "old/" wallets) :testnet4))
+           (let ((manager (bl.wallet:init-wallet-manager dir :testnet4)))
+             (is-true (bl.wallet::wallet-db-format-recognized-p
+                       (merge-pathnames "old/" wallets) :testnet4))
+             (is (equal '("old") (bl.wallet::list-wallet-dir manager)))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))

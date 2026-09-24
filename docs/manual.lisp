@@ -1578,8 +1578,26 @@
   transaction ITS answer extracts to. Core builds all of it behind
   ENABLE_EXTERNAL_SIGNER; this node always has it.
 
+  The wallet directory is Core's GetWalletDir: `-walletdir`, else
+  `<datadir>/wallets/` when that directory exists, else the network data
+  directory itself (an older datadir, and every cache-based Core
+  functional test, keep their wallets there). A wallet NAME is a path
+  relative to it -- `sub/w5` is a wallet in a subdirectory -- but never
+  an absolute path and never one with a `..` segment (the Round-5
+  containment decision). `listwalletdir` walks it recursively, as Core's
+  ListDatabases does, and a directory is a wallet when it holds a LevelDB
+  AND the id file `BITCOIN_LISP_WALLET` (`wallet-write-id`): 16 bytes of
+  magic and this network's message start, the counterpart of the SQLite
+  header magic and application_id Core's IsSQLiteFile reads without
+  opening the database. It is what tells a wallet from the node's own
+  chainstate when both sit in the datadir, and what makes another
+  network's wallet \"Data is not in recognized format\" (-18) here, as it
+  is in Core. A wallet written before the id file existed is stamped at
+  start-up (every LevelDB directly under a dedicated wallet directory was
+  a wallet then); the stamp is never applied in the datadir fallback.
+
   DELIBERATE DIVERGENCE, the one an operator sees first: a wallet is a
-  LevelDB DIRECTORY under `wallets/<name>/`, not Core's single
+  LevelDB DIRECTORY, not Core's single
   `wallet.dat` SQLite file, and `getwalletinfo`'s `format` says `leveldb`
   where Core says `sqlite`. Core's wallet.dat file-format interop is out
   of scope by docs/wallet-plan.md §1. The field names the database a
@@ -1610,6 +1628,9 @@
   (bitcoin-lisp.wallet:*wallet-default-address-type* variable)
   (bitcoin-lisp.wallet:*wallet-default-change-type* variable)
   (bitcoin-lisp.wallet:*wallet-avoid-partial-spends* variable)
+  (bitcoin-lisp.wallet:*wallet-directory* variable)
+  (bitcoin-lisp.wallet:wallet-write-id function)
+  (bitcoin-lisp.wallet::list-wallet-dir function)
   (bitcoin-lisp.wallet::wallet-for-request function)
   (bitcoin-lisp.wallet::*rpc-wallet-name* variable))
 

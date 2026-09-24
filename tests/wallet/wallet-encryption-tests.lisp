@@ -1465,23 +1465,34 @@ load database path '~A'. Data is not in recognized format."
         ;; wallet_backup.py:102: and nothing was created.
         (is (not (uiop:directory-exists-p expected-dir)))))))
 
-(test wenc-backup-refuses-traversal-into-the-wallets-directory
-  "The containment check must resolve `..` before comparing. A textual
-component-prefix test would let a destination spelled with a traversal
-segment pass as 'outside the wallets directory' and then land inside it,
-where it would be picked up as a wallet directory."
+(test wenc-backup-refuses-traversal-into-the-wallet-database
+  "backupwallet refuses the wallet's own database as its destination, as
+Core's Backup does (wallet_backup.py:264-270 names the database file, the
+database directory and the wallet directory, each spelled directly and
+through `.'). The containment check must resolve `..' before comparing: a
+textual component-prefix test would let a destination spelled with a
+traversal segment pass as 'outside the wallet' and then land inside its
+database directory. A file elsewhere in the wallet directory is an ordinary
+file -- nothing is a wallet without its id file -- and is written."
   (with-wallet-test-node (node)
     (let* ((bl.wallet::*rpc-wallet-name* "w")
            (manager (%node-manager node))
-           (wallets (bl.wallet::wallets-directory manager)))
+           (wallets (bl.wallet::wallets-directory manager))
+           (own (wallet-directory-of manager "w")))
       (%wenc-fresh-wallet node "w")
-      ;; <wallets>/w/../../wallets/sneaky.dump resolves back inside.
+      ;; <wallets>/w/../w/sneaky.dump resolves back inside the database.
       (let ((traversal (namestring
-                        (merge-pathnames "w/../../wallets/sneaky.dump" wallets))))
+                        (merge-pathnames "w/../w/sneaky.dump" wallets))))
         (is (= -4 (rpc-error-code-of
                    (lambda () (bl.rpc:dispatch-rpc-method
                                node "backupwallet" (list traversal))))))
-        (is (null (probe-file (merge-pathnames "sneaky.dump" wallets)))))
+        (is (null (probe-file (merge-pathnames "sneaky.dump" own)))))
+      ;; Beside the wallet is fine.
+      (finishes (bl.rpc:dispatch-rpc-method
+                 node "backupwallet"
+                 (list (namestring (merge-pathnames "beside.dump" wallets)))))
+      (is-true (probe-file (merge-pathnames "beside.dump" wallets)))
+      (is (equal '("w") (bl.wallet::list-wallet-dir manager)))
       ;; The resolver itself, directly.
       (is (bl.wallet::%path-under-p
            (merge-pathnames "w/../sneaky.dump" wallets) wallets))
@@ -1652,7 +1663,8 @@ testnet node — Core gets this from the network magic in the SQLite header."
 
 (test wenc-backup-refuses-unsafe-destinations
   "backupwallet maps every failure to Core's single error, and refuses to
-write into the wallets directory (where it would look like a wallet)."
+write over the wallet's own database (Core's Backup fails on it,
+wallet_backup.py:264-270)."
   (with-wallet-test-node (node)
     (with-rpc-wallet ("w")
       (%wenc-fresh-wallet node "w")
@@ -1663,14 +1675,13 @@ write into the wallets directory (where it would look like a wallet)."
                                node "backupwallet" (list (namestring
                                            (bl.wallet::wallets-directory
                                             manager))))))))
-        ;; Inside the wallets directory.
+        ;; Inside the wallet's own database directory.
         (is (= -4 (rpc-error-code-of
                    (lambda () (bl.rpc:dispatch-rpc-method
                                node "backupwallet" (list (namestring
                                            (merge-pathnames
                                             "sneaky.dump"
-                                            (bl.wallet::wallets-directory
-                                             manager)))))))))
+                                            (wallet-directory-of manager "w")))))))))
         ;; A directory that does not exist.
         (is (= -4 (rpc-error-code-of
                    (lambda () (bl.rpc:dispatch-rpc-method

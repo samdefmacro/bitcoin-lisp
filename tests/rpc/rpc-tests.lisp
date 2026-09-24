@@ -6987,6 +6987,35 @@ array / could error."
     (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
     (is (eq t (cdr (assoc "isscript" result :test #'string=))))))
 
+(test rpc-validateaddress-describes-taproot-and-anchor-as-core
+  "validateaddress's isscript/iswitness/witness_* fields are Core's
+DescribeAddress visitor (rpc/util.cpp:270-345): a taproot output is a SCRIPT
+(isscript true, wallet_keypool_topup.py:61 asserts it for a bech32m
+address), a pay-to-anchor is isscript+iswitness with no witness_version or
+witness_program, and an unknown witness version has no isscript at all. Ours
+said isscript false for taproot and anchors, and gave the anchor a witness
+version and program."
+  (let ((node (make-test-node)))
+    (flet ((describe-addr (version program)
+             (bl.rpc:dispatch-rpc-method
+              node "validateaddress"
+              (list (bl.crypto:segwit-address-encode
+                     (bl.crypto:segwit-hrp :testnet3) version
+                     (coerce program '(vector (unsigned-byte 8)))))))
+           (field (name result) (assoc name result :test #'string=)))
+      (let ((tr (describe-addr 1 (make-list 32 :initial-element 9)))
+            (anchor (describe-addr 1 '(#x4e #x73)))
+            (unknown (describe-addr 2 (make-list 16 :initial-element 5))))
+        (is (eq t (cdr (field "isscript" tr))))
+        (is (eq t (cdr (field "iswitness" tr))))
+        (is (eql 1 (cdr (field "witness_version" tr))))
+        (is (eq t (cdr (field "isscript" anchor))))
+        (is (eq t (cdr (field "iswitness" anchor))))
+        (is (null (field "witness_version" anchor)))
+        (is (null (field "witness_program" anchor)))
+        (is (null (field "isscript" unknown)))
+        (is (eql 2 (cdr (field "witness_version" unknown))))))))
+
 (test rpc-validateaddress-empty
   "Test validateaddress with empty string"
   (let* ((node (make-test-node))

@@ -928,8 +928,7 @@ backupwallet). PARAMS: (destination). Returns null.
 Works on a locked wallet: an encrypted wallet's backup holds only
 ciphertext."
   (let ((wallet (wallet-for-request node))
-        (destination (first params))
-        (manager (node-wallet-manager-checked node)))
+        (destination (first params)))
     (unless (stringp destination)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "destination must be a string"))
@@ -938,8 +937,15 @@ ciphertext."
     (%wallet-current-tip node)
     (handler-case
         (let ((path (uiop:parse-native-namestring destination)))
+          ;; Core's Backup fails when the destination cannot be opened as a
+          ;; database file -- a directory, or the wallet's own database
+          ;; (wallet_backup.py:264-270). Ours is a directory, so a path
+          ;; inside it is the second case. Anywhere else in the wallet
+          ;; directory is an ordinary file: nothing is a wallet here without
+          ;; its id file, so a dump beside the wallets is never mistaken
+          ;; for one -- and the wallet directory may be the whole datadir.
           (when (or (uiop:directory-exists-p path)
-                    (%path-under-p path (wallets-directory manager)))
+                    (%path-under-p path (wallet-path wallet)))
             (wallet-error "invalid backup destination"))
           (with-wallet-lock (wallet)
             (wallet-write-best-block wallet)
@@ -957,6 +963,7 @@ none of our business."
   (ignore-errors
    (bl.store:leveldb-destroy-db
     (namestring (uiop:ensure-directory-pathname path))))
+  (ignore-errors (uiop:delete-file-if-exists (%wallet-id-path path)))
   (unless existed
     (ignore-errors
      (when (and (uiop:directory-exists-p path)
@@ -1004,7 +1011,8 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
                             :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Data is not in recognized format."
                                              (wallet-path-string path))))
         (handler-case
-            (let ((db (wallet-db-open path :create t)))
+            (let ((db (wallet-db-open path :create t
+                                           :network (wallet-manager-network manager))))
               (unwind-protect
                    ;; One batch: the restored database is either complete
                    ;; or absent, never half-written.

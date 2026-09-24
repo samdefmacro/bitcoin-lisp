@@ -1736,23 +1736,27 @@ instead of being rescanned onto this chain.")
 
 Core AttachChain (wallet.cpp:3179-3189) asks whether locator.vHave.back() is
 chain.getBlockHash(0): a CBlockLocator always ends at the genesis of the
-chain it was built on, so its last hash IS the wallet's genesis. Ours ends
-there too when it came from BUILD-BLOCK-LOCATOR, which pushes the genesis in
-explicitly -- but the unload path writes a single-hash locator naming only
-the wallet's last processed block (WALLET-WRITE-BEST-BLOCK), and that is what
-a wallet written by this node usually carries. So the question is asked of
-the whole list: a locator NO hash of which this block index has ever seen
-names a history this node does not have. On a Core-shaped locator that is the
-same test, since our own genesis is always in the index; on a single-hash one
-it still says yes only for a block this chain never had.
+chain it was built on, so its last hash IS the wallet's genesis, and nothing
+else in the locator is consulted -- a wallet whose last processed block this
+node no longer has (blocks deleted, wallet_hd.py:71-79) is still this chain's
+wallet. Every locator this node writes ends at the genesis too: BUILD-BLOCK-
+LOCATOR pushes it in explicitly and WALLET-WRITE-BEST-BLOCK appends the
+wallet's own when it has no chain locator to hand.
 
-A wallet merely STALE or on a reorged-away branch is not foreign: those
-blocks stay in the index, and find-fork-in-active-chain handles them."
-  (let ((locator (wallet-loaded-locator wallet)))
-    (and locator
-         (notany (lambda (hash)
-                   (bl.store:get-block-index-entry chain-state hash))
-                 locator))))
+One shape is older than that: before 2026-09-24 the unload path wrote a
+single-hash locator naming only the last processed block. Such a locator's
+back() is that block, not a genesis, and Core's test would call every wallet
+written that way foreign; for it alone the question stays the one it was --
+does this block index know the hash? A stale or reorged-away block stays in
+the index, and find-fork-in-active-chain handles those."
+  (let ((locator (wallet-loaded-locator wallet))
+        (genesis (let ((entry (bl.store:get-block-at-height chain-state 0)))
+                   (and entry (bl.store:block-index-entry-hash entry)))))
+    (cond ((null locator) nil)
+          ((equalp (car (last locator)) genesis) nil)
+          ((rest locator) t)
+          (t (null (bl.store:get-block-index-entry chain-state
+                                                   (first locator)))))))
 
 (defun %rescan-blocks-available-or-refuse (node chain-state start-height stop-height)
   "Core rescanblockchain's guard (wallet/rpc/transactions.cpp:885-893): unless
@@ -1887,6 +1891,14 @@ gate, the prune refusal and the reserver, is unchanged."
           (let ((missing (%attach-chain-missing-data-error
                           node chain-state tip-height rescan-height)))
             (when missing (return-from wallet-attach-chain missing)))
+          ;; Core's chain.initMessage + WalletLogPrintf (wallet.cpp:3261-
+          ;; 3262): how far back the catch-up goes, after the birthday gate.
+          ;; wallet_reorgsrestore.py:121 waits for the second line after an
+          ;; unclean shutdown.
+          (bl:init-message "Rescanning…")
+          (bl:log-info "[~A] Rescanning last ~D blocks (from block ~D)..."
+                       (wallet-name wallet) (- tip-height rescan-height)
+                       rescan-height)
           (let ((start-entry (bl.store:get-block-at-height
                               chain-state rescan-height)))
             (when start-entry

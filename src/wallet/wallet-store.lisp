@@ -415,10 +415,70 @@ compiles first — can SETF its slots."
   :documentation "WriteLockedUTXO's value: the single byte '1' (walletdb.cpp:288).")
 
 ;;; --- Wallet LevelDB lifecycle ---
+;;;
+;;; A wallet database is a LevelDB DIRECTORY plus one small file beside its
+;;; tables, BITCOIN_LISP_WALLET: 16 bytes of magic and the network's 4-byte
+;;; message start. It is this tree's counterpart of the two things Core reads
+;;; out of a SQLite wallet.dat's header without opening it (IsSQLiteFile,
+;;; wallet/db.cpp:119-151): that the file IS a wallet database, and that its
+;;; application_id is THIS network's magic (set at create, sqlite.cpp:325-328).
+;;; A file rather than a LevelDB record because the probe has to answer
+;;; without opening the database -- LevelDB's open is a write, and the
+;;; directory walk that asks (ListDatabases) passes the node's own chainstate
+;;; and index LevelDBs, which are open and locked.
 
-(defun wallet-db-open (path &key create)
-  "Open (or with CREATE, create) the wallet LevelDB at directory PATH."
+(alexandria:define-constant +wallet-id-file+ "BITCOIN_LISP_WALLET"
+  :test #'equal
+  :documentation "The file that makes a LevelDB directory a wallet database of
+one network; see the section comment.")
+
+(alexandria:define-constant +wallet-id-magic+ "bitcoin-lisp-wdb"
+  :test #'equal
+  :documentation "The first 16 bytes of +WALLET-ID-FILE+ (SQLite's own header
+magic is 16 bytes too).")
+
+(defun %wallet-id-path (path)
+  (merge-pathnames +wallet-id-file+ (uiop:ensure-directory-pathname path)))
+
+(defun %wallet-id-bytes (network)
+  "The id file's content for NETWORK: the magic, then the network's message
+start -- the value Core stores as the SQLite application_id (ReadBE32 of
+MessageStart, written big-endian, so the four bytes are the message start's)."
+  (concatenate '(vector (unsigned-byte 8))
+               (map 'vector #'char-code +wallet-id-magic+)
+               (bl.chain:chain-params-magic (bl.chain:find-chain-params network))))
+
+(defun wallet-write-id (path network)
+  "Mark the directory PATH as a wallet database of NETWORK."
   (ensure-directories-exist (uiop:ensure-directory-pathname path))
+  (with-open-file (out (%wallet-id-path path) :direction :output
+                                              :element-type '(unsigned-byte 8)
+                                              :if-exists :supersede
+                                              :if-does-not-exist :create)
+    (write-sequence (%wallet-id-bytes network) out)))
+
+(defun wallet-id-network-p (path network)
+  "T when PATH carries the id file of a NETWORK wallet database. Core's
+IsSQLiteFile: header magic, then the application id against this network's
+magic; a wallet made on another network is simply not a database here, so
+loading it is FAILED_BAD_FORMAT (walletdb.cpp:1340-1344), -18."
+  (let ((expected (%wallet-id-bytes network)))
+    (handler-case
+        (with-open-file (in (%wallet-id-path path) :element-type '(unsigned-byte 8)
+                                                   :if-does-not-exist nil)
+          (when (and in (= (file-length in) (length expected)))
+            (let ((got (make-array (length expected) :element-type '(unsigned-byte 8))))
+              (read-sequence got in)
+              (equalp got expected))))
+      (file-error () nil))))
+
+(defun wallet-db-open (path &key create (network bl:*network*))
+  "Open (or with CREATE, create) the wallet LevelDB at directory PATH. A
+created database is marked as a NETWORK wallet first (WALLET-WRITE-ID), unless
+the directory already carries a mark -- the rewrite copies its wallet's."
+  (ensure-directories-exist (uiop:ensure-directory-pathname path))
+  (when (and create (not (probe-file (%wallet-id-path path))))
+    (wallet-write-id path network))
   (bl.store:leveldb-open
    (namestring (uiop:ensure-directory-pathname path))
    (bl.store:leveldb-make-options :create-if-missing (and create t))))
@@ -429,9 +489,10 @@ compiles first — can SETF its slots."
                                     (uiop:ensure-directory-pathname path)))
        t))
 
-(defun wallet-db-format-recognized-p (path)
-  "T when PATH holds something this build recognizes as a wallet database:
-a CURRENT file naming a MANIFEST that is actually there.
+(defun wallet-db-format-recognized-p (path network)
+  "T when PATH holds something this build recognizes as a NETWORK wallet
+database: the id file (WALLET-ID-NETWORK-P) and a CURRENT file naming a
+MANIFEST that is actually there.
 
 Core's counterpart is IsSQLiteFile, which reads the header magic before
 MakeDatabase will hand the path to SQLite; a path that fails it is
@@ -449,7 +510,7 @@ a hostile or truncated file is a format answer rather than a path lookup."
     (and named
          (alexandria:starts-with-subseq "MANIFEST-" named)
          (probe-file (merge-pathnames named dir))
-         t)))
+         (wallet-id-network-p dir network))))
 
 (defun map-wallet-db-records (db function)
   "Call FUNCTION with the key and the value of every record in DB, in key
@@ -639,6 +700,9 @@ that follows decides which directory gets opened."
                          :direction :output :if-exists :supersede
                          :if-does-not-exist :create)
       (write-line "bitcoin-lisp wallet database rewrite" out))
+    ;; The rebuilt copy is the same network's wallet: carry the id over.
+    (when (probe-file (%wallet-id-path path))
+      (uiop:copy-file (%wallet-id-path path) (%wallet-id-path rewrite)))
     (let ((new-db (wallet-db-open rewrite :create t)))
       (unwind-protect
            (bl.store:with-leveldb-writebatch (batch)

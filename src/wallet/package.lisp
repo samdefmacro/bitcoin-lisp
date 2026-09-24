@@ -21,7 +21,12 @@ through the lower packages; the node reaches it only through these exports.")
    #:wallets-mempool-tx-removed
    ;; Core FillPSBT for an unsigned transaction (FinishTransaction's PSBT);
    ;; send and sendall build theirs with it.
-   #:wallet-fill-psbt)
+   #:wallet-fill-psbt
+   ;; The wallet database's id file (wallet-store.lisp): tests build
+   ;; hand-made wallet directories with it.
+   #:wallet-write-id
+   ;; GetWalletDir, for start-up's "Using wallet directory" line.
+   #:wallets-directory)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
