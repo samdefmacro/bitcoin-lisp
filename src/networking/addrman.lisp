@@ -545,6 +545,13 @@ until every network has been seen once."
 the 16-byte form), or NIL (Core Find)."
   (ab-find book ip port net))
 
+(defun peer-address-addr-port-string (pa)
+  "PA as Core's ToStringAddrPort prints it: `ip:port', an IPv6 address in
+brackets (netaddress.cpp CService::ToStringAddrPort)."
+  (let ((host (peer-address-string pa)))
+    (format nil (if (eq (peer-address-network pa) :ipv6) "[~A]:~D" "~A:~D")
+            host (peer-address-port pa))))
+
 (defun address-book-add (book pa &optional source-group (time-penalty 0))
   "Add address PA (a peer-address carrying net/ip/port/services/last-seen)
 learned from a peer whose net-group key is SOURCE-GROUP (a net-group-key
@@ -613,7 +620,12 @@ Returns T if newly inserted into a new bucket."
               (progn
                 (ab-clear-new book bucket pos)
                 (incf (peer-address-ref-count info))
-                (setf (aref nt slot) id))
+                (setf (aref nt slot) id)
+                ;; Core's line (addrman.cpp:615-616); p2p_invalid_messages.py
+                ;; :236 waits for the address in it. No -asmap here, so no
+                ;; `mapped to AS' part.
+                (bl.log:log-cat "addrman" "Added ~A to new[~D][~D]"
+                                (peer-address-addr-port-string info) bucket pos))
               (when (zerop (peer-address-ref-count info))
                 (ab-delete book id))))
         (setf (address-book-dirty book) t)

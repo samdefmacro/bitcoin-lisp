@@ -723,3 +723,41 @@ names the AS behind NET_IPV6 with the ASN least significant byte first
       (is (equalp (vector 2 (ldb (byte 8 0) asn) (ldb (byte 8 8) asn)
                           (ldb (byte 8 16) asn) (ldb (byte 8 24) asn))
                   group)))))
+
+(test addrv2-logs-cores-addrman-lines
+  "p2p_invalid_messages.py:236 sends an addrv2 whose first entry names an
+unknown network and whose second is 9.9.9.9:8333, and waits for Core's
+addrman lines: `Added 9.9.9.9:8333 to new[b][p]' per stored address
+(addrman.cpp:615-616) and `Added 1 addresses (of 1) from <source>: 0 tried,
+1 new' for the message (addrman.cpp:687-689). Ours logged a `net' line of its
+own, `Added 1 peer addresses from addrv2 message'."
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
+         (book (bl.net:make-address-book))
+         (now (bl.ser:get-unix-time))
+         (payload
+           (coerce
+            (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-varint s 2)
+              ;; An unknown network id: skipped, the next entry still read.
+              (bl.bytes:bb-write-u32-le s now)
+              (bl.bytes:bb-write-varint s 1)
+              (bl.bytes:bb-write-u8 s #x99)
+              (bl.bytes:bb-write-varint s 2)
+              (bl.bytes:bb-write-bytes s (make-array 2 :element-type '(unsigned-byte 8)
+                                                       :initial-element #xab))
+              (bl.bytes:bb-write-u8 s #x20) (bl.bytes:bb-write-u8 s #x8d)
+              (bl.ser:write-net-addr-v2
+               s
+               (bl.ser:make-net-addr :services 1
+                                     :ip (bl.net:ipv4-to-mapped-ipv6 9 9 9 9)
+                                     :port 8333)
+               bl.ser:+addrv2-net-ipv4+ now))
+            '(simple-array (unsigned-byte 8) (*))))
+         (log (nth-value 1 (log-text-of
+                            "addrman"
+                            (lambda ()
+                              (bl.net:handle-addrv2
+                               nil payload (bl.ctx:make-node-context :address-book book)))))))
+    (is (= 1 (bl.net:address-book-count book)))
+    (is-true (search "Added 9.9.9.9:8333 to new[" log) "log: ~A" log)
+    (is-true (search "Added 1 addresses (of 1) from : 0 tried, 1 new" log) "log: ~A" log)))

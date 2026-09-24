@@ -1913,6 +1913,17 @@ m_addr_token_timestamp when the Peer is created, :386)."
               (min (+ (peer-addr-token-bucket peer) increment) cap))))
     (setf (peer-addr-token-timestamp peer) now)))
 
+(defun %log-addrman-added (address-book added peer)
+  "Core's AddrMan::Add_ closing line, `Added N addresses (of M) from <source>:
+T tried, N new' (addrman.cpp:687-689), written when an addr or addrv2 message
+stored anything; p2p_invalid_messages.py:236 waits for `Added 1 addresses'.
+Ours adds one address at a time, so `of' counts the ones that were stored."
+  (when (and address-book (plusp added))
+    (bl:log-cat "addrman" "Added ~D addresses (of ~D) from ~A: ~D tried, ~D new"
+                added added (if peer (peer-address peer) "")
+                (address-book-n-tried address-book)
+                (address-book-n-new address-book))))
+
 (defun %process-gossiped-addresses (peer entries announced-count address-book peers)
   "Shared addr/addrv2 processing core (the per-address loop of Core's
 ADDR/ADDRV2 handler, net_processing.cpp:4038-4118). ENTRIES is a list of
@@ -2022,8 +2033,7 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
                    (push (cons net-addr timestamp) entries)))))
     (let ((added (%process-gossiped-addresses peer (nreverse entries) msg-count
                                               address-book peers)))
-      (when (and address-book (> added 0))
-        (bl:log-cat "net" "Added ~D peer addresses from addr message" added))
+      (%log-addrman-added address-book added peer)
       added))))
 
 ;;; ADDRv2 handling (BIP 155)
@@ -2066,8 +2076,7 @@ block-relay-only peer (Core SetupAddressRelay)."
                               (cons net-addr timestamp)))
                           entries)
                   announced-count address-book peers)))
-      (when (and address-book (> added 0))
-        (bl:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
+      (%log-addrman-added address-book added peer)
       added))))
 
 ;;; Transaction handling
