@@ -5519,7 +5519,7 @@ does have work to do; a run where SORT changes nothing proves nothing."
           (with-ibd-context
             (captured-sends
              (lambda ()
-               (bl.net::request-blocks-from-peers peers state store))))
+               (bl.net:request-blocks-from-peers peers state store))))
           (is (= 4 (length peers))
               "every peer handed in is still in the caller's list")
           (is (equal snapshot peers)
@@ -5558,7 +5558,7 @@ missing (p2p_node_network_limited.py:105-110)."
           (with-ibd-context
             (let* ((sent (captured-sends
                           (lambda ()
-                            (bl.net::request-blocks-from-peers
+                            (bl.net:request-blocks-from-peers
                              (list peer) state store))))
                    (getdata (find "getdata" sent :key #'message-command
                                                  :test #'string=)))
@@ -5570,6 +5570,116 @@ missing (p2p_node_network_limited.py:105-110)."
                   (is (equalp (loop for h from 1 to 5 collect (%bd-hash h))
                               hashes)
                       "the batch is ascending in height, so its tip arrives last"))))))))))
+
+(defun %bd-header-chain (state tip-height)
+  "Give STATE a genesis tip and a TIP-HEIGHT-block header chain above it whose
+bodies we lack (%bd-hash H at height H)."
+  (let* ((genesis (bl.store:make-block-index-entry
+                   :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid
+                   ;; A 1970 timestamp: IBD until *CACHED-IS-IBD* says not.
+                   :header (bl.ser:make-block-header :timestamp 0)))
+         (prev genesis))
+    (bl.store:add-block-index-entry state genesis)
+    (loop for h from 1 to tip-height
+          do (let ((e (bl.store:make-block-index-entry
+                       :hash (%bd-hash h) :height h
+                       :chain-work (+ 1 h) :prev-entry prev
+                       :status :header-valid)))
+               (bl.store:add-block-index-entry state e)
+               (setf prev e)))
+    (bl.store:update-chain-tip state (%bd-hash 0) 0)))
+
+(defun %bd-getdata-hashes (sent)
+  "The block hashes of the first getdata among the framed messages SENT."
+  (let ((getdata (find "getdata" sent :key #'message-command :test #'string=)))
+    (and getdata
+         (map 'list #'bl.ser:inv-vector-hash
+              (bl.ser:parse-inv-payload (subseq getdata 24))))))
+
+(test an-ibd-node-asks-no-limited-peer-for-blocks
+  "Core SendMessages asks a peer for blocks only when `CanServeBlocks(peer) &&
+((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) ||
+!IsInitialBlockDownload())' (net_processing.cpp:6165). An IBD node needs OLD
+blocks and a NODE_NETWORK_LIMITED peer keeps only its last 288, so in IBD it is
+not asked at all; feature_assumeutxo.py:329-335 connects an IBD node to a
+snapshot node still validating its background chain and asserts NOTHING goes in
+flight to it for three seconds. Ours applied only FindNextBlocks' depth rule,
+which still let heights 15..300 of a 300-block chain through. Out of IBD the
+limited peer is asked again, inside its window."
+  (with-temp-directory (dir "bl-limited-ibd")
+    (with-network (:regtest)
+      (let ((state (bl.store:make-chain-state))
+            (store (bl.store:init-block-store dir))
+            (limited (bl.net:make-peer
+                      :address "198.51.100.31" :state :ready
+                      :conn-type :outbound-full-relay
+                      :services (logior bl.ser:+node-network-limited+
+                                        bl.ser:+node-witness+))))
+        (%bd-header-chain state 300)
+        (setf (bl.net:peer-best-known-block-hash limited) (%bd-hash 300))
+        (let ((bl.net:*cached-is-ibd* t))
+          (with-ibd-context
+            (is (null (%bd-getdata-hashes
+                       (captured-sends
+                        (lambda ()
+                          (bl.net:request-blocks-from-peers
+                           (list limited) state store)))))
+                "in IBD the limited peer is not asked for any block")))
+        (let ((bl.net:*cached-is-ibd* nil))
+          (with-ibd-context
+            (let ((hashes (%bd-getdata-hashes
+                           (captured-sends
+                            (lambda ()
+                              (bl.net:request-blocks-from-peers
+                               (list limited) state store))))))
+              (is (equalp (%bd-hash 15) (first hashes))
+                  "out of IBD it is asked, from the shallowest block it keeps"))))
+        (is-true (bl.net:peer-limited-p limited))
+        (is-true (bl.net:peer-can-serve-blocks-p limited))))))
+
+(test an-inbound-peer-waits-while-a-preferred-peer-downloads
+  "Core's `sync_blocks_and_headers_from_peer' (net_processing.cpp:5779-5795):
+in IBD a peer that is not a preferred-download peer -- inbound without noban --
+is asked for blocks only while no preferred peer exists or nothing is in flight
+from anyone, `to avoid putting undue load on (say) some home user'. Here the
+outbound peer is asked first and fills the in-flight map, so the inbound peer
+behind it gets nothing on the same pass; alone, the inbound peer is asked."
+  (with-temp-directory (dir "bl-inbound-waits")
+    (with-network (:regtest)
+      (let ((state (bl.store:make-chain-state))
+            (store (bl.store:init-block-store dir))
+            (outbound (bl.net:make-peer
+                       :address "198.51.100.41" :state :ready
+                       :conn-type :outbound-full-relay
+                       :services (logior bl.ser:+node-network+
+                                         bl.ser:+node-witness+)))
+            (inbound (bl.net:make-peer
+                      :address "198.51.100.42" :state :ready :inbound t
+                      :conn-type :inbound
+                      :services (logior bl.ser:+node-network+
+                                        bl.ser:+node-witness+))))
+        (%bd-header-chain state 100)
+        (dolist (p (list outbound inbound))
+          (setf (bl.net:peer-best-known-block-hash p) (%bd-hash 100)))
+        ;; The pass ranks peers by ping latency: the outbound peer goes first.
+        (setf (bl.net:peer-ping-latency outbound) 10
+              (bl.net:peer-ping-latency inbound) 20)
+        (let ((bl.net:*cached-is-ibd* t))
+          (with-ibd-context
+            (let ((sent (captured-sends
+                         (lambda ()
+                           (bl.net:request-blocks-from-peers
+                            (list outbound inbound) state store)))))
+              (is (= 1 (count "getdata" sent :key #'message-command
+                                             :test #'string=))
+                  "only the preferred outbound peer is asked")))
+          (with-ibd-context
+            (is (= 16 (length (%bd-getdata-hashes
+                               (captured-sends
+                                (lambda ()
+                                  (bl.net:request-blocks-from-peers
+                                   (list inbound) state store))))))
+                "an inbound peer with no preferred peer around is asked")))))))
 
 (test the-initial-getheaders-goes-out-once-per-peer
   "Core's SendMessages guards its initial getheaders with `!state.fSyncStarted'

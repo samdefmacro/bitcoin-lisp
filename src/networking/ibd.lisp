@@ -1265,10 +1265,7 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
              (services (peer-services peer))
              (peer-witness-p (logtest services
                                       bl.ser:+node-witness+))
-             (is-limited (and (logtest services
-                                       bl.ser:+node-network-limited+)
-                              (not (logtest services
-                                            bl.ser:+node-network+))))
+             (is-limited (peer-limited-p peer))
              (best-known-height (bl.store:block-index-entry-height best-known))
              (segwit-height (bl.val:get-segwit-activation-height
                              bl:*network*))
@@ -1795,6 +1792,43 @@ reads; passing it lets a test place a peer's clock without waiting."
 
 ;;;; Multi-Peer Request Distribution
 
+(defun %blocks-to-request-from-peer (peer peers chain-state block-store budget)
+  "One peer's turn in Core SendMessages' `Message: getdata (blocks)' section
+(net_processing.cpp:6161-6198): up to BUDGET blocks to ask PEER for, each
+marked in flight to it before the next peer's turn, returned NEWEST FIRST (the
+caller reverses the batch into Core's ascending getdata order).
+
+The gate is Core's, judged at this peer's turn -- the in-flight map it reads
+grows as earlier peers in the pass are asked (BLOCK-DOWNLOAD-ALLOWED-P, :6165).
+The tip walk goes first; what budget it leaves is topped up from the
+assumeutxo background range, which a limited peer is never asked for
+(`historical_blocks && !IsLimitedPeer(peer)', :6177): that range lies below
+the snapshot base, deeper than such a peer keeps. Then, AFTER both walks
+(:6191-6197): a peer that came away with nothing at all to do while someone
+else holds the window shut starts THAT peer's stalling clock, once."
+  (let ((in-flight (ibd-context-in-flight *ibd-context*))
+        (requested '()))
+    (when (and (plusp budget)
+               (block-download-allowed-p peer peers chain-state))
+      (flet ((take (hashes)
+               (dolist (hash hashes)
+                 (unless (gethash hash in-flight)
+                   (mark-block-in-flight hash peer)
+                   (push hash requested)))))
+        (multiple-value-bind (hashes staller)
+            (find-blocks-to-download-for-peer peer chain-state block-store budget)
+          (take hashes)
+          (let ((hist-budget (- budget (length requested))))
+            (when (and (plusp hist-budget) (not (peer-limited-p peer)))
+              (take (find-historical-blocks-to-download
+                     peer chain-state block-store hist-budget))))
+          (when (and staller
+                     (zerop (count-peer-in-flight peer))
+                     (zerop (peer-stalling-since staller)))
+            (setf (peer-stalling-since staller) (get-internal-real-time))
+            (bl:log-debug "Stall started ~A" (peer-log-name staller))))))
+    requested))
+
 (defun request-blocks-from-peers (peers chain-state block-store)
   "Request blocks from multiple peers, distributing the load.
 Enforces per-peer in-flight limits (like Bitcoin Core's
@@ -1916,49 +1950,17 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     ;; exists to prevent).
     (let ((requests-made 0)
           (peer-requests (make-hash-table :test 'eq))
-          (in-flight (ibd-context-in-flight *ibd-context*))
-          (block-hashes '())
           (remaining total-budget))
       (dolist (peer ready-peers)
         (when (plusp remaining)
-          (let ((budget (min remaining
-                             (max 0 (- max-per-peer (count-peer-in-flight peer)))))
-                (taken 0)
-                (staller nil))
-            (when (plusp budget)
-              (multiple-value-setq (block-hashes staller)
-                (find-blocks-to-download-for-peer
-                 peer chain-state block-store budget))
-              (dolist (hash block-hashes)
-                (unless (gethash hash in-flight)
-                  (mark-block-in-flight hash peer)
-                  (push hash (gethash peer peer-requests))
-                  (incf taken)
-                  (incf requests-made)
-                  (decf remaining)))
-              ;; Assumeutxo background range: top up whatever per-peer budget
-              ;; the tip walk left unused with historical blocks (Core
-              ;; SendMessages runs TryDownloadingHistoricalBlocks right after
-              ;; FindNextBlocksToDownload the same way).
-              (let ((hist-budget (min (- budget taken) remaining)))
-                (when (plusp hist-budget)
-                  (dolist (hash (find-historical-blocks-to-download
-                                 peer chain-state block-store hist-budget))
-                    (unless (gethash hash in-flight)
-                      (mark-block-in-flight hash peer)
-                      (push hash (gethash peer peer-requests))
-                      (incf requests-made)
-                      (decf remaining)))))
-              ;; Core SendMessages (net_processing.cpp:6191-6197), AFTER both
-              ;; walks and their BlockRequested calls: this peer came away with
-              ;; nothing at all to do and someone else is holding the window
-              ;; shut -- start THAT peer's stalling clock, once.
-              (when (and staller
-                         (zerop (count-peer-in-flight peer))
-                         (zerop (peer-stalling-since staller)))
-                (setf (peer-stalling-since staller) (get-internal-real-time))
-                (bl:log-debug "Stall started ~A"
-                              (peer-log-name staller)))))))
+          (let ((hashes (%blocks-to-request-from-peer
+                         peer peers chain-state block-store
+                         (min remaining
+                              (max 0 (- max-per-peer
+                                        (count-peer-in-flight peer)))))))
+            (setf (gethash peer peer-requests) hashes)
+            (incf requests-made (length hashes))
+            (decf remaining (length hashes)))))
       (when (zerop requests-made)
         (return-from request-blocks-from-peers 0))
 
@@ -3147,9 +3149,39 @@ p2p_addrfetch.py:54 asserts exactly the last clause: an addr-fetch peer is sent
 a getaddr and NO getheaders. Ours asked every ready peer."
   (and (eq (peer-state peer) :ready)
        (not (eq (peer-conn-type peer) :addr-fetch))
-       (logtest (peer-services peer)
-                (logior bl.ser:+node-network+ bl.ser:+node-network-limited+))
-       t))
+       (peer-can-serve-blocks-p peer)))
+
+(defun sync-blocks-and-headers-from-peer-p (peer peers)
+  "Core's `sync_blocks_and_headers_from_peer' (net_processing.cpp:5779-5795):
+whether, during IBD, PEER may be the one we sync headers from and download
+blocks from. A preferred-download peer (outbound, or inbound with noban) always
+may. Any other peer that can serve blocks and is not an addr-fetch connection
+may only while no preferred-download peer exists among PEERS
+(m_num_preferred_download_peers == 0) or no block is in flight from anyone
+(mapBlocksInFlight.empty()): `we prefer downloading blocks from outbound peers
+to avoid putting undue load on (say) some home user', but a node whose only
+source of the latest blocks is an inbound peer must still get them."
+  (or (peer-preferred-download-p peer)
+      (and (peer-can-serve-blocks-p peer)
+           (not (eq (peer-conn-type peer) :addr-fetch))
+           (or (notany #'peer-preferred-download-p peers)
+               (null *ibd-context*)
+               (zerop (hash-table-count (ibd-context-in-flight *ibd-context*)))))))
+
+(defun block-download-allowed-p (peer peers chain-state)
+  "Core SendMessages' gate on asking PEER for blocks at all
+(net_processing.cpp:6165): `CanServeBlocks(peer) &&
+((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) ||
+!IsInitialBlockDownload())'. In IBD a NODE_NETWORK_LIMITED peer -- a pruned
+node, or an assumeutxo node still validating its background chain -- is never
+asked for blocks: it holds only its last 288, and the blocks an IBD node needs
+are the old ones, so a request would stall until the peer is dropped for it
+(feature_assumeutxo.py:329-335). Out of IBD every peer that can serve blocks is
+asked, and FindNextBlocks keeps a limited peer's requests inside its window."
+  (and (peer-can-serve-blocks-p peer)
+       (or (and (sync-blocks-and-headers-from-peer-p peer peers)
+                (not (peer-limited-p peer)))
+           (not (initial-block-download-p chain-state)))))
 
 (defun %best-header-is-recent-p (chain-state)
   "Core's `m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
@@ -3263,11 +3295,9 @@ m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
 exactly one peer is actively asked, and the next one is asked only once that
 peer has gone. p2p_initial_headers_sync.py:90-95 connects two more peers and
 asserts neither sees a getheaders. Ours asked every candidate at once. The
-`sync_blocks_and_headers_from_peer' half (net_processing.cpp:5779-5795, which
-also declines an inbound peer while preferred outbound peers have blocks in
-flight) is NOT ported: leaving it out can only make us ask a peer Core would
-skip, never the reverse, and it needs fPreferredDownload and mapBlocksInFlight
-which this layer does not have.
+first peer must also pass `sync_blocks_and_headers_from_peer'
+(SYNC-BLOCKS-AND-HEADERS-FROM-PEER-P, net_processing.cpp:5779-5795), which
+declines an inbound peer while preferred outbound peers have blocks in flight.
 
 At the tip the 24h clause is true, so a live node still primes every peer on
 the pass -- which is the behaviour p2p_add_connections.py needs and the reason
@@ -3280,7 +3310,9 @@ this tree does not have."
     (dolist (peer peers)
       (when (and (header-sync-candidate-p peer)
                  (not (peer-headers-sync-started peer))
-                 (or best-header-recent (zerop sync-started)))
+                 (or best-header-recent
+                     (and (zerop sync-started)
+                          (sync-blocks-and-headers-from-peer-p peer peers))))
         (when (open-header-sync peer chain-state)
           (incf sync-started))))))
 
@@ -4332,11 +4364,15 @@ reset to be reconsidered before a later-connected one."
                                                 (copy-list peers))
                                  #'< :key #'peer-id)))
     (or (find-if #'peer-headers-sync-started candidates)
-        (when (or (%best-header-is-recent-p chain-state)
-                  (zerop (headers-sync-started-count peers)))
-          (let ((peer (first candidates)))
-            (when (and peer (open-header-sync peer chain-state))
-              peer))))))
+        (let ((peer (if (%best-header-is-recent-p chain-state)
+                        (first candidates)
+                        (and (zerop (headers-sync-started-count peers))
+                             (find-if (lambda (p)
+                                        (sync-blocks-and-headers-from-peer-p
+                                         p peers))
+                                      candidates)))))
+          (when (and peer (open-header-sync peer chain-state))
+            peer)))))
 
 (defun sync-headers-with-sync-peer (peers chain-state ctx
                                     &key recent-rejects (sync-fn #'sync-headers)

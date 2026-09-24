@@ -2919,7 +2919,7 @@ fork range — no hash is requested twice."
        ;; Small per-peer cap so BOTH peers must contribute (else p1 takes all 5).
        (setf (bl.net::ibd-context-max-in-flight ctx) 3)
        (let ((bl.net:*ibd-context* ctx))
-         (let ((made (bl.net::request-blocks-from-peers
+         (let ((made (bl.net:request-blocks-from-peers
                       (list p1 p2) cs store))
                (in-flight (bl.net:ibd-context-in-flight ctx)))
            ;; All five fork blocks requested exactly once: requests-made equals the
@@ -2974,7 +2974,7 @@ exhaustion this gate exists to prevent)."
                do (setf (gethash (+ 2 i) q) t)))
        (let ((bl.net:*ibd-context* ctx))
          ;; Over cap + gap missing: exactly one request is allowed.
-         (let ((made (bl.net::request-blocks-from-peers
+         (let ((made (bl.net:request-blocks-from-peers
                       (list peer) cs store)))
            (is (= 1 made))
            (is (= 1 (hash-table-count
