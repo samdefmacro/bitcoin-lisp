@@ -116,7 +116,7 @@ snapshot reads it from RPC threads while the sync thread mutates it."
   (best-header-work 0 :type integer)
   ;; Download queue
   (pending-blocks (make-block-hash-table) :type hash-table)  ; hash -> height
-  (in-flight (make-block-hash-table :synchronized t) :type hash-table) ; hash -> (peer . timestamp)
+  (in-flight (make-block-hash-table :synchronized t) :type hash-table) ; hash -> ((peer . timestamp) ...), see BLOCK-IN-FLIGHT-REQUESTS
   (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> (block . wire-bytes), out-of-order
   (block-queue-bytes 0 :type integer)  ; sum of queued wire-bytes (see +max-block-queue-bytes+)
   ;; Blocks persisted to DISK above the active tip: height -> list of hashes
@@ -442,8 +442,8 @@ outstanding)."
     (when *ibd-context*
       (let ((in-flight (ibd-context-in-flight *ibd-context*)))
         (flet ((scan ()
-                 (maphash (lambda (hash entry)
-                            (when (eq (car entry) peer)
+                 (maphash (lambda (hash requests)
+                            (when (assoc peer requests :test #'eq)
                               (push hash result)))
                           in-flight)))
           #+sbcl (sb-ext:with-locked-hash-table (in-flight) (scan))
@@ -606,7 +606,6 @@ alike)."
     (let* ((header (bl.ser:bitcoin-block-header block))
            (hash (bl.ser:block-header-hash header))
            (pending (ibd-context-pending-blocks *ibd-context*))
-           (in-flight (ibd-context-in-flight *ibd-context*))
            (entry (and chain-state
                        (bl.store:get-block-index-entry chain-state hash)))
            ;; Core's BLOCK_FAILED_VALID: the verdict is final and this block is
@@ -615,7 +614,7 @@ alike)."
                               (eq (bl.store:block-index-entry-status entry)
                                   :invalid))))
       ;; Always free the in-flight slot so a retry / another peer's copy can come.
-      (remhash hash in-flight)
+      (remove-block-request hash)
       ;; The verdict is rendered as Core's BlockValidationState::ToString()
       ;; spells it (consensus/validation.h:110-121), the way Core's own
       ;; "AcceptBlock FAILED (%s)" does (validation.cpp:4457): ~A on the
@@ -727,42 +726,6 @@ Uses the current network from bl:*network*."
     (if checkpoints
         (caar (last checkpoints))
         0)))
-
-(defun default-assumevalid ()
-  "The current network's defaultAssumeValid hash in wire order, or NIL.
-The table itself now lives in config.lisp as NETWORK-ASSUMEVALID, because the
-validation layer must consult it per block and loads before this file."
-  (bl:network-assumevalid bl:*network*))
-
-(defun assumevalid-skip-height (chain-state)
-  "Height of the hardcoded assumevalid block when its header is already in our
-index (i.e. we are syncing the chain that contains it), else -1. Blocks at or
-below this height may skip SIGNATURE checks: the assumevalid hash is unforgeable,
-so a block carrying it pins a known-good ancestor chain. Mirrors Bitcoin Core's
--assumevalid (sigs skipped for ancestors of the assumed-valid block)."
-  (let ((av (default-assumevalid)))
-    (if av
-        (let ((entry (bl.store:get-block-index-entry chain-state av)))
-          (if entry
-              (bl.store:block-index-entry-height entry)
-              -1))
-        -1)))
-
-(defun script-skip-height (chain-state)
-  "Highest height at which a signature skip is even CONSIDERED: the assumevalid
-block's height, or -1 when its header is not in our index.
-
-This is a cheap pre-filter only. The decision itself is
-BITCOIN-LISP.VALIDATION:SCRIPT-CHECKS-SKIPPABLE-P, which additionally requires
-the block to be an ANCESTOR of the assumevalid block — Core's fScriptChecks
-(validation.cpp:2342-2380) is a per-block predicate, not a height comparison.
-
-The checkpoint term is GONE. Checkpoints play no part in Core's fScriptChecks,
-and including them meant that whenever the assumevalid header was not yet in
-our index — the entire first phase of a fresh IBD — we skipped every signature
-up to 840,000 on mainnet and 2,000,000 on testnet3, where Core verifies all of
-them."
-  (assumevalid-skip-height chain-state))
 
 (defun validate-checkpoint (hash height)
   "Validate that HASH at HEIGHT matches any applicable checkpoint.
@@ -1380,7 +1343,7 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                    ;; the window shut is never identified.
                    ((gethash hash in-flight)
                     (unless waiting-for
-                      (setf waiting-for (car (gethash hash in-flight)))))
+                      (setf waiting-for (car (first (gethash hash in-flight))))))
                    ;; Core (:1524-1531): the end of the window, with nothing
                    ;; collected for this peer -- we could fetch if the window
                    ;; were one larger, so whoever holds its first missing block
@@ -1465,6 +1428,51 @@ partition the retired height-based scheduler used to provide."
     (setf (ibd-context-avg-block-wire-bytes ctx)
           (floor (+ (* 9 (ibd-context-avg-block-wire-bytes ctx)) wire-size) 10))))
 
+;;;; The in-flight table is Core's mapBlocksInFlight, a MULTIMAP
+;;;; (net_processing.cpp:954): block hash -> the list of (PEER . REQUEST-TIME)
+;;;; requests for it, oldest first. Up to +MAX-CMPCTBLOCKS-INFLIGHT-PER-BLOCK+
+;;;; peers may hold the same block, which only the compact-block handler ever
+;;;; asks for (a getblocktxn round trip per announcing peer); every other
+;;;; requester asks only for a block nobody holds (IsBlockRequested). A hash
+;;;; with no request left is removed, so GETHASH answers IsBlockRequested.
+
+(defun block-in-flight-requests (hash)
+  "The (PEER . REQUEST-TIME) requests for HASH, oldest first -- Core's
+mapBlocksInFlight.equal_range(hash), whose first element is the peer
+`first in flight'."
+  (and *ibd-context*
+       (values (gethash hash (ibd-context-in-flight *ibd-context*)))))
+
+(defun block-requested-from-peer-p (hash peer)
+  "T when HASH is in flight from PEER."
+  (and (assoc peer (block-in-flight-requests hash) :test #'eq) t))
+
+(defun block-requested-from-outbound-p (hash)
+  "Core IsBlockRequestedFromOutbound (net_processing.cpp:1189-1198): some
+peer holding HASH in flight is one we dialled."
+  (and (find-if-not (lambda (request) (peer-inbound (car request)))
+                    (block-in-flight-requests hash))
+       t))
+
+(defun in-flight-request-count ()
+  "Every (hash, peer) request in flight -- Core mapBlocksInFlight.size(),
+which counts a block held by three peers three times."
+  (let ((n 0))
+    (when *ibd-context*
+      (maphash (lambda (hash requests)
+                 (declare (ignore hash))
+                 (incf n (length requests)))
+               (ibd-context-in-flight *ibd-context*)))
+    n))
+
+(defun %map-in-flight-requests (fn)
+  "Call FN with HASH, PEER and REQUEST-TIME for every request in flight."
+  (when *ibd-context*
+    (maphash (lambda (hash requests)
+               (loop for (peer . time) in requests
+                     do (funcall fn hash peer time)))
+             (ibd-context-in-flight *ibd-context*))))
+
 (defun %peer-front-in-flight (peer)
   "(VALUES HASH REQUEST-TIME COUNT) for the block PEER has had in flight
 longest -- Core's state.vBlocksInFlight.front(), the block its download
@@ -1473,13 +1481,12 @@ how many blocks the peer holds; HASH and REQUEST-TIME are NIL when it holds
 none. Core keeps an insertion-ordered list per peer; our in-flight table is
 keyed by hash, so the front is the oldest request time."
   (let ((front nil) (front-time nil) (count 0))
-    (when *ibd-context*
-      (maphash (lambda (hash entry)
-                 (when (eq (car entry) peer)
-                   (incf count)
-                   (when (or (null front-time) (< (cdr entry) front-time))
-                     (setf front hash front-time (cdr entry)))))
-               (ibd-context-in-flight *ibd-context*)))
+    (%map-in-flight-requests
+     (lambda (hash holder time)
+       (when (eq holder peer)
+         (incf count)
+         (when (or (null front-time) (< time front-time))
+           (setf front hash front-time time)))))
     (values front front-time count)))
 
 (defun count-peer-in-flight (peer)
@@ -1492,11 +1499,9 @@ state.vBlocksInFlight.size())."
 m_peers_downloading_from, which is what widens every peer's download timeout
 so our own saturated downlink cannot evict a fleet of honest peers."
   (let ((seen '()))
-    (when *ibd-context*
-      (maphash (lambda (hash entry)
-                 (declare (ignore hash))
-                 (pushnew (car entry) seen :test #'eq))
-               (ibd-context-in-flight *ibd-context*)))
+    (%map-in-flight-requests (lambda (hash peer time)
+                               (declare (ignore hash time))
+                               (pushnew peer seen :test #'eq)))
     (length seen)))
 
 (defconstant +fetch-block-requests-cap+ 256
@@ -1543,58 +1548,79 @@ RemoveBlockRequest, which is what makes the request one-shot."
     t))
 
 (defun mark-block-in-flight (hash peer)
-  "Mark a block as being requested from PEER."
-  (when *ibd-context*
-    (let ((now (get-internal-real-time)))
-      ;; Core BlockRequested (net_processing.cpp:1258-1266): a peer whose
-      ;; in-flight list goes from EMPTY to non-empty is starting a download
-      ;; batch, and that is when its clock starts.
+  "Core BlockRequested (net_processing.cpp:1237-1270): file a request for HASH
+from PEER at the END of the block's request list. T when it is new, NIL when
+PEER already holds HASH (Core's same-node short circuit, :1246-1254), which
+changes nothing. Only the compact-block handler adds a second or third peer
+to a block (at most +MAX-CMPCTBLOCKS-INFLIGHT-PER-BLOCK+, its own gate);
+every other caller asks only for a block nobody holds."
+  (when (and *ibd-context* (not (block-requested-from-peer-p hash peer)))
+    (let ((now (get-internal-real-time))
+          (table (ibd-context-in-flight *ibd-context*)))
+      ;; Core BlockRequested (:1258-1262): a peer whose in-flight list goes
+      ;; from EMPTY to non-empty is starting a download batch, and that is
+      ;; when its clock starts.
       (when (zerop (count-peer-in-flight peer))
         (setf (peer-downloading-since peer) now))
-      (setf (gethash hash (ibd-context-in-flight *ibd-context*))
-            (cons peer now)))))
+      (setf (gethash hash table)
+            (append (gethash hash table) (list (cons peer now))))
+      t)))
 
-(defun drop-block-in-flight (hash peer)
-  "Core RemoveBlockRequest(hash, from_peer) (net_processing.cpp:1200-1236):
-forget that HASH was requested from PEER, without counting it as delivered.
+(defun remove-block-request (hash &optional peer)
+  "Core RemoveBlockRequest(hash, from_peer) (net_processing.cpp:1200-1235):
+withdraw PEER's request for HASH, or EVERY peer's when PEER is NIL. Returns T
+when a request was removed.
 
-MARK-BLOCK-RECEIVED is the DELIVERY path -- it records latency and restarts
-the download clock; this is the ABANDONMENT path, for a request given up on
-(a compact-block reconstruction replaced, timed out, or refused). Does
-nothing when the entry belongs to another peer, as Core's equal_range scan
-does."
-  (when *ibd-context*
-    (let* ((table (ibd-context-in-flight *ibd-context*))
-           (entry (gethash hash table)))
-      (when (and entry (eq (car entry) peer))
-        (remhash hash table)
-        t))))
+For each withdrawn request, as Core does per erased entry: the peer's FRONT
+block leaving restarts its download clock for the next one (:1221-1224), and
+its stalling stamp clears (:1231) -- a peer whose request is settled is no
+longer the one holding the window shut. The peer's pending compact-block
+reconstruction for HASH goes too: Core keeps the PartiallyDownloadedBlock
+inside the in-flight entry, so erasing the entry is what makes a late
+blocktxn `a block we weren't expecting' (:3465-3468)."
+  (let ((requests (block-in-flight-requests hash)))
+    (when requests
+      (let ((now (get-internal-real-time))
+            (removed nil))
+        (dolist (request requests)
+          (let ((holder (car request)))
+            (when (or (null peer) (eq holder peer))
+              (when (equalp hash (%peer-front-in-flight holder))
+                (setf (peer-downloading-since holder)
+                      (max (peer-downloading-since holder) now)))
+              (setf (peer-stalling-since holder) 0)
+              (let ((pending (peer-pending-compact-block holder)))
+                (when (and pending
+                           (equalp hash (pending-compact-block-block-hash pending)))
+                  (setf (peer-pending-compact-block holder) nil)))
+              (push request removed))))
+        (when removed
+          (let ((left (remove-if (lambda (r) (member r removed :test #'eq))
+                                  requests))
+                (table (ibd-context-in-flight *ibd-context*)))
+            (if left
+                (setf (gethash hash table) left)
+                (remhash hash table)))
+          t)))))
 
 (defun mark-block-received (hash)
   "Mark a block as received, removing it from pending and in-flight.
-Records delivery latency (now - request-time) for the corresponding
-in-flight entry so report-ibd-progress can surface p50/p95."
+Records delivery latency (now - request-time) for the first request in flight
+so report-ibd-progress can surface p50/p95, then withdraws every peer's
+request for it -- Core ProcessBlock's RemoveBlockRequest(hash, nullopt)
+(net_processing.cpp:3437): a stored block settles the request whoever sent it."
   (when *ibd-context*
     (when (gethash hash (ibd-context-pending-blocks *ibd-context*))
       (remhash hash (ibd-context-pending-blocks *ibd-context*))
       (incf (ibd-context-blocks-received *ibd-context*)))
-    (let ((entry (gethash hash (ibd-context-in-flight *ibd-context*))))
-      (when entry
-        (let* ((peer (car entry))
-               (sent-at (cdr entry))
-               (now (get-internal-real-time))
-               (latency-ms (round (* 1000 (- now sent-at))
-                                  internal-time-units-per-second)))
-          (push (list now (peer-address peer) latency-ms)
-                (ibd-context-delivery-samples *ibd-context*))
-          ;; Core RemoveBlockRequest (net_processing.cpp:1221-1231): the FRONT
-          ;; block arriving restarts the download clock for the next one, and
-          ;; ANY delivery clears the stalling stamp -- a peer that is producing
-          ;; blocks is by definition not the one holding the window shut.
-          (when (equalp hash (%peer-front-in-flight peer))
-            (setf (peer-downloading-since peer) now))
-          (setf (peer-stalling-since peer) 0))))
-    (remhash hash (ibd-context-in-flight *ibd-context*))
+    (let ((first (first (block-in-flight-requests hash))))
+      (when first
+        (let ((now (get-internal-real-time)))
+          (push (list now (peer-address (car first))
+                      (round (* 1000 (- now (cdr first)))
+                             internal-time-units-per-second))
+                (ibd-context-delivery-samples *ibd-context*)))))
+    (remove-block-request hash)
     ;; Clear the per-hash timeout counter so a future re-request of this
     ;; hash (e.g. on a reorg) starts fresh.
     (remhash hash (ibd-context-request-timeouts *ibd-context*))))
@@ -1621,9 +1647,11 @@ they are expressed in block intervals, and they decide a disconnect."
     (+ base (* per-peer other-peers))))
 
 (defun get-timed-out-requests (&optional timeout-seconds)
-  "Get list of block hashes whose in-flight request has exceeded
-TIMEOUT-SECONDS (default: the adaptive per-peer request timeout). Callers
-pass a shorter timeout near the tip — see request-blocks-from-peers."
+  "Get list of block hashes whose in-flight requests have ALL exceeded
+TIMEOUT-SECONDS (default: the adaptive per-peer request timeout): a block a
+second or third peer was asked for more recently (a compact-block round trip)
+is still on its way. Callers pass a shorter timeout near the tip — see
+request-blocks-from-peers."
   (unless *ibd-context*
     (return-from get-timed-out-requests nil))
 
@@ -1633,8 +1661,10 @@ pass a shorter timeout near the tip — see request-blocks-from-peers."
                           internal-time-units-per-second))
         (now (get-internal-real-time))
         (timed-out '()))
-    (maphash (lambda (hash peer-time)
-               (when (> (- now (cdr peer-time)) timeout-ticks)
+    (maphash (lambda (hash requests)
+               (when (every (lambda (request)
+                              (> (- now (cdr request)) timeout-ticks))
+                            requests)
                  (push hash timed-out)))
              in-flight)
     timed-out))
@@ -1653,17 +1683,14 @@ a critical-path block stalls the tip for up to the full request timeout
 (per the 2026-05-24 close-wait follow-up). The per-hash timeout counter
 is deliberately left untouched — the peer dying is not the block's fault,
 so it keeps its full retry budget on reassignment."
-  (if *ibd-context*
-      (let ((in-flight (ibd-context-in-flight *ibd-context*))
-            (orphaned '()))
-        (maphash (lambda (hash peer-time)
-                   (unless (eq (peer-state (car peer-time)) :ready)
-                     (push hash orphaned)))
-                 in-flight)
-        (dolist (hash orphaned)
-          (remhash hash in-flight))
-        (length orphaned))
-      0))
+  (let ((orphaned '()))
+    (%map-in-flight-requests (lambda (hash peer time)
+                               (declare (ignore time))
+                               (unless (eq (peer-state peer) :ready)
+                                 (push (cons hash peer) orphaned))))
+    (loop for (hash . peer) in orphaned
+          do (remove-block-request hash peer))
+    (length orphaned)))
 
 (defun retry-timed-out-requests (&optional timeout-seconds)
   "Release timed-out in-flight requests so another peer can be asked for them.
@@ -2155,6 +2182,15 @@ this line is only ever a socket-level reap."
                   (connection-disconnect-reason-text conn) (peer-id peer))
       (handler-case (progn (disconnect-peer peer) t)
         (error () nil)))))
+
+(defvar *forensic-store-from-height* nil
+  "Debug: when set to an integer N, store every received block at
+   height >= N to disk BEFORE validation, so failed-validation blocks
+   are still available for analysis. Use to capture blocks our
+   validator rejects so we can compare against Bitcoin Core.
+
+Defined ahead of DISPATCH-IBD-MESSAGE, its reader: defined after it, a fresh
+build compiled the reference as an undefined variable.")
 
 (defun dispatch-ibd-message (peer command payload node-ctx ctx)
   "Process one wire message from PEER during IBD: connect a received
@@ -3144,13 +3180,19 @@ terms both said the node was done, so the fork was never requested."
     ;; Skipped when a stop is pending — shutdown must return promptly rather
     ;; than start a reorg — and when there is no block store, since then no
     ;; candidate can have a body on disk to switch to.
+    ;;
+    ;; Under the node lock, as every activation is (see
+    ;; BL.VAL:WITH-CHAINSTATE-MUTEX): run without it, this picked a block a
+    ;; generatetoaddress was half-way through connecting as a heavier tip,
+    ;; connected it a second time (bad-txns-BIP30) and marked it invalid.
     (when (and block-store utxo-set (not (bl:interrupt-requested-p)))
       (multiple-value-bind (switched missing)
-          (bl.val:activate-best-chain
-           chain-state block-store utxo-set
-           :fee-estimator fee-estimator
-           :recent-rejects recent-rejects
-           :mempool mempool)
+          (with-current-node-lock
+            (bl.val:activate-best-chain
+             chain-state block-store utxo-set
+             :fee-estimator fee-estimator
+             :recent-rejects recent-rejects
+             :mempool mempool))
         (when switched
           (bl:log-info "Activated best chain: tip now height ~D"
                                  (bl.store:current-height chain-state)))
@@ -4168,7 +4210,7 @@ and p2p_compactblocks_blocksonly.py:99 read the getdata type."
        (eql (peer-compact-block-version peer) +compact-blocks-version+)
        (null (cdr hashes))
        *ibd-context*
-       (= 1 (hash-table-count (ibd-context-in-flight *ibd-context*)))
+       (= 1 (in-flight-request-count))
        (let ((parent (bl.store:block-index-entry-prev-entry last-entry)))
          (and parent
               (or (eq (bl.store:block-index-entry-status parent) :valid)
@@ -4560,12 +4602,6 @@ node whose peers are all inbound would disconnect the only peer it has."
                 (disconnect-peer peer)
                 (decf started)
                 (push (cons peer :disconnected) acted))))))))))
-
-(defvar *forensic-store-from-height* nil
-  "Debug: when set to an integer N, store every received block at
-   height >= N to disk BEFORE validation, so failed-validation blocks
-   are still available for analysis. Use to capture blocks our
-   validator rejects so we can compare against Bitcoin Core.")
 
 (defun %fork-bodies-complete-p (entry tip-entry chain-state block-store)
   "T when every block on ENTRY's branch strictly above its fork point with
@@ -5493,7 +5529,6 @@ the tip is ready to connect."
   (unless *ibd-context*
     (return-from drain-block-queue 0))
   (let ((drained 0)
-        (skip-height (script-skip-height chain-state))
         (mempool (ibd-context-mempool *ibd-context*)))
     (loop
       ;; A full cascade can connect the whole queued window (~170 blocks

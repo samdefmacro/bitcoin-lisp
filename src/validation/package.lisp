@@ -89,6 +89,8 @@ can. src/validation/.")
    #:*default-signet-challenge*
    #:connect-block
    #:accept-block-body
+   #:poison-failed-block
+   #:*cs-main-held-p*
    #:verify-db
    #:+default-checkblocks+
    #:+default-checklevel+

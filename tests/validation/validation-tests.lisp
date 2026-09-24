@@ -113,7 +113,7 @@ than a sideways move."
     (let ((tip (aref entries 0))
           (far (aref entries 3000)))
       ;; Far target: clipped to exactly one step above the tip.
-      (let ((step (bl.val::%activation-step-target cs tip far)))
+      (let ((step (bl.val::%activation-step-target tip far)))
         (is (= bl.val::+activation-step-blocks+
                (bl.store:block-index-entry-height step))
             "a far target was not clipped to one step")
@@ -127,13 +127,13 @@ than a sideways move."
           (is (eq walk step) "the step target is not on the target's chain")))
       ;; Near target: returned unchanged, so a synced node pays nothing.
       (let ((near (aref entries 10)))
-        (is (eq near (bl.val::%activation-step-target cs tip near))))
+        (is (eq near (bl.val::%activation-step-target tip near))))
       ;; Exactly one step away is still the identity, not an off-by-one clip.
       (let ((exact (aref entries bl.val::+activation-step-blocks+)))
-        (is (eq exact (bl.val::%activation-step-target cs tip exact))))
+        (is (eq exact (bl.val::%activation-step-target tip exact))))
       ;; Stepping from a non-zero tip measures from THAT tip.
       (let* ((mid (aref entries 500))
-             (step (bl.val::%activation-step-target cs mid far)))
+             (step (bl.val::%activation-step-target mid far)))
         (is (= (+ 500 bl.val::+activation-step-blocks+)
                (bl.store:block-index-entry-height step)))))))
 

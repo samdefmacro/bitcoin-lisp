@@ -133,7 +133,7 @@
                         bl.net:*ibd-context*)))
         (is (= 1 (hash-table-count in-flight)))
         (let ((entry (gethash hash in-flight)))
-          (is (eq mock-peer (car entry))))))))
+          (is (eq mock-peer (car (first entry)))))))))
 
 (test block-received-tracking
   "Test marking blocks as received."
@@ -364,7 +364,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                          (* 2 internal-time-units-per-second))))  ; 2 seconds ago
         (setf (gethash hash (bl.net:ibd-context-in-flight
                              bl.net:*ibd-context*))
-              (cons :peer old-time)))
+              (list (cons :peer old-time))))
 
       ;; Should detect timeout
       (let ((timed-out (bl.net::get-timed-out-requests)))
@@ -381,8 +381,8 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
              bl.net:*ibd-context*) 120)
       (setf (gethash hash (bl.net:ibd-context-in-flight
                            bl.net:*ibd-context*))
-            (cons :peer (- (get-internal-real-time)
-                           (* 40 internal-time-units-per-second))))  ; 40s ago
+            (list (cons :peer (- (get-internal-real-time)
+                                 (* 40 internal-time-units-per-second)))))  ; 40s ago
       ;; Default (full 120s) timeout: not yet timed out.
       (is (null (bl.net::get-timed-out-requests)))
       ;; Near-tip 30s timeout: timed out.
@@ -403,7 +403,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                          (* 2 internal-time-units-per-second))))
         (setf (gethash hash (bl.net:ibd-context-in-flight
                              bl.net:*ibd-context*))
-              (cons :peer old-time)))
+              (list (cons :peer old-time))))
 
       ;; Also add to pending so it can be retried
       (setf (gethash hash (bl.net:ibd-context-pending-blocks
@@ -436,7 +436,7 @@ won't serve would keep IBD's main loop spinning forever."
         (loop repeat (1- bl.net::+max-block-request-timeouts+)
               do (setf (gethash hash (bl.net:ibd-context-in-flight
                                        bl.net:*ibd-context*))
-                       (cons :peer old-time))
+                       (list (cons :peer old-time)))
                  (bl.net::retry-timed-out-requests)))
       ;; After N-1 timeouts, still in pending.
       (is (= 1 (hash-table-count
@@ -447,7 +447,7 @@ won't serve would keep IBD's main loop spinning forever."
                          (* 2 internal-time-units-per-second))))
         (setf (gethash hash (bl.net:ibd-context-in-flight
                              bl.net:*ibd-context*))
-              (cons :peer old-time)))
+              (list (cons :peer old-time))))
       (bl.net::retry-timed-out-requests)
       (is (= 0 (hash-table-count
                 (bl.net:ibd-context-pending-blocks
@@ -499,7 +499,7 @@ and stamp the peer's download clock as MARK-BLOCK-IN-FLIGHT would have."
     (dotimes (i count)
       (setf (gethash (%bd-hash i)
                      (bl.net:ibd-context-in-flight bl.net:*ibd-context*))
-            (cons peer (+ then i)))
+            (list (cons peer (+ then i))))
       (setf (gethash (%bd-hash i)
                      (bl.net:ibd-context-pending-blocks bl.net:*ibd-context*))
             (+ 100 i)))
@@ -1047,15 +1047,15 @@ leaving a live peer's in-flight untouched."
       (setf (gethash live-hash (bl.net:ibd-context-pending-blocks ctx)) 10
             (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx)) 11)
       (setf (gethash live-hash (bl.net:ibd-context-in-flight ctx))
-            (cons live (get-internal-real-time))
+            (list (cons live (get-internal-real-time)))
             (gethash dead-hash (bl.net:ibd-context-in-flight ctx))
-            (cons dead (get-internal-real-time)))
+            (list (cons dead (get-internal-real-time))))
       (is (= 1 (bl.net::release-orphaned-in-flight)))
       ;; Dead peer's block freed from in-flight but kept in pending.
       (is (null (gethash dead-hash (bl.net:ibd-context-in-flight ctx))))
       (is (= 11 (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx))))
       ;; Live peer's in-flight is untouched.
-      (is (eq live (car (gethash live-hash (bl.net:ibd-context-in-flight ctx))))))))
+      (is (eq live (car (first (gethash live-hash (bl.net:ibd-context-in-flight ctx)))))))))
 
 ;;;; Progress Reporting Tests
 
@@ -1720,54 +1720,6 @@ exceed the bound)."
                            (* 5 internal-time-units-per-second)))))
              (usocket:socket-close client)))
       (usocket:socket-close server))))
-
-(test assumevalid-skip-height
-  "assumevalid lets IBD skip signature checks for ancestors of a known-good
-block. default-assumevalid yields a 32-byte WIRE-order hash for real networks
-(nil on regtest); assumevalid-skip-height returns the assumevalid block's height
-when its header is in the index, -1 when absent or disabled; script-skip-height
-is the max with the checkpoint height. Only sig checks are skipped — everything
-else is still validated."
-  ;; default-assumevalid presence + byte order (display ...51ba5ac -> wire 0xac..0x00)
-  (let ((bl:*network* :mainnet))
-    (let ((av (bl.net::default-assumevalid)))
-      (is (= 32 (length av)))
-      (is (= #xac (aref av 0)))
-      (is (= #x00 (aref av 31)))))
-  (let ((bl:*network* :regtest))
-    (is (null (bl.net::default-assumevalid))))
-  ;; skip-height logic on a synthetic regtest chain (checkpoint height = 0)
-  (let* ((bl:*network* :regtest)
-         (state (bl.store:init-chain-state
-                 (merge-pathnames "test-assumevalid/" (uiop:temporary-directory))))
-         (genesis-hash (bl.store:best-block-hash state))
-         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (av-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
-         (absent (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
-    (bl.store:add-block-index-entry
-     state (bl.store:make-block-index-entry
-            :hash genesis-hash :height 0 :chain-work 1 :status :valid
-            :header (bl.ser:make-block-header
-                     :version 1 :prev-block zeros :merkle-root zeros
-                     :timestamp 1296688600 :bits #x207fffff :nonce 0
-                     :cached-hash genesis-hash)))
-    (bl.store:add-block-index-entry
-     state (bl.store:make-block-index-entry
-            :hash av-hash :height 50 :chain-work 100 :status :header-valid
-            :header (bl.ser:make-block-header
-                     :version 1 :prev-block genesis-hash :merkle-root zeros
-                     :timestamp 1296688700 :bits #x207fffff :nonce 0
-                     :cached-hash av-hash)))
-    ;; assumevalid points at the in-index block -> its height; sigs skip <= 50.
-    (let ((bl:*assumevalid-override* av-hash))
-      (is (= 50 (bl.net::assumevalid-skip-height state)))
-      (is (= 50 (bl.net::script-skip-height state))))
-    ;; assumevalid hash not in our index -> no skip.
-    (let ((bl:*assumevalid-override* absent))
-      (is (= -1 (bl.net::assumevalid-skip-height state))))
-    ;; assumevalid explicitly disabled -> no skip.
-    (let ((bl:*assumevalid-override* nil))
-      (is (= -1 (bl.net::assumevalid-skip-height state))))))
 
 (test block-failure-count-throttle
   "note-block-failure increments a per-hash counter, clear-block-failure resets
