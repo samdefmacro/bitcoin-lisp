@@ -2892,6 +2892,46 @@ handled-p net-log-text)."
    (lambda ()
      (bl.net:handle-message peer command payload (bl.ctx:make-node-context)))))
 
+(test sendtxrcncl-outcomes-are-logged-in-cores-words
+  "Each RegisterPeer outcome has Core's own line (net_processing.cpp:3998-4011,
+txreconciliation.cpp:87, :120, :133), and p2p_sendtxrcncl.py:171-221 greps for
+every one: `Register peer=', the ALREADY_REGISTERED and PROTOCOL_VIOLATION
+disconnects, NOT_FOUND's `Ignore unexpected txreconciliation signal', and
+`Forget txreconciliation state of peer' at a verack without wtxidrelay."
+  (let ((bl:*tx-reconciliation* t)
+        (was-on (bl.log:log-category-enabled-p "txreconciliation")))
+    (flet ((logged (thunk)
+             (nth-value 1 (log-text-of
+                           "net" (lambda ()
+                                   (bl.log:enable-log-category "txreconciliation")
+                                   (funcall thunk))))))
+      (unwind-protect
+           (progn
+             (let* ((peer (%recon-test-peer))
+                    (first-log (logged (lambda () (%sendtxrcncl peer (%sendtxrcncl-payload 1 2)))))
+                    (second-log (logged (lambda () (%sendtxrcncl peer (%sendtxrcncl-payload 1 3))))))
+               (is (search (format nil "Register peer=~A (inbound=0)" (bl.net:peer-id peer))
+                           first-log)
+                   "logged: ~S" first-log)
+               (is (search "txreconciliation protocol violation (sendtxrcncl received from already registered peer), disconnecting peer="
+                           second-log)
+                   "logged: ~S" second-log))
+             (let ((log (logged (lambda () (%sendtxrcncl (%recon-test-peer)
+                                                         (%sendtxrcncl-payload 0 2))))))
+               (is (search "txreconciliation protocol violation, disconnecting peer=" log)
+                   "logged: ~S" log))
+             (let ((log (logged (lambda () (%sendtxrcncl (%recon-test-peer :local-salt nil)
+                                                         (%sendtxrcncl-payload 1 2))))))
+               (is (search "Ignore unexpected txreconciliation signal from peer=" log)
+                   "logged: ~S" log))
+             (let* ((peer (%recon-test-peer))
+                    (log (logged (lambda () (bl.net::%verack-finalize-recon peer)))))
+               (is (search (format nil "Forget txreconciliation state of peer=~A"
+                                   (bl.net:peer-id peer))
+                           log)
+                   "logged: ~S" log)))
+        (unless was-on (bl.log:disable-log-category "txreconciliation"))))))
+
 (test sendtxrcncl-ignored-with-the-feature-off-says-so
   "With -txreconciliation off Core returns from the SENDTXRCNCL branch at once
 and logs WHY (net_processing.cpp:3964-3967). p2p_sendtxrcncl.py:181 asserts

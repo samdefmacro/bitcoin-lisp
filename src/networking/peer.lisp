@@ -1183,6 +1183,7 @@ T — declining to offer never fails the handshake."
       ;; CSPRNG rather than the shared MT stream (Core's is a
       ;; FastRandomContext draw, net_processing.cpp).
       (let ((salt (bl.crypto:rand-u64)))
+        (bl:log-cat "txreconciliation" "Pre-register peer=~A" (peer-id peer))
         (setf (peer-recon-local-salt peer) salt)
         (send-message peer
                       (bl.ser:make-sendtxrcncl-message salt)))))
@@ -1204,7 +1205,9 @@ txreconciliation.cpp:97-126 RegisterPeer). Disconnects PEER and returns NIL
 on a protocol violation; returns T otherwise (registered, or benignly
 ignored)."
   (flet ((violation (reason)
-           (bl:log-cat "net" "sendtxrcncl ~A, ~A" reason (disconnect-msg peer))
+           ;; REASON is Core's line up to the DisconnectMsg (net_processing.cpp:
+           ;; 3970-4011); p2p_sendtxrcncl.py greps for each of them.
+           (bl:log-cat "net" "~A, ~A" reason (disconnect-msg peer))
            (disconnect-peer peer)
            nil))
     (cond
@@ -1214,12 +1217,12 @@ ignored)."
       ;; Our VERSION indicated no tx relay on this connection (block-relay/
       ;; feeler) — Core's RejectIncomingTxs check (:3976-3980).
       ((not (peer-relays-txs-p peer))
-       (violation "received to which we indicated no tx relay"))
+       (violation "sendtxrcncl received to which we indicated no tx relay"))
       ;; The peer's own VERSION had fRelay=0 (:3982-3990).
       ((not (and (peer-version peer)
                  (bl.ser:version-message-relay
                   (peer-version peer))))
-       (violation "received which indicated no tx relay to us"))
+       (violation "sendtxrcncl received which indicated no tx relay to us"))
       (t
        (multiple-value-bind (their-version their-salt)
            (handler-case
@@ -1227,21 +1230,26 @@ ignored)."
              (error () (values nil nil)))
          (cond
            ;; Truncated payload: Core's deserialize failure drops the peer.
-           ((null their-version) (violation "with malformed payload"))
+           ((null their-version) (violation "sendtxrcncl with malformed payload"))
            ;; We never offered, so no pre-registration exists: ignore
-           ;; without disconnecting (RegisterPeer NOT_FOUND).
-           ((null (peer-recon-local-salt peer)) t)
+           ;; without disconnecting (RegisterPeer NOT_FOUND), with Core's line.
+           ((null (peer-recon-local-salt peer))
+            (bl:log-cat "net" "Ignore unexpected txreconciliation signal from peer=~A"
+                        (peer-id peer))
+            t)
            ;; Second sendtxrcncl on one connection (ALREADY_REGISTERED).
            ((peer-recon-registered peer)
-            (violation "from already registered peer"))
+            (violation "txreconciliation protocol violation (sendtxrcncl received from already registered peer)"))
            ;; Negotiated version = min(theirs, ours); v1 is the lowest, so
            ;; below that is a violation — higher-than-ours downgrades fine
            ;; (txreconciliation.cpp:112-119).
            ((< (min their-version
                     bl.ser:+txreconciliation-version+)
                1)
-            (violation "with unsupported version"))
+            (violation "txreconciliation protocol violation"))
            (t
+            (bl:log-cat "txreconciliation" "Register peer=~A (inbound=~D)"
+                        (peer-id peer) (if (peer-inbound peer) 1 0))
             (multiple-value-bind (k0 k1)
                 (compute-recon-salt (peer-recon-local-salt peer) their-salt)
               (setf (peer-recon-version peer)
@@ -1260,6 +1268,11 @@ ignored)."
 cannot be announced later): if the peer (pre-)registered but wtxidrelay never
 arrived, forget the reconciliation state (Core net_processing.cpp:3879-3886)."
   (unless (and (peer-wtxid-relay peer) (peer-recon-registered peer))
+    ;; Core ForgetPeer logs only when there was state to erase
+    ;; (txreconciliation.cpp:128-136); p2p_sendtxrcncl.py:221 waits for it.
+    (when (peer-recon-local-salt peer)
+      (bl:log-cat "txreconciliation" "Forget txreconciliation state of peer=~A"
+                  (peer-id peer)))
     (%forget-recon-state peer)))
 
 (defun local-services ()
