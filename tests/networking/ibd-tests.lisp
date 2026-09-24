@@ -4425,7 +4425,17 @@ tip advance turns a legitimate request into a disconnect."
       (is-false (bl.net::%below-network-limited-threshold-p
                  cs (bl.store:get-block-at-height cs (- 1000 290))))
       (is-true (bl.net::%below-network-limited-threshold-p
-                cs (bl.store:get-block-at-height cs (- 1000 291)))))
+                cs (bl.store:get-block-at-height cs (- 1000 291))))
+      ;; A noban peer is served at any depth: Core's
+      ;; `!pfrom.HasPermission(NetPermissionFlags::NoBan) && (...)' (:2386).
+      (let ((bl.net:*whitelist-entries*
+              (list (bl.net:parse-whitelist-entry "noban@198.51.100.51")))
+            (noban (bl.net:make-peer :address "198.51.100.51" :inbound t))
+            (plain (bl.net:make-peer :address "198.51.100.52" :inbound t)))
+        (is-true (bl.net::%below-network-limited-threshold-p
+                  cs (bl.store:get-block-at-height cs 100) plain))
+        (is-false (bl.net::%below-network-limited-threshold-p
+                   cs (bl.store:get-block-at-height cs 100) noban))))
     ;; A full node advertises NODE_NETWORK and the threshold never applies.
     (let ((bl:*prune-target-mib* 0))
       (is-false (bl.net::%below-network-limited-threshold-p

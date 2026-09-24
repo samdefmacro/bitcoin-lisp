@@ -2729,9 +2729,14 @@ because an old side-chain block is a fingerprint, not a service."
                (bl.ser:block-header-bits best-hdr))
               +stale-relay-age-limit+)))))
 
-(defun %below-network-limited-threshold-p (chain-state entry)
-  "T when serving ENTRY would leak our prune height (Core
+(defun %below-network-limited-threshold-p (chain-state entry &optional peer)
+  "T when serving ENTRY to PEER would leak our prune height (Core
 net_processing.cpp:2385-2392).
+
+A PEER holding the noban permission is exempt, as Core's
+`!pfrom.HasPermission(NetPermissionFlags::NoBan) && (...)' makes it: an
+operator who whitelisted a peer is not hiding the prune height from it, and a
+refusal would disconnect a peer we promised never to punish.
 
 A node advertising NODE_NETWORK_LIMITED without NODE_NETWORK promises the last
 288 blocks. Answering for anything deeper tells the asker how much history this
@@ -2739,7 +2744,8 @@ node actually kept — which is its prune configuration. Core's two-block buffer
 is kept: without it a race against a tip advance turns a legitimate request
 into a disconnect."
   (let ((services (local-services)))
-    (and (plusp (logand services bl.ser:+node-network-limited+))
+    (and (not (and peer (peer-has-permission-p peer +perm-noban+)))
+         (plusp (logand services bl.ser:+node-network-limited+))
          (zerop (logand services bl.ser:+node-network+))
          (let ((tip-height (bl.store:chain-state-best-height chain-state))
                (height (bl.store:block-index-entry-height entry)))
@@ -2994,7 +3000,7 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                  ;; Prune-height leak: refuse AND disconnect, as Core does —
                  ;; a peer left waiting for a block we will never send stalls
                  ;; instead of re-routing the request.
-                 ((and entry (%below-network-limited-threshold-p chain-state entry))
+                 ((and entry (%below-network-limited-threshold-p chain-state entry peer))
                   (bl:log-cat
                    "net" "Ignore block request below NODE_NETWORK_LIMITED ~
                           threshold, ~A"
