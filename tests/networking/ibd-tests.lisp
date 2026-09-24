@@ -2751,7 +2751,8 @@ print(int.from_bytes(h[0:8],'little'), int.from_bytes(h[8:16],'little'))\"
 
 (test sendtxrcncl-offer-conditions
   "We offer reconciliation only when: -txreconciliation on, negotiated proto
->= 70016, our conn relays txs, and the peer's VERSION set fRelay (Core
+>= 70016, our conn relays txs and is not addr-fetch, and the peer's VERSION
+set fRelay (Core
 net_processing.cpp:3728-3742). The offer pre-registers a random local salt."
   (let ((bl:*tx-reconciliation* t))
     (let ((peer (%recon-test-peer :local-salt nil)))
@@ -2761,10 +2762,12 @@ net_processing.cpp:3728-3742). The offer pre-registers a random local salt."
     (let ((peer (%recon-test-peer :relay nil :local-salt nil)))
       (bl.net::%maybe-send-sendtxrcncl peer)
       (is-false (bl.net::peer-recon-local-salt peer)))
-    ;; We don't relay txs on block-relay connections
-    (let ((peer (%recon-test-peer :conn-type :block-relay :local-salt nil)))
-      (bl.net::%maybe-send-sendtxrcncl peer)
-      (is-false (bl.net::peer-recon-local-salt peer)))
+    ;; No offer on a block-relay-only, feeler or addr-fetch connection
+    ;; (net_processing.cpp:3735-3737; p2p_sendtxrcncl.py:151 checks addr-fetch).
+    (dolist (type '(:block-relay :feeler :addr-fetch))
+      (let ((peer (%recon-test-peer :conn-type type :local-salt nil)))
+        (bl.net::%maybe-send-sendtxrcncl peer)
+        (is-false (bl.net::peer-recon-local-salt peer) "offered on ~S" type)))
     ;; Pre-wtxidrelay protocol version
     (let ((peer (%recon-test-peer :proto-version 70015 :local-salt nil)))
       (bl.net::%maybe-send-sendtxrcncl peer)

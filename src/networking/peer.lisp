@@ -1160,7 +1160,8 @@ disconnect needs no extra cleanup."
 our VERACK (Core sends from its VERSION handler, net_processing.cpp:3728-3742),
 when: -txreconciliation is enabled, the negotiated protocol supports wtxid
 relay (>= 70016), our side of the connection relays txs (not block-relay/
-feeler), and the peer's VERSION set fRelay=1. On send, pre-register a random
+feeler), it is not an addr-fetch connection, and the peer's VERSION set
+fRelay=1. On send, pre-register a random
 u64 local salt (txreconciliation.cpp:82-94 PreRegisterPeer). Always returns
 T — declining to offer never fails the handshake."
   (let ((version-msg (peer-version peer)))
@@ -1172,6 +1173,7 @@ T — declining to offer never fails the handshake."
                (>= (bl.ser:version-message-version version-msg)
                    bl.ser:+protocol-version+)
                (peer-relays-txs-p peer)
+               (not (eq (peer-conn-type peer) :addr-fetch))
                ;; Core also skips the offer entirely in blocksonly mode
                ;; (!m_opts.ignore_incoming_txs, net_processing.cpp:3737) —
                ;; reconciliation is pointless when we reject incoming txs.
