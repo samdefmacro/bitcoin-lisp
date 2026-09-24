@@ -1897,7 +1897,10 @@ passes (extra trailing bytes are fine)."
       (multiple-value-bind (valid error)
           (bl.val::validate-coinbase-height block 17)
         (is (null valid))
-        (is (eq :bad-coinbase-height error))))))
+        (is (eq :bad-coinbase-height error))
+        ;; In Core's words (validation.cpp:4189); feature_block.py:1284
+        ;; waits for them in the debug log.
+        (is (string= "bad-cb-height" (bl.val:block-reject-reason error)))))))
 
 (test validate-coinbase-height-rejects-wrong-and-short
   "Wrong height and a too-short scriptSig are both rejected."
