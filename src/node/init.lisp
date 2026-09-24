@@ -1462,6 +1462,25 @@ recorded for startup."
 
   (start-wallets *node* network wallet wallet-supplied-p wallet-names))
 
+(defun %verify-wallet-directory ()
+  "Core VerifyWallets' -walletdir check (wallet/load.cpp:32-51): the path must
+exist, be a directory and be ABSOLUTE -- a relative one is refused even when
+it exists, since Core would resolve it against the process's working
+directory -- and from then on it is used in canonical form. Each refusal is
+an init error in Core's words (wallet_multiwallet.py:143-145, :155-158)."
+  (let ((given bl.wallet:*wallet-directory*))
+    (when given
+      (let* ((path (uiop:parse-native-namestring given))
+             (resolved (uiop:merge-pathnames* path (uiop:getcwd)))
+             (as-directory (uiop:directory-exists-p resolved)))
+        (cond ((not (or as-directory (probe-file resolved)))
+               (init-error "Specified -walletdir \"~A\" does not exist" given))
+              ((not as-directory)
+               (init-error "Specified -walletdir \"~A\" is not a directory" given))
+              ((not (uiop:absolute-pathname-p path))
+               (init-error "Specified -walletdir \"~A\" is a relative path" given)))
+        (setf bl.wallet:*wallet-directory* (namestring as-directory))))))
+
 (defun start-wallets (node network wallet wallet-supplied-p wallet-names)
   "Core Steps 5 and 9 for the wallet (WalletInit's verify and load): make
 NODE's wallet manager and load the wallets start-up names. Wallet support is
@@ -1485,21 +1504,27 @@ settings list when the node was started from arguments (CONFIG-ALIST->START-
 NODE-PLIST always supplies it), and :SETTINGS when it was not, meaning
 settings.json's own list (Core LoadWallets, load.cpp:118)."
   (when (if wallet-supplied-p (and wallet t) (not (eq network :mainnet)))
+    (%verify-wallet-directory)
     (setf (node-wallet-manager node)
           (bl.wallet:init-wallet-manager (node-data-directory node) network))
-    (log-info "Wallet support enabled (descriptor wallets under ~A)"
-              (merge-pathnames "wallets/" (node-data-directory node)))
+    (log-info "Using wallet directory ~A"
+              (bl.wallet:wallets-directory (node-wallet-manager node)))
     (init-message "Verifying wallet(s)…")
     (if (eq wallet-names :settings)
         (bl.wallet:load-wallets-on-startup node)
         ;; Core's LoadWallets says `Loading wallet…' before EACH wallet it
         ;; opens (wallet/load.cpp:149), so the list is walked here, one
-        ;; wallet per call; the loader keeps its own duplicate rule.
-        (let ((names (remove-duplicates (remove-if-not #'stringp wallet-names)
-                                        :test #'string= :from-end t)))
-          (dolist (name names)
-            (init-message "Loading wallet…")
-            (bl.wallet:load-wallets-on-startup node (list name)))))))
+        ;; wallet per call. A name given twice is loaded once, and
+        ;; VerifyWallets says so as an init warning (load.cpp:90-93),
+        ;; which wallet_multiwallet.py:148 reads off stderr.
+        (let ((seen '()))
+          (dolist (name (remove-if-not #'stringp wallet-names))
+            (if (member name seen :test #'string=)
+                (init-warning (format nil "Ignoring duplicate -wallet ~A." name))
+                (progn
+                  (push name seen)
+                  (init-message "Loading wallet…")
+                  (bl.wallet:load-wallets-on-startup node (list name)))))))))
 
 
 (defun apply-initial-network-active (node network-active)

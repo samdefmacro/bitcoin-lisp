@@ -2780,6 +2780,34 @@ from -- not at the call sites, which in Core can only ever RAISE the flag."
   (is-true (bl:known-config-option-p "avoidpartialspends"))
   (is-false (bl.cfg:core-only-option-p "avoidpartialspends")))
 
+(test walletdir-must-exist-be-a-directory-and-be-absolute
+  "Core VerifyWallets (wallet/load.cpp:32-51) refuses a -walletdir that does
+not exist, is not a directory, or is RELATIVE (even an existing one), each
+as an init error in its own words, and otherwise uses it canonical.
+wallet_multiwallet.py:143-145 and :155-158 start the node with each."
+  (let ((saved bl.wallet:*wallet-directory*))
+    (unwind-protect
+         (with-temp-directory (dir)
+           (flet ((refusal (value)
+                    (setf bl.wallet:*wallet-directory* value)
+                    (handler-case (progn (bl::%verify-wallet-directory) nil)
+                      (bl.err:init-error (e) (princ-to-string e)))))
+             (let ((missing (namestring (merge-pathnames "nope/" dir)))
+                   (file (namestring (merge-pathnames "debug.log" dir))))
+               (with-open-file (out file :direction :output) (write-line "x" out))
+               (is (equal (format nil "Specified -walletdir \"~A\" does not exist" missing)
+                          (refusal missing)))
+               (is (equal (format nil "Specified -walletdir \"~A\" is not a directory" file)
+                          (refusal file)))
+               (let ((*default-pathname-defaults* (uiop:ensure-directory-pathname dir)))
+                 (uiop:with-current-directory (dir)
+                   (ensure-directories-exist (merge-pathnames "rel/" dir))
+                   (is (equal "Specified -walletdir \"rel\" is a relative path"
+                              (refusal "rel")))))
+               (is (null (refusal (namestring dir))))
+               (is (equal (namestring (truename dir)) bl.wallet:*wallet-directory*)))))
+      (setf bl.wallet:*wallet-directory* saved))))
+
 (test rpc-config-keypool-and-walletdir
   "-keypool and -walletdir (Core init.cpp). Both are asserted through their
 EFFECT — a freshly made wallet manager's keypool size, and the directory

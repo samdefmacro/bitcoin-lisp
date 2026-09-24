@@ -2706,15 +2706,22 @@ start-up on that line; VerifyWallets runs only when the wallet does."
   "Core's LoadWallets announces `Loading wallet…' before EACH wallet it opens
 (wallet/load.cpp:149, the InitMessage the GUI's splash screen shows), after
 the one `Verifying wallet(s)…'. A name listed twice is loaded, and
-announced, once (wallet_paths is a set, load.cpp:129-131)."
+announced, once (wallet_paths is a set, load.cpp:129-131), and VerifyWallets
+says so on stderr (`Warning: Ignoring duplicate -wallet one.', load.cpp:90-93,
+wallet_multiwallet.py:148)."
   (with-wallet-test-node (node :network :regtest)
     (bl.rpc:dispatch-rpc-method node "createwallet" '("one"))
     (bl.rpc:dispatch-rpc-method node "createwallet" '("two"))
     (setf (bl:node-data-directory node) (%wallet-settings-dir node))
     (bl.wallet:close-wallet-manager (%node-manager node))
     (setf (bl:node-wallet-manager node) nil)
-    (let ((lines (capture-log-lines
-                  (lambda () (bl:start-wallets node :regtest nil nil '("one" "two" "one"))))))
+    (let* ((stderr (make-string-output-stream))
+           (lines (capture-log-lines
+                   (lambda ()
+                     (let ((*error-output* stderr))
+                       (bl:start-wallets node :regtest nil nil '("one" "two" "one")))))))
+      (is (equal (format nil "Warning: Ignoring duplicate -wallet one.~%")
+                 (get-output-stream-string stderr)))
       (is (= 2 (count-if (lambda (l) (search "init message: Loading wallet…" l)) lines)))
       (is (< (position-if (lambda (l) (search "init message: Verifying wallet(s)…" l)) lines)
              (position-if (lambda (l) (search "init message: Loading wallet…" l)) lines))

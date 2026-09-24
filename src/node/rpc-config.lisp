@@ -97,8 +97,9 @@ APPLY-CONFIG-GLOBALS."
         (when v
           (setf bl.wallet:*default-keypool-size*
                 (max 1 (or (ignore-errors (conf-parse-int v)) 0))))))
-    ;; -walletdir relocates <datadir>/wallets/ (Core init.cpp). Relative paths
-    ;; hang off the data directory, as -rpccookiefile does.
+    ;; -walletdir relocates the wallet directory (Core init.cpp). Start-up
+    ;; refuses a relative, missing or non-directory one and stores it
+    ;; canonical (%VERIFY-WALLET-DIRECTORY, Core load.cpp:32-51).
     (let ((v (lk "walletdir")))
       (when v (setf bl.wallet:*wallet-directory* v)))
     ;; -signer: set on EVERY start, so a restart without it forgets the last
