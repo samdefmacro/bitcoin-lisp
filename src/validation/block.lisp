@@ -4930,6 +4930,13 @@ a connect-time verdict is one Core marks BLOCK_FAILED_VALID, and so one it
 punishes the sending peer for."
   (%deterministic-consensus-failure-p error))
 
+(defun %refuse-unconnectable-block (block chain-state block-store error now)
+  "ACTIVATE-BLOCK's verdict on a block it failed to connect: keep the body
+(%KEEP-BODY-OF-UNCONNECTABLE-BLOCK), then mark the block and its descendants
+invalid (%POISON-FAILED-BLOCK), in Core's order."
+  (%keep-body-of-unconnectable-block block chain-state block-store now)
+  (%poison-failed-block chain-state (bl.ser:bitcoin-block-header block) error))
+
 (defun %keep-body-of-unconnectable-block (block chain-state block-store now)
   "Keep on disk the body of a block ACTIVATE-BLOCK failed to connect, when
 AcceptBlock's checks pass for it -- Core's order: AcceptBlock writes the body
@@ -5068,8 +5075,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                  ;; not, so a block rejected here stayed in the index as merely
                  ;; header-valid and submitblock re-judged it on every
                  ;; resubmission (%POISON-FAILED-BLOCK).
-                 (%keep-body-of-unconnectable-block block chain-state block-store now)
-                 (%poison-failed-block chain-state header error)
+                 (%refuse-unconnectable-block block chain-state block-store error now)
                  (values nil error))))))
 
       (t
@@ -5169,9 +5175,8 @@ can neither wedge on an equal-work sibling nor advance past the base."
                            ;; the incoming block was never connected, and it
                            ;; sits above the reverted fork on neither reorg
                            ;; side.
-                           (%keep-body-of-unconnectable-block
-                            block chain-state block-store now)
-                           (%poison-failed-block chain-state header error)
+                           (%refuse-unconnectable-block
+                            block chain-state block-store error now)
                            (let ((fork-tip (bl.store:get-block-index-entry
                                             chain-state
                                             (bl.store:best-block-hash
