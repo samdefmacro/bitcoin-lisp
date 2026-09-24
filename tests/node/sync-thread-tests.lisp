@@ -606,3 +606,76 @@ what it signals is signalled again on the caller's thread."
                                             "")
                          (error (e) (princ-to-string e))))))
       (setf (fdefinition 'bl:catch-up-index) real))))
+
+(test seed-nodes-go-to-the-addr-fetch-queue-on-cores-timer
+  "Core's ThreadOpenConnections (net.cpp:2565-2586, :2690-2695): with an EMPTY
+address book the first -seednode is queued for an addr-fetch dial at once
+(`Empty addrman, adding seednode'); with addresses to try, the next one is
+queued only once 10 s of the MOCKABLE clock pass without two full-relay
+outbound peers (`Couldn't connect to peers from addrman after 10 seconds').
+Ours dialed every -seednode at start-up; p2p_seednode.py:33 and :52 wait for
+Core's lines. The queued seed is dialed as an addr-fetch connection, which
+the `trying' line names."
+  (let* ((t0 1700000000)
+         (bl.ser:*mock-time* t0)
+         (bl:*seed-nodes* '("127.0.0.1:1"))
+         (bl:*use-addrman-outgoing* t)
+         (bl.net:*v2-transport-enabled* nil)) ; the framework's -v2transport=0
+    (flet ((fresh-node ()
+             (let ((node (make-test-node :network :regtest)))
+               (setf (bl:node-address-book node) (bl.net:make-address-book)
+                     (bl:node-network-active node) t)
+               node))
+           (seed-pass (node)
+             (nth-value 1 (log-text-of "net" (lambda () (bl:connect-seed-nodes node))))))
+      (let ((node (fresh-node)))
+        (bl:start-fixed-seed-fallback)
+        (let ((text (seed-pass node)))
+          (is (search "Empty addrman, adding seednode (127.0.0.1:1) to addrfetch" text))
+          (is (search "trying v1 connection (addr-fetch) to 127.0.0.1:1" text)
+              "the queued seed is dialed as an addr-fetch connection")))
+      (let ((node (fresh-node)))
+        (bl.net:address-book-add (bl:node-address-book node)
+                                 (bl.net:make-peer-address
+                                  :ip (bl.net:ipv4-to-mapped-ipv6 8 8 8 8) :port 8333
+                                  :services 1 :last-seen t0))
+        (bl:start-fixed-seed-fallback)
+        (is (not (search "seednode" (seed-pass node))) "a non-empty book tries addrman first")
+        (setf bl.ser:*mock-time* (+ t0 10))
+        (is (not (search "seednode" (seed-pass node))))
+        (setf bl.ser:*mock-time* (+ t0 11))
+        (seed-pass node)                     ; the timer fires: queued next pass
+        (is (search "Couldn't connect to peers from addrman after 10 seconds. Adding seednode (127.0.0.1:1) to addrfetch"
+                    (seed-pass node)))))))
+
+(test dns-seeds-wait-and-log-as-cores-thread-does
+  "Core's ThreadDNSAddressSeed (net.cpp:2255-2391): every seed tried says
+`Loading addresses from DNS seed <seed>', a name proxy included (the seed is
+then queued as an addr-fetch for the proxy to resolve); an empty address book
+queries at once; a non-empty one first says `Waiting 11 seconds before
+querying DNS seeds.' and, with two full-relay outbound peers up by then,
+`P2P peers available. Skipped DNS seeding.' p2p_dns_seeds.py:36, :62, :108
+wait for each; ours resolved every seed at once without any of them."
+  (let ((bl.net:*proxy* (bl.net:make-proxy :host "127.0.0.1" :port 1))
+        (bl.net:*dns-seeds* '("dummySeed.invalid."))
+        (bl:*seed-nodes* '())
+        (bl:*force-dns-seed* nil))
+    (let ((node (make-test-node :network :regtest)))
+      (setf (bl:node-address-book node) (bl.net:make-address-book)
+            (bl:node-running node) t
+            (bl:node-network-active node) t)
+      (let ((text (nth-value 1 (log-text-of "net" (lambda () (bl:dns-address-seed node))))))
+        (is (search "Loading addresses from DNS seed dummySeed.invalid." text))
+        (is (search "0 addresses found from DNS seeds" text)))
+      ;; A book with an address waits first; two ready full-relay peers end it.
+      (bl.net:address-book-add (bl:node-address-book node)
+                               (bl.net:make-peer-address
+                                :ip (bl.net:ipv4-to-mapped-ipv6 8 8 8 8) :port 8333
+                                :services 1 :last-seen 1700000000))
+      (setf (bl:node-peers node)
+            (loop repeat 2 collect (bl.net:make-peer :address "9.9.9.9" :state :ready
+                                                     :conn-type :outbound-full-relay)))
+      (let ((text (nth-value 1 (log-text-of "net" (lambda () (bl:dns-address-seed node))))))
+        (is (search "Waiting 11 seconds before querying DNS seeds." text))
+        (is (search "P2P peers available. Skipped DNS seeding." text))
+        (is (not (search "Loading addresses" text)))))))

@@ -45,6 +45,7 @@ headerssync.cpp. src/networking/.")
    #:*v2-transport-enabled*
    #:v2-available-p
    ;; SOCKS5 outbound proxy (Core netbase.cpp Socks5)
+   #:connection-type-string
    #:*proxy*
    #:*network-proxies*
    #:network-proxy

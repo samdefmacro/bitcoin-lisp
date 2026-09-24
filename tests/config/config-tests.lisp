@@ -2413,10 +2413,10 @@ become a second -addnode."
            (setf (bl:node-network-active node) t
                  bl::*seed-nodes* '("127.0.0.1:1")
                  bl::*use-addrman-outgoing* nil)
-           (bl::connect-seed-nodes node)
+           (bl:connect-seed-nodes node)
            (is (= 0 (length (bl:node-peers node))))
            ;; And it is reached from startup, not merely defined.
-           (is-true (%reached-from-start-node-p 'bl::connect-seed-nodes)))
+           (is-true (%reached-from-start-node-p 'bl:connect-seed-nodes)))
       (setf bl::*use-addrman-outgoing* saved-addrman
             bl::*seed-nodes* saved-seeds)))
   (dolist (name '("seednode" "forcednsseed"))

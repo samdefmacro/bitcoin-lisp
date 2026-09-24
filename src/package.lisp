@@ -68,6 +68,7 @@ init.cpp, node/. src/node/.")
    #:*stop-at-height*
    #:*private-broadcast*
    #:*dns-seed-enabled*
+   #:*force-dns-seed*
    #:*fixed-seeds-enabled*
    #:*capture-messages*
    #:cleanup-block-rev-files
@@ -238,6 +239,8 @@ init.cpp, node/. src/node/.")
    #:blocks-to-announce
    #:log-connect-overrides
    #:maybe-add-fixed-seeds
+   #:connect-seed-nodes
+   #:dns-address-seed
    #:*seed-nodes*
    #:*use-addrman-outgoing*
    #:node-address-book

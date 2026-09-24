@@ -425,6 +425,18 @@ to decide whether the address is charged an addrman attempt at all
           peer)
         (values nil proxy-failed))))
 
+(defun connection-type-string (conn-type)
+  "Core CNode::ConnectionTypeAsString for our peer conn-type keyword -- what
+getpeerinfo's connection_type and the `trying ... connection' line say."
+  (case conn-type
+    (:inbound "inbound")
+    (:outbound-full-relay "outbound-full-relay")
+    (:block-relay "block-relay-only")
+    (:feeler "feeler")
+    (:manual "manual")
+    (:addr-fetch "addr-fetch")
+    (t (string-downcase (symbol-name conn-type)))))
+
 (defun peer-live-p (peer)
   "T while PEER is still a connection we could actually use — our stand-in for
 Core's `!pfrom.fDisconnect`.

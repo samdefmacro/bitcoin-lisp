@@ -5,17 +5,6 @@
 
 ;;; --- Network Query Methods ---
 
-(defun %connection-type-string (conn-type)
-  "Core CNode::ConnectionTypeAsString for our peer conn-type keyword."
-  (case conn-type
-    (:inbound "inbound")
-    (:outbound-full-relay "outbound-full-relay")
-    (:block-relay "block-relay-only")
-    (:feeler "feeler")
-    (:manual "manual")
-    (:addr-fetch "addr-fetch")
-    (t (string-downcase (symbol-name conn-type)))))
-
 (defun %service-names (services)
   "Human-readable service-flag names for SERVICES as a list, in bit order —
 Core serviceFlagsToStr (protocol.cpp:92-115): the six named bits, and
@@ -346,7 +335,7 @@ whatever the cadence is."
            ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
                                     (bl.net:peer-recv-per-msg peer)))
            ;; Core ConnectionTypeAsString (node/connection_types.cpp:9-25).
-           ("connection_type" . ,(%connection-type-string
+           ("connection_type" . ,(bl.net:connection-type-string
                                   (bl.net:peer-conn-type peer)))
            ;; Core TransportTypeAsString: the BIP324 v2 session lives in
            ;; connection-transport (NIL = plaintext v1). A peer is published

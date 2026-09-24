@@ -125,10 +125,9 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
       (copy-list seeds)
       (let ((addresses '()))
         (dolist (seed seeds)
-          ;; Per seed, before the lookup, exactly as Core does (net.cpp:2353).
-          ;; p2p_dns_seeds.py greps for this line to tell which seeds a node
-          ;; actually tried — a summary after the fact cannot answer that.
-          (bl:log-info "Loading addresses from DNS seed ~A" seed)
+          ;; `Loading addresses from DNS seed' is the caller's line: the DNS
+          ;; seed thread writes it per seed before this lookup, as Core does
+          ;; (net.cpp:2353), under a name proxy too.
           (let ((resolved (resolve-dns-seed seed)))
             (when resolved
               (setf addresses (nconc addresses resolved)))))

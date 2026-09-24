@@ -378,7 +378,9 @@ option instantiates from."
                        :initial-contents '(#xFA #xBF #xB5 #xDA))
   :port 18444
   :rpc-port 18443
-  :dns-seeds '()
+  ;; Core regtest's one seed, a name that resolves nowhere
+  ;; (kernel/chainparams.cpp:641); p2p_dns_seeds.py waits for it to be tried.
+  :dns-seeds '("dummySeed.invalid.")
   :fixed-seeds '()
   :genesis-hash (ironclad:hex-string-to-byte-array "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f")
   :genesis-timestamp 1296688602

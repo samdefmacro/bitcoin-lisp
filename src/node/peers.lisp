@@ -315,7 +315,26 @@ Every caller reaches this through %DIAL-OUTBOUND-PEER, which owns Core's
             address-book ip-bytes port
             :count-failure count-failure :net net)))))))
 
-(defun %dial-outbound-peer (node host port count-failure)
+(defun %log-trying-connection (node host port conn-type use-v2)
+  "Core ConnectNode's `trying <v1|v2> connection (<type>) to <dest>,
+lastseen=<hours>hrs' (net.cpp:393-397), logged under -debug=net before every
+outbound dial; p2p_seednode.py:48 waits for it. LASTSEEN is the address
+book's record of HOST:PORT, 0 for a destination it does not hold."
+  (let* ((book (node-address-book node))
+         (known (and book
+                     (multiple-value-bind (net bytes) (bl.net:parse-network-address host)
+                       (and net (bl.net:address-book-lookup book bytes port net)))))
+         (hours (if known
+                    (/ (- (bl.ser:get-unix-time) (bl.net:peer-address-last-seen known)) 3600.0)
+                    0.0)))
+    (bl:log-cat "net" "trying ~A connection (~A) to ~A, lastseen=~,1Fhrs"
+                (if use-v2 "v2" "v1") (bl.net:connection-type-string conn-type)
+                (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)
+                hours)))
+
+(defun %dial-outbound-peer (node host port count-failure
+                            &key (conn-type :outbound-full-relay)
+                                 (use-v2 (bl.net:v2-available-p)))
   "Dial HOST:PORT and record the addrman attempt Core's ConnectNode records.
 Returns the connected peer, or NIL.
 
@@ -345,63 +364,144 @@ Only the PROXY carve-out is Core's. A proxy that answers and then reports the
 target unreachable is a verdict about the target, and Core counts it (its flag
 is raised solely by `proxy.Connect()' returning nothing, netbase.cpp:790-794).
 
-COUNT-FAILURE is Core's fCountFailure; see %RECORD-DIAL-ATTEMPT."
+COUNT-FAILURE is Core's fCountFailure; see %RECORD-DIAL-ATTEMPT. CONN-TYPE
+and USE-V2 only name the dial in Core's `trying' line."
+  (%log-trying-connection node host port conn-type use-v2)
   (multiple-value-bind (peer proxy-failed) (bl.net:connect-peer host port)
     (unless proxy-failed
       (%record-dial-attempt node host port count-failure))
     peer))
 
-(defun %seed-address-book-from-dns (node)
-  "Query the DNS seeds and put what they return into the address book, the way
-Core's ThreadDNSAddressSeed does (net.cpp:2340-2360).
+(defconstant +dnsseeds-to-query-at-once+ 3 "Core DNSSEEDS_TO_QUERY_AT_ONCE (net.cpp:66).")
+(defconstant +dnsseeds-delay-few-peers+ 11 "Core DNSSEEDS_DELAY_FEW_PEERS, seconds (net.cpp:80).")
+(defconstant +dnsseeds-delay-many-peers+ 300 "Core DNSSEEDS_DELAY_MANY_PEERS, seconds (net.cpp:81).")
+(defconstant +dnsseeds-delay-peer-threshold+ 1000
+  "Core DNSSEEDS_DELAY_PEER_THRESHOLD (net.cpp:82): an address book this full
+waits the long delay.")
+(defconstant +seednode-timeout-seconds+ 30
+  "Core's SEEDNODE_TIMEOUT in ThreadDNSAddressSeed (net.cpp:2261): how long the
+seed nodes get before the DNS seeds take over.")
 
-Runs in its own thread so start-up is not blocked on DNS, which is also why
-Core makes it a thread. Failures are logged and dropped: a node that cannot
+(defun %dnsseed-sleep (node seconds)
+  "Core's m_interrupt_net->sleep_for: wait SECONDS, NIL as soon as the node
+stops (the thread then returns), T otherwise."
+  (loop with deadline = (+ (get-internal-real-time)
+                           (* seconds internal-time-units-per-second))
+        while (< (get-internal-real-time) deadline)
+        do (when (or (bl.net:ibd-stop-requested-p) (not (node-running node)))
+             (return-from %dnsseed-sleep nil))
+           (sleep 0.1))
+  (not (or (bl.net:ibd-stop-requested-p) (not (node-running node)))))
+
+(defun %query-dns-seed (node seed port)
+  "One seed of Core's ThreadDNSAddressSeed (net.cpp:2350-2386): with a name
+proxy the seed is handed to the addr-fetch queue as a name, for the proxy to
+resolve; otherwise it is resolved here and every address goes into the
+address book, a seed that resolves to nothing becoming an addr-fetch too.
+Returns how many addresses it resolved to (Core's `found')."
+  (log-info "Loading addresses from DNS seed ~A" seed)
+  (if bl.net:*proxy*
+      (progn (add-addr-fetch seed) 0)
+      (let ((book (node-address-book node))
+            (found 0))
+        (dolist (addr (bl.net:discover-peers (list seed)))
+          (multiple-value-bind (net ip-bytes) (bl.net:parse-network-address addr)
+            (when net
+              (incf found)
+              (unless (bl.net:address-book-lookup book ip-bytes port net)
+                (bl.net:address-book-add
+                 book
+                 (bl.net:make-peer-address
+                  :net net :ip ip-bytes :port port :services 0
+                  ;; A random age between 3 and 7 days (net.cpp:2375).
+                  :last-seen (- (bl.ser:get-unix-time) (* 3 86400) (random (* 4 86400)))))))))
+        (when (zerop found)
+          (add-addr-fetch seed))
+        found)))
+
+(defun %seed-node-phase (node)
+  "ThreadDNSAddressSeed's -seednode prelude (net.cpp:2259-2282): with seed
+nodes configured, give them +SEEDNODE-TIMEOUT-SECONDS+ to bring the node to
++SEED-OUTBOUND-CONNECTION-THRESHOLD+ full-relay outbound peers before the DNS
+seeds are touched. Returns the last outbound count, or NIL when the node
+stopped."
+  (let ((count 0))
+    (when *seed-nodes*
+      (log-info "-seednode enabled. Trying the provided seeds for ~D seconds before defaulting to the dnsseeds."
+                +seednode-timeout-seconds+)
+      (loop with start = (get-internal-real-time)
+            do (unless (%dnsseed-sleep node 0.5) (return-from %seed-node-phase nil))
+               (when (> (- (get-internal-real-time) start)
+                        (* +seednode-timeout-seconds+ internal-time-units-per-second))
+                 (log-info "Couldn't connect to enough peers via seed nodes. Handing fetch logic to the DNS seeds.")
+                 (return))
+               (setf count (full-outbound-count node))
+               (when (>= count +seed-outbound-connection-threshold+)
+                 (log-info "P2P peers available. Finished fetching data from seed nodes.")
+                 (return))))
+    count))
+
+(defun dns-address-seed (node)
+  "Core ThreadDNSAddressSeed (net.cpp:2255-2391). After the seed-node
+prelude, the seeds are shuffled; all are queried at once under -forcednsseed
+or with an empty address book, otherwise +DNSSEEDS-TO-QUERY-AT-ONCE+ at a
+time, each batch after a wait of 11 s (300 s once the book holds
++DNSSEEDS-DELAY-PEER-THRESHOLD+ addresses) that ends the thread early once
++SEED-OUTBOUND-CONNECTION-THRESHOLD+ full-relay outbound peers are up. A
+network switched off holds the queries until it is back on."
+  (let* ((book (node-address-book node))
+         (outbound (or (%seed-node-phase node) (return-from dns-address-seed)))
+         (seeds (alexandria:shuffle (copy-list bl.net:*dns-seeds*)))
+         (port (network-port (node-network node)))
+         (right-now (if (or *force-dns-seed* (zerop (bl.net:address-book-count book)))
+                        (length seeds)
+                        0))
+         (found 0))
+    (unless (or (< outbound +seed-outbound-connection-threshold+) (plusp right-now))
+      (log-info "Skipping DNS seeds. Enough peers have been found")
+      (return-from dns-address-seed))
+    (let ((wait (if (>= (bl.net:address-book-count book) +dnsseeds-delay-peer-threshold+)
+                    +dnsseeds-delay-many-peers+
+                    +dnsseeds-delay-few-peers+)))
+      (dolist (seed seeds)
+        (when (zerop right-now)
+          (incf right-now +dnsseeds-to-query-at-once+)
+          (when (plusp (bl.net:address-book-count book))
+            (log-info "Waiting ~D seconds before querying DNS seeds." wait)
+            (loop with left = wait
+                  while (plusp left)
+                  do (let ((step (min +dnsseeds-delay-few-peers+ left)))
+                       (unless (%dnsseed-sleep node step) (return-from dns-address-seed))
+                       (decf left step))
+                     (when (>= (full-outbound-count node) +seed-outbound-connection-threshold+)
+                       (if (plusp found)
+                           (progn (log-info "~D addresses found from DNS seeds" found)
+                                  (log-info "P2P peers available. Finished DNS seeding."))
+                           (log-info "P2P peers available. Skipped DNS seeding."))
+                       (return-from dns-address-seed)))))
+        (unless (%dnsseed-sleep node 0) (return-from dns-address-seed))
+        (unless (node-network-active node)
+          (log-info "Waiting for network to be reactivated before querying DNS seeds.")
+          (loop until (node-network-active node)
+                do (unless (%dnsseed-sleep node 1) (return-from dns-address-seed))))
+        (incf found (%query-dns-seed node seed port))
+        (decf right-now)))
+    (log-info "~D addresses found from DNS seeds" found)))
+
+(defun %seed-address-book-from-dns (node)
+  "Start Core's ThreadDNSAddressSeed (%DNS-ADDRESS-SEED) on its own thread,
+`dnsseed' (net.cpp:3527). Failures are logged and dropped: a node that cannot
 reach a seed still has its address book, its -connect peers and its fixed
 seeds."
-  (let ((book (node-address-book node))
-        ;; PEER-ADDRESS's PORT slot is an (unsigned-byte 16); a DNS seed
-        ;; answers with bare addresses, so they take the network's default
-        ;; port, exactly as Core's ThreadDNSAddressSeed does.
-        (port (network-port (node-network node))))
-    (when book
-      (bt:make-thread
-       (lambda ()
-         (bl.log:trace-thread
-          "dnsseed"                     ; net.cpp:3527
-          (lambda ()
-            (let ((added 0)
-                  ;; Core's `found': every address the seeds RESOLVED to,
-                  ;; whether or not addrman already had it (net.cpp:2312,
-                  ;; incremented at :2378). Under a proxy the seeds are handed
-                  ;; on as hostnames instead of being resolved here, so nothing
-                  ;; is found -- which is what Core's HaveNameProxy branch does
-                  ;; too (net.cpp:2356-2358).
-                  (found 0))
-              (handler-case
-                  (dolist (addr (bl.net:discover-peers))
-                    (multiple-value-bind (net ip-bytes)
-                        (bl.net:parse-network-address addr)
-                      (when net
-                        (incf found)
-                        (unless (bl.net:address-book-lookup
-                                 book ip-bytes port net)
-                          (when (bl.net:address-book-add
-                                 book
-                                 (bl.net:make-peer-address
-                                  :net net :ip ip-bytes :port port :services 0
-                                  :last-seen (bl.ser:get-unix-time)))
-                            (incf added))))))
-                (error (e)
-                  (log-warn "DNS seeding failed: ~A" e)))
-              ;; Core's closing line of ThreadDNSAddressSeed (net.cpp:2389),
-              ;; written whatever the seeds answered -- a seed that cannot be
-              ;; reached still leaves the count behind, which is the only
-              ;; record that seeding ran at all. feature_config_args.py:305
-              ;; waits for it with an unreachable proxy, where it reads 0.
-              (log-info "~D addresses found from DNS seeds" found)
-              (log-info "DNS seeds contributed ~D new address~:P" added)))))
-       :name "bitcoin-dnsseed-thread"))))
+  (when (node-address-book node)
+    (bt:make-thread
+     (lambda ()
+       (bl.log:trace-thread
+        "dnsseed"                       ; net.cpp:3527
+        (lambda ()
+          (handler-case (dns-address-seed node)
+            (error (e) (log-warn "DNS seeding failed: ~A" e))))))
+     :name "bitcoin-dnsseed-thread")))
 
 (defun %record-outbound-result (address-book addr port peer success
                                 &key count-failure)
@@ -576,7 +676,10 @@ Returns the number of peers connected."
                (dial-port (or (cdr candidate) (network-port (node-network node)))))
           (log-debug "Trying to connect to ~A..." addr)
           (handler-case
-              (let ((peer (bl.net:connect-peer addr dial-port)))
+              (let ((peer (progn
+                            (%log-trying-connection node addr dial-port :outbound-full-relay
+                                                    (bl.net:v2-available-p))
+                            (bl.net:connect-peer addr dial-port))))
                 (when peer
                   (setf (bl.net:peer-address peer) addr)
                   (log-info "Connected to ~A" addr)
@@ -1050,7 +1153,9 @@ AddConnection returns once OpenNetworkConnection has made the connection
 framework's own network thread (the one blocked in that RPC call) must answer."
   (when (node-network-active node)
     (handler-case
-        (let ((peer (%dial-outbound-peer node host port count-failure))
+        (let ((peer (%dial-outbound-peer node host port count-failure
+                                         :conn-type conn-type
+                                         :use-v2 (and use-v2 (bl.net:v2-available-p))))
               (kept nil))
           (when peer
             (setf (bl.net:peer-address peer) host
@@ -1096,21 +1201,97 @@ framework's own network thread (the one blocked in that RPC call) must answer."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
+(defconstant +seed-outbound-connection-threshold+ 2
+  "Core SEED_OUTBOUND_CONNECTION_THRESHOLD (net.cpp:69): the full-relay
+outbound connections at which the seed nodes and DNS seeds have done their
+job.")
+
+(defconstant +add-next-seednode-seconds+ 10
+  "Core ADD_NEXT_SEEDNODE (net.cpp:2569): how long ThreadOpenConnections tries
+addrman before handing the next -seednode to the addr-fetch queue.")
+
+(defun full-outbound-count (node)
+  "Core GetFullOutboundConnCount (net.cpp): the outbound full-relay peers
+whose handshake has finished."
+  (count-if (lambda (p)
+              (and (not (bl.net:peer-inbound p))
+                   (eq (bl.net:peer-conn-type p) :outbound-full-relay)
+                   (eq (bl.net:peer-state p) :ready)))
+            (node-peers node)))
+
+;;; Core CConnman::m_addr_fetches (AddAddrFetch / ProcessAddrFetch): the
+;;; destinations to dial once as ADDR_FETCH connections, fed by the -seednode
+;;; timer below and by ThreadDNSAddressSeed, drained one per pass of the
+;;; outbound loop.
+(defvar *addr-fetches* '() "Core m_addr_fetches, oldest first.")
+(defvar *addr-fetches-lock* (bt:make-lock "addr-fetches"))
+
+(defun clear-addr-fetches ()
+  "Empty the addr-fetch queue, at the start of a run."
+  (bt:with-lock-held (*addr-fetches-lock*) (setf *addr-fetches* '())))
+
+(defun add-addr-fetch (destination)
+  "Core AddAddrFetch (net.cpp): queue DESTINATION for one ADDR_FETCH dial."
+  (bt:with-lock-held (*addr-fetches-lock*)
+    (setf *addr-fetches* (append *addr-fetches* (list destination)))))
+
+(defun process-addr-fetch (node)
+  "Core ProcessAddrFetch (net.cpp): dial the oldest queued destination as an
+ADDR_FETCH connection, unless it is already connected. The handshake sends it
+GETADDR and the addr handler disconnects it once it answers."
+  (let ((destination (bt:with-lock-held (*addr-fetches-lock*)
+                       (pop *addr-fetches*))))
+    (when (and destination (node-network-active node))
+      (multiple-value-bind (host port) (parse-node-endpoint node destination)
+        (unless (peer-connected-to-endpoint-p node host port)
+          (establish-outbound-peer node host port :conn-type :addr-fetch))))))
+
+;;; ThreadOpenConnections' -seednode state (net.cpp:2565-2586, :2690-2695):
+;;; the seeds still to hand out, the mockable time the last one was, and the
+;;; flag that hands out the next. :UNARMED until the first pass of a run arms
+;;; it (START-FIXED-SEED-FALLBACK resets it), so an in-image restart inherits
+;;; nothing.
+(defvar *seed-node-queue* :unarmed)
+(defvar *seed-node-timer* 0)
+(defvar *add-seed-addr-fetch* nil)
+
 (defun connect-seed-nodes (node)
-  "Dial each -seednode once as an addr-fetch peer (Core ProcessAddrFetch,
-net.cpp). The handshake already sends GETADDR for any non-block-relay outbound
-peer, so the fetch needs no extra message; the peer disconnects itself from the
-addr handler once it answers.
+  "The -seednode half of Core's ThreadOpenConnections, one pass of its loop.
+With an EMPTY address book the first seed node goes to the addr-fetch queue at
+once (`Empty addrman, adding seednode'); otherwise the node tries its address
+book first, and every +ADD-NEXT-SEEDNODE-SECONDS+ it still has fewer than
++SEED-OUTBOUND-CONNECTION-THRESHOLD+ full-relay outbound peers, the next seed
+node is queued (`Couldn't connect to peers from addrman after 10 seconds').
+Then one queued addr-fetch is dialed (PROCESS-ADDR-FETCH). Seeds are taken
+from the back of the configured list, as SpanPopBack does. Ours dialed every
+-seednode at start-up, whatever the address book held, and p2p_seednode.py
+waits for Core's lines.
 
 Skipped entirely when -connect is in force, which is Core's behaviour by
 construction: ThreadOpenConnections takes the specified-addresses branch (or is
 never started) and never reaches the seed queue."
-  (when (and (node-network-active node) (addrman-outgoing-enabled-p) *seed-nodes*)
-    (dolist (spec *seed-nodes*)
-      (multiple-value-bind (host port) (parse-node-endpoint node spec)
-        (unless (peer-connected-to-endpoint-p node host port)
-          (log-info "Fetching addresses from -seednode ~A" spec)
-          (establish-outbound-peer node host port :conn-type :addr-fetch))))))
+  (when (and (node-network-active node) (addrman-outgoing-enabled-p))
+    (let ((book-size (let ((book (node-address-book node)))
+                       (if book (bl.net:address-book-count book) 0))))
+      (when (eq *seed-node-queue* :unarmed)
+        (setf *seed-node-queue* (reverse *seed-nodes*)
+              *seed-node-timer* (bl.ser:get-unix-time)
+              *add-seed-addr-fetch* (and (zerop book-size) *seed-nodes* t)))
+      (when *add-seed-addr-fetch*
+        (setf *add-seed-addr-fetch* nil)
+        (let ((seed (pop *seed-node-queue*)))
+          (when seed
+            (add-addr-fetch seed)
+            (if (zerop book-size)
+                (log-info "Empty addrman, adding seednode (~A) to addrfetch" seed)
+                (log-info "Couldn't connect to peers from addrman after ~D seconds. Adding seednode (~A) to addrfetch"
+                          +add-next-seednode-seconds+ seed)))))
+      (process-addr-fetch node)
+      (when (and *seed-node-queue*
+                 (< (full-outbound-count node) +seed-outbound-connection-threshold+)
+                 (> (bl.ser:get-unix-time) (+ *seed-node-timer* +add-next-seednode-seconds+)))
+        (setf *seed-node-timer* (bl.ser:get-unix-time)
+              *add-seed-addr-fetch* t)))))
 
 ;;; Core ThreadOpenConnections' fixed-seed fallback (net.cpp:2562-2640). The
 ;;; two specials are that thread's locals `start' and `add_fixed_seeds'; they
@@ -1130,7 +1311,9 @@ outbound-connection loop began; the fixed seeds are added 60 s after it.")
 it: with -connect Core never reaches this part of ThreadOpenConnections (or
 does not start the thread at all for -connect=0, net.cpp:3540)."
   (setf *fixed-seed-clock-start* (bl.ser:get-unix-time)
-        *fixed-seeds-pending* nil)
+        *fixed-seeds-pending* nil
+        *seed-node-queue* :unarmed
+        *add-seed-addr-fetch* nil)
   (when (addrman-outgoing-enabled-p)
     (if *fixed-seeds-enabled*
         (setf *fixed-seeds-pending* t)
@@ -1347,7 +1530,7 @@ COUNT-FAILURE is Core's fCountFailure: a feeler leaves ThreadOpenConnections
 through the same OpenNetworkConnection call as any other automatic dial
 (net.cpp:2891), so it is gated on the same online test and never hard-coded."
   (handler-case
-      (let ((peer (%dial-outbound-peer node host port count-failure)))
+      (let ((peer (%dial-outbound-peer node host port count-failure :conn-type :feeler)))
         (when peer
           (setf (bl.net:peer-address peer) host)
           (cond ((bl.net:perform-handshake peer :conn-type :feeler)
