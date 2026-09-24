@@ -1803,7 +1803,10 @@ Fee rates arrive as BTC/kvB on the command line, as every other Core fee option
 does, and are stored as satoshis."
   (let ((saved (list bl.val:*dust-relay-fee-rate*
                      bl.mp:*incremental-relay-fee-rate*
-                     bl.mp:*bytes-per-sigop*)))
+                     bl.mp:*bytes-per-sigop*
+                     ;; Raised to match the incremental fee when no
+                     ;; -minrelaytxfee is given (mempool_args.cpp:77-81).
+                     bl.mp:*min-relay-fee-rate*)))
     (unwind-protect
          (progn
            (apply-config-globals
@@ -1812,6 +1815,7 @@ does, and are stored as satoshis."
               ("bytespersigop" . "40")))
            (is (= 4000 bl.val:*dust-relay-fee-rate*))
            (is (= 2000 bl.mp:*incremental-relay-fee-rate*))
+           (is (= 2000 bl.mp:*min-relay-fee-rate*))
            (is (= 40 bl.mp:*bytes-per-sigop*))
            ;; And the sigop-adjusted size actually uses the new value, which is
            ;; the point — a knob nothing reads is the failure this repo keeps
@@ -1820,7 +1824,8 @@ does, and are stored as satoshis."
                   (bl.mp:sigop-adjusted-vsize 1 3))))
       (setf bl.val:*dust-relay-fee-rate* (first saved)
             bl.mp:*incremental-relay-fee-rate* (second saved)
-            bl.mp:*bytes-per-sigop* (third saved))))
+            bl.mp:*bytes-per-sigop* (third saved)
+            bl.mp:*min-relay-fee-rate* (fourth saved))))
   ;; Malformed values are refused, not silently ignored.
   (dolist (bad '((("dustrelayfee" . "notanumber"))
                  (("incrementalrelayfee" . "x"))
