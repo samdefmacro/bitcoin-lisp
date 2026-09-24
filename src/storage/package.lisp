@@ -264,6 +264,7 @@ src/storage/.")
    #:coins-view-empty-p
    #:coins-view-db-best-block
    #:coins-view-db-needs-upgrade-p
+   #:coins-view-db-foreign-obfuscation-p
    #:coins-view-cache-load-best-block
    #:coins-view-batch-set-best-block
    #:coins-view-cache-wipe

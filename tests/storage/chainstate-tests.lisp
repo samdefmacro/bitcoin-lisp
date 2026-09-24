@@ -279,6 +279,43 @@ be refused."
         (is-true (bl.store:coins-view-db-needs-upgrade-p view)
                  "a 'c' record is Core's pre-0.15 coins format")))))
 
+(test a-foreign-obfuscation-key-is-refused-after-needsupgrade-has-spoken
+  "Core's CDBWrapper constructor accepts whatever obfuscation key a database
+holds (dbwrapper.cpp:253-261); the refusals come after it, NeedsUpgrade's
+`Unsupported chainstate database format' first (node/chainstate.cpp:103-109).
+A v0.14.3 chainstate carries a key of its own AND the pre-0.15 records, and
+feature_unsupported_utxo_db.py:48 expects Core's sentence for it; ours refused
+the key at open, before that question was asked. So: a database with a
+non-zero key OPENS, NEEDS-UPGRADE-P still answers, FOREIGN-OBFUSCATION-P names
+the key, and the -reindex-chainstate wipe writes the zero key back (Core's
+wiped database gets a fresh key from the constructor that wiped it). The
+control is a database our own writer created: its key is the zero key."
+  (with-temp-directory (dir "bl-foreign-key")
+    (let ((foreign (namestring (merge-pathnames "foreign/" dir)))
+          (ours (namestring (merge-pathnames "ours/" dir)))
+          (key-key (coerce (list* 14 0 (map 'list #'char-code "obfuscate_key"))
+                           '(simple-array (unsigned-byte 8) (*)))))
+      (bl.store:with-leveldb (db foreign)
+        (bl.store:leveldb-put db key-key (coerce '(8 1 2 3 4 5 6 7 8)
+                                                 '(simple-array (unsigned-byte 8) (*))))
+        (let ((legacy (make-array 33 :element-type '(unsigned-byte 8) :initial-element 7)))
+          (setf (aref legacy 0) (char-code #\c))
+          (bl.store:leveldb-put db legacy (make-array 3 :element-type '(unsigned-byte 8)
+                                                        :initial-element 1))))
+      (bl.store:with-coins-view-db (view foreign)
+        (is-true (bl.store:coins-view-db-needs-upgrade-p view)
+                 "the pre-0.15 question is answered although the key is foreign")
+        (is-true (bl.store:coins-view-db-foreign-obfuscation-p view)
+                 "a non-zero key is named as foreign")
+        (bl.store:coins-view-cache-wipe (bl.store:make-coins-view-cache view))
+        (is-false (bl.store:coins-view-db-foreign-obfuscation-p view)
+                  "the wipe writes the zero key back")
+        (is-false (bl.store:coins-view-db-needs-upgrade-p view)
+                  "and the legacy records are gone with it"))
+      (bl.store:with-coins-view-db (view ours)
+        (is-false (bl.store:coins-view-db-foreign-obfuscation-p view)
+                  "control: our own new database holds the zero key")))))
+
 (test a-damaged-coins-database-fails-at-open
   "Core's CDBWrapper constructor reads the obfuscation key right after DB::Open
 (dbwrapper.cpp:253), with checksums verified (:221), and writes one into a new,

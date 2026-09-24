@@ -212,6 +212,16 @@ the std::string it is written as: a CompactSize length of 14, then the bytes.
 It sorts ahead of every coins-DB record, so it is the first key of the
 database.")
 
+(defparameter *zero-obfuscation-key*
+  (make-array 9 :element-type '(unsigned-byte 8)
+                :initial-contents '(8 0 0 0 0 0 0 0 0))
+  "The obfuscation-key record of a database whose values are stored plain: a
+CompactSize 8 and eight zero bytes.")
+
+(defun %obfuscation-key-hex (record)
+  "The key's eight bytes as Core logs them, without the CompactSize prefix."
+  (bl.crypto:bytes-to-hex (subseq record (min 1 (length record)))))
+
 (defun %read-or-write-obfuscation-key (db path)
   "Core's CDBWrapper constructor tail for the coins DB (dbwrapper.cpp:253-261,
 `.obfuscate = true' at validation.cpp:1921): read the obfuscation key, and on a
@@ -230,24 +240,34 @@ value it stores with it; our coin records are our own layout (see the header
 of this file) and are stored as they are, and the zero key is exactly what
 Core uses for a database whose values are not obfuscated (Obfuscation's
 operator bool). A non-zero key -- a database whose values another writer
-obfuscated -- is refused rather than read as if it were plain."
+obfuscated -- is read and logged as Core reads and logs it, NOT refused here:
+Core's constructor accepts any key, and the refusals come after it in
+InitCoinsDB's order -- NeedsUpgrade's `Unsupported chainstate database
+format' first (node/chainstate.cpp:103-109), which a v0.14.3 chainstate
+must be answered with (feature_unsupported_utxo_db.py:48) although it
+carries a key of its own. COINS-VIEW-DB-FOREIGN-OBFUSCATION-P is the
+question start-up asks next."
   (let ((stored (leveldb-get db *obfuscation-key-key* :verify-checksums t)))
-    (cond
-      (stored
-       (unless (and (= (length stored) 9) (= (aref stored 0) 8)
-                    (every #'zerop (subseq stored 1)))
-         (storage-error "~A holds an obfuscation key this node cannot apply"
-                        (namestring path))))
-      ((with-leveldb-iterator (iter db)
-         (leveldb-iter-seek-to-first iter)
-         (not (leveldb-iter-valid-p iter)))
-       (leveldb-put db *obfuscation-key-key*
-                    (make-array 9 :element-type '(unsigned-byte 8)
-                                  :initial-contents '(8 0 0 0 0 0 0 0 0)))
-       (bl.log:log-info "Wrote new obfuscation key for ~A: 0000000000000000"
-                        (string-right-trim "/" (namestring path)))))
-    (bl.log:log-info "Using obfuscation key for ~A: 0000000000000000"
-                     (string-right-trim "/" (namestring path)))))
+    (unless (or stored
+                (with-leveldb-iterator (iter db)
+                  (leveldb-iter-seek-to-first iter)
+                  (leveldb-iter-valid-p iter)))
+      (leveldb-put db *obfuscation-key-key* *zero-obfuscation-key*)
+      (bl.log:log-info "Wrote new obfuscation key for ~A: 0000000000000000"
+                       (string-right-trim "/" (namestring path))))
+    (bl.log:log-info "Using obfuscation key for ~A: ~A"
+                     (string-right-trim "/" (namestring path))
+                     (%obfuscation-key-hex (or stored *zero-obfuscation-key*)))))
+
+(defun coins-view-db-foreign-obfuscation-p (view)
+  "T iff the coins database holds an obfuscation key that is not the zero key:
+a database another writer XORed its values with. Core applies such a key; our
+coin records are stored plain and could not be read through it, so start-up
+refuses the database (after NeedsUpgrade has had Core's say) and names
+-reindex-chainstate, whose wipe writes the zero key back."
+  (declare (type coins-view-db view))
+  (let ((stored (leveldb-get (cvdb-db view) *obfuscation-key-key*)))
+    (and stored (not (equalp stored *zero-obfuscation-key*)))))
 
 (defun close-coins-view-db (view)
   (when (cvdb-db view)
@@ -367,8 +387,9 @@ makes the question moot, which is why the caller skips it under -reindex and
 (defun coins-view-db-erase-all-coins (view)
   "Empty the base LevelDB: delete every coin ('C') entry AND the best-block
 ('B') pointer, in bounded writebatches, keeping only the 'M' migration marker
-and the obfuscation key (Core's wiped database gets a new key from the very
-constructor that wiped it, dbwrapper.cpp:230-259).
+and the obfuscation key, which the final batch resets to the zero key (Core's
+wiped database gets a new key from the very constructor that wiped it,
+dbwrapper.cpp:230-259; a key another writer left is gone with its values).
 Used by chainstate reindex. Returns the count of COINS erased.
 
 The pointer goes with the coins, and that is the whole point rather than a
@@ -418,6 +439,7 @@ first commit onward a partially-wiped database names no block either."
            ;; (coin count a multiple of the chunk size) — so the whole wipe,
            ;; whose earlier chunks were :sync nil in the same WAL, is durable
            ;; before callers persist state that assumes the coins are gone.
+           (leveldb-writebatch-put batch *obfuscation-key-key* *zero-obfuscation-key*)
            (leveldb-write db batch :sync t))
       (leveldb-destroy-writebatch batch))
     erased))
