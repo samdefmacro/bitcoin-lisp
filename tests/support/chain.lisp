@@ -266,9 +266,13 @@ block-store / utxo-set, ready for activate-block. Call inside (with-network (:re
          (ghdr (bl::make-genesis-header :regtest))
          (node (bl:make-node :network :regtest)))
     (clear-undo-cache)
-    (bl.store:add-block-index-entry
-     cs (bl.store:make-block-index-entry
-         :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr))
+    ;; Marked BLOCK_OPT_WITNESS as the node's own genesis is (Core's
+    ;; LoadGenesisBlock runs ReceivedBlockTransactions): regtest has segwit
+    ;; from height 0, and an unmarked genesis is a chain that needs a redownload.
+    (bl.store:note-block-witness-received
+     (bl.store:add-block-index-entry
+      cs (bl.store:make-block-index-entry
+          :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr)))
     (setf (bl:node-chain-state node) cs
           (bl:node-utxo-set node) (bl.store:make-utxo-set)
           (bl:node-block-store node) store
