@@ -12639,7 +12639,12 @@ our -3 type error."
         (is (eq (bl.rpc:json-bool nil) (field collision "success"))))
       (is (equal '(2 1) (counts)) "the colliding address stays in the new table")
       (is (eq t (field (add "2.0.0.0" nil) "success")))
-      (is (equal '(3 1) (counts))))))
+      (is (equal '(3 1) (counts)))
+      ;; Core's LookupHost strips one pair of brackets (netbase.cpp:178-180),
+      ;; which is how p2p_private_broadcast.py:368 writes its IPv6 addresses.
+      (is (eq t (field (add "[20::1]" nil) "success")))
+      (is (equal '(-30 . "Invalid IP address")
+                 (rpc-error-of (lambda () (add "[[20::1]]" nil))))))))
 
 (test getrawaddrman-reports-cores-bucket-positions-and-fields
   "rpc_net.py:470-583: under -test=addrman and -cjdnsreachable, the eight

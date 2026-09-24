@@ -1037,7 +1037,13 @@ collision test), and reporting success for that would misinform the test."
   (unless (typep port '(unsigned-byte 16))
     (error 'rpc-error :code +rpc-misc-error+ :message "JSON integer out of range"))
   (multiple-value-bind (net bytes)
-      (bl.net:parse-network-address address)
+      ;; Core LookupHost strips ONE enclosing pair of brackets first
+      ;; (netbase.cpp:178-180): p2p_private_broadcast.py:368 adds "[20::1]".
+      (bl.net:parse-network-address
+       (let ((n (length address)))
+         (if (and (>= n 2) (char= #\[ (char address 0)) (char= #\] (char address (1- n))))
+             (subseq address 1 (1- n))
+             address)))
     (unless (and net bytes)
       (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
                         :message "Invalid IP address"))
