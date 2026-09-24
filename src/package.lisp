@@ -272,7 +272,6 @@ init.cpp, node/. src/node/.")
    #:*addcon-thread*
    #:start-index-background-sync
    #:start-wallets
-   #:startup-wallet-names
    #:trim-max-connections
    #:oversized-dbcache-warning
    #:warn-about-bad-listen-ports

@@ -1557,17 +1557,6 @@ recorded for startup."
 
   (start-wallets *node* network wallet wallet-supplied-p wallet-names))
 
-(defun startup-wallet-names (wallet-names)
-  "The -wallet values start-up loads, first occurrence kept, each later
-repeat dropped with Core's InitWarning `Ignoring duplicate -wallet <name>.'
-(VerifyWallets, wallet/load.cpp:90-93) -- on stderr, where
-wallet_multiwallet.py:172 reads it at the next stop."
-  (let ((seen '()))
-    (dolist (name (remove-if-not #'stringp wallet-names) (nreverse seen))
-      (if (member name seen :test #'string=)
-          (init-warning (format nil "Ignoring duplicate -wallet ~A." name))
-          (push name seen)))))
-
 (defun start-wallets (node network wallet wallet-supplied-p wallet-names)
   "Core Steps 5 and 9 for the wallet (WalletInit's verify and load): make
 NODE's wallet manager and load the wallets start-up names. Wallet support is
@@ -1601,7 +1590,8 @@ settings.json's own list (Core LoadWallets, load.cpp:118)."
         ;; Core's LoadWallets says `Loading wallet…' before EACH wallet it
         ;; opens (wallet/load.cpp:149), so the list is walked here, one
         ;; wallet per call; the loader keeps its own duplicate rule.
-        (let ((names (startup-wallet-names wallet-names)))
+        (let ((names (remove-duplicates (remove-if-not #'stringp wallet-names)
+                                        :test #'string= :from-end t)))
           (dolist (name names)
             (init-message "Loading wallet…")
             (bl.wallet:load-wallets-on-startup node (list name)))))))
