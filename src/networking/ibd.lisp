@@ -4101,6 +4101,20 @@ very block it is delivering is what p2p_sendheaders.py:567 catches."
        (%clear-peer-headers-sync peer :finalize t)
        0)
 
+      ;; Core's CheckHeadersPoW before any processing (net_processing.cpp:
+      ;; 2983-2991, :2619-2633): a header whose hash misses its own claimed
+      ;; target, or a batch that does not chain, is Misbehaving in Core's
+      ;; words -- p2p_invalid_messages.py:305 and :78 wait for them and for
+      ;; the disconnect. Ours dropped the header in AcceptBlockHeader and
+      ;; kept the peer. Not for a BLOCK message's own header (DIRECT-FETCH
+      ;; NIL), which Core never routes through ProcessHeadersMessage.
+      ((and direct-fetch (not (headers-pow-valid-p headers)))
+       (when peer
+         (record-misbehavior peer (if (every #'bl.val:check-proof-of-work headers)
+                                      "non-continuous headers sequence"
+                                      "header with invalid proof of work")))
+       0)
+
       ;; A low-work presync/redownload is in progress with this peer: drive
       ;; it and request the next batch via the sync's own locator (Core
       ;; IsContinuationOfLowWorkHeadersSync sends the follow-up getheaders

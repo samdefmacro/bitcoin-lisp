@@ -3437,3 +3437,40 @@ as a real node's does before the test's first setmocktime."
                (is (eq :disconnected (bl.net:peer-state peer))
                    "and the silent peer is evicted")))
         (setf (fdefinition 'bl.net:send-message) real)))))
+
+(test headers-that-fail-checkheaderspow-are-misbehaving-in-cores-words
+  "Core runs CheckHeadersPoW before it processes a headers message at all
+(net_processing.cpp:2983-2991): a header that misses its own claimed target
+is Misbehaving `header with invalid proof of work', a batch that does not
+chain is `non-continuous headers sequence' (:2619-2633).
+p2p_invalid_messages.py:305 and :78 wait for those lines and the disconnect;
+ours dropped the header further in and kept the peer."
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-headers-pow/")
+      (let* ((bl:*minimum-chain-work-override* 0)
+             (good (%pow-header genesis-hash))
+             (other (%pow-header genesis-hash :merkle 2))
+             (bad (%pow-header genesis-hash :merkle 3)))
+        ;; Grind BAD's nonce the other way: a hash above the regtest target.
+        (loop for nonce from (1+ (bl.ser:block-header-nonce bad))
+              do (setf (bl.ser:block-header-nonce bad) nonce
+                       (bl.ser:block-header-cached-hash bad) nil)
+              until (not (bl.val:check-proof-of-work bad)))
+        (flet ((ingest (headers)
+                 (let ((p (bl.net:make-peer :conn-type :outbound-full-relay)))
+                   (multiple-value-bind (added text)
+                       (log-text-of "net" (lambda ()
+                                            (bl.net:ingest-headers-from-peer p headers state)))
+                     (values added text)))))
+          (multiple-value-bind (added text) (ingest (list bad))
+            (is (= 0 added))
+            (is-true (search "Misbehaving" text) "~A" text)
+            (is-true (search "header with invalid proof of work" text) "~A" text))
+          (multiple-value-bind (added text) (ingest (list good other))
+            (is (= 0 added))
+            (is-true (search "non-continuous headers sequence" text) "~A" text))
+          ;; Control: the valid header alone is stored, with no such line.
+          (multiple-value-bind (added text) (ingest (list good))
+            (is (= 1 added))
+            (is-false (search "Misbehaving" text) "~A" text)))))))
