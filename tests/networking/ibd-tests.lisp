@@ -133,7 +133,7 @@
                         bl.net:*ibd-context*)))
         (is (= 1 (hash-table-count in-flight)))
         (let ((entry (gethash hash in-flight)))
-          (is (eq mock-peer (car entry))))))))
+          (is (eq mock-peer (car (first entry)))))))))
 
 (test block-received-tracking
   "Test marking blocks as received."
@@ -364,7 +364,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                          (* 2 internal-time-units-per-second))))  ; 2 seconds ago
         (setf (gethash hash (bl.net:ibd-context-in-flight
                              bl.net:*ibd-context*))
-              (cons :peer old-time)))
+              (list (cons :peer old-time))))
 
       ;; Should detect timeout
       (let ((timed-out (bl.net::get-timed-out-requests)))
@@ -381,8 +381,8 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
              bl.net:*ibd-context*) 120)
       (setf (gethash hash (bl.net:ibd-context-in-flight
                            bl.net:*ibd-context*))
-            (cons :peer (- (get-internal-real-time)
-                           (* 40 internal-time-units-per-second))))  ; 40s ago
+            (list (cons :peer (- (get-internal-real-time)
+                                 (* 40 internal-time-units-per-second)))))  ; 40s ago
       ;; Default (full 120s) timeout: not yet timed out.
       (is (null (bl.net::get-timed-out-requests)))
       ;; Near-tip 30s timeout: timed out.
@@ -403,7 +403,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                          (* 2 internal-time-units-per-second))))
         (setf (gethash hash (bl.net:ibd-context-in-flight
                              bl.net:*ibd-context*))
-              (cons :peer old-time)))
+              (list (cons :peer old-time))))
 
       ;; Also add to pending so it can be retried
       (setf (gethash hash (bl.net:ibd-context-pending-blocks
@@ -436,7 +436,7 @@ won't serve would keep IBD's main loop spinning forever."
         (loop repeat (1- bl.net::+max-block-request-timeouts+)
               do (setf (gethash hash (bl.net:ibd-context-in-flight
                                        bl.net:*ibd-context*))
-                       (cons :peer old-time))
+                       (list (cons :peer old-time)))
                  (bl.net::retry-timed-out-requests)))
       ;; After N-1 timeouts, still in pending.
       (is (= 1 (hash-table-count
@@ -447,7 +447,7 @@ won't serve would keep IBD's main loop spinning forever."
                          (* 2 internal-time-units-per-second))))
         (setf (gethash hash (bl.net:ibd-context-in-flight
                              bl.net:*ibd-context*))
-              (cons :peer old-time)))
+              (list (cons :peer old-time))))
       (bl.net::retry-timed-out-requests)
       (is (= 0 (hash-table-count
                 (bl.net:ibd-context-pending-blocks
@@ -499,7 +499,7 @@ and stamp the peer's download clock as MARK-BLOCK-IN-FLIGHT would have."
     (dotimes (i count)
       (setf (gethash (%bd-hash i)
                      (bl.net:ibd-context-in-flight bl.net:*ibd-context*))
-            (cons peer (+ then i)))
+            (list (cons peer (+ then i))))
       (setf (gethash (%bd-hash i)
                      (bl.net:ibd-context-pending-blocks bl.net:*ibd-context*))
             (+ 100 i)))
@@ -1047,15 +1047,15 @@ leaving a live peer's in-flight untouched."
       (setf (gethash live-hash (bl.net:ibd-context-pending-blocks ctx)) 10
             (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx)) 11)
       (setf (gethash live-hash (bl.net:ibd-context-in-flight ctx))
-            (cons live (get-internal-real-time))
+            (list (cons live (get-internal-real-time)))
             (gethash dead-hash (bl.net:ibd-context-in-flight ctx))
-            (cons dead (get-internal-real-time)))
+            (list (cons dead (get-internal-real-time))))
       (is (= 1 (bl.net::release-orphaned-in-flight)))
       ;; Dead peer's block freed from in-flight but kept in pending.
       (is (null (gethash dead-hash (bl.net:ibd-context-in-flight ctx))))
       (is (= 11 (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx))))
       ;; Live peer's in-flight is untouched.
-      (is (eq live (car (gethash live-hash (bl.net:ibd-context-in-flight ctx))))))))
+      (is (eq live (car (first (gethash live-hash (bl.net:ibd-context-in-flight ctx)))))))))
 
 ;;;; Progress Reporting Tests
 

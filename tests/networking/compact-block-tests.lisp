@@ -362,20 +362,35 @@ passes roughly half of all nonces, so a fixed nonce would flake ~50% of runs on
 
 (defun %cbp-handle-cmpctblock (peer payload ctx)
   "Drive the cmpctblock handler as the dispatch table would. The one place
-this file reaches the handler's internal name."
-  (bl.net::handle-cmpctblock peer payload ctx))
+this file reaches the handler's internal name.
+
+The clock is the fixture's, not the wall's: Core's handler ignores a compact
+block nobody has in flight unless our tip is younger than twenty block
+intervals (CanDirectFetch, net_processing.cpp:1347, :4657-4660), and every
+fixture here builds its chain on regtest-era timestamps. Unless the test set a
+mock time of its own, the handler runs an hour after the tip's timestamp."
+  (let* ((state (bl.ctx:node-context-chain-state ctx))
+         (tip-hash (bl.store:best-block-hash state))
+         (tip (and tip-hash (bl.store:get-block-index-entry state tip-hash)))
+         (bl.ser:*mock-time*
+           (or bl.ser:*mock-time*
+               (and tip (bl.store:block-index-entry-header tip)
+                    (+ 3600 (bl.ser:block-header-timestamp
+                             (bl.store:block-index-entry-header tip)))))))
+    (bl.net::handle-cmpctblock peer payload ctx)))
 
 (defun %cbp-state-with-parent (parent-hash parent-timestamp &key (status :valid))
   "A chain-state holding only PARENT-HASH at height 0, with a real header (the
-MTP walk and the difficulty check both dereference it). BEST-BLOCK-HASH stays
-NIL so ACCEPT-DOWNLOADED-BLOCK takes its side-branch path, which is the one
-that consults the parent index entry. STATUS :INVALID makes the parent a block
-we rejected — Core's BLOCK_INVALID_PREV."
+MTP walk and the difficulty check both dereference it), as its tip: Core's
+handler measures `close to the tip' against it (CanDirectFetch,
+net_processing.cpp:4657-4660, and the tip+2 height rule, :4664). STATUS
+:INVALID makes the parent a block we rejected — Core's BLOCK_INVALID_PREV."
   (let ((state (bl.store:make-chain-state)))
     (bl.store:add-block-index-entry
      state (bl.store:make-block-index-entry
             :hash parent-hash :height 0 :chain-work 1 :status status
             :header (%cbp-header (%cbp-hash 0) parent-timestamp)))
+    (bl.store:update-chain-tip state parent-hash 0)
     state))
 
 (defun %cbp-one-tx-compact-block-with-header (header prefilled-index tx)
@@ -1234,6 +1249,16 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
 ;;;; G7-16: promotion is earned by a VALID delivery, on ANY transport
 ;;;; ------------------------------------------------------------
 
+(defun %cbp-clock-after-genesis ()
+  "An hour after the regtest genesis block (nTime 1296688602,
+kernel/chainparams.cpp:634). A test that mines on a fresh regtest node and
+hands the blocks to the cmpctblock handler binds BL.SER:*MOCK-TIME* to this
+first, the way Core's functional tests run under setmocktime: the handler
+ignores a compact block nobody has in flight while our tip is older than
+twenty block intervals (CanDirectFetch, net_processing.cpp:4657-4660), and
+genesis at the wall clock is fifteen years old."
+  (+ 1296688602 3600))
+
 (defun %g716-mine-on (node spk)
   "Assemble + PoW-mine a block on NODE's tip paying the coinbase to SPK,
 without connecting it."
@@ -1315,12 +1340,12 @@ sends exactly that while a getblocktxn to the honest peer is outstanding."
                                               :block-store store :mempool mp)))
            ;; The honest peer is mid-download of this very hash.
            (setf (gethash hash (bl.net:ibd-context-in-flight bl.net:*ibd-context*))
-                 (cons honest (get-internal-real-time)))
+                 (list (cons honest (get-internal-real-time))))
            (deliver-ibd-message attacker "block" (%g716-block-payload mutated) ctx)
            (is (eq :disconnected (bl.net:peer-state attacker))
                "the peer that sent a mutated block is disconnected")
-           (is (eq honest (car (gethash hash (bl.net:ibd-context-in-flight
-                                              bl.net:*ibd-context*))))
+           (is (eq honest (car (first (gethash hash (bl.net:ibd-context-in-flight
+                                                     bl.net:*ibd-context*)))))
                "and the honest peer's download of the same hash is untouched")
            (is (= 0 (bl.store:current-height cs))
                "nothing was connected")))))))
@@ -1451,7 +1476,8 @@ whatever the promotion code did."
 delivered a reconstructible-but-INVALID compact block bought an HB slot — and
 through the cap-of-3 eviction could demote an honest HB peer at will."
   (with-network (:regtest)
-   (let* ((node (regtest-node-fixture "g716-cb"))
+   (let* ((bl.ser:*mock-time* (%cbp-clock-after-genesis))
+          (node (regtest-node-fixture "g716-cb"))
           (cs (bl:node-chain-state node))
           (utxo (bl:node-utxo-set node))
           (store (bl:node-block-store node))
@@ -1787,7 +1813,8 @@ builds, because \"nothing connected\" is ALSO true of the ungated path — the
 replay was already harmless to the chain and expensive to us, which is exactly
 why the hole survived this long."
   (with-network (:regtest)
-   (let* ((node (regtest-node-fixture "cb-replay-cost"))
+   (let* ((bl.ser:*mock-time* (%cbp-clock-after-genesis))
+          (node (regtest-node-fixture "cb-replay-cost"))
           (cs (bl:node-chain-state node))
           (utxo (bl:node-utxo-set node))
           (store (bl:node-block-store node))
@@ -1861,7 +1888,8 @@ property this whole change exists to establish. Each replay below carries its
 own control: the FIRST, genuinely-connecting delivery of the same block on the
 same path must promote."
   (with-network (:regtest)
-   (let* ((node (regtest-node-fixture "g716-replay"))
+   (let* ((bl.ser:*mock-time* (%cbp-clock-after-genesis))
+          (node (regtest-node-fixture "g716-replay"))
           (cs (bl:node-chain-state node))
           (utxo (bl:node-utxo-set node))
           (store (bl:node-block-store node))
@@ -2040,6 +2068,95 @@ block forever that nothing would ask anyone else for."
        (bl.net:clear-pending-compact-block peer)
        (is (null (bl.net:peer-inflight-block-hashes peer))
            "an abandoned reconstruction must not leave the block in flight")))))
+
+(defun %cbp-slot-peer (address &key inbound hb-to)
+  "A compact-block peer for the parallel-slot tests: INBOUND, and HB-TO when
+we picked it as one of our high-bandwidth peers (Core
+m_bip152_highbandwidth_to)."
+  (let ((p (%cbp-peer address)))
+    (setf (bl.net:peer-inbound p) inbound
+          (bl.net:peer-compact-block-high-bandwidth-to p) hb-to)
+    p))
+
+(defmacro %with-cbp-slot-block ((deliver block-hash) &body body)
+  "Run BODY with DELIVER bound to a function of one peer that hands it the same
+announcement -- a compact block one transaction short, on a tip-parent the
+handler counts as close -- and returns what the handler sent that peer, and
+BLOCK-HASH bound to the announced block."
+  (let ((state (gensym "STATE")) (payload (gensym "PAYLOAD"))
+        (utxo (gensym "UTXO")) (mempool (gensym "MEMPOOL")) (hdr (gensym "HDR")))
+    `(with-network (:regtest)
+       (with-ibd-context
+         (let* ((bl.net:*cached-is-ibd* nil)
+                (,state (%cbp-state-with-parent (%cbp-hash #xC1) 1296688600))
+                (,utxo (bl.store:make-utxo-set))
+                (,mempool (bl.mp:make-mempool))
+                (,hdr (%cbp-grind (%cbp-header (%cbp-hash #xC1) 1296688700)))
+                (,payload (%cbp-payload (%cbp-compact-block-missing-one
+                                         ,hdr (make-simple-tx #x5a))))
+                (,block-hash (bl.ser:block-header-hash ,hdr)))
+           (flet ((,deliver (peer)
+                    (%cbp-capture-sends
+                     (lambda ()
+                       (%cbp-deliver peer ,payload ,state ,utxo ,mempool)))))
+             ,@body))))))
+
+(test the-last-parallel-compact-block-slot-is-kept-for-an-outbound-peer
+  "Core's mapBlocksInFlight is a multimap: up to MAX_CMPCTBLOCKS_INFLIGHT_PER_
+BLOCK (3, net_processing.h:48) peers may each run a getblocktxn round trip for
+the same block (net_processing.cpp:4665), and the peer first in line always
+gets one. Any other peer gets one only when we chose it as high-bandwidth AND
+it is outbound, or an outbound peer already holds the block, or this is not the
+last slot (:4707-4716) -- the last is `reserved for first outbound'.
+p2p_compactblocks.py:917-935 announces one block from four peers in turn: a
+low-bandwidth inbound (first in line), a high-bandwidth inbound (slot 2), a
+second high-bandwidth inbound (the last slot: refused) and a high-bandwidth
+outbound (the last slot: granted).
+
+Ours held one peer per block, and every announcing peer overwrote the last: all
+four were sent a getblocktxn, and :929 caught the third."
+  (%with-cbp-slot-block (deliver block-hash)
+    (let ((stalling (%cbp-slot-peer "203.0.113.90" :inbound t))
+          (delivery (%cbp-slot-peer "203.0.113.91" :inbound t :hb-to t))
+          (inbound (%cbp-slot-peer "203.0.113.92" :inbound t :hb-to t))
+          (outbound (%cbp-slot-peer "203.0.113.93" :hb-to t))
+          (fourth (%cbp-slot-peer "203.0.113.94" :hb-to t)))
+      (is (equal '("getblocktxn") (deliver stalling))
+          "the first announcer is first in line and always gets a getblocktxn")
+      (is (equal '("getblocktxn") (deliver delivery))
+          "a high-bandwidth inbound peer takes the second slot")
+      (is (equal '() (deliver inbound))
+          "an inbound peer may not take the last slot while no outbound holds the block")
+      (is (null (bl.net:peer-inflight-block-hashes inbound))
+          "and the slot it was refused is not held against it")
+      (is (equal '("getblocktxn") (deliver outbound))
+          "an outbound high-bandwidth peer takes the last slot")
+      (is (equal '() (deliver fourth))
+          "no fourth peer: three hold the block already")
+      (is (null (bl.net:peer-inflight-block-hashes fourth)))
+      (dolist (holder (list stalling delivery outbound))
+        (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes holder))
+            "each of the three is in flight for the block (getpeerinfo inflight)")))))
+
+(test an-outbound-holder-opens-the-last-compact-block-slot-to-inbound-peers
+  "The other arm of Core's last-slot rule (net_processing.cpp:4711): once an
+OUTBOUND peer is among the block's holders, `we already have an outbound
+attempt in flight (so we'll take what we can get)', and a high-bandwidth
+inbound peer may take the third slot. A low-bandwidth inbound peer that is not
+first in line never may."
+  (%with-cbp-slot-block (deliver block-hash)
+    (let ((first-outbound (%cbp-slot-peer "203.0.113.95"))
+          (low-bandwidth (%cbp-slot-peer "203.0.113.96" :inbound t))
+          (second (%cbp-slot-peer "203.0.113.97" :inbound t :hb-to t))
+          (third (%cbp-slot-peer "203.0.113.98" :inbound t :hb-to t)))
+      (is (equal '("getblocktxn") (deliver first-outbound)))
+      (is (equal '() (deliver low-bandwidth))
+          "not first in line and not high-bandwidth: no round trip")
+      (is (null (bl.net:peer-inflight-block-hashes low-bandwidth)))
+      (is (equal '("getblocktxn") (deliver second)))
+      (is (equal '("getblocktxn") (deliver third))
+          "an outbound peer holds the block, so the last slot is open")
+      (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes third))))))
 
 (test a-peer-that-asked-for-high-bandwidth-gets-new-blocks-as-cmpctblock
   "BIP152 high-bandwidth mode, Core's two sending sites. A peer that sent

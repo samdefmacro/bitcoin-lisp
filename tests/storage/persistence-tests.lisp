@@ -972,9 +972,9 @@ accumulating score); discouragement is NOT a hard ban."
     (let ((old-time (- (get-internal-real-time)
                        (* 120 internal-time-units-per-second))))
       (setf (gethash hash1 (bl.net:ibd-context-in-flight ctx))
-            (cons peer old-time))
+            (list (cons peer old-time)))
       (setf (gethash hash2 (bl.net:ibd-context-in-flight ctx))
-            (cons peer old-time)))
+            (list (cons peer old-time))))
     ;; Verify both are in-flight
     (is (= 2 (hash-table-count (bl.net:ibd-context-in-flight ctx))))
     ;; Retry timed-out requests

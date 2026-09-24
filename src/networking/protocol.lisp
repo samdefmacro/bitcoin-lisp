@@ -547,6 +547,11 @@ only for the notfound size guard: a peer cannot have more than its
 MAX_PEER_TX_ANNOUNCEMENTS plus this many requests outstanding, so a notfound
 that names more items than that is answering nothing we asked for
 (net_processing.cpp:5150-5164).")
+(defconstant +max-cmpctblocks-inflight-per-block+ 3
+  "Core MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK (net_processing.h:48): how many
+peers may hold one block in flight at once, each on its own compact-block
+getblocktxn round trip. The last slot is kept for an outbound peer
+(:4707-4712).")
 
 (defun reset-tx-requests ()
   "Clear all tx-request tracking (called at node start)."
@@ -1582,7 +1587,7 @@ peer's request for the hash is withdrawn."
             (bl:log-cat "validation" "Block mutated: ~A" reason))
           (bl:log-cat "net" "Received mutated block from peer=~D" (peer-id peer))
           (record-misbehavior peer "mutated block")
-          (drop-block-in-flight (bl.ser:block-header-hash header) peer)
+          (remove-block-request (bl.ser:block-header-hash header) peer)
           t)))))
 
 (define-p2p-handler "block" (peer payload ctx)
@@ -5063,12 +5068,8 @@ half) and does the IO (getheaders / getdata / disconnect) outside."
       ;; both cases our mempool is the wrong tool and reconstruction is pure
       ;; cost. Without this gate a peer can replay one cmpctblock forever and
       ;; make us hash the WHOLE MEMPOOL into a shortid map each time.
-      ;;
       ;; Core also re-requests the block by plain getdata here when it had
-      ;; asked THIS peer for it. We do not track that per-peer state, and the
-      ;; block-download timeout is the single mechanism that re-routes a
-      ;; request here (see the notfound removal), so there is
-      ;; nothing to send.
+      ;; asked THIS peer for it; HANDLE-CMPCTBLOCK's :ALREADY-HAVE arm does.
       ((and known
             (let ((tip-hash (bl.store:best-block-hash chain-state)))
               (or (plusp (bl.store:block-index-entry-tx-count known))
@@ -5170,7 +5171,7 @@ a peer may relay a compact block having validated only the header, and
 reconstruction can substitute our own mempool transactions, so a
 consensus-invalid result earns a full-block getdata instead. A structurally
 malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
+  (bl.ctx:with-node-context (chain-state mempool) ctx
   (let* ((compact-block (bl.ser:parse-cmpctblock-payload payload))
          (header (bl.ser:compact-block-header compact-block))
          (block-hash (bl.ser:block-header-hash header))
@@ -5204,6 +5205,11 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
           "net" "cmpctblock ~A from ~A: already known and no better than our tip"
           (bl.crypto:bytes-to-hex block-hash)
           (peer-log-name peer))
+         ;; `We requested this block for some reason, but our mempool will
+         ;; probably be useless so we just grab the block via normal getdata'
+         ;; (net_processing.cpp:4645-4654).
+         (when (block-requested-from-peer-p block-hash peer)
+           (%getdata-witness-block peer block-hash))
          (return-from handle-cmpctblock nil))
         (:low-work
          ;; Core "Ignoring low-work compact block from peer %d" (:4581):
@@ -5229,89 +5235,151 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
                                        "invalid header via cmpctblock")
          (return-from handle-cmpctblock nil))))
 
-    ;; Core "Peer sent us compact block we were already syncing!" (:4670): a
-    ;; second cmpctblock for a reconstruction this peer already has in flight
-    ;; is dropped, because BlockRequested finds the block in flight from it and
-    ;; the queued entry already holds a PartiallyDownloadedBlock. Ours is the
-    ;; per-peer pending reconstruction, and it is the arm that bounds a replay
-    ;; whose header we DID index above but whose body never arrived: that
-    ;; header beats our tip and has no body, so the already-known arms send it
-    ;; back here, and without this it would rebuild the shortid map and re-send
-    ;; the same getblocktxn on every copy. An announcement for a DIFFERENT
-    ;; block still clears the stale pending state, as before.
+    ;; Core's in-flight rules for an announced block we still want
+    ;; (net_processing.cpp:4629-4745). Up to +MAX-CMPCTBLOCKS-INFLIGHT-PER-
+    ;; BLOCK+ peers may each run a getblocktxn round trip for the same block;
+    ;; the first to complete it wins and settles everyone else's request.
+    (let* ((requests (block-in-flight-requests block-hash))
+           (already-in-flight (length requests))
+           ;; `It's either empty or first in line' (:4633-4634).
+           (first-in-flight (or (null requests) (eq (car (first requests)) peer)))
+           (from-this-peer (block-requested-from-peer-p block-hash peer))
+           (height (1+ (bl.store:block-index-entry-height
+                        (bl.store:get-block-index-entry chain-state prev-hash)))))
+      (cond
+        ;; `If we're not close to tip yet, give up and let parallel block
+        ;; fetch work its magic' (:4657-4660).
+        ((and (zerop already-in-flight) (not (%can-direct-fetch-p chain-state)))
+         nil)
+        ;; Far ahead of our tip (:4735-4746): our mempool will be no use. A
+        ;; block we asked this peer for is fetched whole; an announcement is
+        ;; treated as the headers message it amounts to (:4756-4763).
+        ((> height (+ (bl.store:current-height chain-state) 2))
+         (if from-this-peer
+             (%getdata-witness-block peer block-hash)
+             (with-current-node-lock
+               (ingest-headers-from-peer peer (list header) chain-state))))
+        ;; A slot for this peer (:4665-4666): the block is not yet held by
+        ;; three peers and this one is not at its own download cap -- or it
+        ;; is one of the peers already holding it.
+        ((or (and (< already-in-flight +max-cmpctblocks-inflight-per-block+)
+                  (< (count-peer-in-flight peer) +max-blocks-in-transit-per-peer+))
+             from-this-peer)
+         (%compact-block-take-slot peer compact-block block-hash header
+                                   use-wtxid already-in-flight first-in-flight
+                                   ctx))
+        ;; Already in flight from others, or this peer has too many blocks
+        ;; outstanding: `Optimistically try to reconstruct anyway since we
+        ;; might be able to without any round trips' (:4724-4741), and give
+        ;; up quietly otherwise.
+        (t
+         (let ((block (reconstruct-compact-block compact-block mempool use-wtxid)))
+           (when block
+             (%process-compact-block peer block block-hash ctx
+                                     "reconstructed compact block invalid")))))))))
+
+(defun %getdata-witness-block (peer block-hash)
+  "Ask PEER for BLOCK-HASH as a whole witness block."
+  (send-message peer
+                (bl.ser:make-getdata-message
+                 (list (bl.ser:make-inv-vector
+                        :type bl.ser:+inv-type-witness-block+
+                        :hash block-hash)))))
+
+(defun %process-compact-block (peer block block-hash ctx context)
+  "Validate and connect BLOCK, rebuilt from PEER's compact block (from the
+mempool alone, or completed by a blocktxn). Core ProcessBlock with
+force_processing (net_processing.cpp:3427-3441, :3520, :4777-4798): a block
+that is accepted settles EVERY peer's request for it -- RemoveBlockRequest(hash,
+nullopt) -- so the other peers racing to complete the same block are told
+nothing more and their late blocktxn is one we were not expecting. CONTEXT
+names the path in the failure log. Returns T when the block connected."
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
+    (increment-compact-block-success)
+    ;; A rebuilt block is a block delivery from this peer: stamps getpeerinfo
+    ;; "last_block" and resets stall tracking.
+    (record-block-received-from-peer peer)
+    (let ((connected
+            (with-current-node-lock
+              (let ((tip-before (bl.store:best-block-hash chain-state)))
+                (multiple-value-bind (valid error)
+                    (accept-downloaded-block block chain-state utxo-set block-store
+                                             :mempool mempool
+                                             :fee-estimator fee-estimator
+                                             :recent-rejects recent-rejects)
+                  (cond
+                    (valid
+                     (remove-block-request block-hash)
+                     (%block-newly-connected-p chain-state block-hash tip-before))
+                    (t
+                     (handle-compact-block-failure peer block-hash error context)
+                     nil)))))))
+      ;; Earned HB promotion -- only once the block CONNECTED, never on
+      ;; acceptance alone (Core BlockChecked's valid state comes from
+      ;; ConnectTip; an invalid block goes to MaybePunishNodeForBlock, and a
+      ;; block we already have never reaches ConnectTip at all). Outside the
+      ;; node lock: promotion writes sendcmpct to up to two sockets.
+      (when connected
+        (maybe-promote-block-deliverer peer chain-state))
+      connected)))
+
+(defun %compact-block-take-slot (peer compact-block block-hash header use-wtxid
+                                 already-in-flight first-in-flight ctx)
+  "PEER takes an in-flight slot for BLOCK-HASH and we try to complete its
+compact block: Core net_processing.cpp:4667-4722. ALREADY-IN-FLIGHT and
+FIRST-IN-FLIGHT are the block's request count and whether PEER heads its
+request list, both as they stood BEFORE this announcement.
+
+When transactions are missing, the getblocktxn goes to the peer first in
+line; to any other peer only when it is one we chose as high-bandwidth AND
+it is outbound, or an outbound peer already holds the block, or this is not
+the LAST slot -- `which we may reserve for first outbound' (:4707-4716).
+Otherwise the slot is given back at once."
+  (bl.ctx:with-node-context (mempool) ctx
     (let ((pending (peer-pending-compact-block peer)))
       (when pending
-        (cond
-          ((equalp (pending-compact-block-block-hash pending) block-hash)
-           (bl:log-cat
-            "net" "cmpctblock ~A from ~A: already syncing this compact block"
-            (bl.crypto:bytes-to-hex block-hash)
-            (peer-log-name peer))
-           (return-from handle-cmpctblock nil))
-          (t (clear-pending-compact-block peer)))))
-
-    ;; (Core's dedup — `pindex->nChainWork <= tip->nChainWork || pindex->nTx
-    ;; != 0` — now lives in COMPACT-BLOCK-HEADER-VERDICT's :ALREADY-HAVE arm,
-    ;; ahead of the mempool hash it exists to avoid. A guard that used to sit
-    ;; here tested (eq status :connected), which is not in the status enum
-    ;; (storage/chain.lisp:17) and so could never fire; it was deleted rather
-    ;; than left reading as protection that was not there. What the dedup must
-    ;; NOT be relied on for is HB selection — that is gated below on the block
-    ;; actually connecting, not on it being new to us.)
-
-    ;; Attempt reconstruction
+        (when (equalp (pending-compact-block-block-hash pending) block-hash)
+          ;; Core (:4668-4673): BlockRequested finds the block in flight from
+          ;; this peer with a partial block already attached.
+          (bl:log-cat "net" "Peer sent us compact block we were already syncing!")
+          (return-from %compact-block-take-slot nil))
+        ;; One reconstruction per peer: an announcement of a DIFFERENT block
+        ;; replaces the one this peer had pending.
+        (clear-pending-compact-block peer)))
+    ;; Core BlockRequested (:4668), before the message is even decoded.
+    (mark-block-in-flight block-hash peer)
     (multiple-value-bind (block missing-indexes partial-transactions)
         (reconstruct-compact-block compact-block mempool use-wtxid)
-
       (cond
-        ;; Successful reconstruction
-        (block
-         (increment-compact-block-success)
-         ;; A reconstructed compact block is a block delivery from this peer:
-         ;; stamps getpeerinfo "last_block" and resets stall tracking.
-         (record-block-received-from-peer peer)
-         (bl:log-debug "Compact block reconstructed successfully")
-         ;; Process like a normal block (fork-aware: a reconstructed block on a
-         ;; side branch is stored and reorged, not tip-validated).
-         (let ((connected
-                 (with-current-node-lock
-                   (let ((tip-before (bl.store:best-block-hash chain-state)))
-                     (multiple-value-bind (valid error)
-                         (accept-downloaded-block block chain-state utxo-set block-store
-                                                  :mempool mempool
-                                                  :fee-estimator fee-estimator
-                                                  :recent-rejects recent-rejects)
-                       (unless valid
-                         (handle-compact-block-failure peer block-hash error
-                                                       "reconstructed compact block invalid"))
-                       (and valid
-                            (%block-newly-connected-p chain-state block-hash
-                                                      tip-before)))))))
-           ;; Earned HB promotion — only once the block CONNECTED, never on
-           ;; acceptance alone (Core BlockChecked's valid state comes from
-           ;; ConnectTip; an invalid block goes to MaybePunishNodeForBlock, and
-           ;; a block we already have never reaches ConnectTip at all). Outside
-           ;; the node lock: promotion writes sendcmpct to up to two sockets.
-           (when connected
-             (maybe-promote-block-deliverer peer chain-state))))
-
-        ;; Structurally malformed message — Core READ_STATUS_INVALID ->
-        ;; Misbehaving (net_processing.cpp:4679-4683). This is the one
-        ;; compact-block shape an honest peer cannot produce.
+        ;; READ_STATUS_INVALID (:4679-4683): the one compact-block shape an
+        ;; honest peer cannot produce.
         ((eq missing-indexes :malformed)
+         (remove-block-request block-hash peer)
          (increment-compact-block-failure)
          (record-misbehavior peer "invalid compact block"))
-
-        ;; Short-ID collision in OUR mempool — nobody's fault, fall back to the
-        ;; full block (Core READ_STATUS_FAILED, net_processing.cpp:4683-4694).
+        ;; READ_STATUS_FAILED (:4683-4694): a short-ID collision in OUR
+        ;; mempool, nobody's fault. The peer first in line is asked for the
+        ;; whole block and keeps its slot; any other gives its slot back and
+        ;; waits for the first download.
         ((eq missing-indexes :collision)
-         (request-full-block peer block-hash))
-
-        ;; Missing transactions - request them
-        (missing-indexes
+         (if first-in-flight
+             (request-full-block peer block-hash)
+             (remove-block-request block-hash peer)))
+        ;; Nothing missing (:4697-4703, :4748-4752): Core hands it to
+        ;; ProcessCompactBlockTxns, which gives this peer's slot back
+        ;; (:3508) before processing the block.
+        (block
+         (remove-block-request block-hash peer)
+         (%process-compact-block peer block block-hash ctx
+                                 "reconstructed compact block invalid"))
+        ((or first-in-flight
+             (and (peer-compact-block-high-bandwidth-to peer)
+                  (or (not (peer-inbound peer))
+                      (block-requested-from-outbound-p block-hash)
+                      (< already-in-flight
+                         (1- +max-cmpctblocks-inflight-per-block+)))))
          (bl:log-debug "Compact block missing ~D transactions, requesting"
-                                 (length missing-indexes))
-         ;; Store pending state using the partial transactions from reconstruction
+                       (length missing-indexes))
          (setf (peer-pending-compact-block peer)
                (make-pending-compact-block
                 :block-hash block-hash
@@ -5320,22 +5388,12 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
                 :missing-indexes missing-indexes
                 :request-time (get-internal-real-time)
                 :use-wtxid use-wtxid))
-         ;; Core marks the block IN FLIGHT against this peer before it even
-         ;; builds the request (BlockRequested, net_processing.cpp:4668),
-         ;; because the getblocktxn round trip is a block download like any
-         ;; other: it is what stops the scheduler asking a second peer for the
-         ;; same block, and mapBlocksInFlight is where getpeerinfo's
-         ;; `inflight' array comes from (rpc/net.cpp:275-281).
-         ;; p2p_mutated_blocks.py:76-78 reads exactly that, between the
-         ;; getblocktxn and the answer:
-         ;;     assert_equal([101], peer_info_prior_to_attack[0]["inflight"])
-         ;; Ours tracked the reconstruction only in the per-peer pending slot,
-         ;; so the array was empty.
-         (mark-block-in-flight block-hash peer)
-         ;; Send getblocktxn request
          (send-message peer
                        (bl.ser:make-getblocktxn-message
-                        block-hash missing-indexes))))))))
+                        block-hash missing-indexes)))
+        ;; `Give up for this peer and wait for other peer(s)' (:4717-4722).
+        (t
+         (remove-block-request block-hash peer))))))
 
 (define-p2p-handler ("blocktxn" :needs-mempool t) (peer payload ctx)
   "Handle a blocktxn message. Complete pending block reconstruction.
@@ -5348,83 +5406,55 @@ a full-block refetch and no discouragement, while the header-invalid class
 would still punish (it cannot normally arrive here: HANDLE-CMPCTBLOCK gated the
 same header before sending the getblocktxn). A blocktxn that does not answer
 the getblocktxn we sent — Core's READ_STATUS_INVALID from FillBlock — is
-punished outright (:3487-3491)."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
+punished outright (:3487-3491).
+
+Core looks the block up in PEER's in-flight requests (:3451-3469): an answer
+for a block we are not completing with this peer -- none asked, another block,
+or one another peer already delivered, which settled this peer's request with
+it -- is logged and ignored."
   (let ((response (bl.ser:parse-blocktxn-payload payload))
         (pending (peer-pending-compact-block peer)))
-
-    (unless pending
-      (bl:log-debug "Received blocktxn but no pending reconstruction")
+    (unless (and pending
+                 (equalp (bl.ser:block-txn-response-block-hash response)
+                         (pending-compact-block-block-hash pending)))
+      (bl:log-cat "net" "Peer ~D sent us block transactions for block we weren't expecting"
+                  (peer-id peer))
       (return-from handle-blocktxn nil))
 
     (let ((block-hash (bl.ser:block-txn-response-block-hash response))
-          (txs (bl.ser:block-txn-response-transactions response)))
-
-      ;; Verify block hash matches
-      (unless (equalp block-hash (pending-compact-block-block-hash pending))
-        (bl:log-warn "blocktxn hash mismatch")
+          (txs (bl.ser:block-txn-response-transactions response))
+          (transactions (pending-compact-block-transactions pending))
+          (missing-indexes (pending-compact-block-missing-indexes pending)))
+      ;; A blocktxn that does not deliver exactly the transactions we asked
+      ;; for is structurally malformed: Core's FillBlock returns
+      ;; READ_STATUS_INVALID for both too few and too many
+      ;; (blockencodings.cpp:198-217) and the peer is punished
+      ;; (net_processing.cpp:3487-3491).
+      (when (/= (length txs) (length missing-indexes))
+        (bl:log-warn "blocktxn transaction count mismatch")
+        (clear-pending-compact-block peer)
+        (increment-compact-block-failure)
+        (record-misbehavior peer
+                            "invalid compact block/non-matching block transactions")
         (return-from handle-blocktxn nil))
 
-      ;; Insert missing transactions
-      (let ((transactions (pending-compact-block-transactions pending))
-            (missing-indexes (pending-compact-block-missing-indexes pending)))
-        ;; A blocktxn that does not deliver exactly the transactions we asked
-        ;; for is structurally malformed: Core's FillBlock returns
-        ;; READ_STATUS_INVALID for both too few and too many
-        ;; (blockencodings.cpp:198-217) and the peer is punished
-        ;; (net_processing.cpp:3487-3491).
-        (when (/= (length txs) (length missing-indexes))
-          (bl:log-warn "blocktxn transaction count mismatch")
-          (clear-pending-compact-block peer)
-          (increment-compact-block-failure)
-          (record-misbehavior peer
-                              "invalid compact block/non-matching block transactions")
-          (return-from handle-blocktxn nil))
+      (loop for tx in txs
+            for idx in missing-indexes
+            do (setf (aref transactions idx) tx))
 
-        (loop for tx in txs
-              for idx in missing-indexes
-              do (setf (aref transactions idx) tx))
-
-        ;; Build complete block
-        (let ((block (bl.ser:make-bitcoin-block
-                      :header (pending-compact-block-header pending)
-                      :transactions (coerce transactions 'list))))
-          ;; Clear pending state, and with it the in-flight entry the
-          ;; getblocktxn made: the block is here.
-          (clear-pending-compact-block peer)
-
-          ;; Validate and connect
-          (increment-compact-block-success)
-          ;; Block delivery from this peer (getpeerinfo "last_block").
-          (record-block-received-from-peer peer)
-          (let ((connected
-                  (with-current-node-lock
-                    (let ((tip-before (bl.store:best-block-hash chain-state)))
-                      (multiple-value-bind (valid error)
-                          (accept-downloaded-block block chain-state utxo-set block-store
-                                                   :mempool mempool
-                                                   :fee-estimator fee-estimator
-                                                   :recent-rejects recent-rejects)
-                        (unless valid
-                          (handle-compact-block-failure peer block-hash error
-                                                        "completed compact block invalid"))
-                        (and valid
-                             (%block-newly-connected-p chain-state block-hash
-                                                       tip-before)))))))
-            ;; HB promotion only once the completed block CONNECTED (Core
-            ;; BlockChecked's valid state is emitted from ConnectTip), never on
-            ;; delivery or bare acceptance.
-            (when connected
-              (maybe-promote-block-deliverer peer chain-state)))))))))
+      (let ((block (bl.ser:make-bitcoin-block
+                    :header (pending-compact-block-header pending)
+                    :transactions (coerce transactions 'list))))
+        ;; `Block is okay for further processing' (:3506-3508): this peer's
+        ;; request is settled, and processing the block settles the rest.
+        (clear-pending-compact-block peer)
+        (%process-compact-block peer block block-hash ctx
+                                "completed compact block invalid")))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."
   (increment-compact-block-failure)
-  (send-message peer
-                (bl.ser:make-getdata-message
-                 (list (bl.ser:make-inv-vector
-                        :type bl.ser:+inv-type-witness-block+
-                        :hash block-hash)))))
+  (%getdata-witness-block peer block-hash))
 
 ;;; Timeout handling
 
@@ -5455,7 +5485,7 @@ forgets one of those paths leaves a peer permanently holding a block
 nothing will ask anyone else for, so every clear site goes through here."
   (let ((pending (peer-pending-compact-block peer)))
     (when pending
-      (drop-block-in-flight (pending-compact-block-block-hash pending) peer)))
+      (remove-block-request (pending-compact-block-block-hash pending) peer)))
   (setf (peer-pending-compact-block peer) nil))
 
 ;;; Compact block metrics
