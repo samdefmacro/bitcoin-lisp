@@ -4950,9 +4950,9 @@ punishes the sending peer for."
 (defun %refuse-unconnectable-block (block chain-state block-store error now)
   "ACTIVATE-BLOCK's verdict on a block it failed to connect: keep the body
 (%KEEP-BODY-OF-UNCONNECTABLE-BLOCK), then mark the block and its descendants
-invalid (%POISON-FAILED-BLOCK), in Core's order."
+invalid (POISON-FAILED-BLOCK), in Core's order."
   (%keep-body-of-unconnectable-block block chain-state block-store now)
-  (%poison-failed-block chain-state (bl.ser:bitcoin-block-header block) error))
+  (poison-failed-block chain-state (bl.ser:bitcoin-block-header block) error))
 
 (defun %keep-body-of-unconnectable-block (block chain-state block-store now)
   "Keep on disk the body of a block ACTIVATE-BLOCK failed to connect, when
@@ -4969,7 +4969,7 @@ the prune usage counter)."
            block-store (bl.ser:block-header-hash (bl.ser:bitcoin-block-header block)))
     (%store-block-for-later block chain-state block-store now)))
 
-(defun %poison-failed-block (chain-state header error)
+(defun poison-failed-block (chain-state header error)
   "Mark the block HEADER names, and every indexed descendant, :invalid when
 ERROR is a deterministic consensus verdict -- Core's BLOCK_FAILED_VALID plus
 BLOCK_FAILED_CHILD. Core sets them wherever a block is refused: AcceptBlock
@@ -4987,7 +4987,14 @@ The allowlist is *DETERMINISTIC-INVALID-BLOCK-ERRORS*: only a verdict decided
 from txid-committed data and chain structure poisons a block permanently,
 never a corrupt-body or witness-dependent one that a re-download could fix,
 which is also why a mutation-class failure keeps answering itself on every
-resubmission as Core\'s BLOCK_MUTATED carve-out does."
+resubmission as Core\'s BLOCK_MUTATED carve-out does.
+
+Called by ACTIVATE-BLOCK for a block it failed to connect, and by the network
+layer's ACCEPT-DOWNLOADED-BLOCK for a relayed block -- a compact one included --
+that failed its checks: Core's ProcessNewBlock runs the same AcceptBlock and
+ConnectBlock for both, and InvalidBlockFound caches the verdict either way
+(validation.cpp:4382-4386, :1985-1994). That cache is what makes a child of
+the block BLOCK_INVALID_PREV (p2p_compactblocks.py:789-795)."
   (when (%deterministic-consensus-failure-p error)
     (let ((entry (bl.store:get-block-index-entry
                   chain-state (bl.ser:block-header-hash header))))

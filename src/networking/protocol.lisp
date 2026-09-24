@@ -1450,7 +1450,15 @@ never received the branch's blocks."
          (prev-hash (bl.ser:block-header-prev-block header))
          (current-best-hash (bl.store:best-block-hash chain-state))
          (current-time (bl.ser:get-unix-time)))
-    (flet ((%connect ()
+    (flet ((%refuse (error)
+             ;; Core's InvalidBlockFound (validation.cpp:1985-1994), reached
+             ;; from AcceptBlock (:4382-4386) and ConnectBlock alike: a
+             ;; deterministic verdict is cached on the index entry, so the
+             ;; same block is answered `duplicate-invalid' and a child of it
+             ;; `bad-prevblk' (p2p_compactblocks.py:773-795).
+             (bl.val:poison-failed-block chain-state header error)
+             (values nil error))
+           (%connect ()
              (multiple-value-bind (entry reorg-outcome)
                  (bl.val:connect-block
                   block chain-state block-store utxo-set
@@ -1498,7 +1506,7 @@ never received the branch's blocks."
             (multiple-value-bind (valid error)
                 (bl.val:validate-block
                  block chain-state utxo-set new-height current-time)
-              (if valid (progn (%connect) (values t nil)) (values nil error))))
+              (if valid (progn (%connect) (values t nil)) (%refuse error))))
           ;; Side branch — context-free validation at the block's own height;
           ;; CONNECT-BLOCK stores it and reorgs (validating fully) when it wins.
           (let ((prev-entry (bl.store:get-block-index-entry
@@ -1513,7 +1521,7 @@ never received the branch's blocks."
                       (bl.val:validate-block
                        block chain-state utxo-set fork-height current-time
                        :context-free-only t)
-                    (if valid (progn (%connect) (values t nil)) (values nil error))))))))))
+                    (if valid (progn (%connect) (values t nil)) (%refuse error))))))))))
 
 (defun %block-newly-connected-p (chain-state hash tip-before)
   "T when accepting the block HASH actually ADVANCED the active chain onto it.

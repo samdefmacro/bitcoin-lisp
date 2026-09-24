@@ -2158,6 +2158,85 @@ first in line never may."
           "an outbound peer holds the block, so the last slot is open")
       (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes third))))))
 
+(defun %cbp-overpaying-block (block)
+  "BLOCK rebuilt with its coinbase paying one satoshi more than it may, the
+merkle root recommitted and the header mined: a block whose hash commits to a
+consensus-invalid body (Core bad-cb-amount, BLOCK_CONSENSUS)."
+  (let* ((txs (bl.ser:bitcoin-block-transactions block))
+         (coinbase (first txs))
+         (outs (bl.ser:transaction-outputs coinbase))
+         (first-out (aref outs 0))
+         (overpaying
+           (bl.ser:make-transaction
+            :version (bl.ser:transaction-version coinbase)
+            :inputs (bl.ser:transaction-inputs coinbase)
+            :outputs (concatenate 'vector
+                                  (list (bl.ser:make-tx-out
+                                         :value (1+ (bl.ser:tx-out-value first-out))
+                                         :script-pubkey (bl.ser:tx-out-script-pubkey
+                                                         first-out)))
+                                  (subseq outs 1))
+            :lock-time (bl.ser:transaction-lock-time coinbase)
+            :witness (bl.ser:transaction-witness coinbase)))
+         (new-txs (cons overpaying (rest txs)))
+         (header (bl.ser:bitcoin-block-header block))
+         (rebuilt (bl.ser:make-bitcoin-block
+                   :header (bl.ser:make-block-header
+                            :version (bl.ser:block-header-version header)
+                            :prev-block (bl.ser:block-header-prev-block header)
+                            :merkle-root (bl.val:compute-merkle-root
+                                          (mapcar #'bl.ser:transaction-hash new-txs))
+                            :timestamp (bl.ser:block-header-timestamp header)
+                            :bits (bl.ser:block-header-bits header)
+                            :nonce 0)
+                   :transactions new-txs)))
+    (bl.mining:mine-block rebuilt)
+    rebuilt))
+
+(test a-consensus-invalid-compact-block-is-cached-and-its-child-punished
+  "Core's ProcessNewBlock caches a consensus verdict on the block index for a
+compact block exactly as for any other (InvalidBlockFound, validation.cpp:
+1985-1994, reached from AcceptBlock :4382-4386 and from ConnectBlock), so the
+same announcement is then refused before any work and a block building on it
+is BLOCK_INVALID_PREV, which punishes its sender through the compact path too.
+p2p_compactblocks.py:773-795 sends a block with an invalid transaction, sends
+it again, and expects the child's sender to be disconnected.
+
+Ours validated a tip-extending block and returned the verdict without writing
+it anywhere: the child's header met a parent in good standing and was fetched
+as a fork, so nobody was punished."
+  (with-network (:regtest)
+   (let* ((bl.ser:*mock-time* (%cbp-clock-after-genesis))
+          (node (regtest-node-fixture "cb-invalid-cached"))
+          (cs (bl:node-chain-state node))
+          (ctx (bl.ctx:make-node-context
+                :chain-state cs :utxo-set (bl:node-utxo-set node)
+                :block-store (bl:node-block-store node)
+                :mempool (bl:node-mempool node)))
+          (bad (%cbp-overpaying-block
+                (%g716-mine-on node (p2sh-optrue-script-pubkey))))
+          (bad-hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header bad)))
+          (child-header (%cbp-grind
+                         (%cbp-header bad-hash (+ 60 (bl.ser:block-header-timestamp
+                                                      (bl.ser:bitcoin-block-header bad))))))
+          (sender (%g716-delivering-peer "198.51.100.40"))
+          (child-sender (%g716-delivering-peer "198.51.100.41")))
+     (%g716-quiet
+       (%g716-with-fresh-hb
+         (%cbp-handle-cmpctblock sender (%g716-cmpctblock-payload bad) ctx)
+         (is (= 0 (bl.store:current-height cs)) "the invalid block did not connect")
+         (is (eq :ready (bl.net:peer-state sender))
+             "a consensus-invalid compact block does not cost its relayer the connection")
+         (%cbp-handle-cmpctblock child-sender
+                                 (%cbp-payload (%cbp-one-tx-compact-block-with-header
+                                                child-header 0 (make-simple-tx #x47)))
+                                 ctx)
+         (is (eq :disconnected (bl.net:peer-state child-sender))
+             "a compact block building on the cached-invalid block costs its sender the connection")
+         (is (eq :invalid (bl.store:block-index-entry-status
+                           (bl.store:get-block-index-entry cs bad-hash)))
+             "the verdict is cached on the block's index entry"))))))
+
 (test a-peer-that-asked-for-high-bandwidth-gets-new-blocks-as-cmpctblock
   "BIP152 high-bandwidth mode, Core's two sending sites. A peer that sent
 sendcmpct(1, 2) (m_requested_hb_cmpctblocks, net_processing.cpp:3918) is
