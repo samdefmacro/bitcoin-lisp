@@ -1586,14 +1586,14 @@ peer's request for the hash is withdrawn."
           t)))))
 
 (define-p2p-handler "block" (peer payload ctx)
-  "Handle a block message. When CTX carries peers and the block becomes the new
-active tip, announce it onward (BIP 130 headers / inv), so the node propagates
-blocks instead of being a sink. A peer that delivers a block that CONNECTS
-earns consideration for high-bandwidth compact-block announcements — Core
+  "Handle a block message. Announcing a new tip onward is the :updated-block-tip
+hook's job (announce-block-tip), not this handler's. A peer that delivers a
+block that CONNECTS earns consideration for high-bandwidth compact-block
+announcements — Core
 drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
 filled for plain block messages exactly as it is for reconstructed compact
 ones, so promotion must not be a compact-block-only privilege."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects peers) ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
   (let ((block (bl.ser:parse-block-payload payload)))
     (when (and block (%refuse-mutated-block peer block chain-state))
       (return-from handle-block nil))

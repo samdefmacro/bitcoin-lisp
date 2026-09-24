@@ -3455,6 +3455,7 @@ perform-reorg's success phase, so there is nothing to undo here."
   ;;    the reorg failed on a LATER one.
   (dolist (item connected)
     (destructuring-bind (entry block height spent-utxos) item
+      (declare (ignore entry))
       ;; HEIGHT enables Core's per-output height comparison in the disconnect
       ;; (validation.cpp:2213-2219); it used to be discarded here.
       (bl.store:disconnect-block-from-utxo-set utxo-set block spent-utxos

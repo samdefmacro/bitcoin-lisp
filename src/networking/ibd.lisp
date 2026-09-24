@@ -5493,7 +5493,6 @@ the tip is ready to connect."
   (unless *ibd-context*
     (return-from drain-block-queue 0))
   (let ((drained 0)
-        (skip-height (script-skip-height chain-state))
         (mempool (ibd-context-mempool *ibd-context*)))
     (loop
       ;; A full cascade can connect the whole queued window (~170 blocks
