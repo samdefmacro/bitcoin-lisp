@@ -69,7 +69,6 @@
     "bitcoin-lisp.mempool:mempool-entry-fee-rate"
     "bitcoin-lisp.mempool:mempool-get-transactions"
     "bitcoin-lisp.mempool:orphan-announcements-from-peer"
-    "bitcoin-lisp.mempool:orphan-announcers"
     "bitcoin-lisp.mempool:orphan-usage-by-peer"
     "bitcoin-lisp.mempool:topological-subset-p"
     "bitcoin-lisp.mempool:txgraph-get-ancestors-union"
