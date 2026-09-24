@@ -424,8 +424,10 @@ number of orphans erased."
       (let ((entry (gethash wtxid (orphan-pool-by-wtxid pool))))
         (when entry (%orphan-erase-entry pool entry))))
     (when to-erase
-      (bl:log-cat "mempool"
-                            "Erased ~D orphan transaction~:P included or conflicted by block"
-                            (length to-erase))
+      ;; Core's line, category and all (txorphanage.cpp:636-638);
+      ;; p2p_invalid_tx.py:180 waits for it.
+      (bl:log-cat "txpackages"
+                  "Erased ~D orphan transaction(s) included or conflicted by block"
+                  (length to-erase))
       (%limit-orphans pool))
     (length to-erase)))
