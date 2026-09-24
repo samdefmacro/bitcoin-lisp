@@ -327,7 +327,10 @@
 ;; -i2psam: the I2P SAM proxy. Read by APPLY-PROXY-OPTIONS (node/args.lisp),
 ;; which runs after -dns has been applied, so Lookup(-i2psam, 7656,
 ;; fNameLookup) honours -dns=0 as Core's does (init.cpp:1695, :2232-2238).
-(define-option "i2psam" :kind :core-only :repeatable t)
+(define-option "i2psam" :repeatable t)
+;; -i2pacceptincoming: decided in APPLY-PARAMETER-INTERACTIONS, since an
+;; effective -listen=0 soft-sets it off (init.cpp:810-812).
+(define-option "i2pacceptincoming")
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")
 ;; -discover: its soft-sets read -proxy, -listen and -externalip, so it is
@@ -609,7 +612,7 @@
   "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
-  "help" "i2pacceptincoming"
+  "help"
   "ipcbind" "limitancestorsize"
   "limitdescendantsize"
   "loglevelalways" "logsourcelocations"

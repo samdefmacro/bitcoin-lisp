@@ -432,6 +432,15 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
                    (defer-log :info "parameter interaction: -externalip set -> setting -discover=0")
                    nil)
                   (t t))))
+    ;; -i2pacceptincoming (DEFAULT_I2P_ACCEPT_INCOMING true), soft-set off by
+    ;; an effective -listen=0 (init.cpp:810-812, :2248).
+    (setf *i2p-accept-incoming*
+          (let ((v (lk "i2pacceptincoming")))
+            (cond (v (conf-parse-bool v))
+                  ((not (conf-effective-listen-flags merged))
+                   (defer-log :info "parameter interaction: -listen=0 -> setting -i2pacceptincoming=0")
+                   nil)
+                  (t t))))
     (setf *bind-on-any* (not (or (lk "bind") (lk "whitebind")))
           *listen-port-from-binds* (listen-port-from-binds merged))
     ;; Network reachability. -onlynet (repeatable) replaces the reachable set
@@ -490,13 +499,12 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
                 ((not listenonion-p)
                  (config-error "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is not provided: none of -proxy, -onion or -listenonion is given"))))
         (setf nets (remove :torv3 nets)))
-      (when (member :i2p onlynets)
-        ;; Core's sentence when -i2psam is absent (init.cpp:2239-2243); with
-        ;; it, ours still refuses, since no SAM session is ported.
-        (if bl.net:*i2p-sam-proxy*
-            (config-error "-onlynet=i2p given but I2P (SAM) is not supported")
-            (config-error "Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided")))
-      (setf nets (remove :i2p nets))
+      ;; I2P is reachable through the SAM bridge -i2psam names, and only then
+      ;; (init.cpp:2232-2245).
+      (unless bl.net:*i2p-sam-proxy*
+        (when (member :i2p onlynets)
+          (config-error "Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided"))
+        (setf nets (remove :i2p nets)))
       (setf bl.net:*reachable-networks* nets)
       (setf *private-broadcast*
             (let ((v (lk "privatebroadcast"))) (and v (conf-parse-bool v))))

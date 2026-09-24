@@ -737,10 +737,18 @@ this way); \"add\" entries keep dialing with the node's own setting."
     (when (and use-v2 (not (bl.net:v2-available-p)))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Error: v2transport requested but not enabled (see -v2transport)"))
+  ;; onetry: Core opens the connection on the RPC thread before it returns
+  ;; (rpc/net.cpp:356-361, OpenNetworkConnection), so the dial's own log
+  ;; lines -- p2p_i2p_sessions.py:26 reads `Creating persistent I2P SAM
+  ;; session' the moment the call returns -- are written by then. Wait,
+  ;; bounded and OUTSIDE the node lock the dial needs, for the sync thread.
+  (when (equal command "onetry")
+    (let ((done (bl:queue-onetry-dial node spec use-v2))
+          (sync (bl:node-sync-thread node)))
+      (when (and sync (bt:thread-alive-p sync))
+        (loop repeat 200 until (car done) do (sleep 0.05)))))
   (bt:with-recursive-lock-held ((bl:node-lock node))
     (cond
-      ((equal command "onetry")
-       (push (cons spec use-v2) (bl:node-pending-onetry node)))
       ((equal command "add")
        (when (%added-node-duplicate-p node spec)
          (error 'rpc-error :code +rpc-client-node-already-added+

@@ -710,6 +710,14 @@
   -- usocket's getaddrinfo refuses `::1` where the loopback is the only IPv6
   address, so a dial to an IPv6 proxy never left the machine.
 
+  I2P goes through a SAM 3.1 bridge (`src/networking/i2p.lisp`, Core
+  `i2p.cpp`): -i2psam names it and makes i2p reachable; with
+  -i2pacceptincoming (default on, soft-off under -listen=0) a PERSISTENT
+  session keyed by `<datadir>/i2p_private_key` serves every dial and the
+  `i2paccept` thread (src/node/listen.lisp); without it each dial makes a
+  TRANSIENT session the connection owns. An I2P address is always port 0:
+  a dial to any other port is refused before the bridge is touched.
+
   Our own addresses are Core's mapLocalHost (`ADD-LOCAL`,
   `LOCAL-ADDRESSES`, read by getnetworkinfo's localaddresses). Writers:
   -externalip (LOCAL_MANUAL, at its own port or GetListenPort), the Tor
@@ -745,6 +753,8 @@
   (bitcoin-lisp.networking:network-proxy function)
   (bitcoin-lisp.networking:unix-socket-path-p function)
   (bitcoin-lisp.networking:lookup-service function)
+  (bitcoin-lisp.networking:i2p-session-connect function)
+  (bitcoin-lisp.networking:i2p-dial function)
   (bitcoin-lisp.networking:*onion-proxy* variable)
   (bitcoin-lisp.networking:*name-lookup* variable)
   (bitcoin-lisp.networking:socks5-connect function)

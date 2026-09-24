@@ -155,6 +155,7 @@ system, in this same package, because it drives validation and the mempool."
                              (:file "netaddress") ; BIP155 codecs/reachability; before addrman (netgroups)
                              (:file "addrman")
                              (:file "addrdb")     ; peers.dat in Core's format (addrdb.cpp)
+                             (:file "i2p")        ; the I2P SAM 3.1 client (i2p.cpp)
                              (:file "torcontrol")))))
 
 (defsystem "bitcoin-lisp/rpc-server"
@@ -558,6 +559,7 @@ bitcoin-cli (node-main)."
                              (:file "networking/socks5-tests")
                              (:file "networking/bloom-vectors")
                              (:file "networking/bloom-tests")
+                             (:file "networking/i2p-tests")
                              ;; Tor control client + onion service + self-advertisement
                              (:file "networking/torcontrol-tests")
                              ;; TxOutCompression + hash_serialized_3

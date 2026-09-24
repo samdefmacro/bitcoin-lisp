@@ -183,3 +183,25 @@ Kept free of node state so it is directly unit-testable."
                       most-positive-fixnum))
          (synced (not bl.net:*cached-is-ibd*)))
     (values (health-ok-p alive seconds) seconds synced)))
+
+;;; addnode onetry waiters: the RPC waits for the dial DIAL-QUEUED-NODES makes.
+
+(defvar *onetry-waiters* (make-hash-table :test 'eq :synchronized t)
+  "Queued `addnode onetry' entries (the conses in NODE-PENDING-ONETRY) whose
+RPC call is waiting for the dial, each mapped to its (done) cell.")
+
+(defun onetry-waiter (entry)
+  "The done cell an addnode RPC is waiting on for ENTRY, removed; or NIL."
+  (let ((done (gethash entry *onetry-waiters*)))
+    (when done (remhash entry *onetry-waiters*))
+    done))
+
+(defun queue-onetry-dial (node spec use-v2)
+  "Queue a one-shot manual dial of SPEC and return the (done) cell that turns
+true once the sync thread has made it."
+  (let ((entry (cons spec use-v2))
+        (done (list nil)))
+    (setf (gethash entry *onetry-waiters*) done)
+    (bt:with-recursive-lock-held ((node-lock node))
+      (push entry (node-pending-onetry node)))
+    done))

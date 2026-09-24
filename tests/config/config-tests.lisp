@@ -3666,12 +3666,12 @@ having no effect."
     (is (null (bl.cfg:supplied-core-only-options merged)))
     (is (equal "1" (cfg "allowignoredconf" merged)))))
 
-(test i2psam-is-recorded-for-reporting-and-still-core-only
-  "-i2psam names the I2P SAM proxy Core reports as the i2p network's proxy
-(init.cpp:2232-2238 SetProxy(NET_I2P, ...), default port 7656; rpc/net.cpp:626),
-so its value is kept -- but this node does not speak I2P, and the option stays
-one startup names as accepted-and-unimplemented. A start without it clears
-what an earlier start in the same image left."
+(test i2psam-names-the-sam-bridge-and-makes-i2p-reachable
+  "-i2psam names the I2P SAM bridge (init.cpp:2232-2238 SetProxy(NET_I2P),
+default port 7656; rpc/net.cpp:626): the I2P dials and the persistent session
+use it, and it makes the i2p network reachable, which feature_proxy.py:302
+reads back from getnetworkinfo. A start without it clears what an earlier
+start in the same image left."
   (let ((bl.net:*i2p-sam-proxy* :unset))
     (apply-config-globals '(("i2psam" . "127.0.0.1")))
     (is (equal "127.0.0.1:7656" bl.net:*i2p-sam-proxy*))
@@ -3687,4 +3687,12 @@ what an earlier start in the same image left."
                                                                ("dns" . "0")))
                                        "")
                     (error (e) (princ-to-string e)))))))
-  (is (equal '("i2psam") (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1"))))))
+  (let ((bl.net:*reachable-networks* bl.net:*reachable-networks*)
+        (bl.net:*i2p-sam-proxy* bl.net:*i2p-sam-proxy*))
+    (apply-config-globals '(("i2psam" . "127.0.0.1")))
+    (is-true (bl.net:reachable-network-p :i2p) "-i2psam makes i2p reachable")
+    (apply-config-globals '())
+    (is-false (bl.net:reachable-network-p :i2p) "and nothing else does"))
+  (is (null (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1")
+                                                  ("i2pacceptincoming" . "0"))))
+      "neither option is accepted-and-unimplemented any more"))

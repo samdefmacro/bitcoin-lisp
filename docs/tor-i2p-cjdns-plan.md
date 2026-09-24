@@ -4,6 +4,17 @@ Date: 2026-07-10. Status: **P0 DONE (PR 248, SOCKS5 outbound); P1 DONE
 (tor-address-layer branch: BIP155 address layer, onion/i2p codecs, addrman
 netgroups, peers.dat v4 + anchors v2 migrate-on-load, -onlynet/-cjdnsreachable,
 dialable-network-p filter). P2+ not started — nothing dials non-IP nets yet.**
+
+Status update 2026-09-24: P2 and P3 have long since shipped (onion dialing
+through the per-network proxy table, CJDNS, the torcontrol onion service);
+**P4 DONE** (fix/netops): `src/networking/i2p.lisp` ports Core's i2p.cpp SAM
+3.1 client — persistent session keyed by `<datadir>/i2p_private_key` and
+transient sessions, HELLO / SESSION CREATE / DEST GENERATE / NAMING LOOKUP /
+STREAM CONNECT / STREAM ACCEPT, the port-0 rule, Core's log lines and errors —
+wired into the dial path (MAKE-TCP-CONNECTION's I2P branch, the unused
+transient-session pool) and an `i2paccept` thread that admits inbound I2P
+peers and advertises our .b32.i2p address. `-i2psam` makes i2p reachable;
+`-i2pacceptincoming` is soft-off under `-listen=0`.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core SOCKS5/torcontrol/SAM/CJDNS at byte level; our networking layer).
 
@@ -103,7 +114,7 @@ to, tagged don't-advertise.
 | **P1** | **Address layer generalization**: network-typed address record (net-id + var-len bytes) replacing the hard 16-byte IP; addrv2 decode/encode for TORV3/I2P/CJDNS (codec sizes already tabled, messages.lisp:652-661); onion-v3 + b32.i2p codecs (SHA3 checksum); addrman keying/net-groups/peers.dat v4; anchors.dat format (+port); `-onlynet` reachability. Prereq: live-loop addr wiring fix (erlay-plan P0) | M-L |
 | **P2** | **Outbound onion dialing** (P0+P1): dial `<56char>.onion:8333` via SOCKS5 DOMAINNAME; outbound-selection awareness of networks (per-network proxy pick; skip unreachable nets); **CJDNS** (fc00::/8 retag + `-cjdnsreachable`) — requires finishing IPv6 second-class fixes (`string-to-ip-bytes`, `ip-netgroup`) | S-M |
 | **P3** | **Tor control / inbound onion**: torcontrol client thread (line protocol, SAFECOOKIE HMAC, ADD_ONION, key persistence, backoff); local onion listener on port+1; advertise the onion address (needs minimal self-advertisement — currently we advertise nothing: dummy addr_from, messages.lisp:254-255; ties into the deferred self-advertisement item) | M |
-| **P4** | **I2P SAM**: session manager (persistent + transient), STREAM CONNECT/ACCEPT, key persistence, `-i2psam`/`-i2pacceptincoming`, careful line reader | M-L |
+| **P4** (DONE 2026-09-24) | **I2P SAM**: session manager (persistent + transient), STREAM CONNECT/ACCEPT, key persistence, `-i2psam`/`-i2pacceptincoming`, careful line reader | M-L |
 
 Each phase independently shippable; P0 alone is the classic "run your node over Tor" feature.
 Suggested order: P0 → P1 → P2 → P3, P4 optional/last (I2P peers are scarce; value is niche).

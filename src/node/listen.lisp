@@ -215,3 +215,72 @@ where a failed onion bind and the control thread are independent."
           (log-info "Bound to ~A:~D" bind port)
           (log-info "Listening for inbound onion peers on ~A:~D" bind port))
         (log-warn "Onion inbound listening disabled: could not bind ~A:~D" bind port))))
+
+;;; --- I2P inbound (Core CConnman::ThreadI2PAcceptIncoming, net.cpp:3163-3204) ---
+
+(defvar *i2p-accept-thread* nil "The running `i2paccept' thread, or NIL.")
+
+(defun %i2p-local (session)
+  "SESSION's own address as (VALUES network bytes), or NIL before it exists."
+  (let ((addr (bl.net:i2p-session-my-addr session)))
+    (when addr
+      (bl.net:parse-network-address (subseq addr 0 (position #\: addr))))))
+
+(defun run-i2p-accept-loop (node session)
+  "Listen through the persistent SESSION and hand every accepted I2P peer to
+the ordinary inbound pipeline (ADMIT-INBOUND-CONNECTION). Our own .b32.i2p
+address is advertised (AddLocal LOCAL_MANUAL) while the session listens and
+withdrawn when it cannot; a failure waits 1 s more each time, up to 5 min,
+as Core's err_wait does."
+  (let ((err-wait 1) (advertising nil))
+    (flet ((sleep-on-failure ()
+             (loop repeat (* 10 err-wait)
+                   while (node-running node) do (sleep 0.1))
+             (when (< err-wait 300) (incf err-wait))))
+      (loop while (node-running node)
+            do (let ((sock (bl.net:i2p-session-listen session)))
+                 (cond
+                   ((null sock)
+                    (when advertising
+                      (multiple-value-bind (net bytes) (%i2p-local session)
+                        (when net (bl.net:remove-local net bytes)))
+                      (setf advertising nil))
+                    (sleep-on-failure))
+                   (t
+                    (unless advertising
+                      (multiple-value-bind (net bytes) (%i2p-local session)
+                        (when net (bl.net:add-local net bytes 0 bl.net:+local-manual+)))
+                      (setf advertising t))
+                    (let ((peer (bl.net:i2p-session-accept
+                                 session sock (lambda () (not (node-running node))))))
+                      (cond (peer
+                             (admit-inbound-connection
+                              node (bl.net:i2p-accepted-connection sock peer) nil)
+                             (setf err-wait 1))
+                            (t (ignore-errors (usocket:socket-close sock))
+                               (sleep-on-failure)))))))))))
+
+(defun start-i2p-sessions (node)
+  "Core's CConnman::Start I2P half (net.cpp:3473-3477, :3549-3552): with
+-i2psam and -i2pacceptincoming, the PERSISTENT session keyed by
+<datadir>/i2p_private_key and the `i2paccept' thread listening through it.
+Without -i2pacceptincoming no session is made here: each dial makes its own
+transient one."
+  (bl.net:i2p-reset-sessions)
+  (when (and bl.net:*i2p-sam-proxy* *i2p-accept-incoming*)
+    (let ((session (bl.net:make-i2p-session
+                    bl.net:*i2p-sam-proxy*
+                    (merge-pathnames "i2p_private_key" (node-data-directory node)))))
+      (setf bl.net:*i2p-sam-session* session
+            *i2p-accept-thread*
+            (bt:make-thread
+             (lambda ()
+               (bl.log:trace-thread "i2paccept" (lambda () (run-i2p-accept-loop node session))))
+             :name "bitcoin-i2p-accept")))))
+
+(defun stop-i2p-sessions ()
+  "Join the accept thread and destroy every session (net.cpp:3618-3619, :569)."
+  (when *i2p-accept-thread*
+    (bl.net:join-thread-or-destroy (shiftf *i2p-accept-thread* nil) :timeout 5))
+  (bl.net:i2p-reset-sessions))
+

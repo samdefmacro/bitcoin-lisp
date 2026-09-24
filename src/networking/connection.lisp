@@ -66,6 +66,9 @@ peer from two directions.")
 (defstruct connection
   "A TCP connection to a Bitcoin peer."
   (socket nil)
+  ;; The TRANSIENT I2P SAM session this connection was dialed through, which
+  ;; lives exactly as long as it (Core CNode::m_i2p_sam_session, net.h), or NIL.
+  (i2p-session nil)
   (host "" :type string)
   (port 0 :type (unsigned-byte 16))
   (connected nil :type boolean)
@@ -456,6 +459,19 @@ or refusing socket file is USOCKET:CONNECTION-REFUSED-ERROR."
       (unless done
         (ignore-errors (sb-bsd-sockets:socket-close sock))))))
 
+(defun %make-i2p-connection (host port)
+  "A connection to the I2P peer HOST:PORT through the SAM bridge (I2P-DIAL).
+Returns (VALUES connection proxy-connection-failed-p) as MAKE-TCP-CONNECTION."
+  (multiple-value-bind (sock proxy-error session) (i2p-dial host port)
+    (if sock
+        (progn
+          (set-socket-non-blocking sock)
+          (values (make-connection :socket sock :host host :port port :connected t
+                                   :i2p-session session
+                                   :last-activity (bl.ser:get-node-time))
+                  nil))
+        (values nil proxy-error))))
+
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
 Returns (VALUES CONNECTION PROXY-CONNECTION-FAILED-P): the connection, or NIL
@@ -485,6 +501,10 @@ including a CONNECT reply of \"host unreachable\" or \"connection refused\",
 leaves it false, because the proxy did answer and the verdict is about the
 TARGET. %RECORD-DIAL-ATTEMPT's caller reads it: a dial that never left the
 local machine must not be charged to the address (net.cpp:494-497)."
+  ;; An .b32.i2p target goes through the SAM bridge (Core ConnectNode's I2P
+  ;; branch, net.cpp:453-484), never a SOCKS5 proxy.
+  (when (and *i2p-sam-proxy* (parse-i2p-address host))
+    (return-from make-tcp-connection (%make-i2p-connection host port)))
   (multiple-value-bind (proxy refusal) (proxy-for-target host)
     (when refusal
       (bl.log:log-debug "Not dialing ~A:~D: ~A" host port refusal)
@@ -577,11 +597,13 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
     (error () nil)))
 
 (defun close-connection (conn)
-  "Close a connection."
+  "Close a connection, and the transient I2P session it owns."
   (when (connection-socket conn)
     (handler-case
         (usocket:socket-close (connection-socket conn))
       (error () nil)))
+  (when (connection-i2p-session conn)
+    (i2p-session-disconnect (shiftf (connection-i2p-session conn) nil)))
   (setf (connection-connected conn) nil)
   (setf (connection-socket conn) nil)
   ;; Free any buffered unsent bytes, and the partially-received message — the

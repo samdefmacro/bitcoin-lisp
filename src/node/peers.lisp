@@ -1042,7 +1042,13 @@ Returns the number of new peers connected."
 \"host:port\", and \"[ipv6]:port\"; bare or bracketless addresses default to the
 network's P2P port. A trailing :port is only honored when it is all digits, so a
 bare IPv6 address (which contains colons) is treated as host-only."
-  (let ((default-port (network-port (node-network node))))
+  (let ((default-port (if (bl.net:parse-i2p-address
+                            (string-trim "[]" (subseq spec 0 (or (position #\: spec :from-end t)
+                                                                 (length spec)))))
+                           ;; Core GetDefaultPort: I2P_SAM31_PORT for an I2P
+                           ;; name (net.cpp:3395-3398).
+                           0
+                           (network-port (node-network node)))))
     (cond
       ;; [ipv6]:port  or  [ipv6]
       ((and (plusp (length spec)) (char= (char spec 0) #\[))
@@ -1383,11 +1389,18 @@ sat on getpeerinfo for most of that cycle, once per connection."
     (let ((onetry (bt:with-recursive-lock-held ((node-lock node))
                     (prog1 (node-pending-onetry node)
                       (setf (node-pending-onetry node) nil)))))
-      (loop for (spec . use-v2) in onetry
-            do (multiple-value-bind (host port) (parse-node-endpoint node spec)
-                 (unless (peer-connected-to-endpoint-p node host port)
-                   (establish-outbound-peer node host port :conn-type :manual
-                                                           :use-v2 use-v2)))))
+      (loop for entry in onetry
+            for (spec . use-v2) = entry
+            for done = (onetry-waiter entry)
+            do (unwind-protect
+                    (multiple-value-bind (host port) (parse-node-endpoint node spec)
+                      (unless (peer-connected-to-endpoint-p node host port)
+                        (establish-outbound-peer
+                         node host port :conn-type :manual :use-v2 use-v2
+                         :on-dialed (and done (lambda () (setf (car done) t))))))
+                 ;; The addnode RPC waits on this: Core dials a onetry on
+                 ;; the RPC thread itself (rpc/net.cpp:356-361).
+                 (when done (setf (car done) t)))))
     ;; addconnection (regtest testing RPC): one dial per request, of the
     ;; connection TYPE the caller named — which is the whole point of the RPC,
     ;; since a test cannot otherwise ask for a block-relay or feeler slot.

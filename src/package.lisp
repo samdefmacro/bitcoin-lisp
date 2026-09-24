@@ -58,6 +58,7 @@ init.cpp, node/. src/node/.")
    #:*permit-bare-multisig*
    #:*peer-block-filters*
    #:*peer-bloom-filters*
+   #:*i2p-accept-incoming*
    #:*tx-reconciliation*
    #:pruning-enabled-p
    #:automatic-pruning-p
@@ -263,6 +264,7 @@ init.cpp, node/. src/node/.")
    #:node-peers
    #:node-pending-inbound-peers
    #:node-pending-onetry
+   #:queue-onetry-dial
    #:save-anchors
    #:load-anchors
    #:dial-anchors
