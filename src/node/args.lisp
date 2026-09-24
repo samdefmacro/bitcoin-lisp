@@ -340,7 +340,16 @@ start in the same image inherits nothing."
           (loop for (network proxy) on (list :ipv4 ipv4 :ipv6 ipv6 :cjdns cjdns) by #'cddr
                 when proxy nconc (list network proxy))
           bl.net:*proxy* name
-          bl.net:*onion-proxy* onion)))
+          bl.net:*onion-proxy* onion)
+    ;; -i2psam: Lookup(value, 7656, fNameLookup) (init.cpp:2232-2238), here
+    ;; rather than in the option's own row so -dns is already in force.
+    (setf bl.net:*i2p-sam-proxy*
+          (let ((v (cdr (find "i2psam" merged :key #'car :test #'string= :from-end t))))
+            (when (and v (plusp (length v)))
+              (multiple-value-bind (host port) (bl.net:lookup-service v 7656)
+                (unless host
+                  (config-error "Invalid -i2psam address or hostname: '~A'" v))
+                (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)))))))
 
 (defun apply-parameter-interactions (merged)
   "The options whose value depends on ANOTHER option (Core init.cpp Step 2

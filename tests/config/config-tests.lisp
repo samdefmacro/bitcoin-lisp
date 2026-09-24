@@ -3672,5 +3672,13 @@ what an earlier start in the same image left."
     (apply-config-globals '(("i2psam" . "127.0.0.1:7000")))
     (is (equal "127.0.0.1:7000" bl.net:*i2p-sam-proxy*))
     (apply-config-globals '())
-    (is (null bl.net:*i2p-sam-proxy*)))
+    (is (null bl.net:*i2p-sam-proxy*))
+    ;; -dns=0 forbids resolving a NAME, whichever order the options came in:
+    ;; Core reads fNameLookup before any address option (init.cpp:1695).
+    (let ((bl.net:*name-lookup* t))
+      (is (search "Invalid -i2psam address or hostname: 'localhost'"
+                  (handler-case (progn (apply-config-globals '(("i2psam" . "localhost")
+                                                               ("dns" . "0")))
+                                       "")
+                    (error (e) (princ-to-string e)))))))
   (is (equal '("i2psam") (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1"))))))

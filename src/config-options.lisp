@@ -317,24 +317,10 @@
 (define-option "proxy" :repeatable t)
 (define-option "onion")
 (define-option "proxyrandomize")
-;; -i2psam is accepted and NOT implemented -- a core-only row, so startup still
-;; names it -- but Core reports the address it names as the i2p proxy
-;; (init.cpp:2232-2238, rpc/net.cpp:626), so the value is recorded. Repeatable
-;; only so its function runs on every start, clearing a value an earlier start
-;; in the same image left; the LAST occurrence wins, as GetArg's does.
-(define-option "i2psam" :kind :core-only :repeatable t
-  :apply (lambda (values)
-           (setf bl.net:*i2p-sam-proxy*
-                 (let ((v (car (last values))))
-                   (when (and v (plusp (length v)))
-                     ;; CheckHostPortOptions first (init.cpp:1228-1257), then
-                     ;; Lookup(-i2psam, 7656, fNameLookup), :2233-2236.
-                     (unless (nth-value 2 (bl.cfg:conf-split-host-port v))
-                       (config-error "Invalid port specified in -i2psam: '~A'" v))
-                     (multiple-value-bind (host port) (bl.net:lookup-service v 7656)
-                       (unless host
-                         (config-error "Invalid -i2psam address or hostname: '~A'" v))
-                       (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)))))))
+;; -i2psam: the I2P SAM proxy. Read by APPLY-PROXY-OPTIONS (node/args.lisp),
+;; which runs after -dns has been applied, so Lookup(-i2psam, 7656,
+;; fNameLookup) honours -dns=0 as Core's does (init.cpp:1695, :2232-2238).
+(define-option "i2psam" :kind :core-only :repeatable t)
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")
 ;; -discover: its soft-sets read -proxy, -listen and -externalip, so it is
