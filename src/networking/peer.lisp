@@ -1995,9 +1995,10 @@ mockable microseconds (BL.SER:GET-TIME-MICROS)."
        (cond
          ((and (> age (* +ping-timeout-seconds+ 1000000))
                (should-run-inactivity-checks-p peer))
-          (bl:log-cat "net" "ping timeout: ~,1Fs, disconnecting peer=~A"
-                      (/ (float age) 1000000.0)
-                      (peer-id peer))
+          ;; Core's %f: six decimals (net_processing.cpp:5495).
+          (bl:log-cat "net" "ping timeout: ~,6Fs, ~A"
+                      (/ age 1000000d0)
+                      (disconnect-msg peer))
           :disconnect)
          (t :ok)))
       ;; Never pinged: due NOW, as Core's is.

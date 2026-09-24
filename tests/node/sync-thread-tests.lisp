@@ -695,4 +695,12 @@ clock and reported milliseconds."
         "the ping is stamped with the mock time, in microseconds")
     (setf bl.ser:*mock-time* (+ t0 121))
     (is (eq :ok (bl.net:check-peer-health peer))
-        "an outstanding ping is not replaced")))
+        "an outstanding ping is not replaced")
+    ;; TIMEOUT_INTERVAL later, on the same clock, with Core's %f line
+    ;; (net_processing.cpp:5495) that p2p_ping.py:112 reads.
+    (setf (bl.net:peer-connected-at peer) (- t0 3600)
+          bl.ser:*mock-time* (+ t0 1201))
+    (multiple-value-bind (verdict text)
+        (log-text-of "net" (lambda () (bl.net:check-peer-health peer)))
+      (is (eq :disconnect verdict))
+      (is (search "ping timeout: 1201.000000s" text)))))
