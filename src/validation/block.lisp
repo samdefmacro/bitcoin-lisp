@@ -2063,13 +2063,17 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
     (values t nil)))
 
 (defun %contextual-check-block (block chain-state utxo-set current-height
-                               &key skip-scripts)
+                               &key skip-scripts accepted)
   "The UTXO-dependent half of ConnectBlock -- BIP30, per-input validation and
 fee accumulation, sequence locks, scripts and the coinbase value cap -- around
 %CONTEXTUAL-CHECK-BLOCK-NO-UTXO, which contributes Core's ContextualCheckBlock.
 Every check added here reads the ACTIVE UTXO set or the chain height, so it is
 only correct for a block that extends the tip -- a fork block gets these from
 PERFORM-REORG instead, fork-to-tip against the rewound set.
+
+ACCEPTED says BLOCK is a stored body that already passed the accept gate
+(ACCEPT-BLOCK-BODY); ContextualCheckBlock is then not run again, as Core's
+ConnectBlock never runs it (validation.cpp:2324-2338 runs CheckBlock only).
 
 Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
   (let* ((header (bl.ser:bitcoin-block-header block))
@@ -2083,10 +2087,11 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
     ;; (marked invalid for good) for a body whose witness a peer had mangled.
     ;; Shared verbatim with ACCEPT-BLOCK-BODY, the pre-write gate, so the two
     ;; can never drift.
-    (multiple-value-bind (valid error)
-        (%contextual-check-block-no-utxo block chain-state current-height)
-      (unless valid
-        (return-from %contextual-check-block (values nil error nil))))
+    (unless accepted
+      (multiple-value-bind (valid error)
+          (%contextual-check-block-no-utxo block chain-state current-height)
+        (unless valid
+          (return-from %contextual-check-block (values nil error nil)))))
     ;; BIP 30: reject a block that re-creates a still-unspent txid.
     ;; Per-output point lookups, exactly Core's HaveCoin loop
     ;; (validation.cpp:2444): a duplicate txid implies an identical tx
@@ -2251,7 +2256,8 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
 
 
 (defun validate-block (block chain-state utxo-set current-height current-time
-                        &key skip-scripts skip-header skip-pow context-free-only)
+                        &key skip-scripts skip-header skip-pow context-free-only
+                             accepted)
   "Fully validate a block including all transactions.
 When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
 the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
@@ -2276,6 +2282,9 @@ When SKIP-POW is true, only the PoW hash<=target check (and, on signet, the
 block-solution check — Core gates both on fCheckPOW) is skipped, while every
 contextual header check still runs: the TEST-BLOCK-VALIDITY dry-run of an
 unmined template (Core TestBlockValidity's check_pow=false).
+ACCEPTED: BLOCK is a stored body that passed the accept gate when it was
+written, so ContextualCheckBlock is not judged again (see
+%CONTEXTUAL-CHECK-BLOCK).
 Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
   (multiple-value-bind (ok error)
       (%check-block block chain-state current-height current-time
@@ -2292,7 +2301,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
   (multiple-value-bind (ok error fees)
       (%contextual-check-block block chain-state utxo-set current-height
-                               :skip-scripts skip-scripts)
+                               :skip-scripts skip-scripts :accepted accepted)
     (unless ok
       ;; Core's one line for a block that failed ConnectBlock:
       ;; `Block validation error: <state.ToString()>' (validation.cpp:2619).
@@ -4091,7 +4100,17 @@ when it was rolled back."
                               ;; Header (PoW/difficulty/MTP/timewarp) was
                               ;; validated at index admission — Core's
                               ;; ConnectBlock doesn't re-check it.
-                              :skip-header t))
+                              :skip-header t
+                              ;; And the body passed ContextualCheckBlock when
+                              ;; it was accepted, under the rules of that
+                              ;; moment; ConnectTip does not judge it again
+                              ;; (validation.cpp:3014-3046). Re-judged, Core
+                              ;; v0.14.3's regtest block 1 -- a commitment and
+                              ;; no coinbase witness, accepted before segwit --
+                              ;; could never reconnect after
+                              ;; -reindex-chainstate
+                              ;; (feature_unsupported_utxo_db.py:56).
+                              :accepted t))
         (unless valid
           (bl:log-error
            "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
@@ -4393,22 +4412,18 @@ comment above."
              (bl.store:block-index-entry-height failed))
             (return-from perform-reorg (values nil :invalid-branch))))
 
-        (dolist (entry (reorg-to-connect r))
-          (let* ((block-hash (bl.store:block-index-entry-hash entry))
-                 (block (bl.store:get-block block-store block-hash)))
-            (when (and block (block-witness-stripped-p
-                              block (bl.store:block-index-entry-height entry)))
-              (bl:log-warn
-               "REORG: stored block at height ~D is witness-stripped; pruning for witness-complete re-download"
-               (bl.store:block-index-entry-height entry))
-              ;; FORGET, not prune: a flat record cannot be deleted on its
-              ;; own, and PRUNE-BLOCK refuses for one — which would leave
-              ;; GET-BLOCK serving the same witness-stripped body to every
-              ;; later retry of this reorg.
-              (bl.store:forget-block-body block-store block-hash)
-              ;; Header stays in the index; mark it needing a body so the normal
-              ;; download path re-fetches it.
-              (setf (bl.store:block-index-entry-status entry) :header-valid))))
+        ;; No witness re-check of the stored bodies here. Core judges a body's
+        ;; witness once, when it is accepted (AcceptBlock -> ContextualCheckBlock,
+        ;; validation.cpp:4021-4049 and :4330-4405), and ConnectTip reads the
+        ;; stored body back without judging it again (validation.cpp:3014-3046
+        ;; over ConnectBlock, which runs CheckBlock, not ContextualCheckBlock).
+        ;; Our receive paths hold the same gate: a witness-stripped copy never
+        ;; reaches disk (BLOCK-WITNESS-STRIPPED-P in ibd.lisp and
+        ;; %STORE-BLOCK-FOR-LATER). This pass re-judged ALREADY-ACCEPTED bodies
+        ;; and deleted the ones it disliked, so a block an earlier node accepted
+        ;; under the rules of its time -- Core v0.14.3's regtest block 1, a
+        ;; commitment and no coinbase witness -- could never be reconnected after
+        ;; -reindex-chainstate (feature_unsupported_utxo_db.py:56).
 
         ;; Precondition: every block on BOTH sides must be in the
         ;; block-store. If anything is missing (including a stripped block just
@@ -4962,7 +4977,13 @@ AcceptBlock writes a block with at least the tip's work once its checks pass,
 whether or not ActivateBestChain can connect it yet (validation.cpp:
 4330-4405). The second is new: ours returned :reorg-refused without storing,
 and rpc_blockchain.py:766 read `Block not available (not fully downloaded)'
-for a block submitted on top of a header-only parent."
+for a block submitted on top of a header-only parent.
+
+A winning block is stored BEFORE the reorg toward it, too: a crash part way
+through that reorg -- a flush it triggers -- then restarts with this block on
+disk and in the index, and the start-up activation finishes the switch. Stored
+only after the reorg, it was lost with the crash, and feature_dbcrash.py:87
+waited for a block the node no longer knew."
   (if (block-witness-stripped-p block)
       (values t nil)
       (%store-accepted-block-body block chain-state block-store :current-time now)))
@@ -5080,6 +5101,10 @@ can neither wedge on an equal-work sibling nor advance past the base."
            ((and new-chain-work
                  current-best-work
                  (> new-chain-work current-best-work))
+            ;; Stored FIRST (AcceptBlock, then ActivateBestChain): %STORE-BLOCK-FOR-LATER.
+            (multiple-value-bind (stored error)
+                (%store-block-for-later block chain-state block-store now)
+              (unless stored (return-from activate-block (values nil error))))
             (multiple-value-bind (reorg-ok detail)
                 (perform-reorg chain-state block-store utxo-set
                                current-best-entry prev-entry
@@ -5102,11 +5127,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 ;; The block is still STORED, as AcceptBlock stores it
                 ;; (validation.cpp:4330-4405, rpc_blockchain.py:759-766).
                 ((and (null reorg-ok) detail)
-                 ;; Stored first (AcceptBlock), then the best COMPLETE chain is
-                 ;; activated (ProcessNewBlock's closing ActivateBestChain).
-                 (multiple-value-bind (stored error)
-                     (%store-block-for-later block chain-state block-store now)
-                   (unless stored (return-from activate-block (values nil error))))
+                 ;; Stored above; ProcessNewBlock's closing ActivateBestChain.
                  (%activate-best-after-refused-reorg
                   chain-state block-store utxo-set fee-estimator recent-rejects mempool)
                  (values nil :reorg-refused detail))
