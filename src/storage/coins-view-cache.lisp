@@ -356,49 +356,79 @@ reindex wipe kept the pointer can be empty and still name a block."
                 never (ce-entry ce))
           (not (coins-view-db-any-coin-p (cvc-base view)))))))
 
-(defvar *persist-block-index-hook* nil
-  "Thunk that durably writes the block index, installed by the node; NIL for a
-test fixture or an offline tool that has no index to write.
+;; *PERSIST-BLOCK-INDEX-HOOK* is defined in blocks.lisp: the prune path
+;; there calls it too, before it unlinks a pruned file.
 
-Core's FlushStateToDisk writes the block files and then the block-index
-database BEFORE CoinsTip().Sync()/Flush() (validation.cpp:2780-2812), so the
-coins database can never name a block the block index does not hold. Our
-periodic flush has that order in %FLUSH-CHAINSTATE's Phase 1, but the coins
-pointer is also written from paths that never reach it: every RPC that walks
-the UTXO set syncs the cache first (gettxoutsetinfo, dumptxoutset,
-scantxoutset, the assumeutxo hash check), and loadtxoutset stamps the snapshot
-base and flushes. Hooking the ONE place the pointer is staged, rather than
-those call sites, is what keeps the two from drifting apart again.
 
-What it costs when the pointer outruns the index: the coins DB names a block
-the header index cannot place, RECONCILE-COINS-DB-BEST-BLOCK returns
-:unresolvable, and start-up refuses to run until the node is reindexed — so a
-read-only RPC plus an ordinary unclean shutdown becomes a mandatory reindex.")
+(defun %write-dirty-coins (cache best-block sync)
+  "Write every dirty entry of CACHE to its base LevelDB -- a put for a coin, an
+erase for a spent tombstone -- plus BEST-BLOCK when the caller has one. Returns
+the number of entries written. Core CCoinsViewDB::BatchWrite
+(txdb.cpp:100-164), which Sync and Flush share (coins.cpp:208); the two differ
+only in what they then do with the entries.
 
-(defun %stage-dirty-coins (cache batch best-block)
-  "Stage every dirty entry of CACHE into BATCH — a put for a coin, an erase for
-a spent tombstone — plus BEST-BLOCK when the caller has one. Returns the number
-of entries staged.
-
-Core writes both Sync and Flush through the one CCoinsViewCache::BatchWrite
-(coins.cpp:208); the two differ only in what they then do with the entries, so
-this half is shared here as well and cannot drift between them."
+The write is split into batches of *COINS-DB-BATCH-BYTES*. With a BEST-BLOCK,
+the FIRST batch erases the best-block pointer and records DB_HEAD_BLOCKS
+(BEST-BLOCK, the old pointer), and the LAST erases that record and writes the
+new pointer, so a crash in between leaves a database that says which transition
+it was part way through, and start-up replays it (REPLAY-COINS-DB-BLOCKS in the
+node). A flush that fits one batch writes both in the same one: exactly the
+single atomic commit it always was. Without a BEST-BLOCK -- a cache that has
+seen no block-level change -- there is no transition to record. After each
+partial batch, -dbcrashratio may end the process (txdb.cpp:150-157)."
   (declare (type coins-view-cache cache))
-  (let ((count 0))
-    (maphash (lambda (key ce)
-               (when (ce-dirty ce)
-                 (if (ce-entry ce)
-                     (coins-view-batch-put batch key (ce-entry ce))
-                     (coins-view-batch-erase batch key))
-                 (incf count)))
-             (cvc-entries cache))
-    (when best-block
-      ;; The block index reaches disk BEFORE the pointer that names one of its
-      ;; entries — Core's WriteBlockIndexDB / CoinsTip().Sync() order. Inside
-      ;; the periodic flush this is a second look at an index Phase 1 has just
-      ;; written, which finds nothing changed and writes nothing.
-      (when *persist-block-index-hook* (funcall *persist-block-index-hook*))
-      (coins-view-batch-set-best-block batch best-block))
+  (let* ((base (cvc-base cache))
+         (db (cvdb-db base))
+         (count 0)
+         (bytes 0)
+         (batch (leveldb-make-writebatch)))
+    (unwind-protect
+         (progn
+           (when best-block
+             ;; The block index reaches disk BEFORE the pointer that names one
+             ;; of its entries -- Core's WriteBlockIndexDB / CoinsTip().Sync()
+             ;; order. Inside the periodic flush this is a second look at an
+             ;; index Phase 1 has just written, which finds nothing to write.
+             (when *persist-block-index-hook* (funcall *persist-block-index-hook*))
+             (let ((old (or (coins-view-db-best-block base)
+                            ;; Part way through a replay: the transition in
+                            ;; progress is still from the recorded old tip.
+                            (second (coins-view-db-head-blocks base)))))
+               (leveldb-writebatch-delete batch (encode-best-block-key))
+               (leveldb-writebatch-put batch (encode-head-blocks-key)
+                                       (%head-blocks-value best-block old))))
+           (maphash (lambda (key ce)
+                      (when (ce-dirty ce)
+                        (if (ce-entry ce)
+                            (coins-view-batch-put batch key (ce-entry ce))
+                            (coins-view-batch-erase batch key))
+                        (incf count)
+                        ;; LevelDB's record: a tag, two length prefixes, the
+                        ;; key and the value -- what WriteBatch::ApproximateSize
+                        ;; grows by.
+                        (incf bytes (+ 3 +coin-key-bytes+
+                                       (if (ce-entry ce)
+                                           (+ +coin-value-fixed-bytes+
+                                              (length (utxo-entry-script-pubkey
+                                                       (ce-entry ce))))
+                                           0)))
+                        (when (> bytes *coins-db-batch-bytes*)
+                          (bl.log:log-cat "coindb" "Writing partial batch of ~,2F MiB"
+                                          (/ bytes 1048576.0))
+                          (leveldb-write db batch :sync nil)
+                          (leveldb-writebatch-clear batch)
+                          (setf bytes 0)
+                          (when (and (plusp *coins-db-crash-ratio*)
+                                     (zerop (random *coins-db-crash-ratio*)))
+                            (bl.log:log-error "Simulating a crash. Goodbye.")
+                            (funcall *coins-db-simulated-crash*)))))
+                    (cvc-entries cache))
+           (when best-block
+             (leveldb-writebatch-delete batch (encode-head-blocks-key))
+             (coins-view-batch-set-best-block batch best-block))
+           (bl.log:log-cat "coindb" "Writing final batch of ~,2F MiB" (/ bytes 1048576.0))
+           (leveldb-write db batch :sync sync))
+      (leveldb-destroy-writebatch batch))
     count))
 
 (defun coins-view-cache-sync (cache &key sync (best-block (cvc-best-block cache)))
@@ -426,8 +456,7 @@ iterator that follows it. Core takes cs_main across exactly that pair
 otherwise be in neither the snapshot nor the write."
   (declare (type coins-view-cache cache))
   (let ((count 0))
-    (with-coins-view-batch (batch (cvc-base cache) :sync sync)
-      (setf count (%stage-dirty-coins cache batch best-block)))
+    (setf count (%write-dirty-coins cache best-block sync))
     ;; The entries stay, but nothing about them may still say `unwritten'.
     ;; Core's CoinsViewCacheCursor::NextAndMaybeErase with will_erase = false
     ;; (coins.h:279-295) drops a SPENT entry from the map and calls SetClean()
@@ -488,8 +517,7 @@ cache that has seen no block-level mutation has NIL and the stored pointer is
 left untouched rather than invented."
   (declare (type coins-view-cache cache))
   (let ((count 0))
-    (with-coins-view-batch (batch (cvc-base cache) :sync sync)
-      (setf count (%stage-dirty-coins cache batch best-block)))
+    (setf count (%write-dirty-coins cache best-block sync))
     ;; Core's cursor with will_erase = true leaves the entries alone precisely
     ;; because the caller wipes the whole map next (coins.h:260-268), so no
     ;; per-entry flag needs clearing here: nothing survives to carry one.
@@ -667,6 +695,32 @@ undo list — (txid index entry) for every spent UTXO, in apply order."
                                        ;; passing the right flag via this path.
                                        :allow-overwrite is-coinbase))))
     (nreverse spent)))
+
+(defun coin-view-rollforward-block (cache block height)
+  "Core Chainstate::RollforwardBlock (validation.cpp:4785-4806): apply BLOCK to
+CACHE where some of its effects may already be there -- each non-coinbase input
+is spent if present, and every output added as a possible overwrite. What
+REPLAY-COINS-DB-BLOCKS rolls forward with after a flush interrupted between
+partial batches; both halves are idempotent, so a block half applied comes out
+applied. Provably unspendable outputs are skipped, as AddCoins skips them."
+  (declare (type coins-view-cache cache))
+  (loop for tx in (bl.ser:bitcoin-block-transactions block)
+        for is-coinbase = t then nil
+        do (let ((txid (bl.ser:transaction-hash tx)))
+             (unless is-coinbase
+               (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+                 (let ((prevout (bl.ser:tx-in-previous-output input)))
+                   (coin-view-spend cache (bl.ser:outpoint-hash prevout)
+                                    (bl.ser:outpoint-index prevout)))))
+             (loop for output across (bl.ser:transaction-outputs tx)
+                   for out-idx from 0
+                   for spk = (bl.ser:tx-out-script-pubkey output)
+                   unless (script-unspendable-p spk)
+                     do (coin-view-add cache txid out-idx (bl.ser:tx-out-value output)
+                                       spk height :coinbase is-coinbase
+                                       :allow-overwrite t))))
+  (setf (cvc-best-block cache) (bl.ser:block-header-hash (bl.ser:bitcoin-block-header block)))
+  t)
 
 (defun coin-view-disconnect-block (cache block previous-utxos &key height)
   "Reverse coin-view-apply-block for reorg.

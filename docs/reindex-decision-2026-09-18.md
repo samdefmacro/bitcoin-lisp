@@ -29,6 +29,23 @@ measured, and the node that would pay is the unpruned testnet4 node with three i
 additive rebuild therefore remains the stated divergence for the unpruned case; measure a
 from-disk connect rate first, then revisit.
 
+**Re-checked 2026-09-24 (batch blockindex, coordinator decision): two more of Core's reindex
+OUTCOMES reached without the wipe.** The block index now lives in Core's `blocks/index`
+(`docs/block-file-format-plan.md`), and two things Core's wipe produces are reproduced for the
+records concerned only:
+- *Blocks accepted without segwit enforcement.* Under `-reindex`, every active-chain entry at a
+  segwit height without `BLOCK_OPT_WITNESS` (Core NeedsRedownload, `validation.cpp:4892-4908`) is
+  disconnected, reset to header-only, and its stored body offered again to `ACTIVATE-BLOCK`: the
+  path Core's reindex sends every body through (LoadExternalBlockFile into AcceptBlock,
+  `validation.cpp:4988-5155`). `REACCEPT-UNWITNESSED-ACTIVE-CHAIN` (`src/node/reindex.lisp`).
+  `feature_presegwit_node_upgrade.py` passes, falling back to height 4 as Core does.
+- *Leaving pruned mode.* An unpruned start over a datadir whose `prunedblockfiles` flag is set is
+  Core's refusal (`node/chainstate.cpp:55-59`). Under `-reindex` the flag is erased, entries
+  whose body is gone stop claiming `BLOCK_HAVE_DATA`, and the prune horizon returns to 0
+  (`%REFUSE-OR-FORGET-PRUNING`, `src/node/init.lisp`). Not verified: Core then re-downloads the
+  chain from genesis, and whether our block download fetches missing bodies BELOW the active tip
+  has not been tested.
+
 Decision memo for the maintainer, 2026-09-18. Read-only analysis (functional sweep batch V):
 nothing was built, run or changed; Core citations are `refs/bitcoin` at the project pin
 `d3056bc1`. Question: our `-reindex` is *additive* — it extends the block index from the

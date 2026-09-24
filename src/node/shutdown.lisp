@@ -384,14 +384,18 @@ window the marker exists to close: killed between the two steps,
 chainstate.dat (clean, no marker) was ahead of the coins DB, and startup
 loaded the inconsistency silently. Per-chainstate: with an assumeutxo
 snapshot active there are two, each owning its own storage-suffix-named
-state file and LevelDB. The shared header index is saved inside each flush's
-Phase 1."
+state file and LevelDB. The shared block tree database is written inside each
+flush's Phase 1 and closed after the last."
   (dolist (cs (node-chainstates node))
     (log-info "Flushing chain state~@[ (~A)~]..."
               (let ((suffix (bl.store:chain-state-storage-suffix cs)))
                 (and (plusp (length suffix)) suffix)))
-    (%flush-chainstate cs :label "Shutdown" :force-full-header-index t)
-    (bl.store:close-chainstate-coins-view cs)))
+    (%flush-chainstate cs :label "Shutdown")
+    (bl.store:close-chainstate-coins-view cs))
+  ;; The block tree database is shared by every chainstate and closes once,
+  ;; after the last of them has written to it.
+  (when (node-data-directory node)
+    (bl.store:close-block-tree-db (node-data-directory node))))
 
 (defun stop-node ()
   "Stop the running Bitcoin node: the full teardown, ending with the

@@ -115,3 +115,62 @@ database it opens. Synchronous and potentially slow on a large chainstate."
         (log-info "Finished database compaction of chainstate"))
       (when bfi (compact "blockfilterindex" (bl.store:blockfilterindex-db bfi)))
       (when csi (compact "coinstatsindex" (bl.store:coinstatsindex-db csi))))))
+
+(defun reaccept-unwitnessed-active-chain ()
+  "Under -reindex, reach the state Core's reindex reaches for blocks this node
+accepted without enforcing segwit, without Core's wipe (our -reindex is
+additive: docs/reindex-decision-2026-09-18.md).
+
+Such blocks are the ones Core's NeedsRedownload finds (validation.cpp:
+4892-4908): on the active chain, at a height where segwit is active, without
+BLOCK_OPT_WITNESS. Core's -reindex wipes the block tree database and feeds
+every stored body back through AcceptBlock (LoadExternalBlockFile,
+validation.cpp:4988-5155), which judges each under the rules now in force --
+a body that fails ContextualCheckBlock's witness checks is not accepted, and
+nothing above it can connect. Ours does the same to exactly those blocks: the
+chain is disconnected to the parent of the lowest one, each is reset to
+header-only (no body, validity back to the header), and its stored body is
+offered to ACTIVATE-BLOCK, the path a network or submitted block takes.
+feature_presegwit_node_upgrade.py:47-53: eight blocks mined under
+segwit@10, restarted with -reindex and segwit@5, must end at height 4.
+
+Returns the number of blocks re-offered."
+  (let* ((cs (node-chain-state *node*))
+         (store (node-block-store *node*))
+         (utxo (node-utxo-set *node*))
+         (mempool (node-mempool *node*))
+         (tip (and cs (bl.store:get-block-index-entry
+                       cs (bl.store:best-block-hash cs))))
+         ;; Tip first, so the LAST element is the lowest.
+         (stale (loop for e = tip then (bl.store:block-index-entry-prev-entry e)
+                      while (and e (bl.store:segwit-active-at-p
+                                    (bl.store:block-index-entry-height e)))
+                      unless (logtest (bl.store:block-index-entry-status-flags e)
+                                      bl.store:+block-opt-witness+)
+                        collect e)))
+    (unless (and stale store utxo)
+      (return-from reaccept-unwitnessed-active-chain 0))
+    (let* ((ascending (reverse stale))
+           (bodies (mapcar (lambda (e)
+                             (bl.store:get-block store (bl.store:block-index-entry-hash e)))
+                           ascending))
+           (parent (bl.store:block-index-entry-prev-entry (first ascending))))
+      (log-info "Reindex: ~D block~:P from height ~D were accepted without segwit enforcement; re-accepting them"
+                (length ascending) (bl.store:block-index-entry-height (first ascending)))
+      (unless (bl.val:perform-reorg cs store utxo tip parent :mempool mempool)
+        (log-warn "Reindex: could not disconnect back to height ~D; leaving those blocks as they are"
+                  (bl.store:block-index-entry-height parent))
+        (return-from reaccept-unwitnessed-active-chain 0))
+      (dolist (e ascending)
+        (bl.store:forget-block-body store (bl.store:block-index-entry-hash e))
+        (setf (bl.store:block-index-entry-file e) nil
+              (bl.store:block-index-entry-data-pos e) nil
+              (bl.store:block-index-entry-undo-pos e) nil
+              (bl.store:block-index-entry-status e) :header-valid))
+      (loop for body in bodies
+            when body
+              do (bl.val:activate-block body cs store utxo :mempool mempool))
+      ;; Commit the rewound tip, its coins and the reset entries together, as
+      ;; any other flush does: the coins pointer is what start-up trusts next.
+      (%flush-chainstate cs :label "Reindex")
+      (length ascending))))

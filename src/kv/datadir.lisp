@@ -65,14 +65,16 @@ legacy directory that holds real data."
         (t (values core-path nil))))
 
 (defun datadir-block-index-path (data-dir)
-  "Core's blocks/index/ for the block index. The legacy layout is a flat
-headerindex.dat at the network-dir root; the FILE is resolved by
-DATADIR-HEADER-INDEX-FILE, which is what callers use."
+  "Core's blocks/index/: the block tree database, a LevelDB (Core BlockTreeDB).
+Before 2026-09-24 it held this tree's own headerindex.dat instead, which
+DATADIR-HEADER-INDEX-FILE still finds for the one-time migration."
   (merge-pathnames "index/" (merge-pathnames "blocks/" data-dir)))
 
 (defun datadir-header-index-file (data-dir)
-  "The header/block index file. Core's location is blocks/index/; ours was
-headerindex.dat at the root. Returns (values path legacy-p)."
+  "The FORMER block index file, headerindex.dat: in blocks/index/ after the
+datadir-layout migration, at the network-dir root before it. Only the
+migration into the block tree database reads it. Returns (values path
+legacy-p)."
   (let ((core (merge-pathnames "headerindex.dat"
                                (datadir-block-index-path data-dir)))
         (legacy (merge-pathnames "headerindex.dat" data-dir)))

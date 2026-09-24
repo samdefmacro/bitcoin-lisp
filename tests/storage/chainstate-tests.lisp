@@ -105,8 +105,9 @@ deployed nodes must restart onto the same files with no migration."
                (namestring (bl.store:chainstate-leveldb-path cs))))))
 
 (test chainstate-snapshot-storage-names-distinct
-  "A suffixed chainstate names distinct files; the header index (shared across
-chainstates, like Core's block index) is NOT suffixed."
+  "A suffixed chainstate names distinct files. The block tree database is not
+among them: it is shared across chainstates, like Core's block index, and is
+opened by the base path alone (BL.STORE:BLOCK-TREE-DB-PATH)."
   (let ((primary (bl.store:make-chain-state
                   :base-path #p"/data/bitcoin-lisp/testnet4/"))
         (snapshot (bl.store:make-chain-state
@@ -119,10 +120,7 @@ chainstates, like Core's block index) is NOT suffixed."
     (is (not (equal (namestring (bl.store:state-file-path primary))
                     (namestring (bl.store:state-file-path snapshot)))))
     (is (not (equal (namestring (bl.store:chainstate-leveldb-path primary))
-                    (namestring (bl.store:chainstate-leveldb-path snapshot)))))
-    ;; headerindex.dat is shared: same path whatever the suffix.
-    (is (equal (namestring (bl.store::header-index-file-path primary))
-               (namestring (bl.store::header-index-file-path snapshot))))))
+                    (namestring (bl.store:chainstate-leveldb-path snapshot)))))))
 
 (test chainstate-assumeutxo-status-never-persisted
   "save-state writes the same 45-byte v3 format as before — the assumeutxo

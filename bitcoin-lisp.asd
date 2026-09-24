@@ -123,6 +123,8 @@ of the kv and serialization layers. The pruning policy knobs live here
                              (:file "coins-view-cache")
                              (:file "coins-view-migration")
                              (:file "chain")
+                             (:file "headerindex-legacy") ; read-only: the pre-2026-09-24 format, for migration
+                             (:file "block-tree-db")      ; Core's blocks/index LevelDB
                              (:file "reindex")
                              (:file "migrate-blocks")
                              (:file "index-base")      ; the protocol the four indexes below implement

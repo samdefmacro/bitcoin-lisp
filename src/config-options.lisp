@@ -117,6 +117,11 @@
 (define-option "reindexchainstate" :key :reindex-chainstate :type :bool)
 (define-option "reindex-chainstate" :key :reindex-chainstate :type :bool)
 (define-option "forcecompactdb" :key :force-compact-db :type :bool)
+;; -dbbatchsize (DEBUG_ONLY) and -dbcrashratio (hidden): the coins flush's
+;; partial-batch size and its simulated crash (node/coins_view_args.cpp:13-14,
+;; init.cpp:479,505). Neither is listed anywhere; feature_dbcrash.py sets both.
+(define-option "dbbatchsize" :type :int :global bl.store:*coins-db-batch-bytes*)
+(define-option "dbcrashratio" :type :int :global bl.store:*coins-db-crash-ratio*)
 (define-option "peerblockfilters" :key :peer-block-filters :type :bool)
 (define-option "txreconciliation" :key :tx-reconciliation :type :bool)
 (define-option "webui" :key :webui :type :bool)
@@ -174,9 +179,9 @@
 ;; the flag stays a minutes-long local repair rather than a re-download. Three
 ;; parts of Core's behaviour it does carry: the persisted resume marker, the
 ;; deletion of an assumeutxo snapshot chainstate, and a wipe-and-resync of
-;; every enabled index. What it cannot do is repair a CORRUPT headerindex.dat
-;; -- start-up refuses that outright, and the file must be moved aside by hand
-;; -- or rebuild the UTXO set, which is -reindexchainstate and is not implied.
+;; every enabled index. What it cannot do is repair a CORRUPT block tree
+;; database -- start-up refuses that outright, and blocks/index must be moved
+;; aside by hand -- or rebuild the UTXO set, which is -reindexchainstate and is not implied.
 (define-option "reindex" :key :reindex :type :bool)
 (define-option "port" :key :port :type :int :network-only t)
 (define-option "networkactive" :key :network-active :type :bool)
@@ -608,7 +613,7 @@
   "blockreconstructionextratxn"
   "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
-  "daemonwait" "dbbatchsize" "deprecatedrpc"
+  "daemonwait" "deprecatedrpc"
   "help" "i2pacceptincoming"
   "ipcbind" "limitancestorsize"
   "limitdescendantsize"

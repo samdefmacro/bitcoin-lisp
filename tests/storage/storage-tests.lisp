@@ -1857,19 +1857,19 @@ because iterate itself flushes again before walking the base."
     ;; 100 MiB budget: both terms equal 90 MiB.
     (is (= (* 90 mib) (bl::large-coins-cache-threshold (* 100 mib))))))
 
-(test header-index-v1-file-still-loads
-  "A v1-format header index (181-byte entries, no tx-count) still loads after
-the v2 format bump; its entries get tx-count 0 for lazy backfill. A v1-load
-regression would silently force a from-genesis resync on deploy."
-  (let* ((tmp-dir (merge-pathnames "test-hidx-v1/" (uiop:temporary-directory)))
+(test header-index-v1-file-still-migrates
+  "A v1-format header index (181-byte entries, no tx-count) still migrates into
+the block tree database; its entries get tx-count 0 for lazy backfill. A
+v1-read regression would silently force a from-genesis resync on deploy. The
+stored chain work is not carried over: blocks/index keeps none, and a load
+recomputes it from the headers."
+  (with-network (:regtest)
+  (let* ((tmp-dir (merge-pathnames (format nil "test-hidx-v1-~D/" (get-internal-real-time))
+                                   (uiop:temporary-directory)))
          (cs (bl.store:make-chain-state :base-path tmp-dir))
-         (header (bl.ser:make-block-header
-                  :version 1
-                  :prev-block (make-array 32 :element-type '(unsigned-byte 8)
-                                             :initial-element 0)
-                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                              :initial-element 1)
-                  :timestamp 1231006505 :bits #x1d00ffff :nonce 0))
+         (header (mine-regtest-header
+                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                  7))
          (hash (bl.ser:block-header-hash header)))
     (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
     (unwind-protect
@@ -1892,22 +1892,21 @@ regression would silently force a from-genesis resync on deploy."
                           (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
                                                          :initial-element 0) s)))
                   (bytes (coerce data '(simple-array (unsigned-byte 8) (*)))))
-             ;; The resolved path is Core's blocks/index/ on a fresh datadir,
-             ;; whose directory does not exist yet.
-             (ensure-directories-exist
-              (bl.store::header-index-file-path cs))
-             (with-open-file (out (bl.store::header-index-file-path cs)
-                                  :direction :output :if-exists :supersede
-                                  :element-type '(unsigned-byte 8))
-               (write-sequence bytes out)
-               (write-sequence (bl.store:compute-crc32 bytes) out)))
+             ;; Where the datadir-layout migration left it: blocks/index/.
+             (let ((path (bl.store:datadir-header-index-file tmp-dir)))
+               (ensure-directories-exist path)
+               (with-open-file (out path
+                                    :direction :output :if-exists :supersede
+                                    :element-type '(unsigned-byte 8))
+                 (write-sequence bytes out)
+                 (write-sequence (bl.store:compute-crc32 bytes) out))))
+           (is (= 1 (bl.store:migrate-legacy-header-index cs)))
            (is-true (bl.store:load-header-index cs))
            (let ((entry (bl.store:get-block-index-entry cs hash)))
              (is (not (null entry)))
              (is (= 7 (bl.store:block-index-entry-height entry)))
-             (is (= 42 (bl.store:block-index-entry-chain-work entry)))
              (is (= 0 (bl.store:block-index-entry-tx-count entry)))))
-      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore)))))
 
 (test compute-utxo-set-hash-streams-instead-of-buffering
   "hash_serialized_3 must be computed incrementally. Buffering the whole set

@@ -15,6 +15,9 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
   (:use #:cl)
   (:export
    #:with-temp-directory
+   #:mine-regtest-header
+   #:add-regtest-genesis-entry
+   #:add-mined-chain
    #:wallet-data-directory
    #:wallet-directory-of
    #:make-temp-directory

@@ -230,8 +230,7 @@ window where a crash must be detected at the next startup. Production leaves
 it NIL; crash-safety tests bind it to observe the on-disk marker or abort
 (via THROW) to simulate a crash at the most dangerous point.")
 
-(defun %flush-chainstate (chainstate &key (label "Periodic") force-full-header-index
-                                          (empty-cache t))
+(defun %flush-chainstate (chainstate &key (label "Periodic") (empty-cache t))
   "Synchronously flush one CHAINSTATE (its state file, its coins view, and
 the shared header index) with 3-phase commit (mirrors Bitcoin Core's
 DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
@@ -281,12 +280,12 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; Phase 1: mark the chainstate as in-transition.
         (when chainstate
           (bl.store:save-state chainstate :in-transition t)
-          ;; A shutdown writes the FULL header index rather than a delta: it
-          ;; is the one moment we can guarantee the on-disk snapshot matches
-          ;; memory exactly, which bounds any drift the packed change-detector
-          ;; could not see (a replaced header object on an existing entry).
+          ;; The block index, then the coins: Core's WriteBlockIndexDB before
+          ;; CoinsTip().Flush() (validation.cpp:2789-2812). One synchronous
+          ;; LevelDB batch of the changed 'b' records, the changed 'f' records
+          ;; and 'l'.
           (bl.store:save-header-index
-           chainstate :force-full force-full-header-index))
+           chainstate :block-store (and *node* (node-block-store *node*))))
         (when *flush-mid-commit-hook*
           (funcall *flush-mid-commit-hook* chainstate))
         ;; Phase 2: flush cache → LevelDB. Per-flush work is proportional
@@ -361,19 +360,19 @@ leaves the coins DB naming a block the header index was never told about, and
 start-up refuses to run until the node is reindexed.
 
 The block index is ONE table shared by every chainstate (a snapshot chainstate
-is created on the primary's, and headerindex.dat takes no storage suffix), so
+is created on the primary's, and blocks/index takes no storage suffix), so
 writing the current chainstate's writes the whole of it.
 
 Runs under COINS-VIEW-CACHE-SYNC's caller contract -- the node lock held across
 the call -- which is what keeps it from racing the periodic flush's own
 header-index write. dumptxoutset and the periodic flush hold it; gettxoutsetinfo
 and scantxoutset do not, which is a gap in those two handlers rather than in
-this ordering, and its worst case is a delta-log frame the next start-up's
-replay stops at, leaving the index exactly as stale as it was before this hook
-existed."
+this ordering; the block tree database's own lock serialises the two writes
+themselves."
   (let ((chainstate (and *node* (node-current-chainstate *node*))))
     (when chainstate
-      (bl.store:save-header-index chainstate))))
+      (bl.store:save-header-index chainstate
+                                  :block-store (node-block-store *node*)))))
 
 (setf bl.store:*persist-block-index-hook* 'persist-block-index-for-coins-write)
 

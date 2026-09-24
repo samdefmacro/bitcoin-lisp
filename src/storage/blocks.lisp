@@ -17,7 +17,13 @@ when its entire range lies inside the prunable window."
   (size 0 :type (integer 0))
   (undo-size 0 :type (integer 0))
   (height-first nil :type (or null (unsigned-byte 32)))
-  (height-last nil :type (or null (unsigned-byte 32))))
+  (height-last nil :type (or null (unsigned-byte 32)))
+  ;; Core nTimeFirst / nTimeLast: the earliest and latest header time of a
+  ;; block in the file (CBlockFileInfo::AddBlock). Nothing here reads them;
+  ;; they exist so the 'f' record written to blocks/index is Core's whole
+  ;; record, which is what a Core node opening this datadir reads back.
+  (time-first nil :type (or null (unsigned-byte 64)))
+  (time-last nil :type (or null (unsigned-byte 64))))
 
 (defvar *flat-block-files* t
   "Write new blocks into Core's numbered blk?????.dat files instead of one file
@@ -35,6 +41,31 @@ docs/block-file-format-plan.md, complete.
 Turning it off is still supported and still safe. READING is not gated: a store
 always reads whichever form each block is in, so a datadir written in either
 form, or in both, stays fully readable whichever way the flag is set.")
+
+(defvar *persist-block-index-hook* nil
+  "Thunk that durably writes the block index, installed by the node; NIL for a
+test fixture or an offline tool that has no index to write.
+
+Core's FlushStateToDisk writes the block files and then the block-index
+database BEFORE CoinsTip().Sync()/Flush() (validation.cpp:2780-2812), so the
+coins database can never name a block the block index does not hold. Our
+periodic flush has that order in %FLUSH-CHAINSTATE's Phase 1, but the coins
+pointer is also written from paths that never reach it: every RPC that walks
+the UTXO set syncs the cache first (gettxoutsetinfo, dumptxoutset,
+scantxoutset, the assumeutxo hash check), and loadtxoutset stamps the snapshot
+base and flushes. Hooking the ONE place the pointer is staged, rather than
+those call sites, is what keeps the two from drifting apart again.
+
+PRUNE-FLAT-BLOCK-FILE calls it as well, between clearing the pruned blocks'
+positions and unlinking their files: Core writes the block index before
+UnlinkPrunedFiles (validation.cpp:2780-2836), so no index on disk ever points
+into a file that is gone -- which start-up now refuses as `Error loading block
+database'.
+
+What it costs when the pointer outruns the index: the coins DB names a block
+the header index cannot place, RECONCILE-COINS-DB-BEST-BLOCK returns
+:unresolvable, and start-up refuses to run until the node is reindexed — so a
+read-only RPC plus an ordinary unclean shutdown becomes a mandatory reindex.")
 
 (defstruct block-store
   "Block storage manager."
@@ -197,12 +228,18 @@ the record is missing, mis-framed, or unreadable."
   (or (gethash file (block-store-file-info store))
       (setf (gethash file (block-store-file-info store)) (make-block-file-info))))
 
-(defun %note-block-in-file (store file height bytes &key (count t))
+(defun %note-block-in-file (store file height bytes &key (count t) time)
   "Fold one stored block into FILE's accounting; COUNT NIL folds only HEIGHT
-into the range, for a block the file already holds."
+into the range, for a block the file already holds. TIME, the block's header
+time, widens the file's time range (Core CBlockFileInfo::AddBlock)."
   (let ((info (%store-file-info store file)))
     (when count (incf (block-file-info-blocks info)))
     (incf (block-file-info-size info) bytes)
+    (when time
+      (let ((first (block-file-info-time-first info))
+            (last (block-file-info-time-last info)))
+        (setf (block-file-info-time-first info) (if first (min first time) time)
+              (block-file-info-time-last info) (if last (max last time) time))))
     ;; A file with a block of unknown height has an unknown range, and an
     ;; unknown range can never be shown to lie inside the prunable window — so
     ;; it is never pruned. That is the safe direction: the alternative is
@@ -477,7 +514,9 @@ fresh copy."
        (let ((pos (%store-block-flat store data)))
          (setf (gethash hash (block-store-index store)) pos)
          (%note-block-in-file store (flat-file-pos-file pos) height
-                              (+ (length data) +storage-header-bytes+))
+                              (+ (length data) +storage-header-bytes+)
+                              :time (bl.ser:block-header-timestamp
+                                     (bl.ser:bitcoin-block-header block)))
          ;; The record's overhead counts toward the storage total, as it does
          ;; in Core's per-file accounting.
          (incf (block-store-total-bytes store)
@@ -832,12 +871,15 @@ block is and the header index knows WHAT HEIGHT it is, and pruning needs both."
    (lambda (hash located)
      (when (flat-file-pos-p located)
        (let* ((entry (get-block-index-entry chain-state hash))
-              (height (and entry (block-index-entry-height entry))))
+              (height (and entry (block-index-entry-height entry)))
+              (header (and entry (block-index-entry-header entry))))
          ;; The record's own byte count is not known without re-reading it;
          ;; the running total is maintained elsewhere, and pruning only needs
          ;; the height range plus a per-file byte figure, which the file's own
          ;; size on disk supplies.
-         (%note-block-in-file store (flat-file-pos-file located) height 0))))
+         (%note-block-in-file store (flat-file-pos-file located) height 0
+                              :time (and header
+                                         (bl.ser:block-header-timestamp header))))))
    (block-store-index store))
   ;; Take each file's byte count from the filesystem rather than summing
   ;; records: the difference is the preallocated tail, and pruning frees the
@@ -989,6 +1031,9 @@ callback keeps storage from having to reach into the chain state."
     (dolist (hash hashes)
       (remhash hash (block-store-index store))
       (when on-prune (funcall on-prune hash)))
+    ;; The index that no longer points into FILE is durable before FILE goes
+    ;; (Core: WriteBlockIndexDB, then UnlinkPrunedFiles).
+    (when *persist-block-index-hook* (funcall *persist-block-index-hook*))
     (dolist (seq (list (%blk-seq store) (%rev-seq store)))
       (let ((path (flat-file-name seq (make-flat-file-pos file 0))))
         (let ((size (file-size-bytes path)))

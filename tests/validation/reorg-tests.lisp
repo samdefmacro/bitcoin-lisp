@@ -620,7 +620,8 @@ the block store."
 
 (test rpc-getchaintxstats-window
   "getchaintxstats computes window tx counts over connected blocks (coinbase-only
-test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
+test blocks: 1 tx each). That tx-count survives a restart is
+BLOCK-INDEX-RECORD-IS-CORES-BYTE-FOR-BYTE's nTx."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "chaintxstats")
@@ -634,14 +635,6 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
          (is (= 2 (cdr (assoc "window_block_count" r :test #'string=))))
          (is (= 2 (cdr (assoc "window_tx_count" r :test #'string=))))
          (is (integerp (cdr (assoc "window_interval" r :test #'string=)))))
-       ;; tx-count persists through the v2 header index.
-       (bl.store:save-header-index chain-state)
-       (let ((cs2 (bl.store:make-chain-state
-                   :base-path (bl.store::chain-state-base-path chain-state))))
-         (is-true (bl.store:load-header-index cs2))
-         (let ((tip (bl.store:get-block-index-entry
-                     cs2 (bl.store:best-block-hash chain-state))))
-           (is (= 1 (bl.store:block-index-entry-tx-count tip)))))
        ;; blockcount >= height -> error (Core's bound).
        (signals bl.rpc:rpc-error
          (bl.rpc::rpc-getchaintxstats node (list 99))))
@@ -706,11 +699,16 @@ output and NO coinbase witness — a witness-stripped block (block-witness-strip
                   :cached-hash block-hash)))
     (bl.ser:make-bitcoin-block :header header :transactions (list coinbase-tx))))
 
-(test perform-reorg-prunes-witness-stripped-fork-block
-  "A stored witness-stripped fork block (commitment but no coinbase nonce, e.g.
-from the old v1-compact :weaker-chain path) is pruned during the reorg precondition
-and returned as MISSING so it gets re-downloaded witness-complete — instead of
-failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behind)."
+(test perform-reorg-reconnects-a-stored-body-without-rejudging-its-witness
+  "Core judges a body's witness ONCE, when AcceptBlock stores it
+(ContextualCheckBlock, validation.cpp:4021-4049, :4381-4389); ConnectTip reads
+the stored body back and ConnectBlock runs CheckBlock only. So a body on disk --
+here one with a witness commitment and no coinbase witness, what Core v0.14.3
+wrote for its regtest blocks before segwit applied -- is reconnected, not
+deleted and re-requested. The reorg pass that deleted such bodies is gone, and
+the connect no longer re-runs ContextualCheckBlock on them
+(feature_unsupported_utxo_db.py:56). The accept gate, not the reorg, is what
+keeps a stripped copy off disk now."
   (with-network (:regtest)   ; BIP141 active from genesis: only there is a commitment without witness "stripped" (Core validation.cpp:4021)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "prune-stripped")
@@ -740,18 +738,12 @@ failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behi
            ;; sanity: B1 is stored and detected as stripped
            (is-true (bl.val:block-witness-stripped-p
                      (bl.store:get-block block-store b1-hash)))
-           ;; Attempt reorg A2 -> B2.
-           (multiple-value-bind (ok missing)
-               (bl.val:perform-reorg
-                chain-state block-store utxo-set a2-entry b2-entry)
-             (is (null ok))                                            ; refused
-             (is (not (null missing)))                                 ; missing list returned
-             (is (null (bl.store:get-block block-store b1-hash)))   ; B1 pruned
-             (is (member b1-hash (mapcar #'car missing) :test #'equalp))
-             ;; tip unchanged — no mutation on a refused reorg
-             (is (= 2 (bl.store:current-height chain-state)))
-             (is (equalp (bl.store:block-index-entry-hash a2-entry)
-                         (bl.store:best-block-hash chain-state)))))))
+           ;; Reorg A2 -> B2 connects the stored body as it is.
+           (is-true (bl.val:perform-reorg
+                     chain-state block-store utxo-set a2-entry b2-entry))
+           (is (equalp b2-hash (bl.store:best-block-hash chain-state)))
+           (is-true (bl.store:get-block block-store b1-hash)
+                    "the stored body is kept, not forgotten"))))
      (clear-undo-cache))))
 
 (test activate-best-chain-switches-to-a-downloaded-heavier-fork

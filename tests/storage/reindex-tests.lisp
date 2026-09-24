@@ -299,3 +299,105 @@ abort. Ours logged the count it added and then nothing."
                       (lambda () (bl::%rebuild-block-index-from-block-files)))))
           (is-true (find "Reindexing finished" lines :test #'search)
                    "Core's closing sentence; got ~S" lines))))))
+
+;;;; Partial-batch coins flushes and ReplayBlocks (-dbbatchsize, -dbcrashratio)
+
+(defun %crash-flush (utxo)
+  "Flush UTXO in one-byte batches with a crash after the first: the database a
+-dbcrashratio=1 crash leaves, observed instead of exited."
+  (let ((bl.store:*coins-db-batch-bytes* 1)
+        (bl.store:*coins-db-crash-ratio* 1)
+        (bl.store:*coins-db-simulated-crash* (lambda () (throw 'crashed :crashed))))
+    (catch 'crashed
+      (bl.store:coins-view-cache-flush utxo :sync t))))
+
+(defun %restart-coins-view (node)
+  "A fresh coins cache over NODE's coins database, as a restart opens it."
+  (let ((base (bl.store:coins-view-cache-base (bl:node-utxo-set node))))
+    (setf (bl:node-utxo-set node) (bl.store:make-coins-view-cache base))
+    (bl.store:coins-view-cache-load-best-block (bl:node-utxo-set node))
+    base))
+
+(test an-interrupted-partial-batch-flush-is-replayed-forward
+  "Core CCoinsViewDB::BatchWrite writes a large flush in batches of
+-dbbatchsize, recording DB_HEAD_BLOCKS (new, old) and erasing the best-block
+pointer in the first and reversing that in the last (txdb.cpp:100-164); a crash
+between them is finished at start-up by ReplayBlocks, which rolls forward from
+the old tip to the new one (validation.cpp:4808-4889). feature_dbcrash.py
+crashes nodes at exactly that point, again and again."
+  (with-network (:regtest)
+    (let* ((tag (format nil "replayfwd~D" (get-internal-real-time)))
+           (node (coins-db-node-fixture tag)))
+      (let ((bl:*node* node))
+        (let ((h1 (first (generate-regtest-blocks node 1))))
+          (bl.store:coins-view-cache-flush (bl:node-utxo-set node) :sync t)
+          (let ((h3 (second (generate-regtest-blocks node 2))))
+            (is (eq :crashed (%crash-flush (bl:node-utxo-set node))))
+            (let ((base (%restart-coins-view node))
+                  (cs (bl:node-chain-state node)))
+              (is (null (bl.store:coins-view-db-best-block base))
+                  "the first partial batch erases the best-block pointer")
+              (is (equalp (list (hex-to-internal h3) (hex-to-internal h1))
+                          (bl.store:coins-view-db-head-blocks base)))
+              (is-true (bl:replay-coins-db-blocks node cs))
+              (is (null (bl.store:coins-view-db-head-blocks base)))
+              (is (equalp (hex-to-internal h3) (bl.store:coins-view-db-best-block base)))
+              (is (= (* 3 5000000000)
+                     (bl.store:utxo-set-total-amount (bl:node-utxo-set node)))
+                  "every coinbase of the three blocks, once each"))))))))
+
+(test an-interrupted-flush-across-a-disconnect-is-rolled-back
+  "The rollback half of ReplayBlocks: a flush interrupted while the coins moved
+from a block BACK to its parent is resolved by disconnecting the old branch
+down to the fork with its undo data (validation.cpp:4845-4870)."
+  (with-network (:regtest)
+    (let* ((tag (format nil "replayback~D" (get-internal-real-time)))
+           (node (coins-db-node-fixture tag)))
+      (let ((bl:*node* node))
+        (let* ((hashes (generate-regtest-blocks node 3))
+               (cs (bl:node-chain-state node))
+               (utxo (bl:node-utxo-set node)))
+          (bl.store:coins-view-cache-flush utxo :sync t)
+          (is-true (bl.val:invalidate-block cs (bl:node-block-store node) utxo
+                                            (hex-to-internal (third hashes))))
+          (is (eq :crashed (%crash-flush utxo)))
+          (let ((base (%restart-coins-view node)))
+            (is (equalp (list (hex-to-internal (second hashes))
+                              (hex-to-internal (third hashes)))
+                        (bl.store:coins-view-db-head-blocks base)))
+            (is-true (bl:replay-coins-db-blocks node cs))
+            (is (equalp (hex-to-internal (second hashes))
+                        (bl.store:coins-view-db-best-block base)))
+            (is (= (* 2 5000000000)
+                   (bl.store:utxo-set-total-amount (bl:node-utxo-set node))))))))))
+
+(defun hex-to-internal (hex)
+  "A block hash as RPC prints it, in internal byte order."
+  (bl.crypto:reverse-bytes (bl.crypto:hex-to-bytes hex)))
+
+(test reindex-reaccepts-blocks-taken-without-segwit
+  "Under -reindex, the active-chain blocks at segwit heights without
+BLOCK_OPT_WITNESS are disconnected, reset to header-only and re-offered through
+the ordinary accept path -- the outcome of Core's wiping reindex, which feeds
+every stored body back through AcceptBlock (validation.cpp:4988-5155), for the
+blocks NeedsRedownload names (:4892-4908). Bodies that pass come back
+connected and marked; feature_presegwit_node_upgrade.py:47-53 has the ones that
+do not."
+  (with-network (:regtest)
+    (let* ((tag (format nil "reaccept~D" (get-internal-real-time)))
+           (node (coins-db-node-fixture tag)))
+      (let ((bl:*node* node))
+        (let* ((hashes (generate-regtest-blocks node 3))
+               (cs (bl:node-chain-state node))
+               (entries (mapcar (lambda (h) (bl.store:get-block-index-entry
+                                             cs (hex-to-internal h)))
+                                hashes)))
+          ;; As if blocks 2 and 3 had been accepted by a node not enforcing
+          ;; segwit: no witness mark.
+          (dolist (e (rest entries))
+            (setf (bl.store:block-index-entry-status-flags e) 0))
+          (is-true (bl.store:chain-needs-redownload-p cs))
+          (is (= 2 (bl:reaccept-unwitnessed-active-chain)))
+          (is (= 3 (bl.store:current-height cs)) "valid bodies connect again")
+          (is-false (bl.store:chain-needs-redownload-p cs)
+                    "and carry the witness mark once re-accepted"))))))

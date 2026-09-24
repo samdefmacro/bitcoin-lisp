@@ -231,3 +231,82 @@ disk on the snapshot side."
              (t
               (log-error "Chainstate recovery: no committed ancestor found on disk (blocks pruned below the UTXO tip?); resync required")
               nil))))))))
+
+(defun replay-coins-db-blocks (node chainstate)
+  "Core Chainstate::ReplayBlocks (validation.cpp:4808-4889): finish a coins
+flush that stopped between its partial batches.
+
+The flush's first batch recorded DB_HEAD_BLOCKS -- the block the coins were
+moving to and the one they were moving from -- and erased the best-block
+pointer; its last would have done the reverse. A database holding the record is
+therefore some mix of both states. The old branch is rolled back to the fork
+with each block's undo data, then every block up to the new tip is rolled
+forward; both steps are idempotent (a disconnect over coins already gone is
+merely unclean, a rollforward overwrites), so the mix comes out exactly the new
+tip's coins, which are flushed with the pointer set to it.
+
+Returns T when there was nothing to replay or the replay finished, NIL when it
+could not be done -- Core's `Unable to replay blocks' failure."
+  (let* ((view (bl.store:chain-state-coins-view chainstate))
+         (heads (and (typep view 'bl.store:coins-view-cache)
+                     (bl.store:coins-view-db-head-blocks
+                      (bl.store:coins-view-cache-base view)))))
+    (when (null heads)
+      (return-from replay-coins-db-blocks t))
+    (unless (= 2 (length heads))
+      (log-error "ReplayBlocks(): unknown inconsistent state")
+      (return-from replay-coins-db-blocks nil))
+    (log-info "Replaying blocks")
+    (let* ((store (node-block-store node))
+           (new (bl.store:get-block-index-entry chainstate (first heads)))
+           (old (unless (every #'zerop (second heads))
+                  (or (bl.store:get-block-index-entry chainstate (second heads))
+                      (progn (log-error "ReplayBlocks(): reorganization from unknown block requested")
+                             (return-from replay-coins-db-blocks nil)))))
+           (fork (and old new (bl.val:find-fork-point old new)))
+           (fork-height (if fork (bl.store:block-index-entry-height fork) 0)))
+      (unless new
+        (log-error "ReplayBlocks(): reorganization to unknown block requested")
+        (return-from replay-coins-db-blocks nil))
+      ;; Roll back along the old branch; genesis is never disconnected.
+      (when (and old (not (eq old fork)))
+        (log-info "Rolling back from ~A (~D to ~D)" (%replay-hex (bl.store:block-index-entry-hash old))
+                  (bl.store:block-index-entry-height old) fork-height)
+        (loop for e = old then (bl.store:block-index-entry-prev-entry e)
+              until (or (null e) (eq e fork))
+              when (plusp (bl.store:block-index-entry-height e))
+                do (let ((block (bl.store:get-block store (bl.store:block-index-entry-hash e))))
+                     (multiple-value-bind (undo readable)
+                         (bl.val:get-undo-data (bl.store:block-index-entry-hash e))
+                       (unless (and block readable)
+                         (log-error "RollbackBlock(): ReadBlock() failed at ~D, hash=~A"
+                                    (bl.store:block-index-entry-height e)
+                                    (%replay-hex (bl.store:block-index-entry-hash e)))
+                         (return-from replay-coins-db-blocks nil))
+                       (bl.store:disconnect-block-from-utxo-set
+                        view block undo :height (bl.store:block-index-entry-height e)))))
+        (log-info "Rolled back to ~A" (%replay-hex (bl.store:block-index-entry-hash fork))))
+      ;; Roll forward from the fork to the new tip.
+      (let ((forward (loop for e = new then (bl.store:block-index-entry-prev-entry e)
+                           while (and e (> (bl.store:block-index-entry-height e) fork-height))
+                           collect e)))
+        (when forward
+          (log-info "Rolling forward to ~A (~D to ~D)" (%replay-hex (first heads))
+                    fork-height (bl.store:block-index-entry-height new))
+          (dolist (e (nreverse forward))
+            (let ((block (bl.store:get-block store (bl.store:block-index-entry-hash e))))
+              (unless block
+                (log-error "ReplayBlock(): ReadBlock failed at ~D, hash=~A"
+                           (bl.store:block-index-entry-height e)
+                           (%replay-hex (bl.store:block-index-entry-hash e)))
+                (return-from replay-coins-db-blocks nil))
+              (bl.store:coin-view-rollforward-block view block
+                                                    (bl.store:block-index-entry-height e))))
+          (log-info "Rolled forward to ~A" (%replay-hex (first heads)))))
+      (setf (bl.store:cvc-best-block view) (copy-seq (first heads)))
+      (bl.store:coins-view-cache-flush view :sync t)
+      t)))
+
+(defun %replay-hex (hash)
+  "HASH as Core prints a uint256: byte-reversed hex."
+  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash)))

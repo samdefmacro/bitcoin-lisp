@@ -1569,6 +1569,12 @@ function of (format-string &rest args) that must signal."
            ;; comparison of the two records has nothing to compare.
            (setf (bl.store:cvc-best-block view) (copy-seq base-hash))
            (bl.store:coins-view-cache-flush view :sync t)
+           ;; The snapshot chain's bodies were never received, so nothing marked
+           ;; them BLOCK_OPT_WITNESS; Core fakes the mark from the base down so
+           ;; NeedsRedownload does not ask for -reindex on the next start
+           ;; (validation.cpp:5947-5957).
+           (bl.store:fake-opt-witness-below
+            (bl.store:get-block-index-entry snap base-hash))
            (bl.store:update-chain-tip snap base-hash base-height)
            (bl.store:write-snapshot-base-blockhash snap)
            (bl.store:save-state snap)
