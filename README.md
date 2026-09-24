@@ -304,7 +304,11 @@ The data directory stores blockchain data, chain state, and configuration:
 (bitcoin-lisp:start-node :data-directory "/path/to/data/")
 ```
 
-Default: `~/.bitcoin-lisp/`
+Default: `$HOME/.bitcoin-lisp/` (`/.bitcoin-lisp/` when `$HOME` is unset). Bitcoin
+Core's default is `~/.bitcoin`; this node deliberately does not use it, because
+its chainstate (coins) database is not in Core's format, and a node sharing Core's
+directory on a host that also runs Bitcoin Core would corrupt one of the two. (Core's
+`feature_config_args.py` expects Core's directory name, a documented divergence.)
 
 Directory structure:
 ```

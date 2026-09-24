@@ -38,6 +38,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:clear-recent-block-txs
    #:rpc-error-of
    #:wire-params
+   #:grind-header-pow
    #:rpc-result-json
    #:one-input-tx-hex
    #:make-deterministic-rng

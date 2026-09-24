@@ -268,7 +268,10 @@ condition as a warning, not an error."
 
 (defun %read-config-includes (conf-text cli datadir)
   "Resolve -includeconf, returning the list of config texts to merge (the main
-file first). Core ArgsManager::ReadConfigFiles, common/config.cpp:150-213.
+file first) and, as a second value, the name each INCLUDED text was given by
+-- as written, which is how Core's section warning names the file
+(ReadConfigStream(conf_file_stream, conf_file_name, ...), config.cpp:192).
+Core ArgsManager::ReadConfigFiles, common/config.cpp:150-213.
 
 Ours was unimplemented: a split configuration loaded with everything at
 defaults after a single warning line, which on a node is indistinguishable from
@@ -303,7 +306,8 @@ Core's rules, all of which apply here:
                                   (char= (char datadir (1- (length datadir))) #\/))
                              datadir
                              (concatenate 'string datadir "/"))))
-         (texts (list conf-text)))
+         (texts (list conf-text))
+         (read-names '()))
     (dolist (name names)
       (let ((path (merge-pathnames name base)))
         (when (uiop:directory-exists-p path)
@@ -324,8 +328,9 @@ Core's rules, all of which apply here:
             (when (string= (car inner) "includeconf")
               (bl.cfg:warn-includeconf-from-included-file (cdr inner))))
           (log-info "Included configuration file ~A" name)
-          (push text texts))))
-    (nreverse texts)))
+          (push text texts)
+          (push name read-names))))
+    (values (nreverse texts) (nreverse read-names))))
 
 (defun %network-subdirectory (network)
   "The per-network subdirectory of the datadir, as Bitcoin Core defines it

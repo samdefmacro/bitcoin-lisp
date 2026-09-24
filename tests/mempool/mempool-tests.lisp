@@ -2629,8 +2629,14 @@ output of the same parent tx survives."
     (bl.mp:orphan-add pool conflicted (list :p))
     (bl.mp:orphan-add pool unrelated (list :p))
     (is (= 2 (bl.mp:orphan-pool-count pool)))
-    ;; block-tx spends parent:0 — conflicts with CONFLICTED only.
-    (is (= 1 (bl.mp:orphan-erase-for-block pool block)))
+    ;; block-tx spends parent:0 — conflicts with CONFLICTED only. Logged in
+    ;; Core's words and category (txorphanage.cpp:636-638), which
+    ;; p2p_invalid_tx.py:180 waits for.
+    (multiple-value-bind (erased log)
+        (log-text-of "txpackages" (lambda () (bl.mp:orphan-erase-for-block pool block)))
+      (is (= 1 erased))
+      (is-true (search "Erased 1 orphan transaction(s) included or conflicted by block" log)
+               "log: ~A" log))
     (is-false (bl.mp:orphan-have
                pool (bl.ser:transaction-wtxid conflicted)))
     (is-true (bl.mp:orphan-have

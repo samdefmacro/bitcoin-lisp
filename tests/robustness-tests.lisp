@@ -331,3 +331,59 @@ do we -- and the payload is empty, so nothing about the bytes can be blamed."
         (ignore-errors (bl.ser:parse-headers-payload bytes))
         (incf done)))
     (is (= 200 done))))
+
+;;;; What a caught handler error says, in Core's words
+
+(defun %handler-exception-line (command payload)
+  "The `net' log text of dispatching COMMAND/PAYLOAD to a fresh fake peer."
+  (nth-value 1 (log-text-of "net"
+                            (lambda () (%dispatch-to-fake-peer command payload)))))
+
+(test a-read-past-the-end-is-cores-end-of-data
+  "Every byte-reader primitive that runs out of input signals a
+SERIALIZATION-ERROR with Core's text, DataStream::read(): end of data
+(streams.h:210). The fixed-width readers used to run off the array into an
+SBCL INVALID-ARRAY-INDEX-ERROR, so the log said `Invalid index 0 for
+(SIMPLE-ARRAY ...)' where Core's says `end of data'."
+  (dolist (read (list #'bl.bytes:br-read-u8 #'bl.bytes:br-read-u16-le
+                      #'bl.bytes:br-read-u32-le #'bl.bytes:br-read-u64-le
+                      (lambda (br) (bl.bytes:br-read-bytes br 2))))
+    (let ((c (handler-case (bl.bytes:with-byte-reader (br (%bytes 1))
+                             (bl.bytes:br-read-u8 br)
+                             (funcall read br)
+                             nil)
+               (error (e) e))))
+      (is (typep c 'bl.err:serialization-error))
+      (is (equal "DataStream::read(): end of data" (princ-to-string c))))))
+
+(test process-messages-logs-cores-exception-line
+  "A handler error is logged as Core's ProcessMessages line
+(net_processing.cpp:5284): `ProcessMessages(<type>, <n> bytes): Exception
+'<what>' (<type>) caught'. Core's functional tests read it back:
+p2p_invalid_messages.py:194 (an empty addrv2 -- `end of data') and :220 (an
+address of 513 bytes -- `Address too long: 513 > 512', netaddress.h:433),
+p2p_segwit.py:1201 (a block whose witness is cut short -- `DataStream::read():
+end of data'), and feature_block.py:947 (b64a's non-canonical CompactSize --
+`non-canonical ReadCompactSize()', serialize.h:342)."
+  (let ((empty (%handler-exception-line "addrv2" (%bytes))))
+    (is-true (search "ProcessMessages(addrv2, 0 bytes): Exception 'DataStream::read(): end of data'"
+                     empty)
+             "empty addrv2 logged: ~A" empty))
+  ;; One entry: time, services 0, BIP155 network 1 (IPv4), a CompactSize
+  ;; address length of 513 (0xfd 0x01 0x02), then the address bytes.
+  (let* ((payload (%concat-bytes (%bytes 1 0 0 0 0 0 1 #xfd #x01 #x02)
+                                 (make-array 513 :element-type '(unsigned-byte 8)
+                                                 :initial-element 0)
+                                 (%bytes 0 0)))
+         (line (%handler-exception-line "addrv2" payload)))
+    (is-true (search (format nil "ProcessMessages(addrv2, ~D bytes): Exception 'Address too long: 513 > 512'"
+                             (length payload))
+                     line)
+             "long address logged: ~A" line))
+  (let* ((header (make-array 80 :element-type '(unsigned-byte 8) :initial-element 0))
+         (noncanonical (%concat-bytes header (%bytes #xfd 1 0)))
+         (truncated (%concat-bytes header (%bytes 1 2 0 0 0))))
+    (is-true (search "Exception 'non-canonical ReadCompactSize()'"
+                     (%handler-exception-line "block" noncanonical)))
+    (is-true (search "Exception 'DataStream::read(): end of data'"
+                     (%handler-exception-line "block" truncated)))))

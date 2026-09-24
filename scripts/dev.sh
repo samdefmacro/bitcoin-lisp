@@ -335,8 +335,56 @@ exec_workbench_eval_client() {
   [[ -n "${DEV_EVAL_TIMEOUT:-}" ]] && args+=(--env DEV_EVAL_TIMEOUT="$DEV_EVAL_TIMEOUT")
   [[ -n "${DEV_EVAL_MAX_OUTPUT:-}" ]] && args+=(--env DEV_EVAL_MAX_OUTPUT="$DEV_EVAL_MAX_OUTPUT")
   [[ -n "${DEV_SWANK_PACKAGE:-}" ]] && args+=(--env DEV_SWANK_PACKAGE="$DEV_SWANK_PACKAGE")
+  if ! is_system_load_form "$*"; then
+    "$DOCKER" exec "${args[@]}" "$CONTAINER" \
+      sbcl --script /dev/stdin "$@" <"$client"
+    return
+  fi
+  # A system load: gate its compiler transcript the way the cold lane does.
+  local transcript rc=0
+  transcript="$(mktemp)"
   "$DOCKER" exec "${args[@]}" "$CONTAINER" \
-    sbcl --script /dev/stdin "$@" <"$client"
+    sbcl --script /dev/stdin "$(guarded_load_form "$*")" <"$client" \
+    | tee "$transcript" || rc=$?
+  if [ "$rc" -eq 0 ] && ! "$ROOT/scripts/check-undefined-variables.sh" "$transcript" "$ROOT" >&2; then
+    echo "ERROR: the load compiled a reference to an undefined variable (see above);" >&2
+    echo "       the cold lane fails on the same line (scripts/check-undefined-variables.sh)." >&2
+    rc=1
+  fi
+  rm -f "$transcript"
+  return "$rc"
+}
+
+# The warm-image load guard. SBCL defers an `undefined variable' warning to
+# the end of ASDF's compilation unit, past compile-file's failure-p, so a load
+# that compiles one -- typically a docstring cut short by an unescaped inner
+# quote, whose remaining prose became code -- returns normally, and the eval
+# client never shows it at all: the warnings go to *ERROR-OUTPUT*, which the
+# client does not grab. The cold lane gates its transcript with
+# check-undefined-variables.sh; this gives an ASDF operation run through the
+# warm image the same gate. The form's *ERROR-OUTPUT* is captured, the
+# undefined-variable lines are printed FIRST (the client's output cap keeps
+# the head), then the whole compiler transcript, and the shell runs the same
+# checker over it. Positive control: scripts/check-warm-load-guard.sh.
+is_system_load_form() { # $1 the form text
+  printf '%s' "$1" | grep -qiE '\((asdf:)?(load-system|operate|oos|compile-system|test-system|make)[[:space:]]|\(ql:quickload[[:space:]]'
+}
+
+guarded_load_form() { # $1 the form text
+  cat <<EOF
+(let* ((cl-user::%dev-sh-log (make-string-output-stream))
+       (cl-user::%dev-sh-values
+         (multiple-value-list
+          (let ((*error-output* cl-user::%dev-sh-log))
+            $1)))
+       (cl-user::%dev-sh-text (get-output-stream-string cl-user::%dev-sh-log)))
+  (with-input-from-string (s cl-user::%dev-sh-text)
+    (loop for line = (read-line s nil) while line
+          when (search "undefined variable: " line)
+            do (format t ";;; dev.sh load guard: ~A~%" (string-trim "; " line))))
+  (write-string cl-user::%dev-sh-text)
+  (values-list cl-user::%dev-sh-values))
+EOF
 }
 
 # A batch eval is read in COMMON-LISP-USER, which has no package-local

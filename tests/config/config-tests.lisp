@@ -1588,7 +1588,12 @@ silently a no-op and the BIP94 rule had no way to be turned on."
          ;; An unknown value warns and is otherwise ignored -- the node starts.
          ;; `addrman' is Core's third option: a deterministic address book
          ;; (addrdb.cpp:199).
-         (bl::%apply-test-options :regtest '("nosuch" "bip94" "addrman"))
+         ;; The warning is Core's InitWarning (init.cpp:1118): on stderr too.
+         (let ((err (make-string-output-stream)))
+           (let ((*error-output* err) (bl:*deferred-log-lines* nil))
+             (bl::%apply-test-options :regtest '("nosuch" "bip94" "addrman")))
+           (is (equal (format nil "Warning: Unrecognised option \"nosuch\" provided in -test=<option>.~%")
+                      (get-output-stream-string err))))
          (is-true bl.chain:*enforce-bip94-on-regtest*)
          (is-true bl.net:*deterministic-addrman*)
          ;; Absent, the flag is cleared: a previous run must not leak into this
@@ -3671,3 +3676,116 @@ what an earlier start in the same image left."
     (apply-config-globals '())
     (is (null bl.net:*i2p-sam-proxy*)))
   (is (equal '("i2psam") (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1"))))))
+
+(test unrecognized-config-sections-are-cores-init-warning
+  "Core records every section a config file names -- a [header], or the part
+of a key before its last dot that lies past the header's prefix
+(common/config.cpp:48-66) -- and warns about each one that is not a chain's
+name (common/args.cpp:154-169, init.cpp:958-966), file and line first.
+feature_config_args.py:176 compares the stopped node's whole stderr against
+the two-file form of it. Ours read the sections and never said a word."
+  (is (equal '(("testnot" "include.conf" 1))
+             (bl.cfg:conf-unrecognized-sections
+              (format nil "testnot.datadir=1~%") "include.conf")))
+  (is (equal '(("testnet" "/x/include2.conf" 2) ("main.foo" "/x/include2.conf" 4))
+             (bl.cfg:conf-unrecognized-sections
+              (format nil "# a comment~%[testnet]~%[main]~%foo.bar=1~%") "/x/include2.conf")))
+  ;; Control: every chain name Core knows, as a header and as a key prefix,
+  ;; names nothing unrecognized; nor does a plain key in a known section.
+  (is (null (bl.cfg:conf-unrecognized-sections
+             (format nil "main.rpcport=1~%[main]~%[test]~%[testnet4]~%[signet]~%[regtest]~%port=1~%")
+             "bitcoin.conf")))
+  (is (equal (format nil "include.conf:1 Section [testnot] is not recognized.~%~
+include2.conf:1 Section [testnet] is not recognized.~%")
+             (bl.cfg:unrecognized-sections-warning
+              (list (format nil "testnot.datadir=1~%") (format nil "[testnet]~%"))
+              '("include.conf" "include2.conf"))))
+  (is (null (bl.cfg:unrecognized-sections-warning (list "regtest=1") '("bitcoin.conf")))))
+
+(test default-data-directory-is-home-dot-bitcoin-lisp
+  "Core's GetDefaultDataDir reads $HOME, falling back to / when it is unset or
+empty (common/args.cpp:774-779). Ours was the literal string ~/.bitcoin-lisp/,
+which nothing expands, so a node started without -datadir could not create
+its lock file. The directory NAME stays ours on purpose (see the docstring):
+our chainstate is not Core's, and sharing ~/.bitcoin would corrupt one node."
+  (let ((saved (uiop:getenv "HOME")))
+    (unwind-protect
+         (progn
+           (sb-posix:setenv "HOME" "/tmp/bl-home-probe/" 1)
+           (is (equal "/tmp/bl-home-probe/.bitcoin-lisp/" (bl.cfg:default-data-directory)))
+           (sb-posix:setenv "HOME" "" 1)
+           (is (equal "/.bitcoin-lisp/" (bl.cfg:default-data-directory)))
+           (is (not (find #\~ (bl.cfg:default-data-directory)))))
+      (if saved
+          (sb-posix:setenv "HOME" saved 1)
+          (sb-posix:unsetenv "HOME")))))
+
+(test config-section-headers-compare-exact-case
+  "Core keeps a [header] exactly as written (common/config.cpp:49) and
+compares it exactly (common/args.cpp:157-167), so `[Main]' is not the main
+section: its keys apply to no chain and the section is warned about. Ours
+lower-cased the header and applied them to mainnet."
+  (is (equal '(("rpcport" . "1234"))
+             (bl.cfg:parse-bitcoin-conf (format nil "[main]~%rpcport=1234~%") :mainnet)))
+  (is (null (bl.cfg:parse-bitcoin-conf (format nil "[Main]~%rpcport=1234~%") :mainnet)))
+  (is (equal '(("Main" "bitcoin.conf" 1))
+             (bl.cfg:conf-unrecognized-sections (format nil "[Main]~%rpcport=1234~%")
+                                                "bitcoin.conf"))))
+
+(defmacro %capturing-init-warnings ((var) &body body)
+  "Run BODY with stderr captured, then SETF the existing variable VAR to the
+captured text."
+  (let ((stream (gensym "STDERR")))
+    `(let ((,stream (make-string-output-stream)))
+       (let ((*error-output* ,stream) (bl:*deferred-log-lines* nil))
+         ,@body)
+       (setf ,var (get-output-stream-string ,stream)))))
+
+(test maxconnections-is-trimmed-to-the-descriptor-budget-in-cores-words
+  "Core reserves MIN_CORE_FDS (151), the eight -addnode slots and one per bound
+interface, raises the descriptor limit for the rest, and trims -maxconnections
+to what it gets with an InitWarning (init.cpp:1027-1056). Ours never looked
+at the descriptor limit."
+  (let (err)
+    ;; Reserve = 151 + 8 + 1 = 160; 200 descriptors leave 40.
+    (%capturing-init-warnings (err)
+      (is (= 40 (bl:trim-max-connections 125 1 nil :raise-fn (lambda (n) (declare (ignore n)) 200)))))
+    (is (equal (format nil "Warning: Reducing -maxconnections from 125 to 40, because of system limitations.~%")
+               err))
+    ;; Control: enough descriptors, no trim and no word. The request covers
+    ;; the private-broadcast slots when that is on.
+    (%capturing-init-warnings (err)
+      (is (= 125 (bl:trim-max-connections 125 1 t :raise-fn (lambda (n) (is (= (+ 125 64 160) n)) n)))))
+    (is (equal "" err))
+    ;; Below the reserve itself: Core's InitError.
+    (signals bl.err:init-error
+      (bl:trim-max-connections 125 1 nil :raise-fn (lambda (n) (declare (ignore n)) 100)))))
+
+(test bad-listen-ports-are-cores-initwarnings
+  "Core warns about a -bind whose port IsBadPort names, and about a bad -port
+when no -bind/-whitebind is given (init.cpp:2120-2172). =onion binds and a
+-port shadowed by a -bind are not checked."
+  (let (err)
+    (%capturing-init-warnings (err)
+      (bl:warn-about-bad-listen-ports '(("bind" . "127.0.0.1:22") ("bind" . "127.0.0.1:25=onion")) 18444))
+    (is (equal (format nil "Warning: -bind request to listen on port 22. This port is considered \"bad\" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.~%")
+               err))
+    (%capturing-init-warnings (err)
+      (bl:warn-about-bad-listen-ports '(("port" . "25")) 25))
+    (is-true (search "Warning: -port request to listen on port 25." err))
+    ;; Controls: a -bind makes -port irrelevant; good ports say nothing.
+    (%capturing-init-warnings (err)
+      (bl:warn-about-bad-listen-ports '(("port" . "25") ("bind" . "127.0.0.1:18444")) 25)
+      (bl:warn-about-bad-listen-ports '(("port" . "18444")) 18444))
+    (is (equal "" err))))
+
+(test oversized-dbcache-is-cores-initwarning-text
+  "Core's LogOversizedDbCache (node/caches.cpp:73-83): over 75% of RAM, or
+over the default cache on a machine under 2 GiB, is an InitWarning."
+  (let ((gib (* 1024 1048576)))
+    (is (equal "A 7000 MiB dbcache may be too large for a system memory of only 8192 MiB."
+               (bl:oversized-dbcache-warning (* 7000 1048576) (* 8 gib))))
+    (is (null (bl:oversized-dbcache-warning (* 6000 1048576) (* 8 gib))))
+    (is-true (bl:oversized-dbcache-warning (* 500 1048576) gib))
+    (is (null (bl:oversized-dbcache-warning (* 450 1048576) gib)))
+    (is (null (bl:oversized-dbcache-warning (* 7000 1048576) nil)))))

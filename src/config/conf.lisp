@@ -33,6 +33,28 @@ The steps AROUND the config read keep their own wording: the chain selectors'
          :message (format nil "Error reading configuration file: ~?"
                           format-string args)))
 
+(defun default-data-directory ()
+  "This node's default data directory, `$HOME/.bitcoin-lisp/', as a string
+naming a directory -- used whenever no -datadir is given.
+
+Core's GetDefaultDataDir (common/args.cpp:757-785) reads $HOME, falling back
+to `/' when it is unset or empty, and appends `.bitcoin' (macOS: `Library/
+Application Support/Bitcoin'). We read $HOME the same way but DELIBERATELY
+keep our own directory name: this node's chainstate (coins) database is not
+Core's format, so a node sharing Core's default directory on a host that also
+runs Bitcoin Core would corrupt one of the two. feature_config_args.py:212,
+which expects Core's name, is a documented divergence for that reason.
+
+The path used to be the literal string `~/.bitcoin-lisp/', which nothing
+expands: a node started without -datadir could not even create its lock file
+(`Cannot create the lock file at ~/.bitcoin-lisp/.lock')."
+  (let ((home (uiop:getenv "HOME")))
+    (concatenate 'string
+                 (if (and home (plusp (length home)))
+                     (string-right-trim "/" home)
+                     "")
+                 "/.bitcoin-lisp/")))
+
 (defun %conf-strip-comment (line)
   "Cut LINE at its first #, as Core does (config.cpp:41-44). Returns
  (values text used-hash-p).
@@ -84,11 +106,14 @@ and, once every line has parsed, on a `conf' key (IsConfSupported)."
                      ((zerop (length line)))
                      ((and (char= (char line 0) #\[)
                            (char= (char line (1- (length line))) #\]))
+                      ;; The header as written, case and all: Core keeps
+                      ;; `str.substr(1, size - 2)' (config.cpp:49) and
+                      ;; compares it exactly, so `[Main]' is not [main] --
+                      ;; its keys land in a section no chain reads, and the
+                      ;; section is warned about as unrecognized.
                       (setf prefix
                             (concatenate 'string
-                                         (string-downcase
-                                          (string-trim '(#\Space)
-                                                       (subseq line 1 (1- (length line)))))
+                                         (subseq line 1 (1- (length line)))
                                          ".")))
                      ((char= (char line 0) #\-)
                       (config-file-read-error
@@ -139,6 +164,63 @@ significantly slow down startup. Consider removing or commenting out this option
 better performance, unless there is currently a condition which makes rebuilding the ~
 indexes necessary"))
     (nreverse rows)))
+
+(defparameter +recognized-conf-sections+
+  '("regtest" "signet" "test" "testnet4" "main")
+  "The section names Core's GetUnrecognizedSections accepts
+(common/args.cpp:157-163): ChainTypeToString of each chain, compared exactly.")
+
+(defun conf-unrecognized-sections (text filepath)
+  "The sections TEXT names that Core does not recognize, as
+ (name filepath line) lists in file order -- Core's m_config_sections, filled
+by GetConfigOptions (common/config.cpp:48-66) and filtered by
+GetUnrecognizedSections (common/args.cpp:154-169). A section appears in two
+ways: a `[name]' header, and a key whose full name -- the current header's
+prefix plus the key -- has a dot at or past the end of that prefix, which
+makes the part before its LAST dot a section (`testnot.datadir=1' names
+`testnot'). FILEPATH is what Core prints: the main file's path, or an
+include as it was written. Lines Core refuses are CONF-SETTINGS-ROWS'
+business; they name no section here."
+  (let ((prefix "") (linenr 0) (found '()))
+    (with-input-from-string (in text)
+      (loop for raw = (read-line in nil nil)
+            while raw
+            do (incf linenr)
+               (let ((line (string-trim '(#\Space #\Tab #\Return #\Newline)
+                                        (%conf-strip-comment raw))))
+                 (flet ((note (name) (push (list name filepath linenr) found)))
+                   (cond
+                     ((zerop (length line)))
+                     ((and (char= (char line 0) #\[)
+                           (char= (char line (1- (length line))) #\]))
+                      (let ((section (subseq line 1 (1- (length line)))))
+                        (note section)
+                        (setf prefix (concatenate 'string section "."))))
+                     ((position #\= line)
+                      (let* ((name (concatenate
+                                    'string prefix
+                                    (string-trim '(#\Space #\Tab #\Return #\Newline)
+                                                 (subseq line 0 (position #\= line)))))
+                             (dot (position #\. name :from-end t)))
+                        (when (and dot (<= (length prefix) dot))
+                          (note (subseq name 0 dot))))))))))
+    (remove-if (lambda (s) (member (first s) +recognized-conf-sections+
+                                   :test #'string=))
+               (nreverse found))))
+
+(defun unrecognized-sections-warning (texts filepaths)
+  "Core's InitWarning text for the unrecognized sections of TEXTS, read from
+FILEPATHS in the same order (init.cpp:958-966): one `<file>:<line> Section
+[<name>] is not recognized.' line each, newline-terminated; NIL when there
+are none."
+  (let ((sections (loop for text in texts
+                        for path in filepaths
+                        append (conf-unrecognized-sections text path))))
+    (when sections
+      (with-output-to-string (out)
+        (loop for (name file line) in sections
+              do (format out "~A:~D Section [~A] is not recognized.~%"
+                         file line name))))))
 
 (defun parse-bitcoin-conf-sections (text &optional network)
   "Parse bitcoin.conf TEXT into (values section-entries global-entries

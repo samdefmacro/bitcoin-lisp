@@ -90,14 +90,18 @@ entry claims one, exactly as Core gates it on !GetUndoPos().IsNull()
 (validation.cpp:4703-4712)."
   (let ((height (bl.store:block-index-entry-height entry))
         (hash (bl.store:block-index-entry-hash entry)))
-    (when (and (>= check-level 1)
-               (not (and (check-proof-of-work (bl.ser:bitcoin-block-header block))
-                         (values (%check-block block chain-state height
-                                               (bl.ser:get-unix-time)
-                                               :skip-header t)))))
-      (bl:log-error "Verification error: found bad block at ~D, hash=~A"
-                    height (%hash-hex hash))
-      (return-from %verify-db-block-checks :corrupted-block-db))
+    (when (>= check-level 1)
+      (multiple-value-bind (ok error)
+          (%check-block block chain-state height (bl.ser:get-unix-time)
+                        :skip-header t)
+        ;; CheckBlock's PoW test comes first (validation.cpp:3963), so its
+        ;; verdict is the one reported.
+        (unless (check-proof-of-work (bl.ser:bitcoin-block-header block))
+          (setf ok nil error :bad-proof-of-work))
+        (unless ok
+          (bl:log-error "Verification error: found bad block at ~D, hash=~A (~A)"
+                        height (%hash-hex hash) (block-reject-reason-string error))
+          (return-from %verify-db-block-checks :corrupted-block-db))))
     (when (and (>= check-level 2)
                (bl.store:block-index-entry-undo-pos entry)
                (multiple-value-bind (undo readable) (get-undo-data hash)
@@ -137,16 +141,43 @@ block, or the view is not standing on this block at all)."
           :ok
           :unclean))))
 
-(defun %verify-db-reconnect (chain-state block-store scratch from-entry tip-entry)
+(defun %verify-db-progress (report-done percentage)
+  "Core's progress line, once per 10% step (validation.cpp:4675-4679 and
+:4750-4754): log `Verification progress: N%' when PERCENTAGE, clamped to
+1-99 as Core clamps it, enters a new tens step past REPORT-DONE. Returns the
+new REPORT-DONE. The walk down reports before its depth test, as Core does,
+so the step it stops on is logged too; at level 4 the walk down is the first
+half of the bar and the reconnect the second."
+  (let ((pct (max 1 (min 99 percentage))))
+    (if (< report-done (floor pct 10))
+        (progn (bl:log-info "Verification progress: ~D%" pct)
+               (floor pct 10))
+        report-done)))
+
+(defun %verify-db-reconnect (chain-state block-store scratch from-entry tip-entry
+                             chain-height check-depth report-done)
   "Level 4: reconnect every block above FROM-ENTRY up to TIP-ENTRY into
 SCRATCH (Core validation.cpp:4747-4769). Returns :SUCCESS, :INTERRUPTED or
-:CORRUPTED-BLOCK-DB.
+:CORRUPTED-BLOCK-DB. The progress it reports runs on from REPORT-DONE, the
+walk down's last tens step, from 50% to 99% (Core's second half of the
+bar at level 4).
 
-Core calls ConnectBlock here, the same full pass a live connect makes; ours is
-VALIDATE-BLOCK against the scratch view with SKIP-HEADER, since the header was
-checked at index admission and a re-read body carries no cached hash."
+Core calls ConnectBlock here and nothing else -- not ContextualCheckBlock,
+which runs in AcceptBlock -- so ours is VALIDATE-BLOCK with CONNECT-ONLY
+against the scratch view, and SKIP-HEADER, since the header was checked at
+index admission and a re-read body carries no cached hash. The difference is
+visible: rpc_blockchain.py:106 calls verifychain(4, 0) after restarting with
+-testactivationheight=segwit@6 over blocks mined with segwit active from
+genesis, and block 1's coinbase witness is `unexpected-witness' to
+ContextualCheckBlock but nothing to ConnectBlock."
   (let ((up from-entry))
     (loop
+      (setf report-done
+            (%verify-db-progress
+             report-done
+             (- 100 (truncate (* 50 (- chain-height
+                                       (bl.store:block-index-entry-height up)))
+                              check-depth))))
       (let ((next (bl.store:get-block-at-height
                    chain-state (1+ (bl.store:block-index-entry-height up)))))
         (when (null next) (return :success))
@@ -155,20 +186,34 @@ checked at index admission and a re-read body carries no cached hash."
              (height (bl.store:block-index-entry-height up))
              (block (bl.store:get-block block-store hash)))
         (unless block
-          (bl:log-error "Verification error: reading block failed at ~D, hash=~A"
+          (bl:log-error "Verification error: ReadBlock failed at ~D, hash=~A"
                         height (%hash-hex hash))
           (return :corrupted-block-db))
         (multiple-value-bind (valid error)
             (validate-block block chain-state scratch height
-                            (bl.ser:get-unix-time) :skip-header t)
+                            (bl.ser:get-unix-time) :skip-header t :connect-only t)
           (unless valid
             (bl:log-error "Verification error: found unconnectable block at ~D, hash=~A (~A)"
-                          height (%hash-hex hash) error)
+                          height (%hash-hex hash) (block-reject-reason-string error))
             (return :corrupted-block-db)))
         (bl.store:apply-block-to-utxo-set scratch block height)
         (when (bl:interrupt-requested-p) (return :interrupted))
         (when (equalp hash (bl.store:block-index-entry-hash tip-entry))
           (return :success))))))
+
+(defun %verify-db-finish (chain-height entry good-transactions
+                          skipped-l3 skipped-no-data)
+  "VerifyDB's closing line and verdict (validation.cpp:4771-4780): the block
+count is measured from ENTRY, where the walk down stopped, and a skip is
+reported ahead of success in Core's order."
+  (bl:log-info "Verification: No coin database inconsistencies in last ~D blocks (~D transactions)"
+               (- chain-height (if entry
+                                   (bl.store:block-index-entry-height entry)
+                                   chain-height))
+               good-transactions)
+  (cond (skipped-l3 :skipped-l3-checks)
+        (skipped-no-data :skipped-missing-blocks)
+        (t :success)))
 
 (defun verify-db (chain-state block-store
                   &key (check-level +default-checklevel+)
@@ -200,7 +245,8 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
     (when (or (<= check-depth 0) (> check-depth chain-height))
       (setf check-depth chain-height))
     (setf check-level (max 0 (min 4 check-level)))
-    (bl:log-info "Verifying last ~D block~:P at level ~D" check-depth check-level)
+    (bl:log-info "Verifying last ~D blocks at level ~D" check-depth check-level)
+    (bl:log-info "Verification progress: 0%")
     (let* ((snapshot-p (and (bl.store:chain-state-from-snapshot-blockhash chain-state) t))
            (scratch (when (>= check-level 3) (%verify-db-scratch-view chain-state)))
            (tip-view (bl.store:chain-state-coins-view chain-state))
@@ -212,6 +258,7 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
            (skipped-no-data nil)
            (failure-entry nil)
            (good-transactions 0)
+           (report-done 0)
            (entry tip-entry))
       (when no-coins-db
         (bl:log-warn "Skipped verification of level >=3: this chainstate has no coins database"))
@@ -219,6 +266,8 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
         (unless (and entry (bl.store:block-index-entry-prev-entry entry)) (return))
         (let* ((height (bl.store:block-index-entry-height entry))
                (hash (bl.store:block-index-entry-hash entry)))
+          (setf report-done
+                (%verify-db-progress report-done (truncate (* (- chain-height height) (if (>= check-level 4) 50 100)) check-depth)))
           (when (<= height (- chain-height check-depth)) (return))
           (let ((block (bl.store:get-block block-store hash)))
             ;; Level 0: the body reads back. A pruned or snapshot chainstate
@@ -226,7 +275,7 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
             ;; (validation.cpp:4684-4690).
             (unless block
               (unless (or snapshot-p (bl:pruning-enabled-p))
-                (bl:log-error "Verification error: reading block failed at ~D, hash=~A"
+                (bl:log-error "Verification error: ReadBlock failed at ~D, hash=~A"
                               height (%hash-hex hash))
                 (return-from verify-db :corrupted-block-db))
               (bl:log-info "Block verification stopping at height ~D (no data). This could be due to pruning or use of an assumeutxo snapshot." height)
@@ -235,36 +284,33 @@ argument the way PRUNE-OLD-BLOCKS's byte target does. NIL means no bound."
             (let ((bad (%verify-db-block-checks entry block chain-state check-level)))
               (when bad (return-from verify-db bad)))
             (when (and scratch (not skipped-l3))
-              (if (and coins-cache-bytes
-                       (> (+ (bl.store:view-mem-bytes scratch)
-                             (bl.store:view-mem-bytes tip-view))
-                          coins-cache-bytes))
-                  (setf skipped-l3 t)
-                  (ecase (%verify-db-disconnect entry block scratch)
-                    (:failed (return-from verify-db :corrupted-block-db))
-                    ;; UNCLEAN keeps going, remembering the lowest block that
-                    ;; disagreed (validation.cpp:4726).
-                    (:unclean (setf good-transactions 0 failure-entry entry))
-                    (:ok (incf good-transactions
-                               (length (bl.ser:bitcoin-block-transactions block))))))))
+              ;; Past Core's cache-size guard (validation.cpp:4716), level 3
+              ;; stops for good; UNCLEAN keeps going, remembering the lowest
+              ;; block that disagreed (validation.cpp:4726).
+              (ecase (if (and coins-cache-bytes
+                              (> (+ (bl.store:view-mem-bytes scratch)
+                                    (bl.store:view-mem-bytes tip-view))
+                                 coins-cache-bytes))
+                         :skipped
+                         (%verify-db-disconnect entry block scratch))
+                (:skipped (setf skipped-l3 t))
+                (:failed (return-from verify-db :corrupted-block-db))
+                (:unclean (setf good-transactions 0 failure-entry entry))
+                (:ok (incf good-transactions
+                           (length (bl.ser:bitcoin-block-transactions block)))))))
           (when (bl:interrupt-requested-p) (return-from verify-db :interrupted))
           (setf entry (bl.store:block-index-entry-prev-entry entry))))
       (when failure-entry
-        (bl:log-error "Verification error: coin database inconsistencies found (last ~D block~:P, ~D good transaction~:P before that)"
+        (bl:log-error "Verification error: coin database inconsistencies found (last ~D blocks, ~D good transactions before that)"
                       (1+ (- chain-height
                              (bl.store:block-index-entry-height failure-entry)))
                       good-transactions)
         (return-from verify-db :corrupted-block-db))
-      (when (and (>= check-level 4) (not skipped-l3) entry)
-        (let ((r (%verify-db-reconnect chain-state block-store scratch entry tip-entry)))
-          (unless (eq r :success) (return-from verify-db r))))
       (when (and skipped-l3 (not no-coins-db))
         (bl:log-warn "Skipped verification of level >=3 (insufficient database cache size). Consider increasing -dbcache."))
-      (bl:log-info "Verification: No coin database inconsistencies in last ~D block~:P (~D transaction~:P)"
-                   (- chain-height (if entry
-                                       (bl.store:block-index-entry-height entry)
-                                       chain-height))
-                   good-transactions)
-      (cond (skipped-l3 :skipped-l3-checks)
-            (skipped-no-data :skipped-missing-blocks)
-            (t :success)))))
+      (when (and (>= check-level 4) (not skipped-l3) entry)
+        (let ((r (%verify-db-reconnect chain-state block-store scratch entry tip-entry
+                                       chain-height check-depth report-done)))
+          (unless (eq r :success) (return-from verify-db r))))
+      (%verify-db-finish chain-height entry good-transactions
+                         skipped-l3 skipped-no-data))))

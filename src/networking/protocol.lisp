@@ -1913,6 +1913,17 @@ m_addr_token_timestamp when the Peer is created, :386)."
               (min (+ (peer-addr-token-bucket peer) increment) cap))))
     (setf (peer-addr-token-timestamp peer) now)))
 
+(defun %log-addrman-added (address-book added peer)
+  "Core's AddrMan::Add_ closing line, `Added N addresses (of M) from <source>:
+T tried, N new' (addrman.cpp:687-689), written when an addr or addrv2 message
+stored anything; p2p_invalid_messages.py:236 waits for `Added 1 addresses'.
+Ours adds one address at a time, so `of' counts the ones that were stored."
+  (when (and address-book (plusp added))
+    (bl:log-cat "addrman" "Added ~D addresses (of ~D) from ~A: ~D tried, ~D new"
+                added added (if peer (peer-address peer) "")
+                (address-book-n-tried address-book)
+                (address-book-n-new address-book))))
+
 (defun %process-gossiped-addresses (peer entries announced-count address-book peers)
   "Shared addr/addrv2 processing core (the per-address loop of Core's
 ADDR/ADDRV2 handler, net_processing.cpp:4038-4118). ENTRIES is a list of
@@ -2022,8 +2033,7 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
                    (push (cons net-addr timestamp) entries)))))
     (let ((added (%process-gossiped-addresses peer (nreverse entries) msg-count
                                               address-book peers)))
-      (when (and address-book (> added 0))
-        (bl:log-cat "net" "Added ~D peer addresses from addr message" added))
+      (%log-addrman-added address-book added peer)
       added))))
 
 ;;; ADDRv2 handling (BIP 155)
@@ -2066,8 +2076,7 @@ block-relay-only peer (Core SetupAddressRelay)."
                               (cons net-addr timestamp)))
                           entries)
                   announced-count address-book peers)))
-      (when (and address-book (> added 0))
-        (bl:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
+      (%log-addrman-added address-book added peer)
       added))))
 
 ;;; Transaction handling
@@ -2152,6 +2161,22 @@ THIS witness alone, so the txid keeps its announcements."
          (bl:add-recent-reject recent-rejects txid)
          (tx-request-received txid))))))
 
+(defun %log-invalid-orphan (txid wtxid peer-id error)
+  "Core's two lines for an orphan that turned out invalid once its parent
+arrived: ProcessOrphanTx's `   invalid orphan tx <txid> (wtxid=<wtxid>) from
+peer=<n>. <state>' (net_processing.cpp:3246-3250) and then ProcessInvalidTx's
+`<txid> (wtxid=<wtxid>) from peer=<n> was not accepted: <state>' (:3131-3135).
+p2p_invalid_tx.py:122 waits for the reject reason in them
+(`bad-txns-in-belowout'). PEER-ID is the orphan's announcer -- the peer whose
+orphan work set Core is draining."
+  (let ((state (bl.val:tx-reject-reason-string error))
+        (txid-hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))
+        (wtxid-hex (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))))
+    (bl:log-cat "txpackages" "   invalid orphan tx ~A (wtxid=~A) from peer=~D. ~A"
+                txid-hex wtxid-hex peer-id state)
+    (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
+                txid-hex wtxid-hex peer-id state)))
+
 (defun process-orphans (accepted-txid utxo-set mempool chain-state peers
                         &key recent-rejects)
   "De-orphan cascade: after ACCEPTED-TXID enters the mempool, re-validate the
@@ -2182,6 +2207,9 @@ by TXID, so the cascade work list carries txids."
                           :chainstate-current
                           (current-for-fee-estimation-p chain-state))
                        (when (eq :ok result)
+                         (bl:log-cat "txpackages" "   accepted orphan tx ~A (wtxid=~A)"
+                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes otxid))
+                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes owtxid)))
                          (bl.mp:orphan-remove pool owtxid)
                          (when peers
                            (let ((vsize (bl.mp:mempool-entry-vsize entry)))
@@ -2192,7 +2220,13 @@ by TXID, so the cascade work list carries txids."
                               :wtxid owtxid)))
                          (push otxid work))))   ; cascade to this tx's dependents
                     ((eq error :missing-input) nil)   ; still missing another parent
-                    (t (bl.mp:orphan-remove pool owtxid)  ; now invalid
+                    (t (let ((announcer (first (bl.mp:orphan-announcers pool owtxid))))
+                         (%log-invalid-orphan otxid owtxid
+                                              (if (peer-p announcer)
+                                                  (peer-id announcer)
+                                                  announcer)
+                                              error))
+                       (bl.mp:orphan-remove pool owtxid)  ; now invalid
                        ;; Same insertion rules as handle-tx — Core routes
                        ;; orphan re-validation failures through the same
                        ;; MempoolRejectedTx. This is Core's
@@ -2612,6 +2646,11 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                      (let ((parents (missing-parent-txids tx utxo-set mempool)))
                        (if (%orphan-parents-rejected-p parents recent-rejects)
                            (progn
+                             ;; Core's line (:423-425); p2p_invalid_tx.py:153
+                             ;; waits for it.
+                             (bl:log-cat "mempool" "not keeping orphan with rejected parents ~A (wtxid=~A)"
+                                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
                              (bl:add-recent-reject recent-rejects txid)
                              (bl:add-recent-reject recent-rejects wtxid)
                              ;; :434-435, beside the two filter inserts.

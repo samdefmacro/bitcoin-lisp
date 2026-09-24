@@ -185,3 +185,80 @@ reach start-node instead of being parsed and thrown away."
   (let ((plist (start-node-plist '("-regtest"))))
     (is (null (getf plist :check-blocks)))
     (is (null (getf plist :check-level)))))
+
+(test verify-db-level-1-is-checkblock-over-the-body-on-disk
+  "Level 1 is Core's CheckBlock over the body ReadBlock returns
+(validation.cpp:4696-4700). A flipped bit in the tip coinbase's nLockTime --
+the last byte of a one-transaction block -- still deserializes, so level 0
+passes, but the merkle root no longer matches: level 1 answers
+CORRUPTED-BLOCK-DB and logs Core's line with the reason."
+  (with-network (:regtest)
+    (multiple-value-bind (node cspath base)
+        (coins-db-node-fixture (format nil "vdbl1~D" (get-internal-real-time)))
+      (declare (ignore cspath))
+      (let ((bl:*node* node))
+        (generate-regtest-blocks node 4)
+        (bl.store:coins-view-cache-flush (bl:node-utxo-set node) :sync t)
+        (let* ((cs (bl:node-chain-state node))
+               (entry (bl.store:get-block-index-entry cs (bl.store:best-block-hash cs)))
+               (block (bl.store:get-block (bl:node-block-store node)
+                                          (bl.store:block-index-entry-hash entry)))
+               (size (length (bl.ser:serialize-witness-block block)))
+               (file (merge-pathnames (format nil "blocks/blk~5,'0D.dat"
+                                              (bl.store:block-index-entry-file entry))
+                                      base)))
+          (is (eq :success (bl.val:verify-db cs (bl:node-block-store node) :check-level 1)))
+          ;; XOR obfuscation is positional, so a flipped stored bit is the same
+          ;; flipped bit in the body whatever the key.
+          (with-open-file (s file :direction :io :element-type '(unsigned-byte 8)
+                                  :if-exists :overwrite)
+            (let ((pos (+ (bl.store:block-index-entry-data-pos entry) size -1)))
+              (file-position s pos)
+              (let ((b (read-byte s)))
+                (file-position s pos)
+                (write-byte (logxor b #x80) s))))
+          (setf (bl:node-block-store node) (bl.store:init-block-store base))
+          (let ((store (bl:node-block-store node)))
+            (is (eq :success (bl.val:verify-db cs store :check-level 0)))
+            (let ((lines (capture-log-lines
+                          (lambda ()
+                            (is (eq :corrupted-block-db
+                                    (bl.val:verify-db cs store :check-level 1)))))))
+              (is-true (find-if (lambda (l) (search "Verification error: found bad block at 4" l))
+                                lines))
+              (is-true (find-if (lambda (l) (search "bad-txnmrklroot" l)) lines)))))))))
+
+(test verify-db-level-4-reconnects-without-contextualcheckblock
+  "Level 4 is Core's ConnectBlock alone (validation.cpp:4747-4769);
+ContextualCheckBlock runs in AcceptBlock and never here. rpc_blockchain.py:106
+calls verifychain(4, 0) after a restart with -testactivationheight=segwit@6
+over blocks mined with segwit active from genesis: to ContextualCheckBlock the
+early coinbases' witness reserved value is `unexpected-witness', to
+ConnectBlock it is nothing. Ours reconnected through the whole battery and
+answered CORRUPTED-BLOCK-DB. The walk also logs Core's progress lines, the
+second half of the bar included."
+  (with-network (:regtest)
+    (let ((node (coins-db-node-fixture (format nil "vdbl4~D" (get-internal-real-time)))))
+      (let ((bl:*node* node))
+        (generate-regtest-blocks node 8)
+        (bl.store:coins-view-cache-flush (bl:node-utxo-set node) :sync t))
+      (let ((cs (bl:node-chain-state node))
+            (store (bl:node-block-store node)))
+        (unwind-protect
+             (progn
+               (bl.val:apply-test-activation-heights '("segwit@6"))
+               ;; Control: the moved deployment does make block 1 invalid to
+               ;; ContextualCheckBlock, so the verdict below is not vacuous.
+               (is (not (bl.val:segwit-active-at-height-p 1)))
+               (let ((lines (capture-log-lines
+                             (lambda ()
+                               (is (eq :success
+                                       (bl.val:verify-db cs store :check-level 4
+                                                                  :check-depth 0)))))))
+                 (is-true (find "Verifying last 8 blocks at level 4" lines
+                                :test (lambda (x l) (search x l))))
+                 (is-true (find "Verification progress: 50%" lines
+                                :test (lambda (x l) (search x l))))
+                 (is-true (find "Verification progress: 94%" lines
+                                :test (lambda (x l) (search x l))))))
+          (bl.val:apply-test-activation-heights nil))))))

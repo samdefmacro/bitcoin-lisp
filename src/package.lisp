@@ -272,6 +272,9 @@ init.cpp, node/. src/node/.")
    #:*addcon-thread*
    #:start-index-background-sync
    #:start-wallets
+   #:trim-max-connections
+   #:oversized-dbcache-warning
+   #:warn-about-bad-listen-ports
    #:node-sync-thread
    #:node-running
    #:sync-idle-wait

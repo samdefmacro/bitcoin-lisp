@@ -876,7 +876,7 @@ address length, or any address longer than +max-addrv2-address-size+."
          (network-id (br-read-u8 stream))
          (addr-len (br-read-compact-size stream)))
     (when (> addr-len +max-addrv2-address-size+)
-      (serialization-error "addrv2 address too long: ~D > ~D" addr-len +max-addrv2-address-size+))
+      (serialization-error "Address too long: ~D > ~D" addr-len +max-addrv2-address-size+))
     (let ((expected-len (gethash network-id *addrv2-addr-sizes*)))
       ;; A recognized network with the wrong length is a stream failure in
       ;; Core (SetNetFromBIP155Network throws) — the entire message is bad.

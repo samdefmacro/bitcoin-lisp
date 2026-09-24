@@ -1285,3 +1285,36 @@ without the grant is capped at 5000."
                                                          :inbound t)))
                  "a relay-permission peer's every announcement is tracked")))
       (bl.net:reset-tx-requests))))
+
+(test an-orphan-invalid-once-its-parent-arrives-is-logged-in-cores-words
+  "When a parent arrives, Core re-validates the orphans waiting on it and logs
+one that is now invalid as `   invalid orphan tx <txid> (wtxid=<wtxid>) from
+peer=<n>. <state>' (ProcessOrphanTx, net_processing.cpp:3246-3250), then
+ProcessInvalidTx's `was not accepted' line. p2p_invalid_tx.py:122 waits for
+the reject reason in them, bad-txns-in-belowout for an orphan paying out more
+than its parent gives it. Ours dropped the orphan without a word."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((parent (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (parent-id (bl.ser:transaction-hash parent))
+           ;; Pays out more than the parent's output holds.
+           (child (%pr-tx (list (cons parent-id 0)) 200000000))
+           (child-hex (bl.crypto:bytes-to-hex
+                       (bl.crypto:reverse-bytes (bl.ser:transaction-hash child))))
+           (a (%pr-peer))
+           (b (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (let ((ctx (%pr-ctx state utxo mempool rejects))
+              (pool (bl.mp:mempool-orphan-pool mempool)))
+          (deliver-tx a (%pr-payload child) ctx)
+          (is-true (bl.mp:orphan-tx pool (bl.ser:transaction-hash child)))
+          (let ((log (nth-value 1 (log-text-of
+                                   "txpackages"
+                                   (lambda () (deliver-tx b (%pr-payload parent) ctx))))))
+            (is-true (bl.mp:mempool-has mempool parent-id))
+            (is-false (bl.mp:orphan-tx pool (bl.ser:transaction-hash child)))
+            (is-true (search (format nil "   invalid orphan tx ~A (wtxid=" child-hex) log)
+                     "log: ~A" log)
+            (is-true (search (format nil "from peer=~D. bad-txns-in-belowout"
+                                     (bl.net:peer-id a))
+                             log)
+                     "log: ~A" log)))))))

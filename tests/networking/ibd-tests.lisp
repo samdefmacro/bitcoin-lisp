@@ -1157,6 +1157,7 @@ known parent, unvalidated — letting a peer inflate chain-work with low-target
 headers and bypass checkpoints at admission. Uses a header whose timestamp is at
 the median-time-past, which fails the timestamp>MTP rule deterministically."
   (let* ((bl:*network* :regtest)
+         (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+)
          (state (bl.store:init-chain-state
                  (merge-pathnames "test-hdr-validation/" (uiop:temporary-directory))))
          (genesis-hash (bl.store:best-block-hash state))
@@ -1170,9 +1171,10 @@ the median-time-past, which fails the timestamp>MTP rule deterministically."
                                   :cached-hash genesis-hash))))
     (bl.store:add-block-index-entry state genesis-entry)
     ;; Child of genesis whose timestamp == genesis MTP -> invalid (<= MTP).
-    (let* ((bad-hdr (bl.ser:make-block-header
-                     :version 1 :prev-block genesis-hash :merkle-root zeros
-                     :timestamp genesis-ts :bits #x207fffff :nonce 1))
+    (let* ((bad-hdr (grind-header-pow
+                     (bl.ser:make-block-header
+                      :version 1 :prev-block genesis-hash :merkle-root zeros
+                      :timestamp genesis-ts :bits #x207fffff :nonce 1)))
            (bad-hash (bl.ser:block-header-hash bad-hdr)))
       ;; (a) the shared validation gate rejects it.
       (multiple-value-bind (valid-headers error)
@@ -2176,8 +2178,17 @@ parents', txdownloadman_impl.cpp:422-436)."
     (is-false (equalp txid wtxid))
     ;; The missing parent was recently rejected.
     (bl:add-recent-reject rejects parent-txid)
-    (with-tx-relay-out-of-ibd
-      (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects)))
+    (let ((log (nth-value 1 (log-text-of
+                             "mempool"
+                             (lambda ()
+                               (with-tx-relay-out-of-ibd
+                                 (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))))))))
+      ;; Core's line, which p2p_invalid_tx.py:153 waits for.
+      (is-true (search (format nil "not keeping orphan with rejected parents ~A (wtxid=~A)"
+                               (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                               (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
+                       log)
+               "log: ~A" log))
     ;; Rejected under both ids; never admitted to the orphan pool; the
     ;; parent was NOT re-requested.
     (is-true (bl:recent-reject-p rejects txid))
@@ -5319,13 +5330,14 @@ throttle window is cleared, the next unconnecting message asks again."
                (when peer
                  (unwind-protect
                       (flet ((orphan-header (seed)
-                               (bl.ser:make-block-header
-                                :version 1
-                                :prev-block (make-array 32 :element-type '(unsigned-byte 8)
-                                                           :initial-element seed)
-                                :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                                            :initial-element 1)
-                                :timestamp 1 :bits #x207fffff :nonce 0))
+                               (grind-header-pow
+                                (bl.ser:make-block-header
+                                 :version 1
+                                 :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element seed)
+                                 :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                             :initial-element 1)
+                                 :timestamp 1 :bits #x207fffff :nonce 0)))
                              (getheaders-bytes ()
                                ;; The per-command counter is BYTES (Core
                                ;; mapSendBytesPerMsgType); one getheaders is one

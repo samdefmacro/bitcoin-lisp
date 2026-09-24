@@ -2352,12 +2352,16 @@ warns on, so one broken handler costs a bounded number of loud lines."
   "Count and log a handler error SAFELY-DISPATCH-PEER-MESSAGE swallowed.
 Returns the running total for COMMAND."
   (let ((count (incf (gethash command *message-handler-errors* 0))))
-    ;; Core logs exactly this and nothing else (net_processing.cpp:5283):
-    ;; ProcessMessages(<command>, <n> bytes): Exception ... caught.
+    ;; Core's line (net_processing.cpp:5284), word for word up to `caught':
+    ;; `ProcessMessages(<command>, <n> bytes): Exception '<what()>' (<type>)
+    ;; caught'. The functional tests match on it -- p2p_invalid_messages.py
+    ;; :194 on `ProcessMessages(addrv2, 0 bytes): Exception', feature_block.py
+    ;; :947 on the non-canonical CompactSize text inside it. The peer and our
+    ;; running count follow, where Core's line ends.
     (bl:log-cat "net"
-                "ProcessMessages(~A, ~D bytes) from ~A: ~A caught (~D so far): ~A"
-                command (length payload) (peer-log-name peer)
-                (type-of condition) count condition)
+                "ProcessMessages(~A, ~D bytes): Exception '~A' (~(~A~)) caught, ~A (~D so far)"
+                command (length payload) condition (type-of condition)
+                (peer-log-name peer) count)
     (when (%power-of-ten-p count)
       (bl:log-warn "The ~A message handler has raised ~D time~:P (last from ~A: ~A)"
                    command count (peer-log-name peer) condition))
@@ -4235,6 +4239,20 @@ very block it is delivering is what p2p_sendheaders.py:567 catches."
       ;; suddenly has nothing for us — drop the sync (Core nCount==0 branch).
       ((null headers)
        (%clear-peer-headers-sync peer :finalize t)
+       0)
+
+      ;; Core's CheckHeadersPoW before any processing (net_processing.cpp:
+      ;; 2983-2991, :2619-2633): a header whose hash misses its own claimed
+      ;; target, or a batch that does not chain, is Misbehaving in Core's
+      ;; words -- p2p_invalid_messages.py:305 and :78 wait for them and for
+      ;; the disconnect. Ours dropped the header in AcceptBlockHeader and
+      ;; kept the peer. Not for a BLOCK message's own header (DIRECT-FETCH
+      ;; NIL), which Core never routes through ProcessHeadersMessage.
+      ((and direct-fetch (not (headers-pow-valid-p headers)))
+       (when peer
+         (record-misbehavior peer (if (every #'bl.val:check-proof-of-work headers)
+                                      "non-continuous headers sequence"
+                                      "header with invalid proof of work")))
        0)
 
       ;; A low-work presync/redownload is in progress with this peer: drive
