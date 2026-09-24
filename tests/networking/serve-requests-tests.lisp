@@ -336,7 +336,16 @@ that never sent sendcmpct is asked for the full witness block."
                      (getdata-types
                       (captured-sends
                        (lambda () (bl.net:headers-direct-fetch compact cs (child 2))))))
-              "a compact-block peer is asked for a cmpctblock"))))))
+              "a compact-block peer is asked for a cmpctblock"))
+        ;; Core :2854-2856: where segwit is active, a peer that cannot serve
+        ;; witnesses is asked for nothing (p2p_segwit.py:447, the old node).
+        (let ((old-node (bl.net:make-peer :address "test5" :state :ready
+                                          :services bl.ser:+node-network+)))
+          (with-ibd-context
+            (is (null (getdata-types
+                       (captured-sends
+                        (lambda () (bl.net:headers-direct-fetch old-node cs (child 3))))))
+                "a peer without NODE_WITNESS is not asked for a segwit-era block")))))))
 
 (test getheaders-null-locator-returns-stop-header
   (multiple-value-bind (cs entries) (%make-served-chain 5)

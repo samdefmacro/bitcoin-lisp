@@ -4120,7 +4120,14 @@ requested by anyone. Returns the hashes requested."
                  (unless (or (%block-body-present-p chain-state nil walk)
                              (and *ibd-context*
                                   (gethash hash (ibd-context-in-flight *ibd-context*)))
-                             (fetch-block-requested-p hash))
+                             (fetch-block-requested-p hash)
+                             ;; Core :2854-2856: never from a peer that cannot
+                             ;; serve witnesses, where segwit is active.
+                             (and (not (logtest (peer-services peer)
+                                                bl.ser:+node-witness+))
+                                  (>= (bl.store:block-index-entry-height walk)
+                                      (bl.val:get-segwit-activation-height
+                                       bl:*network*))))
                    (push walk to-fetch)))
                (setf walk (bl.store:block-index-entry-prev-entry walk)))
       ;; A walk that never reached the active chain is a reorg too large to
