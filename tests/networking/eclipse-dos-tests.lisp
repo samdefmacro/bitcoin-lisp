@@ -1027,6 +1027,53 @@ steady-state tip announcements are unaffected by the anti-DoS gate."
           (is (not (null (bl.store:get-block-index-entry state h1-hash)))
               "above-threshold header enters the block index"))))))
 
+(test a-finished-low-work-sync-asks-again-after-a-full-batch
+  "Core's ProcessHeadersMessage, after IsContinuationOfLowWorkHeadersSync has
+taken the sync to FINAL (m_headers_sync.reset()), goes on with
+have_headers_sync false, so a message that was FULL asks again from pindexLast
+(net_processing.cpp:3105-3111): the redownload released only the headers up to
+the end of that message, and the peer may have more. Ours cleared the sync and
+sent nothing, so a chain longer than the sync's last message was never learnt
+past it -- p2p_headers_sync_with_minchainwork.py:166, where a node that had
+redownloaded the new branch up to height 6000 of 6159 sat on the old chain
+until the 300 s sync timed out.
+
+A 4000-header chain, the anti-DoS threshold at height 2500: two full messages
+presync it, two more redownload it, and the last one finishes the sync."
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-final/")
+      (let* ((bl:*minimum-chain-work-override* (+ 1 (* 2 2500)))
+             (peer (bl.net:make-peer :conn-type :outbound-full-relay))
+             (headers (let ((prev genesis-hash))
+                        (loop for i from 1 to 4000
+                              collect (let ((h (%pow-header prev :timestamp (+ 1296688600 (* 60 i)))))
+                                        (setf prev (bl.ser:block-header-hash h))
+                                        h))))
+             (first-half (subseq headers 0 2000))
+             (second-half (subseq headers 2000))
+             (last-hash (bl.ser:block-header-hash (car (last headers)))))
+        (flet ((feed (batch)
+                 (captured-sends
+                  (lambda () (bl.net:ingest-headers-from-peer peer batch state)))))
+          (feed first-half)
+          (feed second-half)
+          (feed first-half)
+          (is (null (bl.store:get-block-index-entry state last-hash))
+              "the redownload has not reached the end of the chain yet")
+          (let* ((sent (feed second-half))
+                 (getheaders (find "getheaders" sent :key #'message-command
+                                                     :test #'string=)))
+            (is-true (bl.store:get-block-index-entry state last-hash)
+                     "the finished sync stored the whole redownloaded chain")
+            (is (null (bl.net:peer-headers-sync peer)) "and the sync is over")
+            (is-true getheaders "a full final message asks for more")
+            (when getheaders
+              (is (equalp last-hash
+                          (first (bl.ser:parse-block-locator-payload
+                                  (subseq getheaders 24))))
+                  "from pindexLast, the last header of that message"))))))))
+
 (test generic-path-unconnecting-headers-store-nothing
   "A header batch that does not connect to our index (unknown prev-block)
 stores nothing and does not error — Core HandleUnconnectingHeaders sends a

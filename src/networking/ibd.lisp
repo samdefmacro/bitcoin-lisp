@@ -3857,22 +3857,38 @@ NIL PEER (degenerate/test caller) is a no-op."
 IsContinuationOfLowWorkHeadersSync): validate batch PoW, advance the state
 machine, store whatever REDOWNLOAD releases. Returns REQUEST-MORE — T when
 the caller should send the next getheaders from the sync's own locator; on
-NIL the sync is over (complete or aborted) and the slot is cleared."
+NIL the sync is over (complete or aborted) and the slot is cleared.
+
+A sync that COMPLETES on a full message is not the end of the conversation.
+Core resets m_headers_sync at FINAL and ProcessHeadersMessage goes on with
+have_headers_sync false, so `nCount == max_headers_result' asks again from
+pindexLast (net_processing.cpp:3105-3111): the redownload released headers
+only up to the end of this message, and the peer may have more. Without the
+follow-up a chain longer than the sync's target was never learnt past its last
+message (p2p_headers_sync_with_minchainwork.py:166)."
   (let ((hss (peer-headers-sync peer)))
     (if (headers-pow-valid-p headers)
         (multiple-value-bind (ok request-more ready)
             (hss-process-next-headers hss headers full-batch)
-          (when ready
-            (%store-validated-headers peer chain-state ready full-batch
-                                      count-fn "Redownload"))
-          (cond ((and ok request-more) t)
-                (t
-                 (bl:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
-                              (if ok "complete" "aborted")
-                              (peer-log-name peer)
-                              (hss-current-height hss))
-                 (%clear-peer-headers-sync peer)
-                 nil)))
+          (let ((last-entry
+                  (and ready
+                       (nth-value 1 (%store-validated-headers
+                                     peer chain-state ready full-batch
+                                     count-fn "Redownload")))))
+            (cond ((and ok request-more) t)
+                  (t
+                   (bl:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
+                                (if ok "complete" "aborted")
+                                (peer-log-name peer)
+                                (hss-current-height hss))
+                   (%clear-peer-headers-sync peer)
+                   (when ok
+                     ;; A valid continuation answers our getheaders (Core
+                     ;; clears m_last_getheaders_timestamp on result.success).
+                     (setf (peer-last-getheaders-time peer) 0)
+                     (%maybe-request-more-headers peer chain-state last-entry
+                                                  full-batch))
+                   nil))))
         ;; PoW-invalid batch from a peer we're presyncing — abort the sync.
         (progn (%clear-peer-headers-sync peer :finalize t) nil))))
 
