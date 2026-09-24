@@ -3747,3 +3747,61 @@ Ours dropped the repeat silently."
     (let ((*error-output* err) (bl:*deferred-log-lines* nil))
       (is (equal '("w1" "w2") (bl:startup-wallet-names '("w1" "w2")))))
     (is (equal "" (get-output-stream-string err)))))
+
+(defmacro %capturing-init-warnings ((var) &body body)
+  "Run BODY with stderr captured, then SETF the existing variable VAR to the
+captured text."
+  (let ((stream (gensym "STDERR")))
+    `(let ((,stream (make-string-output-stream)))
+       (let ((*error-output* ,stream) (bl:*deferred-log-lines* nil))
+         ,@body)
+       (setf ,var (get-output-stream-string ,stream)))))
+
+(test maxconnections-is-trimmed-to-the-descriptor-budget-in-cores-words
+  "Core reserves MIN_CORE_FDS (151), the eight -addnode slots and one per bound
+interface, raises the descriptor limit for the rest, and trims -maxconnections
+to what it gets with an InitWarning (init.cpp:1027-1056). Ours never looked
+at the descriptor limit."
+  (let (err)
+    ;; Reserve = 151 + 8 + 1 = 160; 200 descriptors leave 40.
+    (%capturing-init-warnings (err)
+      (is (= 40 (bl:trim-max-connections 125 1 nil :raise-fn (lambda (n) (declare (ignore n)) 200)))))
+    (is (equal (format nil "Warning: Reducing -maxconnections from 125 to 40, because of system limitations.~%")
+               err))
+    ;; Control: enough descriptors, no trim and no word. The request covers
+    ;; the private-broadcast slots when that is on.
+    (%capturing-init-warnings (err)
+      (is (= 125 (bl:trim-max-connections 125 1 t :raise-fn (lambda (n) (is (= (+ 125 64 160) n)) n)))))
+    (is (equal "" err))
+    ;; Below the reserve itself: Core's InitError.
+    (signals bl.err:init-error
+      (bl:trim-max-connections 125 1 nil :raise-fn (lambda (n) (declare (ignore n)) 100)))))
+
+(test bad-listen-ports-are-cores-initwarnings
+  "Core warns about a -bind whose port IsBadPort names, and about a bad -port
+when no -bind/-whitebind is given (init.cpp:2120-2172). =onion binds and a
+-port shadowed by a -bind are not checked."
+  (let (err)
+    (%capturing-init-warnings (err)
+      (bl:warn-about-bad-listen-ports '(("bind" . "127.0.0.1:22") ("bind" . "127.0.0.1:25=onion")) 18444))
+    (is (equal (format nil "Warning: -bind request to listen on port 22. This port is considered \"bad\" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.~%")
+               err))
+    (%capturing-init-warnings (err)
+      (bl:warn-about-bad-listen-ports '(("port" . "25")) 25))
+    (is-true (search "Warning: -port request to listen on port 25." err))
+    ;; Controls: a -bind makes -port irrelevant; good ports say nothing.
+    (%capturing-init-warnings (err)
+      (bl:warn-about-bad-listen-ports '(("port" . "25") ("bind" . "127.0.0.1:18444")) 25)
+      (bl:warn-about-bad-listen-ports '(("port" . "18444")) 18444))
+    (is (equal "" err))))
+
+(test oversized-dbcache-is-cores-initwarning-text
+  "Core's LogOversizedDbCache (node/caches.cpp:73-83): over 75% of RAM, or
+over the default cache on a machine under 2 GiB, is an InitWarning."
+  (let ((gib (* 1024 1048576)))
+    (is (equal "A 7000 MiB dbcache may be too large for a system memory of only 8192 MiB."
+               (bl:oversized-dbcache-warning (* 7000 1048576) (* 8 gib))))
+    (is (null (bl:oversized-dbcache-warning (* 6000 1048576) (* 8 gib))))
+    (is-true (bl:oversized-dbcache-warning (* 500 1048576) gib))
+    (is (null (bl:oversized-dbcache-warning (* 450 1048576) gib)))
+    (is (null (bl:oversized-dbcache-warning (* 7000 1048576) nil)))))

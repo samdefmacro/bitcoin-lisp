@@ -381,6 +381,7 @@ headerssync.cpp. src/networking/.")
    #:*dns-seeds*
    ;; Checkpoints
    #:network-checkpoints
+   #:bad-port-p
    #:get-checkpoint-hash
    #:last-checkpoint-height
    #:relay-enabled-p

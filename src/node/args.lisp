@@ -240,6 +240,35 @@ compares a stopped node's whole stderr against such lines
         (log-warn "~A" line)
         (defer-log :warn "~A" line))))
 
+(defun %bad-port-warning (prefix port)
+  "Core's BadPortWarning text (init.cpp:2120-2126)."
+  (format nil "~A request to listen on port ~D. This port is considered ~
+\"bad\" and thus it is unlikely that any peer will connect to it. See ~
+doc/p2p-bad-ports.md for details and a full list." prefix port))
+
+(defun warn-about-bad-listen-ports (merged default-port)
+  "Core's two bad-port InitWarnings (init.cpp:2128-2172): every plain -bind
+whose port -- its own, or DEFAULT-PORT, Core's default_bind_port -- is one
+IsBadPort names, and -port itself when it is bad and no -bind or -whitebind
+is given (they make -port irrelevant for listening). An =onion bind is never
+checked, as in Core. Returns the warnings given."
+  (let* ((binds (loop for (k . v) in merged when (string= k "bind") collect v))
+         (whitebinds (loop for (k . v) in merged when (string= k "whitebind") collect v))
+         (port-arg (cdr (assoc "port" merged :test #'string=)))
+         (warnings
+           (append
+            (loop for spec in binds
+                  for (host port onion-p) = (multiple-value-list (parse-bind-option spec))
+                  for p = (or port default-port)
+                  when (and host (not onion-p) (bl.net:bad-port-p p))
+                    collect (%bad-port-warning "-bind" p))
+            (when (and (null binds) (null whitebinds) port-arg)
+              (let ((p (bl.cfg:locale-independent-atoi port-arg)))
+                (when (bl.net:bad-port-p p)
+                  (list (%bad-port-warning "-port" p))))))))
+    (mapc #'init-warning warnings)
+    warnings))
+
 (defun %check-private-broadcast-option (&key reachable onion-may-become-reachable
                                              connect proxy-randomize)
   "Core's -privatebroadcast start-up checks (init.cpp:2257-2280), in Core's
@@ -450,7 +479,12 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
     ;; -forcednsseed silently does nothing (its one consumer requires
     ;; *DNS-SEED-ENABLED* too) and the operator believes seeding is forced.
     (when (and *force-dns-seed* (not *dns-seed-enabled*))
-      (config-error "Cannot set -forcednsseed to true when setting -dnsseed to false."))))
+      (config-error "Cannot set -forcednsseed to true when setting -dnsseed to false."))
+    ;; Last, as Core warns about listen ports only once the connection options
+    ;; are settled (init.cpp:2128-2172).
+    (warn-about-bad-listen-ports
+     merged (let ((p (lk "port")))
+              (if p (bl.cfg:locale-independent-atoi p) (network-port *network*))))))
 
 (defun config-sources (args texts settings-rows network)
   "The four settings sources, as MERGED-CONFIG-ALIST wants them: (kind . rows)

@@ -286,6 +286,27 @@ value the node does not know."
       (setf bl.chain:*enforce-bip94-on-regtest* t)
       (log-info "BIP94 timewarp rules enforced (-test=bip94)"))))
 
+(defun total-ram-bytes ()
+  "Core's GetTotalRAM (common/system.cpp:114-128): sysconf(_SC_PHYS_PAGES)
+times sysconf(_SC_PAGESIZE), or NIL when either is not positive."
+  (let ((pages (cffi:foreign-funcall "sysconf" :int #+darwin 200 #-darwin 85 :long))
+        (page-size (cffi:foreign-funcall "sysconf" :int #+darwin 29 #-darwin 30 :long)))
+    (when (and (plusp pages) (plusp page-size))
+      (* pages page-size))))
+
+(defun oversized-dbcache-warning (dbcache-bytes total-ram)
+  "Core's LogOversizedDbCache text (node/caches.cpp:73-83) when DBCACHE-BYTES
+is over ShouldWarnOversizedDbCache's cap (node/caches.h:32-36): the default
+cache on a machine under 2 GiB, three quarters of TOTAL-RAM otherwise. NIL
+when it is not, or when TOTAL-RAM is unknown."
+  (when total-ram
+    (let ((cap (if (< total-ram (* 2048 1048576))
+                   bl.kv:+default-db-cache-bytes+
+                   (* (floor total-ram 100) 75))))
+      (when (> dbcache-bytes cap)
+        (format nil "A ~D MiB dbcache may be too large for a system memory of only ~D MiB."
+                (ash dbcache-bytes -20) (ash total-ram -20))))))
+
 (defun %init-parameters (network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   "The startup parameters applied before any database opens: test activation
 heights, -test, -mocktime, the -peerblockfilters/-blockfilterindex gate,
@@ -376,6 +397,8 @@ heights, -test, -mocktime, the -peerblockfilters/-blockfilterindex gate,
                  ;; as Core divides its filter budget by n_indexes.
                  :filter-index-count (+ (if blockfilterindex 1 0)
                                         (if coinstatsindex 1 0)))))
+    (let ((warning (oversized-dbcache-warning total (total-ram-bytes))))
+      (when warning (init-warning warning)))
     (setf bl.kv:*cache-sizes* sizes
           *coins-cache-budget-bytes*
           (bl.store:cache-sizes-coins sizes))
@@ -488,7 +511,60 @@ nobody, where Core refuses to start at all (p2p_permissions.py:101)."
           ((zerop port)
            (format nil "Need to specify a port with -whitebind: '~A'" address)))))
 
-(defun %init-connection-options (data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly)
+(defparameter +min-core-fds+ 151
+  "Core's MIN_CORE_FDS (init.cpp:166): MIN_LEVELDB_FDS 150 plus
+NUM_FDS_MESSAGE_CAPTURE 1 (net.h:91), the descriptors reserved before any
+peer connection is counted.")
+
+(defparameter +max-addnode-connections+ 8
+  "Core's MAX_ADDNODE_CONNECTIONS (net.h:71).")
+
+(defparameter +max-private-broadcast-connections+ 64
+  "Core's MAX_PRIVATE_BROADCAST_CONNECTIONS (net.h:77).")
+
+(defun raise-file-descriptor-limit (min-fd)
+  "Core's RaiseFileDescriptorLimit (util/fs_helpers.cpp:157-175): raise the
+soft RLIMIT_NOFILE to MIN-FD when it is lower, never past the hard limit, and
+return the soft limit that results (MIN-FD when getrlimit fails)."
+  (let ((resource #+darwin 8 #-darwin 7))   ; RLIMIT_NOFILE
+    (cffi:with-foreign-object (rl :uint64 2)
+      (if (minusp (cffi:foreign-funcall "getrlimit" :int resource :pointer rl :int))
+          min-fd
+          (progn
+            (when (< (cffi:mem-aref rl :uint64 0) min-fd)
+              (setf (cffi:mem-aref rl :uint64 0)
+                    (min min-fd (cffi:mem-aref rl :uint64 1)))
+              (cffi:foreign-funcall "setrlimit" :int resource :pointer rl :int)
+              (cffi:foreign-funcall "getrlimit" :int resource :pointer rl :int))
+            (cffi:mem-aref rl :uint64 0))))))
+
+(defun trim-max-connections (user-max n-bind private-broadcast-p
+                             &key (raise-fn #'raise-file-descriptor-limit))
+  "Core's file-descriptor budget for -maxconnections (init.cpp:1027-1056):
+reserve MIN_CORE_FDS, the -addnode slots and one per bound interface, raise
+the descriptor limit to fit USER-MAX automatic connections (plus the private
+broadcast slots when PRIVATE-BROADCAST-P), and trim USER-MAX to what is left.
+Too few descriptors for the reserve alone is Core's InitError; a trim is its
+InitWarning `Reducing -maxconnections from N to M, because of system
+limitations.' Our peer reader polls, so there is no FD_SETSIZE cap (Core's
+!USE_POLL branch). Returns the connection count to use."
+  (let* ((min-required (+ +min-core-fds+ +max-addnode-connections+ (max n-bind 1)))
+         (available (funcall raise-fn (+ user-max
+                                          (if private-broadcast-p
+                                              +max-private-broadcast-connections+
+                                              0)
+                                          min-required))))
+    (when (< available min-required)
+      (init-error "Not enough file descriptors available. ~D available, ~D required."
+                  available min-required))
+    (let ((trimmed (min (- available min-required) user-max)))
+      (when (< trimmed user-max)
+        (init-warning (format nil "Reducing -maxconnections from ~D to ~D, because of system limitations."
+                              user-max trimmed)))
+      trimmed)))
+
+(defun %init-connection-options (data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly
+                                 &optional listen-bind-supplied-p)
   "Connection options applied before any peer can connect: -blocksonly,
 -networkactive, -asmap, -whitelist / -whitebind, -acceptstalefeeestimates
 (Core Step 6) and -addnode / -connect / -seednode (Step 12's connection setup)."
@@ -496,6 +572,10 @@ nobody, where Core refuses to start at all (p2p_permissions.py:101)."
   ;; the outbound full-relay count and the remainder is inbound capacity. The
   ;; total itself is kept too: Core's addrman failure-counting gate is stated
   ;; against it, not against either derived figure (net.cpp:2888).
+  (setf max-connections
+        (trim-max-connections max-connections
+                              (+ (length whitebind) (if listen-bind-supplied-p 1 0))
+                              *private-broadcast*))
   (setf *max-automatic-connections* max-connections)
   (setf *max-inbound-connections* (automatic-inbound-capacity max-connections max-peers))
   ;; Core -acceptstalefeeestimates is regtest-only (init.cpp:1654-1656).
@@ -2265,7 +2345,7 @@ Returns the node instance."
   ;; loaded by %init-load-chain below.
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
-  (%init-connection-options data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly)
+  (%init-connection-options data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly listen-bind-supplied-p)
   (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1
                           wallet-broadcast)
   (%init-lock-and-banner network blocks-directory pid-file data-directory)
