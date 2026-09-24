@@ -2197,10 +2197,10 @@ build compiled the reference as an undefined variable.")
 block, ingest announced headers, or hand anything else to the generic
 handler. Shared by the block-download drain and the at-tip reap pass."
   ;; Core logs every received message (net_processing.cpp:3582); the two arms
-  ;; handled here do not pass through handle-message, which logs the rest.
+  ;; handled here do not pass through handle-message, which logs the rest --
+  ;; with the same one line (LOG-RECEIVED-MESSAGE, SanitizeString'd).
   (when (or (string= command "block") (string= command "headers"))
-    (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
-                command (length payload) (peer-id peer)))
+    (log-received-message peer command payload))
   (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects) node-ctx
   (cond
     ((string= command "block")
