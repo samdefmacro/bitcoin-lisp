@@ -1186,19 +1186,23 @@ peer that floods us with invs and orphans from filling the orphanage
       (bl.mp:orphan-add pool otx peer)
       t)))
 
-(defun %orphan-missing-parents (otx mempool utxo-set recent-rejects)
-  "OTX's parents that are worth requesting: the ones in neither the UTXO set
-nor the mempool, minus everything AlreadyHaveTx already covers -- the
-orphanage and the recently-confirmed filter above all (Core's
-std::erase_if(unique_parents, AlreadyHaveTx(...)),
-txdownloadman_impl.cpp:391-396). INCLUDE-RECONSIDERABLE stays false there and
-here: a parent rejected for too low a feerate is exactly the one this orphan
-may be able to fee-bump."
+(defun %orphan-missing-parents (otx mempool recent-rejects)
+  "OTX's parents that are worth requesting: all of its unique parents, minus
+everything AlreadyHaveTx covers -- the orphanage, the recently-confirmed filter,
+the rejects and the mempool (Core's std::erase_if(unique_parents,
+AlreadyHaveTx(...)), txdownloadman_impl.cpp:391-396). INCLUDE-RECONSIDERABLE
+stays false there and here: a parent rejected for too low a feerate is exactly
+the one this orphan may be able to fee-bump.
+
+The UTXO set is deliberately NOT consulted, as Core does not consult it: a
+parent confirmed long enough ago to have left the recently-confirmed filter is
+requested too. p2p_orphan_handling.py:295 expects exactly that getdata; we
+dropped every parent with a coin in the UTXO set."
   (remove-if (lambda (ptxid)
                (%already-have-tx-p ptxid nil mempool recent-rejects))
-             (missing-parent-txids otx utxo-set mempool)))
+             (unique-parent-txids otx)))
 
-(defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool utxo-set
+(defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool
                                                recent-rejects num-wtxid-peers)
   "A wtxid announcement matched a stored orphan: treat PEER as an orphan-
 resolution candidate instead of requesting the announced tx again (Core
@@ -1206,8 +1210,7 @@ AddTxAnnouncement's orphan branch, txdownloadman_impl.cpp:172-190)."
   (let ((otx (bl.mp:orphan-tx (bl.mp:mempool-orphan-pool mempool)
                               orphan-wtxid)))
     (when otx
-      (let ((parents (%orphan-missing-parents otx mempool utxo-set
-                                              recent-rejects)))
+      (let ((parents (%orphan-missing-parents otx mempool recent-rejects)))
         ;; All parents accepted/rejected since the orphan was stored: nothing
         ;; to resolve from this peer (the orphan awaits reprocessing), which
         ;; is Core's early return at :182-185.
@@ -1304,7 +1307,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                           (bl.mp:mempool-orphan-pool mempool)
                           hash))
                     (%maybe-add-orphan-resolution-candidate
-                     peer hash mempool utxo-set recent-rejects num-wtxid-peers))
+                     peer hash mempool recent-rejects num-wtxid-peers))
                    ;; include-reconsiderable: a tx whose last failure was
                    ;; reconsiderable must not be requested to be submitted
                    ;; alone again (Core AddTxAnnouncement, :199).
@@ -2267,23 +2270,18 @@ by TXID, so the cascade work list carries txids."
                        ;; attempted here (net_processing.cpp:3207-3211).
                        (%cache-tx-rejection otx error recent-rejects))))))))))))
 
-(defun missing-parent-txids (tx utxo-set mempool)
-  "Deduplicated txids of TX's inputs found in neither the UTXO set nor the
-mempool — the parents whose absence makes TX an orphan (Core GetUniqueParents,
-txdownloadman_impl.cpp:333-348, minus the already-have filter its callers
-apply)."
-  (let ((seen (make-hash-table :test 'equalp))
-        (parents '()))
+(defun unique-parent-txids (tx)
+  "Core GetUniqueParents (txdownloadman_impl.cpp:335-347): the txids TX's
+inputs spend, deduplicated and sorted as Core sorts them (uint256 order, a
+byte-wise compare of the wire-order bytes). Nothing is filtered here; the
+callers apply AlreadyHaveTx and the rejected-parents scan."
+  (let ((parents '()))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
-      (let* ((prevout (bl.ser:tx-in-previous-output input))
-             (ptxid (bl.ser:outpoint-hash prevout))
-             (pidx (bl.ser:outpoint-index prevout)))
-        (unless (or (gethash ptxid seen)
-                    (bl.store:get-utxo utxo-set ptxid pidx)
-                    (bl.mp:mempool-has mempool ptxid))
-          (setf (gethash ptxid seen) t)
-          (push ptxid parents))))
-    (nreverse parents)))
+      (pushnew (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output input))
+               parents :test #'equalp))
+    (sort parents (lambda (a b)
+                    (let ((i (mismatch a b)))
+                      (and i (< (aref a i) (aref b i))))))))
 
 (defun request-orphan-parents (peer parent-txids &optional (num-wtxid-peers 0))
   "Register an orphan's missing PARENT-TXIDS with the tx-request tracker as
@@ -2466,7 +2464,7 @@ alternative announcer."
         (pushnew p candidates :test #'eq)))
     (nreverse candidates)))
 
-(defun %take-orphan-into-orphanage (peer tx mempool utxo-set recent-rejects peers)
+(defun %take-orphan-into-orphanage (peer tx mempool recent-rejects peers)
   "Core MempoolRejectedTx's orphan branch (txdownloadman_impl.cpp:391-420) in
 its order: filter the missing parents through AlreadyHaveTx, enrol EVERY
 announcer of the orphan as a resolution candidate rather than only the peer
@@ -2477,7 +2475,7 @@ enrolment possible at all: forgetting the hash at receipt, as this used to,
 left GetCandidatePeers nothing to find."
   (let* ((txid (bl.ser:transaction-hash tx))
          (wtxid (bl.ser:transaction-wtxid tx))
-         (parents (%orphan-missing-parents tx mempool utxo-set recent-rejects))
+         (parents (%orphan-missing-parents tx mempool recent-rejects))
          (num-wtxid-peers (count-wtxid-relay-peers peers)))
     ;; The delivering peer knows the parents: it just sent us a child that
     ;; spends them, so announcing them back to it is wasted egress (Core
@@ -2493,9 +2491,9 @@ left GetCandidatePeers nothing to find."
                                         num-wtxid-peers))
     (tx-request-forget-tx txid wtxid)))
 
-(defun %orphan-parents-rejected-p (parent-txids recent-rejects)
+(defun %orphan-parents-rejected-p (parent-txids mempool recent-rejects)
   "Core's fRejectedParents scan (txdownloadman_impl.cpp:371-396): T when an
-orphan with these MISSING PARENT-TXIDS must not be kept at all.
+orphan with these unique PARENT-TXIDS must not be kept at all.
 
 A parent in the MAIN rejects filter is fatal — no witness and no package can
 make this child acceptable. A parent in the RECONSIDERABLE filter is NOT: it
@@ -2503,13 +2501,14 @@ may be precisely the low-feerate parent this child exists to fee-bump. Core
 tolerates exactly ONE such parent, because it only submits 1-parent-1-child
 packages, so a second one could never be rescued.
 
-PARENT-TXIDS are already the parents missing from both the UTXO set and the
-mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
+A reconsiderable parent that has since entered MEMPOOL does not count
+(Core's `!m_opts.m_mempool.exists(parent_txid)`)."
   (let ((reconsiderable 0))
     (dolist (ptxid parent-txids nil)
       (cond ((bl:recent-reject-p recent-rejects ptxid)
              (return t))
-            ((bl.val:reconsiderable-reject-p ptxid)
+            ((and (bl.val:reconsiderable-reject-p ptxid)
+                  (not (bl.mp:mempool-has mempool ptxid)))
              (when (> (incf reconsiderable) 1)
                (return t)))))))
 
@@ -2676,8 +2675,8 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                     ;; the txid too, so non-wtxidrelay peers can't make us
                     ;; re-download it).
                     ((eq error :missing-input)
-                     (let ((parents (missing-parent-txids tx utxo-set mempool)))
-                       (if (%orphan-parents-rejected-p parents recent-rejects)
+                     (let ((parents (unique-parent-txids tx)))
+                       (if (%orphan-parents-rejected-p parents mempool recent-rejects)
                            (progn
                              ;; Core's line (:423-425); p2p_invalid_tx.py:153
                              ;; waits for it.
@@ -2689,7 +2688,7 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                              ;; :434-435, beside the two filter inserts.
                              (tx-request-forget-tx txid wtxid))
                            (%take-orphan-into-orphanage
-                            peer tx mempool utxo-set recent-rejects peers))))
+                            peer tx mempool recent-rejects peers))))
                     (t
                      ;; Cache the failure so we don't re-request it (see
                      ;; %cache-tx-rejection for which filter and which ids).

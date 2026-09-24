@@ -2138,11 +2138,9 @@ Regression: bare MSG_TX fetched the witness-stripped parent, which failed
 scripts and — wtxid == txid for a stripped tx — poisoned recent-rejects
 with the parent's real txid, so the orphan could never resolve."
   (bl.net:reset-tx-requests)
-  (let* ((utxo (bl.store:make-utxo-set))
-         (mempool (bl.mp:make-mempool))
-         (orphan (%wave8-tx :prev-id #xB1))
+  (let* ((orphan (%wave8-tx :prev-id #xB1))
          (peer (%wave8-witness-peer))
-         (parents (bl.net::missing-parent-txids orphan utxo mempool)))
+         (parents (bl.net::unique-parent-txids orphan)))
     (is (= 1 (length parents)))
     (let ((invs (bl.net::request-orphan-parents peer parents)))
       (is (= 1 (length invs)))

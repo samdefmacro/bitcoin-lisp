@@ -120,6 +120,26 @@ which is the whole point of a rejects filter (Core's AlreadyHaveTx gate)."
         (bl.ser:transaction-wtxid tx))
        t))
 
+(test orphan-requests-a-confirmed-parent-the-recent-filter-forgot
+  "Core requests every unique parent of an orphan that AlreadyHaveTx does not
+cover (GetUniqueParents + erase_if, txdownloadman_impl.cpp:335-396), and
+AlreadyHaveTx never reads the UTXO set: a parent confirmed long enough ago to
+have left the recently-confirmed filter is requested too.
+p2p_orphan_handling.py:295 expects a getdata for two of four parents -- the
+old confirmed one and the missing one; we asked for the missing one only."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((missing (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a))
+           (orphan (%pr-tx (list (cons funding 0) (cons missing 0)) (- 100000000 50000)))
+           (peer (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (bl.val:reset-recent-confirmed)
+        (deliver-tx peer (%pr-payload orphan) (%pr-ctx state utxo mempool rejects))
+        (is-true (%pr-orphan-p mempool orphan))
+        (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) missing)
+                 "the control: the missing parent is requested")
+        (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) funding)
+                 "the confirmed parent is requested as well")))))
+
 ;;;; (a) The headline case: an LN-shaped CPFP pair arriving as two messages
 
 (test ln-cpfp-pair-enters-mempool-as-a-package
