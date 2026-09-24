@@ -96,11 +96,23 @@
   "Count signature operations in a raw script byte vector.
 When ACCURATE is NIL (legacy counting), OP_CHECKMULTISIG(VERIFY) counts as 20.
 When ACCURATE is T (P2SH/witness counting), uses the preceding small-integer
-opcode (OP_1..OP_16) as the key count, or 20 if not present."
-  (let ((len (length script))
-        (i 0)
-        (count 0)
-        (last-opcode 0))
+opcode (OP_1..OP_16) as the key count, or 20 if not present.
+
+Declared over a simple octet vector with fixnum counters: every block's
+coinbase and every input goes through here, and untyped it was 47% of the
+CPU of accepting a block whose coinbase carries a 950 KB script
+(feature_pruning.py's mine_large_blocks), all of it in generic = and <."
+  (let* ((script (if (typep script '(simple-array (unsigned-byte 8) (*)))
+                     script
+                     (coerce script '(simple-array (unsigned-byte 8) (*)))))
+         (len (length script))
+         (i 0)
+         (count 0)
+         (last-opcode 0))
+    (declare (type (simple-array (unsigned-byte 8) (*)) script)
+             (type fixnum len i count)
+             (type (unsigned-byte 8) last-opcode)
+             (optimize (speed 3) (safety 1)))
     (loop while (< i len)
           do (let ((opcode (aref script i)))
                (cond

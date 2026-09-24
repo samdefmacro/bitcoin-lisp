@@ -137,6 +137,32 @@ witness stack and the first is non-empty (so transaction-has-witness-p holds)."
                     (bl.ser:block-header-hash
                      (bl.ser:bitcoin-block-header blk2))))))))
 
+(test witness-block-bytes-are-the-header-count-and-wire-transactions
+  "SERIALIZE-WITNESS-BLOCK is Core's block serialization with TX_WITH_WITNESS:
+the 80-byte header, a CompactSize transaction count, then each transaction in
+its wire form (witness form only when it has witness data). Pinned against
+that definition, built from the independently tested pieces, because the
+block writer moved from a flexi-streams sequence stream to a byte-buf and a
+round trip alone cannot see a writer and a reader that agree on a mistake."
+  (let ((state (sb-ext:seed-random-state 405)))
+    (dotimes (i 3)
+      (let* ((txs (cons (%rt-rand-tx state)
+                        (loop repeat (+ 253 (random 4 state)) ; a 3-byte count
+                              collect (%rt-rand-tx state :witness (= 1 (random 2 state))))))
+             (hdr (bl.ser:make-block-header
+                   :version 4 :prev-block (%rt-rand-bytes 32 state)
+                   :merkle-root (%rt-rand-bytes 32 state)
+                   :timestamp 1 :bits #x207fffff :nonce i))
+             (expected (concatenate '(vector (unsigned-byte 8))
+                                    (bl.ser:serialize-block-header hdr)
+                                    (vector #xfd (ldb (byte 8 0) (length txs))
+                                            (ldb (byte 8 8) (length txs)))
+                                    (apply #'concatenate '(vector (unsigned-byte 8))
+                                           (mapcar #'bl.ser:transaction-wire-bytes txs)))))
+        (is (equalp expected
+                    (bl.ser:serialize-witness-block
+                     (bl.ser:make-bitcoin-block :header hdr :transactions txs))))))))
+
 ;;;; Inv vectors (inv/getdata payload)
 
 (test roundtrip-inv-vectors

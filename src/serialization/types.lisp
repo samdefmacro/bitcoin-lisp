@@ -382,8 +382,16 @@ Not the wire encoding. Core emits the marker only when HasWitness()
 transaction written in extended form is what its own deserializer refuses as
 a `Superfluous witness record\'. TRANSACTION-WIRE-BYTES is Core's
 TX_WITH_WITNESS and is what every wire, hex and hash site wants."
-  (let ((bb (make-byte-buf))
-        (inputs (transaction-inputs tx))
+  (let ((bb (make-byte-buf)))
+    (bb-write-transaction-witness bb tx)
+    (bb-finish bb)))
+
+(defun bb-write-transaction-witness (bb tx)
+  "Write TX into byte-buf BB in BIP 144 extended form (marker, flag and one
+witness stack per input) -- SERIALIZE-WITNESS-TRANSACTION's body, shared with
+SERIALIZE-WITNESS-BLOCK."
+  (declare (type bl.bytes:byte-buf bb))
+  (let ((inputs (transaction-inputs tx))
         (outputs (transaction-outputs tx))
         (witness (transaction-witness tx)))
     (bb-write-i32-le bb (transaction-version tx))
@@ -405,8 +413,7 @@ TX_WITH_WITNESS and is what every wire, hex and hash site wants."
              (dolist (item stack)
                (bb-write-varint bb (length item))
                (bb-write-bytes bb item)))
-    (bb-write-u32-le bb (transaction-lock-time tx))
-    (bb-finish bb)))
+    (bb-write-u32-le bb (transaction-lock-time tx))))
 
 (defun transaction-wire-bytes (tx)
   "TX in its wire encoding: BIP 144 witness form only when the tx carries
@@ -599,13 +606,19 @@ TRANSACTIONS: List of transactions in the block."
 witness-serialized when it carries witness data (legacy otherwise). This is the
 wire/`submitblock` form and the inverse of read-bitcoin-block (read-transaction
 auto-detects the per-tx witness marker)."
-  (flexi-streams:with-output-to-sequence (s)
-    (write-block-header s (bitcoin-block-header block))
-    (write-compact-size s (length (bitcoin-block-transactions block)))
-    (dolist (tx (bitcoin-block-transactions block))
+  ;; Into a byte-buf, not a flexi-streams sequence stream: that one routes
+  ;; every byte through Gray-stream CLOS dispatch, and this runs for every
+  ;; block stored and every block served -- 23% of a 950 KB block's
+  ;; acceptance by sb-sprof.
+  (let ((bb (make-byte-buf))
+        (txs (bitcoin-block-transactions block)))
+    (bb-write-block-header bb (bitcoin-block-header block))
+    (bb-write-varint bb (length txs))
+    (dolist (tx txs)
       (if (transaction-has-witness-p tx)
-          (write-witness-transaction s tx)
-          (write-transaction s tx)))))
+          (bb-write-transaction-witness bb tx)
+          (bb-write-transaction-legacy bb tx)))
+    (bb-finish bb)))
 
 ;;;; Generic serialization interface
 

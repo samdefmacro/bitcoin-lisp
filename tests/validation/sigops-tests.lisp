@@ -489,3 +489,18 @@ spends, which this block proves by validating with scripts on."
               block cs utxo 1 (bl.ser:get-unix-time))
            (is (null err))
            (is-true valid)))))))
+
+(test sigops-count-is-the-same-over-any-octet-vector
+  "COUNT-SCRIPT-SIGOPS is declared over a simple octet vector (it was 47% of
+the CPU of accepting a block with a 950 KB coinbase script, all of it generic
+arithmetic); a script handed in as any other vector of octets is copied into
+one first and must count the same."
+  (let* ((simple (make-script #x52 #xac #xad #x52 #xae #x76 #xa9))
+         (adjustable (make-array (length simple) :element-type '(unsigned-byte 8)
+                                                 :adjustable t :initial-contents simple))
+         (general (coerce simple 'simple-vector)))
+    (dolist (accurate '(nil t))
+      (let ((n (bl.val:count-script-sigops simple :accurate accurate)))
+        (is (= (if accurate 4 22) n) "control: the simple vector counts as Core does")
+        (is (= n (bl.val:count-script-sigops adjustable :accurate accurate)))
+        (is (= n (bl.val:count-script-sigops general :accurate accurate)))))))
