@@ -1644,7 +1644,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
 peer's version, send verack, await theirs. CONN-TYPE sets the peer's connection
 type (:outbound-full-relay, :block-relay, :feeler, :addr-fetch or :manual)
 before the version is sent, so a block-relay/feeler peer advertises relay=0 and
-skips wtxidrelay.
+skips wtxidrelay. A feeler returns T as soon as our VERACK is sent, without
+waiting for the peer's (the caller drops it; Core net_processing.cpp:3807-3811).
 When TRY-V2 (default: whenever the v2 transport is enabled and supported), the
 BIP324 encrypted transport is established first, reconnecting as v1 if the peer
 turns out not to speak it. Returns T on success."
@@ -1666,7 +1667,13 @@ turns out not to speak it. Returns T on success."
             (%maybe-send-sendtxrcncl peer)
             (send-message peer (bl.ser:make-verack-message))
             (progn (note-verack-sent peer) t)
-            (%await-verack peer))
+            ;; A feeler is done once the peer's VERSION is in and our VERACK
+            ;; is out: Core's VERSION handler disconnects it right there
+            ;; (net_processing.cpp:3807-3811) and never waits for their
+            ;; VERACK -- a peer that withholds it cost us the whole wait.
+            (if (eq conn-type :feeler)
+                (progn (setf (peer-state peer) :ready) t)
+                (%await-verack peer)))
     (%release-outbound-nonce (peer-local-nonce peer))))
 
 (defun note-inbound-addr-me (peer)
