@@ -54,7 +54,7 @@ Tor nor I2P is."
                   (equalp (bl.net:local-address-bytes la) (bl.net:peer-address-ip pa))))
            (bl.net:local-addresses)))
 
-(defun %start-private-broadcast-conversation (peer)
+(defun %start-private-broadcast-conversation (peer use-v2 proxy)
   "Run PEER's private-broadcast conversation on its own thread, counted
 against MAX_PRIVATE_BROADCAST_CONNECTIONS."
   (bt:with-lock-held (*private-broadcast-conversations-lock*)
@@ -62,7 +62,8 @@ against MAX_PRIVATE_BROADCAST_CONNECTIONS."
   (bt:make-thread
    (lambda ()
      (unwind-protect
-          (handler-case (bl.net:run-private-broadcast-connection peer)
+          (handler-case (bl.net:run-private-broadcast-connection
+                         peer :use-v2 use-v2 :proxy proxy)
             (error (e)
               (log-debug "private broadcast conversation with peer=~D failed: ~A"
                          (bl.net:peer-id peer) e)))
@@ -82,20 +83,25 @@ connection is wanted. Returns the seconds to pause before the next pass."
       (when (or (null pa) (%local-address-p pa))
         (return-from %private-broadcast-open-one 0.5))
       (let* ((host (bl.net:peer-address-string pa))
+             ;; Core: addr.nServices & GetLocalServices() & NODE_P2P_V2
+             ;; (net.cpp:3252).
+             (use-v2 (and (bl.net:v2-available-p)
+                          (logtest (bl.net:peer-address-services pa)
+                                   bl.ser:+node-p2p-v2+)))
              (port (bl.net:peer-address-port pa))
              (target (format nil "~A~@[ through the proxy at ~A~]"
                              (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)
                              (and proxy (format nil "~A:~D" (bl.net:proxy-host proxy)
                                                 (bl.net:proxy-port proxy)))))
              (peer (%dial-outbound-peer node host port t
-                                        :conn-type :private-broadcast :use-v2 nil
+                                        :conn-type :private-broadcast :use-v2 use-v2
                                         :proxy proxy)))
         (cond
           (peer
            (setf (bl.net:peer-address peer) host)
            (bl:log-cat "privatebroadcast" "Socket connected to ~A; remaining connections to open: ~D"
                        target (bl.net:private-broadcast-num-to-open-sub 1))
-           (%start-private-broadcast-conversation peer)
+           (%start-private-broadcast-conversation peer use-v2 proxy)
            0)
           ((zerop (bl.net:private-broadcast-num-to-open))
            (bl:log-cat "privatebroadcast"

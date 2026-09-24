@@ -1605,11 +1605,13 @@ structural fix; this bounds the damage in the meantime."
                               (bl.bytes:sanitize-string command) (peer-id peer)))))
         finally (return nil)))))
 
-(defun %v2-try-outbound (peer)
+(defun %v2-try-outbound (peer &key proxy)
   "Attempt the BIP324 v2 handshake on PEER's fresh outbound connection.
 On :FALLBACK-V1 (the peer never answered our key -- almost certainly a v1
 node), reconnect to the same host/port and continue in v1. Returns T when the
-version handshake may proceed (over whichever transport), NIL to give up."
+version handshake may proceed (over whichever transport), NIL to give up.
+PROXY is the proxy override the first dial used (a private-broadcast dial
+through the Tor proxy); the v1 reconnection goes through it too."
   (let* ((conn (peer-connection peer))
          (result (progn
                    (setf (connection-v2-detecting conn) t)
@@ -1624,7 +1626,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
        t)
       ((eq result :fallback-v1)
        (let ((fresh (make-tcp-connection (connection-host conn)
-                                         (connection-port conn))))
+                                         (connection-port conn)
+                                         :proxy proxy)))
          (when fresh
            (close-connection conn)
            (setf (peer-connection peer) fresh)

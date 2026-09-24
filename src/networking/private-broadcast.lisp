@@ -365,11 +365,13 @@ transaction and a ping; anything else ends the connection. T to go on."
                    (bl.bytes:sanitize-string command) (peer-log-name peer))
        t)))
 
-(defun run-private-broadcast-connection (peer)
+(defun run-private-broadcast-connection (peer &key use-v2 proxy)
   "Drive the connected private-broadcast PEER to the end (Core's
 IsPrivateBroadcastConn branches of ProcessMessage and SendMessages): our
 VERSION, VERACK on theirs, INV / TX / PING, and the hang-up on the pong or at
-PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME. On the way out, Core FinalizeNode's
+PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME. USE-V2 first establishes the
+BIP324 transport, falling back to v1 as any outbound dial does (through PROXY,
+the dial's own proxy override). On the way out, Core FinalizeNode's
 arm (net_processing.cpp:1744-1749): a connection that did not get its
 transaction confirmed while transactions are pending asks for another."
   (setf (peer-state peer) :handshaking
@@ -379,7 +381,8 @@ transaction confirmed while transactions are pending asks for another."
                      (* +private-broadcast-max-connection-lifetime+
                         internal-time-units-per-second))))
     (unwind-protect
-         (when (%pb-send-version peer)
+         (when (and (or (not use-v2) (%v2-try-outbound peer :proxy proxy))
+                    (%pb-send-version peer))
            (loop
              (let ((left (/ (- deadline (get-internal-real-time))
                             internal-time-units-per-second)))

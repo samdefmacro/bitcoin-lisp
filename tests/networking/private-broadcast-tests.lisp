@@ -173,3 +173,41 @@ p2p_private_broadcast.py:349 and :470-485 read both."
                  (rpc-error-of (lambda ()
                                  (bl.rpc:dispatch-rpc-method node "abortprivatebroadcast"
                                                              (list txid)))))))))
+
+(test private-broadcast-dials-v2-when-the-address-offers-it
+  "Core opens a private-broadcast connection over BIP324 when the address
+advertises NODE_P2P_V2 and we speak it (net.cpp:3252 use_v2transport,
+OpenNetworkConnection). With USE-V2 the conversation begins with the v2 key
+exchange -- 64 bytes of ElligatorSwift key on the raw socket -- instead of a
+plaintext VERSION; without it the VERSION is the first thing sent (the
+control). Here the key exchange has nobody to answer it and the v1 re-dial is
+refused, so the connection ends without a VERSION ever leaving in the clear."
+  (%with-private-broadcast-state
+    (flet ((first-output (use-v2)
+             ;; Port 1 on the loopback: the v1 fallback's re-dial is refused
+             ;; at once, never reaching the network.
+             (let* ((conn (make-test-connection :host "127.0.0.1" :port 1 :connected t))
+                    (peer (bl.net:make-peer :id 92 :address "127.0.0.1" :connection conn))
+                    (raw '()) (messages '())
+                    (real-send (fdefinition 'bl.net:send-message))
+                    (real-bytes (fdefinition 'bl.net:send-bytes))
+                    (real-receive (fdefinition 'bl.net:receive-message-blocking)))
+               (unwind-protect
+                    (progn
+                      (setf (fdefinition 'bl.net:send-message)
+                            (lambda (p m) (declare (ignore p)) (push m messages) t)
+                            (fdefinition 'bl.net:send-bytes)
+                            (lambda (c b &rest r) (declare (ignore c r)) (push b raw) t)
+                            (fdefinition 'bl.net:receive-message-blocking)
+                            (lambda (p &key timeout) (declare (ignore p timeout)) (values nil nil)))
+                      (ignore-errors
+                       (bl.net:run-private-broadcast-connection peer :use-v2 use-v2)))
+                 (setf (fdefinition 'bl.net:send-message) real-send
+                       (fdefinition 'bl.net:send-bytes) real-bytes
+                       (fdefinition 'bl.net:receive-message-blocking) real-receive))
+               (list (length (car (last raw))) (length messages)))))
+      (is (equal '(0 1) (list (first (first-output nil)) (second (first-output nil))))
+          "the control: v1 sends the VERSION as a message")
+      (let ((v2 (first-output t)))
+        (is (<= 64 (first v2)) "v2 opens with the key exchange, got ~S" v2)
+        (is (= 0 (second v2)) "no plaintext VERSION")))))
