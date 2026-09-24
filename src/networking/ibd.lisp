@@ -4837,6 +4837,38 @@ wasteful attempt."
                    (setf e (bl.store:block-index-entry-prev-entry e))))
         t))))
 
+(defun %activate-best-reorg-target (chain-state block-store utxo-set
+                                    fee-estimator recent-rejects)
+  "RETRY-BEST-REORG-CANDIDATE's step, run under the node lock: choose the
+highest-work completable candidate against the tip as it is NOW and hand it
+to ACTIVATE-BLOCK. Returns (VALUES ENTRY ACTIVATED ERROR MISSING-BLOCKS);
+ENTRY is NIL when there is nothing to try."
+  (let ((tip-entry (bl.store:get-block-index-entry
+                    chain-state (bl.store:best-block-hash chain-state))))
+    (when tip-entry
+      (multiple-value-bind (entry blk)
+          (%best-completable-reorg-target
+           chain-state block-store tip-entry
+           (bl.store:block-index-entry-chain-work tip-entry))
+        (when entry
+          (let ((height (bl.store:block-index-entry-height entry)))
+            (bl:log-debug
+             "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
+             height (bl.store:block-index-entry-height tip-entry))
+            (multiple-value-call #'values
+              entry
+              (bl.val:activate-block
+               blk chain-state block-store utxo-set
+               :current-time (bl.ser:get-unix-time)
+               :skip-scripts (bl.val:script-checks-skippable-p
+                              chain-state
+                              (bl.ser:block-header-hash
+                               (bl.ser:bitcoin-block-header blk))
+                              height)
+               :fee-estimator fee-estimator
+               :recent-rejects recent-rejects
+               :mempool (ibd-context-mempool *ibd-context*)))))))))
+
 (defun retry-best-reorg-candidate (chain-state block-store utxo-set
                                    &key fee-estimator recent-rejects)
   "Deep-reorg activation — the case the height-dispatched receive path cannot
@@ -4856,35 +4888,19 @@ fetch cycle (which also re-arms after restart via the download walk). Returns T 
 candidate activated."
   (when (null *ibd-context*)
     (return-from retry-best-reorg-candidate nil))
-  (let ((tip-entry (bl.store:get-block-index-entry
-                    chain-state (bl.store:best-block-hash chain-state)))
-        (mempool (ibd-context-mempool *ibd-context*)))
-    (when (null tip-entry)
-      (return-from retry-best-reorg-candidate nil))
-    (multiple-value-bind (entry blk)
-        (%best-completable-reorg-target
-         chain-state block-store tip-entry
-         (bl.store:block-index-entry-chain-work tip-entry))
-      (when (null entry)
-        (return-from retry-best-reorg-candidate nil))
+  ;; ONE lock scope for the selection and the activation, as Core's
+  ;; ActivateBestChainStep picks FindMostWorkChain and connects it under one
+  ;; cs_main (validation.cpp:3390-3417). Chosen outside the lock, the target
+  ;; could be one an RPC thread's invalidateblock or generate had just made
+  ;; stale, and the activation then ran on a chain the choice never saw
+  ;; (feature_assumeutxo.py:367 failed bad-txns-BIP30 in both threads at once).
+  (multiple-value-bind (entry activated error missing-blocks)
+      (with-current-node-lock
+        (%activate-best-reorg-target chain-state block-store utxo-set
+                                     fee-estimator recent-rejects))
+    (when entry
       (let ((cand-hash (bl.store:block-index-entry-hash entry))
             (height (bl.store:block-index-entry-height entry)))
-        (bl:log-debug
-         "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
-         height (bl.store:block-index-entry-height tip-entry))
-        (multiple-value-bind (activated error missing-blocks)
-            (with-current-node-lock
-              (bl.val:activate-block
-               blk chain-state block-store utxo-set
-               :current-time (bl.ser:get-unix-time)
-               :skip-scripts (bl.val:script-checks-skippable-p
-                              chain-state
-                              (bl.ser:block-header-hash
-                               (bl.ser:bitcoin-block-header blk))
-                              height)
-               :fee-estimator fee-estimator
-               :recent-rejects recent-rejects
-               :mempool mempool))
           (cond
             (activated
              (remhash cand-hash (ibd-context-reorg-candidates *ibd-context*))
@@ -4933,7 +4949,7 @@ candidate activated."
               "Deep-reorg candidate at height ~D did not activate (~A); rejecting"
               height error)
              (%reject-reorg-candidate cand-hash)
-             nil)))))))
+             nil))))))
 
 (defun %block-body-acceptable-p (block chain-state peer)
   "Core AcceptBlock's pre-write gate (validation.cpp:4381-4389) for a body that

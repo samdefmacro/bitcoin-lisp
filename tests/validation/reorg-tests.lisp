@@ -2584,9 +2584,24 @@ the retry, not eager arrival-time activation, is what performs the reorg."
            ;; Both are candidates; H5 outranks G3 by work.
            (setf (gethash g-hash set) t
                  (gethash h-hash set) t))
-         ;; Retry must skip higher-work INCOMPLETE H5 and activate complete G3.
-         (is (eq t (bl.net::retry-best-reorg-candidate
-                    csa storea utxoa)))
+         ;; Retry must skip higher-work INCOMPLETE H5 and activate complete G3
+         ;; -- choosing it under the node lock, in the same scope as the
+         ;; activation (Core's ActivateBestChainStep under cs_main): a choice
+         ;; made outside it raced an RPC thread's invalidateblock/generate
+         ;; (feature_assumeutxo.py:367).
+         (let* ((real (fdefinition 'bl.net::%best-completable-reorg-target))
+                (held :never-called)
+                (bl:*node* na))
+           (unwind-protect
+                (progn
+                  (setf (fdefinition 'bl.net::%best-completable-reorg-target)
+                        (lambda (&rest args)
+                          (setf held (sb-thread:holding-mutex-p (bl:node-lock na)))
+                          (apply real args)))
+                  (is (eq t (bl.net::retry-best-reorg-candidate
+                             csa storea utxoa))))
+             (setf (fdefinition 'bl.net::%best-completable-reorg-target) real))
+           (is (eq t held) "the target is chosen with the node lock held"))
          (is (equalp g-hash (bl.store:best-block-hash csa)))
          ;; H5 stays a candidate (still not completable); G3 consumed.
          (is (null (gethash g-hash (bl.net::ibd-context-reorg-candidates
