@@ -19,12 +19,12 @@ which always hold a node, use bl.rpc:with-node-lock (node) instead."
            (progn ,@body)))))
 
 (defun block-interval-seconds ()
-  "Core consensusParams.nPowTargetSpacing -- the target seconds between blocks.
-
-The constant itself lives in the node layer, above this one, so this is the
-ONE place bl.net names it: every other reader in the package calls this
-instead of reaching up for the symbol."
-  bl:+pow-target-spacing-seconds+)
+  "Core consensusParams.nPowTargetSpacing -- the target seconds between blocks
+-- for the chain the node runs, read from the chain parameters in the util
+layer (BL.CHAIN:CHAIN-POW-TARGET-SPACING, kernel/chainparams.cpp:98). It used
+to name BL:+POW-TARGET-SPACING-SECONDS+, which the node layer defines ABOVE
+this one, so a fresh build compiled it as an undefined variable."
+  (bl.chain:chain-pow-target-spacing bl:*network*))
 
 (defstruct peer-manager
   "Manages connections to multiple peers."

@@ -2219,6 +2219,15 @@ this line is only ever a socket-level reap."
       (handler-case (progn (disconnect-peer peer) t)
         (error () nil)))))
 
+(defvar *forensic-store-from-height* nil
+  "Debug: when set to an integer N, store every received block at
+   height >= N to disk BEFORE validation, so failed-validation blocks
+   are still available for analysis. Use to capture blocks our
+   validator rejects so we can compare against Bitcoin Core.
+
+Defined ahead of DISPATCH-IBD-MESSAGE, its reader: defined after it, a fresh
+build compiled the reference as an undefined variable.")
+
 (defun dispatch-ibd-message (peer command payload node-ctx ctx)
   "Process one wire message from PEER during IBD: connect a received
 block, ingest announced headers, or hand anything else to the generic
@@ -4623,12 +4632,6 @@ node whose peers are all inbound would disconnect the only peer it has."
                 (disconnect-peer peer)
                 (decf started)
                 (push (cons peer :disconnected) acted))))))))))
-
-(defvar *forensic-store-from-height* nil
-  "Debug: when set to an integer N, store every received block at
-   height >= N to disk BEFORE validation, so failed-validation blocks
-   are still available for analysis. Use to capture blocks our
-   validator rejects so we can compare against Bitcoin Core.")
 
 (defun %fork-bodies-complete-p (entry tip-entry chain-state block-store)
   "T when every block on ENTRY's branch strictly above its fork point with

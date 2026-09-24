@@ -4631,7 +4631,7 @@ does not do this either — ActivateBestChain LOOPS, and each
 ActivateBestChainStep connects a bounded batch and returns so the caller can
 flush.")
 
-(defun %activation-step-target (chain-state tip target)
+(defun %activation-step-target (tip target)
   "TARGET, or its ancestor at most +ACTIVATION-STEP-BLOCKS+ above TIP.
 
 Walking back from TARGET rather than forward from TIP because the index links
@@ -4687,7 +4687,7 @@ backstop against a candidate that reorgs away and reappears."
              ;; Bounded step, not the absolute best tip: see
              ;; +ACTIVATION-STEP-BLOCKS+. On a synced node the best tip is
              ;; within the step and this is the identity.
-             (target (and tip best (%activation-step-target chain-state tip best))))
+             (target (and tip best (%activation-step-target tip best))))
         (when (or (null tip) (null target))
           (return))
         (multiple-value-bind (ok detail)
