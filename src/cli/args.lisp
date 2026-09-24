@@ -130,9 +130,6 @@ negation is Core's error text."
 
 ;;; --- Data directory and config file (Core common/args.cpp, config.cpp) ---
 
-(defparameter *default-datadir* "~/.bitcoin-lisp/"
-  "This node's default data directory -- the node's own default
- (start-node-from-args), so a client with no -datadir finds the node's cookie.")
 
 (defun %datadir-arg ()
   (let ((d (cli-arg "datadir")))
@@ -151,7 +148,9 @@ negation is Core's error text."
      (if d
          (merge-pathnames (uiop:parse-native-namestring d :ensure-directory t)
                           (uiop:getcwd))
-         *default-datadir*))))
+         ;; The node's own default (BL.CFG:DEFAULT-DATA-DIRECTORY), so a
+         ;; client with no -datadir finds the node's cookie.
+         (bl.cfg:default-data-directory)))))
 
 (defun %net-datadir ()
   "Core GetDataDirNet: the base data directory plus the chain's subdirectory."

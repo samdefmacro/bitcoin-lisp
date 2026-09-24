@@ -25,7 +25,7 @@ Print out all of the wallet key-value records~%~%  info~%       Get wallet info~
   "The network's own data directory: -datadir (the node's default when it is
 absent) plus the chain's subdirectory (chainparamsbase.cpp:40-55)."
   (let ((base (uiop:ensure-directory-pathname
-               (tool-arg args "datadir" "~/.bitcoin-lisp/")))
+               (tool-arg args "datadir" (bl.cfg:default-data-directory))))
         (subdirectory (bl.chain:chain-params-data-subdirectory
                        (bl.chain:find-chain-params network))))
     (if subdirectory (merge-pathnames subdirectory base) base)))

@@ -3701,3 +3701,21 @@ include2.conf:1 Section [testnet] is not recognized.~%")
               (list (format nil "testnot.datadir=1~%") (format nil "[testnet]~%"))
               '("include.conf" "include2.conf"))))
   (is (null (bl.cfg:unrecognized-sections-warning (list "regtest=1") '("bitcoin.conf")))))
+
+(test default-data-directory-is-home-dot-bitcoin-lisp
+  "Core's GetDefaultDataDir reads $HOME, falling back to / when it is unset or
+empty (common/args.cpp:774-779). Ours was the literal string ~/.bitcoin-lisp/,
+which nothing expands, so a node started without -datadir could not create
+its lock file. The directory NAME stays ours on purpose (see the docstring):
+our chainstate is not Core's, and sharing ~/.bitcoin would corrupt one node."
+  (let ((saved (uiop:getenv "HOME")))
+    (unwind-protect
+         (progn
+           (sb-posix:setenv "HOME" "/tmp/bl-home-probe/" 1)
+           (is (equal "/tmp/bl-home-probe/.bitcoin-lisp/" (bl.cfg:default-data-directory)))
+           (sb-posix:setenv "HOME" "" 1)
+           (is (equal "/.bitcoin-lisp/" (bl.cfg:default-data-directory)))
+           (is (not (find #\~ (bl.cfg:default-data-directory)))))
+      (if saved
+          (sb-posix:setenv "HOME" saved 1)
+          (sb-posix:unsetenv "HOME")))))

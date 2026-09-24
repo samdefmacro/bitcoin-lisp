@@ -2087,7 +2087,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
     ;; -addnode upkeep on its own thread, as Core's addcon (net.cpp:3529-3530).
     (start-addcon-thread *node*)))
 
-(defun start-node (&key (data-directory "~/.bitcoin-lisp/")
+(defun start-node (&key (data-directory (default-data-directory))
                         (network :mainnet)
                         (log-level :info)
                         (log-file nil)
@@ -2391,7 +2391,7 @@ file location."
          (datadir (namestring
                    (uiop:ensure-directory-pathname
                     (or (cdr (assoc "datadir" cli :test #'string=))
-                        "~/.bitcoin-lisp/"))))
+                        (default-data-directory)))))
          ;; Core records the ORIGINAL datadir and config path before the file
          ;; is read, because a datadir= line inside it moves the datadir
          ;; afterwards (common/init.cpp:25-35). Both are needed again below,

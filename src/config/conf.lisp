@@ -33,6 +33,28 @@ The steps AROUND the config read keep their own wording: the chain selectors'
          :message (format nil "Error reading configuration file: ~?"
                           format-string args)))
 
+(defun default-data-directory ()
+  "This node's default data directory, `$HOME/.bitcoin-lisp/', as a string
+naming a directory -- used whenever no -datadir is given.
+
+Core's GetDefaultDataDir (common/args.cpp:757-785) reads $HOME, falling back
+to `/' when it is unset or empty, and appends `.bitcoin' (macOS: `Library/
+Application Support/Bitcoin'). We read $HOME the same way but DELIBERATELY
+keep our own directory name: this node's chainstate (coins) database is not
+Core's format, so a node sharing Core's default directory on a host that also
+runs Bitcoin Core would corrupt one of the two. feature_config_args.py:212,
+which expects Core's name, is a documented divergence for that reason.
+
+The path used to be the literal string `~/.bitcoin-lisp/', which nothing
+expands: a node started without -datadir could not even create its lock file
+(`Cannot create the lock file at ~/.bitcoin-lisp/.lock')."
+  (let ((home (uiop:getenv "HOME")))
+    (concatenate 'string
+                 (if (and home (plusp (length home)))
+                     (string-right-trim "/" home)
+                     "")
+                 "/.bitcoin-lisp/")))
+
 (defun %conf-strip-comment (line)
   "Cut LINE at its first #, as Core does (config.cpp:41-44). Returns
  (values text used-hash-p).

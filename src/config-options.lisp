@@ -48,6 +48,10 @@
 
 ;;; --- Scalar start-node options (Core GetArg: last occurrence wins) --------
 
+;; -datadir: absent, the node uses $HOME/.bitcoin-lisp/ -- Core's $HOME
+;; lookup (GetDefaultDataDir, common/args.cpp:757-785) with our own directory
+;; name, so it never shares Core's ~/.bitcoin, whose chainstate is not ours.
+;; See BL.CFG:DEFAULT-DATA-DIRECTORY.
 (define-option "datadir" :key :data-directory :type :string)
 ;; -blocksdir: the volume the blk/rev/xor bulk goes on (Core
 ;; ArgsManager::GetBlocksDirPath, common/args.cpp:286-309). The block INDEX

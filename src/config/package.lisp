@@ -78,6 +78,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:config-parse-error-message
    #:conf-settings-rows
    #:conf-unrecognized-sections
+   #:default-data-directory
    #:unrecognized-sections-warning
    #:parse-bitcoin-conf-sections
    #:parse-bitcoin-conf
