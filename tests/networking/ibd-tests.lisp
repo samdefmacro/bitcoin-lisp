@@ -4908,6 +4908,11 @@ pushes a height-1 fork block at a node whose tip is at height 2 and expects
 getchaintips to call it `headers-only'; ours stored every competing-fork body
 and reported `valid-headers'. An EQUAL-work sibling is stored (the `>=' --
 our out-of-order gate had `>'), and a REQUESTED lighter block still is."
+  ;; A fresh directory: the blocks are deterministic, so bodies a previous
+  ;; run stored would already be there.
+  (dolist (suffix '("unreq-fork-a" "unreq-fork-b"))
+    (uiop:delete-directory-tree (regtest-node-base-path suffix)
+                                :validate t :if-does-not-exist :ignore))
   (with-network (:regtest)
     (let* ((na (regtest-node-fixture "unreq-fork-a"))
            (nb (regtest-node-fixture "unreq-fork-b"))
@@ -4966,6 +4971,11 @@ cycle were not connected when their missing parent arrived in the next:
 p2p_unrequested_blocks.py:230 found the node at height 3 instead of 290.
 Blocks 2 and 3 arrive first, a new cycle begins (RENEW-IBD-CONTEXT), then
 block 1: the tip must reach 3."
+  ;; A fresh directory: the blocks are deterministic, so bodies a previous
+  ;; run stored would already be there.
+  (dolist (suffix '("carry-src" "carry-dst"))
+    (uiop:delete-directory-tree (regtest-node-base-path suffix)
+                                :validate t :if-does-not-exist :ignore))
   (with-network (:regtest)
     (let* ((src (regtest-node-fixture "carry-src"))
            (dst (regtest-node-fixture "carry-dst"))
