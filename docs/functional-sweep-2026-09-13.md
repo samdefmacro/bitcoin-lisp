@@ -1169,3 +1169,329 @@ each failure point:
   index.
 - The three large items still awaiting a decision: Core's `blocks/index`
   LevelDB format, SQLite wallet files, and BerkeleyRO with migratewallet.
+
+## Round 8
+
+Eight worktree batches merged onto `main` on 2026-09-24, from `053f81fd`
+through `cf46af32`: 99 commits including the merges, in merge order texts
+(18), wallet (7), blockindex (4), netops (11), blockdl (19, with its own merge
+of `main`), cmpct (9), tail (13, with its merge of `main`) and regress (5, with
+two merges of `main`). The round was the user's answer to a ranking of what
+was left after Round 7: the three format decisions, the block-download
+divergences that touch the live mainnet node, VerifyDB and the error texts,
+the wallet's P7 remainder, and the two operator-visible network defects --
+with one rule for every batch, "Core's way unless a documented reason says
+otherwise". Every batch ran its own green battery on a fresh FASL volume, as
+five of the round's commits change a macro or a defstruct (`0a5b8f14`,
+`923773a4`, `39cdabb4`, `00ca4420`, `d95be76e`), and the merged battery ran
+before every push: 41,942 → 42,425 passing checks, plus the four skips of the
+Core-binary lane (`build/cold-main-55..58` and the branches' own logs). The
+`::` ceiling fell from 3,761 to 3,682, paid by the retired headerindex.dat
+suites and by the cmpct and tail batches' exports of names that have src
+callers; one seam (`f6cece2a`) reset it to 3,701 where three parallel
+batches met on `main`, before it fell again. The behaviour changes that
+mattered most, by batch:
+
+**texts.** VerifyDB's level 4 is Core's ConnectBlock alone, without
+ContextualCheckBlock, and every level logs Core's `Verifying last N blocks at
+level L` and `Verification progress` lines (`9be290a1`, validation.cpp:4760)
+-- `rpc_blockchain` had failed because a chain mined with segwit active from
+genesis was re-checked under `-testactivationheight=segwit@6`. Every
+byte-reader primitive signals `DataStream::read(): end of data`, the
+CompactSize readers `non-canonical ReadCompactSize()` and `ReadCompactSize():
+size too large`, and a caught handler error is logged as Core's
+`ProcessMessages(...): Exception '...' caught` (`0a5b8f14`, the macro change).
+An unrecognised config-file section is Core's InitWarning on stderr and in the
+log, found per file and line with exact-case headers (`93864fc2`,
+`eb69f6fc`), and the InitWarnings Core gives for a trimmed `-maxconnections`,
+a bad listen port and an oversized `-dbcache` now exist (`bf9e4a36`). Headers
+that fail CheckHeadersPoW are Misbehaving (`d0f630ec`); the orphan-resolution
+log lines and `bad-cb-height` are Core's (`b4f5bb24`, `afdf4984`,
+`6614ed77`). The default datadir is `$HOME/.bitcoin-lisp`, expanded as
+GetDefaultDataDir expands its own -- before, nothing expanded the `~`, so a
+node started without `-datadir` could not take its lock (`6f2e5e00`). The
+warm-image ASDF load now fails on a deferred undefined-variable warning, the
+cold lane's check on the warm path, with `scripts/check-warm-load-guard.sh`
+as its positive control (`f00dd91a`) -- the guard the repeated
+scripted-edit lesson asked for. `rpc_blockchain`, `p2p_invalid_messages` and
+`p2p_invalid_tx` PASS in the batch's oracle runs.
+
+**wallet.** G7-42's four RPCs (gethdkeys, setwalletflag,
+createwalletdescriptor, migratewallet) turned out to have landed in earlier
+rounds: every one of Core's 56 wallet RPCs is registered, and
+[wallet-plan.md](wallet-plan.md) P7 now says so (`317ceb8a`). A wallet whose
+stored best block is gone is still this chain's, as AttachChain decides by
+the genesis alone (`47647c85`) -- before, deleting `blocks/` and `chainstate/`
+made the node refuse its own wallet. The wallet directory is Core's
+GetWalletDir (`-walletdir`, else `wallets/` if it exists, else the network
+datadir), names are relative paths that may nest, and every wallet directory
+carries a `BITCOIN_LISP_WALLET` id file with the network's magic, checked at
+the format probe so another network's wallet is Core's -18 "Data is not in
+recognized format" and is not listed (`776c8f96`); existing wallets are
+stamped on the first start. `-walletdir` is verified as VerifyWallets does
+and a duplicate `-wallet` is warned about (`35ebbca9`). validateaddress and
+getaddressinfo share one DescribeAddress, so a taproot output is a script and
+an anchor carries no witness fields (`bac34008`); a load-time rescan says
+`Rescanning…` first and logs how far back it goes (`484eadac`, `42949259`).
+No unmodified wallet test moved to PASS: the batch ran copies of seven of
+them with only the wallet.dat step replaced (backupwallet/restorewallet, or
+`format == 'leveldb'`), and all seven pass end to end, so the file format
+is the only thing behind them (the classification table under "Decisions").
+
+**blockindex.** The block index persists in Core's `blocks/index` LevelDB,
+byte for byte: `b`+hash records in CDiskBlockIndex's layout, `f`+nFile
+CBlockFileInfo, `l`, `R`, `F`+flag and the obfuscation-key record
+(`923773a4`, txdb.cpp, chain.h). A regtest `blocks/index` written by Core
+v28.2 loads here and re-encodes to the same bytes, and Core v28.2 started on
+our datadir reads its chain from our index. `headerindex.dat` and its delta
+log are converted in place on the first start, in 50k batches, and renamed
+`*.migrated` once the count reads back (900,001 entries in 7.8 s). Start-up
+reports Core's `Error opening block database`, `Error loading block
+database` and the witness-data `-reindex` sentence. Under `-reindex`,
+active-chain blocks past segwit activation that lack BLOCK_OPT_WITNESS are
+reset to header-only and their bodies re-accepted, so the tip falls back as
+Core's reindex makes it fall, without the wipe the reindex memo rules out; an
+unpruned start over pruned files is refused in Core's words and `-reindex`
+clears the `prunedblockfiles` flag; `-dbcrashratio` and `-dbbatchsize` exist,
+coins flushes over the batch size are partial batches with Core's
+in-progress marker, and start-up replays an interrupted flush (`a90a16ae`,
+ReplayBlocks). A stored body is judged once, at accept, and a winning block
+is stored before the reorg toward it, so a crash mid-reorg no longer loses it
+(`7db93c5a`). `feature_presegwit_node_upgrade`, `feature_unsupported_utxo_db`
+and `feature_dbcrash` PASS in the batch's oracle runs.
+
+**netops.** One ZMQ publisher per `-zmqpub<topic>` address with its own
+sequence counter, and IPv6 addresses bind (`9c40430e`) -- `interface_zmq`
+had timed out because only the last address published and the test's
+sync-up loop is unbounded. Proxies are Core's per-network table with
+`=ipv4|ipv6|onion|cjdns` suffixes, CheckHostPortOptions and the exact error
+sentences; a `unix:` proxy dials its socket file; and an IPv6-literal proxy
+is reached at all (`891ea152`): `%socket-connect` handed every host to
+usocket's resolver, which refuses `::1` when loopback is the only IPv6
+address, so `-proxy=[::1]:9050` never left the machine -- the dial path the
+live nodes' Tor outbound uses. The DNS seed thread and the `-seednode` queue
+follow ThreadDNSAddressSeed's timing and lines (`52d65373`); the ping timer
+runs on the mockable clock and a pong names Core's problems (`dbe2542a`,
+`e209ddf3`); a handshake cut short by a shutdown request keeps its peer for
+the anchor dump (`8221caea`). BIP 37 is served as Core serves it: CBloomFilter
+with the BLOOM_UPDATE_* flags, filterload/filteradd/filterclear with their
+limits and Misbehaving, `-peerbloomfilters` and NODE_BLOOM, the filtered
+`mempool` answer and MSG_FILTERED_BLOCK merkleblocks, checked against
+bloom_tests.cpp's vectors (`39cdabb4`). I2P goes through a SAM 3.1 bridge as
+i2p.cpp does it -- persistent and transient sessions, `i2p_private_key`, the
+`i2paccept` thread, `-i2psam` making i2p reachable (`00ca4420`;
+[tor-i2p-cjdns-plan.md](tor-i2p-cjdns-plan.md) P4). Every call that resolves
+a host now sits in a literal-aware function, checked by a structural test
+with a positive control (`ffce1d89`), the mechanical guard for a trap that
+had hit twice. Ten tests PASS in the batch's oracle runs: `interface_zmq`,
+`feature_proxy`, `feature_anchors`, `p2p_dns_seeds`, `p2p_seednode`,
+`p2p_ping`, `p2p_filter`, `feature_maxuploadtarget`, `p2p_i2p_sessions`,
+`p2p_i2p_ports`.
+
+**blockdl.** An IBD node asks no NODE_NETWORK_LIMITED peer for blocks, and
+its initial getheaders is gated the same way (`a37cfecf`,
+net_processing.cpp:6165, :5779); a noban peer is served blocks below the
+limited window (`25e15a8c`). A low-work headers sync that ends on a full
+message asks for the rest (`51e90541`) -- `p2p_headers_sync_with_minchainwork`
+had stopped at height 6000 of 6159, not slowness. The download loop fetches
+an equal-work fork (`b90ffe03`), an unsolicited block meets AcceptBlock's
+gates -- min_pow_checked, "requested" meaning in flight, fHasMoreOrSameWork
+(`445344b6`) -- and bodies stored above the tip and the reorg candidates
+outlive the sync cycle (`00ee80b9`). A block that fails only ConnectBlock
+keeps its body, as AcceptBlock writes it first (`f5271ea6`); a header on an
+invalid parent is `bad-prevblk` and its sender punished (`670693f0`). The
+deep-reorg retry chooses its target and activates it under one node lock
+(`f67c9a9c`), and generate steps aside between blocks so the sync thread
+announces as it goes (`8a76e713`) -- `rpc_rawtransaction`'s stall
+reproduced on Core v28.2 with a replica and came from the RPC thread
+starving the announcer. Compact blocks: NewPoWValidBlock's push to
+high-bandwidth peers, the direct fetch of one block as a cmpctblock, a
+compact header no better than the tip indexed but not reconstructed, and no
+segwit-era getdata to a peer without NODE_WITNESS (`54de6990`, `bcf8ba4e`,
+`59fab7b1`, `977ac639`). `feature_assumeutxo`, `rpc_rawtransaction`,
+`p2p_unrequested_blocks`, `feature_block` (once the texts batch's log line
+landed), `p2p_compactblocks_blocksonly` and
+`p2p_headers_sync_with_minchainwork` PASS in the batch's oracle runs.
+
+**cmpct.** The block in-flight table is Core's mapBlocksInFlight: up to
+three peers per block, the last slot for an outbound peer, and every reader
+-- timeouts, stalling, the download walk, getpeerinfo's `inflight`, the
+compact-block path -- moved to the multimap (`e662c95f`). A relayed block's
+consensus verdict is cached on the block index (`8321b797`); a compact-block
+reconstruction is filled once and a second blocktxn is punished
+(`0eac01e7`); an undecodable tx message reaches ProcessMessages' exception
+line, `Unknown transaction optional data` included (`f2a0ee5b`). Chain
+activation is serialized behind Core's m_chainstate_mutex (`d95be76e`,
+validation.cpp:3354-3368): in one of five `p2p_compactblocks` runs
+generatetoaddress was inside connect-block, the block indexed and its coins
+applied but the tip not yet moved, when the sync thread picked the same
+block as a heavier tip and connected it again -- `bad-txns-BIP30`, a
+deterministic verdict, so a valid block was marked invalid and the tip
+rolled back. `bl.val:*chainstate-mutex*` is held by every activation entry
+point, `install-cs-main-check` refuses an activation without the node lock
+once the threads start, and a deterministic test parks one thread at that
+exact window. `p2p_compactblocks` (5 of 5 serial runs) and `p2p_segwit` PASS.
+
+**tail.** Assumevalid skips scripts only for a buried ancestor on the best
+header chain, Core's three clauses that read the best header (`3817f064`,
+validation.cpp:2357-2362), and the ancestry walk is no longer quadratic in
+chain height; `-reindex-chainstate` reconnects each block through
+ConnectBlock's checks (`9ecd06c7`). `-incrementalrelayfee` raises an unset
+`-minrelaytxfee` (`d7ad89f0`); preciousblock of an invalidated block succeeds
+without reconnecting it (`61f48cf2`); an orphan's parents are Core's unique
+parents (`79855f0e`); no sendtxrcncl on an addr-fetch connection and Core's
+outcome lines (`6bb28f15`, `eee6b5d9`); BIP 157 requests are prepared and
+answered as Core does, stale branches included (`c0c090f9`). Core's private
+broadcast is ported -- the queue, the connection count, the opening thread,
+the per-connection exchange, received-back detection, the 2-3 minute
+rebroadcast, `getprivatebroadcastinfo` and `abortprivatebroadcast` -- and
+sendrawtransaction under `-privatebroadcast` queues instead of refusing
+(`a2e43e11`, the reversal of Round 7's decision; v2 when the address
+advertises it, `8e19920e`). reconsiderblock keeps the validity level a block
+had, as ResetBlockFailureFlags clears only the failure bits (`db9f0e7a`); a
+feeler is done once our verack is out (`8cd5c78e`, 30 s → 0.2 s in
+`p2p_sendtxrcncl`). `feature_assumevalid`, `feature_rbf`,
+`p2p_orphan_handling`, `p2p_sendtxrcncl`, `p2p_blockfilters` and
+`p2p_private_broadcast` PASS in the batch's oracle runs.
+
+**regress.** The interim sweep on `53d98310` found three tests red that
+Round 7 had green. `feature_loadblock` was a race the round only made lose:
+getmempoolinfo's `loaded` was a constant, and mempool.dat was replayed before
+the `-loadblock` import; it is now Core's initload order -- import, then
+replay, then the latch the framework waits for (`6d959558`). `feature_pruning`
+was the blockdl batch's compact-block push meeting a slow acceptor: profiled,
+47% of a 950 KB block's acceptance was an untyped sigop scan and 23% a
+one-byte-at-a-time block writer; acceptance went from 45 ms to 7 ms with
+identical bytes (`c0e53f90`). `feature_init` was not a regression but the
+same failure two frames apart; on the way the coins database reads its
+obfuscation key at open as CDBWrapper does (`bb88da61`), a new chainstate
+names genesis as its best block as ConnectBlock does (`b193a632`), and
+start-up opens `chainstate/` once (`7594955d`). Its last two phases, merged
+after the sweep, take `feature_init` to the end: every index reads its
+best-block record checksummed at open, as BaseIndex::Init does (`29633e4f`),
+the record is Core's serialized block locator, committed from the chainstate
+flush rather than per block, with the old 32- and 36-byte records decoded
+once and rewritten, and a record naming a block the block index does not
+hold is refused with Core's "Please rebuild the index" (`b75d5da4`; the
+base-index struct gained a slot). The obfuscation-key read of `bb88da61` had
+refused a v0.14.3 chainstate's own key before NeedsUpgrade could speak; the
+seam commit on `main` puts the two refusals in InitCoinsDB's order.
+
+### Round-8 sweep
+
+Binary `cf46af32` (the round through the regress batch's second phase; four
+staggered batches of the harness with a 150 s cap, the time-outs and the two
+new failures rerun serially with a 900 s cap), classification in
+`docs/functional-sweep-2026-09-13/after-cf46af32.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
+| `bdfd8434` round 6 | 193 | 59 | 2 | 9 |
+| `632abe24` round 7 | 204 | 48 | 2 | 9 |
+| `cf46af32` round 8 | **233** | **21** | **0** | 9 |
+
+Twenty-nine tests went to PASS and none left it: `feature_anchors`,
+`feature_assumeutxo`, `feature_assumevalid`, `feature_block`,
+`feature_dbcrash`, `feature_maxuploadtarget`, `feature_presegwit_node_upgrade`,
+`feature_proxy`, `feature_rbf`, `interface_zmq`, `p2p_blockfilters`,
+`p2p_compactblocks`, `p2p_compactblocks_blocksonly`, `p2p_dns_seeds`,
+`p2p_feefilter`, `p2p_filter`, `p2p_i2p_ports`, `p2p_i2p_sessions`,
+`p2p_invalid_messages`, `p2p_invalid_tx`, `p2p_orphan_handling`, `p2p_ping`,
+`p2p_private_broadcast`, `p2p_seednode`, `p2p_segwit`, `p2p_sendtxrcncl`,
+`p2p_unrequested_blocks`, `rpc_blockchain`, `rpc_rawtransaction`. An interim
+sweep on `53d98310` (after the first five batches) had found three tests red
+that Round 7 had green -- `feature_pruning`, `feature_loadblock`,
+`feature_init` -- which the regress batch took (above); all three pass here
+except `feature_init`, which had never passed and moved from `:93` to the
+index damage rounds. Of the 21 failures, thirteen are the wallet.dat, MuSig2
+and absolute-path decisions, two need NET_ADMIN, and the rest are the coins
+format (`feature_init`, `feature_coinstatsindex_compatibility`), the default
+datadir (`feature_config_args` `:212`), `tool_bitcoin`'s multiplexer binary,
+`wallet_assumeutxo` `:98`, and `feature_unsupported_utxo_db` `:48` -- a
+regression of the regress batch's own obfuscation-key read, which refused
+a v0.14.3 chainstate's key before NeedsUpgrade could give Core's sentence;
+fixed on the binary after this sweep, in Core's order, together with the
+regress batch's last phase (`feature_init` PASS in its oracle run: every
+index reads its best-block record checksummed at open and commits Core's
+block locator from the chainstate flush). `feature_block` passes in 7.5
+minutes and `feature_dbcrash`, `feature_pruning` and `p2p_ping` within the
+serial cap; all four time out under the parallel 150 s cap, as before. On
+`7bf698a4`, the binary of the seam and the regress batch's last phase,
+`feature_unsupported_utxo_db`, `feature_init`, `feature_coinstatsindex` and
+`feature_index_prune` PASS in a serial confirming run.
+
+### Decisions recorded in Round 8
+
+- **Core's `blocks/index` LevelDB is ported** (reversing
+  [block-file-format-plan.md](block-file-format-plan.md) §6's "keep ours"):
+  the index is a public format now, migrated in place from headerindex.dat on
+  the first start, and `-reindex` stays additive
+  ([reindex-decision-2026-09-18.md](reindex-decision-2026-09-18.md), with the
+  witness-less-entry rule added to its re-checked list).
+- **No SQLite `wallet.dat`, no BerkeleyRO, no migratewallet** -- wallet-plan's
+  policy stands. The wallet tests that fail only there are fail-by-design and
+  keep their rows in the sweep: `wallet_descriptor` `:93` (format is
+  `leveldb`), `wallet_multiwallet` `:78`, `wallet_backup` `:118`,
+  `wallet_startup` `:38`, `wallet_listtransactions` `:229`,
+  `wallet_keypool_topup` `:40`, `wallet_reorgsrestore` `:205`, `wallet_hd`
+  `:86` (each opens, copies or moves a `wallet.dat` file), `tool_wallet` `:46`
+  (the SQLite lock sentence), `wallet_backwards_compatibility` `:278` (an old
+  Core cannot open a LevelDB wallet), `wallet_migration` `:139` (BDB). Adapted
+  copies of seven of them with only that step changed pass end to end
+  (the wallet batch's `build/adapted/`). `wallet_musig` `:262` is MuSig2
+  signing, out of scope; `wallet_crosschain` `:32` is the Round-5 refusal of
+  absolute wallet paths, which stands (nested relative names are accepted
+  now, as Core accepts them).
+- **The default datadir stays `~/.bitcoin-lisp`**: our chainstate is not
+  Core's format, so sharing `~/.bitcoin` with a Core install would corrupt
+  one of the two nodes; the reason is in `BL.CFG:DEFAULT-DATA-DIRECTORY`'s
+  docstring and README.md. `feature_config_args` `:212` expects Core's name
+  and stays red.
+- **Private broadcast is ported** (reversing Round 7's "refuses rather than
+  queueing"). Two divergences are recorded in the manual's p2p section: the
+  short-lived connections run on their own threads and never join the peer
+  list (nothing but the one exchange can be sent on them, where Core relies
+  on a send filter), and a v1 re-dial after a failed v2 attempt keeps the
+  first dial's proxy.
+- **Core's start-up port and address checks are enforced**:
+  CheckHostPortOptions for `-i2psam`, `-onion`, `-proxy`, `-bind`, `-rpcbind`,
+  `-torcontrol`, `-whitebind` and `-zmqpub*` (a `-zmqpub*=ipc://` spelling is
+  refused; Core takes `unix:`), and a proxy host name is resolved at start-up.
+  A relative `-walletdir` refuses start-up. `addnode onetry` blocks for up to
+  10 s until the dial is made, as Core dials it on the RPC thread.
+- **The chainstate lock order differs from Core's**: `*chainstate-mutex*` is
+  taken inside the node lock, because every activation caller already holds
+  the node lock across the whole activation and the connect hooks take it
+  too; Core takes m_chainstate_mutex before cs_main. `install-cs-main-check`
+  makes the order mechanical.
+- **`-reindex-chainstate` re-validates every block**, as Core does; scripts
+  stay skipped under assumevalid.
+
+### Left open after Round 8
+
+- **Core's chainstate (coins) LevelDB format** -- the one decision the round
+  did not take. With `blocks/index` ported and the index records Core's,
+  `feature_coinstatsindex_compatibility` `:34` and full datadir interchange
+  with Core wait on the coins encoding and its obfuscation; a mainnet
+  migration of ~180 M coins is hours of downtime, so it is the user's call.
+- `wallet_assumeutxo` `:98`: pruneblockchain after the background sync must
+  answer GetPruneHeight's walk over the snapshot chain's blocks, which needs
+  them in separate block files (unchanged since Round 7).
+- The Sparrow acceptance run of [wallet-plan.md](wallet-plan.md) P7 needs a
+  desktop client; nothing in this harness can run it.
+- `feature_bind_port_discover` and `feature_bind_port_externalip` need
+  NET_ADMIN in the container; `interface_usdt_*`, `interface_ipc*`,
+  `tool_bench_sanity_check` and `tool_bitcoin_chainstate` stay SKIP as in
+  Round 6.
+- Found and not fixed: Core's "Invalid -wallet path" refusal is reachable only
+  through wallet.dat files; the duplicate `-wallet` check compares names, where
+  Core compares joined paths; the unnamed `""` wallet is `wallets/wallet.dat`
+  in Core; about twenty tolerated undefined-variable forward references
+  remain outside the networking layer (`*blocks-since-flush*`,
+  `+seed-outbound-connection-threshold+`, `+wallet-timestamp-window+`,
+  `*request-id*`, `+standard-script-verify-flags+`); Core's disk-space, exFAT
+  and onion-bind InitWarnings are not emitted.
