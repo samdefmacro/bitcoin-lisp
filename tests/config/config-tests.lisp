@@ -434,6 +434,23 @@ merged config alist (options with no start-node keyword)."
     (is (equalp (bl.crypto:hex-to-bytes "5121ff")
                 bl.val:*signet-challenge*))))
 
+(test incrementalrelayfee-raises-an-unset-minrelaytxfee
+  "Core mempool_args.cpp:77-81: with no -minrelaytxfee, an -incrementalrelayfee
+above the minimum relay feerate raises the minimum to match; an explicit
+-minrelaytxfee is left alone. feature_rbf.py:507 restarts with
+-incrementalrelayfee=0.00000234 and asserts minrelaytxfee >= it."
+  (flet ((apply-fees (alist)
+           (let ((bl.mp:*min-relay-fee-rate* 100)
+                 (bl.mp:*incremental-relay-fee-rate* 100))
+             (apply-config-globals alist)
+             (list bl.mp:*min-relay-fee-rate* bl.mp:*incremental-relay-fee-rate*))))
+    (is (equal '(234 234) (apply-fees '(("incrementalrelayfee" . "0.00000234")))))
+    (is (equal '(100 50) (apply-fees '(("incrementalrelayfee" . "0.0000005"))))
+        "an incremental fee below the minimum changes nothing")
+    (is (equal '(150 234) (apply-fees '(("incrementalrelayfee" . "0.00000234")
+                                        ("minrelaytxfee" . "0.0000015"))))
+        "an explicit -minrelaytxfee wins")))
+
 (test config-cluster-limit-knobs
   "-limitclustercount/-limitclustersize set the cluster-limit specials that
 make-mempool reads when creating its txgraph (cluster mempool P6); the

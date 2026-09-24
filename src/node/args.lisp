@@ -391,7 +391,8 @@ start in the same image inherits nothing."
 applied after APPLY-OPTION-GLOBALS so each present-case row has already
 run and only the soft-set and consistency halves remain, in this order:
 the signet chain instantiated from -signetchallenge / -signetseednode,
-the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
+the ZMQ publisher list, -maxmempool under -blocksonly, -minrelaytxfee
+under -incrementalrelayfee, -dnsseed under
 -connect / -maxconnections, -proxy / -onion / -proxyrandomize,
 -cjdnsreachable, -onlynet with its clearnet privacy check, and last
 -forcednsseed against the -dnsseed every one of those may have turned off."
@@ -425,6 +426,17 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
       (let ((b (lk "blocksonly")))
         (when (and b (conf-parse-bool b))
           (setf bl.mp:*max-mempool-bytes* (* 5 1000 1000)))))
+    ;; -minrelaytxfee under -incrementalrelayfee (Core mempool_args.cpp:77-81):
+    ;; with no -minrelaytxfee, an incremental fee above the minimum raises the
+    ;; minimum to match, so the one option controls both. feature_rbf.py:507
+    ;; asserts getmempoolinfo's minrelaytxfee >= the -incrementalrelayfee it
+    ;; restarted with.
+    (unless (lk "minrelaytxfee")
+      (when (> bl.mp:*incremental-relay-fee-rate* bl.mp:*min-relay-fee-rate*)
+        (setf bl.mp:*min-relay-fee-rate* bl.mp:*incremental-relay-fee-rate*)
+        (multiple-value-bind (btc sats) (truncate bl.mp:*min-relay-fee-rate* 100000000)
+          (defer-log :info "Increasing minrelaytxfee to ~D.~8,'0D BTC/kvB to match incrementalrelayfee"
+                     btc sats))))
     ;; -dnsseed and -listen under -connect / -maxconnections<=0: with only
     ;; trusted nodes to dial (or connections disabled outright) there is
     ;; nothing for a DNS seed to feed, and no reason to listen by default.
