@@ -5429,10 +5429,23 @@ it -- is logged and ignored."
                   (peer-id peer))
       (return-from handle-blocktxn nil))
 
-    (let ((block-hash (bl.ser:block-txn-response-block-hash response))
-          (txs (bl.ser:block-txn-response-transactions response))
-          (transactions (pending-compact-block-transactions pending))
-          (missing-indexes (pending-compact-block-missing-indexes pending)))
+    (let* ((block-hash (bl.ser:block-txn-response-block-hash response))
+           (txs (bl.ser:block-txn-response-transactions response))
+           (header (pending-compact-block-header pending))
+           (transactions (pending-compact-block-transactions pending))
+           (missing-indexes (pending-compact-block-missing-indexes pending))
+           (requests (block-in-flight-requests block-hash))
+           (first-in-flight (or (null requests) (eq (car (first requests)) peer))))
+      ;; FillBlock already ran for this reconstruction and failed; Core wipes
+      ;; the header then (`Make sure we can't call FillBlock again',
+      ;; blockencodings.cpp:210-212), so a second blocktxn for it is refused
+      ;; and punished (net_processing.cpp:3474-3481).
+      (unless header
+        (remove-block-request block-hash peer)
+        (record-misbehavior peer "previous compact block reconstruction attempt failed")
+        (bl:log-cat "net" "Peer ~D sent compact block transactions multiple times"
+                    (peer-id peer))
+        (return-from handle-blocktxn nil))
       ;; A blocktxn that does not deliver exactly the transactions we asked
       ;; for is structurally malformed: Core's FillBlock returns
       ;; READ_STATUS_INVALID for both too few and too many
@@ -5449,15 +5462,44 @@ it -- is logged and ignored."
       (loop for tx in txs
             for idx in missing-indexes
             do (setf (aref transactions idx) tx))
+      (setf (pending-compact-block-header pending) nil)
 
       (let ((block (bl.ser:make-bitcoin-block
-                    :header (pending-compact-block-header pending)
+                    :header header
                     :transactions (coerce transactions 'list))))
-        ;; `Block is okay for further processing' (:3506-3508): this peer's
-        ;; request is settled, and processing the block settles the rest.
-        (clear-pending-compact-block peer)
-        (%process-compact-block peer block block-hash ctx
-                                "completed compact block invalid")))))
+        (cond
+          ;; READ_STATUS_FAILED (blockencodings.cpp:218-222 -> net_processing.
+          ;; cpp:3492-3504): the filled block is mutated, most likely a short-ID
+          ;; collision. The peer first in line is asked for the whole block and
+          ;; keeps its spent reconstruction, so a repeat blocktxn is caught
+          ;; above; any other peer gives its slot back.
+          ((%compact-block-mutated-p block (bl.ctx:node-context-chain-state ctx))
+           (if first-in-flight
+               (request-full-block peer block-hash)
+               (progn
+                 (remove-block-request block-hash peer)
+                 (bl:log-cat "net" "Peer ~D sent us a compact block but it failed to reconstruct, waiting on first download to complete"
+                             (peer-id peer)))))
+          (t
+           ;; `Block is okay for further processing' (:3506-3508): this
+           ;; peer's request is settled, and processing the block settles the
+           ;; rest.
+           (clear-pending-compact-block peer)
+           (%process-compact-block peer block block-hash ctx
+                                   "completed compact block invalid")))))))
+
+(defun %compact-block-mutated-p (block chain-state)
+  "Core FillBlock's early mutation check (blockencodings.cpp:218-222):
+IsBlockMutated on the filled BLOCK -- a merkle root, or with segwit active
+after its parent a witness commitment, that the transactions do not produce."
+  (let ((prev (bl.store:get-block-index-entry
+               chain-state
+               (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header block)))))
+    (and prev
+         (bl.val:block-mutated-p
+          block (bl.val:segwit-active-at-height-p
+                 (1+ (bl.store:block-index-entry-height prev))))
+         t)))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."

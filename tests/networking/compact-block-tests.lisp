@@ -379,6 +379,11 @@ mock time of its own, the handler runs an hour after the tip's timestamp."
                              (bl.store:block-index-entry-header tip)))))))
     (bl.net::handle-cmpctblock peer payload ctx)))
 
+(defun %cbp-handle-blocktxn (peer payload ctx)
+  "Drive the blocktxn handler as the dispatch table would. The one place this
+file reaches the handler's internal name."
+  (bl.net::handle-blocktxn peer payload ctx))
+
 (defun %cbp-state-with-parent (parent-hash parent-timestamp &key (status :valid))
   "A chain-state holding only PARENT-HASH at height 0, with a real header (the
 MTP walk and the difficulty check both dereference it), as its tip: Core's
@@ -570,7 +575,7 @@ right above it), so it gets a full-block refetch, not a discouragement."
             :use-wtxid t))
      (let ((sent (%cbp-capture-sends
                   (lambda ()
-                    (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
+                    (%cbp-handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
                               block-hash (list (make-simple-tx #x21)))
                              24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is (equal '("getdata") sent)
@@ -601,7 +606,7 @@ Previously we treated it as a mere reconstruction miss and sent a getdata."
             :use-wtxid t))
      (let ((sent (%cbp-capture-sends
                   (lambda ()
-                    (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
+                    (%cbp-handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
                               block-hash (list (make-simple-tx #x22)))  ; got ONE
                              24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is-true (bl.net:peer-discouraged-p addr)
@@ -1689,7 +1694,7 @@ fix on half the compact traffic without failing the cmpctblock test."
                      :missing-indexes (loop for i below (length txs) collect i)
                      :request-time (get-internal-real-time)
                      :use-wtxid t))
-              (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
+              (%cbp-handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
                         hash txs :witness t)
                        24) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))))
        (%g716-quiet
@@ -1798,7 +1803,7 @@ none of the block's transactions, then feed the blocktxn carrying TXS."
            :missing-indexes (loop for i below (length txs) collect i)
            :request-time (get-internal-real-time)
            :use-wtxid t))
-    (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message hash txs :witness t) 24) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))))
+    (%cbp-handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message hash txs :witness t) 24) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))))
 
 (test cmpctblock-replay-never-hashes-the-mempool
   "Core returns EARLY from the CMPCTBLOCK handler when
@@ -2236,6 +2241,41 @@ as a fork, so nobody was punished."
          (is (eq :invalid (bl.store:block-index-entry-status
                            (bl.store:get-block-index-entry cs bad-hash)))
              "the verdict is cached on the block's index entry"))))))
+
+(test a-second-blocktxn-after-a-failed-reconstruction-is-punished
+  "Core's FillBlock runs ONCE per reconstruction: it wipes the partial block's
+header before judging the result (blockencodings.cpp:210-212). A filled block
+that is mutated -- most likely a short-ID collision -- is READ_STATUS_FAILED
+(:218-222), and the peer first in line is asked for the whole block while it
+KEEPS the spent reconstruction (net_processing.cpp:3492-3499); a second
+blocktxn for it then finds the header null and is punished as `previous compact
+block reconstruction attempt failed' (:3474-3481). p2p_compactblocks.py:578-595
+sends a blocktxn in the wrong order, expects a getdata, sends it again and
+waits for the disconnect.
+
+Ours dropped the reconstruction the moment the blocktxn arrived, so the repeat
+was a blocktxn `we weren't expecting' and nothing happened."
+  (%with-cbp-slot-block (deliver block-hash)
+    (let* ((peer (%cbp-slot-peer "203.0.113.99" :inbound t))
+           (blocktxn (subseq (bl.ser:make-blocktxn-message
+                              block-hash (list (make-simple-tx #x61)))
+                             24))
+           (ctx (bl.ctx:make-node-context
+                 :chain-state (%cbp-state-with-parent (%cbp-hash #xC1) 1296688600)
+                 :utxo-set (bl.store:make-utxo-set)
+                 :mempool (bl.mp:make-mempool))))
+      (is (equal '("getblocktxn") (deliver peer)))
+      (is (equal '("getdata")
+                 (%cbp-capture-sends
+                  (lambda () (%cbp-handle-blocktxn peer blocktxn ctx))))
+          "a reconstruction that fills to a mutated block falls back to a getdata")
+      (is (eq :ready (bl.net:peer-state peer))
+          "the first failed fill costs the peer nothing")
+      (is (equalp (list block-hash) (bl.net:peer-inflight-block-hashes peer))
+          "the full-block download goes on under the same in-flight request")
+      (%cbp-capture-sends (lambda () (%cbp-handle-blocktxn peer blocktxn ctx)))
+      (is (eq :disconnected (bl.net:peer-state peer))
+          "a second blocktxn for the spent reconstruction is punished"))))
 
 (test a-peer-that-asked-for-high-bandwidth-gets-new-blocks-as-cmpctblock
   "BIP152 high-bandwidth mode, Core's two sending sites. A peer that sent
