@@ -92,10 +92,12 @@ entry claims one, exactly as Core gates it on !GetUndoPos().IsNull()
         (hash (bl.store:block-index-entry-hash entry)))
     (when (>= check-level 1)
       (multiple-value-bind (ok error)
-          (if (check-proof-of-work (bl.ser:bitcoin-block-header block))
-              (%check-block block chain-state height (bl.ser:get-unix-time)
-                            :skip-header t)
-              (values nil :high-hash))
+          (%check-block block chain-state height (bl.ser:get-unix-time)
+                        :skip-header t)
+        ;; CheckBlock's PoW test comes first (validation.cpp:3963), so its
+        ;; verdict is the one reported.
+        (unless (check-proof-of-work (bl.ser:bitcoin-block-header block))
+          (setf ok nil error :bad-proof-of-work))
         (unless ok
           (bl:log-error "Verification error: found bad block at ~D, hash=~A (~A)"
                         height (%hash-hex hash) (block-reject-reason-string error))
