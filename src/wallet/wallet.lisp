@@ -354,9 +354,19 @@ init.cpp). An absolute path is used as given; a relative one hangs off the data
 directory.")
 
 (defun wallets-directory (manager)
+  "The wallet directory (Core GetWalletDir, wallet/walletutil.cpp:12-33):
+-walletdir when given; else <datadir>/wallets/ if that IS a directory, and
+the network data directory itself when it is not. Core's init creates
+wallets/ only for a NEW datadir (common/init.cpp:47-63), so an older or
+hand-made datadir keeps its wallets at the top -- and Core's functional
+framework deletes regtest/wallets from its cached datadir
+(test_framework.py:836), which puts every cache-based test's wallets there.
+Asked on every call, as Core asks: the answer changes when wallets/ appears."
   (cond ((null *wallet-directory*)
-         (merge-pathnames "wallets/" (uiop:ensure-directory-pathname
-                                      (wallet-manager-data-directory manager))))
+         (let* ((data (uiop:ensure-directory-pathname
+                       (wallet-manager-data-directory manager)))
+                (wallets (merge-pathnames "wallets/" data)))
+           (if (uiop:directory-exists-p wallets) wallets data)))
         ((uiop:absolute-pathname-p *wallet-directory*)
          (uiop:ensure-directory-pathname *wallet-directory*))
         (t (merge-pathnames (uiop:ensure-directory-pathname *wallet-directory*)
@@ -376,7 +386,7 @@ is interpreted, and feature_notifications.py creates a wallet named after every
 byte from 1 to 127, brackets and stars included."
   (let ((base (wallets-directory manager)))
     (make-pathname :directory (append (or (pathname-directory base) '(:relative))
-                                      (list name))
+                                      (%wallet-name-components name))
                    :name nil :type nil :version nil
                    :defaults base)))
 
@@ -415,36 +425,42 @@ directory MISSING, so a caller reading the raw path would answer \"no such
 wallet\" -- or, worse, create an empty one over the rebuilt copy."
   (wallet-recover-interrupted-rewrite (wallet-directory manager name)))
 
+(defun %wallet-name-components (name)
+  "NAME's directory components under the wallet directory: split at `/',
+with the empty and `.' segments a POSIX path join ignores dropped. `sub/w5'
+is the wallet directory sub/w5/ (Core AbsPathJoin(GetWalletDir(), name),
+wallet/wallet.cpp:2926)."
+  (remove-if (lambda (part) (member part '("" ".") :test #'string=))
+             (uiop:split-string name :separator "/")))
+
 (defun %valid-wallet-name-p (name)
-  "Wallet names name a subdirectory of <datadir>/wallets/.
+  "Wallet names name a directory under the wallet directory.
 
-The rule is CONTAINMENT, stated positively: any name is fine as long as it
-cannot escape the wallet directory. So no path separator, no NUL, and not the
-traversal names themselves.
-
-⚠️ It used to be an allow-list of [A-Za-z0-9._-], which is much narrower than
-Core and rejected names Core accepts — wallet_multiwallet.py creates one out of
-every printable ASCII character. Widening it does not give up what the
-restriction was actually guaranteeing, because that guarantee is about
-separators and traversal, not about the alphabet.
+Core joins the name onto GetWalletDir() (wallet/wallet.cpp:2926), so a
+RELATIVE path with separators -- `sub/w5' -- is a wallet in a subdirectory,
+and wallet_multiwallet.py:128 creates one. That is accepted.
 
 ⚠️ Core additionally accepts an ABSOLUTE PATH and creates the wallet there
-(wallet_crosschain.py uses one). That is deliberately still refused: it is the
-one form that puts wallet files outside the datadir, and it is a widening of
-where this process writes rather than of what it will call a wallet.
+(wallet_crosschain.py uses one), and a `..' segment walks out of the wallet
+directory the same way. Both stay refused: they are the forms that put wallet
+files outside the directory the node was told to keep them in, a widening of
+where this process writes rather than of what it will call a wallet (the
+Round-5 decision, docs/functional-sweep-2026-09-13.md). So: no NUL, no
+leading `/', no `..' segment, and at least one segment that is not `.' --
+`.', `./' and `' would all name the wallet directory itself, Core's unnamed
+wallet, which this tree does not have.
 
 ⚠️ A BACKSLASH is an ordinary filename character here. It is a separator only
 on Windows, and Core says so in its own tests: feature_notifications.py:24
 disallows `/\\?%*:|\"<>' on Windows and `/' alone everywhere else, then builds
-a wallet name out of every remaining byte from 1 to 127 -- backslash included.
-Refusing it was a Windows rule applied on a POSIX filesystem, and it refused a
-name Core creates."
+a wallet name out of every remaining byte from 1 to 127 -- backslash included."
   (and (stringp name)
        (plusp (length name))
-       (not (member name '("." "..") :test #'string=))
-       (notany (lambda (ch)
-                 (or (char= ch #\/) (char= ch (code-char 0))))
-               name)))
+       (char/= (char name 0) #\/)
+       (not (find (code-char 0) name))
+       (not (search "/../" (concatenate 'string "/" name "/")))
+       (%wallet-name-components name)
+       t))
 
 ;;; --- SPKM key management ---
 
@@ -1187,8 +1203,12 @@ locked with no passphrase that can unlock it."
   (%check-create-wallet-arguments name disable-private-keys external-signer passphrase)
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (let ((path (wallet-path-for manager name)))
+      ;; Core refuses only a path that already holds a DATABASE
+      ;; (MakeDatabase require_create, walletdb.cpp:1346-1350): an empty
+      ;; directory, or a symlink to one (wallet_multiwallet.py:98-99's
+      ;; w7_symlink), is where the new wallet goes.
       (when (or (gethash name (wallet-manager-wallets manager))
-                (probe-file path))
+                (wallet-db-exists-p path))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-exists+
                           :message (format nil "Failed to create database path '~A'. Database already exists."
                                            (wallet-path-string path))))
@@ -1204,7 +1224,8 @@ locked with no passphrase that can unlock it."
                             (if blank-flag +wallet-flag-blank-wallet+ 0)
                             (if avoid-reuse +wallet-flag-avoid-reuse+ 0)
                             (if external-signer +wallet-flag-external-signer+ 0)))
-             (db (handler-case (wallet-db-open path :create t)
+             (db (handler-case (wallet-db-open path :create t
+                                                    :network (wallet-manager-network manager))
                    (bl.err:storage-error (e)
                      (%wallet-database-open-error path e))))
              (wallet (make-wallet :name name :path path :db db
@@ -1682,7 +1703,7 @@ reports the keypool it finds and writes no keys into the file."
       ;; Core's format probe runs before the engine is handed the path, so a
       ;; directory that is absent or holds no recognizable database is -18 and
       ;; never a storage condition.
-      (unless (wallet-db-format-recognized-p path)
+      (unless (wallet-db-format-recognized-p path (wallet-manager-network manager))
         (%wallet-database-not-found-error path))
       (let* ((db (handler-case (wallet-db-open path)
                    (bl.err:storage-error (e)
@@ -1757,18 +1778,89 @@ so its stored locator is left where it was."
                   :test #'string=))
     (%refresh-wallet-snapshot manager)))
 
+(defun %directory-entry-names (directory)
+  "The names in DIRECTORY (a namestring without a trailing slash), `.' and
+`..' excluded; signals SB-POSIX:SYSCALL-ERROR when it cannot be read. Read
+with readdir rather than DIRECTORY so that a symlink is seen as itself and
+never resolved -- wallet_multiwallet.py:101 plants one pointing at `..'."
+  (let ((dir (sb-posix:opendir directory)))
+    (unwind-protect
+         (loop for entry = (sb-posix:readdir dir)
+               until (sb-alien:null-alien entry)
+               for name = (sb-posix:dirent-name entry)
+               unless (member name '("." "..") :test #'string=)
+                 collect name)
+      (sb-posix:closedir dir))))
+
+(defun %stat-directory-p (stat)
+  (= (logand (sb-posix:stat-mode stat) sb-posix:s-ifmt) sb-posix:s-ifdir))
+
 (defun list-wallet-dir (manager)
-  "Names of wallet databases under <datadir>/wallets/ (Core ListDatabases)."
-  (let ((dir (wallets-directory manager)))
-    (when (probe-file dir)
-      (loop for sub in (uiop:subdirectories dir)
-            for name = (first (last (pathname-directory sub)))
-            ;; A rewrite left half-done by a crash is scrap, not a wallet:
-            ;; offering it would let loadwallet open the copy that
-            ;; WALLET-RECOVER-INTERRUPTED-REWRITE is about to delete.
-            when (and (not (wallet-rewrite-directory-p name))
-                      (wallet-db-exists-p sub))
-              collect name))))
+  "Names of this network's wallet databases under the wallet directory, as
+paths relative to it (Core ListDatabases, wallet/db.cpp:23-72).
+
+The walk is recursive -- a wallet created as `sub/w5' is listed as that --
+and a directory is a wallet when it carries this network's id and a LevelDB
+(WALLET-DB-FORMAT-RECOGNIZED-P), which is what lets the wallet directory be
+the network data directory itself, beside chainstate/ and blocks/. A symlink
+to a directory is judged by its target, and never descended into, as Core's
+recursive_directory_iterator does not follow one; a wallet directory is not
+descended into either (a database directory holds no wallets, and a rewrite's
+parked predecessor sits inside one), nor is a rewrite's scratch directory
+listed. An unreadable directory is logged in Core's two sentences and
+skipped."
+  (let ((network (wallet-manager-network manager))
+        (found '()))
+    (labels ((path-string (pathname)
+               (string-right-trim "/" (namestring pathname)))
+             (walk (directory relative)
+               (dolist (name (handler-case (%directory-entry-names directory)
+                               (sb-posix:syscall-error (e)
+                                 (if relative
+                                     (bl:log-warn "Error while scanning wallet dir item: ~A [~A]."
+                                                  e directory)
+                                     (bl:log-warn "Error scanning directory entries under ~A: ~A"
+                                                  directory e))
+                                 nil)))
+                 (let* ((path (concatenate 'string directory "/" name))
+                        (child (append relative (list name)))
+                        (lstat (ignore-errors (sb-posix:lstat path)))
+                        (link-p (and lstat
+                                     (= (logand (sb-posix:stat-mode lstat) sb-posix:s-ifmt)
+                                        sb-posix:s-iflnk)))
+                        (dir-p (and lstat
+                                    (if link-p
+                                        (let ((target (ignore-errors (sb-posix:stat path))))
+                                          (and target (%stat-directory-p target)))
+                                        (%stat-directory-p lstat)))))
+                   (when (and dir-p (not (wallet-rewrite-directory-p name)))
+                     (if (wallet-db-format-recognized-p
+                          (uiop:ensure-directory-pathname path) network)
+                         (push (format nil "~{~A~^/~}" child) found)
+                         (unless link-p (walk path child))))))))
+      (walk (path-string (wallets-directory manager)) '()))
+    (nreverse found)))
+
+(defun %stamp-pre-id-wallets (manager)
+  "Give the id file (WALLET-WRITE-ID) to every wallet written before it
+existed. Until 2026-09-24 a wallet was any LevelDB directly under a dedicated
+wallet directory (<datadir>/wallets/ or -walletdir), so exactly those are
+stamped with this node's network: the datadir is one network's, as it always
+was. Never done when the wallet directory is the data directory itself --
+there, a LevelDB is as likely to be the chainstate."
+  (let* ((directory (wallets-directory manager))
+         (data (uiop:ensure-directory-pathname
+                (wallet-manager-data-directory manager))))
+    (unless (or (equal (namestring directory) (namestring data))
+                (not (uiop:directory-exists-p directory)))
+      (dolist (sub (uiop:subdirectories directory))
+        (let ((name (first (last (pathname-directory sub)))))
+          (when (and (not (wallet-rewrite-directory-p name))
+                     (wallet-db-exists-p sub)
+                     (not (probe-file (%wallet-id-path sub))))
+            (wallet-write-id sub (wallet-manager-network manager))
+            (bl:log-info "Wallet ~A: wrote its database id (~A)" name
+                         +wallet-id-file+)))))))
 
 ;;; --- Persistent settings (Core settings.json) ---
 ;;;
@@ -1896,7 +1988,10 @@ sentinel, :TRUE otherwise."
   "Create the node's wallet manager. Wallets recorded for auto-load in
 settings.json are loaded separately by LOAD-WALLETS-ON-STARTUP once the
 chainstate is up."
-  (make-wallet-manager :data-directory data-directory :network network))
+  (let ((manager (make-wallet-manager :data-directory data-directory
+                                      :network network)))
+    (%stamp-pre-id-wallets manager)
+    manager))
 
 (defun close-wallet-manager (manager)
   "Unload every loaded wallet (shutdown path)."

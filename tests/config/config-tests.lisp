@@ -2808,12 +2808,18 @@ would pass even if no struct ever consulted it."
              (is (= 1 (manager-keypool))
                  "-keypool=~A did not clamp to 1" v))
            ;; Relative -walletdir hangs off the data directory, absolute wins
-           ;; outright, and NIL restores <datadir>/wallets/.
+           ;; outright, and NIL restores Core's GetWalletDir: <datadir>/wallets/
+           ;; when it exists, else the data directory (walletutil.cpp:24-30).
            (let ((manager (bl.wallet::make-wallet-manager
                            :data-directory #p"/tmp/dd/")))
              (setf bl.wallet:*wallet-directory* nil)
+             (uiop:delete-directory-tree #p"/tmp/dd/" :validate t
+                                                      :if-does-not-exist :ignore)
+             (is (equal #p"/tmp/dd/" (bl.wallet::wallets-directory manager)))
+             (ensure-directories-exist #p"/tmp/dd/wallets/")
              (is (equal #p"/tmp/dd/wallets/"
                         (bl.wallet::wallets-directory manager)))
+             (uiop:delete-directory-tree #p"/tmp/dd/" :validate t)
              (bl:apply-rpc-config-globals '(("walletdir" . "purses")))
              (is (equal #p"/tmp/dd/purses/"
                         (bl.wallet::wallets-directory manager)))
