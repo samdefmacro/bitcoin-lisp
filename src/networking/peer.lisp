@@ -966,6 +966,20 @@ a peer the operator explicitly pinned. Feelers and inbound are excluded too."
        (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
        t))
 
+(defun peer-can-serve-blocks-p (peer)
+  "Core CanServeBlocks (net_processing.cpp:1153-1156): PEER advertised
+NODE_NETWORK or NODE_NETWORK_LIMITED, so it can serve at least recent blocks."
+  (logtest (peer-services peer)
+           (logior bl.ser:+node-network+ bl.ser:+node-network-limited+)))
+
+(defun peer-limited-p (peer)
+  "Core IsLimitedPeer (net_processing.cpp:1160-1165): PEER advertised
+NODE_NETWORK_LIMITED without NODE_NETWORK -- a pruned or snapshot node that
+promises only its last NODE_NETWORK_LIMITED_MIN_BLOCKS (288) blocks."
+  (let ((services (peer-services peer)))
+    (and (logtest services bl.ser:+node-network-limited+)
+         (not (logtest services bl.ser:+node-network+)))))
+
 (defun peer-preferred-download-p (peer)
   "Core CNodeState::fPreferredDownload, assigned once at VERACK
 (net_processing.cpp:3750): `(!IsInboundConn() || HasPermission(NoBan)) &&
@@ -980,9 +994,7 @@ peers\"."
   (and (or (not (peer-inbound peer))
            (peer-has-permission-p peer +perm-noban+))
        (not (eq (peer-conn-type peer) :addr-fetch))
-       (logtest (peer-services peer)
-                (logior bl.ser:+node-network+ bl.ser:+node-network-limited+))
-       t))
+       (peer-can-serve-blocks-p peer)))
 
 (defun peer-expects-services-p (peer)
   "T when PEER's connection type makes the DESIRABLE-SERVICES gate apply --

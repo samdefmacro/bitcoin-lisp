@@ -768,16 +768,35 @@ count on the entry."
        ("nTx" . ,(or (%entry-tx-count entry block-store) 0)))
      (%previousblockhash-field entry header))))
 
-(defun chaintip-status (entry on-active best-hash hash block-store)
-  "Bitcoin Core getchaintips status for a tip ENTRY."
+(defun %chain-bodies-complete-p (entry block-store active)
+  "Core CBlockIndex::HaveNumChainTxs for an off-chain ENTRY: its body AND every
+ancestor's down to the active chain are on disk. ACTIVE is the hash set of the
+active chain, whose blocks count as complete, and so does a block that was
+once connected (:valid): Core's m_chain_tx_count, once set, survives pruning."
+  (loop for e = entry then (bl.store:block-index-entry-prev-entry e)
+        while (and e (not (gethash (bl.store:block-index-entry-hash e) active)))
+        always (or (eq (bl.store:block-index-entry-status e) :valid)
+                   (bl.store:block-index-entry-data-pos e)
+                   (and block-store
+                        (bl.store:block-exists-p
+                         block-store (bl.store:block-index-entry-hash e))))))
+
+(defun chaintip-status (entry on-active best-hash hash block-store active)
+  "Bitcoin Core getchaintips status for a tip ENTRY, in Core's order
+(rpc/blockchain.cpp:1626-1642): invalid (BLOCK_FAILED_VALID, which Core now
+sets on a failed block's descendants too -- our :failed-child), then `headers-only' when the body of the tip OR of any ancestor off
+the active chain is missing (!HaveNumChainTxs: the branch cannot be connected),
+then valid-fork, then valid-headers. Ours asked only whether the tip's own
+body was on disk, so a stored block above a missing one was `valid-headers';
+p2p_unrequested_blocks.py:135 stores an equal-work block on a parent whose
+body was never accepted and expects `headers-only'."
   (cond
     ((and on-active (equalp hash best-hash)) "active")
-    (t (case (bl.store:block-index-entry-status entry)
-         (:valid "valid-fork")
-         (:invalid "invalid")
-         (t (if (bl.store:get-block block-store hash)
-                "valid-headers"
-                "headers-only"))))))
+    ((member (bl.store:block-index-entry-status entry) '(:invalid :failed-child))
+     "invalid")
+    ((not (%chain-bodies-complete-p entry block-store active)) "headers-only")
+    ((eq (bl.store:block-index-entry-status entry) :valid) "valid-fork")
+    (t "valid-headers")))
 
 (define-rpc "getchaintips" (node params)
   "Return information about all known chain tips (active and side branches).
@@ -848,7 +867,7 @@ first."
                    ("hash" . ,(hash-to-hex h))
                    ("branchlen" . ,branchlen)
                    ("status" . ,(chaintip-status entry on-active best-hash h
-                                                 block-store))))))
+                                                 block-store active))))))
            tips))
     ;; Core CompareBlocksByHeight: height descending, the active tip included.
     (stable-sort tips #'>

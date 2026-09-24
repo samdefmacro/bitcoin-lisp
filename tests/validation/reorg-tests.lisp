@@ -2576,9 +2576,24 @@ the retry, not eager arrival-time activation, is what performs the reorg."
            ;; Both are candidates; H5 outranks G3 by work.
            (setf (gethash g-hash set) t
                  (gethash h-hash set) t))
-         ;; Retry must skip higher-work INCOMPLETE H5 and activate complete G3.
-         (is (eq t (bl.net::retry-best-reorg-candidate
-                    csa storea utxoa)))
+         ;; Retry must skip higher-work INCOMPLETE H5 and activate complete G3
+         ;; -- choosing it under the node lock, in the same scope as the
+         ;; activation (Core's ActivateBestChainStep under cs_main): a choice
+         ;; made outside it raced an RPC thread's invalidateblock/generate
+         ;; (feature_assumeutxo.py:367).
+         (let* ((real (fdefinition 'bl.net::%best-completable-reorg-target))
+                (held :never-called)
+                (bl:*node* na))
+           (unwind-protect
+                (progn
+                  (setf (fdefinition 'bl.net::%best-completable-reorg-target)
+                        (lambda (&rest args)
+                          (setf held (sb-thread:holding-mutex-p (bl:node-lock na)))
+                          (apply real args)))
+                  (is (eq t (bl.net::retry-best-reorg-candidate
+                             csa storea utxoa))))
+             (setf (fdefinition 'bl.net::%best-completable-reorg-target) real))
+           (is (eq t held) "the target is chosen with the node lock held"))
          (is (equalp g-hash (bl.store:best-block-hash csa)))
          ;; H5 stays a candidate (still not completable); G3 consumed.
          (is (null (gethash g-hash (bl.net::ibd-context-reorg-candidates
@@ -2911,7 +2926,7 @@ fork range — no hash is requested twice."
        ;; Small per-peer cap so BOTH peers must contribute (else p1 takes all 5).
        (setf (bl.net::ibd-context-max-in-flight ctx) 3)
        (let ((bl.net:*ibd-context* ctx))
-         (let ((made (bl.net::request-blocks-from-peers
+         (let ((made (bl.net:request-blocks-from-peers
                       (list p1 p2) cs store))
                (in-flight (bl.net:ibd-context-in-flight ctx)))
            ;; All five fork blocks requested exactly once: requests-made equals the
@@ -2966,7 +2981,7 @@ exhaustion this gate exists to prevent)."
                do (setf (gethash (+ 2 i) q) t)))
        (let ((bl.net:*ibd-context* ctx))
          ;; Over cap + gap missing: exactly one request is allowed.
-         (let ((made (bl.net::request-blocks-from-peers
+         (let ((made (bl.net:request-blocks-from-peers
                       (list peer) cs store)))
            (is (= 1 made))
            (is (= 1 (hash-table-count
@@ -4002,3 +4017,57 @@ signalled the new blocks before the re-add."
                   (is-true (and gone back new (< gone back new))
                            "disconnect, re-add, connect -- got ~S" events))))
          (clear-undo-cache))))))
+
+(test a-block-that-fails-only-connectblock-keeps-its-body
+  "Core's AcceptBlock writes a body once CheckBlock and ContextualCheckBlock
+pass (WriteBlock, validation.cpp:4405) and only then does ActivateBestChain
+run ConnectBlock, so a block that fails there alone stays readable: getblock
+answers it with confirmations -1 (p2p_unrequested_blocks.py:283). Ours
+marked it invalid and stored nothing. Here a block on the tip whose coinbase
+pays more than the subsidy -- a ConnectBlock verdict, bad-cb-amount -- keeps
+its body and is marked invalid; a block with two coinbases, refused by
+CheckBlock, is not written."
+  ;; A fresh directory: the blocks are deterministic, so a body a previous
+  ;; run stored would already be there.
+  (uiop:delete-directory-tree (regtest-node-base-path "keep-unconnectable")
+                              :validate t :if-does-not-exist :ignore)
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "keep-unconnectable"))
+           (cs (bl:node-chain-state node))
+           (store (bl:node-block-store node))
+           (utxo (bl:node-utxo-set node)))
+      (flet ((block-on-tip (txs)
+               (let ((blk (bl.ser:make-bitcoin-block
+                           :header (bl.ser:make-block-header
+                                    :version #x20000000
+                                    :prev-block (bl.store:best-block-hash cs)
+                                    :merkle-root (bl.val:compute-merkle-root
+                                                  (mapcar #'bl.ser:transaction-hash txs))
+                                    :timestamp (+ 1296688602 600)
+                                    :bits #x207fffff :nonce 0)
+                           :transactions txs)))
+                 (bl.mining:mine-block blk)
+                 (bl.net:ingest-headers-from-peer nil (list (bl.ser:bitcoin-block-header blk)) cs)
+                 blk))
+             (hash-of (blk) (bl.ser:block-header-hash (bl.ser:bitcoin-block-header blk))))
+        (let* ((greedy (block-on-tip
+                        (list (bl.mining:build-coinbase-transaction
+                               1 (* 100 100000000)
+                               :script-pubkey (p2sh-optrue-script-pubkey)))))
+               (entry (bl.store:get-block-index-entry cs (hash-of greedy))))
+          (is-true entry "control: its header is indexed")
+          (is-false (bl.store:block-exists-p store (hash-of greedy))
+                    "control: no body before it is handed over")
+          (is (null (bl.val:activate-block greedy cs store utxo)))
+          (is (= 0 (bl.store:current-height cs)))
+          (is-true (bl.store:block-exists-p store (hash-of greedy))
+                   "a block that fails only ConnectBlock keeps its body")
+          (is (eq :invalid (bl.store:block-index-entry-status entry))))
+        (let ((twice (block-on-tip
+                      (list (bl.mining:build-coinbase-transaction
+                             1 100 :script-pubkey (p2sh-optrue-script-pubkey))
+                            (bl.mining:build-coinbase-transaction
+                             1 200 :script-pubkey (p2sh-optrue-script-pubkey))))))
+          (is (null (bl.val:activate-block twice cs store utxo)))
+          (is-false (bl.store:block-exists-p store (hash-of twice))
+                    "a block CheckBlock refuses is not written"))))))

@@ -915,7 +915,19 @@ fixture that never reconstructs anything."
                    "a header below the floor must not enter the block index")
          (is-false (bl.net:peer-discouraged-p addr)
                    "Core logs and returns: a peer far behind us relays low-work blocks honestly")
-         (is (eq :ready (bl.net:peer-state peer)))))
+         (is (eq :ready (bl.net:peer-state peer))))
+       ;; In Core's words (net_processing.cpp:4580); p2p_compactblocks.py:656
+       ;; waits for the line.
+       (let ((text (nth-value 1 (log-text-of
+                                 "net"
+                                 (lambda ()
+                                   (%cbp-capture-sends
+                                    (lambda ()
+                                      (%cbp-deliver peer payload state utxo mempool))))))))
+         (is-true (search (format nil "Ignoring low-work compact block from peer ~D"
+                                  (bl.net:peer-id peer))
+                          text)
+                  "Core's line: ~S" text)))
      ;; Control: with regtest's real floor (0) the identical message IS
      ;; admitted and reaches the mempool exactly once.
      (let ((peer (%cbp-peer "203.0.113.61")))
@@ -2028,3 +2040,94 @@ block forever that nothing would ask anyone else for."
        (bl.net:clear-pending-compact-block peer)
        (is (null (bl.net:peer-inflight-block-hashes peer))
            "an abandoned reconstruction must not leave the block in flight")))))
+
+(test a-peer-that-asked-for-high-bandwidth-gets-new-blocks-as-cmpctblock
+  "BIP152 high-bandwidth mode, Core's two sending sites. A peer that sent
+sendcmpct(1, 2) (m_requested_hb_cmpctblocks, net_processing.cpp:3918) is
+pushed each new tip as a cmpctblock the moment it validates, when it has the
+parent (NewPoWValidBlock, :2105-2153); and SendMessages announces a single
+queued block to it as a cmpctblock too, even though it never asked for
+headers (fRevertToInv, :5838-5840, and :5893-5916). Ours recorded the request
+and never acted on it -- such a peer got an inv, and p2p_compactblocks.py:210
+waits for a cmpctblock."
+  (uiop:delete-directory-tree (regtest-node-base-path "hb-announce")
+                              :validate t :if-does-not-exist :ignore)
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "hb-announce"))
+           (cs (bl:node-chain-state node))
+           (hashes (mapcar (lambda (hex) (bl.crypto:reverse-bytes
+                                          (bl.crypto:hex-to-bytes hex)))
+                           (generate-regtest-blocks node 2)))
+           (entry2 (bl.store:get-block-index-entry cs (second hashes)))
+           (bl:*node* node)
+           (bl.net::*highest-fast-announce* 0))
+      (flet ((peer (address hb)
+               (let ((p (bl.net:make-peer :address address :state :ready)))
+                 (setf (bl.net:peer-compact-block-high-bandwidth p) hb
+                       (bl.net:peer-best-known-block-hash p) (first hashes))
+                 p)))
+        ;; The SendMessages half: a queued single block for an HB peer that
+        ;; never asked for headers.
+        (let ((hb (peer "198.51.100.74" t)))
+          (bl.net:queue-block-announcement hb (second hashes))
+          (is (equal '("cmpctblock")
+                     (mapcar #'message-command
+                             (captured-sends
+                              (lambda ()
+                                (bl.net:flush-block-announcements (list hb) cs)))))))
+        ;; Control: the same peer without HB gets an inv.
+        (let ((lb (peer "198.51.100.75" nil)))
+          (bl.net:queue-block-announcement lb (second hashes))
+          (is (equal '("inv")
+                     (mapcar #'message-command
+                             (captured-sends
+                              (lambda ()
+                                (bl.net:flush-block-announcements (list lb) cs)))))))
+        (let* ((hb (peer "198.51.100.71" t))
+               (lb (peer "198.51.100.72" nil))
+               (sent (captured-sends
+                      (lambda ()
+                        (is (equal (list hb)
+                                   (bl.net:new-pow-valid-block cs entry2 (list hb lb)))
+                            "only the high-bandwidth peer is pushed the block"))))
+               (commands (mapcar #'message-command sent)))
+          (is (equal '("cmpctblock") commands) "one cmpctblock went out: ~S" commands)
+          (is (equalp (second hashes) (bl.net:peer-best-header-sent-hash hb)))
+          (is (null (bl.net:new-pow-valid-block cs entry2 (list (peer "198.51.100.73" t))))
+              "each height is pushed once"))))))
+
+(test a-new-compact-header-no-better-than-the-tip-is-indexed-but-not-rebuilt
+  "Core indexes a cmpctblock's header (ProcessNewBlockHeaders, net_processing.cpp
+:4590) and THEN returns when `pindex->nChainWork <= ActiveChain().Tip()->
+nChainWork' (:4645-4655), so an old fork's compact block leaves a headers-only
+tip and is never reconstructed. Our verdict applied that test only to a header
+it already held; a NEW header on an old fork was reconstructed and stored, and
+p2p_compactblocks.py:708 found it `valid-fork' instead of `headers-only'."
+  (with-network (:regtest)
+   (let* ((bl.net:*cached-is-ibd* nil)
+          (peer (%cbp-peer "203.0.113.81"))
+          (parent (%cbp-hash #xC1))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (tip-hash (%cbp-hash #xC2))
+          (hdr (%cbp-grind (%cbp-header parent 1296688700)))
+          (cb (%cbp-compact-block-missing-one hdr (make-simple-tx #x53)))
+          (block-hash (bl.ser:block-header-hash hdr)))
+     ;; Our tip: a heavier block beside the announced one.
+     (bl.store:add-block-index-entry
+      state (bl.store:make-block-index-entry
+             :hash tip-hash :height 1 :chain-work 100 :status :valid
+             :prev-entry (bl.store:get-block-index-entry state parent)
+             :header (%cbp-header parent 1296688650)))
+     (bl.store:update-chain-tip state tip-hash 1)
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (%cbp-deliver peer (%cbp-payload cb) state
+                             (bl.store:make-utxo-set) (bl.mp:make-mempool))))))
+       (is-true (bl.store:get-block-index-entry state block-hash)
+                "the header is indexed")
+       (is (= 0 passes) "and no reconstruction is attempted")
+       (is (null sent) "nothing is asked for: ~S" sent)
+       (is (eq :ready (bl.net:peer-state peer)))))))

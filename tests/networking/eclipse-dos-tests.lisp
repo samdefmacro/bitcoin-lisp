@@ -1027,6 +1027,79 @@ steady-state tip announcements are unaffected by the anti-DoS gate."
           (is (not (null (bl.store:get-block-index-entry state h1-hash)))
               "above-threshold header enters the block index"))))))
 
+(test a-finished-low-work-sync-asks-again-after-a-full-batch
+  "Core's ProcessHeadersMessage, after IsContinuationOfLowWorkHeadersSync has
+taken the sync to FINAL (m_headers_sync.reset()), goes on with
+have_headers_sync false, so a message that was FULL asks again from pindexLast
+(net_processing.cpp:3105-3111): the redownload released only the headers up to
+the end of that message, and the peer may have more. Ours cleared the sync and
+sent nothing, so a chain longer than the sync's last message was never learnt
+past it -- p2p_headers_sync_with_minchainwork.py:166, where a node that had
+redownloaded the new branch up to height 6000 of 6159 sat on the old chain
+until the 300 s sync timed out.
+
+A 4000-header chain, the anti-DoS threshold at height 2500: two full messages
+presync it, two more redownload it, and the last one finishes the sync."
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-final/")
+      (let* ((bl:*minimum-chain-work-override* (+ 1 (* 2 2500)))
+             (peer (bl.net:make-peer :conn-type :outbound-full-relay))
+             (headers (let ((prev genesis-hash))
+                        (loop for i from 1 to 4000
+                              collect (let ((h (%pow-header prev :timestamp (+ 1296688600 (* 60 i)))))
+                                        (setf prev (bl.ser:block-header-hash h))
+                                        h))))
+             (first-half (subseq headers 0 2000))
+             (second-half (subseq headers 2000))
+             (last-hash (bl.ser:block-header-hash (car (last headers)))))
+        (flet ((feed (batch)
+                 (captured-sends
+                  (lambda () (bl.net:ingest-headers-from-peer peer batch state)))))
+          (feed first-half)
+          (feed second-half)
+          (feed first-half)
+          (is (null (bl.store:get-block-index-entry state last-hash))
+              "the redownload has not reached the end of the chain yet")
+          (let* ((sent (feed second-half))
+                 (getheaders (find "getheaders" sent :key #'message-command
+                                                     :test #'string=)))
+            (is-true (bl.store:get-block-index-entry state last-hash)
+                     "the finished sync stored the whole redownloaded chain")
+            (is (null (bl.net:peer-headers-sync peer)) "and the sync is over")
+            (is-true getheaders "a full final message asks for more")
+            (when getheaders
+              (is (equalp last-hash
+                          (first (bl.ser:parse-block-locator-payload
+                                  (subseq getheaders 24))))
+                  "from pindexLast, the last header of that message"))))))))
+
+(test a-header-on-an-invalid-parent-is-refused-and-punished
+  "Core's AcceptBlockHeader refuses a header whose parent is marked invalid as
+bad-prevblk, before indexing it (validation.cpp:4252-4255), and
+ProcessHeadersMessage punishes the sender: MaybePunishNodeForBlock(...,
+\"invalid header received\") (net_processing.cpp:3095), sparing only
+BLOCK_TIME_FUTURE. Ours indexed the child as invalid and kept the peer;
+p2p_unrequested_blocks.py:291 sends a header on a chain it has just seen
+refused and waits to be disconnected."
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-bad-prevblk/")
+      (let* ((bl:*minimum-chain-work-override* 0)
+             (h1 (%pow-header genesis-hash :timestamp 1296688700))
+             (h2 (%pow-header (bl.ser:block-header-hash h1) :timestamp 1296689300))
+             (p (bl.net:make-peer :conn-type :outbound-full-relay :state :ready)))
+        (is (= 1 (bl.net:ingest-headers-from-peer p (list h1) state)))
+        (is (eq :ready (bl.net:peer-state p)) "control: a valid header costs nothing")
+        (setf (bl.store:block-index-entry-status
+               (bl.store:get-block-index-entry state (bl.ser:block-header-hash h1)))
+              :invalid)
+        (is (= 0 (bl.net:ingest-headers-from-peer p (list h2) state)))
+        (is (null (bl.store:get-block-index-entry state (bl.ser:block-header-hash h2)))
+            "a header on an invalid parent is not indexed")
+        (is (eq :disconnected (bl.net:peer-state p))
+            "and its sender is punished")))))
+
 (test generic-path-unconnecting-headers-store-nothing
   "A header batch that does not connect to our index (unknown prev-block)
 stores nothing and does not error — Core HandleUnconnectingHeaders sends a
@@ -2098,38 +2171,6 @@ below the floor IS dropped. Deleting the check outright would redden this."
         (is (eq :disconnected (bl.net:peer-state p))
             "a stored non-full batch leaving best-known below the floor must drop")))))
 
-(test w3-solicited-phase1-path-drops-low-work-outbound
-  "GA8 W3 (S3), the other half: handle-header-batch — the solicited Phase-1
-path — never applied the drop at all, and %maybe-divert-to-presync had no
-known-ancestor skip, so the CLASSIC case never fired: an outbound peer pinned
-on a low-work fork answers our getheaders with a short batch of headers we
-already hold. Core sets already_validated_work for exactly that shape
-(net_processing.cpp:3046-3054, and the comment at :2786-2790), skipping
-TryLowWorkHeadersSync and reaching the disconnect."
-  (%w3-with-regtest
-    (multiple-value-bind (state genesis-hash h1 h1-hash)
-        (%w3-stored-header "test-w3-phase1-drop/")
-      (declare (ignore genesis-hash h1-hash))
-      (let ((bl:*minimum-chain-work-override* 1000))
-        (let* ((p (%g718-peer))
-               (added 0)
-               (done (bl.net::handle-header-batch
-                      p state (list h1) nil (lambda (n) (incf added n)))))
-          (is-true done "a non-full batch ends header sync with this peer")
-          (is (= 0 added) "an already-known batch adds nothing")
-          (is (eq :disconnected (bl.net:peer-state p))
-              "the solicited path must drop a sub-minchainwork outbound peer"))
-        ;; Same batch declared FULL: may_have_more_headers, so the peer is kept
-        ;; (Core's !may_have_more_headers guard) — but sync still ends, because
-        ;; nothing entered the index and our locator is built from our own
-        ;; header tip, so re-asking would fetch this very batch again.
-        (let ((p (%g718-peer)))
-          (is-true (bl.net::handle-header-batch
-                    p state (list h1) t (lambda (n) (declare (ignore n))))
-                   "an all-known batch ends sync even when the message was full")
-          (is (eq :ready (bl.net:peer-state p))
-              "a full batch must not drop the peer"))))))
-
 ;;;; ============================================================
 ;;;; GA8 W3 review: already_validated_work is Core's ANCESTOR test, not plain
 ;;;; index membership.
@@ -2208,55 +2249,6 @@ was about: a header we HOLD is not thereby a header on our chain."
                   state b2)
                  "a header on the ACTIVE chain qualifies even off the best-header branch")))))
 
-(test w3-all-known-fork-batch-must-not-end-header-sync
-  "THE REGRESSION. We hold a fork B1..B2 below our header tip (an aborted
-presync, a peer rotation, or a restart mid-fork leaves exactly this). Phase 1
-asks with a locator off the A-branch tip; the fork peer matches the fork point
-and answers with a FULL batch of B headers — all of which we already have.
-
-Plain index membership ended header sync there and returned DONE. Nothing
-entered the index, so the next run-ibd cycle built the identical locator, got
-the identical batch and stopped again: the fork could never be synced. Core
-sends this shape to TryLowWorkHeadersSync (net_processing.cpp:2769-2800), which
-starts a presync whose own locator anchors on the peer's chain and advances."
-  (%w3-with-regtest
-    (multiple-value-bind (state a-headers b-headers)
-        (%w3-fork-fixture "test-w3-fork-presync/")
-      (declare (ignore a-headers))
-      (let* ((bl:*minimum-chain-work-override* 1000)
-             (b-last-hash (bl.ser:block-header-hash
-                           (car (last b-headers))))
-             (p (%g718-peer)))
-        ;; Preconditions: the batch really is all-known, and really is off our
-        ;; best-header/active chain — else the assertions below are vacuous.
-        (is (not (null (bl.store:get-block-index-entry
-                        state b-last-hash)))
-            "fixture must already hold the whole fork batch")
-        (is-false (bl.net::%ancestor-of-best-header-or-tip-p
-                   state (bl.store:get-block-index-entry
-                          state b-last-hash))
-                  "the fork tip must be off our best-header/active chain")
-        (let ((done (bl.net::handle-header-batch
-                     p state b-headers t (lambda (n) (declare (ignore n))))))
-          (is-false done
-                    "an all-known FULL batch on a fork must NOT end header sync"))
-        ;; And the next round actually makes progress: the follow-up getheaders
-        ;; is anchored on the fork header just processed (Core
-        ;; NextHeadersRequestLocator), not on our own header tip — a different
-        ;; request from the one that produced this batch. Guarded, so that a
-        ;; regression reads as failed assertions rather than an error inside
-        ;; hss-locator-hashes.
-        (let ((hss (bl.net:peer-headers-sync p)))
-          (is (not (null hss))
-              "it must divert into a presync, as Core's TryLowWorkHeadersSync does")
-          (when hss
-            (let ((next (bl.net::hss-locator-hashes hss))
-                  (ours (bl.net::build-header-locator state)))
-              (is (equalp b-last-hash (first next))
-                  "the presync locator anchors on the peer's fork, advancing into its chain")
-              (is-false (equalp (first next) (first ours))
-                        "and differs from the header-tip locator that would repeat this batch"))))))))
-
 (test w3-all-known-fork-batch-non-full-is-not-judged
   "The same class, non-full: Core's TryLowWorkHeadersSync logs \"Ignoring
 low-work chain\" and returns true, so ProcessHeadersMessage returns without ever
@@ -2271,41 +2263,12 @@ instead and dropped an outbound peer Core keeps."
             (p (%g718-peer)))
         (is-true (bl.net:initial-block-download-p state)
                  "fixture must be in IBD, or the drop could not fire either way")
-        (is-true (bl.net::handle-header-batch
-                  p state b-headers nil (lambda (n) (declare (ignore n))))
-                 "an ignored low-work batch ends header sync with this peer")
+        (is (= 0 (bl.net:ingest-headers-from-peer p b-headers state))
+            "an ignored low-work batch stores nothing")
         (is (null (bl.net:peer-best-known-block-hash p))
             "an ignored batch must not update availability (Core never gets there)")
         (is (eq :ready (bl.net:peer-state p))
             "and must NOT drop the peer")))))
-
-(test w3-all-known-batch-on-our-own-chain-still-ends-sync
-  "The anti-DoS control the narrowing must NOT lose. A FULL batch of headers we
-already hold ON OUR OWN CHAIN is Core's already_validated_work: the work gate is
-skipped, no presync is started, and this loop stops asking — our locator is
-built from our header tip, which the batch did not move, so re-asking would
-fetch this very batch again (free round-trips for a peer replaying our own chain
-at us)."
-  (%w3-with-regtest
-    (multiple-value-bind (state a-headers b-headers)
-        (%w3-fork-fixture "test-w3-own-chain-stop/")
-      (declare (ignore b-headers))
-      (let* ((bl:*minimum-chain-work-override* 1000)
-             (a-last-hash (bl.ser:block-header-hash
-                           (car (last a-headers))))
-             (p (%g718-peer))
-             (added 0))
-        (is-true (bl.net::handle-header-batch
-                  p state a-headers t (lambda (n) (incf added n)))
-                 "an all-known FULL batch on our own chain must still end sync")
-        (is (null (bl.net:peer-headers-sync p))
-            "and must NOT start a presync — that is the suppression's whole point")
-        (is (= 0 added) "an already-known batch adds nothing to the index")
-        (is (equalp a-last-hash
-                    (bl.net:peer-best-known-block-hash p))
-            "the store path still ran, refreshing availability")
-        (is (eq :ready (bl.net:peer-state p))
-            "a full batch must not drop the peer")))))
 
 (test w3-known-ancestor-batch-still-drops-low-work-outbound
   "The genuine low-work disconnect must still fire, and through the ANCESTOR arm

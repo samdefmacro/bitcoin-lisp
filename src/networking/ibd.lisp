@@ -780,6 +780,21 @@ whose nBits is negative / zero / overflowing / above the PoW limit is rejected
 (Core CheckBlockHeader), not silently decoded as an in-range target."
   (bl.val:check-proof-of-work header))
 
+(defun block-min-pow-checked-p (header chain-state)
+  "Core's min_pow_checked for a BLOCK message (net_processing.cpp:4895-4898):
+the parent is known and its chain work plus this block's own proof reaches
+GetAntiDoSWorkThreshold. AcceptBlockHeader refuses to index a header that
+fails it (validation.cpp:4261-4264) -- after, not instead of, its proof-of-work,
+parent and contextual checks -- so an unsolicited block on a chain too light to
+matter is never stored."
+  (let ((prev (bl.store:get-block-index-entry
+               chain-state (bl.ser:block-header-prev-block header))))
+    (and prev
+         (>= (bl.store:calculate-chain-work
+              (bl.ser:block-header-bits header)
+              (bl.store:block-index-entry-chain-work prev))
+             (anti-dos-work-threshold chain-state)))))
+
 (defun %refuse-block-with-invalid-header (peer header chain-state)
   "The header of a block message PEER sent is not in the index after the
 ingest: T, with PEER punished, when that is Core's verdict on the header --
@@ -800,6 +815,16 @@ anti-DoS work floor)."
                   (t (nth-value 2 (with-current-node-lock
                                     (validate-header-chain (list header)
                                                            chain-state)))))))
+      ;; Every check passed and the header is still not indexed: it was held
+      ;; back by the anti-DoS work floor, which is nobody's fault
+      ;; (MaybePunishNodeForBlock's BLOCK_HEADER_LOW_WORK arm,
+      ;; net_processing.cpp:1915-1918). Core's line, validation.cpp:4262;
+      ;; p2p_unrequested_blocks.py:100 waits for it.
+      (unless reason
+        (bl:log-cat "validation" "AcceptBlockHeader: not adding new block header ~A, ~
+                                  missing anti-dos proof-of-work validation"
+                    (bl.crypto:bytes-to-hex
+                     (bl.crypto:reverse-bytes (bl.ser:block-header-hash header)))))
       (when (and reason (not (equal reason "time-too-new")))
         (record-misbehavior peer reason)
         t))))
@@ -855,6 +880,19 @@ the second stays the sentence the log line has always carried."
                                 (bl.crypto:bytes-to-hex header-prev-hash))
                         ;; Core AcceptBlockHeader, validation.cpp:4249.
                         "prev-blk-not-found"
+                        hash)))
+
+            ;; Core AcceptBlockHeader (validation.cpp:4252-4255): a header whose
+            ;; parent is marked invalid is refused as bad-prevblk and never
+            ;; indexed; the headers handler then punishes its sender.
+            (when (member (bl.store:block-index-entry-status parent)
+                          '(:invalid :failed-child))
+              (return-from validate-header-chain
+                (values (nreverse valid-headers)
+                        (format nil "header ~A has prev block invalid: ~A"
+                                (bl.crypto:bytes-to-hex hash)
+                                (bl.crypto:bytes-to-hex header-prev-hash))
+                        "bad-prevblk"
                         hash)))
 
             ;; Validate proof-of-work
@@ -1265,10 +1303,7 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
              (services (peer-services peer))
              (peer-witness-p (logtest services
                                       bl.ser:+node-witness+))
-             (is-limited (and (logtest services
-                                       bl.ser:+node-network-limited+)
-                              (not (logtest services
-                                            bl.ser:+node-network+))))
+             (is-limited (peer-limited-p peer))
              (best-known-height (bl.store:block-index-entry-height best-known))
              (segwit-height (bl.val:get-segwit-activation-height
                              bl:*network*))
@@ -1483,12 +1518,9 @@ whole reason fRequested exists: validation.cpp:4363 says removing it `would
 break the getblockfrompeer RPC', because a body the node has pruned is dropped
 at :4369 (`if (pindex->nTx != 0) return true') unless it was asked for.
 
-A process global rather than a slot on the IBD context, and deliberately so: the
-steady-state receive pump builds a FRESH ibd-context on every tick
-(PUMP-PEER-MESSAGES is called with a NIL context from the sync loop), so a hash
-the RPC thread wrote into that context's in-flight table would be gone before
-the block arrived -- and the RPC thread does not see the pump thread's binding
-of *IBD-CONTEXT* in any case.")
+A process global rather than a slot on the IBD context: the RPC thread writes
+it and the sync thread consumes it, and RENEW-IBD-CONTEXT replaces the context
+every sync cycle, carrying over only the tables that describe the node.")
 
 (defun note-fetch-block-request (hash)
   "Remember that getblockfrompeer asked a peer for HASH (Core FetchBlock ->
@@ -1795,6 +1827,43 @@ reads; passing it lets a test place a peer's clock without waiting."
 
 ;;;; Multi-Peer Request Distribution
 
+(defun %blocks-to-request-from-peer (peer peers chain-state block-store budget)
+  "One peer's turn in Core SendMessages' `Message: getdata (blocks)' section
+(net_processing.cpp:6161-6198): up to BUDGET blocks to ask PEER for, each
+marked in flight to it before the next peer's turn, returned NEWEST FIRST (the
+caller reverses the batch into Core's ascending getdata order).
+
+The gate is Core's, judged at this peer's turn -- the in-flight map it reads
+grows as earlier peers in the pass are asked (BLOCK-DOWNLOAD-ALLOWED-P, :6165).
+The tip walk goes first; what budget it leaves is topped up from the
+assumeutxo background range, which a limited peer is never asked for
+(`historical_blocks && !IsLimitedPeer(peer)', :6177): that range lies below
+the snapshot base, deeper than such a peer keeps. Then, AFTER both walks
+(:6191-6197): a peer that came away with nothing at all to do while someone
+else holds the window shut starts THAT peer's stalling clock, once."
+  (let ((in-flight (ibd-context-in-flight *ibd-context*))
+        (requested '()))
+    (when (and (plusp budget)
+               (block-download-allowed-p peer peers chain-state))
+      (flet ((take (hashes)
+               (dolist (hash hashes)
+                 (unless (gethash hash in-flight)
+                   (mark-block-in-flight hash peer)
+                   (push hash requested)))))
+        (multiple-value-bind (hashes staller)
+            (find-blocks-to-download-for-peer peer chain-state block-store budget)
+          (take hashes)
+          (let ((hist-budget (- budget (length requested))))
+            (when (and (plusp hist-budget) (not (peer-limited-p peer)))
+              (take (find-historical-blocks-to-download
+                     peer chain-state block-store hist-budget))))
+          (when (and staller
+                     (zerop (count-peer-in-flight peer))
+                     (zerop (peer-stalling-since staller)))
+            (setf (peer-stalling-since staller) (get-internal-real-time))
+            (bl:log-debug "Stall started ~A" (peer-log-name staller))))))
+    requested))
+
 (defun request-blocks-from-peers (peers chain-state block-store)
   "Request blocks from multiple peers, distributing the load.
 Enforces per-peer in-flight limits (like Bitcoin Core's
@@ -1916,49 +1985,17 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     ;; exists to prevent).
     (let ((requests-made 0)
           (peer-requests (make-hash-table :test 'eq))
-          (in-flight (ibd-context-in-flight *ibd-context*))
-          (block-hashes '())
           (remaining total-budget))
       (dolist (peer ready-peers)
         (when (plusp remaining)
-          (let ((budget (min remaining
-                             (max 0 (- max-per-peer (count-peer-in-flight peer)))))
-                (taken 0)
-                (staller nil))
-            (when (plusp budget)
-              (multiple-value-setq (block-hashes staller)
-                (find-blocks-to-download-for-peer
-                 peer chain-state block-store budget))
-              (dolist (hash block-hashes)
-                (unless (gethash hash in-flight)
-                  (mark-block-in-flight hash peer)
-                  (push hash (gethash peer peer-requests))
-                  (incf taken)
-                  (incf requests-made)
-                  (decf remaining)))
-              ;; Assumeutxo background range: top up whatever per-peer budget
-              ;; the tip walk left unused with historical blocks (Core
-              ;; SendMessages runs TryDownloadingHistoricalBlocks right after
-              ;; FindNextBlocksToDownload the same way).
-              (let ((hist-budget (min (- budget taken) remaining)))
-                (when (plusp hist-budget)
-                  (dolist (hash (find-historical-blocks-to-download
-                                 peer chain-state block-store hist-budget))
-                    (unless (gethash hash in-flight)
-                      (mark-block-in-flight hash peer)
-                      (push hash (gethash peer peer-requests))
-                      (incf requests-made)
-                      (decf remaining)))))
-              ;; Core SendMessages (net_processing.cpp:6191-6197), AFTER both
-              ;; walks and their BlockRequested calls: this peer came away with
-              ;; nothing at all to do and someone else is holding the window
-              ;; shut -- start THAT peer's stalling clock, once.
-              (when (and staller
-                         (zerop (count-peer-in-flight peer))
-                         (zerop (peer-stalling-since staller)))
-                (setf (peer-stalling-since staller) (get-internal-real-time))
-                (bl:log-debug "Stall started ~A"
-                              (peer-log-name staller)))))))
+          (let ((hashes (%blocks-to-request-from-peer
+                         peer peers chain-state block-store
+                         (min remaining
+                              (max 0 (- max-per-peer
+                                        (count-peer-in-flight peer)))))))
+            (setf (gethash peer peer-requests) hashes)
+            (incf requests-made (length hashes))
+            (decf remaining (length hashes)))))
       (when (zerop requests-made)
         (return-from request-blocks-from-peers 0))
 
@@ -2169,7 +2206,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        ;; The header goes through the same ingest as a headers message
        ;; (anti-DoS work floor included); a header on an unknown parent is
        ;; not added, and the body is then dropped as before.
-       (unless (bl.store:get-block-index-entry chain-state hash)
+       ;; Only with Core's min_pow_checked (BLOCK-MIN-POW-CHECKED-P): a header
+       ;; on a chain below the anti-DoS floor is not indexed here, and not
+       ;; diverted into a headers presync either -- that is the HEADERS
+       ;; message's gate (TryLowWorkHeadersSync), not AcceptBlockHeader's.
+       (when (and (not (bl.store:get-block-index-entry chain-state hash))
+                  (block-min-pow-checked-p header chain-state))
          (with-current-node-lock
            (ingest-headers-from-peer
             peer (list header) chain-state
@@ -2231,8 +2273,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
          ;; Capture "did we request this?" BEFORE mark-block-received clears
          ;; the in-flight/pending entry — the out-of-order persist gate needs
          ;; it to tell a solicited download from an unsolicited disk-fill push.
-         (let ((requested (and ctx (or (gethash hash (ibd-context-in-flight ctx))
-                                       (gethash hash (ibd-context-pending-blocks ctx))))))
+         ;; Core's fRequested is IsBlockRequested -- in flight from anyone
+         ;; (net_processing.cpp:4886) -- not "a block we would like": a
+         ;; header the index merely queued for download (PENDING) was never
+         ;; asked for, and counting it let every pushed fork block past
+         ;; AcceptBlock's unrequested gates (p2p_unrequested_blocks.py:119).
+         (let ((requested (and ctx (gethash hash (ibd-context-in-flight ctx)))))
            (mark-block-received hash)
            ;; Core mapBlockSource.emplace (net_processing.cpp:4893).
            (note-block-source hash peer)
@@ -2702,20 +2748,45 @@ once without polling."
                                     readable)
                             timeout))))
 
+(defun renew-ibd-context ()
+  "Give a sync cycle fresh bookkeeping while carrying over what describes the
+NODE rather than the cycle, and return the new *IBD-CONTEXT*.
+
+The in-flight table: those requests are outstanding at our peers whatever
+pass made them (Core's mapBlocksInFlight outlives every loop); the timeout and
+disconnected-peer sweeps (GET-TIMED-OUT-REQUESTS, RELEASE-ORPHANED-IN-FLIGHT)
+retire the stale ones.
+
+And the record of bodies on disk above the tip -- DISK-BLOCKS-ABOVE-TIP, the
+reorg-candidate set and its unlinked/parked index -- which is our share of
+Core's setBlockIndexCandidates and m_blocks_unlinked: chain facts that
+ActivateBestChain consults after every block (FindMostWorkChain,
+validation.cpp:3153), never reset between message loops. Dropping them with the cycle stranded every
+block persisted in an earlier cycle: p2p_unrequested_blocks.py:230 pushes 288
+blocks of a fork whose base arrives only later, from another peer, and Core
+connects all of them at once; ours reorged onto the base's child and stopped,
+because the disk map that led on from it belonged to a context already
+replaced. Rejected candidates are not carried, which leaves their retry
+cadence what it was: once per cycle."
+  (let ((old *ibd-context*)
+        (fresh (make-ibd)))
+    (when old
+      (setf (ibd-context-in-flight fresh) (ibd-context-in-flight old)
+            (ibd-context-disk-blocks-above-tip fresh)
+            (ibd-context-disk-blocks-above-tip old)
+            (ibd-context-reorg-candidates fresh) (ibd-context-reorg-candidates old)
+            (ibd-context-unlinked-reorg-candidates fresh)
+            (ibd-context-unlinked-reorg-candidates old)
+            (ibd-context-parked-reorg-candidates fresh)
+            (ibd-context-parked-reorg-candidates old)))
+    (setf *ibd-context* fresh)))
+
 (defun start-ibd (peers node-ctx target-height)
   "Start Initial Block Download.
 Returns the number of blocks downloaded. NODE-CTX's historical-chainstate, when
 non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
 a second download cursor for its [tip .. snapshot-base] range."
-  ;; A fresh cycle's bookkeeping, but the node's in-flight table carries over:
-  ;; those requests are outstanding at our peers whatever pass made them
-  ;; (Core's mapBlocksInFlight outlives every loop). The timeout and
-  ;; disconnected-peer sweeps (GET-TIMED-OUT-REQUESTS,
-  ;; RELEASE-ORPHANED-IN-FLIGHT) retire the stale ones.
-  (let ((fresh (make-ibd)))
-    (when *ibd-context*
-      (setf (ibd-context-in-flight fresh) (ibd-context-in-flight *ibd-context*)))
-    (setf *ibd-context* fresh))
+  (renew-ibd-context)
   ;; TARGET-HEIGHT arrives as a peer's advertised start height, which is a
   ;; SIGNED int32 on the wire and whose "unknown" value is -1 (Core's
   ;; CNode::nStartingHeight initialises to -1, and its own P2PInterface test
@@ -2749,6 +2820,64 @@ Asking a peer for headers here returns zero and costs a full round trip."
   (and ctx
        (> (ibd-context-header-tip-height ctx)
           (bl.store:current-height chain-state))))
+
+(defun %equal-work-fork-to-fetch-p (peers chain-state block-store)
+  "T when some ready peer's best-known block is off our active chain, carries
+at least our tip's work and has no body here: a fork Core's
+FindNextBlocksToDownload would be fetching. Core's only work test there is
+`pindexBestKnownBlock->nChainWork < ActiveChain().Tip()->nChainWork' ->
+nothing interesting (net_processing.cpp:1407), so an EQUAL-work fork is
+downloaded and stored (AcceptBlock's fHasMoreOrSameWork, validation.cpp:4351)
+without becoming the tip. The fork's own tip is its last block to arrive
+(requests go out in ascending height), so its body stands for the branch."
+  (let ((tip (bl.store:get-block-index-entry
+              chain-state (bl.store:best-block-hash chain-state))))
+    (and tip
+         (some (lambda (peer)
+                 (let* ((hash (and (eq (peer-state peer) :ready)
+                                   (peer-best-known-block-hash peer)))
+                        (best (and hash (bl.store:get-block-index-entry
+                                         chain-state hash))))
+                   (and best
+                        (>= (bl.store:block-index-entry-chain-work best)
+                            (bl.store:block-index-entry-chain-work tip))
+                        (not (member (bl.store:block-index-entry-status best)
+                                     '(:invalid :failed-child)))
+                        (not (bl.store:entry-on-active-chain-p chain-state best))
+                        (not (%block-body-present-p chain-state block-store best)))))
+               peers))))
+
+(defun block-download-wanted-p (ctx chain-state block-store peers)
+  "Whether RUN-IBD's download loop has work: blocks are pending AND either our
+tip is below the header tip, a heavier header chain outweighs the tip, or an
+assumeutxo background chainstate is still short of its target -- or, with
+nothing pending, a peer serves an equal-work fork we have not fetched
+(%EQUAL-WORK-FORK-TO-FETCH-P).
+
+The WORK term matters: a heavier-but-SHORTER fork (tip height <= ours but
+more cumulative work) must still be downloaded, and a height-only gate would
+leave it unrequested (a most-work-chain liveness violation). Any remaining
+pending entries once the gate closes are competing-fork blocks no peer serves;
+without the gate they would pin the loop forever. A historical (assumeutxo)
+chainstate keeps the loop alive for its background cursor. The
++no-progress-yield-seconds+ exit inside the loop is the backstop for a gate
+held open by an UNOBTAINABLE chain.
+
+The equal-work arm is feature_block.py:1318: 1088 headers of a fork as heavy
+as our tip, then a wait for the getdata of its last block. The height and work
+terms both said the node was done, so the fork was never requested."
+  (let ((tip (bl.store:get-block-index-entry
+              chain-state (bl.store:best-block-hash chain-state))))
+    (or (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
+             (or (< (bl.store:current-height chain-state)
+                    (ibd-context-header-tip-height ctx))
+                 (> (ibd-context-best-header-work ctx)
+                    (if tip (bl.store:block-index-entry-chain-work tip) 0))
+                 (let ((hist (ibd-context-historical-chain-state ctx)))
+                   (and hist
+                        (< (bl.store:current-height hist)
+                           (or (bl.store:chain-state-target-height hist) 0))))))
+        (%equal-work-fork-to-fetch-p peers chain-state block-store))))
 
 (defun run-ibd (peers node-ctx)
   "Main IBD loop."
@@ -2876,34 +3005,9 @@ Asking a peer for headers here returns zero and costs a full round trip."
           ;; bounded exit below.
           (last-progress-time (get-universal-time)))
 
-      ;; Loop until either (a) the pending queue is empty, or (b) we've caught
-      ;; up to the best chain — current height >= header tip AND no heavier
-      ;; header chain outweighs our tip. The WORK term matters: a heavier-but-
-      ;; SHORTER fork (tip height <= ours but more cumulative work) must still
-      ;; be downloaded, and a height-only gate would leave it unrequested (a
-      ;; most-work-chain liveness violation). Any remaining pending entries once
-      ;; the gate closes are competing-fork blocks no peer serves; without the
-      ;; gate they'd pin the loop forever. A historical (assumeutxo) chainstate
-      ;; keeps the loop alive for its background cursor. The +no-progress-yield-
-      ;; seconds+ exit inside the body is the required backstop: the work gate
-      ;; can stay open on an UNOBTAINABLE heavier chain, and without a bounded
-      ;; exit the loop would spin forever (its pending blocks never go in-flight
-      ;; so never time out) and starve the 30s maintenance cadence.
-      (loop while (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
-                       (or (< (bl.store:current-height chain-state)
-                              (ibd-context-header-tip-height ctx))
-                           (let ((tip (bl.store:get-block-index-entry
-                                       chain-state
-                                       (bl.store:best-block-hash chain-state))))
-                             (> (ibd-context-best-header-work ctx)
-                                (if tip
-                                    (bl.store:block-index-entry-chain-work tip)
-                                    0)))
-                           (let ((hist (ibd-context-historical-chain-state ctx)))
-                             (and hist
-                                  (< (bl.store:current-height hist)
-                                     (or (bl.store:chain-state-target-height hist)
-                                         0))))))
+      ;; The gate is %BLOCK-DOWNLOAD-WANTED-P; the +no-progress-yield-seconds+
+      ;; exit inside the body is its required backstop (see there).
+      (loop while (block-download-wanted-p ctx chain-state block-store peers)
             do (let ((cycle-received (ibd-context-blocks-received ctx))
                      (cycle-requested 0))
                  (when *ibd-stop-requested*
@@ -3151,9 +3255,39 @@ p2p_addrfetch.py:54 asserts exactly the last clause: an addr-fetch peer is sent
 a getaddr and NO getheaders. Ours asked every ready peer."
   (and (eq (peer-state peer) :ready)
        (not (eq (peer-conn-type peer) :addr-fetch))
-       (logtest (peer-services peer)
-                (logior bl.ser:+node-network+ bl.ser:+node-network-limited+))
-       t))
+       (peer-can-serve-blocks-p peer)))
+
+(defun sync-blocks-and-headers-from-peer-p (peer peers)
+  "Core's `sync_blocks_and_headers_from_peer' (net_processing.cpp:5779-5795):
+whether, during IBD, PEER may be the one we sync headers from and download
+blocks from. A preferred-download peer (outbound, or inbound with noban) always
+may. Any other peer that can serve blocks and is not an addr-fetch connection
+may only while no preferred-download peer exists among PEERS
+(m_num_preferred_download_peers == 0) or no block is in flight from anyone
+(mapBlocksInFlight.empty()): `we prefer downloading blocks from outbound peers
+to avoid putting undue load on (say) some home user', but a node whose only
+source of the latest blocks is an inbound peer must still get them."
+  (or (peer-preferred-download-p peer)
+      (and (peer-can-serve-blocks-p peer)
+           (not (eq (peer-conn-type peer) :addr-fetch))
+           (or (notany #'peer-preferred-download-p peers)
+               (null *ibd-context*)
+               (zerop (hash-table-count (ibd-context-in-flight *ibd-context*)))))))
+
+(defun block-download-allowed-p (peer peers chain-state)
+  "Core SendMessages' gate on asking PEER for blocks at all
+(net_processing.cpp:6165): `CanServeBlocks(peer) &&
+((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) ||
+!IsInitialBlockDownload())'. In IBD a NODE_NETWORK_LIMITED peer -- a pruned
+node, or an assumeutxo node still validating its background chain -- is never
+asked for blocks: it holds only its last 288, and the blocks an IBD node needs
+are the old ones, so a request would stall until the peer is dropped for it
+(feature_assumeutxo.py:329-335). Out of IBD every peer that can serve blocks is
+asked, and FindNextBlocks keeps a limited peer's requests inside its window."
+  (and (peer-can-serve-blocks-p peer)
+       (or (and (sync-blocks-and-headers-from-peer-p peer peers)
+                (not (peer-limited-p peer)))
+           (not (initial-block-download-p chain-state)))))
 
 (defun %best-header-is-recent-p (chain-state)
   "Core's `m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
@@ -3267,11 +3401,9 @@ m_chainman.m_best_header->Time() > NodeClock::now() - 24h'
 exactly one peer is actively asked, and the next one is asked only once that
 peer has gone. p2p_initial_headers_sync.py:90-95 connects two more peers and
 asserts neither sees a getheaders. Ours asked every candidate at once. The
-`sync_blocks_and_headers_from_peer' half (net_processing.cpp:5779-5795, which
-also declines an inbound peer while preferred outbound peers have blocks in
-flight) is NOT ported: leaving it out can only make us ask a peer Core would
-skip, never the reverse, and it needs fPreferredDownload and mapBlocksInFlight
-which this layer does not have.
+first peer must also pass `sync_blocks_and_headers_from_peer'
+(SYNC-BLOCKS-AND-HEADERS-FROM-PEER-P, net_processing.cpp:5779-5795), which
+declines an inbound peer while preferred outbound peers have blocks in flight.
 
 At the tip the 24h clause is true, so a live node still primes every peer on
 the pass -- which is the behaviour p2p_add_connections.py needs and the reason
@@ -3284,7 +3416,9 @@ this tree does not have."
     (dolist (peer peers)
       (when (and (header-sync-candidate-p peer)
                  (not (peer-headers-sync-started peer))
-                 (or best-header-recent (zerop sync-started)))
+                 (or best-header-recent
+                     (and (zerop sync-started)
+                          (sync-blocks-and-headers-from-peer-p peer peers))))
         (when (open-header-sync peer chain-state)
           (incf sync-started))))))
 
@@ -3626,7 +3760,14 @@ threads read/write under the same lock."
                   (if (equal reason "high-hash")
                       "CheckBlockHeader"          ; validation.cpp:4240
                       "ContextualCheckBlockHeader")
-                  (and rejected (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes rejected))) reason error))
+                  (and rejected (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes rejected))) reason error)
+      ;; ProcessHeadersMessage: `MaybePunishNodeForBlock(..., "invalid header
+      ;; received")' (net_processing.cpp:3095), which spares only
+      ;; BLOCK_TIME_FUTURE (:1945-1946). Our headers path logged the verdict
+      ;; and kept the peer; p2p_unrequested_blocks.py:291 sends a header on a
+      ;; chain it has just seen refused and waits for the disconnect.
+      (when (and peer reason (not (equal reason "time-too-new")))
+        (record-misbehavior peer "invalid header received")))
     (let* (;; Core's received_new_header (net_processing.cpp:3079) is
            ;; `last_received_header == nullptr', where last_received_header is
            ;; the index lookup of headers.BACK() (:3052) — i.e. the LAST header
@@ -3787,7 +3928,7 @@ membership half, since headers are admitted parent-first — last-known implies
 all-known.
 
 Such a batch costs no new index memory and leaks nothing that could fingerprint
-us, so both header paths skip the anti-DoS work gate for it and take the store
+us, so the header path skips the anti-DoS work gate for it and takes the store
 path instead: a near-no-op that still refreshes per-peer availability and
 applies the IBD sub-minchainwork outbound drop (Core
 UpdatePeerStateForReceivedHeaders). Core's comment at :2786-2790 relies on
@@ -3829,22 +3970,38 @@ NIL PEER (degenerate/test caller) is a no-op."
 IsContinuationOfLowWorkHeadersSync): validate batch PoW, advance the state
 machine, store whatever REDOWNLOAD releases. Returns REQUEST-MORE — T when
 the caller should send the next getheaders from the sync's own locator; on
-NIL the sync is over (complete or aborted) and the slot is cleared."
+NIL the sync is over (complete or aborted) and the slot is cleared.
+
+A sync that COMPLETES on a full message is not the end of the conversation.
+Core resets m_headers_sync at FINAL and ProcessHeadersMessage goes on with
+have_headers_sync false, so `nCount == max_headers_result' asks again from
+pindexLast (net_processing.cpp:3105-3111): the redownload released headers
+only up to the end of this message, and the peer may have more. Without the
+follow-up a chain longer than the sync's target was never learnt past its last
+message (p2p_headers_sync_with_minchainwork.py:166)."
   (let ((hss (peer-headers-sync peer)))
     (if (headers-pow-valid-p headers)
         (multiple-value-bind (ok request-more ready)
             (hss-process-next-headers hss headers full-batch)
-          (when ready
-            (%store-validated-headers peer chain-state ready full-batch
-                                      count-fn "Redownload"))
-          (cond ((and ok request-more) t)
-                (t
-                 (bl:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
-                              (if ok "complete" "aborted")
-                              (peer-log-name peer)
-                              (hss-current-height hss))
-                 (%clear-peer-headers-sync peer)
-                 nil)))
+          (let ((last-entry
+                  (and ready
+                       (nth-value 1 (%store-validated-headers
+                                     peer chain-state ready full-batch
+                                     count-fn "Redownload")))))
+            (cond ((and ok request-more) t)
+                  (t
+                   (bl:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
+                                (if ok "complete" "aborted")
+                                (peer-log-name peer)
+                                (hss-current-height hss))
+                   (%clear-peer-headers-sync peer)
+                   (when ok
+                     ;; A valid continuation answers our getheaders (Core
+                     ;; clears m_last_getheaders_timestamp on result.success).
+                     (setf (peer-last-getheaders-time peer) 0)
+                     (%maybe-request-more-headers peer chain-state last-entry
+                                                  full-batch))
+                   nil))))
         ;; PoW-invalid batch from a peer we're presyncing — abort the sync.
         (progn (%clear-peer-headers-sync peer :finalize t) nil))))
 
@@ -3894,67 +4051,6 @@ NIL the sync is over (complete or aborted) and the slot is cleared."
                      (if peer (peer-id peer) -1)))
        :ignore)
       (t :store))))
-
-(defun handle-header-batch (peer chain-state headers full-batch count-fn)
-  "Process one received header batch during Phase-1 sync, driving PEER's
-low-work sync state (peer-headers-sync — Core Peer::m_headers_sync; shared
-with the generic path, ingest-headers-from-peer). Returns DONE: whether
-header sync from this peer is finished.
-
-Four cases:
-  - a low-work sync is already running: drive it, storing any headers it
-    releases during REDOWNLOAD, and end when it finalizes;
-  - the batch already sits on our own best-header/active chain: skip the
-    anti-DoS gate, take the store path (Core already_validated_work) and end
-    sync — the peer has taught us nothing, so our locator cannot advance;
-    a batch we hold only on a FORK is NOT this case (see
-    %batch-already-validated-work-p) and falls through to the gate below;
-  - no sync, but this batch connects and claims sub-threshold work: start a
-    presync when it is a full batch (store nothing yet), or ignore it
-    entirely when not (anti-DoS — Core TryLowWorkHeadersSync);
-  - otherwise: store the batch normally, ending on a short (non-full) batch."
-  (cond
-    ((null headers)
-     ;; Core nCount==0: the peer suddenly has nothing to give (perhaps it
-     ;; reorged onto our chain) — clear any sync state and stop asking.
-     (%clear-peer-headers-sync peer :finalize t)
-     t)
-
-    ;; A low-work presync/redownload is in progress with this peer.
-    ((peer-headers-sync peer)
-     (not (%drive-headers-sync peer chain-state headers full-batch count-fn)))
-
-    ;; Batch already on OUR OWN best-header/active chain
-    ;; (%batch-already-validated-work-p = Core already_validated_work): store
-    ;; path, no work gate. Without this branch the classic case never fired —
-    ;; an outbound peer pinned on a low-work chain, answering our getheaders
-    ;; with a short batch we already have, was swallowed by :ignore and never
-    ;; judged.
-    ;;
-    ;; DONE is T even for a full batch, where Core asks again from
-    ;; GetLocator(pindexLast). Nothing entered the index, and this loop re-asks
-    ;; from our own header tip, so that locator is byte-identical next time
-    ;; round and the peer would resend the same batch until the 100-request cap
-    ;; — free round-trips for a peer replaying our own chain at us. Ending here
-    ;; cannot strand anything precisely because the batch is on our chain: a
-    ;; batch we hold only on a FORK is excluded from this branch and goes to
-    ;; the presync gate below, whose locator does advance into the peer's
-    ;; chain.
-    ((%batch-already-validated-work-p chain-state headers)
-     (%store-validated-headers peer chain-state headers full-batch
-                               count-fn "Received")
-     t)
-
-    ;; No sync yet: divert into presync, ignore, or store.
-    (t
-     (ecase (%maybe-divert-to-presync peer chain-state headers full-batch)
-       (:presync nil)
-       (:ignore t)
-       (:store
-        (%store-validated-headers peer chain-state headers full-batch
-                                  count-fn "Received")
-        (< (length headers)
-           bl.ser:+max-headers-count+))))))
 
 (defconstant +headers-response-time-seconds+ 120
   "Minimum gap between getheaders messages to one peer (Core
@@ -4024,7 +4120,14 @@ requested by anyone. Returns the hashes requested."
                  (unless (or (%block-body-present-p chain-state nil walk)
                              (and *ibd-context*
                                   (gethash hash (ibd-context-in-flight *ibd-context*)))
-                             (fetch-block-requested-p hash))
+                             (fetch-block-requested-p hash)
+                             ;; Core :2854-2856: never from a peer that cannot
+                             ;; serve witnesses, where segwit is active.
+                             (and (not (logtest (peer-services peer)
+                                                bl.ser:+node-witness+))
+                                  (>= (bl.store:block-index-entry-height walk)
+                                      (bl.val:get-segwit-activation-height
+                                       bl:*network*))))
                    (push walk to-fetch)))
                (setf walk (bl.store:block-index-entry-prev-entry walk)))
       ;; A walk that never reached the active chain is a reorg too large to
@@ -4037,17 +4140,40 @@ requested by anyone. Returns the hashes requested."
                             collect (bl.store:block-index-entry-hash entry))))
           (when hashes
             (dolist (hash hashes) (mark-block-in-flight hash peer))
-            (send-message peer
-                          (bl.ser:make-getdata-message
-                           (mapcar (lambda (hash)
-                                     (bl.ser:make-inv-vector
-                                      :type (if (logtest (peer-services peer)
-                                                         bl.ser:+node-witness+)
-                                                bl.ser:+inv-type-witness-block+
-                                                bl.ser:+inv-type-block+)
-                                      :hash hash))
-                                   hashes))))
+            (let ((compact (%direct-fetch-compact-p peer chain-state last-entry hashes)))
+              (send-message peer
+                            (bl.ser:make-getdata-message
+                             (mapcar (lambda (hash)
+                                       (bl.ser:make-inv-vector
+                                        :type (cond (compact
+                                                     bl.ser:+inv-type-cmpct-block+)
+                                                    ((logtest (peer-services peer)
+                                                              bl.ser:+node-witness+)
+                                                     bl.ser:+inv-type-witness-block+)
+                                                    (t bl.ser:+inv-type-block+))
+                                        :hash hash))
+                                     hashes)))))
           hashes)))))
+
+(defun %direct-fetch-compact-p (peer chain-state last-entry hashes)
+  "Core HeadersDirectFetchBlocks' compact-block request (net_processing.cpp:
+2890-2897): ask for the block as MSG_CMPCT_BLOCK rather than a full block when
+we take transactions from the network (!ignore_incoming_txs), PEER announced
+compact-block support (m_provides_cmpctblocks, a sendcmpct of version 2), this
+getdata names ONE block, it is the only block in flight from anyone, and the
+announced header's parent is connected (last_header.pprev->IsValid(
+BLOCK_VALID_CHAIN)). p2p_compactblocks.py:388
+and p2p_compactblocks_blocksonly.py:99 read the getdata type."
+  (and (not (ignore-incoming-txs-p))
+       (eql (peer-compact-block-version peer) +compact-blocks-version+)
+       (null (cdr hashes))
+       *ibd-context*
+       (= 1 (hash-table-count (ibd-context-in-flight *ibd-context*)))
+       (let ((parent (bl.store:block-index-entry-prev-entry last-entry)))
+         (and parent
+              (or (eq (bl.store:block-index-entry-status parent) :valid)
+                  (bl.store:entry-on-active-chain-p chain-state parent))))
+       t))
 
 (defun ingest-headers-from-peer (peer headers chain-state &key count-fn (direct-fetch t))
   "Generic-path headers ingestion — BIP130 sendheaders announcements,
@@ -4350,11 +4476,15 @@ reset to be reconsidered before a later-connected one."
                                                 (copy-list peers))
                                  #'< :key #'peer-id)))
     (or (find-if #'peer-headers-sync-started candidates)
-        (when (or (%best-header-is-recent-p chain-state)
-                  (zerop (headers-sync-started-count peers)))
-          (let ((peer (first candidates)))
-            (when (and peer (open-header-sync peer chain-state))
-              peer))))))
+        (let ((peer (if (%best-header-is-recent-p chain-state)
+                        (first candidates)
+                        (and (zerop (headers-sync-started-count peers))
+                             (find-if (lambda (p)
+                                        (sync-blocks-and-headers-from-peer-p
+                                         p peers))
+                                      candidates)))))
+          (when (and peer (open-header-sync peer chain-state))
+            peer)))))
 
 (defun sync-headers-with-sync-peer (peers chain-state ctx
                                     &key recent-rejects (sync-fn #'sync-headers)
@@ -4493,19 +4623,20 @@ window reaches it)."
         (pushnew hash (gethash height map) :test #'equalp)))))
 
 (defun %out-of-order-block-acceptable-p (entry current-height requested chain-state)
-  "Core AcceptBlock anti-DoS gate (validation.cpp:4367-4378) for an
-out-of-order block: keep it if we REQUESTED it, or (unsolicited) it has more
-work than our tip, sits within +min-blocks-to-keep+ of the tip, and meets
-minimum chain work. Header admission already validated its PoW before the
-entry got chain-work, so this bounds only unsolicited far-ahead / low-work
-disk fill."
+  "Core AcceptBlock anti-DoS gate (validation.cpp:4367-4378) for a block that
+does not extend the tip -- out of order above it, or a competing fork at or
+below it: keep it if we REQUESTED it, or (unsolicited) it has AT LEAST our
+tip's work (fHasMoreOrSameWork, :4351 -- `>=', so an equal-work sibling is
+stored), sits within +min-blocks-to-keep+ of the tip, and meets minimum chain
+work. Header admission already validated its PoW before the entry got
+chain-work, so this bounds only unsolicited far-ahead / low-work disk fill."
   (or requested
       (let* ((tip-entry (bl.store:get-block-index-entry
                          chain-state (bl.store:best-block-hash chain-state)))
              (work (bl.store:block-index-entry-chain-work entry))
              (height (bl.store:block-index-entry-height entry)))
         (and tip-entry
-             (> work (bl.store:block-index-entry-chain-work tip-entry))
+             (>= work (bl.store:block-index-entry-chain-work tip-entry))
              (<= height (+ current-height bl:+min-blocks-to-keep+))
              (>= work (bl:minimum-chain-work bl:*network*))))))
 
@@ -4692,6 +4823,38 @@ wasteful attempt."
                    (setf e (bl.store:block-index-entry-prev-entry e))))
         t))))
 
+(defun %activate-best-reorg-target (chain-state block-store utxo-set
+                                    fee-estimator recent-rejects)
+  "RETRY-BEST-REORG-CANDIDATE's step, run under the node lock: choose the
+highest-work completable candidate against the tip as it is NOW and hand it
+to ACTIVATE-BLOCK. Returns (VALUES ENTRY ACTIVATED ERROR MISSING-BLOCKS);
+ENTRY is NIL when there is nothing to try."
+  (let ((tip-entry (bl.store:get-block-index-entry
+                    chain-state (bl.store:best-block-hash chain-state))))
+    (when tip-entry
+      (multiple-value-bind (entry blk)
+          (%best-completable-reorg-target
+           chain-state block-store tip-entry
+           (bl.store:block-index-entry-chain-work tip-entry))
+        (when entry
+          (let ((height (bl.store:block-index-entry-height entry)))
+            (bl:log-debug
+             "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
+             height (bl.store:block-index-entry-height tip-entry))
+            (multiple-value-call #'values
+              entry
+              (bl.val:activate-block
+               blk chain-state block-store utxo-set
+               :current-time (bl.ser:get-unix-time)
+               :skip-scripts (bl.val:script-checks-skippable-p
+                              chain-state
+                              (bl.ser:block-header-hash
+                               (bl.ser:bitcoin-block-header blk))
+                              height)
+               :fee-estimator fee-estimator
+               :recent-rejects recent-rejects
+               :mempool (ibd-context-mempool *ibd-context*)))))))))
+
 (defun retry-best-reorg-candidate (chain-state block-store utxo-set
                                    &key fee-estimator recent-rejects)
   "Deep-reorg activation — the case the height-dispatched receive path cannot
@@ -4711,35 +4874,19 @@ fetch cycle (which also re-arms after restart via the download walk). Returns T 
 candidate activated."
   (when (null *ibd-context*)
     (return-from retry-best-reorg-candidate nil))
-  (let ((tip-entry (bl.store:get-block-index-entry
-                    chain-state (bl.store:best-block-hash chain-state)))
-        (mempool (ibd-context-mempool *ibd-context*)))
-    (when (null tip-entry)
-      (return-from retry-best-reorg-candidate nil))
-    (multiple-value-bind (entry blk)
-        (%best-completable-reorg-target
-         chain-state block-store tip-entry
-         (bl.store:block-index-entry-chain-work tip-entry))
-      (when (null entry)
-        (return-from retry-best-reorg-candidate nil))
+  ;; ONE lock scope for the selection and the activation, as Core's
+  ;; ActivateBestChainStep picks FindMostWorkChain and connects it under one
+  ;; cs_main (validation.cpp:3390-3417). Chosen outside the lock, the target
+  ;; could be one an RPC thread's invalidateblock or generate had just made
+  ;; stale, and the activation then ran on a chain the choice never saw
+  ;; (feature_assumeutxo.py:367 failed bad-txns-BIP30 in both threads at once).
+  (multiple-value-bind (entry activated error missing-blocks)
+      (with-current-node-lock
+        (%activate-best-reorg-target chain-state block-store utxo-set
+                                     fee-estimator recent-rejects))
+    (when entry
       (let ((cand-hash (bl.store:block-index-entry-hash entry))
             (height (bl.store:block-index-entry-height entry)))
-        (bl:log-debug
-         "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
-         height (bl.store:block-index-entry-height tip-entry))
-        (multiple-value-bind (activated error missing-blocks)
-            (with-current-node-lock
-              (bl.val:activate-block
-               blk chain-state block-store utxo-set
-               :current-time (bl.ser:get-unix-time)
-               :skip-scripts (bl.val:script-checks-skippable-p
-                              chain-state
-                              (bl.ser:block-header-hash
-                               (bl.ser:bitcoin-block-header blk))
-                              height)
-               :fee-estimator fee-estimator
-               :recent-rejects recent-rejects
-               :mempool mempool))
           (cond
             (activated
              (remhash cand-hash (ibd-context-reorg-candidates *ibd-context*))
@@ -4788,7 +4935,7 @@ candidate activated."
               "Deep-reorg candidate at height ~D did not activate (~A); rejecting"
               height error)
              (%reject-reorg-candidate cand-hash)
-             nil)))))))
+             nil))))))
 
 (defun %block-body-acceptable-p (block chain-state peer)
   "Core AcceptBlock's pre-write gate (validation.cpp:4381-4389) for a body that
@@ -4925,6 +5072,37 @@ deterministic; the sender is punished for that one too, and for nothing else."
                                      (bl.val:block-reject-reason-string error))))
   nil)
 
+(defun %competing-fork-block-storable-p (block entry hash height current-height
+                                         requested chain-state peer)
+  "Core AcceptBlock's gates for a competing-fork block (at or below our tip, off
+the active chain), which PROCESS-RECEIVED-BLOCK stores BEFORE any validation of
+its own -- that is deferred to the reorg that needs it -- so these are all that
+stands between a peer and a body on disk under an honest header's hash.
+
+Never a witness-stripped copy: a stripped block on disk fails every later
+reorg, which is exactly what wedged testnet4; a witness-complete copy arrives
+by v2 compact blocks or a full witness download if the fork ever matters.
+
+Never an UNREQUESTED one lighter than our tip: AcceptBlock returns before
+storing it (`if (!fHasMoreOrSameWork) return true', validation.cpp:4370), so
+p2p_unrequested_blocks.py:119 finds a pushed fork block at height 1 behind a
+height-2 tip `headers-only'. getblockfrompeer's FetchBlock is a request too
+(Core BlockRequested, net_processing.cpp:1979).
+
+And never one that fails the body gate (%BLOCK-BODY-ACCEPTABLE-P)."
+  (cond ((bl.val:block-witness-stripped-p block height)
+         (bl:log-debug
+          "Competing-fork block ~D arrived witness-stripped; not storing" height)
+         nil)
+        ((not (%out-of-order-block-acceptable-p
+               entry current-height
+               (or requested (fetch-block-requested-p hash))
+               chain-state))
+         (bl:log-debug "Competing-fork block ~D not stored (unrequested, less work than the tip)"
+                       height)
+         nil)
+        (t (%block-body-acceptable-p block chain-state peer))))
+
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects
                                   (wire-size 0) requested peer)
@@ -4963,21 +5141,9 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
       ;; without changing our active tip. A later block that pushes the
       ;; fork past our tip will then trigger the reorg.
       (when (<= height current-height)
-        ;; Never PERSIST a witness-stripped competing-fork block: the
-        ;; :weaker-chain path stores before full validation (deferred until a
-        ;; reorg needs it), so a stripped block would land on disk and then fail
-        ;; every reorg attempt — exactly what wedged testnet4. Drop this copy; a
-        ;; witness-complete copy arrives via v2 compact blocks / full witness
-        ;; downloads if the fork ever becomes relevant.
-        (when (bl.val:block-witness-stripped-p block height)
-          (bl:log-debug
-           "Competing-fork block ~D arrived witness-stripped; not storing" height)
-          (return-from process-received-block nil))
-        ;; Nor one that fails Core's AcceptBlock gate: this arm stores BEFORE
-        ;; any validation (a fork block's own is deferred to the reorg that
-        ;; needs it), so the gate is the only thing between a peer and an
-        ;; arbitrary body on disk under this honest header's hash.
-        (unless (%block-body-acceptable-p block chain-state peer)
+        (unless (%competing-fork-block-storable-p block entry hash height
+                                                  current-height requested
+                                                  chain-state peer)
           (return-from process-received-block nil))
         ;; Node lock: activation mutates chainstate/UTXO/mempool state
         ;; the RPC threads access under the same lock.

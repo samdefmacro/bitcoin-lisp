@@ -4946,6 +4946,28 @@ a connect-time verdict is one Core marks BLOCK_FAILED_VALID, and so one it
 punishes the sending peer for."
   (%deterministic-consensus-failure-p error))
 
+(defun %refuse-unconnectable-block (block chain-state block-store error now)
+  "ACTIVATE-BLOCK's verdict on a block it failed to connect: keep the body
+(%KEEP-BODY-OF-UNCONNECTABLE-BLOCK), then mark the block and its descendants
+invalid (%POISON-FAILED-BLOCK), in Core's order."
+  (%keep-body-of-unconnectable-block block chain-state block-store now)
+  (%poison-failed-block chain-state (bl.ser:bitcoin-block-header block) error))
+
+(defun %keep-body-of-unconnectable-block (block chain-state block-store now)
+  "Keep on disk the body of a block ACTIVATE-BLOCK failed to connect, when
+AcceptBlock's checks pass for it -- Core's order: AcceptBlock writes the body
+(WriteBlock, validation.cpp:4405) after CheckBlock and
+ContextualCheckBlock and BEFORE ActivateBestChain runs ConnectBlock, so a
+block that fails only there (an immature coinbase spend, a missing input)
+stays readable, and getblock reports it with confirmations -1.
+p2p_unrequested_blocks.py:283 reads block_291 that way after the reorg it
+triggered was undone. A body that fails the checks themselves is not written,
+and one already on disk is not written again (a second copy is invisible to
+the prune usage counter)."
+  (unless (bl.store:block-exists-p
+           block-store (bl.ser:block-header-hash (bl.ser:bitcoin-block-header block)))
+    (%store-block-for-later block chain-state block-store now)))
+
 (defun %poison-failed-block (chain-state header error)
   "Mark the block HEADER names, and every indexed descendant, :invalid when
 ERROR is a deterministic consensus verdict -- Core's BLOCK_FAILED_VALID plus
@@ -5075,7 +5097,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                  ;; not, so a block rejected here stayed in the index as merely
                  ;; header-valid and submitblock re-judged it on every
                  ;; resubmission (%POISON-FAILED-BLOCK).
-                 (%poison-failed-block chain-state header error)
+                 (%refuse-unconnectable-block block chain-state block-store error now)
                  (values nil error))))))
 
       (t
@@ -5175,7 +5197,8 @@ can neither wedge on an equal-work sibling nor advance past the base."
                            ;; the incoming block was never connected, and it
                            ;; sits above the reverted fork on neither reorg
                            ;; side.
-                           (%poison-failed-block chain-state header error)
+                           (%refuse-unconnectable-block
+                            block chain-state block-store error now)
                            (let ((fork-tip (bl.store:get-block-index-entry
                                             chain-state
                                             (bl.store:best-block-hash

@@ -3825,7 +3825,10 @@ shape. Positive control: the slot is NIL before and the pump's list after."
 real tx message over the wire — the regression for the ~30s receive dead
 window and the NIL-mempool drains (a getdata for a tx we announced used to
 get notfound). Runs over a loopback socket pair."
-  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+  ;; The pump works in the node's context (ENSURE-IBD-CONTEXT); bound here so
+  ;; the one it creates dies with the test instead of polluting later suites.
+  (let ((bl.net:*ibd-context* nil)
+        (srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect
@@ -4436,7 +4439,17 @@ tip advance turns a legitimate request into a disconnect."
       (is-false (bl.net::%below-network-limited-threshold-p
                  cs (bl.store:get-block-at-height cs (- 1000 290))))
       (is-true (bl.net::%below-network-limited-threshold-p
-                cs (bl.store:get-block-at-height cs (- 1000 291)))))
+                cs (bl.store:get-block-at-height cs (- 1000 291))))
+      ;; A noban peer is served at any depth: Core's
+      ;; `!pfrom.HasPermission(NetPermissionFlags::NoBan) && (...)' (:2386).
+      (let ((bl.net:*whitelist-entries*
+              (list (bl.net:parse-whitelist-entry "noban@198.51.100.51")))
+            (noban (bl.net:make-peer :address "198.51.100.51" :inbound t))
+            (plain (bl.net:make-peer :address "198.51.100.52" :inbound t)))
+        (is-true (bl.net::%below-network-limited-threshold-p
+                  cs (bl.store:get-block-at-height cs 100) plain))
+        (is-false (bl.net::%below-network-limited-threshold-p
+                   cs (bl.store:get-block-at-height cs 100) noban))))
     ;; A full node advertises NODE_NETWORK and the threshold never applies.
     (let ((bl:*prune-target-mib* 0))
       (is-false (bl.net::%below-network-limited-threshold-p
@@ -4842,6 +4855,150 @@ above the tip does lead the locator."
         (is (equalp tip-hash (first (bl.net::build-header-locator cs))))))))
 
 ;;;; The block-download drain indexes an unseen header before judging the body
+
+(test an-unsolicited-block-below-the-anti-dos-floor-is-not-indexed
+  "Core's block handler computes min_pow_checked -- the parent is known and its
+work plus the block's proof reaches GetAntiDoSWorkThreshold
+(net_processing.cpp:4895-4898) -- and AcceptBlockHeader, once the header's own
+checks pass, refuses to index it without that and logs `AcceptBlockHeader: not
+adding new block header <hash>, missing anti-dos proof-of-work validation'
+(validation.cpp:4261-4264). Nobody is punished (BLOCK_HEADER_LOW_WORK,
+:1915-1918). Ours sent the header through the HEADERS message's gate, which
+logged TryLowWorkHeadersSync's `Ignoring low-work chain' instead, and
+p2p_unrequested_blocks.py:100 waits for Core's line."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "drain-low-work-block"))
+           (cs (bl:node-chain-state node))
+           (b1 (let ((blk (bl.mining:assemble-full-block
+                           cs (bl:node-mempool node)
+                           :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+                 (bl.mining:mine-block blk)
+                 blk))
+           (b1-hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1)))
+           (peer (bl.net:make-peer :address "198.51.100.43" :state :ready))
+           (ctx (bl.ctx:make-node-context :chain-state cs
+                                          :utxo-set (bl:node-utxo-set node)
+                                          :block-store (bl:node-block-store node))))
+      (let ((bl:*minimum-chain-work-override* (expt 2 64)))
+        (let ((text (nth-value 1 (log-text-of
+                                  "validation"
+                                  (lambda ()
+                                    (with-ibd-context
+                                      (deliver-ibd-message
+                                       peer "block"
+                                       (subseq (bl.ser:make-block-message b1 :witness t) 24)
+                                       ctx)))))))
+          (is (null (bl.store:get-block-index-entry cs b1-hash))
+              "a block below the anti-DoS floor leaves no index entry")
+          (is (= 0 (bl.store:current-height cs)))
+          (is (eq :ready (bl.net:peer-state peer)) "and its sender is not punished")
+          (is-true (search (format nil "AcceptBlockHeader: not adding new block header ~A, missing anti-dos proof-of-work validation"
+                                   (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes b1-hash)))
+                           text)
+                   "Core's line: ~S" text)
+          (is-false (bl.net:block-min-pow-checked-p (bl.ser:bitcoin-block-header b1) cs))))
+      (is-true (bl.net:block-min-pow-checked-p (bl.ser:bitcoin-block-header b1) cs)
+               "with the floor at its regtest default the same header passes"))))
+
+(test an-unrequested-fork-block-lighter-than-the-tip-is-not-stored
+  "Core's AcceptBlock stores an UNREQUESTED block only when it has at least our
+tip's work (`if (!fHasMoreOrSameWork) return true', validation.cpp:4351,
+:4370): its header is indexed, its body is not. p2p_unrequested_blocks.py:119
+pushes a height-1 fork block at a node whose tip is at height 2 and expects
+getchaintips to call it `headers-only'; ours stored every competing-fork body
+and reported `valid-headers'. An EQUAL-work sibling is stored (the `>=' --
+our out-of-order gate had `>'), and a REQUESTED lighter block still is."
+  ;; A fresh directory: the blocks are deterministic, so bodies a previous
+  ;; run stored would already be there.
+  (dolist (suffix '("unreq-fork-a" "unreq-fork-b"))
+    (uiop:delete-directory-tree (regtest-node-base-path suffix)
+                                :validate t :if-does-not-exist :ignore))
+  (with-network (:regtest)
+    (let* ((na (regtest-node-fixture "unreq-fork-a"))
+           (nb (regtest-node-fixture "unreq-fork-b"))
+           (cs (bl:node-chain-state na))
+           (utxo (bl:node-utxo-set na))
+           (store (bl:node-block-store na)))
+      (flet ((mine-on (node spk)
+               (let ((blk (bl.mining:assemble-full-block
+                           (bl:node-chain-state node) (bl:node-mempool node)
+                           :coinbase-script-pubkey spk)))
+                 (bl.mining:mine-block blk)
+                 blk))
+             (hash-of (blk) (bl.ser:block-header-hash (bl.ser:bitcoin-block-header blk)))
+             (deliver (blk &key requested)
+               ;; The header first, as DISPATCH-IBD-MESSAGE indexes it.
+               (bl.net:ingest-headers-from-peer
+                nil (list (bl.ser:bitcoin-block-header blk)) cs)
+               (deliver-block blk cs utxo store :requested requested)))
+        (let* ((a1 (mine-on na (p2sh-optrue-script-pubkey)))
+               (b1 (mine-on nb (coerce '(#x51) '(vector (unsigned-byte 8)))))
+               ;; A second sibling on genesis, distinct from b1.
+               (b1x (mine-on nb (coerce '(#x52) '(vector (unsigned-byte 8))))))
+          (with-ibd-context
+            (is-true (deliver a1 :requested t))
+            (is (= 1 (bl.store:current-height cs)))
+            ;; Equal work, unrequested: stored, not the tip.
+            (deliver b1)
+            (is-true (bl.store:block-exists-p store (hash-of b1))
+                     "an unrequested EQUAL-work sibling is stored")
+            ;; Extend a1 so the next sibling is lighter than the tip.
+            (is-true (deliver (mine-on na (p2sh-optrue-script-pubkey)) :requested t))
+            (is (= 2 (bl.store:current-height cs)))
+            ;; Pushed as a block message: the drain indexes its header, which
+            ;; also queues it for download -- queued is not REQUESTED (Core's
+            ;; fRequested is IsBlockRequested, in flight from anyone).
+            (deliver-ibd-message
+             (bl.net:make-peer :address "198.51.100.44" :state :ready)
+             "block" (subseq (bl.ser:make-block-message b1x :witness t) 24)
+             (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                       :block-store store))
+            (is-true (bl.store:get-block-index-entry cs (hash-of b1x))
+                     "control: the lighter sibling's header is indexed")
+            (is-false (bl.store:block-exists-p store (hash-of b1x))
+                      "an unrequested sibling lighter than the tip is not stored")
+            (deliver-block b1x cs utxo store :requested t)
+            (is-true (bl.store:block-exists-p store (hash-of b1x))
+                     "the same block, requested, is stored")))))))
+
+(test bodies-stored-above-the-tip-outlive-the-sync-cycle
+  "Core's setBlockIndexCandidates and m_blocks_unlinked are chain facts that
+ActivateBestChain consults after every block (FindMostWorkChain,
+validation.cpp:3153); nothing resets them between message loops. Ours kept
+the record of bodies persisted above the tip in the sync cycle's context,
+which START-IBD replaced every cycle, so blocks stored out of order in one
+cycle were not connected when their missing parent arrived in the next:
+p2p_unrequested_blocks.py:230 found the node at height 3 instead of 290.
+Blocks 2 and 3 arrive first, a new cycle begins (RENEW-IBD-CONTEXT), then
+block 1: the tip must reach 3."
+  ;; A fresh directory: the blocks are deterministic, so bodies a previous
+  ;; run stored would already be there.
+  (dolist (suffix '("carry-src" "carry-dst"))
+    (uiop:delete-directory-tree (regtest-node-base-path suffix)
+                                :validate t :if-does-not-exist :ignore))
+  (with-network (:regtest)
+    (let* ((src (regtest-node-fixture "carry-src"))
+           (dst (regtest-node-fixture "carry-dst"))
+           (cs (bl:node-chain-state dst))
+           (utxo (bl:node-utxo-set dst))
+           (store (bl:node-block-store dst)))
+      (generate-regtest-blocks src 3)
+      (let ((blocks (loop for h from 1 to 3
+                          collect (bl.store:get-block
+                                   (bl:node-block-store src)
+                                   (bl.store:block-index-entry-hash
+                                    (bl.store:get-block-at-height
+                                     (bl:node-chain-state src) h))))))
+        (bl.net:ingest-headers-from-peer
+         nil (mapcar #'bl.ser:bitcoin-block-header blocks) cs)
+        (with-ibd-context
+          (deliver-block (second blocks) cs utxo store :requested t)
+          (deliver-block (third blocks) cs utxo store :requested t)
+          (is (= 0 (bl.store:current-height cs)) "control: nothing connects yet")
+          (bl.net:renew-ibd-context)
+          (deliver-block (first blocks) cs utxo store :requested t)
+          (is (= 3 (bl.store:current-height cs))
+              "the bodies stored in the previous cycle connect behind their parent"))))))
 
 (test drain-accepts-an-unsolicited-block-whose-header-it-has-never-seen
   "Core's ProcessNewBlock runs AcceptBlock, which runs AcceptBlockHeader first
@@ -5531,7 +5688,7 @@ does have work to do; a run where SORT changes nothing proves nothing."
           (with-ibd-context
             (captured-sends
              (lambda ()
-               (bl.net::request-blocks-from-peers peers state store))))
+               (bl.net:request-blocks-from-peers peers state store))))
           (is (= 4 (length peers))
               "every peer handed in is still in the caller's list")
           (is (equal snapshot peers)
@@ -5570,7 +5727,7 @@ missing (p2p_node_network_limited.py:105-110)."
           (with-ibd-context
             (let* ((sent (captured-sends
                           (lambda ()
-                            (bl.net::request-blocks-from-peers
+                            (bl.net:request-blocks-from-peers
                              (list peer) state store))))
                    (getdata (find "getdata" sent :key #'message-command
                                                  :test #'string=)))
@@ -5582,6 +5739,163 @@ missing (p2p_node_network_limited.py:105-110)."
                   (is (equalp (loop for h from 1 to 5 collect (%bd-hash h))
                               hashes)
                       "the batch is ascending in height, so its tip arrives last"))))))))))
+
+(defun %bd-header-chain (state tip-height)
+  "Give STATE a genesis tip and a TIP-HEIGHT-block header chain above it whose
+bodies we lack (%bd-hash H at height H)."
+  (let* ((genesis (bl.store:make-block-index-entry
+                   :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid
+                   ;; A 1970 timestamp: IBD until *CACHED-IS-IBD* says not.
+                   :header (bl.ser:make-block-header :timestamp 0)))
+         (prev genesis))
+    (bl.store:add-block-index-entry state genesis)
+    (loop for h from 1 to tip-height
+          do (let ((e (bl.store:make-block-index-entry
+                       :hash (%bd-hash h) :height h
+                       :chain-work (+ 1 h) :prev-entry prev
+                       :status :header-valid)))
+               (bl.store:add-block-index-entry state e)
+               (setf prev e)))
+    (bl.store:update-chain-tip state (%bd-hash 0) 0)))
+
+(defun %bd-getdata-hashes (sent)
+  "The block hashes of the first getdata among the framed messages SENT."
+  (let ((getdata (find "getdata" sent :key #'message-command :test #'string=)))
+    (and getdata
+         (map 'list #'bl.ser:inv-vector-hash
+              (bl.ser:parse-inv-payload (subseq getdata 24))))))
+
+(test an-ibd-node-asks-no-limited-peer-for-blocks
+  "Core SendMessages asks a peer for blocks only when `CanServeBlocks(peer) &&
+((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) ||
+!IsInitialBlockDownload())' (net_processing.cpp:6165). An IBD node needs OLD
+blocks and a NODE_NETWORK_LIMITED peer keeps only its last 288, so in IBD it is
+not asked at all; feature_assumeutxo.py:329-335 connects an IBD node to a
+snapshot node still validating its background chain and asserts NOTHING goes in
+flight to it for three seconds. Ours applied only FindNextBlocks' depth rule,
+which still let heights 15..300 of a 300-block chain through. Out of IBD the
+limited peer is asked again, inside its window."
+  (with-temp-directory (dir "bl-limited-ibd")
+    (with-network (:regtest)
+      (let ((state (bl.store:make-chain-state))
+            (store (bl.store:init-block-store dir))
+            (limited (bl.net:make-peer
+                      :address "198.51.100.31" :state :ready
+                      :conn-type :outbound-full-relay
+                      :services (logior bl.ser:+node-network-limited+
+                                        bl.ser:+node-witness+))))
+        (%bd-header-chain state 300)
+        (setf (bl.net:peer-best-known-block-hash limited) (%bd-hash 300))
+        (let ((bl.net:*cached-is-ibd* t))
+          (with-ibd-context
+            (is (null (%bd-getdata-hashes
+                       (captured-sends
+                        (lambda ()
+                          (bl.net:request-blocks-from-peers
+                           (list limited) state store)))))
+                "in IBD the limited peer is not asked for any block")))
+        (let ((bl.net:*cached-is-ibd* nil))
+          (with-ibd-context
+            (let ((hashes (%bd-getdata-hashes
+                           (captured-sends
+                            (lambda ()
+                              (bl.net:request-blocks-from-peers
+                               (list limited) state store))))))
+              (is (equalp (%bd-hash 15) (first hashes))
+                  "out of IBD it is asked, from the shallowest block it keeps"))))
+        (is-true (bl.net:peer-limited-p limited))
+        (is-true (bl.net:peer-can-serve-blocks-p limited))))))
+
+(test an-inbound-peer-waits-while-a-preferred-peer-downloads
+  "Core's `sync_blocks_and_headers_from_peer' (net_processing.cpp:5779-5795):
+in IBD a peer that is not a preferred-download peer -- inbound without noban --
+is asked for blocks only while no preferred peer exists or nothing is in flight
+from anyone, `to avoid putting undue load on (say) some home user'. Here the
+outbound peer is asked first and fills the in-flight map, so the inbound peer
+behind it gets nothing on the same pass; alone, the inbound peer is asked."
+  (with-temp-directory (dir "bl-inbound-waits")
+    (with-network (:regtest)
+      (let ((state (bl.store:make-chain-state))
+            (store (bl.store:init-block-store dir))
+            (outbound (bl.net:make-peer
+                       :address "198.51.100.41" :state :ready
+                       :conn-type :outbound-full-relay
+                       :services (logior bl.ser:+node-network+
+                                         bl.ser:+node-witness+)))
+            (inbound (bl.net:make-peer
+                      :address "198.51.100.42" :state :ready :inbound t
+                      :conn-type :inbound
+                      :services (logior bl.ser:+node-network+
+                                        bl.ser:+node-witness+))))
+        (%bd-header-chain state 100)
+        (dolist (p (list outbound inbound))
+          (setf (bl.net:peer-best-known-block-hash p) (%bd-hash 100)))
+        ;; The pass ranks peers by ping latency: the outbound peer goes first.
+        (setf (bl.net:peer-ping-latency outbound) 10
+              (bl.net:peer-ping-latency inbound) 20)
+        (let ((bl.net:*cached-is-ibd* t))
+          (with-ibd-context
+            (let ((sent (captured-sends
+                         (lambda ()
+                           (bl.net:request-blocks-from-peers
+                            (list outbound inbound) state store)))))
+              (is (= 1 (count "getdata" sent :key #'message-command
+                                             :test #'string=))
+                  "only the preferred outbound peer is asked")))
+          (with-ibd-context
+            (is (= 16 (length (%bd-getdata-hashes
+                               (captured-sends
+                                (lambda ()
+                                  (bl.net:request-blocks-from-peers
+                                   (list inbound) state store))))))
+                "an inbound peer with no preferred peer around is asked")))))))
+
+(test the-download-loop-fetches-an-equal-work-fork
+  "Core's FindNextBlocksToDownload gives up on a peer only when its best block
+has LESS work than our tip (net_processing.cpp:1407), so a fork exactly as
+heavy as the tip is downloaded and stored without becoming the tip. Our
+download loop ran only while the tip was below the header tip or a HEAVIER
+header chain existed, so an equal-work fork was never requested:
+feature_block.py:1318 sends 1088 headers of one and waits for the getdata of
+its last block. BLOCK-DOWNLOAD-WANTED-P now also opens for a ready peer whose
+best block is an equal-work fork we hold no body for -- and stays shut for a
+lighter fork, and for a peer at our own tip."
+  (with-temp-directory (dir "bl-equal-work-fork")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid))
+             (a1 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 1) :height 1 :chain-work 2 :status :valid
+                  :prev-entry genesis))
+             (a2 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 2) :height 2 :chain-work 3 :status :valid
+                  :prev-entry a1))
+             (b1 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 101) :height 1 :chain-work 2
+                  :status :header-valid :prev-entry genesis))
+             (b2 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 102) :height 2 :chain-work 3
+                  :status :header-valid :prev-entry b1))
+             (peer (bl.net:make-peer :address "198.51.100.61" :state :ready
+                                     :conn-type :outbound-full-relay
+                                     :services (logior bl.ser:+node-network+
+                                                       bl.ser:+node-witness+))))
+        (dolist (e (list genesis a1 a2 b1 b2))
+          (bl.store:add-block-index-entry state e))
+        (bl.store:update-chain-tip state (%bd-hash 2) 2)
+        (with-ibd-context
+          (flet ((wanted-with-best (hash)
+                   (setf (bl.net:peer-best-known-block-hash peer) hash)
+                   (bl.net:block-download-wanted-p
+                    bl.net:*ibd-context* state store (list peer))))
+            (is-false (wanted-with-best (%bd-hash 2))
+                      "a peer at our own tip leaves nothing to fetch")
+            (is-false (wanted-with-best (%bd-hash 101))
+                      "a lighter fork is not fetched")
+            (is-true (wanted-with-best (%bd-hash 102))
+                     "an equal-work fork we hold no body for is fetched")))))))
 
 (test the-initial-getheaders-goes-out-once-per-peer
   "Core's SendMessages guards its initial getheaders with `!state.fSyncStarted'
@@ -5847,7 +6161,10 @@ the next block 25 ms after the pong: a verdict deferred to the next sync-thread
 tick is measured against the wrong tip. Here an outbound peer whose probe
 already went unanswered past its deadline sends one ping, and the pump pass
 that reads it also drops it. Runs over a loopback socket pair."
-  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+  ;; The pump works in the node's context (ENSURE-IBD-CONTEXT); bound here so
+  ;; the one it creates dies with the test instead of polluting later suites.
+  (let ((bl.net:*ibd-context* nil)
+        (srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect

@@ -1815,6 +1815,13 @@ node0 connected ten pushed blocks and node1 heard about one of them."
             ;; here, synchronously from whichever thread connected the block,
             ;; made a 400-block `generate' send 400 separate invs to every peer.
             (bt:with-recursive-lock-held ((node-lock *node*))
+              ;; A single new block on the tip is first pushed as a
+              ;; cmpctblock to the peers that asked for high-bandwidth
+              ;; announcements -- Core's NewPoWValidBlock, which fires before
+              ;; UpdatedBlockTip (validation.cpp:4393-4395). The queue below
+              ;; then finds those peers already have it.
+              (when (null (cdr hashes))
+                (bl.net:new-pow-valid-block chainstate entry (node-peers *node*)))
               (dolist (peer (node-peers *node*))
                 ;; Oldest first; HASH is each announced block in turn.
                 (dolist (hash hashes)

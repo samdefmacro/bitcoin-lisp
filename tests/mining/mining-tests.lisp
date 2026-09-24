@@ -1395,6 +1395,32 @@ have said unknown-parent. mining_template_verification.py:152."
      (signals bl.rpc:rpc-error
        (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 1 "frobnicate(03ab)"))))))
 
+(test generate-steps-aside-between-blocks
+  "Core's generateblocks takes cs_main per block (ProcessNewBlock in
+GenerateBlock, rpc/mining.cpp:157-181) and its message thread runs between
+blocks: it announces each one and serves the getdata that follows. Ours
+released the node lock between blocks too, yet a 400-block generate on a
+pruned node let its sync thread announce almost nothing until the run was over,
+and rpc_rawtransaction.py:246 failed twice in two runs; stepping aside for a
+millisecond between blocks (YIELD-NODE-LOCK) passes it. A thread waiting on the
+lock got it mid-generate in this image either way, so what is pinned here is
+the wiring: one step aside per mined block, taken with the lock released."
+  (with-network (:regtest)
+   (let* ((node (regtest-node-fixture "gen-yield"))
+          (real (fdefinition 'bl.rpc::yield-node-lock))
+          (calls '()))
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'bl.rpc::yield-node-lock)
+                  (lambda ()
+                    (push (sb-thread:holding-mutex-p (bl:node-lock node)) calls)))
+            (bl.rpc:dispatch-rpc-method node "generatetodescriptor"
+                                        (list 3 "raw(51)")))
+       (setf (fdefinition 'bl.rpc::yield-node-lock) real))
+     (is (= 3 (bl.store:current-height (bl:node-chain-state node))))
+     (is (= 3 (length calls)) "one step aside per block")
+     (is (notany #'identity calls) "each taken with the node lock released"))))
+
 (test generate-asked-for-no-blocks-mines-none-and-says-so
   "Core's generateBlocks loop is `while (nGenerate > 0 && !chainman.m_interrupt)'
 (rpc/mining.cpp:169) and neither RPC checks the count before it, so

@@ -2801,9 +2801,14 @@ because an old side-chain block is a fingerprint, not a service."
                (bl.ser:block-header-bits best-hdr))
               +stale-relay-age-limit+)))))
 
-(defun %below-network-limited-threshold-p (chain-state entry)
-  "T when serving ENTRY would leak our prune height (Core
+(defun %below-network-limited-threshold-p (chain-state entry &optional peer)
+  "T when serving ENTRY to PEER would leak our prune height (Core
 net_processing.cpp:2385-2392).
+
+A PEER holding the noban permission is exempt, as Core's
+`!pfrom.HasPermission(NetPermissionFlags::NoBan) && (...)' makes it: an
+operator who whitelisted a peer is not hiding the prune height from it, and a
+refusal would disconnect a peer we promised never to punish.
 
 A node advertising NODE_NETWORK_LIMITED without NODE_NETWORK promises the last
 288 blocks. Answering for anything deeper tells the asker how much history this
@@ -2811,7 +2816,8 @@ node actually kept — which is its prune configuration. Core's two-block buffer
 is kept: without it a race against a tip advance turns a legitimate request
 into a disconnect."
   (let ((services (local-services)))
-    (and (plusp (logand services bl.ser:+node-network-limited+))
+    (and (not (and peer (peer-has-permission-p peer +perm-noban+)))
+         (plusp (logand services bl.ser:+node-network-limited+))
          (zerop (logand services bl.ser:+node-network+))
          (let ((tip-height (bl.store:chain-state-best-height chain-state))
                (height (bl.store:block-index-entry-height entry)))
@@ -3081,7 +3087,7 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                  ;; Prune-height leak: refuse AND disconnect, as Core does —
                  ;; a peer left waiting for a block we will never send stalls
                  ;; instead of re-routing the request.
-                 ((and entry (%below-network-limited-threshold-p chain-state entry))
+                 ((and entry (%below-network-limited-threshold-p chain-state entry peer))
                   (bl:log-cat
                    "net" "Ignore block request below NODE_NETWORK_LIMITED ~
                           threshold, ~A"
@@ -4438,7 +4444,12 @@ oldest-first, skipping what the peer already has until the first NEW block,
 then take the rest -- bailing out to an inv on anything that has left the
 active chain or does not connect to what came before it."
   (let ((queue (peer-blocks-for-headers-relay peer)))
-    (when (or (not (peer-prefers-headers peer))
+    ;; fRevertToInv (:5838-5840): a peer that asked for neither headers nor
+    ;; high-bandwidth compact blocks, or asked only for compact blocks with
+    ;; more than one block queued, or any queue over the limit.
+    (when (or (and (not (peer-prefers-headers peer))
+                   (or (not (peer-compact-block-high-bandwidth peer))
+                       (> (length queue) 1)))
               (> (length queue) +max-blocks-to-announce+))
       (return-from %announcement-headers nil))
     (let ((headers '())
@@ -4475,6 +4486,16 @@ Returns T when something was sent."
       (unwind-protect
            (let ((headers (%announcement-headers peer chain-state)))
              (cond
+               ;; One new block for a peer that asked us to announce in
+               ;; high-bandwidth mode: send it as header-and-ids (:5893-5916).
+               ((and headers (null (cdr headers))
+                     (peer-compact-block-high-bandwidth peer)
+                     (%send-announcement-cmpctblock
+                      peer (bl.ser:block-header-hash (first headers))))
+                t)
+               ((and headers (not (peer-prefers-headers peer)))
+                ;; Core's `else fRevertToInv = true' (:5930-5931).
+                (%announce-by-inv peer chain-state queue))
                (headers
                 (send-message peer (bl.ser:make-headers-message headers))
                 ;; Remember the highest header sent: PeerHasHeader asks it
@@ -4482,20 +4503,67 @@ Returns T when something was sent."
                 (setf (peer-best-header-sent-hash peer)
                       (bl.ser:block-header-hash (car (last headers))))
                 t)
-               (t
-                ;; Revert to an inv of the LAST queued hash -- Core's "just try
-                ;; to inv the tip" (:5931-5953) -- unless the peer has it.
-                (let* ((hash (car (last queue)))
-                       (entry (bl.store:get-block-index-entry chain-state hash)))
-                  (when (and entry
-                             (not (%peer-has-header-p peer chain-state entry)))
-                    (send-message
-                     peer
-                     (bl.ser:make-inv-message
-                      (list (bl.ser:make-inv-vector
-                             :type bl.ser:+inv-type-block+ :hash hash))))
-                    t)))))
+               (t (%announce-by-inv peer chain-state queue))))
         (setf (peer-blocks-for-headers-relay peer) nil)))))
+
+(defun %announce-by-inv (peer chain-state queue)
+  "Revert to an inv of the LAST queued hash -- Core's \"just try to inv the
+tip\" (net_processing.cpp:5933-5953) -- unless the peer has it. T when sent."
+  (let* ((hash (car (last queue)))
+         (entry (bl.store:get-block-index-entry chain-state hash)))
+    (when (and entry (not (%peer-has-header-p peer chain-state entry)))
+      (send-message peer (bl.ser:make-inv-message
+                          (list (bl.ser:make-inv-vector
+                                 :type bl.ser:+inv-type-block+ :hash hash))))
+      t)))
+
+(defun %send-announcement-cmpctblock (peer hash)
+  "Announce block HASH to PEER as a cmpctblock and record it as the best
+header sent (Core SendMessages :5893-5916 and NewPoWValidBlock :2144-2151):
+the cached message when HASH is the most recent block, else one built from
+the body on disk. NIL, sending nothing, when the body is not there."
+  (let ((msg (or (bl.val:most-recent-cmpctblock hash)
+                 (let ((block (and bl:*node* (bl.store:get-block
+                                           (bl:node-block-store bl:*node*) hash))))
+                   (and block (bl.ser:make-cmpctblock-message block))))))
+    (when msg
+      (bl:log-debug "sending header-and-ids ~A to ~A"
+                    (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
+                    (peer-log-name peer))
+      (send-message peer msg)
+      (setf (peer-best-header-sent-hash peer) hash)
+      t)))
+
+(defvar *highest-fast-announce* 0
+  "Core m_highest_fast_announce: the highest block NEW-POW-VALID-BLOCK has
+pushed, so each height is pushed once.")
+
+(defun new-pow-valid-block (chain-state entry peers)
+  "Core PeerManagerImpl::NewPoWValidBlock (net_processing.cpp:2105-2153): a
+new block on our tip is pushed at once, as a cmpctblock, to every peer that
+asked us for high-bandwidth announcements (sendcmpct 1) and already has its
+parent -- not left for the next SendMessages pass. Once per height, and only
+where segwit is active (:2111-2115), and not while relay is disabled, like
+every other block announcement here (FLUSH-BLOCK-ANNOUNCEMENTS). Returns the
+peers it was sent to."
+  (unless (relay-enabled-p)
+    (return-from new-pow-valid-block nil))
+  (let ((height (bl.store:block-index-entry-height entry))
+        (hash (bl.store:block-index-entry-hash entry))
+        (prev (bl.store:block-index-entry-prev-entry entry))
+        (sent '()))
+    (when (and prev
+               (> height *highest-fast-announce*)
+               (>= height (bl.val:get-segwit-activation-height bl:*network*)))
+      (setf *highest-fast-announce* height)
+      (dolist (peer peers)
+        (when (and (eq (peer-state peer) :ready)
+                   (peer-compact-block-high-bandwidth peer)
+                   (not (%peer-has-header-p peer chain-state entry))
+                   (%peer-has-header-p peer chain-state prev)
+                   (%send-announcement-cmpctblock peer hash))
+          (push peer sent))))
+    sent))
 
 (defun flush-block-announcements (peers chain-state)
   "Announce every peer's queued blocks, one message per peer (Core's
@@ -5070,7 +5138,20 @@ cannot drop a header the verdict accepted."
       (compact-block-header-verdict chain-state header block-hash prev-hash)
     (when (eq verdict :accept)
       (process-headers (list header) chain-state)
-      (update-block-availability peer chain-state block-hash))
+      (update-block-availability peer chain-state block-hash)
+      ;; Core's `pindex->nChainWork <= ActiveChain().Tip()->nChainWork'
+      ;; return (net_processing.cpp:4645-4655) runs on the header it has JUST
+      ;; indexed too: a new header no better than our tip stays headers-only
+      ;; and is not reconstructed. The verdict tested it only for a header
+      ;; already known, so an old fork's compact block was rebuilt and stored
+      ;; (p2p_compactblocks.py:708 expects `headers-only').
+      (let ((entry (bl.store:get-block-index-entry chain-state block-hash))
+            (tip (bl.store:get-block-index-entry
+                  chain-state (bl.store:best-block-hash chain-state))))
+        (when (and entry tip
+                   (<= (bl.store:block-index-entry-chain-work entry)
+                       (bl.store:block-index-entry-chain-work tip)))
+          (setf verdict :already-have))))
     (values verdict reason credits-announcement)))
 
 (define-p2p-handler ("cmpctblock" :needs-mempool t) (peer payload ctx)
@@ -5125,11 +5206,10 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
         (:low-work
          ;; Core "Ignoring low-work compact block from peer %d" (:4581):
          ;; LogDebug and return, with no misbehaviour score — a peer whose
-         ;; chain is far behind ours relays such blocks in good faith.
-         (bl:log-cat
-          "net" "cmpctblock ~A from ~A: ignoring low-work compact block"
-          (bl.crypto:bytes-to-hex block-hash)
-          (peer-log-name peer))
+         ;; chain is far behind ours relays such blocks in good faith. In
+         ;; Core's words: p2p_compactblocks.py:656 waits for this line.
+         (bl:log-cat "net" "Ignoring low-work compact block from peer ~D"
+                     (peer-id peer))
          (return-from handle-cmpctblock nil))
         (:no-parent
          (bl:log-cat "net"

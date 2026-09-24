@@ -173,6 +173,8 @@ headerssync.cpp. src/networking/.")
    #:peer-manual-p
    #:peer-permissions
    #:peer-outbound-or-block-relay-p
+   #:peer-can-serve-blocks-p
+   #:peer-limited-p
    #:peer-expects-services-p
    #:loopback-address-p
    #:peer-conn-type
@@ -436,6 +438,11 @@ headerssync.cpp. src/networking/.")
    #:*ibd-context*
    #:activate-historical-chainstate
    #:find-historical-blocks-to-download
+   #:request-blocks-from-peers
+   #:block-download-wanted-p
+   #:block-min-pow-checked-p
+   #:renew-ibd-context
+   #:new-pow-valid-block
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*

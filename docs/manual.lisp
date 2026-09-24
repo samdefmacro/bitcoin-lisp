@@ -871,7 +871,13 @@
   clock, whose timeout DOUBLES from 2s toward 64s after each use so our
   own bandwidth cannot evict a fleet) or for going silent past
   nPowTargetSpacing * (1 + 0.5 * other downloading peers) measured from
-  its LAST DELIVERY, never from when we asked. An assumeutxo background
+  its LAST DELIVERY, never from when we asked. WHO is asked is Core's
+  SendMessages gate, judged per peer at its turn of
+  REQUEST-BLOCKS-FROM-PEERS: a peer must serve blocks at all, and in IBD
+  it must also be a sync peer (preferred download, or any peer while no
+  preferred one is downloading) and not NODE_NETWORK_LIMITED
+  (PEER-LIMITED-P) -- an IBD node needs old blocks, which a pruned or
+  snapshot node does not keep. An assumeutxo background
   chainstate is driven two ways, as Core's is:
   FIND-HISTORICAL-BLOCKS-TO-DOWNLOAD walks the target path from the LAST
   COMMON ANCESTOR of its tip and the snapshot base (a snapshot loaded over
@@ -1054,6 +1060,8 @@
   (bitcoin-lisp.networking:ban-address function)
   (bitcoin-lisp.networking:*default-ban-time-seconds* variable)
   (bitcoin-lisp.networking:*max-tip-age-seconds* variable)
+  (bitcoin-lisp.networking:request-blocks-from-peers function)
+  (bitcoin-lisp.networking:peer-limited-p function)
   (bitcoin-lisp.networking:find-historical-blocks-to-download function)
   (bitcoin-lisp.networking:activate-historical-chainstate function))
 
