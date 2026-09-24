@@ -14,6 +14,14 @@ datadir in either form, or both, stays fully readable whichever way the flag is
 set. An EXISTING datadir is untouched: its old per-block files keep being read,
 and only new blocks go into blk files.
 
+Index best-block records (2026-09-24): every index (txindex, blockfilterindex,
+coinstatsindex, txospenderindex) now keeps Core's DB_BEST_BLOCK record, a
+serialized CBlockLocator (int32 70016, CompactSize count, hashes; index/base.cpp
+BaseIndex::DB::ReadBestBlock/WriteBestBlock), written only by Commit -- at the
+end of a catch-up and after each chainstate flush. The records this tree wrote
+before (32-byte hash; 36-byte height||hash or hash||height) are read once at
+open and replaced by the next commit.
+
 Two things had to land with the flip, both found by flipping it:
 
 - **Prune locks** (Core `BlockManager::m_prune_locks`, `PRUNE_LOCK_BUFFER` 10).

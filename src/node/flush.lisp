@@ -321,6 +321,10 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
           (bl.store:save-state chainstate :in-transition nil))
+        ;; ChainStateFlushed: the indexes commit their locators now that the
+        ;; block index and the coins they describe are on disk
+        ;; (validation.cpp:2828-2831).
+        (%commit-indexes-after-flush chainstate)
         (log-info "~A flush: chainstate~@[~A~] at height ~D"
                   label
                   (let ((suffix (and chainstate

@@ -103,6 +103,21 @@ genesis in place."
   (let ((pruned (bl.store:chain-state-pruned-height chainstate)))
     (if (plusp pruned) (1+ pruned) 0)))
 
+(defun %init-index (node index)
+  "Core BaseIndex::Init (index/base.cpp:119-134): place the best block read from
+INDEX's own database on the node's block index. A block the block index does
+not hold is an InitError -- `best block of <name> not found. Please rebuild the
+index.' -- which Init returns to AppInitMain's Step 8 (init.cpp:1925), ending
+start-up; a null record starts the index from nothing.
+
+The record can only name a block the block index made durable because it is
+written by COMMIT-INDEX alone, from the end of a catch-up and after each
+chainstate flush (%COMMIT-INDEXES-AFTER-FLUSH), as Core's Commit is."
+  (when (eq :not-found (bl.store:resolve-index-best
+                        index (node-validated-chainstate node)))
+    (init-error "best block of ~A not found. Please rebuild the index."
+                (bl.store:index-name index))))
+
 (defun %refuse-index-beyond-pruned-data (node index)
   "Stop start-up when INDEX would have to read blocks this node has pruned.
 
@@ -143,33 +158,43 @@ Failed to start indexes, shutting down~A"
 
 (defun catch-up-index (node index)
   "Catch INDEX up to NODE's validated chainstate tip (Core BaseIndex::Sync):
-make its best marker trustworthy (INDEX-PREPARE-SYNC), then backfill the
-shortfall (INDEX-SYNC), logging progress and the final height. Indexes bind
-the validated chainstate (Core ValidatedChainstate) and index blocks in order
+place its best block on the chain (RESOLVE-INDEX-BEST), make it trustworthy
+(INDEX-PREPARE-SYNC), backfill the shortfall (%CATCH-UP-INDEX-SYNC), and commit
+the best block reached (COMMIT-INDEX), as Core's Sync does on both of its
+exits. Indexes bind the validated chainstate (Core ValidatedChainstate) and index blocks in order
 from genesis -- identical to the current chainstate while only the primary
 exists, and the promoted snapshot chainstate after assumeutxo completion.
 Shared by startup and the post-promotion index rebind. Synchronous, unlike
 Core's background BaseIndex thread. Returns what INDEX-SYNC returned, or NIL
 when there was nothing to do."
+  (bl.store:resolve-index-best index (node-validated-chainstate node))
   (when *index-start-check*
     (%refuse-index-beyond-pruned-data node index))
   (let* ((cs (node-validated-chainstate node))
          (tip (bl.store:current-height cs))
          (name (bl.store:index-name index)))
     (bl.store:index-prepare-sync index cs (node-block-store node))
-    (when (< (bl.store:index-height index cs) tip)
-      (log-info "Building ~A to height ~D..." name tip)
-      (let ((n (bl.store:index-sync index cs (node-block-store node)
-                                    :undo-fn #'bl.val:get-undo-data
-                                    :subsidy-fn #'bl.val:calculate-block-subsidy
-                                    :progress (lambda (h pct)
-                                                (log-info "~A: height ~D (~,1F%)" name h pct)))))
-        (log-info "~A build complete: ~D block~:P indexed" name n)
-        (when (< (bl.store:index-height index cs) tip)
-          (log-warn "~A stopped at height ~D of ~D (missing block/undo data ~
+    ;; Core's Sync commits when it catches up, and when it is interrupted
+    ;; (index/base.cpp:214-236): the locator of wherever the index got to.
+    (unwind-protect (%catch-up-index-sync node index cs tip name)
+      (bl.store:commit-index index cs))))
+
+(defun %catch-up-index-sync (node index cs tip name)
+  "CATCH-UP-INDEX's backfill: INDEX-SYNC from the best block to CS's TIP,
+logging progress and the final height."
+  (when (< (bl.store:index-height index cs) tip)
+    (log-info "Building ~A to height ~D..." name tip)
+    (let ((n (bl.store:index-sync index cs (node-block-store node)
+                                  :undo-fn #'bl.val:get-undo-data
+                                  :subsidy-fn #'bl.val:calculate-block-subsidy
+                                  :progress (lambda (h pct)
+                                              (log-info "~A: height ~D (~,1F%)" name h pct)))))
+      (log-info "~A build complete: ~D block~:P indexed" name n)
+      (when (< (bl.store:index-height index cs) tip)
+        (log-warn "~A stopped at height ~D of ~D (missing block/undo data ~
 below the pruned horizon; the index needs genesis-contiguous history)"
-                    name (bl.store:index-height index cs) tip))
-        n))))
+                  name (bl.store:index-height index cs) tip))
+      n)))
 
 (defparameter +index-thread-specials+
   '(*node* bl.chain:*network* bl.log:*log-stream* bl.log:*log-buffer*
@@ -189,6 +214,7 @@ at the tip, where Core's BaseIndex ignores the blocks it is notified of until
 its own sync has caught up (BaseIndex::BlockConnected's m_synced guard). The
 thread is real; only the concurrency is not ported. What the catch-up
 signals is signalled again here, on the caller's thread."
+  (%init-index node index)
   (when *index-start-check*
     (%refuse-index-beyond-pruned-data node index))
   (let* ((specials +index-thread-specials+)
@@ -726,3 +752,38 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
       (log-info "Coinstats index: rebuilding after chainstate reindex"))
     (bl.rpc:set-rpc-warmup-status "Catching up coinstats index...")
     (start-index-background-sync *node* (node-coinstatsindex *node*))))
+
+(defun %commit-indexes-after-flush (chainstate)
+  "Core BaseIndex::ChainStateFlushed (index/base.cpp:380-422), signalled after
+every full chainstate flush (validation.cpp:2828-2831): an index on the
+validated chainstate whose best block is on the flushed chain at or above its
+tip commits its locator (COMMIT-INDEX). One behind the tip is not synced and
+is skipped quietly; one on another branch is skipped with Core's warning.
+
+This is the ONLY place a running node writes an index's best-block record
+(besides the catch-up's end), which is what makes Core's refusal of a record
+naming an unknown block (%INIT-INDEX) safe: the flush wrote the block index
+first."
+  (when (and *node* chainstate (eq chainstate (node-validated-chainstate *node*)))
+    (let* ((tip-hash (bl.store:best-block-hash chainstate))
+           (tip (and tip-hash (bl.store:get-block-index-entry chainstate tip-hash))))
+      (when tip
+        (dolist (index (node-indexes *node*))
+          (let* ((best-hash (values (bl.store:index-best-block index)))
+                 (best (and best-hash
+                            (bl.store:get-block-index-entry chainstate best-hash))))
+            (cond
+              ;; Nothing indexed, or behind the tip: Core's `if (!m_synced)
+              ;; return' (:387-389) -- an index still catching up commits from
+              ;; its own sync.
+              ((or (null best)
+                   (< (bl.store:block-index-entry-height best)
+                      (bl.store:block-index-entry-height tip))))
+              ((eq (bl.store:entry-ancestor-at-height
+                    best (bl.store:block-index-entry-height tip))
+                   tip)
+               (bl.store:commit-index index chainstate))
+              (t
+               (log-warn "Locator contains block (hash=~A) not on known best chain (tip=~A); not writing index locator"
+                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes tip-hash))
+                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes best-hash)))))))))))

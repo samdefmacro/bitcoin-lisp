@@ -425,6 +425,10 @@ src/storage/.")
    #:index-height
    #:index-best-block
    #:index-set-best
+   #:commit-index
+   #:resolve-index-best
+   #:encode-block-locator
+   #:decode-index-best-block-record
    #:index-clear-best
    #:index-write-block
    #:index-rewind-block

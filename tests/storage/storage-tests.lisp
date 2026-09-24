@@ -2835,11 +2835,12 @@ The control is the same index undamaged: it opens and reports its height."
           (bitcoin-lisp.kv:leveldb-put (bl.store:coinstatsindex-db csi) k
                                        (make-array 40 :element-type '(unsigned-byte 8)
                                                       :initial-element (ldb (byte 8 0) i)))))
+      (bl.store:commit-index csi)
       (bl.store:close-coinstatsindex csi)
       ;; Reopening turns the write-ahead log into a table file.
       (let ((again (bl.store:init-coinstatsindex dir)))
-        (is (= 200 (bl.store:coinstatsindex-height again))
-            "control: the undamaged index opens and reads its marker")
+        (is (equalp hash (values (bl.store:index-best-block again)))
+            "control: the undamaged index opens and reads its best block")
         (bl.store:close-coinstatsindex again))
       (let ((tables (directory (merge-pathnames "indexes/coinstatsindex/db/*.ldb" dir))))
         (is-true tables "control: the index has table files to damage")
@@ -2856,6 +2857,150 @@ The control is the same index undamaged: it opens and reports its height."
                        (error (e) (princ-to-string e)))))
         (is-true (and message (search "Corruption" message))
                  "a damaged index must fail at open with LevelDB's Corruption, got ~S"
+                 message)))))
+
+(defun %locator-bytes (&rest hashes)
+  "Core's CBlockLocator serialization, spelled out: DUMMY_VERSION 70016 as an
+int32 LE (80 11 01 00), a one-byte CompactSize count, the hashes."
+  (concatenate '(vector (unsigned-byte 8))
+               (vector #x80 #x11 #x01 #x00 (length hashes))
+               (apply #'concatenate '(vector (unsigned-byte 8)) hashes)))
+
+(defun %raw-best-record (index)
+  "INDEX's DB_BEST_BLOCK record as it is on disk."
+  (bitcoin-lisp.kv:leveldb-get (bl.store:base-index-db index)
+                               (coerce (list (char-code #\B))
+                                       '(simple-array (unsigned-byte 8) (*)))))
+
+(test an-index-best-block-record-is-cores-block-locator
+  "Every index's DB_BEST_BLOCK record is a serialized CBlockLocator
+(index/base.cpp:78-93, primitives/block.h:116-138): DUMMY_VERSION 70016, a
+CompactSize count, then the hashes of GetLocator over the index's best block
+(chain.cpp:26-48) -- ten consecutive blocks back from it, then steps doubling,
+ending at genesis. For a best block at height 14: heights 14..4, 2, 0.
+Ours wrote height||hash or the bare hash. Pinned against a hand-assembled
+vector."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-index-locator")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (genesis (add-regtest-genesis-entry cs))
+             (chain (cons genesis (add-mined-chain cs genesis 14)))
+             (hash-at (lambda (h) (bl.store:block-index-entry-hash (nth h chain))))
+             (csi (bl.store:init-coinstatsindex dir)))
+        (unwind-protect
+             (progn
+               (is (equalp (%locator-bytes (funcall hash-at 3) (funcall hash-at 0))
+                           (bl.store:encode-block-locator
+                            (list (funcall hash-at 3) (funcall hash-at 0))))
+                   "the encoding is Core's")
+               (bl.store:index-set-best csi (funcall hash-at 14) 14)
+               (is-true (bl.store:commit-index csi cs))
+               (is (equalp (apply #'%locator-bytes
+                                  (mapcar hash-at '(14 13 12 11 10 9 8 7 6 5 4 2 0)))
+                           (%raw-best-record csi))
+                   "the committed record is GetLocator's, byte for byte"))
+          (bl.store:close-coinstatsindex csi))))))
+
+(test an-old-best-block-record-is-read-once-and-rewritten-as-a-locator
+  "The layouts this tree wrote before Core's locator -- 32 bytes (txindex: the
+hash), 36 bytes height LE32 || hash (blockfilterindex, coinstatsindex), 36
+bytes hash || height LE32 (txospenderindex) -- are read at open, and the next
+commit writes the locator in their place. Each is planted raw, as an existing
+datadir holds it."
+  (with-temp-directory (dir "bl-index-legacy")
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5A))
+          (le7 (vector 7 0 0 0)))
+      (flet ((check (label open close record expect-height)
+               (let ((index (funcall open)))
+                 (bitcoin-lisp.kv:leveldb-put
+                  (bl.store:base-index-db index)
+                  (coerce (list (char-code #\B)) '(simple-array (unsigned-byte 8) (*)))
+                  (coerce record '(simple-array (unsigned-byte 8) (*))))
+                 (funcall close index))
+               (let ((index (funcall open)))
+                 (multiple-value-bind (h height) (bl.store:index-best-block index)
+                   (is (equalp hash h) "~A: the old record's hash is read" label)
+                   (is (eql expect-height height) "~A: its height, when it had one" label))
+                 (is-true (bl.store:commit-index index))
+                 (is (equalp (%locator-bytes hash) (%raw-best-record index))
+                     "~A: the commit rewrites it as a locator" label)
+                 (funcall close index))))
+        (check "txindex" (lambda () (bl.store:init-tx-index dir)) #'bl.store:close-tx-index
+               hash -1)
+        (check "blockfilterindex" (lambda () (bl.store:init-blockfilterindex dir))
+               #'bl.store:close-blockfilterindex
+               (concatenate 'vector le7 hash) 7)
+        (check "coinstatsindex" (lambda () (bl.store:init-coinstatsindex dir))
+               #'bl.store:close-coinstatsindex
+               (concatenate 'vector le7 hash) 7)
+        (check "txospenderindex" (lambda () (bl.store:init-txospender-index dir))
+               #'bl.store:close-txospender-index
+               (concatenate 'vector hash le7) 7)))))
+
+(test an-index-writes-its-best-block-only-from-the-chainstate-flush
+  "Core moves an index's best block in memory per block (SetBestBlockIndex) and
+writes its record only from Commit: when Sync catches up and after each full
+chainstate flush (ChainStateFlushed, index/base.cpp:380-422, signalled at
+validation.cpp:2828-2831), so the record can only name a block the block
+index has already made durable. Ours wrote the record with every block.
+
+A node's coinstatsindex is moved to its tip in memory: the record on disk must
+not follow until the flush hook runs, and then it is the tip's locator."
+  (with-network (:regtest)
+    (let* ((node (%index-wipe-node (format nil "flush-commit-~D" (get-internal-real-time))))
+           (cs (bl:node-chain-state node))
+           (tip (bl.store:best-block-hash cs))
+           (csi (bl.store:init-coinstatsindex (bl:node-data-directory node))))
+      (unwind-protect
+           (let ((bl:*node* node))
+             (setf (bl:node-coinstatsindex node) csi)
+             (bl.store:index-set-best csi tip (bl.store:current-height cs))
+             (is (null (%raw-best-record csi))
+                 "a block processed in memory does not reach the record")
+             (bl::%commit-indexes-after-flush cs)
+             (is (equalp (bl.store:encode-block-locator
+                          (bl.store:build-block-locator
+                           cs (bl.store:get-block-index-entry cs tip)))
+                         (%raw-best-record csi))
+                 "the flush commits the tip's locator"))
+        (setf (bl:node-coinstatsindex node) nil)
+        (bl.store:close-coinstatsindex csi)))))
+
+(test an-index-whose-best-block-is-unknown-refuses-to-start
+  "Core's BaseIndex::Init looks the locator's block up in the block index and,
+when it is not there, returns InitError(`best block of <name> not found.
+Please rebuild the index.') (index/base.cpp:129-132), ending start-up at Step 8
+(init.cpp:1925). Safe only because the record is written from the flush alone
+(see AN-INDEX-WRITES-ITS-BEST-BLOCK-ONLY-FROM-THE-CHAINSTATE-FLUSH). Ours read
+a record it could not place as `nothing indexed' and rebuilt from genesis over
+the rows the database still held.
+
+Built by the real start-up step, then the record is pointed at a block this
+node never saw and start-up runs again; the control is the first start."
+  (with-network (:regtest)
+    (let ((node (%index-wipe-node (format nil "unknown-best-~D" (get-internal-real-time)))))
+      (multiple-value-bind (entry after)
+          (%index-fill-around-catch-up node
+                                       (lambda (n) (bl.store:txindex-count (bl:node-tx-index n)))
+                                       :txindex t)
+        (declare (ignore entry))
+        (is (plusp after) "control: start-up built the index"))
+      (bl.store:index-set-best (bl:node-tx-index node)
+                               (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element #xEE)
+                               3)
+      (bl.store:commit-index (bl:node-tx-index node))
+      (bl.store:close-tx-index (bl:node-tx-index node))
+      (let ((message (handler-case
+                         (progn (%index-fill-around-catch-up node (constantly 0) :txindex t)
+                                nil)
+                       (error (e) (princ-to-string e)))))
+        (bl.rpc:finish-rpc-warmup)
+        (ignore-errors (bl.store:close-tx-index (bl:node-tx-index node)))
+        (is-true (and message
+                      (search "best block of txindex not found. Please rebuild the index."
+                              message))
+                 "start-up must refuse an index whose best block it cannot place, got ~S"
                  message)))))
 
 (test a-new-coins-database-names-genesis-as-its-best-block
