@@ -1074,6 +1074,32 @@ presync it, two more redownload it, and the last one finishes the sync."
                                   (subseq getheaders 24))))
                   "from pindexLast, the last header of that message"))))))))
 
+(test a-header-on-an-invalid-parent-is-refused-and-punished
+  "Core's AcceptBlockHeader refuses a header whose parent is marked invalid as
+bad-prevblk, before indexing it (validation.cpp:4252-4255), and
+ProcessHeadersMessage punishes the sender: MaybePunishNodeForBlock(...,
+\"invalid header received\") (net_processing.cpp:3095), sparing only
+BLOCK_TIME_FUTURE. Ours indexed the child as invalid and kept the peer;
+p2p_unrequested_blocks.py:291 sends a header on a chain it has just seen
+refused and waits to be disconnected."
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-bad-prevblk/")
+      (let* ((bl:*minimum-chain-work-override* 0)
+             (h1 (%pow-header genesis-hash :timestamp 1296688700))
+             (h2 (%pow-header (bl.ser:block-header-hash h1) :timestamp 1296689300))
+             (p (bl.net:make-peer :conn-type :outbound-full-relay :state :ready)))
+        (is (= 1 (bl.net:ingest-headers-from-peer p (list h1) state)))
+        (is (eq :ready (bl.net:peer-state p)) "control: a valid header costs nothing")
+        (setf (bl.store:block-index-entry-status
+               (bl.store:get-block-index-entry state (bl.ser:block-header-hash h1)))
+              :invalid)
+        (is (= 0 (bl.net:ingest-headers-from-peer p (list h2) state)))
+        (is (null (bl.store:get-block-index-entry state (bl.ser:block-header-hash h2)))
+            "a header on an invalid parent is not indexed")
+        (is (eq :disconnected (bl.net:peer-state p))
+            "and its sender is punished")))))
+
 (test generic-path-unconnecting-headers-store-nothing
   "A header batch that does not connect to our index (unknown prev-block)
 stores nothing and does not error — Core HandleUnconnectingHeaders sends a

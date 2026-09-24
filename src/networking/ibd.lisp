@@ -882,6 +882,19 @@ the second stays the sentence the log line has always carried."
                         "prev-blk-not-found"
                         hash)))
 
+            ;; Core AcceptBlockHeader (validation.cpp:4252-4255): a header whose
+            ;; parent is marked invalid is refused as bad-prevblk and never
+            ;; indexed; the headers handler then punishes its sender.
+            (when (member (bl.store:block-index-entry-status parent)
+                          '(:invalid :failed-child))
+              (return-from validate-header-chain
+                (values (nreverse valid-headers)
+                        (format nil "header ~A has prev block invalid: ~A"
+                                (bl.crypto:bytes-to-hex hash)
+                                (bl.crypto:bytes-to-hex header-prev-hash))
+                        "bad-prevblk"
+                        hash)))
+
             ;; Validate proof-of-work
             (unless (validate-header-pow header)
               (return-from validate-header-chain
@@ -3747,7 +3760,14 @@ threads read/write under the same lock."
                   (if (equal reason "high-hash")
                       "CheckBlockHeader"          ; validation.cpp:4240
                       "ContextualCheckBlockHeader")
-                  (and rejected (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes rejected))) reason error))
+                  (and rejected (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes rejected))) reason error)
+      ;; ProcessHeadersMessage: `MaybePunishNodeForBlock(..., "invalid header
+      ;; received")' (net_processing.cpp:3095), which spares only
+      ;; BLOCK_TIME_FUTURE (:1945-1946). Our headers path logged the verdict
+      ;; and kept the peer; p2p_unrequested_blocks.py:291 sends a header on a
+      ;; chain it has just seen refused and waits for the disconnect.
+      (when (and peer reason (not (equal reason "time-too-new")))
+        (record-misbehavior peer "invalid header received")))
     (let* (;; Core's received_new_header (net_processing.cpp:3079) is
            ;; `last_received_header == nullptr', where last_received_header is
            ;; the index lookup of headers.BACK() (:3052) — i.e. the LAST header
