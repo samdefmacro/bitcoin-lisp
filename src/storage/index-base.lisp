@@ -50,13 +50,24 @@ from the block files must not be described by rows derived from the old one."
     (when wipe
       (leveldb-destroy-db path))
     (ensure-directories-exist path)
-    (setf (base-index-db index)
-          (leveldb-open-tuned
-           path :cache-bytes (if *cache-sizes*
-                                 (ecase (base-index-cache-share index)
-                                   (:filter-index (cache-sizes-filter-index *cache-sizes*))
-                                   (:tx-index (cache-sizes-tx-index *cache-sizes*)))
-                                 0))))
+    (let ((db (leveldb-open-tuned
+               path :cache-bytes (if *cache-sizes*
+                                     (ecase (base-index-cache-share index)
+                                       (:filter-index (cache-sizes-filter-index *cache-sizes*))
+                                       (:tx-index (cache-sizes-tx-index *cache-sizes*)))
+                                     0))))
+      ;; Core BaseIndex::Init's first read, GetDB().ReadBestBlock()
+      ;; (index/base.cpp:119), checksums verified as every CDBWrapper read is
+      ;; (dbwrapper.cpp:221): a damaged table under the marker is
+      ;; HandleError's dbwrapper_error and start-up fails with LevelDB's
+      ;; Corruption sentence (feature_init.py:170-189 damages each index's
+      ;; files and expects exactly that). Unverified, our later reads of the
+      ;; same record decoded the damaged block and the node came up.
+      (handler-bind ((error (lambda (e)
+                              (declare (ignore e))
+                              (leveldb-close db))))
+        (leveldb-get db (base-index-meta-key index) :verify-checksums t))
+      (setf (base-index-db index) db)))
   index)
 
 (defun close-index (index)

@@ -2814,6 +2814,50 @@ must be contiguous from genesis, so `resume from the marker' is the only shape
 it has -- and a marker it cannot place leaves it stuck until something wipes
 it.")
 
+(test a-damaged-index-database-fails-at-open
+  "Core's BaseIndex::Init reads the best-block locator from the index's own
+database first (index/base.cpp:119), with checksums verified as every
+CDBWrapper read is (dbwrapper.cpp:221), so a damaged table is HandleError's
+`Fatal LevelDB error: Corruption' and start-up ends. feature_init.py:170-189
+damages each index's files and expects that sentence; ours opened the index,
+read the marker unverified out of the damaged block and came up.
+
+The control is the same index undamaged: it opens and reports its height."
+  (with-temp-directory (dir "bl-damaged-index")
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+          (csi (bl.store:init-coinstatsindex dir)))
+      ;; The marker plus enough rows that the first table's first block is the
+      ;; one offset 150..350 lands in.
+      (bl.store:index-set-best csi hash 200)
+      (dotimes (i 400)
+        (let ((k (make-array 9 :element-type '(unsigned-byte 8) :initial-element 0)))
+          (setf (aref k 0) (char-code #\s) (aref k 1) (ldb (byte 8 8) i) (aref k 2) (ldb (byte 8 0) i))
+          (bitcoin-lisp.kv:leveldb-put (bl.store:coinstatsindex-db csi) k
+                                       (make-array 40 :element-type '(unsigned-byte 8)
+                                                      :initial-element (ldb (byte 8 0) i)))))
+      (bl.store:close-coinstatsindex csi)
+      ;; Reopening turns the write-ahead log into a table file.
+      (let ((again (bl.store:init-coinstatsindex dir)))
+        (is (= 200 (bl.store:coinstatsindex-height again))
+            "control: the undamaged index opens and reads its marker")
+        (bl.store:close-coinstatsindex again))
+      (let ((tables (directory (merge-pathnames "indexes/coinstatsindex/db/*.ldb" dir))))
+        (is-true tables "control: the index has table files to damage")
+        (dolist (table tables)
+          (with-open-file (s table :direction :io :element-type '(unsigned-byte 8)
+                                   :if-exists :overwrite)
+            (file-position s 150)
+            (write-sequence (make-array 200 :element-type '(unsigned-byte 8)
+                                            :initial-element (char-code #\1))
+                            s))))
+      (let ((message (handler-case (progn (bl.store:close-coinstatsindex
+                                           (bl.store:init-coinstatsindex dir))
+                                          nil)
+                       (error (e) (princ-to-string e)))))
+        (is-true (and message (search "Corruption" message))
+                 "a damaged index must fail at open with LevelDB's Corruption, got ~S"
+                 message)))))
+
 (test a-new-coins-database-names-genesis-as-its-best-block
   "Core's first ActivateBestChain connects genesis, and ConnectBlock's genesis
 special case sets the coins view's best block without adding a coin
