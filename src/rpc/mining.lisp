@@ -792,6 +792,25 @@ header); errors if the parent is missing or the header fails validation."
         (bl.net:process-headers valid chain-state))
       nil))))
 
+(defconstant +generate-yield-seconds+ 1/1000
+  "How long GENERATE steps aside between blocks (see YIELD-NODE-LOCK).")
+
+(defun yield-node-lock ()
+  "Step aside between two mined blocks, with the node lock released, so the
+sync thread gets its turn before GENERATE mines the next one.
+
+Core's generateblocks mines each block through ProcessNewBlock in its own
+cs_main scope (rpc/mining.cpp:161-181, GenerateBlock :157), and the message
+handler thread runs between blocks: it announces each new tip and answers the
+getdata that follows. Our loop released the lock between blocks too, and still
+a 400-block generate on a pruned node let its sync thread announce almost
+nothing until the run was over; its peers, by then more than 288 blocks
+behind a NODE_NETWORK_LIMITED peer, could never fetch the gap.
+rpc_rawtransaction.py:246 failed in 2 of 2 runs without this and passes with
+it. Releasing the lock alone did not give the waiting thread its turn;
+sleeping a millisecond does, at 0.4 s over those 400 blocks."
+  (sleep +generate-yield-seconds+))
+
 (defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
   "Mine NBLOCKS blocks whose coinbase pays SCRIPT-PUBKEY, activating each through
 the normal consensus path. Returns the list of mined block hashes (hex). Shared
@@ -838,7 +857,8 @@ Core's loop is `while (nGenerate > 0 && !chainman.m_interrupt)'
                                      :message (format nil "Mined block rejected: ~A" reason)))
                  (push (hash-to-hex (bl.ser:block-header-hash
                                      (bl.ser:bitcoin-block-header block)))
-                       hashes)))
+                       hashes))
+               (yield-node-lock))
           finally (return (nreverse hashes)))))
 
 (define-rpc "generatetoaddress" (node (nblocks address (maxtries :or 1000000)))
