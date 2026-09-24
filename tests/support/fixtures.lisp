@@ -661,9 +661,11 @@ connection -- enough to drive dispatch + disconnect without a real socket."
                 :connection conn :state :ready :address "127.0.0.1"))
     peer))
 
-(defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer)))
+(defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer))
+                                                   (node-ctx (bl.ctx:make-node-context)))
   "Drive COMMAND/PAYLOAD through the shipped per-peer dispatch isolation the
-drain loop uses. Returns (values still-connected peer)."
+drain loop uses, on NODE-CTX (empty by default: a handler that needs a mempool
+is then skipped). Returns (values still-connected peer)."
   (values (bl.net::safely-dispatch-peer-message
-           peer command payload (bl.ctx:make-node-context) (bl.net::make-ibd))
+           peer command payload node-ctx (bl.net::make-ibd))
           peer))

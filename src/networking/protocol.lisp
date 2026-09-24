@@ -2577,170 +2577,172 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
   ;; MAIN rejects filter, which the end of IBD does not clear.
   (when (initial-block-download-p chain-state)
     (return-from handle-tx nil))
-  (handler-case
-      (let ((tx (bl.ser:parse-tx-payload payload)))
-        (when tx
-          (with-current-node-lock
-            (let ((txid (bl.ser:transaction-hash tx))
-                  (wtxid (bl.ser:transaction-wtxid tx))
-                  (current-height (bl.store:current-height chain-state)))
-              ;; A response arrived from THIS peer — Core ReceivedTx's first
-              ;; act (txdownloadman_impl.cpp:505-513). ReceivedResponse, not
-              ;; ForgetTxHash: only the delivering peer's announcement
-              ;; completes, and every other announcer stays a candidate.
-              ;; Forgetting the hash here instead let any peer evict every
-              ;; honest announcer of a TXID by sending one unsolicited
-              ;; witness-malleated twin -- same txid, different wtxid, so the
-              ;; twin is rejected and cached under its own wtxid while the
-              ;; real transaction is neither in the mempool nor requestable
-              ;; any more. MSG_WTX announcements are tracked under the wtxid,
-              ;; so answer that key too (txids and wtxids never collide; for
-              ;; no-witness txs they are equal and one call suffices).
-              (tx-request-received-response peer txid)
-              (unless (equalp wtxid txid)
-                (tx-request-received-response peer wtxid))
-              ;; The peer knows this transaction: it just sent it to us.
-              ;; Core AddKnownTx(peer, peer.m_wtxid_relay ? wtxid : txid),
-              ;; net_processing.cpp:4491-4492 -- the filter is keyed by the
-              ;; id THIS peer's inventory uses, which is what the relay path
-              ;; looks up.
-              (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
-              ;; A transaction we ALREADY HAVE, from a peer holding
-              ;; ForceRelay: relay it onward anyway. Core's ReceivedTx answers
-              ;; should_validate=false for anything AlreadyHaveTx knows -- the
-              ;; mempool among its sources -- and the ForceRelay arm that
-              ;; follows exists so "the node can function as a gateway for
-              ;; nodes hidden behind it" (net_processing.cpp:4508-4521); it
-              ;; relays when the transaction is in the mempool and says so
-              ;; when it is not. Ours parsed the permission and read it
-              ;; nowhere, so p2p_permissions.py:121-123 -- a forcerelay peer
-              ;; re-sending a transaction node1 already holds, asserting node0
-              ;; receives it -- waited out its sixty seconds.
-              (when (and (peer-has-permission-p peer +perm-force-relay+)
-                         (%already-have-tx-p wtxid t mempool recent-rejects))
-                (%force-relay-known-tx peer txid wtxid mempool peers)
-                (return-from handle-tx nil))
-              ;; Check recent rejects and recently-confirmed before expensive
-              ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
-              ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
-              ;; entries exist only where Core adds them too, so check both
-              ;; ids. Freshly-confirmed txs (still relaying through the
-              ;; network) are dropped without being treated as rejects.
-              (when (or (bl:recent-reject-p recent-rejects wtxid)
-                        (bl:recent-reject-p recent-rejects txid)
-                        (bl.val:recently-confirmed-p wtxid)
-                        (bl.val:recently-confirmed-p txid))
-                (return-from handle-tx nil))
-              ;; Already known to fail RECONSIDERABLY (too-low feerate, RBF
-              ;; economics, mempool full): do not submit it alone again — but
-              ;; it may succeed paired with a child we are already holding as
-              ;; an orphan, which is how a CPFP package whose two halves
-              ;; arrive separately gets assembled (Core ReceivedTx's second
-              ;; branch, txdownloadman_impl.cpp:544-551).
-              (when (bl.val:reconsiderable-reject-p wtxid)
-                (%try-1p1c-package peer tx utxo-set mempool chain-state peers
-                                   recent-rejects)
-                (return-from handle-tx nil))
-              ;; Validate for mempool. THE hot path for this fix: a peer
-              ;; streaming transactions that fail after input fetch -- a bad
-              ;; signature suffices -- otherwise leaves one cache entry per
-              ;; distinct prevout, with no eviction until the next block. A
-              ;; ~1 MB transaction can name ~24,000 outpoints, so the
-              ;; amplification is several times the bandwidth and is held for
-              ;; a whole inter-block interval (Core validation.cpp:1787-1790).
-              (multiple-value-bind (valid error fee replaced sigops)
-                  (bl.store:with-coins-to-uncache (utxo-set)
-                    (bl.val:validate-transaction-for-mempool
-                     tx utxo-set mempool current-height :chain-state chain-state))
-                (unless valid
-                  ;; Core logs every rejection a peer's transaction earns,
-                  ;; before any of the caching decisions below: ProcessInvalidTx
-                  ;; opens with LogDebug(BCLog::MEMPOOLREJ, "%s (wtxid=%s) from
-                  ;; peer=%d was not accepted: %s", txid, wtxid, nodeid,
-                  ;; state.ToString()) (net_processing.cpp:3131-3135). We logged
-                  ;; nothing at all here, and p2p_permissions.py:133-138 greps
-                  ;; for exactly that line.
-                  (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
-                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
-                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))
-                              (peer-id peer)
-                              (bl.val:tx-reject-reason-string error))
-                  (cond
-                    ;; Missing inputs => hold as an orphan (not a real reject);
-                    ;; a later parent will trigger re-evaluation. Request the
-                    ;; missing parents from this peer so they arrive sooner.
-                    ;; UNLESS the parents make the orphan hopeless
-                    ;; (%orphan-parents-rejected-p): then reject it outright —
-                    ;; under BOTH ids, exactly like Core's "not keeping orphan
-                    ;; with rejected parents" (txdownloadman_impl.cpp:422-436;
-                    ;; the txid too, so non-wtxidrelay peers can't make us
-                    ;; re-download it).
-                    ((eq error :missing-input)
-                     (let ((parents (missing-parent-txids tx utxo-set mempool)))
-                       (if (%orphan-parents-rejected-p parents recent-rejects)
-                           (progn
-                             ;; Core's line (:423-425); p2p_invalid_tx.py:153
-                             ;; waits for it.
-                             (bl:log-cat "mempool" "not keeping orphan with rejected parents ~A (wtxid=~A)"
-                                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
-                                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
-                             (bl:add-recent-reject recent-rejects txid)
-                             (bl:add-recent-reject recent-rejects wtxid)
-                             ;; :434-435, beside the two filter inserts.
-                             (tx-request-forget-tx txid wtxid))
-                           (%take-orphan-into-orphanage
-                            peer tx mempool utxo-set recent-rejects peers))))
-                    (t
-                     ;; Cache the failure so we don't re-request it (see
-                     ;; %cache-tx-rejection for which filter and which ids).
-                     ;; A loose transaction that fails validation is NOT
-                     ;; misbehavior: Bitcoin Core removed tx-relay punishment
-                     ;; (PR #26294), since tx validity is subjective (our
-                     ;; mempool/chain state) and an honest peer shouldn't be
-                     ;; discouraged for relaying a tx we happen to reject.
-                     ;; Consensus-invalid txs are only punished inside a block.
-                     (%cache-tx-rejection tx error recent-rejects)
-                     ;; A FIRST-TIME reconsiderable failure is where Core looks
-                     ;; for a child in the orphanage and retries the pair as a
-                     ;; package (txdownloadman_impl.cpp:460-465).
-                     (when (%reconsiderable-failure-p error)
-                       (%try-1p1c-package peer tx utxo-set mempool chain-state
-                                          peers recent-rejects)))))
-                (when valid
-                  (let ((result (bl.mp:accept-validated-tx
-                                 mempool txid tx fee current-height
-                                 :sigops sigops :replaced replaced
-                                 :chainstate-current
-                                 (current-for-fee-estimation-p chain-state))))
-                    (cond
-                      ((eq result :ok)
-                       ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
-                       ;; stamped only on mempool ACCEPTANCE,
-                       ;; net_processing.cpp:4540).
-                       (setf (peer-last-tx-time peer)
-                             (bl.ser:get-unix-time))
-                       ;; Relay, de-orphan, cascade.
-                       (%after-mempool-accept tx peer peers utxo-set mempool
-                                              chain-state recent-rejects))
-                      ;; The tx passed validation but the mempool refused it.
-                      ;; Core reports these through the same MempoolRejectedTx
-                      ;; path as any other failure, so they are cached like
-                      ;; one: :mempool-full is reconsiderable — the tx
-                      ;; self-evicted on the trim and a package could still
-                      ;; carry it (validation.cpp:1399-1402) — while
-                      ;; :too-large-cluster and :conflict go to the main
-                      ;; filter. Uncached, every re-announcement was
-                      ;; re-downloaded and fully re-validated.
-                      ((eq result :duplicate) nil)   ; we already have it
-                      (t
-                       (%cache-tx-rejection tx result recent-rejects)
-                       (when (%reconsiderable-failure-p result)
-                         (%try-1p1c-package peer tx utxo-set mempool
-                                            chain-state peers
-                                            recent-rejects)))))))))))
-    (error (c)
-      (declare (ignore c))
-      nil))))
+  ;; No catch here: Core deserializes the transaction inside ProcessMessage
+  ;; (`vRecv >> TX_WITH_WITNESS(ptx)', net_processing.cpp:4486), and an
+  ;; undecodable one -- an unknown witness flag is `Unknown transaction
+  ;; optional data' (primitives/transaction.h:235) -- reaches ProcessMessages'
+  ;; catch, which logs it and keeps the peer (SAFELY-DISPATCH-PEER-MESSAGE).
+  ;; p2p_segwit.py:1984 waits for that line; ours was swallowed here.
+  (let ((tx (bl.ser:parse-tx-payload payload)))
+    (when tx
+      (with-current-node-lock
+        (let ((txid (bl.ser:transaction-hash tx))
+              (wtxid (bl.ser:transaction-wtxid tx))
+              (current-height (bl.store:current-height chain-state)))
+          ;; A response arrived from THIS peer — Core ReceivedTx's first
+          ;; act (txdownloadman_impl.cpp:505-513). ReceivedResponse, not
+          ;; ForgetTxHash: only the delivering peer's announcement
+          ;; completes, and every other announcer stays a candidate.
+          ;; Forgetting the hash here instead let any peer evict every
+          ;; honest announcer of a TXID by sending one unsolicited
+          ;; witness-malleated twin -- same txid, different wtxid, so the
+          ;; twin is rejected and cached under its own wtxid while the
+          ;; real transaction is neither in the mempool nor requestable
+          ;; any more. MSG_WTX announcements are tracked under the wtxid,
+          ;; so answer that key too (txids and wtxids never collide; for
+          ;; no-witness txs they are equal and one call suffices).
+          (tx-request-received-response peer txid)
+          (unless (equalp wtxid txid)
+            (tx-request-received-response peer wtxid))
+          ;; The peer knows this transaction: it just sent it to us.
+          ;; Core AddKnownTx(peer, peer.m_wtxid_relay ? wtxid : txid),
+          ;; net_processing.cpp:4491-4492 -- the filter is keyed by the
+          ;; id THIS peer's inventory uses, which is what the relay path
+          ;; looks up.
+          (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
+          ;; A transaction we ALREADY HAVE, from a peer holding
+          ;; ForceRelay: relay it onward anyway. Core's ReceivedTx answers
+          ;; should_validate=false for anything AlreadyHaveTx knows -- the
+          ;; mempool among its sources -- and the ForceRelay arm that
+          ;; follows exists so "the node can function as a gateway for
+          ;; nodes hidden behind it" (net_processing.cpp:4508-4521); it
+          ;; relays when the transaction is in the mempool and says so
+          ;; when it is not. Ours parsed the permission and read it
+          ;; nowhere, so p2p_permissions.py:121-123 -- a forcerelay peer
+          ;; re-sending a transaction node1 already holds, asserting node0
+          ;; receives it -- waited out its sixty seconds.
+          (when (and (peer-has-permission-p peer +perm-force-relay+)
+                     (%already-have-tx-p wtxid t mempool recent-rejects))
+            (%force-relay-known-tx peer txid wtxid mempool peers)
+            (return-from handle-tx nil))
+          ;; Check recent rejects and recently-confirmed before expensive
+          ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
+          ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
+          ;; entries exist only where Core adds them too, so check both
+          ;; ids. Freshly-confirmed txs (still relaying through the
+          ;; network) are dropped without being treated as rejects.
+          (when (or (bl:recent-reject-p recent-rejects wtxid)
+                    (bl:recent-reject-p recent-rejects txid)
+                    (bl.val:recently-confirmed-p wtxid)
+                    (bl.val:recently-confirmed-p txid))
+            (return-from handle-tx nil))
+          ;; Already known to fail RECONSIDERABLY (too-low feerate, RBF
+          ;; economics, mempool full): do not submit it alone again — but
+          ;; it may succeed paired with a child we are already holding as
+          ;; an orphan, which is how a CPFP package whose two halves
+          ;; arrive separately gets assembled (Core ReceivedTx's second
+          ;; branch, txdownloadman_impl.cpp:544-551).
+          (when (bl.val:reconsiderable-reject-p wtxid)
+            (%try-1p1c-package peer tx utxo-set mempool chain-state peers
+                               recent-rejects)
+            (return-from handle-tx nil))
+          ;; Validate for mempool. THE hot path for this fix: a peer
+          ;; streaming transactions that fail after input fetch -- a bad
+          ;; signature suffices -- otherwise leaves one cache entry per
+          ;; distinct prevout, with no eviction until the next block. A
+          ;; ~1 MB transaction can name ~24,000 outpoints, so the
+          ;; amplification is several times the bandwidth and is held for
+          ;; a whole inter-block interval (Core validation.cpp:1787-1790).
+          (multiple-value-bind (valid error fee replaced sigops)
+              (bl.store:with-coins-to-uncache (utxo-set)
+                (bl.val:validate-transaction-for-mempool
+                 tx utxo-set mempool current-height :chain-state chain-state))
+            (unless valid
+              ;; Core logs every rejection a peer's transaction earns,
+              ;; before any of the caching decisions below: ProcessInvalidTx
+              ;; opens with LogDebug(BCLog::MEMPOOLREJ, "%s (wtxid=%s) from
+              ;; peer=%d was not accepted: %s", txid, wtxid, nodeid,
+              ;; state.ToString()) (net_processing.cpp:3131-3135). We logged
+              ;; nothing at all here, and p2p_permissions.py:133-138 greps
+              ;; for exactly that line.
+              (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
+                          (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                          (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))
+                          (peer-id peer)
+                          (bl.val:tx-reject-reason-string error))
+              (cond
+                ;; Missing inputs => hold as an orphan (not a real reject);
+                ;; a later parent will trigger re-evaluation. Request the
+                ;; missing parents from this peer so they arrive sooner.
+                ;; UNLESS the parents make the orphan hopeless
+                ;; (%orphan-parents-rejected-p): then reject it outright —
+                ;; under BOTH ids, exactly like Core's "not keeping orphan
+                ;; with rejected parents" (txdownloadman_impl.cpp:422-436;
+                ;; the txid too, so non-wtxidrelay peers can't make us
+                ;; re-download it).
+                ((eq error :missing-input)
+                 (let ((parents (missing-parent-txids tx utxo-set mempool)))
+                   (if (%orphan-parents-rejected-p parents recent-rejects)
+                       (progn
+                         ;; Core's line (:423-425); p2p_invalid_tx.py:153
+                         ;; waits for it.
+                         (bl:log-cat "mempool" "not keeping orphan with rejected parents ~A (wtxid=~A)"
+                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                                     (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
+                         (bl:add-recent-reject recent-rejects txid)
+                         (bl:add-recent-reject recent-rejects wtxid)
+                         ;; :434-435, beside the two filter inserts.
+                         (tx-request-forget-tx txid wtxid))
+                       (%take-orphan-into-orphanage
+                        peer tx mempool utxo-set recent-rejects peers))))
+                (t
+                 ;; Cache the failure so we don't re-request it (see
+                 ;; %cache-tx-rejection for which filter and which ids).
+                 ;; A loose transaction that fails validation is NOT
+                 ;; misbehavior: Bitcoin Core removed tx-relay punishment
+                 ;; (PR #26294), since tx validity is subjective (our
+                 ;; mempool/chain state) and an honest peer shouldn't be
+                 ;; discouraged for relaying a tx we happen to reject.
+                 ;; Consensus-invalid txs are only punished inside a block.
+                 (%cache-tx-rejection tx error recent-rejects)
+                 ;; A FIRST-TIME reconsiderable failure is where Core looks
+                 ;; for a child in the orphanage and retries the pair as a
+                 ;; package (txdownloadman_impl.cpp:460-465).
+                 (when (%reconsiderable-failure-p error)
+                   (%try-1p1c-package peer tx utxo-set mempool chain-state
+                                      peers recent-rejects)))))
+            (when valid
+              (let ((result (bl.mp:accept-validated-tx
+                             mempool txid tx fee current-height
+                             :sigops sigops :replaced replaced
+                             :chainstate-current
+                             (current-for-fee-estimation-p chain-state))))
+                (cond
+                  ((eq result :ok)
+                   ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
+                   ;; stamped only on mempool ACCEPTANCE,
+                   ;; net_processing.cpp:4540).
+                   (setf (peer-last-tx-time peer)
+                         (bl.ser:get-unix-time))
+                   ;; Relay, de-orphan, cascade.
+                   (%after-mempool-accept tx peer peers utxo-set mempool
+                                          chain-state recent-rejects))
+                  ;; The tx passed validation but the mempool refused it.
+                  ;; Core reports these through the same MempoolRejectedTx
+                  ;; path as any other failure, so they are cached like
+                  ;; one: :mempool-full is reconsiderable — the tx
+                  ;; self-evicted on the trim and a package could still
+                  ;; carry it (validation.cpp:1399-1402) — while
+                  ;; :too-large-cluster and :conflict go to the main
+                  ;; filter. Uncached, every re-announcement was
+                  ;; re-downloaded and fully re-validated.
+                  ((eq result :duplicate) nil)   ; we already have it
+                  (t
+                   (%cache-tx-rejection tx result recent-rejects)
+                   (when (%reconsiderable-failure-p result)
+                     (%try-1p1c-package peer tx utxo-set mempool
+                                        chain-state peers
+                                        recent-rejects)))))))))))))
 
 (defconstant +stale-relay-age-limit+ (* 30 24 60 60)
   "Core STALE_RELAY_AGE_LIMIT (net_processing.cpp:117): a block NOT on the
