@@ -3727,6 +3727,9 @@ stored and the verdict is its first, so only the mutation class is exempt.")
     (:bad-difficulty             . "bad-diffbits")                       ; :4121 ContextualCheckBlockHeader
     (:bad-merkle-root            . "bad-txnmrklroot")                    ; :3878 CheckMerkleRoot
     (:non-final-tx               . "bad-txns-nonfinal")                  ; :4179 ContextualCheckBlock
+    ;; BIP34, ContextualCheckBlock again; feature_block.py:1284 (b_cb34)
+    ;; waits for it in the debug log.
+    (:bad-coinbase-height        . "bad-cb-height")                      ; :4189
     (:bad-signet-solution        . "bad-signet-blksig")                  ; :3964 CheckSignetBlockSolution
     ;; CheckBlock relays CheckTransaction's reason as the block's
     ;; (validation.cpp:3992-3996: tx_state.GetRejectReason()), so these are

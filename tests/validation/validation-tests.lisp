@@ -1146,6 +1146,14 @@ body gate logs through it."
                    "the rejection line carries Core's lower-case reason")
           (is-false (find (symbol-name reason) lines :test #'search)
                     "and not the keyword's upper-case name"))))))
+(test a-bip34-height-mismatch-is-refused-as-bad-cb-height
+  "ContextualCheckBlock refuses a coinbase whose BIP34 height push does not
+match the block's height as `bad-cb-height' (validation.cpp:4189). Ours
+reported the downcased keyword bad-coinbase-height, so feature_block.py:1284
+(b_cb34, a coinbase with its height push cut short) waited for Core's word in
+the debug log and failed."
+  (is (string= "bad-cb-height" (bl.val:block-reject-reason :bad-coinbase-height))))
+
 (test block-reject-reasons-name-the-coinbase-and-the-script-error
   "Two block verdicts spoke words no Bitcoin implementation uses.
 
