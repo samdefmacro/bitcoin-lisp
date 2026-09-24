@@ -324,6 +324,7 @@ src/storage/.")
    #:block-tree-db-path
    #:migrate-legacy-header-index
    #:read-block-tree-flag
+   #:forget-pruned-block-files
    #:read-block-tree-file-info
    #:data-files-missing
    #:encode-disk-block-index
@@ -335,6 +336,12 @@ src/storage/.")
    #:note-block-witness-received
    #:fake-opt-witness-below
    #:chain-needs-redownload-p
+   #:*coins-db-batch-bytes*
+   #:*coins-db-crash-ratio*
+   #:*coins-db-simulated-crash*
+   #:coins-view-db-head-blocks
+   #:coin-view-rollforward-block
+   #:segwit-active-at-p
    #:+block-opt-witness+
    ;; Integrity utilities
    #:compute-crc32

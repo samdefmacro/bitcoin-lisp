@@ -43,8 +43,34 @@ BIP30 replay brick. See docs/coins-db-best-block-plan.md; this key is phase 1.")
   (make-array 1 :element-type '(unsigned-byte 8)
                 :initial-element +db-prefix-best-block+))
 
-;; Future prefixes for DB_BEST_BLOCK ('B') and DB_HEAD_BLOCKS ('H')
-;; will land here when those move into the same LevelDB.
+(defconstant +db-prefix-head-blocks+ #x48       ; 'H' — Core's DB_HEAD_BLOCKS
+  "1-byte key of the in-progress marker a partial-batch flush leaves: the block
+the coins are being moved TO and the one they were moved FROM
+(CCoinsViewDB::BatchWrite, txdb.cpp:126-129). Present only while a flush is
+between its first and its last batch; REPLAY-COINS-DB-BLOCKS resolves it.")
+
+(defun encode-head-blocks-key ()
+  "The single key of the coins DB's DB_HEAD_BLOCKS record."
+  (make-array 1 :element-type '(unsigned-byte 8)
+                :initial-element +db-prefix-head-blocks+))
+
+(defvar *coins-db-batch-bytes* (* 32 1024 1024)
+  "-dbbatchsize: the size at which a coins flush commits a partial batch (Core
+DEFAULT_DB_CACHE_BATCH, kernel/caches.h:15; CCoinsViewDB::BatchWrite,
+txdb.cpp:147-160).")
+
+(defvar *coins-db-crash-ratio* 0
+  "-dbcrashratio, a hidden test option: after each partial coins batch, exit
+at a 1-in-N chance, logging `Simulating a crash. Goodbye.' (txdb.cpp:150-157).
+0 never does.")
+
+(defun %simulate-crash ()
+  "Core's `_Exit(0)': no unwinding, no flush, no shutdown."
+  (sb-ext:exit :code 0 :abort t))
+
+(defvar *coins-db-simulated-crash* '%simulate-crash
+  "What -dbcrashratio's crash does: end the process, as Core's _Exit(0).
+Tests bind it to a non-local exit to observe the database the crash leaves.")
 
 (defconstant +coin-key-bytes+ 37
   "LevelDB key size: 1 prefix + 32 txid + 4 vout.")
@@ -215,6 +241,25 @@ every write path now sets it, so NIL only ever appears on a chainstate written
 by an older build, not on one that has been flushed since."
   (declare (type coins-view-db view))
   (leveldb-get (cvdb-db view) (encode-best-block-key)))
+
+(defun coins-view-db-head-blocks (view)
+  "Core CCoinsViewDB::GetHeadBlocks (txdb.cpp:90-96): the DB_HEAD_BLOCKS record
+as a list of hashes, the new tip first -- empty when no flush is in progress.
+The value is a serialized std::vector<uint256>: a CompactSize count, then the
+hashes."
+  (declare (type coins-view-db view))
+  (let ((v (leveldb-get (cvdb-db view) (encode-head-blocks-key))))
+    (when (and v (plusp (length v)))
+      (loop for i from 0 below (aref v 0)
+            collect (subseq v (+ 1 (* 32 i)) (+ 33 (* 32 i)))))))
+
+(defun %head-blocks-value (new old)
+  "NEW and OLD as Core's two-hash vector; OLD NIL is the null hash."
+  (let ((v (make-array 65 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref v 0) 2)
+    (replace v new :start1 1)
+    (when old (replace v old :start1 33))
+    v))
 
 (defun coins-view-batch-set-best-block (batch block-hash)
   "Stage the coins DB's best-block pointer in BATCH.

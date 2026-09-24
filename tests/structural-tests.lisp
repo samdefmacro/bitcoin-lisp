@@ -91,7 +91,6 @@
     "bitcoin-lisp.kv:find-next-record"
     "bitcoin-lisp.kv:flat-file-pos-null-p"
     "bitcoin-lisp.storage:gcs-filter-match"
-    "bitcoin-lisp.kv:leveldb-writebatch-clear"
     "bitcoin-lisp.storage:load-tx-index"
     "bitcoin-lisp.storage:remove-utxo"
     "bitcoin-lisp.storage:save-utxo-set"

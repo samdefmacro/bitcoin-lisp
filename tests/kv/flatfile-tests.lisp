@@ -1213,15 +1213,16 @@ Returns the hashes, oldest first."
                (push prev hashes)))
     (nreverse hashes)))
 
-(defun %ff-load-chain-once (dir)
-  "Run the shipped start-up step %INIT-LOAD-CHAIN over DIR with NO -reindex,
-and return how many entries the block index ended up with. The coins DB it
-opens is closed again, so the next run over the same directory can open it."
+(defun %ff-load-chain-once (dir &optional reindex)
+  "Run the shipped start-up step %INIT-LOAD-CHAIN over DIR, with -reindex when
+REINDEX, and return how many entries the block index ended up with. The coins
+DB it opens is closed again, so the next run over the same directory can open
+it."
   (let ((node (bl:make-node :network :mainnet :data-directory dir)))
     (let ((bl:*node* node))
       (unwind-protect
            (progn
-             (bl::%init-load-chain :mainnet nil nil nil)
+             (bl::%init-load-chain :mainnet reindex nil nil)
              (hash-table-count
               (bl.store:chain-state-block-index (bl:node-chain-state node))))
         (ignore-errors
@@ -1275,6 +1276,33 @@ were expected in the index")
         (is-true (bl.store:reindex-flag-set-p dir))
         (bl.store:write-reindex-flag dir nil)
         (is-false (bl.store:reindex-flag-set-p dir))))))
+
+(test an-unpruned-start-over-pruned-block-files-is-refused-unless-reindexing
+  "Core refuses to start without -prune over block files it once pruned: `You
+need to rebuild the database using -reindex to go back to unpruned mode.  This
+will redownload the entire blockchain' (node/chainstate.cpp:55-59), read from
+the prunedblockfiles flag of the block tree database. Its -reindex wipes that
+database; ours, additive, erases the flag, stops every entry whose body is gone
+from claiming one, and returns the prune horizon to 0 -- Core's end state."
+  (with-network (:mainnet)
+    (let ((bl.store:*flat-block-files* t))
+      (with-temp-directory (dir)
+        (%ff-datadir-with-three-blocks dir)
+        ;; A pruning node wrote the index: the flag goes in with it.
+        (let ((cs (bl.store:init-chain-state dir))
+              (bl.store:*prune-target-mib* 550))
+          (setf (bl.store:chain-state-pruned-height cs) 1)
+          (bl.store:save-header-index cs))
+        (is-true (bl.store:read-block-tree-flag dir "prunedblockfiles"))
+        (let ((bl.store:*prune-target-mib* 0))
+          (let ((refusal (handler-case (progn (%ff-load-chain-once dir) nil)
+                           (bl.err:chainstate-load-error (e) (princ-to-string e)))))
+            (is (equal "You need to rebuild the database using -reindex to go back to unpruned mode.  This will redownload the entire blockchain"
+                       refusal)))
+          (is (plusp (%ff-load-chain-once dir t)) "-reindex starts")
+          (is-false (bl.store:read-block-tree-flag dir "prunedblockfiles")
+                    "and leaves no record of pruning, so the next start without ~
+-prune is not refused"))))))
 
 ;;; --- Migrating legacy per-block files into flat files (P4) --------------------
 

@@ -587,7 +587,19 @@
   every entry the node stored or connected, which the old format never
   recorded and without which the migrated chain would need a redownload.
   An interrupted migration leaves the old files in place and simply runs
-  again. Traps: a synthetic test entry with a made-up hash or no header
+  again. The prunedblockfiles flag is written only by a node in prune
+  mode, and an unpruned start over it is Core's refusal unless it is a
+  `-reindex`, which erases the flag instead (see the `-reindex` paragraph).
+
+  A coins flush is written in batches of `*coins-db-batch-bytes*`
+  (-dbbatchsize, Core's CCoinsViewDB::BatchWrite): the first batch
+  replaces the best-block pointer with a DB_HEAD_BLOCKS record naming
+  the new and the old tip, the last reverses that. A crash in between
+  (`*coins-db-crash-ratio*`, -dbcrashratio, simulates one) is finished at
+  start-up by `bl:replay-coins-db-blocks`, Core's ReplayBlocks: the old
+  branch is rolled back with its undo data, then `coin-view-rollforward-
+  block` rolls forward to the new tip. A flush that fits one batch is the
+  single atomic commit it always was. Traps: a synthetic test entry with a made-up hash or no header
   cannot round-trip (the key is the header's hash; a header-less entry is
   not written at all), and a mainnet-difficulty fixture header fails the
   proof-of-work check on load -- use the mined regtest fixtures in
@@ -617,7 +629,12 @@
   re-synced from genesis, as Core's `f_wipe` does (`index/base.cpp:68-73`)
   -- on a pruned node that rebuild can only reach back to the prune
   horizon. Genesis must be in the index BEFORE the walk starts, or every
-  record parks and nothing links.
+  record parks and nothing links. Two more of Core's reindex outcomes are reached without
+  the wipe: active-chain blocks taken without segwit enforcement (no
+  BLOCK_OPT_WITNESS) are disconnected, reset to header-only and offered
+  again to the accept path (`bl:reaccept-unwitnessed-active-chain`), and a
+  datadir leaving pruned mode loses its prunedblockfiles flag and every
+  claim to a body it no longer has.
 
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage

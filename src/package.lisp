@@ -72,6 +72,8 @@ init.cpp, node/. src/node/.")
    #:*capture-messages*
    #:cleanup-block-rev-files
    #:wipe-for-pruned-reindex
+   #:replay-coins-db-blocks
+   #:reaccept-unwitnessed-active-chain
    #:check-cli-args
    #:cli-parse-error
    #:unknown-config-file-keys

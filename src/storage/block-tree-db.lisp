@@ -418,6 +418,14 @@ CALL-WITH-BLOCK-TREE-DB."
 
 ;;; Flags (node/blockstorage.cpp:73-118)
 
+(defun forget-pruned-block-files (base-path)
+  "Erase the prunedblockfiles flag -- the state Core's -reindex leaves, since it
+wipes the whole block tree database (init.cpp:1344)."
+  (with-block-tree-db (db base-path)
+    (leveldb-delete (block-tree-db-handle db) (%db-flag-key "prunedblockfiles") :sync t)
+    (setf (block-tree-db-pruned-flag-written db) nil))
+  t)
+
 (defun vector-of-octet (octet)
   "A one-byte octet vector holding OCTET."
   (make-array 1 :element-type '(unsigned-byte 8) :initial-element octet))
@@ -611,7 +619,11 @@ after (validation.cpp:2780-2812) -- is %FLUSH-CHAINSTATE's."
                        (%changed-header-index-entries state))))
       (%write-block-index-batch db entries
                                 :block-store block-store
-                                :pruned (plusp (chain-state-pruned-height state)))
+                                ;; Core sets m_have_pruned only when prune mode
+                                ;; deletes a file; an unpruned node with a
+                                ;; leftover horizon must not record it.
+                                :pruned (and (pruning-enabled-p)
+                                             (plusp (chain-state-pruned-height state))))
       t)))
 
 ;;; Reading (Core LoadBlockIndexGuts + LoadBlockIndex, node/blockstorage.cpp:120-162, 423-508)

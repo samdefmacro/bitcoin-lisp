@@ -926,7 +926,8 @@ reindex's wiped index has no entry to point anywhere in Core."
     (log-info "Loading block index db: last block file = ~D"
               (values (bl.store:read-block-tree-file-info (node-data-directory *node*))))
     (when (bl.store:read-block-tree-flag (node-data-directory *node*) "prunedblockfiles")
-      (log-info "Loading block index db: Block files have previously been pruned"))
+      (log-info "Loading block index db: Block files have previously been pruned")
+      (%refuse-or-forget-pruning reindex))
     (when (and store (not reindex))
       (log-info "Checking all blk files are present...")
       (let ((missing (bl.store:data-files-missing
@@ -948,6 +949,38 @@ feature_init.py:210 deletes chainstate/*.ldb and expects that sentence."
     (error (e)
       (log-error "~A" e)
       (chainstate-load-error "Error opening coins database"))))
+
+(defun %refuse-or-forget-pruning (reindex)
+  "A datadir whose block files were pruned, started without -prune. Core
+refuses it unless the start is a -reindex (node/chainstate.cpp:55-59), and its
+-reindex wipes the block tree database -- the flag with it -- and downloads the
+chain again from nothing.
+
+Our -reindex is additive (docs/reindex-decision-2026-09-18.md), so it reaches
+Core's end state by hand: the prunedblockfiles record is erased, every index
+entry whose body is not in the store stops claiming one (no BLOCK_HAVE_DATA,
+no undo), and each chainstate's prune horizon returns to 0, so nothing records
+the datadir as pruned any more. A pruning start keeps everything as it is."
+  (cond
+    ((pruning-enabled-p) nil)
+    ((not reindex)
+     (chainstate-load-error "You need to rebuild the database using -reindex to go back to unpruned mode.  This will redownload the entire blockchain"))
+    (t
+     (let ((store (node-block-store *node*))
+           (cleared 0))
+       (maphash (lambda (hash entry)
+                  (when (and (bl.store:block-index-entry-data-pos entry)
+                             store (not (bl.store:block-exists-p store hash)))
+                    (setf (bl.store:block-index-entry-file entry) nil
+                          (bl.store:block-index-entry-data-pos entry) nil
+                          (bl.store:block-index-entry-undo-pos entry) nil)
+                    (incf cleared)))
+                (bl.store:chain-state-block-index (node-chain-state *node*)))
+       (dolist (cs (node-chainstates *node*))
+         (setf (bl.store:chain-state-pruned-height cs) 0))
+       (bl.store:forget-pruned-block-files (node-data-directory *node*))
+       (log-info "Reindex: leaving pruned mode; ~D block~:P no longer claim a body on disk"
+                 cleared)))))
 
 (defun %init-load-chain (network reindex reindex-chainstate blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
@@ -1135,6 +1168,21 @@ startup refusal rather than a directory we create somewhere else."
       (when (plusp files)
         (log-info "Block file accounting: ~D flat block file~:P" files)))))
 
+(defun %replay-interrupted-coins-flushes (wipe-chainstate)
+  "A coins flush interrupted between its partial batches left DB_HEAD_BLOCKS
+behind: finish it before anything reads the coins, as Core's
+CompleteChainstateInitialization runs ReplayBlocks right after opening the
+coins DB (node/chainstate.cpp:111-114). Either reindex flag (WIPE-CHAINSTATE)
+wipes the coins first, which makes it a no-op there too. The rollback reads undo
+data, so undo storage is set up for it here as well as later."
+  (unless (or wipe-chainstate (null (node-data-directory *node*)))
+    (bl.val:initialize-undo-storage
+     (merge-pathnames "undo/" (node-data-directory *node*))
+     :block-store (node-block-store *node*) :chain-state (node-chain-state *node*))
+    (dolist (cs (node-chainstates *node*))
+      (unless (replay-coins-db-blocks *node* cs)
+        (chainstate-load-error "Unable to replay blocks. You will need to rebuild the database using -reindex-chainstate.")))))
+
 (defun %init-recover-chain (reindex reindex-chainstate)
   "Core Step 7 after LoadChainstate: the assumeutxo snapshot chainstate, crash
 recovery of an interrupted flush, snapshot validation at startup, undo storage
@@ -1169,6 +1217,7 @@ connect."
   ;; Resolve interrupted-flush chainstates now that the block store, UTXO
   ;; caches, and header index are all available. Only abort (resync) if the
   ;; on-disk state needed to recover is gone.
+  (%replay-interrupted-coins-flushes (or reindex reindex-chainstate))
   (let ((pending *pending-chainstate-recovery*))
     (setf *pending-chainstate-recovery* nil)
     (dolist (cs pending)
@@ -1232,7 +1281,8 @@ connect."
   ;; before the sync thread starts (single-threaded here, no writer races).
   ;; Runs after the block index + undo storage are ready.
   (when reindex-chainstate
-    (do-reindex-chainstate)))
+    (do-reindex-chainstate))
+  (when reindex (reaccept-unwitnessed-active-chain)))
 
 
 (defun %init-chain-tip (reindex &optional reindex-chainstate)
