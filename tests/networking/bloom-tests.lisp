@@ -10,17 +10,17 @@
 
 (in-suite :bloom-tests)
 
-(defun %hex (s) (bl.crypto:hex-to-bytes s))
+(defun %bloom-hex (s) (bl.crypto:hex-to-bytes s))
 
 (defun %uint256 (display-hex)
   "Core's uint256{\"...\"}: display hex, stored byte-reversed."
-  (reverse (%hex display-hex)))
+  (reverse (%bloom-hex display-hex)))
 
 (defun %vector-tx (hex)
-  (bl.ser:br-read-transaction (bl.ser:make-byte-reader-from (%hex hex))))
+  (bl.ser:br-read-transaction (bl.ser:make-byte-reader-from (%bloom-hex hex))))
 
 (defun %vector-block (hex)
-  (bl.ser:br-read-bitcoin-block (bl.ser:make-byte-reader-from (%hex hex))))
+  (bl.ser:br-read-bitcoin-block (bl.ser:make-byte-reader-from (%bloom-hex hex))))
 
 (defun %matched-display (matched)
   "vMatchedTxn as (index . display-hex txid)."
@@ -30,18 +30,18 @@
   "bloom_tests.cpp:36-59 and :61-82: CBloomFilter(3, 0.01, tweak, UPDATE_ALL),
 three inserts, and the serialized filter byte for byte."
   (let ((f (bl.net:make-bloom-filter 3 0.01 0 bl.net:+bloom-update-all+)))
-    (is-false (bl.net:bloom-contains-p f (%hex "99108ad8ed9bb6274d3980bab5a85c048f0950c8")))
-    (bl.net:bloom-insert f (%hex "99108ad8ed9bb6274d3980bab5a85c048f0950c8"))
-    (is-true (bl.net:bloom-contains-p f (%hex "99108ad8ed9bb6274d3980bab5a85c048f0950c8")))
-    (is-false (bl.net:bloom-contains-p f (%hex "19108ad8ed9bb6274d3980bab5a85c048f0950c8")))
-    (bl.net:bloom-insert f (%hex "b5a2c786d9ef4658287ced5914b37a1b4aa32eee"))
-    (bl.net:bloom-insert f (%hex "b9300670b4c5366e95b2699e8b18bc75e5f729c5"))
-    (is (equalp (%hex "03614e9b050000000000000001") (bl.net:serialize-bloom-filter f))))
+    (is-false (bl.net:bloom-contains-p f (%bloom-hex "99108ad8ed9bb6274d3980bab5a85c048f0950c8")))
+    (bl.net:bloom-insert f (%bloom-hex "99108ad8ed9bb6274d3980bab5a85c048f0950c8"))
+    (is-true (bl.net:bloom-contains-p f (%bloom-hex "99108ad8ed9bb6274d3980bab5a85c048f0950c8")))
+    (is-false (bl.net:bloom-contains-p f (%bloom-hex "19108ad8ed9bb6274d3980bab5a85c048f0950c8")))
+    (bl.net:bloom-insert f (%bloom-hex "b5a2c786d9ef4658287ced5914b37a1b4aa32eee"))
+    (bl.net:bloom-insert f (%bloom-hex "b9300670b4c5366e95b2699e8b18bc75e5f729c5"))
+    (is (equalp (%bloom-hex "03614e9b050000000000000001") (bl.net:serialize-bloom-filter f))))
   (let ((f (bl.net:make-bloom-filter 3 0.01 2147483649 bl.net:+bloom-update-all+)))
     (dolist (h '("99108ad8ed9bb6274d3980bab5a85c048f0950c8" "b5a2c786d9ef4658287ced5914b37a1b4aa32eee"
                  "b9300670b4c5366e95b2699e8b18bc75e5f729c5"))
-      (bl.net:bloom-insert f (%hex h)))
-    (is (equalp (%hex "03ce4299050000000100008001") (bl.net:serialize-bloom-filter f)))
+      (bl.net:bloom-insert f (%bloom-hex h)))
+    (is (equalp (%bloom-hex "03ce4299050000000100008001") (bl.net:serialize-bloom-filter f)))
     ;; And it reads back as the same filter.
     (is (equalp (bl.net:serialize-bloom-filter f)
                 (bl.net:serialize-bloom-filter
@@ -57,20 +57,20 @@ near-misses that must not match."
     (flet ((fresh () (bl.net:make-bloom-filter 10 0.000001 0 bl.net:+bloom-update-all+))
            (outpoint (display n) (bl.net:outpoint-bytes (%uint256 display) n)))
       (dolist (key (list (%uint256 "b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b")
-                         (%hex "6bff7fcd4f8565ef406dd5d63d4ff94f318fe82027fd4dc451b04474019f74b4")
-                         (%hex "30450220070aca44506c5cef3a16ed519d7c3c39f8aab192c4e1c90d065f37b8a4af6141022100a8e160b856c2d43d27d8fba71e5aef6405b8643ac4cb7cb3c462aced7f14711a01")
-                         (%hex "046d11fee51b0e60666d5049a9101a72741df480b96ee26488a4d3466b95c9a40ac5eeef87e10a5cd336c19a84565f80fa6c547957b7700ff4dfbdefe76036c339")
-                         (%hex "a266436d2965547608b9e15d9032a7b9d64fa431")
+                         (%bloom-hex "6bff7fcd4f8565ef406dd5d63d4ff94f318fe82027fd4dc451b04474019f74b4")
+                         (%bloom-hex "30450220070aca44506c5cef3a16ed519d7c3c39f8aab192c4e1c90d065f37b8a4af6141022100a8e160b856c2d43d27d8fba71e5aef6405b8643ac4cb7cb3c462aced7f14711a01")
+                         (%bloom-hex "046d11fee51b0e60666d5049a9101a72741df480b96ee26488a4d3466b95c9a40ac5eeef87e10a5cd336c19a84565f80fa6c547957b7700ff4dfbdefe76036c339")
+                         (%bloom-hex "a266436d2965547608b9e15d9032a7b9d64fa431")
                          (outpoint "90c122d70786e899529d71dbeba91ba216982fb6ba58f3bdaab65e73b7e9260b" 0)))
         (let ((f (fresh)))
           (bl.net:bloom-insert f key)
           (is-true (bl.net:bloom-relevant-and-update-p f tx))))
       (let ((f (fresh)))
-        (bl.net:bloom-insert f (%hex "04943fdd508053c75000106d3bc6e2754dbcff19"))
+        (bl.net:bloom-insert f (%bloom-hex "04943fdd508053c75000106d3bc6e2754dbcff19"))
         (is-true (bl.net:bloom-relevant-and-update-p f tx) "output address")
         (is-true (bl.net:bloom-relevant-and-update-p f spend) "UPDATE_ALL added the output"))
       (dolist (key (list (%uint256 "00000009e784f32f62ef849763d4f45b98e07ba658647343b915ff832b110436")
-                         (%hex "0000006d2965547608b9e15d9032a7b9d64fa431")
+                         (%bloom-hex "0000006d2965547608b9e15d9032a7b9d64fa431")
                          (outpoint "90c122d70786e899529d71dbeba91ba216982fb6ba58f3bdaab65e73b7e9260b" 1)
                          (outpoint "000000d70786e899529d71dbeba91ba216982fb6ba58f3bdaab65e73b7e9260b" 0)))
         (let ((f (fresh)))
@@ -98,7 +98,7 @@ into the transaction that spends it (4 matches); UPDATE_NONE does not (3)."
             (f (bl.net:make-bloom-filter 10 0.000001 0 flags)))
         (bl.net:bloom-insert f (%uint256 "e980fe9f792d014e73b95203dc1335c5f9ce19ac537a419e6df5b47aecb93b70"))
         (%merkle-block-checks block f '((0 . "e980fe9f792d014e73b95203dc1335c5f9ce19ac537a419e6df5b47aecb93b70")))
-        (bl.net:bloom-insert f (%hex "044a656f065871a353f216ca26cef8dde2f03e8c16202d2e8ad769f02032cb86a5eb5e56842e92e19141d60a01928f8dd2c875a390f67c1f6c94cfc617c0ea45af"))
+        (bl.net:bloom-insert f (%bloom-hex "044a656f065871a353f216ca26cef8dde2f03e8c16202d2e8ad769f02032cb86a5eb5e56842e92e19141d60a01928f8dd2c875a390f67c1f6c94cfc617c0ea45af"))
         (%merkle-block-checks
          block f
          (if (= n 4)
@@ -116,7 +116,7 @@ Core's exact merkleblock bytes."
   (let ((block (%vector-block +merkle-block-3-hex+))
         (f (bl.net:make-bloom-filter 10 0.000001 0 bl.net:+bloom-update-all+)))
     (bl.net:bloom-insert f (%uint256 "63194f18be0af63f2c6bc9dc0f777cbefed3d9415c4af83f3ee3a3d669c00cb5"))
-    (is (equalp (%hex "0100000079cda856b143d9db2c1caff01d1aecc8630d30625d10e8b4b8b0000000000000b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f196367291b4d4c86041b8fa45d630100000001b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f19630101")
+    (is (equalp (%bloom-hex "0100000079cda856b143d9db2c1caff01d1aecc8630d30625d10e8b4b8b0000000000000b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f196367291b4d4c86041b8fa45d630100000001b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f19630101")
                 (%merkle-block-checks
                  block f '((0 . "63194f18be0af63f2c6bc9dc0f777cbefed3d9415c4af83f3ee3a3d669c00cb5")))))))
 
@@ -135,8 +135,8 @@ but not the pay-to-pubkey-hash one; NONE inserts neither."
     (destructuring-bind (flags generation-inserted) case
       (let ((block (%vector-block +merkle-block-4-hex+))
             (f (bl.net:make-bloom-filter 10 0.000001 0 flags)))
-        (bl.net:bloom-insert f (%hex "04eaafc2314def4ca98ac970241bcab022b9c1e1f4ea423a20f134c876f2c01ec0f0dd5b2e86e7168cefe0d81113c3807420ce13ad1357231a2252247d97a46a91"))
-        (bl.net:bloom-insert f (%hex "b6efd80d99179f4f4ff6f4dd0a007d018c385d21"))
+        (bl.net:bloom-insert f (%bloom-hex "04eaafc2314def4ca98ac970241bcab022b9c1e1f4ea423a20f134c876f2c01ec0f0dd5b2e86e7168cefe0d81113c3807420ce13ad1357231a2252247d97a46a91"))
+        (bl.net:bloom-insert f (%bloom-hex "b6efd80d99179f4f4ff6f4dd0a007d018c385d21"))
         (bl.net:make-merkle-block block f)
         (is (eq generation-inserted
                 (bl.net:bloom-contains-p
