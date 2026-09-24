@@ -4842,6 +4842,106 @@ above the tip does lead the locator."
 
 ;;;; The block-download drain indexes an unseen header before judging the body
 
+(test an-unsolicited-block-below-the-anti-dos-floor-is-not-indexed
+  "Core's block handler computes min_pow_checked -- the parent is known and its
+work plus the block's proof reaches GetAntiDoSWorkThreshold
+(net_processing.cpp:4895-4898) -- and AcceptBlockHeader, once the header's own
+checks pass, refuses to index it without that and logs `AcceptBlockHeader: not
+adding new block header <hash>, missing anti-dos proof-of-work validation'
+(validation.cpp:4261-4264). Nobody is punished (BLOCK_HEADER_LOW_WORK,
+:1915-1918). Ours sent the header through the HEADERS message's gate, which
+logged TryLowWorkHeadersSync's `Ignoring low-work chain' instead, and
+p2p_unrequested_blocks.py:100 waits for Core's line."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "drain-low-work-block"))
+           (cs (bl:node-chain-state node))
+           (b1 (let ((blk (bl.mining:assemble-full-block
+                           cs (bl:node-mempool node)
+                           :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+                 (bl.mining:mine-block blk)
+                 blk))
+           (b1-hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1)))
+           (peer (bl.net:make-peer :address "198.51.100.43" :state :ready))
+           (ctx (bl.ctx:make-node-context :chain-state cs
+                                          :utxo-set (bl:node-utxo-set node)
+                                          :block-store (bl:node-block-store node))))
+      (let ((bl:*minimum-chain-work-override* (expt 2 64)))
+        (let ((text (nth-value 1 (log-text-of
+                                  "validation"
+                                  (lambda ()
+                                    (with-ibd-context
+                                      (deliver-ibd-message
+                                       peer "block"
+                                       (subseq (bl.ser:make-block-message b1 :witness t) 24)
+                                       ctx)))))))
+          (is (null (bl.store:get-block-index-entry cs b1-hash))
+              "a block below the anti-DoS floor leaves no index entry")
+          (is (= 0 (bl.store:current-height cs)))
+          (is (eq :ready (bl.net:peer-state peer)) "and its sender is not punished")
+          (is-true (search (format nil "AcceptBlockHeader: not adding new block header ~A, missing anti-dos proof-of-work validation"
+                                   (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes b1-hash)))
+                           text)
+                   "Core's line: ~S" text)
+          (is-false (bl.net:block-min-pow-checked-p (bl.ser:bitcoin-block-header b1) cs))))
+      (is-true (bl.net:block-min-pow-checked-p (bl.ser:bitcoin-block-header b1) cs)
+               "with the floor at its regtest default the same header passes"))))
+
+(test an-unrequested-fork-block-lighter-than-the-tip-is-not-stored
+  "Core's AcceptBlock stores an UNREQUESTED block only when it has at least our
+tip's work (`if (!fHasMoreOrSameWork) return true', validation.cpp:4351,
+:4370): its header is indexed, its body is not. p2p_unrequested_blocks.py:119
+pushes a height-1 fork block at a node whose tip is at height 2 and expects
+getchaintips to call it `headers-only'; ours stored every competing-fork body
+and reported `valid-headers'. An EQUAL-work sibling is stored (the `>=' --
+our out-of-order gate had `>'), and a REQUESTED lighter block still is."
+  (with-network (:regtest)
+    (let* ((na (regtest-node-fixture "unreq-fork-a"))
+           (nb (regtest-node-fixture "unreq-fork-b"))
+           (cs (bl:node-chain-state na))
+           (utxo (bl:node-utxo-set na))
+           (store (bl:node-block-store na)))
+      (flet ((mine-on (node spk)
+               (let ((blk (bl.mining:assemble-full-block
+                           (bl:node-chain-state node) (bl:node-mempool node)
+                           :coinbase-script-pubkey spk)))
+                 (bl.mining:mine-block blk)
+                 blk))
+             (hash-of (blk) (bl.ser:block-header-hash (bl.ser:bitcoin-block-header blk)))
+             (deliver (blk &key requested)
+               ;; The header first, as DISPATCH-IBD-MESSAGE indexes it.
+               (bl.net:ingest-headers-from-peer
+                nil (list (bl.ser:bitcoin-block-header blk)) cs)
+               (deliver-block blk cs utxo store :requested requested)))
+        (let* ((a1 (mine-on na (p2sh-optrue-script-pubkey)))
+               (b1 (mine-on nb (coerce '(#x51) '(vector (unsigned-byte 8)))))
+               ;; A second sibling on genesis, distinct from b1.
+               (b1x (mine-on nb (coerce '(#x52) '(vector (unsigned-byte 8))))))
+          (with-ibd-context
+            (is-true (deliver a1 :requested t))
+            (is (= 1 (bl.store:current-height cs)))
+            ;; Equal work, unrequested: stored, not the tip.
+            (deliver b1)
+            (is-true (bl.store:block-exists-p store (hash-of b1))
+                     "an unrequested EQUAL-work sibling is stored")
+            ;; Extend a1 so the next sibling is lighter than the tip.
+            (is-true (deliver (mine-on na (p2sh-optrue-script-pubkey)) :requested t))
+            (is (= 2 (bl.store:current-height cs)))
+            ;; Pushed as a block message: the drain indexes its header, which
+            ;; also queues it for download -- queued is not REQUESTED (Core's
+            ;; fRequested is IsBlockRequested, in flight from anyone).
+            (deliver-ibd-message
+             (bl.net:make-peer :address "198.51.100.44" :state :ready)
+             "block" (subseq (bl.ser:make-block-message b1x :witness t) 24)
+             (bl.ctx:make-node-context :chain-state cs :utxo-set utxo
+                                       :block-store store))
+            (is-true (bl.store:get-block-index-entry cs (hash-of b1x))
+                     "control: the lighter sibling's header is indexed")
+            (is-false (bl.store:block-exists-p store (hash-of b1x))
+                      "an unrequested sibling lighter than the tip is not stored")
+            (deliver-block b1x cs utxo store :requested t)
+            (is-true (bl.store:block-exists-p store (hash-of b1x))
+                     "the same block, requested, is stored")))))))
+
 (test drain-accepts-an-unsolicited-block-whose-header-it-has-never-seen
   "Core's ProcessNewBlock runs AcceptBlock, which runs AcceptBlockHeader first
 (validation.cpp:4340), so an unrequested block on a known parent is indexed

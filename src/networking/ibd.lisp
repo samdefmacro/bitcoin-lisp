@@ -780,6 +780,21 @@ whose nBits is negative / zero / overflowing / above the PoW limit is rejected
 (Core CheckBlockHeader), not silently decoded as an in-range target."
   (bl.val:check-proof-of-work header))
 
+(defun block-min-pow-checked-p (header chain-state)
+  "Core's min_pow_checked for a BLOCK message (net_processing.cpp:4895-4898):
+the parent is known and its chain work plus this block's own proof reaches
+GetAntiDoSWorkThreshold. AcceptBlockHeader refuses to index a header that
+fails it (validation.cpp:4261-4264) -- after, not instead of, its proof-of-work,
+parent and contextual checks -- so an unsolicited block on a chain too light to
+matter is never stored."
+  (let ((prev (bl.store:get-block-index-entry
+               chain-state (bl.ser:block-header-prev-block header))))
+    (and prev
+         (>= (bl.store:calculate-chain-work
+              (bl.ser:block-header-bits header)
+              (bl.store:block-index-entry-chain-work prev))
+             (anti-dos-work-threshold chain-state)))))
+
 (defun %refuse-block-with-invalid-header (peer header chain-state)
   "The header of a block message PEER sent is not in the index after the
 ingest: T, with PEER punished, when that is Core's verdict on the header --
@@ -800,6 +815,16 @@ anti-DoS work floor)."
                   (t (nth-value 2 (with-current-node-lock
                                     (validate-header-chain (list header)
                                                            chain-state)))))))
+      ;; Every check passed and the header is still not indexed: it was held
+      ;; back by the anti-DoS work floor, which is nobody's fault
+      ;; (MaybePunishNodeForBlock's BLOCK_HEADER_LOW_WORK arm,
+      ;; net_processing.cpp:1915-1918). Core's line, validation.cpp:4262;
+      ;; p2p_unrequested_blocks.py:100 waits for it.
+      (unless reason
+        (bl:log-cat "validation" "AcceptBlockHeader: not adding new block header ~A, ~
+                                  missing anti-dos proof-of-work validation"
+                    (bl.crypto:bytes-to-hex
+                     (bl.crypto:reverse-bytes (bl.ser:block-header-hash header)))))
       (when (and reason (not (equal reason "time-too-new")))
         (record-misbehavior peer reason)
         t))))
@@ -2171,7 +2196,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        ;; The header goes through the same ingest as a headers message
        ;; (anti-DoS work floor included); a header on an unknown parent is
        ;; not added, and the body is then dropped as before.
-       (unless (bl.store:get-block-index-entry chain-state hash)
+       ;; Only with Core's min_pow_checked (BLOCK-MIN-POW-CHECKED-P): a header
+       ;; on a chain below the anti-DoS floor is not indexed here, and not
+       ;; diverted into a headers presync either -- that is the HEADERS
+       ;; message's gate (TryLowWorkHeadersSync), not AcceptBlockHeader's.
+       (when (and (not (bl.store:get-block-index-entry chain-state hash))
+                  (block-min-pow-checked-p header chain-state))
          (with-current-node-lock
            (ingest-headers-from-peer
             peer (list header) chain-state
@@ -2233,8 +2263,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
          ;; Capture "did we request this?" BEFORE mark-block-received clears
          ;; the in-flight/pending entry — the out-of-order persist gate needs
          ;; it to tell a solicited download from an unsolicited disk-fill push.
-         (let ((requested (and ctx (or (gethash hash (ibd-context-in-flight ctx))
-                                       (gethash hash (ibd-context-pending-blocks ctx))))))
+         ;; Core's fRequested is IsBlockRequested -- in flight from anyone
+         ;; (net_processing.cpp:4886) -- not "a block we would like": a
+         ;; header the index merely queued for download (PENDING) was never
+         ;; asked for, and counting it let every pushed fork block past
+         ;; AcceptBlock's unrequested gates (p2p_unrequested_blocks.py:119).
+         (let ((requested (and ctx (gethash hash (ibd-context-in-flight ctx)))))
            (mark-block-received hash)
            ;; Core mapBlockSource.emplace (net_processing.cpp:4893).
            (note-block-source hash peer)
@@ -4560,19 +4594,20 @@ window reaches it)."
         (pushnew hash (gethash height map) :test #'equalp)))))
 
 (defun %out-of-order-block-acceptable-p (entry current-height requested chain-state)
-  "Core AcceptBlock anti-DoS gate (validation.cpp:4367-4378) for an
-out-of-order block: keep it if we REQUESTED it, or (unsolicited) it has more
-work than our tip, sits within +min-blocks-to-keep+ of the tip, and meets
-minimum chain work. Header admission already validated its PoW before the
-entry got chain-work, so this bounds only unsolicited far-ahead / low-work
-disk fill."
+  "Core AcceptBlock anti-DoS gate (validation.cpp:4367-4378) for a block that
+does not extend the tip -- out of order above it, or a competing fork at or
+below it: keep it if we REQUESTED it, or (unsolicited) it has AT LEAST our
+tip's work (fHasMoreOrSameWork, :4351 -- `>=', so an equal-work sibling is
+stored), sits within +min-blocks-to-keep+ of the tip, and meets minimum chain
+work. Header admission already validated its PoW before the entry got
+chain-work, so this bounds only unsolicited far-ahead / low-work disk fill."
   (or requested
       (let* ((tip-entry (bl.store:get-block-index-entry
                          chain-state (bl.store:best-block-hash chain-state)))
              (work (bl.store:block-index-entry-chain-work entry))
              (height (bl.store:block-index-entry-height entry)))
         (and tip-entry
-             (> work (bl.store:block-index-entry-chain-work tip-entry))
+             (>= work (bl.store:block-index-entry-chain-work tip-entry))
              (<= height (+ current-height bl:+min-blocks-to-keep+))
              (>= work (bl:minimum-chain-work bl:*network*))))))
 
@@ -4992,6 +5027,37 @@ deterministic; the sender is punished for that one too, and for nothing else."
                                      (bl.val:block-reject-reason-string error))))
   nil)
 
+(defun %competing-fork-block-storable-p (block entry hash height current-height
+                                         requested chain-state peer)
+  "Core AcceptBlock's gates for a competing-fork block (at or below our tip, off
+the active chain), which PROCESS-RECEIVED-BLOCK stores BEFORE any validation of
+its own -- that is deferred to the reorg that needs it -- so these are all that
+stands between a peer and a body on disk under an honest header's hash.
+
+Never a witness-stripped copy: a stripped block on disk fails every later
+reorg, which is exactly what wedged testnet4; a witness-complete copy arrives
+by v2 compact blocks or a full witness download if the fork ever matters.
+
+Never an UNREQUESTED one lighter than our tip: AcceptBlock returns before
+storing it (`if (!fHasMoreOrSameWork) return true', validation.cpp:4370), so
+p2p_unrequested_blocks.py:119 finds a pushed fork block at height 1 behind a
+height-2 tip `headers-only'. getblockfrompeer's FetchBlock is a request too
+(Core BlockRequested, net_processing.cpp:1979).
+
+And never one that fails the body gate (%BLOCK-BODY-ACCEPTABLE-P)."
+  (cond ((bl.val:block-witness-stripped-p block height)
+         (bl:log-debug
+          "Competing-fork block ~D arrived witness-stripped; not storing" height)
+         nil)
+        ((not (%out-of-order-block-acceptable-p
+               entry current-height
+               (or requested (fetch-block-requested-p hash))
+               chain-state))
+         (bl:log-debug "Competing-fork block ~D not stored (unrequested, less work than the tip)"
+                       height)
+         nil)
+        (t (%block-body-acceptable-p block chain-state peer))))
+
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects
                                   (wire-size 0) requested peer)
@@ -5030,21 +5096,9 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
       ;; without changing our active tip. A later block that pushes the
       ;; fork past our tip will then trigger the reorg.
       (when (<= height current-height)
-        ;; Never PERSIST a witness-stripped competing-fork block: the
-        ;; :weaker-chain path stores before full validation (deferred until a
-        ;; reorg needs it), so a stripped block would land on disk and then fail
-        ;; every reorg attempt — exactly what wedged testnet4. Drop this copy; a
-        ;; witness-complete copy arrives via v2 compact blocks / full witness
-        ;; downloads if the fork ever becomes relevant.
-        (when (bl.val:block-witness-stripped-p block height)
-          (bl:log-debug
-           "Competing-fork block ~D arrived witness-stripped; not storing" height)
-          (return-from process-received-block nil))
-        ;; Nor one that fails Core's AcceptBlock gate: this arm stores BEFORE
-        ;; any validation (a fork block's own is deferred to the reorg that
-        ;; needs it), so the gate is the only thing between a peer and an
-        ;; arbitrary body on disk under this honest header's hash.
-        (unless (%block-body-acceptable-p block chain-state peer)
+        (unless (%competing-fork-block-storable-p block entry hash height
+                                                  current-height requested
+                                                  chain-state peer)
           (return-from process-received-block nil))
         ;; Node lock: activation mutates chainstate/UTXO/mempool state
         ;; the RPC threads access under the same lock.

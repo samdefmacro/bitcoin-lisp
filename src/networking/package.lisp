@@ -398,6 +398,7 @@ headerssync.cpp. src/networking/.")
    #:find-historical-blocks-to-download
    #:request-blocks-from-peers
    #:block-download-wanted-p
+   #:block-min-pow-checked-p
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*
