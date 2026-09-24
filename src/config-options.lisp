@@ -589,10 +589,13 @@
 
 ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, since each topic
 ;; contributes two options and they produce a list of publishers rather than
-;; a start-node keyword.
+;; a start-node keyword. -zmqpub<topic> is REPEATABLE: Core reads it with
+;; GetArgs, one notifier per address (zmqnotificationinterface.cpp:59); the
+;; hwm is a scalar GetIntArg (:69).
 (dolist (topic '("hashblock" "hashtx" "rawblock" "rawtx" "sequence"))
   (register-config-option
-   (make-config-option :name (format nil "zmqpub~A" topic) :kind :global))
+   (make-config-option :name (format nil "zmqpub~A" topic) :kind :global
+                       :repeatable t))
   (register-config-option
    (make-config-option :name (format nil "zmqpub~Ahwm" topic) :kind :global)))
 

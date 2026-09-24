@@ -2,11 +2,12 @@
 
 ;;;; ZMQ notification interface (Bitcoin Core src/zmq/)
 ;;;;
-;;;; Five PUB sockets that broadcast what the node just did, so external
-;;;; software can react without polling the RPC. Each is bound to its own
-;;;; -zmqpub<topic>=<address>, and every message is three parts: the topic, the
-;;;; body, and a per-topic little-endian uint32 counter that lets a subscriber
-;;;; notice it missed something.
+;;;; PUB sockets that broadcast what the node just did, so external software
+;;;; can react without polling the RPC. There is one publisher per
+;;;; -zmqpub<topic>=<address> occurrence (a topic may name several addresses),
+;;;; and every message is three parts: the topic, the body, and that
+;;;; publisher's little-endian uint32 counter that lets a subscriber notice it
+;;;; missed something.
 ;;;;
 ;;;; libzmq is loaded LAZILY -- only when a -zmqpub* option is actually
 ;;;; configured. A host without libzmq therefore runs the node perfectly well
@@ -23,6 +24,8 @@
 still queued for a subscriber that has gone away. Core sets it to 0 immediately
 before closing (zmqpublishnotifier.cpp:186) and so do we.")
 (defconstant +zmq-sndhwm+ 23 "ZMQ_SNDHWM: outbound high-water mark.")
+(defconstant +zmq-tcp-keepalive+ 34 "ZMQ_TCP_KEEPALIVE.")
+(defconstant +zmq-ipv6+ 42 "ZMQ_IPV6: without it a tcp:// bind to an IPv6 address fails.")
 
 (defconstant +default-zmq-sndhwm+ 1000
   "Core CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM. Messages beyond this many
@@ -64,7 +67,8 @@ start."
       "libzmq not loaded"))
 
 (defstruct zmq-publisher
-  "One PUB socket for one topic at one address."
+  "One notifier: one topic at one address (Core CZMQAbstractPublishNotifier).
+Several may share a SOCKET, when their topics are bound to the same address."
   (topic "" :type string)
   (address "" :type string)
   (socket nil)
@@ -111,7 +115,13 @@ throughout."
     (when (cffi:null-pointer-p socket)
       (log-error "ZMQ: could not create a PUB socket for ~A: ~A" topic (%zmq-strerror))
       (return-from %zmq-open-publisher nil))
+    ;; Core's three socket options, in its order (zmqpublishnotifier.cpp:
+    ;; 111-135): the high-water mark, SO_KEEPALIVE, and ZMQ_IPV6 exactly when
+    ;; the address is an IPv6 one -- libzmq refuses `tcp://[::1]:port'
+    ;; otherwise, which is what interface_zmq.py's test_ipv6 binds.
     (%zmq-setsockopt-int socket +zmq-sndhwm+ hwm)
+    (%zmq-setsockopt-int socket +zmq-tcp-keepalive+ 1)
+    (%zmq-setsockopt-int socket +zmq-ipv6+ (if (%zmq-address-ipv6-p address) 1 0))
     (let ((rc (cffi:with-foreign-string (a (%zmq-bind-endpoint address))
                 (cffi:foreign-funcall "zmq_bind" :pointer socket :pointer a :int))))
       (when (minusp rc)
@@ -121,6 +131,15 @@ throughout."
         (return-from %zmq-open-publisher nil)))
     (log-info "ZMQ: publishing ~A to ~A (hwm ~D)" topic address hwm)
     (make-zmq-publisher :topic topic :address address :socket socket :hwm hwm)))
+
+(defun %zmq-address-ipv6-p (address)
+  "Core IsZMQAddressIPV6 (zmqpublishnotifier.cpp:82-92): a `tcp://' address
+whose host -- the text up to the LAST colon -- is an IPv6 address, bracketed
+as libzmq spells it (`tcp://[::1]:28332')."
+  (let ((colon (position #\: address :from-end t)))
+    (when (and colon (> colon 6) (string= "tcp://" (subseq address 0 6)))
+      (let ((host (string-trim "[]" (subseq address 6 colon))))
+        (eq :ipv6 (bl.net:parse-network-address host))))))
 
 (defun %zmq-bind-endpoint (address)
   "ADDRESS as libzmq's zmq_bind spells it.
@@ -205,25 +224,36 @@ Core does, or this blocks forever on anything still queued."
                                            :int)
           0))))
 
+(defun %zmq-publish-one (pub body)
+  "Core CZMQAbstractPublishNotifier::SendZmqMessage for one notifier: three
+frames -- topic, body, and that notifier's little-endian uint32 sequence. The
+counter advances only after a successful send, so a gap in it means a message
+was genuinely lost rather than merely renumbered."
+  (let* ((socket (zmq-publisher-socket pub))
+         (seq (zmq-publisher-sequence pub))
+         (seq-bytes (make-array 4 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4)
+      (setf (aref seq-bytes i) (ldb (byte 8 (* 8 i)) seq)))
+    (when (and (%zmq-send-frame socket
+                                (map '(vector (unsigned-byte 8)) #'char-code
+                                     (zmq-publisher-topic pub))
+                                t)
+               (%zmq-send-frame socket body t)
+               (%zmq-send-frame socket seq-bytes nil))
+      (setf (zmq-publisher-sequence pub) (ldb (byte 32 0) (1+ seq)))
+      t)))
+
 (defun zmq-publish (topic body)
-  "Publish BODY on TOPIC to whichever publisher serves it (Core
-SendZmqMessage): three frames — topic, body, and a little-endian uint32
-sequence. The counter advances only after a successful send, so a gap in it
-means a message was genuinely lost rather than merely renumbered."
-  (let ((pub (find topic *zmq-publishers* :key #'zmq-publisher-topic :test #'string=)))
-    (when (and pub (zmq-publisher-socket pub))
-      (let* ((socket (zmq-publisher-socket pub))
-             (seq (zmq-publisher-sequence pub))
-             (seq-bytes (make-array 4 :element-type '(unsigned-byte 8))))
-        (dotimes (i 4)
-          (setf (aref seq-bytes i) (ldb (byte 8 (* 8 i)) seq)))
-        (when (and (%zmq-send-frame socket
-                                    (map '(vector (unsigned-byte 8)) #'char-code topic)
-                                    t)
-                   (%zmq-send-frame socket body t)
-                   (%zmq-send-frame socket seq-bytes nil))
-          (setf (zmq-publisher-sequence pub) (ldb (byte 32 0) (1+ seq)))
-          t)))))
+  "Publish BODY on TOPIC through EVERY publisher that serves it: Core keeps
+one notifier per (topic, address) and CZMQNotificationInterface calls each in
+turn (TryForEachAndRemoveFailed, zmqnotificationinterface.cpp:115-125), each
+with its own sequence counter. Returns T when at least one send succeeded."
+  (let ((sent nil))
+    (dolist (pub *zmq-publishers* sent)
+      (when (and (string= topic (zmq-publisher-topic pub))
+                 (zmq-publisher-socket pub)
+                 (%zmq-publish-one pub body))
+        (setf sent t)))))
 
 (defun %zmq-reversed (hash)
   "Core sends every hash in DISPLAY order — reversed from internal byte order
@@ -271,24 +301,30 @@ or #\\D (block disconnected). The block events carry no counter."
 
 (defun zmq-specs-from-config (merged)
   "The publishers -zmqpub<topic>=<address> asks for, as (topic address hwm),
-in +ZMQ-TOPICS+ order. -zmqpub<topic>hwm sets that topic's high-water mark;
-Core reads it per topic, not globally (zmqnotificationinterface.cpp:69).
+in +ZMQ-TOPICS+ order and, within a topic, in the order the addresses were
+given. -zmqpub<topic> is a LIST option: Core reads it with GetArgs and makes
+one notifier per (topic, address) pair (zmqnotificationinterface.cpp:57-71),
+so `-zmqpubhashblock=A -zmqpubhashblock=B' publishes every block hash to both
+A and B. -zmqpub<topic>hwm sets that topic's high-water mark, one value for
+every address of the topic; Core reads it per topic, not globally (:69).
 
 Returns NIL when no topic is configured, which is what keeps libzmq unloaded on
 a node that does not use ZMQ."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
     (loop for topic in +zmq-topics+
-          for address = (lk (format nil "zmqpub~A" topic))
-          when (and address (plusp (length address)))
-            collect (list topic
-                          address
-                          (let ((h (lk (format nil "zmqpub~Ahwm" topic))))
-                            (if h
-                                (let ((n (conf-parse-int h)))
-                                  (when (minusp n)
-                                    (config-error "Invalid value for -zmqpub~Ahwm=~A" topic h))
-                                  n)
-                                +default-zmq-sndhwm+))))))
+          for key = (format nil "zmqpub~A" topic)
+          for addresses = (loop for (k . v) in merged
+                                when (and (string= k key) v (plusp (length v)))
+                                  collect v)
+          when addresses
+            nconc (let ((hwm (let ((h (lk (format nil "zmqpub~Ahwm" topic))))
+                               (if h
+                                   (let ((n (conf-parse-int h)))
+                                     (when (minusp n)
+                                       (config-error "Invalid value for -zmqpub~Ahwm=~A" topic h))
+                                     n)
+                                   +default-zmq-sndhwm+))))
+                    (mapcar (lambda (address) (list topic address hwm)) addresses)))))
 
 ;;;; --- Node events (Core CZMQNotificationInterface) ---
 

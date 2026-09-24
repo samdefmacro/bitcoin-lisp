@@ -1605,10 +1605,11 @@
 
 (defsection @zmq (:title "zmq: the notification sockets")
   "`src/zmq.lisp`. Core: `zmq/zmqnotificationinterface.cpp`,
-  `zmq/zmqpublishnotifier.cpp`. Five PUB sockets -- hashblock, hashtx,
-  rawblock, rawtx, sequence -- each bound by its own `-zmqpub<topic>`
-  option, each message the topic, the body and a per-topic sequence
-  counter. libzmq is loaded lazily, only when a `-zmqpub*` option is set,
+  `zmq/zmqpublishnotifier.cpp`. Five topics -- hashblock, hashtx,
+  rawblock, rawtx, sequence -- and one publisher per (topic, address)
+  pair: `-zmqpub<topic>` is a list option and may name several addresses
+  (Core's GetArgs, zmqnotificationinterface.cpp:57-71). Each message is the
+  topic, the body and that publisher's own sequence counter. libzmq is loaded lazily, only when a `-zmqpub*` option is set,
   so a host without it runs the node with ZMQ off.
 
   Invariants: the notifications are validation-interface hooks (see the
