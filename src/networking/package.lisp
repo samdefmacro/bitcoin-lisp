@@ -397,6 +397,7 @@ headerssync.cpp. src/networking/.")
    #:activate-historical-chainstate
    #:find-historical-blocks-to-download
    #:request-blocks-from-peers
+   #:block-download-wanted-p
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*

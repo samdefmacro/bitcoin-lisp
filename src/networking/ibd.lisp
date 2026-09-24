@@ -2748,6 +2748,64 @@ Asking a peer for headers here returns zero and costs a full round trip."
        (> (ibd-context-header-tip-height ctx)
           (bl.store:current-height chain-state))))
 
+(defun %equal-work-fork-to-fetch-p (peers chain-state block-store)
+  "T when some ready peer's best-known block is off our active chain, carries
+at least our tip's work and has no body here: a fork Core's
+FindNextBlocksToDownload would be fetching. Core's only work test there is
+`pindexBestKnownBlock->nChainWork < ActiveChain().Tip()->nChainWork' ->
+nothing interesting (net_processing.cpp:1407), so an EQUAL-work fork is
+downloaded and stored (AcceptBlock's fHasMoreOrSameWork, validation.cpp:4351)
+without becoming the tip. The fork's own tip is its last block to arrive
+(requests go out in ascending height), so its body stands for the branch."
+  (let ((tip (bl.store:get-block-index-entry
+              chain-state (bl.store:best-block-hash chain-state))))
+    (and tip
+         (some (lambda (peer)
+                 (let* ((hash (and (eq (peer-state peer) :ready)
+                                   (peer-best-known-block-hash peer)))
+                        (best (and hash (bl.store:get-block-index-entry
+                                         chain-state hash))))
+                   (and best
+                        (>= (bl.store:block-index-entry-chain-work best)
+                            (bl.store:block-index-entry-chain-work tip))
+                        (not (member (bl.store:block-index-entry-status best)
+                                     '(:invalid :failed-child)))
+                        (not (bl.store:entry-on-active-chain-p chain-state best))
+                        (not (%block-body-present-p chain-state block-store best)))))
+               peers))))
+
+(defun block-download-wanted-p (ctx chain-state block-store peers)
+  "Whether RUN-IBD's download loop has work: blocks are pending AND either our
+tip is below the header tip, a heavier header chain outweighs the tip, or an
+assumeutxo background chainstate is still short of its target -- or, with
+nothing pending, a peer serves an equal-work fork we have not fetched
+(%EQUAL-WORK-FORK-TO-FETCH-P).
+
+The WORK term matters: a heavier-but-SHORTER fork (tip height <= ours but
+more cumulative work) must still be downloaded, and a height-only gate would
+leave it unrequested (a most-work-chain liveness violation). Any remaining
+pending entries once the gate closes are competing-fork blocks no peer serves;
+without the gate they would pin the loop forever. A historical (assumeutxo)
+chainstate keeps the loop alive for its background cursor. The
++no-progress-yield-seconds+ exit inside the loop is the backstop for a gate
+held open by an UNOBTAINABLE chain.
+
+The equal-work arm is feature_block.py:1318: 1088 headers of a fork as heavy
+as our tip, then a wait for the getdata of its last block. The height and work
+terms both said the node was done, so the fork was never requested."
+  (let ((tip (bl.store:get-block-index-entry
+              chain-state (bl.store:best-block-hash chain-state))))
+    (or (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
+             (or (< (bl.store:current-height chain-state)
+                    (ibd-context-header-tip-height ctx))
+                 (> (ibd-context-best-header-work ctx)
+                    (if tip (bl.store:block-index-entry-chain-work tip) 0))
+                 (let ((hist (ibd-context-historical-chain-state ctx)))
+                   (and hist
+                        (< (bl.store:current-height hist)
+                           (or (bl.store:chain-state-target-height hist) 0))))))
+        (%equal-work-fork-to-fetch-p peers chain-state block-store))))
+
 (defun run-ibd (peers node-ctx)
   "Main IBD loop."
   (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects mempool address-book historical-chainstate) node-ctx
@@ -2874,34 +2932,9 @@ Asking a peer for headers here returns zero and costs a full round trip."
           ;; bounded exit below.
           (last-progress-time (get-universal-time)))
 
-      ;; Loop until either (a) the pending queue is empty, or (b) we've caught
-      ;; up to the best chain — current height >= header tip AND no heavier
-      ;; header chain outweighs our tip. The WORK term matters: a heavier-but-
-      ;; SHORTER fork (tip height <= ours but more cumulative work) must still
-      ;; be downloaded, and a height-only gate would leave it unrequested (a
-      ;; most-work-chain liveness violation). Any remaining pending entries once
-      ;; the gate closes are competing-fork blocks no peer serves; without the
-      ;; gate they'd pin the loop forever. A historical (assumeutxo) chainstate
-      ;; keeps the loop alive for its background cursor. The +no-progress-yield-
-      ;; seconds+ exit inside the body is the required backstop: the work gate
-      ;; can stay open on an UNOBTAINABLE heavier chain, and without a bounded
-      ;; exit the loop would spin forever (its pending blocks never go in-flight
-      ;; so never time out) and starve the 30s maintenance cadence.
-      (loop while (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
-                       (or (< (bl.store:current-height chain-state)
-                              (ibd-context-header-tip-height ctx))
-                           (let ((tip (bl.store:get-block-index-entry
-                                       chain-state
-                                       (bl.store:best-block-hash chain-state))))
-                             (> (ibd-context-best-header-work ctx)
-                                (if tip
-                                    (bl.store:block-index-entry-chain-work tip)
-                                    0)))
-                           (let ((hist (ibd-context-historical-chain-state ctx)))
-                             (and hist
-                                  (< (bl.store:current-height hist)
-                                     (or (bl.store:chain-state-target-height hist)
-                                         0))))))
+      ;; The gate is %BLOCK-DOWNLOAD-WANTED-P; the +no-progress-yield-seconds+
+      ;; exit inside the body is its required backstop (see there).
+      (loop while (block-download-wanted-p ctx chain-state block-store peers)
             do (let ((cycle-received (ibd-context-blocks-received ctx))
                      (cycle-requested 0))
                  (when *ibd-stop-requested*

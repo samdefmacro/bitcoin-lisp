@@ -5691,6 +5691,53 @@ behind it gets nothing on the same pass; alone, the inbound peer is asked."
                                    (list inbound) state store))))))
                 "an inbound peer with no preferred peer around is asked")))))))
 
+(test the-download-loop-fetches-an-equal-work-fork
+  "Core's FindNextBlocksToDownload gives up on a peer only when its best block
+has LESS work than our tip (net_processing.cpp:1407), so a fork exactly as
+heavy as the tip is downloaded and stored without becoming the tip. Our
+download loop ran only while the tip was below the header tip or a HEAVIER
+header chain existed, so an equal-work fork was never requested:
+feature_block.py:1318 sends 1088 headers of one and waits for the getdata of
+its last block. BLOCK-DOWNLOAD-WANTED-P now also opens for a ready peer whose
+best block is an equal-work fork we hold no body for -- and stays shut for a
+lighter fork, and for a peer at our own tip."
+  (with-temp-directory (dir "bl-equal-work-fork")
+    (with-network (:regtest)
+      (let* ((state (bl.store:make-chain-state))
+             (store (bl.store:init-block-store dir))
+             (genesis (bl.store:make-block-index-entry
+                       :hash (%bd-hash 0) :height 0 :chain-work 1 :status :valid))
+             (a1 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 1) :height 1 :chain-work 2 :status :valid
+                  :prev-entry genesis))
+             (a2 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 2) :height 2 :chain-work 3 :status :valid
+                  :prev-entry a1))
+             (b1 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 101) :height 1 :chain-work 2
+                  :status :header-valid :prev-entry genesis))
+             (b2 (bl.store:make-block-index-entry
+                  :hash (%bd-hash 102) :height 2 :chain-work 3
+                  :status :header-valid :prev-entry b1))
+             (peer (bl.net:make-peer :address "198.51.100.61" :state :ready
+                                     :conn-type :outbound-full-relay
+                                     :services (logior bl.ser:+node-network+
+                                                       bl.ser:+node-witness+))))
+        (dolist (e (list genesis a1 a2 b1 b2))
+          (bl.store:add-block-index-entry state e))
+        (bl.store:update-chain-tip state (%bd-hash 2) 2)
+        (with-ibd-context
+          (flet ((wanted-with-best (hash)
+                   (setf (bl.net:peer-best-known-block-hash peer) hash)
+                   (bl.net:block-download-wanted-p
+                    bl.net:*ibd-context* state store (list peer))))
+            (is-false (wanted-with-best (%bd-hash 2))
+                      "a peer at our own tip leaves nothing to fetch")
+            (is-false (wanted-with-best (%bd-hash 101))
+                      "a lighter fork is not fetched")
+            (is-true (wanted-with-best (%bd-hash 102))
+                     "an equal-work fork we hold no body for is fetched")))))))
+
 (test the-initial-getheaders-goes-out-once-per-peer
   "Core's SendMessages guards its initial getheaders with `!state.fSyncStarted'
 and sets that flag when one goes out (net_processing.cpp:5797-5821), so a peer
