@@ -278,3 +278,51 @@ be refused."
       (bl.store:with-coins-view-db (view legacy)
         (is-true (bl.store:coins-view-db-needs-upgrade-p view)
                  "a 'c' record is Core's pre-0.15 coins format")))))
+
+(test a-damaged-coins-database-fails-at-open
+  "Core's CDBWrapper constructor reads the obfuscation key right after DB::Open
+(dbwrapper.cpp:253), with checksums verified (:221), and writes one into a new,
+empty coins database (validation.cpp:1921 `.obfuscate = true'). The key is the
+first record, so a damaged table is found at OPEN, and InitCoinsDB's
+dbwrapper_error is `Error opening coins database' (node/chainstate.cpp:89-97).
+feature_init.py:160 overwrites 200 bytes at offset 150 of every
+chainstate/*.ldb and expects exactly that; ours opened the damaged database
+without reading it and failed later, in VerifyDB, with a bare LevelDB error.
+
+The control is the same database undamaged: it opens, and it holds the key."
+  (with-temp-directory (dir "bl-damaged-coins")
+    (let ((path (namestring (merge-pathnames "chainstate/" dir)))
+          (coin-key (bl.store:make-utxo-key
+                     (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9) 0)))
+      (bl.store:with-coins-view-db (view path)
+        (bl.store:coins-view-db-put
+         view coin-key
+         (bl.store:make-utxo-entry :value 5000000000
+                                   :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x51)
+                                   :height 1 :coinbase t)))
+      ;; Reopening turns the write-ahead log into a table file.
+      (bl.store:with-coins-view-db (view path)
+        (is-true (bl.store:coins-view-db-get view coin-key)
+                 "control: the undamaged database opens and reads back its coin"))
+      (bl.store:with-leveldb (db path)
+        (is (equalp #(8 0 0 0 0 0 0 0 0)
+                    (bl.store:leveldb-get db (coerce (list* 14 0 (map 'list #'char-code "obfuscate_key"))
+                                                     '(simple-array (unsigned-byte 8) (*)))))
+            "a new coins database holds Core's obfuscation key, the zero key"))
+      (let ((tables (directory (merge-pathnames "*.ldb" path))))
+        (is-true tables "control: the database has table files to damage")
+        (dolist (table tables)
+          (with-open-file (s table :direction :io :element-type '(unsigned-byte 8)
+                                   :if-exists :overwrite)
+            (file-position s 150)
+            (write-sequence (make-array 200 :element-type '(unsigned-byte 8)
+                                            :initial-element (char-code #\1))
+                            s))))
+      (let ((message (handler-case (progn (bl.store:close-coins-view-db
+                                           (bl.store:open-coins-view-db path))
+                                          nil)
+                       (error (e) (princ-to-string e)))))
+        (is-true (and message (search "Corruption" message))
+                 "a damaged coins database must fail at open with LevelDB's Corruption, got ~S"
+                 message)))))

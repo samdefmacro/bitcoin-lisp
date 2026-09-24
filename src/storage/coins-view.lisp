@@ -186,16 +186,68 @@ mistake is what made 4096 look like a free win.
 The original tuning problem was real — at 64 the table cache thrashes
 Table::Open/mmap/munmap on every point-Get, ~12% of IBD CPU by sb-sprof at
 h≈280k — but 1000 is well clear of that and stays inside the mmap regime, where
-cached tables cost address space rather than descriptors."
-  (make-coins-view-db
-   :db (leveldb-open-tuned
-        path
-        ;; Core gives the coins DB its own share of -dbcache and a bloom
-        ;; filter; we gave it neither, so every negative coin lookup — most of
-        ;; them during IBD, since an input's coin is checked before it is
-        ;; found — read a data block per level off disk.
-        :cache-bytes (if *cache-sizes* (cache-sizes-coins-db *cache-sizes*) 0)
-        :max-open-files 1000)))
+cached tables cost address space rather than descriptors.
+
+The open ends with Core's obfuscation-key step (%READ-OR-WRITE-OBFUSCATION-KEY),
+which is also the read that finds a damaged database at open time."
+  (let ((db (leveldb-open-tuned
+             path
+             ;; Core gives the coins DB its own share of -dbcache and a bloom
+             ;; filter; we gave it neither, so every negative coin lookup —
+             ;; most of them during IBD, since an input's coin is checked
+             ;; before it is found — read a data block per level off disk.
+             :cache-bytes (if *cache-sizes* (cache-sizes-coins-db *cache-sizes*) 0)
+             :max-open-files 1000)))
+    (handler-bind ((error (lambda (e)
+                            (declare (ignore e))
+                            (leveldb-close db))))
+      (%read-or-write-obfuscation-key db path))
+    (make-coins-view-db :db db)))
+
+(defparameter *obfuscation-key-key*
+  (let ((name (map 'list #'char-code "obfuscate_key")))
+    (coerce (list* 14 0 name) '(simple-array (unsigned-byte 8) (*))))
+  "Core's OBFUSCATION_KEY (dbwrapper.h:192), `\\000obfuscate_key', serialized as
+the std::string it is written as: a CompactSize length of 14, then the bytes.
+It sorts ahead of every coins-DB record, so it is the first key of the
+database.")
+
+(defun %read-or-write-obfuscation-key (db path)
+  "Core's CDBWrapper constructor tail for the coins DB (dbwrapper.cpp:253-261,
+`.obfuscate = true' at validation.cpp:1921): read the obfuscation key, and on a
+database that is still EMPTY write one; then log `Using obfuscation key'.
+
+The read is what makes a damaged coins database a failure at OPEN, Core's
+`Error opening coins database' (node/chainstate.cpp:89-97): the key is the
+first record, so it sits in the first block of the oldest table, and the read
+verifies that block's checksum. feature_init.py:160 overwrites 200 bytes at
+offset 150 of every chainstate/*.ldb and expects that sentence; without the
+read, our first access to a damaged table came later, in VerifyDB, and
+surfaced as a bare LevelDB error.
+
+The key we write is the all-zero one. Core draws it at random and XORs every
+value it stores with it; our coin records are our own layout (see the header
+of this file) and are stored as they are, and the zero key is exactly what
+Core uses for a database whose values are not obfuscated (Obfuscation's
+operator bool). A non-zero key -- a database whose values another writer
+obfuscated -- is refused rather than read as if it were plain."
+  (let ((stored (leveldb-get db *obfuscation-key-key* :verify-checksums t)))
+    (cond
+      (stored
+       (unless (and (= (length stored) 9) (= (aref stored 0) 8)
+                    (every #'zerop (subseq stored 1)))
+         (storage-error "~A holds an obfuscation key this node cannot apply"
+                        (namestring path))))
+      ((with-leveldb-iterator (iter db)
+         (leveldb-iter-seek-to-first iter)
+         (not (leveldb-iter-valid-p iter)))
+       (leveldb-put db *obfuscation-key-key*
+                    (make-array 9 :element-type '(unsigned-byte 8)
+                                  :initial-contents '(8 0 0 0 0 0 0 0 0)))
+       (bl.log:log-info "Wrote new obfuscation key for ~A: 0000000000000000"
+                        (string-right-trim "/" (namestring path)))))
+    (bl.log:log-info "Using obfuscation key for ~A: 0000000000000000"
+                     (string-right-trim "/" (namestring path)))))
 
 (defun close-coins-view-db (view)
   (when (cvdb-db view)
@@ -314,7 +366,9 @@ makes the question moot, which is why the caller skips it under -reindex and
 
 (defun coins-view-db-erase-all-coins (view)
   "Empty the base LevelDB: delete every coin ('C') entry AND the best-block
-('B') pointer, in bounded writebatches, keeping only the 'M' migration marker.
+('B') pointer, in bounded writebatches, keeping only the 'M' migration marker
+and the obfuscation key (Core's wiped database gets a new key from the very
+constructor that wiped it, dbwrapper.cpp:230-259).
 Used by chainstate reindex. Returns the count of COINS erased.
 
 The pointer goes with the coins, and that is the whole point rather than a
@@ -327,7 +381,7 @@ deleted 'C' keys, and a crash before the rebuild's first flush then left the
 node claiming the pre-reindex tip over an EMPTY UTXO set, with startup
 reconciliation moving chainstate.dat FORWARD onto it and logging 'Recovered'.
 
-The keep-list is explicit ('M' only) rather than a delete-'C'-only rule, so a
+The keep-list is explicit ('M' and the key) rather than a delete-'C'-only rule, so a
 prefix added later is erased by default instead of silently surviving. 'B'
 sorts before 'C', so it also leaves in the FIRST committed chunk: from the
 first commit onward a partially-wiped database names no block either."
@@ -348,7 +402,8 @@ first commit onward a partially-wiped database names no block either."
                (unless (leveldb-iter-valid-p iter) (return))
                (let ((k (leveldb-iter-key iter)))
                  (when (and (>= (length k) 1)
-                            (/= (aref k 0) +db-prefix-migration-marker+))
+                            (/= (aref k 0) +db-prefix-migration-marker+)
+                            (not (equalp k *obfuscation-key-key*)))
                    (leveldb-writebatch-delete batch k)
                    (incf pending)
                    (when (= (aref k 0) +db-prefix-coin+) (incf erased))

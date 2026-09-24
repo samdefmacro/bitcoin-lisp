@@ -479,10 +479,16 @@ destroy on unwind."
         (cffi:with-pointer-to-vector-data (vptr val)
           (%leveldb-put db wopts kptr (length key) vptr (length val) errptr))))))
 
-(defun leveldb-get (db key)
-  "Return the value for KEY as a fresh byte vector, or NIL if absent."
+(defun leveldb-get (db key &key verify-checksums)
+  "Return the value for KEY as a fresh byte vector, or NIL if absent.
+
+VERIFY-CHECKSUMS checks the table block the read lands in against its CRC, as
+Core's CDBWrapper does for every read (dbwrapper.cpp:221): a damaged block is
+then a Corruption error rather than whatever its bytes decode to."
   (declare (type (simple-array (unsigned-byte 8) (*)) key))
   (with-read-options (ropts)
+    (when verify-checksums
+      (%leveldb-readoptions-set-verify-checksums ropts 1))
     (cffi:with-foreign-object (vallen :size)
       (with-errptr (errptr)
         (cffi:with-pointer-to-vector-data (kptr key)
