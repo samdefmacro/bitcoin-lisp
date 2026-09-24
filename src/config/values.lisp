@@ -180,37 +180,32 @@ character makes -uacomment an init error, matching Core."
   "Default SOCKS5 proxy port when -proxy/-onion gives no :port (Tor's SOCKS
 port; Bitcoin Core init.cpp:1721 Lookup(..., 9050, ...)).")
 
-(defun conf-parse-proxy (value)
-  "Parse a -proxy/-onion VALUE \"ip[:port]\" into (values host port), with
-PORT defaulting to 9050. Returns NIL for \"0\" or the empty string — Core's
--noproxy / -proxy=0 'remove the proxy' convention (init.cpp:1700-1704).
-Accepts \"[ipv6]:port\" / \"[ipv6]\"; a trailing :port is only honored when it
-is all digits after a single colon, so a bare IPv6 address is host-only
-(same splitting rules as parse-node-endpoint, node/peers.lisp)."
-  (let ((v (string-trim '(#\Space #\Tab) value)))
-    (cond
-      ((or (zerop (length v)) (string= v "0")) nil)
-      ;; [ipv6]:port or [ipv6]
-      ((char= (char v 0) #\[)
-       (let ((close (position #\] v)))
-         (if close
-             (let ((host (subseq v 1 close))
-                   (rest (subseq v (1+ close))))
-               (if (and (plusp (length rest)) (char= (char rest 0) #\:)
-                        (plusp (length (subseq rest 1)))
-                        (every #'digit-char-p (subseq rest 1)))
-                   (values host (parse-integer rest :start 1))
-                   (values host +default-proxy-port+)))
-             (values v +default-proxy-port+))))
-      (t
-       (let ((colon (position #\: v :from-end t)))
-         (if (and colon
-                  (< (1+ colon) (length v))
-                  (every #'digit-char-p (subseq v (1+ colon)))
-                  ;; A single colon => host:port; multiple => bare IPv6.
-                  (= colon (position #\: v)))
-             (values (subseq v 0 colon) (parse-integer v :start (1+ colon)))
-             (values v +default-proxy-port+)))))))
+(defun conf-split-host-port (in)
+  "Core SplitHostPort (util/strencodings.cpp:72-96): IN as (VALUES host port
+valid-p). The last colon separates a port when it follows `[...]' or is the
+only colon; that port must be a decimal uint16 other than 0, or VALID-P is
+NIL. PORT is NIL when IN names none; a bracketed host loses its brackets."
+  (let* ((colon (position #\: in :from-end t))
+         (bracketed (and colon (plusp colon)
+                         (char= (char in 0) #\[) (char= (char in (1- colon)) #\])))
+         (multi (and colon (plusp colon) (position #\: in :end colon)))
+         (valid nil) (port nil))
+    (if (and colon (or (zerop colon) bracketed (not multi)))
+        (let* ((digits (subseq in (1+ colon)))
+               (n (and (plusp (length digits)) (<= (length digits) 5)
+                       (every #'digit-char-p digits)
+                       (parse-integer digits))))
+          (when (and n (<= n 65535))
+            (setf in (subseq in 0 colon)
+                  port n
+                  valid (/= n 0))))
+        (setf valid t))
+    (values (if (and (>= (length in) 2) (char= (char in 0) #\[)
+                     (char= (char in (1- (length in))) #\]))
+                (subseq in 1 (1- (length in)))
+                in)
+            port
+            valid)))
 
 (defun conf-parse-byte-units (value &optional (default-unit #\M))
   "Core ParseByteUnits (common/args.cpp): a byte count with an optional
@@ -244,7 +239,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
           ((string= v "onion") :torv3)
           ((string= v "i2p") :i2p)
           ((string= v "cjdns") :cjdns)
-          (t (config-error "Unknown network specified in -onlynet: ~S" value)))))
+          (t (config-error "Unknown network specified in -onlynet: '~A'" value)))))
 
 (defun conf-section-name (network)
   "The bitcoin.conf [section] header that scopes options to NETWORK
@@ -346,7 +341,10 @@ nothing else has already answered."
                     (and m (let ((n (parse-integer m :junk-allowed t)))
                              (and n (<= n 0))))))
           (soft-set nil))
-        (when (let ((v (lk "proxy"))) (and v (conf-parse-proxy v)))
+        ;; GetArg of the list option -proxy: its LAST value (init.cpp:786).
+        (when (let ((v (cdr (find "proxy" alist :key #'car :test #'string=
+                                                :from-end t))))
+                (and v (string/= v "") (string/= v "0")))
           (soft-set nil)))
       (let* ((listen-p (if listen (first listen) t)) ; Core DEFAULT_LISTEN
              (lo (lk "listenonion"))

@@ -258,6 +258,90 @@ needs to open new connections to randomly chosen Tor or I2P peers. Consider usin
 -proxyrandomize is disabled. Tor circuits for private broadcast connections may be ~
 correlated to other connections over Tor. For maximum privacy set -proxyrandomize=1."))))
 
+(defun %check-host-port-options (merged)
+  "Core CheckHostPortOptions (init.cpp:1215-1258), the address-valued half:
+every value of these options must split into a host and a valid port
+(SplitHostPort), a `unix:' path standing in for one where the option takes
+a socket file, and a `=<suffix>' stripped first where the option allows
+one. Otherwise `Invalid port specified in -<option>: '<value>''."
+  (loop for (name unix-p suffix-p)
+          in '(("i2psam" nil nil) ("onion" t nil) ("proxy" t t) ("bind" nil t)
+               ("rpcbind" nil nil) ("torcontrol" nil nil) ("whitebind" nil nil)
+               ("zmqpubhashblock" t nil) ("zmqpubhashtx" t nil)
+               ("zmqpubrawblock" t nil) ("zmqpubrawtx" t nil)
+               ("zmqpubsequence" t nil))
+        do (loop for (k . value) in merged
+                 when (and (string= k name) (stringp value))
+                   do (let ((hostport (if suffix-p
+                                          (subseq value 0 (or (position #\= value :from-end t)
+                                                              (length value)))
+                                          value)))
+                        (unless (or (nth-value 2 (conf-split-host-port hostport))
+                                    (and unix-p (>= (length value) 5)
+                                         (string= "unix:" value :end2 5)))
+                          (config-error "Invalid port specified in -~A: '~A'" name value))))))
+
+(defun %proxy-from-arg (option value randomize)
+  "The PROXY a -proxy or -onion address VALUE names (Core init.cpp:1718-1729,
+:1774-1783): a `unix:' socket path as given, otherwise Lookup(VALUE, 9050,
+fNameLookup) -- a literal parsed, a name resolved when -dns allows. An
+address that names nothing refuses startup with Core's sentence."
+  (if (bl.net:unix-socket-path-p value)
+      (bl.net:make-proxy :host value :port 0 :randomize-credentials randomize)
+      (multiple-value-bind (host port) (bl.net:lookup-service value +default-proxy-port+)
+        (unless host
+          (config-error "Invalid -~A address or hostname: '~A'" option value))
+        (bl.net:make-proxy :host host :port port :randomize-credentials randomize))))
+
+(defun apply-proxy-options (merged)
+  "Core's proxy block (init.cpp:1698-1800) over the merged options.
+
+Every -proxy value is `<address>[=<network>]': unsuffixed it sets the proxy
+for ipv4, ipv6, cjdns, onion AND names; `=ipv4' / `=ipv6' set that network's
+and the name proxy, `=onion' / `=cjdns' only theirs, and an address of `0'
+(or empty) removes what it names. The values apply in order, so a later one
+overrides an earlier one (`-proxy=A -proxy=B=onion' is A everywhere but
+onion). -onion then overrides the onion proxy (`0' removes it), and
+-proxyrandomize (default on) gives every proxy Tor stream-isolation
+credentials. The results land in BL.NET:*NETWORK-PROXIES*, the name proxy
+BL.NET:*PROXY* and BL.NET:*ONION-PROXY*; every one is assigned, so a second
+start in the same image inherits nothing."
+  (let* ((randomize (let ((v (cdr (assoc "proxyrandomize" merged :test #'string=))))
+                      (if v (conf-parse-bool v) t)))
+         (ipv4 nil) (ipv6 nil) (name nil) (cjdns nil) (onion nil))
+    (loop for (k . value) in merged
+          when (string= k "proxy")
+            do (let* ((eq-pos (position #\= value :from-end t))
+                      (address (subseq value 0 (or eq-pos (length value))))
+                      (net (when eq-pos
+                             (when (= (1+ eq-pos) (length value))
+                               (config-error "Invalid -proxy address or hostname, ends with '=': '~A'"
+                                             value))
+                             (string-downcase (subseq value (1+ eq-pos)))))
+                      (proxy (unless (member address '("" "0") :test #'string=)
+                               (%proxy-from-arg "proxy" address randomize))))
+                 (cond ((null net) (setf ipv4 proxy ipv6 proxy name proxy
+                                         cjdns proxy onion proxy))
+                       ((string= net "ipv4") (setf ipv4 proxy name proxy))
+                       ((string= net "ipv6") (setf ipv6 proxy name proxy))
+                       ((string= net "onion") (setf onion proxy))
+                       ((string= net "cjdns") (setf cjdns proxy))
+                       (t (config-error "Unrecognized network in -proxy='~A': '~A'"
+                                        value net)))))
+    ;; The torcontrol client only auto-configures the onion proxy from Tor's
+    ;; GETINFO when -onion was never given at all (Core's raw
+    ;; GetArg("-onion","") == "" test) -- record the raw fact.
+    (let ((v (cdr (assoc "onion" merged :test #'string=))))
+      (setf bl.net:*onion-proxy-explicit* (and v t))
+      (cond ((or (null v) (string= v "")))
+            ((string= v "0") (setf onion nil))
+            (t (setf onion (%proxy-from-arg "onion" v randomize)))))
+    (setf bl.net:*network-proxies*
+          (loop for (network proxy) on (list :ipv4 ipv4 :ipv6 ipv6 :cjdns cjdns) by #'cddr
+                when proxy nconc (list network proxy))
+          bl.net:*proxy* name
+          bl.net:*onion-proxy* onion)))
+
 (defun apply-parameter-interactions (merged)
   "The options whose value depends on ANOTHER option (Core init.cpp Step 2
 \"parameter interactions\" and the proxy / reachability block of Step 6),
@@ -314,35 +398,10 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
         (defer-log :info "parameter interaction: -connect or -maxconnections=0 set -> setting -dnsseed=0"))
       (unless (or (lk "listen") (lk "bind") (lk "whitebind"))
         (defer-log :info "parameter interaction: -connect or -maxconnections=0 set -> setting -listen=0")))
-    ;; -proxy: run ALL outbound P2P connections through a SOCKS5 proxy
-    ;; (Bitcoin Core init.cpp:1698-1762 sets it for every network).
-    ;; -noproxy / -proxy=0 clears it. -proxyrandomize (default on) enables
-    ;; Tor stream-isolation credentials (init.cpp:1698, netbase.cpp:748-810).
-    ;; -onion overrides the proxy for reaching onion services, defaulting to
-    ;; -proxy (init.cpp:1764-1790); stored for P1+, nothing dials .onion yet.
-    (let ((randomize (let ((v (lk "proxyrandomize")))
-                       (if v (conf-parse-bool v) t))))
-      (flet ((parse-proxy (value)
-               (multiple-value-bind (host port) (conf-parse-proxy value)
-                 (when host
-                   (bl.net:make-proxy
-                    :host host :port port
-                    :randomize-credentials randomize)))))
-        (let ((v (lk "proxy")))
-          (when v
-            (setf bl.net:*proxy* (parse-proxy v))))
-        (let ((v (lk "onion")))
-          ;; The torcontrol client only auto-configures the onion proxy from
-          ;; Tor's GETINFO when -onion was never given at all (Core's raw
-          ;; GetArg("-onion","") == "" test) — record the raw fact.
-          (setf bl.net:*onion-proxy-explicit* (and v t))
-          (cond (v (setf bl.net:*onion-proxy* (parse-proxy v)))
-                ;; No -onion: onion reachability follows -proxy when one was
-                ;; given (Core init.cpp:1764 "An empty string is used to not
-                ;; override the onion proxy").
-                ((lk "proxy")
-                 (setf bl.net:*onion-proxy*
-                       bl.net:*proxy*))))))
+    ;; -proxy / -onion / -i2psam: Core CheckHostPortOptions, then its
+    ;; proxy block (init.cpp:1698-1800) -- APPLY-PROXY-OPTIONS.
+    (%check-host-port-options merged)
+    (apply-proxy-options merged)
     ;; -discover (Core init.cpp:796-819, read at :1578): on unless -proxy
     ;; (a real one: "" and "0" are none, :786-787), an effective -listen=0 or
     ;; any -externalip soft-set it off; an explicit value wins either way.
@@ -350,7 +409,9 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
     ;; run's.
     (setf bl.net:*discover*
           (let ((explicit (lk "discover"))
-                (proxy (lk "proxy")))
+                ;; GetArg of the list option: its LAST value (init.cpp:786).
+                (proxy (cdr (find "proxy" merged :key #'car :test #'string=
+                                                 :from-end t))))
             (cond (explicit (conf-parse-bool explicit))
                   ((and proxy (string/= proxy "") (string/= proxy "0"))
                    (defer-log :info "parameter interaction: -proxy set -> setting -discover=0")
@@ -393,7 +454,7 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
       ;; step removes either.
       (unless bl.net:*cjdns-reachable*
         (when (member :cjdns onlynets)
-          (config-error "-onlynet=cjdns given without -cjdnsreachable"))
+          (config-error "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided"))
         (setf nets (remove :cjdns nets)))
       ;; PRIVACY: requesting DNS seeds entails clearnet. Resolving a seed
       ;; hostname is a plaintext DNS query to the local resolver, and the
@@ -416,12 +477,16 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
           ;; the Tor route; otherwise -listenonion may still deliver a proxy
           ;; later via the torcontrol connection.
           (cond ((lk "onion")
-                 (config-error "-onlynet=onion given but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
+                 (config-error "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
                 ((not listenonion-p)
-                 (config-error "-onlynet=onion given but no Tor route is configured: none of -proxy, -onion or -listenonion is given"))))
+                 (config-error "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is not provided: none of -proxy, -onion or -listenonion is given"))))
         (setf nets (remove :torv3 nets)))
       (when (member :i2p onlynets)
-        (config-error "-onlynet=i2p given but I2P (SAM) is not supported"))
+        ;; Core's sentence when -i2psam is absent (init.cpp:2239-2243); with
+        ;; it, ours still refuses, since no SAM session is ported.
+        (if bl.net:*i2p-sam-proxy*
+            (config-error "-onlynet=i2p given but I2P (SAM) is not supported")
+            (config-error "Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided")))
       (setf nets (remove :i2p nets))
       (setf bl.net:*reachable-networks* nets)
       (setf *private-broadcast*

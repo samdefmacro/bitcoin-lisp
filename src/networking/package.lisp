@@ -46,6 +46,10 @@ headerssync.cpp. src/networking/.")
    #:v2-available-p
    ;; SOCKS5 outbound proxy (Core netbase.cpp Socks5)
    #:*proxy*
+   #:*network-proxies*
+   #:network-proxy
+   #:unix-socket-path-p
+   #:lookup-service
    #:*onion-proxy*
    #:*i2p-sam-proxy*
    #:proxy

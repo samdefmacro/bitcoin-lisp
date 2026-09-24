@@ -222,10 +222,11 @@ GetProxy(target network), table built by init.cpp:1696-1801). Returns
     not happen at all — falling through to a raw dial would leak the onion
     name to local DNS;
   - a .b32.i2p target is always refused (no SAM transport until P4);
-  - everything else — IPv4/IPv6/CJDNS literals and hostnames — uses *proxy*
-    (NIL = direct dial). Matches Core, where an unsuffixed -proxy covers
-    IPv4/IPv6/CJDNS/name lookups (init.cpp:1735) and CJDNS without a proxy
-    is ordinary TCP to the fc00::/8 address."
+  - an IPv4/IPv6/CJDNS literal uses its network's proxy (NETWORK-PROXY) and
+    a hostname the name proxy, *proxy* (NIL = direct dial). Matches Core,
+    where an unsuffixed -proxy covers IPv4/IPv6/CJDNS/name lookups
+    (init.cpp:1735), a suffixed one only its network, and CJDNS without a
+    proxy is ordinary TCP to the fc00::/8 address."
   (cond ((parse-onion-address host)
          (if *onion-proxy*
              (values *onion-proxy* nil)
@@ -236,7 +237,11 @@ GetProxy(target network), table built by init.cpp:1696-1801). Returns
         ;; Core's NET_UNROUTABLE has no proxy registered for it. See
         ;; %TARGET-UNROUTABLE-P.
         ((%target-unroutable-p host) (values nil nil))
-        (t (values *proxy* nil))))
+        ;; An address literal takes its own network's proxy (Core ConnectNode
+        ;; GetProxy(addrConnect.GetNetwork()), net.cpp:449-452); a name the
+        ;; name proxy (:474-480), which resolves it.
+        (t (let ((network (parse-network-address host)))
+             (values (if network (network-proxy network) *proxy*) nil)))))
 
 ;;;; Base32 (Core util/strencodings.cpp:144-200)
 ;;;

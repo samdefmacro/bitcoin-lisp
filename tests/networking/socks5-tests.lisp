@@ -490,24 +490,20 @@ of being resolved locally (Core net.cpp:2353-2358 AddAddrFetch)."
 
 ;;; --- config wiring ----------------------------------------------------------------
 
-(test conf-parse-proxy-forms
-  "-proxy value parsing: default port 9050, explicit port, \"0\" clears,
-bracketed IPv6."
-  (multiple-value-bind (host port) (bl.cfg:conf-parse-proxy "127.0.0.1")
-    (is (equal "127.0.0.1" host))
-    (is (= 9050 port)))
-  (multiple-value-bind (host port)
-      (bl.cfg:conf-parse-proxy "127.0.0.1:9150")
-    (is (equal "127.0.0.1" host))
-    (is (= 9150 port)))
-  (is (null (bl.cfg:conf-parse-proxy "0")))
-  (is (null (bl.cfg:conf-parse-proxy "")))
-  (multiple-value-bind (host port) (bl.cfg:conf-parse-proxy "[::1]:9150")
-    (is (equal "::1" host))
-    (is (= 9150 port)))
-  (multiple-value-bind (host port) (bl.cfg:conf-parse-proxy "[::1]")
-    (is (equal "::1" host))
-    (is (= 9050 port))))
+(test conf-split-host-port-is-cores-split-host-port
+  "Core SplitHostPort (util/strencodings.cpp:72-96), which CheckHostPortOptions
+and every host:port option read: the last colon is a port separator after
+`[...]' or when it is the only colon, the port must be a uint16 other than
+0, and a bare IPv6 address has no port."
+  (flet ((split (in) (multiple-value-list (bl.cfg:conf-split-host-port in))))
+    (is (equal '("127.0.0.1" nil t) (split "127.0.0.1")))
+    (is (equal '("127.0.0.1" 9150 t) (split "127.0.0.1:9150")))
+    (is (equal '("::1" 9150 t) (split "[::1]:9150")))
+    (is (equal '("::1" nil t) (split "[::1]")))
+    (is (equal '("::1" nil t) (split "::1")) "several colons: no port")
+    (is (equal '("192.0.0.1:def" nil nil) (split "192.0.0.1:def")))
+    (is (equal '("h" 0 nil) (split "h:0")) "port 0 is invalid")
+    (is (equal '("h:65536" nil nil) (split "h:65536")))))
 
 (test apply-config-globals-proxy
   "-proxy sets networking's *proxy* (randomize default on), -proxyrandomize=0
@@ -515,6 +511,7 @@ disables isolation, -noproxy/-proxy=0 clears, -onion overrides and defaults
 to -proxy."
   (let ((old-proxy bl.net:*proxy*)
         (old-onion bl.net:*onion-proxy*)
+        (bl.net:*network-proxies* bl.net:*network-proxies*)
         ;; apply-config-globals also recomputes the reachable-network set
         ;; (onion follows the proxy) — keep that from leaking out of the test.
         (bl.net:*reachable-networks*
@@ -552,6 +549,80 @@ to -proxy."
           (is (null bl.net:*proxy*)))
       (setf bl.net:*proxy* old-proxy
             bl.net:*onion-proxy* old-onion))))
+
+(defmacro %with-proxy-globals (&body body)
+  "BODY with every global APPLY-CONFIG-GLOBALS sets for -proxy / -onion /
+-onlynet bound, so nothing leaks into later tests."
+  `(let ((bl.net:*proxy* nil) (bl.net:*network-proxies* nil)
+         (bl.net:*onion-proxy* nil) (bl.net:*onion-proxy-explicit* nil)
+         (bl.net:*reachable-networks* bl.net:*reachable-networks*)
+         (bl.net:*cjdns-reachable* bl.net:*cjdns-reachable*)
+         (bl.net:*onlynet-networks* bl.net:*onlynet-networks*))
+     ,@body))
+
+(defun %proxy-config-error (args)
+  "The message APPLY-CONFIG-GLOBALS refuses the command line ARGS with, or NIL."
+  (handler-case (progn (apply-config-globals (bl.cfg:parse-cli-args args)) nil)
+    (error (e) (princ-to-string e))))
+
+(test proxy-values-apply-per-network-in-order
+  "-proxy is a list option whose values may carry a `=<network>' suffix
+(Core init.cpp:1706-1757): unsuffixed it covers ipv4, ipv6, cjdns, onion and
+names; `=ipv4' / `=ipv6' set that network and the name proxy; `=onion' and
+`=cjdns' only theirs; an address of 0 removes; later values override
+earlier ones. feature_proxy.py:476-504 reads each network's proxy back from
+getnetworkinfo. Ours read ONE -proxy for everything."
+  (%with-proxy-globals
+    (flet ((host (network)
+             (let ((p (if (eq network :torv3)
+                          bl.net:*onion-proxy*
+                          (bl.net:network-proxy network))))
+               (and p (format nil "~A:~D" (bl.net:proxy-host p) (bl.net:proxy-port p)))))
+           (apply-args (&rest args)
+             (apply-config-globals (bl.cfg:parse-cli-args args))))
+      (apply-args "-proxy=127.6.6.6:6666=ipv6")
+      (is (null (host :ipv4)))
+      (is (equal "127.6.6.6:6666" (host :ipv6)))
+      (is (equal "127.6.6.6" (bl.net:proxy-host bl.net:*proxy*)) "=ipv6 sets the name proxy too")
+      (apply-args "-proxy=127.4.4.4:4444=ipv4" "-proxy=127.6.6.6:6666=ipv6")
+      (is (equal "127.4.4.4:4444" (host :ipv4)))
+      (is (equal "127.6.6.6:6666" (host :ipv6)))
+      (apply-args "-proxy=127.1.1.1:1111" "-proxy=127.2.2.2:2222=onion")
+      (is (equal "127.1.1.1:1111" (host :ipv4)))
+      (is (equal "127.1.1.1:1111" (host :cjdns)))
+      (is (equal "127.2.2.2:2222" (host :torv3)))
+      (apply-args "-proxy=127.1.1.1:1111" "-proxy=0=cjdns")
+      (is (equal "127.1.1.1:1111" (host :ipv6)))
+      (is (equal "127.1.1.1:1111" (host :torv3)))
+      (is (null (host :cjdns)) "-proxy=0=cjdns removes the cjdns proxy")
+      ;; An IP literal is dialed through its own network's proxy.
+      (apply-args "-proxy=127.6.6.6:6666=ipv6")
+      (is (null (bl.net:proxy-for-target "8.8.8.8")))
+      (is-true (bl.net:proxy-for-target "2001:4860::8888"))
+      ;; A `unix:' path is a proxy, reported as given (netbase.h Proxy).
+      (apply-args "-proxy=unix:/tmp/bl-socks.sock")
+      (is (equal "unix:/tmp/bl-socks.sock" (bl.net:proxy-host (bl.net:network-proxy :ipv4)))))))
+
+(test proxy-option-errors-are-cores
+  "Each malformed -proxy / -onion / -i2psam / -onlynet refuses startup with
+Core's sentence (init.cpp:1215-1258 CheckHostPortOptions, :1706-1800,
+:2232-2243, :1529-1545); feature_proxy.py:405-474 matches each exactly."
+  (%with-proxy-globals
+    (dolist (case '((("-proxy=192.0.0.1:def") "Invalid port specified in -proxy: '192.0.0.1:def'")
+                    (("-onion=192.0.0.1:def") "Invalid port specified in -onion: '192.0.0.1:def'")
+                    (("-i2psam=192.0.0.1:def") "Invalid port specified in -i2psam: '192.0.0.1:def'")
+                    (("-proxy=abc..abc:23456") "Invalid -proxy address or hostname: 'abc..abc:23456'")
+                    (("-onion=xyz..xyz:23456") "Invalid -onion address or hostname: 'xyz..xyz:23456'")
+                    (("-proxy=127.0.0.1:9050=") "Invalid -proxy address or hostname, ends with '=': '127.0.0.1:9050='")
+                    (("-proxy=127.0.0.1:9050=foo") "Unrecognized network in -proxy='127.0.0.1:9050=foo': 'foo'")
+                    (("-onlynet=cjdns") "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided")
+                    (("-onlynet=onion" "-onion=0") "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is explicitly forbidden: -onion=0")
+                    (("-onlynet=abc") "Unknown network specified in -onlynet: 'abc'")))
+      (destructuring-bind (args expected) case
+        (is (equal expected (%proxy-config-error args)) "~{~A ~}" args)))
+    ;; The positive control: well-formed values start.
+    (is (null (%proxy-config-error '("-proxy=127.0.0.1:9050" "-onion=[::1]:9150"
+                                     "-proxy=unix:/tmp/x.sock=onion"))))))
 
 (test onion-zero-disables-tor-dialing
   "-onion=0 (or -noonion) disables onion dialing even with -proxy set (Core
@@ -604,8 +675,11 @@ any private network.
 
 Hostnames keep the proxy on purpose — Core routes name lookups through it
 precisely so the name does not leak to local DNS."
-  (let ((bl.net:*proxy*
-          (bl.net:make-proxy :host "127.0.0.1" :port 1)))
+  (let* ((bl.net:*proxy*
+           (bl.net:make-proxy :host "127.0.0.1" :port 1))
+         ;; An unsuffixed -proxy: every IP network's proxy too (init.cpp:1735).
+         (bl.net:*network-proxies* (list :ipv4 bl.net:*proxy* :ipv6 bl.net:*proxy*
+                                         :cjdns bl.net:*proxy*)))
     (dolist (direct '("127.0.0.1" "127.5.5.5" "10.0.0.1" "172.16.0.1"
                       "192.168.1.5" "169.254.1.1" "100.64.0.1" "::1"
                       "fe80::1"))
@@ -624,7 +698,7 @@ precisely so the name does not leak to local DNS."
     ;; The positive control: with no proxy configured, everything is direct,
     ;; so a test that only asserted NIL above would pass against a broken
     ;; classifier.
-    (let ((bl.net:*proxy* nil))
+    (let ((bl.net:*proxy* nil) (bl.net:*network-proxies* nil))
       (is (null (bl.net:proxy-for-target "8.8.8.8"))))))
 
 (test proxy-soft-defaults-listen-off
@@ -713,3 +787,65 @@ resolve. A gate that refused every dial would fail them."
                               :proxy-port 9050 :name-lookup t)))
     (is (and (consp consulted) (eq :signalled (first consulted)))
         "with -dns=1 the proxy's own name is resolved, got ~S" consulted)))
+
+(test an-ipv6-literal-is-dialed-without-the-resolver
+  "An address literal is parsed, never resolved (Core Lookup, netbase.cpp:
+181-190). usocket hands even `::1' to getaddrinfo with AI_ADDRCONFIG, which
+refuses it with EAI_ADDRFAMILY where the loopback is the only IPv6 address --
+every container -- so a node given `-proxy=[::1]:port' never reached its proxy
+and feature_proxy.py waited on it until its time-out. Both spellings the dial
+sees, bare and bracketed, must connect to a listener on ::1."
+  (let ((srv (make-instance 'sb-bsd-sockets:inet6-socket :type :stream :protocol :tcp))
+        (old-proxy bl.net:*proxy*))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address srv) t)
+           (sb-bsd-sockets:socket-bind srv (sb-bsd-sockets:make-inet6-address "::1") 0)
+           (sb-bsd-sockets:socket-listen srv 4)
+           (setf bl.net:*proxy* nil)
+           (let ((port (nth-value 1 (sb-bsd-sockets:socket-name srv))))
+             (is-true (%dial-verdict "::1" port) "the bare literal connects")
+             (is-true (%dial-verdict "[::1]" port) "and so does the bracketed one")))
+      (setf bl.net:*proxy* old-proxy)
+      (sb-bsd-sockets:socket-close srv))))
+
+(test a-unix-socket-proxy-is-dialed-over-its-socket-file
+  "`-proxy=unix:<path>' names a SOCKS5 proxy listening on a socket file
+(Core IsUnixSocketPath and Proxy::Connect, netbase.cpp:226-242, :666-690).
+Ours handed the path to the resolver and never reached the proxy;
+feature_proxy.py's node 5 waited on it until the test's time-out. The dial
+must reach a unix-socket SOCKS5 server and complete the CONNECT."
+  (let* ((path (format nil "/tmp/bl-socks-~D.sock" (random 1000000)))
+         (srv (make-instance 'sb-bsd-sockets:local-socket :type :stream))
+         (seen nil))
+    (ignore-errors (delete-file path))
+    (sb-bsd-sockets:socket-bind srv path)
+    (sb-bsd-sockets:socket-listen srv 1)
+    (let ((thread
+            (bt:make-thread
+             (lambda ()
+               (let* ((client (sb-bsd-sockets:socket-accept srv))
+                      (s (sb-bsd-sockets:socket-make-stream
+                          client :input t :output t :element-type '(unsigned-byte 8))))
+                 (unwind-protect
+                      (flet ((rd (n) (let ((v (make-array n :element-type '(unsigned-byte 8))))
+                                       (read-sequence v s) v))
+                             (wr (bytes) (write-sequence (coerce bytes '(vector (unsigned-byte 8))) s)
+                               (force-output s)))
+                        (rd 3) (wr #(5 0))          ; greeting: no auth
+                        (let ((head (rd 5)))        ; 05 01 00 03 len
+                          (setf seen (map 'string #'code-char (rd (aref head 4))))
+                          (rd 2))
+                        (wr #(5 0 0 1 10 0 0 1 #x20 #x8d)))
+                   (ignore-errors (sb-bsd-sockets:socket-close client)))))
+             :name "unix-socks5-server")))
+      (unwind-protect
+           (%with-proxy-globals
+             (setf bl.net:*proxy* (bl.net:make-proxy :host (format nil "unix:~A" path)
+                                                     :port 0 :randomize-credentials nil))
+             (is-true (%dial-verdict "node.example" 8333)
+                      "the dial must reach the proxy over its socket file")
+             (bt:join-thread thread)
+             (is (equal "node.example" seen)))
+        (sb-bsd-sockets:socket-close srv)
+        (ignore-errors (delete-file path))))))

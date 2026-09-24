@@ -1930,6 +1930,8 @@ and interface_bitcoin_cli.py:238 expects `127.0.0.1:9050 (ipv4, ipv6, onion,
 cjdns), 127.0.0.1:7656 (i2p)'. The list used to be one entry named after the
 chain, with no proxy at all."
   (let* ((bl.net:*proxy* (bl.net:make-proxy :host "127.0.0.1" :port 9050))
+         (bl.net:*network-proxies* (list :ipv4 bl.net:*proxy* :ipv6 bl.net:*proxy*
+                                         :cjdns bl.net:*proxy*))
          (bl.net:*onion-proxy* bl.net:*proxy*)
          (bl.net:*i2p-sam-proxy* "127.0.0.1:7656")
          (bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3))
@@ -1945,7 +1947,8 @@ chain, with no proxy at all."
       (is (equal (list nil nil nil t t)
                  (mapcar (lambda (e) (eq t (field e "limited"))) networks)))))
   ;; Without a proxy every proxy is the empty string, as in Core.
-  (let* ((bl.net:*proxy* nil) (bl.net:*onion-proxy* nil) (bl.net:*i2p-sam-proxy* nil)
+  (let* ((bl.net:*proxy* nil) (bl.net:*network-proxies* nil)
+         (bl.net:*onion-proxy* nil) (bl.net:*i2p-sam-proxy* nil)
          (networks (cdr (assoc "networks" (bl.rpc:dispatch-rpc-method (make-test-node) "getnetworkinfo" nil)
                                :test #'string=))))
     (is (every (lambda (e) (equal "" (cdr (assoc "proxy" e :test #'string=)))) networks))

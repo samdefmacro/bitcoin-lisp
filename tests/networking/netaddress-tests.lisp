@@ -315,11 +315,13 @@ dialability (it is applied separately, via reachable-network-p)."
 (test proxy-for-target-per-network
   "Per-target-network proxy pick (Core ConnectNode, net.cpp:449): .onion =>
 *onion-proxy* (refused when none — never raw-dialed/DNS-leaked); .b32.i2p
-=> always refused; everything else => *proxy* (NIL = direct dial)."
+=> always refused; an IP literal => its network's proxy, a name => *proxy*
+(NIL = direct dial)."
   (let ((tor (bl.net:make-proxy :host "10.0.0.2" :port 9051))
         (all (bl.net:make-proxy :host "10.0.0.1" :port 9050)))
     ;; Onion with a Tor proxy configured.
     (let ((bl.net:*proxy* all)
+          (bl.net:*network-proxies* (list :ipv4 all :ipv6 all :cjdns all))
           (bl.net:*onion-proxy* tor))
       (multiple-value-bind (proxy refusal)
           (bl.net:proxy-for-target +onion-str-1+)
@@ -347,6 +349,7 @@ dialability (it is applied separately, via reachable-network-p)."
         (is (stringp refusal))))
     ;; No proxies at all: onion refused, clearnet/cjdns dial direct.
     (let ((bl.net:*proxy* nil)
+          (bl.net:*network-proxies* nil)
           (bl.net:*onion-proxy* nil))
       (multiple-value-bind (proxy refusal)
           (bl.net:proxy-for-target +onion-str-1+)

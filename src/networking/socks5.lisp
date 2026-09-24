@@ -25,11 +25,25 @@ puts each peer connection on its own circuit."
   (randomize-credentials t :type boolean))
 
 (defvar *proxy* nil
-  "The configured outbound SOCKS5 proxy (a PROXY struct), or NIL for direct
-connections. Set from -proxy by apply-config-globals (node/args.lisp); applies to
+  "The NAME proxy (Core SetNameProxy/HaveNameProxy): the SOCKS5 proxy (a PROXY
+struct) a hostname is handed to instead of the local resolver, or NIL. An
+address literal goes through its network's proxy, *NETWORK-PROXIES*. Set from -proxy by apply-config-globals (node/args.lisp); applies to
 ALL outbound P2P connections (Core init.cpp:1698-1762 sets it for every
 network). When set, make-tcp-connection dials the proxy and tunnels via
 SOCKS5, and discover-peers stops resolving DNS seeds locally.")
+
+(defvar *network-proxies* '()
+  "The proxy for each IP network, as a plist (:ipv4 P :ipv6 P :cjdns P) --
+Core's proxyInfo table (netbase.cpp:45, SetProxy/GetProxy) for the networks
+-proxy covers. An unsuffixed -proxy sets all three; `-proxy=<addr>=ipv4',
+`=ipv6' and `=cjdns' set one each, and `-proxy=0=cjdns' removes one
+(init.cpp:1706-1757). *PROXY* is the NAME proxy beside it, and .onion has
+*ONION-PROXY*.")
+
+(defun network-proxy (network)
+  "The proxy an address on NETWORK (:ipv4 :ipv6 :cjdns) is dialed through, or
+NIL for a direct dial (Core GetProxy)."
+  (getf *network-proxies* network))
 
 (defvar *onion-proxy* nil
   "The SOCKS5 proxy (a PROXY struct) for reaching Tor onion services, or NIL.

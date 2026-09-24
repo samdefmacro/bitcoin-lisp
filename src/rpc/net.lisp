@@ -410,22 +410,25 @@ whatever the cadence is."
       ("warnings" . ,(bl.log:warnings-for-rpc)))))
 
 (defun %proxy-string (proxy)
-  "Core Proxy::ToString for an IP proxy: host:port, an IPv6 host bracketed."
+  "Core Proxy::ToString (netbase.h:223-229): a `unix:' proxy is its path as
+given, with no port; an IP one host:port, an IPv6 host bracketed."
   (let ((host (bl.net:proxy-host proxy)))
-    (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host (bl.net:proxy-port proxy))))
+    (cond ((bl.net:unix-socket-path-p host) host)
+          ((find #\: host) (format nil "[~A]:~D" host (bl.net:proxy-port proxy)))
+          (t (format nil "~A:~D" host (bl.net:proxy-port proxy))))))
 
 (defun %networks-info ()
   "Core GetNetworksInfo (rpc/net.cpp:614-631): one entry per network a peer
 can be on -- ipv4, ipv6, onion, i2p, cjdns, in Core's enum order -- with its
-reachability and the proxy that reaches it. -proxy serves ipv4, ipv6 and cjdns
-(init.cpp:1734-1757), the onion proxy (-onion, or -proxy) serves onion, and
--i2psam is i2p's. The list used to hold ONE entry named after the CHAIN, so
+reachability and the proxy that reaches it: each IP network's own
+(BL.NET:NETWORK-PROXY -- -proxy, or its `=<network>' form, init.cpp:1706-1757),
+the onion proxy (-onion, or -proxy) for onion, and -i2psam for i2p. The list used to hold ONE entry named after the CHAIN, so
 nothing reading it -- bitcoin-cli -getinfo's Proxies line, -netinfo's
 counts table (bitcoin-cli.cpp:611-627) -- found a network in it."
   (loop for (network name) in '((:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
                                 (:i2p "i2p") (:cjdns "cjdns"))
         collect (let ((proxy (case network
-                               ((:ipv4 :ipv6 :cjdns) bl.net:*proxy*)
+                               ((:ipv4 :ipv6 :cjdns) (bl.net:network-proxy network))
                                (:torv3 bl.net:*onion-proxy*)))
                       (reachable (bl.net:reachable-network-p network)))
                   `(("name" . ,name)

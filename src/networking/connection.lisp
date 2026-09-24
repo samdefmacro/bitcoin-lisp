@@ -312,8 +312,58 @@ resolves under fNameLookup at init.cpp:1722. The -dns half is this flag. An
 address literal is never a lookup, in Core (Lookup parses it first) or here."
   (when (and (not *name-lookup*)
              (stringp host)
-             (not (string-to-ip-bytes host)))
+             (not (string-to-ip-bytes host))
+             (not (unix-socket-path-p host)))
     "-dns=0 forbids resolving a name locally"))
+
+(defconstant +unix-socket-path-max+ 108
+  "sizeof(sockaddr_un::sun_path) on Linux, the bound Core's IsUnixSocketPath
+checks a `unix:' path against (netbase.cpp:226-242).")
+
+(defun unix-socket-path-p (name)
+  "Core IsUnixSocketPath (netbase.cpp:226-242): NAME is `unix:<path>' and the
+path, with its terminating NUL, fits in a sockaddr_un. Such a -proxy or
+-onion names a SOCKS5 proxy listening on that socket file."
+  (and (stringp name)
+       (>= (length name) 5)
+       (string= "unix:" name :end2 5)
+       (<= (+ (- (length name) 5) 1) +unix-socket-path-max+)))
+
+(defun lookup-service (spec default-port)
+  "Core Lookup(SPEC, DEFAULT-PORT, fNameLookup) (netbase.cpp:195-215) for one
+address: split SPEC into host and port, parse an address literal, and
+resolve a name only when -dns allows it (*NAME-LOOKUP*). Returns (VALUES
+host port) with HOST the address's text (an IPv6 one without brackets), or
+NIL when SPEC names nothing -- which -proxy, -onion and -i2psam report as
+`Invalid -<option> address or hostname' (init.cpp:1719-1726, :1776-1781,
+:2233-2236)."
+  (multiple-value-bind (host port) (split-host-port spec default-port)
+    (let ((ip (or (string-to-ip-bytes host)
+                  (and *name-lookup*
+                       (plusp (length host))
+                       (let ((resolved (ignore-errors
+                                        (car (usocket:get-hosts-by-name host)))))
+                         (case (length resolved)
+                           (4 (apply #'ipv4-to-mapped-ipv6 (coerce resolved 'list)))
+                           (16 (coerce resolved '(simple-array (unsigned-byte 8) (16))))))))))
+      (when (and ip (<= 1 port 65535) (notevery #'zerop ip))
+        (values (ip-bytes-to-string ip) port)))))
+
+(defun %dial-host-address (host)
+  "HOST's address as SB-BSD-SOCKETS:SOCKET-CONNECT takes it: 4 octets for
+IPv4, 16 for IPv6. An address LITERAL is parsed here and never handed to the
+resolver, as Core's Lookup parses a numeric host before any name lookup
+(netbase.cpp:181-190). usocket resolves even `::1' through getaddrinfo with
+AI_ADDRCONFIG, which glibc refuses with EAI_ADDRFAMILY on a host whose only
+IPv6 address is the loopback, so every dial to an IPv6 literal -- a
+`-proxy=[::1]:port' proxy above all -- failed before it left the machine
+(feature_proxy.py's node 3 never reached its proxy, and the test waited on
+it until its time-out)."
+  (let ((ip (and (stringp host) (string-to-ip-bytes (string-trim "[]" host)))))
+    (cond ((null ip)
+           (car (usocket:get-hosts-by-name (usocket:host-to-hostname host))))
+          ((ipv4-mapped-p ip) (subseq ip 12))
+          (t ip))))
 
 (defun %socket-connect (host port timeout)
   "Open a TCP stream socket to HOST:PORT within TIMEOUT seconds, returning a
@@ -334,7 +384,10 @@ failed connect."
   #-sbcl (usocket:socket-connect host port :element-type '(unsigned-byte 8)
                                            :timeout timeout)
   #+sbcl
-  (let* ((remote (car (usocket:get-hosts-by-name (usocket:host-to-hostname host))))
+  (when (unix-socket-path-p host)
+    (return-from %socket-connect (%unix-socket-connect (subseq host 5) timeout)))
+  #+sbcl
+  (let* ((remote (%dial-host-address host))
          (sock (make-instance (if (= 16 (length remote))
                                   'sb-bsd-sockets:inet6-socket
                                   'sb-bsd-sockets:inet-socket)
@@ -375,6 +428,31 @@ failed connect."
              (error 'usocket:connection-refused-error :socket nil))
            (sb-bsd-sockets:socket-error ()
              (error 'usocket:socket-error :socket nil)))
+      (unless done
+        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
+#+sbcl
+(defun %unix-socket-connect (path timeout)
+  "Open a stream socket to the unix-domain socket file PATH, as a usocket
+STREAM-USOCKET like %SOCKET-CONNECT's -- Core's Proxy::Connect for a
+`unix:' proxy (netbase.cpp:666-690, ConnectDirectly over AF_UNIX). A missing
+or refusing socket file is USOCKET:CONNECTION-REFUSED-ERROR."
+  (let ((sock (make-instance 'sb-bsd-sockets:local-socket :type :stream))
+        (done nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (sb-bsd-sockets:socket-connect sock path)
+               (prog1 (make-instance
+                       'usocket:stream-usocket
+                       :socket sock
+                       :stream (sb-bsd-sockets:socket-make-stream
+                                sock :input t :output t :buffering :full
+                                     :element-type '(unsigned-byte 8)
+                                     :timeout timeout :serve-events nil))
+                 (setf done t)))
+           (sb-bsd-sockets:socket-error ()
+             (error 'usocket:connection-refused-error :socket nil)))
       (unless done
         (ignore-errors (sb-bsd-sockets:socket-close sock))))))
 

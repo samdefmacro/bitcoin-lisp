@@ -588,6 +588,7 @@ init.cpp:1688-1693, long before it looks for -i2psam (:2240-2245), so
         (bl.net:*onlynet-networks* bl.net:*onlynet-networks*)
         (bl.net:*onion-proxy-explicit* nil)
         (bl.net:*proxy* nil)
+        (bl.net:*network-proxies* nil)
         (bl.net:*onion-proxy* nil)
         (bl:*dns-seed-enabled* bl:*dns-seed-enabled*))
     (flet ((message (alist)
@@ -595,8 +596,10 @@ init.cpp:1688-1693, long before it looks for -i2psam (:2240-2245), so
                (error (e) (princ-to-string e)))))
       (is (search "Incompatible options: -dnsseed=1 was explicitly specified"
                   (or (message '(("dnsseed" . "1") ("onlynet" . "i2p"))) "")))
-      ;; Without the explicit -dnsseed=1 the I2P refusal is still the answer.
-      (is (search "I2P" (or (message '(("onlynet" . "i2p"))) ""))))))
+      ;; Without the explicit -dnsseed=1 the I2P refusal is still the answer,
+      ;; in Core's words (init.cpp:2239-2243).
+      (is (search "restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
+                  (or (message '(("onlynet" . "i2p"))) ""))))))
 
 ;;; --- G7-03: -onlynet clearnet exclusion must disable DNS seeding ------------
 ;;;

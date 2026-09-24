@@ -312,7 +312,9 @@
 (define-option "signetseednode" :repeatable t)
 ;; -proxy / -onion / -proxyrandomize / -onlynet / -cjdnsreachable form one
 ;; interaction (each reads the others): APPLY-PARAMETER-INTERACTIONS.
-(define-option "proxy")
+;; -proxy is a LIST option (Core GetArgs, init.cpp:1706): each value may
+;; carry a `=<network>' suffix and they apply in order.
+(define-option "proxy" :repeatable t)
 (define-option "onion")
 (define-option "proxyrandomize")
 ;; -i2psam is accepted and NOT implemented -- a core-only row, so startup still
@@ -325,7 +327,13 @@
            (setf bl.net:*i2p-sam-proxy*
                  (let ((v (car (last values))))
                    (when (and v (plusp (length v)))
-                     (multiple-value-bind (host port) (bl.net:split-host-port v 7656)
+                     ;; CheckHostPortOptions first (init.cpp:1228-1257), then
+                     ;; Lookup(-i2psam, 7656, fNameLookup), :2233-2236.
+                     (unless (nth-value 2 (bl.cfg:conf-split-host-port v))
+                       (config-error "Invalid port specified in -i2psam: '~A'" v))
+                     (multiple-value-bind (host port) (bl.net:lookup-service v 7656)
+                       (unless host
+                         (config-error "Invalid -i2psam address or hostname: '~A'" v))
                        (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)))))))
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")

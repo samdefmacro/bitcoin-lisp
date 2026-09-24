@@ -700,6 +700,16 @@
   does NOT gate the DNS seeds; those are `-dnsseed`, which Core queries
   with a hardcoded fAllowLookup.
 
+  Proxies are Core's per-network table (src/node/args.lisp, init.cpp:
+  1698-1800): `*network-proxies*` holds the ipv4/ipv6/cjdns proxy
+  (NETWORK-PROXY), `*proxy*` is the NAME proxy, `*onion-proxy*` onion's.
+  -proxy is a list option whose values may carry `=<network>`; an address
+  literal dials through its own network's proxy and a name through the
+  name proxy. A proxy may be a `unix:<path>` socket file
+  (UNIX-SOCKET-PATH-P). Trap: an address literal is parsed, never resolved
+  -- usocket's getaddrinfo refuses `::1` where the loopback is the only IPv6
+  address, so a dial to an IPv6 proxy never left the machine.
+
   Our own addresses are Core's mapLocalHost (`ADD-LOCAL`,
   `LOCAL-ADDRESSES`, read by getnetworkinfo's localaddresses). Writers:
   -externalip (LOCAL_MANUAL, at its own port or GetListenPort), the Tor
@@ -731,6 +741,10 @@
   (bitcoin-lisp.networking:open-listener function)
   (bitcoin-lisp.networking:accept-connection function)
   (bitcoin-lisp.networking:*proxy* variable)
+  (bitcoin-lisp.networking:*network-proxies* variable)
+  (bitcoin-lisp.networking:network-proxy function)
+  (bitcoin-lisp.networking:unix-socket-path-p function)
+  (bitcoin-lisp.networking:lookup-service function)
   (bitcoin-lisp.networking:*onion-proxy* variable)
   (bitcoin-lisp.networking:*name-lookup* variable)
   (bitcoin-lisp.networking:socks5-connect function)

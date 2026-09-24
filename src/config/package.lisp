@@ -57,7 +57,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:conf-try-parse-hex
    #:ua-comment-safe-p
    #:+default-proxy-port+
-   #:conf-parse-proxy
+   #:conf-split-host-port
    #:conf-parse-byte-units
    #:conf-parse-network-name
    #:conf-section-name
