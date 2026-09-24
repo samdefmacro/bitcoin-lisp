@@ -106,11 +106,14 @@ and, once every line has parsed, on a `conf' key (IsConfSupported)."
                      ((zerop (length line)))
                      ((and (char= (char line 0) #\[)
                            (char= (char line (1- (length line))) #\]))
+                      ;; The header as written, case and all: Core keeps
+                      ;; `str.substr(1, size - 2)' (config.cpp:49) and
+                      ;; compares it exactly, so `[Main]' is not [main] --
+                      ;; its keys land in a section no chain reads, and the
+                      ;; section is warned about as unrecognized.
                       (setf prefix
                             (concatenate 'string
-                                         (string-downcase
-                                          (string-trim '(#\Space)
-                                                       (subseq line 1 (1- (length line)))))
+                                         (subseq line 1 (1- (length line)))
                                          ".")))
                      ((char= (char line 0) #\-)
                       (config-file-read-error

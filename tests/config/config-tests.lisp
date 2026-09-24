@@ -3719,3 +3719,15 @@ our chainstate is not Core's, and sharing ~/.bitcoin would corrupt one node."
       (if saved
           (sb-posix:setenv "HOME" saved 1)
           (sb-posix:unsetenv "HOME")))))
+
+(test config-section-headers-compare-exact-case
+  "Core keeps a [header] exactly as written (common/config.cpp:49) and
+compares it exactly (common/args.cpp:157-167), so `[Main]' is not the main
+section: its keys apply to no chain and the section is warned about. Ours
+lower-cased the header and applied them to mainnet."
+  (is (equal '(("rpcport" . "1234"))
+             (bl.cfg:parse-bitcoin-conf (format nil "[main]~%rpcport=1234~%") :mainnet)))
+  (is (null (bl.cfg:parse-bitcoin-conf (format nil "[Main]~%rpcport=1234~%") :mainnet)))
+  (is (equal '(("Main" "bitcoin.conf" 1))
+             (bl.cfg:conf-unrecognized-sections (format nil "[Main]~%rpcport=1234~%")
+                                                "bitcoin.conf"))))
