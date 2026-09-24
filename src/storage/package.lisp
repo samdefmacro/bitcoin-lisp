@@ -142,6 +142,7 @@ src/storage/.")
    #:derive-target
    #:target-to-bits
    #:calculate-chain-work
+   #:block-proof-equivalent-time
    #:calculate-next-work-required
    ;; Difficulty constants
    #:+difficulty-adjustment-interval+

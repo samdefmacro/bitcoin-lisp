@@ -2752,21 +2752,6 @@ tells the asker exactly which forks this node witnessed and kept.")
   "Core NODE_NETWORK_LIMITED_MIN_BLOCKS (net_processing.cpp:154): a
 NODE_NETWORK_LIMITED peer promises the last 288 blocks and nothing more.")
 
-(defun %block-proof-equivalent-time (to-work from-work tip-bits)
-  "Core GetBlockProofEquivalentTime (chain.cpp:136-151): how long the work
-difference between two entries would take at the TIP's difficulty. Signed —
-negative when TO has less work than FROM.
-
-This is the half of the staleness test that a timestamp cannot forge. A header's
-nTime is attacker-influenced within the median-time-past and 2-hour windows, so
-an age test on timestamps alone can be talked out of; the work difference
-cannot be."
-  (let* ((tip-proof (max 1 (bl.store:calculate-chain-work tip-bits 0)))
-         (sign (if (> to-work from-work) 1 -1))
-         (r (abs (- to-work from-work)))
-         (spacing (block-interval-seconds)))
-    (* sign (floor (* r spacing) tip-proof))))
-
 (defun %block-request-allowed-p (chain-state entry best-header)
   "Core PeerManagerImpl::BlockRequestAllowed (net_processing.cpp:1953-1960).
 
@@ -2795,10 +2780,7 @@ because an old side-chain block is a fingerprint, not a service."
            (< (- (bl.ser:block-header-timestamp best-hdr)
                  (bl.ser:block-header-timestamp header))
               +stale-relay-age-limit+)
-           (< (%block-proof-equivalent-time
-               (bl.store:block-index-entry-chain-work best-header)
-               (bl.store:block-index-entry-chain-work entry)
-               (bl.ser:block-header-bits best-hdr))
+           (< (bl.store:block-proof-equivalent-time best-header entry best-header)
               +stale-relay-age-limit+)))))
 
 (defun %below-network-limited-threshold-p (chain-state entry &optional peer)

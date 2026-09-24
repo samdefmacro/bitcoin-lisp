@@ -1558,17 +1558,90 @@ Core keeps the same memo in ChainstateManager (m_last_script_check_reason_logged
 validation.h:573) and writes the line only when the verdict CHANGES
 (validation.cpp:2493-2502) -- otherwise a sync would log it once per block.")
 
+(defconstant +assumevalid-min-burial-seconds+ (* 60 60 24 7 2)
+  "Core TWO_WEEKS_IN_SECONDS (validation.cpp:2346): the equivalent work that
+must sit on an assumevalid ancestor before its signatures may be skipped.")
+
+(defvar *assumevalid-ancestry* nil
+  "(AV-ENTRY . VECTOR): every ancestor of the assumevalid index entry, indexed
+by height, built by one walk the first time a block is judged against that
+entry. Core answers GetAncestor through a skip list; our entries have only the
+prev link, and a walk from the assumevalid block down to each block connected
+below it made an initial sync quadratic in the chain height.")
+
+(defvar *best-header-assumevalid-memo* nil
+  "(BEST AV-ENTRY . ANSWER): whether the best header entry BEST descends from
+AV-ENTRY, remembered until either changes -- a walk from the best header down
+to the assumevalid height per connected block would be quadratic too.")
+
+(defun %same-entry-p (a b)
+  (and a b (equalp (bl.store:block-index-entry-hash a)
+                   (bl.store:block-index-entry-hash b))))
+
+(defun %assumevalid-ancestor (av-entry height)
+  "AV-ENTRY's ancestor at HEIGHT (Core GetAncestor), from *ASSUMEVALID-ANCESTRY*."
+  (when (<= 0 height (bl.store:block-index-entry-height av-entry))
+    (let ((memo *assumevalid-ancestry*))
+      (unless (eq (car memo) av-entry)
+        (let ((ancestry (make-array (1+ (bl.store:block-index-entry-height av-entry))
+                                    :initial-element nil)))
+          (loop for e = av-entry then (bl.store:block-index-entry-prev-entry e)
+                while e
+                do (setf (aref ancestry (bl.store:block-index-entry-height e)) e))
+          (setf memo (cons av-entry ancestry)
+                *assumevalid-ancestry* memo)))
+      (aref (cdr memo) height))))
+
+(defun %on-best-header-chain-p (best av-entry entry)
+  "T when ENTRY, an ancestor of AV-ENTRY, is also an ancestor of the best
+header BEST (Core `m_best_header->GetAncestor(pindex->nHeight) == pindex')."
+  (let ((best-height (bl.store:block-index-entry-height best))
+        (av-height (bl.store:block-index-entry-height av-entry))
+        (height (bl.store:block-index-entry-height entry)))
+    (cond
+      ;; BEST at or above the assumevalid block: ENTRY is on BEST's chain
+      ;; exactly when the assumevalid block is.
+      ((>= best-height av-height)
+       (let ((memo *best-header-assumevalid-memo*))
+         (if (and (eq (first memo) best) (eq (second memo) av-entry))
+             (cddr memo)
+             (let ((answer (%same-entry-p
+                            (bl.store:entry-ancestor-at-height best av-height)
+                            av-entry)))
+               (setf *best-header-assumevalid-memo* (list* best av-entry answer))
+               answer))))
+      ;; BEST itself on the assumevalid chain, below its top.
+      ((%same-entry-p (%assumevalid-ancestor av-entry best-height) best)
+       (<= height best-height))
+      (t (%same-entry-p (bl.store:entry-ancestor-at-height best height) entry)))))
+
+(defun %best-header-script-check-reason (chain-state av-entry entry)
+  "Core\'s last three script_check_reasons (validation.cpp:2357-2363) for ENTRY,
+an ancestor of the assumevalid block AV-ENTRY: the reason its signatures must
+still be verified because of where the best header stands, or NIL."
+  (let ((best (bl.store:best-header-entry chain-state)))
+    (cond
+      ((not (and best (%on-best-header-chain-p best av-entry entry)))
+       "block not in best header chain")
+      ((< (bl.store:block-index-entry-chain-work best)
+          (bl:minimum-chain-work bl:*network*))
+       "best header chainwork below minimumchainwork")
+      ((<= (bl.store:block-proof-equivalent-time best entry best)
+           +assumevalid-min-burial-seconds+)
+       "block too recent relative to best header"))))
+
 (defun %script-check-reason (chain-state hash height)
   "Core's script_check_reason (validation.cpp:2342-2380): the reason this block\'s
 signatures MUST be verified, as Core words it, or NIL when they may be skipped.
 
-The four reasons below are Core\'s first four, in Core\'s order. Core has three
-more that only ever make skipping STRICTER -- the block must be on the
-best-header chain, that header\'s work at or above nMinimumChainWork, and more
-than two weeks of equivalent work below it -- and all three need m_best_header,
-which Core maintains incrementally and we recompute by scanning the whole index
-(BEST-HEADER-ENTRY is O(index size) by its own docstring). Omitting them is a
-NARROWER skip window than Core\'s, never a wider one."
+All seven of Core\'s reasons, in Core\'s order. The last three need
+m_best_header (BL.STORE:BEST-HEADER-ENTRY, O(1)): the block must lie on the
+best header chain, that header must carry nMinimumChainWork, and more than two
+weeks of equivalent work must be stacked on the block. They were omitted once,
+on the grounds that the best header cost a full index scan; that made the skip
+window WIDER than Core\'s, not narrower -- a block buried under only a few
+headers, or under a header chain below the minimum work, skipped its
+signatures -- and feature_assumevalid.py:181 found it."
   (let ((av (bl:network-assumevalid bl:*network*)))
     (cond
       ((null av) "assumevalid=0 (always verify)")
@@ -1585,14 +1658,14 @@ NARROWER skip window than Core\'s, never a wider one."
             ;; silently answer NIL there and quietly verify every signature --
             ;; safe, but it would make the assumevalid optimisation dead on the
             ;; main IBD path rather than merely correct.
-            (let ((ancestor (bl.store:entry-ancestor-at-height av-entry height)))
+            (let ((ancestor (%assumevalid-ancestor av-entry height)))
               (cond
-                ((and ancestor
-                      (equalp (bl.store:block-index-entry-hash ancestor) hash))
-                 nil)
-                ((> height (bl.store:block-index-entry-height av-entry))
-                 "block height above assumevalid height")
-                (t "block not in assumevalid chain"))))))))))
+                ((not (and ancestor
+                           (equalp (bl.store:block-index-entry-hash ancestor) hash)))
+                 (if (> height (bl.store:block-index-entry-height av-entry))
+                     "block height above assumevalid height"
+                     "block not in assumevalid chain"))
+                (t (%best-header-script-check-reason chain-state av-entry ancestor)))))))))))
 
 (defun script-checks-skippable-p (chain-state hash height)
   "T when signature verification may be skipped for the block HASH names.
