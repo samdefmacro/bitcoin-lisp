@@ -1142,6 +1142,11 @@ tmp LevelDB path. Both are cleaned up on exit."
             ,@body)
        (ignore-errors (delete-file ,dat-var)))))
 
+(defun %migration-complete-p (ldb-path)
+  "Whether the coins LevelDB at LDB-PATH carries the migration marker."
+  (bl.store:with-coins-view-db (view ldb-path)
+    (bl.store:coins-view-db-migration-complete-p view)))
+
 (defun %populated-utxo-set (count)
   "Build an in-memory utxo-set with COUNT distinct entries. Keys vary
 in their txid first-byte to give a mix; values vary in amount/height."
@@ -1163,7 +1168,7 @@ in their txid first-byte to give a mix; values vary in amount/height."
     (let ((written (bl.store:migrate-utxoset-dat-to-leveldb
                     dat-path ldb-path)))
       (is (= 0 written)))
-    (is (eq t (bl.store:leveldb-utxo-migration-complete-p ldb-path)))))
+    (is (eq t (%migration-complete-p ldb-path)))))
 
 (test migration-round-trip
   "After migration, every entry in the source set is retrievable from
@@ -1188,12 +1193,12 @@ the LevelDB via coins-view-db-get."
                  (bl.store::utxo-set-entries source))))))
 
 (test migration-marker-detection
-  "leveldb-utxo-migration-complete-p returns NIL for an empty LevelDB
+  "coins-view-db-migration-complete-p returns NIL for an empty LevelDB
 (never migrated) and T after a successful migration."
   (%with-tmp-leveldb-path (ldb-path)
     ;; Empty LevelDB — marker absent.
     (bl.store:with-leveldb (db ldb-path) db)
-    (is (null (bl.store:leveldb-utxo-migration-complete-p ldb-path)))
+    (is (null (%migration-complete-p ldb-path)))
     ;; Migrate an empty set; marker should now be present.
     (let ((dat-path (%tmp-dat-path)))
       (unwind-protect
@@ -1201,7 +1206,7 @@ the LevelDB via coins-view-db-get."
              (bl.store:save-utxo-set
               (bl.store:make-utxo-set) dat-path)
              (bl.store:migrate-utxoset-dat-to-leveldb dat-path ldb-path)
-             (is (eq t (bl.store:leveldb-utxo-migration-complete-p
+             (is (eq t (%migration-complete-p
                         ldb-path))))
         (ignore-errors (delete-file dat-path))))))
 
@@ -1221,7 +1226,27 @@ the LevelDB via coins-view-db-get."
       (let ((written (bl.store:migrate-utxoset-dat-to-leveldb
                       dat-path ldb-path :batch-size 32)))
         (is (= 250 written))))
-    (is (eq t (bl.store:leveldb-utxo-migration-complete-p ldb-path)))))
+    (is (eq t (%migration-complete-p ldb-path)))))
+
+(test migration-into-an-open-coins-view
+  "Start-up opens chainstate/ once, as Core's InitCoinsDB opens its coins
+database once (validation.cpp:1910-1925), so the legacy utxoset.dat migration
+runs INTO the view already open and asks that view whether it is done. Ours
+opened the directory once for the check and again for the view."
+  (%with-tmp-dat-and-leveldb (dat-path ldb-path)
+    (bl.store:save-utxo-set (%populated-utxo-set 40) dat-path)
+    (bl.store:with-coins-view-db (view ldb-path)
+      (is (null (bl.store:coins-view-db-migration-complete-p view))
+          "control: an unmigrated view says so")
+      (is (= 40 (bl.store:migrate-utxoset-dat-to-leveldb dat-path ldb-path
+                                                         :into-view view)))
+      (is (eq t (bl.store:coins-view-db-migration-complete-p view))
+          "the open view sees its own marker")
+      (is-true (bl.store:coins-view-db-get
+                view (bl.store:make-utxo-key
+                      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                      1))
+               "the coins went into the open view"))))
 
 ;;;; LevelDB iterator tests
 

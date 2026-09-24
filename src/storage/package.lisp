@@ -276,7 +276,7 @@ src/storage/.")
    #:coin-view-disconnect-block
    ;; Migration: utxoset.dat → LevelDB
    #:migrate-utxoset-dat-to-leveldb
-   #:leveldb-utxo-migration-complete-p
+   #:coins-view-db-migration-complete-p
    ;; UTXO iteration and statistics
    #:utxo-set-iterate
    #:utxo-set-total-amount

@@ -1155,18 +1155,19 @@ startup refusal rather than a directory we create somewhere else."
          ;; chainstate_snapshot/ through the same path function.
          (chainstate-path (namestring
                            (bl.store:chainstate-leveldb-path primary)))
-         (utxoset-dat (bl.store:utxo-set-file-path data-dir))
-         (migrated-p (%open-coins-db-or-refuse
-                      (lambda () (bl.store:leveldb-utxo-migration-complete-p
-                                  chainstate-path)))))
-    (when (and (not migrated-p) (probe-file utxoset-dat))
-      (log-info "Found legacy utxoset.dat; migrating into LevelDB at ~A ..."
-                chainstate-path)
-      (bl.store:migrate-utxoset-dat-to-leveldb
-       utxoset-dat chainstate-path)
-      (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
+         (utxoset-dat (bl.store:utxo-set-file-path data-dir)))
+    ;; ONE open of chainstate/, as Core's InitCoinsDB opens its coins database
+    ;; once (validation.cpp:1910-1925); the legacy-migration check asks the
+    ;; view that is already open.
     (let ((view (%open-coins-db-or-refuse
                  (lambda () (bl.store:open-coins-view-db chainstate-path)))))
+      (when (and (probe-file utxoset-dat)
+                 (not (bl.store:coins-view-db-migration-complete-p view)))
+        (log-info "Found legacy utxoset.dat; migrating into LevelDB at ~A ..."
+                  chainstate-path)
+        (bl.store:migrate-utxoset-dat-to-leveldb utxoset-dat chainstate-path
+                                                 :into-view view)
+        (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
       ;; Refuse a pre-0.15 coins database, as Core does right after opening
       ;; it (node/chainstate.cpp:103-109). Either reindex flag wipes the
       ;; coins before they are read, which is why Core's check is a no-op
