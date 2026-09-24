@@ -34,22 +34,16 @@ per-lookup file open together, and gives the index the persisted best-block
 marker it never had.")
 
 (defmethod index-name ((index tx-index)) "txindex")
-(defmethod index-best-block ((index tx-index))
-  "The txindex marker is a hash only (Core TxIndex stores a locator, not a
-height); the height comes from the chain, so it is -1 here."
-  (let ((hash (txindex-best-block index)))
-    (and hash (values hash -1))))
 (defmethod index-height ((index tx-index) chainstate)
   "The marker is a hash only (Core TxIndex stores a locator), so resolve it
 against CHAINSTATE: the marker's height while it is still on the active chain
 there, the fork point after a reorg, -1 with no usable marker -- one below
 what %TXINDEX-RESUME-HEIGHT scans from."
   (1- (%txindex-resume-height index chainstate)))
-(defmethod index-set-best ((index tx-index) block-hash height)
-  (declare (ignore height))
-  (txindex-set-best-block index block-hash))
-(defmethod index-clear-best ((index tx-index))
-  (when (tx-index-db index) (leveldb-delete (tx-index-db index) *index-meta-key*)))
+(defmethod index-decode-legacy-best ((index tx-index) bytes)
+  "The txindex's old record: the best block's 32-byte hash, no height."
+  (when (= (length bytes) 32)
+    (values (copy-seq bytes) nil)))
 (defmethod index-write-block ((index tx-index) chainstate block block-hash height spent-utxos)
   (declare (ignore chainstate height spent-utxos))
   (txindex-add-block index block block-hash)
@@ -157,17 +151,16 @@ index explicitly."
        t))
 
 (defun txindex-set-best-block (txindex block-hash)
-  "Record the block this index is caught up to (Core BaseIndex's locator).
-The file-based index had no such marker at all, so nothing could tell whether
-it was current."
+  "Move the block this index is caught up to (Core SetBestBlockIndex). In
+memory: COMMIT-INDEX writes it to the database, as Core's Commit does."
   (when (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (leveldb-put (tx-index-db txindex) *index-meta-key* block-hash)
+    (index-set-best txindex block-hash -1)
     t))
 
 (defun txindex-best-block (txindex)
   "The block hash this index is caught up to, or NIL."
   (when (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (leveldb-get (tx-index-db txindex) *index-meta-key*)))
+    (values (index-best-block txindex))))
 
 (defun txindex-count (txindex)
   "Number of indexed transactions, by DB scan.

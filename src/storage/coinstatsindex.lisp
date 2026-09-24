@@ -352,11 +352,9 @@ the caller should stop/backfill)."
       (let ((stats (apply-block-to-coinstats
                     (if parent (%copy-coinstats parent) (make-coinstats))
                     block block-hash height spent-utxos subsidy)))
-        ;; Record and best marker in ONE batch (Core BaseIndex::Commit writes
-        ;; CustomCommit's entries and the best-block locator in a single
-        ;; CDBBatch, index/base.cpp:270-288). As two separate puts, a kill
-        ;; between them left the marker naming a height whose record was not
-        ;; written, or a record no marker vouched for.
+        ;; The record, then the in-memory best block (Core CustomAppend, then
+        ;; SetBestBlockIndex). The best-block record on disk moves only at
+        ;; COMMIT-INDEX, from the chainstate flush, as Core's does.
         (let ((batch (leveldb-make-writebatch))
               ;; Core's CopyHeightIndexToHashIndex (coinstatsindex.cpp:222-225,
               ;; run from CustomRemove as the rewind walks the abandoned
@@ -375,10 +373,9 @@ the caller should stop/backfill)."
                                            (cdr displaced)))
                  (leveldb-writebatch-put batch (%csi-stat-key height)
                                          (%csi-encode-stat stats block-hash))
-                 (leveldb-writebatch-put batch (base-index-meta-key csi)
-                                         (index-meta-encode height block-hash))
                  (leveldb-write (coinstatsindex-db csi) batch))
             (leveldb-destroy-writebatch batch)))
+        (index-set-best csi block-hash height)
         stats))))
 
 (defun coinstatsindex-record-matches-block-p (csi block block-hash height

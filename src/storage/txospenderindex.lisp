@@ -56,12 +56,12 @@ no in-memory table and no startup replay."
 ;;; node/indexes.lisp beside the rewind that repairs an off-chain marker: the
 ;;; fork walk it needs is above this layer. TXOSPENDERINDEX-HEIGHT below is
 ;;; the raw stored height, which getindexinfo reports.
-(defmethod index-best-block ((index txospender-index)) (txospenderindex-best-block index))
-(defmethod index-set-best ((index txospender-index) block-hash height)
-  (txospenderindex-set-best-block index block-hash height))
-(defmethod index-clear-best ((index txospender-index))
-  (when (%txospender-index-live-p index)
-    (leveldb-delete (txospender-index-db index) *index-meta-key*)))
+(defmethod index-decode-legacy-best ((index txospender-index) bytes)
+  "The spender index's old record: hash || height LE32."
+  (when (= (length bytes) 36)
+    (values (subseq bytes 0 32)
+            (logior (aref bytes 32) (ash (aref bytes 33) 8)
+                    (ash (aref bytes 34) 16) (ash (aref bytes 35) 24)))))
 (defmethod index-write-block ((index txospender-index) chainstate block block-hash height spent-utxos)
   "Record BLOCK's spends, refusing one that would sit above a GAP (Core's
 indexes only ever append to a contiguous range; the blockfilterindex refuses
@@ -274,33 +274,16 @@ the one that really spends this outpoint."
     (nreverse found)))
 
 (defun txospenderindex-set-best-block (index block-hash height)
-  "Record how far the index has got: the block hash and its height.
-
-The HEIGHT is stored beside the hash so the marker can be read without a
-chain-state lookup: TXOSPENDERINDEX-HEIGHT reports it, and the backfill
-resumes from it once INDEX-PREPARE-SYNC has made it trustworthy. What must
-not be fooled by a marker on an abandoned branch — getindexinfo and the
-catch-up guard, both of which read it BEFORE that repair — asks INDEX-HEIGHT
-instead, which resolves the HASH against the active chain; Core's BaseIndex
-keeps a locator and reads its height off the chain for the same reason. The
-layout is hash||height, the reverse of INDEX-META-ENCODE's height||hash (the
-other two indexes); it is on disk, so it stays."
+  "Move how far the index has got (Core SetBestBlockIndex), in memory;
+COMMIT-INDEX writes it to the database as Core's Commit does."
   (when (%txospender-index-live-p index)
-    (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
-      (replace v block-hash)
-      (dotimes (i 4)
-        (setf (aref v (+ 32 i)) (logand (ash height (* -8 i)) #xFF)))
-      (leveldb-put (txospender-index-db index) *index-meta-key* v))
+    (index-set-best index block-hash height)
     t))
 
 (defun txospenderindex-best-block (index)
   "(values block-hash height), or NIL when nothing has been indexed."
   (when (%txospender-index-live-p index)
-    (let ((v (leveldb-get (txospender-index-db index) *index-meta-key*)))
-      (when (and v (= 36 (length v)))
-        (values (subseq v 0 32)
-                (logior (aref v 32) (ash (aref v 33) 8)
-                        (ash (aref v 34) 16) (ash (aref v 35) 24)))))))
+    (index-best-block index)))
 
 (defun txospenderindex-height (index)
   "How far the index has got, or -1 when it holds nothing — the shape

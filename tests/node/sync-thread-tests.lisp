@@ -575,6 +575,11 @@ the thread ends when the node stops running."
   (:documentation "An index that is only its name, for the index-thread test."))
 
 (defmethod bl.store:index-name ((index %named-test-index)) "txindex")
+;; A new index: nothing indexed, so start-up has no best block to place
+;; (Core BaseIndex::Init with a null locator, index/base.cpp:124-125).
+(defmethod bl.store:resolve-index-best ((index %named-test-index) chainstate)
+  (declare (ignore chainstate))
+  nil)
 
 (test an-index-catches-up-on-a-thread-named-after-it
   "Core BaseIndex::StartBackgroundSync (index/base.cpp:453-459) syncs each

@@ -16,8 +16,9 @@
 
 (defparameter *index-meta-key*
   (make-array 1 :element-type '(unsigned-byte 8) :initial-element (char-code #\B))
-  "ASCII B: the best-block marker's LevelDB key. One byte, so it can never be
-mistaken for a record key, all of which start with a different prefix byte.")
+  "ASCII B, Core's DB_BEST_BLOCK (index/base.cpp:47): the best-block record's
+key. One byte, so it can never be mistaken for a record key, all of which
+start with a different prefix byte.")
 
 (defstruct (base-index (:constructor nil) (:copier nil) (:predicate nil))
   "What every index shares: where its LevelDB lives, the open handle (NIL
@@ -31,9 +32,14 @@ indexes :INCLUDE it."
   ;; -dbcache budget the DB gets: Core divides one budget across the indexes
   ;; (node/caches.cpp:66-70); the txindex has its own line.
   (meta-key *index-meta-key* :type (simple-array (unsigned-byte 8) (1)))
-  (cache-share :filter-index :type (member :filter-index :tx-index)))
+  (cache-share :filter-index :type (member :filter-index :tx-index))
+  ;; Core's m_best_block_index: the block the index has processed, held in
+  ;; memory and moved per block (SetBestBlockIndex, index/base.cpp:487-504).
+  ;; (HASH . HEIGHT), HEIGHT -1 until RESOLVE-INDEX-BEST places a record read
+  ;; from disk on the chain. Only COMMIT-INDEX writes it to the database.
+  (best-entry nil :type (or null cons)))
 
-;;; --- The skeleton: open, close, key layout, the 36-byte marker ---
+;;; --- The skeleton: open, close, key layout ---
 
 (defun open-index-db (index path &key wipe)
   "Open (creating if needed) INDEX's LevelDB at PATH with its cache share,
@@ -63,11 +69,17 @@ from the block files must not be described by rows derived from the old one."
       ;; Corruption sentence (feature_init.py:170-189 damages each index's
       ;; files and expects exactly that). Unverified, our later reads of the
       ;; same record decoded the damaged block and the node came up.
-      (handler-bind ((error (lambda (e)
-                              (declare (ignore e))
-                              (leveldb-close db))))
-        (leveldb-get db (base-index-meta-key index) :verify-checksums t))
-      (setf (base-index-db index) db)))
+      (let ((record (handler-bind ((error (lambda (e)
+                                            (declare (ignore e))
+                                            (leveldb-close db))))
+                      (leveldb-get db (base-index-meta-key index)
+                                   :verify-checksums t))))
+        (setf (base-index-db index) db
+              (base-index-best-entry index)
+              (and record
+                   (multiple-value-bind (hash height)
+                       (decode-index-best-block-record index record)
+                     (and hash (cons hash (or height -1)))))))))
   index)
 
 (defun close-index (index)
@@ -86,16 +98,8 @@ from the block files must not be described by rows derived from the old one."
       (replace key part :start1 pos)
       (incf pos (length part)))))
 
-(defun index-meta-encode (height hash)
-  "The best-block marker's value: HEIGHT as 4 little-endian bytes, then the
-32-byte HASH (the blockfilterindex and coinstatsindex layout)."
-  (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
-    (dotimes (i 4) (setf (aref v i) (logand (ash height (* -8 i)) #xff)))
-    (replace v hash :start1 4)
-    v))
-
 (defun index-meta-decode (v)
-  "(values height hash) from a marker value written by INDEX-META-ENCODE."
+  "(values height hash) from an old height LE32 || hash best-block record."
   (values (loop for i below 4 sum (ash (aref v i) (* 8 i)))
           (subseq v 4 36)))
 
@@ -150,23 +154,105 @@ SUBSIDY-FN a height to its subsidy, for the indexes that need them; PROGRESS
 is called with (height percent). Returns how many blocks (or entries) were
 added."))
 
-;;; --- Default marker methods (the height||hash layout) ---
-;;; The txindex (hash-only marker) and the txospenderindex (hash||height)
-;;; keep their own; the blockfilterindex and coinstatsindex use these.
+;;; --- The best-block record: Core's CBlockLocator (DB_BEST_BLOCK) ---
+;;;
+;;; Core keeps ONE record per index under DB_BEST_BLOCK ('B'): a serialized
+;;; CBlockLocator (index/base.cpp:78-93) -- an int32 version, the DUMMY_VERSION
+;;; 70016 that is never read, then a CompactSize count and that many 32-byte
+;;; hashes, the index's best block first (primitives/block.h:116-138). Commit
+;;; alone writes it (base.cpp:270-288), from Sync when the index catches up and
+;;; from ChainStateFlushed after every full chainstate flush (:380-422): never
+;;; per block, so the record only ever names a block the block index has
+;;; already made durable. Between commits the index's position lives in
+;;; memory (the BEST-ENTRY slot, Core's m_best_block_index).
+;;;
+;;; This tree wrote its own layouts per block before: 32 bytes (txindex, the
+;;; hash), 36 bytes (blockfilterindex and coinstatsindex, height LE32 || hash;
+;;; txospenderindex, hash || height LE32). None can be mistaken for a locator,
+;;; which is 4 + CompactSize + 32n bytes, never 32 or 36. INDEX-DECODE-LEGACY-
+;;; BEST reads them once; the next commit writes the locator.
+
+(defconstant +locator-dummy-version+ 70016
+  "CBlockLocator::DUMMY_VERSION (primitives/block.h:125).")
+
+(defun encode-block-locator (hashes)
+  "HASHES (internal byte order, best first) serialized as Core's CBlockLocator."
+  (let ((bb (bl.bytes:make-byte-buf)))
+    (bl.bytes:bb-write-u32-le bb +locator-dummy-version+)
+    (bl.bytes:bb-write-varint bb (length hashes))
+    (dolist (h hashes) (bl.bytes:bb-write-bytes bb h))
+    (bl.bytes:bb-finish bb)))
+
+(defun %decode-block-locator (bytes)
+  "The hashes of a serialized CBlockLocator, or NIL when BYTES is not one."
+  (ignore-errors
+   (bl.bytes:with-byte-reader (br bytes)
+     (when (= (bl.bytes:br-read-u32-le br) +locator-dummy-version+)
+       (let* ((n (bl.bytes:br-read-compact-size br))
+              (hashes (loop repeat n collect (bl.bytes:br-read-bytes br 32))))
+         (when (and hashes (bl.bytes:br-eof-p br))
+           hashes))))))
+
+(defgeneric index-decode-legacy-best (index bytes)
+  (:documentation "(values hash height) from a best-block record this tree
+wrote before it wrote Core's locator, or NIL. Default: height LE32 || hash, the
+blockfilterindex and coinstatsindex layout.")
+  (:method ((index base-index) bytes)
+    (when (= (length bytes) 36)
+      (multiple-value-bind (height hash) (index-meta-decode bytes)
+        (values hash height)))))
+
+(defun decode-index-best-block-record (index bytes)
+  "(values hash height) from INDEX's DB_BEST_BLOCK record: a CBlockLocator's
+first hash (HEIGHT NIL, a locator carries none), or an old layout's."
+  (let ((hashes (%decode-block-locator bytes)))
+    (if hashes
+        (values (first hashes) nil)
+        (index-decode-legacy-best index bytes))))
 
 (defmethod index-best-block ((index base-index))
-  (let ((db (base-index-db index)))
-    (when db
-      (let ((v (leveldb-get db (base-index-meta-key index))))
-        (when (and v (>= (length v) 36))
-          (multiple-value-bind (height hash) (index-meta-decode v)
-            (values hash height)))))))
+  (let ((best (base-index-best-entry index)))
+    (when best (values (car best) (cdr best)))))
 
 (defmethod index-set-best ((index base-index) block-hash height)
-  (when (base-index-db index)
-    (leveldb-put (base-index-db index) (base-index-meta-key index)
-                 (index-meta-encode height block-hash))))
+  "Core SetBestBlockIndex: memory only. COMMIT-INDEX persists it."
+  (setf (base-index-best-entry index) (cons (copy-seq block-hash) height)))
 
 (defmethod index-clear-best ((index base-index))
+  "Forget the position in memory and on disk, so the next catch-up rebuilds
+from genesis (Core's wiped database reads a null DB_BEST_BLOCK)."
+  (setf (base-index-best-entry index) nil)
   (when (base-index-db index)
     (leveldb-delete (base-index-db index) (base-index-meta-key index))))
+
+(defgeneric resolve-index-best (index chainstate)
+  (:documentation "Place INDEX's best block on CHAINSTATE's block index, as
+BaseIndex::Init does with the locator's first hash (index/base.cpp:124-134):
+its entry, with the entry's height recorded in the BEST-ENTRY slot; :NOT-FOUND
+when the block index does not hold it; NIL when the index has no best block.")
+  (:method ((index base-index) chainstate)
+    (let ((best (base-index-best-entry index)))
+      (when best
+        (let ((entry (get-block-index-entry chainstate (car best))))
+          (cond
+            (entry (setf (cdr best) (block-index-entry-height entry)) entry)
+            (t :not-found)))))))
+
+(defun commit-index (index &optional chainstate)
+  "Core BaseIndex::Commit (index/base.cpp:270-288): write the in-memory best
+block to the index's database as a CBlockLocator -- GetLocator over
+CHAINSTATE's block index, byte for byte Core's -- and nothing when the index
+has processed no block yet. Without CHAINSTATE, or with a best block it does
+not hold, the locator is that one hash, which ReadBestBlock (vHave.at(0))
+reads the same way. Returns T when a record was written."
+  (let ((best (base-index-best-entry index))
+        (db (base-index-db index)))
+    (when (and best db)
+      (let ((entry (and chainstate
+                        (get-block-index-entry chainstate (car best)))))
+        (leveldb-put db (base-index-meta-key index)
+                     (encode-block-locator
+                      (if entry
+                          (build-block-locator chainstate entry)
+                          (list (car best)))))
+        t))))

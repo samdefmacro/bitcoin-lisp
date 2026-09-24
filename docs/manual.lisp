@@ -532,7 +532,14 @@
   implements the BASE-INDEX generic functions and catches up at startup.
 
   Invariants: the flush order (blocks and undo, the block tree database,
-  then the coins database) is what makes a crash recoverable; an index is only as
+  then the coins database) is what makes a crash recoverable; an index's
+  best block moves in memory per block (INDEX-SET-BEST, Core's
+  SetBestBlockIndex) and reaches its database ONLY through COMMIT-INDEX --
+  at the end of a catch-up and after each chainstate flush -- as Core's
+  DB_BEST_BLOCK record, a serialized CBlockLocator (the old 32/36-byte
+  records are read once and rewritten), so the record can only name a
+  block the block index made durable and start-up refuses one it cannot
+  place (`best block of <name> not found'); an index is only as
   current as its recorded best block, and that marker is only meaningful
   while it names a block on the ACTIVE chain -- INDEX-HEIGHT resolves it
   against the chainstate and INDEX-PREPARE-SYNC rewinds one that has
@@ -698,6 +705,9 @@
   (bitcoin-lisp.storage:index-rewind-block generic-function)
   (bitcoin-lisp.storage:index-prepare-sync generic-function)
   (bitcoin-lisp.storage:index-sync generic-function)
+  (bitcoin-lisp.storage:index-set-best generic-function)
+  (bitcoin-lisp.storage:commit-index function)
+  (bitcoin-lisp.storage:resolve-index-best generic-function)
   (bitcoin-lisp.storage:tx-index class)
   (bitcoin-lisp.storage:txospender-index class)
   (bitcoin-lisp.storage:reindex-block-index function)
