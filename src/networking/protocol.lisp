@@ -5067,7 +5067,20 @@ cannot drop a header the verdict accepted."
       (compact-block-header-verdict chain-state header block-hash prev-hash)
     (when (eq verdict :accept)
       (process-headers (list header) chain-state)
-      (update-block-availability peer chain-state block-hash))
+      (update-block-availability peer chain-state block-hash)
+      ;; Core's `pindex->nChainWork <= ActiveChain().Tip()->nChainWork'
+      ;; return (net_processing.cpp:4645-4655) runs on the header it has JUST
+      ;; indexed too: a new header no better than our tip stays headers-only
+      ;; and is not reconstructed. The verdict tested it only for a header
+      ;; already known, so an old fork's compact block was rebuilt and stored
+      ;; (p2p_compactblocks.py:708 expects `headers-only').
+      (let ((entry (bl.store:get-block-index-entry chain-state block-hash))
+            (tip (bl.store:get-block-index-entry
+                  chain-state (bl.store:best-block-hash chain-state))))
+        (when (and entry tip
+                   (<= (bl.store:block-index-entry-chain-work entry)
+                       (bl.store:block-index-entry-chain-work tip)))
+          (setf verdict :already-have))))
     (values verdict reason credits-announcement)))
 
 (define-p2p-handler ("cmpctblock" :needs-mempool t) (peer payload ctx)

@@ -2083,3 +2083,39 @@ waits for a cmpctblock."
           (is (equalp (second hashes) (bl.net:peer-best-header-sent-hash hb)))
           (is (null (bl.net:new-pow-valid-block cs entry2 (list (peer "198.51.100.73" t))))
               "each height is pushed once"))))))
+
+(test a-new-compact-header-no-better-than-the-tip-is-indexed-but-not-rebuilt
+  "Core indexes a cmpctblock's header (ProcessNewBlockHeaders, net_processing.cpp
+:4590) and THEN returns when `pindex->nChainWork <= ActiveChain().Tip()->
+nChainWork' (:4645-4655), so an old fork's compact block leaves a headers-only
+tip and is never reconstructed. Our verdict applied that test only to a header
+it already held; a NEW header on an old fork was reconstructed and stored, and
+p2p_compactblocks.py:708 found it `valid-fork' instead of `headers-only'."
+  (with-network (:regtest)
+   (let* ((bl.net:*cached-is-ibd* nil)
+          (peer (%cbp-peer "203.0.113.81"))
+          (parent (%cbp-hash #xC1))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (tip-hash (%cbp-hash #xC2))
+          (hdr (%cbp-grind (%cbp-header parent 1296688700)))
+          (cb (%cbp-compact-block-missing-one hdr (make-simple-tx #x53)))
+          (block-hash (bl.ser:block-header-hash hdr)))
+     ;; Our tip: a heavier block beside the announced one.
+     (bl.store:add-block-index-entry
+      state (bl.store:make-block-index-entry
+             :hash tip-hash :height 1 :chain-work 100 :status :valid
+             :prev-entry (bl.store:get-block-index-entry state parent)
+             :header (%cbp-header parent 1296688650)))
+     (bl.store:update-chain-tip state tip-hash 1)
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (%cbp-deliver peer (%cbp-payload cb) state
+                             (bl.store:make-utxo-set) (bl.mp:make-mempool))))))
+       (is-true (bl.store:get-block-index-entry state block-hash)
+                "the header is indexed")
+       (is (= 0 passes) "and no reconstruction is attempted")
+       (is (null sent) "nothing is asked for: ~S" sent)
+       (is (eq :ready (bl.net:peer-state peer)))))))
