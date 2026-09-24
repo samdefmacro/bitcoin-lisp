@@ -17,6 +17,8 @@ count = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 
 ctx = zmq.Context()
 sock = ctx.socket(zmq.SUB)
+if addr.startswith("tcp://["):
+    sock.setsockopt(zmq.IPV6, 1)  # as interface_zmq.py sets socket.ipv6
 sock.connect(addr)
 sock.setsockopt(zmq.SUBSCRIBE, topic)
 sock.RCVTIMEO = 20000

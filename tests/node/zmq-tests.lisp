@@ -507,3 +507,53 @@ two-block reorg; ours published one per connected block."
         (bl:zmq-notify-block-connected a-block tip)
         (bl:zmq-notify-updated-block-tip tip t no-block)
         (is (= 0 (heard)))))))
+
+(test zmq-one-topic-publishes-to-every-address-it-names
+  "-zmqpub<topic> is a LIST option: Core makes one notifier per (topic,
+address) pair (CZMQNotificationInterface::Create, zmqnotificationinterface.cpp:
+57-71), each with its own socket and sequence counter, and getzmqnotifications
+lists every one. interface_zmq.py:563 starts the node with two
+-zmqpubhashblock addresses and reads the block hash on both; ours kept only
+the last address, so the first subscriber never heard a thing."
+  ;; The command line keeps every occurrence, in order, and the spec list
+  ;; turns each into its own publisher.
+  (is (equal '(("hashblock" "tcp://127.0.0.1:1" 1000)
+               ("hashblock" "tcp://127.0.0.1:2" 1000))
+             (bl:zmq-specs-from-config
+              (bl.cfg:parse-cli-args '("-zmqpubhashblock=tcp://127.0.0.1:1"
+                                       "-zmqpubhashblock=tcp://127.0.0.1:2")))))
+  (multiple-value-bind (address1 path1) (%zmq-test-address "multi1")
+    (multiple-value-bind (address2 path2) (%zmq-test-address "multi2")
+      (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a)))
+        (unwind-protect
+             (progn
+               (is (= 2 (bl:zmq-start-publishers
+                         (list (list "hashblock" address1 1000)
+                               (list "hashblock" address2 7)))))
+               (dolist (address (list address1 address2))
+                 (is (= 1 (length (%zmq-collect address "hashblock" 1
+                                                (lambda () (bl:zmq-notify-hash-block hash)))))
+                     "the subscriber on ~A must receive the hash" address))
+               (is (equal (list (list "pubhashblock" address1 1000)
+                                (list "pubhashblock" address2 7))
+                          (bl:zmq-notifications-info))
+                   "getzmqnotifications lists one entry per address"))
+          (bl:zmq-stop-publishers)
+          (ignore-errors (delete-file path1))
+          (ignore-errors (delete-file path2)))))))
+
+(test zmq-an-ipv6-tcp-address-is-bound-with-zmq-ipv6
+  "Core sets ZMQ_IPV6 on a socket whose tcp:// address is an IPv6 one
+(IsZMQAddressIPV6, zmqpublishnotifier.cpp:82-92, :127-134); without it libzmq
+refuses `tcp://[::1]:port', which interface_zmq.py:575 test_ipv6 binds, and
+the node published nothing there."
+  (let ((address (format nil "tcp://[::1]:~D" (+ 40000 (random 20000))))
+        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x6b)))
+    (unwind-protect
+         (progn
+           (is (= 1 (bl:zmq-start-publishers (list (list "hashblock" address 1000))))
+               "an IPv6 tcp:// address must bind")
+           (is (= 1 (length (%zmq-collect address "hashblock" 1
+                                          (lambda () (bl:zmq-notify-hash-block hash)))))
+               "and a subscriber on it must hear the hash"))
+      (bl:zmq-stop-publishers))))

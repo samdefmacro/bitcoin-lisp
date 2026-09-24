@@ -44,7 +44,8 @@ of the same :: is what the structural ratchet exists to collapse."
               (bl:network-magic :regtest)))
   (is (= 18444 (bl:network-port :regtest)))
   (is (= 18443 (bl:network-rpc-port :regtest)))
-  (is (null (bl:network-dns-seeds :regtest))))
+  ;; Core regtest's one seed, which resolves nowhere (chainparams.cpp:641).
+  (is (equal '("dummySeed.invalid.") (bl:network-dns-seeds :regtest))))
 
 (test regtest-startup-dispatchers-handle-regtest
   ;; Per-network dispatchers reached during node startup / validation must

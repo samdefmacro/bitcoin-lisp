@@ -1589,8 +1589,7 @@ Core's last_send rule and could not stand in for it."
          (peer (bl.net:make-peer :connection conn :state :ready
                                  :address "203.0.113.7"))
          ;; Core's TIMEOUT_INTERVAL (net.h:58-59), written out.
-         (window (* 20 60))
-         (units internal-time-units-per-second))
+         (window (* 20 60)))
     (flet ((connected-ago (seconds)
              (setf (bl.net:peer-connected-at peer)
                    (- (bl.ser:get-unix-time) seconds)))
@@ -1602,8 +1601,8 @@ Core's last_send rule and could not stand in for it."
       ;; 1. The ping timeout, which is what an operator raises the knob for.
       (setf (bl.net:peer-ping-nonce peer) 7
             (bl.net:peer-last-ping-time peer)
-            (- (get-internal-real-time)
-               (* (1+ window) units)))
+            (- (bl.ser:get-time-micros)
+               (* (1+ window) 1000000)))
       (is (eq :disconnect (bl.net:check-peer-health peer))
           "at the default -peertimeout the ping ladder is unchanged")
       (let ((bl:*handshake-timeout-seconds* 999999999))
@@ -1611,7 +1610,7 @@ Core's last_send rule and could not stand in for it."
             "the value Core's own test framework writes must silence it"))
       ;; 2. Core's receive rule, which we did not have at all.
       (setf (bl.net:peer-ping-nonce peer) nil
-            (bl.net:peer-last-ping-time peer) (get-internal-real-time))
+            (bl.net:peer-last-ping-time peer) (bl.ser:get-time-micros))
       (setf (bl.net:connection-last-recv-time conn)
             (- (bl.ser:get-node-time) (1+ window)))
       (is (eq :disconnect (bl.net:check-peer-health peer))

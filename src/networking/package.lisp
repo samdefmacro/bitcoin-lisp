@@ -45,9 +45,47 @@ headerssync.cpp. src/networking/.")
    #:*v2-transport-enabled*
    #:v2-available-p
    ;; SOCKS5 outbound proxy (Core netbase.cpp Socks5)
+   #:connection-type-string
+   ;; BIP37 bloom filters and merkle blocks (bloom.lisp, merkleblock.lisp)
+   #:bloom-filter
+   #:make-bloom-filter
+   #:bloom-filter-data
+   #:bloom-filter-hash-funcs
+   #:bloom-insert
+   #:bloom-contains-p
+   #:bloom-relevant-and-update-p
+   #:serialize-bloom-filter
+   #:parse-bloom-filter
+   #:outpoint-bytes
+   #:murmur-hash3
+   #:+bloom-update-none+
+   #:+bloom-update-all+
+   #:+bloom-update-p2pubkey-only+
+   #:build-partial-merkle-tree
+   #:extract-partial-merkle-tree
+   #:serialize-merkle-block
+   #:parse-merkle-block
+   #:make-merkle-block
    #:*proxy*
+   #:*network-proxies*
+   #:network-proxy
+   #:unix-socket-path-p
+   #:lookup-service
    #:*onion-proxy*
    #:*i2p-sam-proxy*
+   ;; I2P SAM 3.1 (i2p.lisp)
+   #:i2p-session
+   #:make-i2p-session
+   #:i2p-session-my-addr
+   #:i2p-session-listen
+   #:i2p-session-accept
+   #:i2p-session-connect
+   #:i2p-session-disconnect
+   #:i2p-accepted-connection
+   #:i2p-destination-address
+   #:i2p-dial
+   #:i2p-reset-sessions
+   #:*i2p-sam-session*
    #:proxy
    #:make-proxy
    #:proxy-host
@@ -141,6 +179,9 @@ headerssync.cpp. src/networking/.")
    #:peer-relays-txs-p
    #:peer-tx-relay-p
    #:peer-tx-relay-state-p
+   #:peer-bloom-filter
+   #:peer-our-services
+   #:peer-offers-bloom-p
    #:peer-last-inv-sequence
    #:peer-getaddr-sent
    #:connect-peer

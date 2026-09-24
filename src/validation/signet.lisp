@@ -74,8 +74,9 @@ encodes as OP_0 (0x00), matching Core."
                (aref out 3) (ldb (byte 8 16) n) (aref out 4) (ldb (byte 8 24) n))
          (replace out data :start1 5) out)))))
 
-(defun %next-script-op (script pos)
-  "Decode the script element at POS. Returns (VALUES opcode pushdata next-pos),
+(defun next-script-op (script pos)
+  "Decode the script element at POS (Core CScript::GetOp, script/script.cpp).
+Returns (VALUES opcode pushdata next-pos),
 where PUSHDATA is the pushed byte-vector for a data push (0x01..0x4e) or NIL for
 a bare opcode. Returns NIL opcode on truncation (a push claiming past the end)."
   (let* ((len (length script))
@@ -128,7 +129,7 @@ the miner signed). If none is found, return (VALUES #() witness-commitment NIL).
         (found nil)
         (hlen (length *signet-header*)))
     (loop while (< pos len) do
-      (multiple-value-bind (op pushdata next) (%next-script-op witness-commitment pos)
+      (multiple-value-bind (op pushdata next) (next-script-op witness-commitment pos)
         (when (null op) (return))       ; truncation: stop, like GetOp returning false
         (cond
           ((and pushdata (plusp (length pushdata)))

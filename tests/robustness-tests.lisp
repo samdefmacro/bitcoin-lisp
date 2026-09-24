@@ -143,29 +143,12 @@
 ;;;; inside the handler and calls Misbehaving (inv :4128, getdata :4219,
 ;;;; headers, addr).
 
-(defun %fake-ready-peer ()
-  "A peer object in the :ready state with a socket-less (but 'connected')
-connection -- enough to drive dispatch + disconnect without a real socket."
-  (let ((conn (make-test-connection
-               :host "127.0.0.1" :port 48333 :connected t))
-        (peer nil))
-    (setf peer (bl.net:make-peer
-                :connection conn :state :ready :address "127.0.0.1"))
-    peer))
-
-(defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer)))
-  "Drive COMMAND/PAYLOAD through the shipped per-peer dispatch isolation the
-drain loop uses. Returns (values still-connected peer)."
-  (values (bl.net::safely-dispatch-peer-message
-           peer command payload (bl.ctx:make-node-context) (bl.net::make-ibd))
-          peer))
-
 (defun %arm-ping (peer nonce)
   "Give PEER an outstanding ping carrying NONCE, the way SEND-PING leaves it:
 the nonce AND the send time, without which RECORD-PONG has no clock to
 subtract and raises for a reason that has nothing to do with the payload."
   (setf (bl.net:peer-ping-nonce peer) nonce
-        (bl.net:peer-last-ping-time peer) (get-internal-real-time))
+        (bl.net:peer-last-ping-time peer) (bl.ser:get-time-micros))
   peer)
 
 (defun %outstanding-ping (peer)
@@ -295,6 +278,25 @@ connected -- the isolation forgives on FAILURE, it does not simply never act."
     (is (eq :ready (bl.net:peer-state peer)))
     (is (null (%outstanding-ping peer))
         "a short pong cancels the ping instead of leaving it outstanding")))
+
+(test pong-problems-are-cores
+  "Core's PONG handler (net_processing.cpp:4990-5049): a pong with no ping
+outstanding is `Unsolicited pong without ping'; a different nonce is `Nonce
+mismatch' and leaves the ping outstanding; a zero nonce is `Nonce zero' and
+cancels it; each is one net-category line in hex, as p2p_ping.py:60-83 reads
+them. Ours cancelled the ping on any nonce and logged only the short case."
+  (flet ((pong-log (peer bytes)
+           (nth-value 1 (log-text-of "net" (lambda () (%dispatch-to-fake-peer "pong" bytes peer))))))
+    (let ((peer (%fake-ready-peer)))
+      (is (search "Unsolicited pong without ping, 0 expected, 0 received, 8 bytes"
+                  (pong-log peer (%bytes 0 0 0 0 0 0 0 0))))
+      (%arm-ping peer #x3039)
+      (is (search "Nonce mismatch, 3039 expected, 3038 received, 8 bytes"
+                  (pong-log peer (%bytes #x38 #x30 0 0 0 0 0 0))))
+      (is (eql #x3039 (%outstanding-ping peer)) "a mismatched pong leaves the ping outstanding")
+      (is (search "Nonce zero, 3039 expected, 0 received, 8 bytes"
+                  (pong-log peer (%bytes 0 0 0 0 0 0 0 0))))
+      (is (null (%outstanding-ping peer)) "a zero nonce cancels it"))))
 
 (test swallowed-handler-errors-are-counted
   "Forgiving a handler error hides OUR bugs too, so each one is counted per

@@ -123,6 +123,13 @@
 (define-option "dbbatchsize" :type :int :global bl.store:*coins-db-batch-bytes*)
 (define-option "dbcrashratio" :type :int :global bl.store:*coins-db-crash-ratio*)
 (define-option "peerblockfilters" :key :peer-block-filters :type :bool)
+;; -peerbloomfilters: BIP37 serving and NODE_BLOOM (init.cpp:1104-1105).
+;; Repeatable only so its function runs on every start (the LAST value wins,
+;; as GetBoolArg's does) and an absent option clears an earlier start's value.
+(define-option "peerbloomfilters" :repeatable t
+  :apply (lambda (values)
+           (setf *peer-bloom-filters*
+                 (let ((v (car (last values)))) (and v (conf-parse-bool v) t)))))
 (define-option "txreconciliation" :key :tx-reconciliation :type :bool)
 (define-option "webui" :key :webui :type :bool)
 (define-option "webuipath" :key :webui-path :type :string)
@@ -321,21 +328,18 @@
 (define-option "signetseednode" :repeatable t)
 ;; -proxy / -onion / -proxyrandomize / -onlynet / -cjdnsreachable form one
 ;; interaction (each reads the others): APPLY-PARAMETER-INTERACTIONS.
-(define-option "proxy")
+;; -proxy is a LIST option (Core GetArgs, init.cpp:1706): each value may
+;; carry a `=<network>' suffix and they apply in order.
+(define-option "proxy" :repeatable t)
 (define-option "onion")
 (define-option "proxyrandomize")
-;; -i2psam is accepted and NOT implemented -- a core-only row, so startup still
-;; names it -- but Core reports the address it names as the i2p proxy
-;; (init.cpp:2232-2238, rpc/net.cpp:626), so the value is recorded. Repeatable
-;; only so its function runs on every start, clearing a value an earlier start
-;; in the same image left; the LAST occurrence wins, as GetArg's does.
-(define-option "i2psam" :kind :core-only :repeatable t
-  :apply (lambda (values)
-           (setf bl.net:*i2p-sam-proxy*
-                 (let ((v (car (last values))))
-                   (when (and v (plusp (length v)))
-                     (multiple-value-bind (host port) (bl.net:split-host-port v 7656)
-                       (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port)))))))
+;; -i2psam: the I2P SAM proxy. Read by APPLY-PROXY-OPTIONS (node/args.lisp),
+;; which runs after -dns has been applied, so Lookup(-i2psam, 7656,
+;; fNameLookup) honours -dns=0 as Core's does (init.cpp:1695, :2232-2238).
+(define-option "i2psam" :repeatable t)
+;; -i2pacceptincoming: decided in APPLY-PARAMETER-INTERACTIONS, since an
+;; effective -listen=0 soft-sets it off (init.cpp:810-812).
+(define-option "i2pacceptincoming")
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")
 ;; -discover: its soft-sets read -proxy, -listen and -externalip, so it is
@@ -598,10 +602,13 @@
 
 ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, since each topic
 ;; contributes two options and they produce a list of publishers rather than
-;; a start-node keyword.
+;; a start-node keyword. -zmqpub<topic> is REPEATABLE: Core reads it with
+;; GetArgs, one notifier per address (zmqnotificationinterface.cpp:59); the
+;; hwm is a scalar GetIntArg (:69).
 (dolist (topic '("hashblock" "hashtx" "rawblock" "rawtx" "sequence"))
   (register-config-option
-   (make-config-option :name (format nil "zmqpub~A" topic) :kind :global))
+   (make-config-option :name (format nil "zmqpub~A" topic) :kind :global
+                       :repeatable t))
   (register-config-option
    (make-config-option :name (format nil "zmqpub~Ahwm" topic) :kind :global)))
 
@@ -614,12 +621,12 @@
   "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "deprecatedrpc"
-  "help" "i2pacceptincoming"
+  "help"
   "ipcbind" "limitancestorsize"
   "limitdescendantsize"
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"
-  "natpmp" "peerbloomfilters" "printpriority"
+  "natpmp" "printpriority"
   "rpcdoccheck"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"

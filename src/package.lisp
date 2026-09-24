@@ -57,6 +57,8 @@ init.cpp, node/. src/node/.")
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*
    #:*peer-block-filters*
+   #:*peer-bloom-filters*
+   #:*i2p-accept-incoming*
    #:*tx-reconciliation*
    #:pruning-enabled-p
    #:automatic-pruning-p
@@ -68,6 +70,7 @@ init.cpp, node/. src/node/.")
    #:*stop-at-height*
    #:*private-broadcast*
    #:*dns-seed-enabled*
+   #:*force-dns-seed*
    #:*fixed-seeds-enabled*
    #:*capture-messages*
    #:cleanup-block-rev-files
@@ -240,6 +243,8 @@ init.cpp, node/. src/node/.")
    #:blocks-to-announce
    #:log-connect-overrides
    #:maybe-add-fixed-seeds
+   #:connect-seed-nodes
+   #:dns-address-seed
    #:*seed-nodes*
    #:*use-addrman-outgoing*
    #:node-address-book
@@ -261,6 +266,7 @@ init.cpp, node/. src/node/.")
    #:node-peers
    #:node-pending-inbound-peers
    #:node-pending-onetry
+   #:queue-onetry-dial
    #:save-anchors
    #:load-anchors
    #:dial-anchors

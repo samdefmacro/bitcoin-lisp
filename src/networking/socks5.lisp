@@ -25,11 +25,25 @@ puts each peer connection on its own circuit."
   (randomize-credentials t :type boolean))
 
 (defvar *proxy* nil
-  "The configured outbound SOCKS5 proxy (a PROXY struct), or NIL for direct
-connections. Set from -proxy by apply-config-globals (node/args.lisp); applies to
+  "The NAME proxy (Core SetNameProxy/HaveNameProxy): the SOCKS5 proxy (a PROXY
+struct) a hostname is handed to instead of the local resolver, or NIL. An
+address literal goes through its network's proxy, *NETWORK-PROXIES*. Set from -proxy by apply-config-globals (node/args.lisp); applies to
 ALL outbound P2P connections (Core init.cpp:1698-1762 sets it for every
 network). When set, make-tcp-connection dials the proxy and tunnels via
 SOCKS5, and discover-peers stops resolving DNS seeds locally.")
+
+(defvar *network-proxies* '()
+  "The proxy for each IP network, as a plist (:ipv4 P :ipv6 P :cjdns P) --
+Core's proxyInfo table (netbase.cpp:45, SetProxy/GetProxy) for the networks
+-proxy covers. An unsuffixed -proxy sets all three; `-proxy=<addr>=ipv4',
+`=ipv6' and `=cjdns' set one each, and `-proxy=0=cjdns' removes one
+(init.cpp:1706-1757). *PROXY* is the NAME proxy beside it, and .onion has
+*ONION-PROXY*.")
+
+(defun network-proxy (network)
+  "The proxy an address on NETWORK (:ipv4 :ipv6 :cjdns) is dialed through, or
+NIL for a direct dial (Core GetProxy)."
+  (getf *network-proxies* network))
 
 (defvar *onion-proxy* nil
   "The SOCKS5 proxy (a PROXY struct) for reaching Tor onion services, or NIL.
@@ -37,12 +51,10 @@ Set from -onion, defaulting to -proxy when unset (Core init.cpp:1764-1790).
 Stored for the P1+ onion-dialing phases — nothing dials .onion yet.")
 
 (defvar *i2p-sam-proxy* nil
-  "The -i2psam address as Core would report it, \"host:port\" (default port
-7656), or NIL. This node does not speak I2P: -i2psam stays a core-only option
-and startup still says so. The value is kept only because Core REPORTS it --
-getnetworkinfo's i2p entry carries it as its proxy (init.cpp:2232-2238
-SetProxy(NET_I2P), rpc/net.cpp:626) and bitcoin-cli -getinfo lists it among
-the proxies.")
+  "The -i2psam SAM bridge as Core prints it, \"host:port\" (default port
+7656), or NIL: Core's SetProxy(NET_I2P) (init.cpp:2232-2238). I2P-DIAL and the
+persistent session connect to it, and getnetworkinfo reports it as the i2p
+network's proxy (rpc/net.cpp:626).")
 
 (defvar *onion-proxy-explicit* nil
   "T when the user gave -onion (any value, including -onion=0) explicitly.

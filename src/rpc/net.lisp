@@ -5,17 +5,6 @@
 
 ;;; --- Network Query Methods ---
 
-(defun %connection-type-string (conn-type)
-  "Core CNode::ConnectionTypeAsString for our peer conn-type keyword."
-  (case conn-type
-    (:inbound "inbound")
-    (:outbound-full-relay "outbound-full-relay")
-    (:block-relay "block-relay-only")
-    (:feeler "feeler")
-    (:manual "manual")
-    (:addr-fetch "addr-fetch")
-    (t (string-downcase (symbol-name conn-type)))))
-
 (defun %service-names (services)
   "Human-readable service-flag names for SERVICES as a list, in bit order —
 Core serviceFlagsToStr (protocol.cpp:92-115): the six named bits, and
@@ -210,8 +199,7 @@ the reap cadence: reporting a peer we have closed the socket on is wrong
 whatever the cadence is."
   (let ((peers (sort (rpc-get-connected-peers node)
                      #'< :key #'bl.net:peer-id))
-        (chain-state (rpc-get-chain-state node))
-        (now (get-internal-real-time)))
+        (chain-state (rpc-get-chain-state node)))
     (mapcar
      (lambda (peer)
        ;; peer-version holds the received version *message* struct, not a
@@ -264,7 +252,9 @@ whatever the cadence is."
            ;; own values (net_processing.cpp:1819-1829). Asking
            ;; PEER-TX-RELAY-P instead answered relaytxes true and
            ;; last_inv_sequence 1 for a peer that had sent nothing at all.
-           ("relaytxes" . ,(json-bool tx-relay))
+           ;; m_relay_txs itself: an fRelay=0 peer offered NODE_BLOOM has the
+           ;; object but relays nothing until a filterload/filterclear.
+           ("relaytxes" . ,(json-bool (and tx-relay (bl.net:peer-tx-relay-p peer))))
            ;; Mempool sequence snapshot of our last inv flush to this peer +
            ;; queued-but-unsent announcements (Core m_last_inv_sequence /
            ;; m_inv_to_send).
@@ -285,16 +275,18 @@ whatever the cadence is."
            ("conntime" . ,(bl.net:peer-connected-at peer))
            ;; Peer's version-message timestamp vs our clock at receipt.
            ("timeoffset" . ,(bl.net:peer-time-offset peer))
-           ;; ping stats are in internal-time units; report seconds. All
+           ;; ping stats are in microseconds; report seconds. All
            ;; three are optional in Core: pingtime/minping only once a pong
            ;; arrived, pingwait only while a ping is outstanding.
            ,@(when (plusp ping)
-               `(("pingtime" . ,(/ ping internal-time-units-per-second 1.0d0))))
+               `(("pingtime" . ,(/ ping 1000000 1.0d0))))
            ,@(when (plusp minping)
-               `(("minping" . ,(/ minping internal-time-units-per-second 1.0d0))))
+               `(("minping" . ,(/ minping 1000000 1.0d0))))
+           ;; Core GetNodeStateStats: the MOCKABLE clock less m_ping_start.
            ,@(when ping-nonce
-               `(("pingwait" . ,(/ (- now (bl.net:peer-last-ping-time peer))
-                                   internal-time-units-per-second 1.0d0))))
+               `(("pingwait" . ,(/ (- (bl.ser:get-time-micros)
+                                      (bl.net:peer-last-ping-time peer))
+                                   1000000 1.0d0))))
            ("version" . ,(if vmsg
                              (bl.ser:version-message-version vmsg)
                              0))
@@ -346,7 +338,7 @@ whatever the cadence is."
            ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
                                     (bl.net:peer-recv-per-msg peer)))
            ;; Core ConnectionTypeAsString (node/connection_types.cpp:9-25).
-           ("connection_type" . ,(%connection-type-string
+           ("connection_type" . ,(bl.net:connection-type-string
                                   (bl.net:peer-conn-type peer)))
            ;; Core TransportTypeAsString: the BIP324 v2 session lives in
            ;; connection-transport (NIL = plaintext v1). A peer is published
@@ -410,22 +402,25 @@ whatever the cadence is."
       ("warnings" . ,(bl.log:warnings-for-rpc)))))
 
 (defun %proxy-string (proxy)
-  "Core Proxy::ToString for an IP proxy: host:port, an IPv6 host bracketed."
+  "Core Proxy::ToString (netbase.h:223-229): a `unix:' proxy is its path as
+given, with no port; an IP one host:port, an IPv6 host bracketed."
   (let ((host (bl.net:proxy-host proxy)))
-    (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host (bl.net:proxy-port proxy))))
+    (cond ((bl.net:unix-socket-path-p host) host)
+          ((find #\: host) (format nil "[~A]:~D" host (bl.net:proxy-port proxy)))
+          (t (format nil "~A:~D" host (bl.net:proxy-port proxy))))))
 
 (defun %networks-info ()
   "Core GetNetworksInfo (rpc/net.cpp:614-631): one entry per network a peer
 can be on -- ipv4, ipv6, onion, i2p, cjdns, in Core's enum order -- with its
-reachability and the proxy that reaches it. -proxy serves ipv4, ipv6 and cjdns
-(init.cpp:1734-1757), the onion proxy (-onion, or -proxy) serves onion, and
--i2psam is i2p's. The list used to hold ONE entry named after the CHAIN, so
+reachability and the proxy that reaches it: each IP network's own
+(BL.NET:NETWORK-PROXY -- -proxy, or its `=<network>' form, init.cpp:1706-1757),
+the onion proxy (-onion, or -proxy) for onion, and -i2psam for i2p. The list used to hold ONE entry named after the CHAIN, so
 nothing reading it -- bitcoin-cli -getinfo's Proxies line, -netinfo's
 counts table (bitcoin-cli.cpp:611-627) -- found a network in it."
   (loop for (network name) in '((:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
                                 (:i2p "i2p") (:cjdns "cjdns"))
         collect (let ((proxy (case network
-                               ((:ipv4 :ipv6 :cjdns) bl.net:*proxy*)
+                               ((:ipv4 :ipv6 :cjdns) (bl.net:network-proxy network))
                                (:torv3 bl.net:*onion-proxy*)))
                       (reachable (bl.net:reachable-network-p network)))
                   `(("name" . ,name)
@@ -742,10 +737,18 @@ this way); \"add\" entries keep dialing with the node's own setting."
     (when (and use-v2 (not (bl.net:v2-available-p)))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Error: v2transport requested but not enabled (see -v2transport)"))
+  ;; onetry: Core opens the connection on the RPC thread before it returns
+  ;; (rpc/net.cpp:356-361, OpenNetworkConnection), so the dial's own log
+  ;; lines -- p2p_i2p_sessions.py:26 reads `Creating persistent I2P SAM
+  ;; session' the moment the call returns -- are written by then. Wait,
+  ;; bounded and OUTSIDE the node lock the dial needs, for the sync thread.
+  (when (equal command "onetry")
+    (let ((done (bl:queue-onetry-dial node spec use-v2))
+          (sync (bl:node-sync-thread node)))
+      (when (and sync (bt:thread-alive-p sync))
+        (loop repeat 200 until (car done) do (sleep 0.05)))))
   (bt:with-recursive-lock-held ((bl:node-lock node))
     (cond
-      ((equal command "onetry")
-       (push (cons spec use-v2) (bl:node-pending-onetry node)))
       ((equal command "add")
        (when (%added-node-duplicate-p node spec)
          (error 'rpc-error :code +rpc-client-node-already-added+

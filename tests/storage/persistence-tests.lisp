@@ -740,8 +740,7 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
              (setf (bl.net:peer-connected-at peer) (- (bl.ser:get-unix-time) 3600)
                    (bl.net:peer-ping-nonce peer) nonce
                    (bl.net:peer-last-ping-time peer)
-                   (- (get-internal-real-time)
-                      (* age-seconds internal-time-units-per-second)))
+                   (- (bl.ser:get-time-micros) (* age-seconds 1000000)))
              peer)))
     ;; Outstanding for 100 s: left alone — no new ping, no disconnect.
     (let ((peer (peer-with-ping 100)))
@@ -768,17 +767,11 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
      peer (bl.net:peer-ping-nonce peer))
     (is (eq :ok (bl.net:check-peer-health peer))))
   ;; The positive control for the bug this replaced: the old code compared
-  ;; against a 0 initform on INTERNAL-REAL-TIME, whose zero is process start.
-  ;; Simulate a node less than PING-INTERVAL old by stamping the peer at
-  ;; internal time 0 — under the old rule that read as "pinged at boot, not due
-  ;; yet" and no ping went out for the node's first two minutes.
+  ;; against a 0 initform, so a 0 stamp read as "never". A 0 stamp is a TIME
+  ;; (the epoch, on the microsecond clock), so the ping is long overdue.
   (let ((peer (bl.net:make-peer :state :ready)))
     (setf (bl.net:peer-last-ping-time peer) 0)
-    (is (eq (if (> (get-internal-real-time)
-                   (* bl.net::+ping-interval-seconds+
-                      internal-time-units-per-second))
-                :ping-sent
-                :ok)
+    (is (eq :ping-sent
             (bl.net:check-peer-health peer))
         "a 0 last-ping-time must be read as a TIME, not as \"never\" — the two ~
 must stay distinguishable or the fix is indistinguishable from the bug")))

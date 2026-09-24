@@ -97,7 +97,7 @@ route to the target — a proxy for its network, or plain TCP):
     init.cpp:1766-1780);
   - :cjdns — only with -cjdnsreachable (dialing is ordinary TCP into the
     local cjdroute TUN's fc00::/8);
-  - :i2p — never (the SAM transport is P4).
+  - :i2p — only with -i2psam (the SAM bridge, I2P-DIAL).
 Automatic outbound selection, feelers, block-relay slot filling and anchor
 redials MUST filter through this predicate (select-dialable-address adds the
 -onlynet reachability check on top): raw-TCP-ing a 32-byte onion key is a
@@ -106,6 +106,7 @@ dial time via proxy-for-target."
   (case network
     ((:ipv4 :ipv6) t)
     (:torv3 (and *onion-proxy* t))
+    (:i2p (and *i2p-sam-proxy* t))
     (:cjdns *cjdns-reachable*)))
 
 (alexandria:define-constant +bad-ports+
@@ -221,22 +222,30 @@ GetProxy(target network), table built by init.cpp:1696-1801). Returns
     -proxy). With none configured, REFUSAL (a string) says why the dial must
     not happen at all — falling through to a raw dial would leak the onion
     name to local DNS;
-  - a .b32.i2p target is always refused (no SAM transport until P4);
-  - everything else — IPv4/IPv6/CJDNS literals and hostnames — uses *proxy*
-    (NIL = direct dial). Matches Core, where an unsuffixed -proxy covers
-    IPv4/IPv6/CJDNS/name lookups (init.cpp:1735) and CJDNS without a proxy
-    is ordinary TCP to the fc00::/8 address."
+  - a .b32.i2p target is refused: it is dialed through the SAM bridge when
+    -i2psam is set, and has no route when it is not;
+  - an IPv4/IPv6/CJDNS literal uses its network's proxy (NETWORK-PROXY) and
+    a hostname the name proxy, *proxy* (NIL = direct dial). Matches Core,
+    where an unsuffixed -proxy covers IPv4/IPv6/CJDNS/name lookups
+    (init.cpp:1735), a suffixed one only its network, and CJDNS without a
+    proxy is ordinary TCP to the fc00::/8 address."
   (cond ((parse-onion-address host)
          (if *onion-proxy*
              (values *onion-proxy* nil)
              (values nil "onion peer but no Tor proxy is configured (-proxy/-onion)")))
+        ;; With -i2psam the dial never gets here (MAKE-TCP-CONNECTION takes
+        ;; the SAM branch); without it there is no route at all.
         ((parse-i2p-address host)
-         (values nil "I2P peers are not dialable (no SAM support)"))
+         (values nil "I2P peer but no -i2psam is configured"))
         ;; Unroutable targets are dialed directly, never through the proxy —
         ;; Core's NET_UNROUTABLE has no proxy registered for it. See
         ;; %TARGET-UNROUTABLE-P.
         ((%target-unroutable-p host) (values nil nil))
-        (t (values *proxy* nil))))
+        ;; An address literal takes its own network's proxy (Core ConnectNode
+        ;; GetProxy(addrConnect.GetNetwork()), net.cpp:449-452); a name the
+        ;; name proxy (:474-480), which resolves it.
+        (t (let ((network (parse-network-address host)))
+             (values (if network (network-proxy network) *proxy*) nil)))))
 
 ;;;; Base32 (Core util/strencodings.cpp:144-200)
 ;;;

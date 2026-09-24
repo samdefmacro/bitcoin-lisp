@@ -458,6 +458,9 @@ thread; see the shutdown-coordination section above."
     (bl.net:stop-tor-control (node-tor-controller *node*))
     (setf (node-tor-controller *node*) nil))
 
+  ;; The I2P accept thread and every SAM session.
+  (stop-i2p-sessions)
+
   ;; Stop the inbound listeners: close the sockets (unblocks accept) and let
   ;; the accept threads observe node-running=nil and exit (accept timeout 1s).
   (when (node-listener-socket *node*)

@@ -648,3 +648,22 @@ effect."
            ;; drained.
            (values (funcall thunk) (get-output-stream-string out)))
       (unless was-on (bl.log:disable-log-category category)))))
+
+;;;; Driving one message through the shipped per-peer dispatch
+
+(defun %fake-ready-peer ()
+  "A peer object in the :ready state with a socket-less (but 'connected')
+connection -- enough to drive dispatch + disconnect without a real socket."
+  (let ((conn (make-test-connection
+               :host "127.0.0.1" :port 48333 :connected t))
+        (peer nil))
+    (setf peer (bl.net:make-peer
+                :connection conn :state :ready :address "127.0.0.1"))
+    peer))
+
+(defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer)))
+  "Drive COMMAND/PAYLOAD through the shipped per-peer dispatch isolation the
+drain loop uses. Returns (values still-connected peer)."
+  (values (bl.net::safely-dispatch-peer-message
+           peer command payload (bl.ctx:make-node-context) (bl.net::make-ibd))
+          peer))

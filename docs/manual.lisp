@@ -759,6 +759,24 @@
   does NOT gate the DNS seeds; those are `-dnsseed`, which Core queries
   with a hardcoded fAllowLookup.
 
+  Proxies are Core's per-network table (src/node/args.lisp, init.cpp:
+  1698-1800): `*network-proxies*` holds the ipv4/ipv6/cjdns proxy
+  (NETWORK-PROXY), `*proxy*` is the NAME proxy, `*onion-proxy*` onion's.
+  -proxy is a list option whose values may carry `=<network>`; an address
+  literal dials through its own network's proxy and a name through the
+  name proxy. A proxy may be a `unix:<path>` socket file
+  (UNIX-SOCKET-PATH-P). Trap: an address literal is parsed, never resolved
+  -- usocket's getaddrinfo refuses `::1` where the loopback is the only IPv6
+  address, so a dial to an IPv6 proxy never left the machine.
+
+  I2P goes through a SAM 3.1 bridge (`src/networking/i2p.lisp`, Core
+  `i2p.cpp`): -i2psam names it and makes i2p reachable; with
+  -i2pacceptincoming (default on, soft-off under -listen=0) a PERSISTENT
+  session keyed by `<datadir>/i2p_private_key` serves every dial and the
+  `i2paccept` thread (src/node/listen.lisp); without it each dial makes a
+  TRANSIENT session the connection owns. An I2P address is always port 0:
+  a dial to any other port is refused before the bridge is touched.
+
   Our own addresses are Core's mapLocalHost (`ADD-LOCAL`,
   `LOCAL-ADDRESSES`, read by getnetworkinfo's localaddresses). Writers:
   -externalip (LOCAL_MANUAL, at its own port or GetListenPort), the Tor
@@ -790,6 +808,12 @@
   (bitcoin-lisp.networking:open-listener function)
   (bitcoin-lisp.networking:accept-connection function)
   (bitcoin-lisp.networking:*proxy* variable)
+  (bitcoin-lisp.networking:*network-proxies* variable)
+  (bitcoin-lisp.networking:network-proxy function)
+  (bitcoin-lisp.networking:unix-socket-path-p function)
+  (bitcoin-lisp.networking:lookup-service function)
+  (bitcoin-lisp.networking:i2p-session-connect function)
+  (bitcoin-lisp.networking:i2p-dial function)
   (bitcoin-lisp.networking:*onion-proxy* variable)
   (bitcoin-lisp.networking:*name-lookup* variable)
   (bitcoin-lisp.networking:socks5-connect function)
@@ -999,8 +1023,19 @@
   on transactions read it, the inv handler and the tx handler, so a test
   driving either has to say which side of it the node is on. A reorg used to
   be triggered only by an ARRIVING block -- the sync pass now re-evaluates
-  the best chain itself."
+  the best chain itself.
+
+  BIP37 (`src/networking/bloom.lisp`, `merkleblock.lisp`; Core
+  `common/bloom.cpp`, `merkleblock.cpp`): a node started with
+  -peerbloomfilters, or a peer holding the bloomfilter permission, is offered
+  NODE_BLOOM (PEER-OUR-SERVICES); filterload/filteradd/filterclear then load,
+  grow and drop the peer's filter, and tx announcements, the answer to
+  `mempool` and the `merkleblock` for a MSG_FILTERED_BLOCK getdata are what
+  BLOOM-RELEVANT-AND-UPDATE-P matches. The filter and merkleblock bytes are
+  checked against Core's own vectors (tests/networking/bloom-tests.lisp)."
   (bitcoin-lisp.networking:peer class)
+  (bitcoin-lisp.networking:bloom-relevant-and-update-p function)
+  (bitcoin-lisp.networking:make-merkle-block function)
   (bitcoin-lisp.networking:connect-peer function)
   (bitcoin-lisp.networking:disconnect-peer function)
   (bitcoin-lisp.networking:disconnect-msg function)
@@ -1689,10 +1724,11 @@
 
 (defsection @zmq (:title "zmq: the notification sockets")
   "`src/zmq.lisp`. Core: `zmq/zmqnotificationinterface.cpp`,
-  `zmq/zmqpublishnotifier.cpp`. Five PUB sockets -- hashblock, hashtx,
-  rawblock, rawtx, sequence -- each bound by its own `-zmqpub<topic>`
-  option, each message the topic, the body and a per-topic sequence
-  counter. libzmq is loaded lazily, only when a `-zmqpub*` option is set,
+  `zmq/zmqpublishnotifier.cpp`. Five topics -- hashblock, hashtx,
+  rawblock, rawtx, sequence -- and one publisher per (topic, address)
+  pair: `-zmqpub<topic>` is a list option and may name several addresses
+  (Core's GetArgs, zmqnotificationinterface.cpp:57-71). Each message is the
+  topic, the body and that publisher's own sequence counter. libzmq is loaded lazily, only when a `-zmqpub*` option is set,
   so a host without it runs the node with ZMQ off.
 
   Invariants: the notifications are validation-interface hooks (see the

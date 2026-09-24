@@ -151,10 +151,13 @@ src/serialization/.")
    #:message-header-checksum
    #:read-message-header
    #:serialize-message
+   #:encode-base64
+   #:decode-base64
    #:compute-checksum
    #:*network-magic*
    ;; Service bit constants
    #:+node-network+
+   #:+node-bloom+
    #:+node-witness+
    #:+node-network-limited+
    #:+node-p2p-v2+
@@ -243,6 +246,7 @@ src/serialization/.")
    #:+psbt-out-tap-tree+ #:+psbt-out-tap-bip32+
    #:coinbase-input-p
    #:get-unix-time
+   #:get-time-micros
    #:get-scheduler-time
    #:mock-scheduler-forward
    #:*scheduler-offset*

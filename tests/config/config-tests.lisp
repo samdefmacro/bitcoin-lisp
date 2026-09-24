@@ -588,6 +588,7 @@ init.cpp:1688-1693, long before it looks for -i2psam (:2240-2245), so
         (bl.net:*onlynet-networks* bl.net:*onlynet-networks*)
         (bl.net:*onion-proxy-explicit* nil)
         (bl.net:*proxy* nil)
+        (bl.net:*network-proxies* nil)
         (bl.net:*onion-proxy* nil)
         (bl:*dns-seed-enabled* bl:*dns-seed-enabled*))
     (flet ((message (alist)
@@ -595,8 +596,10 @@ init.cpp:1688-1693, long before it looks for -i2psam (:2240-2245), so
                (error (e) (princ-to-string e)))))
       (is (search "Incompatible options: -dnsseed=1 was explicitly specified"
                   (or (message '(("dnsseed" . "1") ("onlynet" . "i2p"))) "")))
-      ;; Without the explicit -dnsseed=1 the I2P refusal is still the answer.
-      (is (search "I2P" (or (message '(("onlynet" . "i2p"))) ""))))))
+      ;; Without the explicit -dnsseed=1 the I2P refusal is still the answer,
+      ;; in Core's words (init.cpp:2239-2243).
+      (is (search "restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
+                  (or (message '(("onlynet" . "i2p"))) ""))))))
 
 ;;; --- G7-03: -onlynet clearnet exclusion must disable DNS seeding ------------
 ;;;
@@ -2415,10 +2418,10 @@ become a second -addnode."
            (setf (bl:node-network-active node) t
                  bl::*seed-nodes* '("127.0.0.1:1")
                  bl::*use-addrman-outgoing* nil)
-           (bl::connect-seed-nodes node)
+           (bl:connect-seed-nodes node)
            (is (= 0 (length (bl:node-peers node))))
            ;; And it is reached from startup, not merely defined.
-           (is-true (%reached-from-start-node-p 'bl::connect-seed-nodes)))
+           (is-true (%reached-from-start-node-p 'bl:connect-seed-nodes)))
       (setf bl::*use-addrman-outgoing* saved-addrman
             bl::*seed-nodes* saved-seeds)))
   (dolist (name '("seednode" "forcednsseed"))
@@ -2459,6 +2462,12 @@ MEBIbytes. Reading it as bytes — the obvious mistake — would make every
 ordinary command line set a target of a few hundred bytes, i.e. permanently
 over budget from the first message."
   ;; ParseByteUnits: lowercase 1000-base, uppercase 1024-base, default M.
+  ;; The option names itself in the refusal (init.cpp:1426-1428;
+  ;; feature_maxuploadtarget.py:203).
+  (let ((bl.net:*max-upload-target* bl.net:*max-upload-target*))
+    (is (equal "Unable to parse -maxuploadtarget: 'abc'"
+               (handler-case (progn (apply-config-globals '(("maxuploadtarget" . "abc"))) nil)
+                 (error (e) (princ-to-string e))))))
   (is (= (* 100 1024 1024) (bl.cfg:conf-parse-byte-units "100")))
   ;; Core's ByteUnit::NOOP, where a bare number really is a byte count.
   (is (= 100 (bl.cfg:conf-parse-byte-units "100" #\B)))
@@ -3696,20 +3705,36 @@ having no effect."
     (is (null (bl.cfg:supplied-core-only-options merged)))
     (is (equal "1" (cfg "allowignoredconf" merged)))))
 
-(test i2psam-is-recorded-for-reporting-and-still-core-only
-  "-i2psam names the I2P SAM proxy Core reports as the i2p network's proxy
-(init.cpp:2232-2238 SetProxy(NET_I2P, ...), default port 7656; rpc/net.cpp:626),
-so its value is kept -- but this node does not speak I2P, and the option stays
-one startup names as accepted-and-unimplemented. A start without it clears
-what an earlier start in the same image left."
+(test i2psam-names-the-sam-bridge-and-makes-i2p-reachable
+  "-i2psam names the I2P SAM bridge (init.cpp:2232-2238 SetProxy(NET_I2P),
+default port 7656; rpc/net.cpp:626): the I2P dials and the persistent session
+use it, and it makes the i2p network reachable, which feature_proxy.py:302
+reads back from getnetworkinfo. A start without it clears what an earlier
+start in the same image left."
   (let ((bl.net:*i2p-sam-proxy* :unset))
     (apply-config-globals '(("i2psam" . "127.0.0.1")))
     (is (equal "127.0.0.1:7656" bl.net:*i2p-sam-proxy*))
     (apply-config-globals '(("i2psam" . "127.0.0.1:7000")))
     (is (equal "127.0.0.1:7000" bl.net:*i2p-sam-proxy*))
     (apply-config-globals '())
-    (is (null bl.net:*i2p-sam-proxy*)))
-  (is (equal '("i2psam") (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1"))))))
+    (is (null bl.net:*i2p-sam-proxy*))
+    ;; -dns=0 forbids resolving a NAME, whichever order the options came in:
+    ;; Core reads fNameLookup before any address option (init.cpp:1695).
+    (let ((bl.net:*name-lookup* t))
+      (is (search "Invalid -i2psam address or hostname: 'localhost'"
+                  (handler-case (progn (apply-config-globals '(("i2psam" . "localhost")
+                                                               ("dns" . "0")))
+                                       "")
+                    (error (e) (princ-to-string e)))))))
+  (let ((bl.net:*reachable-networks* bl.net:*reachable-networks*)
+        (bl.net:*i2p-sam-proxy* bl.net:*i2p-sam-proxy*))
+    (apply-config-globals '(("i2psam" . "127.0.0.1")))
+    (is-true (bl.net:reachable-network-p :i2p) "-i2psam makes i2p reachable")
+    (apply-config-globals '())
+    (is-false (bl.net:reachable-network-p :i2p) "and nothing else does"))
+  (is (null (bl.cfg:supplied-core-only-options '(("i2psam" . "127.0.0.1")
+                                                  ("i2pacceptincoming" . "0"))))
+      "neither option is accepted-and-unimplemented any more"))
 
 (test unrecognized-config-sections-are-cores-init-warning
   "Core records every section a config file names -- a [header], or the part

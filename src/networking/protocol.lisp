@@ -125,10 +125,9 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
       (copy-list seeds)
       (let ((addresses '()))
         (dolist (seed seeds)
-          ;; Per seed, before the lookup, exactly as Core does (net.cpp:2353).
-          ;; p2p_dns_seeds.py greps for this line to tell which seeds a node
-          ;; actually tried — a summary after the fact cannot answer that.
-          (bl:log-info "Loading addresses from DNS seed ~A" seed)
+          ;; `Loading addresses from DNS seed' is the caller's line: the DNS
+          ;; seed thread writes it per seed before this lookup, as Core does
+          ;; (net.cpp:2353), under a name proxy too.
           (let ((resolved (resolve-dns-seed seed)))
             (when resolved
               (setf addresses (nconc addresses resolved)))))
@@ -191,73 +190,107 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     (reply-to-ping peer nonce)))
 
 (define-p2p-handler "pong" (peer payload ctx)
-  "Close the round trip our last ping opened.
-
-Core hand-writes a forgiving branch for a pong that is too short to hold the
-nonce (net_processing.cpp:5030-5035): nAvail < sizeof(nonce) sets sProblem to
-`Short payload', cancels the outstanding ping (bPingFinished), logs at debug
-and returns - the peer is kept. It is the one message whose truncation Core
-names, because a short pong is most likely a bug in another implementation and
-costs us nothing. Reading the u64 unguarded here instead raised, and the
-dispatch turned that into a disconnect."
+  "Close the round trip our last ping opened: Core's PONG handler
+(net_processing.cpp:4990-5049), problem by problem. A pong too short to hold
+the nonce is `Short payload' and cancels the outstanding ping; with no ping
+outstanding it is `Unsolicited pong without ping'; a different nonce is
+`Nonce mismatch' and leaves the ping outstanding (pings overlap), except a
+zero one, `Nonce zero', which cancels it. Each problem is one debug line,
+`pong peer=<id>: <problem>, <sent> expected, <received> received, <n> bytes'
+in hex, which p2p_ping.py:60-83 waits for; the peer is kept. Ours cancelled
+the ping on any nonce and named only the short payload."
   (declare (ignore ctx))
-  (if (< (length payload) 8)
-      (progn
-        (bl:log-cat "net" "pong peer=~A: Short payload, ~X expected, ~D bytes"
-                    (peer-id peer) (or (peer-ping-nonce peer) 0) (length payload))
-        (setf (peer-ping-nonce peer) nil))
-      (record-pong peer (bl.bytes:with-byte-reader (s payload)
-                          (bl.bytes:br-read-u64-le s)))))
+  (let ((avail (length payload))
+        (sent (or (peer-ping-nonce peer) 0))
+        (nonce 0)
+        (finished nil)
+        (problem nil))
+    (cond ((< avail 8)
+           (setf finished t problem "Short payload"))
+          (t
+           (setf nonce (bl.bytes:with-byte-reader (s payload) (bl.bytes:br-read-u64-le s)))
+           (cond ((zerop sent) (setf problem "Unsolicited pong without ping"))
+                 ((= nonce sent)
+                  (setf finished t)
+                  (unless (record-pong peer nonce)
+                    (setf problem "Timing mishap")))
+                 ((zerop nonce) (setf finished t problem "Nonce zero"))
+                 (t (setf problem "Nonce mismatch")))))
+    (when problem
+      (bl:log-cat "net" "pong peer=~A: ~A, ~(~X~) expected, ~(~X~) received, ~D bytes"
+                  (peer-id peer) problem sent nonce avail))
+    (when finished
+      (setf (peer-ping-nonce peer) nil))))
 
 (define-p2p-handler "mempool" (peer payload ctx)
-  "BIP35. Core honors this only when it advertises NODE_BLOOM or the peer
-holds the \"mempool\" permission; otherwise it disconnects (\"mempool
-request with bloom filters disabled\", net_processing.cpp:4940-4951). We
-never advertise NODE_BLOOM, so the permission is the only way in.
-
-Core also refuses a permitted request once -maxuploadtarget is spent
-(:4953), and does not disconnect a noban peer for it either."
+  "BIP35 (Core net_processing.cpp:4939-4966): honoured only when we offer the
+peer NODE_BLOOM or it holds the \"mempool\" permission, and -- unless it holds
+that permission -- only while -maxuploadtarget is not spent. Either refusal
+disconnects, except a noban peer, which is kept. The answer is the pool
+filtered by the peer's feefilter and bloom filter (HANDLE-MEMPOOL-REQUEST)."
   (cond
-    ((not (peer-has-permission-p peer +perm-mempool+))
-     (bl:log-cat "net" "mempool request with bloom filters disabled, ~A"
-                 (disconnect-msg peer))
-     (disconnect-peer peer))
-    ((outbound-target-reached-p nil)
-     (bl:log-cat "net" "mempool request with bandwidth limit reached, ~A"
-                 (disconnect-msg peer))
+    ((not (or (peer-offers-bloom-p peer) (peer-has-permission-p peer +perm-mempool+)))
      (unless (peer-has-permission-p peer +perm-noban+)
+       (bl:log-cat "net" "mempool request with bloom filters disabled, ~A"
+                   (disconnect-msg peer))
+       (disconnect-peer peer)))
+    ((and (outbound-target-reached-p nil)
+          (not (peer-has-permission-p peer +perm-mempool+)))
+     (unless (peer-has-permission-p peer +perm-noban+)
+       (bl:log-cat "net" "mempool request with bandwidth limit reached, ~A"
+                   (disconnect-msg peer))
        (disconnect-peer peer)))
     (t (handle-mempool-request peer payload ctx))))
 
 (defun %refuse-bloom-filter-message (peer command)
-  "Drop PEER for a BIP37 filter message. Core answers filterload, filteradd and
-filterclear with this line and a disconnect whenever it does not advertise
-NODE_BLOOM (net_processing.cpp:5051-5056, :5076-5081, :5104-5109). This node
-never advertises NODE_BLOOM -- LOCAL-SERVICES has no bit for it and BIP37
-serving is not implemented -- so all three are always refused, which is the
-same answer Core gives under -peerbloomfilters=0.
-
-The line is Core's own, with CNode::DisconnectMsg at the end;
-p2p_nobloomfilter_messages.py sends each of the three and waits for the
-connection to close."
-  (bl:log-cat "net" "~A received despite not offering bloom services, ~A"
-              command (disconnect-msg peer))
-  (disconnect-peer peer))
+  "Drop PEER for a BIP37 filter message when we do not offer it NODE_BLOOM
+(Core net_processing.cpp:5051-5056, :5076-5081, :5104-5109), with Core's line
+and CNode::DisconnectMsg; p2p_nobloomfilter_messages.py sends each of the
+three and waits for the connection to close. Returns T when it refused."
+  (unless (peer-offers-bloom-p peer)
+    (bl:log-cat "net" "~A received despite not offering bloom services, ~A"
+                command (disconnect-msg peer))
+    (disconnect-peer peer)
+    t))
 
 (define-p2p-handler "filterload" (peer payload ctx)
-  "BIP37: refused, because this node does not offer bloom services."
-  (declare (ignore payload ctx))
-  (%refuse-bloom-filter-message peer "filterload"))
+  "BIP37 filterload (Core net_processing.cpp:5051-5074): a filter over the
+size limits is Misbehaving (`too-large bloom filter'); otherwise it replaces
+the peer's filter and turns tx relay on, for a tx-relay peer."
+  (declare (ignore ctx))
+  (unless (%refuse-bloom-filter-message peer "filterload")
+    (let ((filter (parse-bloom-filter payload)))
+      (cond ((not (bloom-within-size-constraints-p filter))
+             (record-misbehavior peer "too-large bloom filter"))
+            ((peer-tx-relay-state-p peer)
+             (setf (peer-bloom-filter peer) filter
+                   (peer-bloom-relay-txs peer) t))))))
 
 (define-p2p-handler "filteradd" (peer payload ctx)
-  "BIP37: refused, because this node does not offer bloom services."
-  (declare (ignore payload ctx))
-  (%refuse-bloom-filter-message peer "filteradd"))
+  "BIP37 filteradd (Core net_processing.cpp:5076-5102): an element over
+MAX_SCRIPT_ELEMENT_SIZE, or one sent with no filter loaded, is Misbehaving
+(`bad filteradd message'); otherwise it is inserted into the filter."
+  (declare (ignore ctx))
+  (unless (%refuse-bloom-filter-message peer "filteradd")
+    (let* ((data (bl.bytes:with-byte-reader (s payload)
+                   (bl.bytes:br-read-bytes s (bl.bytes:br-read-compact-size s))))
+           (bad (cond ((> (length data) +max-script-element-size+) t)
+                      ((not (peer-tx-relay-state-p peer)) nil)
+                      ((peer-bloom-filter peer)
+                       (bloom-insert (peer-bloom-filter peer) data)
+                       nil)
+                      (t t))))
+      (when bad
+        (record-misbehavior peer "bad filteradd message")))))
 
 (define-p2p-handler "filterclear" (peer payload ctx)
-  "BIP37: refused, because this node does not offer bloom services."
+  "BIP37 filterclear (Core net_processing.cpp:5104-5120): drop the filter and
+turn tx relay on."
   (declare (ignore payload ctx))
-  (%refuse-bloom-filter-message peer "filterclear"))
+  (unless (%refuse-bloom-filter-message peer "filterclear")
+    (when (peer-tx-relay-state-p peer)
+      (setf (peer-bloom-filter peer) nil
+            (peer-bloom-relay-txs peer) t))))
 
 (define-p2p-handler "version" (peer payload ctx)
   "A second version, after the handshake already took the first. Core ignores
@@ -2829,6 +2862,19 @@ form would waste the construction on both ends."
 the -maxuploadtarget serving limit (Core HISTORICAL_BLOCK_AGE,
 net_processing.cpp:120).")
 
+(defun %serve-filtered-block (peer block)
+  "Answer a MSG_FILTERED_BLOCK getdata (Core ProcessGetBlockData,
+net_processing.cpp:2440-2458): with a bloom filter loaded, the merkleblock
+the filter selects and then every matched transaction, witness-stripped, so
+the client need not ask for them; with none, nothing at all."
+  (let ((filter (peer-bloom-filter peer)))
+    (when filter
+      (multiple-value-bind (payload matched) (make-merkle-block block filter)
+        (send-message peer (bl.ser:serialize-message "merkleblock" payload))
+        (let ((txs (coerce (bl.ser:bitcoin-block-transactions block) 'vector)))
+          (dolist (m matched)
+            (send-message peer (bl.ser:make-tx-message (aref txs (car m)) :witness nil))))))))
+
 (defun %inv-vector-description (inv)
   "One inv as Core's CInv::ToString prints it -- `<type> <hash>'
 (protocol.cpp:58-84). The type name is Core's own spelling, the
@@ -2991,6 +3037,7 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
           ;; ProcessGetBlockData does, and differs only in what is sent.
           ((or (= inv-type bl.ser:+inv-type-block+)
                (= inv-type bl.ser:+inv-type-witness-block+)
+               (= inv-type bl.ser:+inv-type-filtered-block+)
                (= inv-type bl.ser:+inv-type-cmpct-block+))
            (when (and block-store (< blocks-served +max-blocks-served-per-getdata+))
              (let ((entry (and chain-state
@@ -3024,8 +3071,9 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                                     (and h (bl.ser:block-header-timestamp h)))))
                            (let ((bt (and best (btime best)))
                                  (et (btime entry)))
-                             (and bt et
-                                  (> (- bt et) +historical-block-age-seconds+))))))
+                             (or (= inv-type bl.ser:+inv-type-filtered-block+)
+                                 (and bt et
+                                      (> (- bt et) +historical-block-age-seconds+)))))))
                   (bl:log-cat "net" "historical block serving limit reached, ~A"
                               (disconnect-msg peer))
                   (disconnect-peer peer)
@@ -3048,6 +3096,10 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                         ;; ProcessGetBlockData, TX_WITH_WITNESS).
                         (witnessed (/= inv-type
                                        bl.ser:+inv-type-block+)))
+                    (when (and block (= inv-type bl.ser:+inv-type-filtered-block+))
+                      (incf blocks-served)
+                      (%serve-filtered-block peer block)
+                      (setf block nil))
                     (when block
                       (incf blocks-served)
                       (send-message
@@ -3600,7 +3652,7 @@ IsAddrCompatible test."
                  :net (local-address-network la)
                  :ip (local-address-bytes la)
                  :port (local-address-port la)
-                 :services (local-services)
+                 :services (peer-our-services peer)
                  :last-seen (bl.ser:get-unix-time))))
         ;; Core logs this in GetLocalAddrForPeer (net.cpp:262-264), i.e. for
         ;; the repeats that ride the queue as well as for the first;
@@ -4044,6 +4096,17 @@ entries with the higher mining score to sort later\" — so the heap's maximum
 is the announcement Core would send first."
   (minusp (bl.mp:mempool-compare-mining-order mempool (first b) (first a))))
 
+(defun %bloom-admits-p (peer mempool txid)
+  "T unless PEER has a bloom filter the mempool transaction TXID does not
+match (Core IsRelevantAndUpdate in SendMessages, net_processing.cpp:6075). A
+transaction that has left the mempool is not judged here."
+  (let ((filter (peer-bloom-filter peer)))
+    (or (null filter)
+        (null mempool)
+        (let ((entry (bl.mp:mempool-get mempool txid)))
+          (or (null entry)
+              (bloom-relevant-and-update-p filter (bl.mp:mempool-entry-transaction entry)))))))
+
 (defun %flush-peer-tx-invs (peer mempool)
   "Drain queued announcements to PEER as one inv message: as many as
 %TX-INV-BROADCAST-MAX allows at the current backlog, in the order the mempool
@@ -4101,7 +4164,10 @@ Core's `continue` before nRelayedTransactions++."
                                 (bl.mp:mempool-has mempool txid))
                             ;; BIP 133 feefilter, evaluated at flush time.
                             (or (zerop (peer-feefilter-rate peer))
-                                (>= fee-rate-per-kb (peer-feefilter-rate peer))))
+                                (>= fee-rate-per-kb (peer-feefilter-rate peer)))
+                            ;; BIP37: only what the peer's filter matches
+                            ;; (net_processing.cpp:6075).
+                            (%bloom-admits-p peer mempool txid))
                    (%mark-tx-known-to-peer peer known)
                    (incf count)
                    (push inv invs)))))
@@ -4150,8 +4216,13 @@ that connected mid-flush would see it."
                        (floor (* 1000 (bl.mp:mempool-entry-fee entry))
                               vsize)
                        0))))
-           (when (or (zerop (peer-feefilter-rate peer))
-                     (>= fee-rate-per-kb (peer-feefilter-rate peer)))
+           (when (and (or (zerop (peer-feefilter-rate peer))
+                          (>= fee-rate-per-kb (peer-feefilter-rate peer)))
+                      ;; BIP37 (net_processing.cpp:6017-6019).
+                      (or (null (peer-bloom-filter peer))
+                          (bloom-relevant-and-update-p
+                           (peer-bloom-filter peer)
+                           (bl.mp:mempool-entry-transaction entry))))
              (incf count)
              ;; Mark it known to the peer, under the id its inventory uses, so
              ;; the ordinary relay path does not announce it a second time

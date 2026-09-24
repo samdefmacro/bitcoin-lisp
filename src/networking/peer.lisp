@@ -286,6 +286,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
   ;; BIP 133 feefilter support
   (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
+  ;; BIP37 (Core Peer::TxRelay::m_bloom_filter / m_relay_txs): the filter a
+  ;; filterload loaded, and T once a filterload or filterclear has turned tx
+  ;; relay on for a peer whose version said fRelay=0.
+  (bloom-filter nil)
+  (bloom-relay-txs nil :type boolean)
   ;; Mempool-sequence snapshot taken at each inv flush to this peer (Core
   ;; Peer::TxRelay::m_last_inv_sequence, net_processing.cpp:322, init 1).
   ;; The getdata anti-probing gate serves a mempool tx only when its entry
@@ -424,6 +429,18 @@ to decide whether the address is charged an addrman attempt at all
               (bl:log-cat "net" "Added connection peer=~D" (peer-id peer)))
           peer)
         (values nil proxy-failed))))
+
+(defun connection-type-string (conn-type)
+  "Core CNode::ConnectionTypeAsString for our peer conn-type keyword -- what
+getpeerinfo's connection_type and the `trying ... connection' line say."
+  (case conn-type
+    (:inbound "inbound")
+    (:outbound-full-relay "outbound-full-relay")
+    (:block-relay "block-relay-only")
+    (:feeler "feeler")
+    (:manual "manual")
+    (:addr-fetch "addr-fetch")
+    (t (string-downcase (symbol-name conn-type)))))
 
 (defun peer-live-p (peer)
   "T while PEER is still a connection we could actually use — our stand-in for
@@ -1046,15 +1063,17 @@ peer fRelay=0 and then accepted its transactions (p2p_blocksonly.py:57)."
   "T when tx-relay state exists for PEER — the exact condition under which
 Core initializes Peer::TxRelay at VERSION time (net_processing.cpp:3681-3696):
 the connection is not block-relay-only or feeler, AND the peer's version set
-fRelay=1. We never advertise NODE_BLOOM, so Core's other arm (fRelay=0 but
-NODE_BLOOM offered, letting a later filterload turn relay on) never applies:
-a BIP37/BIP60 fRelay=0 peer gets NO tx invs and its tx getdata is ignored for
-the life of the connection. A peer with no stored version yet counts as
-relaying — Core's pre-70001 default is fRelay=true (net_processing.cpp:3597)."
+fRelay=1 -- Core's m_relay_txs. A filterload or filterclear turns it on for
+an fRelay=0 peer we offer NODE_BLOOM to (net_processing.cpp:5064-5069,
+:5112-5117; PEER-BLOOM-RELAY-TXS); until then a BIP37/BIP60 fRelay=0 peer gets
+NO tx invs and its tx getdata is ignored. A peer with no stored version yet
+counts as relaying — Core's pre-70001 default is fRelay=true
+(net_processing.cpp:3597)."
   (and (peer-relays-txs-p peer)
-       (let ((v (peer-version peer)))
-         (or (null v)
-             (bl.ser:version-message-relay v)))))
+       (or (peer-bloom-relay-txs peer)
+           (let ((v (peer-version peer)))
+             (or (null v)
+                 (bl.ser:version-message-relay v))))))
 
 (defun peer-tx-relay-state-p (peer)
   "T when PEER has a Peer::TxRelay at all -- Core's `peer->GetTxRelay() !=
@@ -1069,7 +1088,25 @@ and deliberately treats a version-less peer as relaying, because Core's
 pre-70001 fRelay default is true. Reading that one in getpeerinfo reported
 relaytxes true and last_inv_sequence 1 for a peer that had said nothing
 (rpc_net.py:148 expects false and 0)."
-  (and (peer-version peer) (peer-tx-relay-p peer) t))
+  (and (peer-version peer)
+       (peer-relays-txs-p peer)
+       ;; fRelay, or NODE_BLOOM offered: the peer may turn relay on later.
+       (or (peer-tx-relay-p peer) (peer-offers-bloom-p peer))
+       t))
+
+(defun peer-offers-bloom-p (peer)
+  "T when we offer PEER NODE_BLOOM (Core peer.m_our_services & NODE_BLOOM):
+-peerbloomfilters for everyone (init.cpp:1104-1105), or the bloomfilter
+permission for this peer (net_processing.cpp:1614-1616)."
+  (or bl:*peer-bloom-filters*
+      (peer-has-permission-p peer +perm-bloom-filter+)))
+
+(defun peer-our-services (peer)
+  "Core Peer::m_our_services: LOCAL-SERVICES, plus NODE_BLOOM for a peer
+holding the bloomfilter permission. It is what our version message and our
+self-advertised address tell that peer."
+  (logior (local-services)
+          (if (peer-offers-bloom-p peer) bl.ser:+node-bloom+ 0)))
 
 ;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
 ;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist
@@ -1234,7 +1271,9 @@ NODE_COMPACT_FILTERS when filter serving is enabled."
                 bl.ser:+node-p2p-v2+ 0)
             ;; BIP157: advertise filter serving when enabled.
             (if bl:*peer-block-filters*
-                bl.ser:+node-compact-filters+ 0))))
+                bl.ser:+node-compact-filters+ 0)
+            ;; BIP111: -peerbloomfilters (init.cpp:1104-1105).
+            (if bl:*peer-bloom-filters* bl.ser:+node-bloom+ 0))))
 
 (defun %version-addr-recv (peer)
   "The addr_recv (\"addr_you\") field for our version message to PEER: the
@@ -1354,7 +1393,7 @@ go out, as they always did. Returns T."
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
 VERACK). Returns T if the version was sent."
-  (let* ((services (local-services))
+  (let* ((services (peer-our-services peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
          ;; The height is the CURRENT (active) chainstate's tip — never a
@@ -1827,7 +1866,9 @@ The nonce is published, so BL.SER:MAKE-PING-MESSAGE's OS-CSPRNG default is
 what draws it -- named here because the pong has to match it."
   (let ((nonce (bl.crypto:rand-u64)))
     (setf (peer-ping-nonce peer) nonce)
-    (setf (peer-last-ping-time peer) (get-internal-real-time))
+    ;; Core's m_ping_start: the MOCKABLE microsecond clock
+    ;; (net_processing.cpp:5504), which p2p_ping.py moves with setmocktime.
+    (setf (peer-last-ping-time peer) (bl.ser:get-time-micros))
     (send-message peer (bl.ser:make-ping-message nonce))))
 
 (defun reply-to-ping (peer nonce)
@@ -1835,16 +1876,21 @@ what draws it -- named here because the pong has to match it."
   (send-message peer (bl.ser:make-pong-message nonce)))
 
 (defun record-pong (peer nonce)
-  "Record the round trip a pong carrying NONCE closes; HANDLE-PONG parses the wire."
+  "Record the round trip a pong carrying NONCE, the outstanding ping's, closes
+(Core PongReceived) and end the ping. Returns NIL, recording nothing, for a
+negative round trip (Core's `Timing mishap') or a NONCE that is not the
+outstanding one; the \"pong\" handler sorts out the other cases."
   (when (and (peer-ping-nonce peer)
              (= nonce (peer-ping-nonce peer)))
-    (let ((rtt (- (get-internal-real-time) (peer-last-ping-time peer))))
-      (setf (peer-ping-latency peer) rtt)
-      ;; Track the connection's best round trip (Core m_min_ping_time).
-      (when (or (zerop (peer-min-ping-latency peer))
-                (< rtt (peer-min-ping-latency peer)))
-        (setf (peer-min-ping-latency peer) rtt)))
-    (setf (peer-ping-nonce peer) nil)))
+    (let ((rtt (- (bl.ser:get-time-micros) (peer-last-ping-time peer))))
+      (setf (peer-ping-nonce peer) nil)
+      (when (>= rtt 0)
+        (setf (peer-ping-latency peer) rtt)
+        ;; Track the connection's best round trip (Core m_min_ping_time).
+        (when (or (zerop (peer-min-ping-latency peer))
+                  (< rtt (peer-min-ping-latency peer)))
+          (setf (peer-min-ping-latency peer) rtt))
+        t))))
 
 ;;; Peer Health Monitoring
 
@@ -1955,7 +2001,7 @@ for exactly these texts."
         :disconnect)
       :ok))
 
-(defun maybe-send-ping (peer &optional (now (get-internal-real-time)))
+(defun maybe-send-ping (peer &optional (now (bl.ser:get-time-micros)))
   "Core PeerManagerImpl::MaybeSendPing (net_processing.cpp:5487-5510). Returns
 :disconnect, :ping-sent or :ok.
 
@@ -1967,17 +2013,19 @@ a node started with a huge -peertimeout still pings and still measures latency,
 it just never disconnects for the answer.
 
 Both clocks are the send time of the last ping, so an outstanding ping is never
-overwritten and its age never reset."
+overwritten and its age never reset. NOW and the ping fields are Core's
+mockable microseconds (BL.SER:GET-TIME-MICROS)."
   (let* ((last (peer-last-ping-time peer))
          (age (and last (- now last))))
     (cond
       ((peer-ping-nonce peer)
        (cond
-         ((and (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
+         ((and (> age (* +ping-timeout-seconds+ 1000000))
                (should-run-inactivity-checks-p peer))
-          (bl:log-cat "net" "ping timeout: ~,1Fs, disconnecting peer=~A"
-                      (/ (float age) (float internal-time-units-per-second))
-                      (peer-id peer))
+          ;; Core's %f: six decimals (net_processing.cpp:5495).
+          (bl:log-cat "net" "ping timeout: ~,6Fs, ~A"
+                      (/ age 1000000d0)
+                      (disconnect-msg peer))
           :disconnect)
          (t :ok)))
       ;; Never pinged: due NOW, as Core's is.
@@ -1998,7 +2046,7 @@ overwritten and its age never reset."
       ((null last)
        (send-ping peer)
        :ping-sent)
-      ((> age (* +ping-interval-seconds+ internal-time-units-per-second))
+      ((> age (* +ping-interval-seconds+ 1000000))
        (send-ping peer)
        :ping-sent)
       (t :ok))))
@@ -2013,8 +2061,7 @@ Inside the gate the rules are Core's: the send-buffer backpressure signal, then
 InactivityCheck's timing rules (INACTIVITY-CHECK-REASON), then the unfinished
 handshake (CHECK-HANDSHAKE-TIMEOUT, which is InactivityCheck's fourth rule),
 then MaybeSendPing (MAYBE-SEND-PING)."
-  (let ((conn (peer-connection peer))
-        (now (get-internal-real-time)))
+  (let ((conn (peer-connection peer)))
     (when (and conn (connection-connected conn))
       ;; Upkeep, not a verdict, so it runs whether or not the gate is open:
       ;; retry buffered unsent bytes, non-blocking (Core's periodic
@@ -2037,7 +2084,7 @@ then MaybeSendPing (MAYBE-SEND-PING)."
     ;; handshake rule is behind the same gate, inside CHECK-HANDSHAKE-TIMEOUT.
     (unless (eq (peer-state peer) :ready)
       (return-from check-peer-health (check-handshake-timeout peer)))
-    (maybe-send-ping peer now)))
+    (maybe-send-ping peer)))
 
 (defun record-block-received-from-peer (peer)
   "Record that we received a block from PEER. Resets stalling state and

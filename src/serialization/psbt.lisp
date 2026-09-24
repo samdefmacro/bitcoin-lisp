@@ -549,7 +549,11 @@ signature after its bip32 derivations."
   "Serialize PSBT and base64-encode it (the RPC wire form)."
   (cl-base64:usb8-array-to-base64-string (serialize-psbt psbt)))
 
-(defun %core-decode-base64 (string)
+(defun encode-base64 (bytes)
+  "Core EncodeBase64: standard alphabet, `=' padded."
+  (cl-base64:usb8-array-to-base64-string bytes))
+
+(defun decode-base64 (string)
   "Core's DecodeBase64 (util/strencodings.cpp:109-142), or NIL where it
 answers nullopt: a length that is not a multiple of four, anything but the
 64-character alphabet once at most two trailing `=' are dropped, or leftover
@@ -569,7 +573,7 @@ bits that are not zero (ConvertBits<6, 8, false>)."
                           ((char<= #\0 c #\9) (+ 52 (- (char-code c) 48)))
                           ((char= c #\+) 62)
                           ((char= c #\/) 63))))
-            (unless v (return-from %core-decode-base64 nil))
+            (unless v (return-from decode-base64 nil))
             (setf acc (logior (ash (logand acc #xffff) 6) v))
             (incf bits 6)
             (when (>= bits 8)
@@ -583,7 +587,7 @@ bits that are not zero (ConvertBits<6, 8, false>)."
 Core's \"invalid base64\" (DecodeBase64PSBT, psbt.cpp:607-616) --
 rpc_psbt.py:871 reads it after the \"TX decode failed \" prefix; ours was
 cl-base64's own complaint about the character it tripped on."
-  (let ((bytes (%core-decode-base64 base64-string)))
+  (let ((bytes (decode-base64 base64-string)))
     (unless bytes (serialization-error "invalid base64"))
     (parse-psbt bytes)))
 

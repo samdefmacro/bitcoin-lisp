@@ -2831,10 +2831,10 @@ ThreadOpenConnections does."
   "Drive the shipped steady-state refill — our ThreadOpenConnections."
   (bl::replace-disconnected-peers node))
 
-(defun %dial-named-destination (node host port)
+(defun %dial-named-destination (node host port &key (conn-type :manual))
   "Drive the shipped dial for a destination somebody NAMED: -addnode,
 -connect, `addnode onetry', -seednode and the addconnection RPC all land here."
-  (bl::establish-outbound-peer node host port :conn-type :manual))
+  (bl::establish-outbound-peer node host port :conn-type conn-type))
 
 (defun %hosts-dialed-by (thunk &optional proxy-failed)
   "The hosts the code under test asked BL.NET:CONNECT-PEER for while THUNK ran.
@@ -3474,3 +3474,41 @@ ours dropped the header further in and kept the peer."
           (multiple-value-bind (added text) (ingest (list good))
             (is (= 1 added))
             (is-false (search "Misbehaving" text) "~A" text)))))))
+
+(test a-handshake-cut-short-by-shutdown-keeps-its-anchor
+  "Core keeps an outbound CNode in m_nodes from the moment it connects until
+StopNodes, which writes every block-relay-only one to anchors.dat -- handshake
+finished or not (GetCurrentBlockRelayOnlyConns, net.cpp:2896-2907, :3637-3649)
+-- and only then closes them. Ours withdrew a peer whose handshake a shutdown
+request cut short, so feature_anchors.py:107 (a block-relay-only dial to an
+onion proxy that never answers, then `stop') found 0 anchors to flush. The
+peer must stay published, not :disconnected, for the dump."
+  (let* ((srv (usocket:socket-listen "127.0.0.1" 0 :element-type '(unsigned-byte 8)
+                                                   :reuse-address t))
+         (port (usocket:get-local-port srv))
+         (held '())
+         (acceptor (bt:make-thread
+                    (lambda ()
+                      (ignore-errors
+                       (loop (push (usocket:socket-accept srv) held))))
+                    :name "silent-peer")))
+    (flet ((dial (node)
+             (%dial-named-destination node "127.0.0.1" port :conn-type :block-relay)))
+      (unwind-protect
+           (let ((node (make-test-node)))
+             (setf (bl:node-network-active node) t)
+             (let ((stopper (bt:make-thread (lambda () (sleep 1) (bl.net:request-ibd-stop))
+                                            :name "shutdown-request")))
+               (dial node)
+               (bt:join-thread stopper))
+             (let ((peer (first (bl:node-peers node))))
+               (is-true peer "the peer stays published for StopNodes")
+               (when peer
+                 (is (eq :block-relay (bl.net:peer-conn-type peer)))
+                 (is (not (eq :disconnected (bl.net:peer-state peer)))
+                     "and is not retired, so the anchor dump sees it")
+                 (bl.net:disconnect-peer peer))))
+        (bl.net:reset-ibd-stop)
+        (ignore-errors (usocket:socket-close srv))
+        (when (bt:thread-alive-p acceptor) (ignore-errors (bt:destroy-thread acceptor)))
+        (dolist (s held) (ignore-errors (usocket:socket-close s)))))))

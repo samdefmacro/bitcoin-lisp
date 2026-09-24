@@ -1818,6 +1818,7 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
          (admitted (progn
                      (merge-inbound-peers *node*)
                      (dial-queued-nodes *node*)
+                     (connect-seed-nodes *node*) ; + ProcessAddrFetch
                      (> (length (node-peers *node*)) peers-before))))
   (%sync-tick-liveness *node*)      ; InactivityCheck + ConsiderEviction
   (run-header-sync-duties *node*)   ; Core SendMessages, headers half
@@ -2096,7 +2097,8 @@ seconds and dial again."
              do (sleep 1)
                 (merge-inbound-peers *node*)
                 (maybe-add-fixed-seeds *node*)
-                (dial-queued-nodes *node*))
+                (dial-queued-nodes *node*)
+                (connect-seed-nodes *node*))
        (when (null (node-peers *node*))
          (connect-to-peers *node* max-peers
                            :timeout 30 :min-peers 1))))))
@@ -2192,6 +2194,7 @@ listener, the onion listener with its Tor control connection, and
   ;; (config.lisp), so the only nodes this reaches are the ones that asked.
   ;; Results go into the ADDRESS BOOK, which is what Core's thread does — not
   ;; into one dial's candidate list, which is what the old placement did.
+  (clear-addr-fetches)
   (if *dns-seed-enabled*
       (%seed-address-book-from-dns *node*)
       (log-info "DNS seeding disabled (-dnsseed=0)"))
@@ -2259,7 +2262,10 @@ listener, the onion listener with its Tor control connection, and
   ;; Discover, only when listening on the wildcard address (Core
   ;; init.cpp:2193-2197); a no-op under -discover=0.
   (when (and listen *bind-on-any*)
-    (bl.net:discover-local-addresses (get-listen-port network))))
+    (bl.net:discover-local-addresses (get-listen-port network)))
+  ;; The I2P SAM session and its accept thread (Core CConnman::Start), last:
+  ;; the tor block's clear-local-addresses must not wipe our I2P address.
+  (when sync (start-i2p-sessions *node*)))
 
 (defun %sync-thread-main (max-peers)
   "The sync thread's body, traced with the names of the two Core threads whose
