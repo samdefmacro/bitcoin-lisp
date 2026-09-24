@@ -1505,12 +1505,9 @@ whole reason fRequested exists: validation.cpp:4363 says removing it `would
 break the getblockfrompeer RPC', because a body the node has pruned is dropped
 at :4369 (`if (pindex->nTx != 0) return true') unless it was asked for.
 
-A process global rather than a slot on the IBD context, and deliberately so: the
-steady-state receive pump builds a FRESH ibd-context on every tick
-(PUMP-PEER-MESSAGES is called with a NIL context from the sync loop), so a hash
-the RPC thread wrote into that context's in-flight table would be gone before
-the block arrived -- and the RPC thread does not see the pump thread's binding
-of *IBD-CONTEXT* in any case.")
+A process global rather than a slot on the IBD context: the RPC thread writes
+it and the sync thread consumes it, and RENEW-IBD-CONTEXT replaces the context
+every sync cycle, carrying over only the tables that describe the node.")
 
 (defun note-fetch-block-request (hash)
   "Remember that getblockfrompeer asked a peer for HASH (Core FetchBlock ->
@@ -3911,7 +3908,7 @@ membership half, since headers are admitted parent-first — last-known implies
 all-known.
 
 Such a batch costs no new index memory and leaks nothing that could fingerprint
-us, so both header paths skip the anti-DoS work gate for it and take the store
+us, so the header path skips the anti-DoS work gate for it and takes the store
 path instead: a near-no-op that still refreshes per-peer availability and
 applies the IBD sub-minchainwork outbound drop (Core
 UpdatePeerStateForReceivedHeaders). Core's comment at :2786-2790 relies on
@@ -4034,67 +4031,6 @@ message (p2p_headers_sync_with_minchainwork.py:166)."
                      (if peer (peer-id peer) -1)))
        :ignore)
       (t :store))))
-
-(defun handle-header-batch (peer chain-state headers full-batch count-fn)
-  "Process one received header batch during Phase-1 sync, driving PEER's
-low-work sync state (peer-headers-sync — Core Peer::m_headers_sync; shared
-with the generic path, ingest-headers-from-peer). Returns DONE: whether
-header sync from this peer is finished.
-
-Four cases:
-  - a low-work sync is already running: drive it, storing any headers it
-    releases during REDOWNLOAD, and end when it finalizes;
-  - the batch already sits on our own best-header/active chain: skip the
-    anti-DoS gate, take the store path (Core already_validated_work) and end
-    sync — the peer has taught us nothing, so our locator cannot advance;
-    a batch we hold only on a FORK is NOT this case (see
-    %batch-already-validated-work-p) and falls through to the gate below;
-  - no sync, but this batch connects and claims sub-threshold work: start a
-    presync when it is a full batch (store nothing yet), or ignore it
-    entirely when not (anti-DoS — Core TryLowWorkHeadersSync);
-  - otherwise: store the batch normally, ending on a short (non-full) batch."
-  (cond
-    ((null headers)
-     ;; Core nCount==0: the peer suddenly has nothing to give (perhaps it
-     ;; reorged onto our chain) — clear any sync state and stop asking.
-     (%clear-peer-headers-sync peer :finalize t)
-     t)
-
-    ;; A low-work presync/redownload is in progress with this peer.
-    ((peer-headers-sync peer)
-     (not (%drive-headers-sync peer chain-state headers full-batch count-fn)))
-
-    ;; Batch already on OUR OWN best-header/active chain
-    ;; (%batch-already-validated-work-p = Core already_validated_work): store
-    ;; path, no work gate. Without this branch the classic case never fired —
-    ;; an outbound peer pinned on a low-work chain, answering our getheaders
-    ;; with a short batch we already have, was swallowed by :ignore and never
-    ;; judged.
-    ;;
-    ;; DONE is T even for a full batch, where Core asks again from
-    ;; GetLocator(pindexLast). Nothing entered the index, and this loop re-asks
-    ;; from our own header tip, so that locator is byte-identical next time
-    ;; round and the peer would resend the same batch until the 100-request cap
-    ;; — free round-trips for a peer replaying our own chain at us. Ending here
-    ;; cannot strand anything precisely because the batch is on our chain: a
-    ;; batch we hold only on a FORK is excluded from this branch and goes to
-    ;; the presync gate below, whose locator does advance into the peer's
-    ;; chain.
-    ((%batch-already-validated-work-p chain-state headers)
-     (%store-validated-headers peer chain-state headers full-batch
-                               count-fn "Received")
-     t)
-
-    ;; No sync yet: divert into presync, ignore, or store.
-    (t
-     (ecase (%maybe-divert-to-presync peer chain-state headers full-batch)
-       (:presync nil)
-       (:ignore t)
-       (:store
-        (%store-validated-headers peer chain-state headers full-batch
-                                  count-fn "Received")
-        (< (length headers)
-           bl.ser:+max-headers-count+))))))
 
 (defconstant +headers-response-time-seconds+ 120
   "Minimum gap between getheaders messages to one peer (Core

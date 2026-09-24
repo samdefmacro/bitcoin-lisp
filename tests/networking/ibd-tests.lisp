@@ -3825,7 +3825,10 @@ shape. Positive control: the slot is NIL before and the pump's list after."
 real tx message over the wire — the regression for the ~30s receive dead
 window and the NIL-mempool drains (a getdata for a tx we announced used to
 get notfound). Runs over a loopback socket pair."
-  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+  ;; The pump works in the node's context (ENSURE-IBD-CONTEXT); bound here so
+  ;; the one it creates dies with the test instead of polluting later suites.
+  (let ((bl.net:*ibd-context* nil)
+        (srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect
@@ -6148,7 +6151,10 @@ the next block 25 ms after the pong: a verdict deferred to the next sync-thread
 tick is measured against the wrong tip. Here an outbound peer whose probe
 already went unanswered past its deadline sends one ping, and the pump pass
 that reads it also drops it. Runs over a loopback socket pair."
-  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+  ;; The pump works in the node's context (ENSURE-IBD-CONTEXT); bound here so
+  ;; the one it creates dies with the test instead of polluting later suites.
+  (let ((bl.net:*ibd-context* nil)
+        (srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect
