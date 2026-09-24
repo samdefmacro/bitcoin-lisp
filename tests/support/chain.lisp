@@ -311,3 +311,16 @@ caller that needs these blocks to pass Core's AcceptBlock gate as well."
                      results)
                (setf prev-hash block-hash)))
     (nreverse results)))
+
+(defun grind-header-pow (header)
+  "HEADER with its nonce advanced until its hash meets its own claimed target,
+then returned. A synthetic header built with a fixed nonce passes the regtest
+target only about half the time, and since headers messages are
+CheckHeadersPoW'd before anything else (net_processing.cpp:2983-2991), a test
+that means to exercise a LATER rule (MTP, an unconnecting parent) needs a
+header whose proof of work is not what gets it refused."
+  (loop until (bl.val:check-proof-of-work header)
+        do (setf (bl.ser:block-header-nonce header)
+                 (1+ (bl.ser:block-header-nonce header))
+                 (bl.ser:block-header-cached-hash header) nil))
+  header)
