@@ -4971,6 +4971,12 @@ is already the tip or weaker), (values nil reason) on failure."
                 (< (bl.store:block-index-entry-chain-work entry)
                    (bl.store:block-index-entry-chain-work tip)))
             (values t nil))
+           ;; An invalid block keeps its sequence id but never becomes a
+           ;; candidate (validation.cpp:3544-3547), so Core's ActivateBestChain
+           ;; has nothing to switch to and the call succeeds. p2p_orphan_
+           ;; handling.py:271 invalidates the tip and then preciousblocks it.
+           ((eq (bl.store:block-index-entry-status entry) :invalid)
+            (values t nil))
            ;; Can only reorg to a block whose data is present.
            ((not (bl.store:block-exists-p block-store block-hash))
             (values nil :block-missing))
