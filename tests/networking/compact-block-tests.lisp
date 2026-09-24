@@ -915,7 +915,19 @@ fixture that never reconstructs anything."
                    "a header below the floor must not enter the block index")
          (is-false (bl.net:peer-discouraged-p addr)
                    "Core logs and returns: a peer far behind us relays low-work blocks honestly")
-         (is (eq :ready (bl.net:peer-state peer)))))
+         (is (eq :ready (bl.net:peer-state peer))))
+       ;; In Core's words (net_processing.cpp:4580); p2p_compactblocks.py:656
+       ;; waits for the line.
+       (let ((text (nth-value 1 (log-text-of
+                                 "net"
+                                 (lambda ()
+                                   (%cbp-capture-sends
+                                    (lambda ()
+                                      (%cbp-deliver peer payload state utxo mempool))))))))
+         (is-true (search (format nil "Ignoring low-work compact block from peer ~D"
+                                  (bl.net:peer-id peer))
+                          text)
+                  "Core's line: ~S" text)))
      ;; Control: with regtest's real floor (0) the identical message IS
      ;; admitted and reaches the mempool exactly once.
      (let ((peer (%cbp-peer "203.0.113.61")))

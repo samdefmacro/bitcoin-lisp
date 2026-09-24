@@ -5135,11 +5135,10 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
         (:low-work
          ;; Core "Ignoring low-work compact block from peer %d" (:4581):
          ;; LogDebug and return, with no misbehaviour score — a peer whose
-         ;; chain is far behind ours relays such blocks in good faith.
-         (bl:log-cat
-          "net" "cmpctblock ~A from ~A: ignoring low-work compact block"
-          (bl.crypto:bytes-to-hex block-hash)
-          (peer-log-name peer))
+         ;; chain is far behind ours relays such blocks in good faith. In
+         ;; Core's words: p2p_compactblocks.py:656 waits for this line.
+         (bl:log-cat "net" "Ignoring low-work compact block from peer ~D"
+                     (peer-id peer))
          (return-from handle-cmpctblock nil))
         (:no-parent
          (bl:log-cat "net"
