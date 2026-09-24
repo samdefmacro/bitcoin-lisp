@@ -292,6 +292,52 @@ stale, are not fetched."
                             (lambda () (bl.net:headers-direct-fetch other cs equal-work)))))))
             (setf (bl.net:peer-state other) :disconnected)))))))
 
+(test a-direct-fetch-of-one-block-asks-a-compact-peer-for-a-cmpctblock
+  "Core's HeadersDirectFetchBlocks asks for the block as MSG_CMPCT_BLOCK when
+it takes transactions from the network, the peer announced compact-block
+support (sendcmpct version 2), the getdata names one block that is the only
+one in flight, and the header's parent is connected (net_processing.cpp:
+2890-2897). Ours always asked for the full block: p2p_compactblocks.py:388
+and p2p_compactblocks_blocksonly.py:99 read getdata type 4. Control: a peer
+that never sent sendcmpct is asked for the full witness block."
+  (multiple-value-bind (cs entries) (%make-served-chain 2)   ; tip at height 2
+    (flet ((child (nonce)
+             (let* ((parent (nth 2 entries))
+                    (header (bl.ser:make-block-header
+                             :version 1 :prev-block (bl.store:block-index-entry-hash parent)
+                             :merkle-root (%uniq-hash (+ 7100 nonce))
+                             :timestamp 1700000003 :bits #x1d00ffff :nonce nonce))
+                    (entry (bl.store:make-block-index-entry
+                            :hash (bl.ser:block-header-hash header) :height 3
+                            :header header :prev-entry parent
+                            :chain-work 4 :status :header-valid)))
+               (bl.store:add-block-index-entry cs entry)
+               entry))
+           (getdata-types (sent)
+             (loop for msg in sent
+                   when (string= "getdata" (%message-command msg))
+                     append (mapcar #'bl.ser:inv-vector-type
+                                    (bl.ser:parse-inv-payload (%message-payload msg))))))
+      (let ((bl:*network* :regtest)
+            (bl.ser:*mock-time* 1700000100)
+            (plain (bl.net:make-peer :address "test3" :state :ready
+                                     :services bl.ser:+node-witness+))
+            (compact (bl.net:make-peer :address "test4" :state :ready
+                                       :services bl.ser:+node-witness+)))
+        (setf (bl.net:peer-compact-block-version compact) 2)
+        (with-ibd-context
+          (is (equal (list bl.ser:+inv-type-witness-block+)
+                     (getdata-types
+                      (captured-sends
+                       (lambda () (bl.net:headers-direct-fetch plain cs (child 1))))))
+              "control: a peer without compact blocks is asked for the full block"))
+        (with-ibd-context
+          (is (equal (list bl.ser:+inv-type-cmpct-block+)
+                     (getdata-types
+                      (captured-sends
+                       (lambda () (bl.net:headers-direct-fetch compact cs (child 2))))))
+              "a compact-block peer is asked for a cmpctblock"))))))
+
 (test getheaders-null-locator-returns-stop-header
   (multiple-value-bind (cs entries) (%make-served-chain 5)
     (let* ((payload (%getheaders-payload '() (%entry-hash entries 3)))

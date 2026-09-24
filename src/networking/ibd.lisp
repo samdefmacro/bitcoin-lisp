@@ -4133,17 +4133,40 @@ requested by anyone. Returns the hashes requested."
                             collect (bl.store:block-index-entry-hash entry))))
           (when hashes
             (dolist (hash hashes) (mark-block-in-flight hash peer))
-            (send-message peer
-                          (bl.ser:make-getdata-message
-                           (mapcar (lambda (hash)
-                                     (bl.ser:make-inv-vector
-                                      :type (if (logtest (peer-services peer)
-                                                         bl.ser:+node-witness+)
-                                                bl.ser:+inv-type-witness-block+
-                                                bl.ser:+inv-type-block+)
-                                      :hash hash))
-                                   hashes))))
+            (let ((compact (%direct-fetch-compact-p peer chain-state last-entry hashes)))
+              (send-message peer
+                            (bl.ser:make-getdata-message
+                             (mapcar (lambda (hash)
+                                       (bl.ser:make-inv-vector
+                                        :type (cond (compact
+                                                     bl.ser:+inv-type-cmpct-block+)
+                                                    ((logtest (peer-services peer)
+                                                              bl.ser:+node-witness+)
+                                                     bl.ser:+inv-type-witness-block+)
+                                                    (t bl.ser:+inv-type-block+))
+                                        :hash hash))
+                                     hashes)))))
           hashes)))))
+
+(defun %direct-fetch-compact-p (peer chain-state last-entry hashes)
+  "Core HeadersDirectFetchBlocks' compact-block request (net_processing.cpp:
+2890-2897): ask for the block as MSG_CMPCT_BLOCK rather than a full block when
+we take transactions from the network (!ignore_incoming_txs), PEER announced
+compact-block support (m_provides_cmpctblocks, a sendcmpct of version 2), this
+getdata names ONE block, it is the only block in flight from anyone, and the
+announced header's parent is connected (last_header.pprev->IsValid(
+BLOCK_VALID_CHAIN)). p2p_compactblocks.py:388
+and p2p_compactblocks_blocksonly.py:99 read the getdata type."
+  (and (not (ignore-incoming-txs-p))
+       (eql (peer-compact-block-version peer) +compact-blocks-version+)
+       (null (cdr hashes))
+       *ibd-context*
+       (= 1 (hash-table-count (ibd-context-in-flight *ibd-context*)))
+       (let ((parent (bl.store:block-index-entry-prev-entry last-entry)))
+         (and parent
+              (or (eq (bl.store:block-index-entry-status parent) :valid)
+                  (bl.store:entry-on-active-chain-p chain-state parent))))
+       t))
 
 (defun ingest-headers-from-peer (peer headers chain-state &key count-fn (direct-fetch t))
   "Generic-path headers ingestion — BIP130 sendheaders announcements,
