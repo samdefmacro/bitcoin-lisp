@@ -2788,3 +2788,41 @@ records no spends, so what the wipe has to reset here is the best-block marker
 must be contiguous from genesis, so `resume from the marker' is the only shape
 it has -- and a marker it cannot place leaves it stuck until something wipes
 it.")
+
+(test a-new-coins-database-names-genesis-as-its-best-block
+  "Core's first ActivateBestChain connects genesis, and ConnectBlock's genesis
+special case sets the coins view's best block without adding a coin
+(validation.cpp:2334-2339); so the first flush of a new chainstate writes
+DB_BEST_BLOCK = genesis (txdb.cpp:126-159). Ours named no block until block 1:
+start-up found no pointer (:UNRECORDED) and left the view's pointer NIL, and a
+flush wrote nothing. feature_init.py:160 depends on that first record: it is
+what makes the coins database's first table large enough for its damage to
+reach.
+
+Drives the real start-up step, %INIT-CHAIN-TIP, over a new chainstate at
+genesis, flushes, and checks the next start agrees (:MATCH)."
+  (with-network (:regtest)
+    (with-temp-directory (base "bl-genesis-pointer")
+      (let* ((chain-state (bl.store:init-chain-state base))
+             (genesis (bl.store:chain-state-genesis-hash chain-state))
+             (db (bl.store:open-coins-view-db
+                  (ensure-directories-exist (merge-pathnames "chainstate/" base))))
+             (cache (bl.store:make-coins-view-cache db))
+             (node (bl:make-node)))
+        (unwind-protect
+             (let ((bl:*node* node)
+                   (start-up (lambda () (bl::%init-chain-tip nil))))
+               (setf (bl:node-chain-state node) chain-state
+                     (bl.store:chain-state-coins-view chain-state) cache)
+               (bl.store:add-block-index-entry
+                chain-state (bl.store:make-block-index-entry
+                             :hash genesis :height 0 :chain-work 0 :status :valid))
+               (is (null (bl.store:coins-view-db-best-block db))
+                   "control: a new coins database names no block")
+               (funcall start-up)
+               (bl.store:coins-view-cache-flush cache :sync t)
+               (is (equalp genesis (bl.store:coins-view-db-best-block db))
+                   "after start-up and a flush, the coins database names genesis")
+               (is (eq :match (funcall start-up))
+                   "and the next start finds the pointer and the tip agree"))
+          (bl.store:close-coins-view-db db))))))

@@ -1395,6 +1395,8 @@ ends: %REFUSE-A-CHAIN-NEEDING-REDOWNLOAD, Core's NeedsRedownload test
 CHAINSTATE is the second)."
   (flet ((verdict () (reconcile-coins-db-best-block *node*)))
     (let ((result (verdict)))
+      (when (eq result :unrecorded)
+        (%name-genesis-as-coins-best-block (node-chain-state *node*)))
       (when (eq result :unresolvable)
         (cond
           ((or reindex
@@ -1421,6 +1423,27 @@ CHAINSTATE is the second)."
       (log-loaded-best-chain (node-chain-state *node*))
       (%refuse-a-chain-needing-redownload (or reindex reindex-chainstate))
       result)))
+
+(defun %name-genesis-as-coins-best-block (chain-state)
+  "A coins view that names no block, holds no coins and sits under a chain at
+genesis is a new chainstate. Core's first ActivateBestChain connects genesis,
+and ConnectBlock's special case for it sets the view's best block without
+touching a coin (validation.cpp:2334-2339), so the first flush of even an
+empty chainstate writes DB_HEAD_BLOCKS and DB_BEST_BLOCK (txdb.cpp:126-159).
+
+Ours named no block until block 1 connected. The record is not decoration:
+it is the first thing a new coins database holds after its obfuscation key,
+so it shares that key's table, and feature_init.py:160, which damages every
+chainstate table from offset 150, relies on that table being large enough to
+reach. On the next start RECONCILE-COINS-DB-BEST-BLOCK finds the pointer equal
+to the genesis tip and answers :MATCH."
+  (let ((view (and chain-state (bl.store:chain-state-coins-view chain-state))))
+    (when (and (typep view 'bl.store:coins-view-cache)
+               (null (bl.store:cvc-best-block view))
+               (zerop (bl.store:current-height chain-state))
+               (bl.store:coins-view-empty-p view))
+      (setf (bl.store:cvc-best-block view)
+            (copy-seq (bl.store:chain-state-genesis-hash chain-state))))))
 
 (defun %refuse-a-chain-needing-redownload (wipe-chainstate)
   "The last test of Core's CompleteChainstateInitialization
