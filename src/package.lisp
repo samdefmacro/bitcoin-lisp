@@ -142,6 +142,7 @@ init.cpp, node/. src/node/.")
    #:node
    #:*node*
    #:start-node
+   #:install-cs-main-check
    #:start-node-from-args
    #:stop-node
    ;; Shutdown coordination (internal paths request; the main thread performs)

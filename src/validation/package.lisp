@@ -90,6 +90,7 @@ can. src/validation/.")
    #:connect-block
    #:accept-block-body
    #:poison-failed-block
+   #:*cs-main-held-p*
    #:verify-db
    #:+default-checkblocks+
    #:+default-checklevel+

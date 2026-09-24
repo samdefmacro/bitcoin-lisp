@@ -604,5 +604,6 @@ thread; see the shutdown-coordination section above."
 
   (log-info "Node stopped")
 
+  (setf bl.val:*cs-main-held-p* nil)
   (setf *node* nil)
   t)

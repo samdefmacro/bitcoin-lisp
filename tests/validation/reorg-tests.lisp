@@ -4071,3 +4071,105 @@ CheckBlock, is not written."
           (is (null (bl.val:activate-block twice cs store utxo)))
           (is-false (bl.store:block-exists-p store (hash-of twice))
                     "a block CheckBlock refuses is not written"))))))
+
+(test two-threads-activating-one-block-connect-it-once
+  "Core serializes every activation behind Chainstate::m_chainstate_mutex
+(ActivateBestChain, validation.cpp:3354-3368): a second caller waits, then
+finds the block already the tip and does nothing.
+
+Ours had no such lock inside validation and relied on every caller holding the
+node lock; run-ibd's ACTIVATE-BEST-CHAIN did not. Observed 1 run in 5 of
+p2p_compactblocks.py:268: while generatetoaddress was inside CONNECT-BLOCK --
+the block indexed and its coins applied, the tip not yet moved -- the sync
+thread chose that block as a heavier tip, connected it a second time, failed
+bad-txns-BIP30, marked the VALID block invalid and rolled the tip back.
+
+Reproduced deterministically: thread A activates a freshly mined block and is
+parked at exactly that point (BL.MP:BPE-NOTE-BLOCK, which CONNECT-BLOCK calls
+between applying the coins and moving the tip) until thread B's
+ACTIVATE-BEST-CHAIN returns, or for one second when B cannot get in."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "two-thread-activation"))
+           (cs (bl:node-chain-state node))
+           (store (bl:node-block-store node))
+           (utxo (bl:node-utxo-set node))
+           (block (bl.mining:assemble-full-block
+                   cs (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
+           (hash (progn (bl.mining:mine-block block)
+                        (bl.ser:block-header-hash (bl.ser:bitcoin-block-header block))))
+           (real (fdefinition 'bl.mp:bpe-note-block))
+           (a-parked (bt:make-semaphore))
+           (b-done (bt:make-semaphore))
+           (thread-a nil)
+           (a-result nil)
+           (b-result :not-run))
+      (flet ((spawn (name fn)
+               ;; A new thread sees only GLOBAL values; carry WITH-NETWORK's.
+               (let ((network bl:*network*)
+                     (pow-limit bl.store:*pow-limit-target*))
+                 (bt:make-thread (lambda ()
+                                   (let ((bl:*network* network)
+                                         (bl.store:*pow-limit-target* pow-limit))
+                                     (funcall fn)))
+                                 :name name))))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bl.mp:bpe-note-block)
+                   (lambda (height txids)
+                     (when (eq (bt:current-thread) thread-a)
+                       (bt:signal-semaphore a-parked)
+                       (bt:wait-on-semaphore b-done :timeout 1))
+                     (funcall real height txids)))
+             (setf thread-a
+                   (spawn "activation-a"
+                          (lambda ()
+                            (setf a-result
+                                  (handler-case (bl.val:activate-block block cs store utxo)
+                                    (error (e) (list :error (princ-to-string e))))))))
+             (is-true (bt:wait-on-semaphore a-parked :timeout 10)
+                      "control: thread A reached the point between coins and tip")
+             (let ((thread-b
+                     (spawn "activation-b"
+                            (lambda ()
+                              (setf b-result
+                                    (handler-case (bl.val:activate-best-chain cs store utxo)
+                                      (error (e) (list :error (princ-to-string e)))))
+                              (bt:signal-semaphore b-done)))))
+               (bt:join-thread thread-b)
+               (bt:join-thread thread-a)))
+        (setf (fdefinition 'bl.mp:bpe-note-block) real)))
+      (is (eq t a-result) "thread A connected the block: ~S" a-result)
+      (is (null b-result) "thread B found nothing to do: ~S" b-result)
+      (is (equalp hash (bl.store:best-block-hash cs)))
+      (is (= 1 (bl.store:current-height cs)))
+      (is (eq :valid (bl.store:block-index-entry-status
+                      (bl.store:get-block-index-entry cs hash)))
+          "a block connected once must not be marked invalid"))))
+
+(test chain-activation-without-the-node-lock-is-refused
+  "Every activation holds the node lock (our cs_main) first and the chainstate
+mutex inside it; the connect hooks take the node lock, so a caller entering
+activation without it could deadlock against one that holds it -- and the one
+caller that did (run-ibd's ACTIVATE-BEST-CHAIN) raced a mining RPC instead.
+BL:INSTALL-CS-MAIN-CHECK, which the node installs once it runs its threads,
+makes that a refusal (Core's AssertLockHeld(cs_main)). Control: the same call
+holding the lock goes through."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "cs-main-check"))
+           (cs (bl:node-chain-state node))
+           (store (bl:node-block-store node))
+           (utxo (bl:node-utxo-set node))
+           (bl:*node* node)
+           (bl.val:*cs-main-held-p* nil))
+      (bl:install-cs-main-check node)
+      (is (null (bt:with-recursive-lock-held ((bl:node-lock node))
+                  (bl.val:activate-best-chain cs store utxo)))
+          "control: with the node lock held, activation runs (nothing to do)")
+      (let ((refusal (handler-case (progn (bl.val:activate-best-chain cs store utxo) nil)
+                       (error (e) (princ-to-string e)))))
+        (is-true (and refusal (search "without the node lock" refusal))
+                 "without the node lock activation is refused: ~S" refusal))
+      (let ((bl:*node* nil))
+        (is (null (bl.val:activate-best-chain cs store utxo))
+            "a thread working for no running node is not checked")))))

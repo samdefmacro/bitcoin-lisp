@@ -1,5 +1,61 @@
 (in-package #:bitcoin-lisp.validation)
 
+;;;; Chain activation is serialized (Core m_chainstate_mutex)
+;;;
+;;; Core's ActivateBestChain takes Chainstate::m_chainstate_mutex for the whole
+;;; select-and-connect loop (validation.cpp:3354-3368), InvalidateBlock takes it
+;;; too (:3553-3565) and PreciousBlock ends in ActivateBestChain, so two threads
+;;; never both connect the same block: the second waits, then finds it already
+;;; the tip or already judged and returns. ProcessNewBlock calls it after AcceptBlock
+;;; (:4465-4473).
+;;;
+;;; Ours: WITH-CHAINSTATE-MUTEX around every entry point that changes the
+;;; active chain -- CONNECT-BLOCK, PERFORM-REORG, ACTIVATE-BLOCK,
+;;; ACTIVATE-BEST-CHAIN, INVALIDATE-BLOCK, RECONSIDER-BLOCK, PRECIOUS-BLOCK --
+;;; one lock for both chainstates, since both are driven from one place. The
+;;; lock ORDER is the one divergence: every caller holds the node lock (our
+;;; cs_main, bl:node-lock) across the whole activation, so the node lock is
+;;; taken FIRST and this one inside it, where Core takes m_chainstate_mutex
+;;; before cs_main. The connect hooks take the node lock, so a caller that
+;;; entered here without it could deadlock against one that holds it; that
+;;; is what *CS-MAIN-HELD-P* checks (Core's AssertLockHeld).
+;;;
+;;; Found 2026-09-24: run-ibd's activate-best-chain ran WITHOUT the node lock
+;;; while generatetoaddress was inside CONNECT-BLOCK, between the index write
+;;; and the tip update; it picked the half-connected block as a heavier tip,
+;;; reconnected it (bad-txns-BIP30), marked the VALID block invalid and rolled
+;;; the tip back under the RPC (p2p_compactblocks.py:268, 1 run in 5).
+
+(defvar *chainstate-mutex* (bt:make-recursive-lock "chainstate-mutex")
+  "Core Chainstate::m_chainstate_mutex: held across every change of the active
+chain. Recursive, because ACTIVATE-BLOCK calls PERFORM-REORG and
+CONNECT-BLOCK inside it, as Core's ActivateBestChain calls
+ActivateBestChainStep.")
+
+(defvar *cs-main-held-p* nil
+  "NIL, or a function of no arguments answering whether the calling thread
+holds the node lock (cs_main). The node installs it while it runs; with it,
+entering WITH-CHAINSTATE-MUTEX without the node lock is an error -- Core's
+AssertLockHeld, made a check because the lock ORDER (node lock first) is what
+keeps the chainstate mutex from deadlocking against the connect hooks.")
+
+(defun %assert-cs-main-held (where)
+  "Signal when a caller enters the chainstate mutex at WHERE without the node
+lock (see *CS-MAIN-HELD-P*)."
+  (let ((held-p *cs-main-held-p*))
+    (when (and held-p (not (funcall held-p)))
+      (bl.err:internal-error
+       "~A entered without the node lock (cs_main): chain activation must hold it"
+       where))))
+
+(defmacro with-chainstate-mutex ((where) &body body)
+  "Run BODY holding *CHAINSTATE-MUTEX*, after checking that the node lock is
+held (%ASSERT-CS-MAIN-HELD). WHERE names the entry point for the error."
+  `(progn
+     (%assert-cs-main-held ',where)
+     (bt:with-recursive-lock-held (*chainstate-mutex*)
+       ,@body)))
+
 ;;; Block Validation
 ;;;
 ;;; This module validates Bitcoin blocks according to consensus rules.
@@ -3040,194 +3096,195 @@ Optionally clears RECENT-REJECTS on chain reorganization.
 When MEMPOOL is provided, removes the block's confirmed/conflicting txs from it
 (the single removal chokepoint — every connect path, IBD or relay, goes here).
 Handles chain reorganizations when a competing chain has more work."
-  (let* ((header (bl.ser:bitcoin-block-header block))
-         (hash (bl.ser:block-header-hash header))
-         (prev-hash (bl.ser:block-header-prev-block header))
-         (prev-entry (bl.store:get-block-index-entry chain-state prev-hash))
-         (new-height (if prev-entry
-                         (1+ (bl.store:block-index-entry-height prev-entry))
-                         0))
-         (prev-work (if prev-entry
-                        (bl.store:block-index-entry-chain-work prev-entry)
-                        0))
-         (chain-work (bl.store:calculate-chain-work
-                      (bl.ser:block-header-bits header)
-                      prev-work))
-         ;; Store the block here, in the binding list: the height travels with
-         ;; it so the file it lands in can be pruned later (a flat block file
-         ;; prunes whole, which needs its range). Where it landed is recorded
-         ;; on the index entry below, once that entry exists.
-         (stored-at (progn
-                      ;; Core checks free space before every block and undo
-                      ;; write (FindBlockPos, blockstorage.cpp:337) and treats
-                      ;; a failure as fatal. Writing blocks onto a full disk is
-                      ;; how a truncated-but-indexed .blk gets created, which
-                      ;; this node has seen.
-                      (bl:gate-block-write-on-disk-space)
-                      (nth-value 1 (bl.store:store-block
-                                    block-store block :height new-height)))))
+  (with-chainstate-mutex (connect-block)
+    (let* ((header (bl.ser:bitcoin-block-header block))
+           (hash (bl.ser:block-header-hash header))
+           (prev-hash (bl.ser:block-header-prev-block header))
+           (prev-entry (bl.store:get-block-index-entry chain-state prev-hash))
+           (new-height (if prev-entry
+                           (1+ (bl.store:block-index-entry-height prev-entry))
+                           0))
+           (prev-work (if prev-entry
+                          (bl.store:block-index-entry-chain-work prev-entry)
+                          0))
+           (chain-work (bl.store:calculate-chain-work
+                        (bl.ser:block-header-bits header)
+                        prev-work))
+           ;; Store the block here, in the binding list: the height travels with
+           ;; it so the file it lands in can be pruned later (a flat block file
+           ;; prunes whole, which needs its range). Where it landed is recorded
+           ;; on the index entry below, once that entry exists.
+           (stored-at (progn
+                        ;; Core checks free space before every block and undo
+                        ;; write (FindBlockPos, blockstorage.cpp:337) and treats
+                        ;; a failure as fatal. Writing blocks onto a full disk is
+                        ;; how a truncated-but-indexed .blk gets created, which
+                        ;; this node has seen.
+                        (bl:gate-block-write-on-disk-space)
+                        (nth-value 1 (bl.store:store-block
+                                      block-store block :height new-height)))))
 
-    ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
-    ;; try_emplace that returns the existing object when the hash is already
-    ;; known (node/blockstorage.cpp:228-231), and receiving the body mutates
-    ;; that object in place. We constructed a fresh entry with :status :valid
-    ;; and ADD-BLOCK-INDEX-ENTRY is a plain (setf gethash) — a REPLACE, which
-    ;; erased an existing :invalid mark.
-    ;;
-    ;; That made invalidateblock defeatable by a single unsolicited block
-    ;; message: the RPC reorgs down and marks the block :invalid, leaving the
-    ;; tip at its parent, so a peer replaying the block hits the tip-extension
-    ;; arm, passes validate-block (it IS consensus-valid — invalidateblock is a
-    ;; manual override), and landed here to be re-created as :valid. The
-    ;; operator's node silently returned to the chain they explicitly refused.
-    ;; The same erasure cleared the automatic poison on a doomed fork subtree.
-    (let* ((existing (bl.store:get-block-index-entry chain-state hash))
-           (entry (or existing
-                      (bl.store:make-block-index-entry
-                       :hash hash
-                       :height new-height
-                       :header header
-                       :prev-entry prev-entry
-                       :chain-work chain-work
-                       :status :valid
-                       :tx-count (length (bl.ser:bitcoin-block-transactions
-                                          block))))))
-      (when existing
-        ;; Refresh what arriving BODY data supplies, in place. Status is RAISED
-        ;; only: an :invalid mark is a decision (operator or validator) and
-        ;; nothing here is entitled to overrule it.
-        (setf (bl.store:block-index-entry-height entry) new-height
-              (bl.store:block-index-entry-header entry) header
-              (bl.store:block-index-entry-prev-entry entry) prev-entry
-              (bl.store:block-index-entry-chain-work entry) chain-work
-              (bl.store:block-index-entry-tx-count entry)
-              (length (bl.ser:bitcoin-block-transactions block)))
-        (unless (eq (bl.store:block-index-entry-status entry) :invalid)
-          (setf (bl.store:block-index-entry-status entry) :valid)))
-      (bl.store:add-block-index-entry chain-state entry)
-      ;; nFile/nDataPos and nSequenceId, now that the entry is in the index
-      ;; (Core ReceivedBlockTransactions, validation.cpp:3829-3853).
-      (bl.store:%record-block-position entry stored-at)
-      (bl.store:note-block-received chain-state entry)
+      ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
+      ;; try_emplace that returns the existing object when the hash is already
+      ;; known (node/blockstorage.cpp:228-231), and receiving the body mutates
+      ;; that object in place. We constructed a fresh entry with :status :valid
+      ;; and ADD-BLOCK-INDEX-ENTRY is a plain (setf gethash) — a REPLACE, which
+      ;; erased an existing :invalid mark.
+      ;;
+      ;; That made invalidateblock defeatable by a single unsolicited block
+      ;; message: the RPC reorgs down and marks the block :invalid, leaving the
+      ;; tip at its parent, so a peer replaying the block hits the tip-extension
+      ;; arm, passes validate-block (it IS consensus-valid — invalidateblock is a
+      ;; manual override), and landed here to be re-created as :valid. The
+      ;; operator's node silently returned to the chain they explicitly refused.
+      ;; The same erasure cleared the automatic poison on a doomed fork subtree.
+      (let* ((existing (bl.store:get-block-index-entry chain-state hash))
+             (entry (or existing
+                        (bl.store:make-block-index-entry
+                         :hash hash
+                         :height new-height
+                         :header header
+                         :prev-entry prev-entry
+                         :chain-work chain-work
+                         :status :valid
+                         :tx-count (length (bl.ser:bitcoin-block-transactions
+                                            block))))))
+        (when existing
+          ;; Refresh what arriving BODY data supplies, in place. Status is RAISED
+          ;; only: an :invalid mark is a decision (operator or validator) and
+          ;; nothing here is entitled to overrule it.
+          (setf (bl.store:block-index-entry-height entry) new-height
+                (bl.store:block-index-entry-header entry) header
+                (bl.store:block-index-entry-prev-entry entry) prev-entry
+                (bl.store:block-index-entry-chain-work entry) chain-work
+                (bl.store:block-index-entry-tx-count entry)
+                (length (bl.ser:bitcoin-block-transactions block)))
+          (unless (eq (bl.store:block-index-entry-status entry) :invalid)
+            (setf (bl.store:block-index-entry-status entry) :valid)))
+        (bl.store:add-block-index-entry chain-state entry)
+        ;; nFile/nDataPos and nSequenceId, now that the entry is in the index
+        ;; (Core ReceivedBlockTransactions, validation.cpp:3829-3853).
+        (bl.store:%record-block-position entry stored-at)
+        (bl.store:note-block-received chain-state entry)
 
-      ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
-      ;; result so callers can act on a refused reorg: NIL for a tip extension or
-      ;; a stored side block, or (REORG-OK DETAIL) for the reorg branch — where
-      ;; a NIL REORG-OK with a LIST detail is "refused, these (hash . height)
-      ;; fork blocks are missing from the store" (re-download them) and a NIL
-      ;; REORG-OK with a KEYWORD detail is "a fork block was invalid, rolled
-      ;; back". Returned as connect-block's second value; existing callers that
-      ;; read only the first value (the index entry) are unaffected.
-      (let ((reorg-outcome
-      (let* ((current-best-hash (bl.store:best-block-hash chain-state))
-             (current-best-entry (bl.store:get-block-index-entry
-                                  chain-state current-best-hash))
-             (current-best-work (if current-best-entry
-                                    (bl.store:block-index-entry-chain-work
-                                     current-best-entry)
-                                    0)))
+        ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
+        ;; result so callers can act on a refused reorg: NIL for a tip extension or
+        ;; a stored side block, or (REORG-OK DETAIL) for the reorg branch — where
+        ;; a NIL REORG-OK with a LIST detail is "refused, these (hash . height)
+        ;; fork blocks are missing from the store" (re-download them) and a NIL
+        ;; REORG-OK with a KEYWORD detail is "a fork block was invalid, rolled
+        ;; back". Returned as connect-block's second value; existing callers that
+        ;; read only the first value (the index entry) are unaffected.
+        (let ((reorg-outcome
+        (let* ((current-best-hash (bl.store:best-block-hash chain-state))
+               (current-best-entry (bl.store:get-block-index-entry
+                                    chain-state current-best-hash))
+               (current-best-work (if current-best-entry
+                                      (bl.store:block-index-entry-chain-work
+                                       current-best-entry)
+                                      0)))
 
-        (cond
-          ;; New block extends the current best chain (normal case).
-          ;; Apply UTXO updates and advance chain tip atomically — without-
-          ;; interrupts defers any pending bt:destroy-thread / SIGTERM until
-          ;; this critical section completes, so saved state on disk is never
-          ;; "chain advanced but UTXOs not applied" or vice versa.
-          ((equalp prev-hash current-best-hash)
-           ;; The undo list the critical section produces, announced
-           ;; (BlockConnected) outside it.
-           (let ((spent-utxos nil))
-           #+sbcl (sb-sys:without-interrupts
-           (progn
-             (setf spent-utxos (bl.store:apply-block-to-utxo-set
-                                     utxo-set block new-height))
-             (%warn-if-undo-empty block hash new-height spent-utxos)
-             (store-undo-data hash spent-utxos new-height :block block)
-             ;; Record fee statistics for fee estimation
-             (when fee-estimator
-               (let ((stats (bl.mp:compute-block-fee-stats
-                             block spent-utxos new-height)))
-                 (when stats
-                   (bl.mp:fee-estimator-add-stats fee-estimator stats)
-                   (bl.mp:maybe-flush-fee-stats fee-estimator)))))
-           ;; Core's fee estimator learns from this block: for every
-           ;; transaction it was tracking, how many blocks that feerate waited
-           ;; (processBlock). Untracked txids are ignored, so the whole block
-           ;; goes in. Runs BEFORE the mempool drops the block's transactions,
-           ;; while they are still tracked.
-           (bl.mp:bpe-note-block
-            new-height
-            (map 'list #'bl.ser:transaction-hash
-                 (bl.ser:bitcoin-block-transactions block)))
-           (bl.store:update-chain-tip chain-state hash new-height)
-           ;; Remove now-confirmed (and conflicting) txs from the mempool,
-           ;; inside the same critical section as the tip update.
-           (when mempool
-             (bl.mp:mempool-remove-for-block mempool block)))
-           ;; Tx-relay tip bookkeeping (outside the critical section):
-           ;; expire stale mempool entries once per block (Core expire-on-
-           ;; block); erase orphans included in/conflicted by this block
-           ;; (Core BlockConnected -> TxOrphanage::EraseForBlock); record the
-           ;; block's txids/wtxids as recently confirmed and getdata-servable
-           ;; (Core m_lazy_recent_confirmed_transactions +
-           ;; m_most_recent_block_txs). A TARGETED chainstate — the assumeutxo
-           ;; historical chainstate re-deriving old history — must not touch
-           ;; these: its "tip" blocks are ancient, and Core only wires the
-           ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
-           ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
-           (unless (historical-chainstate-p chain-state)
+          (cond
+            ;; New block extends the current best chain (normal case).
+            ;; Apply UTXO updates and advance chain tip atomically — without-
+            ;; interrupts defers any pending bt:destroy-thread / SIGTERM until
+            ;; this critical section completes, so saved state on disk is never
+            ;; "chain advanced but UTXOs not applied" or vice versa.
+            ((equalp prev-hash current-best-hash)
+             ;; The undo list the critical section produces, announced
+             ;; (BlockConnected) outside it.
+             (let ((spent-utxos nil))
+             #+sbcl (sb-sys:without-interrupts
+             (progn
+               (setf spent-utxos (bl.store:apply-block-to-utxo-set
+                                       utxo-set block new-height))
+               (%warn-if-undo-empty block hash new-height spent-utxos)
+               (store-undo-data hash spent-utxos new-height :block block)
+               ;; Record fee statistics for fee estimation
+               (when fee-estimator
+                 (let ((stats (bl.mp:compute-block-fee-stats
+                               block spent-utxos new-height)))
+                   (when stats
+                     (bl.mp:fee-estimator-add-stats fee-estimator stats)
+                     (bl.mp:maybe-flush-fee-stats fee-estimator)))))
+             ;; Core's fee estimator learns from this block: for every
+             ;; transaction it was tracking, how many blocks that feerate waited
+             ;; (processBlock). Untracked txids are ignored, so the whole block
+             ;; goes in. Runs BEFORE the mempool drops the block's transactions,
+             ;; while they are still tracked.
+             (bl.mp:bpe-note-block
+              new-height
+              (map 'list #'bl.ser:transaction-hash
+                   (bl.ser:bitcoin-block-transactions block)))
+             (bl.store:update-chain-tip chain-state hash new-height)
+             ;; Remove now-confirmed (and conflicting) txs from the mempool,
+             ;; inside the same critical section as the tip update.
              (when mempool
-               (bl.mp:mempool-expire mempool)
-               (bl.mp:orphan-erase-for-block
-                (bl.mp:mempool-orphan-pool mempool) block))
-             (note-block-connected block))
-           ;; Core's validation interface, after the tip update and the
-           ;; mempool's conflict removals (Core's signal order): the indexes,
-           ;; ZMQ and the wallet subscribe to BlockConnected; -blocknotify,
-           ;; -stopatheight and the periodic flush to the tip update that
-           ;; follows it (KernelNotifications::blockTip fires after the
-           ;; wallet's BlockConnected). Subscribers decide for themselves
-           ;; whether a targeted (assumeutxo background) chainstate concerns
-           ;; them, as Core's do by ChainstateRole.
-           (bl.vi:notify-block-connected chain-state block hash new-height spent-utxos)
-           (bl.vi:notify-updated-block-tip chain-state hash new-height)
-           ;; Core CheckForkWarningConditions after every activation step
-           ;; (validation.cpp:3302): the warning must CLEAR once our own chain
-           ;; has outgrown the invalid one again, not only be raised.
-           (%check-fork-warning-conditions chain-state)
-           ;; Core resets the recent-rejects filter on EVERY active tip change,
-           ;; not just reorgs: cached failures (non-final, too-low-fee, missing
-           ;; inputs) can become valid at the next block (ActiveTipChange,
-           ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
-           ;; RecentRejectsFilter().reset()). Previously only the reorg path
-           ;; cleared it. ActiveTipChange resets BOTH filters.
-           (bl:clear-recent-rejects recent-rejects)
-           (clear-reconsiderable-rejects)
-           ;; Automatic block pruning after connecting a new block; each
-           ;; pruned block's undo file goes with it.
-           (when (bl:automatic-pruning-p)
-             (let ((pruned (bl.store:prune-old-blocks
-                            block-store chain-state
-                            :on-prune #'delete-undo-file
-                            :target-bytes (bl:effective-prune-target-bytes)
-                            :initial-block-download-p (%ibd-latch))))
-               (when (> pruned 0)
-                 (bl:log-info "Pruned ~D old block~:P" pruned))))))
+               (bl.mp:mempool-remove-for-block mempool block)))
+             ;; Tx-relay tip bookkeeping (outside the critical section):
+             ;; expire stale mempool entries once per block (Core expire-on-
+             ;; block); erase orphans included in/conflicted by this block
+             ;; (Core BlockConnected -> TxOrphanage::EraseForBlock); record the
+             ;; block's txids/wtxids as recently confirmed and getdata-servable
+             ;; (Core m_lazy_recent_confirmed_transactions +
+             ;; m_most_recent_block_txs). A TARGETED chainstate — the assumeutxo
+             ;; historical chainstate re-deriving old history — must not touch
+             ;; these: its "tip" blocks are ancient, and Core only wires the
+             ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
+             ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
+             (unless (historical-chainstate-p chain-state)
+               (when mempool
+                 (bl.mp:mempool-expire mempool)
+                 (bl.mp:orphan-erase-for-block
+                  (bl.mp:mempool-orphan-pool mempool) block))
+               (note-block-connected block))
+             ;; Core's validation interface, after the tip update and the
+             ;; mempool's conflict removals (Core's signal order): the indexes,
+             ;; ZMQ and the wallet subscribe to BlockConnected; -blocknotify,
+             ;; -stopatheight and the periodic flush to the tip update that
+             ;; follows it (KernelNotifications::blockTip fires after the
+             ;; wallet's BlockConnected). Subscribers decide for themselves
+             ;; whether a targeted (assumeutxo background) chainstate concerns
+             ;; them, as Core's do by ChainstateRole.
+             (bl.vi:notify-block-connected chain-state block hash new-height spent-utxos)
+             (bl.vi:notify-updated-block-tip chain-state hash new-height)
+             ;; Core CheckForkWarningConditions after every activation step
+             ;; (validation.cpp:3302): the warning must CLEAR once our own chain
+             ;; has outgrown the invalid one again, not only be raised.
+             (%check-fork-warning-conditions chain-state)
+             ;; Core resets the recent-rejects filter on EVERY active tip change,
+             ;; not just reorgs: cached failures (non-final, too-low-fee, missing
+             ;; inputs) can become valid at the next block (ActiveTipChange,
+             ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
+             ;; RecentRejectsFilter().reset()). Previously only the reorg path
+             ;; cleared it. ActiveTipChange resets BOTH filters.
+             (bl:clear-recent-rejects recent-rejects)
+             (clear-reconsiderable-rejects)
+             ;; Automatic block pruning after connecting a new block; each
+             ;; pruned block's undo file goes with it.
+             (when (bl:automatic-pruning-p)
+               (let ((pruned (bl.store:prune-old-blocks
+                              block-store chain-state
+                              :on-prune #'delete-undo-file
+                              :target-bytes (bl:effective-prune-target-bytes)
+                              :initial-block-download-p (%ibd-latch))))
+                 (when (> pruned 0)
+                   (bl:log-info "Pruned ~D old block~:P" pruned))))))
 
-          ;; New chain has more work - reorganize. Capture perform-reorg's
-          ;; (values ok detail) so the caller can re-queue missing fork blocks
-          ;; on a refusal.
-          ((> chain-work current-best-work)
-           (multiple-value-list
-            (perform-reorg chain-state block-store utxo-set
-                           current-best-entry entry
-                           :fee-estimator fee-estimator
-                           :recent-rejects recent-rejects
-                           :mempool mempool)))
-          ;; New block is on a weaker chain: it is stored, nothing more.
-          (t nil)))))
+            ;; New chain has more work - reorganize. Capture perform-reorg's
+            ;; (values ok detail) so the caller can re-queue missing fork blocks
+            ;; on a refusal.
+            ((> chain-work current-best-work)
+             (multiple-value-list
+              (perform-reorg chain-state block-store utxo-set
+                             current-best-entry entry
+                             :fee-estimator fee-estimator
+                             :recent-rejects recent-rejects
+                             :mempool mempool)))
+            ;; New block is on a weaker chain: it is stored, nothing more.
+            (t nil)))))
 
-      (values entry reorg-outcome)))))
+        (values entry reorg-outcome))))))
 
 (defun find-fork-point (entry-a entry-b)
   "Find the common ancestor (fork point) of two chain entries.
@@ -4364,148 +4421,149 @@ boundary and returns (VALUES NIL :INTERRUPTED): the chain is left on whatever
 block the coins reached — never rolled back, never half-applied — and the side
 effects below are committed for exactly the blocks that moved. See the section
 comment above."
-  (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
-    (unless fork-entry
-      (return-from perform-reorg nil))
+  (with-chainstate-mutex (perform-reorg)
+    (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
+      (unless fork-entry
+        (return-from perform-reorg nil))
 
-    (let ((old-height (bl.store:block-index-entry-height old-tip-entry))
-          (new-height (bl.store:block-index-entry-height new-tip-entry))
-          (fork-height (bl.store:block-index-entry-height fork-entry)))
+      (let ((old-height (bl.store:block-index-entry-height old-tip-entry))
+            (new-height (bl.store:block-index-entry-height new-tip-entry))
+            (fork-height (bl.store:block-index-entry-height fork-entry)))
 
-      ;; No pruned-height gate: a fork point below the pruned height is not a
-      ;; reason to refuse. Core has none -- ActivateBestChainStep connects the
-      ;; chain FindMostWorkChain chose, and FindMostWorkChain asks each block
-      ;; only for BLOCK_HAVE_DATA (validation.cpp:3158-3196), which a pruned
-      ;; block regains when it is downloaded again. The pruned height is a
-      ;; HEIGHT, not a chain: pruning a stale branch's file raised it over the
-      ;; blocks of the chain we later had to return to, bodies and all
-      ;; (feature_pruning.py:263). The missing-body precondition below is the
-      ;; real test, and its list is what the caller re-queues for download.
+        ;; No pruned-height gate: a fork point below the pruned height is not a
+        ;; reason to refuse. Core has none -- ActivateBestChainStep connects the
+        ;; chain FindMostWorkChain chose, and FindMostWorkChain asks each block
+        ;; only for BLOCK_HAVE_DATA (validation.cpp:3158-3196), which a pruned
+        ;; block regains when it is downloaded again. The pruned height is a
+        ;; HEIGHT, not a chain: pruning a stale branch's file raised it over the
+        ;; blocks of the chain we later had to return to, bodies and all
+        ;; (feature_pruning.py:263). The missing-body precondition below is the
+        ;; real test, and its list is what the caller re-queues for download.
 
-      ;; Collect blocks to disconnect (old chain, tip to fork)
-      ;; All the state the three phases share, as one value -- Core carries
-      ;; the same thing through ActivateBestChainStep (a
-      ;; DisconnectedBlockTransactions pool plus the per-phase bookkeeping).
-      ;; It exists so the phases below can become functions instead of one
-      ;; 469-line body: eight accumulators written in PHASE A and read in
-      ;; PHASE C is exactly what made the split impossible before.
-      (let ((r (%make-reorg :to-disconnect (collect-chain-entries old-tip-entry fork-entry)
-                            :to-connect (collect-chain-entries new-tip-entry fork-entry))))
+        ;; Collect blocks to disconnect (old chain, tip to fork)
+        ;; All the state the three phases share, as one value -- Core carries
+        ;; the same thing through ActivateBestChainStep (a
+        ;; DisconnectedBlockTransactions pool plus the per-phase bookkeeping).
+        ;; It exists so the phases below can become functions instead of one
+        ;; 469-line body: eight accumulators written in PHASE A and read in
+        ;; PHASE C is exactly what made the split impossible before.
+        (let ((r (%make-reorg :to-disconnect (collect-chain-entries old-tip-entry fork-entry)
+                              :to-connect (collect-chain-entries new-tip-entry fork-entry))))
 
-        ;; Self-heal stored witness-stripped forward blocks. A fork block stored
-        ;; via the deferred-validation (:weaker-chain) path before the v2-only
-        ;; compact-block fix could land on disk witness-stripped (legacy coinbase
-        ;; carrying a witness commitment but no 32-byte reserved value). Such a
-        ;; block can NEVER pass BIP141, so it would fail this reorg on every
-        ;; attempt and wedge the node permanently (testnet4 stuck ~1800 blocks
-        ;; behind). Prune it here so the missing-precondition below re-queues it
-        ;; for a witness-complete re-download. Only the to-connect side is checked:
-        ;; to-disconnect blocks already validated when they were connected, and we
-        ;; still need their bodies for the UTXO disconnect.
-        ;; Core's fFailedChain arm (FindMostWorkChain, validation.cpp:3170-3196):
-        ;; a candidate tip is refused outright when ANY block on the path to it
-        ;; carries BLOCK_FAILED_VALID. We read no status at all here, so a
-        ;; branch containing a block the operator invalidated -- or one the
-        ;; validator poisoned -- was a legitimate reorg target as long as it
-        ;; carried more work.
-        ;;
-        ;; Checked BEFORE anything is mutated, so refusing costs nothing and
-        ;; cannot leave the chainstate half-moved.
-        (let ((failed (find-if (lambda (e)
-                                 (eq (bl.store:block-index-entry-status e)
-                                     :invalid))
-                               (reorg-to-connect r))))
-          (when failed
-            (bl:log-warn
-             "REORG refused: block at height ~D on the target branch is marked invalid"
-             (bl.store:block-index-entry-height failed))
-            (return-from perform-reorg (values nil :invalid-branch))))
+          ;; Self-heal stored witness-stripped forward blocks. A fork block stored
+          ;; via the deferred-validation (:weaker-chain) path before the v2-only
+          ;; compact-block fix could land on disk witness-stripped (legacy coinbase
+          ;; carrying a witness commitment but no 32-byte reserved value). Such a
+          ;; block can NEVER pass BIP141, so it would fail this reorg on every
+          ;; attempt and wedge the node permanently (testnet4 stuck ~1800 blocks
+          ;; behind). Prune it here so the missing-precondition below re-queues it
+          ;; for a witness-complete re-download. Only the to-connect side is checked:
+          ;; to-disconnect blocks already validated when they were connected, and we
+          ;; still need their bodies for the UTXO disconnect.
+          ;; Core's fFailedChain arm (FindMostWorkChain, validation.cpp:3170-3196):
+          ;; a candidate tip is refused outright when ANY block on the path to it
+          ;; carries BLOCK_FAILED_VALID. We read no status at all here, so a
+          ;; branch containing a block the operator invalidated -- or one the
+          ;; validator poisoned -- was a legitimate reorg target as long as it
+          ;; carried more work.
+          ;;
+          ;; Checked BEFORE anything is mutated, so refusing costs nothing and
+          ;; cannot leave the chainstate half-moved.
+          (let ((failed (find-if (lambda (e)
+                                   (eq (bl.store:block-index-entry-status e)
+                                       :invalid))
+                                 (reorg-to-connect r))))
+            (when failed
+              (bl:log-warn
+               "REORG refused: block at height ~D on the target branch is marked invalid"
+               (bl.store:block-index-entry-height failed))
+              (return-from perform-reorg (values nil :invalid-branch))))
 
-        ;; No witness re-check of the stored bodies here. Core judges a body's
-        ;; witness once, when it is accepted (AcceptBlock -> ContextualCheckBlock,
-        ;; validation.cpp:4021-4049 and :4330-4405), and ConnectTip reads the
-        ;; stored body back without judging it again (validation.cpp:3014-3046
-        ;; over ConnectBlock, which runs CheckBlock, not ContextualCheckBlock).
-        ;; Our receive paths hold the same gate: a witness-stripped copy never
-        ;; reaches disk (BLOCK-WITNESS-STRIPPED-P in ibd.lisp and
-        ;; %STORE-BLOCK-FOR-LATER). This pass re-judged ALREADY-ACCEPTED bodies
-        ;; and deleted the ones it disliked, so a block an earlier node accepted
-        ;; under the rules of its time -- Core v0.14.3's regtest block 1, a
-        ;; commitment and no coinbase witness -- could never be reconnected after
-        ;; -reindex-chainstate (feature_unsupported_utxo_db.py:56).
+          ;; No witness re-check of the stored bodies here. Core judges a body's
+          ;; witness once, when it is accepted (AcceptBlock -> ContextualCheckBlock,
+          ;; validation.cpp:4021-4049 and :4330-4405), and ConnectTip reads the
+          ;; stored body back without judging it again (validation.cpp:3014-3046
+          ;; over ConnectBlock, which runs CheckBlock, not ContextualCheckBlock).
+          ;; Our receive paths hold the same gate: a witness-stripped copy never
+          ;; reaches disk (BLOCK-WITNESS-STRIPPED-P in ibd.lisp and
+          ;; %STORE-BLOCK-FOR-LATER). This pass re-judged ALREADY-ACCEPTED bodies
+          ;; and deleted the ones it disliked, so a block an earlier node accepted
+          ;; under the rules of its time -- Core v0.14.3's regtest block 1, a
+          ;; commitment and no coinbase witness -- could never be reconnected after
+          ;; -reindex-chainstate (feature_unsupported_utxo_db.py:56).
 
-        ;; Precondition: every block on BOTH sides must be in the
-        ;; block-store. If anything is missing (including a stripped block just
-        ;; pruned above), refuse the reorg without mutating any state — better to
-        ;; defer than to leave the chain half-disconnected and corrupt. Return the
-        ;; missing list so activate-block's caller can re-queue those blocks for
-        ;; download instead of looping forever on the unprocessable incoming tip.
-        (let ((missing '()))
-          (dolist (entry (append (reorg-to-disconnect r) (reorg-to-connect r)))
-            (let ((block-hash (bl.store:block-index-entry-hash entry)))
-              (unless (bl.store:get-block block-store block-hash)
-                (push (cons block-hash
-                            (bl.store:block-index-entry-height entry))
-                      missing))))
-          (when missing
-            (bl:log-warn
-             "REORG REFUSED: ~D blocks missing from store (first: height ~D)"
-             (length missing) (cdr (first missing)))
-            (return-from perform-reorg (values nil missing))))
+          ;; Precondition: every block on BOTH sides must be in the
+          ;; block-store. If anything is missing (including a stripped block just
+          ;; pruned above), refuse the reorg without mutating any state — better to
+          ;; defer than to leave the chain half-disconnected and corrupt. Return the
+          ;; missing list so activate-block's caller can re-queue those blocks for
+          ;; download instead of looping forever on the unprocessable incoming tip.
+          (let ((missing '()))
+            (dolist (entry (append (reorg-to-disconnect r) (reorg-to-connect r)))
+              (let ((block-hash (bl.store:block-index-entry-hash entry)))
+                (unless (bl.store:get-block block-store block-hash)
+                  (push (cons block-hash
+                              (bl.store:block-index-entry-height entry))
+                        missing))))
+            (when missing
+              (bl:log-warn
+               "REORG REFUSED: ~D blocks missing from store (first: height ~D)"
+               (length missing) (cdr (first missing)))
+              (return-from perform-reorg (values nil missing))))
 
-        ;; Corrupt/missing undo on the DISCONNECT side. PHASE A disconnects each
-        ;; old-chain block with (or undo '()) — an EMPTY undo for a SPENDING
-        ;; block silently corrupts the UTXO set: it removes the outputs the
-        ;; block created but never restores the coins it spent, surfacing later
-        ;; as spurious MISSING-INPUT wedges or double-spend acceptance (this node
-        ;; has a documented history of corrupt undo files). Core aborts
-        ;; DisconnectBlock on an undo-read failure (DISCONNECT_FAILED,
-        ;; validation.cpp:2181-2185 over blockstorage.cpp:1075-1096) for the
-        ;; same reason, and it makes no exception for a coinbase-only block:
-        ;; every connected block has a rev record, so a rev file that is gone
-        ;; fails the disconnect whatever the block holds. That is the first
-        ;; test below — GET-UNDO-DATA's second value. The second test is ours:
-        ;; where no record was ever written, an EMPTY undo list is
-        ;; indistinguishable from a lost one, so it is refused for a SPENDING
-        ;; block and allowed for a coinbase-only one, mirroring
-        ;; %warn-if-undo-empty's exemption. Refuse with a DISTINCT keyword —
-        ;; NOT the missing-block list, which would (wrongly) tell the caller to
-        ;; re-download the to-CONNECT fork; a corrupt LOCAL disconnect-side
-        ;; undo is not fixed by fetching fork blocks.
-        (dolist (entry (reorg-to-disconnect r))
-          (let* ((block-hash (bl.store:block-index-entry-hash entry))
-                 (block (bl.store:get-block block-store block-hash)))
-            (when block
-              (multiple-value-bind (undo readable)
-                  (get-undo-data block-hash)
-                (when (or (not readable)
-                          (and (> (length (bl.ser:bitcoin-block-transactions
-                                           block))
-                                  1)
-                               (null undo)))
-                  (bl:log-error
-                   "REORG REFUSED: corrupt/missing undo for block ~A at height ~D — refusing rather than corrupting the UTXO set"
-                   (bl.crypto:bytes-to-hex block-hash)
-                   (bl.store:block-index-entry-height entry))
-                  ;; A disconnect that cannot run is a failure of the local
-                  ;; system, and Core aborts the node rather than stay on the
-                  ;; less-work chain (validation.cpp:3234-3243).
-                  (when abort-on-disconnect-failure
-                    (bl.log:fatal-error "Failed to disconnect block."))
-                  (return-from perform-reorg (values nil :corrupt-undo)))))))
+          ;; Corrupt/missing undo on the DISCONNECT side. PHASE A disconnects each
+          ;; old-chain block with (or undo '()) — an EMPTY undo for a SPENDING
+          ;; block silently corrupts the UTXO set: it removes the outputs the
+          ;; block created but never restores the coins it spent, surfacing later
+          ;; as spurious MISSING-INPUT wedges or double-spend acceptance (this node
+          ;; has a documented history of corrupt undo files). Core aborts
+          ;; DisconnectBlock on an undo-read failure (DISCONNECT_FAILED,
+          ;; validation.cpp:2181-2185 over blockstorage.cpp:1075-1096) for the
+          ;; same reason, and it makes no exception for a coinbase-only block:
+          ;; every connected block has a rev record, so a rev file that is gone
+          ;; fails the disconnect whatever the block holds. That is the first
+          ;; test below — GET-UNDO-DATA's second value. The second test is ours:
+          ;; where no record was ever written, an EMPTY undo list is
+          ;; indistinguishable from a lost one, so it is refused for a SPENDING
+          ;; block and allowed for a coinbase-only one, mirroring
+          ;; %warn-if-undo-empty's exemption. Refuse with a DISTINCT keyword —
+          ;; NOT the missing-block list, which would (wrongly) tell the caller to
+          ;; re-download the to-CONNECT fork; a corrupt LOCAL disconnect-side
+          ;; undo is not fixed by fetching fork blocks.
+          (dolist (entry (reorg-to-disconnect r))
+            (let* ((block-hash (bl.store:block-index-entry-hash entry))
+                   (block (bl.store:get-block block-store block-hash)))
+              (when block
+                (multiple-value-bind (undo readable)
+                    (get-undo-data block-hash)
+                  (when (or (not readable)
+                            (and (> (length (bl.ser:bitcoin-block-transactions
+                                             block))
+                                    1)
+                                 (null undo)))
+                    (bl:log-error
+                     "REORG REFUSED: corrupt/missing undo for block ~A at height ~D — refusing rather than corrupting the UTXO set"
+                     (bl.crypto:bytes-to-hex block-hash)
+                     (bl.store:block-index-entry-height entry))
+                    ;; A disconnect that cannot run is a failure of the local
+                    ;; system, and Core aborts the node rather than stay on the
+                    ;; less-work chain (validation.cpp:3234-3243).
+                    (when abort-on-disconnect-failure
+                      (bl.log:fatal-error "Failed to disconnect block."))
+                    (return-from perform-reorg (values nil :corrupt-undo)))))))
 
-        (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
-                               old-height fork-height new-height)
+          (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
+                                 old-height fork-height new-height)
 
-        (%reorg-disconnect r chain-state block-store utxo-set mempool fork-entry)
+          (%reorg-disconnect r chain-state block-store utxo-set mempool fork-entry)
 
-        (multiple-value-bind (ok error)
-            (%reorg-connect r chain-state block-store utxo-set old-tip-entry
-                            skip-scripts)
-          (unless ok (return-from perform-reorg (values nil error))))
+          (multiple-value-bind (ok error)
+              (%reorg-connect r chain-state block-store utxo-set old-tip-entry
+                              skip-scripts)
+            (unless ok (return-from perform-reorg (values nil error))))
 
-        (%reorg-commit r chain-state utxo-set mempool fee-estimator
-                       recent-rejects :max-readd-blocks max-readd-blocks)))))
+          (%reorg-commit r chain-state utxo-set mempool fee-estimator
+                         recent-rejects :max-readd-blocks max-readd-blocks))))))
 
 ;;;; Chain-control helpers (invalidateblock / reconsiderblock)
 ;;;;
@@ -4674,81 +4732,82 @@ happened to arrive and re-trigger the path.
 The loop terminates: each successful switch moves the tip TO the maximum-work
 candidate, so the next pass finds nothing above it. The iteration cap is a
 backstop against a candidate that reorgs away and reappears."
-  (let ((switched nil)
-        (missing '()))
-    (dotimes (i 4)
-      (let* ((tip (bl.store:get-block-index-entry
-                   chain-state (bl.store:best-block-hash chain-state)))
-             (tip-work (if tip
-                           (bl.store:block-index-entry-chain-work tip)
-                           0))
-             (best (and tip (best-valid-tip chain-state block-store
-                                            tip-work tip)))
-             ;; Bounded step, not the absolute best tip: see
-             ;; +ACTIVATION-STEP-BLOCKS+. On a synced node the best tip is
-             ;; within the step and this is the identity.
-             (target (and tip best (%activation-step-target tip best))))
-        (when (or (null tip) (null target))
-          (return))
-        (multiple-value-bind (ok detail)
-            (perform-reorg chain-state block-store utxo-set tip target
-                           :fee-estimator fee-estimator
-                           :recent-rejects recent-rejects :mempool mempool)
-          (cond
-            (ok
-             (setf switched t)
-             ;; Flush BETWEEN steps (Core flushes PERIODIC from
-             ;; ActivateBestChain, validation.cpp:3489). Not inside
-             ;; PERFORM-REORG's connect loop — that is the flush its own note
-             ;; correctly refuses, because a rollback there rewinds in memory.
-             ;; Here the step has COMPLETED and is committed, so persisting it
-             ;; is persisting a real chain state.
-             ;;
-             ;; Without this the coins cache grows across every step and never
-             ;; drains: *blocks-since-flush* is advanced only by connect-block's
-             ;; tip-extension arm, so reorg-connected blocks never trigger a
-             ;; periodic flush at all — an unbounded cache on any long
-             ;; activation, which is a correctness-of-resource problem whatever
-             ;; it costs in time.
-             ;;
-             ;; It is worth NOT overselling the speed effect. A/B on the same
-             ;; offline reindex: ~58,000 blocks in 25 min without it, ~56,000 in
-             ;; 20 min with it — about 12% better, not the order of magnitude a
-             ;; first reading of the per-step timings suggested. Most of the
-             ;; slowdown with height is testnet4's own busy zone around
-             ;; 51,000-55,000 (the region scripts/profile-regions.sh already
-             ;; singles out), not this cache.
-             ;; -stopatheight, for the same reason and at the same boundary.
-             ;; MAYBE-STOP-AT-HEIGHT is called from CONNECT-BLOCK's
-             ;; tip-EXTENSION arm only, so a chain activated through
-             ;; PERFORM-REORG — which is every block of an offline reindex,
-             ;; and every step of any long activation — sailed straight past
-             ;; the configured height. Measured on the reindex benchmark:
-             ;; -stopatheight=134000 ran on to 134,898, the header tip.
-             ;;
-             ;; Core checks here too: ActivateBestChain fires the blockTip
-             ;; notification after each ActivateBestChainStep
-             ;; (validation.cpp), and that notification is what
-             ;; kernel_notifications.cpp:61-66 turns into the shutdown
-             ;; request. Between steps, never inside the connect loop: the
-             ;; step has completed and is committed, and PERFORM-REORG's own
-             ;; interrupt check then unwinds the next one on a block boundary.
-             (let ((new-tip (bl.store:get-block-index-entry
-                             chain-state
-                             (bl.store:best-block-hash chain-state))))
-               (when new-tip
-                 (bl.vi:notify-updated-block-tip
-                  chain-state
-                  (bl.store:block-index-entry-hash new-tip)
-                  (bl.store:block-index-entry-height new-tip))
-                 (%check-fork-warning-conditions chain-state))))
-            (t
-             ;; :interrupted means the node is stopping — not a refusal to
-             ;; re-queue against.
-             (when (reorg-missing-blocks-p detail)
-               (setf missing detail))
-             (return))))))
-    (values switched missing)))
+  (with-chainstate-mutex (activate-best-chain)
+    (let ((switched nil)
+          (missing '()))
+      (dotimes (i 4)
+        (let* ((tip (bl.store:get-block-index-entry
+                     chain-state (bl.store:best-block-hash chain-state)))
+               (tip-work (if tip
+                             (bl.store:block-index-entry-chain-work tip)
+                             0))
+               (best (and tip (best-valid-tip chain-state block-store
+                                              tip-work tip)))
+               ;; Bounded step, not the absolute best tip: see
+               ;; +ACTIVATION-STEP-BLOCKS+. On a synced node the best tip is
+               ;; within the step and this is the identity.
+               (target (and tip best (%activation-step-target tip best))))
+          (when (or (null tip) (null target))
+            (return))
+          (multiple-value-bind (ok detail)
+              (perform-reorg chain-state block-store utxo-set tip target
+                             :fee-estimator fee-estimator
+                             :recent-rejects recent-rejects :mempool mempool)
+            (cond
+              (ok
+               (setf switched t)
+               ;; Flush BETWEEN steps (Core flushes PERIODIC from
+               ;; ActivateBestChain, validation.cpp:3489). Not inside
+               ;; PERFORM-REORG's connect loop — that is the flush its own note
+               ;; correctly refuses, because a rollback there rewinds in memory.
+               ;; Here the step has COMPLETED and is committed, so persisting it
+               ;; is persisting a real chain state.
+               ;;
+               ;; Without this the coins cache grows across every step and never
+               ;; drains: *blocks-since-flush* is advanced only by connect-block's
+               ;; tip-extension arm, so reorg-connected blocks never trigger a
+               ;; periodic flush at all — an unbounded cache on any long
+               ;; activation, which is a correctness-of-resource problem whatever
+               ;; it costs in time.
+               ;;
+               ;; It is worth NOT overselling the speed effect. A/B on the same
+               ;; offline reindex: ~58,000 blocks in 25 min without it, ~56,000 in
+               ;; 20 min with it — about 12% better, not the order of magnitude a
+               ;; first reading of the per-step timings suggested. Most of the
+               ;; slowdown with height is testnet4's own busy zone around
+               ;; 51,000-55,000 (the region scripts/profile-regions.sh already
+               ;; singles out), not this cache.
+               ;; -stopatheight, for the same reason and at the same boundary.
+               ;; MAYBE-STOP-AT-HEIGHT is called from CONNECT-BLOCK's
+               ;; tip-EXTENSION arm only, so a chain activated through
+               ;; PERFORM-REORG — which is every block of an offline reindex,
+               ;; and every step of any long activation — sailed straight past
+               ;; the configured height. Measured on the reindex benchmark:
+               ;; -stopatheight=134000 ran on to 134,898, the header tip.
+               ;;
+               ;; Core checks here too: ActivateBestChain fires the blockTip
+               ;; notification after each ActivateBestChainStep
+               ;; (validation.cpp), and that notification is what
+               ;; kernel_notifications.cpp:61-66 turns into the shutdown
+               ;; request. Between steps, never inside the connect loop: the
+               ;; step has completed and is committed, and PERFORM-REORG's own
+               ;; interrupt check then unwinds the next one on a block boundary.
+               (let ((new-tip (bl.store:get-block-index-entry
+                               chain-state
+                               (bl.store:best-block-hash chain-state))))
+                 (when new-tip
+                   (bl.vi:notify-updated-block-tip
+                    chain-state
+                    (bl.store:block-index-entry-hash new-tip)
+                    (bl.store:block-index-entry-height new-tip))
+                   (%check-fork-warning-conditions chain-state))))
+              (t
+               ;; :interrupted means the node is stopping — not a refusal to
+               ;; re-queue against.
+               (when (reorg-missing-blocks-p detail)
+                 (setf missing detail))
+               (return))))))
+      (values switched missing))))
 
 (defun %best-reachable-tip (chain-state block-store tip)
   "The best non-invalid entry that beats TIP by Core's comparator (more work, or
@@ -4800,78 +4859,80 @@ block of the active chain lands on the most-work valid tip, not on the
 invalidated block's parent. rpc_invalidateblock.py:52-56 reorgs a node onto a
 six-block chain, invalidates that chain's block 2, and expects the node back
 on its OWN four-block chain; we left it at height 1."
-  (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
-    (cond
-      ((null entry) (values nil :block-not-found))
-      ((zerop (bl.store:block-index-entry-height entry))
-       (values nil :cannot-invalidate-genesis))
-      (t
-       (let ((tip (bl.store:get-block-index-entry
-                   chain-state (bl.store:best-block-hash chain-state)))
-             (parent (bl.store:block-index-entry-prev-entry entry)))
-         ;; If the active chain contains the invalidated block, reorg down to its
-         ;; parent first. perform-reorg downgrades the disconnected blocks to
-         ;; :header-valid, so we mark :invalid AFTER it, making invalidation stick.
-         ;; Only mark invalid once the block is OFF the active chain — if the
-         ;; reorg-away is refused (e.g. blocks pruned), marking the active tip's
-         ;; ancestry :invalid would leave status flags disagreeing with the UTXO
-         ;; set. (perform-reorg returns NIL on refusal.)
-         (when (and tip parent (block-descends-from-p tip entry))
-           (multiple-value-bind (ok detail)
-               (perform-reorg chain-state block-store utxo-set tip parent
-                              :fee-estimator fee-estimator
-                              :recent-rejects recent-rejects :mempool mempool
-                              ;; Core InvalidateBlock's fAddToMempool
-                              ;; (validation.cpp:3621): only the ten blocks
-                              ;; nearest the old tip come back.
-                              :max-readd-blocks +max-invalidate-readd-blocks+
-                              ;; A failed DisconnectTip fails the RPC and
-                              ;; leaves the node running (validation.cpp:
-                              ;; 3614-3622); only ActivateBestChainStep aborts.
-                              :abort-on-disconnect-failure nil)
-             ;; Surface :interrupted as itself — the node is stopping, the reorg
-             ;; did not fail — so the RPC reports why nothing was invalidated.
-             (unless ok
-               (return-from invalidate-block
-                 (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))))
-         ;; The same marking as everywhere else, and Core's order: the branch
-         ;; is marked failed AFTER the reorg away from it, and InvalidChainFound
-         ;; then runs against the rewound tip (validation.cpp:3690-3705). This
-         ;; was a second copy of the marking loop, which is how the fork warning
-         ;; would have been left out of the RPC path.
-         (%mark-block-subtree-invalid chain-state entry)
-         ;; Core ActivateBestChain (rpc/blockchain.cpp:1707-1709).
-         (%activate-best-valid-chain chain-state block-store utxo-set
-                                     :fee-estimator fee-estimator
-                                     :recent-rejects recent-rejects
-                                     :mempool mempool))))))
+  (with-chainstate-mutex (invalidate-block)
+    (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
+      (cond
+        ((null entry) (values nil :block-not-found))
+        ((zerop (bl.store:block-index-entry-height entry))
+         (values nil :cannot-invalidate-genesis))
+        (t
+         (let ((tip (bl.store:get-block-index-entry
+                     chain-state (bl.store:best-block-hash chain-state)))
+               (parent (bl.store:block-index-entry-prev-entry entry)))
+           ;; If the active chain contains the invalidated block, reorg down to its
+           ;; parent first. perform-reorg downgrades the disconnected blocks to
+           ;; :header-valid, so we mark :invalid AFTER it, making invalidation stick.
+           ;; Only mark invalid once the block is OFF the active chain — if the
+           ;; reorg-away is refused (e.g. blocks pruned), marking the active tip's
+           ;; ancestry :invalid would leave status flags disagreeing with the UTXO
+           ;; set. (perform-reorg returns NIL on refusal.)
+           (when (and tip parent (block-descends-from-p tip entry))
+             (multiple-value-bind (ok detail)
+                 (perform-reorg chain-state block-store utxo-set tip parent
+                                :fee-estimator fee-estimator
+                                :recent-rejects recent-rejects :mempool mempool
+                                ;; Core InvalidateBlock's fAddToMempool
+                                ;; (validation.cpp:3621): only the ten blocks
+                                ;; nearest the old tip come back.
+                                :max-readd-blocks +max-invalidate-readd-blocks+
+                                ;; A failed DisconnectTip fails the RPC and
+                                ;; leaves the node running (validation.cpp:
+                                ;; 3614-3622); only ActivateBestChainStep aborts.
+                                :abort-on-disconnect-failure nil)
+               ;; Surface :interrupted as itself — the node is stopping, the reorg
+               ;; did not fail — so the RPC reports why nothing was invalidated.
+               (unless ok
+                 (return-from invalidate-block
+                   (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))))
+           ;; The same marking as everywhere else, and Core's order: the branch
+           ;; is marked failed AFTER the reorg away from it, and InvalidChainFound
+           ;; then runs against the rewound tip (validation.cpp:3690-3705). This
+           ;; was a second copy of the marking loop, which is how the fork warning
+           ;; would have been left out of the RPC path.
+           (%mark-block-subtree-invalid chain-state entry)
+           ;; Core ActivateBestChain (rpc/blockchain.cpp:1707-1709).
+           (%activate-best-valid-chain chain-state block-store utxo-set
+                                       :fee-estimator fee-estimator
+                                       :recent-rejects recent-rejects
+                                       :mempool mempool)))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
                          &key fee-estimator recent-rejects mempool)
   "Clear :invalid from BLOCK-HASH plus its ancestors and descendants, then
 reorganize to the best valid chain if it now outweighs the active tip. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
-  (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
-    (if entry
-        (progn
-          (maphash (lambda (h e) (declare (ignore h))
-                     (when (and (eq (bl.store:block-index-entry-status e) :invalid)
-                                (or (block-descends-from-p e entry)
-                                    (block-descends-from-p entry e)))
-                       (setf (bl.store:block-index-entry-status e) :header-valid)))
-                   (bl.store:chain-state-block-index chain-state))
-          ;; Core's reconsiderblock recalculates m_best_header right after
-          ;; ResetBlockFailureFlags (rpc/blockchain.cpp:1749-1750), so a
-          ;; reconsidered branch with more work is the best header at once.
-          (bl.store:recalculate-best-header chain-state)
-          ;; Core ResetBlockFailureFlags then ActivateBestChain
-          ;; (rpc/blockchain.cpp:1749-1754) -- the same second step
-          ;; invalidateblock takes.
-          (%activate-best-valid-chain chain-state block-store utxo-set
-                                      :fee-estimator fee-estimator
-                                      :recent-rejects recent-rejects
-                                      :mempool mempool))
-        (values nil :block-not-found))))
+  (with-chainstate-mutex (reconsider-block)
+    (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
+      (if entry
+          (progn
+            (maphash (lambda (h e) (declare (ignore h))
+                       (when (and (eq (bl.store:block-index-entry-status e) :invalid)
+                                  (or (block-descends-from-p e entry)
+                                      (block-descends-from-p entry e)))
+                         (setf (bl.store:block-index-entry-status e) :header-valid)))
+                     (bl.store:chain-state-block-index chain-state))
+            ;; Core's reconsiderblock recalculates m_best_header right after
+            ;; ResetBlockFailureFlags (rpc/blockchain.cpp:1749-1750), so a
+            ;; reconsidered branch with more work is the best header at once.
+            (bl.store:recalculate-best-header chain-state)
+            ;; Core ResetBlockFailureFlags then ActivateBestChain
+            ;; (rpc/blockchain.cpp:1749-1754) -- the same second step
+            ;; invalidateblock takes.
+            (%activate-best-valid-chain chain-state block-store utxo-set
+                                        :fee-estimator fee-estimator
+                                        :recent-rejects recent-rejects
+                                        :mempool mempool))
+          (values nil :block-not-found)))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
                        &key fee-estimator recent-rejects mempool)
@@ -4883,33 +4944,34 @@ breaks an equal-work tie on the sequence id, so without it the next
 ACTIVATE-BEST-CHAIN would hand the tip back to the chain whose data arrived
 first. Returns (values t nil) on success (including the no-ops where the block
 is already the tip or weaker), (values nil reason) on failure."
-  (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
-    (cond
-      ((null entry) (values nil :block-not-found))
-      (t
-       (let ((tip (bl.store:get-block-index-entry
-                   chain-state (bl.store:best-block-hash chain-state))))
-         (when (and tip (>= (bl.store:block-index-entry-chain-work entry)
-                            (bl.store:block-index-entry-chain-work tip)))
-           (bl.store:precious-block-sequence chain-state entry))
-         (cond
-           ;; Already the tip, or weaker than it — nothing to do.
-           ((or (null tip)
-                (eq entry tip)
-                (< (bl.store:block-index-entry-chain-work entry)
-                   (bl.store:block-index-entry-chain-work tip)))
-            (values t nil))
-           ;; Can only reorg to a block whose data is present.
-           ((not (bl.store:block-exists-p block-store block-hash))
-            (values nil :block-missing))
-           (t
-            (multiple-value-bind (ok detail)
-                (perform-reorg chain-state block-store utxo-set tip entry
-                               :fee-estimator fee-estimator
-                               :recent-rejects recent-rejects :mempool mempool)
-              (cond (ok (values t nil))
-                    ((eq detail :interrupted) (values nil :interrupted))
-                    (t (values nil :reorg-failed)))))))))))
+  (with-chainstate-mutex (precious-block)
+    (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
+      (cond
+        ((null entry) (values nil :block-not-found))
+        (t
+         (let ((tip (bl.store:get-block-index-entry
+                     chain-state (bl.store:best-block-hash chain-state))))
+           (when (and tip (>= (bl.store:block-index-entry-chain-work entry)
+                              (bl.store:block-index-entry-chain-work tip)))
+             (bl.store:precious-block-sequence chain-state entry))
+           (cond
+             ;; Already the tip, or weaker than it — nothing to do.
+             ((or (null tip)
+                  (eq entry tip)
+                  (< (bl.store:block-index-entry-chain-work entry)
+                     (bl.store:block-index-entry-chain-work tip)))
+              (values t nil))
+             ;; Can only reorg to a block whose data is present.
+             ((not (bl.store:block-exists-p block-store block-hash))
+              (values nil :block-missing))
+             (t
+              (multiple-value-bind (ok detail)
+                  (perform-reorg chain-state block-store utxo-set tip entry
+                                 :fee-estimator fee-estimator
+                                 :recent-rejects recent-rejects :mempool mempool)
+                (cond (ok (values t nil))
+                      ((eq detail :interrupted) (values nil :interrupted))
+                      (t (values nil :reorg-failed))))))))))))
 
 ;;;; Activate block — validate + connect with reorg awareness.
 ;;;;
@@ -5066,6 +5128,16 @@ target (Core TryAddBlockIndexCandidate, validation.cpp:3764-3794). Anything
 off that path (a sibling fork, or any block past the target) is stored for
 the block store's benefit but never activated, so the historical chainstate
 can neither wedge on an equal-work sibling nor advance past the base."
+  (with-chainstate-mutex (activate-block)
+    (%activate-block block chain-state block-store utxo-set
+                     :current-time current-time :skip-scripts skip-scripts
+                     :fee-estimator fee-estimator :recent-rejects recent-rejects
+                     :mempool mempool)))
+
+(defun %activate-block (block chain-state block-store utxo-set
+                        &key current-time skip-scripts fee-estimator
+                             recent-rejects mempool)
+  "ACTIVATE-BLOCK's body, run holding the chainstate mutex."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (prev-hash (bl.ser:block-header-prev-block header))
          (current-best-hash (bl.store:best-block-hash chain-state))
@@ -5083,8 +5155,8 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 (%store-accepted-block-body block chain-state block-store
                                             :current-time now)
               (unless stored
-                (return-from activate-block (values nil error)))))
-          (return-from activate-block (values nil :weaker-chain)))))
+                (return-from %activate-block (values nil error)))))
+          (return-from %activate-block (values nil :weaker-chain)))))
     (cond
       ;; Case 1: extends current tip — normal path.
       ((equalp prev-hash current-best-hash)
@@ -5142,7 +5214,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
             ;; Stored FIRST (AcceptBlock, then ActivateBestChain): %STORE-BLOCK-FOR-LATER.
             (multiple-value-bind (stored error)
                 (%store-block-for-later block chain-state block-store now)
-              (unless stored (return-from activate-block (values nil error))))
+              (unless stored (return-from %activate-block (values nil error))))
             (multiple-value-bind (reorg-ok detail)
                 (perform-reorg chain-state block-store utxo-set
                                current-best-entry prev-entry
@@ -5238,5 +5310,5 @@ can neither wedge on an equal-work sibling nor advance past the base."
            (t
             (multiple-value-bind (stored error)
                 (%store-block-for-later block chain-state block-store now)
-              (unless stored (return-from activate-block (values nil error))))
+              (unless stored (return-from %activate-block (values nil error))))
             (values nil :weaker-chain))))))))

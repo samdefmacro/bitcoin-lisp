@@ -3180,13 +3180,19 @@ terms both said the node was done, so the fork was never requested."
     ;; Skipped when a stop is pending — shutdown must return promptly rather
     ;; than start a reorg — and when there is no block store, since then no
     ;; candidate can have a body on disk to switch to.
+    ;;
+    ;; Under the node lock, as every activation is (see
+    ;; BL.VAL:WITH-CHAINSTATE-MUTEX): run without it, this picked a block a
+    ;; generatetoaddress was half-way through connecting as a heavier tip,
+    ;; connected it a second time (bad-txns-BIP30) and marked it invalid.
     (when (and block-store utxo-set (not (bl:interrupt-requested-p)))
       (multiple-value-bind (switched missing)
-          (bl.val:activate-best-chain
-           chain-state block-store utxo-set
-           :fee-estimator fee-estimator
-           :recent-rejects recent-rejects
-           :mempool mempool)
+          (with-current-node-lock
+            (bl.val:activate-best-chain
+             chain-state block-store utxo-set
+             :fee-estimator fee-estimator
+             :recent-rejects recent-rejects
+             :mempool mempool))
         (when switched
           (bl:log-info "Activated best chain: tip now height ~D"
                                  (bl.store:current-height chain-state)))

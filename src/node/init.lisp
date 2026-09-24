@@ -2062,15 +2062,19 @@ seconds and dial again."
   ;; Cheap when there is nothing to do: it returns
   ;; immediately once the tip IS the most-work
   ;; candidate, which is the steady state.
+  ;;
+  ;; Under the node lock, as every activation is (BL.VAL:WITH-CHAINSTATE-MUTEX):
+  ;; an RPC generate or submitblock may be connecting a block at the same time.
   (let ((switched
           (ignore-errors
-           (bl.val:activate-best-chain
-            (node-current-chainstate *node*)
-            (node-block-store *node*)
-            (bl.store:chain-state-coins-view
-             (node-current-chainstate *node*))
-            :fee-estimator (node-fee-estimator *node*)
-            :mempool (node-mempool *node*)))))
+           (bt:with-recursive-lock-held ((node-lock *node*))
+             (bl.val:activate-best-chain
+              (node-current-chainstate *node*)
+              (node-block-store *node*)
+              (bl.store:chain-state-coins-view
+               (node-current-chainstate *node*))
+              :fee-estimator (node-fee-estimator *node*)
+              :mempool (node-mempool *node*))))))
     (cond
       (switched
        (note-node-tip-progress *node*))
@@ -2284,11 +2288,26 @@ begun; feature_init.py:83 interrupts start-up on `msghand thread start'."
          (bl.log:trace-thread "opencon" (lambda () (%sync-thread-loop max-peers)))
          (%sync-thread-loop max-peers)))))
 
+(defun install-cs-main-check (node)
+  "Make BL.VAL:WITH-CHAINSTATE-MUTEX refuse a caller that does not hold NODE's
+lock (see BL.VAL:*CS-MAIN-HELD-P*). Only NODE is checked: an in-image test that
+binds another node, or none, is not this node's business. Cleared by
+STOP-NODE."
+  (setf bl.val:*cs-main-held-p*
+        (lambda ()
+          (or (not (eq *node* node))
+              (sb-thread:holding-mutex-p (node-lock node))))))
+
 (defun %finish-init-and-start-sync (rpc-port startup-notify sync max-peers)
   "Core Step 13 (finished): mark the node running, end RPC warmup and fire
 -startupnotify; then Core Step 12's sync thread (%SYNC-THREAD-LOOP), with the
 per-process sync state and the at-tip liveness signal reset for this run."
   (setf (node-running *node*) t)
+  ;; From here on the node runs threads that activate blocks (the RPC workers
+  ;; once warm-up ends, the sync thread below), so every activation must hold
+  ;; the node lock: BL.VAL:WITH-CHAINSTATE-MUTEX checks it (Core's
+  ;; AssertLockHeld(cs_main)).
+  (install-cs-main-check *node*)
 
   ;; The RPC server is UP by now (start-rpc-early, from %INIT-SERVICES); the node is
   ;; ready, so stop answering -28.
