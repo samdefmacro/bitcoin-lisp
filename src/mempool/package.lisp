@@ -138,6 +138,7 @@ src/mempool/.")
    #:mempool-unbroadcast-count
    #:mempool-unbroadcast-p
    #:mempool-dat-path
+   #:*mempool-load-tried*
    #:save-mempool-file
    #:read-mempool-file
    #:*persist-mempool-v1*

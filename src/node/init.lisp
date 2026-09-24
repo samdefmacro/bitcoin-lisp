@@ -743,7 +743,7 @@ previous node's state."
   ;; defaults back rather than the previous run's answer.
   (setf *persist-mempool* (and persist-mempool t)
         bl.mp:*persist-mempool-v1* (and persist-mempool-v1 t)
-        *mempool-load-tried* nil)
+        bl.mp:*mempool-load-tried* nil)
   ;; The node's warnings map and the fork-warning state it is fed from (Core
   ;; node::Warnings' constructor, warnings.cpp:20-27, and
   ;; ChainstateManager::m_best_invalid): a warning describes the node that is
@@ -828,7 +828,8 @@ util/thread.cpp:20-22).
 We do that work inline on the init thread, in a different order, but a caller
 waiting for it can only wait on the exit line: wallet_reindex.py:64 restarts a
 node with -reindex=1 and reads the wallet again as soon as it appears. So the
-pair brackets the same WORK, which here ends with the external block files.
+pair brackets the same WORK, which here ends with %INITLOAD: the external block
+files and then the mempool replay, Core's own tail.
 
 EDGE is :START or :EXIT."
   (log-info "initload thread ~(~A~)" edge))
@@ -1572,8 +1573,7 @@ than a hand-built one."
 (defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
   "The RPC server, up early (Core Step 4a AppInitServers, answering
 RPC_IN_WARMUP while the rest loads); the recent-rejects filter, the fee
-estimator, the address book and banlist (Step 6); mempool.dat (Step 11); the
-anchors (Step 12); the coins-DB tip reconciliation and the VerifyDB pass over
+estimator, the address book and banlist (Step 6); the anchors (Step 12); the coins-DB tip reconciliation and the VerifyDB pass over
 it; the indexes (Step 8) and -forcecompactdb."
   ;; Initialize recent rejects filter (DoS protection)
   (setf (node-recent-rejects *node*) (make-rejects-filter))
@@ -1584,17 +1584,19 @@ it; the indexes (Step 8) and -forcecompactdb."
 
   (%init-fee-estimation (node-data-directory *node*))
 
-  ;; The RPC server comes up HERE — before the mempool replay and the index
-  ;; catch-ups below, which is Core's order: AppInitServers (which starts the
-  ;; HTTP/RPC server) runs long before LoadMempool and the index sync
-  ;; (init.cpp:750-760 vs the import thread). Every request answers
-  ;; RPC_IN_WARMUP (-28) with the current status until start-node finishes.
+  ;; The RPC server comes up HERE — before the index catch-ups below and the
+  ;; mempool replay at the end of start-up, which is Core's order:
+  ;; AppInitServers (which starts the HTTP/RPC server) runs long before
+  ;; LoadMempool and the index sync (init.cpp:750-760 vs the import thread).
+  ;; Every request answers RPC_IN_WARMUP (-28) with the current status until
+  ;; the warmup ends in %FINISH-INIT-AND-START-SYNC.
   ;;
   ;; This is the fix for a real outage: an 83 MB mempool.dat turned a restart
   ;; into a ~45-minute window in which the node was alive, working, and
   ;; completely unreachable — bitcoin-cli got connection refused and the
-  ;; monitoring saw a dead node. It now gets "-28 Replaying mempool...", which
-  ;; is retryable and true.
+  ;; monitoring saw a dead node. The replay now runs after the warmup, as
+  ;; Core's initload thread runs it, and getmempoolinfo says `loaded': false
+  ;; until it is done (%INITLOAD).
   (when rpc-port
     (start-rpc-early *node* rpc-port rpc-bind rpc-bind-supplied-p
                       rpc-user rpc-password rpc-auth rpc-allow-ip
@@ -1602,15 +1604,8 @@ it; the indexes (Step 8) and -forcecompactdb."
                       rest-enabled network webui webui-supplied-p
                       webui-path webui-open))
 
-  ;; Reload the persisted mempool through normal acceptance (Core LoadMempool).
-  ;; -persistmempool=0 leaves the PATH empty rather than skipping the call, so
-  ;; the load-tried latch below is set either way -- Core's exact shape at
-  ;; init.cpp:2046-2049.
-  (bl.rpc:set-rpc-warmup-status "Replaying mempool...")
-  (load-mempool-from-disk *node* (mempool-load-path *node*))
-  ;; Core pool->SetLoadTried(!chainman.m_interrupt): a run that was interrupted
-  ;; mid-replay must not overwrite the dump it was still reading.
-  (setf *mempool-load-tried* (not (interrupt-requested-p)))
+  ;; mempool.dat is replayed at the END of start-up, after the -loadblock
+  ;; files, where Core's initload thread replays it (%INITLOAD).
 
   ;; Initialize peer address book
   (init-message "Loading P2P addresses…")         ; init.cpp:1636
@@ -2522,10 +2517,7 @@ Returns the node instance."
   (%start-network-services network sync listen listen-bind listen-bind-supplied-p
                            listen-onion tor-control tor-password onion-bind
                            extra-onion-binds)
-  ;; -loadblock=<file>: import external block files before declaring the node
-  ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
-  ;; on it). A file that cannot be opened warns and the rest still run.
-  (%import-external-block-files *node* load-block)
+  (%initload *node* load-block)
   (log-initload-thread :exit)
 
   ;; Startup is over: a stop arriving from here on has a fully-built node to
@@ -2534,6 +2526,28 @@ Returns the node instance."
   (setf *node-starting* nil)
   (log-info "Node started successfully")
   *node*)
+
+(defun %initload (node load-block)
+  "The work Core's initload thread does once the node is up (init.cpp:2026-2050),
+in its order: ImportBlocks over the -loadblock files, then LoadMempool, then
+pool->SetLoadTried(!m_interrupt).
+
+The order is what callers can observe. getmempoolinfo's `loaded' turns true
+only at SetLoadTried, so a caller that waits for it -- the functional
+framework's wait_for_rpc_connection does, test_node.py:292-310 -- has also
+waited out the block import: feature_loadblock.py:76 restarts a node with
+-loadblock and asserts its block count at once. We replayed mempool.dat before
+the RPC left warmup and imported the files last, so `loaded' was already true
+while the import ran and the count came back short (88 of 100).
+
+The replay goes through normal acceptance. -persistmempool=0 leaves the PATH
+empty rather than skipping the call, so the load-tried latch is set either way
+-- Core's exact shape at init.cpp:2046-2049; a run that was interrupted
+mid-replay must not overwrite the dump it was still reading. A file that
+cannot be opened warns and the rest still run."
+  (%import-external-block-files node load-block)
+  (load-mempool-from-disk node (mempool-load-path node))
+  (setf bl.mp:*mempool-load-tried* (not (interrupt-requested-p))))
 
 (defun %import-external-block-files (node paths)
   "Import every file in PATHS through the ordinary consensus path (Core

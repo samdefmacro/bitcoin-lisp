@@ -80,7 +80,12 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           (bl.mp:mempool-for-each
            mempool (lambda (txid e) (declare (ignore txid))
                      (incf total-fee-sat (bl.mp:mempool-entry-fee e))))
-          `(("loaded" . t)
+          ;; Core pool.GetLoadTried() (rpc/mempool.cpp:1038): whether the
+          ;; start-up replay of mempool.dat has been attempted, not whether a
+          ;; mempool exists. The functional framework waits for it to turn
+          ;; true before it calls a node started (test_node.py:292-310), and
+          ;; that wait is what covers the -loadblock import (bl::%INITLOAD).
+          `(("loaded" . ,(json-bool bl.mp:*mempool-load-tried*))
             ("size" . ,count)
             ("bytes" . ,bytes)
             ;; Core DynamicMemoryUsage(): the malloc-modeled memory usage the

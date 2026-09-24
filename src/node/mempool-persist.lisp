@@ -14,16 +14,6 @@ It is the switch an operator reaches for after a restart spent replaying a
 large mempool.dat, and the only way to stop the shutdown write of a file that
 holds this node's own unbroadcast transactions in recoverable form.")
 
-(defvar *mempool-load-tried* nil
-  "Core CTxMemPool::m_load_tried, set by SetLoadTried once the startup load has
-been attempted (init.cpp:2048) and read by GetLoadTried before the shutdown dump
-(init.cpp:338). Without it a node that is stopped BEFORE the replay finishes
-dumps its half-filled mempool over the good file it was still reading.
-
-A special rather than a mempool slot: there is one mempool per process, and a
-per-run latch on the struct would survive an in-image restart in exactly the
-way START-NODE re-arms every other latch against.")
-
 (defun should-persist-mempool-p ()
   "Core ShouldPersistMempool (node/mempool_persist_args.cpp:13-16)."
   (and *persist-mempool* t))
@@ -52,7 +42,7 @@ only ever read part of it."
       ((not (should-persist-mempool-p))
        (log-info "Not saving mempool: -persistmempool=0")
        nil)
-      ((not *mempool-load-tried*)
+      ((not bl.mp:*mempool-load-tried*)
        (log-info "Not saving mempool: the startup replay never finished, so the ~
 existing ~A is the better copy" (file-namestring path))
        nil)

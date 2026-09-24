@@ -1898,6 +1898,17 @@ so a Core node too old to know version 2 can read it. The READER accepts both
 versions either way; only the writer follows this flag. Set once per run by
 START-NODE.")
 
+(defvar *mempool-load-tried* nil
+  "Core CTxMemPool::m_load_tried, set by SetLoadTried once the startup load has
+been attempted (init.cpp:2048) and read by GetLoadTried before the shutdown dump
+(init.cpp:338). Without it a node that is stopped BEFORE the replay finishes
+dumps its half-filled mempool over the good file it was still reading.
+
+It lives in this layer because getmempoolinfo reads it as `loaded'
+(rpc/mempool.cpp:1038). A special rather than a mempool slot: there is one mempool per process, and a
+per-run latch on the struct would survive an in-image restart in exactly the
+way START-NODE re-arms every other latch against.")
+
 (defun mempool-dat-path (data-directory)
   "Path of the mempool persistence file under DATA-DIRECTORY, or NIL."
   (when data-directory

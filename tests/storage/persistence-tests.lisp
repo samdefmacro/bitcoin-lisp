@@ -1619,7 +1619,7 @@ LoadMempool, init.cpp:2048). Without it the shutdown dump is correctly skipped
 -- Core does not overwrite a good mempool.dat from a node that never read one
 -- and a test about teardown ORDERING would be measuring the persist gate
 instead. That gate has its own test, on both branches."
-  (setf bl::*mempool-load-tried* t)
+  (setf bl.mp:*mempool-load-tried* t)
   (let ((node (bl:make-node :network :regtest)))
     (setf (bl:node-data-directory node) base
           (bl:node-chainstates node)

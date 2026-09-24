@@ -2086,6 +2086,43 @@ gave the argument would have claimed an array is not an array."
                        "JSON value of type string is not of expected type array")
                  (multiple-value-list (%rails-error (lambda () (create "foo")))))))))
 
+(test getmempoolinfo-loaded-waits-for-the-block-import
+  "getmempoolinfo's `loaded' is pool.GetLoadTried() (rpc/mempool.cpp:1038), and
+SetLoadTried runs at the END of Core's initload thread, after ImportBlocks and
+LoadMempool (init.cpp:2026-2050). The functional framework calls a node started
+only once `loaded' is true (test_node.py:292-310), and feature_loadblock.py:76
+counts on that wait covering the -loadblock import: it asserts the block count
+at once. Ours said `loaded': true whenever a mempool existed, and replayed
+mempool.dat before the import besides, so the count came back 88 of 100.
+
+The latch is read as it stands (bound both ways), then %INITLOAD is driven with
+the import stubbed to record what the RPC said while it ran."
+  (with-temp-directory (dir "bl-initload")
+    (let ((node (make-test-node)))
+      (setf (bl:node-data-directory node) dir)
+      (flet ((loaded ()
+               (cdr (assoc "loaded" (bl.rpc:dispatch-rpc-method node "getmempoolinfo" nil)
+                           :test #'string=))))
+        (let ((bl.mp:*mempool-load-tried* nil))
+          (is (eq bl.rpc:+json-false+ (loaded))
+              "before the start-up load is tried, `loaded' is false"))
+        (let ((bl.mp:*mempool-load-tried* t))
+          (is (eq t (loaded)) "control: once it is tried, `loaded' is true"))
+        (let ((bl.mp:*mempool-load-tried* nil)
+              (during :not-called)
+              (saved-import (fdefinition 'bl::%import-external-block-files)))
+          (unwind-protect
+               (progn
+                 (setf (fdefinition 'bl::%import-external-block-files)
+                       (lambda (node paths)
+                         (declare (ignore node paths))
+                         (setf during (loaded))))
+                 (bl::%initload node (list "/nonexistent/bootstrap.dat")))
+            (setf (fdefinition 'bl::%import-external-block-files) saved-import))
+          (is (eq bl.rpc:+json-false+ during)
+              "while the -loadblock files import, `loaded' must still be false")
+          (is (eq t (loaded)) "after the import and the replay, `loaded' is true"))))))
+
 (test rpc-getmempoolinfo-reports-cores-policy-fields
   "getmempoolinfo's last four fields (rpc/mempool.cpp:1050-1053):
 maxdatacarriersize, limitclustercount, limitclustersize and optimal. Every

@@ -4255,7 +4255,7 @@ gate that returned the right NIL while still writing would fail."
            (txid (bl.ser:transaction-hash tx))
            (path (bl.mp:mempool-dat-path dir))
            (bl::*persist-mempool* t)
-           (bl::*mempool-load-tried* t))
+           (bl.mp:*mempool-load-tried* t))
       (setf (bl:node-data-directory node) dir)
       (bl.mp:mempool-add (bl:node-mempool node) txid (make-mempool-entry-for-tx tx))
       ;; (1) positive control: on, and the replay finished => the file is written
@@ -4278,7 +4278,7 @@ gate that returned the right NIL while still writing would fail."
       (is (= 1 (bl::save-mempool-at-shutdown node)))
       (let ((before (with-open-file (in path :element-type '(unsigned-byte 8))
                       (file-length in)))
-            (bl::*mempool-load-tried* nil))
+            (bl.mp:*mempool-load-tried* nil))
         (is (null (bl::save-mempool-at-shutdown node)))
         (is (= before (with-open-file (in path :element-type '(unsigned-byte 8))
                         (file-length in))))))))
