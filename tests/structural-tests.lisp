@@ -1257,6 +1257,62 @@ works on a cache-free CMutableTransaction (primitives/transaction.h:395-420 vs
         "~D in-place transaction mutation~:P in a file that never invalidates ~
 the cached txid/wtxid/weight: ~S" (length violations) violations)))
 
+;;; --- every name resolution goes through a literal-aware function ---------
+
+(defparameter +resolver-call-patterns+
+  '("usocket:socket-connect" "usocket:get-hosts-by-name"
+    "sb-bsd-sockets:get-host-by-name")
+  "Calls that hand a host string to getaddrinfo. glibc refuses an IPv6
+literal such as `::1' there (EAI_ADDRFAMILY under AI_ADDRCONFIG) wherever the
+loopback is the only IPv6 address -- every container -- so a dial through one
+of these directly never reaches an IPv6 peer or proxy.")
+
+(defparameter +literal-aware-resolvers+
+  '(("src/networking/connection.lisp" . "%dial-host-address")
+    ("src/networking/connection.lisp" . "lookup-service")
+    ("src/networking/connection.lisp" . "%socket-connect") ; the #-sbcl fallback
+    ;; Seed HOSTNAMES only; a literal never reaches it.
+    ("src/networking/protocol.lisp" . "resolve-dns-seed")
+    ;; bitcoin-cli: parses both literal families before it resolves.
+    ("src/cli/http.lisp" . "%resolve"))
+  "The (file . function) pairs allowed to call +RESOLVER-CALL-PATTERNS+: each
+parses an address literal itself and resolves only a name.")
+
+(defun %resolver-call-sites (&optional (corpus (%source-corpus)))
+  "Every (file . enclosing-defun) of CORPUS whose code calls one of
++RESOLVER-CALL-PATTERNS+."
+  (loop for (file . lines) in corpus
+        append (let ((in-string nil) (defun-name nil))
+                 (loop for raw across lines
+                       do (when (uiop:string-prefix-p "(defun " raw)
+                            (setf defun-name (%definition-name raw "(defun ")))
+                       append (multiple-value-bind (code next) (%code-only raw in-string)
+                                (setf in-string next)
+                                (when (some (lambda (p) (search p code)) +resolver-call-patterns+)
+                                  (list (cons file defun-name))))))))
+
+(defun %unapproved-resolver-calls (&optional (corpus (%source-corpus)))
+  (remove-if (lambda (site) (member site +literal-aware-resolvers+ :test #'equal))
+             (%resolver-call-sites corpus)))
+
+(test every-resolver-call-is-literal-aware
+  "A dial to an address literal never reaches getaddrinfo: every call that
+resolves a host sits in a function that parses literals first (Core's Lookup
+parses a numeric host before any name lookup, netbase.cpp:181-190). The trap
+struck twice -- the RPC listener, then every outbound dial through an IPv6
+proxy (feature_proxy.py timed out on it) -- so it is a ratchet, not prose."
+  (is (null (%unapproved-resolver-calls))
+      "resolver calls outside the literal-aware functions: ~S" (%unapproved-resolver-calls))
+  (is (member '("src/networking/connection.lisp" . "%dial-host-address")
+              (%resolver-call-sites) :test #'equal)
+      "the scan finds the one real dial resolver, so it is not vacuous")
+  ;; Positive control: a bare call in any other function trips it.
+  (is (equal '(("src/x.lisp" . "dial-somewhere"))
+             (%unapproved-resolver-calls
+              (list (cons "src/x.lisp"
+                          (vector "(defun dial-somewhere (h p)"
+                                  "  (usocket:socket-connect h p))")))))))
+
 ;;; --- layering -------------------------------------------------------------
 
 (defun %load-order ()
