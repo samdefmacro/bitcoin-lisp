@@ -222,6 +222,17 @@ counterpart of flexi-streams:with-input-from-sequence."
   `(let ((,var (make-byte-reader-from ,bytes)))
      ,@body))
 
+(declaim (ftype (function () nil) %end-of-data))
+(defun %end-of-data ()
+  "Core's text for a read past the end of a message or record:
+DataStream::read throws std::ios_base::failure(\"DataStream::read(): end of
+data\") (streams.h:210), and ProcessMessages logs that what() in its
+`Exception '...' caught' line (net_processing.cpp:5284), which the functional
+tests read back -- p2p_invalid_messages.py:194 for an empty addrv2,
+p2p_segwit.py:1201 for a block whose witness is cut short. Out of line, so
+the inlined readers carry only the bounds test."
+  (serialization-error "DataStream::read(): end of data"))
+
 (defun br-eof-p (br)
   (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
   (>= (br-pos br) (length (br-data br))))
@@ -230,6 +241,7 @@ counterpart of flexi-streams:with-input-from-sequence."
   (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
   (let ((p (br-pos br)))
     (declare (type fixnum p))
+    (when (>= p (length (br-data br))) (%end-of-data))
     (prog1 (aref (br-data br) p)
       (setf (br-pos br) (the fixnum (1+ p))))))
 
@@ -254,6 +266,7 @@ and advance. Expands to the hand-unrolled AREFs."
      (let ((p (br-pos br))
            (d (br-data br)))
        (declare (type fixnum p))
+       (when (> (the fixnum (+ p ,nbytes)) (length d)) (%end-of-data))
        (prog1 (logior ,@(loop for i below nbytes
                               collect `(ash (aref d (the fixnum (+ p ,i))) ,(* 8 i))))
          (setf (br-pos br) (the fixnum (+ p ,nbytes)))))))
@@ -283,8 +296,7 @@ ahead of an overrun error."
   (let ((p (br-pos br)))
     (declare (type fixnum p))
     (when (> (+ p n) (length (br-data br)))
-      (serialization-error "br-read-bytes: read past end of buffer (pos ~D + ~D > ~D)"
-             p n (length (br-data br))))
+      (%end-of-data))
     (let ((out (make-array n :element-type '(unsigned-byte 8))))
       (declare (type (simple-array (unsigned-byte 8) (*)) out))
       (replace out (br-data br) :start2 p :end2 (the fixnum (+ p n)))
@@ -305,21 +317,21 @@ bits."
              ((= first 253)
               (let ((v (br-read-u16-le br)))
                 (when (< v 253)
-                  (serialization-error "non-canonical ReadCompactSize"))
+                  (serialization-error "non-canonical ReadCompactSize()"))
                 v))
              ((= first 254)
               (let ((v (br-read-u32-le br)))
                 (when (< v #x10000)
-                  (serialization-error "non-canonical ReadCompactSize"))
+                  (serialization-error "non-canonical ReadCompactSize()"))
                 v))
              (t
               (let ((v (br-read-u64-le br)))
                 (when (< v #x100000000)
-                  (serialization-error "non-canonical ReadCompactSize"))
+                  (serialization-error "non-canonical ReadCompactSize()"))
                 v)))))
     (when (and range-check (> value +max-compact-size+))
-      (serialization-error "ReadCompactSize: size too large (~D > ~D)"
-             value +max-compact-size+))
+      ;; Core's words (serialize.h:357), which carry no numbers.
+      (serialization-error "ReadCompactSize(): size too large"))
     value))
 
 (defun br-read-var-bytes (br)
