@@ -336,10 +336,13 @@ do we -- and the payload is empty, so nothing about the bytes can be blamed."
 
 ;;;; What a caught handler error says, in Core's words
 
-(defun %handler-exception-line (command payload)
-  "The `net' log text of dispatching COMMAND/PAYLOAD to a fresh fake peer."
+(defun %handler-exception-line (command payload &optional (node-ctx (bl.ctx:make-node-context)))
+  "The `net' log text of dispatching COMMAND/PAYLOAD to a fresh fake peer, on
+NODE-CTX."
   (nth-value 1 (log-text-of "net"
-                            (lambda () (%dispatch-to-fake-peer command payload)))))
+                            (lambda ()
+                              (%dispatch-to-fake-peer command payload
+                                                      (%fake-ready-peer) node-ctx)))))
 
 (test a-read-past-the-end-is-cores-end-of-data
   "Every byte-reader primitive that runs out of input signals a
@@ -389,3 +392,31 @@ end of data'), and feature_block.py:947 (b64a's non-canonical CompactSize --
                      (%handler-exception-line "block" noncanonical)))
     (is-true (search "Exception 'DataStream::read(): end of data'"
                      (%handler-exception-line "block" truncated)))))
+
+(test an-unknown-witness-flag-in-a-tx-message-is-logged-as-cores-exception
+  "A tx whose extended-format flag byte carries a bit besides the witness bit
+is undecodable: Core's UnserializeTransaction throws `Unknown transaction
+optional data' (primitives/transaction.h:235), inside ProcessMessage's
+`vRecv >> TX_WITH_WITNESS(ptx)' (net_processing.cpp:4486), so ProcessMessages
+logs it with its Exception line and keeps the peer. p2p_segwit.py:1984 waits
+for that text. Our tx handler wrapped its parse in a catch-all that returned
+NIL, so nothing was logged at all. The control is the same bytes with the
+flag at 1, which decode."
+  (let ((bl.net:*cached-is-ibd* nil))
+    (flet ((tx-with-flag (flag)
+             (%concat-bytes (%bytes 1 0 0 0 0 flag 1)
+                            (make-array 36 :element-type '(unsigned-byte 8)
+                                           :initial-element 0)
+                            (%bytes 0 #xff #xff #xff #xff 1)
+                            (make-array 8 :element-type '(unsigned-byte 8)
+                                          :initial-element 0)
+                            (%bytes 0 1 1 0 0 0 0 0))))
+      (is (typep (bl.ser:parse-tx-payload (tx-with-flag 1))
+                 'bl.ser:transaction)
+          "control: with the witness flag alone the bytes are a transaction")
+      (let ((line (%handler-exception-line
+                   "tx" (tx-with-flag 3)
+                   (bl.ctx:make-node-context :mempool (bl.mp:make-mempool)))))
+        (is-true (search "ProcessMessages(tx, 65 bytes): Exception 'Unknown transaction optional data'"
+                         line)
+                 "unknown flag logged: ~A" line)))))

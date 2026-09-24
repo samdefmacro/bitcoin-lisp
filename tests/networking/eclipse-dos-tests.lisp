@@ -1566,8 +1566,16 @@ turn a link they meant to keep block-only into a tx firehose."
                (setf (bl.net:peer-address p) address)
                ;; The permission question is asked BEFORE Core's IBD gate, so
                ;; the node has to be out of IBD for the answer to be visible.
+               ;; The empty payload is no transaction at all: a peer let
+               ;; through the gate reaches the parse, which signals Core's
+               ;; `end of data' for ProcessMessages' catch to log
+               ;; (SAFELY-DISPATCH-PEER-MESSAGE). Only the disconnect is the
+               ;; question here.
                (with-tx-relay-out-of-ibd
-                 (deliver-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context)))
+                 (handler-case
+                     (deliver-tx p (make-array 0 :element-type '(unsigned-byte 8))
+                                 (bl.ctx:make-node-context))
+                   (bl.err:serialization-error () nil)))
                (eq :disconnected (bl.net:peer-state p)))))
       (with-whitelist (:entries '("relay@10.0.0.0/8"))
         ;; Control: without the permission, -blocksonly drops the sender.
@@ -2463,7 +2471,7 @@ Core's and is preserved deliberately."
           (ctx (bl.net::make-ibd-context)))
       (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)
                      (bl.net:ibd-context-in-flight ctx))
-            (cons fresh2 now))
+            (list (cons fresh2 now)))
       (let ((bl.net:*ibd-context* ctx))
         (is (= 1 (bl.net::count-peer-in-flight fresh2))
             "sanity: the in-flight seam is actually connected")
@@ -2630,7 +2638,7 @@ lands on five hours if copied literally and makes the check effectively dead."
           (peer (%p3-peer)))
       (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
                      (bl.net:ibd-context-in-flight ctx))
-            (cons peer 1))
+            (list (cons peer 1)))
       (let ((bl.net:*ibd-context* ctx))
         (is-true (bl.net:any-blocks-in-flight-p)
                  "sanity: the in-flight seam is actually connected")

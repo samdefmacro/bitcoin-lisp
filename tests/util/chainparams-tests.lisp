@@ -61,6 +61,17 @@ for every chain."
     (let ((av (bl:network-assumevalid name)))
       (is (or (null av) (= 32 (length av))) "~A assumevalid" name))))
 
+(test assumevalid-hash-is-in-wire-order
+  "The mainnet defaultAssumeValid is written in display order in
+kernel/chainparams.cpp (...51ba5ac) and consulted as a block-index key, i.e.
+in wire order: first byte #xac, last #x00. Regtest has none. (Moved here with
+the deletion of the unused BL.NET::DEFAULT-ASSUMEVALID, whose test carried it.)"
+  (let ((av (bl:network-assumevalid :mainnet)))
+    (is (= 32 (length av)))
+    (is (= #xac (aref av 0)))
+    (is (= #x00 (aref av 31))))
+  (is (null (bl:network-assumevalid :regtest))))
+
 (test every-chain-rebuilds-its-genesis-block
   "make-genesis-block is self-verifying: it recomputes the merkle root from the
 timestamp message and checks the header hash against the table's genesis hash,

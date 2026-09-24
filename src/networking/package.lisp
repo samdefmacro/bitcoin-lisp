@@ -318,6 +318,9 @@ headerssync.cpp. src/networking/.")
    #:reset-private-broadcast
    #:initiate-tx-broadcast-private
    #:private-broadcast-add
+   #:private-broadcast-pick-tx
+   #:private-broadcast-tx-for-peer
+   #:private-broadcast-confirm
    #:note-own-tx-received-back
    #:private-broadcast-remove
    #:private-broadcast-stale
