@@ -2934,6 +2934,33 @@ feature-off path is the test above."
       (is-true (search "sendtxrcncl received after verack, disconnecting peer=3" log)
                "sendtxrcncl disconnect line, logged: ~S" log))))
 
+(test handshake-window-messages-are-logged-as-received
+  "Core writes `received: <type> (<n> bytes) peer=<id>' for every inbound
+message before processing it (net_processing.cpp:3582), including those
+between VERSION and VERACK. p2p_sendtxrcncl.py:171 waits for `received:
+sendtxrcncl' from a peer that never sends verack; our handshake window read
+them without the line."
+  (let* ((bl:*tx-reconciliation* nil)
+         (peer (%recon-test-peer :local-salt nil))
+         (queue (list (cons "sendtxrcncl" (%sendtxrcncl-payload 1 2))
+                      (cons "verack" (make-array 0 :element-type '(unsigned-byte 8)))))
+         (real (fdefinition 'bl.net:receive-message-blocking)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.net:receive-message-blocking)
+                 (lambda (p &key timeout)
+                   (declare (ignore p timeout))
+                   (let ((m (pop queue))) (values (car m) (cdr m)))))
+           (multiple-value-bind (ok log)
+               (%net-log-of (lambda () (bl.net::%await-verack peer :timeout 5)))
+             (is-true ok "the control: the handshake completes")
+             (is-true (search (format nil "received: sendtxrcncl (12 bytes) peer=~A"
+                                      (bl.net:peer-id peer))
+                              log)
+                      "logged: ~S" log)
+             (is-true (search "received: verack (0 bytes)" log) "logged: ~S" log)))
+      (setf (fdefinition 'bl.net:receive-message-blocking) real))))
+
 (test feature-negotiation-after-verack-disconnects
   "BIP155 (sendaddrv2) and BIP339 (wtxidrelay) negotiate strictly between
 VERSION and VERACK, and Core drops a peer that sends either afterwards

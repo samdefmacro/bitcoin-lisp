@@ -1475,11 +1475,21 @@ and then asserts the peer is still connected."
         (when (<= remaining 0) (return nil))
         (multiple-value-bind (command payload)
             (receive-message-blocking peer :timeout remaining)
+          (when command (log-received-message peer command payload))
           (cond ((null command) (return nil))
                 ((string= command "version") (return (values command payload)))
                 (t (bl:log-cat "net" "non-version message before version handshake. ~
                                       Message \"~A\" from peer=~A"
                                (bl.bytes:sanitize-string command) (peer-id peer)))))))))
+
+(defun log-received-message (peer command payload)
+  "Core's line for EVERY inbound message, before it is processed
+(net_processing.cpp:3582): `received: <type> (<payload bytes> bytes)
+peer=<id>'. Handshake messages included -- p2p_sendtxrcncl.py:171 waits for
+`received: sendtxrcncl' before its peer has sent verack. The command is
+peer-controlled bytes, so it is sanitized for the log (SanitizeString)."
+  (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
+              (bl.bytes:sanitize-string command) (length payload) (peer-id peer)))
 
 (defun %receive-and-store-version (peer &key (timeout 30) near-tip)
   "Receive the peer's version message and record its services/height/user-agent.
@@ -1563,6 +1573,7 @@ structural fix; this bounds the damage in the meantime."
            (multiple-value-bind (command payload)
                (receive-message-blocking peer :timeout (remaining))
              (unless command (return nil))
+             (log-received-message peer command payload)
              (cond
                ((string= command "verack")
                 (%verack-finalize-recon peer)

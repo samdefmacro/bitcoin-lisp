@@ -160,8 +160,7 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     ;; DISPATCH below must keep using the RAW command -- sanitizing drops
     ;; characters rather than escaping them, so "bl<LF>ock" would sanitize to
     ;; "block" and a forged command name would reach a real handler.
-    (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
-                (bl.bytes:sanitize-string command) (length payload) (peer-id peer))
+    (log-received-message peer command payload)
     ;; No per-command message count is checked here: Core disconnects a peer
     ;; for how many messages of a kind it sends for none of them
     ;; (net_processing.cpp ProcessMessage). Its bounds are per message, in the
