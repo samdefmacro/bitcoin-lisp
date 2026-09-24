@@ -2722,34 +2722,38 @@ refuses (PRIVATEBROADCAST-SENDRAWTRANSACTION-REFUSES-RATHER-THAN-BROADCASTS)."
     (is-true (bl:known-config-option-p "privatebroadcast"))
     (is-false (bl.cfg:core-only-option-p "privatebroadcast"))))
 
-(test privatebroadcast-sendrawtransaction-refuses-rather-than-broadcasts
-  "Under -privatebroadcast Core hands a sendrawtransaction to its private
-Tor/I2P queue and never to the mempool (rpc/mempool.cpp:115-131). That queue
-does not exist here, and the ordinary path would announce the transaction to
-every peer from this node's own address, so the RPC refuses: Core's own error
-when no Tor/I2P network is reachable, ours otherwise. The transaction reaches
-neither the mempool nor a peer."
+(test privatebroadcast-sendrawtransaction-test-accepts-then-queues
+  "Under -privatebroadcast Core refuses sendrawtransaction when no Tor/I2P
+network is reachable (rpc/mempool.cpp:115-124), and otherwise test-accepts the
+transaction and hands it to the private-broadcast queue, never to the mempool
+(node/transaction.cpp:74-84, :105-106, :135-136). A transaction the
+test-accept refuses is refused with the same verdict as without the option
+and queues nothing: p2p_private_broadcast.py:398 sends one whose parent is
+missing and expects -25 bad-txns-inputs-missingorspent."
   (let* ((node (make-test-node))
          ;; One input spending an outpoint nobody has, one OP_TRUE output.
          (hex (concatenate 'string "0200000001"
                            (make-string 64 :initial-element #\1)
                            "0000000000ffffffff01e8030000000000000151"
-                           "00000000")))
+                           "00000000"))
+         (verdict nil))
     (flet ((send () (rpc-error-of (lambda ()
                                     (bl.rpc:dispatch-rpc-method
                                      node "sendrawtransaction" (list hex))))))
+      (bl.net:reset-private-broadcast)
+      ;; Control: without the option the call reaches validation's verdict.
+      (let ((bl:*private-broadcast* nil))
+        (setf verdict (send))
+        (is (member (car verdict) '(-25 -26))))
       (let ((bl:*private-broadcast* t)
             (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
         (is (equal '(-1 . "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly.")
                    (send))))
       (let ((bl:*private-broadcast* t)
             (bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3)))
-        (let ((err (send)))
-          (is (eql -1 (car err)))
-          (is-true (search "does not implement private broadcast" (cdr err)))))
-      ;; Control: without the option the same call reaches validation.
-      (let ((bl:*private-broadcast* nil))
-        (is (not (equal -1 (car (send)))))))))
+        (is (equal verdict (send)))
+        (is (null (bl.net:private-broadcast-info)) "nothing was queued")
+        (is (= 0 (bl.net:private-broadcast-num-to-open)))))))
 
 (test dns-is-a-real-option
   "-dns left the accept-and-drop list (GA11 1f1f28b7). Core reads it into

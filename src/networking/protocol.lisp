@@ -2603,6 +2603,9 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
               ;; id THIS peer's inventory uses, which is what the relay path
               ;; looks up.
               (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
+              ;; One of ours we are broadcasting privately came back from
+              ;; the network: stop (net_processing.cpp:4494-4503).
+              (note-own-tx-received-back peer tx)
               ;; A transaction we ALREADY HAVE, from a peer holding
               ;; ForceRelay: relay it onward anyway. Core's ReceivedTx answers
               ;; should_validate=false for anything AlreadyHaveTx knows -- the

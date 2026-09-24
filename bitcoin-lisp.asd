@@ -295,6 +295,7 @@ bitcoin-cli (node-main)."
                                (:file "bloom")       ; BIP37 CBloomFilter
                                (:file "merkleblock") ; CMerkleBlock / partial merkle tree
                                (:file "peer")
+                               (:file "private-broadcast") ; Core private_broadcast.cpp
                                (:file "protocol")
                                (:file "headers-sync")
                                (:file "ibd")))
@@ -398,6 +399,7 @@ bitcoin-cli (node-main)."
                                (:file "reindex")
                                (:file "wallet-hooks")
                                (:file "peers")
+                               (:file "private-broadcast") ; Core ThreadPrivateBroadcast
                                (:file "sync")
                                (:file "threads")   ; the scheduler and addcon threads
                                (:file "init"))))))
@@ -543,6 +545,8 @@ bitcoin-cli (node-main)."
                              ;; -reindex-chainstate tests
                              ;; Connection types (block-relay-only + feeler)
                              (:file "networking/conn-type-tests")
+                             ;; -privatebroadcast: the queue and one connection's conversation
+                             (:file "networking/private-broadcast-tests")
                              ;; Low-work headers sync (anti-DoS presync/redownload)
                              (:file "networking/headers-sync-tests")
                              ;; Wave 9A: eclipse/DoS hardening (outbound accounting,

@@ -404,7 +404,7 @@ PEER-LOG-NAME. A caller with a reason of its own writes it as Core does,
 
 ;;; Peer connection
 
-(defun connect-peer (host &optional (port *current-port*))
+(defun connect-peer (host &optional (port *current-port*) proxy)
   "Connect to a peer at HOST:PORT.
 Returns (VALUES PEER PROXY-CONNECTION-FAILED-P): the peer, or NIL on failure.
 Returns NIL if the host is banned or discouraged (never dial either).
@@ -413,10 +413,10 @@ PROXY-CONNECTION-FAILED-P is MAKE-TCP-CONNECTION's second value passed
 straight through — Core's `proxy_connection_failed', T only when the dial died
 at the SOCKS5 proxy and so says nothing about HOST. The dial's caller uses it
 to decide whether the address is charged an addrman attempt at all
-(net.cpp:494-497)."
+(net.cpp:494-497). PROXY overrides the per-network proxy (MAKE-TCP-CONNECTION)."
   (when (or (peer-banned-p host) (peer-discouraged-p host))
     (return-from connect-peer nil))
-  (multiple-value-bind (conn proxy-failed) (make-tcp-connection host port)
+  (multiple-value-bind (conn proxy-failed) (make-tcp-connection host port :proxy proxy)
     (if conn
         (let ((peer (make-peer :connection conn
                                :state :connected
@@ -1665,6 +1665,7 @@ turns out not to speak it. Returns T on success."
             ;; and before our VERACK (Core net_processing.cpp:3728-3744).
             (%maybe-send-sendtxrcncl peer)
             (send-message peer (bl.ser:make-verack-message))
+            (progn (note-verack-sent peer) t)
             (%await-verack peer))
     (%release-outbound-nonce (peer-local-nonce peer))))
 
