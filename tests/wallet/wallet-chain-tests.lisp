@@ -1006,11 +1006,17 @@ no fork, the wallet was rescanned from its birthday, every stored
 confirmation was demoted to :inactive by %wtx-update-state-from-chain, its
 own transactions were pushed at this node's mempool, and the persisted
 locator was overwritten with THIS chain's -- a wallet shown as emptied
-instead of an operator told why."
+instead of an operator told why.
+
+The refusal reads locator.vHave.back() and nothing else, so a wallet whose
+LAST PROCESSED BLOCK this node does not have is still this chain's wallet:
+wallet_hd.py:71-79 deletes blocks/ and chainstate/ and restarts, and Core
+loads the wallet and rescans. Ours wrote a single-hash locator on unload and
+refused it as foreign, so wallet_hd.py:84 found no wallet loaded."
   (with-wallet-chain-node (node "xchain" :wallet "xchainw")
     (%wc-mine node 2 (%wc-optrue-address))
-    (let ((foreign-genesis (make-array 32 :element-type '(unsigned-byte 8)
-                                          :initial-element #xfe))
+    (let ((unknown-block (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element #xfe))
           ;; Core's LoadWalletInternal prefixes every LoadExisting failure --
           ;; this one included -- with "Wallet loading failed. "
           ;; (wallet.cpp:286-291).
@@ -1022,11 +1028,9 @@ instead of an operator told why."
       ;; Control: this chain's own locator reloads without complaint.
       (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
       (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw")))
-      ;; unload-wallet writes a single-hash locator for the wallet's last
-      ;; processed block, so stamping that hash makes the STORED locator's
-      ;; oldest -- and only -- entry a block this chain has never seen.
-      (setf (bl.wallet::wallet-last-block-hash (%wc-wallet node "xchainw"))
-            foreign-genesis)
+      ;; A wallet built on another network: unload ends its locator at THAT
+      ;; network's genesis, which is not this chain's.
+      (setf (bl.wallet::wallet-network (%wc-wallet node "xchainw")) :testnet4)
       (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
       (signals-rpc-error (:code -4 :exact-message message)
         (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw")))
@@ -1037,7 +1041,16 @@ instead of an operator told why."
       (let ((bl.wallet:*wallet-cross-chain* t))
         (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw"))))
       (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
-      (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw"))))))
+      (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw")))
+      ;; This chain's wallet whose last processed block the node no longer
+      ;; has (its blocks were deleted): the locator still ends at this
+      ;; chain's genesis, so it loads, as Core's does.
+      (setf (bl.wallet::wallet-last-block-hash (%wc-wallet node "xchainw"))
+            unknown-block)
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
+      (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw")))
+      (is-true (%wc-wallet node "xchainw")
+               "a wallet whose last block is gone is still this chain's"))))
 
 ;;; --- CWalletTx mapValue strings are Core's bytes ---------------------------
 

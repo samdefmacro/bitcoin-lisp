@@ -1109,10 +1109,17 @@ GenerateRandomKey -> CExtKey::SetSeed over the 32 secret bytes)."
 versions rescan) and the real locator under 'bestblock_nomerkle' (Core
 WalletBatch::WriteBestBlock, walletdb.cpp:180-184). LOCATOR-HASHES is the
 exponential step-back locator for the wallet's last processed block, built
-by callers with chain access; without one (unload/shutdown, where the last
-processed block is on the active chain anyway) a single-hash locator is
-written — fork lookup still succeeds unless that exact block was reorged
-away, in which case the load-time catch-up rescans from genesis (safe)."
+by callers with chain access; without one (unload/shutdown, backupwallet) the
+last processed block is written followed by the wallet's genesis -- fork
+lookup still succeeds unless that exact block was reorged away, in which case
+the load-time catch-up rescans from genesis (safe).
+
+The genesis is not optional: Core's locator always ENDS at the genesis of the
+chain it was built on, and AttachChain's cross-chain refusal reads exactly
+that entry, locator.vHave.back() (wallet.cpp:3178-3190). A single-hash locator
+left the refusal nothing to read but the last block itself, so a node whose
+blocks were deleted (wallet_hd.py:71-79 removes blocks/ and chainstate/ and
+restarts) called its OWN wallet foreign and refused to load it."
   (bl.store:leveldb-put (wallet-db wallet)
                                     (wdb-key-simple +wdb-key-bestblock+)
                                     (wdb-block-locator-value '()))
@@ -1121,9 +1128,11 @@ away, in which case the load-time catch-up rescans from genesis (safe)."
    (wdb-key-simple +wdb-key-bestblock-nomerkle+)
    (wdb-block-locator-value
     (or locator-hashes
-        (and (wallet-last-block-hash wallet)
-             (list (wallet-last-block-hash wallet)))
-        '()))
+        (let ((last (wallet-last-block-hash wallet))
+              (genesis (bl.store:network-genesis-hash (wallet-network wallet))))
+          (cond ((null last) '())
+                ((equalp last genesis) (list genesis))
+                (t (list last genesis))))))
    :sync t))
 
 ;;; --- Wallet creation (Core CreateWallet, wallet.cpp:377-470 + CWallet::CreateNew) ---
