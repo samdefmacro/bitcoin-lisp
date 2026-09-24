@@ -42,10 +42,11 @@ src/storage/.")
    #:block-file-info-size
    #:block-file-info-height-first
    #:block-file-info-height-last
+   #:block-file-info-time-first
+   #:block-file-info-time-last
    #:block-store-file-info
    #:rebuild-block-file-info
    #:reindex-block-index
-   #:reindex-flag-path
    #:write-reindex-flag
    #:reindex-flag-set-p
    #:migrate-blocks-to-flat-files
@@ -118,6 +119,7 @@ src/storage/.")
    #:block-index-entry-file
    #:block-index-entry-data-pos
    #:block-index-entry-undo-pos
+   #:block-index-entry-status-flags
    #:note-block-position
    #:%record-block-position
    #:block-index-entry-sequence-id
@@ -316,6 +318,24 @@ src/storage/.")
    ;; Header index persistence
    #:save-header-index
    #:load-header-index
+   ;; The block tree database (block-tree-db.lisp; Core BlockTreeDB)
+   #:open-block-tree-db
+   #:close-block-tree-db
+   #:block-tree-db-path
+   #:migrate-legacy-header-index
+   #:read-block-tree-flag
+   #:read-block-tree-file-info
+   #:data-files-missing
+   #:encode-disk-block-index
+   #:decode-disk-block-index
+   #:entry-disk-status
+   #:encode-block-file-info
+   #:decode-block-file-info
+   #:*segwit-height-fn*
+   #:note-block-witness-received
+   #:fake-opt-witness-below
+   #:chain-needs-redownload-p
+   #:+block-opt-witness+
    ;; Integrity utilities
    #:compute-crc32
    #:save-file-with-crc32

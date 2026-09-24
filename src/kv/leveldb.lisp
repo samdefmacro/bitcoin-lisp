@@ -103,6 +103,9 @@
 (cffi:defcfun ("leveldb_readoptions_create" %leveldb-readoptions-create) :pointer)
 (cffi:defcfun ("leveldb_readoptions_destroy" %leveldb-readoptions-destroy) :void
   (options :pointer))
+(cffi:defcfun ("leveldb_readoptions_set_verify_checksums"
+               %leveldb-readoptions-set-verify-checksums) :void
+  (options :pointer) (flag :uint8))
 
 (cffi:defcfun ("leveldb_writeoptions_create" %leveldb-writeoptions-create) :pointer)
 (cffi:defcfun ("leveldb_writeoptions_destroy" %leveldb-writeoptions-destroy) :void
@@ -548,12 +551,21 @@ destroy on unwind."
 ;;;; style key/value pointers that are only valid until the next iter
 ;;;; operation, so callers must copy out the bytes before advancing.
 
-(defmacro with-leveldb-iterator ((iter db) &body body)
+(defmacro with-leveldb-iterator ((iter db &key verify-checksums) &body body)
   "Bind ITER to a fresh LevelDB iterator over DB, destroy on unwind.
 Use leveldb-iter-* for traversal. The iterator's exposed key/value
-pointers are valid only until the next leveldb-iter-* call."
+pointers are valid only until the next leveldb-iter-* call.
+
+VERIFY-CHECKSUMS checks every block the scan reads against its CRC, as Core's
+CDBWrapper does for all its reads and iterators (dbwrapper.cpp:217-218). A
+damaged table block then STOPS the iterator with a Corruption status, which
+LEVELDB-ITER-CHECK-ERROR reports, instead of handing back whatever the
+damaged bytes decode to."
   (let ((ropts (gensym "ROPTS")))
-    `(let* ((,ropts (%leveldb-readoptions-create))
+    `(let* ((,ropts (let ((o (%leveldb-readoptions-create)))
+                      (when ,verify-checksums
+                        (%leveldb-readoptions-set-verify-checksums o 1))
+                      o))
             (,iter (%leveldb-create-iterator ,db ,ropts)))
        (unwind-protect (progn ,@body)
          (%leveldb-iter-destroy ,iter)

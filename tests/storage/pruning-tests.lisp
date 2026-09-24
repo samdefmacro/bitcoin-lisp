@@ -1076,8 +1076,8 @@ of it, so feature_remove_pruned_files_on_startup.py:66 read the old tip."
   (with-temp-directory (dir)
     (let ((blocks (merge-pathnames "blocks/" dir))
           (made '("blocks/blk00002.dat" "blocks/rev00002.dat" "blocks/xor.dat"
-                  "blocks/index/headerindex.dat" "chainstate.dat"
-                  "chainstate/CURRENT" "indexes/txindex/CURRENT"
+                  "blocks/index/headerindex.dat" "blocks/index/CURRENT"
+                  "chainstate.dat" "chainstate/CURRENT" "indexes/txindex/CURRENT"
                   "indexes/blockfilter/basic/db/CURRENT" "wallets/w/CURRENT"
                   "peers.dat")))
       (dolist (rel made)
@@ -1088,7 +1088,8 @@ of it, so feature_remove_pruned_files_on_startup.py:66 read the old tip."
       (bl:wipe-for-pruned-reindex dir blocks)
       (flet ((there-p (rel) (and (probe-file (merge-pathnames rel dir)) t)))
         (dolist (gone '("blocks/blk00002.dat" "blocks/rev00002.dat"
-                        "blocks/index/headerindex.dat" "chainstate.dat"
+                        "blocks/index/headerindex.dat" "blocks/index/"
+                        "chainstate.dat"
                         "chainstate/" "indexes/txindex/"
                         "indexes/blockfilter/basic/db/"))
           (is-false (there-p gone) "~A survived the wipe" gone))

@@ -525,8 +525,8 @@
   the chain state owns the block index and the tip; every index
   implements the BASE-INDEX generic functions and catches up at startup.
 
-  Invariants: the three-phase flush (blocks, undo, then the coins
-  database) is what makes a crash recoverable; an index is only as
+  Invariants: the flush order (blocks and undo, the block tree database,
+  then the coins database) is what makes a crash recoverable; an index is only as
   current as its recorded best block, and that marker is only meaningful
   while it names a block on the ACTIVE chain -- INDEX-HEIGHT resolves it
   against the chainstate and INDEX-PREPARE-SYNC rewinds one that has
@@ -552,17 +552,46 @@
   O(1) by BEST-HEADER-ENTRY, which rescans only when the recorded entry has
   been marked invalid or the index was loaded whole; getblockchaininfo's
   `headers', the getdata off-chain test and IsCurrentForFeeEstimation's
-  third arm all read it. The header index and its delta log are shared by
-  every chainstate on a datadir (they take no storage-suffix), so what binds
-  the delta to the snapshot it extends is a per-BASE-PATH record, not a
-  chain-state slot:
-  Core keeps the block index in BlockManager, outside any chainstate, and
-  a per-chainstate copy of that binding let a snapshot chainstate and the
-  primary invalidate each other's log. Replaying that log MUTATES the entry
-  a hash already has -- Core's InsertBlockIndex is a try_emplace, so there
-  is exactly one object per hash and a prev-entry pointer can never
-  disagree with a lookup; installing a second object left every ancestry
-  walk handing out the superseded copy.
+  third arm all read it.
+
+  The block index persists in Core's block tree database, the LevelDB at
+  `<datadir>/<net>/blocks/index` (Core BlockTreeDB, since 2026-09-24),
+  record for record in Core's format, so a datadir written by either node
+  loads in the other: `b`+hash is a CDiskBlockIndex (VARINT client version,
+  height, nStatus, nTx, the conditional nFile/nDataPos/nUndoPos, then the
+  80-byte header), `f`+nFile a CBlockFileInfo, `l` the last blk file, `R`
+  the reindex-in-progress record, `F`+name a flag (`prunedblockfiles`).
+  SAVE-HEADER-INDEX is WriteBlockIndexDB: one synchronous batch of the
+  changed `b` records (`%entry-persist-key` finds them), the changed `f`
+  records and `l`, between the block/undo file flush and the coins flush.
+  LOAD-HEADER-INDEX is LoadBlockIndexGuts plus LoadBlockIndex: the hash is
+  RECOMPUTED from each header and the chain work summed up the heights --
+  neither is stored -- the proof of work is re-checked, a hole in the
+  heights fails the load, and a descendant of a failed block loads failed.
+  nStatus is derived from the entry (`entry-disk-status`): the status
+  keyword gives the validity level, the positions give HAVE_DATA and
+  HAVE_UNDO, and the bits we do not model travel verbatim in
+  `block-index-entry-status-flags` -- BLOCK_OPT_WITNESS above all, set when
+  a body is stored at a segwit height (`note-block-witness-received`) and
+  read by `chain-needs-redownload-p`, Core's NeedsRedownload. The database
+  is shared by every chainstate on a datadir (it takes no storage-suffix):
+  the node opens it once (`open-block-tree-db`) and closes it after the
+  last shutdown flush; a chain-state with no open database opens one for
+  the length of each call.
+
+  A datadir from before the move still holds `headerindex.dat` and
+  `headerindex.delta`; `migrate-legacy-header-index` converts it at
+  start-up, in place and in batches, reads the record count back, and only
+  then renames both files `*.migrated`. It replays the delta log first --
+  that log holds the newest statuses -- and marks BLOCK_OPT_WITNESS on
+  every entry the node stored or connected, which the old format never
+  recorded and without which the migrated chain would need a redownload.
+  An interrupted migration leaves the old files in place and simply runs
+  again. Traps: a synthetic test entry with a made-up hash or no header
+  cannot round-trip (the key is the header's hash; a header-less entry is
+  not written at all), and a mainnet-difficulty fixture header fails the
+  proof-of-work check on load -- use the mined regtest fixtures in
+  tests/support.
 
   `-reindex` is a STATED DIVERGENCE from Core, decided 2026-09-18
   (`docs/reindex-decision-2026-09-18.md`). Core's wipes four things and
@@ -576,8 +605,8 @@
   discarded, and neither the block files nor the coins database are
   touched. The flag is therefore a minutes-long local repair of a LOST
   block index rather than a re-download; what it cannot do is repair a
-  CORRUPT `headerindex.dat` (start-up refuses that outright -- the file has
-  to be moved aside by hand) or rebuild the UTXO set, which is
+  CORRUPT block tree database (start-up refuses that outright -- blocks/index
+  has to be moved aside by hand) or rebuild the UTXO set, which is
   `-reindexchainstate` and is not implied. Three pieces of Core's behaviour
   it does carry, all of them free of the block files: WRITE-REINDEX-FLAG
   brackets the walk with Core's persisted `R` marker, so an interrupted
@@ -628,6 +657,13 @@
   (bitcoin-lisp.storage:get-utxo function)
   (bitcoin-lisp.storage:coins-view-cache class)
   (bitcoin-lisp.storage:*persist-block-index-hook* variable)
+  (bitcoin-lisp.storage:save-header-index function)
+  (bitcoin-lisp.storage:load-header-index function)
+  (bitcoin-lisp.storage:open-block-tree-db function)
+  (bitcoin-lisp.storage:migrate-legacy-header-index function)
+  (bitcoin-lisp.storage:encode-disk-block-index function)
+  (bitcoin-lisp.storage:entry-disk-status function)
+  (bitcoin-lisp.storage:chain-needs-redownload-p function)
   (bitcoin-lisp.storage:coin-view-get function)
   (bitcoin-lisp.storage:disconnect-block-from-utxo-set function)
   (bitcoin-lisp.storage:save-utxo-set function)

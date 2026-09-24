@@ -85,302 +85,412 @@
     (when (probe-file path)
       (delete-file path))))
 
-;;;; Header Index Persistence Tests
+;;;; The block tree database (blocks/index, Core BlockTreeDB)
 
-(defun %hi-state (name)
-  "A chain-state on a private directory."
-  (let ((dir (ensure-directories-exist
-              (merge-pathnames (format nil "test-hidx-~A-~D/" name (get-internal-real-time))
-                               (uiop:temporary-directory)))))
-    (values (bl.store:init-chain-state dir) dir)))
+(defun %btdb-hex-octets (hex)
+  (coerce (bl.crypto:hex-to-bytes hex) '(simple-array (unsigned-byte 8) (*))))
 
-(defun %hi-add (state hash height &key file data-pos undo-pos (status :valid))
-  (bl.store:add-block-index-entry
-   state
-   (bl.store:make-block-index-entry
-    :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element hash)
-    :height height :chain-work (* height 10) :status status
-    :file file :data-pos data-pos :undo-pos undo-pos))
-  (make-array 32 :element-type '(unsigned-byte 8) :initial-element hash))
+(defparameter *core-block-1-record*
+  '("62b588c58b15dd34fe2701f79293931c9714cc0ae6790450ac5353a23e2244811a"
+    "8eed3c01801d0100812d080000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f436c2bd7168dfaab8016bc169aef2639a048837d6d218d453fe7cee83c87492e938cb46affff7f2001000000")
+  "Key and value of block 1's 'b' record in a blocks/index written by Bitcoin
+Core v28.2 (/releases/v28.2/bin/bitcoind -regtest, generatetoaddress 5, clean
+stop; 2026-09-24).")
 
-(test header-index-v3-round-trips-the-flat-file-position
-  "v3 carries where a block's body and undo record live. A NIL position must
-survive as NIL rather than becoming 0, because 0 is a real position -- the
-first record in a file -- and confusing the two would send a reader to the
-wrong offset."
-  (multiple-value-bind (state dir) (%hi-state "v3")
-    (unwind-protect
-         (let ((placed (%hi-add state #x11 1 :file 0 :data-pos 8 :undo-pos 40))
-               (body-only (%hi-add state #x22 2 :file 3 :data-pos 0))
-               (header-only (%hi-add state #x33 3)))
-           (bl.store:save-header-index state)
-           (let ((reloaded (bl.store:init-chain-state dir)))
-             (is-true (bl.store:load-header-index reloaded))
-             (let ((e (bl.store:get-block-index-entry reloaded placed)))
-               (is (= 0 (bl.store:block-index-entry-file e)))
-               (is (= 8 (bl.store:block-index-entry-data-pos e)))
-               (is (= 40 (bl.store:block-index-entry-undo-pos e))))
-             ;; Position 0 in file 3, and no undo record at all.
-             (let ((e (bl.store:get-block-index-entry reloaded body-only)))
-               (is (= 3 (bl.store:block-index-entry-file e)))
-               (is (eql 0 (bl.store:block-index-entry-data-pos e)))
-               (is (null (bl.store:block-index-entry-undo-pos e))))
-             ;; A header-only entry has no position anywhere.
-             (let ((e (bl.store:get-block-index-entry reloaded header-only)))
-               (is (null (bl.store:block-index-entry-file e)))
-               (is (null (bl.store:block-index-entry-data-pos e)))
-               (is (null (bl.store:block-index-entry-undo-pos e))))))
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+(test block-index-record-is-cores-byte-for-byte
+  "The contract is byte-exactness against Core, so the test is Core's own
+bytes. The value decodes to what Core wrote -- client version 259900, height 1,
+nStatus 157 (SCRIPTS | HAVE_DATA | HAVE_UNDO | OPT_WITNESS), one transaction,
+the block at offset 301 of blk00000 and its undo at offset 8 of rev00000 --
+and the hash CDiskBlockIndex::ConstructBlockHash computes from the header is the
+key it is stored under. Re-encoding the decoded entry gives the same bytes."
+  (destructuring-bind (key-hex value-hex) *core-block-1-record*
+    (let ((key (%btdb-hex-octets key-hex))
+          (value (%btdb-hex-octets value-hex)))
+      (multiple-value-bind (entry prev-hash nstatus)
+          (bl.store:decode-disk-block-index value)
+        (is (= 157 nstatus))
+        (is (= 1 (bl.store:block-index-entry-height entry)))
+        (is (eq :valid (bl.store:block-index-entry-status entry)))
+        (is (= 1 (bl.store:block-index-entry-tx-count entry)))
+        (is (eql 0 (bl.store:block-index-entry-file entry)))
+        (is (eql 301 (bl.store:block-index-entry-data-pos entry)))
+        (is (eql 8 (bl.store:block-index-entry-undo-pos entry)))
+        (is (= bl.store:+block-opt-witness+
+               (bl.store:block-index-entry-status-flags entry)))
+        (is (equalp (subseq key 1) (bl.store:block-index-entry-hash entry))
+            "the recomputed hash is not the record's key")
+        (is (equalp (bl.store:network-genesis-hash :regtest) prev-hash))
+        (is (equalp value (bl.store:encode-disk-block-index entry))
+            "re-encoding a Core record changed its bytes")))))
 
-(test header-index-position-changes-are-not-missed-by-the-delta-log
-  "The delta log writes only entries whose persist key changed, so a position
-appearing or disappearing has to move that key. If it does not, a block's body
-location is written once and never updated -- and after a prune the index would
-still claim the data is there."
-  (multiple-value-bind (state dir) (%hi-state "delta")
-    (unwind-protect
-         (let ((h (%hi-add state #x44 1)))
-           (bl.store:save-header-index state)
-           (let ((entry (bl.store:get-block-index-entry state h)))
-             ;; Body lands.
-             (setf (bl.store:block-index-entry-file entry) 2
-                   (bl.store:block-index-entry-data-pos entry) 1234)
-             (is (member entry (bl.store::%changed-header-index-entries state))
-                 "gaining a position must mark the entry changed")
-             (bl.store:save-header-index state)
-             (is (not (member entry (bl.store::%changed-header-index-entries state)))
-                 "and it must be clean once written")
-             ;; Undo record lands.
-             (setf (bl.store:block-index-entry-undo-pos entry) 99)
-             (is (member entry (bl.store::%changed-header-index-entries state)))
-             (bl.store:save-header-index state)
-             ;; Pruned away again.
-             (setf (bl.store:block-index-entry-data-pos entry) nil
-                   (bl.store:block-index-entry-undo-pos entry) nil)
-             (is (member entry (bl.store::%changed-header-index-entries state))
-                 "losing a position must mark the entry changed too")
-             (bl.store:save-header-index state)
-             (let ((reloaded (bl.store:init-chain-state dir)))
-               (is-true (bl.store:load-header-index reloaded))
-               (let ((e (bl.store:get-block-index-entry reloaded h)))
-                 (is (null (bl.store:block-index-entry-data-pos e)))
-                 (is (null (bl.store:block-index-entry-undo-pos e)))))))
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+(test block-file-record-is-cores-byte-for-byte
+  "Core's 'f' record for blk00000 after the same six blocks: seven VARINTs,
+nBlocks 6, nSize 1573, nUndoSize 205, heights 0..5, then the header times."
+  (let* ((value (%btdb-hex-octets "068b25804d000583e9a6ca5a85d4d19815"))
+         (info (bl.store:decode-block-file-info value)))
+    (is (= 6 (bl.store:block-file-info-blocks info)))
+    (is (= 1573 (bl.store:block-file-info-size info)))
+    (is (= 0 (bl.store:block-file-info-height-first info)))
+    (is (= 5 (bl.store:block-file-info-height-last info)))
+    (is (< (bl.store:block-file-info-time-first info)
+           (bl.store:block-file-info-time-last info)))
+    (is (equalp value (bl.store:encode-block-file-info info)))))
+
+(test entry-status-maps-onto-cores-nstatus-and-back
+  "Each status keyword, with and without a body and an undo record, encodes to
+the nStatus Core would hold for that block and decodes back to itself. A body
+we hold has passed BLOCK_VALID_TRANSACTIONS; :valid is BLOCK_VALID_SCRIPTS;
+:invalid is BLOCK_FAILED_VALID over the level reached."
+  (with-network (:regtest)
+    (let* ((cs (bl.store:make-chain-state))
+           (entry (first (add-mined-chain cs (add-regtest-genesis-entry cs) 1))))
+      (loop for (status data undo expected)
+              in '((:unknown nil nil 0) (:header-valid nil nil 2)
+                   (:header-valid 8 nil 11) (:valid 8 40 29) (:valid nil nil 5)
+                   (:invalid nil nil 34) (:invalid 8 nil 43))
+            do (setf (bl.store:block-index-entry-status entry) status
+                     (bl.store:block-index-entry-file entry) (and (or data undo) 0)
+                     (bl.store:block-index-entry-data-pos entry) data
+                     (bl.store:block-index-entry-undo-pos entry) undo)
+               (is (= expected (bl.store:entry-disk-status entry))
+                   "~A data=~A undo=~A" status data undo)
+               (let ((back (bl.store:decode-disk-block-index
+                            (bl.store:encode-disk-block-index entry))))
+                 (is (eq status (bl.store:block-index-entry-status back)))
+                 (is (eql data (bl.store:block-index-entry-data-pos back)))
+                 (is (eql undo (bl.store:block-index-entry-undo-pos back))))))))
+
+(test block-index-round-trips-through-the-block-tree-db
+  "A saved index reloads with every entry, the parent links rebuilt from the
+headers, and the chain work RECOMPUTED -- blocks/index stores neither hash nor
+work. A NIL position must survive as NIL rather than becoming 0, because 0 is a
+real position, the first record in a file."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-btdb")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (chain (add-mined-chain cs (add-regtest-genesis-entry cs) 3))
+             (placed (first chain)) (body-only (second chain)) (header-only (third chain)))
+        (setf (bl.store:block-index-entry-file placed) 0
+              (bl.store:block-index-entry-data-pos placed) 8
+              (bl.store:block-index-entry-undo-pos placed) 40
+              (bl.store:block-index-entry-file body-only) 3
+              (bl.store:block-index-entry-data-pos body-only) 0
+              (bl.store:block-index-entry-status header-only) :header-valid)
+        (bl.store:save-header-index cs)
+        (let ((reloaded (bl.store:init-chain-state dir :network :regtest)))
+          (is-true (bl.store:load-header-index reloaded))
+          (is (= 4 (hash-table-count (bl.store:chain-state-block-index reloaded))))
+          (flet ((back (e) (bl.store:get-block-index-entry
+                            reloaded (bl.store:block-index-entry-hash e))))
+            (let ((e (back placed)))
+              (is (= 0 (bl.store:block-index-entry-file e)))
+              (is (= 8 (bl.store:block-index-entry-data-pos e)))
+              (is (= 40 (bl.store:block-index-entry-undo-pos e))))
+            (let ((e (back body-only)))
+              (is (= 3 (bl.store:block-index-entry-file e)))
+              (is (eql 0 (bl.store:block-index-entry-data-pos e)))
+              (is (null (bl.store:block-index-entry-undo-pos e))))
+            (let ((e (back header-only)))
+              (is (eq :header-valid (bl.store:block-index-entry-status e)))
+              (is (null (bl.store:block-index-entry-file e)))
+              (is (null (bl.store:block-index-entry-data-pos e)))
+              (is (= (bl.store:block-index-entry-chain-work header-only)
+                     (bl.store:block-index-entry-chain-work e))
+                  "chain work recomputed on load must equal what was built")
+              (is (eq (back body-only) (bl.store:block-index-entry-prev-entry e))
+                  "the parent link must resolve to the reloaded parent object")
+              (is (> (bl.store:block-index-entry-chain-work e)
+                     (bl.store:block-index-entry-chain-work (back body-only)))
+                  "each block adds its proof to its parent's work"))))))))
+
+(test only-changed-entries-are-rewritten
+  "A flush writes the 'b' record of each entry that changed since it was last
+written (Core's m_dirty_blockindex), so a position appearing or disappearing,
+and a status change, must each be seen. Missing one means an index that
+claims a pruned body is still there, or an :invalid block that comes back
+:valid after a restart."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-btdb-dirty")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (entry (first (add-mined-chain cs (add-regtest-genesis-entry cs) 1))))
+        (bl.store:save-header-index cs)
+        (is (null (bl.store::%changed-header-index-entries cs)))
+        (setf (bl.store:block-index-entry-file entry) 2
+              (bl.store:block-index-entry-data-pos entry) 1234)
+        (is (member entry (bl.store::%changed-header-index-entries cs))
+            "gaining a position must mark the entry changed")
+        (bl.store:save-header-index cs)
+        (setf (bl.store:block-index-entry-data-pos entry) nil
+              (bl.store:block-index-entry-status entry) :invalid)
+        (is (member entry (bl.store::%changed-header-index-entries cs)))
+        (bl.store:save-header-index cs)
+        (let ((reloaded (bl.store:init-chain-state dir :network :regtest)))
+          (is-true (bl.store:load-header-index reloaded))
+          (let ((e (bl.store:get-block-index-entry
+                    reloaded (bl.store:block-index-entry-hash entry))))
+            (is (null (bl.store:block-index-entry-data-pos e)))
+            (is (eq :invalid (bl.store:block-index-entry-status e)))))))))
 
 (test header-index-persist-key-still-tracks-everything-it-did-before
-  "Widening the key to hold the position bits meant re-packing height and
-tx-count. Re-check every field the key is supposed to notice, since a silently
-dropped one means a status or tx-count change is never written."
-  (multiple-value-bind (state dir) (%hi-state "key")
-    (unwind-protect
-         (let* ((h (%hi-add state #x55 7 :status :header-valid))
-                (entry (bl.store:get-block-index-entry state h))
-                (base (bl.store::%entry-persist-key entry)))
-           (macrolet ((changes (&body mutation)
-                        `(let ((before (bl.store::%entry-persist-key entry)))
-                           ,@mutation
-                           (is (/= before (bl.store::%entry-persist-key entry))))))
-             (changes (setf (bl.store:block-index-entry-status entry) :valid))
-             (changes (setf (bl.store:block-index-entry-status entry) :invalid))
-             (changes (setf (bl.store:block-index-entry-height entry) 8))
-             (changes (setf (bl.store:block-index-entry-tx-count entry) 3))
-             (changes (setf (bl.store:block-index-entry-data-pos entry) 0))
-             (changes (setf (bl.store:block-index-entry-undo-pos entry) 0))
-             (changes (setf (bl.store:block-index-entry-header entry)
-                            (bl.ser:make-block-header))))
-           ;; And the key stays a fixnum, which is why the flush can compute it
-           ;; for every entry on a 963k-entry index.
-           (is (typep (bl.store::%entry-persist-key entry) 'fixnum))
-           (is (plusp base)))
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+  "Re-check every field the change detector is supposed to notice, since a
+silently dropped one means a status, tx-count or witness mark is never written."
+  (let* ((entry (bl.store:make-block-index-entry
+                 :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5)
+                 :height 7 :status :header-valid))
+         (base (bl.store::%entry-persist-key entry)))
+    (macrolet ((changes (&body mutation)
+                 `(let ((before (bl.store::%entry-persist-key entry)))
+                    ,@mutation
+                    (is (/= before (bl.store::%entry-persist-key entry))))))
+      (changes (setf (bl.store:block-index-entry-status entry) :valid))
+      (changes (setf (bl.store:block-index-entry-status entry) :invalid))
+      (changes (setf (bl.store:block-index-entry-height entry) 8))
+      (changes (setf (bl.store:block-index-entry-tx-count entry) 3))
+      (changes (setf (bl.store:block-index-entry-data-pos entry) 0))
+      (changes (setf (bl.store:block-index-entry-undo-pos entry) 0))
+      (changes (setf (bl.store:block-index-entry-header entry)
+                     (bl.ser:make-block-header)))
+      (changes (setf (bl.store:block-index-entry-status-flags entry)
+                     bl.store:+block-opt-witness+)))
+    ;; And the key stays a fixnum, which is why the flush can compute it for
+    ;; every entry on a 963k-entry index.
+    (is (typep (bl.store::%entry-persist-key entry) 'fixnum))
+    (is (plusp base))))
 
-(defun %write-v2-header-index (path entries)
-  "Emit a v2 header-index file by hand: 185-byte entries, no position fields.
-This is what both live nodes carry today, so the v3 build has to load it."
-  (bl.store:save-file-with-crc32-bb
-   path
-   (lambda (bb)
-     (bl.ser:bb-write-bytes
-      bb bl.store::*header-index-magic*)
-     (bl.ser:bb-write-u32-le bb 2)
-     (bl.ser:bb-write-u32-le bb (length entries))
-     (dolist (e entries)
-       (destructuring-bind (hash height chain-work status tx-count) e
-         (bl.ser:bb-write-bytes bb hash)
-         (bl.ser:bb-write-u32-le bb height)
-         (loop repeat 80 do (bl.ser:bb-write-u8 bb 0))
-         (bl.store::bb-write-chainwork bb chain-work)
-         (bl.ser:bb-write-u8
-          bb (ecase status (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
-         (loop repeat 32 do (bl.ser:bb-write-u8 bb 0))
-         (bl.ser:bb-write-u32-le bb tx-count))))))
+(test block-file-records-are-written-with-the-index
+  "Core writes each changed CBlockFileInfo and nLastFile in the SAME batch as
+the block index (BlockTreeDB::WriteBatchSync), and a Core node opening this
+datadir reads them to know where its next block goes: an 'f' record short of
+the bytes in use would have it write over live blocks. The file being appended
+to reports the store's cursor, not its preallocated length on disk."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-btdb-files")
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (cs (bl.store:init-chain-state dir :network :regtest)))
+        (bl.store:ensure-genesis-on-disk store)
+        (add-regtest-genesis-entry cs)
+        (bl.store:rebuild-block-file-info store cs)
+        (bl.store:save-header-index cs :block-store store)
+        (multiple-value-bind (last-file table) (bl.store:read-block-tree-file-info dir)
+          (is (= 0 last-file))
+          (let ((info (gethash 0 table)))
+            (is-true info)
+            (is (= 1 (bl.store:block-file-info-blocks info)))
+            (is (= 0 (bl.store:block-file-info-height-first info)))
+            (is (plusp (bl.store:block-file-info-size info)))
+            (is (< (bl.store:block-file-info-size info)
+                   bl.kv:+blockfile-chunk-size+)
+                "nSize is the used length, not the preallocated chunk")))))))
 
-(test header-index-v2-files-still-load-and-upgrade-in-place
-  "Both live nodes carry a v2 headerindex.dat -- 963k entries on mainnet -- so
-the v3 build must read one, and an entry without a position must come back
-with NIL rather than 0: those blocks live in the legacy per-block files, and
-claiming they sit at offset 0 of file 0 would send every read to the wrong
-place. Then the next save must write v3 and reload cleanly."
-  (multiple-value-bind (state dir) (%hi-state "v2compat")
-    (unwind-protect
-         (let ((a (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x77))
-               (b (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x88)))
-           (%write-v2-header-index
-            (bl.store::header-index-file-path state)
-            (list (list a 1 10 :valid 3)
-                  (list b 2 20 :header-valid 0)))
-           (is-true (bl.store:load-header-index state))
-           (let ((ea (bl.store:get-block-index-entry state a)))
-             (is (= 1 (bl.store:block-index-entry-height ea)))
-             (is (= 3 (bl.store:block-index-entry-tx-count ea)))
-             (is (eq :valid (bl.store:block-index-entry-status ea)))
-             (is (null (bl.store:block-index-entry-file ea))
-                 "a v2 entry has no flat-file position, and NIL is not 0")
-             (is (null (bl.store:block-index-entry-data-pos ea)))
-             (is (null (bl.store:block-index-entry-undo-pos ea))))
-           ;; A v2 load must leave the index clean, or every start would write a
-           ;; full snapshot and undo the delta-log work of the delta-log change.
-           (is (null (bl.store::%changed-header-index-entries state)))
-           ;; Now give one entry a position and save; the file becomes v3.
-           (let ((ea (bl.store:get-block-index-entry state a)))
-             (setf (bl.store:block-index-entry-file ea) 0
-                   (bl.store:block-index-entry-data-pos ea) 8))
-           (bl.store:save-header-index state :force-full t)
-           (let ((reloaded (bl.store:init-chain-state dir)))
-             (is-true (bl.store:load-header-index reloaded))
-             (let ((ea (bl.store:get-block-index-entry reloaded a))
-                   (eb (bl.store:get-block-index-entry reloaded b)))
-               (is (= 0 (bl.store:block-index-entry-file ea)))
-               (is (= 8 (bl.store:block-index-entry-data-pos ea)))
-               (is (= 3 (bl.store:block-index-entry-tx-count ea)))
-               (is (null (bl.store:block-index-entry-file eb))
-                   "the untouched entry keeps its absent position"))))
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+(test a-missing-block-index-is-a-first-run-not-corruption
+  "No block index records at all is a legitimate first run: NIL loaded, and NO
+reason -- the caller must not confuse it with a database it cannot read, or
+every fresh node would refuse to start."
+  (with-temp-directory (dir "bl-btdb-absent")
+    (multiple-value-bind (loaded reason)
+        (bl.store:load-header-index (bl.store:init-chain-state dir))
+      (is (null loaded))
+      (is (null reason)))))
 
-(defun %v1-delta-bytes (crc entries)
-  "A delta log in the PREVIOUS entry layout: 185-byte entries, no position
-fields, bound to CRC."
-  (let ((bb (bl.ser:make-byte-buf))
-        (payload (bl.ser:make-byte-buf)))
-    (bl.ser:bb-write-bytes
-     bb bl.store::*header-index-delta-magic*)
-    (bl.ser:bb-write-u32-le bb 1)
-    (bl.ser:bb-write-bytes bb crc)
-    (bl.ser:bb-write-u32-le payload (length entries))
+(test an-untrustworthy-block-index-reports-a-reason
+  "Core refuses to start on a block index it cannot load, `Error loading block
+database' (node/chainstate.cpp:42-45), for three reasons among others: a header
+that fails its own proof of work (LoadBlockIndexGuts, blockstorage.cpp:148-151),
+a height with no entry below one that has (LoadBlockIndex, :457-460), and table
+data that fails its checksum. Each must report a reason, distinguishable from
+absence."
+  (with-network (:regtest)
+    ;; A header that does not meet its nBits.
+    (with-temp-directory (dir "bl-btdb-pow")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (entry (first (add-mined-chain cs (add-regtest-genesis-entry cs) 1)))
+             (header (bl.store:block-index-entry-header entry)))
+        ;; Tighten the target until this header no longer meets it.
+        (setf (bl.ser:block-header-bits header) #x1d00ffff
+              (bl.ser:block-header-cached-hash header) nil)
+        (bl.store:save-header-index cs :force-full t)
+        (let ((reason (nth-value 1 (bl.store:load-header-index
+                                    (bl.store:init-chain-state dir :network :regtest)))))
+          (is-true (and reason (search "CheckProofOfWork" reason))))))
+    ;; A hole in the heights.
+    (with-temp-directory (dir "bl-btdb-hole")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (chain (add-mined-chain cs (add-regtest-genesis-entry cs) 3)))
+        (remhash (bl.store:block-index-entry-hash (second chain))
+                 (bl.store:chain-state-block-index cs))
+        (bl.store:save-header-index cs)
+        (let ((reason (nth-value 1 (bl.store:load-header-index
+                                    (bl.store:init-chain-state dir :network :regtest)))))
+          (is-true (and reason (search "non-contiguous" reason))))))
+    ;; Table data overwritten on disk, as feature_init.py:202 perturbs it.
+    (with-temp-directory (dir "bl-btdb-ldb")
+      (let ((cs (bl.store:init-chain-state dir :network :regtest)))
+        (add-mined-chain cs (add-regtest-genesis-entry cs) 40)
+        (bl.store:save-header-index cs)
+        ;; A reopen replays the log into a table file, which is what gets hit.
+        (is-true (bl.store:load-header-index (bl.store:init-chain-state dir :network :regtest)))
+        (let ((tables (directory (merge-pathnames "*.ldb" (bl.store:block-tree-db-path dir)))))
+          (is-true tables)
+          (dolist (table tables)
+            (with-open-file (out table :direction :io :element-type '(unsigned-byte 8)
+                                       :if-exists :overwrite)
+              (file-position out 150)
+              (write-sequence (make-array 200 :element-type '(unsigned-byte 8)
+                                              :initial-element (char-code #\1))
+                              out))))
+        (let ((reason (nth-value 1 (bl.store:load-header-index
+                                    (bl.store:init-chain-state dir :network :regtest)))))
+          (is-true (stringp reason)))))))
+
+(test descendants-of-a-failed-block-load-as-failed
+  "Core LoadBlockIndex marks every descendant of a BLOCK_FAILED_VALID block
+failed as it walks the heights (node/blockstorage.cpp:488-492)."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-btdb-failed")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (chain (add-mined-chain cs (add-regtest-genesis-entry cs) 3)))
+        (setf (bl.store:block-index-entry-status (first chain)) :invalid)
+        (bl.store:save-header-index cs)
+        (let ((reloaded (bl.store:init-chain-state dir :network :regtest)))
+          (is-true (bl.store:load-header-index reloaded))
+          (is (eq :invalid (bl.store:block-index-entry-status
+                            (bl.store:get-block-index-entry
+                             reloaded (bl.store:block-index-entry-hash (third chain)))))))))))
+
+(test a-chain-without-the-witness-mark-needs-redownload
+  "Core NeedsRedownload (validation.cpp:4892-4908): walking down from the tip
+while segwit is active, a block without BLOCK_OPT_WITNESS means the chain was
+accepted without enforcing segwit. The mark is set when a body is stored at a
+segwit-active height (ReceivedBlockTransactions, :3817-3819)."
+  (with-network (:regtest)
+    (let* ((bl.store:*segwit-height-fn* (constantly 2))
+           (cs (bl.store:make-chain-state))
+           (chain (add-mined-chain cs (add-regtest-genesis-entry cs) 3))
+           (tip (third chain)))
+      (setf (bl.store:chain-state-best-block-hash cs) (bl.store:block-index-entry-hash tip)
+            (bl.store:chain-state-best-height cs) 3)
+      (is-true (bl.store:chain-needs-redownload-p cs)
+               "blocks 2 and 3 were never marked")
+      (dolist (e chain) (bl.store:note-block-witness-received e))
+      (is (zerop (bl.store:block-index-entry-status-flags (first chain)))
+          "block 1 is below the activation height and is not marked")
+      (is-false (bl.store:chain-needs-redownload-p cs))
+      (let ((bl.store:*segwit-height-fn* (constantly 1)))
+        (is-true (bl.store:chain-needs-redownload-p cs)
+                 "a lower activation height reaches the unmarked block 1")))))
+
+(defun %legacy-header-index-bytes (entries)
+  "A v3 headerindex.dat by hand: magic, version, count, 197-byte entries,
+CRC32 -- the format both live nodes carried until the block index moved into
+blocks/index. ENTRIES are block-index-entries."
+  (let ((bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-bytes bb (map '(vector (unsigned-byte 8)) #'char-code "HIDX"))
+    (bl.ser:bb-write-u32-le bb 3)
+    (bl.ser:bb-write-u32-le bb (length entries))
     (dolist (e entries)
-      (destructuring-bind (hash height chain-work status tx-count) e
-        (bl.ser:bb-write-bytes payload hash)
-        (bl.ser:bb-write-u32-le payload height)
-        (loop repeat 80 do (bl.ser:bb-write-u8 payload 0))
-        (bl.store::bb-write-chainwork payload chain-work)
-        (bl.ser:bb-write-u8
-         payload (ecase status (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
-        (loop repeat 32 do (bl.ser:bb-write-u8 payload 0))
-        (bl.ser:bb-write-u32-le payload tx-count)))
-    (let ((bytes (bl.ser:bb-finish payload)))
-      (bl.ser:bb-write-bytes bb bytes)
-      (bl.ser:bb-write-bytes
-       bb (bl.store:compute-crc32 bytes)))
-    (bl.ser:bb-finish bb)))
+      (bl.ser:bb-write-bytes bb (bl.store:block-index-entry-hash e))
+      (bl.ser:bb-write-u32-le bb (bl.store:block-index-entry-height e))
+      (bl.ser:bb-write-bytes bb (bl.ser:serialize-block-header
+                                 (bl.store:block-index-entry-header e)))
+      (let ((work (bl.store:block-index-entry-chain-work e)))
+        (loop for i from 31 downto 0
+              do (bl.ser:bb-write-u8 bb (ldb (byte 8 (* 8 i)) work))))
+      (bl.ser:bb-write-u8 bb (ecase (bl.store:block-index-entry-status e)
+                               (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
+      (let ((prev (bl.store:block-index-entry-prev-entry e)))
+        (bl.ser:bb-write-bytes bb (if prev
+                                      (bl.store:block-index-entry-hash prev)
+                                      (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0))))
+      (bl.ser:bb-write-u32-le bb (bl.store:block-index-entry-tx-count e))
+      (bl.ser:bb-write-i32-le bb (or (bl.store:block-index-entry-file e) -1))
+      (bl.ser:bb-write-u32-le bb (or (bl.store:block-index-entry-data-pos e) #xFFFFFFFF))
+      (bl.ser:bb-write-u32-le bb (or (bl.store:block-index-entry-undo-pos e) #xFFFFFFFF)))
+    (let ((payload (bl.ser:bb-finish bb)))
+      (concatenate '(vector (unsigned-byte 8)) payload (bl.store:compute-crc32 payload)))))
 
-(test header-index-replays-a-delta-written-in-the-previous-layout
-  "The upgrade hazard, and why it is not solved by discarding. A delta records
-whole entries, and its CRC binds it to the snapshot it extends -- so on the
-first start after an entry-layout change the OLD log is still bound to the
-snapshot still on disk and the CRC check waves it through, at the wrong width.
+(defun %btdb-write-octets (path octets)
+  (ensure-directories-exist path)
+  (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                            :if-exists :supersede :if-does-not-exist :create)
+    (write-sequence octets out)))
 
-Discarding it instead would look harmless, since a delta only holds changes
-since the last snapshot. But those are precisely the most recently updated
-statuses, so dropping the log can revert a block from :invalid back to :valid.
-So an old log is replayed at ITS width, and only an unrecognised version is
-thrown away."
-  (multiple-value-bind (state dir) (%hi-state "deltaver")
-    (unwind-protect
-         (let ((h (%hi-add state #x66 1 :status :header-valid)))
-           (bl.store:save-header-index state :force-full t)
-           ;; Hand-write a previous-layout delta marking that block :invalid,
-           ;; bound to the snapshot that is on disk right now.
-           (let ((delta (bl.store::header-index-delta-path state))
-                 (crc (bl.store::%file-trailing-crc
-                       (bl.store::header-index-file-path state))))
-             (with-open-file (out delta :direction :output
-                                        :element-type '(unsigned-byte 8)
-                                        :if-exists :supersede
-                                        :if-does-not-exist :create)
-               (write-sequence (%v1-delta-bytes crc (list (list h 1 10 :invalid 0))) out))
-             (let ((reloaded (bl.store:init-chain-state dir)))
-               (is-true (bl.store:load-header-index reloaded))
-               (let ((e (bl.store:get-block-index-entry reloaded h)))
-                 (is (eq :invalid (bl.store:block-index-entry-status e))
-                     "the old-layout delta must be replayed, not dropped")
-                 (is (null (bl.store:block-index-entry-data-pos e))
-                     "and an entry from it has no position, which is correct")))
-             ;; An unrecognised version IS discarded -- there is no width to
-             ;; frame it with, so misparsing is the only alternative.
-             (let ((bytes (alexandria:read-file-into-byte-vector delta)))
-               (setf (aref bytes 4) 99)
-               (with-open-file (out delta :direction :output
-                                          :element-type '(unsigned-byte 8)
-                                          :if-exists :supersede)
-                 (write-sequence bytes out)))
-             (let ((reloaded (bl.store:init-chain-state dir)))
-               (is-true (bl.store:load-header-index reloaded))
-               (let ((e (bl.store:get-block-index-entry reloaded h)))
-                 (is (eq :header-valid (bl.store:block-index-entry-status e))
-                     "an unknown layout falls back to the snapshot's state"))
-               (is-false (probe-file delta) "and the unreadable log is removed"))))
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+(test a-legacy-header-index-migrates-into-the-block-tree-db
+  "A datadir that still holds headerindex.dat is converted at start-up, in
+place: every entry written to blocks/index, the count read back, and the old
+file renamed headerindex.dat.migrated -- kept for a downgrade, never read
+again. Entries the node stored or connected get BLOCK_OPT_WITNESS where segwit
+applies, which the old format never recorded; without it the first start after
+the migration would refuse the chain as needing a redownload."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-btdb-migrate")
+      (let* ((bl.store:*segwit-height-fn* (constantly 0))
+             (source (bl.store:make-chain-state))
+             (chain (add-mined-chain source (add-regtest-genesis-entry source) 3))
+             (legacy (merge-pathnames "blocks/index/headerindex.dat" dir)))
+        (setf (bl.store:block-index-entry-file (first chain)) 0
+              (bl.store:block-index-entry-data-pos (first chain)) 8
+              (bl.store:block-index-entry-status (third chain)) :header-valid)
+        (%btdb-write-octets legacy (%legacy-header-index-bytes
+                               (loop for e being the hash-values
+                                       of (bl.store:chain-state-block-index source)
+                                     collect e)))
+        (let ((cs (bl.store:init-chain-state dir :network :regtest)))
+          (is (= 4 (bl.store:migrate-legacy-header-index cs)))
+          (is-false (probe-file legacy) "the old file must be renamed away")
+          (is-true (probe-file (merge-pathnames "blocks/index/headerindex.dat.migrated" dir)))
+          (is (null (bl.store:migrate-legacy-header-index cs))
+              "a second start has nothing to migrate")
+          (is-true (bl.store:load-header-index cs))
+          (is (= 4 (hash-table-count (bl.store:chain-state-block-index cs))))
+          (flet ((back (e) (bl.store:get-block-index-entry
+                            cs (bl.store:block-index-entry-hash e))))
+            (is (= 8 (bl.store:block-index-entry-data-pos (back (first chain)))))
+            (is (eq :header-valid (bl.store:block-index-entry-status (back (third chain)))))
+            (is (logtest bl.store:+block-opt-witness+
+                         (bl.store:block-index-entry-status-flags (back (second chain))))
+                "a connected block must carry the witness mark after migration")
+            (is (zerop (bl.store:block-index-entry-status-flags (back (third chain))))
+                "a header-only block was never received and is not marked")))))))
 
-(test header-index-save-load-round-trip
-  "Saving and loading header index should preserve entries and linkage."
-  (let* ((base-path (ensure-directories-exist
-                     (merge-pathnames "test-headers/"
-                                      (uiop:temporary-directory))))
-         (state (bl.store:init-chain-state base-path))
-         (genesis-hash (bl.store:best-block-hash state)))
-    ;; Add genesis to block index
-    (bl.store:add-block-index-entry
-     state
-     (bl.store:make-block-index-entry
-      :hash genesis-hash
-      :height 0
-      :chain-work 0
-      :status :valid))
-    ;; Add a child block
-    (let ((block1-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA)))
-      (bl.store:add-block-index-entry
-       state
-       (bl.store:make-block-index-entry
-        :hash block1-hash
-        :height 1
-        :prev-entry (bl.store:get-block-index-entry state genesis-hash)
-        :chain-work 100
-        :status :valid))
-      (bl.store:update-chain-tip state block1-hash 1)
-      ;; Save
-      (bl.store:save-header-index state)
-      ;; Load into fresh state
-      (let ((state2 (bl.store:init-chain-state base-path)))
-        (is (bl.store:load-header-index state2))
-        ;; Verify genesis entry
-        (let ((ge (bl.store:get-block-index-entry state2 genesis-hash)))
-          (is (not (null ge)))
-          (is (= 0 (bl.store:block-index-entry-height ge)))
-          (is (eq :valid (bl.store:block-index-entry-status ge))))
-        ;; Verify block 1 entry
-        (let ((b1 (bl.store:get-block-index-entry state2 block1-hash)))
-          (is (not (null b1)))
-          (is (= 1 (bl.store:block-index-entry-height b1)))
-          (is (= 100 (bl.store:block-index-entry-chain-work b1)))
-          (is (eq :valid (bl.store:block-index-entry-status b1)))
-          ;; Verify prev-entry linkage
-          (let ((prev (bl.store:block-index-entry-prev-entry b1)))
-            (is (not (null prev)))
-            (is (equalp genesis-hash (bl.store:block-index-entry-hash prev)))))))
-    ;; Cleanup
-    (let ((path (bl.store::header-index-file-path state)))
-      (when (probe-file path)
-        (delete-file path)))))
+(test a-legacy-delta-log-is-part-of-the-migration
+  "headerindex.delta holds the entries changed since the last snapshot -- the
+most recent statuses, an operator's invalidateblock among them -- so migrating
+the snapshot alone could turn an :invalid block :valid again. The migration
+replays the delta bound to the snapshot on disk before it writes anything."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-btdb-migrate-delta")
+      (let* ((source (bl.store:make-chain-state))
+             (chain (add-mined-chain source (add-regtest-genesis-entry source) 2))
+             (entries (loop for e being the hash-values
+                              of (bl.store:chain-state-block-index source) collect e))
+             (snapshot (%legacy-header-index-bytes entries))
+             (legacy (merge-pathnames "blocks/index/headerindex.dat" dir)))
+        (%btdb-write-octets legacy snapshot)
+        ;; The delta: header, then one CRC-framed batch marking block 2 invalid.
+        (setf (bl.store:block-index-entry-status (second chain)) :invalid)
+        (let* ((framed (%legacy-header-index-bytes (list (second chain))))
+               ;; One v3 entry is the 197 bytes after the 12-byte file header.
+               (entry-bytes (subseq framed 12 (+ 12 197)))
+               (payload (concatenate '(vector (unsigned-byte 8))
+                                     #(1 0 0 0) entry-bytes)))
+          (%btdb-write-octets (merge-pathnames "headerindex.delta" dir)
+                         (concatenate '(vector (unsigned-byte 8))
+                                      (map 'vector #'char-code "HIDD")
+                                      #(2 0 0 0)
+                                      (subseq snapshot (- (length snapshot) 4))
+                                      payload
+                                      (bl.store:compute-crc32 payload))))
+        (let ((cs (bl.store:init-chain-state dir :network :regtest)))
+          (is (= 3 (bl.store:migrate-legacy-header-index cs)))
+          (is-false (probe-file (merge-pathnames "headerindex.delta" dir)))
+          (is-true (bl.store:load-header-index cs))
+          (is (eq :invalid (bl.store:block-index-entry-status
+                            (bl.store:get-block-index-entry
+                             cs (bl.store:block-index-entry-hash (second chain)))))
+              "the delta's status must survive the migration"))))))
 
 ;;;; Persistence Integrity Tests
 
@@ -500,44 +610,6 @@ thrown away."
         (is (= 1000000 (bl.store:utxo-entry-value entry)))))
     (when (probe-file path) (delete-file path))))
 
-(test header-index-detect-corrupted
-  "Loading a corrupted header index file should fail (CRC mismatch)."
-  (let* ((base-path (ensure-directories-exist
-                     (merge-pathnames "test-corrupt-headers/"
-                                      (uiop:temporary-directory))))
-         (state (bl.store:init-chain-state base-path))
-         (genesis-hash (bl.store:best-block-hash state)))
-    (bl.store:add-block-index-entry
-     state
-     (bl.store:make-block-index-entry
-      :hash genesis-hash :height 0 :chain-work 0 :status :valid))
-    (bl.store:save-header-index state)
-    ;; Corrupt the file. Resolved, not hardcoded: SAVE-HEADER-INDEX writes to
-    ;; Core's blocks/index/ on a fresh datadir, and a test that corrupted the
-    ;; legacy path would be corrupting a file nothing reads.
-    (let* ((path (bl.store::header-index-file-path state))
-           (file-bytes (with-open-file (s path :direction :input
-                                               :element-type '(unsigned-byte 8))
-                         (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
-                           (read-sequence b s) b))))
-      (setf (aref file-bytes (floor (length file-bytes) 2))
-            (logxor (aref file-bytes (floor (length file-bytes) 2)) #xFF))
-      (with-open-file (s path :direction :output :if-exists :supersede
-                              :element-type '(unsigned-byte 8))
-        (write-sequence file-bytes s)))
-    ;; Loading should fail — AND say why. The reason is what makes startup
-    ;; refuse rather than continue with an empty index; detecting the
-    ;; corruption without reporting it is what let the node start anyway.
-    (let ((state2 (bl.store:init-chain-state base-path)))
-      (multiple-value-bind (loaded reason)
-          (bl.store:load-header-index state2)
-        (is (null loaded))
-        (is-true (stringp reason))
-        (is-true (search "CRC32" reason))))
-    ;; Cleanup
-    (let ((path (bl.store::header-index-file-path state)))
-      (when (probe-file path) (delete-file path)))))
-
 (test shrink-log-file-scrolls-only-past-the-threshold
   "Core's ShrinkDebugFile (logging.cpp): a log over 11 MB is restarted holding
 its last 10 MB; anything at or under the threshold is left completely alone."
@@ -649,408 +721,6 @@ with only -blocksdir pointing at a running node's directory."
            (is (= 1 (directory-locks-held))
                "one directory, one lock"))
       (release-directory-locks))))
-
-(defun %hidx-fixture (suffix)
-  "A chain-state on a private directory with no header-index files."
-  (let* ((dir (ensure-directories-exist
-               (merge-pathnames (format nil "test-hidx-~A/" suffix)
-                                (uiop:temporary-directory))))
-         (cs (bl.store:init-chain-state dir)))
-    (dolist (f (list (bl.store::header-index-file-path cs)
-                     (bl.store::header-index-delta-path cs)))
-      (when (probe-file f) (delete-file f)))
-    (values cs dir)))
-
-(defun %hidx-add (cs i status)
-  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)))
-    (bl.store:add-block-index-entry
-     cs (bl.store:make-block-index-entry
-         :hash h :height i :chain-work (* i 10) :status status))
-    h))
-
-(defun %hidx-size (path)
-  (and (probe-file path)
-       (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s))))
-
-(test header-index-delta-avoids-rewriting-the-snapshot
-  "A flush must write only what CHANGED. The whole index used to be rewritten
-every time — 178 MB per flush on mainnet, measured 2026-08-19, to persist about
-one entry."
-  (multiple-value-bind (cs) (%hidx-fixture "delta")
-    (let ((h1 (%hidx-add cs 1 :valid))
-          (h2 (%hidx-add cs 2 :header-valid))
-          (snap (bl.store::header-index-file-path cs))
-          (delta (bl.store::header-index-delta-path cs)))
-      (bl.store:save-header-index cs)
-      (let ((snap-size (%hidx-size snap)))
-        (is-true (plusp snap-size))
-        (is (null (%hidx-size delta)))
-        ;; Nothing changed: no delta is written at all.
-        (bl.store:save-header-index cs)
-        (is (null (%hidx-size delta)))
-        (is (= snap-size (%hidx-size snap)))
-        ;; One status change: a delta appears, the snapshot is untouched.
-        (setf (bl.store:block-index-entry-status
-               (bl.store:get-block-index-entry cs h2))
-              :valid)
-        (bl.store:save-header-index cs)
-        (is (= snap-size (%hidx-size snap)) "the snapshot must not be rewritten")
-        ;; header(12) + count(4) + one entry + crc(4). Derived from the
-        ;; constant rather than written out, so an entry-layout change fails
-        ;; here only if the FRAMING is wrong, not merely because the entry grew.
-        (is (= (+ 12 4 bl.store::+header-index-entry-bytes+ 4)
-               (%hidx-size delta)))
-        ;; And it reloads to the mutated state.
-        (let ((cs2 (bl.store:init-chain-state
-                    (bl.store::chain-state-base-path cs))))
-          (is-true (bl.store:load-header-index cs2))
-          (is (eq :valid (bl.store:block-index-entry-status
-                          (bl.store:get-block-index-entry cs2 h2))))
-          (is (eq :valid (bl.store:block-index-entry-status
-                          (bl.store:get-block-index-entry cs2 h1))))
-          (is (= 2 (hash-table-count
-                    (bl.store:chain-state-block-index cs2)))))))))
-
-(test header-index-stale-delta-is-discarded-not-replayed
-  "A delta orphaned by a crash between 'write new snapshot' and 'remove old
-delta' must be IGNORED. Replaying it would roll entries BACK to older statuses
-— strictly worse than losing them, because a block downgraded from :invalid to
-:valid undoes an operator's invalidateblock."
-  (multiple-value-bind (cs) (%hidx-fixture "stale")
-    (let ((h (%hidx-add cs 1 :header-valid))
-          (delta (bl.store::header-index-delta-path cs)))
-      (bl.store:save-header-index cs)
-      ;; Produce a delta carrying the OLD status.
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs h))
-            :valid)
-      (bl.store:save-header-index cs)
-      (is-true (plusp (%hidx-size delta)))
-      (let ((orphan (alexandria:read-file-into-byte-vector delta)))
-        ;; Now the entry becomes :invalid and a FULL snapshot is written, which
-        ;; removes the delta — then the crash puts the old one back.
-        (setf (bl.store:block-index-entry-status
-               (bl.store:get-block-index-entry cs h))
-              :invalid)
-        (bl.store:save-header-index cs :force-full t)
-        (is (null (%hidx-size delta)))
-        (alexandria:write-byte-vector-into-file orphan delta :if-exists :supersede)
-        (let ((cs2 (bl.store:init-chain-state
-                    (bl.store::chain-state-base-path cs))))
-          (is-true (bl.store:load-header-index cs2))
-          ;; :invalid survived — the stale delta did NOT resurrect :valid.
-          (is (eq :invalid (bl.store:block-index-entry-status
-                            (bl.store:get-block-index-entry cs2 h)))))))))
-
-(test header-index-torn-delta-tail-keeps-complete-frames
-  "A crash mid-append leaves a short final frame. Replay must keep every
-complete frame before it and stop there, rather than rejecting the whole log."
-  (multiple-value-bind (cs) (%hidx-fixture "torn")
-    (let ((h1 (%hidx-add cs 1 :header-valid))
-          (h2 (%hidx-add cs 2 :header-valid))
-          (delta (bl.store::header-index-delta-path cs)))
-      (bl.store:save-header-index cs)
-      ;; Frame 1: h1 becomes :valid.
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs h1)) :valid)
-      (bl.store:save-header-index cs)
-      ;; Frame 2: h2 becomes :valid — then tear it.
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs h2)) :valid)
-      (bl.store:save-header-index cs)
-      (let ((full (alexandria:read-file-into-byte-vector delta)))
-        ;; CONTROL: intact, BOTH frames apply. Without this the test below
-        ;; could pass on a log that never applied frame 2 in the first place.
-        (let ((cs0 (bl.store:init-chain-state
-                    (bl.store::chain-state-base-path cs))))
-          (is-true (bl.store:load-header-index cs0))
-          (is (eq :valid (bl.store:block-index-entry-status
-                          (bl.store:get-block-index-entry cs0 h1))))
-          (is (eq :valid (bl.store:block-index-entry-status
-                          (bl.store:get-block-index-entry cs0 h2)))))
-        ;; Now tear the final frame.
-        (alexandria:write-byte-vector-into-file
-         (subseq full 0 (- (length full) 60)) delta :if-exists :supersede)
-        (let ((cs2 (bl.store:init-chain-state
-                    (bl.store::chain-state-base-path cs))))
-          (is-true (bl.store:load-header-index cs2))
-          ;; Frame 1 survived...
-          (is (eq :valid (bl.store:block-index-entry-status
-                          (bl.store:get-block-index-entry cs2 h1))))
-          ;; ...frame 2 did not, and the entry keeps its snapshot state.
-          (is (eq :header-valid (bl.store:block-index-entry-status
-                                 (bl.store:get-block-index-entry cs2 h2)))))))))
-
-(test header-index-compaction-folds-the-delta-back-in
-  "Once the delta has grown past its bound, the next flush rewrites the
-snapshot and drops the log, so the delta can never approach the size of the
-thing it optimises."
-  (multiple-value-bind (cs) (%hidx-fixture "compact")
-    (let ((hashes (loop for i from 1 to 40 collect (%hidx-add cs i :header-valid)))
-          (snap (bl.store::header-index-file-path cs))
-          (delta (bl.store::header-index-delta-path cs)))
-      (bl.store:save-header-index cs)
-      (let ((snap-size (%hidx-size snap)))
-        ;; The floor is 20000 entries, so drive compaction by forcing it
-        ;; directly and separately assert the predicate's shape.
-        (is-false (bl.store::%header-index-compaction-due-p cs 1))
-        (is-true (bl.store::%header-index-compaction-due-p cs 20000))
-        ;; A forced full write folds any delta back into the snapshot.
-        (setf (bl.store:block-index-entry-status
-               (bl.store:get-block-index-entry cs (first hashes)))
-              :valid)
-        (bl.store:save-header-index cs)
-        (is-true (plusp (%hidx-size delta)))
-        (bl.store:save-header-index cs :force-full t)
-        (is (null (%hidx-size delta)))
-        (is (= snap-size (%hidx-size snap)))
-        (is (zerop (bl.store::hip-delta-entries
-                    (bl.store::header-index-persistence cs))))))))
-
-(defun %hidx-crc (cs)
-  "The snapshot CRC the delta log beside CS's header index is bound to."
-  (bl.store::hip-snapshot-crc (bl.store::header-index-persistence cs)))
-
-(defun (setf %hidx-crc) (value cs)
-  (setf (bl.store::hip-snapshot-crc (bl.store::header-index-persistence cs))
-        value))
-
-(defun %hidx-second-chainstate (cs)
-  "A second chain-state on CS's base path with CS's block index, built exactly
-as %MAKE-SNAPSHOT-CHAINSTATE builds a snapshot chainstate: same directory,
-shared index, its own storage suffix. The header index takes no suffix, so the
-two write the SAME headerindex.dat and headerindex.delta."
-  (bl.store:make-chain-state
-   :base-path (bl.store::chain-state-base-path cs)
-   :genesis-hash (bl.store:chain-state-genesis-hash cs)
-   :block-index (bl.store:chain-state-block-index cs)
-   :storage-suffix "_snapshot"))
-
-(defun %hidx-reload-status (cs hash)
-  "Load the header index from CS's base path into a fresh chain-state (replaying
-whatever delta is intact) and report HASH's status, as a restart would see it."
-  (let ((reload (bl.store:init-chain-state (bl.store::chain-state-base-path cs))))
-    (bl.store:load-header-index reload)
-    (let ((e (bl.store:get-block-index-entry reload hash)))
-      (and e (bl.store:block-index-entry-status e)))))
-
-(test header-index-delta-binding-is-per-file-not-per-chainstate
-  "GA11 dc27ca3a. Two chainstates on one datadir share one headerindex.dat and
-one headerindex.delta -- Core keeps the block index in BlockManager, outside
-any chainstate (node/blockstorage.cpp:407-421,510-527) -- so the CRC that binds
-the delta to its snapshot belongs to the FILE PAIR. While it lived on the
-chain-state struct, %make-snapshot-chainstate copied neither slot, so the
-snapshot chainstate's first flush rewrote the shared index, deleted the delta
-and took the new CRC for itself, leaving the primary bound to a snapshot that
-no longer existed; every later frame the primary wrote was then discarded at
-the next start, an operator's invalidateblock included."
-  (multiple-value-bind (cs1) (%hidx-fixture "shared")
-    (let* ((h1 (%hidx-add cs1 1 :valid))
-           (h2 (%hidx-add cs1 2 :valid))
-           (h3 (%hidx-add cs1 3 :valid))
-           (cs2 (%hidx-second-chainstate cs1))
-           (delta (bl.store::header-index-delta-path cs1)))
-      ;; One record, reached from either chainstate.
-      (bl.store:save-header-index cs1)
-      (is (eq (bl.store::header-index-persistence cs1)
-              (bl.store::header-index-persistence cs2)))
-      (is-true (%hidx-crc cs2))
-      ;; Alternating saves: each appends to the log the other created rather
-      ;; than rewriting the snapshot out from under it.
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs1 h1)) :header-valid)
-      (bl.store:save-header-index cs1)
-      (is-true (plusp (%hidx-size delta)))
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs1 h2)) :header-valid)
-      (bl.store:save-header-index cs2)
-      (is-true (plusp (%hidx-size delta)) "cs2's save deleted the shared delta")
-      ;; The mark that matters, persisted through the chainstate that did NOT
-      ;; create the log, and read back by a restart.
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs1 h3)) :invalid)
-      (bl.store:save-header-index cs2)
-      (is (eq :invalid (%hidx-reload-status cs1 h3)))
-      (is (eq :header-valid (%hidx-reload-status cs1 h1))))))
-
-(test header-index-per-chainstate-binding-loses-the-mark
-  "The positive control for the test above: give each chainstate its OWN
-persistence record -- the pre-fix shape, reproduced by rebinding the registry
-around each save rather than by editing the struct -- and the same sequence
-loses the :invalid mark at the next load. The snapshot chainstate, starting
-with no CRC, rewrites the shared index and takes the new one for itself; the
-primary then opens a delta stamped with the snapshot it replaced, and the
-loader discards the whole log."
-  (multiple-value-bind (cs1) (%hidx-fixture "unshared")
-    (let* ((h1 (%hidx-add cs1 1 :valid))
-           (h3 (progn (%hidx-add cs1 2 :valid) (%hidx-add cs1 3 :valid)))
-           (cs2 (%hidx-second-chainstate cs1))
-           (per-cs1 (make-hash-table :test 'equal))
-           (per-cs2 (make-hash-table :test 'equal)))
-      (flet ((save (cs table)
-               (let ((bl.store::*header-index-persistence* table))
-                 (bl.store:save-header-index cs)))
-             (mark (hash status)
-               (setf (bl.store:block-index-entry-status
-                      (bl.store:get-block-index-entry cs1 hash))
-                     status)))
-        (save cs1 per-cs1)
-        ;; cs2 has never seen a snapshot, so it rewrites the index and adopts
-        ;; the new CRC alone; cs1's record still names the one just replaced.
-        ;; The change is what makes the new snapshot a DIFFERENT file.
-        (mark h1 :header-valid)
-        (save cs2 per-cs2)
-        (mark h3 :invalid)
-        (save cs1 per-cs1)
-        (is (eq :valid (%hidx-reload-status cs1 h3))
-            "the pre-fix shape kept the mark, so the test above proves nothing")))))
-
-(test header-index-delta-append-rechecks-the-log-header
-  "The other half of dc27ca3a: %append-header-index-delta writes the 12-byte
-header only when the log is FRESH, so a writer bound to a superseded snapshot
-used to append frames into a log the loader will discard whole -- taking with
-it every frame a healthy writer had contributed. An existing log's recorded
-CRC is now re-checked, and a mismatch refuses the append so the caller writes
-a full snapshot instead."
-  (multiple-value-bind (cs) (%hidx-fixture "logcrc")
-    (let ((h (%hidx-add cs 1 :valid))
-          (delta (bl.store::header-index-delta-path cs)))
-      (bl.store:save-header-index cs)
-      (setf (bl.store:block-index-entry-status
-             (bl.store:get-block-index-entry cs h)) :header-valid)
-      (is-true (bl.store::%append-header-index-delta
-                cs (list (bl.store:get-block-index-entry cs h))))
-      (is (equalp (%hidx-crc cs) (bl.store::%delta-log-header-crc delta)))
-      ;; Pretend our snapshot is a different one: the existing log is no longer
-      ;; ours to extend.
-      (setf (%hidx-crc cs)
-            (make-array 4 :element-type '(unsigned-byte 8) :initial-element 7))
-      (is-false (bl.store::%append-header-index-delta
-                 cs (list (bl.store:get-block-index-entry cs h)))))))
-
-(defun %hidx-linked-chain (cs n)
-  "N linked, positioned, :valid entries in CS's index, oldest first. The shape
-a replay has to preserve: every child's PREV-ENTRY points at the one object
-its parent's hash resolves to."
-  (let ((prev nil) (entries '()))
-    (dotimes (i n)
-      (let* ((hash (make-array 32 :element-type '(unsigned-byte 8)
-                                  :initial-element (1+ i)))
-             (e (bl.store:make-block-index-entry
-                 :hash hash :height (1+ i) :chain-work (* 10 (1+ i))
-                 :status :valid :prev-entry prev
-                 :file 0 :data-pos (* 100 (1+ i)) :undo-pos (* 10 (1+ i)))))
-        (bl.store:add-block-index-entry cs e)
-        (push e entries)
-        (setf prev e)))
-    (nreverse entries)))
-
-(defun %hidx-graph-is-single-valued-p (cs)
-  "T when no entry's PREV-ENTRY is a different object from what its parent's
-hash resolves to -- Core's InsertBlockIndex invariant, one object per hash.
-Second value: the offending entries."
-  (let ((bad '()))
-    (maphash (lambda (hash e)
-               (declare (ignore hash))
-               (let ((prev (bl.store:block-index-entry-prev-entry e)))
-                 (when (and prev
-                            (not (eq prev
-                                     (bl.store:get-block-index-entry
-                                      cs (bl.store:block-index-entry-hash prev)))))
-                   (push e bad))))
-             (bl.store:chain-state-block-index cs))
-    (values (null bad) bad)))
-
-(test header-index-delta-replay-keeps-one-object-per-hash
-  "GA11 b07c72f4. Replay must MUTATE the entry a hash already has, not install
-a second object for it -- Core's InsertBlockIndex is a try_emplace and resolves
-every pprev through the same function, so a pprev pointer and a map lookup can
-never disagree (node/blockstorage.cpp:407-421,425-426). Replay used to build a
-fresh entry per record and relink only the hashes the delta carried, so an
-unchanged CHILD kept pointing at its parent's superseded copy; every ancestry
-walk follows prev-entry, so the active-chain walk handed out the orphan while
-the hash table held the current one, and a status written through such a walk
-was invisible to the next save.
-
-The reachable producer is pruning: forget-undo-data clears file/data-pos/
-undo-pos on an OLD entry whose already-connected child has not changed since
-the last full snapshot."
-  (multiple-value-bind (cs) (%hidx-fixture "replay-identity")
-    (let* ((chain (%hidx-linked-chain cs 4))
-           (parent (second chain)))
-      (bl.store:save-header-index cs)
-      ;; Prune the height-2 body: the parent changes, its child does not.
-      (setf (bl.store:block-index-entry-file parent) nil
-            (bl.store:block-index-entry-data-pos parent) nil
-            (bl.store:block-index-entry-undo-pos parent) nil)
-      (bl.store:save-header-index cs)
-      (is-true (plusp (%hidx-size (bl.store::header-index-delta-path cs))))
-      (let ((reload (bl.store:init-chain-state
-                     (bl.store::chain-state-base-path cs))))
-        (bl.store:load-header-index reload)
-        ;; The sweep below is only worth anything over a linked graph, and a
-        ;; replay that dropped every prev-entry would pass it vacuously.
-        (is (= 3 (let ((n 0))
-                   (maphash (lambda (h e)
-                              (declare (ignore h))
-                              (when (bl.store:block-index-entry-prev-entry e)
-                                (incf n)))
-                            (bl.store:chain-state-block-index reload))
-                   n))
-            "the reloaded graph is not linked, so the identity sweep is vacuous")
-        (multiple-value-bind (ok bad) (%hidx-graph-is-single-valued-p reload)
-          (is-true ok "~D entr~:@P whose prev-entry is not the indexed object"
-                   (length bad)))
-        ;; And the walked view agrees with the indexed one about the prune.
-        (let* ((hash (bl.store:block-index-entry-hash parent))
-               (indexed (bl.store:get-block-index-entry reload hash))
-               (child (bl.store:get-block-index-entry
-                       reload (bl.store:block-index-entry-hash (third chain))))
-               (walked (bl.store:block-index-entry-prev-entry child)))
-          (is (eq indexed walked))
-          (is (null (bl.store:block-index-entry-data-pos walked))
-              "the walk still reports a data-pos for a pruned body"))))))
-
-(test header-index-absent-is-not-corruption
-  "No headerindex.dat at all is a legitimate first run: NIL loaded, and NO
-reason — the caller must not confuse it with a file it cannot read, or every
-fresh node would refuse to start."
-  (let* ((base-path (ensure-directories-exist
-                     (merge-pathnames "test-absent-headers/"
-                                      (uiop:temporary-directory))))
-         (path (merge-pathnames "headerindex.dat" base-path)))
-    (when (probe-file path) (delete-file path))
-    (let ((state (bl.store:init-chain-state base-path)))
-      (multiple-value-bind (loaded reason)
-          (bl.store:load-header-index state)
-        (is (null loaded))
-        (is (null reason))))))
-
-(test header-index-corruption-modes-all-report-a-reason
-  "Every way headerindex.dat can be untrustworthy reports a reason: a
-truncated file, an unsupported format version, and a file too short to hold
-even a header. Each must be distinguishable from absence."
-  (let* ((base-path (ensure-directories-exist
-                     (merge-pathnames "test-corrupt-modes/"
-                                      (uiop:temporary-directory))))
-         (path (merge-pathnames "headerindex.dat" base-path)))
-    (flet ((reason-for (bytes)
-             (with-open-file (s path :direction :output :if-exists :supersede
-                                     :if-does-not-exist :create
-                                     :element-type '(unsigned-byte 8))
-               (write-sequence (coerce bytes '(vector (unsigned-byte 8))) s))
-             (nth-value 1 (bl.store:load-header-index
-                           (bl.store:init-chain-state base-path)))))
-      ;; Magic present, but the file cannot even hold magic+version+count+crc.
-      (is-true (search "too short" (reason-for '(#x48 #x49 #x44 #x58 1 0 0 0))))
-      ;; Magic + a version this build does not know, padded past the length
-      ;; floor so the version check is what rejects it.
-      (let ((r (reason-for (append '(#x48 #x49 #x44 #x58 #xFF 0 0 0)
-                                   (make-list 12 :initial-element 0)))))
-        (is-true (stringp r)))
-      ;; No magic => legacy path, and a stub too short to parse as entries.
-      (is-true (stringp (reason-for '(1 0 0 0 9 9 9 9)))))
-    (when (probe-file path) (delete-file path))))
 
 ;;;; Peer Health Monitoring Tests
 
@@ -1327,69 +997,47 @@ accumulating score); discouragement is NOT a hard ban."
 
 (test simulate-restart-resume
   "Simulating a node restart should resume from persisted state."
-  (let* ((base-path (ensure-directories-exist
-                     (merge-pathnames "test-restart/"
-                                      (uiop:temporary-directory))))
-         ;; Step 1: Create initial state at height 50
-         (state1 (bl.store:init-chain-state base-path))
-         (utxo1 (bl.store:make-utxo-set)))
-    ;; Add genesis to index
-    (let ((genesis-hash (bl.store:best-block-hash state1)))
-      (bl.store:add-block-index-entry
-       state1
-       (bl.store:make-block-index-entry
-        :hash genesis-hash :height 0 :chain-work 0 :status :valid))
-      ;; Build a chain of 3 block entries
-      (let ((prev-entry (bl.store:get-block-index-entry state1 genesis-hash)))
-        (loop for h from 1 to 3
-              for hash = (make-array 32 :element-type '(unsigned-byte 8) :initial-element h)
-              do (let ((entry (bl.store:make-block-index-entry
-                               :hash hash :height h :prev-entry prev-entry
-                               :chain-work (* h 100) :status :valid)))
-                   (bl.store:add-block-index-entry state1 entry)
-                   (bl.store:update-chain-tip state1 hash h)
-                   (setf prev-entry entry)))))
-    ;; Add some UTXOs as if blocks were connected
-    (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC))
-          (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
-      (bl.store:add-utxo utxo1 txid 0 5000000000 script 1 :coinbase t)
-      (bl.store:add-utxo utxo1 txid 1 2500000000 script 1 :coinbase t))
-    ;; Save everything (simulating shutdown)
-    (bl.store:save-state state1)
-    (bl.store:save-utxo-set utxo1
-                                         (bl.store:utxo-set-file-path base-path))
-    (bl.store:save-header-index state1)
-    ;; Step 2: Create a fresh state (simulating restart)
-    (let ((state2 (bl.store:init-chain-state base-path))
-          (utxo2 (bl.store:make-utxo-set)))
-      ;; Load persisted state
-      (bl.store:load-state state2)
-      (bl.store:load-utxo-set utxo2
-                                           (bl.store:utxo-set-file-path base-path))
-      (bl.store:load-header-index state2)
-      ;; Verify chain state resumed
-      (is (= 3 (bl.store:current-height state2)))
-      ;; Verify UTXO set resumed
-      (is (= 2 (bl.store:utxo-count utxo2)))
-      (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC)))
-        (is (bl.store:utxo-exists-p utxo2 txid 0))
-        (is (= 5000000000 (bl.store:utxo-entry-value
-                            (bl.store:get-utxo utxo2 txid 0)))))
-      ;; Verify header index resumed with linkage
-      (let* ((tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
-             (tip-entry (bl.store:get-block-index-entry state2 tip-hash)))
-        (is (not (null tip-entry)))
-        (is (= 3 (bl.store:block-index-entry-height tip-entry)))
-        (is (= 300 (bl.store:block-index-entry-chain-work tip-entry)))
-        ;; Verify chain linkage exists
-        (let ((prev (bl.store:block-index-entry-prev-entry tip-entry)))
-          (is (not (null prev)))
-          (is (= 2 (bl.store:block-index-entry-height prev))))))
-    ;; Cleanup
-    (dolist (file '("chainstate.dat" "utxoset.dat" "headerindex.dat"))
-      (let ((path (merge-pathnames file base-path)))
-        (when (probe-file path)
-          (delete-file path))))))
+  (with-network (:regtest)
+    (with-temp-directory (base-path "bl-restart")
+      (let* ((state1 (bl.store:init-chain-state base-path :network :regtest))
+             (utxo1 (bl.store:make-utxo-set))
+             (chain (add-mined-chain state1 (add-regtest-genesis-entry state1) 3))
+             (tip (third chain)))
+        (bl.store:update-chain-tip state1 (bl.store:block-index-entry-hash tip) 3)
+        ;; Add some UTXOs as if blocks were connected
+        (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC))
+              (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+          (bl.store:add-utxo utxo1 txid 0 5000000000 script 1 :coinbase t)
+          (bl.store:add-utxo utxo1 txid 1 2500000000 script 1 :coinbase t))
+        ;; Save everything (simulating shutdown)
+        (bl.store:save-state state1)
+        (bl.store:save-utxo-set utxo1 (bl.store:utxo-set-file-path base-path))
+        (bl.store:save-header-index state1)
+        ;; Step 2: Create a fresh state (simulating restart)
+        (let ((state2 (bl.store:init-chain-state base-path :network :regtest))
+              (utxo2 (bl.store:make-utxo-set)))
+          (bl.store:load-state state2)
+          (bl.store:load-utxo-set utxo2 (bl.store:utxo-set-file-path base-path))
+          (bl.store:load-header-index state2)
+          ;; Verify chain state resumed
+          (is (= 3 (bl.store:current-height state2)))
+          ;; Verify UTXO set resumed
+          (is (= 2 (bl.store:utxo-count utxo2)))
+          (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC)))
+            (is (bl.store:utxo-exists-p utxo2 txid 0))
+            (is (= 5000000000 (bl.store:utxo-entry-value
+                                (bl.store:get-utxo utxo2 txid 0)))))
+          ;; Verify header index resumed with linkage
+          (let ((tip-entry (bl.store:get-block-index-entry
+                            state2 (bl.store:block-index-entry-hash tip))))
+            (is (not (null tip-entry)))
+            (is (= 3 (bl.store:block-index-entry-height tip-entry)))
+            (is (= (bl.store:block-index-entry-chain-work tip)
+                   (bl.store:block-index-entry-chain-work tip-entry)))
+            ;; Verify chain linkage exists
+            (let ((prev (bl.store:block-index-entry-prev-entry tip-entry)))
+              (is (not (null prev)))
+              (is (= 2 (bl.store:block-index-entry-height prev))))))))))
 
 ;;;; Reorg and Persistence Edge-Case Tests
 
@@ -1549,25 +1197,21 @@ header; these synthetic fixtures must too."
         (bl.store:save-state chain-state)
         (bl.store:save-utxo-set utxo-set
                                              (bl.store:utxo-set-file-path base-path))
-        (bl.store:save-header-index chain-state)
-        ;; Load into fresh state
+        ;; The block index is not reloaded here: these fixture blocks carry
+        ;; made-up hashes, which blocks/index cannot hold -- it stores no hash
+        ;; and recomputes each from its header. BLOCK-INDEX-ROUND-TRIPS-THROUGH-
+        ;; THE-BLOCK-TREE-DB covers that half with mined headers.
         (let ((state2 (bl.store:init-chain-state base-path))
               (utxo2 (bl.store:make-utxo-set)))
           (bl.store:load-state state2)
           (bl.store:load-utxo-set utxo2
                                                (bl.store:utxo-set-file-path base-path))
-          (bl.store:load-header-index state2)
           ;; Verify chain state matches
           (is (= 3 (bl.store:current-height state2)))
           (is (equalp (third chain-b-hashes)
                       (bl.store:best-block-hash state2)))
           ;; Verify UTXO count matches
-          (is (= utxo-count-before (bl.store:utxo-count utxo2)))
-          ;; Verify header index has entries from both chains
-          (let ((tip-entry (bl.store:get-block-index-entry
-                            state2 (third chain-b-hashes))))
-            (is (not (null tip-entry)))
-            (is (= 3 (bl.store:block-index-entry-height tip-entry)))))))
+          (is (= utxo-count-before (bl.store:utxo-count utxo2))))))
     ;; Cleanup
     (clear-undo-cache)
     (dolist (file '("chainstate.dat" "utxoset.dat" "headerindex.dat"))
@@ -1924,18 +1568,15 @@ crash into a mandatory reindex.
 
 Driven through the shipped entry point (UTXO-SET-ITERATE) with the node's own
 hook installed, so this covers the wiring and not just the ordering."
-  (with-network (:mainnet)
+  (with-network (:regtest)
     (with-temp-directory (base "bl-coins-order")
       (let* ((node (bl:make-node))
-             (cs (bl.store:init-chain-state base))
-             (hash (make-array 32 :element-type '(unsigned-byte 8)
-                                  :initial-element #xAB)))
+             (cs (bl.store:init-chain-state base :network :regtest))
+             ;; A block index entry accepted since the last flush: in memory
+             ;; only, which is the ordinary state between flushes.
+             (hash (bl.store:block-index-entry-hash
+                    (first (add-mined-chain cs (add-regtest-genesis-entry cs) 1)))))
         (setf (bl:node-chainstates node) (list cs))
-        ;; A block index entry accepted since the last flush: in memory only,
-        ;; which is the ordinary state between flushes.
-        (bl.store:add-block-index-entry
-         cs (bl.store:make-block-index-entry
-             :hash hash :height 7 :chain-work 9 :status :valid))
         (bl.store:open-chainstate-coins-view cs)
         (unwind-protect
              (let ((view (bl.store:chain-state-coins-view cs)))

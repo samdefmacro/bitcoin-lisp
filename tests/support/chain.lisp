@@ -10,6 +10,61 @@
                   (setf (aref h 1) i)
                   h)))
 
+;;;; Mined regtest headers, for the block tree database
+;;;;
+;;;; blocks/index stores no hash and no chain work: a reload recomputes both
+;;;; from the header, and re-checks its proof of work (Core LoadBlockIndexGuts).
+;;;; A synthetic entry with a made-up hash or no header therefore cannot
+;;;; round-trip, and a test of persistence needs headers that are real.
+
+(defun mine-regtest-header (prev-hash height &key (tag 0)
+                                                  (timestamp (+ 1296688602 (* 600 height))))
+  "A header on PREV-HASH that meets regtest's #x207fffff proof-of-work limit,
+found by counting the nonce up (about two tries a header). HEIGHT and TAG go
+into the merkle root, so two chains built on one parent differ."
+  (let ((merkle (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref merkle 0) (ldb (byte 8 0) height)
+          (aref merkle 1) (ldb (byte 8 8) height)
+          (aref merkle 2) (ldb (byte 8 0) tag))
+    (loop for nonce from 0
+          for header = (bl.ser:make-block-header
+                        :version #x20000000 :prev-block prev-hash :merkle-root merkle
+                        :timestamp timestamp :bits bl.store:+regtest-pow-limit-bits+
+                        :nonce nonce)
+          when (<= (loop with h = (bl.ser:block-header-hash header)
+                         for i from 0 below 32 sum (ash (aref h i) (* 8 i)))
+                   bl.store:+regtest-pow-limit-target+)
+            return header)))
+
+(defun add-regtest-genesis-entry (state)
+  "Put regtest's genesis into STATE's block index, header and work as the node
+builds it, and return the entry."
+  (let ((header (bl.ser:bitcoin-block-header (bl.store:make-genesis-block :regtest))))
+    (bl.store:add-block-index-entry
+     state (bl.store:make-block-index-entry
+            :hash (bl.store:network-genesis-hash :regtest) :height 0 :header header
+            :chain-work (bl.store:calculate-chain-work
+                         (bl.ser:block-header-bits header) 0)
+            :status :valid :tx-count 1))))
+
+(defun add-mined-chain (state parent n &key (status :valid) (tag 0))
+  "Extend STATE's block index by N mined regtest headers on the entry PARENT,
+each with the chain work a load recomputes. Returns the new entries, lowest
+first."
+  (loop repeat n
+        for prev = parent then entry
+        for height = (1+ (bl.store:block-index-entry-height prev))
+        for header = (mine-regtest-header (bl.store:block-index-entry-hash prev)
+                                          height :tag tag)
+        for entry = (bl.store:add-block-index-entry
+                     state (bl.store:make-block-index-entry
+                            :hash (bl.ser:block-header-hash header) :height height
+                            :header header :prev-entry prev :status status
+                            :chain-work (bl.store:calculate-chain-work
+                                         (bl.ser:block-header-bits header)
+                                         (bl.store:block-index-entry-chain-work prev))))
+        collect entry))
+
 (defun make-versionbits-chain (n &key (network :regtest) (signal-bit nil) (base-time 1000000)
                                       (signal-when (constantly t)))
   "(values chain-state last-entry) for a synthetic chain of N blocks.

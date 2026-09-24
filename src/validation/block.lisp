@@ -289,6 +289,12 @@ startup."
   (%activation-height "segwit"
    (bl.chain:chain-params-segwit-height (bl.chain:find-chain-params network))))
 
+;; The storage layer marks a block BLOCK_OPT_WITNESS when its body arrives at a
+;; height where segwit is active, and NeedsRedownload reads the mark; the
+;; deployment table it needs lives here.
+(setf bl.store:*segwit-height-fn*
+      (lambda () (get-segwit-activation-height bl:*network*)))
+
 (defun segwit-active-at-height-p (height &optional (network bl:*network*))
   "T when BIP141 is active for a block at HEIGHT on NETWORK -- Core's
 DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT), evaluated for the block

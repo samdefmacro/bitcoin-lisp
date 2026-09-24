@@ -81,6 +81,18 @@ key); pre-existing file always wins; `-blocksxor` default true; applied to blk+r
 the index DB. (Distinct from the LevelDB obfuscation record format — don't conflate.)
 
 ### Block index records (Core keeps them in a LevelDB at blocks/index)
+
+**Built 2026-09-24** (decision 2 below reversed by the maintainer): the block
+index now persists here too, in Core's `blocks/index` LevelDB, byte for byte
+(`src/storage/block-tree-db.lisp`). Verified against a `blocks/index` written by
+Core v28.2: every `b` record decodes and re-encodes to Core's bytes, and the
+recomputed hash is the record's key (`BLOCK-INDEX-RECORD-IS-CORES-BYTE-FOR-BYTE`,
+`BLOCK-FILE-RECORD-IS-CORES-BYTE-FOR-BYTE`). The former `headerindex.dat` +
+`headerindex.delta` pair is read only by the one-time start-up migration, which
+renames both files `*.migrated`. What CDiskBlockIndex does not hold, our entry
+recomputes: the hash (from the header) and the chain work (summed up the
+heights); nStatus is derived from the entry's status keyword and positions, and
+the bits we do not model (BLOCK_OPT_WITNESS) travel in `status-flags`.
 `'b'+hash → CDiskBlockIndex`: `VARINT(dummy client version)`, `VARINT(nHeight)`,
 `VARINT(nStatus)`, `VARINT(nTx)`, then **conditionally** `VARINT(nFile)` iff HAVE_DATA|HAVE_UNDO,
 `VARINT(nDataPos)` iff HAVE_DATA, `VARINT(nUndoPos)` iff HAVE_UNDO, then the fixed 80-byte-header
@@ -116,8 +128,9 @@ and drains recursively after each accept (validation.cpp:4988-5155).
 - Pruning today is per-block deletion with a monotone `pruned-height` (blocks.lisp:146-211);
   the RPC + auto-prune semantics carry over, the granularity changes.
 - txindex is hash-based (txid→block-hash+position) — storage-layout-agnostic, unaffected.
-- We do NOT port Core's blocks/index LevelDB (decision below): our headerindex.dat +
-  chainstate.dat 3-phase flush is the established, crash-tested persistence.
+- ~~We do NOT port Core's blocks/index LevelDB~~ — reversed 2026-09-24: the block index
+  is Core's `blocks/index` LevelDB (see §2 "Block index records"); `chainstate.dat`
+  stays ours.
 
 ## 4. Staged milestones
 
@@ -174,8 +187,11 @@ XOR + checksum layers are pure functions — low risk, high test coverage availa
 
 1. Do it at all now? (Recommendation: **defer** until after cluster-mempool/assumeutxo unless
    file-count pain or `-reindex` need arrives first. Pruned nodes = bounded file count today.)
-2. Adopt Core's blocks/index LevelDB too, or keep headerindex.dat v3? (Recommend **keep ours** —
-   Core-parity of the *index* only matters for external tooling that reads the index itself.)
+2. Adopt Core's blocks/index LevelDB too, or keep headerindex.dat v3? The recommendation
+   was **keep ours**; the maintainer **reversed it on 2026-09-24**: Core's `blocks/index`,
+   so a Core datadir loads here and ours in Core, and the functional tests that read the
+   index by name (`feature_init.py:202`) and Core's init errors for it apply. Built the
+   same day; an existing datadir is migrated in place at start-up.
 3. XOR default: on for fresh dirs (Core default) — trivial either way.
 4. Undo payload: Core-exact CBlockUndo (recommended — free interop + smaller via compression)
    vs keeping our entry format inside the rev framing.

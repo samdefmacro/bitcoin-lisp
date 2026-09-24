@@ -473,7 +473,7 @@ block index and UTXO cache and flushes over the other's files, so the loser is
 not the second to start but whichever flushes last. The coins LevelDB takes its
 own lock, but only over that subdirectory and only once startup gets that far —
 by which point this node has already read, and may already have rewritten,
-chainstate.dat and headerindex.dat.
+chainstate.dat and the block index.
 
 Advisory-only, like Core's: it stops a second bitcoin-lisp, not an unrelated
 process editing the files."

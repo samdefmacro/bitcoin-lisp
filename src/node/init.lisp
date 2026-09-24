@@ -135,17 +135,21 @@ case ever exercised) has genesis for a root."
                      (bl.store:chain-state-block-index (node-chain-state *node*)))
             (bl.store:save-header-index
              (node-chain-state *node*) :force-full t)))
-        ;; Create new genesis entry
-        (bl.store:add-block-index-entry
-         (node-chain-state *node*)
-         (bl.store:make-block-index-entry
-          :hash genesis-hash
-          :height 0
-          :header genesis-header
-          :prev-entry nil
-          :chain-work genesis-work
-          :status :valid
-          :tx-count 1)))))   ; genesis carries exactly its coinbase
+        ;; Create new genesis entry. Core's LoadGenesisBlock runs it through
+        ;; ReceivedBlockTransactions like any other block, which marks it
+        ;; BLOCK_OPT_WITNESS wherever segwit is active from height 0
+        ;; (validation.cpp:3817-3819, :4966-4985).
+        (bl.store:note-block-witness-received
+         (bl.store:add-block-index-entry
+          (node-chain-state *node*)
+          (bl.store:make-block-index-entry
+           :hash genesis-hash
+           :height 0
+           :header genesis-header
+           :prev-entry nil
+           :chain-work genesis-work
+           :status :valid
+           :tx-count 1))))))   ; genesis carries exactly its coinbase
 
 (defun %init-logging (data-directory network log-level log-file console-log block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
   "Core AppInitMain Step 4a, application initialization: the log file and level,
@@ -786,7 +790,7 @@ the option."
                 added (and (plusp orphans) orphans))
       (when (plusp added)
         (bl.store:save-header-index (node-chain-state *node*)
-                                    :force-full t))
+                                    :block-store (node-block-store *node*)))
       (%record-reindex-in-progress nil)
       ;; Core's own sentence for the end of the reindex
       ;; (ImportBlocks, node/blockstorage.cpp:1291). It is what says the block
@@ -875,13 +879,75 @@ the start is a fresh one over whatever contiguous files remain."
          (drop-dir (path)
            (when (and path (uiop:directory-exists-p path))
              (uiop:delete-directory-tree path :validate t))))
+    ;; The block tree database, wiped as DBParams::wipe_data wipes it, and the
+    ;; files it replaced wherever a datadir still has them.
+    (bl.store:close-block-tree-db data-dir)
+    (drop-dir (bl.kv:datadir-block-index-path data-dir))
     (drop-file (bl.kv:datadir-header-index-file data-dir))
+    (drop-file (merge-pathnames "headerindex.delta" data-dir))
     (drop-file (merge-pathnames "chainstate.dat" data-dir))
     (drop-dir (merge-pathnames "chainstate/" data-dir))
     (drop-dir (merge-pathnames "undo/" data-dir))
     (dolist (which '(:txindex :blockfilter :coinstats :txospenderindex))
       (drop-dir (bl.kv:datadir-index-path data-dir which))))
   (log-info "Reindex with -prune: block index, chainstate and indexes wiped"))
+
+(defun %init-load-block-index (reindex)
+  "Core LoadBlockIndexDB (node/blockstorage.cpp:529-589) over the block tree
+database the start-up has just opened: migrate a datadir that still holds the
+former headerindex.dat, load every 'b' record, and check that each blk file an
+entry with data points into is present.
+
+A block index that will not load is `Error loading block database', the
+chainstate-load failure Core offers a reindex for (node/chainstate.cpp:42-45):
+a record that does not decode, a table block that fails its checksum, a header
+that fails its own proof of work, a hole in the heights -- or a blk file that
+is gone (:564-567). Starting anyway would leave an empty index under a
+chainstate that names a tip. Under -reindex the file check is skipped, as a
+reindex's wiped index has no entry to point anywhere in Core."
+  (let ((chain-state (node-chain-state *node*))
+        (store (node-block-store *node*)))
+    ;; A datadir written before the block index moved into blocks/index still
+    ;; holds it in headerindex.dat; convert it in place, once.
+    (handler-case (bl.store:migrate-legacy-header-index chain-state :block-store store)
+      (error (e)
+        (log-error "The block index could not be migrated: ~A" e)
+        (log-error "Recover by restoring a backup of headerindex.dat, or reindex from the block files.")
+        (init-error "Corrupt headerindex.dat at ~A" (node-data-directory *node*))))
+    (multiple-value-bind (loaded corrupt-reason)
+        (bl.store:load-header-index chain-state)
+      (cond
+        (loaded
+         (log-info "Loaded persisted header index: ~D entries"
+                   (hash-table-count (bl.store:chain-state-block-index chain-state))))
+        (corrupt-reason
+         (log-error "LoadBlockIndex: ~A" corrupt-reason)
+         (chainstate-load-error "Error loading block database"))))
+    (log-info "Loading block index db: last block file = ~D"
+              (values (bl.store:read-block-tree-file-info (node-data-directory *node*))))
+    (when (bl.store:read-block-tree-flag (node-data-directory *node*) "prunedblockfiles")
+      (log-info "Loading block index db: Block files have previously been pruned"))
+    (when (and store (not reindex))
+      (log-info "Checking all blk files are present...")
+      (let ((missing (bl.store:data-files-missing
+                      chain-state
+                      (lambda (file)
+                        (probe-file (merge-pathnames (format nil "blk~5,'0D.dat" file)
+                                                     (bl.store:store-blocks-path store)))))))
+        (when missing
+          (log-error "Block file blk~5,'0D.dat is missing~@[ (and ~D more)~]"
+                     (first missing) (and (rest missing) (length (rest missing))))
+          (chainstate-load-error "Error loading block database"))))))
+
+(defun %open-coins-db-or-refuse (thunk)
+  "THUNK's value, where THUNK opens the coins LevelDB. One that will not open is
+Core's chainstate-load failure `Error opening coins database' (InitCoinsDB's
+dbwrapper_error, node/chainstate.cpp:89-97), not a bare LevelDB error:
+feature_init.py:210 deletes chainstate/*.ldb and expects that sentence."
+  (handler-case (funcall thunk)
+    (error (e)
+      (log-error "~A" e)
+      (chainstate-load-error "Error opening coins database"))))
 
 (defun %init-load-chain (network reindex reindex-chainstate blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
@@ -945,10 +1011,14 @@ startup refusal rather than a directory we create somewhere else."
          :blocks-path (blocks-dir-path blocks-directory
                                        (node-data-directory *node*)
                                        network)))
-  ;; Genesis is never RECEIVED, so nothing else ever writes its body. Core has
-  ;; it on disk from initialisation, which is what makes blk00000.dat start at
-  ;; height 0 for every reader that walks the block files from outside the node.
-  (bl.store:ensure-genesis-on-disk (node-block-store *node*))
+  ;; The block tree database, blocks/index. Core's BlockManager opens it in its
+  ;; constructor, and a LevelDB that will not open -- a table file missing, a
+  ;; MANIFEST naming one that is not there -- is the chainstate-load failure
+  ;; `Error opening block database' (init.cpp:1353-1358).
+  (handler-case (bl.store:open-block-tree-db (node-data-directory *node*))
+    (error (e)
+      (log-error "~A" e)
+      (chainstate-load-error "Error opening block database")))
   ;; -loadblock=<file>, once the store and chain state exist. Deferred to
   ;; %IMPORT-EXTERNAL-BLOCK-FILES (called from START-NODE), which runs after validation is ready.
 
@@ -971,15 +1041,17 @@ startup refusal rather than a directory we create somewhere else."
          (chainstate-path (namestring
                            (bl.store:chainstate-leveldb-path primary)))
          (utxoset-dat (bl.store:utxo-set-file-path data-dir))
-         (migrated-p (bl.store:leveldb-utxo-migration-complete-p
-                      chainstate-path)))
+         (migrated-p (%open-coins-db-or-refuse
+                      (lambda () (bl.store:leveldb-utxo-migration-complete-p
+                                  chainstate-path)))))
     (when (and (not migrated-p) (probe-file utxoset-dat))
       (log-info "Found legacy utxoset.dat; migrating into LevelDB at ~A ..."
                 chainstate-path)
       (bl.store:migrate-utxoset-dat-to-leveldb
        utxoset-dat chainstate-path)
       (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
-    (let ((view (bl.store:open-coins-view-db chainstate-path)))
+    (let ((view (%open-coins-db-or-refuse
+                 (lambda () (bl.store:open-coins-view-db chainstate-path)))))
       ;; Refuse a pre-0.15 coins database, as Core does right after opening
       ;; it (node/chainstate.cpp:103-109). Either reindex flag wipes the
       ;; coins before they are read, which is why Core's check is a no-op
@@ -997,27 +1069,15 @@ startup refusal rather than a directory we create somewhere else."
        (bl.store:chain-state-coins-view primary))
       (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
-  ;; Load persisted header index if available.
-  (multiple-value-bind (loaded corrupt-reason)
-      (bl.store:load-header-index (node-chain-state *node*))
-    (cond
-      (loaded
-       (log-info "Loaded persisted header index: ~D entries"
-                 (hash-table-count
-                  (bl.store:chain-state-block-index
-                   (node-chain-state *node*)))))
-      ;; A file IS there but did not validate. Starting anyway would leave us
-      ;; with an EMPTY block index while chainstate.dat still names a tip: the
-      ;; node would claim a height it has no headers for, re-request the whole
-      ;; header chain, and on a pruned node could never rebuild the entries
-      ;; below the prune horizon from disk. Refuse, exactly as the corrupt
-      ;; chainstate.dat branch above does, and as Core's "Error loading block
-      ;; database" does for a CBlockTreeDB it cannot read (init.cpp).
-      (corrupt-reason
-       (log-error "headerindex.dat is present but unreadable: ~A." corrupt-reason)
-       (log-error "Refusing to start: an empty block index would contradict the stored chainstate.")
-       (log-error "Recover by restoring a backup of headerindex.dat, or reindex from the block files.")
-       (init-error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))))
+  (%init-load-block-index reindex)
+  ;; Genesis is never RECEIVED, so nothing else ever writes its body. Core has
+  ;; it on disk from initialisation, which is what makes blk00000.dat start at
+  ;; height 0 for every reader that walks the block files from outside the node.
+  ;; AFTER the block index has checked its blk files, as Core's LoadGenesisBlock
+  ;; follows LoadBlockIndex (node/chainstate.cpp:42-66): written first, it
+  ;; recreated a deleted blk00000.dat and the check saw a file that held
+  ;; nothing but genesis.
+  (bl.store:ensure-genesis-on-disk (node-block-store *node*))
 
   ;; Genesis FIRST: the reindex below links each record to a parent already in
   ;; the index, so without a root the drain never starts and every record is
@@ -1175,7 +1235,7 @@ connect."
     (do-reindex-chainstate)))
 
 
-(defun %init-chain-tip (reindex)
+(defun %init-chain-tip (reindex &optional reindex-chainstate)
   "Core's LoadChainTip, the last step of CompleteChainstateInitialization
  (node/chainstate.cpp:120-126): with a non-empty coins view, the chain tip is
 placed on the block the coins pointer names, and a pointer naming a block the
@@ -1195,7 +1255,12 @@ functional tests pre-answer yes with
 -test=reindex_after_failure_noninteractive_yes (init.cpp:1860-1879,
 HasTestOption). noui answers NO (noui.cpp:49-52), so an operator who was not
 asked gets the refusal and the advice. REINDEX is whether this run was already
-a -reindex, which is Core's `!do_reindex' guard: one retry, never a loop."
+a -reindex, which is Core's `!do_reindex' guard: one retry, never a loop.
+
+With the tip settled, the function ends where CompleteChainstateInitialization
+ends: %REFUSE-A-CHAIN-NEEDING-REDOWNLOAD, Core's NeedsRedownload test
+ (node/chainstate.cpp:136-141), which either reindex flag skips (REINDEX-
+CHAINSTATE is the second)."
   (flet ((verdict () (reconcile-coins-db-best-block *node*)))
     (let ((result (verdict)))
       (when (eq result :unresolvable)
@@ -1222,7 +1287,35 @@ a -reindex, which is Core's `!do_reindex' guard: one retry, never a loop."
         (bl.store:reset-block-sequence-state)
         (bl.store:mark-best-chain-from-disk (node-chain-state *node*)))
       (log-loaded-best-chain (node-chain-state *node*))
+      (%refuse-a-chain-needing-redownload (or reindex reindex-chainstate))
       result)))
+
+(defun %refuse-a-chain-needing-redownload (wipe-chainstate)
+  "The last test of Core's CompleteChainstateInitialization
+ (node/chainstate.cpp:136-141): a chainstate whose active chain holds a block,
+at a height where segwit is active, that this node accepted without enforcing
+segwit -- one without BLOCK_OPT_WITNESS -- is a chainstate-load failure whose
+advice is -reindex. It is how a node that ran pre-segwit rules, or ran with a
+later -testactivationheight=segwit@N than it now has, finds out its chain was
+never validated under the rules now in force
+ (feature_presegwit_node_upgrade.py:39).
+
+Core walks each chainstate's m_chain from its Tip(), and a chainstate whose
+coins view is empty -- a first run, or either reindex flag, which wipes it
+(WIPE-CHAINSTATE; is_coinsview_empty, :69-71) -- never had LoadChainTip set a
+tip, so there is nothing to walk. feature_unsupported_utxo_db.py:55 depends on
+it: it restarts over Core v0.14.3's blocks, which carry no BLOCK_OPT_WITNESS,
+with -reindex-chainstate, and expects the node up."
+  (when (and (not wipe-chainstate)
+             (some (lambda (cs)
+                     (let ((view (bl.store:chain-state-coins-view cs)))
+                       (and (not (and (typep view 'bl.store:coins-view-cache)
+                                      (bl.store:coins-view-empty-p view)))
+                            (bl.store:chain-needs-redownload-p cs))))
+                   (node-chainstates *node*)))
+    (chainstate-load-error
+     "Witness data for blocks after height ~D requires validation. Please restart with -reindex."
+     (bl.val:get-segwit-activation-height (node-network *node*)))))
 
 (defun log-loaded-best-chain (chainstate)
   "Core's closing line of LoadChainTip: `Loaded best chain: hashBestChain=<hash>
@@ -2258,7 +2351,7 @@ Returns the node instance."
   ;; LoadChainTip, where Core has it: the tip is settled before the mempool
   ;; replay and the RPC server, and a coins pointer this node cannot place is
   ;; the chainstate-load failure Core offers a reindex for.
-  (%init-chain-tip reindex)
+  (%init-chain-tip reindex reindex-chainstate)
   (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p (if wallet-names-supplied-p wallet-names :settings))
   (prune-blockstore-at-startup *node*)   ; Step 10, after the wallets' rescans

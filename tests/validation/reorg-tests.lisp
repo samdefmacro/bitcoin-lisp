@@ -620,7 +620,8 @@ the block store."
 
 (test rpc-getchaintxstats-window
   "getchaintxstats computes window tx counts over connected blocks (coinbase-only
-test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
+test blocks: 1 tx each). That tx-count survives a restart is
+BLOCK-INDEX-RECORD-IS-CORES-BYTE-FOR-BYTE's nTx."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "chaintxstats")
@@ -634,14 +635,6 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
          (is (= 2 (cdr (assoc "window_block_count" r :test #'string=))))
          (is (= 2 (cdr (assoc "window_tx_count" r :test #'string=))))
          (is (integerp (cdr (assoc "window_interval" r :test #'string=)))))
-       ;; tx-count persists through the v2 header index.
-       (bl.store:save-header-index chain-state)
-       (let ((cs2 (bl.store:make-chain-state
-                   :base-path (bl.store::chain-state-base-path chain-state))))
-         (is-true (bl.store:load-header-index cs2))
-         (let ((tip (bl.store:get-block-index-entry
-                     cs2 (bl.store:best-block-hash chain-state))))
-           (is (= 1 (bl.store:block-index-entry-tx-count tip)))))
        ;; blockcount >= height -> error (Core's bound).
        (signals bl.rpc:rpc-error
          (bl.rpc::rpc-getchaintxstats node (list 99))))

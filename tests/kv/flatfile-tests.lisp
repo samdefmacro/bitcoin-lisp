@@ -654,7 +654,7 @@ this in its block-index database; deriving it means there is no second file to
 fall out of step."
   (with-network (:mainnet)
    (with-temp-directory (dir)
-     (let ((blocks '()))
+     (let ((blocks '()) (cs2 nil))
        ;; Store three blocks and record them in a chain state at known heights.
        (let* ((bl.store:*flat-block-files* t)
               (store (bl.store:init-block-store dir))
@@ -666,12 +666,11 @@ fall out of step."
                     (bl.store:add-block-index-entry
                      cs (bl.store:make-block-index-entry
                          :hash hash :height h :status :valid))))
-         (bl.store:save-header-index cs))
-       ;; A fresh store and chain state, as a restart would give.
+         (setf cs2 cs))
+       ;; A fresh store, as a restart would give; the index is the one built
+       ;; above (a reload of it is the block tree database's own test).
        (let* ((bl.store:*flat-block-files* t)
-              (store2 (bl.store:init-block-store dir))
-              (cs2 (bl.store:init-chain-state dir)))
-         (is-true (bl.store:load-header-index cs2))
+              (store2 (bl.store:init-block-store dir)))
          ;; Before the join, the store has positions but no heights.
          (is (null (bl.store::%prunable-flat-files store2 0 1000000)))
          (is (= 1 (bl.store:rebuild-block-file-info store2 cs2)))
@@ -1226,7 +1225,8 @@ opens is closed again, so the next run over the same directory can open it."
              (hash-table-count
               (bl.store:chain-state-block-index (bl:node-chain-state node))))
         (ignore-errors
-         (bl.store:close-chainstate-coins-view (bl:node-chain-state node)))))))
+         (bl.store:close-chainstate-coins-view (bl:node-chain-state node)))
+        (bl.store:close-block-tree-db dir)))))
 
 (test an-interrupted-reindex-resumes-on-the-next-start-without-the-option
   "Core records an unfinished reindex ON DISK and resumes it: the block tree db
@@ -1273,7 +1273,6 @@ were expected in the index")
         (is-false (bl.store:reindex-flag-set-p dir))
         (bl.store:write-reindex-flag dir t)
         (is-true (bl.store:reindex-flag-set-p dir))
-        (is-true (probe-file (bl.store:reindex-flag-path dir)))
         (bl.store:write-reindex-flag dir nil)
         (is-false (bl.store:reindex-flag-set-p dir))))))
 
