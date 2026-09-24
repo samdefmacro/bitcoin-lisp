@@ -401,6 +401,7 @@ headerssync.cpp. src/networking/.")
    #:block-download-wanted-p
    #:block-min-pow-checked-p
    #:renew-ibd-context
+   #:new-pow-valid-block
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*

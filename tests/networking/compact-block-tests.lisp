@@ -2028,3 +2028,58 @@ block forever that nothing would ask anyone else for."
        (bl.net:clear-pending-compact-block peer)
        (is (null (bl.net:peer-inflight-block-hashes peer))
            "an abandoned reconstruction must not leave the block in flight")))))
+
+(test a-peer-that-asked-for-high-bandwidth-gets-new-blocks-as-cmpctblock
+  "BIP152 high-bandwidth mode, Core's two sending sites. A peer that sent
+sendcmpct(1, 2) (m_requested_hb_cmpctblocks, net_processing.cpp:3918) is
+pushed each new tip as a cmpctblock the moment it validates, when it has the
+parent (NewPoWValidBlock, :2105-2153); and SendMessages announces a single
+queued block to it as a cmpctblock too, even though it never asked for
+headers (fRevertToInv, :5838-5840, and :5893-5916). Ours recorded the request
+and never acted on it -- such a peer got an inv, and p2p_compactblocks.py:210
+waits for a cmpctblock."
+  (uiop:delete-directory-tree (regtest-node-base-path "hb-announce")
+                              :validate t :if-does-not-exist :ignore)
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "hb-announce"))
+           (cs (bl:node-chain-state node))
+           (hashes (mapcar (lambda (hex) (bl.crypto:reverse-bytes
+                                          (bl.crypto:hex-to-bytes hex)))
+                           (generate-regtest-blocks node 2)))
+           (entry2 (bl.store:get-block-index-entry cs (second hashes)))
+           (bl:*node* node)
+           (bl.net::*highest-fast-announce* 0))
+      (flet ((peer (address hb)
+               (let ((p (bl.net:make-peer :address address :state :ready)))
+                 (setf (bl.net:peer-compact-block-high-bandwidth p) hb
+                       (bl.net:peer-best-known-block-hash p) (first hashes))
+                 p)))
+        ;; The SendMessages half: a queued single block for an HB peer that
+        ;; never asked for headers.
+        (let ((hb (peer "198.51.100.74" t)))
+          (bl.net:queue-block-announcement hb (second hashes))
+          (is (equal '("cmpctblock")
+                     (mapcar #'message-command
+                             (captured-sends
+                              (lambda ()
+                                (bl.net:flush-block-announcements (list hb) cs)))))))
+        ;; Control: the same peer without HB gets an inv.
+        (let ((lb (peer "198.51.100.75" nil)))
+          (bl.net:queue-block-announcement lb (second hashes))
+          (is (equal '("inv")
+                     (mapcar #'message-command
+                             (captured-sends
+                              (lambda ()
+                                (bl.net:flush-block-announcements (list lb) cs)))))))
+        (let* ((hb (peer "198.51.100.71" t))
+               (lb (peer "198.51.100.72" nil))
+               (sent (captured-sends
+                      (lambda ()
+                        (is (equal (list hb)
+                                   (bl.net:new-pow-valid-block cs entry2 (list hb lb)))
+                            "only the high-bandwidth peer is pushed the block"))))
+               (commands (mapcar #'message-command sent)))
+          (is (equal '("cmpctblock") commands) "one cmpctblock went out: ~S" commands)
+          (is (equalp (second hashes) (bl.net:peer-best-header-sent-hash hb)))
+          (is (null (bl.net:new-pow-valid-block cs entry2 (list (peer "198.51.100.73" t))))
+              "each height is pushed once"))))))
