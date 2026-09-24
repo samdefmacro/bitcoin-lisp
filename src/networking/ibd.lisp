@@ -727,42 +727,6 @@ Uses the current network from bl:*network*."
         (caar (last checkpoints))
         0)))
 
-(defun default-assumevalid ()
-  "The current network's defaultAssumeValid hash in wire order, or NIL.
-The table itself now lives in config.lisp as NETWORK-ASSUMEVALID, because the
-validation layer must consult it per block and loads before this file."
-  (bl:network-assumevalid bl:*network*))
-
-(defun assumevalid-skip-height (chain-state)
-  "Height of the hardcoded assumevalid block when its header is already in our
-index (i.e. we are syncing the chain that contains it), else -1. Blocks at or
-below this height may skip SIGNATURE checks: the assumevalid hash is unforgeable,
-so a block carrying it pins a known-good ancestor chain. Mirrors Bitcoin Core's
--assumevalid (sigs skipped for ancestors of the assumed-valid block)."
-  (let ((av (default-assumevalid)))
-    (if av
-        (let ((entry (bl.store:get-block-index-entry chain-state av)))
-          (if entry
-              (bl.store:block-index-entry-height entry)
-              -1))
-        -1)))
-
-(defun script-skip-height (chain-state)
-  "Highest height at which a signature skip is even CONSIDERED: the assumevalid
-block's height, or -1 when its header is not in our index.
-
-This is a cheap pre-filter only. The decision itself is
-BITCOIN-LISP.VALIDATION:SCRIPT-CHECKS-SKIPPABLE-P, which additionally requires
-the block to be an ANCESTOR of the assumevalid block — Core's fScriptChecks
-(validation.cpp:2342-2380) is a per-block predicate, not a height comparison.
-
-The checkpoint term is GONE. Checkpoints play no part in Core's fScriptChecks,
-and including them meant that whenever the assumevalid header was not yet in
-our index — the entire first phase of a fresh IBD — we skipped every signature
-up to 840,000 on mainnet and 2,000,000 on testnet3, where Core verifies all of
-them."
-  (assumevalid-skip-height chain-state))
-
 (defun validate-checkpoint (hash height)
   "Validate that HASH at HEIGHT matches any applicable checkpoint.
 Returns T if valid or no checkpoint at that height, NIL if checkpoint mismatch."

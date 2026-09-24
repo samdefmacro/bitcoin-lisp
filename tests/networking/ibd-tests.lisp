@@ -1721,54 +1721,6 @@ exceed the bound)."
              (usocket:socket-close client)))
       (usocket:socket-close server))))
 
-(test assumevalid-skip-height
-  "assumevalid lets IBD skip signature checks for ancestors of a known-good
-block. default-assumevalid yields a 32-byte WIRE-order hash for real networks
-(nil on regtest); assumevalid-skip-height returns the assumevalid block's height
-when its header is in the index, -1 when absent or disabled; script-skip-height
-is the max with the checkpoint height. Only sig checks are skipped — everything
-else is still validated."
-  ;; default-assumevalid presence + byte order (display ...51ba5ac -> wire 0xac..0x00)
-  (let ((bl:*network* :mainnet))
-    (let ((av (bl.net::default-assumevalid)))
-      (is (= 32 (length av)))
-      (is (= #xac (aref av 0)))
-      (is (= #x00 (aref av 31)))))
-  (let ((bl:*network* :regtest))
-    (is (null (bl.net::default-assumevalid))))
-  ;; skip-height logic on a synthetic regtest chain (checkpoint height = 0)
-  (let* ((bl:*network* :regtest)
-         (state (bl.store:init-chain-state
-                 (merge-pathnames "test-assumevalid/" (uiop:temporary-directory))))
-         (genesis-hash (bl.store:best-block-hash state))
-         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (av-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
-         (absent (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
-    (bl.store:add-block-index-entry
-     state (bl.store:make-block-index-entry
-            :hash genesis-hash :height 0 :chain-work 1 :status :valid
-            :header (bl.ser:make-block-header
-                     :version 1 :prev-block zeros :merkle-root zeros
-                     :timestamp 1296688600 :bits #x207fffff :nonce 0
-                     :cached-hash genesis-hash)))
-    (bl.store:add-block-index-entry
-     state (bl.store:make-block-index-entry
-            :hash av-hash :height 50 :chain-work 100 :status :header-valid
-            :header (bl.ser:make-block-header
-                     :version 1 :prev-block genesis-hash :merkle-root zeros
-                     :timestamp 1296688700 :bits #x207fffff :nonce 0
-                     :cached-hash av-hash)))
-    ;; assumevalid points at the in-index block -> its height; sigs skip <= 50.
-    (let ((bl:*assumevalid-override* av-hash))
-      (is (= 50 (bl.net::assumevalid-skip-height state)))
-      (is (= 50 (bl.net::script-skip-height state))))
-    ;; assumevalid hash not in our index -> no skip.
-    (let ((bl:*assumevalid-override* absent))
-      (is (= -1 (bl.net::assumevalid-skip-height state))))
-    ;; assumevalid explicitly disabled -> no skip.
-    (let ((bl:*assumevalid-override* nil))
-      (is (= -1 (bl.net::assumevalid-skip-height state))))))
-
 (test block-failure-count-throttle
   "note-block-failure increments a per-hash counter, clear-block-failure resets
 it, and counts are independent per hash. This bounded counter backs the
