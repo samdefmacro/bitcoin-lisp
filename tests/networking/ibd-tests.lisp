@@ -2178,8 +2178,17 @@ parents', txdownloadman_impl.cpp:422-436)."
     (is-false (equalp txid wtxid))
     ;; The missing parent was recently rejected.
     (bl:add-recent-reject rejects parent-txid)
-    (with-tx-relay-out-of-ibd
-      (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects)))
+    (let ((log (nth-value 1 (log-text-of
+                             "mempool"
+                             (lambda ()
+                               (with-tx-relay-out-of-ibd
+                                 (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))))))))
+      ;; Core's line, which p2p_invalid_tx.py:153 waits for.
+      (is-true (search (format nil "not keeping orphan with rejected parents ~A (wtxid=~A)"
+                               (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                               (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
+                       log)
+               "log: ~A" log))
     ;; Rejected under both ids; never admitted to the orphan pool; the
     ;; parent was NOT re-requested.
     (is-true (bl:recent-reject-p rejects txid))

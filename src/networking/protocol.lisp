@@ -2646,6 +2646,11 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                      (let ((parents (missing-parent-txids tx utxo-set mempool)))
                        (if (%orphan-parents-rejected-p parents recent-rejects)
                            (progn
+                             ;; Core's line (:423-425); p2p_invalid_tx.py:153
+                             ;; waits for it.
+                             (bl:log-cat "mempool" "not keeping orphan with rejected parents ~A (wtxid=~A)"
+                                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                                         (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid)))
                              (bl:add-recent-reject recent-rejects txid)
                              (bl:add-recent-reject recent-rejects wtxid)
                              ;; :434-435, beside the two filter inserts.
