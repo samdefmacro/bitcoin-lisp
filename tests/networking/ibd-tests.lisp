@@ -2090,11 +2090,9 @@ Regression: bare MSG_TX fetched the witness-stripped parent, which failed
 scripts and — wtxid == txid for a stripped tx — poisoned recent-rejects
 with the parent's real txid, so the orphan could never resolve."
   (bl.net:reset-tx-requests)
-  (let* ((utxo (bl.store:make-utxo-set))
-         (mempool (bl.mp:make-mempool))
-         (orphan (%wave8-tx :prev-id #xB1))
+  (let* ((orphan (%wave8-tx :prev-id #xB1))
          (peer (%wave8-witness-peer))
-         (parents (bl.net::missing-parent-txids orphan utxo mempool)))
+         (parents (bl.net::unique-parent-txids orphan)))
     (is (= 1 (length parents)))
     (let ((invs (bl.net::request-orphan-parents peer parents)))
       (is (= 1 (length invs)))
@@ -2705,7 +2703,8 @@ print(int.from_bytes(h[0:8],'little'), int.from_bytes(h[8:16],'little'))\"
 
 (test sendtxrcncl-offer-conditions
   "We offer reconciliation only when: -txreconciliation on, negotiated proto
->= 70016, our conn relays txs, and the peer's VERSION set fRelay (Core
+>= 70016, our conn relays txs and is not addr-fetch, and the peer's VERSION
+set fRelay (Core
 net_processing.cpp:3728-3742). The offer pre-registers a random local salt."
   (let ((bl:*tx-reconciliation* t))
     (let ((peer (%recon-test-peer :local-salt nil)))
@@ -2715,10 +2714,12 @@ net_processing.cpp:3728-3742). The offer pre-registers a random local salt."
     (let ((peer (%recon-test-peer :relay nil :local-salt nil)))
       (bl.net::%maybe-send-sendtxrcncl peer)
       (is-false (bl.net::peer-recon-local-salt peer)))
-    ;; We don't relay txs on block-relay connections
-    (let ((peer (%recon-test-peer :conn-type :block-relay :local-salt nil)))
-      (bl.net::%maybe-send-sendtxrcncl peer)
-      (is-false (bl.net::peer-recon-local-salt peer)))
+    ;; No offer on a block-relay-only, feeler or addr-fetch connection
+    ;; (net_processing.cpp:3735-3737; p2p_sendtxrcncl.py:151 checks addr-fetch).
+    (dolist (type '(:block-relay :feeler :addr-fetch))
+      (let ((peer (%recon-test-peer :conn-type type :local-salt nil)))
+        (bl.net::%maybe-send-sendtxrcncl peer)
+        (is-false (bl.net::peer-recon-local-salt peer) "offered on ~S" type)))
     ;; Pre-wtxidrelay protocol version
     (let ((peer (%recon-test-peer :proto-version 70015 :local-salt nil)))
       (bl.net::%maybe-send-sendtxrcncl peer)
@@ -2843,6 +2844,46 @@ handled-p net-log-text)."
    (lambda ()
      (bl.net:handle-message peer command payload (bl.ctx:make-node-context)))))
 
+(test sendtxrcncl-outcomes-are-logged-in-cores-words
+  "Each RegisterPeer outcome has Core's own line (net_processing.cpp:3998-4011,
+txreconciliation.cpp:87, :120, :133), and p2p_sendtxrcncl.py:171-221 greps for
+every one: `Register peer=', the ALREADY_REGISTERED and PROTOCOL_VIOLATION
+disconnects, NOT_FOUND's `Ignore unexpected txreconciliation signal', and
+`Forget txreconciliation state of peer' at a verack without wtxidrelay."
+  (let ((bl:*tx-reconciliation* t)
+        (was-on (bl.log:log-category-enabled-p "txreconciliation")))
+    (flet ((logged (thunk)
+             (nth-value 1 (log-text-of
+                           "net" (lambda ()
+                                   (bl.log:enable-log-category "txreconciliation")
+                                   (funcall thunk))))))
+      (unwind-protect
+           (progn
+             (let* ((peer (%recon-test-peer))
+                    (first-log (logged (lambda () (%sendtxrcncl peer (%sendtxrcncl-payload 1 2)))))
+                    (second-log (logged (lambda () (%sendtxrcncl peer (%sendtxrcncl-payload 1 3))))))
+               (is (search (format nil "Register peer=~A (inbound=0)" (bl.net:peer-id peer))
+                           first-log)
+                   "logged: ~S" first-log)
+               (is (search "txreconciliation protocol violation (sendtxrcncl received from already registered peer), disconnecting peer="
+                           second-log)
+                   "logged: ~S" second-log))
+             (let ((log (logged (lambda () (%sendtxrcncl (%recon-test-peer)
+                                                         (%sendtxrcncl-payload 0 2))))))
+               (is (search "txreconciliation protocol violation, disconnecting peer=" log)
+                   "logged: ~S" log))
+             (let ((log (logged (lambda () (%sendtxrcncl (%recon-test-peer :local-salt nil)
+                                                         (%sendtxrcncl-payload 1 2))))))
+               (is (search "Ignore unexpected txreconciliation signal from peer=" log)
+                   "logged: ~S" log))
+             (let* ((peer (%recon-test-peer))
+                    (log (logged (lambda () (bl.net::%verack-finalize-recon peer)))))
+               (is (search (format nil "Forget txreconciliation state of peer=~A"
+                                   (bl.net:peer-id peer))
+                           log)
+                   "logged: ~S" log)))
+        (unless was-on (bl.log:disable-log-category "txreconciliation"))))))
+
 (test sendtxrcncl-ignored-with-the-feature-off-says-so
   "With -txreconciliation off Core returns from the SENDTXRCNCL branch at once
 and logs WHY (net_processing.cpp:3964-3967). p2p_sendtxrcncl.py:181 asserts
@@ -2884,6 +2925,33 @@ feature-off path is the test above."
       (is (eq :disconnected (bl.net:peer-state peer)))
       (is-true (search "sendtxrcncl received after verack, disconnecting peer=3" log)
                "sendtxrcncl disconnect line, logged: ~S" log))))
+
+(test handshake-window-messages-are-logged-as-received
+  "Core writes `received: <type> (<n> bytes) peer=<id>' for every inbound
+message before processing it (net_processing.cpp:3582), including those
+between VERSION and VERACK. p2p_sendtxrcncl.py:171 waits for `received:
+sendtxrcncl' from a peer that never sends verack; our handshake window read
+them without the line."
+  (let* ((bl:*tx-reconciliation* nil)
+         (peer (%recon-test-peer :local-salt nil))
+         (queue (list (cons "sendtxrcncl" (%sendtxrcncl-payload 1 2))
+                      (cons "verack" (make-array 0 :element-type '(unsigned-byte 8)))))
+         (real (fdefinition 'bl.net:receive-message-blocking)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.net:receive-message-blocking)
+                 (lambda (p &key timeout)
+                   (declare (ignore p timeout))
+                   (let ((m (pop queue))) (values (car m) (cdr m)))))
+           (multiple-value-bind (ok log)
+               (%net-log-of (lambda () (bl.net::%await-verack peer :timeout 5)))
+             (is-true ok "the control: the handshake completes")
+             (is-true (search (format nil "received: sendtxrcncl (12 bytes) peer=~A"
+                                      (bl.net:peer-id peer))
+                              log)
+                      "logged: ~S" log)
+             (is-true (search "received: verack (0 bytes)" log) "logged: ~S" log)))
+      (setf (fdefinition 'bl.net:receive-message-blocking) real))))
 
 (test feature-negotiation-after-verack-disconnects
   "BIP155 (sendaddrv2) and BIP339 (wtxidrelay) negotiate strictly between

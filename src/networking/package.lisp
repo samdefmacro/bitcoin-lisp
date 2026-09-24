@@ -313,6 +313,27 @@ headerssync.cpp. src/networking/.")
    #:*cjdns-reachable*
    #:*onlynet-networks*
    #:reachable-network-p
+   ;; Private broadcast (networking/private-broadcast.lisp)
+   #:*outbound-tor-ok-at-least-once*
+   #:reset-private-broadcast
+   #:initiate-tx-broadcast-private
+   #:private-broadcast-add
+   #:private-broadcast-pick-tx
+   #:private-broadcast-tx-for-peer
+   #:private-broadcast-confirm
+   #:note-own-tx-received-back
+   #:private-broadcast-remove
+   #:private-broadcast-stale
+   #:private-broadcast-info
+   #:private-broadcast-abort
+   #:private-broadcast-num-to-open
+   #:private-broadcast-num-to-open-add
+   #:private-broadcast-num-to-open-sub
+   #:private-broadcast-wait-to-open
+   #:run-private-broadcast-connection
+   #:pb-send-status-address
+   #:pb-send-status-picked
+   #:pb-send-status-confirmed
    #:dialable-network-p
    ;; Local addresses (Core mapLocalHost) + self-advertisement
    #:+local-manual+

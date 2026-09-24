@@ -88,8 +88,8 @@ chainparams GetDefaultPort regardless of -port.")
   "Core -privatebroadcast (DEFAULT_PRIVATE_BROADCAST = false, init.cpp:687):
 broadcast sendrawtransaction's transactions over short-lived Tor/I2P
 connections without entering the mempool. Validated at start-up as Core does
-(%CHECK-PRIVATE-BROADCAST-OPTION); the mechanism itself is not implemented, so
-sendrawtransaction refuses while it is on. Assigned on every start by
+(%CHECK-PRIVATE-BROADCAST-OPTION); the mechanism is networking/private-broadcast.lisp
+and node/private-broadcast.lisp. Assigned on every start by
 APPLY-PARAMETER-INTERACTIONS.")
 
 (defvar *stop-at-height* 0

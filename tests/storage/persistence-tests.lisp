@@ -159,7 +159,24 @@ we hold has passed BLOCK_VALID_TRANSACTIONS; :valid is BLOCK_VALID_SCRIPTS;
                             (bl.store:encode-disk-block-index entry))))
                  (is (eq status (bl.store:block-index-entry-status back)))
                  (is (eql data (bl.store:block-index-entry-data-pos back)))
-                 (is (eql undo (bl.store:block-index-entry-undo-pos back))))))))
+                 (is (eql undo (bl.store:block-index-entry-undo-pos back)))))
+      ;; A SCRIPTS-valid block that fails keeps its level beside the failure
+      ;; bit (5|8|16|32 = 61), survives the disk, and is :valid again once
+      ;; the failure is cleared (Core ResetBlockFailureFlags, which the
+      ;; reconsiderblock RPC runs).
+      (setf (bl.store:block-index-entry-status entry) :valid
+            (bl.store:block-index-entry-file entry) 0
+            (bl.store:block-index-entry-data-pos entry) 8
+            (bl.store:block-index-entry-undo-pos entry) 40)
+      (bl.store:mark-entry-failed entry)
+      (is (= 61 (bl.store:entry-disk-status entry)))
+      (let ((back (bl.store:decode-disk-block-index
+                   (bl.store:encode-disk-block-index entry))))
+        (is (eq :invalid (bl.store:block-index-entry-status back)))
+        (is (= 61 (bl.store:entry-disk-status back)) "the level survives the disk")
+        (is (eq :valid (bl.store:block-index-entry-status
+                        (bl.store:clear-entry-failure back))))
+        (is (= 29 (bl.store:entry-disk-status back)))))))
 
 (test block-index-round-trips-through-the-block-tree-db
   "A saved index reloads with every entry, the parent links rebuilt from the

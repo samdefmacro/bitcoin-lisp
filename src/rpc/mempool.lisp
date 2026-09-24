@@ -767,27 +767,91 @@ txn-already-known from us."
       (error 'rpc-error :code +rpc-verify-already-in-utxo-set+
                         :message "Transaction outputs already in utxo set"))))
 
-(defun %refuse-private-broadcast ()
-  "sendrawtransaction under -privatebroadcast. Core first refuses when neither
-Tor nor I2P is reachable NOW (rpc/mempool.cpp:115-124, the proxy may have been
-expected from the Tor daemon at start-up), in its words; otherwise it hands
-the transaction to the private-broadcast queue WITHOUT the mempool. That queue
-does not exist here, and the ordinary path would announce the transaction to
-every peer from this node's own address -- what the operator asked us not to
-do -- so the transaction is refused, not broadcast."
+(defun %refuse-unreachable-private-broadcast ()
+  "sendrawtransaction under -privatebroadcast refuses when neither Tor nor I2P
+is reachable NOW (rpc/mempool.cpp:115-124; the proxy may have been expected
+from the Tor daemon at start-up), in Core's words. Otherwise the transaction
+goes to the private-broadcast queue WITHOUT the mempool
+(BL.NET:INITIATE-TX-BROADCAST-PRIVATE)."
   (unless (or (bl.net:reachable-network-p :torv3) (bl.net:reachable-network-p :i2p))
     (error 'rpc-error :code +rpc-misc-error+
-                      :message "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly."))
-  (error 'rpc-error :code +rpc-misc-error+
-                    :message "-privatebroadcast is enabled, but this node does not implement private broadcast; the transaction was neither added to the mempool nor broadcast"))
+                      :message "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly.")))
 
 (defun %refuse-before-broadcast (tx txid utxo-set)
   "sendrawtransaction's two refusals in Core's order: the -privatebroadcast
 gate (rpc/mempool.cpp:115-124) runs before BroadcastTransaction's first
 question, the UTXO-set check (node/transaction.cpp:52-61)."
   (when bl:*private-broadcast*
-    (%refuse-private-broadcast))
+    (%refuse-unreachable-private-broadcast))
   (%refuse-if-already-in-utxo-set tx txid utxo-set))
+
+(defun %private-broadcast-tx-json (tx)
+  "Core's txid / wtxid / hex fields for a private-broadcast transaction."
+  `(("txid" . ,(hash-to-hex (bl.ser:transaction-hash tx)))
+    ("wtxid" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
+    ("hex" . ,(bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx)))))
+
+(define-rpc "getprivatebroadcastinfo" (node params)
+  "The transactions being privately broadcast and, per transaction, the peers
+it was sent to (Core getprivatebroadcastinfo, rpc/mempool.cpp:142-205):
+address, when it was picked for them, and when they confirmed reception."
+  (declare (ignore node params))
+  `(("transactions"
+     . ,(json-array
+         (loop for (tx . statuses) in (bl.net:private-broadcast-info)
+               collect (append
+                        (%private-broadcast-tx-json tx)
+                        `(("peers"
+                           . ,(json-array
+                               (loop for s in statuses
+                                     collect `(("address" . ,(bl.net:pb-send-status-address s))
+                                               ("sent" . ,(bl.net:pb-send-status-picked s))
+                                               ,@(when (bl.net:pb-send-status-confirmed s)
+                                                   `(("received"
+                                                      . ,(bl.net:pb-send-status-confirmed s)))))))))))))))
+
+(define-rpc "abortprivatebroadcast" (node (id))
+  "Stop privately broadcasting every queued transaction whose txid or wtxid is
+ID (Core abortprivatebroadcast, rpc/mempool.cpp:207-259); the removed ones,
+or -5 when there were none."
+  (declare (ignore node))
+  (let ((removed (bl.net:private-broadcast-abort (parse-hash-v id "id"))))
+    (unless removed
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Transaction not in private broadcast queue. Check getprivatebroadcastinfo."))
+    `(("removed_transactions"
+       . ,(json-array (mapcar #'%private-broadcast-tx-json removed))))))
+
+(defun %sendraw-test-accept (tx utxo-set mempool current-height chain-state max-fee)
+  "sendrawtransaction's test-accept of TX: (values FEE REPLACED SIGOPS), or the
+RPC error Core answers.
+
+Core runs ATMP with test_accept FIRST and only submits for real once the fee
+is under the rail (node/transaction.cpp:74-84), so an over-paying transaction
+never enters the mempool and is never announced; MAX-FEE zero disables the
+rail (check_max_fee). VALIDATE-TRANSACTION-FOR-MEMPOOL is that test-accept
+half: it computes the fee without mutating the pool.
+
+A rejection reports the state's own reason with no prefix:
+BroadcastTransaction sets err_string to state.ToString() (node/transaction.cpp:
+21) and the RPC prints exactly that (rpc/util.cpp:408-414). The CODE splits on
+the result: TX_MISSING_INPUTS becomes TransactionError::MISSING_INPUTS
+(:23-25), i.e. RPC_VERIFY_ERROR -25 (rpc/util.cpp:391-401, protocol.h:54), and
+everything else -26. rpc_rawtransaction.py:354 pins the pair: -25 with
+\"bad-txns-inputs-missingorspent\"."
+  (multiple-value-bind (valid error fee replaced sigops)
+      (bl.val:validate-transaction-for-mempool
+       tx utxo-set mempool current-height :chain-state chain-state)
+    (unless valid
+      (error 'rpc-error
+             :code (if (eq error :missing-input)
+                       +rpc-verify-error+
+                       +rpc-transaction-rejected+)
+             :message (bl.val:tx-reject-reason-string error)))
+    (when (and (plusp max-fee) (> fee max-fee))
+      (error 'rpc-error :code +rpc-verify-error+
+                        :message "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"))
+    (values fee replaced sigops)))
 
 (define-rpc "sendrawtransaction" (node (hex-str))
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
@@ -830,39 +894,22 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
             ;; re-announces, with the POOL entry's wtxid. Asking VALIDATE
             ;; instead threw -26 txn-same-nonwitness-data-in-mempool where
             ;; Core answers the txid (mempool_accept_wtxid.py:82).
+            ;; Under -privatebroadcast the SUBMITTED transaction is queued
+            ;; for private broadcast either way (node/transaction.cpp:
+            ;; 134-136).
             (when (bl.mp:mempool-has mempool txid)
-              (bl:broadcast-transaction-to-peers node txid)
+              (if bl:*private-broadcast*
+                  (bl.net:initiate-tx-broadcast-private tx)
+                  (bl:broadcast-transaction-to-peers node txid))
               (return-from rpc-sendrawtransaction (hash-to-hex txid)))
-            ;; Validate transaction for mempool
-            (multiple-value-bind (valid error fee replaced sigops)
-                (bl.val:validate-transaction-for-mempool
-                 tx utxo-set mempool current-height :chain-state chain-state)
-              (unless valid
-                ;; Core reports the state's own reject reason, with no prefix
-                ;; of its own: BroadcastTransaction sets err_string to
-                ;; state.ToString() (node/transaction.cpp:21) and the RPC
-                ;; prints exactly that (rpc/util.cpp:408-414). The CODE splits
-                ;; on the result: TX_MISSING_INPUTS becomes
-                ;; TransactionError::MISSING_INPUTS (:23-25), which maps to
-                ;; RPC_TRANSACTION_ERROR = RPC_VERIFY_ERROR = -25
-                ;; (rpc/util.cpp:391-401, protocol.h:54), and everything else
-                ;; to -26. rpc_rawtransaction.py:354 pins the pair: -25 with
-                ;; "bad-txns-inputs-missingorspent".
-                (error 'rpc-error
-                       :code (if (eq error :missing-input)
-                                 +rpc-verify-error+
-                                 +rpc-transaction-rejected+)
-                       :message (bl.val:tx-reject-reason-string error)))
-              ;; Core runs ATMP with test_accept FIRST and only submits for real
-              ;; once the fee is under the rail (node/transaction.cpp:74-84), so
-              ;; an over-paying transaction never enters the mempool and is
-              ;; never announced. Our VALIDATE-TRANSACTION-FOR-MEMPOOL is
-              ;; already the test-accept half: it computes FEE without
-              ;; mutating the pool, and ACCEPT-VALIDATED-TX below is the
-              ;; submission. A zero rate disables the rail (check_max_fee).
-              (when (and (plusp max-fee) (> fee max-fee))
-                (error 'rpc-error :code +rpc-verify-error+
-                                  :message "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"))
+            (multiple-value-bind (fee replaced sigops)
+                (%sendraw-test-accept tx utxo-set mempool current-height chain-state max-fee)
+              ;; TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST: the test-accept
+              ;; above is all the mempool sees of it (node/transaction.cpp:
+              ;; 75-84, :105-106, :135-136).
+              (when bl:*private-broadcast*
+                (bl.net:initiate-tx-broadcast-private tx)
+                (return-from rpc-sendrawtransaction (hash-to-hex txid)))
               (let ((add-result (bl.mp:accept-validated-tx
                                  mempool txid tx fee current-height
                                  :sigops sigops :replaced replaced

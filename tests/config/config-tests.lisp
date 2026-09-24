@@ -434,6 +434,23 @@ merged config alist (options with no start-node keyword)."
     (is (equalp (bl.crypto:hex-to-bytes "5121ff")
                 bl.val:*signet-challenge*))))
 
+(test incrementalrelayfee-raises-an-unset-minrelaytxfee
+  "Core mempool_args.cpp:77-81: with no -minrelaytxfee, an -incrementalrelayfee
+above the minimum relay feerate raises the minimum to match; an explicit
+-minrelaytxfee is left alone. feature_rbf.py:507 restarts with
+-incrementalrelayfee=0.00000234 and asserts minrelaytxfee >= it."
+  (flet ((apply-fees (alist)
+           (let ((bl.mp:*min-relay-fee-rate* 100)
+                 (bl.mp:*incremental-relay-fee-rate* 100))
+             (apply-config-globals alist)
+             (list bl.mp:*min-relay-fee-rate* bl.mp:*incremental-relay-fee-rate*))))
+    (is (equal '(234 234) (apply-fees '(("incrementalrelayfee" . "0.00000234")))))
+    (is (equal '(100 50) (apply-fees '(("incrementalrelayfee" . "0.0000005"))))
+        "an incremental fee below the minimum changes nothing")
+    (is (equal '(150 234) (apply-fees '(("incrementalrelayfee" . "0.00000234")
+                                        ("minrelaytxfee" . "0.0000015"))))
+        "an explicit -minrelaytxfee wins")))
+
 (test config-cluster-limit-knobs
   "-limitclustercount/-limitclustersize set the cluster-limit specials that
 make-mempool reads when creating its txgraph (cluster mempool P6); the
@@ -1260,6 +1277,25 @@ twice. We used to record the bind address and start deaf on it, discarding the
                   '("-regtest")
                   (format nil "[regtest]~%bind=127.0.0.1~%listen=0~%"))))))
 
+(test blockfilterindex-values-name-filter-types
+  "Core init.cpp:972-985: -blockfilterindex=\"\"/1 enables every filter type
+and 0 none; any other value makes every value a type name, and one naming no
+type refuses startup with `Unknown -blockfilterindex value <v>.'
+(p2p_blockfilters.py:275). `basic' enables the index, which the option's
+boolean parse read as atoi's 0."
+  (is (string= "Unknown -blockfilterindex value abc."
+               (%start-node-plist-refusal "-regtest" "-blockfilterindex=abc")))
+  (is (string= "Unknown -blockfilterindex value abc."
+               (%start-node-plist-refusal "-regtest" "-blockfilterindex=basic"
+                                          "-blockfilterindex=abc")))
+  (is (eq t (getf (start-node-plist '("-regtest" "-blockfilterindex=basic"))
+                  :blockfilterindex)))
+  (is (eq t (getf (start-node-plist '("-regtest" "-blockfilterindex"))
+                  :blockfilterindex))
+      "the control: a bare -blockfilterindex enables it")
+  (is (null (getf (start-node-plist '("-regtest" "-blockfilterindex=0"))
+                  :blockfilterindex))))
+
 (test negative-maxconnections-is-an-init-error
   "GA10 32758a48. `if (user_max_connection < 0) return
 InitError(\"-maxconnections must be greater or equal than zero\")`
@@ -1767,7 +1803,10 @@ Fee rates arrive as BTC/kvB on the command line, as every other Core fee option
 does, and are stored as satoshis."
   (let ((saved (list bl.val:*dust-relay-fee-rate*
                      bl.mp:*incremental-relay-fee-rate*
-                     bl.mp:*bytes-per-sigop*)))
+                     bl.mp:*bytes-per-sigop*
+                     ;; Raised to match the incremental fee when no
+                     ;; -minrelaytxfee is given (mempool_args.cpp:77-81).
+                     bl.mp:*min-relay-fee-rate*)))
     (unwind-protect
          (progn
            (apply-config-globals
@@ -1776,6 +1815,7 @@ does, and are stored as satoshis."
               ("bytespersigop" . "40")))
            (is (= 4000 bl.val:*dust-relay-fee-rate*))
            (is (= 2000 bl.mp:*incremental-relay-fee-rate*))
+           (is (= 2000 bl.mp:*min-relay-fee-rate*))
            (is (= 40 bl.mp:*bytes-per-sigop*))
            ;; And the sigop-adjusted size actually uses the new value, which is
            ;; the point — a knob nothing reads is the failure this repo keeps
@@ -1784,7 +1824,8 @@ does, and are stored as satoshis."
                   (bl.mp:sigop-adjusted-vsize 1 3))))
       (setf bl.val:*dust-relay-fee-rate* (first saved)
             bl.mp:*incremental-relay-fee-rate* (second saved)
-            bl.mp:*bytes-per-sigop* (third saved))))
+            bl.mp:*bytes-per-sigop* (third saved)
+            bl.mp:*min-relay-fee-rate* (fourth saved))))
   ;; Malformed values are refused, not silently ignored.
   (dolist (bad '((("dustrelayfee" . "notanumber"))
                  (("incrementalrelayfee" . "x"))
@@ -2686,34 +2727,38 @@ refuses (PRIVATEBROADCAST-SENDRAWTRANSACTION-REFUSES-RATHER-THAN-BROADCASTS)."
     (is-true (bl:known-config-option-p "privatebroadcast"))
     (is-false (bl.cfg:core-only-option-p "privatebroadcast"))))
 
-(test privatebroadcast-sendrawtransaction-refuses-rather-than-broadcasts
-  "Under -privatebroadcast Core hands a sendrawtransaction to its private
-Tor/I2P queue and never to the mempool (rpc/mempool.cpp:115-131). That queue
-does not exist here, and the ordinary path would announce the transaction to
-every peer from this node's own address, so the RPC refuses: Core's own error
-when no Tor/I2P network is reachable, ours otherwise. The transaction reaches
-neither the mempool nor a peer."
+(test privatebroadcast-sendrawtransaction-test-accepts-then-queues
+  "Under -privatebroadcast Core refuses sendrawtransaction when no Tor/I2P
+network is reachable (rpc/mempool.cpp:115-124), and otherwise test-accepts the
+transaction and hands it to the private-broadcast queue, never to the mempool
+(node/transaction.cpp:74-84, :105-106, :135-136). A transaction the
+test-accept refuses is refused with the same verdict as without the option
+and queues nothing: p2p_private_broadcast.py:398 sends one whose parent is
+missing and expects -25 bad-txns-inputs-missingorspent."
   (let* ((node (make-test-node))
          ;; One input spending an outpoint nobody has, one OP_TRUE output.
          (hex (concatenate 'string "0200000001"
                            (make-string 64 :initial-element #\1)
                            "0000000000ffffffff01e8030000000000000151"
-                           "00000000")))
+                           "00000000"))
+         (verdict nil))
     (flet ((send () (rpc-error-of (lambda ()
                                     (bl.rpc:dispatch-rpc-method
                                      node "sendrawtransaction" (list hex))))))
+      (bl.net:reset-private-broadcast)
+      ;; Control: without the option the call reaches validation's verdict.
+      (let ((bl:*private-broadcast* nil))
+        (setf verdict (send))
+        (is (member (car verdict) '(-25 -26))))
       (let ((bl:*private-broadcast* t)
             (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
         (is (equal '(-1 . "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly.")
                    (send))))
       (let ((bl:*private-broadcast* t)
             (bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3)))
-        (let ((err (send)))
-          (is (eql -1 (car err)))
-          (is-true (search "does not implement private broadcast" (cdr err)))))
-      ;; Control: without the option the same call reaches validation.
-      (let ((bl:*private-broadcast* nil))
-        (is (not (equal -1 (car (send)))))))))
+        (is (equal verdict (send)))
+        (is (null (bl.net:private-broadcast-info)) "nothing was queued")
+        (is (= 0 (bl.net:private-broadcast-num-to-open)))))))
 
 (test dns-is-a-real-option
   "-dns left the accept-and-drop list (GA11 1f1f28b7). Core reads it into

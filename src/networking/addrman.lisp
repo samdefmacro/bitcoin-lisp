@@ -673,15 +673,33 @@ Returns T if newly inserted into a new bucket."
     (when (and pa (> (- now (peer-address-last-seen pa)) 1200))
       (setf (peer-address-last-seen pa) now))))
 
-(defun address-book-select (book &key new-only (now (ab-now)))
+(defun %address-book-network-counts (book networks)
+  "(values new tried): how many of BOOK's entries on NETWORKS sit in each
+table (Core's m_network_counts, summed as Select_ sums them, addrman.cpp:
+722-734). A walk of the entries: only the private-broadcast opener asks."
+  (let ((new 0) (tried 0))
+    (maphash (lambda (id pa)
+               (declare (ignore id))
+               (when (member (peer-address-network pa) networks)
+                 (if (peer-address-in-tried pa) (incf tried) (incf new))))
+             (address-book-info book))
+    (values new tried)))
+
+(defun address-book-select (book &key new-only (now (ab-now)) networks)
   "Choose an address for a new outbound connection (Core Select). Returns a
 peer-address or NIL. Picks a random bucket+position, biased toward higher-quality
-entries via GetChance; alternates new/tried roughly 50/50 when both are present."
+entries via GetChance; alternates new/tried roughly 50/50 when both are present.
+NETWORKS, when given, restricts the pick to entries on those networks (Core
+Select's `networks' argument, addrman.cpp:713-800)."
   (maybe-check-address-book book)
   (when (zerop (fill-pointer (address-book-random-ids book)))
     (return-from address-book-select nil))
-  (let ((have-new (> (address-book-n-new book) 0))
-        (have-tried (> (address-book-n-tried book) 0)))
+  (multiple-value-bind (n-new n-tried)
+      (if networks
+          (%address-book-network-counts book networks)
+          (values (address-book-n-new book) (address-book-n-tried book)))
+  (let ((have-new (> n-new 0))
+        (have-tried (> n-tried 0)))
     (when (and new-only (not have-new)) (return-from address-book-select nil))
     (unless (or have-new have-tried) (return-from address-book-select nil))
     (let ((search-tried (cond ((or new-only (not have-tried)) nil)
@@ -705,12 +723,24 @@ entries via GetChance; alternates new/tried roughly 50/50 when both are present.
                                                             +addrman-bucket-size+)))))
                (when (>= id 0)
                  (let ((pa (gethash id (address-book-info book))))
-                   (when (and pa (< (random 1.0d0) (* chance (addr-info-chance pa now))))
+                   (when (and pa
+                              (or (null networks)
+                                  (member (peer-address-network pa) networks))
+                              (< (random 1.0d0) (* chance (addr-info-chance pa now))))
                      (return-from address-book-select pa))))))
            (setf chance (* chance 1.2d0))))
        (let ((v (address-book-random-ids book)))
-         (when (plusp (fill-pointer v))
-           (gethash (aref v (random (fill-pointer v))) (address-book-info book))))))))
+         (if networks
+             (let ((ids (loop for i below (fill-pointer v)
+                              for id = (aref v i)
+                              when (member (peer-address-network
+                                            (gethash id (address-book-info book)))
+                                           networks)
+                                collect id)))
+               (when ids
+                 (gethash (nth (random (length ids)) ids) (address-book-info book))))
+             (when (plusp (fill-pointer v))
+               (gethash (aref v (random (fill-pointer v))) (address-book-info book))))))))))
 
 (defun select-dialable-address (book &key new-only (tries 20))
   "address-book-select restricted to AUTOMATIC-outbound-eligible addresses:

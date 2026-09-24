@@ -511,6 +511,7 @@ thread; see the shutdown-coordination section above."
   ;; told to (Core stops the scheduler with the rest of the node,
   ;; init.cpp:405-410).
   (stop-addcon-thread)
+  (stop-private-broadcast-thread)
   (stop-scheduler-thread)
 
   ;; Disconnect all peers

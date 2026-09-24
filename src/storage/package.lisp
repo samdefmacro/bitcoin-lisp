@@ -142,6 +142,7 @@ src/storage/.")
    #:derive-target
    #:target-to-bits
    #:calculate-chain-work
+   #:block-proof-equivalent-time
    #:calculate-next-work-required
    ;; Difficulty constants
    #:+difficulty-adjustment-interval+
@@ -180,6 +181,8 @@ src/storage/.")
    #:entry-target-ancestor-p
    #:chain-state-target-height
    #:best-header-entry
+   #:mark-entry-failed
+   #:clear-entry-failure
    #:recalculate-best-header
    ;; Per-chainstate coins-view lifecycle
    #:open-chainstate-coins-view

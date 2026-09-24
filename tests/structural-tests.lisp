@@ -2227,3 +2227,17 @@ from under it: the reader must hand back the tree, not the poison."
           *source-corpus-stamp* stale)
     (is-false (member "zzz-poison-export" (%orphan-exported-functions) :test #'string=)
               "%ORPHAN-EXPORTED-FUNCTIONS must re-run after the stamp moved")))
+
+(test one-received-message-log-line
+  "Core writes `received: <type> (<n> bytes) peer=<id>' from exactly one place,
+ProcessMessages, over the SanitizeString'd type (net_processing.cpp:3582).
+Ours is LOG-RECEIVED-MESSAGE; a second copy of the format string is how
+dispatch-ibd-message came to log the raw command bytes. The control is the one
+occurrence itself."
+  (let* ((text (%source-text))
+         (needle "\"received: ~a (~d bytes) peer=~a\"")
+         (count (loop with start = 0
+                      for at = (search needle text :start2 start)
+                      while at do (setf start (1+ at))
+                      count t)))
+    (is (= 1 count) "~D copies of the received-message format in src/" count)))

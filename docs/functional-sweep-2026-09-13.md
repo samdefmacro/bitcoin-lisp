@@ -1103,12 +1103,10 @@ BIP 30 at every height.
   addr token bucket that drops addresses and the send-buffer pause remain.
   The rationale lives in the two commit bodies, and the manual's p2p
   invariants say the same since `88d96f06`.
-- **`-privatebroadcast` refuses sendrawtransaction rather than queueing** --
-  the private-broadcast mechanism is not ported, and the ordinary path would
-  announce from this node's own address, the act the option exists to
-  prevent (`37b29646`; the comment at the option in
-  [src/config-options.lisp](../src/config-options.lisp),
-  `%CHECK-PRIVATE-BROADCAST-OPTION` in [src/node/args.lisp](../src/node/args.lisp)).
+- ~~**`-privatebroadcast` refuses sendrawtransaction rather than queueing**~~
+  -- reversed in Round 8: Core's private broadcast is ported
+  (networking/private-broadcast.lisp, node/private-broadcast.lisp) and
+  sendrawtransaction queues as Core does; p2p_private_broadcast.py passes.
 - **`Checking all blk files are present` is not logged**: the block index
   keeps no per-entry data flag or file number to check against, so the line
   would describe a check that did not run; `feature_init` `:93` stays red

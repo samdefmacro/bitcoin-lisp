@@ -504,6 +504,45 @@ reconsider-block clears the flags and reorgs back to the best valid chain."
        (is (null ok)) (is (eq :cannot-invalidate-genesis reason)))
      (clear-undo-cache))))
 
+(test reconsiderblock-keeps-the-validity-level-a-block-had
+  "Core ResetBlockFailureFlags clears only BLOCK_FAILED_MASK
+(validation.cpp:3754-3784): a block that reached BLOCK_VALID_SCRIPTS before it
+was invalidated is SCRIPTS-valid again after reconsiderblock, even when it is
+left off the active chain -- still servable (BlockRequestAllowed wants
+BLOCK_VALID_SCRIPTS) and connectable without re-validation. Ours set every
+reconsidered entry to :header-valid."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture "reconsider-level")
+      (let ((a-hashes (make-test-chain-hashes #xA1 4))
+            (b-hashes (make-test-chain-hashes #xB1 5)))
+        (build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
+        (flet ((status (h) (bl.store:block-index-entry-status
+                            (bl.store:get-block-index-entry chain-state h))))
+          (is (eq :valid (status (third a-hashes))) "the control: A3 was connected")
+          (bl.val:invalidate-block chain-state block-store utxo-set (third a-hashes))
+          (is (eq :invalid (status (third a-hashes))))
+          ;; A heavier chain B1..B5 takes over, so reconsidering A3 leaves the
+          ;; A branch where it is.
+          (let ((prev genesis-hash))
+            (loop for h from 1 to 4
+                  for block-hash in b-hashes
+                  do (let ((block (make-reorg-test-block prev block-hash h)))
+                       (bl.store:store-block block-store block)
+                       (bl.val:connect-block block chain-state block-store utxo-set)
+                       (setf prev block-hash)))
+            (let ((block (make-reorg-test-block prev (fifth b-hashes) 5)))
+              (bl.store:store-block block-store block)
+              (bl.val:activate-block block chain-state block-store utxo-set
+                                     :skip-scripts t)))
+          (is (= 5 (bl.store:current-height chain-state)))
+          (bl.val:reconsider-block chain-state block-store utxo-set (third a-hashes))
+          (is (= 5 (bl.store:current-height chain-state)) "B stays active")
+          (is (eq :valid (status (third a-hashes)))
+              "A3 is SCRIPTS-valid again, got ~S" (status (third a-hashes)))
+          (is (eq :valid (status (fourth a-hashes))))))
+      (clear-undo-cache))))
+
 (test invalidate-block-activates-the-best-chain-that-is-still-valid
   "Core's invalidateblock is TWO steps: InvalidateBlock, which disconnects back
 to the invalidated block's parent and marks the branch failed, and then
@@ -602,6 +641,28 @@ equal-work forks."
               chain-state block-store utxo-set
               (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE))
            (is (null ok)) (is (eq :block-not-found reason)))))
+     (clear-undo-cache))))
+
+(test preciousblock-of-an-invalidated-block-is-a-no-op
+  "Core PreciousBlock (validation.cpp:3522-3550) inserts the block into the
+candidate set only when it is valid, then runs ActivateBestChain: an
+invalidated block is never activated and the call SUCCEEDS.
+p2p_orphan_handling.py:271 invalidates the tip, preciousblocks it, and expects
+no error -- we answered reorg-failed."
+  (with-network (:mainnet)
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (make-activate-block-fixture "precious-invalid")
+     (let ((hashes (make-test-chain-hashes #xA3 2)))
+       (build-and-connect chain-state block-store utxo-set genesis-hash hashes)
+       (is (eq t (bl.val:invalidate-block chain-state block-store utxo-set
+                                          (second hashes))))
+       (is (= 1 (bl.store:current-height chain-state)))
+       (multiple-value-bind (ok reason)
+           (bl.val:precious-block chain-state block-store utxo-set (second hashes))
+         (is (eq t ok))
+         (is (null reason)))
+       (is (equalp (first hashes) (bl.store:best-block-hash chain-state))
+           "the invalid block is not reconnected"))
      (clear-undo-cache))))
 
 (test rpc-verifychain-reads-stored-blocks

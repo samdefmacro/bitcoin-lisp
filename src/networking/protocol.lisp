@@ -160,8 +160,7 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     ;; DISPATCH below must keep using the RAW command -- sanitizing drops
     ;; characters rather than escaping them, so "bl<LF>ock" would sanitize to
     ;; "block" and a forged command name would reach a real handler.
-    (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
-                (bl.bytes:sanitize-string command) (length payload) (peer-id peer))
+    (log-received-message peer command payload)
     ;; No per-command message count is checked here: Core disconnects a peer
     ;; for how many messages of a kind it sends for none of them
     ;; (net_processing.cpp ProcessMessage). Its bounds are per message, in the
@@ -1191,19 +1190,23 @@ peer that floods us with invs and orphans from filling the orphanage
       (bl.mp:orphan-add pool otx peer)
       t)))
 
-(defun %orphan-missing-parents (otx mempool utxo-set recent-rejects)
-  "OTX's parents that are worth requesting: the ones in neither the UTXO set
-nor the mempool, minus everything AlreadyHaveTx already covers -- the
-orphanage and the recently-confirmed filter above all (Core's
-std::erase_if(unique_parents, AlreadyHaveTx(...)),
-txdownloadman_impl.cpp:391-396). INCLUDE-RECONSIDERABLE stays false there and
-here: a parent rejected for too low a feerate is exactly the one this orphan
-may be able to fee-bump."
+(defun %orphan-missing-parents (otx mempool recent-rejects)
+  "OTX's parents that are worth requesting: all of its unique parents, minus
+everything AlreadyHaveTx covers -- the orphanage, the recently-confirmed filter,
+the rejects and the mempool (Core's std::erase_if(unique_parents,
+AlreadyHaveTx(...)), txdownloadman_impl.cpp:391-396). INCLUDE-RECONSIDERABLE
+stays false there and here: a parent rejected for too low a feerate is exactly
+the one this orphan may be able to fee-bump.
+
+The UTXO set is deliberately NOT consulted, as Core does not consult it: a
+parent confirmed long enough ago to have left the recently-confirmed filter is
+requested too. p2p_orphan_handling.py:295 expects exactly that getdata; we
+dropped every parent with a coin in the UTXO set."
   (remove-if (lambda (ptxid)
                (%already-have-tx-p ptxid nil mempool recent-rejects))
-             (missing-parent-txids otx utxo-set mempool)))
+             (unique-parent-txids otx)))
 
-(defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool utxo-set
+(defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool
                                                recent-rejects num-wtxid-peers)
   "A wtxid announcement matched a stored orphan: treat PEER as an orphan-
 resolution candidate instead of requesting the announced tx again (Core
@@ -1211,8 +1214,7 @@ AddTxAnnouncement's orphan branch, txdownloadman_impl.cpp:172-190)."
   (let ((otx (bl.mp:orphan-tx (bl.mp:mempool-orphan-pool mempool)
                               orphan-wtxid)))
     (when otx
-      (let ((parents (%orphan-missing-parents otx mempool utxo-set
-                                              recent-rejects)))
+      (let ((parents (%orphan-missing-parents otx mempool recent-rejects)))
         ;; All parents accepted/rejected since the orphan was stored: nothing
         ;; to resolve from this peer (the orphan awaits reprocessing), which
         ;; is Core's early return at :182-185.
@@ -1309,7 +1311,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                           (bl.mp:mempool-orphan-pool mempool)
                           hash))
                     (%maybe-add-orphan-resolution-candidate
-                     peer hash mempool utxo-set recent-rejects num-wtxid-peers))
+                     peer hash mempool recent-rejects num-wtxid-peers))
                    ;; include-reconsiderable: a tx whose last failure was
                    ;; reconsiderable must not be requested to be submitted
                    ;; alone again (Core AddTxAnnouncement, :199).
@@ -2280,23 +2282,18 @@ by TXID, so the cascade work list carries txids."
                        ;; attempted here (net_processing.cpp:3207-3211).
                        (%cache-tx-rejection otx error recent-rejects))))))))))))
 
-(defun missing-parent-txids (tx utxo-set mempool)
-  "Deduplicated txids of TX's inputs found in neither the UTXO set nor the
-mempool — the parents whose absence makes TX an orphan (Core GetUniqueParents,
-txdownloadman_impl.cpp:333-348, minus the already-have filter its callers
-apply)."
-  (let ((seen (make-hash-table :test 'equalp))
-        (parents '()))
+(defun unique-parent-txids (tx)
+  "Core GetUniqueParents (txdownloadman_impl.cpp:335-347): the txids TX's
+inputs spend, deduplicated and sorted as Core sorts them (uint256 order, a
+byte-wise compare of the wire-order bytes). Nothing is filtered here; the
+callers apply AlreadyHaveTx and the rejected-parents scan."
+  (let ((parents '()))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
-      (let* ((prevout (bl.ser:tx-in-previous-output input))
-             (ptxid (bl.ser:outpoint-hash prevout))
-             (pidx (bl.ser:outpoint-index prevout)))
-        (unless (or (gethash ptxid seen)
-                    (bl.store:get-utxo utxo-set ptxid pidx)
-                    (bl.mp:mempool-has mempool ptxid))
-          (setf (gethash ptxid seen) t)
-          (push ptxid parents))))
-    (nreverse parents)))
+      (pushnew (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output input))
+               parents :test #'equalp))
+    (sort parents (lambda (a b)
+                    (let ((i (mismatch a b)))
+                      (and i (< (aref a i) (aref b i))))))))
 
 (defun request-orphan-parents (peer parent-txids &optional (num-wtxid-peers 0))
   "Register an orphan's missing PARENT-TXIDS with the tx-request tracker as
@@ -2479,7 +2476,7 @@ alternative announcer."
         (pushnew p candidates :test #'eq)))
     (nreverse candidates)))
 
-(defun %take-orphan-into-orphanage (peer tx mempool utxo-set recent-rejects peers)
+(defun %take-orphan-into-orphanage (peer tx mempool recent-rejects peers)
   "Core MempoolRejectedTx's orphan branch (txdownloadman_impl.cpp:391-420) in
 its order: filter the missing parents through AlreadyHaveTx, enrol EVERY
 announcer of the orphan as a resolution candidate rather than only the peer
@@ -2490,7 +2487,7 @@ enrolment possible at all: forgetting the hash at receipt, as this used to,
 left GetCandidatePeers nothing to find."
   (let* ((txid (bl.ser:transaction-hash tx))
          (wtxid (bl.ser:transaction-wtxid tx))
-         (parents (%orphan-missing-parents tx mempool utxo-set recent-rejects))
+         (parents (%orphan-missing-parents tx mempool recent-rejects))
          (num-wtxid-peers (count-wtxid-relay-peers peers)))
     ;; The delivering peer knows the parents: it just sent us a child that
     ;; spends them, so announcing them back to it is wasted egress (Core
@@ -2506,9 +2503,9 @@ left GetCandidatePeers nothing to find."
                                         num-wtxid-peers))
     (tx-request-forget-tx txid wtxid)))
 
-(defun %orphan-parents-rejected-p (parent-txids recent-rejects)
+(defun %orphan-parents-rejected-p (parent-txids mempool recent-rejects)
   "Core's fRejectedParents scan (txdownloadman_impl.cpp:371-396): T when an
-orphan with these MISSING PARENT-TXIDS must not be kept at all.
+orphan with these unique PARENT-TXIDS must not be kept at all.
 
 A parent in the MAIN rejects filter is fatal — no witness and no package can
 make this child acceptable. A parent in the RECONSIDERABLE filter is NOT: it
@@ -2516,13 +2513,14 @@ may be precisely the low-feerate parent this child exists to fee-bump. Core
 tolerates exactly ONE such parent, because it only submits 1-parent-1-child
 packages, so a second one could never be rescued.
 
-PARENT-TXIDS are already the parents missing from both the UTXO set and the
-mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
+A reconsiderable parent that has since entered MEMPOOL does not count
+(Core's `!m_opts.m_mempool.exists(parent_txid)`)."
   (let ((reconsiderable 0))
     (dolist (ptxid parent-txids nil)
       (cond ((bl:recent-reject-p recent-rejects ptxid)
              (return t))
-            ((bl.val:reconsiderable-reject-p ptxid)
+            ((and (bl.val:reconsiderable-reject-p ptxid)
+                  (not (bl.mp:mempool-has mempool ptxid)))
              (when (> (incf reconsiderable) 1)
                (return t)))))))
 
@@ -2623,6 +2621,9 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
           ;; id THIS peer's inventory uses, which is what the relay path
           ;; looks up.
           (%mark-tx-known-to-peer peer (%peer-inv-hash peer txid wtxid))
+          ;; One of ours we are broadcasting privately came back from
+          ;; the network: stop (net_processing.cpp:4494-4503).
+          (note-own-tx-received-back peer tx)
           ;; A transaction we ALREADY HAVE, from a peer holding
           ;; ForceRelay: relay it onward anyway. Core's ReceivedTx answers
           ;; should_validate=false for anything AlreadyHaveTx knows -- the
@@ -2694,8 +2695,8 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                 ;; the txid too, so non-wtxidrelay peers can't make us
                 ;; re-download it).
                 ((eq error :missing-input)
-                 (let ((parents (missing-parent-txids tx utxo-set mempool)))
-                   (if (%orphan-parents-rejected-p parents recent-rejects)
+                 (let ((parents (unique-parent-txids tx)))
+                   (if (%orphan-parents-rejected-p parents mempool recent-rejects)
                        (progn
                          ;; Core's line (:423-425); p2p_invalid_tx.py:153
                          ;; waits for it.
@@ -2707,7 +2708,7 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                          ;; :434-435, beside the two filter inserts.
                          (tx-request-forget-tx txid wtxid))
                        (%take-orphan-into-orphanage
-                        peer tx mempool utxo-set recent-rejects peers))))
+                        peer tx mempool recent-rejects peers))))
                 (t
                  ;; Cache the failure so we don't re-request it (see
                  ;; %cache-tx-rejection for which filter and which ids).
@@ -2767,21 +2768,6 @@ tells the asker exactly which forks this node witnessed and kept.")
   "Core NODE_NETWORK_LIMITED_MIN_BLOCKS (net_processing.cpp:154): a
 NODE_NETWORK_LIMITED peer promises the last 288 blocks and nothing more.")
 
-(defun %block-proof-equivalent-time (to-work from-work tip-bits)
-  "Core GetBlockProofEquivalentTime (chain.cpp:136-151): how long the work
-difference between two entries would take at the TIP's difficulty. Signed —
-negative when TO has less work than FROM.
-
-This is the half of the staleness test that a timestamp cannot forge. A header's
-nTime is attacker-influenced within the median-time-past and 2-hour windows, so
-an age test on timestamps alone can be talked out of; the work difference
-cannot be."
-  (let* ((tip-proof (max 1 (bl.store:calculate-chain-work tip-bits 0)))
-         (sign (if (> to-work from-work) 1 -1))
-         (r (abs (- to-work from-work)))
-         (spacing (block-interval-seconds)))
-    (* sign (floor (* r spacing) tip-proof))))
-
 (defun %block-request-allowed-p (chain-state entry best-header)
   "Core PeerManagerImpl::BlockRequestAllowed (net_processing.cpp:1953-1960).
 
@@ -2810,10 +2796,7 @@ because an old side-chain block is a fingerprint, not a service."
            (< (- (bl.ser:block-header-timestamp best-hdr)
                  (bl.ser:block-header-timestamp header))
               +stale-relay-age-limit+)
-           (< (%block-proof-equivalent-time
-               (bl.store:block-index-entry-chain-work best-header)
-               (bl.store:block-index-entry-chain-work entry)
-               (bl.ser:block-header-bits best-hdr))
+           (< (bl.store:block-proof-equivalent-time best-header entry best-header)
               +stale-relay-age-limit+)))))
 
 (defun %below-network-limited-threshold-p (chain-state entry &optional peer)
@@ -3156,98 +3139,140 @@ off (-peerblockfilters absent) or the index is unavailable."
        (let ((bfi (bl:node-blockfilterindex bl:*node*)))
          (and bfi (bl.store:blockfilterindex-enabled bfi) bfi))))
 
-(defun %cf-active-hash (chain-state height)
-  "Hash of the ACTIVE-chain block at HEIGHT, or NIL."
-  (let ((e (bl.store:get-block-at-height chain-state height)))
-    (and e (bl.store:block-index-entry-hash e))))
+(defun %prepare-block-filter-request (peer chain-state filter-type start-height
+                                      stop-hash max-height-diff)
+  "Core PrepareBlockFilterRequest (net_processing.cpp:3265-3316): the stop
+block's index entry and the filter index to answer from, as two values, or NIL
+when the request is not served. In Core's order, each refusal but the last
+DISCONNECTS the peer with Core's debug line: a filter type other than basic,
+or any type when we do not offer this peer NODE_COMPACT_FILTERS; a stop hash
+that is unknown or that BlockRequestAllowed would not serve (a recent stale
+block IS served -- p2p_blockfilters.py:116 asks for one); a start height above
+the stop height; a span of MAX-HEIGHT-DIFF blocks or more. A missing filter
+index answers nothing.
 
-(defun %cf-request-stop-height (chain-state start-height stop-hash max-diff)
-  "Validate a BIP157 request (Core PrepareBlockFilterRequest): STOP-HASH must be
-a known block on the ACTIVE chain, START-HEIGHT <= stop height, and the span
-under MAX-DIFF. Returns the stop height, or NIL. (Core also serves recent fork
-blocks via GetAncestor; we serve the active chain only -- the light-client case.)"
-  (let ((entry (bl.store:get-block-index-entry chain-state stop-hash)))
-    (when entry
-      (let* ((stop-height (bl.store:block-index-entry-height entry))
-             (active (%cf-active-hash chain-state stop-height)))
-        (when (and active (equalp active stop-hash)
-                   (<= start-height stop-height)
-                   (< (- stop-height start-height) max-diff))
-          stop-height)))))
+We used to serve the active chain only and drop every bad request silently,
+so a light client that asked a wrong question waited forever instead of being
+told by the disconnect."
+  (flet ((refuse (control &rest args)
+           (bl:log-cat "net" "~?, ~A" control args (disconnect-msg peer))
+           (disconnect-peer peer)
+           (return-from %prepare-block-filter-request nil)))
+    (unless (and (eql filter-type 0)
+                 (logtest (peer-our-services peer) bl.ser:+node-compact-filters+))
+      (refuse "peer requested unsupported block filter type: ~D" filter-type))
+    (let ((stop (bl.store:get-block-index-entry chain-state stop-hash)))
+      (unless (and stop (%block-request-allowed-p
+                         chain-state stop (bl.store:best-header-entry chain-state)))
+        (refuse "peer requested invalid block hash: ~A"
+                (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes stop-hash))))
+      (let ((stop-height (bl.store:block-index-entry-height stop)))
+        (when (> start-height stop-height)
+          (refuse "peer sent invalid getcfilters/getcfheaders with start height ~D ~
+and stop height ~D" start-height stop-height))
+        (when (>= (- stop-height start-height) max-height-diff)
+          (refuse "peer requested too many cfilters/cfheaders: ~D / ~D"
+                  (1+ (- stop-height start-height)) max-height-diff)))
+      (let ((bfi (%cf-serving-index)))
+        (if bfi
+            (values stop bfi)
+            (bl:log-cat "net" "Filter index for supported type basic not found"))))))
+
+(defun %cf-chain-accessor (chain-state stop)
+  "A function from a height to the hash of STOP's ancestor there, or NIL (Core
+GetAncestor, as LookupFilterRange and ProcessGetCFCheckPt use it), so a stale
+stop block is
+answered from its own branch. The branch below STOP is walked once, down to
+where it rejoins the active chain; every height at or below that is an O(1)
+active-chain lookup, which keeps a getcfcheckpt at the mainnet tip from
+walking the whole chain."
+  (let ((branch '())
+        (e stop))
+    (loop while (and e (not (bl.store:entry-on-active-chain-p chain-state e)))
+          do (push e branch)
+             (setf e (bl.store:block-index-entry-prev-entry e)))
+    (let ((fork-height (if e (bl.store:block-index-entry-height e) -1))
+          (branch (coerce branch 'vector)))
+      (lambda (height)
+        (let ((entry (if (<= height fork-height)
+                         (bl.store:get-block-at-height chain-state height)
+                         (let ((i (- height fork-height 1)))
+                           (and (< -1 i (length branch)) (aref branch i))))))
+          (and entry (bl.store:block-index-entry-hash entry)))))))
+
+(defun %cf-range-filters (at bfi start-height stop-height)
+  "((hash . filter) ...) for every height START-HEIGHT..STOP-HEIGHT through the
+ancestor accessor AT, or NIL when any filter is missing -- Core's
+LookupFilterRange / LookupFilterHashRange, which fail the whole request then."
+  (loop for h from start-height to stop-height
+        for bh = (funcall at h)
+        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
+        unless filter do (return nil)
+        collect (cons bh filter)))
 
 (define-p2p-handler "getcfilters" (peer payload ctx)
-  "Serve a BIP157 getcfilters: one cfilter message per block in the requested
-range, from the block filter index. Silently ignored when serving is disabled
-or the request is invalid (Core disconnects; we drop the request)."
+  "Serve a BIP157 getcfilters (Core ProcessGetCFilters, net_processing.cpp:
+3318-3344): one cfilter per block from START-HEIGHT to the stop block, along
+the stop block's chain, or nothing when a filter is missing."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((bfi (%cf-serving-index)))
-    (when bfi
-      (multiple-value-bind (ftype start-height stop-hash)
-          (bl.ser:parse-getcfilters-payload payload)
-        (when (and ftype (zerop ftype))   ; type 0 = basic
-          (let ((stop-height (%cf-request-stop-height
-                              chain-state start-height stop-hash
-                              +max-getcfilters-size+)))
-            (when stop-height
-              (loop for h from start-height to stop-height
-                    for bh = (%cf-active-hash chain-state h)
-                    for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
-                    while filter
-                    do (send-message
-                        peer (bl.ser:make-cfilter-message
-                              0 bh filter)))))))))))
+    (multiple-value-bind (ftype start-height stop-hash)
+        (bl.ser:parse-getcfilters-payload payload)
+      (multiple-value-bind (stop bfi)
+          (%prepare-block-filter-request peer chain-state ftype start-height
+                                         stop-hash +max-getcfilters-size+)
+        (when stop
+          (loop for (bh . filter)
+                  in (%cf-range-filters (%cf-chain-accessor chain-state stop) bfi
+                                        start-height (bl.store:block-index-entry-height stop))
+                do (send-message peer (bl.ser:make-cfilter-message 0 bh filter))))))))
 
 (define-p2p-handler "getcfheaders" (peer payload ctx)
-  "Serve a BIP157 getcfheaders: the previous filter header at START-1 (zeros at
-genesis) plus the per-block filter HASHES for the range, in one cfheaders."
+  "Serve a BIP157 getcfheaders (Core ProcessGetCFHeaders, net_processing.cpp:
+3346-3386): the filter header of the stop block's ancestor at START-1 (zeros
+at genesis) plus the filter HASHES from START-HEIGHT to the stop block."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((bfi (%cf-serving-index)))
-    (when bfi
-      (multiple-value-bind (ftype start-height stop-hash)
-          (bl.ser:parse-getcfilters-payload payload)
-        (when (and ftype (zerop ftype))
-          (let ((stop-height (%cf-request-stop-height
-                              chain-state start-height stop-hash
-                              +max-getcfheaders-size+)))
-            (when stop-height
-              (let ((prev-header (make-array 32 :element-type '(unsigned-byte 8)
-                                                :initial-element 0)))
-                (when (plusp start-height)
-                  (let* ((ph (%cf-active-hash chain-state (1- start-height)))
-                         (hdr (and ph (bl.store:blockfilterindex-get-header bfi ph))))
-                    (unless hdr (return-from handle-getcfheaders))
-                    (setf prev-header hdr)))
-                (let ((hashes '()))
-                  (loop for h from start-height to stop-height
-                        for bh = (%cf-active-hash chain-state h)
-                        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
-                        do (unless filter (return-from handle-getcfheaders))
-                           (push (bl.crypto:hash256 filter) hashes))
-                  (send-message
-                   peer (bl.ser:make-cfheaders-message
-                         0 stop-hash prev-header (nreverse hashes)))))))))))))
+    (multiple-value-bind (ftype start-height stop-hash)
+        (bl.ser:parse-getcfilters-payload payload)
+      (multiple-value-bind (stop bfi)
+          (%prepare-block-filter-request peer chain-state ftype start-height
+                                         stop-hash +max-getcfheaders-size+)
+        (when stop
+          (let* ((at (%cf-chain-accessor chain-state stop))
+                 (prev-header
+                   (if (plusp start-height)
+                       (let ((ph (funcall at (1- start-height))))
+                         (or (and ph (bl.store:blockfilterindex-get-header bfi ph))
+                             (return-from handle-getcfheaders)))
+                       (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (filters (%cf-range-filters at bfi start-height
+                                             (bl.store:block-index-entry-height stop))))
+            (when filters
+              (send-message
+               peer (bl.ser:make-cfheaders-message
+                     0 stop-hash prev-header
+                     (mapcar (lambda (f) (bl.crypto:hash256 (cdr f))) filters))))))))))
 
 (define-p2p-handler "getcfcheckpt" (peer payload ctx)
-  "Serve a BIP157 getcfcheckpt: the filter header at every 1000th block up to
-the stop hash."
+  "Serve a BIP157 getcfcheckpt (Core ProcessGetCFCheckPt, net_processing.cpp:
+3388-3421): the filter header at every 1000th height of the stop block's
+chain, up to the stop block."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((bfi (%cf-serving-index)))
-    (when bfi
-      (multiple-value-bind (ftype stop-hash)
-          (bl.ser:parse-getcfcheckpt-payload payload)
-        (when (and ftype (zerop ftype))
-          (let ((stop-height (%cf-request-stop-height
-                              chain-state 0 stop-hash most-positive-fixnum)))
-            (when stop-height
-              (let ((headers '()))
-                (loop for h from +cfcheckpt-interval+ to stop-height by +cfcheckpt-interval+
-                      for bh = (%cf-active-hash chain-state h)
-                      for hdr = (and bh (bl.store:blockfilterindex-get-header bfi bh))
-                      do (unless hdr (return-from handle-getcfcheckpt))
-                         (push hdr headers))
-                (send-message
-                 peer (bl.ser:make-cfcheckpt-message
-                       0 stop-hash (nreverse headers))))))))))))
+    (multiple-value-bind (ftype stop-hash)
+        (bl.ser:parse-getcfcheckpt-payload payload)
+      (multiple-value-bind (stop bfi)
+          (%prepare-block-filter-request peer chain-state ftype 0 stop-hash
+                                         (1- (expt 2 32)))
+        (when stop
+          (let* ((at (%cf-chain-accessor chain-state stop))
+                 (headers
+                  (loop for h from +cfcheckpt-interval+
+                          to (bl.store:block-index-entry-height stop)
+                          by +cfcheckpt-interval+
+                        for bh = (funcall at h)
+                        collect (or (and bh (bl.store:blockfilterindex-get-header bfi bh))
+                                    (return-from handle-getcfcheckpt)))))
+            (send-message
+             peer (bl.ser:make-cfcheckpt-message 0 stop-hash headers))))))))
 
 (defconstant +max-blocktxn-depth+ 10
   "Core MAX_BLOCKTXN_DEPTH (net_processing.cpp:140). Deeper than this we refuse

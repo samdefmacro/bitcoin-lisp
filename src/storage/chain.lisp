@@ -715,6 +715,26 @@ Work = 2^256 / (target + 1)"
          (work (target-to-work target)))
     (+ prev-work work)))
 
+(defun block-proof-equivalent-time (to from tip)
+  "Core GetBlockProofEquivalentTime (chain.cpp:136-151): how long the chain-work
+difference between the index entries TO and FROM would take to produce at TIP's
+difficulty, in seconds. Signed -- negative when TO has less work than FROM.
+Core saturates at the int64 range; an integer here needs no clamp.
+
+A header's nTime is attacker-influenced within the median-time-past and
+two-hour windows, so an age test on timestamps alone can be talked out of; the
+work difference cannot be. Net_processing asks it whether an old side-chain
+block may be served, ConnectBlock whether the assumevalid skip is buried deep
+enough."
+  (let ((to-work (block-index-entry-chain-work to))
+        (from-work (block-index-entry-chain-work from)))
+    (* (if (> to-work from-work) 1 -1)
+       (floor (* (abs (- to-work from-work))
+                 (bl.chain:chain-pow-target-spacing bl.chain:*network*))
+              (max 1 (calculate-chain-work
+                      (bl.ser:block-header-bits (block-index-entry-header tip))
+                      0))))))
+
 (defun target-to-bits (target)
   "Convert a full 256-bit target to compact 'bits' representation.
 Inverse of bits-to-target. Matches Bitcoin Core's GetCompact()."

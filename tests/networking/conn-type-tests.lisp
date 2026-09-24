@@ -159,3 +159,41 @@ offer the expected services' lines where Core writes nine."
                "and so is a feeler")
       (is-true (handshake :addr-fetch full)
                "control: an addr-fetch peer that does offer the services connects"))))
+
+(test feeler-handshake-ends-at-our-verack
+  "Core's VERSION handler sends VERACK and then disconnects a feeler
+(net_processing.cpp:3744, :3807-3811): it never waits for the peer's VERACK.
+Ours waited up to 30 s for it, so a peer that withheld it held the feeler --
+p2p_sendtxrcncl.py's feeler step (a P2PFeelerReceiver sends only its version)
+took 30 s. The control is a full-relay outbound on the same script: it still
+needs the peer's VERACK and fails without one."
+  (flet ((handshake (conn-type)
+           (let* ((peer (bl.net:make-peer :id 90 :address "20.0.0.1"))
+                  (script (list (lambda ()
+                                  (values "version"
+                                          (bl.ser:make-version-message-bytes
+                                           :services (logior bl.ser:+node-network+
+                                                             bl.ser:+node-witness+)
+                                           :relay t)))))
+                  (sent '())
+                  (real-send (fdefinition 'bl.net:send-message))
+                  (real-receive (fdefinition 'bl.net:receive-message-blocking)))
+             (unwind-protect
+                  (progn
+                    (setf (fdefinition 'bl.net:send-message)
+                          (lambda (p m) (declare (ignore p)) (push m sent) t)
+                          (fdefinition 'bl.net:receive-message-blocking)
+                          (lambda (p &key timeout)
+                            (declare (ignore p timeout))
+                            (let ((next (pop script)))
+                              (if next (funcall next) (values nil nil)))))
+                    (list (bl.net:perform-handshake peer :conn-type conn-type :try-v2 nil)
+                          (string-right-trim (list (code-char 0))
+                                             (map 'string #'code-char
+                                                  (subseq (first sent) 4 16)))))
+               (setf (fdefinition 'bl.net:send-message) real-send
+                     (fdefinition 'bl.net:receive-message-blocking) real-receive)))))
+    (is (equal '(t "verack") (handshake :feeler))
+        "a feeler is done once its VERACK is out")
+    (is (null (first (handshake :outbound-full-relay)))
+        "the control: a full-relay handshake still waits for the peer's VERACK")))

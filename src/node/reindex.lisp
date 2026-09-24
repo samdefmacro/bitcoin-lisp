@@ -1,10 +1,38 @@
 (in-package #:bitcoin-lisp)
 
+(defun %reindex-connect-block (cs utxo blk hash height)
+  "Reconnect the stored block BLK (HASH, at HEIGHT) during -reindex-chainstate:
+T once its UTXO effects are applied and the tip moved to it, NIL (logged) when
+it no longer validates, which ends the replay one short.
+
+Core's -reindex-chainstate reconnects every block through ConnectBlock
+(validation.cpp:2342-2502), so its scripts are verified unless the assumevalid
+predicate lets them be skipped, and that verdict is logged as on any other
+connect (feature_assumevalid.py:234 reads it after a reindex). Applying the
+block removes the spent prevouts and adds the spendable outputs (the
+unspendable skip lives in apply-block-to-utxo-set); its undo list is dropped,
+the on-disk undo files being unchanged."
+  (multiple-value-bind (valid error)
+      (bl.val:validate-block
+       blk cs utxo height (bl.ser:get-unix-time)
+       :skip-header t :connect-only t
+       :skip-scripts (bl.val:script-checks-skippable-p cs hash height))
+    (cond
+      (valid
+       (bl.store:apply-block-to-utxo-set utxo blk height)
+       (bl.store:update-chain-tip cs hash height)
+       t)
+      (t
+       (log-warn "Reindex-chainstate: block at height ~D failed validation (~A); ~
+stopping (UTXO set rebuilt to height ~D)" height error (1- height))
+       nil))))
+
 (defun do-reindex-chainstate ()
   "Rebuild the UTXO set from already-stored blocks (Bitcoin Core
 -reindex-chainstate): wipe the coins view, reset the chainstate to genesis,
-and re-apply every stored active-chain block's UTXO effects, trusting the
-already-validated stored blocks (no script re-validation, no re-download).
+and reconnect every stored active-chain block: each is re-validated as Core's
+ConnectBlock does it (scripts included unless assumevalid lets them be
+skipped), then its UTXO effects are applied. Nothing is re-downloaded.
 The undo files are left as-is -- they record spent prevouts, which the rebuild
 does not change. Clears the coinstatsindex best marker so its startup backfill
 rebuilds it against the reindexed set; the blockfilterindex is unaffected
@@ -73,11 +101,8 @@ a crash loaded it silently over garbage."
                 (log-warn "Reindex-chainstate: block at height ~D missing from store; ~
 stopping (UTXO set rebuilt to height ~D)" height (1- height))
                 (return-from replay))
-              ;; Apply removes spent prevouts + adds spendable outputs (the
-              ;; unspendable skip lives in apply-block-to-utxo-set). Discard the
-              ;; returned undo list -- the on-disk undo files are unchanged.
-              (bl.store:apply-block-to-utxo-set utxo blk height)
-              (bl.store:update-chain-tip cs hash height)
+              (unless (%reindex-connect-block cs utxo blk hash height)
+                (return-from replay))
               (incf n)
               ;; Size-triggered flushes go through the 3-phase commit like
               ;; the periodic flush: marker at the replay height, one atomic

@@ -404,7 +404,7 @@ PEER-LOG-NAME. A caller with a reason of its own writes it as Core does,
 
 ;;; Peer connection
 
-(defun connect-peer (host &optional (port *current-port*))
+(defun connect-peer (host &optional (port *current-port*) proxy)
   "Connect to a peer at HOST:PORT.
 Returns (VALUES PEER PROXY-CONNECTION-FAILED-P): the peer, or NIL on failure.
 Returns NIL if the host is banned or discouraged (never dial either).
@@ -413,10 +413,10 @@ PROXY-CONNECTION-FAILED-P is MAKE-TCP-CONNECTION's second value passed
 straight through — Core's `proxy_connection_failed', T only when the dial died
 at the SOCKS5 proxy and so says nothing about HOST. The dial's caller uses it
 to decide whether the address is charged an addrman attempt at all
-(net.cpp:494-497)."
+(net.cpp:494-497). PROXY overrides the per-network proxy (MAKE-TCP-CONNECTION)."
   (when (or (peer-banned-p host) (peer-discouraged-p host))
     (return-from connect-peer nil))
-  (multiple-value-bind (conn proxy-failed) (make-tcp-connection host port)
+  (multiple-value-bind (conn proxy-failed) (make-tcp-connection host port :proxy proxy)
     (if conn
         (let ((peer (make-peer :connection conn
                                :state :connected
@@ -1160,7 +1160,8 @@ disconnect needs no extra cleanup."
 our VERACK (Core sends from its VERSION handler, net_processing.cpp:3728-3742),
 when: -txreconciliation is enabled, the negotiated protocol supports wtxid
 relay (>= 70016), our side of the connection relays txs (not block-relay/
-feeler), and the peer's VERSION set fRelay=1. On send, pre-register a random
+feeler), it is not an addr-fetch connection, and the peer's VERSION set
+fRelay=1. On send, pre-register a random
 u64 local salt (txreconciliation.cpp:82-94 PreRegisterPeer). Always returns
 T — declining to offer never fails the handshake."
   (let ((version-msg (peer-version peer)))
@@ -1172,6 +1173,7 @@ T — declining to offer never fails the handshake."
                (>= (bl.ser:version-message-version version-msg)
                    bl.ser:+protocol-version+)
                (peer-relays-txs-p peer)
+               (not (eq (peer-conn-type peer) :addr-fetch))
                ;; Core also skips the offer entirely in blocksonly mode
                ;; (!m_opts.ignore_incoming_txs, net_processing.cpp:3737) —
                ;; reconciliation is pointless when we reject incoming txs.
@@ -1181,6 +1183,7 @@ T — declining to offer never fails the handshake."
       ;; CSPRNG rather than the shared MT stream (Core's is a
       ;; FastRandomContext draw, net_processing.cpp).
       (let ((salt (bl.crypto:rand-u64)))
+        (bl:log-cat "txreconciliation" "Pre-register peer=~A" (peer-id peer))
         (setf (peer-recon-local-salt peer) salt)
         (send-message peer
                       (bl.ser:make-sendtxrcncl-message salt)))))
@@ -1202,7 +1205,9 @@ txreconciliation.cpp:97-126 RegisterPeer). Disconnects PEER and returns NIL
 on a protocol violation; returns T otherwise (registered, or benignly
 ignored)."
   (flet ((violation (reason)
-           (bl:log-cat "net" "sendtxrcncl ~A, ~A" reason (disconnect-msg peer))
+           ;; REASON is Core's line up to the DisconnectMsg (net_processing.cpp:
+           ;; 3970-4011); p2p_sendtxrcncl.py greps for each of them.
+           (bl:log-cat "net" "~A, ~A" reason (disconnect-msg peer))
            (disconnect-peer peer)
            nil))
     (cond
@@ -1212,12 +1217,12 @@ ignored)."
       ;; Our VERSION indicated no tx relay on this connection (block-relay/
       ;; feeler) — Core's RejectIncomingTxs check (:3976-3980).
       ((not (peer-relays-txs-p peer))
-       (violation "received to which we indicated no tx relay"))
+       (violation "sendtxrcncl received to which we indicated no tx relay"))
       ;; The peer's own VERSION had fRelay=0 (:3982-3990).
       ((not (and (peer-version peer)
                  (bl.ser:version-message-relay
                   (peer-version peer))))
-       (violation "received which indicated no tx relay to us"))
+       (violation "sendtxrcncl received which indicated no tx relay to us"))
       (t
        (multiple-value-bind (their-version their-salt)
            (handler-case
@@ -1225,21 +1230,26 @@ ignored)."
              (error () (values nil nil)))
          (cond
            ;; Truncated payload: Core's deserialize failure drops the peer.
-           ((null their-version) (violation "with malformed payload"))
+           ((null their-version) (violation "sendtxrcncl with malformed payload"))
            ;; We never offered, so no pre-registration exists: ignore
-           ;; without disconnecting (RegisterPeer NOT_FOUND).
-           ((null (peer-recon-local-salt peer)) t)
+           ;; without disconnecting (RegisterPeer NOT_FOUND), with Core's line.
+           ((null (peer-recon-local-salt peer))
+            (bl:log-cat "net" "Ignore unexpected txreconciliation signal from peer=~A"
+                        (peer-id peer))
+            t)
            ;; Second sendtxrcncl on one connection (ALREADY_REGISTERED).
            ((peer-recon-registered peer)
-            (violation "from already registered peer"))
+            (violation "txreconciliation protocol violation (sendtxrcncl received from already registered peer)"))
            ;; Negotiated version = min(theirs, ours); v1 is the lowest, so
            ;; below that is a violation — higher-than-ours downgrades fine
            ;; (txreconciliation.cpp:112-119).
            ((< (min their-version
                     bl.ser:+txreconciliation-version+)
                1)
-            (violation "with unsupported version"))
+            (violation "txreconciliation protocol violation"))
            (t
+            (bl:log-cat "txreconciliation" "Register peer=~A (inbound=~D)"
+                        (peer-id peer) (if (peer-inbound peer) 1 0))
             (multiple-value-bind (k0 k1)
                 (compute-recon-salt (peer-recon-local-salt peer) their-salt)
               (setf (peer-recon-version peer)
@@ -1258,6 +1268,11 @@ ignored)."
 cannot be announced later): if the peer (pre-)registered but wtxidrelay never
 arrived, forget the reconciliation state (Core net_processing.cpp:3879-3886)."
   (unless (and (peer-wtxid-relay peer) (peer-recon-registered peer))
+    ;; Core ForgetPeer logs only when there was state to erase
+    ;; (txreconciliation.cpp:128-136); p2p_sendtxrcncl.py:221 waits for it.
+    (when (peer-recon-local-salt peer)
+      (bl:log-cat "txreconciliation" "Forget txreconciliation state of peer=~A"
+                  (peer-id peer)))
     (%forget-recon-state peer)))
 
 (defun local-services ()
@@ -1473,11 +1488,21 @@ and then asserts the peer is still connected."
         (when (<= remaining 0) (return nil))
         (multiple-value-bind (command payload)
             (receive-message-blocking peer :timeout remaining)
+          (when command (log-received-message peer command payload))
           (cond ((null command) (return nil))
                 ((string= command "version") (return (values command payload)))
                 (t (bl:log-cat "net" "non-version message before version handshake. ~
                                       Message \"~A\" from peer=~A"
                                (bl.bytes:sanitize-string command) (peer-id peer)))))))))
+
+(defun log-received-message (peer command payload)
+  "Core's line for EVERY inbound message, before it is processed
+(net_processing.cpp:3582): `received: <type> (<payload bytes> bytes)
+peer=<id>'. Handshake messages included -- p2p_sendtxrcncl.py:171 waits for
+`received: sendtxrcncl' before its peer has sent verack. The command is
+peer-controlled bytes, so it is sanitized for the log (SanitizeString)."
+  (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
+              (bl.bytes:sanitize-string command) (length payload) (peer-id peer)))
 
 (defun %receive-and-store-version (peer &key (timeout 30) near-tip)
   "Receive the peer's version message and record its services/height/user-agent.
@@ -1561,6 +1586,7 @@ structural fix; this bounds the damage in the meantime."
            (multiple-value-bind (command payload)
                (receive-message-blocking peer :timeout (remaining))
              (unless command (return nil))
+             (log-received-message peer command payload)
              (cond
                ((string= command "verack")
                 (%verack-finalize-recon peer)
@@ -1579,11 +1605,13 @@ structural fix; this bounds the damage in the meantime."
                               (bl.bytes:sanitize-string command) (peer-id peer)))))
         finally (return nil)))))
 
-(defun %v2-try-outbound (peer)
+(defun %v2-try-outbound (peer &key proxy)
   "Attempt the BIP324 v2 handshake on PEER's fresh outbound connection.
 On :FALLBACK-V1 (the peer never answered our key -- almost certainly a v1
 node), reconnect to the same host/port and continue in v1. Returns T when the
-version handshake may proceed (over whichever transport), NIL to give up."
+version handshake may proceed (over whichever transport), NIL to give up.
+PROXY is the proxy override the first dial used (a private-broadcast dial
+through the Tor proxy); the v1 reconnection goes through it too."
   (let* ((conn (peer-connection peer))
          (result (progn
                    (setf (connection-v2-detecting conn) t)
@@ -1598,7 +1626,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
        t)
       ((eq result :fallback-v1)
        (let ((fresh (make-tcp-connection (connection-host conn)
-                                         (connection-port conn))))
+                                         (connection-port conn)
+                                         :proxy proxy)))
          (when fresh
            (close-connection conn)
            (setf (peer-connection peer) fresh)
@@ -1618,7 +1647,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
 peer's version, send verack, await theirs. CONN-TYPE sets the peer's connection
 type (:outbound-full-relay, :block-relay, :feeler, :addr-fetch or :manual)
 before the version is sent, so a block-relay/feeler peer advertises relay=0 and
-skips wtxidrelay.
+skips wtxidrelay. A feeler returns T as soon as our VERACK is sent, without
+waiting for the peer's (the caller drops it; Core net_processing.cpp:3807-3811).
 When TRY-V2 (default: whenever the v2 transport is enabled and supported), the
 BIP324 encrypted transport is established first, reconnecting as v1 if the peer
 turns out not to speak it. Returns T on success."
@@ -1639,7 +1669,14 @@ turns out not to speak it. Returns T on success."
             ;; and before our VERACK (Core net_processing.cpp:3728-3744).
             (%maybe-send-sendtxrcncl peer)
             (send-message peer (bl.ser:make-verack-message))
-            (%await-verack peer))
+            (progn (note-verack-sent peer) t)
+            ;; A feeler is done once the peer's VERSION is in and our VERACK
+            ;; is out: Core's VERSION handler disconnects it right there
+            ;; (net_processing.cpp:3807-3811) and never waits for their
+            ;; VERACK -- a peer that withholds it cost us the whole wait.
+            (if (eq conn-type :feeler)
+                (progn (setf (peer-state peer) :ready) t)
+                (%await-verack peer)))
     (%release-outbound-nonce (peer-local-nonce peer))))
 
 (defun note-inbound-addr-me (peer)

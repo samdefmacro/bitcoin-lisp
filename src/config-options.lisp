@@ -573,11 +573,8 @@
 ;; for transactions submitted through sendrawtransaction and keeps them out of
 ;; the mempool entirely (net.h:77,89, rpc/mempool.cpp:115-126). The option's
 ;; start-up VALIDATION is Core's (init.cpp:2257-2280, in
-;; %CHECK-PRIVATE-BROADCAST-OPTION); the broadcast mechanism is not
-;; implemented, so sendrawtransaction REFUSES under the option rather than
-;; announce the transaction to every peer from this node's own address -- the
-;; irreversible act the option exists to prevent. Wallet sends are unaffected,
-;; as in Core.
+;; %CHECK-PRIVATE-BROADCAST-OPTION); the mechanism is networking/ and
+;; node/private-broadcast.lisp. Wallet sends are unaffected, as in Core.
 (define-option "privatebroadcast" :type :bool :global *private-broadcast*)
 ;; -dns: whether a name may be handed to the LOCAL resolver (Core fNameLookup,
 ;; DEFAULT_NAME_LOOKUP = true, netbase.h:23,28). Read at net.cpp:406 as

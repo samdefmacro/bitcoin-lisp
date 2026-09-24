@@ -472,7 +472,7 @@ Returns (VALUES connection proxy-connection-failed-p) as MAKE-TCP-CONNECTION."
                   nil))
         (values nil proxy-error))))
 
-(defun make-tcp-connection (host port &key (timeout 10))
+(defun make-tcp-connection (host port &key (timeout 10) proxy)
   "Create a TCP connection to HOST:PORT.
 Returns (VALUES CONNECTION PROXY-CONNECTION-FAILED-P): the connection, or NIL
 on failure, and T only when the failure was that the SOCKS5 PROXY itself could
@@ -500,12 +500,17 @@ NOWHERE else (netbase.cpp:785-809). A SOCKS5 handshake that fails after that,
 including a CONNECT reply of \"host unreachable\" or \"connection refused\",
 leaves it false, because the proxy did answer and the verdict is about the
 TARGET. %RECORD-DIAL-ATTEMPT's caller reads it: a dial that never left the
-local machine must not be charged to the address (net.cpp:494-497)."
+local machine must not be charged to the address (net.cpp:494-497).
+
+PROXY, when given, is used instead of the per-network pick: Core's
+OpenNetworkConnection takes a proxy_override, which only the private-broadcast
+opener passes -- a clearnet private broadcast goes through the Tor proxy
+whatever -proxy says (net.cpp:3227-3257, ConnectNode :445-452)."
   ;; An .b32.i2p target goes through the SAM bridge (Core ConnectNode's I2P
   ;; branch, net.cpp:453-484), never a SOCKS5 proxy.
   (when (and *i2p-sam-proxy* (parse-i2p-address host))
     (return-from make-tcp-connection (%make-i2p-connection host port)))
-  (multiple-value-bind (proxy refusal) (proxy-for-target host)
+  (multiple-value-bind (proxy refusal) (if proxy (values proxy nil) (proxy-for-target host))
     (when refusal
       (bl.log:log-debug "Not dialing ~A:~D: ~A" host port refusal)
       (return-from make-tcp-connection nil))

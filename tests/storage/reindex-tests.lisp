@@ -60,18 +60,40 @@ the exact set (same whole-set MuHash) and the same chain tip."
 
 (test reindex-chainstate-recovers-emptied-coins-view
   "Reindex rebuilds even from a fully-emptied coins view (disaster recovery:
-blocks + index intact, chainstate DB wiped)."
+blocks + index intact, chainstate DB wiped). Each block is reconnected as
+Core's ConnectBlock does it, so the assumevalid verdict is decided and logged
+(validation.cpp:2342-2502): feature_assumevalid.py:234 restarts with
+-reindex-chainstate and an -assumevalid hash it never saw, and waits for
+`Enabling script verification at block #1 (<hash>): assumevalid hash not in
+headers.'"
   (with-network (:regtest)
    (let* ((tag (format nil "recov~D" (get-internal-real-time)))
           (node (coins-db-node-fixture tag)))
      (let ((bl:*node* node))
        (generate-regtest-blocks node 5)
        (let* ((utxo (bl:node-utxo-set node))
+              (cs (bl:node-chain-state node))
+              (block1 (bl.store:block-index-entry-hash
+                       (bl.store:get-block-at-height cs 1)))
               (truth (bl.store:compute-utxo-set-muhash utxo)))
+         ;; A different verdict first, so the one the reindex reaches is a
+         ;; change and is logged whatever an earlier test left behind.
+         (let ((bl:*assumevalid-override* nil))
+           (bl.val:script-checks-skippable-p cs block1 1))
          ;; Nuke the coins view entirely, then reindex.
          (bl.store:coins-view-cache-wipe utxo)
-         (bl::do-reindex-chainstate)
-         (is (equalp truth (bl.store:compute-utxo-set-muhash utxo))))))))
+         (let* ((bl:*assumevalid-override*
+                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x12))
+                (lines (capture-log-lines #'bl::do-reindex-chainstate)))
+           (is (equalp truth (bl.store:compute-utxo-set-muhash utxo)))
+           (is (find-if (lambda (line)
+                          (search (format nil "Enabling script verification at block #1 (~A): ~
+assumevalid hash not in headers."
+                                          (bl.crypto:bytes-to-hex
+                                           (bl.crypto:reverse-bytes block1)))
+                                  line))
+                        lines)
+               "the reindex decides block 1's script checks; got ~S" lines)))))))
 
 ;;;; Crash safety. do-reindex-chainstate rewinds chainstate.dat to genesis
 ;;;; WITH the in-transition marker before wiping the coins DB, and every

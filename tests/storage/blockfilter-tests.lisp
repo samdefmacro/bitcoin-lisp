@@ -544,8 +544,8 @@ of that block twice."
           (is (equalp once twice)))))))
 
 (test bip157-serving-request-validation-and-messages
-  "BIP157 serving: %cf-request-stop-height enforces active-chain stop hash +
-range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
+  "BIP157 serving: %prepare-block-filter-request enforces Core's request
+rules, disconnecting on a bad one; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
 against a real backfilled index. peer-block-filters gates %cf-serving-index."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
@@ -560,16 +560,30 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
          (is-true (bl.net::%cf-serving-index))
          (let ((bl:*peer-block-filters* nil))
            (is (null (bl.net::%cf-serving-index))))
-         ;; valid request: active-chain stop hash, in range
-         (is (= 3 (bl.net::%cf-request-stop-height cs 1 h3 1000)))
-         ;; start > stop -> nil
-         (is (null (bl.net::%cf-request-stop-height cs 4 h3 1000)))
-         ;; span >= max-diff -> nil (0..3 is 4 blocks, max-diff 3 -> reject)
-         (is (null (bl.net::%cf-request-stop-height cs 0 h3 3)))
-         ;; unknown/fork stop hash -> nil
-         (is (null (bl.net::%cf-request-stop-height
-                    cs 0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
-                    1000)))
+         ;; Core PrepareBlockFilterRequest: a served request answers the stop
+         ;; entry; every refusal but a missing index disconnects the peer
+         ;; (p2p_blockfilters.py:217-270).
+         (flet ((prepare (ftype start stop-hash max-diff)
+                  (let ((peer (%fake-ready-peer)))
+                    (list (and (bl.net::%prepare-block-filter-request
+                                peer cs ftype start stop-hash max-diff)
+                               t)
+                          (bl.net:peer-state peer)))))
+           (is (equal '(t :ready) (prepare 0 1 h3 1000)))
+           (is (equal '(nil :disconnected) (prepare 1 1 h3 1000))
+               "an unsupported filter type")
+           (let ((bl:*peer-block-filters* nil))
+             (is (equal '(nil :disconnected) (prepare 0 1 h3 1000))
+                 "no NODE_COMPACT_FILTERS offered"))
+           (is (equal '(nil :disconnected) (prepare 0 4 h3 1000))
+               "start above stop")
+           (is (equal '(nil :disconnected) (prepare 0 0 h3 3))
+               "0..3 is four blocks, max-diff 3")
+           (is (equal '(nil :disconnected)
+                      (prepare 0 0 (make-array 32 :element-type '(unsigned-byte 8)
+                                                  :initial-element 9)
+                               1000))
+               "an unknown stop hash"))
          ;; getcfilters payload round-trips
          (let ((payload (subseq (bl.ser:make-cfilter-message
                                  0 h3 (bl.store:blockfilterindex-get-filter bfi h3))
@@ -585,6 +599,49 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
                       (bl.bytes:with-byte-reader (s msg)
                         (bl.ser:read-message-header s)))))
            (is (string= "cfcheckpt" cmd))))
+       (bl.store:close-blockfilterindex (bl:node-blockfilterindex node))))))
+
+(test bip157-serves-a-recent-stale-block-from-its-own-branch
+  "Core serves a BIP157 request whose stop block is off the active chain when
+BlockRequestAllowed does -- a recent, fully validated stale block -- and walks
+that block's OWN ancestry (net_processing.cpp:3265-3421, LookupFilterRange).
+p2p_blockfilters.py:116-183 asks for a stale block's cfcheckpt, cfheaders and
+cfilters; we served the active chain only and answered nothing."
+  (with-network (:regtest)
+   (let ((node (%bfi-regtest-node)))
+     (let ((bl:*node* node)
+           (bl:*peer-block-filters* t))
+       (let* ((stale (third (generate-regtest-blocks node 3)))
+              (stale-bytes (bl.crypto:reverse-bytes (bl.crypto:hex-to-bytes stale)))
+              (sent '())
+              (real (fdefinition 'bl.net:send-message)))
+         ;; Make block 3 stale: a heavier four-block branch from genesis, mined
+         ;; by a second node and submitted, reorganizes it away.
+         (let ((other (regtest-node-fixture (format nil "bfi-fork~D" (get-internal-real-time)))))
+           (dolist (hash (let ((bl:*node* other))
+                           (bl.rpc:dispatch-rpc-method other "generatetodescriptor"
+                                                       (list 4 "raw(52)"))))
+             (bl.rpc:dispatch-rpc-method
+              node "submitblock"
+              (list (let ((bl:*node* other))
+                      (bl.rpc:dispatch-rpc-method other "getblock" (list hash 0)))))))
+         (is (= 4 (bl.store:current-height (bl:node-chain-state node)))
+             "the control: the heavier branch is active")
+         (unwind-protect
+              (progn
+                (setf (fdefinition 'bl.net:send-message)
+                      (lambda (p m) (declare (ignore p)) (push m sent)))
+                ;; getcfilters: type 0, start height 3, stop = the stale block.
+                (%dispatch-to-fake-peer
+                 "getcfilters"
+                 (concatenate '(vector (unsigned-byte 8)) (vector 0 3 0 0 0) stale-bytes)
+                 (%fake-ready-peer)
+                 (bl.ctx:make-node-context :chain-state (bl:node-chain-state node))))
+           (setf (fdefinition 'bl.net:send-message) real))
+         (is (= 1 (length sent)) "one cfilter for the stale block, got ~D" (length sent))
+         (when sent
+           (is (equalp stale-bytes (subseq (first sent) 25 57))
+               "the cfilter names the stale block")))
        (bl.store:close-blockfilterindex (bl:node-blockfilterindex node))))))
 
 ;;; --- BIP157 genesis anchor ---

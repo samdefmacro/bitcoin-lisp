@@ -516,9 +516,6 @@ peer connection is counted.")
 (defparameter +max-addnode-connections+ 8
   "Core's MAX_ADDNODE_CONNECTIONS (net.h:71).")
 
-(defparameter +max-private-broadcast-connections+ 64
-  "Core's MAX_PRIVATE_BROADCAST_CONNECTIONS (net.h:77).")
-
 (defun raise-file-descriptor-limit (min-fd)
   "Core's RaiseFileDescriptorLimit (util/fs_helpers.cpp:157-175): raise the
 soft RLIMIT_NOFILE to MIN-FD when it is lower, never past the hard limit, and
@@ -1905,6 +1902,9 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
     (bl.net:maybe-reattempt-initial-broadcast
      (node-peers *node*)
      (node-mempool *node*))
+    ;; Private-broadcast transactions nobody has confirmed lately get
+    ;; another connection (Core ReattemptPrivateBroadcast, every 2-3 min).
+    (maybe-reattempt-private-broadcast *node*)
     ;; Wallet rebroadcast timer (Core
     ;; MaybeResendWalletTxs on the
     ;; scheduler, every minute): each
@@ -2370,7 +2370,10 @@ per-process sync state and the at-tip liveness signal reset for this run."
           (bt:make-thread (lambda () (%sync-thread-main max-peers))
                           :name "bitcoin-sync-thread"))
     ;; -addnode upkeep on its own thread, as Core's addcon (net.cpp:3529-3530).
-    (start-addcon-thread *node*)))
+    (start-addcon-thread *node*)
+    ;; -privatebroadcast's connection opener, as Core's privbcast
+    ;; (net.cpp:3554-3556).
+    (start-private-broadcast-thread *node*)))
 
 (defun start-node (&key (data-directory (default-data-directory))
                         (network :mainnet)

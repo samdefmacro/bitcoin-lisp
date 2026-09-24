@@ -334,7 +334,8 @@ book's record of HOST:PORT, 0 for a destination it does not hold."
 
 (defun %dial-outbound-peer (node host port count-failure
                             &key (conn-type :outbound-full-relay)
-                                 (use-v2 (bl.net:v2-available-p)))
+                                 (use-v2 (bl.net:v2-available-p))
+                                 proxy)
   "Dial HOST:PORT and record the addrman attempt Core's ConnectNode records.
 Returns the connected peer, or NIL.
 
@@ -365,9 +366,11 @@ target unreachable is a verdict about the target, and Core counts it (its flag
 is raised solely by `proxy.Connect()' returning nothing, netbase.cpp:790-794).
 
 COUNT-FAILURE is Core's fCountFailure; see %RECORD-DIAL-ATTEMPT. CONN-TYPE
-and USE-V2 only name the dial in Core's `trying' line."
+and USE-V2 only name the dial in Core's `trying' line. PROXY is Core's
+proxy_override (the private-broadcast opener's Tor proxy for a clearnet
+target)."
   (%log-trying-connection node host port conn-type use-v2)
-  (multiple-value-bind (peer proxy-failed) (bl.net:connect-peer host port)
+  (multiple-value-bind (peer proxy-failed) (bl.net:connect-peer host port proxy)
     (unless proxy-failed
       (%record-dial-attempt node host port count-failure))
     peer))

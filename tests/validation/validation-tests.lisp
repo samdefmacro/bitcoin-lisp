@@ -2897,3 +2897,62 @@ before it kills the node, so a node that never writes it hangs that test."
                 (first (capture-log-lines
                         (lambda () (bl::log-assumevalid-decision :regtest)))))
         "the configured-assumevalid sentence")))
+
+(test assumevalid-skip-needs-a-buried-ancestor-on-the-best-header-chain
+  "Core's script_check_reason has seven clauses (validation.cpp:2342-2380);
+the last three read m_best_header. An assumevalid ancestor still has its
+signatures verified when it is not on the best header chain, when that header
+is below nMinimumChainWork, or when less than two weeks of equivalent work is
+stacked on it -- feature_assumevalid.py:181 sends 200 headers and expects block
+1 to be verified `block too recent relative to best header'."
+  (with-network (:regtest)
+    (let* ((state (bl.store:make-chain-state))
+           (genesis (add-regtest-genesis-entry state))
+           (chain (add-mined-chain state genesis 2100 :status :header-valid))
+           (block1 (first chain))
+           (hash1 (bl.store:block-index-entry-hash block1))
+           (bl:*minimum-chain-work-override* nil))
+      (flet ((verdict (&key (av (nth 101 chain)))
+               ;; A verdict other than the previous one is always logged, so
+               ;; every call below reads its reason back from the log line.
+               (let* ((bl:*assumevalid-override* (and av (bl.store:block-index-entry-hash av)))
+                      (skip nil)
+                      (lines (capture-log-lines
+                              (lambda ()
+                                (setf skip (bl.val:script-checks-skippable-p
+                                            state hash1 1))))))
+                 (values skip (first lines)))))
+        ;; Positive control: 2099 blocks on block 1 is > two weeks at regtest's
+        ;; ten-minute spacing, the chain is the best one and regtest's minimum
+        ;; work is zero, so the skip is taken.
+        (verdict :av nil)
+        (multiple-value-bind (skip line) (verdict)
+          (is-true skip "a buried assumevalid ancestor skips its scripts")
+          (is (search "Disabling script verification at block #1" line)
+              "got ~S" line))
+        ;; Below the minimum chain work.
+        (let ((bl:*minimum-chain-work-override* (expt 2 200)))
+          (multiple-value-bind (skip line) (verdict)
+            (is-false skip)
+            (is (search "best header chainwork below minimumchainwork." line)
+                "got ~S" line)))
+        ;; A heavier competing header chain from genesis: block 1 is no longer
+        ;; on the best header chain.
+        (add-mined-chain state genesis 2101 :status :header-valid :tag 1)
+        (multiple-value-bind (skip line) (verdict)
+          (is-false skip)
+          (is (search "block not in best header chain." line) "got ~S" line)))
+      ;; A best header only 199 blocks above block 1 (the Core test's node2).
+      (let* ((short (bl.store:make-chain-state))
+             (short-chain (add-mined-chain short (add-regtest-genesis-entry short) 199
+                                           :status :header-valid))
+             (bl:*assumevalid-override*
+               (bl.store:block-index-entry-hash (nth 101 short-chain)))
+             (skip :unset)
+             (lines (capture-log-lines
+                     (lambda ()
+                       (setf skip (bl.val:script-checks-skippable-p
+                                   short (bl.store:block-index-entry-hash (first short-chain)) 1))))))
+        (is-false skip)
+        (is (search "block too recent relative to best header." (first lines))
+            "got ~S" lines)))))

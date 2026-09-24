@@ -1038,7 +1038,26 @@
   grow and drop the peer's filter, and tx announcements, the answer to
   `mempool` and the `merkleblock` for a MSG_FILTERED_BLOCK getdata are what
   BLOOM-RELEVANT-AND-UPDATE-P matches. The filter and merkleblock bytes are
-  checked against Core's own vectors (tests/networking/bloom-tests.lisp)."
+  checked against Core's own vectors (tests/networking/bloom-tests.lisp).
+
+  Private broadcast (`src/networking/private-broadcast.lisp` and
+  `src/node/private-broadcast.lisp`; Core `private_broadcast.cpp`,
+  ThreadPrivateBroadcast and the IsPrivateBroadcastConn branches): under
+  -privatebroadcast sendrawtransaction queues the transaction WITHOUT the
+  mempool and asks for three connections; the opener thread dials Tor or I2P
+  (IPv4/IPv6 only through the Tor proxy, once an outbound Tor peer took our
+  VERACK), over BIP324 when the address advertises NODE_P2P_V2 and we speak it
+  (Core's use_v2transport), and each connection runs its whole conversation on
+  its own thread
+  -- a VERSION naming nothing, INV, TX, PING, hang-up on the PONG. Invariant:
+  a private-broadcast connection never joins the node's peer list, so the pump
+  never reads it and nothing else is ever sent on it (Core filters its shared
+  send path instead). That is a documented divergence: Core lists these
+  connections in getpeerinfo as `private-broadcast', ours are not listed. The transaction leaves the queue when it comes back
+  from the network (the TX handler) or is aborted; one nobody has confirmed
+  for a minute gets another connection every 2-3 minutes."
+  (bitcoin-lisp.networking:initiate-tx-broadcast-private function)
+  (bitcoin-lisp.networking:run-private-broadcast-connection function)
   (bitcoin-lisp.networking:peer class)
   (bitcoin-lisp.networking:bloom-relevant-and-update-p function)
   (bitcoin-lisp.networking:make-merkle-block function)
