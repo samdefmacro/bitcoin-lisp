@@ -252,7 +252,9 @@ whatever the cadence is."
            ;; own values (net_processing.cpp:1819-1829). Asking
            ;; PEER-TX-RELAY-P instead answered relaytxes true and
            ;; last_inv_sequence 1 for a peer that had sent nothing at all.
-           ("relaytxes" . ,(json-bool tx-relay))
+           ;; m_relay_txs itself: an fRelay=0 peer offered NODE_BLOOM has the
+           ;; object but relays nothing until a filterload/filterclear.
+           ("relaytxes" . ,(json-bool (and tx-relay (bl.net:peer-tx-relay-p peer))))
            ;; Mempool sequence snapshot of our last inv flush to this peer +
            ;; queued-but-unsent announcements (Core m_last_inv_sequence /
            ;; m_inv_to_send).

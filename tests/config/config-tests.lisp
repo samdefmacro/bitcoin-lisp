@@ -2457,6 +2457,12 @@ MEBIbytes. Reading it as bytes — the obvious mistake — would make every
 ordinary command line set a target of a few hundred bytes, i.e. permanently
 over budget from the first message."
   ;; ParseByteUnits: lowercase 1000-base, uppercase 1024-base, default M.
+  ;; The option names itself in the refusal (init.cpp:1426-1428;
+  ;; feature_maxuploadtarget.py:203).
+  (let ((bl.net:*max-upload-target* bl.net:*max-upload-target*))
+    (is (equal "Unable to parse -maxuploadtarget: 'abc'"
+               (handler-case (progn (apply-config-globals '(("maxuploadtarget" . "abc"))) nil)
+                 (error (e) (princ-to-string e))))))
   (is (= (* 100 1024 1024) (bl.cfg:conf-parse-byte-units "100")))
   ;; Core's ByteUnit::NOOP, where a bare number really is a byte count.
   (is (= 100 (bl.cfg:conf-parse-byte-units "100" #\B)))

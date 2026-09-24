@@ -105,7 +105,13 @@
     ;; ACTIVE group (rpc/mining.cpp:977-984), not from an activation height.
     ;; Kept exported because it is still the only reader of the chain-params
     ;; taproot-height column, which several chains carry a real value in.
-    "bitcoin-lisp.validation:get-taproot-activation-height")
+    "bitcoin-lisp.validation:get-taproot-activation-height"
+    ;; The CLIENT half of BIP37 (Core's CBloomFilter(nElements, nFPRate, ...)
+    ;; constructor and its serializer): a node only receives filters, so only
+    ;; Core's own vectors in tests/networking/bloom-tests.lisp build one --
+    ;; which is how the byte contract is checked.
+    "bitcoin-lisp.networking:make-bloom-filter"
+    "bitcoin-lisp.networking:serialize-bloom-filter")
   "Exported functions with no caller in src/ as of 2026-08-22, as
 \"package:name\" strings -- strings rather than symbols so that unexporting one
 is an ordinary test failure and not a READ error that kills compilation.")

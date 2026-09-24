@@ -57,6 +57,7 @@ init.cpp, node/. src/node/.")
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*
    #:*peer-block-filters*
+   #:*peer-bloom-filters*
    #:*tx-reconciliation*
    #:pruning-enabled-p
    #:automatic-pruning-p

@@ -61,6 +61,7 @@ can. src/validation/.")
    ;; Script disassembly and classification
    #:disassemble-script
    #:classify-script
+   #:next-script-op
    #:script-type-to-string
    #:script-type-name
    #:is-coinbase-tx

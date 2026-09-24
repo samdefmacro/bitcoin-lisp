@@ -289,6 +289,8 @@ bitcoin-cli (node-main)."
                  (:module "networking"
                   :components ((:file "p2p-handlers")
                                (:file "txreconciliation-set")
+                               (:file "bloom")       ; BIP37 CBloomFilter
+                               (:file "merkleblock") ; CMerkleBlock / partial merkle tree
                                (:file "peer")
                                (:file "protocol")
                                (:file "headers-sync")
@@ -554,6 +556,8 @@ bitcoin-cli (node-main)."
                              (:file "tools/tools-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
                              (:file "networking/socks5-tests")
+                             (:file "networking/bloom-vectors")
+                             (:file "networking/bloom-tests")
                              ;; Tor control client + onion service + self-advertisement
                              (:file "networking/torcontrol-tests")
                              ;; TxOutCompression + hash_serialized_3

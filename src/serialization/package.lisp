@@ -151,10 +151,13 @@ src/serialization/.")
    #:message-header-checksum
    #:read-message-header
    #:serialize-message
+   #:encode-base64
+   #:decode-base64
    #:compute-checksum
    #:*network-magic*
    ;; Service bit constants
    #:+node-network+
+   #:+node-bloom+
    #:+node-witness+
    #:+node-network-limited+
    #:+node-p2p-v2+

@@ -954,8 +954,19 @@
   on transactions read it, the inv handler and the tx handler, so a test
   driving either has to say which side of it the node is on. A reorg used to
   be triggered only by an ARRIVING block -- the sync pass now re-evaluates
-  the best chain itself."
+  the best chain itself.
+
+  BIP37 (`src/networking/bloom.lisp`, `merkleblock.lisp`; Core
+  `common/bloom.cpp`, `merkleblock.cpp`): a node started with
+  -peerbloomfilters, or a peer holding the bloomfilter permission, is offered
+  NODE_BLOOM (PEER-OUR-SERVICES); filterload/filteradd/filterclear then load,
+  grow and drop the peer's filter, and tx announcements, the answer to
+  `mempool` and the `merkleblock` for a MSG_FILTERED_BLOCK getdata are what
+  BLOOM-RELEVANT-AND-UPDATE-P matches. The filter and merkleblock bytes are
+  checked against Core's own vectors (tests/networking/bloom-tests.lisp)."
   (bitcoin-lisp.networking:peer class)
+  (bitcoin-lisp.networking:bloom-relevant-and-update-p function)
+  (bitcoin-lisp.networking:make-merkle-block function)
   (bitcoin-lisp.networking:connect-peer function)
   (bitcoin-lisp.networking:disconnect-peer function)
   (bitcoin-lisp.networking:disconnect-msg function)

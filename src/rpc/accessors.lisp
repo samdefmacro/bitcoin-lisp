@@ -54,9 +54,15 @@ getchainstates, which reports every chainstate)."
     (copy-list (bl:node-chainstates node))))
 
 (defun rpc-get-peers (node)
-  "Get a copy of the peer list with lock protection."
+  "A copy of Core's m_nodes, under the node lock: the peers the sync thread
+has merged AND the accepted inbound peers still in the hand-off list. Core's
+CNode joins m_nodes at accept (net.cpp:1854-1858), so getpeerinfo sees a peer
+the moment its handshake has run; ours saw it only after the next sync-thread
+merge, and p2p_filter.py:247 read an empty getpeerinfo right after
+wait_for_verack."
   (bt:with-recursive-lock-held ((bl:node-lock node))
-    (copy-list (bl:node-peers node))))
+    (append (bl:node-pending-inbound-peers node)
+            (copy-list (bl:node-peers node)))))
 
 (defun rpc-get-connected-peers (node)
   "The peers Core's CConnman::GetNodeCount counts: m_nodes, which

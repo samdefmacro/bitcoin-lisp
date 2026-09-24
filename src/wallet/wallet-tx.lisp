@@ -2397,12 +2397,12 @@ and IsHex refuses the empty string too) and
         ;; server answers -1 with the deserializer's text, which is not
         ;; reproducible from this side; -5 is at least the right shape and
         ;; the right sentence for "that proof is not usable".
-        (handler-case (bl.rpc:parse-merkle-block bytes)
+        (handler-case (bl.net:parse-merkle-block bytes)
           (error ()
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                               :message "Something wrong with merkleblock")))
       (multiple-value-bind (root matched indices)
-          (bl.rpc:extract-partial-merkle-tree ntx bits hashes)
+          (bl.net:extract-partial-merkle-tree ntx bits hashes)
         ;; A malformed tree recomputes NO root, which is the same failure as
         ;; recomputing the wrong one: Core compares ExtractMatches' return
         ;; value, and a failed extraction returns uint256{}.

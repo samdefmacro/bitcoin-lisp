@@ -114,6 +114,13 @@
 (define-option "reindex-chainstate" :key :reindex-chainstate :type :bool)
 (define-option "forcecompactdb" :key :force-compact-db :type :bool)
 (define-option "peerblockfilters" :key :peer-block-filters :type :bool)
+;; -peerbloomfilters: BIP37 serving and NODE_BLOOM (init.cpp:1104-1105).
+;; Repeatable only so its function runs on every start (the LAST value wins,
+;; as GetBoolArg's does) and an absent option clears an earlier start's value.
+(define-option "peerbloomfilters" :repeatable t
+  :apply (lambda (values)
+           (setf *peer-bloom-filters*
+                 (let ((v (car (last values)))) (and v (conf-parse-bool v) t)))))
 (define-option "txreconciliation" :key :tx-reconciliation :type :bool)
 (define-option "webui" :key :webui :type :bool)
 (define-option "webuipath" :key :webui-path :type :string)
@@ -607,7 +614,7 @@
   "limitdescendantsize"
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"
-  "natpmp" "peerbloomfilters" "printpriority"
+  "natpmp" "printpriority"
   "rpcdoccheck"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"

@@ -230,6 +230,11 @@ MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR =
 100,000 (policy.h:81-83). Consensus is unaffected; this only gates mempool
 standardness.")
 
+(defvar *peer-bloom-filters* nil
+  "Core -peerbloomfilters (DEFAULT_PEERBLOOMFILTERS = false): offer NODE_BLOOM
+and serve BIP37 filterload/filteradd/filterclear, filtered tx relay, the
+mempool message and merkleblocks to every peer.")
+
 (defvar *peer-block-filters* nil
   "When true (and the block filter index is enabled), serve BIP157 compact
 filter messages (getcfilters/getcfheaders/getcfcheckpt) and advertise

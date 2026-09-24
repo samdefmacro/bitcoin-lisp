@@ -186,7 +186,10 @@ rejects, \"Invalid value for -x=v (must be a positive integer)\" for an
               n))
       (:money (or (conf-parse-money raw)
                   (config-error "Invalid amount for -~A=~A" name raw)))
-      (:byte-units (conf-parse-byte-units raw))
+      ;; Core names the option: `Unable to parse -maxuploadtarget: '<v>''
+      ;; (init.cpp:1426-1428), not the generic byte-amount sentence.
+      (:byte-units (handler-case (conf-parse-byte-units raw)
+                     (error () (config-error "Unable to parse -~A: '~A'" name raw))))
       (:loglevel (conf-parse-loglevel raw))
       (:loglevel-global (conf-parse-loglevel-global raw)))))
 

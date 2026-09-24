@@ -226,6 +226,7 @@ reach."
 which BIP339 wtxid relay was introduced, and the gate on the WTXIDRELAY
 message (net_processing.cpp:3715).")
 (defconstant +node-network+ 1)
+(defconstant +node-bloom+ (ash 1 2))              ; BIP111: serves BIP37 filters
 (defconstant +node-witness+ (ash 1 3))
 (defconstant +node-network-limited+ (ash 1 10))  ; BIP 159: pruned node
 (defconstant +node-p2p-v2+ (ash 1 11))            ; BIP 324: v2 transport support

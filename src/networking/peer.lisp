@@ -286,6 +286,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
   ;; BIP 133 feefilter support
   (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
+  ;; BIP37 (Core Peer::TxRelay::m_bloom_filter / m_relay_txs): the filter a
+  ;; filterload loaded, and T once a filterload or filterclear has turned tx
+  ;; relay on for a peer whose version said fRelay=0.
+  (bloom-filter nil)
+  (bloom-relay-txs nil :type boolean)
   ;; Mempool-sequence snapshot taken at each inv flush to this peer (Core
   ;; Peer::TxRelay::m_last_inv_sequence, net_processing.cpp:322, init 1).
   ;; The getdata anti-probing gate serves a mempool tx only when its entry
@@ -1058,15 +1063,17 @@ peer fRelay=0 and then accepted its transactions (p2p_blocksonly.py:57)."
   "T when tx-relay state exists for PEER — the exact condition under which
 Core initializes Peer::TxRelay at VERSION time (net_processing.cpp:3681-3696):
 the connection is not block-relay-only or feeler, AND the peer's version set
-fRelay=1. We never advertise NODE_BLOOM, so Core's other arm (fRelay=0 but
-NODE_BLOOM offered, letting a later filterload turn relay on) never applies:
-a BIP37/BIP60 fRelay=0 peer gets NO tx invs and its tx getdata is ignored for
-the life of the connection. A peer with no stored version yet counts as
-relaying — Core's pre-70001 default is fRelay=true (net_processing.cpp:3597)."
+fRelay=1 -- Core's m_relay_txs. A filterload or filterclear turns it on for
+an fRelay=0 peer we offer NODE_BLOOM to (net_processing.cpp:5064-5069,
+:5112-5117; PEER-BLOOM-RELAY-TXS); until then a BIP37/BIP60 fRelay=0 peer gets
+NO tx invs and its tx getdata is ignored. A peer with no stored version yet
+counts as relaying — Core's pre-70001 default is fRelay=true
+(net_processing.cpp:3597)."
   (and (peer-relays-txs-p peer)
-       (let ((v (peer-version peer)))
-         (or (null v)
-             (bl.ser:version-message-relay v)))))
+       (or (peer-bloom-relay-txs peer)
+           (let ((v (peer-version peer)))
+             (or (null v)
+                 (bl.ser:version-message-relay v))))))
 
 (defun peer-tx-relay-state-p (peer)
   "T when PEER has a Peer::TxRelay at all -- Core's `peer->GetTxRelay() !=
@@ -1081,7 +1088,25 @@ and deliberately treats a version-less peer as relaying, because Core's
 pre-70001 fRelay default is true. Reading that one in getpeerinfo reported
 relaytxes true and last_inv_sequence 1 for a peer that had said nothing
 (rpc_net.py:148 expects false and 0)."
-  (and (peer-version peer) (peer-tx-relay-p peer) t))
+  (and (peer-version peer)
+       (peer-relays-txs-p peer)
+       ;; fRelay, or NODE_BLOOM offered: the peer may turn relay on later.
+       (or (peer-tx-relay-p peer) (peer-offers-bloom-p peer))
+       t))
+
+(defun peer-offers-bloom-p (peer)
+  "T when we offer PEER NODE_BLOOM (Core peer.m_our_services & NODE_BLOOM):
+-peerbloomfilters for everyone (init.cpp:1104-1105), or the bloomfilter
+permission for this peer (net_processing.cpp:1614-1616)."
+  (or bl:*peer-bloom-filters*
+      (peer-has-permission-p peer +perm-bloom-filter+)))
+
+(defun peer-our-services (peer)
+  "Core Peer::m_our_services: LOCAL-SERVICES, plus NODE_BLOOM for a peer
+holding the bloomfilter permission. It is what our version message and our
+self-advertised address tell that peer."
+  (logior (local-services)
+          (if (peer-offers-bloom-p peer) bl.ser:+node-bloom+ 0)))
 
 ;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
 ;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist
@@ -1246,7 +1271,9 @@ NODE_COMPACT_FILTERS when filter serving is enabled."
                 bl.ser:+node-p2p-v2+ 0)
             ;; BIP157: advertise filter serving when enabled.
             (if bl:*peer-block-filters*
-                bl.ser:+node-compact-filters+ 0))))
+                bl.ser:+node-compact-filters+ 0)
+            ;; BIP111: -peerbloomfilters (init.cpp:1104-1105).
+            (if bl:*peer-bloom-filters* bl.ser:+node-bloom+ 0))))
 
 (defun %version-addr-recv (peer)
   "The addr_recv (\"addr_you\") field for our version message to PEER: the
@@ -1366,7 +1393,7 @@ go out, as they always did. Returns T."
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
 VERACK). Returns T if the version was sent."
-  (let* ((services (local-services))
+  (let* ((services (peer-our-services peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
          ;; The height is the CURRENT (active) chainstate's tip — never a
