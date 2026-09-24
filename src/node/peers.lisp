@@ -1079,7 +1079,15 @@ framework's own network thread (the one blocked in that RPC call) must answer."
                            (setf kept t)
                            (log-info "Added-node peer connected: ~A" host)
                            peer))
-                     (progn (bl.net:disconnect-peer peer) nil))
+                     ;; A handshake cut short by a shutdown request leaves the
+                     ;; peer where it is: Core's CNode stays in m_nodes until
+                     ;; StopNodes, which dumps it to anchors.dat first when it
+                     ;; is block-relay-only (net.cpp:3637-3658) and then
+                     ;; closes every node. Withdrawing it here dropped the
+                     ;; anchor feature_anchors.py:107 waits for.
+                     (if (bl.net:ibd-stop-requested-p)
+                         (progn (setf kept t) nil)
+                         (progn (bl.net:disconnect-peer peer) nil)))
               (unless kept
                 (ignore-errors (bl.net:disconnect-peer peer))
                 (bt:with-recursive-lock-held ((node-lock node))
