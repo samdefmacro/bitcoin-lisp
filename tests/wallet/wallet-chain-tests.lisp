@@ -1052,6 +1052,26 @@ refused it as foreign, so wallet_hd.py:84 found no wallet loaded."
       (is-true (%wc-wallet node "xchainw")
                "a wallet whose last block is gone is still this chain's"))))
 
+(test wallet-load-logs-how-far-back-it-rescans
+  "Core AttachChain logs `Rescanning last N blocks (from block H)...' through
+WalletLogPrintf (\"[name] \" prefix) before its catch-up scan
+(wallet.cpp:3261-3262). wallet_reorgsrestore.py:121 waits for exactly that
+line after an unclean shutdown left the wallet one block behind the chain;
+ours scanned without saying so."
+  (with-wallet-chain-node (node "rescanlog" :wallet "rlw")
+    (%wc-mine node 2 (%wc-optrue-address))
+    (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "rlw"))
+    (%wc-mine node 1 (%wc-optrue-address))
+    (let* ((tip (bl.store:current-height (bl:node-chain-state node)))
+           (expected (format nil "[rlw] Rescanning last 1 blocks (from block ~D)..."
+                             (1- tip)))
+           (lines (capture-log-lines
+                   (lambda ()
+                     (bl.rpc:dispatch-rpc-method node "loadwallet"
+                                                 (list "rlw"))))))
+      (is-true (%wc-mentions-p expected lines)
+               "missing ~S" expected))))
+
 ;;; --- CWalletTx mapValue strings are Core's bytes ---------------------------
 
 (test wallet-tx-map-value-holds-cores-utf-8-bytes
