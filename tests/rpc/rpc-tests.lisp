@@ -11819,6 +11819,48 @@ the headers-only one."
                              (field (second rows) "status")
                              (field (second rows) "branchlen"))))))))))
 
+(test a-chain-tip-above-a-missing-body-is-headers-only
+  "Core's getchaintips says `headers-only' when the tip's body OR any
+ancestor's is missing (!HaveNumChainTxs, rpc/blockchain.cpp:1631-1633), and
+`valid-headers' only for a complete, unvalidated branch. Ours asked about the
+tip's own body alone. p2p_unrequested_blocks.py:135 stores an equal-work block
+whose parent's body was never accepted and expects `headers-only'."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "chaintips-missing-parent"))
+           (cs (bl:node-chain-state node))
+           (store (bl:node-block-store node)))
+      (generate-regtest-blocks node 3)
+      (flet ((header-hex (b)
+               (bl.crypto:bytes-to-hex
+                (bl.ser:serialize-block-header (bl.ser:bitcoin-block-header b))))
+             (tip-status ()
+               (cdr (assoc "status"
+                           (first (bl.rpc:dispatch-rpc-method
+                                   node "getchaintips" (wire-params '())))
+                           :test #'string=))))
+        (let ((b1 (bl.mining:assemble-full-block
+                   cs (bl:node-mempool node)
+                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+          (bl.mining:mine-block b1)
+          (bl.rpc:dispatch-rpc-method node "submitheader" (list (header-hex b1)))
+          (let ((b2 (bl.mining:assemble-full-block
+                     cs (bl:node-mempool node)
+                     :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
+            (setf (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header b2))
+                  (bl.ser:block-header-hash (bl.ser:bitcoin-block-header b1))
+                  (bl.ser:block-header-timestamp (bl.ser:bitcoin-block-header b2))
+                  (1+ (bl.ser:block-header-timestamp (bl.ser:bitcoin-block-header b1)))
+                  (bl.ser:block-header-cached-hash (bl.ser:bitcoin-block-header b2)) nil)
+            (bl.mining:mine-block b2)
+            (bl.rpc:dispatch-rpc-method node "submitheader" (list (header-hex b2)))
+            (is (equal "headers-only" (tip-status)) "control: no bodies at all")
+            (bl.store:store-block store b2 :height 5)
+            (is (equal "headers-only" (tip-status))
+                "the tip's body alone is not enough while its parent's is missing")
+            (bl.store:store-block store b1 :height 4)
+            (is (equal "valid-headers" (tip-status))
+                "with the whole branch on disk it is valid-headers")))))))
+
 (test pruneheight-is-the-lowest-block-still-on-disk
   "Core's `pruneheight' -- and the value pruneblockchain returns -- is
 GetFirstStoredBlock(tip)->nHeight, the height of the lowest block whose body
