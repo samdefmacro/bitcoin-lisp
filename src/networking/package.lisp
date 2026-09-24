@@ -399,6 +399,7 @@ headerssync.cpp. src/networking/.")
    #:request-blocks-from-peers
    #:block-download-wanted-p
    #:block-min-pow-checked-p
+   #:renew-ibd-context
    #:*max-upload-target*
    #:*whitebind-flags*
    #:*whitelist-entries*

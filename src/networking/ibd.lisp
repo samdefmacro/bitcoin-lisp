@@ -2734,20 +2734,45 @@ once without polling."
                                     readable)
                             timeout))))
 
+(defun renew-ibd-context ()
+  "Give a sync cycle fresh bookkeeping while carrying over what describes the
+NODE rather than the cycle, and return the new *IBD-CONTEXT*.
+
+The in-flight table: those requests are outstanding at our peers whatever
+pass made them (Core's mapBlocksInFlight outlives every loop); the timeout and
+disconnected-peer sweeps (GET-TIMED-OUT-REQUESTS, RELEASE-ORPHANED-IN-FLIGHT)
+retire the stale ones.
+
+And the record of bodies on disk above the tip -- DISK-BLOCKS-ABOVE-TIP, the
+reorg-candidate set and its unlinked/parked index -- which is our share of
+Core's setBlockIndexCandidates and m_blocks_unlinked: chain facts that
+ActivateBestChain consults after every block (FindMostWorkChain,
+validation.cpp:3153), never reset between message loops. Dropping them with the cycle stranded every
+block persisted in an earlier cycle: p2p_unrequested_blocks.py:230 pushes 288
+blocks of a fork whose base arrives only later, from another peer, and Core
+connects all of them at once; ours reorged onto the base's child and stopped,
+because the disk map that led on from it belonged to a context already
+replaced. Rejected candidates are not carried, which leaves their retry
+cadence what it was: once per cycle."
+  (let ((old *ibd-context*)
+        (fresh (make-ibd)))
+    (when old
+      (setf (ibd-context-in-flight fresh) (ibd-context-in-flight old)
+            (ibd-context-disk-blocks-above-tip fresh)
+            (ibd-context-disk-blocks-above-tip old)
+            (ibd-context-reorg-candidates fresh) (ibd-context-reorg-candidates old)
+            (ibd-context-unlinked-reorg-candidates fresh)
+            (ibd-context-unlinked-reorg-candidates old)
+            (ibd-context-parked-reorg-candidates fresh)
+            (ibd-context-parked-reorg-candidates old)))
+    (setf *ibd-context* fresh)))
+
 (defun start-ibd (peers node-ctx target-height)
   "Start Initial Block Download.
 Returns the number of blocks downloaded. NODE-CTX's historical-chainstate, when
 non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
 a second download cursor for its [tip .. snapshot-base] range."
-  ;; A fresh cycle's bookkeeping, but the node's in-flight table carries over:
-  ;; those requests are outstanding at our peers whatever pass made them
-  ;; (Core's mapBlocksInFlight outlives every loop). The timeout and
-  ;; disconnected-peer sweeps (GET-TIMED-OUT-REQUESTS,
-  ;; RELEASE-ORPHANED-IN-FLIGHT) retire the stale ones.
-  (let ((fresh (make-ibd)))
-    (when *ibd-context*
-      (setf (ibd-context-in-flight fresh) (ibd-context-in-flight *ibd-context*)))
-    (setf *ibd-context* fresh))
+  (renew-ibd-context)
   ;; TARGET-HEIGHT arrives as a peer's advertised start height, which is a
   ;; SIGNED int32 on the wire and whose "unknown" value is -1 (Core's
   ;; CNode::nStartingHeight initialises to -1, and its own P2PInterface test

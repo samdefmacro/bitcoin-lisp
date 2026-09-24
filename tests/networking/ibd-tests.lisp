@@ -4942,6 +4942,40 @@ our out-of-order gate had `>'), and a REQUESTED lighter block still is."
             (is-true (bl.store:block-exists-p store (hash-of b1x))
                      "the same block, requested, is stored")))))))
 
+(test bodies-stored-above-the-tip-outlive-the-sync-cycle
+  "Core's setBlockIndexCandidates and m_blocks_unlinked are chain facts that
+ActivateBestChain consults after every block (FindMostWorkChain,
+validation.cpp:3153); nothing resets them between message loops. Ours kept
+the record of bodies persisted above the tip in the sync cycle's context,
+which START-IBD replaced every cycle, so blocks stored out of order in one
+cycle were not connected when their missing parent arrived in the next:
+p2p_unrequested_blocks.py:230 found the node at height 3 instead of 290.
+Blocks 2 and 3 arrive first, a new cycle begins (RENEW-IBD-CONTEXT), then
+block 1: the tip must reach 3."
+  (with-network (:regtest)
+    (let* ((src (regtest-node-fixture "carry-src"))
+           (dst (regtest-node-fixture "carry-dst"))
+           (cs (bl:node-chain-state dst))
+           (utxo (bl:node-utxo-set dst))
+           (store (bl:node-block-store dst)))
+      (generate-regtest-blocks src 3)
+      (let ((blocks (loop for h from 1 to 3
+                          collect (bl.store:get-block
+                                   (bl:node-block-store src)
+                                   (bl.store:block-index-entry-hash
+                                    (bl.store:get-block-at-height
+                                     (bl:node-chain-state src) h))))))
+        (bl.net:ingest-headers-from-peer
+         nil (mapcar #'bl.ser:bitcoin-block-header blocks) cs)
+        (with-ibd-context
+          (deliver-block (second blocks) cs utxo store :requested t)
+          (deliver-block (third blocks) cs utxo store :requested t)
+          (is (= 0 (bl.store:current-height cs)) "control: nothing connects yet")
+          (bl.net:renew-ibd-context)
+          (deliver-block (first blocks) cs utxo store :requested t)
+          (is (= 3 (bl.store:current-height cs))
+              "the bodies stored in the previous cycle connect behind their parent"))))))
+
 (test drain-accepts-an-unsolicited-block-whose-header-it-has-never-seen
   "Core's ProcessNewBlock runs AcceptBlock, which runs AcceptBlockHeader first
 (validation.cpp:4340), so an unrequested block on a known parent is indexed
