@@ -189,7 +189,19 @@ resolved network. Honors -server (enable RPC on the default port when no
       ;; integer)"); this option has an error message of its own.
       (let ((n (getf plist :max-connections)))
         (when (and n (minusp n))
-          (config-error "-maxconnections must be greater or equal than zero"))))
+          (config-error "-maxconnections must be greater or equal than zero")))
+      ;; -blockfilterindex names filter TYPES (init.cpp:972-985): "" or "1"
+      ;; enables every type and "0" none; any other value makes every value
+      ;; given a type name, and one that names no type refuses startup. The
+      ;; option's :BOOL parse read "basic" as atoi's 0 and "abc" as off;
+      ;; p2p_blockfilters.py:275 expects the refusal.
+      (let ((last (lookup "blockfilterindex")))
+        (when (and last (not (member (cdr last) '("" "1" "0") :test #'string=)))
+          (dolist (name (loop for (k . v) in alist
+                              when (string= k "blockfilterindex") collect v))
+            (unless (string= name "basic")
+              (config-error "Unknown -blockfilterindex value ~A." name)))
+          (setf (getf plist :blockfilterindex) t))))
     plist))
 
 (defun apply-config-globals (merged)

@@ -1277,6 +1277,25 @@ twice. We used to record the bind address and start deaf on it, discarding the
                   '("-regtest")
                   (format nil "[regtest]~%bind=127.0.0.1~%listen=0~%"))))))
 
+(test blockfilterindex-values-name-filter-types
+  "Core init.cpp:972-985: -blockfilterindex=\"\"/1 enables every filter type
+and 0 none; any other value makes every value a type name, and one naming no
+type refuses startup with `Unknown -blockfilterindex value <v>.'
+(p2p_blockfilters.py:275). `basic' enables the index, which the option's
+boolean parse read as atoi's 0."
+  (is (string= "Unknown -blockfilterindex value abc."
+               (%start-node-plist-refusal "-regtest" "-blockfilterindex=abc")))
+  (is (string= "Unknown -blockfilterindex value abc."
+               (%start-node-plist-refusal "-regtest" "-blockfilterindex=basic"
+                                          "-blockfilterindex=abc")))
+  (is (eq t (getf (start-node-plist '("-regtest" "-blockfilterindex=basic"))
+                  :blockfilterindex)))
+  (is (eq t (getf (start-node-plist '("-regtest" "-blockfilterindex"))
+                  :blockfilterindex))
+      "the control: a bare -blockfilterindex enables it")
+  (is (null (getf (start-node-plist '("-regtest" "-blockfilterindex=0"))
+                  :blockfilterindex))))
+
 (test negative-maxconnections-is-an-init-error
   "GA10 32758a48. `if (user_max_connection < 0) return
 InitError(\"-maxconnections must be greater or equal than zero\")`
