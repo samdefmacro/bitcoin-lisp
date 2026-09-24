@@ -3121,98 +3121,140 @@ off (-peerblockfilters absent) or the index is unavailable."
        (let ((bfi (bl:node-blockfilterindex bl:*node*)))
          (and bfi (bl.store:blockfilterindex-enabled bfi) bfi))))
 
-(defun %cf-active-hash (chain-state height)
-  "Hash of the ACTIVE-chain block at HEIGHT, or NIL."
-  (let ((e (bl.store:get-block-at-height chain-state height)))
-    (and e (bl.store:block-index-entry-hash e))))
+(defun %prepare-block-filter-request (peer chain-state filter-type start-height
+                                      stop-hash max-height-diff)
+  "Core PrepareBlockFilterRequest (net_processing.cpp:3265-3316): the stop
+block's index entry and the filter index to answer from, as two values, or NIL
+when the request is not served. In Core's order, each refusal but the last
+DISCONNECTS the peer with Core's debug line: a filter type other than basic,
+or any type when we do not offer this peer NODE_COMPACT_FILTERS; a stop hash
+that is unknown or that BlockRequestAllowed would not serve (a recent stale
+block IS served -- p2p_blockfilters.py:116 asks for one); a start height above
+the stop height; a span of MAX-HEIGHT-DIFF blocks or more. A missing filter
+index answers nothing.
 
-(defun %cf-request-stop-height (chain-state start-height stop-hash max-diff)
-  "Validate a BIP157 request (Core PrepareBlockFilterRequest): STOP-HASH must be
-a known block on the ACTIVE chain, START-HEIGHT <= stop height, and the span
-under MAX-DIFF. Returns the stop height, or NIL. (Core also serves recent fork
-blocks via GetAncestor; we serve the active chain only -- the light-client case.)"
-  (let ((entry (bl.store:get-block-index-entry chain-state stop-hash)))
-    (when entry
-      (let* ((stop-height (bl.store:block-index-entry-height entry))
-             (active (%cf-active-hash chain-state stop-height)))
-        (when (and active (equalp active stop-hash)
-                   (<= start-height stop-height)
-                   (< (- stop-height start-height) max-diff))
-          stop-height)))))
+We used to serve the active chain only and drop every bad request silently,
+so a light client that asked a wrong question waited forever instead of being
+told by the disconnect."
+  (flet ((refuse (control &rest args)
+           (bl:log-cat "net" "~?, ~A" control args (disconnect-msg peer))
+           (disconnect-peer peer)
+           (return-from %prepare-block-filter-request nil)))
+    (unless (and (eql filter-type 0)
+                 (logtest (peer-our-services peer) bl.ser:+node-compact-filters+))
+      (refuse "peer requested unsupported block filter type: ~D" filter-type))
+    (let ((stop (bl.store:get-block-index-entry chain-state stop-hash)))
+      (unless (and stop (%block-request-allowed-p
+                         chain-state stop (bl.store:best-header-entry chain-state)))
+        (refuse "peer requested invalid block hash: ~A"
+                (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes stop-hash))))
+      (let ((stop-height (bl.store:block-index-entry-height stop)))
+        (when (> start-height stop-height)
+          (refuse "peer sent invalid getcfilters/getcfheaders with start height ~D ~
+and stop height ~D" start-height stop-height))
+        (when (>= (- stop-height start-height) max-height-diff)
+          (refuse "peer requested too many cfilters/cfheaders: ~D / ~D"
+                  (1+ (- stop-height start-height)) max-height-diff)))
+      (let ((bfi (%cf-serving-index)))
+        (if bfi
+            (values stop bfi)
+            (bl:log-cat "net" "Filter index for supported type basic not found"))))))
+
+(defun %cf-chain-accessor (chain-state stop)
+  "A function from a height to the hash of STOP's ancestor there, or NIL (Core
+GetAncestor, as LookupFilterRange and ProcessGetCFCheckPt use it), so a stale
+stop block is
+answered from its own branch. The branch below STOP is walked once, down to
+where it rejoins the active chain; every height at or below that is an O(1)
+active-chain lookup, which keeps a getcfcheckpt at the mainnet tip from
+walking the whole chain."
+  (let ((branch '())
+        (e stop))
+    (loop while (and e (not (bl.store:entry-on-active-chain-p chain-state e)))
+          do (push e branch)
+             (setf e (bl.store:block-index-entry-prev-entry e)))
+    (let ((fork-height (if e (bl.store:block-index-entry-height e) -1))
+          (branch (coerce branch 'vector)))
+      (lambda (height)
+        (let ((entry (if (<= height fork-height)
+                         (bl.store:get-block-at-height chain-state height)
+                         (let ((i (- height fork-height 1)))
+                           (and (< -1 i (length branch)) (aref branch i))))))
+          (and entry (bl.store:block-index-entry-hash entry)))))))
+
+(defun %cf-range-filters (at bfi start-height stop-height)
+  "((hash . filter) ...) for every height START-HEIGHT..STOP-HEIGHT through the
+ancestor accessor AT, or NIL when any filter is missing -- Core's
+LookupFilterRange / LookupFilterHashRange, which fail the whole request then."
+  (loop for h from start-height to stop-height
+        for bh = (funcall at h)
+        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
+        unless filter do (return nil)
+        collect (cons bh filter)))
 
 (define-p2p-handler "getcfilters" (peer payload ctx)
-  "Serve a BIP157 getcfilters: one cfilter message per block in the requested
-range, from the block filter index. Silently ignored when serving is disabled
-or the request is invalid (Core disconnects; we drop the request)."
+  "Serve a BIP157 getcfilters (Core ProcessGetCFilters, net_processing.cpp:
+3318-3344): one cfilter per block from START-HEIGHT to the stop block, along
+the stop block's chain, or nothing when a filter is missing."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((bfi (%cf-serving-index)))
-    (when bfi
-      (multiple-value-bind (ftype start-height stop-hash)
-          (bl.ser:parse-getcfilters-payload payload)
-        (when (and ftype (zerop ftype))   ; type 0 = basic
-          (let ((stop-height (%cf-request-stop-height
-                              chain-state start-height stop-hash
-                              +max-getcfilters-size+)))
-            (when stop-height
-              (loop for h from start-height to stop-height
-                    for bh = (%cf-active-hash chain-state h)
-                    for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
-                    while filter
-                    do (send-message
-                        peer (bl.ser:make-cfilter-message
-                              0 bh filter)))))))))))
+    (multiple-value-bind (ftype start-height stop-hash)
+        (bl.ser:parse-getcfilters-payload payload)
+      (multiple-value-bind (stop bfi)
+          (%prepare-block-filter-request peer chain-state ftype start-height
+                                         stop-hash +max-getcfilters-size+)
+        (when stop
+          (loop for (bh . filter)
+                  in (%cf-range-filters (%cf-chain-accessor chain-state stop) bfi
+                                        start-height (bl.store:block-index-entry-height stop))
+                do (send-message peer (bl.ser:make-cfilter-message 0 bh filter))))))))
 
 (define-p2p-handler "getcfheaders" (peer payload ctx)
-  "Serve a BIP157 getcfheaders: the previous filter header at START-1 (zeros at
-genesis) plus the per-block filter HASHES for the range, in one cfheaders."
+  "Serve a BIP157 getcfheaders (Core ProcessGetCFHeaders, net_processing.cpp:
+3346-3386): the filter header of the stop block's ancestor at START-1 (zeros
+at genesis) plus the filter HASHES from START-HEIGHT to the stop block."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((bfi (%cf-serving-index)))
-    (when bfi
-      (multiple-value-bind (ftype start-height stop-hash)
-          (bl.ser:parse-getcfilters-payload payload)
-        (when (and ftype (zerop ftype))
-          (let ((stop-height (%cf-request-stop-height
-                              chain-state start-height stop-hash
-                              +max-getcfheaders-size+)))
-            (when stop-height
-              (let ((prev-header (make-array 32 :element-type '(unsigned-byte 8)
-                                                :initial-element 0)))
-                (when (plusp start-height)
-                  (let* ((ph (%cf-active-hash chain-state (1- start-height)))
-                         (hdr (and ph (bl.store:blockfilterindex-get-header bfi ph))))
-                    (unless hdr (return-from handle-getcfheaders))
-                    (setf prev-header hdr)))
-                (let ((hashes '()))
-                  (loop for h from start-height to stop-height
-                        for bh = (%cf-active-hash chain-state h)
-                        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
-                        do (unless filter (return-from handle-getcfheaders))
-                           (push (bl.crypto:hash256 filter) hashes))
-                  (send-message
-                   peer (bl.ser:make-cfheaders-message
-                         0 stop-hash prev-header (nreverse hashes)))))))))))))
+    (multiple-value-bind (ftype start-height stop-hash)
+        (bl.ser:parse-getcfilters-payload payload)
+      (multiple-value-bind (stop bfi)
+          (%prepare-block-filter-request peer chain-state ftype start-height
+                                         stop-hash +max-getcfheaders-size+)
+        (when stop
+          (let* ((at (%cf-chain-accessor chain-state stop))
+                 (prev-header
+                   (if (plusp start-height)
+                       (let ((ph (funcall at (1- start-height))))
+                         (or (and ph (bl.store:blockfilterindex-get-header bfi ph))
+                             (return-from handle-getcfheaders)))
+                       (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (filters (%cf-range-filters at bfi start-height
+                                             (bl.store:block-index-entry-height stop))))
+            (when filters
+              (send-message
+               peer (bl.ser:make-cfheaders-message
+                     0 stop-hash prev-header
+                     (mapcar (lambda (f) (bl.crypto:hash256 (cdr f))) filters))))))))))
 
 (define-p2p-handler "getcfcheckpt" (peer payload ctx)
-  "Serve a BIP157 getcfcheckpt: the filter header at every 1000th block up to
-the stop hash."
+  "Serve a BIP157 getcfcheckpt (Core ProcessGetCFCheckPt, net_processing.cpp:
+3388-3421): the filter header at every 1000th height of the stop block's
+chain, up to the stop block."
   (bl.ctx:with-node-context (chain-state) ctx
-  (let ((bfi (%cf-serving-index)))
-    (when bfi
-      (multiple-value-bind (ftype stop-hash)
-          (bl.ser:parse-getcfcheckpt-payload payload)
-        (when (and ftype (zerop ftype))
-          (let ((stop-height (%cf-request-stop-height
-                              chain-state 0 stop-hash most-positive-fixnum)))
-            (when stop-height
-              (let ((headers '()))
-                (loop for h from +cfcheckpt-interval+ to stop-height by +cfcheckpt-interval+
-                      for bh = (%cf-active-hash chain-state h)
-                      for hdr = (and bh (bl.store:blockfilterindex-get-header bfi bh))
-                      do (unless hdr (return-from handle-getcfcheckpt))
-                         (push hdr headers))
-                (send-message
-                 peer (bl.ser:make-cfcheckpt-message
-                       0 stop-hash (nreverse headers))))))))))))
+    (multiple-value-bind (ftype stop-hash)
+        (bl.ser:parse-getcfcheckpt-payload payload)
+      (multiple-value-bind (stop bfi)
+          (%prepare-block-filter-request peer chain-state ftype 0 stop-hash
+                                         (1- (expt 2 32)))
+        (when stop
+          (let* ((at (%cf-chain-accessor chain-state stop))
+                 (headers
+                  (loop for h from +cfcheckpt-interval+
+                          to (bl.store:block-index-entry-height stop)
+                          by +cfcheckpt-interval+
+                        for bh = (funcall at h)
+                        collect (or (and bh (bl.store:blockfilterindex-get-header bfi bh))
+                                    (return-from handle-getcfcheckpt)))))
+            (send-message
+             peer (bl.ser:make-cfcheckpt-message 0 stop-hash headers))))))))
 
 (defconstant +max-blocktxn-depth+ 10
   "Core MAX_BLOCKTXN_DEPTH (net_processing.cpp:140). Deeper than this we refuse
