@@ -43,6 +43,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:log-debug
    #:log-error
    #:log-info
+   #:init-message
    #:log-ip
    #:log-level-value
    #:log-warn
@@ -556,6 +557,17 @@ via the logging RPC (or the node is globally at :debug)."
 
 (defmacro log-info (format-string &rest args)
   `(node-log :info ,format-string ,@args))
+
+(defun init-message (text)
+  "Core's uiInterface.InitMessage as the non-GUI build logs it: `init message:
+<TEXT>` (noui.cpp:56). The functional framework waits on these lines --
+rpc_users.py for `Done loading`, feature_init.py for `Verifying blocks` and
+`Starting network threads` -- so the wording is Core's, ellipsis included.
+
+Here, in the logging layer, rather than with the start-up sequence: Core's
+wallet calls chain.initMessage too (AttachChain's `Rescanning…',
+wallet.cpp:3261), and the wallet loads before src/node/."
+  (log-info "init message: ~A" text))
 
 (defmacro log-warn (format-string &rest args)
   `(node-log :warn ,format-string ,@args))

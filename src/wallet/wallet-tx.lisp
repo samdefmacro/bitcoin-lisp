@@ -1891,9 +1891,11 @@ gate, the prune refusal and the reserver, is unchanged."
           (let ((missing (%attach-chain-missing-data-error
                           node chain-state tip-height rescan-height)))
             (when missing (return-from wallet-attach-chain missing)))
-          ;; Core's WalletLogPrintf (wallet.cpp:3262): how far back the
-          ;; catch-up goes, after the birthday gate. wallet_reorgsrestore.py
-          ;; :121 waits for this line after an unclean shutdown.
+          ;; Core's chain.initMessage + WalletLogPrintf (wallet.cpp:3261-
+          ;; 3262): how far back the catch-up goes, after the birthday gate.
+          ;; wallet_reorgsrestore.py:121 waits for the second line after an
+          ;; unclean shutdown.
+          (bl:init-message "Rescanning…")
           (bl:log-info "[~A] Rescanning last ~D blocks (from block ~D)..."
                        (wallet-name wallet) (- tip-height rescan-height)
                        rescan-height)

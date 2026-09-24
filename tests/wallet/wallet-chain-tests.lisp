@@ -1057,7 +1057,8 @@ refused it as foreign, so wallet_hd.py:84 found no wallet loaded."
 WalletLogPrintf (\"[name] \" prefix) before its catch-up scan
 (wallet.cpp:3261-3262). wallet_reorgsrestore.py:121 waits for exactly that
 line after an unclean shutdown left the wallet one block behind the chain;
-ours scanned without saying so."
+ours scanned without saying so. The init message before it is Core's too
+(chain.initMessage, :3261)."
   (with-wallet-chain-node (node "rescanlog" :wallet "rlw")
     (%wc-mine node 2 (%wc-optrue-address))
     (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "rlw"))
@@ -1070,7 +1071,11 @@ ours scanned without saying so."
                      (bl.rpc:dispatch-rpc-method node "loadwallet"
                                                  (list "rlw"))))))
       (is-true (%wc-mentions-p expected lines)
-               "missing ~S" expected))))
+               "missing ~S" expected)
+      ;; Core's chain.initMessage(_("Rescanning…")) comes first (:3261).
+      (is-true (%wc-mentions-p (format nil "init message: Rescanning~C"
+                                       (code-char #x2026))
+                               lines)))))
 
 ;;; --- CWalletTx mapValue strings are Core's bytes ---------------------------
 

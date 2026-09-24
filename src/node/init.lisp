@@ -2,13 +2,6 @@
 
 ;;;; Startup Sequence
 
-(defun init-message (text)
-  "Core's uiInterface.InitMessage as the non-GUI build logs it: `init message:
-<TEXT>` (noui.cpp:56). The functional framework waits on these lines --
-rpc_users.py for `Done loading`, feature_init.py for `Verifying blocks` and
-`Starting network threads` -- so the wording is Core's, ellipsis included."
-  (log-info "init message: ~A" text))
-
 (defun init-node (data-directory &key (network :mainnet) (log-level :info))
   "Initialize a new node with the given data directory and network.
 For mainnet, data is stored in a 'mainnet' subdirectory.
