@@ -272,6 +272,7 @@ init.cpp, node/. src/node/.")
    #:*addcon-thread*
    #:start-index-background-sync
    #:start-wallets
+   #:startup-wallet-names
    #:node-sync-thread
    #:node-running
    #:sync-idle-wait

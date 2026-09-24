@@ -3731,3 +3731,19 @@ lower-cased the header and applied them to mainnet."
   (is (equal '(("Main" "bitcoin.conf" 1))
              (bl.cfg:conf-unrecognized-sections (format nil "[Main]~%rpcport=1234~%")
                                                 "bitcoin.conf"))))
+
+(test a-repeated-wallet-option-is-cores-initwarning
+  "Core's VerifyWallets loads each -wallet once and warns about every repeat,
+`Ignoring duplicate -wallet w1.' (wallet/load.cpp:90-93), an InitWarning, so
+on stderr; wallet_multiwallet.py:172 stops the node expecting exactly that.
+Ours dropped the repeat silently."
+  (let ((err (make-string-output-stream)))
+    (let ((*error-output* err) (bl:*deferred-log-lines* nil))
+      (is (equal '("w1" "w2") (bl:startup-wallet-names '("w1" "w1" "w2")))))
+    (is (equal (format nil "Warning: Ignoring duplicate -wallet w1.~%")
+               (get-output-stream-string err))))
+  ;; Control: no repeat, no word.
+  (let ((err (make-string-output-stream)))
+    (let ((*error-output* err) (bl:*deferred-log-lines* nil))
+      (is (equal '("w1" "w2") (bl:startup-wallet-names '("w1" "w2")))))
+    (is (equal "" (get-output-stream-string err)))))
