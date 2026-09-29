@@ -22,7 +22,7 @@
 ;;;    GetRequiredFeeRate.
 ;;;  - Wallet signing: CWallet::SignTransaction over the descriptor SPKMs'
 ;;;    derived keys, through the same signing machinery as
-;;;    signrawtransactionwithkey (%sign-tx-inputs).
+;;;    signrawtransactionwithkey (BL.RPC:SIGN-TX-INPUTS).
 ;;;  - CommitTransaction + SubmitTxMemoryPoolAndRelay +
 ;;;    ResubmitWalletTransactions / MaybeResendWalletTxs (wallet.cpp:
 ;;;    2019-2148, 2455).
@@ -585,8 +585,13 @@ solvable pre-selected input\"."
      (multiple-value-bind (size elems) (%inner-sat-size wallet cc script use-max-sig)
        (when size (values size t elems))))
     (:witness-v1-taproot
-     ;; Keypath spend assumed, like Core's TRDescriptor (FIXME parity).
-     (values (+ 1 65) t 1))
+     ;; InferScript gives an output key on the curve tr() or rawtr(), and
+     ;; both size a KEY-PATH spend: Core's own FIXME (descriptor.cpp:1522-1530,
+     ;; 1725-1733), kept so our fee estimate is Core's. A key off the curve
+     ;; infers only addr(), which has no satisfaction weight (:2796-2802,
+     ;; :2824-2828, DescriptorImpl's default at :1021).
+     (when (bl.crypto:xonly-pubkey-valid-p (subseq script 2 34))
+       (values (+ 1 65) t 1)))
     (:scripthash
      (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
        (when redeem

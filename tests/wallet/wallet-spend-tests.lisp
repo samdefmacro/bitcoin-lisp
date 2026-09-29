@@ -488,6 +488,31 @@ own, which is the whole of IsExternalSelected."
   "Core CalculateMaximumSignedTxSize's weight for TX under CC."
   (nth-value 1 (bl.wallet::%max-signed-tx-size wallet cc tx txouts)))
 
+(test ws-p2tr-input-is-sized-as-core-infers-it
+  "Core sizes a P2TR input through InferDescriptor: an output key on the curve
+is tr() or rawtr(), both a key-path spend of 1 + 65 witness bytes in one
+element (descriptor.cpp:1522-1530, 1725-1733 -- Core's own FIXME, since a
+script path can weigh far more); a key OFF the curve infers only addr(),
+which has no satisfaction, so the input is not solvable
+(descriptor.cpp:2796-2802, :2824-2828, and DescriptorImpl's default,
+:1021). Ours sized every P2TR output as a
+key-path spend."
+  (flet ((p2tr (x)
+           (concatenate '(simple-array (unsigned-byte 8) (*)) (vector #x51 #x20) x))
+         (x-only (n)
+           (let ((x (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+             (setf (aref x 31) n)
+             x)))
+    (let ((valid (loop for n from 1 below 256
+                       when (bl.crypto:xonly-pubkey-valid-p (x-only n)) return (x-only n)))
+          (invalid (loop for n from 1 below 256
+                         unless (bl.crypto:xonly-pubkey-valid-p (x-only n)) return (x-only n))))
+      (is-true (and valid invalid) "positive control: both kinds of key exist below 256")
+      ;; (32 + 4 + 4 + 1) * 4 non-witness units, one stack-count byte, 66.
+      (is (eql (+ (* 4 41) 1 66) (%ws-input-weight (p2tr valid) nil)))
+      (is (null (%ws-input-weight (p2tr invalid) nil))
+          "an output key off the curve was sized as a key-path spend"))))
+
 (test ws-external-selected-input-is-sized-for-a-foreign-signature
   "Core's UseMaxSig (spend.cpp:54-58) is CCoinControl::IsExternalSelected, and
 GetSignedTxinWeight passes the txin so it can fire (spend.cpp:138): a
