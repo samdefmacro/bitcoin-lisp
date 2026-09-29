@@ -1694,7 +1694,7 @@ shape: bl.bytes:make-octets-hash-table is the fast one."
                             (push (cons file n) hits))))))
     (nreverse hits)))
 
-(defparameter +equalp-hash-table-ceiling+ 103
+(defparameter +equalp-hash-table-ceiling+ 102
   "How many EQUALP hash tables src/ may make: 111 when the second-round
 review counted them, 103 after the mempool's seven txid tables and the IBD
 block-hash tables moved to bl.bytes:make-octets-hash-table (wave E), 102 when
