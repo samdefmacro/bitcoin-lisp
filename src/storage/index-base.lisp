@@ -246,9 +246,17 @@ when the block index does not hold it; NIL when the index has no best block.")
             (entry (setf (cdr best) (block-index-entry-height entry)) entry)
             (t :not-found)))))))
 
+(defgeneric index-commit-records (index)
+  (:documentation "The (key . value) records Core's CustomCommit writes in the
+SAME batch as the best-block locator (index/base.cpp:270-288): the filter
+index's next write position, the coinstats index's running MuHash. Default:
+none.")
+  (:method ((index base-index)) nil))
+
 (defun commit-index (index &optional chainstate)
   "Core BaseIndex::Commit (index/base.cpp:270-288): write the in-memory best
-block to the index's database as a CBlockLocator -- GetLocator over
+block to the index's database as a CBlockLocator, in one batch with the
+index's own INDEX-COMMIT-RECORDS -- GetLocator over
 CHAINSTATE's block index, byte for byte Core's -- and nothing when the index
 has processed no block yet. Without CHAINSTATE, or with a best block it does
 not hold, the locator is that one hash, which ReadBestBlock (vHave.at(0))
@@ -258,9 +266,13 @@ reads the same way. Returns T when a record was written."
     (when (and best db)
       (let ((entry (and chainstate
                         (get-block-index-entry chainstate (car best)))))
-        (leveldb-put db (base-index-meta-key index)
-                     (encode-block-locator
-                      (if entry
-                          (build-block-locator chainstate entry)
-                          (list (car best)))))
+        (with-leveldb-writebatch (batch)
+          (leveldb-writebatch-put batch (base-index-meta-key index)
+                                  (encode-block-locator
+                                   (if entry
+                                       (build-block-locator chainstate entry)
+                                       (list (car best)))))
+          (loop for (key . value) in (index-commit-records index)
+                do (leveldb-writebatch-put batch key value))
+          (leveldb-write db batch))
         t))))

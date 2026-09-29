@@ -943,14 +943,15 @@ because our index can contain holes below its best marker."
                  (let ((h1 (bl.store:block-index-entry-hash
                             (bl.store:get-block-at-height state 1))))
                    (is (member (bl.wallet::%rescan-filter-matches-block
-                                bfi (bl.wallet::%make-wallet-rescan-filter wallet) h1)
+                                bfi (bl.wallet::%make-wallet-rescan-filter wallet) h1 1)
                                '(:match :no-match))))
                  ;; A hash with no stored filter => :unknown, so the caller reads it.
                  (is (eq :unknown
                          (bl.wallet::%rescan-filter-matches-block
                           bfi (bl.wallet::%make-wallet-rescan-filter wallet)
                           (make-array 32 :element-type '(unsigned-byte 8)
-                                         :initial-element 99)))))))
+                                         :initial-element 99)
+                          1))))))
         (ignore-errors
          (bl.wallet:close-wallet-manager
           (bl:node-wallet-manager node)))))))

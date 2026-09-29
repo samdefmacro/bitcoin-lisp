@@ -2,22 +2,14 @@
 
 ;;; coinstatsindex rewind (Core BaseIndex::Rewind, index/base.cpp:239/290)
 ;;;
-;;; coinstats records are keyed by HEIGHT with no block hash, there is no
-;;; disconnect hook, and index writes reach the OS immediately while the
-;;; chainstate tip only becomes durable at a flush (600s / N blocks / cache
-;;; size — and a reorg does not trigger one). So a process kill inside that
-;;; window leaves records holding an ABANDONED chain's state at heights at or
-;;; below the tip that startup restores. The repair loop this replaces blessed
-;;; any record it found at height <= tip and overwrote the stored meta hash,
-;;; destroying the one piece of evidence that could have detected the
-;;; divergence; every later query then served abandoned-chain numbers labelled
-;;; with the active chain's hash. Core defends this with a per-record block
-;;; hash it re-checks in RevertBlock; we recover the same guarantee at startup.
-
-(defconstant +coinstatsindex-max-rewind+ 1000
-  "How far back the coinstats rewind will verify records by recomputation
-before giving up and rebuilding from genesis. Far deeper than any plausible
-reorg; the cheap header-index walk is tried first and has no such bound.")
+;;; The index keeps Core's running state -- the MuHash fraction and the
+;;; tallies of its best block -- and each record only the finalized digest, so
+;;; moving the index back means reversing blocks, as Core's CustomRemove /
+;;; RevertBlock do (index/coinstatsindex.cpp:245-262, 329-399): each block from
+;;; the best down to the fork point, with its body and undo data, the result
+;;; checked against the parent's record. A block that cannot be reversed
+;;; (body or undo gone, a record that disagrees) rebuilds the index from
+;;; genesis instead.
 
 (defmethod bl.store:index-prepare-sync ((bfi bl.store:blockfilterindex) cs store)
   "BIP157 genesis-anchor migration (see BLOCKFILTERINDEX-ENSURE-GENESIS-ANCHOR:
@@ -269,74 +261,47 @@ chain."
     (when (and fork (bl.store:entry-on-active-chain-p cs fork))
       fork)))
 
-(defun %coinstatsindex-verified-height (csi cs store from)
-  "The highest height at or below FROM whose stored record provably belongs to
-the ACTIVE chain, found by recomputing it from its stored parent and the active
-block at that height (see coinstatsindex-record-matches-block-p). This is the
-fallback for when the header index cannot resolve the fork point, and it is
-what keeps an ordinary unclean shutdown — index a few blocks ahead of the last
-flushed tip, same chain — from costing a rebuild from genesis: the record at
-the restored tip verifies on the first try. NIL if nothing verifies within
-+coinstatsindex-max-rewind+."
-  (loop for h from from downto (max 0 (- from +coinstatsindex-max-rewind+))
-        do (when (zerop h)
-             ;; Genesis is on every chain; its record is synthesized, not
-             ;; folded from a parent, so presence is the whole check.
-             (return (and (bl.store:coinstatsindex-get-stats csi 0) 0)))
-           (let* ((entry (bl.store:get-block-at-height cs h))
-                  (hash (and entry (bl.store:block-index-entry-hash entry)))
-                  (block (and hash (bl.store:get-block store hash))))
-             (when (and block
-                        (bl.store:coinstatsindex-record-matches-block-p
-                         csi block hash h
-                         (bl.val:get-undo-data hash)
-                         (bl.val:calculate-block-subsidy h)))
-               (return h)))))
-
 (defun %rewind-coinstatsindex (csi cs store)
-  "Make the coinstats index's best marker name a block on the ACTIVE chain
-before anything backfills on top of it, moving it back to the last common
-ancestor when it does not (Core BaseIndex::Rewind). Records above the new best
-are then rewritten by the backfill.
+  "Make the coinstats index's best block one on the ACTIVE chain before anything
+backfills on top of it, reversing the abandoned blocks down to the fork point
+(Core BaseIndex::Rewind over CoinStatsIndex::CustomRemove). The running state
+is loaded first (Core's CustomInit).
 
-Returns NIL when the index was already consistent — the common case, and it
-costs one hash comparison: a rewind that always rebuilt would be a severe
-performance regression. Otherwise returns the height rewound to, or -1 when no
-trustworthy record could be identified and the index must be rebuilt."
+Returns NIL when the index was already consistent -- the common case, one hash
+comparison. Otherwise the height rewound to, or -1 when a block could not be
+reversed and the index must be rebuilt."
+  (bl.store:coinstatsindex-load-running csi)
   (let ((tip (bl.store:current-height cs)))
-    (multiple-value-bind (best-height best-hash)
-        (bl.store:coinstatsindex-best csi)
+    (multiple-value-bind (best-height best-hash) (bl.store:coinstatsindex-best csi)
       (when (minusp best-height)
         (return-from %rewind-coinstatsindex nil))
       (let ((active (and (<= best-height tip)
                          (bl.store:get-block-at-height cs best-height))))
-        (when (and active best-hash
-                   (equalp (bl.store:block-index-entry-hash active) best-hash))
+        (when (and active (equalp (bl.store:block-index-entry-hash active) best-hash))
           (return-from %rewind-coinstatsindex nil)))
       (log-warn "Coinstats index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
-                best-height
-                (if best-hash (bl.crypto:bytes-to-hex best-hash) "no hash")
-                tip)
-      (let* ((fork-entry (and best-hash (%index-fork-entry cs best-hash)))
-             (fork (and fork-entry (bl.store:block-index-entry-height fork-entry)))
-             (target (or (and fork
-                              (<= fork tip)
-                              (bl.store:coinstatsindex-get-stats csi fork)
-                              fork)
-                         (%coinstatsindex-verified-height csi cs store (min best-height tip))))
-             (entry (and target (bl.store:get-block-at-height cs target))))
-        (cond
-          (entry
-           (log-warn "Coinstats index rewound to height ~D (~A records above it will be rebuilt)"
-                     target (- tip target))
-           (bl.store:coinstatsindex-set-best
-            csi target (bl.store:block-index-entry-hash entry))
-           target)
-          (t
-           (log-warn "Coinstats index: no record below height ~D could be tied to the active chain; rebuilding from genesis"
-                     (min best-height tip))
-           (bl.store:coinstatsindex-clear-best csi)
-           -1))))))
+                best-height (bl.crypto:bytes-to-hex best-hash) tip)
+      (let ((stale (bl.store:get-block-index-entry cs best-hash))
+            (fork (%index-fork-entry cs best-hash)))
+        (flet ((rebuild (why)
+                 (log-warn "Coinstats index: ~A; rebuilding from genesis" why)
+                 (bl.store:coinstatsindex-clear-best csi)
+                 (return-from %rewind-coinstatsindex -1)))
+          (unless (and stale fork)
+            (rebuild "the branch its best block names cannot be placed in the header index"))
+          (loop for e = stale then (bl.store:block-index-entry-prev-entry e)
+                until (or (null e) (eq e fork))
+                do (let* ((hash (bl.store:block-index-entry-hash e))
+                          (block (and store (bl.store:get-block store hash))))
+                     (unless (and block
+                                  (bl.store:coinstatsindex-revert-block
+                                   csi block hash (bl.store:block-index-entry-height e)
+                                   (bl.val:get-undo-data hash)))
+                       (rebuild (format nil "block ~A could not be reversed"
+                                        (bl.crypto:bytes-to-hex hash))))))
+          (log-warn "Coinstats index rewound to height ~D"
+                    (bl.store:block-index-entry-height fork))
+          (bl.store:block-index-entry-height fork))))))
 
 (defmethod bl.store:index-prepare-sync ((idx bl.store:txospender-index) cs store)
   "Rewind a best marker that is not on the active chain (including one left
@@ -402,7 +367,7 @@ node's (Core refuses -blockfilterindex with pruning outright)."
   (loop for h from (min height (bl.store:current-height cs)) downto 0
         for e = (bl.store:get-block-at-height cs h)
         when (and e (bl.store:blockfilterindex-has-block-p
-                     bfi (bl.store:block-index-entry-hash e)))
+                     bfi (bl.store:block-index-entry-hash e) h))
           return e))
 
 (defun %rewind-blockfilterindex (bfi cs)

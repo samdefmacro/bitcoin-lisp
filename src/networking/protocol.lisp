@@ -3206,7 +3206,7 @@ ancestor accessor AT, or NIL when any filter is missing -- Core's
 LookupFilterRange / LookupFilterHashRange, which fail the whole request then."
   (loop for h from start-height to stop-height
         for bh = (funcall at h)
-        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
+        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh h))
         unless filter do (return nil)
         collect (cons bh filter)))
 
@@ -3241,7 +3241,8 @@ at genesis) plus the filter HASHES from START-HEIGHT to the stop block."
                  (prev-header
                    (if (plusp start-height)
                        (let ((ph (funcall at (1- start-height))))
-                         (or (and ph (bl.store:blockfilterindex-get-header bfi ph))
+                         (or (and ph (bl.store:blockfilterindex-get-header
+                                      bfi ph (1- start-height)))
                              (return-from handle-getcfheaders)))
                        (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                  (filters (%cf-range-filters at bfi start-height
@@ -3269,7 +3270,7 @@ chain, up to the stop block."
                           to (bl.store:block-index-entry-height stop)
                           by +cfcheckpt-interval+
                         for bh = (funcall at h)
-                        collect (or (and bh (bl.store:blockfilterindex-get-header bfi bh))
+                        collect (or (and bh (bl.store:blockfilterindex-get-header bfi bh h))
                                     (return-from handle-getcfcheckpt)))))
             (send-message
              peer (bl.ser:make-cfcheckpt-message 0 stop-hash headers))))))))

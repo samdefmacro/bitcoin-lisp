@@ -2103,8 +2103,7 @@ caller has already found an enabled index and a hash type the index carries."
             ;; index-free one by a key, which is exactly what
             ;; feature_coinstatsindex.py:84-90 compares.
             ,@(when (string= hash-type "muhash")
-                `(("muhash" . ,(hash-to-hex (bl.crypto:muhash-finalize
-                                             (bl.store:coinstats-muhash stats))))))
+                `(("muhash" . ,(hash-to-hex (bl.store:coinstats-muhash-hash stats)))))
             ("total_amount" . ,(satoshi->btc (bl.store:coinstats-total-amount stats)))
             ("total_unspendable_amount" . ,(satoshi->btc unspendable-total))
             ("block_info"
@@ -2601,15 +2600,16 @@ PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
       (unless (and bfi (bl.store:blockfilterindex-enabled bfi))
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Index is not enabled for filtertype basic"))
-      (unless (bl.store:get-block-index-entry (rpc-get-chain-state node) hash)
-        (error 'rpc-error :code +rpc-invalid-address-or-key+ :message "Block not found"))
+      (let ((entry (bl.store:get-block-index-entry (rpc-get-chain-state node) hash)))
+        (unless entry
+          (error 'rpc-error :code +rpc-invalid-address-or-key+ :message "Block not found"))
       (multiple-value-bind (filter header)
-          (bl.store:blockfilterindex-get bfi hash)
+          (bl.store:blockfilterindex-get bfi hash (bl.store:block-index-entry-height entry))
         (unless filter
           (error 'rpc-error :code +rpc-misc-error+
                             :message "Could not find block filter for the given block"))
         `(("filter" . ,(bl.crypto:bytes-to-hex filter))
-          ("header" . ,(hash-to-hex header)))))))
+          ("header" . ,(hash-to-hex header))))))))
 
 ;;; scanblocks — return blockhashes whose filters match a descriptor set.
 
@@ -2691,7 +2691,7 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
                 (let ((entry (bl.store:get-block-at-height chain-state height)))
                   (when entry
                     (let* ((hash (bl.store:block-index-entry-hash entry))
-                           (filter (bl.store:blockfilterindex-get-filter bfi hash)))
+                           (filter (bl.store:blockfilterindex-get-filter bfi hash height)))
                       (when filter
                         (multiple-value-bind (k0 k1)
                             (bl.store:block-filter-siphash-keys hash)
