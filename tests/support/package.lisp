@@ -14,6 +14,14 @@ bindings, the minimal test node, synthetic transactions, blocks and chains,
 a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
   (:use #:cl)
   (:export
+   #:raw-chacha20
+   #:raw-chacha20-seek
+   #:raw-chacha20-crypt
+   #:raw-chacha20-keystream
+   #:raw-aead
+   #:raw-aead-encrypt
+   #:raw-aead-decrypt
+   #:raw-aead-keystream
    #:with-temp-directory
    #:mine-regtest-header
    #:add-regtest-genesis-entry

@@ -432,6 +432,7 @@ bitcoin-cli (node-main)."
                              (:file "support/chain")
                              (:file "support/mempool-fixtures")
                              (:file "support/wallet")
+                             (:file "support/crypto")
                              (:file "package")
                              (:file "crypto/crypto-tests")
                              (:file "serialization/serialization-tests")
