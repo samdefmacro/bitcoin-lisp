@@ -51,9 +51,9 @@ unavailable."
          (done 0))
     (when (> from tip)
       (return-from bl.store:index-sync 0))
-    (loop for h from from to tip
-          for entry = (bl.store:get-block-at-height cs h)
-          while entry
+    ;; One forward pass (Core's NextSyncBlock), not a tip walk per height.
+    (loop for entry in (bl.store:active-chain-entries-from cs from (1+ (- tip from)))
+          for h = (bl.store:block-index-entry-height entry)
           do (when (bl:interrupt-requested-p)
                (log-warn "Spender index backfill stopped at height ~D" h)
                (return))

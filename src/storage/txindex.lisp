@@ -354,16 +354,22 @@ marker, and neither can Core, which also resumes from its locator."
   (let* ((current-height (current-height chain-state))
          (total-indexed 0)
          (last-report-time (get-internal-real-time)))
-    (loop for height from start-height to current-height
-          do (let ((entry (get-block-at-height chain-state height)))
-               (when entry
-                 (let* ((block-hash (block-index-entry-hash entry))
-                        (block (get-block block-store block-hash)))
-                   (when (and block
-                              (plusp height)
-                              (not (%txindex-block-indexed-p txindex block block-hash)))
-                     (let ((count (txindex-add-block txindex block block-hash height)))
-                       (incf total-indexed count))))))
+    ;; Core's BaseIndex::Sync walks forward with NextSyncBlock, one step per
+    ;; block (index/base.cpp:160-179, 201-247). The range is collected in one
+    ;; backward pass from the tip (ACTIVE-CHAIN-ENTRIES-FROM); a
+    ;; GET-BLOCK-AT-HEIGHT per height walked back from the tip each time,
+    ;; which is quadratic in the chain's length.
+    (loop for entry in (and (<= start-height current-height)
+                            (active-chain-entries-from chain-state start-height
+                                                       (1+ (- current-height start-height))))
+          for height = (block-index-entry-height entry)
+          do (let* ((block-hash (block-index-entry-hash entry))
+                    (block (get-block block-store block-hash)))
+               (when (and block
+                          (plusp height)
+                          (not (%txindex-block-indexed-p txindex block block-hash)))
+                 (let ((count (txindex-add-block txindex block block-hash height)))
+                   (incf total-indexed count))))
              ;; Report progress every second
              (when progress-callback
                (let ((now (get-internal-real-time)))
@@ -377,9 +383,8 @@ marker, and neither can Core, which also resumes from its locator."
       (funcall progress-callback current-height 100.0))
     ;; Record where we got to, so the next start resumes instead of re-reading
     ;; every block from genesis.
-    (let ((tip (get-block-at-height chain-state current-height)))
-      (when tip
-        (txindex-set-best-block txindex (block-index-entry-hash tip))))
+    (when (best-block-hash chain-state)
+      (txindex-set-best-block txindex (best-block-hash chain-state)))
     total-indexed))
 
 ;;; --- Migration: this tree's records -> Core's (2026-09-29) ---

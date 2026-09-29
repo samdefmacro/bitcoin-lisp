@@ -2270,6 +2270,63 @@ shutdown flush, say — would move coins while leaving the pointer behind."
                    "the reopened cache adopts what is on disk")))
         (bl.store:close-coins-view-db base)))))
 
+(test a-datadir-without-chainstate-dat-takes-its-tip-from-the-coins-quietly
+  "A datadir Bitcoin Core wrote has no chainstate.dat: its chain tip IS the
+coins database's best block (LoadChainTip reads GetBestBlock,
+validation.cpp:4822-4845). Starting on one is a normal case now that the coins
+database is Core's, so the reconcile takes the tip from the coins without the
+`chainstate.dat records tip height ... Recovered' warnings an interrupted
+flush earns. Control: with a chainstate.dat that disagrees, they are logged."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "bl-nocsdat-~D/" (random 1000000))
+                                 (uiop:temporary-directory))))
+         (chain-state (bl.store:init-chain-state base))
+         (db (bl.store:open-coins-view-db
+              (ensure-directories-exist (merge-pathnames "chainstate/" base))))
+         (cache (bl.store:make-coins-view-cache db))
+         (node (bl:make-node))
+         (coins-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xC5)))
+    (unwind-protect
+         (flet ((reconcile-lines ()
+                  (let ((result nil))
+                    (values (mapcar #'princ-to-string
+                                    (capture-log-lines
+                                     (lambda ()
+                                       (setf result (bl::reconcile-coins-db-best-block node)))))
+                            result))))
+           (setf (bl:node-chain-state node) chain-state
+                 (bl.store:chain-state-coins-view chain-state) cache)
+           (bl.store:add-block-index-entry
+            chain-state (bl.store:make-block-index-entry :hash coins-hash :height 129
+                                                         :chain-work 0 :status :valid))
+           (bl.store:coin-view-add
+            cache (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xA5)
+            0 5000 (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51)
+            129 :coinbase t :allow-overwrite nil)
+           (bl.store:coins-view-cache-flush cache :best-block coins-hash)
+           (is (null (probe-file (bl.store:state-file-path chain-state))))
+           (multiple-value-bind (lines result) (reconcile-lines)
+             (is (eq :loaded result))
+             (is (= 129 (bl.store:current-height chain-state)))
+             (is (equalp coins-hash (bl.store:best-block-hash chain-state)))
+             (is (notany (lambda (l) (search "chainstate.dat" l)) lines)
+                 "no warning for a datadir that never had chainstate.dat: ~S" lines))
+           ;; Control: a chainstate.dat that names another tip is an
+           ;; interrupted flush, and says so.
+           (bl.store:add-block-index-entry
+            chain-state (bl.store:make-block-index-entry
+                         :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xF5)
+                         :height 200 :chain-work 0 :status :valid))
+           (bl.store:update-chain-tip chain-state (make-array 32 :element-type '(unsigned-byte 8)
+                                                                  :initial-element #xF5)
+                                      200)
+           (bl.store:save-state chain-state)
+           (multiple-value-bind (lines result) (reconcile-lines)
+             (is (eq :reconciled result))
+             (is (some (lambda (l) (search "chainstate.dat records tip height 200" l)) lines))))
+      (bl.store:close-coins-view-db db)
+      (ignore-errors (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore)))))
+
 (test reconcile-moves-the-tip-record-to-where-the-coins-are
   "chainstate.dat must follow the coins, not the other way round.
 
@@ -2319,8 +2376,10 @@ cache is afterwards flushed cleanly."
            (is (eq :unrecorded (bl::reconcile-coins-db-best-block node)))
            (is (= 200 (bl.store:current-height chain-state))
                "and the tip is left alone")
-           ;; Now record where the coins actually are.
+           ;; Now record where the coins actually are, with a chainstate.dat
+           ;; that says 200: an interrupted reorg, which is what warns.
            (bl.store:coins-view-cache-flush cache :best-block coins-hash)
+           (bl.store:save-state chain-state)
            (is (eq :reconciled (bl::reconcile-coins-db-best-block node)))
            (is (= 150 (bl.store:current-height chain-state))
                "the tip record follows the coins")
@@ -3077,3 +3136,49 @@ genesis, flushes, and checks the next start agrees (:MATCH)."
                (is (eq :match (funcall start-up))
                    "and the next start finds the pointer and the tip agree"))
           (bl.store:close-coins-view-db db))))))
+
+(defmacro %counting-calls ((counter fname) &body body)
+  "Run BODY with calls to FNAME counted in COUNTER (the real function runs)."
+  (let ((real (gensym "REAL")))
+    `(let ((,counter 0) (,real (fdefinition ,fname)))
+       (unwind-protect
+            (progn (setf (fdefinition ,fname)
+                         (lambda (&rest args) (incf ,counter) (apply ,real args)))
+                   ,@body)
+         (setf (fdefinition ,fname) ,real)))))
+
+(test index-backfills-walk-the-chain-once
+  "Core's BaseIndex::Sync walks forward one block at a time (NextSyncBlock,
+index/base.cpp:160-179). The txindex catch-up and the filter-index build asked
+GET-BLOCK-AT-HEIGHT for every height, and each call walks back from the tip:
+on this 1,000-block chain that is about half a million ancestor steps, on
+mainnet's ~950k heights about 4.5e11. Now the range is collected in ONE
+backward pass (ACTIVE-CHAIN-ENTRIES-FROM) and walked forward: no per-height
+lookup at all, at most one ancestor step per height."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-linear-walk")
+      (let ((cs (bl.store:make-chain-state)) (prev nil))
+        ;; A 1,000-block active chain of index entries (no bodies needed:
+        ;; what is measured is the walk, not the indexing).
+        (dotimes (i 1000)
+          (let* ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+                 (e (progn (setf (aref h 0) (ldb (byte 8 0) i) (aref h 1) (ldb (byte 8 8) i))
+                           (bl.store:make-block-index-entry :hash h :height i :chain-work (1+ i)
+                                                            :status :valid :prev-entry prev))))
+            (bl.store:add-block-index-entry cs e)
+            (setf prev e)))
+        (setf (bl.store:chain-state-best-block-hash cs) (bl.store:block-index-entry-hash prev)
+              (bl.store:chain-state-best-height cs) 999)
+        (let ((store (bl.store:init-block-store dir))
+              (txindex (bl.store:init-tx-index dir))
+              (bfi (bl.store:init-blockfilterindex dir)))
+          (unwind-protect
+               (%counting-calls (per-height 'bl.store:get-block-at-height)
+                 (%counting-calls (walks 'bl.store:active-chain-entries-from)
+                   (bl.store:build-tx-index txindex cs store :from-genesis t)
+                   (bl.store:build-blockfilterindex bfi cs store (constantly nil))
+                   (is (= 0 per-height)
+                       "the backfills asked for ~D heights one by one" per-height)
+                   (is (<= walks 2) "~D chain walks for two backfills" walks)))
+            (bl.store:close-tx-index txindex)
+            (bl.store:close-blockfilterindex bfi)))))))

@@ -389,20 +389,28 @@ re-indexes exactly the blocks above it."
                     (bl.store:coinstats-muhash-hash (%csi-stats-at csi cs tip)))))
       (bl.store:close-coinstatsindex csi))))
 
-(test coinstatsindex-rebuilds-when-its-branch-cannot-be-reversed
-  "A best block the header index cannot place, or one whose blocks are not on
-disk, cannot be reversed. The index is then rebuilt from genesis -- and the
-rebuild writes exactly the records a consistent index holds."
+(test coinstatsindex-refuses-a-best-block-it-cannot-read
+  "A best block whose record the index cannot find is Core's CustomInit refusal,
+`Cannot read current coinstatsindex state; index may be corrupted'
+(coinstatsindex.cpp:288-292), and the start fails -- the index is not rebuilt
+behind the operator's back, and nothing is cleared. (At start-up a best block
+the block index does not hold is refused one step earlier, by
+BaseIndex::Init's `best block of coinstatsindex not found. Please rebuild the
+index.', %INIT-INDEX.)"
   (with-network (:regtest)
     (multiple-value-bind (node csi cs tip)
         (%csi-fixture (format nil "csirb~D" (get-internal-real-time)) 4)
+      (declare (ignore cs))
       (let ((records (loop for h from 0 to tip collect (%csi-raw-record csi h))))
+        (bl.store:coinstatsindex-clear-best csi)
         (bl.store:index-set-best
          csi (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xE7) tip)
         (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
-          (bl:catch-up-index node csi)
-          (is (= tip adds) "the rebuild indexed ~D block(s)" adds))
-        (is (= tip (bl.store:coinstatsindex-height csi)))
+          (let ((e (handler-case (progn (bl:catch-up-index node csi) nil)
+                     (bl.err:init-error (e) e))))
+            (is (equal "Cannot read current coinstatsindex state; index may be corrupted"
+                       (and e (princ-to-string e)))))
+          (is (= 0 adds) "the refusal re-indexed ~D block(s)" adds))
         (is (equalp records (loop for h from 0 to tip collect (%csi-raw-record csi h)))))
       (bl.store:close-coinstatsindex csi))))
 
@@ -546,3 +554,35 @@ The control is the same start without the old directory: no warning."
                            (first lines))
                    "Core's sentence, got ~S" (first lines)))
         (is-true (uiop:directory-exists-p old) "the old index is left in place")))))
+
+(test coinstatsindex-refuses-a-running-state-its-best-record-disagrees-with
+  "Core's CustomInit (coinstatsindex.cpp:275-309) finalizes 'M' and compares it
+with the best block's record; a mismatch is `Cannot read current coinstatsindex
+state; index may be corrupted' and BaseIndex::Init fails, which fails the start
+(init.cpp:1925). The index is NOT rebuilt behind the operator's back: disabling
+it or -reindex is theirs to choose. Control: an intact 'M' loads."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csicorrupt~D" (get-internal-real-time)) 3)
+      (declare (ignore node))
+      (let ((tip-hash (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs tip)))
+            (m-key (make-array 1 :element-type '(unsigned-byte 8) :initial-element (char-code #\M))))
+        (flet ((reload ()
+                 (bl.store:coinstatsindex-clear-best csi)
+                 (bl.store:index-set-best csi tip-hash tip)
+                 (bl.store:coinstatsindex-load-running csi)))
+          (bl.store:commit-index csi cs)
+          (is-true (reload) "control: the committed 'M' matches the best record")
+          ;; An 'M' that is some other set's fraction: the empty set's, 1/1.
+          (let ((one (make-array 768 :element-type '(unsigned-byte 8) :initial-element 0)))
+            (setf (aref one 0) 1 (aref one 384) 1)
+            (bl.kv:leveldb-put (bl.store:coinstatsindex-db csi) m-key one))
+          (let ((e (handler-case (progn (reload) nil)
+                     (bl.err:init-error (e) e))))
+            (is-true e "a disagreeing 'M' must refuse the start")
+            (is (equal "Cannot read current coinstatsindex state; index may be corrupted"
+                       (and e (princ-to-string e)))))
+          ;; And nothing was rebuilt or cleared behind the refusal.
+          (is (= tip (bl.store:coinstatsindex-height csi)))
+          (is-true (%csi-raw-record csi tip))))
+      (bl.store:close-coinstatsindex csi))))

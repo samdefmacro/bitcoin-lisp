@@ -428,9 +428,12 @@ indexed."
            (seeded (>= (blockfilterindex-height bfi) 0))
            (last-report (get-internal-real-time)))
       (block done
-        (loop for height from start to tip
-              do (let* ((entry (get-block-at-height chain-state height))
-                        (hash (and entry (block-index-entry-hash entry)))
+        ;; One pass over the range, as Core's Sync walks it with NextSyncBlock
+        ;; (index/base.cpp:160-179); see %BUILD-TX-INDEX-FROM.
+        (loop for entry in (and (<= start tip)
+                                (active-chain-entries-from chain-state start (1+ (- tip start))))
+              for height = (block-index-entry-height entry)
+              do (let* ((hash (block-index-entry-hash entry))
                         (block (and hash (get-block block-store hash)))
                         (undo (and block (funcall get-undo-fn hash)))
                         ;; FILTER is nil when the height is unindexable (missing
