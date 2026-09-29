@@ -8,8 +8,10 @@
 ;;; RevertBlock do (index/coinstatsindex.cpp:245-262, 329-399): each block from
 ;;; the best down to the fork point, with its body and undo data, the result
 ;;; checked against the parent's record. A block that cannot be reversed
-;;; (body or undo gone, a record that disagrees) rebuilds the index from
-;;; genesis instead.
+;;; (body or undo gone, a record that disagrees) is Core's FatalErrorf
+;;; `Failed to rewind coinstatsindex to a previous chain tip' (index/base.cpp:
+;;; 239-241 and :363-366): the node aborts, and the index is neither rebuilt
+;;; nor built on.
 
 (defmethod bl.store:index-prepare-sync ((bfi bl.store:blockfilterindex) cs store)
   "BIP157 genesis-anchor migration (see BLOCKFILTERINDEX-ENSURE-GENESIS-ANCHOR:
@@ -169,11 +171,15 @@ when there was nothing to do."
     ;; rewritten first, in place (INDEX-MIGRATE-RECORDS), so everything the
     ;; rewind and the backfill read is in one layout.
     (bl.store:index-migrate-records index cs)
-    (bl.store:index-prepare-sync index cs (node-block-store node))
-    ;; Core's Sync commits when it catches up, and when it is interrupted
-    ;; (index/base.cpp:214-236): the locator of wherever the index got to.
-    (unwind-protect (%catch-up-index-sync node index cs tip name)
-      (bl.store:commit-index index cs))))
+    ;; A rewind that failed has aborted the node (FATAL-ERROR); Core's Sync
+    ;; returns right after its FatalErrorf, with no Commit and nothing synced
+    ;; on top (index/base.cpp:239-241).
+    (unless (eq :rewind-failed
+                (bl.store:index-prepare-sync index cs (node-block-store node)))
+      ;; Core's Sync commits when it catches up, and when it is interrupted
+      ;; (index/base.cpp:214-236): the locator of wherever the index got to.
+      (unwind-protect (%catch-up-index-sync node index cs tip name)
+        (bl.store:commit-index index cs)))))
 
 (defun %catch-up-index-sync (node index cs tip name)
   "CATCH-UP-INDEX's backfill: INDEX-SYNC from the best block to CS's TIP,
@@ -268,8 +274,19 @@ backfills on top of it, reversing the abandoned blocks down to the fork point
 is loaded first (Core's CustomInit).
 
 Returns NIL when the index was already consistent -- the common case, one hash
-comparison. Otherwise the height rewound to, or -1 when a block could not be
-reversed and the index must be rebuilt."
+comparison. Otherwise the height rewound to; -1 when the stale branch cannot be
+placed in the header index and the index must be rebuilt; or :REWIND-FAILED
+when a block on it could not be reversed.
+
+That last is Core's abort, not a rebuild. BaseIndex::Rewind returns false when
+a block's body or undo data cannot be read (index/base.cpp:299-310) or
+CustomRemove fails (:313-315, coinstatsindex.cpp:217-234), and both of its
+callers then FatalErrorf \"Failed to rewind %s to a previous chain tip\"
+ (:239-241 in Sync, :363-366 in BlockConnected) -- AbortNode, the node stops
+with a failing exit status. Ours cleared the best block and rebuilt the index
+from genesis behind the operator's back, which on mainnet is hours of work to
+paper over a datadir that has lost block data. The best block and every record
+are left as they were, and the caller builds nothing on top."
   (bl.store:coinstatsindex-load-running csi)
   (let ((tip (bl.store:current-height cs)))
     (multiple-value-bind (best-height best-hash) (bl.store:coinstatsindex-best csi)
@@ -293,12 +310,17 @@ reversed and the index must be rebuilt."
                 until (or (null e) (eq e fork))
                 do (let* ((hash (bl.store:block-index-entry-hash e))
                           (block (and store (bl.store:get-block store hash))))
+                     (unless block
+                       (log-error "Failed to read block ~A from disk"
+                                  (bl.crypto:bytes-to-hex hash)))
                      (unless (and block
                                   (bl.store:coinstatsindex-revert-block
                                    csi block hash (bl.store:block-index-entry-height e)
                                    (bl.val:get-undo-data hash)))
-                       (rebuild (format nil "block ~A could not be reversed"
-                                        (bl.crypto:bytes-to-hex hash))))))
+                       (bl.log:fatal-error
+                        (format nil "Failed to rewind ~A to a previous chain tip"
+                                (bl.store:index-name csi)))
+                       (return-from %rewind-coinstatsindex :rewind-failed))))
           (log-warn "Coinstats index rewound to height ~D"
                     (bl.store:block-index-entry-height fork))
           (bl.store:block-index-entry-height fork))))))
@@ -536,7 +558,9 @@ happens here, when a replacement has arrived. INDEX-PREPARE-SYNC is the same
 rewind the startup catch-up runs -- walk the best marker back to the last
 block it shares with the active chain, removing what the abandoned branch
 wrote on the way. It runs only on the rare connect that is not a
-continuation."
+continuation. Returns what INDEX-PREPARE-SYNC returned: :REWIND-FAILED means
+Core's FatalErrorf has been raised and the block must not be written
+ (index/base.cpp:363-366 returns before CustomAppend)."
   (let ((best (bl.store:index-best-block index)))
     (when (and best
                (not (equalp best (bl.ser:block-header-prev-block
@@ -557,8 +581,8 @@ connect, so consensus is unaffected whether an index is on or off."
       (let ((name (bl.store:index-name index)))
         (handler-case
             (multiple-value-bind (result status)
-                (progn
-                  (%index-rewind-if-not-parent index chainstate block)
+                (unless (eq :rewind-failed
+                            (%index-rewind-if-not-parent index chainstate block))
                   (bl.store:index-write-block index chainstate block block-hash height spent-utxos))
               (declare (ignore result))
               (when (and (eq status :noncontiguous)

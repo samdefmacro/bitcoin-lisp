@@ -440,7 +440,8 @@ key, the MuHash loses the outputs BLOCK created and regains the coins it spent
 (SPENT-UTXOS, its undo list), and the tallies come back from the parent's
 record -- whose digest must be what the reversed MuHash finalizes to (Core
 asserts it). Returns T, or NIL when the state is not BLOCK's or the parent's
-record disagrees; the caller then rebuilds the index."
+record disagrees -- Core's CustomRemove returning false, on which the caller
+aborts the node (index/base.cpp:239-241, :363-366)."
   (let ((running (coinstatsindex-running csi))
         (db (coinstatsindex-db csi))
         (prev-hash (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header block))))
