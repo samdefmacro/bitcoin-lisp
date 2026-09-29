@@ -53,6 +53,7 @@ headerssync.cpp. src/networking/.")
    #:bloom-filter-hash-funcs
    #:bloom-insert
    #:bloom-contains-p
+   #:bloom-within-size-constraints-p
    #:bloom-relevant-and-update-p
    #:serialize-bloom-filter
    #:parse-bloom-filter
@@ -410,6 +411,7 @@ headerssync.cpp. src/networking/.")
    ;; Net permissions (-whitelist / -whitebind)
    #:parse-permission-flags
    #:parse-whitelist-entry
+   #:whitelist-entry-flags
    #:permission-flag-names
    #:peer-permission-flags
    #:peer-has-permission-p
@@ -422,6 +424,7 @@ headerssync.cpp. src/networking/.")
    #:+perm-download+
    #:+perm-addr+
    #:+perm-all+
+   #:+perm-implicit+
    #:subnet-match-p
    #:subnet-string
    #:address-in-subnets-p
