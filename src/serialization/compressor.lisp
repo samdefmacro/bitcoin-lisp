@@ -41,20 +41,36 @@ non-final digit and setting its high bit."
     (loop for i from len downto 0
           do (bb-write-u8 buf (aref tmp i)))))
 
-(defun br-read-core-varint (br)
-  "Read a Bitcoin Core VARINT from BR (serialize.h:442-462 ReadVarInt).
-Errors if the value would exceed 64 bits, mirroring Core's
-\"ReadVarInt(): size too large\" overflow checks."
+(defconstant +varint-max-uint64+ #xFFFFFFFFFFFFFFFF
+  "numeric_limits<uint64_t>::max(): ReadVarInt's bound for a uint64_t field.")
+
+(defconstant +varint-max-uint32+ #xFFFFFFFF
+  "numeric_limits<uint32_t>::max() (and unsigned int's): ReadVarInt's bound
+for a 32-bit unsigned field -- a Coin's code word, a compressed script's size,
+CBlockFileInfo's counts, CDiskBlockIndex's nStatus, nTx and positions.")
+
+(defconstant +varint-max-int32+ #x7FFFFFFF
+  "numeric_limits<int>::max(): ReadVarInt's bound for an int read in
+VarIntMode::NONNEGATIVE_SIGNED -- CDiskBlockIndex's version, nHeight and nFile,
+FlatFilePos's nFile.")
+
+(defun br-read-core-varint (br &optional (max +varint-max-uint64+))
+  "Read a Bitcoin Core VARINT from BR (serialize.h:442-462 ReadVarInt<I>).
+MAX is numeric_limits<I>::max() of the type Core reads the field INTO --
++VARINT-MAX-UINT64+ unless the field is narrower -- and a value
+that would not fit is refused as \"ReadVarInt(): size too large\", exactly
+where Core refuses it: before a digit that would overflow is shifted in, and
+before the +1 of a continuation byte that would."
   (declare (type byte-reader br))
   (let ((n 0))
     (loop
       (let ((b (br-read-u8 br)))
-        (when (> n (ash #xFFFFFFFFFFFFFFFF -7))
+        (when (> n (ash max -7))
           (serialization-error "ReadVarInt(): size too large"))
         (setf n (logior (ash n 7) (logand b #x7F)))
         (if (logtest b #x80)
             (progn
-              (when (= n #xFFFFFFFFFFFFFFFF)
+              (when (= n max)
                 (serialization-error "ReadVarInt(): size too large"))
               (incf n))
             (return n))))))
@@ -73,8 +89,11 @@ Errors if the value would exceed 64 bits, mirroring Core's
 
 (defun compress-amount (n)
   "Compress the satoshi amount N (compressor.cpp:149-166 CompressAmount).
-Defined for 0 <= N <= MAX_MONEY."
-  (declare (type (unsigned-byte 64) n))
+Meaningful for 0 <= N <= MAX_MONEY. Core's argument is a uint64_t and its
+arithmetic uint64_t, so any CAmount -- a negative one converted modulo 2^64 --
+compresses to SOME uint64, as it does there (AmountCompression::Ser)."
+  (declare (type (or (signed-byte 64) (unsigned-byte 64)) n))
+  (setf n (ldb (byte 64 0) n))
   (when (zerop n)
     (return-from compress-amount 0))
   (let ((e 0))
@@ -85,11 +104,13 @@ Defined for 0 <= N <= MAX_MONEY."
         (let ((d (mod n 10)))
           (assert (<= 1 d 9))
           (setf n (floor n 10))
-          (+ 1 (* (+ (* n 9) d -1) 10) e))
-        (+ 1 (* (- n 1) 10) 9))))
+          (ldb (byte 64 0) (+ 1 (* (+ (* n 9) d -1) 10) e)))
+        (ldb (byte 64 0) (+ 1 (* (- n 1) 10) 9)))))
 
 (defun decompress-amount (x)
-  "Inverse of compress-amount (compressor.cpp:168-192 DecompressAmount)."
+  "Inverse of compress-amount (compressor.cpp:168-192 DecompressAmount), in
+Core's uint64_t arithmetic: a code whose amount does not fit in 64 bits WRAPS
+modulo 2^64, it does not grow (fuzz target txoutcompressor-deserialize)."
   (declare (type (unsigned-byte 64) x))
   ;; x = 0  OR  x = 1+10*(9*n + d - 1) + e  OR  x = 1+10*(n - 1) + 9
   (when (zerop x)
@@ -109,7 +130,12 @@ Defined for 0 <= N <= MAX_MONEY."
     (loop while (plusp e)
           do (setf n (* n 10))
              (decf e))
-    n))
+    (ldb (byte 64 0) n)))
+
+(defun %amount-from-uint64 (u)
+  "The CAmount (int64_t) a uint64_t converts to: AmountCompression::Unser
+(compressor.h:98-110) assigns DecompressAmount's result to a CAmount."
+  (if (logbitp 63 u) (- u (ash 1 64)) u))
 
 ;;;; Script compression (compressor.cpp:11-138)
 ;;;;
@@ -251,7 +277,7 @@ ScriptCompression::Unser). An invalid special form (0x04/0x05 point not
 on curve) signals an error; a raw script longer than MAX_SCRIPT_SIZE is
 skipped and replaced with a one-byte OP_RETURN, matching Core."
   (declare (type byte-reader br))
-  (let ((n (br-read-core-varint br)))
+  (let ((n (br-read-core-varint br +varint-max-uint32+))) ; unsigned int nSize
     (if (< n +special-scripts+)
         (let* ((payload (br-read-bytes br (special-script-size n)))
                (script (decompress-script n payload)))
@@ -279,7 +305,7 @@ TxOutCompression): VARINT(compressed amount) + compressed script."
 
 (defun br-read-compressed-tx-out (br)
   "Read a compressed TxOut from BR. Returns (values value script)."
-  (let ((value (decompress-amount (br-read-core-varint br))))
+  (let ((value (%amount-from-uint64 (decompress-amount (br-read-core-varint br)))))
     (values value (br-read-compressed-script br))))
 
 ;;;; Stream read variants
@@ -289,17 +315,17 @@ TxOutCompression): VARINT(compressed amount) + compressed script."
 ;;;; fully materialized byte-reader. Byte-exact mirrors of the br-
 ;;;; functions above.
 
-(defun read-core-varint (stream)
-  "Stream variant of br-read-core-varint (serialize.h:442-462 ReadVarInt)."
+(defun read-core-varint (stream &optional (max +varint-max-uint64+))
+  "Stream variant of br-read-core-varint (serialize.h:442-462 ReadVarInt<I>)."
   (let ((n 0))
     (loop
       (let ((b (read-byte stream)))
-        (when (> n (ash #xFFFFFFFFFFFFFFFF -7))
+        (when (> n (ash max -7))
           (serialization-error "ReadVarInt(): size too large"))
         (setf n (logior (ash n 7) (logand b #x7F)))
         (if (logtest b #x80)
             (progn
-              (when (= n #xFFFFFFFFFFFFFFFF)
+              (when (= n max)
                 (serialization-error "ReadVarInt(): size too large"))
               (incf n))
             (return n))))))
@@ -307,7 +333,7 @@ TxOutCompression): VARINT(compressed amount) + compressed script."
 (defun read-compressed-script (stream)
   "Stream variant of br-read-compressed-script (compressor.h:76-95
 ScriptCompression::Unser)."
-  (let ((n (read-core-varint stream)))
+  (let ((n (read-core-varint stream +varint-max-uint32+))) ; unsigned int nSize
     (if (< n +special-scripts+)
         (let* ((payload (read-bytes stream (special-script-size n)))
                (script (decompress-script n payload)))
@@ -332,7 +358,7 @@ ScriptCompression::Unser)."
 
 (defun read-compressed-tx-out (stream)
   "Stream variant of br-read-compressed-tx-out. Returns (values value script)."
-  (let ((value (decompress-amount (read-core-varint stream))))
+  (let ((value (%amount-from-uint64 (decompress-amount (read-core-varint stream)))))
     (values value (read-compressed-script stream))))
 
 ;;;; Per-output Coin record (coins.h:63-79)
@@ -351,13 +377,13 @@ VARINT(height*2 + coinbase) then the compressed TxOut."
 (defun br-read-compressed-coin (br)
   "Read one unspent output from BR (coins.h:71-79 Coin::Unserialize).
 Returns (values height coinbase-p value script)."
-  (let ((code (br-read-core-varint br)))
+  (let ((code (br-read-core-varint br +varint-max-uint32+))) ; uint32_t code
     (multiple-value-bind (value script) (br-read-compressed-tx-out br)
       (values (ash code -1) (logtest code 1) value script))))
 
 (defun read-compressed-coin (stream)
   "Stream variant of br-read-compressed-coin.
 Returns (values height coinbase-p value script)."
-  (let ((code (read-core-varint stream)))
+  (let ((code (read-core-varint stream +varint-max-uint32+))) ; uint32_t code
     (multiple-value-bind (value script) (read-compressed-tx-out stream)
       (values (ash code -1) (logtest code 1) value script))))

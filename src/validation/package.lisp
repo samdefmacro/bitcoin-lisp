@@ -26,6 +26,18 @@ can. src/validation/.")
    #:block-reject-reason-string
    #:deterministic-consensus-failure-p
    #:standard-output-script-p
+   ;; Core's policy predicates by their own names (policy.cpp IsStandardTx,
+   ;; AreInputsStandard, IsWitnessStandard; consensus/tx_verify.cpp
+   ;; GetLegacySigOpCount) and the Solver's fast paths -- API because Core's
+   ;; transaction.cpp / script.cpp fuzz targets ask each one directly
+   #:is-standard-tx
+   #:are-inputs-standard-p
+   #:is-witness-standard-p
+   #:count-legacy-sigops
+   #:script-is-p2sh-p
+   #:witness-program-parts
+   #:cast-to-bool
+   #:output-is-dust-p
    ;; Core's reject-reason vocabulary (keyword -> state.GetRejectReason())
    #:tx-reject-keyword
    #:tx-reject-reason-only

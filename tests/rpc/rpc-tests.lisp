@@ -1151,7 +1151,7 @@ rather than 2^63-1."
                  ("31.0011" 3 nil) ("31.99999999" 3 nil)
                  ("31.999999999999999999999" 3 nil)))
     (destructuring-bind (text decimals expected) row
-      (let ((got (bl.rpc::parse-fixed-point text decimals)))
+      (let ((got (bl.rpc:parse-fixed-point text decimals)))
         (is (equal expected got)
             "ParseFixedPoint(~S, ~D) is ~S in Core, ~S here"
             text decimals expected got)))))

@@ -148,7 +148,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
             (return-from validate-transaction-structure
               (values nil :bad-prevout-null)))))
 
-    ;; The two size limits above and in %IS-STANDARD-TX are Core's two, and
+    ;; The two size limits above and in IS-STANDARD-TX are Core's two, and
     ;; they are separate rules with separate reasons: the consensus one here
     ;; (bad-txns-oversize, non-witness size against the block ceiling) and the
     ;; policy one (tx-size, full weight against MAX_STANDARD_TX_WEIGHT).
@@ -262,7 +262,7 @@ FEE is returned as a Satoshi type."
 true; mempool_args.cpp:101). NIL relays and mines transactions this node would
 otherwise refuse as non-standard.
 
-ONE flag gating ONE set of checks, as Core has it: %IS-STANDARD-TX, the input
+ONE flag gating ONE set of checks, as Core has it: IS-STANDARD-TX, the input
 and witness standardness tests, and the three ephemeral-dust checks. It does
 NOT gate consensus, and it does not gate the 64-byte minimum size (Core keeps
 that outside, validation.cpp:813-815 — CVE-2017-12842 applies to every node).
@@ -718,7 +718,7 @@ reuse standard-output-script-p — and a P2SH redeem script may carry at most
               (return-from are-inputs-standard-p nil)))))))
   t)
 
-(defun %is-standard-tx (tx)
+(defun is-standard-tx (tx)
   "Core IsStandardTx (policy.cpp:113-172), as ONE function so -acceptnonstdtxn
 can be ONE gate.
 
@@ -734,7 +734,7 @@ transaction is refused even on a node told to relay non-standard ones."
   ;; Policy: standard transaction version
   (let ((version (bl.ser:transaction-version tx)))
     (unless (<= +min-standard-tx-version+ version +max-standard-tx-version+)
-      (return-from %is-standard-tx
+      (return-from is-standard-tx
         (values nil :version-non-standard))))
 
   ;; Policy: max standard transaction weight (policy.cpp:110-113, Core's
@@ -742,17 +742,17 @@ transaction is refused even on a node told to relay non-standard ones."
   ;; CheckTransaction's consensus ceiling is checked in
   ;; VALIDATE-TRANSACTION-STRUCTURE, on the non-witness serialization.
   (when (> (bl.ser:transaction-weight tx) +max-standard-tx-weight+)
-    (return-from %is-standard-tx
+    (return-from is-standard-tx
       (values nil :tx-weight-too-large)))
 
   ;; Policy: scriptSig must be push-only and within the size limit
   (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
     (let ((script-sig (bl.ser:tx-in-script-sig input)))
       (when (> (length script-sig) +max-standard-scriptsig-size+)
-        (return-from %is-standard-tx
+        (return-from is-standard-tx
           (values nil :scriptsig-too-large)))
       (unless (scriptsig-push-only-p script-sig)
-        (return-from %is-standard-tx
+        (return-from is-standard-tx
           (values nil :scriptsig-not-pushonly)))))
 
   ;; Policy: all outputs must be standard script types (dust is handled
@@ -771,7 +771,7 @@ transaction is refused even on a node told to relay non-standard ones."
     (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
       (let ((spk (bl.ser:tx-out-script-pubkey output)))
         (unless (standard-output-script-p spk)
-          (return-from %is-standard-tx
+          (return-from is-standard-tx
             (values nil :non-standard-output)))
         ;; Core's if/else-if over the classified type (policy.cpp:145-154):
         ;; a NULL_DATA output draws on the shared budget, and ONLY an output
@@ -779,12 +779,12 @@ transaction is refused even on a node told to relay non-standard ones."
         (cond
           ((null-data-script-p spk)
            (when (> (length spk) datacarrier-bytes-left)
-             (return-from %is-standard-tx
+             (return-from is-standard-tx
                (values nil :datacarrier)))
            (decf datacarrier-bytes-left (length spk)))
           ((and (eq (classify-script spk) :multisig)
                 (not bl:*permit-bare-multisig*))
-           (return-from %is-standard-tx
+           (return-from is-standard-tx
              (values nil :bare-multisig)))))))
 
   ;; EPHEMERAL DUST (Core policy.cpp:157-161 + policy/ephemeral_policy.cpp).
@@ -798,7 +798,7 @@ transaction is refused even on a node told to relay non-standard ones."
   ;; peer relays.
   (let ((dust-count (transaction-dust-output-count tx)))
     (when (> dust-count +max-dust-outputs-per-tx+)
-      (return-from %is-standard-tx
+      (return-from is-standard-tx
         (values nil :dust))))
   (values t nil))
 
@@ -1191,9 +1191,9 @@ bytes."
 
   ;; 3. The standardness battery, behind Core's single require_standard flag
   ;;    (-acceptnonstdtxn, :807-810). Everything it covers lives in
-  ;;    %IS-STANDARD-TX; the size check below does not, because Core's does not.
+  ;;    IS-STANDARD-TX; the size check below does not, because Core's does not.
   (when *require-standard*
-    (multiple-value-bind (ok reason) (%is-standard-tx tx)
+    (multiple-value-bind (ok reason) (is-standard-tx tx)
       (unless ok
         (return-from %mempool-precheck-context-free (values nil reason)))))
 

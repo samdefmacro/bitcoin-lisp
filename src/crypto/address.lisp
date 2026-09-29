@@ -161,14 +161,20 @@ meaning the corresponding public key is the 33-byte form."
   "Decode a WIF string to (VALUES privkey-32-bytes compressed-p version-byte),
 or NIL if invalid. VERSION-BYTE is the chainparams SECRET_KEY prefix the key
 was encoded under -- compare it with the expected chain's, as Core's
-DecodeSecret does; the byte alone cannot tell the test chains apart."
+DecodeSecret does; the byte alone cannot tell the test chains apart.
+
+A well-formed WIF over a scalar that is not a secret key -- zero, or at or
+above the group order -- is NIL too: Core's DecodeSecret hands the bytes to
+CKey::Set, which keeps them only when secp256k1_ec_seckey_verify accepts them
+(key_io.cpp:209-229, key.cpp CKey::Check)."
   ;; Core DecodeSecret (key_io.cpp:214-217) bounds this at 34: the
   ;; SECRET_KEY prefix, the 32-byte scalar and the compression flag.
   (multiple-value-bind (version payload) (base58check-decode wif 34)
     (when (and version payload
                (bl.chain:secret-prefix-known-p version)
                (or (= (length payload) 32)
-                   (and (= (length payload) 33) (= (aref payload 32) #x01))))
+                   (and (= (length payload) 33) (= (aref payload 32) #x01)))
+               (valid-private-key-p (subseq payload 0 32)))
       (values (subseq payload 0 32)
               (= (length payload) 33)
               version))))

@@ -223,16 +223,17 @@ one that makes the reloaded hash come out right."
 a fresh entry whose hash is its header's (ConstructBlockHash), with no parent
 link and no chain work yet -- LOAD-HEADER-INDEX supplies both."
   (let* ((br (bl.bytes:make-byte-reader-from bytes))
-         (_version (bl.ser:br-read-core-varint br))
-         (height (bl.ser:br-read-core-varint br))
-         (nstatus (bl.ser:br-read-core-varint br))
-         (tx-count (bl.ser:br-read-core-varint br))
+         ;; Each VARINT is bounded by the type chain.h:343-351 reads it into.
+         (_version (bl.ser:br-read-core-varint br bl.ser:+varint-max-int32+))
+         (height (bl.ser:br-read-core-varint br bl.ser:+varint-max-int32+))
+         (nstatus (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+))
+         (tx-count (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+))
          (file (when (logtest nstatus (logior +block-have-data+ +block-have-undo+))
-                 (bl.ser:br-read-core-varint br)))
+                 (bl.ser:br-read-core-varint br bl.ser:+varint-max-int32+)))
          (data-pos (when (logtest nstatus +block-have-data+)
-                     (bl.ser:br-read-core-varint br)))
+                     (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+)))
          (undo-pos (when (logtest nstatus +block-have-undo+)
-                     (bl.ser:br-read-core-varint br)))
+                     (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+)))
          (header-bytes (bl.bytes:br-read-bytes br 80))
          (hash (bl.crypto:hash256 header-bytes))
          (hbr (bl.bytes:make-byte-reader-from header-bytes))
@@ -285,10 +286,12 @@ whose length on disk includes its preallocated tail."
 (defun decode-block-file-info (bytes)
   "Parse a CBlockFileInfo value into a BLOCK-FILE-INFO."
   (let ((br (bl.bytes:make-byte-reader-from bytes)))
-    (flet ((v () (bl.ser:br-read-core-varint br)))
+    ;; Five uint32_t fields, then two uint64_t (node/blockstorage.h:59-75).
+    (flet ((v () (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+))
+           (v64 () (bl.ser:br-read-core-varint br)))
       (let* ((blocks (v)) (size (v)) (undo-size (v))
              (height-first (v)) (height-last (v))
-             (time-first (v)) (time-last (v)))
+             (time-first (v64)) (time-last (v64)))
         (make-block-file-info
          :blocks blocks :size size :undo-size undo-size
          :height-first height-first :height-last height-last

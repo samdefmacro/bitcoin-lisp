@@ -173,6 +173,7 @@ hash.cpp. src/crypto/.")
    #:base58check-decode
    #:bech32-encode
    #:bech32-decode
+   #:convert-bits
    #:segwit-address-encode
    #:segwit-hrp
    #:segwit-address-decode

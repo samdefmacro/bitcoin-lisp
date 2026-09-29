@@ -298,7 +298,7 @@ cache)."
                  (desc (bl.rpc:parse-descriptor desc-str :testnet4))
                  (next (bl.wallet::desc-spkm-next-index spkm))
                  (expected (bl.rpc:script->address
-                            (first (bl.rpc::out-desc-expand desc next))
+                            (first (bl.rpc:out-desc-expand desc next))
                             :testnet4))
                  (issued (bl.wallet::with-wallet-lock (wallet)
                            (bl.wallet::spkm-get-new-destination
@@ -2891,7 +2891,7 @@ path is unavailable by construction and only a script path can spend."
       (let* ((wallet (loaded-wallet manager "trtree"))
              (desc (bl.rpc:parse-descriptor
                     (format nil "tr(~A,pk(~A))" internal leaf-wif) :mainnet))
-             (spk (first (bl.rpc::out-desc-expand desc 0)))
+             (spk (first (bl.rpc:out-desc-expand desc 0)))
              (amount 100000)
              (empty (make-array 0 :element-type '(unsigned-byte 8)))
              (prev-txid (make-array 32 :element-type '(unsigned-byte 8)

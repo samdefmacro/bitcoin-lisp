@@ -27,23 +27,23 @@ re-run split into fragments to exercise the one-block output buffer."
          (expect (%bc-hex out-hex))
          (n (length expect))
          (out (%bc-buf n))
-         (c (bl.crypto::make-chacha20 key)))
-    (bl.crypto::chacha20-seek c nonce1 nonce2 seek)
+         (c (raw-chacha20 key)))
+    (raw-chacha20-seek c nonce1 nonce2 seek)
     (if (plusp (length msg))
-        (bl.crypto::chacha20-crypt c msg out)
-        (bl.crypto::chacha20-keystream c out))
+        (raw-chacha20-crypt c msg out)
+        (raw-chacha20-keystream c out))
     (is (equalp expect out))
     ;; Fragmented re-runs at deterministic split points.
     (dolist (cut (remove-duplicates
                   (list 1 (floor n 3) (max 1 (- n 2)) (floor n 2))))
       (when (< 0 cut n)
-        (bl.crypto::chacha20-seek c nonce1 nonce2 seek)
+        (raw-chacha20-seek c nonce1 nonce2 seek)
         (fill out 0)
         (if (plusp (length msg))
-            (progn (bl.crypto::chacha20-crypt c msg out :end cut)
-                   (bl.crypto::chacha20-crypt c msg out :start cut))
-            (progn (bl.crypto::chacha20-keystream c out :end cut)
-                   (bl.crypto::chacha20-keystream c out :start cut)))
+            (progn (raw-chacha20-crypt c msg out :end cut)
+                   (raw-chacha20-crypt c msg out :start cut))
+            (progn (raw-chacha20-keystream c out :end cut)
+                   (raw-chacha20-keystream c out :start cut)))
         (is (equalp expect out))))))
 
 (defun %check-poly1305 (msg-hex key-hex tag-hex)
@@ -58,31 +58,31 @@ re-run split into fragments to exercise the one-block output buffer."
          (expect (%bc-hex cipher-hex))
          (n (length plain))
          (cipher (%bc-buf (+ n 16)))
-         (aead (bl.crypto::make-aead-chacha20-poly1305 key)))
+         (aead (raw-aead key)))
     ;; Single-segment encrypt.
-    (bl.crypto::aead-encrypt aead plain aad nonce1 nonce2 cipher)
+    (raw-aead-encrypt aead plain aad nonce1 nonce2 cipher)
     (is (equalp expect cipher))
     ;; Split-segment encrypt (plain1/plain2 at the midpoint).
     (let ((k (floor n 2)))
       (fill cipher 0)
-      (bl.crypto::aead-encrypt
+      (raw-aead-encrypt
        aead (subseq plain 0 k) aad nonce1 nonce2 cipher (subseq plain k))
       (is (equalp expect cipher)))
     ;; Decrypt round-trip.
     (let ((out (%bc-buf n)))
-      (is-true (bl.crypto::aead-decrypt aead cipher aad nonce1 nonce2 out))
+      (is-true (raw-aead-decrypt aead cipher aad nonce1 nonce2 out))
       (is (equalp plain out)))
     ;; Keystream XOR property.
     (when (plusp n)
       (let ((ks (%bc-buf n)))
-        (bl.crypto::aead-keystream aead nonce1 nonce2 ks)
+        (raw-aead-keystream aead nonce1 nonce2 ks)
         (is (loop for i below n
                   always (= (logxor (aref plain i) (aref ks i)) (aref expect i))))))
     ;; Tampered tag must fail.
     (let ((bad (copy-seq cipher))
           (out (%bc-buf n)))
       (setf (aref bad (1- (length bad))) (logxor (aref bad (1- (length bad))) 1))
-      (is-false (bl.crypto::aead-decrypt aead bad aad nonce1 nonce2 out)))))
+      (is-false (raw-aead-decrypt aead bad aad nonce1 nonce2 out)))))
 
 (defun %check-fschacha20 (plain-hex key-hex interval expect-hex)
   "Crypt the same plaintext INTERVAL+1 times; the final output (the first
@@ -142,14 +142,14 @@ packet must match CIPHER-HEX; an independent receiver decrypts it."
 (test chacha20-midblock
   "Consuming 5+7+52 keystream bytes equals one straight 64-byte block."
   (let* ((key (%bc-buf 32))
-         (c1 (bl.crypto::make-chacha20 key))
-         (c2 (bl.crypto::make-chacha20 key))
+         (c1 (raw-chacha20 key))
+         (c2 (raw-chacha20 key))
          (block (%bc-buf 64))
          (b1 (%bc-buf 5)) (b2 (%bc-buf 7)) (b3 (%bc-buf 52)))
-    (bl.crypto::chacha20-keystream c1 block)
-    (bl.crypto::chacha20-keystream c2 b1)
-    (bl.crypto::chacha20-keystream c2 b2)
-    (bl.crypto::chacha20-keystream c2 b3)
+    (raw-chacha20-keystream c1 block)
+    (raw-chacha20-keystream c2 b1)
+    (raw-chacha20-keystream c2 b2)
+    (raw-chacha20-keystream c2 b3)
     (is (equalp (subseq block 0 5) b1))
     (is (equalp (subseq block 5 12) b2))
     (is (equalp (subseq block 12 64) b3))))

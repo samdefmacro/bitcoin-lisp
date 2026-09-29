@@ -24,7 +24,7 @@ The biggest shortfall is not missing functionality but behavioral-consistency ve
 | Indexes | 4 | 3 (missing `txospenderindex`) | **75%** |
 | Source size | 191,784 lines of C++ (excl. test/qt/vendored) | 83,956 lines of Lisp | 0.44x |
 | Unit tests | 132 files | 98 files / 2,359 tests / **33,406 checks** | — |
-| Fuzz testing | 133 fuzz targets | 0 (only 3 hand-written randomized tests) | **0%** |
+| Fuzz testing | 133 target files, 216 FUZZ_TARGETs | 69 targets from 37 files, ported as seeded property tests (tests/fuzz/, 2026-09-30) | **28% of files, 32% of targets** |
 | Functional tests (behavioral consistency) | 263 | **35 run** | **13%** |
 
 ### The 12 missing RPCs, classified by reason
@@ -171,7 +171,7 @@ ours are embedded synchronously in `connect-block`/`perform-reorg`. This has rep
 | Pruning / assumeutxo / reindex / flat block files | ✅ All present; plus `migrateblocks` in-place migration, which Core doesn't have |
 | LevelDB / secp256k1 | Called via CFFI against system libraries, not vendored |
 | `src/support/` secure memory (mlock / secure allocator / `memory_cleanse`) | ❌ **No counterpart at all**; key material is manually zeroed in only two places |
-| fuzz framework (133 targets) | ❌ 0 |
+| fuzz framework (133 target files) | ⚠️ no engine; 69 of 216 targets (37 files) ported as seeded property tests on a FuzzedDataProvider port (tests/fuzz/) |
 
 **What we have that Core doesn't:** the Web UI, a complete Erlay message set (Core has only the `sendtxrcncl` handshake,
 while we implement `reqrecon`/`sketch`/`reqsketchext`/`reconcildiff` + our own minisketch,
@@ -624,6 +624,48 @@ Covers the properties of Core's `deserialize`, `block_header`, `parse_script`, `
 
 Caught on its very first run: **`parse-tx-payload` accepts trailing bytes**, while Core's `DecodeTx` only accepts
 a decode that reads the buffer empty (core_io.cpp:180).
+
+#### 2026-09-30: Core's targets, one by one (tests/fuzz/)
+
+`tests/fuzz/fuzz.lisp` ports `FuzzedDataProvider.h` (integral values from the END of the buffer, byte strings
+and `ConsumeRandomLengthString` from the front) and the harness a `FUZZ_TARGET` runs in; `tests/fuzz/util.lisp`
+ports `test/fuzz/util.{h,cpp}` (`ConsumeScript`, `ConsumeTransaction`, `ConsumeMoney`, ...). `DEFINE-FUZZ-TARGET`
+makes one fiveam test per Core target, named `fuzz-<target>`: a seeded xorshift feeds raw bytes and -- three draws
+in four -- a mutated entry from a corpus the target's own consume helpers generate (there is no qa-assets here).
+Only `BL.ERR:SERIALIZATION-ERROR`, Core's `std::ios_base::failure`, is a legitimate refusal; any other condition
+is a crash. Every target also runs as its own **positive control**, sabotaged so its assertion must fail, and
+must report at least one assertion per twenty draws, so none can pass vacuously. `*FUZZ-ITERATION-SCALE*` (4)
+sets the draw count; the whole battery takes about 70 s warm. A failure prints the buffer;
+`(replay-fuzz-target 'NAME "hex")` reruns it.
+
+Ported (69 of Core's 216 targets, 37 of its 133 files):
+
+| Core file | Targets |
+|---|---|
+| deserialize.cpp | 20 of 37: out_point, script, tx_in, blockheader, block, blockmerkleroot, coins, txoutcompressor, inv, messageheader, bloomfilter, merkle_block, block_header_and_short_txids, blocktransactionsrequest, blocktransactions, partially_signed_transaction (psbt_input/output inside it), address, blockundo (txundo inside it), diskblockindex, block_file_info |
+| transaction, decode_tx, tx_in, tx_out, block, block_header | all six |
+| script, script_flags, script_ops, eval_script, script_format | all five; script_interpreter's two (script_interpreter, sighash_cache) |
+| addrman | all three (data_stream_addr_man, addrman, addrman_serdeser) |
+| bloom_filter, rolling_bloom_filter, net_permissions, netaddress | all four |
+| crypto, crypto_chacha20 (split_crypt, split_keystream, fschacha20), crypto_chacha20poly1305 (both), crypto_hkdf_hmac_sha256_l32, bip324, muhash (muhash; not num3072_*) | nine |
+| base_encode_decode (all five), bech32 (both), key_io, descriptor_parse (descriptor_parse), psbt, miniscript (string, script) | twelve |
+| parse_numbers, hex, pow (pow, pow_transition), merkleblock, blockfilter, minisketch, parse_univalue | eight |
+
+Defects they found, each fixed Core's way with a regression test pinning the input: TxOutCompression's amount is
+Core's uint64 arithmetic and a Coin's code word a uint32 (a wrapping amount crashed the next serialization); the
+BIP152 getblocktxn/prefilled indexes are uint16 (index 65536 was accepted, then punished as Misbehaving where
+Core drops the message); a subnet netmask must be contiguous (1.2.3.4/255.0.255.0 was accepted and printed as
+1.0.3.0/8); the address book refused neither 0.0.0.0 nor 255.255.255.255, which its own peers.dat reader then
+dropped; a WIF over an invalid scalar decoded as a key; a PSBT's final scriptWitness, partial-signature and BIP32
+pubkeys and key origins were not read at decode; LocaleIndependentAtoi did not saturate or trim vertical tab and
+accepted `++5`, and ParseMoney refused `.5` and `5.`; and the rev-file / blocks/index / filter-index VARINTs were
+read as uint64 where Core reads them into narrower types (TYPE-ERROR on a corrupt record).
+
+Not ported: the cluster-linearize, txgraph, mempool, mini-miner, package, orphan and txrequest simulations; the
+P2P message-processing targets (process_message(s), p2p_handshake, headers presync, connman, net, the v1/v2
+transport simulations); coins_view and the UTXO snapshot; the targets of C++ containers and integer arithmetic
+that have no Lisp counterpart (prevector, span, bitdeque, vecdeque, overflow, float, strprintf, ...); and the
+miniscript generators (miniscript_stable, miniscript_smart) that need Core's key and preimage tables.
 
 ### Deployment
 

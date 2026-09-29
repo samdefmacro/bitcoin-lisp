@@ -84,7 +84,9 @@ an empty script, and a script long enough to leave the compressed special
 forms behind."
   (let ((cases (list (%bu-entry :height 0 :value 0 :script #())
                      (%bu-entry :height 1 :coinbase t)
-                     (%bu-entry :height #xFFFFFFFF :value 2100000000000000)
+                     ;; Coin::nHeight is a 31-bit field (coins.h:44), so
+                     ;; 2^31-1 is the largest height a code word carries.
+                     (%bu-entry :height #x7FFFFFFF :value 2100000000000000)
                      (%bu-entry :value 1 :script (make-array 100 :initial-element #xAB))
                      ;; A P2PKH script, which the compressor stores in a
                      ;; special form rather than raw.
@@ -636,3 +638,40 @@ Core returns early for a coinbase for exactly this reason
         (is (equalp (list (first all))
                     (bl.rpc::%tx-spent-coins-in-block block (second txs)))
             "transaction 1 was given the wrong coins")))))
+
+(defun %varints-bytes (&rest values)
+  (let ((bb (bl.ser:make-byte-buf)))
+    (dolist (v values) (bl.ser:bb-write-core-varint bb v))
+    (bl.ser:bb-finish bb)))
+
+(test storage-varints-are-read-into-cores-field-types
+  "ReadVarInt<I> refuses a value that does not fit the type Core reads the field
+INTO (serialize.h:442-462): TxInUndoFormatter's nCode is an unsigned int
+(undo.h:35-48), CBlockFileInfo's heights and sizes uint32_t
+(node/blockstorage.h:59-75), CDiskBlockIndex's nHeight and nFile NONNEGATIVE
+ints and its positions unsigned ints (chain.h:340-351), FlatFilePos an int and
+an unsigned int (flatfile.h:16-19). Ours read every one as a uint64, and the
+record's own slot then refused the value with a TYPE-ERROR -- a corrupt rev
+file, blocks/index record or txindex entry crashed its reader instead of
+failing as unreadable. Found by the fuzz targets blockundo_deserialize,
+block_file_info_deserialize and diskblockindex_deserialize."
+  (let ((big (ash 1 32)))
+    ;; one tx, one coin, code 2^32 (height 2^31), no version dummy needed
+    (signals bl.err:serialization-error
+      (bl.store:deserialize-block-undo
+       (concatenate '(simple-array (unsigned-byte 8) (*))
+                    (%bytes 1 1) (%varints-bytes big) (%bytes 0) (%varints-bytes 0 7) (%bytes #x51))))
+    (signals bl.err:serialization-error
+      (bl.store:decode-block-file-info (%varints-bytes 1 2 3 4 big 6 7)))
+    (signals bl.err:serialization-error
+      (bl.store:decode-disk-block-index
+       (concatenate '(simple-array (unsigned-byte 8) (*))
+                    (%varints-bytes 1 (ash 1 31) 0 1)
+                    (make-array 80 :element-type '(unsigned-byte 8) :initial-element 0))))
+    (signals bl.err:serialization-error
+      (bl.store:decode-disk-block-index
+       (concatenate '(simple-array (unsigned-byte 8) (*))
+                    (%varints-bytes 1 5 16 1 0 big)   ; nStatus BLOCK_HAVE_UNDO
+                    (make-array 80 :element-type '(unsigned-byte 8) :initial-element 0))))
+    ;; The same records at the edge of each type still read.
+    (is (bl.store:decode-block-file-info (%varints-bytes 1 2 3 4 (1- big) 6 (1- (ash 1 64)))))))

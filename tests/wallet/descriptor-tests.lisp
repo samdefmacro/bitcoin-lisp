@@ -23,7 +23,7 @@
 
 (defun %desc-scripts (s net pos)
   (mapcar #'bl.crypto:bytes-to-hex
-          (bl.rpc::out-desc-expand (%desc-parse s net) pos)))
+          (bl.rpc:out-desc-expand (%desc-parse s net) pos)))
 
 (defun %check-desc (prv pub scripts &key (net :mainnet) range hardened)
   "Port of Core's Check(): PRV and PUB must both parse and canonicalize to
@@ -48,7 +48,7 @@ PUB form must fail to expand."
                  prv i (%desc-scripts prv net i) expected)
              (if hardened
                  (signals bl.rpc:descriptor-derivation-error
-                   (bl.rpc::out-desc-expand pub-desc i))
+                   (bl.rpc:out-desc-expand pub-desc i))
                  (is (equal expected (%desc-scripts pub net i)))))))
 
 (defun %check-unparsable (prv pub message &key (net :mainnet))
@@ -477,14 +477,14 @@ TR-SCRIPT-TREES-MATCH-CORE-VECTORS below holds it to Core's vectors."
 the cache; different descriptors/indices don't collide."
   (let* ((s "wpkh([ffffffff/13']xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/1/2/*)")
          (desc (%desc-parse s)))
-    (let ((first-time (bl.rpc::out-desc-expand desc 7)))
+    (let ((first-time (bl.rpc:out-desc-expand desc 7)))
       ;; second expansion returns the identical (cached) list
-      (is (eq first-time (bl.rpc::out-desc-expand desc 7)))
+      (is (eq first-time (bl.rpc:out-desc-expand desc 7)))
       ;; a fresh parse of the same string hits the same cache entry
-      (is (eq first-time (bl.rpc::out-desc-expand (%desc-parse s) 7)))
+      (is (eq first-time (bl.rpc:out-desc-expand (%desc-parse s) 7)))
       ;; a different index derives a different script
       (is (not (equalp (first first-time)
-                       (first (bl.rpc::out-desc-expand desc 8))))))))
+                       (first (bl.rpc:out-desc-expand desc 8))))))))
 
 ;;; --- getdescriptorinfo (Core rpc/output_script.cpp behavior) ---
 
@@ -638,8 +638,8 @@ regtest node, the underlying scriptPubKeys must match exactly)."
          (utxo (bl:node-utxo-set node))
          (desc "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/*)")
          (parsed (bl.rpc:parse-descriptor desc :testnet3))
-         (script-at-5 (first (bl.rpc::out-desc-expand parsed 5)))
-         (script-at-1500 (first (bl.rpc::out-desc-expand parsed 1500)))
+         (script-at-5 (first (bl.rpc:out-desc-expand parsed 5)))
+         (script-at-1500 (first (bl.rpc:out-desc-expand parsed 1500)))
          (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
     (bl.store:add-utxo utxo txid-a 0 100000000 script-at-5 0)
@@ -711,11 +711,11 @@ structure. Expanding every branch at every index here exercises the same thing."
                      for i from 0
                      do (is (equal expected
                                    (mapcar #'bl.crypto:bytes-to-hex
-                                           (bl.rpc::out-desc-expand desc i)))
+                                           (bl.rpc:out-desc-expand desc i)))
                             "~A branch ~A at ~D expands to ~S, wanted ~S"
                             form want i
                             (mapcar #'bl.crypto:bytes-to-hex
-                                    (bl.rpc::out-desc-expand desc i))
+                                    (bl.rpc:out-desc-expand desc i))
                             expected)))))
   ;; The checksum covers the multipath string as written; each branch gets its
   ;; own when one is needed.
@@ -1235,7 +1235,7 @@ the script from the print flag silently gives a 33-byte push here — a differen
 leaf hash, a different merkle root, and therefore a different ADDRESS."
   (let* ((d (%desc-parse (format nil "tr(~A/0/*,pk(~A/1/*))" +tr-xpub+ +tr-xpub+)))
          (leaf (cdr (first (bl.rpc:out-desc-tree d))))
-         (script (first (bl.rpc::out-desc-expand leaf 0))))
+         (script (first (bl.rpc:out-desc-expand leaf 0))))
     (is (= 34 (length script))
         "leaf script is ~D bytes, wanted 34 (push32 + CHECKSIG)" (length script))
     (is (= 32 (aref script 0)) "leaf pushes ~D bytes, wanted 32" (aref script 0))
@@ -1320,7 +1320,7 @@ vectors by the rest of this battery, so a witness it accepts under standard
 flags is one Core accepts. A hand-written expected witness would only re-assert
 whatever the signer happened to build."
   (let* ((desc (bl.rpc:parse-descriptor desc-str :mainnet))
-         (spk (first (bl.rpc::out-desc-expand desc 0)))
+         (spk (first (bl.rpc:out-desc-expand desc 0)))
          (amount 100000)
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (multiple-value-bind (output-key leaves)
@@ -1888,7 +1888,7 @@ the same split that produced a wrong address twice in the tr() work."
          (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd")
          (d (%desc-parse (format nil "tr(~A,and_v(v:pk(~A),older(42)))" i a)))
          (leaf (cdr (first (bl.rpc:out-desc-tree d))))
-         (script (first (bl.rpc::out-desc-expand leaf 0))))
+         (script (first (bl.rpc:out-desc-expand leaf 0))))
     ;; <32> <x> CHECKSIGVERIFY <42> CHECKSEQUENCEVERIFY
     (is (= 32 (aref script 0))
         "leaf pushes ~D bytes, wanted 32 (x-only)" (aref script 0))

@@ -65,7 +65,7 @@ directly to the state machine which does not re-check PoW)."
 (test permitted-difficulty-transition-bounds
   "PermittedDifficultyTransition: off on min-difficulty nets; on mainnet it
 pins bits off-boundary and clamps to 4x either way on a retarget boundary."
-  (flet ((pdt (net h o n) (bl.net::permitted-difficulty-transition net h o n)))
+  (flet ((pdt (net h o n) (bl.net:permitted-difficulty-transition net h o n)))
     ;; Min-difficulty networks: always permitted (fPowAllowMinDifficultyBlocks).
     (is-true (pdt :regtest  2016 #x1d00ffff #x1e0fffff))
     (is-true (pdt :testnet4 2016 #x1d00ffff #x1e0fffff))

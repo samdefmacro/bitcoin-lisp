@@ -1286,7 +1286,7 @@ BIP141. It has no production caller (we parse cmpctblock, we never emit one),
 so it is a latent bug in the emitter rather than one this test can assert on."
   (let ((txs (bl.ser:bitcoin-block-transactions block)))
     (bl.bytes:with-byte-buf (s)
-      (bl.ser::bb-write-block-header
+      (bl.ser:bb-write-block-header
        s (bl.ser:bitcoin-block-header block))
       (bl.bytes:bb-write-u64-le s 0)     ; short-id nonce
       (bl.bytes:bb-write-varint s 0)  ; no short ids

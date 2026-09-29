@@ -115,6 +115,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:+tapleaf-version-tapscript+
    #:activate-submitted-block
    #:amount-from-value
+   #:parse-fixed-point
    #:construct-transaction
    #:build-spent-utxos
    #:compute-input-signatures
@@ -168,6 +169,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:out-desc-ordered-keys
    #:out-desc-ranged-p
    #:out-desc-solvable-p
+   #:out-desc-expand
    #:out-desc-string
    #:out-desc-string-normalized
    #:out-desc-string-private

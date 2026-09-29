@@ -98,8 +98,9 @@ legacy layout."
     (bl.ser:bb-finish bb)))
 
 (defun %bfi-read-flat-pos (br)
-  (let* ((file (bl.ser:br-read-core-varint br))
-         (pos (bl.ser:br-read-core-varint br)))
+  ;; FlatFilePos: an int NONNEGATIVE_SIGNED and an unsigned int (flatfile.h:16-19).
+  (let* ((file (bl.ser:br-read-core-varint br bl.ser:+varint-max-int32+))
+         (pos (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+)))
     (make-flat-file-pos file pos)))
 
 (defun %bfi-height-key (height)

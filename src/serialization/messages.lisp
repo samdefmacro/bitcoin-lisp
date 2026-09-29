@@ -630,14 +630,27 @@ reads instead of Gray-stream input dispatch."
   ;; carries the BIP141 reserved value, and emitting it stripped makes every
   ;; reconstruction fail bad-witness-nonce-size. br-read-transaction
   ;; auto-detects the BIP144 marker, so the reading side is symmetric.
+  ;;
+  ;; Core keeps both index kinds in 16 bits (blockencodings.h:74-80, 118-123):
+  ;; PrefilledTransaction reads its differential index with
+  ;; COMPACTSIZE(uint16_t), which throws above 65535, and the reader refuses
+  ;; a block of more than 65535 transactions in all. The ABSOLUTE index may
+  ;; still run past 65535 here; Core judges that in InitData, as we do in the
+  ;; handler.
   (prefilled-txs :custom :slot-type list
-    :read (let ((last-index -1))
-            (loop repeat (br-read-bounded-count br +max-block-tx-count+ "compact-block prefilled")
-                  collect (let* ((diff-index (br-read-compact-size br))
-                                 (abs-index (+ last-index diff-index 1))
-                                 (tx (br-read-transaction br)))
-                            (setf last-index abs-index)
-                            (make-prefilled-tx :index abs-index :transaction tx))))
+    :read (let* ((last-index -1)
+                 (prefilled
+                   (loop repeat (br-read-bounded-count br +max-block-tx-count+ "compact-block prefilled")
+                         collect (let ((diff-index (br-read-compact-size br)))
+                                   (when (> diff-index #xffff)
+                                     (serialization-error "CompactSize exceeds limit of type"))
+                                   (let* ((abs-index (+ last-index diff-index 1))
+                                          (tx (br-read-transaction br)))
+                                     (setf last-index abs-index)
+                                     (make-prefilled-tx :index abs-index :transaction tx))))))
+            (when (> (+ (length short-ids) (length prefilled)) #xffff)
+              (serialization-error "indexes overflowed 16 bits"))
+            prefilled)
     :write (let ((last-index -1))
              (bb-write-varint bb (length value))
              (dolist (ptx value)
@@ -653,11 +666,16 @@ reads instead of Gray-stream input dispatch."
 (define-message block-txn-request
     (:documentation "BIP 152 block transactions request (getblocktxn).")
   (block-hash :hash256)
-  ;; absolute indexes, DIFFERENTIALLY encoded on the wire (gap minus one)
+  ;; absolute indexes, DIFFERENTIALLY encoded on the wire (gap minus one),
+  ;; into Core's std::vector<uint16_t>: DifferenceFormatter::Unser throws
+  ;; `differential value overflow' for an index above 65535
+  ;; (blockencodings.h:25-33), so the message fails to deserialize.
   (indexes :custom :slot-type list
     :read (let ((last-index -1))
             (loop repeat (br-read-bounded-count br +max-block-tx-count+ "getblocktxn indexes")
                   collect (let ((abs-index (+ last-index (br-read-compact-size br) 1)))
+                            (when (> abs-index #xffff)
+                              (serialization-error "differential value overflow"))
                             (setf last-index abs-index)
                             abs-index)))
     :write (let ((last-index -1))
