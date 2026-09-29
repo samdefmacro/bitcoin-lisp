@@ -216,7 +216,12 @@ explicit -maxmempool still wins."
     (apply-config-globals '(("blocksonly" . "0")))
     (is (= bl.mp:+default-max-mempool-bytes+
            bl.mp:*max-mempool-bytes*))
-    (signals error (apply-config-globals '(("maxmempool" . "junk"))))))
+    ;; A value GetIntArg cannot read is 0 (mempool_args.cpp:49 reads it with
+    ;; LocaleIndependentAtoi), and Core's Flatten (txmempool.cpp:169) refuses
+    ;; only a negative or a positive-but-small cap: junk is a 0 MB pool, not
+    ;; an error.
+    (apply-config-globals '(("maxmempool" . "junk")))
+    (is (= 0 bl.mp:*max-mempool-bytes*))))
 
 (test wave10-block-weight-options-wire-and-validate
   "-blockmaxweight/-blockreservedweight are template SELECTION budgets with

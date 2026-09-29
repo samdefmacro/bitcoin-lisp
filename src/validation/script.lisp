@@ -163,7 +163,8 @@ CPU of accepting a block whose coinbase carries a 950 KB script
   "Execution context for script validation."
   (stack '() :type list)
   (alt-stack '() :type list)
-  (script #() :type (simple-array (unsigned-byte 8) (*)))
+  (script (make-array 0 :element-type '(unsigned-byte 8))
+          :type (simple-array (unsigned-byte 8) (*)))
   (position 0 :type (unsigned-byte 32))
   (tx nil)
   (input-index 0 :type (unsigned-byte 32))

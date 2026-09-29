@@ -9,7 +9,8 @@
 (defstruct utxo-entry
   "An entry in the UTXO set."
   (value 0 :type (signed-byte 64))
-  (script-pubkey #() :type (simple-array (unsigned-byte 8) (*)))
+  (script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
+                 :type (simple-array (unsigned-byte 8) (*)))
   (height 0 :type (unsigned-byte 32))
   (coinbase nil :type boolean))
 

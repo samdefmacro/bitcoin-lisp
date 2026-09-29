@@ -96,7 +96,7 @@ APPLY-CONFIG-GLOBALS."
       (let ((v (lk "keypool")))
         (when v
           (setf bl.wallet:*default-keypool-size*
-                (max 1 (or (ignore-errors (conf-parse-int v)) 0))))))
+                (max 1 (conf-parse-int v))))))
     ;; -walletdir relocates the wallet directory (Core init.cpp). Start-up
     ;; refuses a relative, missing or non-directory one and stores it
     ;; canonical (%VERIFY-WALLET-DIRECTORY, Core load.cpp:32-51).

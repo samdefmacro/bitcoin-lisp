@@ -19,8 +19,9 @@
 ;;;   (:struct NAME)                   any type with read-NAME (byte-reader)
 ;;;                                    and write-NAME (byte-buf value), whether
 ;;;                                    a define-message or hand-written
-;;;   (:list TYPE :max M :name STRING) CompactSize count (refused above M,
-;;;                                    STRING labels the error) then TYPE items
+;;;   (:list TYPE)                     Core's VectorFormatter: a CompactSize
+;;;                                    count (MAX_SIZE-checked, as every
+;;;                                    ReadCompactSize) then TYPE items
 ;;; and the bare keyword :custom, which generates nothing: :READ, :WRITE and
 ;;; :SLOT-TYPE are all required. A :READ or :WRITE form on a row type replaces
 ;;; that half of the generated code (the version message's relay flag, which
@@ -91,13 +92,13 @@ behind DEFINE-MESSAGE and the wallet's DEFINE-WDB-KEY / DEFINE-WDB-VALUE."
                  `(bb-write-var-bytes ,bb (utf8-string-to-bytes ,value))
                  "")))
       ((eq (first type) :list)
-       (destructuring-bind (element &key max name) (rest type)
+       (destructuring-bind (element) (rest type)
          (let ((item (gensym "ITEM")))
            (multiple-value-bind (item-type item-read item-write)
                (field-codec-forms element br bb item)
              (declare (ignore item-type))
              (values 'list
-                     `(loop repeat (br-read-bounded-count ,br ,max ,name)
+                     `(loop repeat (br-read-compact-size ,br)
                             collect ,item-read)
                      `(progn (bb-write-varint ,bb (length ,value))
                              (dolist (,item ,value) ,item-write))

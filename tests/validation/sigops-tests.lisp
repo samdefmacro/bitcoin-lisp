@@ -422,9 +422,13 @@ last-push extractor found the witness program regardless and charged 1."
 
 (test p2sh-empty-redeem-script-within-standard-sigops-cost
   "The standardness cap MAX_STANDARD_TX_SIGOPS_COST is fed by the same count, so
-the over-count also made us refuse to relay a transaction Core relays. The input
-stays nonstandard for an unrelated reason — the per-input MAX_P2SH_SIGOPS gate
-keeps its own policy last-push extraction."
+the over-count also made us refuse to relay a transaction Core relays. The
+per-input MAX_P2SH_SIGOPS gate reads the redeem script as Core's
+AreInputsStandard does -- the stack top the scriptSig leaves
+(policy.cpp:234-245), here the EMPTY script under the trailing OP_0 -- so the
+input is standard too, and the transaction is accepted as Core accepts it.
+(This test used to expect :NONSTANDARD-INPUTS from a last-push extractor that
+counted the 520-byte blob.)"
   (let* ((mempool (bl.mp:make-mempool))
          (utxo (bl.store:make-utxo-set))
          (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a))
@@ -444,8 +448,8 @@ keeps its own policy last-push extraction."
     (is (> 16640 bl.val::+max-standard-tx-sigops-cost+))
     (multiple-value-bind (valid err)
         (bl.val:validate-transaction-for-mempool tx utxo mempool 100)
-      (is (null valid))
-      (is (eq :nonstandard-inputs err)))))
+      (is-true valid "refused as ~S" err)
+      (is (null err)))))
 
 (test block-with-empty-redeem-p2sh-inputs-is-accepted
   "Five such inputs in one block are 83,200 weighted sigops under the last-push

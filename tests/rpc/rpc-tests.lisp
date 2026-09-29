@@ -2679,10 +2679,16 @@ transactions whose signatures Core deliberately never checked."
            (garbage (pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                             :initial-element 0)
                              5 1000))
+           ;; A spend that passes PreChecks and fails its script, as Core's
+           ;; unsigned spend does (rpc_packages.py:112-126): the scriptSig
+           ;; pushes the WRONG redeem script, OP_0 instead of OP_TRUE, so its
+           ;; hash does not match. An EMPTY scriptSig would not do -- Core's
+           ;; AreInputsStandard refuses the empty stack it leaves in PreChecks.
            (bad-script (let ((tx (pkg-tx funding-txid 0 99999000)))
                          (setf (bl.ser:tx-in-script-sig
                                 (aref (bl.ser:transaction-inputs tx) 0))
-                               (make-array 0 :element-type '(unsigned-byte 8)))
+                               (make-array 2 :element-type '(unsigned-byte 8)
+                                             :initial-contents '(1 0)))
                          tx)))
       (flet ((hex (tx) (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx)))
              (keys (row) (mapcar #'car row))

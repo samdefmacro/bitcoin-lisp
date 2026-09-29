@@ -59,10 +59,13 @@ Core's — a silent, opposite-direction divergence on a security-relevant flag."
         (/= 0 (locale-independent-atoi v)))))
 
 (defun conf-parse-int (value)
-  "Parse a config VALUE as an integer, or signal an error."
-  (let ((v (string-trim '(#\Space #\Tab) value)))
-    (handler-case (parse-integer v)
-      (error () (config-error "Invalid integer config value: ~S" value)))))
+  "An integer option's string VALUE as Core's GetIntArg reads it:
+SettingTo<int64_t> hands every string setting to LocaleIndependentAtoi
+(common/args.cpp:498-506). So nothing is refused as a non-integer -- `abc' is
+0, `3.25' is 3, `125peers' is 125 and a value past int64 saturates; an
+option that must be positive says so where it is applied, in Core's words for
+that option."
+  (locale-independent-atoi value))
 
 (defun log-categories-string ()
   "Core's LogCategoriesString: every category name, comma-separated, for the
@@ -352,8 +355,7 @@ nothing else has already answered."
           (soft-set t))
         (when (or (assoc "connect" alist :test #'string=)
                   (let ((m (lk "maxconnections")))
-                    (and m (let ((n (parse-integer m :junk-allowed t)))
-                             (and n (<= n 0))))))
+                    (and m (<= (conf-parse-int m) 0))))
           (soft-set nil))
         ;; GetArg of the list option -proxy: its LAST value (init.cpp:786).
         (when (let ((v (cdr (find "proxy" alist :key #'car :test #'string=

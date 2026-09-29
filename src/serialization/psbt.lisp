@@ -299,13 +299,26 @@ value was not the stated size\"."
     (unless (br-eof-p br)
       (serialization-error "Size of value was not the stated size"))))
 
+(defun %psbt-partial-sig-check (value)
+  "Core's check on a partial signature's value (psbt.h:543-546): `if
+(sig.empty() || !CheckSignatureEncoding(sig, SCRIPT_VERIFY_DERSIG |
+SCRIPT_VERIFY_STRICTENC, nullptr))' -- non-empty, BIP66 strict DER and a
+defined hashtype byte. LOW_S is not among the flags, so a high-S signature
+decodes."
+  (unless (and (plusp (length value))
+               (bl.crypto:valid-signature-encoding-p value)
+               (bl.crypto:defined-hashtype-signature-p value))
+    (serialization-error "Signature is not a valid encoding")))
+
 (defun %psbt-validate-content (context keytype keydata value)
   "The typed-value readers Core runs on these records at parse time, with
-their own error sentences: the partial-signature and BIP32 pubkeys, the key
+their own error sentences: the partial-signature and BIP32 pubkeys, the
+partial signature's encoding, the key
 origins, the final scriptWitness, the taproot derivations and tree, MuSig2."
   (case context
     (:input (case keytype
-              (#x02 (%psbt-pubkey-check keydata))
+              (#x02 (%psbt-pubkey-check keydata)
+                    (%psbt-partial-sig-check value))
               (#x06 (%psbt-pubkey-check keydata)
                     (%psbt-key-origin-check value))
               (#x08 (%psbt-witness-stack-check value))

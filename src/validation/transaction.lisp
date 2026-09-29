@@ -344,11 +344,26 @@ transactions, which a 64-byte internal merkle node can be confused with
 (defconstant +taproot-leaf-tapscript+ #xc0
   "BIP 342 tapscript leaf version (Bitcoin Core TAPROOT_LEAF_TAPSCRIPT).")
 
+(defun %script-sig-stack-top (script-sig)
+  "What Core's three policy readers of a P2SH scriptSig take as its redeem
+script: `EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE,
+BaseSignatureChecker(), SigVersion::BASE)', then `stack.back()' -- or NIL
+where they give up, on a failed evaluation or an empty stack
+(AreInputsStandard policy.cpp:235-241, IsWitnessStandard :274-283,
+SpendsNonAnchorWitnessProg :359-365). It is the stack TOP, not the scriptSig's
+last data push: a trailing OP_0 or OP_1..OP_16 pushes too, OP_RESERVED fails
+the evaluation, and an empty scriptSig leaves nothing. Evaluated by the script
+interpreter with no flags, as Core's SCRIPT_VERIFY_NONE -- whatever flags the
+caller is validating under."
+  (let ((bl.interop:*script-flags* nil))
+    (bl.interop:p2sh-redeem-script script-sig)))
+
 (defun spends-non-anchor-witness-program-p (tx utxo-set extra-coins)
   "True if any input of TX spends a witness-program output (any version,
 including not-yet-defined ones) other than pay-to-anchor — directly, or via
-P2SH whose redeem script (the scriptSig's last push; the scriptSig is known
-push-only here from the standardness checks) is a witness program. Port of
+P2SH whose redeem script (%SCRIPT-SIG-STACK-TOP; an input whose scriptSig
+fails to evaluate or leaves nothing is skipped, as Core skips it) is a
+witness program. Port of
 Core SpendsNonAnchorWitnessProg (policy/policy.cpp:340-373): the classifier
 for a script failure that could be explained by a stripped witness."
   (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
@@ -364,8 +379,7 @@ for a script failure that could be explained by a stripped witness."
                 (not (pay-to-anchor-p spk)))
            (return-from spends-non-anchor-witness-program-p t))
           ((script-is-p2sh-p spk)
-           (let ((redeem (extract-last-push
-                          (bl.ser:tx-in-script-sig input))))
+           (let ((redeem (%script-sig-stack-top (bl.ser:tx-in-script-sig input))))
              (when (and redeem (output-witness-program-p redeem))
                (return-from spends-non-anchor-witness-program-p t))))))))
   nil)
@@ -591,10 +605,10 @@ have no policy rules."
     (return-from input-witness-standard-p nil))
   (let ((prev-script spk)
         (p2sh nil))
-    ;; P2SH-wrapped: the redeemScript is the last push of the (push-only) scriptSig
-    ;; (Bitcoin Core extracts it by evaluating the scriptSig).
+    ;; P2SH-wrapped: the redeemScript is the stack top the scriptSig leaves;
+    ;; a failed evaluation or an empty stack is nonstandard (:274-283).
     (when (script-is-p2sh-p spk)
-      (let ((redeem (extract-last-push script-sig)))
+      (let ((redeem (%script-sig-stack-top script-sig)))
         (unless redeem (return-from input-witness-standard-p nil))
         (setf prev-script redeem p2sh t)))
     (multiple-value-bind (version program) (witness-program-parts prev-script)
@@ -610,11 +624,13 @@ have no policy rules."
 (defun is-witness-standard-p (tx spent-script-fn)
   "Bitcoin Core IsWitnessStandard: every input carrying a witness must spend a
 standard witness program (P2WSH/Taproot stack & script limits, no annex).
-SPENT-SCRIPT-FN maps (txid index) to the spent output's scriptPubKey. Coinbase
-has no witness inputs to check. A tx with no witness at all is vacuously
-standard."
+SPENT-SCRIPT-FN maps (txid index) to the spent output's scriptPubKey. A
+coinbase is skipped (policy.cpp:253-254) -- it does carry a witness, the
+BIP141 reserved value, which no spent script explains. A tx with no witness
+at all is vacuously standard."
   (let ((witness (bl.ser:transaction-witness tx)))
     (or (null witness)
+        (is-coinbase-tx tx)
         (loop for input across (bl.ser:transaction-inputs tx)
         for wstack across witness
         ;; An input with no witness data imposes no witness-standardness rule.
@@ -696,8 +712,15 @@ reserved as upgrade hooks and blocks DoS via expensive scripts; WITNESS_UNKNOWN
 stops us relaying spends of future segwit versions we cannot validate. Both are
 standard as OUTPUTS and only nonstandard to SPEND, which is why this cannot
 reuse standard-output-script-p — and a P2SH redeem script may carry at most
-+max-standard-p2sh-sigops+ sigops (:224-232). GET-SPENT-SCRIPT takes
-(txid index) and returns the spent scriptPubKey or NIL."
++max-standard-p2sh-sigops+ sigops, counted in the stack top the scriptSig leaves
+(:234-245, %SCRIPT-SIG-STACK-TOP). GET-SPENT-SCRIPT takes
+(txid index) and returns the spent scriptPubKey or NIL.
+
+A coinbase is standard before anything is looked at (:215-217). A coin
+GET-SPENT-SCRIPT does not have is Core's coinEmpty, whose scriptPubKey is
+empty -- NONSTANDARD to Solver -- so it makes the transaction nonstandard."
+  (when (is-coinbase-tx tx)
+    (return-from are-inputs-standard-p t))
   (unless (check-sigops-bip54-p tx get-spent-script)
     (return-from are-inputs-standard-p nil))
   (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
@@ -705,17 +728,17 @@ reuse standard-output-script-p — and a P2SH redeem script may carry at most
            (spk (funcall get-spent-script
                          (bl.ser:outpoint-hash prevout)
                          (bl.ser:outpoint-index prevout))))
-      (when spk
-        (case (classify-script spk)
-          ((:nonstandard :witness-unknown)
-           (return-from are-inputs-standard-p nil)))
-        (when (script-is-p2sh-p spk)
-          (let ((redeem (extract-last-push
-                         (bl.ser:tx-in-script-sig input))))
-            (when (and redeem
-                       (> (count-script-sigops redeem :accurate t)
-                          +max-standard-p2sh-sigops+))
-              (return-from are-inputs-standard-p nil)))))))
+      (unless spk
+        (return-from are-inputs-standard-p nil))
+      (case (classify-script spk)
+        ((:nonstandard :witness-unknown)
+         (return-from are-inputs-standard-p nil)))
+      (when (script-is-p2sh-p spk)
+        (let ((redeem (%script-sig-stack-top (bl.ser:tx-in-script-sig input))))
+          (when (or (null redeem)
+                    (> (count-script-sigops redeem :accurate t)
+                       +max-standard-p2sh-sigops+))
+            (return-from are-inputs-standard-p nil))))))
   t)
 
 (defun is-standard-tx (tx)

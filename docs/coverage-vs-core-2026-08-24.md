@@ -661,6 +661,14 @@ pubkeys and key origins were not read at decode; LocaleIndependentAtoi did not s
 accepted `++5`, and ParseMoney refused `.5` and `5.`; and the rev-file / blocks/index / filter-index VARINTs were
 read as uint64 where Core reads them into narrower types (TYPE-ERROR on a corrupt record).
 
+Found while porting them, by reading Core beside the target, and fixed the same way: an integer option is read as
+GetIntArg reads it (LocaleIndependentAtoi, so `abc` is 0 and `3.25` is 3, where we refused both); a PSBT partial
+signature must be strict DER with a defined hashtype at decode; the cmpctblock / getblocktxn / blocktxn counts had
+an invented 50,000 cap that punished the peer where Core reads a plain vector and forgives; nine defstruct slots
+defaulted to `#()` against a byte, double-float or fixnum array type; and AreInputsStandard passed a missing coin
+and read a P2SH redeem script as the scriptSig's last data push instead of the stack top Core's three policy
+readers take (so `<blob> OP_0` spending P2SH of the empty script, which Core relays, was refused).
+
 Not ported: the cluster-linearize, txgraph, mempool, mini-miner, package, orphan and txrequest simulations; the
 P2P message-processing targets (process_message(s), p2p_handshake, headers presync, connman, net, the v1/v2
 transport simulations); coins_view and the UTXO snapshot; the targets of C++ containers and integer arithmetic
