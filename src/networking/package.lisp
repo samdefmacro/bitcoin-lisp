@@ -321,6 +321,7 @@ headerssync.cpp. src/networking/.")
    #:address-banned-or-discouraged-p
    #:decode-peers-dat
    #:addrdb-read-error
+   #:permitted-difficulty-transition
    #:check-address-book
    #:*addrman-check-ratio*
    #:peer-address-source
