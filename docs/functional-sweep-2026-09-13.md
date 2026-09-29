@@ -1740,3 +1740,214 @@ at its tip with no error line. Neither node needed `-reindex`.
   where Core aborts; Core v28.2 cannot share a coinstats index with the
   pinned Core at all (the path and record changed after v29); the tests/
   tree still carries 29 style warnings the gates do not cover.
+
+## Round 10
+
+Five worktree batches merged onto `main` on 2026-09-30, from `12202352`
+(the Round-9 deploy note) onward: sketch (2), structs (9), storage (6),
+fuzz (19 with its merges) and net (11 with its merges), plus the batches'
+second phases. The round took the list that followed Round 9 -- the
+verification gaps, the compile-order debt, the last storage-layout items
+and the two sweep failures that were not decisions -- with the same rule,
+Core's way unless a documented reason. Every batch ran its own green
+battery on a fresh FASL volume (three commits change a defstruct's slots or
+file), and the merged battery ran before every push; the `::` ceiling fell
+from 3,608 to 3,557, the EQUALP hash-table ceiling from 102 to 86, and the
+cold lane gained two gates: no defstruct compiled after a reader
+(`scripts/check-struct-order.sh`) and no unused variable in tests/ either.
+The behaviour changes that mattered most, by batch:
+
+**sketch.** The minisketch port is held to Core's C++ library itself, not
+only to pyminisketch (`bf68b748`): `scripts/minisketch-cpp-vectors.sh`
+builds a session-tagged derived image that adds g++ and make to the pinned
+one, compiles `refs/bitcoin/src/minisketch/` with Core's own defines,
+generates `tests/data/minisketch_cpp_vectors.json` through the C API (field
+tables, 14 sketches, Core's merge scenario, 116 decode verdicts, capacity
+and element edges, seeded random sets, 259 entries shared with the Python
+file), compares the two files and removes its image. The library,
+pyminisketch and our port agree on every vector; the port needed no change.
+The battery reads the checked-in JSON and never needs the C++ image.
+
+**structs.** Four structs were compiled after code that read their accessors
+-- BLOCK-INDEX-ENTRY and CHAIN-STATE (now in a new `src/storage/types.lisp`
+at the head of the storage module), MEMPOOL and VB-WARNING-CHECKER (moved up
+in their files) -- and PEER's early reader, `txreconciliation-set`, now loads
+after it (`8320bc2a`, `20d83cfc`, `5853deb6`, `cb81f49c`): the hot accessors
+inline again (`recon-should-start-round-p` 13.2 → 7.8 ns per call), and
+`scripts/check-struct-order.sh` refuses a recurrence (`45367e96`). The
+tests/ tree compiled with 30 style warnings and one WARNING; four were real
+test bugs -- an ibd test bound a constant that no longer existed and so
+always waited its full 10 s -- and the unused-variable gate now covers
+tests/ (`b9af97b2`, `a1b0d58f`). createwallet and restorewallet over a path
+through a plain file answer Core's `-4` filesystem sentence instead of a raw
+SBCL error (`fbfd3e63`); sixteen txid- and wtxid-keyed sets use the octet
+test (`8920d0d2`).
+
+**storage.** Every index directory now lives at Core's path --
+`indexes/txindex`, `indexes/blockfilter/basic` with the `fltr?????.dat` files
+beside the database, `indexes/coinstats`, `indexes/txospenderindex` -- and a
+datadir with the old flat directories moves each one into place at start-up
+with a single rename, both parents fsynced, refusing before it moves anything
+if an index exists at both paths (`aced0dd7`, `09c4236b`, `bf268e3c`); the
+`-migratedatadir` option, which Core does not have, is gone. A loaded
+assumeutxo snapshot's blocks go to block files of their own, as Core's second
+block-file cursor keeps them (`32003780`, blockstorage.cpp:771-905): before,
+one file mixed the snapshot's heights with the background chain's, and
+pruneblockchain after the background sync answered -1 where Core's
+GetPruneHeight answers 298. A coinstats or spender-index rewind that cannot
+reverse a block aborts the node with Core's "Failed to rewind" instead of
+rebuilding (`31d65d69`, `bc436f00`). `wallet_assumeutxo` PASSES in the
+batch's oracle run.
+
+**fuzz.** 69 of Core's 216 fuzz targets, from 37 of its 133 files, are
+seeded property tests under `tests/fuzz/` -- a port of FuzzedDataProvider
+(`tests/fuzz/fuzz.lisp`), the Consume* helpers, one fiveam test per target
+citing Core's file and invariant, a positive control and a minimum-reached
+floor each -- covering deserialization, transactions, scripts and flags,
+net messages, addrman, crypto, encodings, wallet keys and PSBT, miniscript,
+RPC parsing and storage codecs, about 70 s in all. They found eight real
+defects, each fixed in its own commit with the input pinned:
+TxOutCompression's amount now wraps as Core's uint64 and the code and script
+size are uint32 (`348c1c6f`); compact-block indexes are uint16 with Core's
+three refusals (`729b7055`); a subnet mask must be contiguous and a full
+IPv6 mask works (`29971918`); 0.0.0.0 and 255.255.255.255 are not routable
+(`132e0528`); a WIF over an invalid scalar is refused (`1303ec27`); PSBT
+pubkeys, origins and witness stacks are type-checked at decode
+(`abe86d0e`); LocaleIndependentAtoi saturates and ParseMoney follows Core's
+grammar (`9e3a1472`); storage VARINTs are read into Core's field types
+(`8282a5e7`).
+
+**net.** An unfinished handshake is judged by the thread that owns its
+socket, between its 50 ms reads, and closed in that pass, as Core's
+SocketHandler closes what InactivityCheck marked (`dee1ef27`) -- the sweep's
+`p2p_v2_misbehaving` failure was the sync thread's tick arriving 0.7 s after
+`bumpmocktime`; a ready peer's ping and inactivity are judged every tick
+(`753f27fd`); Discover runs whenever the node binds on any address, listening
+or not (`1a078558`, init.cpp:2193-2197); an accepted peer is published
+already marked detecting when we offer v2 (`a3cd76dd`). The two `bind_port`
+tests fail on Core v28.2's own bitcoind at the same lines, because the
+pinned framework adds `-bind` to nodes given none and dials ports their
+1.1.1.1 binds do not listen on; copies with only those two steps replaced
+pass on Core and, after the Discover fix, on ours. An IBD profile over
+2,100 full regtest blocks (sb-sprof on the syncing node) found three hot
+spots and fixed each with identical bytes: `cl-array-to-coalton-vector`'s
+generic VECTOR-MAP-INTO (12.9 % → 1.4 %, `bbb7dc5c`), `flag-enabled-p`'s
+synchronized string-keyed cache (10.2 % → 1.4 %, `49044f9c`) and the
+one-byte-at-a-time receive drain (11.3 % → 0.3 %, `9db478e6`, 51-78 MB/s →
+2.7-4 GB/s); the P2P sync fell from 339-373 s to 295-301 s, a `-loadblock`
+import from 138 s to 107 s, sampled CPU by 30 %. The no-peer, reorg and
+index-rewind lines log at Core's levels (`330c5ccb`, `3c0732e1`).
+
+The batches' second phases, merged after the first: fuzz's five findings
+went Core's way -- `conf-parse-int` reads as GetIntArg's atoi (`abc` is 0,
+`125peers` is 125, past int64 saturates; `59488307`), a PSBT partial
+signature must pass DERSIG|STRICTENC at decode (`d46ee324`), nine struct
+slot defaults now satisfy their declared array types (`4a7dc674`), the
+invented `+max-block-tx-count+` is gone and an oversized BIP152 count is
+dropped through MAX_SIZE without punishment (`a9d787e6`, a `define-message`
+macro change), and AreInputsStandard treats a coinbase and a missing coin as
+Core does while the three P2SH policy readers take the stack top an
+evaluation leaves, so `<16×CHECKSIG> OP_0` over an empty redeem script is
+relayed as Core relays it (`c8582723`; the consensus sigop counter keeps
+Core's last-push read). net's second phase gave the project one outpoint
+key, COutPoint's own bytes in `bl.ser:make-outpoint-table`, and moved the
+validation layer's cons-keyed overlays onto it: EQUALP hashing fell from
+15.2 % of the IBD profile to none, the sync from 339-373 s before the batch
+to 246-253 s (`7adb3665`, `0d53645e`); the fee estimator now learns only what
+Core's processBlock learns and does nothing for an empty mempool
+(`8278da9a`); `scripts/conformance.sh` gained `--runner` and `--adapted`
+lanes and the two adapted bind tests are tracked under
+`tests/functional-adapted/` (`e8369f4c`); the SIGUSR1 profile lands beside
+debug.log (`4430ff79`).
+
+### Round-10 sweep
+
+Binary `1df60a1c` (every batch and second phase merged; four staggered
+batches of the harness with a 150 s cap, the three time-outs rerun serially
+with a 900 s cap), classification in
+`docs/functional-sweep-2026-09-13/after-1df60a1c.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
+| `bdfd8434` round 6 | 193 | 59 | 2 | 9 |
+| `632abe24` round 7 | 204 | 48 | 2 | 9 |
+| `cf46af32` round 8 | 233 | 21 | 0 | 9 |
+| `ddb02f15` round 9 | 236 | 18 | 0 | 9 |
+| `1df60a1c` round 10 | **239** | **15** | **0** | 9 |
+
+Three tests went to PASS and none left it: `feature_includeconf` (the
+single config read), `p2p_v2_misbehaving` (the handshake thread's own
+close) and `wallet_assumeutxo` (the snapshot's own block files). Every one
+of the 15 failures is a recorded decision or a framework limit: eleven are
+the wallet.dat file format (`tool_wallet`, `wallet_backup`,
+`wallet_backwards_compatibility`, `wallet_descriptor`, `wallet_hd`,
+`wallet_keypool_topup`, `wallet_listtransactions`, `wallet_migration`,
+`wallet_multiwallet`, `wallet_reorgsrestore`, `wallet_startup`), one the
+Round-5 refusal of absolute wallet paths (`wallet_crosschain`), one the
+documented datadir name (`feature_config_args` `:212`), and two the pinned
+framework's `-bind` handling that fails on Core v28.2 too
+(`feature_bind_port_discover`, `feature_bind_port_externalip`; their
+adapted copies pass). `feature_block`, `feature_dbcrash` and
+`feature_pruning` time out under the parallel 150 s cap and pass serially,
+as before. The 9 SKIPs are unchanged since Round 6.
+
+### Decisions recorded in Round 10
+
+- **`-migratedatadir` is removed**: Core has no such option; the index
+  directories move to Core's paths by themselves at start-up, and nothing
+  else it moved still needs moving.
+- **`feature_bind_port_discover` and `feature_bind_port_externalip` are
+  SKIP-by-framework**: both fail on Core v28.2's own bitcoind at the same
+  lines, because the pinned framework adds `-bind` to nodes given none and
+  dials 127.0.0.1 ports that a 1.1.1.1 bind does not listen on. Copies with
+  only those two steps replaced live in `tests/functional-adapted/` (README
+  names the steps and Core's lines) and pass on Core and on ours; they run
+  through `scripts/conformance.sh --adapted`.
+- **The minisketch capacity ceiling (128) stays ours** even though the C++
+  library decodes larger capacities; the library vectors cover 129 and 256,
+  and only our reconciliation layer refuses them.
+- **A coinstats or spender-index rewind that cannot reverse a block aborts
+  the node**, reversing Round 9's rebuild; the case where the stale branch
+  is not in the header index still rebuilds (start-up refuses it earlier).
+- **The three P2SH policy readers take the evaluated stack top**, as
+  AreInputsStandard, IsWitnessStandard and the MAX_P2SH_SIGOPS gate do in
+  policy.cpp:213-250, superseding gap-analysis-8-plan's "do not repoint";
+  the consensus sigop count (script.cpp:183-205) keeps its own last-push
+  read.
+- **The fee estimator keeps no per-block statistics**: the block fee-rate
+  percentile nothing read, and its ten-block rewrite of fee_estimates.dat,
+  are gone; `connect-block` and `perform-reorg` still accept
+  `:fee-estimator` for their callers and collect nothing.
+
+### Left open after Round 10
+
+- The IBD profile's top frame is now the Coalton interpreter's type checks
+  (10.5 %), then the syscall and socket floor; the coins cache's
+  `utxo-key-hash` reads only the first eight bytes of the txid and does not
+  mix the output index, so one transaction's outputs share a bucket chain.
+- The `:fee-estimator` keyword is still threaded through the IBD and RPC
+  call paths and is now unused; `src/networking/ibd.lisp` writes forensic
+  blocks to a fixed `/data/bitcoin-lisp/forensic-blocks/` path.
+- Fuzz: 69 of Core's 216 targets are ported; the cluster/txgraph/mempool/
+  orphanage/txrequest simulations, the P2P processing and transport
+  simulations, the coins-view and chainstate targets, and miniscript_stable/
+  smart need harnesses of their own. Found by the targets and not fixed:
+  `scriptsig-push-only-p` accepts a direct push that runs off the end where
+  IsPushOnly says false (reject reason only); `-maxmempool=-1`'s message;
+  the bitcoin-wallet tool's createfromdump still surfaces a raw file error
+  for a name through a plain file.
+- Five src/ style warnings no gate covers: `&OPTIONAL and &KEY` in one
+  lambda list each in src/node/init.lisp, src/node/mempool-persist.lisp and
+  three in src/rpc/blockchain.lisp; the musig BIP327 signing-vector test
+  never reads the vectors' signer column.
+- The minisketch CLMUL field implementations exist only on x86_64; the
+  Docker VM is arm64, so only the generic fields were exercised (they
+  compute the same field).
+- Unchanged: the live mainnet node's libsecp256k1 v0.5.1 (musig module at the
+  next image bump), `wallet_assumeutxo` now passes but the wallet.dat-bound
+  tests, `wallet_crosschain`, `feature_config_args` `:212` and the Sparrow
+  and CJDNS items stand as in Rounds 8-9.
