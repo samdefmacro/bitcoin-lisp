@@ -461,17 +461,22 @@ the position once it exists."
 the entry names no position yet; returns the entry.
 
 Core's LoadGenesisBlock hands the position WriteBlock returned to
-ReceivedBlockTransactions (validation.cpp:4971-4979), so genesis carries
-BLOCK_HAVE_DATA, nFile and nDataPos like any block received. ENSURE-GENESIS-ON-DISK
-runs before the genesis entry exists, and nothing noted the position after:
-our genesis record in blocks/index had no HAVE_DATA, and Core v28.2 started on
-our regtest datadir dropped every chain in FindMostWorkChain for the missing
-body and waited for a genesis block forever (scripts/interop/datadir_interop.py).
-Also repairs a datadir written before this, where the body is on disk and the
-record says otherwise."
+ReceivedBlockTransactions (validation.cpp:4966-4985), so genesis carries
+BLOCK_HAVE_DATA, nFile and nDataPos like any block received. Ours wrote the
+body (ENSURE-GENESIS-ON-DISK) before the genesis entry existed, and nothing
+noted the position after: the record in blocks/index had no HAVE_DATA. Core
+v28.2 started on such a datadir dropped every chain in FindMostWorkChain for
+the missing body and waited for a genesis block forever
+(scripts/interop/datadir_interop.py), and with -coinstatsindex it refused the
+index as pruned (`best block of the index goes beyond pruned data',
+GetFirstBlock(tip, BLOCK_HAVE_DATA) != Genesis(), index/base.cpp).
+
+Start-up calls it every time, so it also REPAIRS a datadir written before --
+the live nodes' genesis entries lack the flag -- whenever the store still
+indexes genesis's body; a pruned store that dropped it is left as it is."
   (let* ((hash (chain-state-genesis-hash chain-state))
          (entry (get-block-index-entry chain-state hash))
-         (located (gethash hash (block-store-index store))))
+         (located (and store (gethash hash (block-store-index store)))))
     (when (and entry (flat-file-pos-p located)
                (null (block-index-entry-data-pos entry)))
       (note-block-position chain-state hash located))
@@ -822,10 +827,15 @@ across chainstates and take no suffix."
 
 (defun open-chainstate-coins-view (state)
   "Open STATE's coins LevelDB (at its chainstate-leveldb-path) and install a
-coins-view-cache over it as the chainstate's coins view. Returns the view."
-  (setf (chain-state-coins-view state)
-        (make-coins-view-cache
-         (open-coins-view-db (namestring (chainstate-leveldb-path state))))))
+coins-view-cache over it as the chainstate's coins view. Returns the view.
+A database still in this tree's pre-2026-09-29 coin layout is converted first
+(UPGRADE-COINS-VIEW-DB); a stop request part way is an error here, and the
+next open continues the conversion."
+  (let ((db (open-coins-view-db (namestring (chainstate-leveldb-path state)))))
+    (unless (upgrade-coins-view-db db)
+      (close-coins-view-db db)
+      (storage-error "Error upgrading chainstate database"))
+    (setf (chain-state-coins-view state) (make-coins-view-cache db))))
 
 (defun close-chainstate-coins-view (state)
   "Close STATE's coins LevelDB (releasing its lock) if the chainstate owns a

@@ -1540,7 +1540,7 @@ function of (format-string &rest args) that must signal."
                       (funcall fail "Bad snapshot data after deserializing ~D coins - bad tx out value"
                                processed))
                     (bl.store:coins-view-batch-put
-                     batch
+                     base-db batch
                      (bl.store:make-utxo-key txid vout)
                      (bl.store:make-utxo-entry
                       :value value :script-pubkey script

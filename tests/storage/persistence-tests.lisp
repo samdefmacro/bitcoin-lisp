@@ -124,6 +124,40 @@ key it is stored under. Re-encoding the decoded entry gives the same bytes."
         (is (equalp value (bl.store:encode-disk-block-index entry))
             "re-encoding a Core record changed its bytes")))))
 
+(test genesis-entry-carries-the-position-of-its-body
+  "Core's LoadGenesisBlock saves genesis and runs it through
+ReceivedBlockTransactions (validation.cpp:4966-4985), so the genesis record in
+blocks/index has nFile/nDataPos and BLOCK_HAVE_DATA (8). Ours wrote the body
+into blk00000.dat but left the entry without a position, and Core v28.2
+started on our datadir with -coinstatsindex refused to start the index --
+`best block of the index goes beyond pruned data', because BaseIndex::Init
+reads a genesis without HAVE_DATA as pruned
+(feature_coinstatsindex_compatibility.py:34). The control is the entry before
+NOTE-GENESIS-POSITION: no HAVE_DATA."
+  (with-network (:regtest)
+    (with-temp-directory (dir)
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (cs (bl.store:init-chain-state dir :network :regtest))
+             (entry (add-regtest-genesis-entry cs)))
+        (bl.store:ensure-genesis-on-disk store)
+        (is (zerop (logand 8 (bl.store:entry-disk-status entry)))
+            "control: the entry has no position yet")
+        (bl.store:note-genesis-position cs store)
+        (is (= 8 (logand 8 (bl.store:entry-disk-status entry))) "BLOCK_HAVE_DATA")
+        (is (eql 0 (bl.store:block-index-entry-file entry)))
+        (is (eql 8 (bl.store:block-index-entry-data-pos entry))
+            "genesis follows blk00000.dat's 8-byte record header")
+        ;; The repair: an entry an earlier start saved without the position is
+        ;; given it on the next start, and a second call changes nothing.
+        (setf (bl.store:block-index-entry-file entry) nil
+              (bl.store:block-index-entry-data-pos entry) nil)
+        (is (zerop (logand 8 (bl.store:entry-disk-status entry))))
+        (is (eq entry (bl.store:note-genesis-position cs store)))
+        (is (= 8 (logand 8 (bl.store:entry-disk-status entry))) "repaired")
+        (is (eq entry (bl.store:note-genesis-position cs store)))
+        (is (eql 8 (bl.store:block-index-entry-data-pos entry)))))))
+
 (test block-file-record-is-cores-byte-for-byte
   "Core's 'f' record for blk00000 after the same six blocks: seven VARINTs,
 nBlocks 6, nSize 1573, nUndoSize 205, heights 0..5, then the header times."
@@ -300,28 +334,6 @@ to reports the store's cursor, not its preallocated length on disk."
             (is (< (bl.store:block-file-info-size info)
                    bl.kv:+blockfile-chunk-size+)
                 "nSize is the used length, not the preallocated chunk")))))))
-
-(test genesis-record-names-its-body
-  "Core's LoadGenesisBlock hands WriteBlock's position to
-ReceivedBlockTransactions (validation.cpp:4971-4979): genesis's blocks/index
-record has BLOCK_HAVE_DATA, nFile and nDataPos. Without them Core v28.2,
-started on our datadir, finds no body for genesis and never activates a
-chain. NOTE-GENESIS-POSITION also repairs an entry saved without them."
-  (with-network (:regtest)
-    (with-temp-directory (dir "bl-genesis-pos")
-      (let* ((bl.store:*flat-block-files* t)
-             (store (bl.store:init-block-store dir))
-             (cs (bl.store:init-chain-state dir :network :regtest)))
-        (bl.store:ensure-genesis-on-disk store)
-        ;; 8 is BLOCK_HAVE_DATA (chain.h:75).
-        (let ((entry (add-regtest-genesis-entry cs)))
-          (is (not (logtest 8 (bl.store:entry-disk-status entry)))
-              "control: the entry as the node creates it names no body")
-          (is (eq entry (bl.store:note-genesis-position cs store)))
-          (is (logtest 8 (bl.store:entry-disk-status entry)))
-          (is (eql 0 (bl.store:block-index-entry-file entry)))
-          ;; blk00000.dat starts with genesis: magic and size, then the body.
-          (is (eql 8 (bl.store:block-index-entry-data-pos entry))))))))
 
 (test a-missing-block-index-is-a-first-run-not-corruption
   "No block index records at all is a legitimate first run: NIL loaded, and NO

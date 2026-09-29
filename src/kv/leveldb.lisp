@@ -447,6 +447,16 @@ survived three more calls. Anything that must not remain on disk needs a
 rebuild into a new directory, not a compaction — see WALLET-DB-REWRITE."
   (%leveldb-compact-range db (cffi:null-pointer) 0 (cffi:null-pointer) 0))
 
+(defun leveldb-compact-range (db start limit)
+  "leveldb CompactRange over the keys in [START, LIMIT] (byte vectors): what
+Core's CDBWrapper::CompactRange does (dbwrapper.h:258-265), used by its 0.15
+chainstate upgrade after every batch to reclaim the space the converted
+records' tombstones pin. The same caveats as LEVELDB-COMPACT apply."
+  (declare (type (simple-array (unsigned-byte 8) (*)) start limit))
+  (cffi:with-pointer-to-vector-data (sptr start)
+    (cffi:with-pointer-to-vector-data (lptr limit)
+      (%leveldb-compact-range db sptr (length start) lptr (length limit)))))
+
 ;;;; Per-key operations. We create writeoptions/readoptions per call. A
 ;;;; future refactor should cache these (Core keeps one set per
 ;;;; CDBWrapper) but a naive defvar cache hit a libleveldb-side issue

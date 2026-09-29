@@ -604,6 +604,28 @@
   mode, and an unpruned start over it is Core's refusal unless it is a
   `-reindex`, which erases the flag instead (see the `-reindex` paragraph).
 
+  The coins database, `chainstate/` (and a snapshot's
+  `chainstate_snapshot/`), is Core's CCoinsViewDB record for record since
+  2026-09-29, so a chainstate written by either node loads in the other:
+  `C`+txid+VARINT(vout) (`encode-coin-key`, Core's CoinEntry) holds a Coin,
+  VARINT(height*2+coinbase) then the compressed amount and script
+  (`encode-coin-value`, the TxOutCompression codec the snapshot and the
+  undo files share); `B` is the best block and `H` the head blocks of an
+  unfinished flush. Every VALUE is XORed with the database's obfuscation
+  key, drawn at random when the database is created (and again by the
+  -reindex-chainstate wipe) and stored plain under `\\000obfuscate_key`;
+  a key another writer chose is simply used. Traps: VARINT sorts
+  numerically only within one encoded length (16512 sorts before 256), so
+  the raw key walk is not numeric vout order and `utxo-set-iterate`
+  regroups each txid as Core's coinstats does -- gettxoutsetinfo's hash and
+  dumptxoutset depend on it. A database in this tree's older layout (a
+  37-byte key with a little-endian vout, plain values) is converted in
+  place at start-up by `upgrade-coins-view-db`, Core 0.15's own upgrade
+  pattern: each batch writes the new records, erases the old ones and
+  records how far it got, the range is compacted, and a stop request or a
+  crash leaves a database the next start continues; the key length tells
+  the two layouts apart record by record.
+
   A coins flush is written in batches of `*coins-db-batch-bytes*`
   (-dbbatchsize, Core's CCoinsViewDB::BatchWrite): the first batch
   replaces the best-block pointer with a DB_HEAD_BLOCKS record naming
@@ -686,6 +708,10 @@
   (bitcoin-lisp.storage:utxo-entry class)
   (bitcoin-lisp.storage:get-utxo function)
   (bitcoin-lisp.storage:coins-view-cache class)
+  (bitcoin-lisp.storage:encode-coin-key function)
+  (bitcoin-lisp.storage:encode-coin-value function)
+  (bitcoin-lisp.storage:upgrade-coins-view-db function)
+  (bitcoin-lisp.storage:utxo-set-iterate function)
   (bitcoin-lisp.storage:*persist-block-index-hook* variable)
   (bitcoin-lisp.storage:save-header-index function)
   (bitcoin-lisp.storage:load-header-index function)

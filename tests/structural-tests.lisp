@@ -79,7 +79,6 @@
     "bitcoin-lisp.networking:request-headers"
     "bitcoin-lisp.networking:tor-controller-service-id"
     "bitcoin-lisp.serialization:bip155-network-keyword"
-    "bitcoin-lisp.serialization:br-read-compressed-coin"
     "bitcoin-lisp.serialization:make-getblocks-message"
     "bitcoin-lisp.storage:add-utxo"
     "bitcoin-lisp.storage:any-utxo-for-txid-p"

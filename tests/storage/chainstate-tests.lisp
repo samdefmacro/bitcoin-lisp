@@ -279,22 +279,25 @@ be refused."
         (is-true (bl.store:coins-view-db-needs-upgrade-p view)
                  "a 'c' record is Core's pre-0.15 coins format")))))
 
-(test a-foreign-obfuscation-key-is-refused-after-needsupgrade-has-spoken
+(test a-coins-database-under-a-foreign-key-opens-and-a-wipe-draws-a-new-one
   "Core's CDBWrapper constructor accepts whatever obfuscation key a database
-holds (dbwrapper.cpp:253-261); the refusals come after it, NeedsUpgrade's
-`Unsupported chainstate database format' first (node/chainstate.cpp:103-109).
-A v0.14.3 chainstate carries a key of its own AND the pre-0.15 records, and
-feature_unsupported_utxo_db.py:48 expects Core's sentence for it; ours refused
-the key at open, before that question was asked. So: a database with a
-non-zero key OPENS, NEEDS-UPGRADE-P still answers, FOREIGN-OBFUSCATION-P names
-the key, and the -reindex-chainstate wipe writes the zero key back (Core's
-wiped database gets a fresh key from the constructor that wiped it). The
-control is a database our own writer created: its key is the zero key."
+holds (dbwrapper.cpp:253-261) and XORs every value with it; the refusal that
+follows is NeedsUpgrade's `Unsupported chainstate database format'
+(node/chainstate.cpp:103-109), which a v0.14.3 chainstate -- a key of its own
+AND the pre-0.15 records -- must be answered with
+(feature_unsupported_utxo_db.py:48). So a database with a non-zero key OPENS
+under that key, NEEDS-UPGRADE-P still answers, and the -reindex-chainstate wipe
+draws a fresh random key (Core's wiped database gets one from the constructor
+that wiped it) that the open view then writes under. The control is a database
+our own writer created: a random, non-zero key, as Core's."
   (with-temp-directory (dir "bl-foreign-key")
     (let ((foreign (namestring (merge-pathnames "foreign/" dir)))
           (ours (namestring (merge-pathnames "ours/" dir)))
           (key-key (coerce (list* 14 0 (map 'list #'char-code "obfuscate_key"))
-                           '(simple-array (unsigned-byte 8) (*)))))
+                           '(simple-array (unsigned-byte 8) (*))))
+          (coin (bl.store:make-utxo-key (make-array 32 :element-type '(unsigned-byte 8)
+                                                       :initial-element 9)
+                                        3)))
       (bl.store:with-leveldb (db foreign)
         (bl.store:leveldb-put db key-key (coerce '(8 1 2 3 4 5 6 7 8)
                                                  '(simple-array (unsigned-byte 8) (*))))
@@ -305,16 +308,27 @@ control is a database our own writer created: its key is the zero key."
       (bl.store:with-coins-view-db (view foreign)
         (is-true (bl.store:coins-view-db-needs-upgrade-p view)
                  "the pre-0.15 question is answered although the key is foreign")
-        (is-true (bl.store:coins-view-db-foreign-obfuscation-p view)
-                 "a non-zero key is named as foreign")
         (bl.store:coins-view-cache-wipe (bl.store:make-coins-view-cache view))
-        (is-false (bl.store:coins-view-db-foreign-obfuscation-p view)
-                  "the wipe writes the zero key back")
         (is-false (bl.store:coins-view-db-needs-upgrade-p view)
-                  "and the legacy records are gone with it"))
-      (bl.store:with-coins-view-db (view ours)
-        (is-false (bl.store:coins-view-db-foreign-obfuscation-p view)
-                  "control: our own new database holds the zero key")))))
+                  "the legacy records are gone with the wipe")
+        (bl.store:coins-view-db-put
+         view coin (bl.store:make-utxo-entry :value 7 :script-pubkey
+                                             (make-array 1 :element-type '(unsigned-byte 8)
+                                                           :initial-element #x51)
+                                             :height 2)))
+      (bl.store:with-leveldb (db foreign)
+        (let ((record (bl.store:leveldb-get db key-key)))
+          (is (and (= 9 (length record)) (= 8 (aref record 0))))
+          (is-false (equalp record #(8 1 2 3 4 5 6 7 8)) "the wipe drew a new key")
+          (is-true (bl.store:obfuscation-key-active-p (subseq record 1)))))
+      (bl.store:with-coins-view-db (view foreign)
+        (is (= 7 (bl.store:utxo-entry-value (bl.store:coins-view-db-get view coin)))
+            "a value written after the wipe reads back under the new key"))
+      (bl.store:with-coins-view-db (view ours) view)
+      (bl.store:with-leveldb (db ours)
+        (let ((record (bl.store:leveldb-get db key-key)))
+          (is-true (and record (bl.store:obfuscation-key-active-p (subseq record 1)))
+                   "control: our own new database holds a random, non-zero key"))))))
 
 (test a-damaged-coins-database-fails-at-open
   "Core's CDBWrapper constructor reads the obfuscation key right after DB::Open
@@ -343,10 +357,12 @@ The control is the same database undamaged: it opens, and it holds the key."
         (is-true (bl.store:coins-view-db-get view coin-key)
                  "control: the undamaged database opens and reads back its coin"))
       (bl.store:with-leveldb (db path)
-        (is (equalp #(8 0 0 0 0 0 0 0 0)
-                    (bl.store:leveldb-get db (coerce (list* 14 0 (map 'list #'char-code "obfuscate_key"))
-                                                     '(simple-array (unsigned-byte 8) (*)))))
-            "a new coins database holds Core's obfuscation key, the zero key"))
+        (let ((record (bl.store:leveldb-get
+                       db (coerce (list* 14 0 (map 'list #'char-code "obfuscate_key"))
+                                  '(simple-array (unsigned-byte 8) (*))))))
+          (is-true (and record (= 9 (length record)) (= 8 (aref record 0))
+                        (bl.store:obfuscation-key-active-p (subseq record 1)))
+                   "a new coins database holds Core's obfuscation key, drawn at random")))
       (let ((tables (directory (merge-pathnames "*.ldb" path))))
         (is-true tables "control: the database has table files to damage")
         (dolist (table tables)

@@ -1,6 +1,9 @@
 # Aligning chainstate consistency with Bitcoin Core
 
-Date: 2026-08-16. Status: **P1–P3b implemented.**
+Date: 2026-08-16. Status: **P1–P3b implemented.** Since 2026-09-24 a flush
+is Core's partial-batch BatchWrite with DB_HEAD_BLOCKS and ReplayBlocks, and
+since 2026-09-29 the whole database is Core's format byte for byte -- see
+section 5. Sections 1-4 are the record of how the pointer got there.
 
 Written after reading Core rather than reasoning from our own structure. Two
 GA8 findings and one live incident all turned out to be symptoms of a single
@@ -155,6 +158,9 @@ away from — so the pointer records a falsehood, and the P1 startup check
 compares two copies of the same wrong answer and reports agreement. Only once
 the pointer is honest does reconciling it with `chainstate.dat` mean anything.
 
+**Superseded 2026-09-24: we now write Core's `DB_HEAD_BLOCKS`** (the
+flush is split into `-dbbatchsize` batches and `bl:replay-coins-db-blocks`
+is Core's ReplayBlocks). The reasoning as it stood on 2026-08-16:
 **We do NOT need Core's `DB_HEAD_BLOCKS`.** That marker exists because
 `CCoinsViewDB::BatchWrite` splits a large flush across several `WriteBatch`
 commits (`batch_write_bytes`), leaving a window where neither the old nor the
@@ -183,3 +189,51 @@ source of truth.
   than strictly unreachable, and no longer corrupting when it does fire.
 - Keep PR 334's `:corrupt` refusal after P2 lands: it covers a chainstate file
   that is unreadable for reasons a replay cannot fix.
+
+## 5. The on-disk format is Core's (2026-09-29)
+
+The coins LevelDB is now CCoinsViewDB's (`txdb.cpp`, `dbwrapper.cpp` at the
+pin), decided by the user on 2026-09-29, so a `chainstate/` written by
+Bitcoin Core loads here and one written here loads in Core:
+
+| Key | Value (every value XORed with the obfuscation key) |
+|---|---|
+| `\x0e\x00obfuscate_key` | CompactSize 8 + the 8-byte key, stored PLAIN; drawn at random when the database is created, again by the `-reindex-chainstate` wipe |
+| `C` + txid + VARINT(vout) | Coin: VARINT(height*2 + coinbase), compressed amount, compressed script (`src/serialization/compressor.lisp`) |
+| `B` | the uint256 of the block the coins are at |
+| `H` | vector<uint256>{new, old} while a flush is between its first and last batch |
+
+Persistence is exactly as described above: `%write-dirty-coins` is
+BatchWrite -- the first batch erases `B` and writes `H`, partial batches at
+`-dbbatchsize`, the last erases `H` and writes `B` -- and start-up replays an
+`H` it finds. The values of `B` and `H` are obfuscated like every other
+value, so the pointer written by Core reads correctly here.
+
+Two records are ours and Core ignores both: `M`, the marker of the one-shot
+utxoset.dat import, and `\x0e\x00coins_upgrade`, present only while a database
+in the previous layout is being converted.
+
+**The previous layout and its upgrade.** Until 2026-09-29 a coin was stored
+under `C` + txid + a fixed 4-byte little-endian vout (37 bytes) as an i64
+value, u32 height, u8 coinbase flag, u32 script length and the script, plain,
+under the all-zero key. A Core key is at most 36 bytes for any vout a block
+can hold, so the key length tells the layouts apart record by record.
+`upgrade-coins-view-db` converts in place at start-up (and when a snapshot
+chainstate is opened), following Core 0.15's `CCoinsViewDB::Upgrade`: walk the
+old records in key order; write each coin in the new layout and erase the old
+record in the same batch; commit every 16 MiB together with a progress record
+naming the last key converted; compact the range just converted; log the
+percentage from the txid's first two bytes; stop between batches on a stop
+request (`Error upgrading chainstate database`). The first batch installs a
+random key and rewrites `B`/`H` under it; the last erases the progress record.
+Every durable state is a mix the next start continues from, memory is one
+batch plus one iterator (re-opened per batch so compacted tables can be
+deleted), and no second copy of the set is made -- which matters on a pruned
+node, whose coins database is the only copy. Unspendable coins found in the
+old layout are dropped, as Core's upgrade dropped them.
+
+**VARINT order.** Core's VARINT is order-preserving only within one encoded
+length (16512 = `80 80 00` sorts before 256 = `81 00`), so the raw key walk
+is not numeric vout order. `utxo-set-iterate` regroups each txid as
+`kernel/coinstats.cpp` does with its `std::map`, and gettxoutsetinfo's hash,
+dumptxoutset and the coinstats index depend on it.
