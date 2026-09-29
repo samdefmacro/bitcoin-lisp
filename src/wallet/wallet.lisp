@@ -214,7 +214,7 @@ map, and the descriptor's private keys."
   ;; per SPKM because our signer merges every SPKM's keys into one provider
   ;; per call, where Core's FillPSBT asks each SPKM in turn; the provider
   ;; that signs is the one whose table the nonce must be in.
-  (musig2-secnonces (make-hash-table :test 'equalp) :type hash-table))
+  (musig2-secnonces (bl.bytes:make-octets-hash-table) :type hash-table))
 
 (defmacro with-wallet-lock ((wallet) &body body)
   "Execute BODY holding WALLET's recursive cs_wallet-equivalent lock.
