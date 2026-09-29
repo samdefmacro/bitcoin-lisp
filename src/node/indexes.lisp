@@ -267,6 +267,16 @@ chain."
     (when (and fork (bl.store:entry-on-active-chain-p cs fork))
       fork)))
 
+(defun %index-rewind-failed (index)
+  "Core's answer to a Rewind that returned false: FatalErrorf \"Failed to rewind
+%s to a previous chain tip\" (index/base.cpp:239-241 in Sync, :363-366 in
+BlockConnected) -- AbortNode, and the sync returns with no Commit. Raises
+FATAL-ERROR with INDEX's name and returns :REWIND-FAILED, which CATCH-UP-INDEX
+and the connect-time hook read as `build nothing on top'."
+  (bl.log:fatal-error (format nil "Failed to rewind ~A to a previous chain tip"
+                              (bl.store:index-name index)))
+  :rewind-failed)
+
 (defun %rewind-coinstatsindex (csi cs store)
   "Make the coinstats index's best block one on the ACTIVE chain before anything
 backfills on top of it, reversing the abandoned blocks down to the fork point
@@ -317,10 +327,8 @@ are left as they were, and the caller builds nothing on top."
                                   (bl.store:coinstatsindex-revert-block
                                    csi block hash (bl.store:block-index-entry-height e)
                                    (bl.val:get-undo-data hash)))
-                       (bl.log:fatal-error
-                        (format nil "Failed to rewind ~A to a previous chain tip"
-                                (bl.store:index-name csi)))
-                       (return-from %rewind-coinstatsindex :rewind-failed))))
+                       (return-from %rewind-coinstatsindex
+                         (%index-rewind-failed csi)))))
           (log-warn "Coinstats index rewound to height ~D"
                     (bl.store:block-index-entry-height fork))
           (bl.store:block-index-entry-height fork))))))
@@ -484,8 +492,9 @@ for blocks disconnected while the process was down (a kill with the index ahead
 of the flushed chainstate, or an invalidateblock across a restart).
 
 Returns NIL when the marker was already on the active chain -- the common case,
-and it costs one lookup. Otherwise the height rewound to, or -1 when the branch
-could not be walked and the index must be rebuilt."
+and it costs one lookup. Otherwise the height rewound to; -1 when the branch
+cannot be placed in the header index and the index must be rebuilt; or
+:REWIND-FAILED when a block on it could not be read (%INDEX-REWIND-FAILED)."
   (multiple-value-bind (best-hash best-height) (bl.store:txospenderindex-best-block idx)
     (unless best-hash
       (return-from %rewind-txospenderindex nil))
@@ -503,11 +512,9 @@ in the header index; rebuilding from genesis")
           (return-from %rewind-txospenderindex -1))
         ;; Core's Rewind loop: walk pprev from the stale tip to (not including)
         ;; the fork point, reading each block and calling CustomRemove. A body
-        ;; we cannot read is Core's ReadBlock failure, which aborts the rewind;
-        ;; here the marker is cleared instead, so the backfill rebuilds rather
-        ;; than leaving a gap nothing will ever fill. The abandoned rows then
-        ;; survive, but they are inert: %TXOSPENDER-CONFIRMED-SPENDER discards
-        ;; any locator whose block is not on the active chain.
+        ;; we cannot read is Core's ReadBlock failure (index/base.cpp:299-305):
+        ;; the rewind returns false and the node aborts (%INDEX-REWIND-FAILED),
+        ;; with the marker and every row left as they were.
         (let ((fork-hash (bl.store:block-index-entry-hash fork)))
           (loop for e = stale then (bl.store:block-index-entry-prev-entry e)
                 while (and e (not (equalp (bl.store:block-index-entry-hash e)
@@ -515,10 +522,10 @@ in the header index; rebuilding from genesis")
                 do (let* ((hash (bl.store:block-index-entry-hash e))
                           (block (and store (bl.store:get-block store hash))))
                      (unless block
-                       (log-warn "Spender index: block ~A of the abandoned branch ~
-is unavailable; rebuilding from genesis" (bl.crypto:bytes-to-hex hash))
-                       (bl.store:index-clear-best idx)
-                       (return-from %rewind-txospenderindex -1))
+                       (log-error "Failed to read block ~A from disk"
+                                  (bl.crypto:bytes-to-hex hash))
+                       (return-from %rewind-txospenderindex
+                         (%index-rewind-failed idx)))
                      ;; Core's CustomRemove, reached the one way it is ever
                      ;; reached: from a rewind (index/base.cpp:313).
                      (bl.store:index-rewind-block
