@@ -308,6 +308,45 @@ ONE idle tick, with Core's line."
                       "one idle tick must walk the ladder to the disconnect: ~S" lines)))
       (setf (bl:node-running node) nil))))
 
+(test idle-tick-drops-a-peer-whose-ping-went-unanswered
+  "Core runs MaybeSendPing from SendMessages (net_processing.cpp:5757), which
+ThreadMessageHandler calls for every peer on every pass, at most 100 ms apart
+(net.cpp:3139-3159), and the socket-level InactivityCheck on every socket-
+handler pass (net.cpp:2218). Ours asked both of a ready peer only from
+MAINTAIN-PEERS, once per sync pass -- up to 30 s after the clock said so, and
+not at all while a sync pass ran long.
+
+A ready peer whose ping has been outstanding past TIMEOUT_INTERVAL on the mock
+clock is dropped by ONE idle tick, with Core's line (net_processing.cpp:5495,
+the text p2p_ping.py:112 waits for).
+
+Control: one second earlier the same tick keeps it."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node)
+         (t0 1780000000)
+         (bl.ser:*mock-time* t0)
+         (peer (bl.net:make-peer :state :ready :address "203.0.113.11")))
+    (unwind-protect
+         (progn
+           (setf (bl:node-running node) t)
+           (push peer (bl:node-peers node))
+           (bl.net:check-peer-health peer)   ; never pinged: pings now
+           (is-true (bl.net:peer-ping-nonce peer) "control: the ping is outstanding")
+           (setf (bl.net:peer-connected-at peer) (- t0 3600)
+                 bl.ser:*mock-time* (+ t0 1200))
+           (%idle-tick)
+           (is-true (member peer (bl:node-peers node))
+                    "control: at exactly TIMEOUT_INTERVAL the peer stays")
+           (setf bl.ser:*mock-time* (+ t0 1201))
+           (let ((text (nth-value 1 (log-text-of "net" #'%idle-tick))))
+             (is-true (search "ping timeout: 1201.000000s" text)
+                      "one idle tick judges the ping, in Core's words: ~S" text))
+           (is-false (member peer (bl:node-peers node))
+                     "and the peer is gone in that tick")
+           (is (eq :disconnected (bl.net:peer-state peer))))
+      (setf (bl:node-running node) nil))))
+
 (test an-addconnection-feeler-is-dropped-once-its-handshake-is-done
   "Core's VERSION handler disconnects a feeler as soon as the version is in:
 \"feeler connection completed, disconnecting peer=N\"

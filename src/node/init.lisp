@@ -1844,7 +1844,8 @@ every outbound peer (Core SendMessages, net_processing.cpp:6159). Run BEFORE
 the pump answers anything, so a peer whose ping is answered this tick has seen
 the verdict for the clock it set before pinging (p2p_outbound_eviction.py:46-56).
 An unfinished handshake is judged by the thread driving it
-(BL.NET:CALL-WITH-INACTIVITY-VERDICT), which owns its socket."
+(BL.NET:CALL-WITH-INACTIVITY-VERDICT), which owns its socket; a ready peer's
+InactivityCheck and MaybeSendPing run after the pump (CHECK-PEERS-HEALTH)."
   (consider-chain-sync-evictions node))
 
 (defun %sync-idle-tick (second)
@@ -1873,10 +1874,8 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
                      (> (length (node-peers *node*)) peers-before))))
   (%sync-tick-liveness *node*)      ; InactivityCheck + ConsiderEviction
   (run-header-sync-duties *node*)   ; Core SendMessages, headers half
-  ;; Retry buffered unsent bytes on
-  ;; every peer (non-blocking) — the
-  ;; periodic half of Core's
-  ;; SocketSendData.
+  ;; Retry buffered unsent bytes on every peer (non-blocking) — the
+  ;; periodic half of Core's SocketSendData.
   (bl.net:flush-peer-send-buffers
    (node-peers *node*))
   ;; Steady-state receive pump: drain
@@ -1896,6 +1895,9 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
                 (node-peers *node*)
                 ctx
                 nil)))
+    ;; Ready peers' InactivityCheck + MaybeSendPing, after their messages as
+    ;; Core's SendMessages follows ProcessMessages (net.cpp:2218, :3143-3148).
+    (check-peers-health *node*)
     ;; Tx-request scheduler: send
     ;; delayed announcements now due,
     ;; and re-route requests that
