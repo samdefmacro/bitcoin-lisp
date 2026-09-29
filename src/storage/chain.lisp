@@ -456,6 +456,22 @@ the position once it exists."
     (when located (note-block-received chain-state entry))
     entry))
 
+(defun note-genesis-position (chain-state store)
+  "Give CHAIN-STATE's genesis entry the position of the genesis body STORE
+holds, when the entry has none. Core's LoadGenesisBlock saves genesis and runs
+it through ReceivedBlockTransactions (validation.cpp:4966-4985), so its entry
+carries nFile/nDataPos and BLOCK_HAVE_DATA like any other block; ours wrote the
+body (ENSURE-GENESIS-ON-DISK) but never told the entry, and a blocks/index
+without HAVE_DATA on genesis is one Core's BaseIndex::Init reads as pruned: an
+index started on it fails with `best block of the index goes beyond pruned
+data' (GetFirstBlock(tip, BLOCK_HAVE_DATA) != Genesis(), index/base.cpp)."
+  (let* ((hash (chain-state-genesis-hash chain-state))
+         (entry (get-block-index-entry chain-state hash))
+         (located (and store (gethash hash (block-store-index store)))))
+    (when (and entry (null (block-index-entry-data-pos entry))
+               (flat-file-pos-p located))
+      (note-block-position chain-state hash located))))
+
 ;;; Block sequence ids (Core nSequenceId / nBlockSequenceId / m_blocks_unlinked).
 
 (defconstant +seq-id-best-chain-from-disk+ 0

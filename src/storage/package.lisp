@@ -121,6 +121,7 @@ src/storage/.")
    #:block-index-entry-undo-pos
    #:block-index-entry-status-flags
    #:note-block-position
+   #:note-genesis-position
    #:%record-block-position
    #:block-index-entry-sequence-id
    #:note-block-received

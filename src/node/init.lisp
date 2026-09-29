@@ -1206,6 +1206,7 @@ startup refusal rather than a directory we create somewhere else."
   ;; the index, so without a root the drain never starts and every record is
   ;; orphaned. See %ENSURE-GENESIS-INDEX-ENTRY.
   (%ensure-genesis-index-entry network)
+  (bl.store:note-genesis-position (node-chain-state *node*) (node-block-store *node*))
 
   ;; A recorded tip the block index cannot place is not a tip. Core keeps NO
   ;; tip record outside blocks/ -- its chain tip IS the block index -- so a
