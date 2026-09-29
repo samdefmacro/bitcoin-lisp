@@ -573,3 +573,62 @@ time closes nothing."
           (dolist (p (bl:node-pending-inbound-peers node))
             (ignore-errors (bl.net:disconnect-peer p)))
           (bl.net:close-listener srv))))))
+
+(test an-accepted-v2-peer-is-published-detecting
+  "Core's accepted CNode carries a V2Transport from construction whenever the
+node offers NODE_P2P_V2 (CreateNodeFromAcceptedSocket, net.cpp:1826-1850;
+MakeTransport, :3962), and V2Transport::GetInfo reports DETECTING until the
+peer's version packet is in (:1586-1592). p2p_v2_transport.py:141-145 waits for
+the new peer to appear in getpeerinfo, sends 15 of the 16 v1-prefix bytes and
+reads transport_protocol_type AT ONCE, expecting \"detecting\". Ours set the
+flag on the handshake thread when it started, and a round-10 run read \"v1\"
+0.6 ms after the accept line: the peer was published before its thread ran.
+
+The handshake itself is stubbed out here (it would set the flag on its own
+thread), so what is asserted is the peer as the accept publishes it."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0))
+        (saved (fdefinition 'bl.net:perform-inbound-handshake))
+        (saved-v2 bl.net:*v2-transport-enabled*))
+    (is-true srv)
+    (when srv
+      (let ((node (bl:make-node))
+            (port (usocket:get-local-port srv))
+            (listener nil)
+            (client nil))
+        ;; Global, not bound: the accept runs on the listener's thread.
+        (setf (bl:node-running node) t
+              bl.net:*v2-transport-enabled* t)
+        (unwind-protect
+             (progn
+               (is-true (bl.net:v2-available-p) "control: this node offers v2")
+               (setf (fdefinition 'bl.net:perform-inbound-handshake)
+                     (lambda (peer &key timeout)
+                       (declare (ignore peer timeout))
+                       (sleep 0.5)
+                       nil))
+               (setf listener
+                     (bt:make-thread
+                      (lambda () (ignore-errors (bl:run-inbound-listener node :socket srv)))
+                      :name "test-inbound-listener"))
+               (setf client (usocket:socket-connect "127.0.0.1" port
+                                                    :element-type '(unsigned-byte 8)))
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* 5 internal-time-units-per-second))))
+                 (loop until (or (bl:node-pending-inbound-peers node)
+                                 (> (get-internal-real-time) deadline))
+                       do (sleep 0.01)))
+               (let ((peer (first (bl:node-pending-inbound-peers node))))
+                 (is-true peer "the accepted peer is published")
+                 (is-true (and peer (bl.net:peer-connection peer)
+                               (bl.net:connection-v2-detecting
+                                (bl.net:peer-connection peer)))
+                          "and it is published as detecting, before any handshake runs")))
+          (setf (bl:node-running node) nil
+                bl.net:*v2-transport-enabled* saved-v2
+                (fdefinition 'bl.net:perform-inbound-handshake) saved)
+          (when client (ignore-errors (usocket:socket-close client)))
+          (when listener (ignore-errors (bt:join-thread listener)))
+          (sleep 0.6)                   ; the stubbed handshake thread ends
+          (dolist (p (bl:node-pending-inbound-peers node))
+            (ignore-errors (bl.net:disconnect-peer p)))
+          (bl.net:close-listener srv))))))

@@ -96,6 +96,12 @@ it flips that state or disconnects the peer."
        (let ((peer (bl.net:make-inbound-peer
                     conn (bl.net:connection-host conn)
                     :inbound-onion onion :local-port local-port)))
+         ;; Published DETECTING when we offer v2: Core's accepted CNode holds a
+         ;; V2Transport from construction (net.cpp:1826-1850, :3962), whose
+         ;; GetInfo says DETECTING until the version packet (:1586-1592).
+         ;; p2p_v2_transport.py:145 reads getpeerinfo before our thread runs.
+         (when (bl.net:v2-available-p)
+           (setf (bl.net:connection-v2-detecting conn) t))
          (bt:with-recursive-lock-held ((node-lock node))
            (push peer (node-pending-inbound-peers node)))
          (bt:with-lock-held (*inbound-handshake-lock*)
