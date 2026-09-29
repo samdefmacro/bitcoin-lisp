@@ -346,6 +346,8 @@ src/serialization/.")
    ;; TxOutCompression (compressor.lisp — Core compressor.{h,cpp})
    #:bb-write-core-varint
    #:br-read-core-varint
+   #:+varint-max-uint32+
+   #:+varint-max-int32+
    #:compress-amount
    #:decompress-amount
    #:compress-script

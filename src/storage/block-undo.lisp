@@ -43,11 +43,11 @@
 (defun br-read-undo-coin (br)
   "Read one spent output from BR (Core TxInUndoFormatter::Unser, undo.h:35-48).
 Returns a UTXO-ENTRY."
-  (let* ((code (bl.ser:br-read-core-varint br))
+  (let* ((code (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+)) ; unsigned int nCode
          (height (ash code -1))
          (coinbase (logtest code 1)))
     (when (plusp height)
-      (bl.ser:br-read-core-varint br))
+      (bl.ser:br-read-core-varint br bl.ser:+varint-max-uint32+))
     (multiple-value-bind (value script)
         (bl.ser:br-read-compressed-tx-out br)
       (make-utxo-entry :value value

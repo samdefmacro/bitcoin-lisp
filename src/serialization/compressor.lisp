@@ -46,7 +46,13 @@ non-final digit and setting its high bit."
 
 (defconstant +varint-max-uint32+ #xFFFFFFFF
   "numeric_limits<uint32_t>::max() (and unsigned int's): ReadVarInt's bound
-for a 32-bit unsigned field -- a Coin's code word, a compressed script's size.")
+for a 32-bit unsigned field -- a Coin's code word, a compressed script's size,
+CBlockFileInfo's counts, CDiskBlockIndex's nStatus, nTx and positions.")
+
+(defconstant +varint-max-int32+ #x7FFFFFFF
+  "numeric_limits<int>::max(): ReadVarInt's bound for an int read in
+VarIntMode::NONNEGATIVE_SIGNED -- CDiskBlockIndex's version, nHeight and nFile,
+FlatFilePos's nFile.")
 
 (defun br-read-core-varint (br &optional (max +varint-max-uint64+))
   "Read a Bitcoin Core VARINT from BR (serialize.h:442-462 ReadVarInt<I>).
