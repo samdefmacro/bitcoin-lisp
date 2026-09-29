@@ -168,6 +168,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:out-desc-ordered-keys
    #:out-desc-ranged-p
    #:out-desc-solvable-p
+   #:out-desc-expand
    #:out-desc-string
    #:out-desc-string-normalized
    #:out-desc-string-private

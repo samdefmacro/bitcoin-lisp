@@ -638,6 +638,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/net")
                              (:file "fuzz/addrman")
                              (:file "fuzz/crypto")
-                             (:file "fuzz/encoding"))))
+                             (:file "fuzz/encoding")
+                             (:file "fuzz/wallet"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
