@@ -2135,7 +2135,9 @@ seconds and dial again."
       (switched
        (note-node-tip-progress *node*))
       (t
-       (log-warn "No peers available, reconnecting in 5s...")
+       ;; A debug line: Core's ThreadOpenConnections logs nothing when it has
+       ;; no peer, and a peerless regtest node is every functional test's.
+       (log-cat "net" "No peers available, reconnecting in 5s...")
        ;; Merge each second, not only at the top of the next loop iteration:
        ;; this branch runs when the node has NO peer, which is exactly when an
        ;; inbound connection arrives at a node nothing has dialled, and a peer

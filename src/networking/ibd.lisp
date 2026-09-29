@@ -3068,7 +3068,7 @@ terms both said the node was done, so the fork was never requested."
                  (when (null peers)
                    (incf no-peer-cycles)
                    (when (> no-peer-cycles 5)
-                     (bl:log-warn "No peers available, pausing block download")
+                     (bl:log-cat "net" "No peers available, pausing block download")
                      (return))
                    (sleep 1))
 

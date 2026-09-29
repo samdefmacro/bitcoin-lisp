@@ -749,3 +749,20 @@ clock and reported milliseconds."
         (log-text-of "net" (lambda () (bl.net:check-peer-health peer)))
       (is (eq :disconnect verdict))
       (is (search "ping timeout: 1201.000000s" text)))))
+
+(test a-peerless-pass-is-not-a-warning
+  "Core's ThreadOpenConnections logs nothing when it has no peer to talk to,
+and a peerless regtest node is every functional test's first seconds; ours
+logged `No peers available, reconnecting in 5s...' at WARNING on each pass.
+It is a debug line in the net category now. The node is not running, so the
+pass's five-second wait ends at once."
+  (let* ((bl:*network* :regtest)
+         (node (make-test-node :network :regtest))
+         (bl:*node* node))
+    (setf (bl:node-running node) nil)
+    (let ((lines (capture-log-lines #'%offline-pass)))
+      (is-false (find "No peers available" lines :test #'search)
+                "no line at the default level: ~S" lines))
+    (is-true (search "No peers available, reconnecting"
+                     (nth-value 1 (log-text-of "net" #'%offline-pass)))
+             "control: the line is still there under -debug=net")))

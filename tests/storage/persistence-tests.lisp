@@ -1144,13 +1144,23 @@ header; these synthetic fixtures must too."
       (is (= 3 (bl.store:utxo-count utxo-set)))
       ;; Build chain B: genesis -> B1 -> B2 -> B3 -> B4 (4 blocks, more work)
       (let ((chain-b-hashes (make-test-chain-hashes #xB0 4)))
-        (let ((prev-hash genesis-hash))
-          (loop for h from 1 to 4
-                for block-hash in chain-b-hashes
-                do (let ((block (make-reorg-test-block prev-hash block-hash h)))
-                     (bl.val:connect-block
-                      block chain-state block-store utxo-set)
-                     (setf prev-hash block-hash))))
+        (let* ((prev-hash genesis-hash)
+               (lines
+                 (capture-log-lines
+                  (lambda ()
+                    (loop for h from 1 to 4
+                          for block-hash in chain-b-hashes
+                          do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                               (bl.val:connect-block
+                                block chain-state block-store utxo-set)
+                               (setf prev-hash block-hash)))))))
+          ;; A reorg is logged at info, as Core logs its steps; a warning is
+          ;; for an invalid chain.
+          (is-true (find "REORG: old tip height 3 -> fork at 0 -> new tip height 4"
+                         lines :test #'search)
+                   "control: the reorg is logged: ~S" lines)
+          (is-false (find "[warning] REORG" lines :test #'search)
+                    "and not as a warning: ~S" lines))
         ;; After reorg: chain B should be active (4 blocks, more work)
         (is (= 4 (bl.store:current-height chain-state)))
         (is (equalp (fourth chain-b-hashes)

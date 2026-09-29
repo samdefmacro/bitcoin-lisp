@@ -4348,7 +4348,7 @@ relay filters."
 ;; parents before children. Txs re-confirmed or invalidated by the
 ;; new chain are dropped by re-validation.
 (when (plusp (reorg-disconnected-dropped r))
-  (bl:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
+  (bl:log-info "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
                          +max-disconnected-tx-pool-bytes+
                          (reorg-disconnected-dropped r)))
 ;; Re-validate against the height the chain ACTUALLY reached: equal to
@@ -4585,7 +4585,10 @@ comment above."
                       (bl.log:fatal-error "Failed to disconnect block."))
                     (return-from perform-reorg (values nil :corrupt-undo)))))))
 
-          (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
+          ;; Info, not a warning: a reorg is the chain working. Core logs its
+          ;; steps at info (UpdateTip, validation.cpp) and warns only on an
+          ;; invalid chain (InvalidChainFound).
+          (bl:log-info "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                  old-height fork-height new-height)
 
           (%reorg-disconnect r chain-state block-store utxo-set mempool fork-entry)
