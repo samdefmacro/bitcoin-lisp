@@ -1424,6 +1424,13 @@ serial cap; all four time out under the parallel 150 s cap, as before. On
 `feature_unsupported_utxo_db`, `feature_init`, `feature_coinstatsindex` and
 `feature_index_prune` PASS in a serial confirming run.
 
+Deployed: both live nodes to `93da36a9` -- testnet4 on 2026-09-24 (the block
+index migrated in place, 170,958 entries in 3.0 s; three wallets stamped with
+their network id; a four-day soak with no restart, no error line, 51 peers)
+and mainnet on 2026-09-29 after a clean stop (969,102 entries in 16.0 s; the
+pruned node came back at its tip with 18 peers). Neither node needed
+`-reindex`; each left its `headerindex.dat.migrated` behind for a downgrade.
+
 ### Decisions recorded in Round 8
 
 - **Core's `blocks/index` LevelDB is ported** (reversing
