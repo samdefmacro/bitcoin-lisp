@@ -133,7 +133,7 @@ special defined later in the tree is no longer tolerated either: define it
 before its first use (`scripts/check-undefined-variables.sh`), because a
 `let` of a not-yet-declared special binds LEXICALLY and 2026-09-29 that had
 every BIP125 replacement announced with the caller's removal reason -- and
-on an unused variable in src/ (`scripts/check-unused-variables.sh`): ASDF's
+on an unused variable in src/ or tests/ (`scripts/check-unused-variables.sh`): ASDF's
 compilation unit defers those warnings past compile-file's failure-p, so a
 from-scratch build otherwise passes with them buried in the transcript —
 2026-08-28 it hid a `setf` of a deleted defvar and six docstrings cut short

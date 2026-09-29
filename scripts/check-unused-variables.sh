@@ -14,9 +14,12 @@
 # IGNORABLE where a macro reads the variable (DOTIMES, WITH-OPEN-FILE), and
 # move a DEFVAR ahead of its first binding.
 #
-# Only warnings raised while compiling the project's src/ count: tests/ keep
-# scaffolding variables, and refs/coalton is not ours. The lexical-binding
-# warning counts under tests/ too -- it is a wrong answer wherever it is.
+# Warnings raised while compiling the project's src/ AND tests/ count;
+# refs/coalton is not ours. tests/ was outside the gate until 2026-09-30 and
+# had gathered 30 of these, three of them wrong answers rather than noise: a
+# LET binding a test meant as a knob (a constant that no longer existed, so
+# the callee never saw it), a LET* binding named IGNORE-ERRORS, and IGNORE
+# declarations on variables of an outer scope that the body did use.
 # Attribution is by the file being compiled (scripts/transcript-messages.awk).
 #
 #   check-unused-variables.sh TRANSCRIPT [SRC-ROOT]  exit 1 on a finding
@@ -37,7 +40,9 @@ if [ "${1:-}" = "--self-test" ]; then
   printf '; compiling file "%s/tests/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   using the lexical binding of the symbol (BITCOIN-LISP::*SOME-SPECIAL*), not the\n;   dynamic binding, even though the name follows\n;   the usual naming convention (names like *FOO*) for special variables\n' "$root" > "$tmp"
   "$0" "$tmp" "$root" >/dev/null 2>&1 && fail "a wrapped lexical binding of a special under tests/ passed"
   printf '; compiling file "%s/tests/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   The variable STATE is defined but never used.\n' "$root" > "$tmp"
-  "$0" "$tmp" "$root" >/dev/null 2>&1 || fail "an unused test variable was reported"
+  "$0" "$tmp" "$root" >/dev/null 2>&1 && fail "an unused variable under tests/ passed"
+  printf '; compiling file "%s/tests/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   IGNORE declaration for a variable from outer scope: DIR\n' "$root" > "$tmp"
+  "$0" "$tmp" "$root" >/dev/null 2>&1 && fail "an outer-scope IGNORE under tests/ passed"
   printf '; compiling file "%s/refs/coalton/src/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   The variable ENV is defined but never used.\n' "$root" > "$tmp"
   "$0" "$tmp" "$root" >/dev/null 2>&1 || fail "a dependency's own warning was reported"
   rm -f "$tmp"; echo "check-unused-variables: self-test ok"; exit 0
@@ -45,9 +50,9 @@ fi
 
 transcript=$1; root=${2:-/workspace}
 findings=$(awk -f "$(dirname "$0")/transcript-messages.awk" "$transcript" |
-  awk -F'\t' -v src="^$root/src/" -v any="^$root/(src|tests)/" '
-    $2 ~ /using the lexical binding of the symbol/ { if ($1 ~ any) print $1 ": " $2; next }
-    $1 ~ src && ($2 ~ /The variable [^ ]+ is defined but never used/ ||
+  awk -F'\t' -v ours="^$root/(src|tests)/" '
+    $1 ~ ours && ($2 ~ /using the lexical binding of the symbol/ ||
+                 $2 ~ /The variable [^ ]+ is defined but never used/ ||
                  $2 ~ /reading an ignored variable/ ||
                  $2 ~ /is being set even though it was declared to be ignored/ ||
                  $2 ~ /IGNORE declaration for an unknown variable/ ||

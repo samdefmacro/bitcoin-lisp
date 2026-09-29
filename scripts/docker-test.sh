@@ -98,7 +98,7 @@ fi
 # style warnings too, mostly dead parameters -- but "using the lexical binding
 # of the symbol (*NAME*)" is a LET of a special compiled before its DEFVAR,
 # invisible to every callee (2026-09-29: BIP125 replacements announced with
-# the caller's removal reason). src/ only, plus that one warning in tests/.
+# the caller's removal reason). src/ and tests/ both (tests/ since 2026-09-30).
 "$(dirname "$0")/check-unused-variables.sh" --self-test >&2 || exit 1
 if ! "$(dirname "$0")/check-unused-variables.sh" "$TRANSCRIPT" >&2; then
   echo "ERROR: the build has unused variables or contradicted IGNORE declarations (see above)" >&2
