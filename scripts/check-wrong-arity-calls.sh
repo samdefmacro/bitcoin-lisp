@@ -45,21 +45,8 @@ if [ "${1:-}" = "--self-test" ]; then
 fi
 
 transcript=$1; root=${2:-/workspace}
-findings=$(awk -v pat="^$root/(src|tests)/" '
-  # A compiler message body is indented under its own "; " prefix and a long
-  # one wraps, so consecutive continuation lines are joined before matching.
-  function flush(   ) {
-    if (msg ~ /is called with/ && file ~ pat) print file ": " msg
-    msg = ""
-  }
-  /^;   / { line = substr($0, 5); msg = (msg == "" ? line : msg " " line); next }
-  {
-    flush()
-    if ($0 ~ /^; compiling file "/) { f = $0; sub(/^.*compiling file "/, "", f); sub(/".*$/, "", f); file = f }
-    else if ($0 ~ /^; file: /) { file = substr($0, 9) }
-  }
-  END { flush() }
-' "$transcript")
+findings=$(awk -f "$(dirname "$0")/transcript-messages.awk" "$transcript" |
+  awk -F'\t' -v pat="^$root/(src|tests)/" '$1 ~ pat && $2 ~ /is called with/ { print $1 ": " $2 }')
 
 if [ -n "$findings" ]; then
   printf '%s\n' "$findings"
