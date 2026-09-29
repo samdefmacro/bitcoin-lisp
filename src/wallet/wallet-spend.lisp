@@ -1937,9 +1937,10 @@ the wrong keys."
                     collect (list script leaf-hash control
                                   (mapcar #'cdr own)))))))))
 
-(defun %spkm-tap-bip32-origins (spkm script pos pairs)
-  "Core's sigdata.taproot_misc_pubkeys for a taproot output of SPKM, as one
-(XONLY LEAF-HASHES FINGERPRINT PATH) per key whose origin the wallet knows --
+(defun %desc-tap-bip32-origins (desc cache script pos pairs)
+  "Core's sigdata.taproot_misc_pubkeys for a taproot output DESC solves (CACHE
+a wallet SPKM's descriptor cache, or NIL), as one
+(XONLY LEAF-HASHES FINGERPRINT PATH) per key whose origin the provider knows --
 exactly the records FromSignatureData then writes as
 PSBT_IN/OUT_TAP_BIP32_DERIVATION (psbt.cpp:203-205, :296-297).
 
@@ -1949,13 +1950,12 @@ Core fills that map from two sites, and they differ in what they carry:
     hash (script/sign.cpp:361-369), one key appearing under several leaves
     when several leaves name it.
 
-PAIRS is the SPKM's expansion at POS. OUT-DESC-ORDERED-KEYS lays a node's OWN
+PAIRS is the expansion at POS. OUT-DESC-ORDERED-KEYS lays a node's OWN
 keys down before its children's, and every taproot descriptor a wallet SPKM
 can hold -- tr() and rawtr() -- has exactly one own key, so (FIRST PAIRS) is
 the internal key and the rest is sliced per leaf, the same way
 %SPKM-TR-SCRIPT-LEAVES slices it."
-  (let* ((desc (desc-spkm-desc spkm))
-         (entries (when pairs
+  (let* ((entries (when pairs
                     (list (list (car (first pairs)) (cdr (first pairs)) '())))))
     (when (and (eq (bl.rpc:out-desc-kind desc) :tr)
                (bl.rpc:out-desc-tree desc)
@@ -1988,14 +1988,14 @@ the internal key and the rest is sliced per leaf, the same way
           do (when (bl.rpc:desc-key-musig-participants key)
                (loop for (participant . pubkey)
                        in (bl.rpc:descriptor-musig2-participant-pairs
-                           desc key pos (desc-spkm-cache spkm))
+                           desc key pos cache)
                      for hit = (assoc participant entries :test #'eq)
                      do (if hit
                             (dolist (h hashes) (pushnew h (third hit) :test #'equalp))
                             (push (list participant pubkey (copy-list hashes)) entries)))))
     (loop for (key pubkey hashes) in (nreverse entries)
           collect (multiple-value-bind (fpr path)
-                      (bl.rpc:descriptor-key-origin key pubkey pos desc (desc-spkm-cache spkm))
+                      (bl.rpc:descriptor-key-origin key pubkey pos desc cache)
                     (list (bl.rpc:key-xonly-bytes pubkey)
                           (reverse hashes) fpr path)))))
 
@@ -2058,7 +2058,7 @@ entry is (secret . merkle-root) under the output key, and only when the spend
 data derives exactly this output (%SPKM-TR-TREE-DATA's guard)."
   (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
     (declare (ignore scripts))
-    (let ((root (and pairs (%spkm-tr-tree-data spkm script pos pairs))))
+    (let ((root (and pairs (%desc-tr-tree-data (desc-spkm-desc spkm) script pos pairs))))
       (when root
         (let ((priv (%desc-key-priv-at (car (first pairs)) pos
                                        (spkm-privkey-provider wallet spkm))))
@@ -2132,7 +2132,15 @@ pubkeys reach the signer."
   "Core CWallet::SignTransaction: sign every input COINS covers with keys
 from the wallet's SPKMs. COINS: (txid . vout) -> (script-pubkey amount
 redeem-script witness-script). Returns the (index . message) error list;
-NIL = complete."
+NIL = complete.
+
+There is deliberately NO MuSig2 step here. Core's SignTransaction goes
+through ProduceSignature, whose SignMuSig2 would make nonces for a musig()
+input (script/sign.cpp:348-356) -- but a transaction has nowhere to carry a
+public nonce, so the secrets would sit orphaned in the SPKM's table and the
+input would come back unsigned all the same. A musig() output is spent
+through the PSBT rounds (psbt-musig.lisp); leaving this path out changes no
+output and keeps no secret nobody can use."
   (let ((bl.rpc:*solving-pubkeys* (bl.bytes:make-octets-hash-table)))
     (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
         (%wallet-sign-maps wallet tx coins)
