@@ -2692,12 +2692,12 @@ h = hashlib.sha256(tag + tag + (1).to_bytes(8,'little')
 print(int.from_bytes(h[0:8],'little'), int.from_bytes(h[8:16],'little'))\"
   => 6513280882736911012 14473150418129592761"
   (multiple-value-bind (k0 k1)
-      (bl.net::compute-recon-salt 1 2)
+      (bl.net:compute-recon-salt 1 2)
     (is (= 6513280882736911012 k0))
     (is (= 14473150418129592761 k1)))
   ;; Ascending order is applied internally, so argument order is irrelevant.
   (multiple-value-bind (k0 k1)
-      (bl.net::compute-recon-salt 2 1)
+      (bl.net:compute-recon-salt 2 1)
     (is (= 6513280882736911012 k0))
     (is (= 14473150418129592761 k1))))
 
@@ -2782,6 +2782,25 @@ disconnects (Core RejectIncomingTxs, net_processing.cpp:3976-3980)."
     (is-false (%sendtxrcncl
                peer (%sendtxrcncl-payload 0 2)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
+
+(test sendtxrcncl-truncated-payload-keeps-the-peer
+  "A sendtxrcncl too short to read throws out of `vRecv >> version >> salt'
+(net_processing.cpp:3994) into ProcessMessages' catch, which logs
+`ProcessMessages(sendtxrcncl, N bytes): Exception ... caught' and keeps the
+connection (:5283-5284): no registration and no disconnect. This used to be a
+disconnect of its own invention. The positive control is the same peer
+registering from a well-formed payload afterwards."
+  (let ((bl:*tx-reconciliation* t)
+        (peer (%recon-test-peer)))
+    (let ((log (nth-value 1 (log-text-of
+                             "net" (lambda ()
+                                     (is-true (%sendtxrcncl
+                                               peer (subseq (%sendtxrcncl-payload 1 2) 0 7))))))))
+      (is (search "ProcessMessages(sendtxrcncl, 7 bytes): Exception '" log) "logged: ~S" log))
+    (is (not (eq :disconnected (bl.net:peer-state peer))))
+    (is-false (bl.net::peer-recon-registered peer))
+    (is-true (%sendtxrcncl peer (%sendtxrcncl-payload 1 2)))
+    (is-true (bl.net::peer-recon-registered peer))))
 
 (test sendtxrcncl-higher-version-downgrades
   "A peer announcing version 2 registers fine at negotiated min(2, 1) = 1

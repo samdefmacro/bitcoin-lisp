@@ -1061,6 +1061,19 @@ the datadir as pruned any more. A pruning start keeps everything as it is."
        (log-info "Reindex: leaving pruned mode; ~D block~:P no longer claim a body on disk"
                  cleared)))))
 
+(defun start-wipes-coins-p (reindex reindex-chainstate)
+  "T when this start empties the coins database before anything reads it. In
+Core both flags do (wipe_chainstate_db = do_reindex || do_reindex_chainstate,
+init.cpp:1386), which is why Core skips NeedsUpgrade and ReplayBlocks under
+either. Ours is a STATED DIVERGENCE: -reindex is additive and keeps the coins
+(docs/reindex-decision-2026-09-18.md), and only -reindex-chainstate wipes them
+(DO-REINDEX-CHAINSTATE). So only -reindex-chainstate may skip the start-up
+work over the coins: the pre-0.15 refusal, the layout upgrade and the replay of
+an interrupted flush. Asked -reindex alone, it answers NIL -- the coins stay
+and must be made whole."
+  (declare (ignore reindex))
+  (and reindex-chainstate t))
+
 (defun %init-load-chain (network reindex reindex-chainstate blocks-directory)
   "Core Step 7, LoadChainstate: chain state, block store, coins view, header
 index, -reindex, and the block-store <-> header-index position map.
@@ -1168,18 +1181,17 @@ startup refusal rather than a directory we create somewhere else."
       ;; Refuse a pre-0.15 coins database, as Core does right after opening
       ;; it (node/chainstate.cpp:103-109). Either reindex flag wipes the
       ;; coins before they are read, which is why Core's check is a no-op
-      ;; then and ours is skipped (feature_unsupported_utxo_db.py:48-56).
-      (when (and (not (or reindex reindex-chainstate))
+      ;; then; ours wipes only under -reindex-chainstate (START-WIPES-COINS-P)
+      ;; and skips only then (feature_unsupported_utxo_db.py:48-56).
+      (when (and (not (start-wipes-coins-p reindex reindex-chainstate))
                  (bl.store:coins-view-db-needs-upgrade-p view))
         (bl.store:close-coins-view-db view)
         (init-error "Unsupported chainstate database format found. Please restart with -reindex-chainstate. This will rebuild the chainstate database."))
       ;; A database in this tree's pre-2026-09-29 coin layout is converted to
       ;; Core's in place, as Core 0.15 converted its own (CCoinsViewDB::Upgrade,
-      ;; `Error upgrading chainstate database' when interrupted). Only
-      ;; -reindex-chainstate wipes the coins here, so only it skips the work;
-      ;; our -reindex is additive and keeps them (the -reindex paragraph of
-      ;; docs/manual.lisp's storage section).
-      (when (and (not reindex-chainstate)
+      ;; `Error upgrading chainstate database' when interrupted). Skipped only
+      ;; when the start wipes the coins anyway (START-WIPES-COINS-P).
+      (when (and (not (start-wipes-coins-p reindex reindex-chainstate))
                  (not (bl.store:upgrade-coins-view-db view)))
         (bl.store:close-coins-view-db view)
         (init-error "Error upgrading chainstate database"))
@@ -1262,14 +1274,16 @@ startup refusal rather than a directory we create somewhere else."
       (when (plusp files)
         (log-info "Block file accounting: ~D flat block file~:P" files)))))
 
-(defun %replay-interrupted-coins-flushes (wipe-chainstate)
+(defun replay-interrupted-coins-flushes (reindex reindex-chainstate)
   "A coins flush interrupted between its partial batches left DB_HEAD_BLOCKS
 behind: finish it before anything reads the coins, as Core's
 CompleteChainstateInitialization runs ReplayBlocks right after opening the
-coins DB (node/chainstate.cpp:111-114). Either reindex flag (WIPE-CHAINSTATE)
-wipes the coins first, which makes it a no-op there too. The rollback reads undo
-data, so undo storage is set up for it here as well as later."
-  (unless (or wipe-chainstate (null (node-data-directory *node*)))
+coins DB (node/chainstate.cpp:111-114). Skipped only when the start wipes the
+coins (START-WIPES-COINS-P): -reindex keeps them here, so it replays. The
+rollback reads undo data, so undo storage is set up for it here as well as
+later."
+  (unless (or (start-wipes-coins-p reindex reindex-chainstate)
+              (null (node-data-directory *node*)))
     (bl.val:initialize-undo-storage
      (merge-pathnames "undo/" (node-data-directory *node*))
      :block-store (node-block-store *node*) :chain-state (node-chain-state *node*))
@@ -1311,7 +1325,7 @@ connect."
   ;; Resolve interrupted-flush chainstates now that the block store, UTXO
   ;; caches, and header index are all available. Only abort (resync) if the
   ;; on-disk state needed to recover is gone.
-  (%replay-interrupted-coins-flushes (or reindex reindex-chainstate))
+  (replay-interrupted-coins-flushes reindex reindex-chainstate)
   (let ((pending *pending-chainstate-recovery*))
     (setf *pending-chainstate-recovery* nil)
     (dolist (cs pending)
@@ -1977,7 +1991,7 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
           ;; the handshake.
           (ignore-errors
            (bl.net:maybe-start-reconciliation
-            p now)))))
+            p now mp)))))
     ;; Hourly fee-estimate flush (Core's scheduler,
     ;; init.cpp:1662). Cadence-gated inside, so this is
     ;; a cheap no-op most ticks -- and it is per TICK
