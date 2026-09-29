@@ -1049,9 +1049,16 @@
   listener sends sketch), is ignored; a sketch is never sized or accepted
   past `+recon-max-sketch-capacity+`; and the initiator opens a round even
   with an EMPTY set, since the listener's held transactions drain through
-  the dialler's rounds and no other way. Core d3056bc has none of this past
-  the handshake; with -txreconciliation off no peer registers, so none of it
-  is reachable from the wire.
+  the dialler's rounds and no other way. A round MOVES the set into its
+  snapshot and clears the set (a latecomer waits for the next round); an
+  unanswered round times out after `+recon-round-timeout-seconds+` (Core's
+  GETDATA_TX_INTERVAL, the nearest request expiry) and floods; q is
+  re-estimated from each decoded round by BIP-330's rule. Every announcement
+  reaches a peer's queue through `%queue-tx-announcement` with a txid and a
+  real fee rate -- the flush checks both, and a structural test holds src/
+  to that one writer. Core d3056bc has none of this past the handshake; with
+  -txreconciliation off no peer registers, so none of it is reachable from
+  the wire.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.

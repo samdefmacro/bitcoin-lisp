@@ -122,7 +122,7 @@ merges the remainder** — revisit at the next ref bump.
 | `sendtxrcncl` handshake, `PreRegisterPeer`/`RegisterPeer`/`ForgetPeer`, the salt combination (`ComputeSalt`, tag `"Tx Relay Salting"`, ascending order) | yes (node/txreconciliation.cpp, net_processing.cpp:3728-3742, :3879-3886, :3963-4014) | ported | Core source; `p2p_sendtxrcncl.py` (PASS); a truncated payload now takes Core's `ProcessMessages ... Exception caught` path and keeps the peer (:3994, :5283-5284) instead of our invented disconnect |
 | minisketch GF(2^32) sketches: add, serialize, merge, decode | vendored (src/minisketch/), used only by tests | pure-Lisp; decoder ported from sketch_impl.h | vectors from Core's `src/minisketch/tests/pyminisketch.py` (tests/data/minisketch_core_vectors.py: field, 14 serializations, Core's minisketch_tests.cpp scenario, 116 decode verdicts incl. every failure shape) + the C library's SQR/QRT tables. The C++ library itself cannot be built in the container (no C++ compiler in the runtime image): pyminisketch-vs-C is the one residual |
 | Short ID `1 + (SipHash-2-4(k0,k1,wtxid) mod 0xFFFFFFFF)` | **absent** (no `ComputeShortID`, no `AddToSet`, no `ShouldFanoutTo` at the pin) | BIP-330 | BIP-330 text + Core's functional-test SipHash (vectors) |
-| Reconciliation sets, fanout, round timer | **absent** | BIP-330 + named choices (`+recon-max-set-size+`, `+recon-round-interval-seconds+`, `+recon-default-q+`, fanout shares, `+recon-max-sketch-capacity+`) | properties + the two-node loopback test |
+| Reconciliation sets and snapshots, fanout, round timer and timeout, q | **absent** | BIP-330 + named choices (`+recon-max-set-size+`, `+recon-round-interval-seconds+`, `+recon-default-q+` then BIP-330's q update, fanout shares, `+recon-max-sketch-capacity+` (ours, measured), `+recon-round-timeout-seconds+` (Core's GETDATA_TX_INTERVAL)) | properties + the two-node loopback test |
 | `reqrecon` / `sketch` / `reqsketchext` / `reconcildiff` | **absent** (protocol.h:266 ends at `sendtxrcncl`) | BIP-330 tables: reqrecon = uint16 set_size + uint16 q (q x (2^15-1)); the extension is the double-capacity sketch minus the part already sent | BIP-330 text |
 
 Reachability: every round message is ignored unless the peer completed the
@@ -147,13 +147,34 @@ reconciled difference was queued for announcement as `(wtxid wtxid 0)`, so a
 segwit transaction read as gone from the mempool and every one fell under
 the peer's feefilter.
 
-Left open: a round whose responder never answers keeps `peer-recon-round`
-set for the life of the connection (no round timeout; BIP-330 names none);
-the responder keeps new transactions in the set during a round rather than
-BIP-330's "move the set to the snapshot and clear it" (equivalent outcome,
-different bookkeeping); q is never re-estimated from the previous round
-(BIP-330's suggested update); and byte-exactness against the C++ library
-itself, which needs a C++ toolchain in the container.
+Round 9, second phase (2026-09-29), each with a test red on the code before it:
+
+- **Round timeout** (`+recon-round-timeout-seconds+` = 60). BIP-330 names no
+  timeout and Core has no round, so the value is Core's nearest analogue: the
+  expiry of an unanswered transaction request, `GETDATA_TX_INTERVAL` = 60 s
+  (node/txdownloadman.h:38, armed at txdownloadman_impl.cpp:278). A reqrecon is
+  a request whose answer we need before we can announce, as a getdata is. On
+  timeout the initiator sends reconcildiff(success=0), floods its snapshot and
+  opens the next round (`maybe-start-reconciliation` now takes the mempool the
+  announcements need).
+- **The set moves into the snapshot**, per BIP-330 ("Makes a snapshot of their
+  current reconciliation set, and clears the set itself"), on both sides: a
+  transaction arriving mid-round waits for the next round. A reqrecon arriving
+  before the previous round's reconcildiff folds the stale snapshot into the
+  new one rather than dropping it.
+- **q is re-estimated** after every decoded round with BIP-330's rule,
+  q = (d - |R - L|) / min(R, L) (R derived from the decoded split), held to
+  what the uint16 carries; the next reqrecon sends it. The default is 1/4.
+- **One writer of the announcement queue**: `%queue-tx-announcement` (txid,
+  wtxid, integer fee rate per kvB); a test reads every src file and fails on
+  any other definition that pushes onto `peer-tx-inv-queue`, with a positive
+  control; reconciliation's announcements come from the mempool (a segwit
+  transaction's txid, not its wtxid), and without a mempool nothing is queued.
+- **`+recon-max-sketch-capacity+` = 128 is OUR number** (decided 2026-09-29):
+  a measured denial-of-service bound with no Core reference behind it.
+
+Left open: byte-exactness against the C++ minisketch itself, which needs a
+C++ toolchain in the container.
 
 ## 7. Effort & risk
 
