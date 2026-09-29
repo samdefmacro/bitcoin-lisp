@@ -2770,12 +2770,19 @@ START-NODE-FROM-ARGS builds on it."
          (settings-cells (and settings-path (%read-settings-file settings-path))))
     (list :cli cli :datadir datadir :orig-datadir orig-datadir :conf-explicit-p conf-explicit-p :conf-path conf-path :conf-text conf-text :conf-read conf-read :conf-texts conf-texts :conf-globals conf-globals :settings-network settings-network :settings-scope settings-scope :settings-path settings-path :settings-cells settings-cells)))
 
-(defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
+(defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*))
+                             &key init-config)
   "Start the node from Bitcoin Core-style options: a list of CLI ARGS
  (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
 CLI arguments override the config file. This is the argv-friendly entry point —
  e.g. from a saved image's toplevel, or (start-node-from-args
 '(\"-chain=main\" \"-txindex\" \"-dbcache=2000\" \"-server\")).
+INIT-CONFIG is what %READ-INIT-CONFIG already returned for ARGS, when the
+caller read the config first (NODE-MAIN reads it before -help/-version, as
+Core's ParseArgs runs InitConfig once): the files are read ONCE, so a config
+warning Core writes to stderr -- the -includeconf-from-an-included-file one
+that feature_includeconf.py:59 compares the whole of stderr against -- is
+written once.
 
 The data directory and network are resolved from the CLI first (so the config
 file can be located and its [network] section scoped), then the merged config
@@ -2785,7 +2792,7 @@ file location."
   ;; Core ArgsManager::ParseParameters ("Invalid parameter -foo").
   (check-cli-args args)
   (destructuring-bind (&key cli datadir orig-datadir conf-path conf-read conf-texts settings-network settings-path settings-cells &allow-other-keys)
-      (%read-init-config args)
+      (or init-config (%read-init-config args))
     (multiple-value-bind (plist merged)
         (args->start-node-plist args conf-texts
                                 (bl:settings-config-rows settings-cells))
@@ -2957,7 +2964,8 @@ Core's behaviour and what assert_start_raises_init_error reads."
   (setf bl.log:*fatal-error-shutdown-function*
         (lambda (message)
           (request-node-shutdown message :exit-code +node-exit-error+)))
-  (let ((args (rest sb-ext:*posix-argv*)))
+  (let ((args (rest sb-ext:*posix-argv*))
+        (init-config nil))
     (handler-case
         (cond
           ;; -version and -help print and exit 0 before anything is started,
@@ -2969,7 +2977,9 @@ Core's behaviour and what assert_start_raises_init_error reads."
           ;; unreadable or malformed config file and an invalid chain
           ;; combination are refused before -help and -version too. The
           ;; checks signal on a refusal; this clause never selects anything.
-          ((progn (check-cli-args args) (%read-init-config args) nil))
+          ((progn (check-cli-args args)
+                  (setf init-config (%read-init-config args))
+                  nil))
           ((%argv-asks-for args '("version"))
            (format t "~A~A" (%daemon-version-line) (bl.tools:tool-license-info))
            (finish-output)
@@ -2985,7 +2995,7 @@ startup.~%"
            (finish-output)
            (sb-ext:exit :code 0))
           (t
-           (start-node-from-args args)
+           (start-node-from-args args :init-config init-config)
            ;; Blocks until shutdown, runs stop-node on THIS thread so the
            ;; flush/mempool.dat/peers.dat sequence completes, then exits.
            (run-node-watchdog)
