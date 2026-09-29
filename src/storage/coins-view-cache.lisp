@@ -395,23 +395,13 @@ partial batch, -dbcrashratio may end the process (txdb.cpp:150-157)."
                             ;; progress is still from the recorded old tip.
                             (second (coins-view-db-head-blocks base)))))
                (leveldb-writebatch-delete batch (encode-best-block-key))
-               (leveldb-writebatch-put batch (encode-head-blocks-key)
-                                       (%head-blocks-value best-block old))))
+               (coins-view-batch-set-head-blocks base batch best-block old)))
            (maphash (lambda (key ce)
                       (when (ce-dirty ce)
-                        (if (ce-entry ce)
-                            (coins-view-batch-put batch key (ce-entry ce))
-                            (coins-view-batch-erase batch key))
+                        (incf bytes (if (ce-entry ce)
+                                        (coins-view-batch-put base batch key (ce-entry ce))
+                                        (coins-view-batch-erase batch key)))
                         (incf count)
-                        ;; LevelDB's record: a tag, two length prefixes, the
-                        ;; key and the value -- what WriteBatch::ApproximateSize
-                        ;; grows by.
-                        (incf bytes (+ 3 +coin-key-bytes+
-                                       (if (ce-entry ce)
-                                           (+ +coin-value-fixed-bytes+
-                                              (length (utxo-entry-script-pubkey
-                                                       (ce-entry ce))))
-                                           0)))
                         (when (> bytes *coins-db-batch-bytes*)
                           (bl.log:log-cat "coindb" "Writing partial batch of ~,2F MiB"
                                           (/ bytes 1048576.0))
@@ -425,7 +415,7 @@ partial batch, -dbcrashratio may end the process (txdb.cpp:150-157)."
                     (cvc-entries cache))
            (when best-block
              (leveldb-writebatch-delete batch (encode-head-blocks-key))
-             (coins-view-batch-set-best-block batch best-block))
+             (coins-view-batch-set-best-block base batch best-block))
            (bl.log:log-cat "coindb" "Writing final batch of ~,2F MiB" (/ bytes 1048576.0))
            (leveldb-write db batch :sync sync))
       (leveldb-destroy-writebatch batch))
@@ -627,16 +617,13 @@ txid check."
         (unless (leveldb-iter-valid-p iter) (return))
         (let ((k (leveldb-iter-key iter)))
           (unless (%txid-matches-key-p k txid) (return))
-          (let* ((vout (logior (aref k 33)
-                               (ash (aref k 34) 8)
-                               (ash (aref k 35) 16)
-                               (ash (aref k 36) 24)))
-                 (uk (make-utxo-key txid vout))
-                 (ce (gethash uk (cvc-entries cache))))
+          (let ((vout (nth-value 1 (decode-coin-key k))))
             ;; Base says this output exists. The cache supersedes iff
             ;; it has a tombstone (entry=NIL); otherwise it's unspent.
-            (unless (and ce (null (ce-entry ce)))
-              (return-from coin-view-any-utxo-for-txid-p t)))
+            (when vout
+              (let ((ce (gethash (make-utxo-key txid vout) (cvc-entries cache))))
+                (unless (and ce (null (ce-entry ce)))
+                  (return-from coin-view-any-utxo-for-txid-p t)))))
           (leveldb-iter-next iter)))))
   nil)
 
@@ -1043,11 +1030,10 @@ reorg paths log it and carry on, as Core does."
           (funcall callback (utxo-key-txid key) (uk-vout key) entry))))))
 
 (defun %coin-view-iterate (cache callback)
-  "Raw iteration over a coins-view-cache: flush, then walk base via
-LevelDB iterator. The iterator emits keys in lex order, which for our
-key encoding ('C' + txid + LE vout, all fixed-width) equals the
-on-disk 36-byte key order — same raw order %utxo-set-iterate produces.
-utxo-set-iterate layers Core's numeric-vout cursor order on top."
+  "Raw iteration over a coins-view-cache: sync, then walk the base LevelDB's
+'C' records in key order -- Core's CCoinsViewDBCursor (txdb.cpp:185-243):
+txids in serialized lex order, each one's vouts in VARINT byte order, which
+UTXO-SET-ITERATE regroups into numeric order."
   ;; SYNC, not FLUSH: this runs from RPC threads (gettxoutsetinfo,
   ;; dumptxoutset) while the validation thread mutates the same entries table
   ;; under the node lock. Flush CLRHASHes it, so an entry inserted while we
@@ -1065,23 +1051,15 @@ utxo-set-iterate layers Core's numeric-vout cursor order on top."
     ;; scan independent of where any metadata prefix sorts.
     (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
                                           :initial-element +db-prefix-coin+))
-    (let ((txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
+    (let ((base (cvc-base cache)))
       (loop
         (unless (leveldb-iter-valid-p iter) (return))
-        (let ((k (leveldb-iter-key iter)))
-          ;; Only 'C'-prefixed coin entries; bail on any future
-          ;; metadata prefix that sorts after 'C' (e.g. 'M' marker).
-          (unless (and (>= (length k) +coin-key-bytes+)
-                       (= (aref k 0) +db-prefix-coin+))
-            (return))
-          (replace txid-buf k :start2 1 :end2 33)
-          (let* ((vout (logior (aref k 33)
-                               (ash (aref k 34) 8)
-                               (ash (aref k 35) 16)
-                               (ash (aref k 36) 24)))
-                 (v (leveldb-iter-value iter))
-                 (entry (decode-coin-value v)))
-            (funcall callback (copy-seq txid-buf) vout entry)))
+        ;; Core's cursor stops at the first key that is not a CoinEntry
+        ;; (CCoinsViewDBCursor::Next), e.g. the 'H' or 'M' records after 'C'.
+        (multiple-value-bind (txid vout) (decode-coin-key (leveldb-iter-key iter))
+          (unless txid (return))
+          (funcall callback txid vout
+                   (decode-coin-value (%xor-value base (leveldb-iter-value iter)))))
         (leveldb-iter-next iter)))))
 
 (defun utxo-set-iterate (view callback)
@@ -1090,13 +1068,16 @@ order: coins grouped per txid in serialized-txid lex order, vouts
 NUMERICALLY ascending within each txid — the order ComputeUTXOStats
 consumes (kernel/coinstats.cpp:112-146, which buffers each txid's
 outputs into a std::map<uint32_t, Coin>) and the assumeutxo snapshot
-cursor order (node/utxo_snapshot.h). The raw key walk yields LE-u32
-vout byte order, which diverges from numeric at vout >= 256
-(256 = #x00 #x01 sorts before 1 = #x01 #x00), so each txid's coins
-are buffered and sorted before delivery. CALLBACK is called with
+cursor order (node/utxo_snapshot.h). CALLBACK is called with
 (txid vout entry) for each UTXO.
 
-For coins-view-cache, this forces a flush so the iteration sees a
+Neither raw walk is numeric. CoinEntry's VARINT vout sorts numerically only
+among VARINTs of one length: 16512 (80 80 00) sorts before 256 (81 00). The
+in-memory utxo-set's key bytes carry the vout little-endian, which diverges at
+256 = #x00 #x01 before 1 = #x01 #x00. So each txid's coins are buffered and
+sorted before delivery, as Core's std::map does.
+
+For coins-view-cache, this syncs the cache first so the iteration sees a
 single consistent snapshot (matches Core's CCoinsViewDB::Cursor usage
 in gettxoutsetinfo)."
   (let ((group-txid nil)

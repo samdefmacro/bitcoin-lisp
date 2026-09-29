@@ -1173,14 +1173,16 @@ startup refusal rather than a directory we create somewhere else."
                  (bl.store:coins-view-db-needs-upgrade-p view))
         (bl.store:close-coins-view-db view)
         (init-error "Unsupported chainstate database format found. Please restart with -reindex-chainstate. This will rebuild the chainstate database."))
-      ;; After NeedsUpgrade, as Core's constructor accepts any obfuscation
-      ;; key: a database whose values another writer XORed cannot be read
-      ;; through our plain coin records, and the same wipe is the way out.
-      (when (and (not (or reindex reindex-chainstate))
-                 (bl.store:coins-view-db-foreign-obfuscation-p view))
+      ;; A database in this tree's pre-2026-09-29 coin layout is converted to
+      ;; Core's in place, as Core 0.15 converted its own (CCoinsViewDB::Upgrade,
+      ;; `Error upgrading chainstate database' when interrupted). Only
+      ;; -reindex-chainstate wipes the coins here, so only it skips the work;
+      ;; our -reindex is additive and keeps them (the -reindex paragraph of
+      ;; docs/manual.lisp's storage section).
+      (when (and (not reindex-chainstate)
+                 (not (bl.store:upgrade-coins-view-db view)))
         (bl.store:close-coins-view-db view)
-        (init-error "The chainstate database at ~A holds an obfuscation key this node cannot apply. Please restart with -reindex-chainstate. This will rebuild the chainstate database."
-                    chainstate-path))
+        (init-error "Error upgrading chainstate database"))
       (setf (bl.store:chain-state-coins-view primary)
             (bl.store:make-coins-view-cache view))
       ;; Adopt the stored pointer so a flush before the first block-level

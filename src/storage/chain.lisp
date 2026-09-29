@@ -801,10 +801,15 @@ across chainstates and take no suffix."
 
 (defun open-chainstate-coins-view (state)
   "Open STATE's coins LevelDB (at its chainstate-leveldb-path) and install a
-coins-view-cache over it as the chainstate's coins view. Returns the view."
-  (setf (chain-state-coins-view state)
-        (make-coins-view-cache
-         (open-coins-view-db (namestring (chainstate-leveldb-path state))))))
+coins-view-cache over it as the chainstate's coins view. Returns the view.
+A database still in this tree's pre-2026-09-29 coin layout is converted first
+(UPGRADE-COINS-VIEW-DB); a stop request part way is an error here, and the
+next open continues the conversion."
+  (let ((db (open-coins-view-db (namestring (chainstate-leveldb-path state)))))
+    (unless (upgrade-coins-view-db db)
+      (close-coins-view-db db)
+      (storage-error "Error upgrading chainstate database"))
+    (setf (chain-state-coins-view state) (make-coins-view-cache db))))
 
 (defun close-chainstate-coins-view (state)
   "Close STATE's coins LevelDB (releasing its lock) if the chainstate owns a

@@ -425,6 +425,7 @@ bitcoin-cli (node-main)."
                              (:file "crypto/crypto-tests")
                              (:file "serialization/serialization-tests")
                              (:file "storage/storage-tests")
+                             (:file "storage/coins-db-tests")
                              (:file "validation/validation-tests")
                              (:file "integration-tests")
                              ;; Coalton tests
