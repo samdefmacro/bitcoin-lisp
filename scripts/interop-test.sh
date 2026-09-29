@@ -19,13 +19,11 @@
 #                                              #     cl-workbench validation run interop
 #   BL_INTEROP_RELEASE=v25.0 scripts/interop-test.sh      (the tx lane only)
 #   BL_INTEROP_LANES=datadir scripts/interop-test.sh      (one lane)
-#   BL_INTEROP_COPY_CHAINSTATE=1 scripts/interop-test.sh
-#       -- copy chainstate/ too and start the consumer WITHOUT
-#       -reindex-chainstate: the switch for when our coins database is Core's
-#       format (batch coinsdb); until then the consumer rebuilds it.
-#   BL_INTEROP_COPY_INDEXES=1 scripts/interop-test.sh
-#       -- copy indexes/ too: only their best-block locators are Core's
-#       format yet, so by default each consumer builds its own indexes.
+#   BL_INTEROP_COPY_CHAINSTATE=0 BL_INTEROP_COPY_INDEXES=0 scripts/interop-test.sh
+#       -- copy only blocks/ and let each consumer rebuild its chainstate
+#       (-reindex-chainstate) and its indexes. By default chainstate/ and
+#       indexes/ are copied too: both are Core's formats since the coinsdb
+#       batch and the tools batch's index-record port (2026-09-29).
 #
 # The tx lane is a cold container with its own FASL volume (never the cold
 # battery's, which a concurrent battery would share) and a 2 GiB heap, so it
@@ -83,8 +81,8 @@ case " $LANES " in *" datadir "*)
     rc=1
   else
     args=""
-    [ "${BL_INTEROP_COPY_CHAINSTATE:-0}" = 1 ] && args="$args --copy-chainstate"
-    [ "${BL_INTEROP_COPY_INDEXES:-0}" = 1 ] && args="$args --copy-indexes"
+    [ "${BL_INTEROP_COPY_CHAINSTATE:-1}" = 1 ] && args="$args --copy-chainstate"
+    [ "${BL_INTEROP_COPY_INDEXES:-1}" = 1 ] && args="$args --copy-indexes"
     BL_CONFORMANCE_TIMEOUT="${BL_CONFORMANCE_TIMEOUT:-1200}" \
     BL_CONFORMANCE_ARGS="$args ${BL_CONFORMANCE_ARGS:-}" \
       "$REPO/scripts/conformance.sh" scripts/interop/datadir_interop.py \

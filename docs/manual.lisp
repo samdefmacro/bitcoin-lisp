@@ -690,7 +690,23 @@
   Core makes between `GetDataDirNet()` and `GetBlocksDirPath()`, so
   `-blocksdir` moves hundreds of GB of block data to a second volume while
   the block INDEX stays under the datadir and the directory remains
-  readable by Core."
+  readable by Core.
+
+  The four optional indexes keep Core's RECORDS, not only Core's paths, so
+  a Core node reads them and ours reads Core's (the datadir interop lane
+  copies indexes/ both ways): the txindex maps txid -> CDiskTxPos and the
+  spender index keys (salted outpoint hash, CDiskTxPos) -- the block's
+  FlatFilePos and the offset past its header, read back through the blk
+  files (`index/disktxpos.h`); the filter index keeps height and hash
+  records beside `fltr?????.dat` files and its next write position under
+  `P`; the coinstats index keeps the finalized MuHash per height and the
+  running fraction once, under `M`, as Core's CustomCommit writes it. What
+  Core writes with the locator goes through INDEX-COMMIT-RECORDS in the same
+  batch. A block still in a legacy per-block file has no FlatFilePos: its
+  transactions get records under prefixes Core never reads. Records this
+  tree wrote before 2026-09-29 are rewritten in place on the first start
+  (INDEX-MIGRATE-RECORDS, before the rewind and the backfill), each index
+  resumable and answering throughout."
   (bitcoin-lisp.storage package)
   (bitcoin-lisp.storage:block-store class)
   (bitcoin-lisp.storage:init-block-store function)
@@ -733,6 +749,13 @@
   (bitcoin-lisp.storage:index-sync generic-function)
   (bitcoin-lisp.storage:index-set-best generic-function)
   (bitcoin-lisp.storage:commit-index function)
+  (bitcoin-lisp.storage:index-commit-records generic-function)
+  (bitcoin-lisp.storage:index-migrate-records generic-function)
+  (bitcoin-lisp.storage:txindex-find-tx function)
+  (bitcoin-lisp.storage:txospenderindex-find-spender function)
+  (bitcoin-lisp.storage:migrate-txindex function)
+  (bitcoin-lisp.storage:migrate-blockfilterindex function)
+  (bitcoin-lisp.storage:migrate-coinstatsindex function)
   (bitcoin-lisp.storage:resolve-index-best generic-function)
   (bitcoin-lisp.storage:tx-index class)
   (bitcoin-lisp.storage:txospender-index class)
@@ -2018,10 +2041,12 @@
   height, getrawtransaction and gettxoutproof per transaction, then
   getblockchaininfo, getchaintips and getindexinfo. A field only the pin
   reports (getblockheader's `target`) is a version gap; one only Core
-  reports is a mismatch. The consumer runs -reindex-chainstate and builds
-  its own indexes: only the indexes' best-block LOCATORS are Core's format
-  yet, not their records. BL_INTEROP_COPY_CHAINSTATE=1 and
-  BL_INTEROP_COPY_INDEXES=1 copy those too, for when the formats agree.
+  reports is a mismatch. The consumer starts on the producer's chainstate/
+  and indexes/ as they are (the txindex, the filter index and the spender
+  index hold Core's records; v28.2 keeps its coinstats index under an older
+  path, so that one is rebuilt by each side); BL_INTEROP_COPY_CHAINSTATE=0 and
+  BL_INTEROP_COPY_INDEXES=0 copy blocks/ alone and make the consumer rebuild
+  them.
   The lane found that genesis's blocks/index record named no body
   (src/storage/chain.lisp) and that doubles were not spelled with
   setprecision(16).

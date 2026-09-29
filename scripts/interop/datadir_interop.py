@@ -8,7 +8,7 @@ own functional framework, with Core's previous releases mounted at /releases):
   ours-to-core  our node mines a chain (coinbase, P2TR, P2PK, P2WPKH, P2SH and
                 OP_RETURN outputs, spends of them, and a two-block reorg) with
                 -txindex -blockfilterindex -coinstatsindex, and records what
-                it answers; Core v28.2 then starts on a copy of its blocks/
+                it answers; Core v28.2 then starts on a copy of its datadir
                 and must answer the same, block by block;
   core-to-ours  the same chain shape mined by Core v28.2, then our node on the
                 copy.
@@ -20,24 +20,18 @@ transaction getrawtransaction through the txindex and gettxoutproof. Then
 getblockchaininfo's chain facts, getchaintips, and getindexinfo's synced
 heights.
 
-What is copied is blocks/ -- the blk/rev files and blocks/index, which are
-Core's formats on both sides -- and nothing else by default; the consumer
-builds its own indexes from the copied blocks and must answer the same:
+What is copied is blocks/ -- the blk/rev files and blocks/index -- and, with
+`--copy-chainstate' and `--copy-indexes' (which scripts/interop-test.sh passes
+by default), chainstate/ and indexes/ too: the consumer then starts on the
+producer's UTXO set and index databases as they are, with no
+-reindex-chainstate, and must answer the same from them. Without the flags it
+rebuilds its chainstate (-reindex-chainstate) and its indexes from the copied
+blocks.
 
-  chainstate/  our coins database is not Core's format until batch coinsdb
-               lands, so the consumer runs -reindex-chainstate;
-               `--copy-chainstate' copies it and drops the flag.
-  indexes/     only the best-block LOCATOR record of each index is Core's
-               format here; the records are not (our txindex stores
-               (block hash, position) where Core stores CDiskTxPos, our
-               blockfilter index keeps header+filter by hash where Core keeps
-               DBVal by height and hash plus fltr?????.dat files), and Core
-               v28.2 refuses ours at start-up ("Cannot read last block filter
-               header; index may be corrupted"). `--copy-indexes' copies them,
-               for when the formats agree. The coinstats index cannot be
-               shared with v28.2 at all: Core moved it from indexes/coinstats
-               to indexes/coinstatsindex with a wider record after v29
-               (index/coinstatsindex.cpp:93-101 at the pin).
+The coinstats index is the one index v28.2 cannot share: Core moved it from
+indexes/coinstats to indexes/coinstatsindex with a wider record after v29
+(index/coinstatsindex.cpp:93-101 at the pin), so each side builds its own and
+only the answers are compared.
 
 Prints `INTEROP <lane> checks=<n>' per lane; any mismatch fails the test.
 """
