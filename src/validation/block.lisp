@@ -1766,46 +1766,6 @@ correctly, which is what marks this as an oversight rather than a decision."
 
 ;;;; Sigops cost calculation
 
-(defun extract-last-push (script)
-  "Extract the data from the last push operation in SCRIPT.
-Used to get the redeemScript from a P2SH scriptSig.
-Tracks indices and allocates only once at the end."
-  (let ((len (length script))
-        (i 0)
-        (last-start nil)
-        (last-end nil))
-    (loop while (< i len)
-          do (let ((opcode (aref script i)))
-               (cond
-                 ((<= 1 opcode 75)
-                  (let ((end (min (+ i 1 opcode) len)))
-                    (setf last-start (1+ i) last-end end i end)))
-                 ((= opcode +op-pushdata1+)
-                  (if (< (1+ i) len)
-                      (let* ((size (aref script (1+ i)))
-                             (end (min (+ i 2 size) len)))
-                        (setf last-start (+ i 2) last-end end i end))
-                      (return)))
-                 ((= opcode +op-pushdata2+)
-                  (if (< (+ i 2) len)
-                      (let* ((size (logior (aref script (1+ i))
-                                           (ash (aref script (+ i 2)) 8)))
-                             (end (min (+ i 3 size) len)))
-                        (setf last-start (+ i 3) last-end end i end))
-                      (return)))
-                 ((= opcode +op-pushdata4+)
-                  (if (< (+ i 4) len)
-                      (let* ((size (logior (aref script (1+ i))
-                                           (ash (aref script (+ i 2)) 8)
-                                           (ash (aref script (+ i 3)) 16)
-                                           (ash (aref script (+ i 4)) 24)))
-                             (end (min (+ i 5 size) len)))
-                        (setf last-start (+ i 5) last-end end i end))
-                      (return)))
-                 (t (incf i)))))
-    (when (and last-start last-end)
-      (subseq script last-start last-end))))
-
 (defun p2sh-sigop-subscript (script-sig)
   "The subscript Bitcoin Core counts the sigops of when SCRIPT-SIG spends a P2SH
 output, or NIL when Core counts none.
@@ -1820,8 +1780,9 @@ GetScriptOp clears its data buffer for every opcode and refills it only for
 opcode <= OP_PUSHDATA4 (script.cpp:313-359), so OP_1NEGATE, OP_RESERVED and
 OP_1..OP_16 leave an EMPTY subscript behind instead of the preceding push.
 
-Deliberately separate from EXTRACT-LAST-PUSH, which is the policy/standardness
-redeem-script extractor and has different semantics."
+Deliberately separate from the policy readers' redeem script, which is the
+stack top an evaluation leaves (%SCRIPT-SIG-STACK-TOP): the sigop count reads
+the last opcode's data buffer, not the stack."
   (let ((len (length script-sig))
         (i 0)
         (start 0)
