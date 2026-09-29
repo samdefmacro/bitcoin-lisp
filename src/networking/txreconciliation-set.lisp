@@ -25,7 +25,7 @@
 ;;;;
 ;;;; Choices the BIP leaves open and Core has no code for, each a named
 ;;;; constant below: the set bound, the round interval, the default q, the
-;;;; fanout shares and the sketch-capacity ceiling.
+;;;; fanout shares, the sketch-capacity ceiling and the round timeout.
 
 (defconstant +recon-short-id-bits+ 32
   "BIP-330 short IDs are 32 bits, which is also minisketch's field size here.")
@@ -52,21 +52,33 @@ cancels."
 
 Keyed by SHORT ID rather than by wtxid because that is what the sketch holds
 and what comes back from a decode; the wtxid is kept alongside so the node can
-announce the real transaction once the difference is known."
+announce the real transaction once the difference is known.
+
+Two tables, as BIP-330 has them: the SET, where arriving transactions go, and
+the SNAPSHOT a round works on. `A reconciliation set is moved to the
+corresponding set snapshot after the transmission of the initial sketch', and
+`every node should store the snapshot of the current reconciliation set, and
+clear the set' -- so a transaction arriving mid-round goes to the next round,
+and the round reconciles exactly what its sketch described."
   (by-short-id (make-hash-table :test 'eql) :type hash-table)
-  ;; Snapshot taken when a round starts. A round spans several messages, and
-  ;; transactions keep arriving meanwhile; reconciling against a moving set
-  ;; would make the sketch describe something the peer never saw.
-  (snapshot nil)
+  ;; The snapshot, short ID -> wtxid, moved out of BY-SHORT-ID when a round
+  ;; starts; NIL between rounds.
+  (snapshot nil :type (or null hash-table))
   ;; The RESPONDER's capacity for the snapshot's sketch, NIL when it has not
   ;; answered a reqrecon. A reqsketchext is answered from it: BIP-330's
   ;; extension is the same transactions at a higher capacity `without the
   ;; part sent initially', so the responder must know where that part ended.
-  (snapshot-capacity nil :type (or null (integer 0))))
+  (snapshot-capacity nil :type (or null (integer 0)))
+  ;; The INITIATOR's q for this peer, re-estimated after every decoded round
+  ;; (RECON-REESTIMATE-Q); NIL until then, which means +RECON-DEFAULT-Q+.
+  (q nil :type (or null rational)))
 
 (defun make-recon-set () (%make-recon-set))
 
-(defun recon-set-size (set) (hash-table-count (recon-set-by-short-id set)))
+(defun recon-set-size (set)
+  "Everything SET holds: the set proper and a round's snapshot."
+  (+ (hash-table-count (recon-set-by-short-id set))
+     (let ((snap (recon-set-snapshot set))) (if snap (hash-table-count snap) 0))))
 
 (defconstant +recon-max-set-size+ 3000
   "The most transactions one peer's reconciliation set holds.
@@ -76,7 +88,8 @@ reqrecon, and every entry costs sketch capacity on every round until it
 settles. The figure is the MAX_SET_SIZE of the Core Erlay work that d3056bc
 does not yet carry (its tracker has no set at all), so it is a ported number
 without a ported reader to check against. A transaction that finds the set
-full is announced by inv instead -- the fallback is flooding, never dropping.")
+full is announced by inv instead -- the fallback is flooding, never dropping.
+The snapshot counts: it is held too.")
 
 (defun recon-set-add (set k0 k1 wtxid)
   "Queue WTXID for reconciliation. Returns its short ID -- also when it was
@@ -87,30 +100,53 @@ path answers with a plain inv."
   (let ((id (recon-short-id k0 k1 wtxid))
         (table (recon-set-by-short-id set)))
     (cond ((gethash id table) id)
-          ((>= (hash-table-count table) +recon-max-set-size+) nil)
+          ((>= (recon-set-size set) +recon-max-set-size+) nil)
           (t (setf (gethash id table) (copy-seq wtxid))
              id))))
 
 (defun recon-set-remove (set k0 k1 wtxid)
   "Drop WTXID: the peer is known to hold it (%MARK-TX-KNOWN-TO-PEER is the one
-caller), so there is nothing left to reconcile. A transaction that left the
-mempool is not dropped here; the inv flush skips it when it comes to be
-announced."
-  (remhash (recon-short-id k0 k1 wtxid) (recon-set-by-short-id set)))
+caller), so there is nothing left to reconcile, in the set or in a round's
+snapshot. A transaction that left the mempool is not dropped here; the inv
+flush skips it when it comes to be announced."
+  (let ((id (recon-short-id k0 k1 wtxid)))
+    (remhash id (recon-set-by-short-id set))
+    (when (recon-set-snapshot set)
+      (remhash id (recon-set-snapshot set)))))
 
 (defun recon-set-wtxid (set short-id)
-  (gethash short-id (recon-set-by-short-id set)))
+  "The wtxid SHORT-ID stands for, from the snapshot or the set."
+  (or (and (recon-set-snapshot set) (gethash short-id (recon-set-snapshot set)))
+      (gethash short-id (recon-set-by-short-id set))))
 
 (defun recon-set-short-ids (set)
+  "The short IDs in the set proper -- what the NEXT round will reconcile."
   (loop for id being the hash-keys of (recon-set-by-short-id set) collect id))
 
+(defun recon-set-snapshot-ids (set)
+  "The short IDs of the round in progress, NIL between rounds."
+  (let ((snap (recon-set-snapshot set)))
+    (and snap (loop for id being the hash-keys of snap collect id))))
+
 (defun recon-set-take-snapshot (set)
-  "Freeze the current contents for a reconciliation round and return the short
-IDs in it. Named apart from the RECON-SET-SNAPSHOT accessor on purpose: one
-reads the frozen list, this one creates it."
-  (setf (recon-set-snapshot set) (recon-set-short-ids set)))
+  "BIP-330's move: the set becomes the round's snapshot and the set starts
+empty. Returns the snapshot's short IDs.
+
+A snapshot still standing from an earlier round (a reqrecon arriving before
+the previous round's reconcildiff, which BIP-330 forbids the initiator to
+send) is not dropped: its entries join the new one, so a protocol slip costs
+a larger sketch, never a transaction."
+  (let ((snap (recon-set-by-short-id set))
+        (stale (recon-set-snapshot set)))
+    (when stale
+      (maphash (lambda (id wtxid) (setf (gethash id snap) wtxid)) stale))
+    (setf (recon-set-snapshot set) snap
+          (recon-set-by-short-id set) (make-hash-table :test 'eql))
+    (recon-set-snapshot-ids set)))
 
 (defun recon-set-clear-snapshot (set)
+  "End the round: forget the snapshot. Whatever it still held was settled by
+the round (cancelled in the sketch) or is flooded by the caller first."
   (setf (recon-set-snapshot set) nil
         (recon-set-snapshot-capacity set) nil))
 
@@ -144,7 +180,12 @@ for the capacity-256 extension (2026-09-29, warm image), which bounds what one
 round can cost. Without it a reqrecon claiming a 65535-transaction set with q
 near 2 sized a sketch in the hundreds of thousands. A difference larger than
 the extension can hold fails to decode, and the round floods -- the BIP's
-answer to any failed round.")
+answer to any failed round.
+
+DECIDED 2026-09-29 (Round 9): this is OUR number, a measured denial-of-service
+bound with no Core reference behind it -- Core d3056bc has no sketch exchange,
+and BIP-330 gives none. Revisit it against Core's value if Core ever merges
+the round.")
 
 (defun recon-build-sketch (short-ids capacity)
   "A sketch of CAPACITY over SHORT-IDS."
@@ -224,7 +265,10 @@ holding transactions back to reconcile with nobody else would only delay them."
   ;; than the whole thing resent.
   (their-sketch nil)
   (extended nil :type boolean)
-  (state :requested :type keyword))
+  (state :requested :type keyword)
+  ;; When the round was opened, on the clock MAYBE-START-RECONCILIATION is
+  ;; given: the timeout is measured from here.
+  (started 0 :type real))
 
 (defun recon-round-decode (round their-sketch)
   "Merge the responder's sketch with our own and try to decode.
@@ -286,9 +330,26 @@ BIP-330 spreads rounds across peers rather than running them all at once, so a
 node's announcement pattern does not reveal how many peers it has. Eight
 seconds is a starting point, not a ported constant — Core has no timer to copy.")
 
-(defconstant +recon-default-q+ 0.25d0
-  "The initiator's guess at the fraction of the smaller set the two sides do
-not share. Also unported for the same reason.")
+(defconstant +recon-default-q+ 1/4
+  "The initiator's first guess at the fraction of the smaller set the two sides
+do not share, before any round has been decoded (RECON-REESTIMATE-Q replaces
+it per peer). Unported for the same reason.")
+
+(defconstant +recon-round-timeout-seconds+ 60
+  "How long the initiator waits for a round's sketch before it gives the round
+up and floods the snapshot, sending reconcildiff(success=0) so the responder
+floods its own.
+
+BIP-330 names no timeout and Core at d3056bc has no round to time out, so the
+value is Core's nearest analogue: the expiry of an unanswered transaction
+request, GETDATA_TX_INTERVAL = 60 s (node/txdownloadman.h:38, armed at
+txdownloadman_impl.cpp:278 as current_time + GETDATA_TX_INTERVAL). A reqrecon
+is a request whose answer we need in order to announce -- exactly what a
+getdata is -- and a responder slower than that has kept the snapshot's
+transactions from the peer for as long as Core would wait before asking
+someone else. Without a timeout, a responder that never answered pinned the
+round for the life of the connection: no later round could open, and the
+snapshot was never announced at all.")
 
 (defun recon-should-start-round-p (peer now)
   "T when it is this peer's turn and it has nothing already in flight."
@@ -315,11 +376,14 @@ our rounds and no other way: skipping the round whenever OUR side had nothing
 left a listening node's transactions unannounced to a quiet dialler (bar the
 fanout draw) until its set overflowed into flooding. BIP-330's reqrecon
 carries set_size 0 as readily as any other."
-  (let ((ids (recon-set-take-snapshot (%peer-recon-set peer))))
+  (let* ((set (%peer-recon-set peer))
+         (ids (recon-set-take-snapshot set)))
     (setf (peer-recon-last-round peer) now
           (peer-recon-round peer)
-          (make-recon-round :peer peer :local-ids ids :state :requested))
-    (bl.ser:make-reqrecon-message (length ids) +recon-default-q+)))
+          (make-recon-round :peer peer :local-ids ids :state :requested
+                            :started now))
+    (bl.ser:make-reqrecon-message (length ids)
+                                  (or (recon-set-q set) +recon-default-q+))))
 
 (defun recon-respond-to-request (peer their-size q)
   "The responder's half: size a sketch against what the initiator says it has,
@@ -345,38 +409,54 @@ forever for it."
     (when capacity
       (bl.ser:make-sketch-message
        (ms-sketch-serialize
-        (recon-sketch-extension (recon-set-snapshot set) capacity))))))
+        (recon-sketch-extension (recon-set-snapshot-ids set) capacity))))))
 
 (defun recon-settle-ids (set short-ids)
-  "Drop SHORT-IDS from SET and return the wtxids they were holding.
+  "Drop SHORT-IDS from SET -- the round's snapshot first, then the set -- and
+return the wtxids they were holding.
 
-An id passed here is SETTLED with this peer — announced to it, requested from
-it, or shown by the sketch to be held by both sides — so it must not still be
-in the set the next round reconciles. Returns NIL for a NIL SET, and skips an
-id the set no longer holds."
+An id passed here is SETTLED with this peer -- announced to it or requested
+from it -- so it must not still be held when the next round reconciles.
+Returns NIL for a NIL SET, and skips an id nothing holds any more."
   (when set
     (loop for id in short-ids
           for wtxid = (recon-set-wtxid set id)
           when wtxid
             collect wtxid
-            and do (remhash id (recon-set-by-short-id set)))))
+            and do (remhash id (recon-set-by-short-id set))
+                   (when (recon-set-snapshot set)
+                     (remhash id (recon-set-snapshot set))))))
+
+(defun recon-reestimate-q (local-size ours-only theirs-only old-q)
+  "BIP-330's q update from a decoded round: `if in previous round
+set_size=30 and local_set_size=20, and the *actual* difference was 12, then
+a node should compute q as following: q=(12 - |30-20|) / min(30, 20)=0.1'.
+
+The initiator knows its own LOCAL-SIZE and the decoded difference, split into
+OURS-ONLY and THEIRS-ONLY; the responder's set size follows, local - ours-only
++ theirs-only, since every element it holds is shared or one of theirs. With
+an empty side the formula divides by zero and says nothing, so OLD-Q stands.
+The result is held to what reqrecon's uint16 can carry, [0, 65535/32767]."
+  (let* ((remote-size (+ (- local-size ours-only) theirs-only))
+         (smaller (min local-size remote-size)))
+    (if (zerop smaller)
+        old-q
+        (max 0 (min (/ #xFFFF bl.ser:+recon-q-precision+)
+                    (/ (- (+ ours-only theirs-only) (abs (- remote-size local-size)))
+                       smaller))))))
 
 (defun recon-finish-round (peer decoded-ids)
-  "Split the decoded difference and retire the round's snapshot.
+  "Split the decoded difference, re-estimate q, and retire the round.
 
 Returns (values ids-to-request wtxids-to-announce). Nothing is sent here — the
 caller owns the socket — but the split has to happen while the round's frozen
 snapshot is still around.
 
 A SUCCESSFUL round retires the WHOLE snapshot, not only the symmetric
-difference. Every id in the snapshot is known to both sides once the round
-succeeds: the ones in the difference because they were just requested or
-announced, and the ones that CANCELLED in the sketch because both sides
-already held them. Removing only the difference — which is what this did —
-kept every cancelled id for the life of the connection, so the set grew
-monotonically and RECON-ESTIMATE-CAPACITY sized every later sketch against
-dead weight, which is exactly the bandwidth Erlay exists to save.
-RECON-ABANDON-ROUND already retires the same ids; this is that shape.
+difference: the differing ids were just requested or are announced now, and
+the ones that CANCELLED in the sketch cancelled because both sides hold them.
+Clearing the snapshot is that retirement -- the set it was moved out of holds
+only what arrived after the round began.
 
 BIP-330 is the specification for this: Core at d3056bc ships the sendtxrcncl
 handshake and no reconciliation set at all (see this file's header)."
@@ -384,13 +464,14 @@ handshake and no reconciliation set at all (see this file's header)."
          (ask (recon-round-missing-ids round decoded-ids))
          (mine (recon-round-ours-to-announce round decoded-ids))
          (set (peer-recon-set peer))
-         ;; Ours are announced by wtxid, so they leave the set: the peer is
-         ;; about to hear about them the ordinary way.
          (announce (recon-settle-ids set mine)))
     (setf (peer-recon-round peer) nil)
-    ;; The rest of the snapshot cancelled in the sketch: both sides hold it.
-    (recon-settle-ids set (recon-round-local-ids round))
-    (when set (recon-set-clear-snapshot set))
+    (when set
+      (setf (recon-set-q set)
+            (recon-reestimate-q (length (recon-round-local-ids round))
+                                (length mine) (length ask)
+                                (or (recon-set-q set) +recon-default-q+)))
+      (recon-set-clear-snapshot set))
     (values ask announce)))
 
 (defun recon-flood-snapshot (peer)
@@ -398,20 +479,17 @@ handshake and no reconciliation set at all (see this file's header)."
 snapshot and return the wtxids to announce -- BIP-330's fallback to flooding.
 A failed reconciliation costs bandwidth, never transactions.
 
-The initiator's snapshot is the one RECON-START-ROUND froze (the round's
-LOCAL-IDS are that same list); the responder's is the one
-RECON-RESPOND-TO-REQUEST froze to answer reqrecon. The responder has no round
+The initiator's snapshot is the one RECON-START-ROUND moved out of the set
+(the round's LOCAL-IDS are its ids); the responder's is the one
+RECON-RESPOND-TO-REQUEST moved to answer reqrecon. The responder has no round
 object -- only the initiator opens one -- which is why this reads the set's
-snapshot and not the round: the responder's reconcildiff(success=0) path used
-to reach for a round it never had, find none, and announce nothing, so
-everything the initiator could not decode stayed unannounced until some later
-round happened to settle it. BIP-330: `If success=0 (reconciliation failure),
+snapshot and not the round. BIP-330: `If success=0 (reconciliation failure),
 receiver should announce all transactions from the reconciliation set via an
 inv message', and the snapshot `is cleared by the sender and the receiver of
-the message'. A transaction that arrived after the snapshot was taken is not
-part of this round; it stays in the set for the next one."
+the message'. A transaction that arrived after the snapshot was taken is in
+the set, not the snapshot, and waits for the next round."
   (let* ((set (peer-recon-set peer))
-         (announce (and set (recon-settle-ids set (recon-set-snapshot set)))))
+         (announce (and set (recon-settle-ids set (recon-set-snapshot-ids set)))))
     (when set (recon-set-clear-snapshot set))
     announce))
 
@@ -422,14 +500,8 @@ same with its own snapshot."
   (setf (peer-recon-round peer) nil)
   (recon-flood-snapshot peer))
 
-(defun maybe-start-reconciliation (peer now)
-  "The timer entry point: open a round with PEER if it is due. Returns T when
-one was started.
-
-Rounds are spread across peers rather than run together, so a node's
-announcement pattern does not reveal how many peers it has."
-  (when (recon-should-start-round-p peer now)
-    (let ((msg (recon-start-round peer now)))
-      (when msg
-        (send-message peer msg)
-        t))))
+(defun recon-round-timed-out-p (peer now)
+  "T when PEER has a round open for +RECON-ROUND-TIMEOUT-SECONDS+ or longer."
+  (let ((round (peer-recon-round peer)))
+    (and round
+         (>= (- now (recon-round-started round)) +recon-round-timeout-seconds+))))

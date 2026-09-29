@@ -63,11 +63,29 @@ a registered peer that did not draw the fanout slot — and return the set. The
 set is created on first use, exactly as the relay path creates it."
   (let ((set (bl.net::%peer-recon-set peer)))
     (dolist (w wtxids set)
-      (bl.net::recon-set-add set k0 k1 w))))
+      (bl.net:recon-set-add set k0 k1 w))))
 
 (defun %rc-short-ids (wtxids &key (k0 11) (k1 22))
   "The short IDs of WTXIDS under the salt %RC-PEER gives a registered peer."
   (mapcar (lambda (w) (bl.net:recon-short-id k0 k1 w)) wtxids))
+
+(defun %rc-mempool-wtxids (n &key (seed 1))
+  "A mempool holding N real transactions -- P2SH(OP_TRUE) spends of distinct
+synthetic fundings numbered from SEED -- and their wtxids, in order. The
+announcement path reads each txid and fee rate from the mempool, so a test
+that asserts on what a round ANNOUNCES holds these, not bare wtxids."
+  (let ((mempool (bl.mp:make-mempool)))
+    (values mempool
+            (loop for i from seed below (+ seed n)
+                  collect (let ((funding (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)))
+                            (setf (aref funding 0) (ldb (byte 8 0) i)
+                                  (aref funding 1) (ldb (byte 8 8) i)
+                                  (aref funding 2) 1)
+                            (let ((tx (pkg-tx funding 0 (- 100000000 10000))))
+                              (bl.mp:mempool-add mempool (bl.ser:transaction-hash tx)
+                                                 (bl.mp:make-entry-from-tx tx 10000 1))
+                              (bl.ser:transaction-wtxid tx)))))))
 
 (defun %rc-round-open-p (peer)
   "Whether PEER has a reconciliation round in flight -- the initiator's state,
@@ -117,51 +135,56 @@ remapped to 1, differs on almost every one of them."
   "Keyed by short ID because that is what the sketch holds and what a decode
 returns; the wtxid rides along so the node can announce the real transaction
 once the difference is known."
-  (let ((set (bl.net::make-recon-set))
+  (let ((set (bl.net:make-recon-set))
         (wtxid (%rc-wtxid 11)))
     (is (= 0 (%rc-count set)))
-    (let ((id (bl.net::recon-set-add set 1 2 wtxid)))
+    (let ((id (bl.net:recon-set-add set 1 2 wtxid)))
       (is-true id)
       (is (= 1 (%rc-count set)))
       (is (equalp wtxid (bl.net::recon-set-wtxid set id)))
       ;; Adding the same transaction again is a no-op, not a duplicate -- and
       ;; not a refusal either: NIL is reserved for a FULL set, which the relay
       ;; path answers by announcing the transaction instead.
-      (is (= id (bl.net::recon-set-add set 1 2 wtxid)))
+      (is (= id (bl.net:recon-set-add set 1 2 wtxid)))
       (is (= 1 (%rc-count set)))
       ;; Removal is by wtxid, resolved through the same salt.
       (bl.net::recon-set-remove set 1 2 wtxid)
       (is (= 0 (%rc-count set))))))
 
 (test a-round-reconciles-a-frozen-snapshot
-  "A round spans several messages while transactions keep arriving.
-Reconciling against a moving set would make the sketch describe something the
-peer never saw, so the round works from a snapshot."
-  (let ((set (bl.net::make-recon-set)))
-    (dotimes (i 3) (bl.net::recon-set-add set 1 2 (%rc-wtxid i)))
-    (let ((snap (bl.net::recon-set-take-snapshot set)))
+  "BIP-330: `A reconciliation set is moved to the corresponding set snapshot
+after the transmission of the initial sketch' and the node should `clear the
+set'. So a round works on the snapshot, the set starts empty, and a
+transaction arriving mid-round goes to the NEXT round -- where this used to
+leave it in the one table the round also read from."
+  (let ((set (bl.net:make-recon-set)))
+    (dotimes (i 3) (bl.net:recon-set-add set 1 2 (%rc-wtxid i)))
+    (let ((snap (bl.net:recon-set-take-snapshot set)))
       (is (= 3 (length snap)))
-      ;; More arrive mid-round; the snapshot does not move.
-      (dotimes (i 3) (bl.net::recon-set-add set 1 2 (%rc-wtxid (+ 100 i))))
-      (is (= 6 (%rc-count set)))
-      (is (= 3 (length (bl.net::recon-set-snapshot set))))
+      (is (null (bl.net::recon-set-short-ids set)) "the set was moved, and is empty")
+      ;; More arrive mid-round; they go to the set, not the snapshot.
+      (dotimes (i 3) (bl.net:recon-set-add set 1 2 (%rc-wtxid (+ 100 i))))
+      (is (= 6 (%rc-count set)) "both are held")
+      (is (= 3 (length (bl.net:recon-set-snapshot-ids set))))
+      (is (= 3 (length (bl.net::recon-set-short-ids set))))
       (bl.net::recon-set-clear-snapshot set)
-      (is-false (bl.net::recon-set-snapshot set)))))
+      (is (null (bl.net:recon-set-snapshot-ids set)))
+      (is (= 3 (%rc-count set)) "and the latecomers wait for the next round"))))
 
 (test two-sets-reconcile-to-their-difference
   "The whole point, end to end over the sketch layer: each side sketches its
 own short IDs, the sketches are merged, and what decodes out is exactly what
 one side has and the other does not."
-  (let* ((mine (bl.net::make-recon-set))
-         (theirs (bl.net::make-recon-set))
+  (let* ((mine (bl.net:make-recon-set))
+         (theirs (bl.net:make-recon-set))
          (k0 77) (k1 88)
          (shared (loop for i from 0 below 5 collect (%rc-wtxid i)))
          (only-mine (loop for i from 20 below 23 collect (%rc-wtxid i)))
          (only-theirs (loop for i from 40 below 42 collect (%rc-wtxid i))))
     (dolist (w (append shared only-mine))
-      (bl.net::recon-set-add mine k0 k1 w))
+      (bl.net:recon-set-add mine k0 k1 w))
     (dolist (w (append shared only-theirs))
-      (bl.net::recon-set-add theirs k0 k1 w))
+      (bl.net:recon-set-add theirs k0 k1 w))
     (let* ((capacity (bl.net::recon-estimate-capacity
                       (%rc-count mine)
                       (%rc-count theirs)
@@ -190,11 +213,11 @@ one side has and the other does not."
   "|local - remote| + q * min(local, remote) + 1. The estimate is deliberately
 tight — guessing high costs bandwidth on every round, which is what Erlay
 exists to save, so the extension round is the safety net rather than slack."
-  (is (= 1 (bl.net::recon-estimate-capacity 0 0 0.5d0)))
-  (is (= 6 (bl.net::recon-estimate-capacity 10 5 0.0d0)))
+  (is (= 1 (bl.net:recon-estimate-capacity 0 0 0.5d0)))
+  (is (= 6 (bl.net:recon-estimate-capacity 10 5 0.0d0)))
   ;; q pays for the shared-but-unknown part of the smaller set.
-  (is (= 11 (bl.net::recon-estimate-capacity 10 5 1.0d0)))
-  (is (= 3 (bl.net::recon-estimate-capacity 4 4 0.5d0))))
+  (is (= 11 (bl.net:recon-estimate-capacity 10 5 1.0d0)))
+  (is (= 3 (bl.net:recon-estimate-capacity 4 4 0.5d0))))
 
 (test fanout-selection-is-deterministic-and-a-minority
   "Reconciliation alone would let an adversary time which link announces a
@@ -268,15 +291,15 @@ already holds — which it must ANNOUNCE — and the ones it does not, which it
 must ASK for. Getting that backwards would have each side request what it
 already has and announce nothing."
   (let* ((k0 5) (k1 6)
-         (mine (bl.net::make-recon-set))
-         (theirs (bl.net::make-recon-set))
+         (mine (bl.net:make-recon-set))
+         (theirs (bl.net:make-recon-set))
          (shared (loop for i from 0 below 4 collect (%rc-wtxid i)))
          (only-mine (loop for i from 30 below 33 collect (%rc-wtxid i)))
          (only-theirs (loop for i from 60 below 62 collect (%rc-wtxid i))))
     (dolist (w (append shared only-mine))
-      (bl.net::recon-set-add mine k0 k1 w))
+      (bl.net:recon-set-add mine k0 k1 w))
     (dolist (w (append shared only-theirs))
-      (bl.net::recon-set-add theirs k0 k1 w))
+      (bl.net:recon-set-add theirs k0 k1 w))
     (let* ((capacity (bl.net::recon-estimate-capacity
                       (%rc-count mine)
                       (%rc-count theirs)
@@ -287,7 +310,7 @@ already has and announce nothing."
                           (bl.net::recon-set-short-ids theirs)
                           capacity)))
       (multiple-value-bind (ids ok)
-          (bl.net::recon-round-decode round their-sketch)
+          (bl.net:recon-round-decode round their-sketch)
         (is-true ok)
         (let ((ask (bl.net::recon-round-missing-ids round ids))
               (tell (bl.net::recon-round-ours-to-announce round ids)))
@@ -321,7 +344,7 @@ future change that starts trusting the decode has to delete this test first."
          (their-sketch (bl.net::recon-build-sketch
                         '(#xAAAAAAAA #xBBBBBBBB) 2)))
     (multiple-value-bind (ids ok)
-        (bl.net::recon-round-decode round their-sketch)
+        (bl.net:recon-round-decode round their-sketch)
       (when ok
         ;; If it decoded at all, the answer reproduces the merged sketch...
         (is (= 2 (length ids)))
@@ -335,7 +358,7 @@ future change that starts trusting the decode has to delete this test first."
            (round2 (bl.net::make-recon-round :local-ids truth))
            (sketch (bl.net::recon-build-sketch theirs capacity)))
       (multiple-value-bind (ids ok)
-          (bl.net::recon-round-decode round2 sketch)
+          (bl.net:recon-round-decode round2 sketch)
         (is-true ok)
         (is (= (+ (length truth) (length theirs)) (length ids)))
         (is (equal (sort (copy-list theirs) #'<)
@@ -445,8 +468,8 @@ what the handshake recorded."
         (now 100000))
     (dolist (p (list out in))
       (%rc-hold p (list (%rc-wtxid 9))))
-    (is-true (bl.net::recon-should-start-round-p out now))
-    (is-false (bl.net::recon-should-start-round-p in now))))
+    (is-true (bl.net:recon-should-start-round-p out now))
+    (is-false (bl.net:recon-should-start-round-p in now))))
 
 (test rounds-are-spaced-and-not-doubled-up
   "One round per peer at a time, and not more often than the interval — a node
@@ -455,13 +478,13 @@ peers it has."
   (let ((peer (%rc-peer :registered t))
         (now 100000))
     (%rc-hold peer (list (%rc-wtxid 4)))
-    (is-true (bl.net::recon-should-start-round-p peer now))
+    (is-true (bl.net:recon-should-start-round-p peer now))
     (is-true (bl.net::recon-start-round peer now))
     ;; A round is in flight: not again.
-    (is-false (bl.net::recon-should-start-round-p peer (+ now 100)))
+    (is-false (bl.net:recon-should-start-round-p peer (+ now 100)))
     ;; Even once it clears, the interval still applies.
     (setf (bl.net::peer-recon-round peer) nil)
-    (is-false (bl.net::recon-should-start-round-p peer now))
+    (is-false (bl.net:recon-should-start-round-p peer now))
     (is-true (bl.net::recon-should-start-round-p
               peer (+ now bl.net::+recon-round-interval-seconds+)))))
 
@@ -520,22 +543,22 @@ here; Core ships no reconciliation set to compare against."
         "the 20 that cancelled must leave the set too, or it never shrinks")))
 
 (test a-reconcildiff-retires-the-responders-whole-snapshot
-  "The responder half of the same rule. It froze a snapshot to answer
-reqrecon; a SUCCESS reconcildiff asks for the ids it was missing, and the rest
-of that snapshot is settled because cancelling in the sketch is exactly what
-both sides holding it looks like."
-  (let* ((peer (%rc-peer :registered t))
-         (wtxids (loop for i from 70 below 78 collect (%rc-wtxid i)))
-         (set (%rc-hold peer wtxids))
-         (asked (first (%rc-short-ids wtxids))))
-    ;; RECON-RESPOND-TO-REQUEST freezes the set like this before it sketches.
-    (bl.net::recon-set-take-snapshot set)
-    (bl.net::%handle-reconcildiff
-     peer (subseq (bl.ser:make-reconcildiff-message t (list asked)) 24))
-    (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
-        "only the asked-for transaction is announced")
-    (is (= 0 (%rc-count set))
-        "and the seven that cancelled leave the set with it")))
+  "The responder half of the same rule. It moved its set into a snapshot to
+answer reqrecon; a SUCCESS reconcildiff asks for the ids it was missing, and
+the rest of that snapshot is settled because cancelling in the sketch is
+exactly what both sides holding it looks like."
+  (multiple-value-bind (mempool wtxids) (%rc-mempool-wtxids 8 :seed 70)
+    (let* ((peer (%rc-peer :registered t))
+           (set (%rc-hold peer wtxids))
+           (asked (first (%rc-short-ids wtxids))))
+      ;; RECON-RESPOND-TO-REQUEST moves the set like this before it sketches.
+      (bl.net:recon-set-take-snapshot set)
+      (bl.net::%handle-reconcildiff
+       peer (subseq (bl.ser:make-reconcildiff-message t (list asked)) 24) mempool)
+      (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
+          "only the asked-for transaction is announced")
+      (is (= 0 (%rc-count set))
+          "and the seven that cancelled leave with it"))))
 
 ;;; --- Bounds, settlement and the failure paths (GA11 left-outs) -----------------
 ;;;
@@ -635,9 +658,9 @@ only the initiator opens one -- and the old path reached for that round, found
 none, and announced nothing: every transaction the initiator could not decode
 stayed unannounced until some later round happened to settle it."
   (let* ((peer (%rc-peer :registered t :we-initiate nil :inbound t))
-         (wtxids (loop for i from 70 below 75 collect (%rc-wtxid i)))
-         (set (%rc-hold peer wtxids))
-         (ctx (bl.ctx:make-node-context)))
+         (held (multiple-value-list (%rc-mempool-wtxids 5 :seed 70)))
+         (set (%rc-hold peer (second held)))
+         (ctx (bl.ctx:make-node-context :mempool (first held))))
     ;; reqrecon freezes the snapshot and is answered with a sketch.
     (let ((sent (captured-sends
                  (lambda ()
@@ -671,10 +694,11 @@ flag set', and that message 'should also be accompanied with announcing all
 transactions from the ... set snapshot'. Then the positive control: a round
 that DECODES closes the same round, announcing only the difference."
   (let* ((peer (%rc-peer :registered t :we-initiate t))
-         (wtxids (loop for i from 40 below 45 collect (%rc-wtxid i)))
+         (held (multiple-value-list (%rc-mempool-wtxids 5 :seed 40)))
+         (wtxids (second held))
          (ids (%rc-short-ids wtxids))
          (set (%rc-hold peer wtxids))
-         (ctx (bl.ctx:make-node-context))
+         (ctx (bl.ctx:make-node-context :mempool (first held)))
          ;; Ten ids we do not hold at capacity 5, against our five: fifteen
          ;; differences. An over-full sketch CAN decode (to a wrong set; Core
          ;; decodes about half of the random capacity-2 sketches), so the
@@ -732,8 +756,9 @@ does: the initiator floods its snapshot AND tells the responder so, because
 the responder keeps its snapshot 'until a reconcildiff message is received'
 (BIP-330) and would otherwise hold it until the next reqrecon replaced it."
   (let* ((peer (%rc-peer :registered t :we-initiate t))
-         (set (%rc-hold peer (loop for i from 50 below 53 collect (%rc-wtxid i))))
-         (ctx (bl.ctx:make-node-context)))
+         (held (multiple-value-list (%rc-mempool-wtxids 3 :seed 50)))
+         (set (%rc-hold peer (second held)))
+         (ctx (bl.ctx:make-node-context :mempool (first held))))
     (bl.net:maybe-start-reconciliation peer 100000)
     (let ((sent (captured-sends
                  (lambda ()
@@ -848,13 +873,13 @@ or a first sketch past +RECON-MAX-SKETCH-CAPACITY+, is a failed decode."
       (is (equal extra (sort (copy-list (second diff)) #'<))
           "and asks for exactly the ten we lack")))
   (let ((round (bl.net::make-recon-round :local-ids '(1 2))))
-    (is-false (nth-value 1 (bl.net::recon-round-decode
+    (is-false (nth-value 1 (bl.net:recon-round-decode
                             round (bl.net:ms-make-sketch
                                    (1+ bl.net::+recon-max-sketch-capacity+))))
               "a first sketch past the ceiling is not decoded")
-    (bl.net::recon-round-decode round (bl.net:ms-make-sketch 3))
+    (bl.net:recon-round-decode round (bl.net:ms-make-sketch 3))
     (setf (bl.net::recon-round-extended round) t)
-    (is-false (nth-value 1 (bl.net::recon-round-decode round (bl.net:ms-make-sketch 4)))
+    (is-false (nth-value 1 (bl.net:recon-round-decode round (bl.net:ms-make-sketch 4)))
               "an extension must be exactly as long as the first sketch")))
 
 (test the-responder-caps-the-sketch-it-sizes
@@ -1063,3 +1088,168 @@ Two controls, because a green convergence check alone proves nothing:
     (is (zerop (getf wrong :missing)) "the flood still converges: ~S" wrong)
     (is (= 10 (getf wrong :shared-announced))
         "but nothing cancelled -- the round failed and flooded: ~S" wrong)))
+
+;;; --- Phase 2: the round timeout, the responder's move, q, one queue writer ---
+
+(test an-unanswered-round-times-out-and-floods
+  "A responder that never sends its sketch used to pin the round for the life
+of the connection: no later round could open and the snapshot was never
+announced. After +RECON-ROUND-TIMEOUT-SECONDS+ (Core's GETDATA_TX_INTERVAL,
+the expiry of an unanswered transaction request, txdownloadman.h:38) the
+initiator gives the round up as a failed one: reconcildiff(success=0) so the
+responder floods its snapshot, our snapshot announced from the mempool, and the
+next round opens. One second earlier, nothing happens -- the control."
+  (multiple-value-bind (mempool wtxids) (%rc-mempool-wtxids 4 :seed 120)
+    (let ((peer (%rc-peer :registered t :we-initiate t))
+          (timeout bl.net::+recon-round-timeout-seconds+))
+      (%rc-hold peer wtxids)
+      (bl.net:maybe-start-reconciliation peer 100000 mempool)
+      (is-true (%rc-round-open-p peer))
+      (is (null (captured-sends
+                 (lambda ()
+                   (bl.net:maybe-start-reconciliation peer (+ 100000 timeout -1) mempool))))
+          "still waiting one second before the timeout")
+      (is-true (%rc-round-open-p peer))
+      (let ((sent (captured-sends
+                   (lambda ()
+                     (bl.net:maybe-start-reconciliation peer (+ 100000 timeout) mempool)))))
+        (is (equal '("reconcildiff" "reqrecon") (mapcar #'message-command sent))
+            "the failure is reported, and the next round opens")
+        (is (equal '(nil nil) (%rc-reconcildiff (list (first sent))))))
+      (is (= 4 (length (bl.net:peer-tx-inv-queue peer)))
+          "the timed-out snapshot is announced the ordinary way"))))
+
+(test the-responder-moves-its-set-into-the-snapshot
+  "BIP-330 on reqrecon: the receiver `Makes a snapshot of their current
+reconciliation set, and clears the set itself.' A transaction arriving during
+the round goes to the next one: the next reqrecon's sketch holds it and
+nothing the settled round already carried. A reqrecon arriving before the
+previous round's reconcildiff (which BIP-330 forbids) folds the stale
+snapshot into the new one rather than dropping it."
+  (let* ((peer (%rc-peer :registered t :we-initiate nil :inbound t))
+         (first-three (loop for i from 130 below 133 collect (%rc-wtxid i)))
+         (late (%rc-wtxid 140))
+         (set (%rc-hold peer first-three))
+         (ctx (bl.ctx:make-node-context)))
+    (%rc-reqrecon peer 0 0 ctx)
+    (is (null (bl.net::recon-set-short-ids set)) "the set was moved out and cleared")
+    (is (= 3 (length (bl.net:recon-set-snapshot-ids set))))
+    (%rc-hold peer (list late))
+    (is (equal (%rc-short-ids (list late)) (bl.net::recon-set-short-ids set))
+        "the latecomer is in the set, not the round")
+    (bl.net:handle-message peer "reconcildiff"
+                           (subseq (bl.ser:make-reconcildiff-message t '()) 24) ctx)
+    ;; The next round sketches the latecomer alone: |1 - 0| + 0 + 1 = 2.
+    (is (equalp (%rc-sketch-payload (%rc-short-ids (list late)) 2)
+                (subseq (first (%rc-reqrecon peer 0 0 ctx)) 24)))
+    ;; No reconcildiff for that round, and a third reqrecon: nothing is lost.
+    (%rc-hold peer (list (%rc-wtxid 141)))
+    (%rc-reqrecon peer 0 0 ctx)
+    (is (= 2 (length (bl.net:recon-set-snapshot-ids set)))
+        "the stale snapshot joined the new one")))
+
+(test q-is-re-estimated-from-the-previous-round
+  "BIP-330's worked example: set_size=30, local_set_size=20, an actual
+difference of 12 gives q = (12 - |30-20|) / min(30,20) = 0.1. The initiator
+holds 20, the responder 30 (19 shared, 11 of its own, 1 of ours); after that
+round decodes, the NEXT reqrecon carries floor(0.1 * 32767) = 3276 instead of
+the default 1/4's 8191."
+  (is (= 1/10 (bl.net::recon-reestimate-q 20 1 11 1/4)))
+  (is (= 1/4 (bl.net::recon-reestimate-q 0 0 5 1/4)) "an empty side says nothing")
+  (let* ((peer (%rc-peer :registered t :we-initiate t))
+         (ours (loop for i from 150 below 170 collect (%rc-wtxid i)))
+         (ids (%rc-short-ids ours))
+         (theirs (append (rest ids)
+                         (%rc-short-ids (loop for i from 300 below 311 collect (%rc-wtxid i))
+                                        :k0 5 :k1 6)))
+         (ctx (bl.ctx:make-node-context)))
+    (%rc-hold peer ours)
+    (let ((first-req (first (captured-sends
+                             (lambda () (bl.net:maybe-start-reconciliation peer 100000))))))
+      (is (= 8191 (nth-value 1 (%rc-reqrecon-raw first-req)))))
+    ;; The responder would size |30-20| + floor(1/4 * 20) + 1 = 16.
+    (is-true (first (%rc-reconcildiff
+                     (captured-sends
+                      (lambda ()
+                        (bl.net:handle-message peer "sketch" (%rc-sketch-payload theirs 16) ctx)))))
+             "the first round decodes")
+    (%rc-hold peer (list (%rc-wtxid 200)))
+    (let ((second-req (first (captured-sends
+                              (lambda () (bl.net:maybe-start-reconciliation peer 100010))))))
+      (is (= 3276 (nth-value 1 (%rc-reqrecon-raw second-req)))
+          "the second reqrecon carries the re-estimated q"))))
+
+(defun %rc-reqrecon-raw (message)
+  "The (set_size q-raw) of a framed reqrecon MESSAGE, both uint16 LE."
+  (let ((p (subseq message 24)))
+    (values (logior (aref p 0) (ash (aref p 1) 8))
+            (logior (aref p 2) (ash (aref p 3) 8)))))
+
+(defun %inv-queue-writers (text)
+  "The names of the top-level definitions in TEXT that PUSH onto a peer's
+tx-inv queue, read with the Lisp reader (IN-PACKAGE forms honoured) and walked
+for (push ITEM (peer-tx-inv-queue ...)). The scanner the queue-writer ratchet
+runs over src/, factored out so its positive control can feed it a writer that
+must be reported."
+  (let ((names '())
+        (*package* (find-package :bitcoin-lisp.tests))
+        (*read-eval* t))
+    (labels ((queue-place-p (place)
+               (and (consp place) (symbolp (first place))
+                    (string= "PEER-TX-INV-QUEUE" (symbol-name (first place)))))
+             (writes-p (form)
+               (and (consp form)
+                    (or (and (symbolp (first form))
+                             (string= "PUSH" (symbol-name (first form)))
+                             (consp (cdr form)) (consp (cddr form))
+                             (queue-place-p (third form)))
+                        (loop for rest on form
+                              thereis (and (consp rest) (writes-p (car rest))))))))
+      (with-input-from-string (in text)
+        (loop for form = (read in nil in)
+              until (eq form in)
+              do (cond ((and (consp form) (eq (first form) 'in-package))
+                        (setf *package* (find-package (second form))))
+                       ((and (consp form) (writes-p form))
+                        (push (string-downcase (symbol-name (second form))) names))))))
+    (nreverse names)))
+
+(test one-writer-queues-tx-announcements
+  "Every transaction announcement goes onto a peer's queue through
+%QUEUE-TX-ANNOUNCEMENT, which takes a txid and an integer fee rate per kvB:
+the flush checks the TXID against the mempool and the rate against the
+feefilter, and reconciliation's (wtxid wtxid 0) entries failed both silently.
+The ratchet: no other src definition pushes onto the queue. The positive
+control is a synthetic writer the scanner must report. And the reconciliation
+path queues the mempool's txid for a SEGWIT transaction, whose txid and wtxid
+differ, with its real fee rate."
+  (is (equal '("rogue") (%inv-queue-writers (format nil "~%(defun rogue (p w)~%  (push (list w w 0) (peer-tx-inv-queue p)))~%(defun fine () 1)"))))
+  (let ((writers (loop for path in (directory (merge-pathnames
+                                                "src/**/*.lisp"
+                                                (asdf:system-source-directory :bitcoin-lisp)))
+                       for text = (uiop:read-file-string path)
+                       ;; Only a file that names the queue can write it.
+                       when (search "peer-tx-inv-queue" text)
+                         append (%inv-queue-writers text))))
+    (is (equal '("%queue-tx-announcement") writers) "writers: ~S" writers))
+  (let* ((mempool (bl.mp:make-mempool))
+         (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (plain (pkg-tx funding 0 (- 100000000 20000)))
+         (segwit (bl.ser:make-transaction
+                  :version 2 :inputs (bl.ser:transaction-inputs plain)
+                  :outputs (bl.ser:transaction-outputs plain) :lock-time 0
+                  :witness (vector (list (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-element 1)))))
+         (txid (bl.ser:transaction-hash segwit))
+         (wtxid (bl.ser:transaction-wtxid segwit))
+         (peer (%rc-peer :registered t)))
+    (bl.mp:mempool-add mempool txid (bl.mp:make-entry-from-tx segwit 20000 1))
+    (is (not (equalp txid wtxid)) "the control: a segwit transaction's ids differ")
+    (bl.net::%announce-wtxids peer (list wtxid) mempool)
+    (let ((entry (first (bl.net:peer-tx-inv-queue peer))))
+      (is (equalp txid (first entry)) "the txid slot holds the txid")
+      (is (equalp wtxid (second entry)))
+      (is (plusp (third entry)) "and the real fee rate"))
+    (setf (bl.net:peer-tx-inv-queue peer) '())
+    (bl.net::%announce-wtxids peer (list wtxid) nil)
+    (is (null (bl.net:peer-tx-inv-queue peer)) "no mempool, no txid, nothing queued")))

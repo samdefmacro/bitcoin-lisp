@@ -1963,7 +1963,7 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
           ;; the handshake.
           (ignore-errors
            (bl.net:maybe-start-reconciliation
-            p now)))))
+            p now mp)))))
     ;; Hourly fee-estimate flush (Core's scheduler,
     ;; init.cpp:1662). Cadence-gated inside, so this is
     ;; a cheap no-op most ticks -- and it is per TICK

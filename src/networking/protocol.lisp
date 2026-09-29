@@ -3981,8 +3981,7 @@ reach here anyway — their senders are disconnected)."
           ;; this peer at all. A PUSH is Core's O(1) insert; the flush
           ;; restores announcement order and drains faster as the queue
           ;; grows (%TX-INV-BROADCAST-MAX).
-          (push (list txid wtxid fee-rate-per-kb)
-                (peer-tx-inv-queue peer)))))))
+          (%queue-tx-announcement peer txid wtxid fee-rate-per-kb))))))
 
 (defun %handle-reqrecon (peer payload)
   "The peer wants to reconcile: size a sketch against what it says it holds and
@@ -4064,9 +4063,7 @@ NIL and announce nothing."
         (let ((set (peer-recon-set peer)))
           (cond (ok
                  (%announce-wtxids peer (recon-settle-ids set ask) mempool)
-                 (when set
-                   (recon-settle-ids set (recon-set-snapshot set))
-                   (recon-set-clear-snapshot set)))
+                 (when set (recon-set-clear-snapshot set)))
                 (t
                  (%announce-wtxids peer (recon-flood-snapshot peer) mempool)))))
     (error (e)
@@ -4076,27 +4073,40 @@ NIL and announce nothing."
 (defun %announce-wtxids (peer wtxids mempool)
   "Queue WTXIDS for ordinary announcement to PEER. Reconciliation decides WHAT
 to announce; the announcement itself is the same inv path everything else uses,
-so each entry is what RELAY-TRANSACTION queues: the TXID, the wtxid and the
-fee rate per kvB, read from MEMPOOL by wtxid. The flush checks the TXID
-against the mempool and the fee rate against the peer's feefilter; queued as
-(wtxid wtxid 0), which this used to do, a segwit transaction was `gone from
-the mempool' at flush time and every transaction fell under any feefilter, so
-a reconciled difference was silently never announced. A wtxid no longer in
-the mempool has nothing to announce. Without a MEMPOOL (a bare context) the
-wtxid stands in for both ids."
-  (dolist (wtxid wtxids)
-    (if (null mempool)
-        (push (list wtxid wtxid 0) (peer-tx-inv-queue peer))
-        (let* ((txid (gethash wtxid (bl.mp:mempool-by-wtxid mempool)))
-               (entry (and txid (bl.mp:mempool-get mempool txid))))
-          (when entry
-            (let ((vsize (bl.mp:mempool-entry-vsize entry)))
-              (push (list txid
-                          wtxid
-                          (if (plusp vsize)
-                              (floor (* 1000 (bl.mp:mempool-entry-fee entry)) vsize)
-                              0))
-                    (peer-tx-inv-queue peer))))))))
+through %QUEUE-TX-ANNOUNCEMENT with what RELAY-TRANSACTION gives it: the TXID
+and the fee rate per kvB, both read from MEMPOOL by wtxid. A wtxid the mempool
+no longer holds has nothing to announce, and without a MEMPOOL nothing does --
+there is no txid to queue."
+  (when mempool
+    (dolist (wtxid wtxids)
+      (let* ((txid (gethash wtxid (bl.mp:mempool-by-wtxid mempool)))
+             (entry (and txid (bl.mp:mempool-get mempool txid))))
+        (when entry
+          (let ((vsize (bl.mp:mempool-entry-vsize entry)))
+            (%queue-tx-announcement
+             peer txid wtxid
+             (if (plusp vsize)
+                 (floor (* 1000 (bl.mp:mempool-entry-fee entry)) vsize)
+                 0))))))))
+
+(defun maybe-start-reconciliation (peer now &optional mempool)
+  "The timer entry point, per peer per tick: give up a round that has waited
++RECON-ROUND-TIMEOUT-SECONDS+ for its sketch, and open a new one if it is due.
+Returns T when a round was started.
+
+A timed-out round ends as a failed one does (BIP-330's fallback): our snapshot
+is flooded -- from MEMPOOL, which the announcement needs for each txid and fee
+rate -- and reconcildiff(success=0) tells the responder to flood its own.
+Rounds are spread across peers rather than run together, so a node's
+announcement pattern does not reveal how many peers it has."
+  (when (recon-round-timed-out-p peer now)
+    (bl:log-cat "txreconciliation" "reconciliation round with peer=~A timed out"
+                (peer-id peer))
+    (send-message peer (bl.ser:make-reconcildiff-message nil '()))
+    (%announce-wtxids peer (recon-abandon-round peer) mempool))
+  (when (recon-should-start-round-p peer now)
+    (send-message peer (recon-start-round peer now))
+    t))
 
 (defun %mark-tx-known-to-peer (peer hash)
   "Record that PEER holds the transaction its inventory calls HASH: it

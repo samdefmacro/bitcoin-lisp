@@ -173,6 +173,13 @@ headerssync.cpp. src/networking/.")
    ;; the API its Core-oracle vector suites drive.
    #:compute-recon-salt
    #:recon-short-id
+   #:make-recon-set
+   #:recon-set-add
+   #:recon-set-take-snapshot
+   #:recon-set-snapshot-ids
+   #:recon-estimate-capacity
+   #:recon-should-start-round-p
+   #:recon-round-decode
    #:ms-make-sketch
    #:ms-sketch-add
    #:ms-sketch-merge

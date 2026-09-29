@@ -1028,6 +1028,19 @@ inv/getdata either way). This is our half only; whether the PEER wants tx
 announcements from us is PEER-TX-RELAY-P (their version's fRelay)."
   (not (member (peer-conn-type peer) '(:block-relay :feeler))))
 
+(defun %queue-tx-announcement (peer txid wtxid fee-rate-per-kvb)
+  "Queue one transaction for announcement to PEER: Core's PushTxInventory, one
+insert into m_tx_inventory_to_send (net_processing.cpp:2261-2263), drained by
+%FLUSH-PEER-TX-INVS. The ONLY writer of that queue, and what it holds is the
+TXID, the wtxid and the fee rate per kvB: the flush checks the TXID against the
+mempool and the rate against the peer's feefilter, so an entry that carries a
+wtxid in the txid slot or a made-up rate is silently never announced -- which
+is what reconciliation's announcements were, (wtxid wtxid 0), until
+2026-09-29. A test (one-writer-queues-tx-announcements) reads src/ and holds
+every other definition to this one."
+  (check-type fee-rate-per-kvb (integer 0))
+  (push (list txid wtxid fee-rate-per-kvb) (peer-tx-inv-queue peer)))
+
 (defun relay-enabled-p ()
   "Check if transaction relay is enabled for the current network: always on
 test networks, disabled by default on mainnet for safety (a non-participation
