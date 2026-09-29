@@ -4,7 +4,7 @@
 # Tails /data/bitcoin-lisp/logs/node.log and SIGUSR1-toggles sb-sprof at
 # region boundaries during a fresh testnet4 sync. The node's SIGUSR1
 # handler (src/node/shutdown.lisp install-shutdown-handler) toggles sb-sprof and writes the report
-# to /data/bitcoin-lisp/logs/profile.txt on the SECOND USR1. We then
+# to $PROFILE_FILE (beside the node's debug.log) on the SECOND USR1. We then
 # rename the report so it isn't clobbered by the next region.
 #
 # Regions:
@@ -18,7 +18,10 @@
 set -euo pipefail
 
 NODE_LOG=/data/bitcoin-lisp/logs/node.log
-PROFILE_FILE=/data/bitcoin-lisp/logs/profile.txt
+# The node writes its report beside its debug.log (src/node/shutdown.lisp
+# SPROF-REPORT-PATH): <datadir>/<network>/profile.txt unless -debuglogfile
+# moves the log. Set PROFILE_FILE to that path for the node being profiled.
+PROFILE_FILE="${PROFILE_FILE:?set PROFILE_FILE to the profiled node s <datadir>/<network>/profile.txt}"
 PROFILE_DIR=/data/bitcoin-lisp/logs/profiles
 mkdir -p "$PROFILE_DIR"
 

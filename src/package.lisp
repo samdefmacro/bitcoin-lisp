@@ -227,6 +227,7 @@ init.cpp, node/. src/node/.")
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
    #:*log-file-path*
+   #:sprof-report-path
    #:*node-start-time*
    #:*pending-test-connections*
    #:+pow-target-spacing-seconds+

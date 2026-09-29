@@ -308,6 +308,21 @@ stop (feature_assumeutxo.py:695 then found no snapshot chainstate to clean up)."
           (bt:make-thread #'%run-shutdown-servicer :name "shutdown-servicer")))
   *shutdown-servicer-thread*)
 
+(defun sprof-report-path ()
+  "Where the SIGUSR1 profiler writes its report: profile.txt beside the debug
+log (the directory -debuglogfile resolved to, Core's GetDebugLogPath,
+init/common.cpp), else the node's network data directory, which is where
+Core puts every debug artifact it writes, else the working directory. It
+used to be the fixed /data/bitcoin-lisp/logs/profile.txt, which exists only on
+the live servers: anywhere else the second SIGUSR1 signalled inside the
+handler and no report was written."
+  (let ((dir (cond (*log-file-path*
+                    (uiop:pathname-directory-pathname (pathname *log-file-path*)))
+                   ((and *node* (node-data-directory *node*))
+                    (node-data-directory *node*))
+                   (t *default-pathname-defaults*))))
+    (merge-pathnames "profile.txt" dir)))
+
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
    chain state and UTXO set before exit. Without this, SIGKILL is the only way
@@ -331,7 +346,8 @@ stop (feature_assumeutxo.py:695 then found no snapshot chainstate to clean up)."
       (sb-sys:enable-interrupt sb-unix:sigterm handler)
       (sb-sys:enable-interrupt sb-unix:sigint handler)))
   ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
-  ;; USR1: stop, write graph + flat report to /data/bitcoin-lisp/logs/profile.txt.
+  ;; USR1: stop, write graph + flat report to SPROF-REPORT-PATH (profile.txt
+  ;; beside debug.log).
   ;; Use to identify the hot path during live validation: kill -USR1 <pid> to
   ;; arm, wait through a heavy block, kill -USR1 <pid> again, then read report.
   #+sbcl
@@ -351,7 +367,7 @@ stop (feature_assumeutxo.py:695 then found no snapshot chainstate to clean up)."
           (log-info "[sprof] profiling started"))
          (t
           (sb-sprof:stop-profiling)
-          (with-open-file (s "/data/bitcoin-lisp/logs/profile.txt"
+          (with-open-file (s (sprof-report-path)
                              :direction :output
                              :if-exists :supersede
                              :if-does-not-exist :create)
@@ -361,7 +377,7 @@ stop (feature_assumeutxo.py:695 then found no snapshot chainstate to clean up)."
               (format s "~%~%=== sb-sprof graph report ===~%")
               (sb-sprof:report :type :graph :max 50)))
           (setf profiling nil)
-          (log-info "[sprof] profile written to /data/bitcoin-lisp/logs/profile.txt")))))
+          (log-info "[sprof] profile written to ~A" (namestring (sprof-report-path)))))))
     (log-info "SIGUSR1 toggles sb-sprof profiling"))
   #+sbcl
   (setf sb-ext:*invoke-debugger-hook*

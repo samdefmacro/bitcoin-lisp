@@ -235,3 +235,23 @@ entries and no entry in common."
           "the value passed for %s is the block hash as the RPCs print it")
       (is (string= (bl.rpc:hash-to-hex hash) (cdr (first records)))
           "and that is exactly HASH-TO-HEX, the RPC layer's own uint256 spelling"))))
+
+(test the-sigusr1-profile-lands-beside-the-debug-log
+  "SIGUSR1 twice writes an sb-sprof report (src/node/shutdown.lisp). It went to
+the fixed path /data/bitcoin-lisp/logs/profile.txt, which exists only on the
+live servers: in the functional framework's datadirs (and anyone else's) the
+second signal failed inside the handler and no report was written. Core keeps
+its debug artifacts in the datadir, beside debug.log (GetDebugLogPath,
+init/common.cpp), so the report goes to profile.txt in the directory the debug
+log is open in, else the node's data directory."
+  (let ((bl:*log-file-path* "/tmp/bl-sprof/node0/regtest/debug.log"))
+    (is (string= "/tmp/bl-sprof/node0/regtest/profile.txt"
+                 (namestring (bl:sprof-report-path)))
+        "beside the debug log"))
+  (let* ((node (bl:make-node))
+         (bl:*node* node)
+         (bl:*log-file-path* nil))
+    (setf (bl:node-data-directory node) #p"/tmp/bl-sprof/node1/regtest/")
+    (is (string= "/tmp/bl-sprof/node1/regtest/profile.txt"
+                 (namestring (bl:sprof-report-path)))
+        "no file log: the node's data directory")))
