@@ -8,15 +8,23 @@
 ;;; interactions derived from them. Pure functions of strings; nothing here
 ;;; reads a special.
 
-(defun locale-independent-atoi (value)
-  "Core LocaleIndependentAtoi (util/strencodings.h:118-143), the integer
-interpretation the config system is built on.
+(defparameter +core-space-characters+
+  (list #\Space #\Page #\Newline #\Return #\Tab (code-char 11))
+  "Core IsSpace and TrimString's default pattern (util/string.h,
+util/strencodings.h:166): space, form feed, newline, carriage return, tab and
+vertical tab -- and nothing else, whatever the locale.")
 
-Emulates C-locale atoi: trim, allow one leading `+` (but `+-` is 0), then take
-the LONGEST INTEGER PREFIX. No digits at all is 0 — which is the whole reason
-this function has to exist here rather than being approximated, because
-`atoi(\"true\")` is 0 and therefore `true` is FALSE to Bitcoin Core."
-  (let* ((s (string-trim '(#\Space #\Tab #\Return #\Newline #\Page) value))
+(defun locale-independent-atoi (value)
+  "Core LocaleIndependentAtoi<int64_t> (util/strencodings.h:117-143), the
+integer interpretation the config system is built on.
+
+Emulates C-locale atoi: trim Core's whitespace, allow ONE leading `+` (but
+`+-` is 0), then std::from_chars -- an optional `-` and the LONGEST run of
+digits. No digits at all is 0 -- which is the whole reason this function has
+to exist here rather than being approximated, because `atoi(\"true\")` is 0
+and therefore `true` is FALSE to Bitcoin Core. A value past the int64 range
+SATURATES at its bound, per strtoll."
+  (let* ((s (string-trim +core-space-characters+ value))
          (start 0)
          (len (length s)))
     (when (and (< start len) (char= (char s start) #\+))
@@ -24,14 +32,16 @@ this function has to exist here rather than being approximated, because
         (return-from locale-independent-atoi 0))
       (incf start))
     (let ((sign 1))
-      (when (and (< start len) (member (char s start) '(#\+ #\-)))
-        (when (char= (char s start) #\-) (setf sign -1))
+      (when (and (< start len) (char= (char s start) #\-))
+        (setf sign -1)
         (incf start))
       (let ((end start))
         (loop while (and (< end len) (digit-char-p (char s end))) do (incf end))
         (if (= end start)
             0
-            (* sign (parse-integer s :start start :end end)))))))
+            (max (- (ash 1 63))
+                 (min (1- (ash 1 63))
+                      (* sign (parse-integer s :start start :end end)))))))))
 
 (defun conf-parse-bool (value)
   "Interpret a config VALUE as a boolean, exactly as Core's InterpretBool
@@ -105,26 +115,30 @@ category instead. A category-specific spec leaves the global level alone."
 Valid values: info, debug, trace." value)))))
 
 (defun conf-parse-money (value)
-  "Parse a config VALUE as a BTC amount string into satoshis (Bitcoin Core
-ParseMoney, util/moneystr.cpp): optional whitespace, digits, optional '.'
-plus up to 8 decimal digits. Returns NIL for anything else (negative,
-malformed, >8 decimals, out of range) — callers turn that into their own
-AmountErrMsg-style error."
-  (let* ((v (string-trim '(#\Space #\Tab) value))
-         (dot (position #\. v)))
-    (flet ((digits-p (s) (and (plusp (length s)) (every #'digit-char-p s))))
-      (let ((whole (if dot (subseq v 0 dot) v))
-            (frac (if dot (subseq v (1+ dot)) "")))
-        (when (and (digits-p whole)
-                   (or (null dot) (digits-p frac))
-                   (<= (length frac) 8))
-          (let ((sats (+ (* (parse-integer whole) 100000000)
-                         (if (plusp (length frac))
-                             (* (parse-integer frac)
-                                (expt 10 (- 8 (length frac))))
-                             0))))
-            (when (<= sats 2100000000000000) ; MAX_MONEY
-              sats)))))))
+  "Parse a config VALUE as a BTC amount string into satoshis: Core ParseMoney
+(util/moneystr.cpp:45-94) step for step. Trim Core's whitespace; then digits,
+optionally a point and up to eight more digits -- either side of the point
+may be empty, so `.5', `5.' and `.' are amounts -- and nothing after; a whole
+part of at most ten digits; the result within MoneyRange. Returns NIL for
+anything else -- callers turn that into their own AmountErrMsg-style error."
+  (when (find (code-char 0) value)
+    (return-from conf-parse-money nil))
+  (let* ((v (string-trim +core-space-characters+ value))
+         (dot (position #\. v))
+         (whole (if dot (subseq v 0 dot) v))
+         (frac (if dot (subseq v (1+ dot)) "")))
+    (flet ((digits-p (s) (every #'digit-char-p s)))
+      (when (and (plusp (length v))
+                 (digits-p whole)
+                 (digits-p frac)
+                 (<= (length frac) 8)
+                 (<= (length whole) 10))
+        (let ((sats (+ (* (if (plusp (length whole)) (parse-integer whole) 0) 100000000)
+                       (if (plusp (length frac))
+                           (* (parse-integer frac) (expt 10 (- 8 (length frac))))
+                           0))))
+          (when (<= sats 2100000000000000) ; MAX_MONEY
+            sats))))))
 
 (defun conf-parse-user-hex (value)
   "Core uint256::FromUserHex (uint256.h:165-176) as raw bytes: strip an

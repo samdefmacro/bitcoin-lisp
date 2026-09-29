@@ -3893,3 +3893,25 @@ over the default cache on a machine under 2 GiB, is an InitWarning."
     (is-true (bl:oversized-dbcache-warning (* 500 1048576) gib))
     (is (null (bl:oversized-dbcache-warning (* 450 1048576) gib)))
     (is (null (bl:oversized-dbcache-warning (* 7000 1048576) nil)))))
+
+(test number-parsers-read-as-cores-do
+  "LocaleIndependentAtoi<int64_t> (util/strencodings.h:117-143) trims Core's six
+whitespace characters (vertical tab included), takes ONE leading `+', reads
+the longest integer prefix through std::from_chars and SATURATES at the int64
+bounds; ParseMoney (util/moneystr.cpp:45-94) accepts a point with no digits on
+either side of it and refuses a whole part of more than ten digits. Ours
+answered 0 for an out-of-range or vertical-tab-led number, 5 for `++5', and
+refused `.5' and `5.'. Found by the fuzz target parse_numbers, whose
+reference models are Core's code."
+  (flet ((vt (s) (format nil "~C~A" (code-char 11) s)))
+    (is (= (1- (ash 1 63)) (bl.cfg:locale-independent-atoi "99999999999999999999")))
+    (is (= (- (ash 1 63)) (bl.cfg:locale-independent-atoi "-99999999999999999999")))
+    (is (= 12 (bl.cfg:locale-independent-atoi (vt "12"))))
+    (is (= 0 (bl.cfg:locale-independent-atoi "++5")))
+    (is (= 12 (bl.cfg:locale-independent-atoi "12abc")) "the prefix rule is the control")
+    (is (eql 50000000 (bl.cfg:conf-parse-money ".5")))
+    (is (eql 500000000 (bl.cfg:conf-parse-money "5.")))
+    (is (eql 150000000 (bl.cfg:conf-parse-money (vt "1.5"))))
+    (is (null (bl.cfg:conf-parse-money "00000000001")))
+    (is (null (bl.cfg:conf-parse-money "1 .5")))
+    (is (eql 0 (bl.cfg:conf-parse-money ".")) "a lone point is zero in Core's loop")))
