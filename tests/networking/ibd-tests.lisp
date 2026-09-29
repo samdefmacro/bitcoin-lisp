@@ -4017,7 +4017,7 @@ buckets, or our quantization would become a fingerprint."
   "round() clamps anything above the top bucket to the top bucket, never
 returns a non-bucket value, and is never above the requested fee's bucket."
   (dotimes (i 200)
-    (declare (ignore i))
+    (declare (ignorable i))
     (let ((r (bl.net:fee-filter-round 1000)))
       (is (find (float r 1d0) bl.net::*fee-filter-buckets*
                 :test (lambda (x b) (= x (floor b))))
@@ -4207,7 +4207,6 @@ already hold; counting only NEW headers would score it exactly like a peer that
 went silent, and the failover would rotate away from every healthy peer the
 moment we caught up."
   (let* ((bl:*network* :regtest)
-         (state (%hdr-sync-chain-state "answered"))
          (peer (bl.net:make-peer :state :ready)))
     (is (= 0 (bl.net::%peer-headers-bytes peer)))
     ;; The counter is the transport's own per-command byte tally, so record an
@@ -4301,14 +4300,16 @@ second peer sends a headers message; that second peer must still be served."
                            (usocket:socket-stream talker-client))
            (force-output (usocket:socket-stream talker-client))
            (sleep 0.2)
-           ;; Short idle window so the test does not sit out the real one.
-           (let ((bl.net::+header-sync-idle-passes+ 3))
-             (multiple-value-bind (received stalled)
-                 (bl.net:sync-headers
-                  quiet state :ctx ctx
-                  :utxo-set (bl.store:make-utxo-set))
-               (declare (ignore received))
-               (is-true stalled "the chosen peer never answered, so rotate")))
+           ;; The whole silent budget (+HEADER-SYNC-SILENT-PASSES+, ~10 s): a
+           ;; constant, so a test cannot shorten it -- the LET that meant to
+           ;; bound a +HEADER-SYNC-IDLE-PASSES+ 3 here named a constant that
+           ;; no longer exists and bound nothing the callee could see.
+           (multiple-value-bind (received stalled)
+               (bl.net:sync-headers
+                quiet state :ctx ctx
+                :utxo-set (bl.store:make-utxo-set))
+             (declare (ignore received))
+             (is-true stalled "the chosen peer never answered, so rotate"))
            (is (plusp (bl.net::%peer-headers-bytes talker))
                "the OTHER peer was served while header sync waited")
            (is (= 0 (bl.net::%peer-headers-bytes quiet))

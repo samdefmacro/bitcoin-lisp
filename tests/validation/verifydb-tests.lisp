@@ -162,7 +162,7 @@ chain of coinbase-only blocks with no rev file verified clean at every level."
                ;; holding no record: still a failed read.
                (with-open-file (s (merge-pathnames "blocks/rev00000.dat" base)
                                   :direction :output :if-does-not-exist :create)
-                 (declare (ignore s)))
+                 (declare (ignorable s)))
                (is (eq :corrupted-block-db (bl.val:verify-db cs store :check-level 2))
                    "an empty rev file is not a readable undo record"))
           (bl.val:initialize-undo-storage undo))))))

@@ -1011,8 +1011,7 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
                             :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Data is not in recognized format."
                                              (wallet-path-string path))))
         (handler-case
-            (let ((db (wallet-db-open path :create t
-                                           :network (wallet-manager-network manager))))
+            (let ((db (%create-wallet-db manager path)))
               (unwind-protect
                    ;; One batch: the restored database is either complete
                    ;; or absent, never half-written.
@@ -1025,7 +1024,14 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
           ;; The same classification the load path uses: a storage condition
           ;; from opening or writing the new database is Core's FAILED_LOAD
           ;; behind the verification sentence, at RPC_WALLET_ERROR, never an
-          ;; internal error.
+          ;; internal error. Making the directory is RestoreWallet's own
+          ;; TryCreateDirectories (wallet.cpp:515-521), whose throw lands in
+          ;; its catch-all: `Unexpected exception: ' and the what() (:531-535),
+          ;; left at RPC_WALLET_ERROR by HandleWalletError (rpc/util.cpp:152).
+          (wallet-filesystem-error (e)
+            (%restore-cleanup path existed)
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                                     :message (format nil "Unexpected exception: ~A" e)))
           (bl.err:storage-error (e)
             (%restore-cleanup path existed)
             (%wallet-database-open-error path e))

@@ -122,7 +122,9 @@
     (is (vectorp script-pubkey))
     (is (null wit-ver))
     ;; P2PKH scriptPubKey is 25 bytes
-    (is (= (length script-pubkey) 25))))
+    (is (= (length script-pubkey) 25))
+    ;; The fourth value carries the payload: here the key hash the script pushes.
+    (is (equalp wit-prog (subseq script-pubkey 3 23)))))
 
 (test decode-address-p2wpkh-testnet
   "Test decode-address for testnet P2WPKH."

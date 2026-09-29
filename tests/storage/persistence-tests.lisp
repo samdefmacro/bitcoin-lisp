@@ -634,8 +634,7 @@ replays the delta bound to the snapshot on disk before it writes anything."
 
 (test utxo-backward-compat-old-format
   "Loading an old-format UTXO file (no magic) should succeed."
-  (let ((utxo-set (bl.store:make-utxo-set))
-        (path (merge-pathnames "test-oldfmt-utxo.dat"
+  (let ((path (merge-pathnames "test-oldfmt-utxo.dat"
                                (ensure-directories-exist
                                 (merge-pathnames "test-persist/"
                                                  (uiop:temporary-directory)))))

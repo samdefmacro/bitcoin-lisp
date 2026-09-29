@@ -292,6 +292,97 @@ wrapping or throwing, so a delta that would leave the range pins at the bound."
           ((< sum +int64-min+) +int64-min+)
           (t sum))))
 
+(defstruct mempool
+  "In-memory transaction pool."
+  ;; txid (byte vector) -> mempool-entry
+  (entries (bl.bytes:make-octets-hash-table) :type hash-table)
+  ;; wtxid (byte vector) -> txid  (BIP339 witness-txid lookup for getdata)
+  (by-wtxid (bl.bytes:make-octets-hash-table) :type hash-table)
+  ;; outpoint-key (byte vector) -> txid that spends it
+  (spent-outpoints (bl.bytes:make-octets-hash-table) :type hash-table)
+  ;; A LOWER BOUND on the entry-time of everything in ENTRIES -- no entry is
+  ;; older than this, and 0 means "unknown, sweep to find out". Core reads the
+  ;; first element of its entry_time index and stops there (CTxMemPool::Expire,
+  ;; txmempool.cpp:811-827), so its expiry sweep costs nothing when nothing has
+  ;; expired; ours walks a hash table, and LimitMempoolSize runs it after EVERY
+  ;; accepted transaction, which would make each acceptance O(mempool).
+  ;; A removal never invalidates the bound: taking entries out can only raise
+  ;; the true minimum.
+  (oldest-entry-time 0 :type integer)
+  ;; Sum of the entries' sigop-adjusted virtual sizes (Core totalTxSize,
+  ;; txmempool.h:191 "sum of all mempool tx's virtual sizes" —
+  ;; getmempoolinfo's "bytes").
+  (total-size 0 :type integer)
+  ;; Sum of the entries' modeled dynamic memory usage (Core cachedInnerUsage,
+  ;; txmempool.h:193). Pool-level usage — Core DynamicMemoryUsage(), the
+  ;; number the -maxmempool cap compares against — adds the per-entry
+  ;; container overheads on top; see MEMPOOL-DYNAMIC-USAGE.
+  (total-usage 0 :type integer)
+  ;; Maximum allowed MEMORY usage in bytes (Core -maxmempool * 1'000'000),
+  ;; compared against MEMPOOL-DYNAMIC-USAGE. The default form reads
+  ;; *MAX-MEMPOOL-BYTES* at MAKE-MEMPOOL time, so -maxmempool applies to the
+  ;; pool the node builds at startup without threading the value through.
+  (max-size *max-mempool-bytes* :type integer)
+  ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units).
+  ;; The default form reads *min-relay-fee-rate* at MAKE-MEMPOOL time, so
+  ;; -minrelaytxfee (applied before the node's mempool is built) takes effect.
+  (min-fee-rate *min-relay-fee-rate* :type integer)
+  ;; Rolling dynamic minimum fee rate (sat/kvB), raised when the mempool is full
+  ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
+  ;; rolling minimum fee. A DOUBLE, like Core's rollingMinimumFeeRate
+  ;; (txmempool.h:197): the decay is applied to the stored value and written
+  ;; back on every read, so keeping it as an integer would truncate once per
+  ;; read and the sum of those truncations dwarfs the decay itself.
+  (rolling-min-fee-rate 0.0d0 :type double-float)
+  ;; When the rolling minimum was last decayed (Core lastRollingFeeUpdate);
+  ;; a connected block restarts it.
+  (rolling-min-fee-time 0 :type integer)
+  ;; Has a block connected since the last bump (Core
+  ;; blockSinceLastRollingFeeBump, txmempool.h:196, false at construction)?
+  ;; While this is NIL the rolling minimum does not decay at all: the floor
+  ;; stays at the feerate that was just trimmed until a block has come in, so
+  ;; that "we don't allow txn to enter mempool with feerate equal to txn which
+  ;; were removed with no block in between" (TrimToSize, txmempool.cpp:873-875).
+  (block-since-rolling-fee-bump nil :type boolean)
+  ;; txid -> satoshi fee delta from prioritisetransaction (Core's mapDeltas).
+  ;; Deltas may exist for txs not (yet) in the mempool; applied on acceptance.
+  (deltas (bl.bytes:make-octets-hash-table) :type hash-table)
+  ;; txid -> T for locally-submitted transactions (sendrawtransaction) whose
+  ;; initial broadcast hasn't been confirmed yet (Core m_unbroadcast_txids,
+  ;; txmempool.h:286). A peer's getdata for the tx is the confirmation signal;
+  ;; until then the periodic re-announcement pass keeps re-relaying. Always a
+  ;; subset of ENTRIES: adds are gated on membership, removal drops the txid.
+  (unbroadcast (bl.bytes:make-octets-hash-table) :type hash-table)
+  ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
+  ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
+  (orphan-pool (make-orphan-pool) :type orphan-pool)
+  ;; Monotonic admission counter (Core CTxMemPool::m_sequence_number,
+  ;; txmempool.h:202, initialized to 1): each accepted tx records the current
+  ;; value and increments it. MEMPOOL-SEQUENCE reads the counter (Core
+  ;; GetSequence()) for the per-peer last-inv-sequence snapshots.
+  (next-sequence 1 :type (unsigned-byte 64))
+  ;; Edits that changed no MEMBERSHIP but did change what a block template
+  ;; would contain -- prioritisations (Core ++nTransactionsUpdated at
+  ;; txmempool.cpp:642). MEMPOOL-TRANSACTIONS-UPDATED derives the rest of the
+  ;; counter from admissions and removals; this is the part no population
+  ;; count can show.
+  (non-membership-updates 0 :type (unsigned-byte 64))
+  ;; The cluster/chunk engine (Core TxGraph), maintained in lockstep with
+  ;; ENTRIES on every mutation. AUTHORITATIVE since the P4-P6 flips for
+  ;; mining (chunk-walk block builder), eviction (worst-chunk trim), and the
+  ;; acceptance limits (64 tx / 101 kvB per cluster, enforced in MEMPOOL-ADD,
+  ;; so the graph never stays oversized). RBF economics flip in P7. The BFS
+  ;; parent/child machinery remains for RPC ancestor/descendant reporting,
+  ;; TRUC topology checks, and mempool.dat ordering, with the P3 shadow
+  ;; equivalence asserts as the standing safety net.
+  ;; The graph's limit is in WEIGHT, the configured one in vbytes: Core's
+  ;; MakeTxGraph(cluster_size_vbytes * WITNESS_SCALE_FACTOR),
+  ;; txmempool.cpp:179-181.
+  (graph (make-txgraph :max-cluster-count *cluster-count-limit*
+                       :max-cluster-size (* 4 *cluster-size-limit*)
+                       :fallback-order #'%graph-txid-order)
+         :type txgraph))
+
 (defun mempool-prioritise (mempool txid fee-delta)
   "Add FEE-DELTA satoshis to TXID's prioritisation (Core
 PrioritiseTransaction, txmempool.cpp:630-655). Deltas stack; a net-zero delta
@@ -457,97 +548,6 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
           for d = (- (aref ta i) (aref tb i))
           unless (zerop d) return (signum d)
           finally (return 0))))
-
-(defstruct mempool
-  "In-memory transaction pool."
-  ;; txid (byte vector) -> mempool-entry
-  (entries (bl.bytes:make-octets-hash-table) :type hash-table)
-  ;; wtxid (byte vector) -> txid  (BIP339 witness-txid lookup for getdata)
-  (by-wtxid (bl.bytes:make-octets-hash-table) :type hash-table)
-  ;; outpoint-key (byte vector) -> txid that spends it
-  (spent-outpoints (bl.bytes:make-octets-hash-table) :type hash-table)
-  ;; A LOWER BOUND on the entry-time of everything in ENTRIES -- no entry is
-  ;; older than this, and 0 means "unknown, sweep to find out". Core reads the
-  ;; first element of its entry_time index and stops there (CTxMemPool::Expire,
-  ;; txmempool.cpp:811-827), so its expiry sweep costs nothing when nothing has
-  ;; expired; ours walks a hash table, and LimitMempoolSize runs it after EVERY
-  ;; accepted transaction, which would make each acceptance O(mempool).
-  ;; A removal never invalidates the bound: taking entries out can only raise
-  ;; the true minimum.
-  (oldest-entry-time 0 :type integer)
-  ;; Sum of the entries' sigop-adjusted virtual sizes (Core totalTxSize,
-  ;; txmempool.h:191 "sum of all mempool tx's virtual sizes" —
-  ;; getmempoolinfo's "bytes").
-  (total-size 0 :type integer)
-  ;; Sum of the entries' modeled dynamic memory usage (Core cachedInnerUsage,
-  ;; txmempool.h:193). Pool-level usage — Core DynamicMemoryUsage(), the
-  ;; number the -maxmempool cap compares against — adds the per-entry
-  ;; container overheads on top; see MEMPOOL-DYNAMIC-USAGE.
-  (total-usage 0 :type integer)
-  ;; Maximum allowed MEMORY usage in bytes (Core -maxmempool * 1'000'000),
-  ;; compared against MEMPOOL-DYNAMIC-USAGE. The default form reads
-  ;; *MAX-MEMPOOL-BYTES* at MAKE-MEMPOOL time, so -maxmempool applies to the
-  ;; pool the node builds at startup without threading the value through.
-  (max-size *max-mempool-bytes* :type integer)
-  ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units).
-  ;; The default form reads *min-relay-fee-rate* at MAKE-MEMPOOL time, so
-  ;; -minrelaytxfee (applied before the node's mempool is built) takes effect.
-  (min-fee-rate *min-relay-fee-rate* :type integer)
-  ;; Rolling dynamic minimum fee rate (sat/kvB), raised when the mempool is full
-  ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
-  ;; rolling minimum fee. A DOUBLE, like Core's rollingMinimumFeeRate
-  ;; (txmempool.h:197): the decay is applied to the stored value and written
-  ;; back on every read, so keeping it as an integer would truncate once per
-  ;; read and the sum of those truncations dwarfs the decay itself.
-  (rolling-min-fee-rate 0.0d0 :type double-float)
-  ;; When the rolling minimum was last decayed (Core lastRollingFeeUpdate);
-  ;; a connected block restarts it.
-  (rolling-min-fee-time 0 :type integer)
-  ;; Has a block connected since the last bump (Core
-  ;; blockSinceLastRollingFeeBump, txmempool.h:196, false at construction)?
-  ;; While this is NIL the rolling minimum does not decay at all: the floor
-  ;; stays at the feerate that was just trimmed until a block has come in, so
-  ;; that "we don't allow txn to enter mempool with feerate equal to txn which
-  ;; were removed with no block in between" (TrimToSize, txmempool.cpp:873-875).
-  (block-since-rolling-fee-bump nil :type boolean)
-  ;; txid -> satoshi fee delta from prioritisetransaction (Core's mapDeltas).
-  ;; Deltas may exist for txs not (yet) in the mempool; applied on acceptance.
-  (deltas (bl.bytes:make-octets-hash-table) :type hash-table)
-  ;; txid -> T for locally-submitted transactions (sendrawtransaction) whose
-  ;; initial broadcast hasn't been confirmed yet (Core m_unbroadcast_txids,
-  ;; txmempool.h:286). A peer's getdata for the tx is the confirmation signal;
-  ;; until then the periodic re-announcement pass keeps re-relaying. Always a
-  ;; subset of ENTRIES: adds are gated on membership, removal drops the txid.
-  (unbroadcast (bl.bytes:make-octets-hash-table) :type hash-table)
-  ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
-  ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
-  (orphan-pool (make-orphan-pool) :type orphan-pool)
-  ;; Monotonic admission counter (Core CTxMemPool::m_sequence_number,
-  ;; txmempool.h:202, initialized to 1): each accepted tx records the current
-  ;; value and increments it. MEMPOOL-SEQUENCE reads the counter (Core
-  ;; GetSequence()) for the per-peer last-inv-sequence snapshots.
-  (next-sequence 1 :type (unsigned-byte 64))
-  ;; Edits that changed no MEMBERSHIP but did change what a block template
-  ;; would contain -- prioritisations (Core ++nTransactionsUpdated at
-  ;; txmempool.cpp:642). MEMPOOL-TRANSACTIONS-UPDATED derives the rest of the
-  ;; counter from admissions and removals; this is the part no population
-  ;; count can show.
-  (non-membership-updates 0 :type (unsigned-byte 64))
-  ;; The cluster/chunk engine (Core TxGraph), maintained in lockstep with
-  ;; ENTRIES on every mutation. AUTHORITATIVE since the P4-P6 flips for
-  ;; mining (chunk-walk block builder), eviction (worst-chunk trim), and the
-  ;; acceptance limits (64 tx / 101 kvB per cluster, enforced in MEMPOOL-ADD,
-  ;; so the graph never stays oversized). RBF economics flip in P7. The BFS
-  ;; parent/child machinery remains for RPC ancestor/descendant reporting,
-  ;; TRUC topology checks, and mempool.dat ordering, with the P3 shadow
-  ;; equivalence asserts as the standing safety net.
-  ;; The graph's limit is in WEIGHT, the configured one in vbytes: Core's
-  ;; MakeTxGraph(cluster_size_vbytes * WITNESS_SCALE_FACTOR),
-  ;; txmempool.cpp:179-181.
-  (graph (make-txgraph :max-cluster-count *cluster-count-limit*
-                       :max-cluster-size (* 4 *cluster-size-limit*)
-                       :fallback-order #'%graph-txid-order)
-         :type txgraph))
 
 (defun mempool-cluster-count-limit (mempool)
   "The pool's cluster transaction-count limit -- Core
@@ -894,7 +894,7 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
 
 (defun mempool-find-parents (mempool tx)
   "Return the distinct txids of TX's inputs that are themselves in the mempool."
-  (let ((seen (make-hash-table :test 'equalp))
+  (let ((seen (bl.bytes:make-octets-hash-table))
         (result '()))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
       (let ((ptxid (bl.ser:outpoint-hash
@@ -908,7 +908,7 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
   "BFS from SEED-TXIDS following LINK-ACCESSOR (parents or children of an entry).
 Returns a hash-set (txid -> t) of all reached txids (excluding the seeds unless
 they are reachable from each other). Bounded by the 64-tx cluster limit."
-  (let ((found (make-hash-table :test 'equalp))
+  (let ((found (bl.bytes:make-octets-hash-table))
         (queue (copy-list seed-txids)))
     (loop while queue
           do (let ((txid (pop queue)))
@@ -928,7 +928,7 @@ they are reachable from each other). Bounded by the 64-tx cluster limit."
                              (loop for k being the hash-keys of (mempool-entry-parents entry)
                                    collect k)
                              #'mempool-entry-parents)
-        (make-hash-table :test 'equalp))))
+        (bl.bytes:make-octets-hash-table))))
 
 (defun mempool-descendants (mempool txid)
   "Hash-set of all in-mempool descendant txids of TXID (excluding TXID itself)."
@@ -938,7 +938,7 @@ they are reachable from each other). Bounded by the 64-tx cluster limit."
                              (loop for k being the hash-keys of (mempool-entry-children entry)
                                    collect k)
                              #'mempool-entry-children)
-        (make-hash-table :test 'equalp))))
+        (bl.bytes:make-octets-hash-table))))
 
 (defun %stats-over (mempool txid-set seed-entry)
   "Return (values count vsize fees) over SEED-ENTRY plus every entry in TXID-SET."
@@ -1471,7 +1471,7 @@ The acceptance path is full-RBF UNCONDITIONALLY — signaling is not consulted
 (defun find-rbf-conflicts (mempool tx)
   "Distinct txids of mempool txs that directly conflict with TX (spend a common
 outpoint). Generalizes mempool-check-conflict, which returns only the first."
-  (let ((seen (make-hash-table :test 'equalp)) (result '()))
+  (let ((seen (bl.bytes:make-octets-hash-table)) (result '()))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx) result)
       (let* ((prevout (bl.ser:tx-in-previous-output input))
              (key (make-outpoint-key
@@ -1499,7 +1499,7 @@ a hash-set's keys), skipping any that are absent or handle-less."
   "The full set a replacement of DIRECT-CONFLICTS evicts, as a txid hash-set:
 each conflict and all its in-mempool descendants (Core GetEntriesForConflicts
 -> CalculateDescendants)."
-  (let ((replaced (make-hash-table :test 'equalp)))
+  (let ((replaced (bl.bytes:make-octets-hash-table)))
     (dolist (ctxid direct-conflicts replaced)
       (setf (gethash ctxid replaced) t)
       (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
@@ -1794,7 +1794,7 @@ because any prefix of the staged additions forms only smaller clusters (and
 the package-RBF evictions that precede the adds only shrink clusters
 further)."
   (let ((graph (mempool-graph mempool))
-        (staged (make-hash-table :test 'equalp))   ; txid -> handle
+        (staged (bl.bytes:make-octets-hash-table))   ; txid -> handle
         (handles '()))
     (unwind-protect
          (progn
@@ -1811,7 +1811,7 @@ further)."
                  ;; In-package parents: inputs spending an already-staged
                  ;; member (MEMBERS is topologically sorted, so parents are
                  ;; staged before their spenders). Dedupe multi-input spends.
-                 (let ((seen (make-hash-table :test 'equalp)))
+                 (let ((seen (bl.bytes:make-octets-hash-table)))
                    (bl.ser:dovector
                        (input (bl.ser:transaction-inputs tx))
                      (let* ((ptxid (bl.ser:outpoint-hash

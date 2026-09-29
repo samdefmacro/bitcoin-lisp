@@ -817,13 +817,13 @@ node-lock) run concurrently without crashing or deadlocking."
   "A loopback peer that delivers DELIVERED-BYTES and then goes silent forever,
 while the reader is about to ask for ANNOUNCED-BYTES. Returns
 (VALUES connection client-socket server-socket listener)."
+  (declare (ignore announced-bytes))
   (let* ((listener (usocket:socket-listen "127.0.0.1" 0
                                           :element-type '(unsigned-byte 8)))
          (port (usocket:get-local-port listener))
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
-    (declare (ignore announced-bytes))
     (write-sequence (make-array delivered-bytes :element-type '(unsigned-byte 8)
                                                 :initial-element 7)
                     (usocket:socket-stream client))
