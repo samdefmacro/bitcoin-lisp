@@ -857,9 +857,11 @@
   -externalip (LOCAL_MANUAL, at its own port or GetListenPort), the Tor
   onion service, and under `*DISCOVER*` -- Core's fDiscover, on unless a
   real -proxy, -listen=0 or -externalip soft-sets it off -- the bound
-  address (`ADD-BOUND-LOCAL-ADDRESS`, LOCAL_BIND) and, when listening on
-  the wildcard, every interface address getifaddrs reports
-  (`DISCOVER-LOCAL-ADDRESSES`, LOCAL_IF). Both learned kinds use Core's full
+  address (`ADD-BOUND-LOCAL-ADDRESS`, LOCAL_BIND) and, when the node binds
+  on the wildcard (no -bind, no -whitebind: Core's bind_on_any, whether or
+  not it listens), every interface address getifaddrs reports
+  (`DISCOVER-LOCAL-ADDRESSES`, LOCAL_IF, run at start by
+  BITCOIN-LISP:ADD-DISCOVERED-LOCALS). Both learned kinds use Core's full
   IsRoutable (`ADDRESS-PUBLICLY-ROUTABLE-P`), never the dial predicate that
   keeps RFC1918 dialable: a container or LAN address is not advertised.
 
@@ -969,7 +971,13 @@
   jumps disconnect nobody. Behind that gate are Core's rules themselves:
   nothing ever sent or received inside the first -peertimeout seconds,
   nothing SENT for TIMEOUT_INTERVAL, nothing RECEIVED for TIMEOUT_INTERVAL,
-  and an unfinished handshake. The receive rule is suspended while a peer
+  and an unfinished handshake. The verdicts are asked where Core asks them:
+  an unfinished handshake by the thread driving it, between the 50 ms
+  waits of its blocking reads (`CALL-WITH-INACTIVITY-VERDICT` binds
+  `*INACTIVITY-VERDICT*`), which then closes the socket in that pass -- the
+  sync thread never touches a handshake's socket; a ready peer's rules and
+  MaybeSendPing on every idle tick after its messages (CHECK-PEERS-HEALTH),
+  as SendMessages follows ProcessMessages. The receive rule is suspended while a peer
   is send-paused, because our pump -- unlike Core's socket thread -- stops
   READING a paused peer, so its last-recv would measure our own pause;
   CONNECTION-SEND-STALLED-P, which additionally wants data pending, stays
