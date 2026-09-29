@@ -100,6 +100,8 @@ hash.cpp. src/crypto/.")
    ;; secp256k1 ECDSA
    #:verify-signature
    #:check-signature-encoding
+   #:valid-signature-encoding-p
+   #:defined-hashtype-signature-p
    #:parse-public-key
    #:public-key-valid-p
    #:decompress-public-key
