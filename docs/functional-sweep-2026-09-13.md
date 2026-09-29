@@ -1667,6 +1667,16 @@ two above. `feature_block`, `feature_dbcrash`, `feature_pruning` and
 `p2p_ping` time out under the parallel 150 s cap and pass serially, as
 before.
 
+Deployed: both live nodes to `ceaf9994` on 2026-09-29. testnet4 first: its
+14.25 M coins converted to Core's chainstate format in two minutes (about
+100 k coins/s on the server's disk), the block filter index in 10 s, the
+coinstats index in 221 s, the txindex in place; all three indexes synced at
+the tip, no error line. Then mainnet, after a clean stop: 400,530,565 coins
+-- more than twice the 180 M the batch had budgeted for -- converted in 31
+minutes, the chainstate shrank from 32 GB to 11 GB under Core's compressed
+records, the filter index migrated in 5.5 s, and the pruned node came back
+at its tip with no error line. Neither node needed `-reindex`.
+
 ### Decisions recorded in Round 9
 
 - **Core's chainstate (coins) LevelDB format is ported** -- the decision Round
