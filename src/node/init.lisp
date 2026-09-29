@@ -2777,12 +2777,9 @@ START-NODE-FROM-ARGS builds on it."
 CLI arguments override the config file. This is the argv-friendly entry point —
  e.g. from a saved image's toplevel, or (start-node-from-args
 '(\"-chain=main\" \"-txindex\" \"-dbcache=2000\" \"-server\")).
-INIT-CONFIG is what %READ-INIT-CONFIG already returned for ARGS, when the
-caller read the config first (NODE-MAIN reads it before -help/-version, as
-Core's ParseArgs runs InitConfig once): the files are read ONCE, so a config
-warning Core writes to stderr -- the -includeconf-from-an-included-file one
-that feature_includeconf.py:59 compares the whole of stderr against -- is
-written once.
+INIT-CONFIG is %READ-INIT-CONFIG's plist when the caller read the config
+first (NODE-MAIN, before -help/-version): the files are read ONCE, as Core's
+InitConfig runs once, so a stderr warning is written once (feature_includeconf.py:59).
 
 The data directory and network are resolved from the CLI first (so the config
 file can be located and its [network] section scoped), then the merged config
@@ -2964,8 +2961,7 @@ Core's behaviour and what assert_start_raises_init_error reads."
   (setf bl.log:*fatal-error-shutdown-function*
         (lambda (message)
           (request-node-shutdown message :exit-code +node-exit-error+)))
-  (let ((args (rest sb-ext:*posix-argv*))
-        (init-config nil))
+  (let ((args (rest sb-ext:*posix-argv*)) init-config)
     (handler-case
         (cond
           ;; -version and -help print and exit 0 before anything is started,
@@ -2977,9 +2973,7 @@ Core's behaviour and what assert_start_raises_init_error reads."
           ;; unreadable or malformed config file and an invalid chain
           ;; combination are refused before -help and -version too. The
           ;; checks signal on a refusal; this clause never selects anything.
-          ((progn (check-cli-args args)
-                  (setf init-config (%read-init-config args))
-                  nil))
+          ((progn (check-cli-args args) (setf init-config (%read-init-config args)) nil))
           ((%argv-asks-for args '("version"))
            (format t "~A~A" (%daemon-version-line) (bl.tools:tool-license-info))
            (finish-output)
