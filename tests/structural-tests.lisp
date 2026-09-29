@@ -1524,7 +1524,6 @@ accessor of a struct defined by a macro, say) is skipped, not flagged."
 
 (defparameter +top-package-upward-baseline+
   '(
-    ("src/networking/peer.lisp" . "bl:*mainnet-relay-enabled*")
     ("src/networking/protocol.lisp" . "bl:rebalance-caches-on-ibd-exit")
     ("src/networking/protocol.lisp" . "bl:+pow-target-spacing-seconds+")
     ("src/rpc/blockchain.lisp" . "bl:chainstate-coins-cache-budget")
@@ -1535,11 +1534,8 @@ accessor of a struct defined by a macro, say) is skipped, not flagged."
     ("src/rpc/mempool.lisp" . "bl:broadcast-transaction-to-peers")
     ("src/rpc/mempool.lisp" . "bl:load-mempool-from-disk")
     ("src/rpc/net.lisp" . "bl:peers-of-conn-type")
-    ("src/rpc/net.lisp" . "bl:+target-block-relay-peers+")
-    ("src/rpc/net.lisp" . "bl:*pending-test-connections*")
     ("src/rpc/net.lisp" . "bl:parse-node-endpoint")
     ("src/rpc/node.lisp" . "bl:request-node-shutdown")
-    ("src/rpc/node.lisp" . "bl:*log-file-path*")
     ("src/rpc/node.lisp" . "bl:node-indexes")
     ("src/validation/block.lisp" . "bl:gate-block-write-on-disk-space")
     ("src/validation/block.lisp" . "bl:effective-prune-target-bytes")
@@ -1549,8 +1545,9 @@ accessor of a struct defined by a macro, say) is skipped, not flagged."
   "Pinned (file . \"bl:name\") pairs a src file reaches upward into the top
 package -- 77 distinct pairs on the scanner's first run (wave F, after the
 validation interface took validation's and the mempool's fourteen away),
-22 once src/node/state.lisp loaded early (wave F2); allowed only to
-shrink. What remains is node machinery reached from rpc, networking and
+22 once src/node/state.lisp loaded early (wave F2), 18 once the four node
+globals the RPC handlers and the protocol name were defined in config.lisp
+and node/state.lisp (2026-09-29); allowed only to shrink. What remains is node machinery reached from rpc, networking and
 validation by name -- snapshot chainstates, the flush budget, the
 disk-space gate, peer endpoints, shutdown -- each a candidate to move
 down or to announce through the validation interface. Each entry is a layer boundary the code crosses by name; the

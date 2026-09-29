@@ -364,39 +364,6 @@ node could not mine at all under `-testactivationheight=segwit@N' the last time
 a construction site was left behind."
   (>= height (get-segwit-activation-height network)))
 
-;;; Policy vs Consensus Flag Separation
-;;;
-;;; Bitcoin Core distinguishes MANDATORY (consensus) flags from STANDARD (policy) flags.
-;;; Mandatory flags are required for block validation. Standard flags add policy
-;;; restrictions for mempool acceptance and transaction relay.
-
-(alexandria:define-constant +standard-policy-flags+
-  '("STRICTENC" "MINIMALDATA" "DISCOURAGE_UPGRADABLE_NOPS"
-    "CLEANSTACK" "MINIMALIF" "NULLFAIL" "LOW_S"
-    "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "WITNESS_PUBKEYTYPE"
-    "CONST_SCRIPTCODE" "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
-    "DISCOURAGE_OP_SUCCESS" "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
-  :test #'equalp :documentation "Policy flags layered on top of mandatory consensus flags for mempool acceptance
-(Core STANDARD_SCRIPT_VERIFY_FLAGS minus MANDATORY_SCRIPT_VERIFY_FLAGS =
-STANDARD_NOT_MANDATORY_VERIFY_FLAGS, policy/policy.h:118-134).")
-
-(alexandria:define-constant +mandatory-script-verify-flags+
-  '("P2SH" "DERSIG" "NULLDUMMY" "CHECKLOCKTIMEVERIFY"
-    "CHECKSEQUENCEVERIFY" "WITNESS" "TAPROOT")
-  :test #'equalp :documentation "Core MANDATORY_SCRIPT_VERIFY_FLAGS (policy/policy.h:104-110): the flags all
-NEW transactions must comply with. A height-independent CONSTANT in Core —
-distinct from GetBlockScriptFlags/compute-script-flags-for-height, which gate
-each flag on its activation height for block (consensus) validation.")
-
-(alexandria:define-constant +standard-script-verify-flags+ (format nil "~{~A~^,~}" (append +mandatory-script-verify-flags+
-                                  +standard-policy-flags+))
-  :test #'equalp :documentation "Core STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-133) as the
-comma-separated flag string the script engine consumes: the mandatory set
-plus every policy flag. This is what MemPoolAccept::PolicyScriptChecks runs
-(validation.cpp:1140) — a constant, not a per-height computation, because
-the mempool only ever validates against the current tip where every
-deployment is active.")
-
 (alexandria:define-constant +always-on-block-script-flags+
   '("P2SH" "WITNESS" "TAPROOT")
   :test #'equalp :documentation "The flags Core turns on for EVERY block, whatever its height
@@ -3151,13 +3118,6 @@ zmq.lisp), as Core's do by ChainstateRole."
 
 ;;;; Block connection
 
-(defun %ibd-latch ()
-  "Core's IsInitialBlockDownload as FindFilesToPrune asks it
-(node/blockstorage.cpp:356): the latch's current value, READ and not updated.
-SYMBOL-VALUE because protocol.lisp, which defines the latch, compiles after
-this file."
-  (symbol-value 'bl.net:*cached-is-ibd*))
-
 (defun connect-block (block chain-state block-store utxo-set
                       &key fee-estimator recent-rejects mempool)
   "Connect a validated block to the chain.
@@ -3340,7 +3300,7 @@ Handles chain reorganizations when a competing chain has more work."
                               block-store chain-state
                               :on-prune #'delete-undo-file
                               :target-bytes (bl:effective-prune-target-bytes)
-                              :initial-block-download-p (%ibd-latch))))
+                              :initial-block-download-p bl.net:*cached-is-ibd*)))
                  (when (> pruned 0)
                    (bl:log-info "Pruned ~D old block~:P" pruned))))))
 

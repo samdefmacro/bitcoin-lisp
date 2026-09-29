@@ -80,6 +80,11 @@ version, as Core writes its CLIENT_VERSION.")
   "getwalletinfo's deprecated walletversion field: Core reports the latest
 legacy minversion 169900 for backwards compatibility (rpc/wallet.cpp:86-90).")
 
+(defconstant +wallet-timestamp-window+ 7200
+  "Core chain.h TIMESTAMP_WINDOW (= MAX_FUTURE_BLOCK_TIME): the slack applied
+to key/birth timestamps when deciding which blocks could contain relevant
+transactions.")
+
 ;;; --- Output types (Core outputtype.{h,cpp}) ---
 
 (alexandria:define-constant +output-types+ '(:legacy :p2sh-segwit :bech32 :bech32m)
@@ -2333,7 +2338,6 @@ method Core's client.cpp lists -- migratewallet's two arguments were the only
 rows left out. Answering Core's own sentence also tells an operator who ran
 the migration why there is nothing to migrate, where an unknown-command error
 would suggest the node is too old."
-  (declare (ignore passphrase))
   (let* ((manager (node-wallet-manager-checked node))
          (name (%ensure-unique-wallet-name wallet-name))
          (loaded (bt:with-recursive-lock-held ((wallet-manager-lock manager))
