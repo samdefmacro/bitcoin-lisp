@@ -370,6 +370,53 @@ unconditionally, so a witnessless prefilled transaction went out as a
     (is (equalp (bl.ser:block-txn-request-block-hash request) block-hash))
     (is (equal (bl.ser:block-txn-request-indexes request) indexes))))
 
+(defun %cmpct-minimal-tx-hex ()
+  "One input, no outputs, no witness: the smallest transaction the wire form
+reads without taking the witness-marker branch."
+  (concatenate 'string "01000000" "01" (make-string 64 :initial-element #\0)
+               "00000000" "00" "ffffffff" "00" "00000000"))
+
+(test getblocktxn-index-above-uint16-is-refused
+  "Core BlockTransactionsRequest keeps its indexes in a std::vector<uint16_t>
+through DifferenceFormatter, whose Unser throws `differential value overflow'
+for an absolute index above 65535 (blockencodings.h:25-33): the message fails
+to deserialize, it does not reach the out-of-bounds Misbehaving check. 65535
+itself decodes. Found by the fuzz target blocktransactionsrequest-deserialize."
+  (let ((hash (make-string 64 :initial-element #\a)))
+    (is (equal '(65535)
+               (bl.ser:block-txn-request-indexes
+                (bl.ser:parse-getblocktxn-payload
+                 (bl.crypto:hex-to-bytes (concatenate 'string hash "01" "fdffff"))))))
+    (signals bl.err:serialization-error
+      (bl.ser:parse-getblocktxn-payload
+       (bl.crypto:hex-to-bytes (concatenate 'string hash "01" "fe00000100"))))
+    (signals bl.err:serialization-error
+      (bl.ser:parse-getblocktxn-payload
+       (bl.crypto:hex-to-bytes (concatenate 'string hash "02" "fdffff" "00"))))))
+
+(test cmpctblock-prefilled-index-is-a-uint16
+  "Core PrefilledTransaction reads its differential index with
+COMPACTSIZE(uint16_t), which throws `CompactSize exceeds limit of type' above
+65535 (blockencodings.h:74-80, serialize.h CompactSizeFormatter), and
+CBlockHeaderAndShortTxIDs refuses more than 65535 transactions in all --
+`indexes overflowed 16 bits' (blockencodings.h:118-123)."
+  (let ((head (concatenate 'string (make-string 160 :initial-element #\0) "0000000000000000")))
+    (signals bl.err:serialization-error
+      (bl.ser:parse-cmpctblock-payload
+       (bl.crypto:hex-to-bytes
+        (concatenate 'string head "00" "01" "fe00000100" (%cmpct-minimal-tx-hex)))))
+    (let* ((short-ids 50000) (prefilled 15536)
+           (payload (with-output-to-string (o)
+                      (write-string head o)
+                      (format o "fd~2,'0x~2,'0x" (ldb (byte 8 0) short-ids) (ldb (byte 8 8) short-ids))
+                      (dotimes (i short-ids) (write-string "000000000000" o))
+                      (format o "fd~2,'0x~2,'0x" (ldb (byte 8 0) prefilled) (ldb (byte 8 8) prefilled))
+                      (dotimes (i prefilled)
+                        (write-string "00" o)
+                        (write-string (%cmpct-minimal-tx-hex) o)))))
+      (signals bl.err:serialization-error
+        (bl.ser:parse-cmpctblock-payload (bl.crypto:hex-to-bytes payload))))))
+
 (test short-txid-in-compact-block
   "Short txids in compact blocks should round-trip correctly."
   ;; Test via compact block serialization which uses short txids internally
