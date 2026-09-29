@@ -10,9 +10,6 @@
 (defconstant +fee-history-size+ 1008
   "Number of blocks to keep in fee history (~1 week).")
 
-(defconstant +fee-stats-flush-interval+ 10
-  "Flush fee stats to disk every N blocks.")
-
 ;;;; Block fee statistics
 
 (defstruct block-fee-stats
@@ -37,65 +34,6 @@
   (data-directory nil :type (or null pathname))
   ;; Blocks since last flush
   (blocks-since-flush 0 :type (unsigned-byte 16)))
-
-;;;; Fee rate calculation
-
-(defun calculate-tx-fee-rate (tx spent-utxos-map)
-  "Calculate the fee rate (sat/vB) for a transaction given spent UTXO values.
-TX is a transaction, SPENT-UTXOS-MAP maps (txid . index) to utxo-entry.
-Returns the fee rate as an integer, or NIL if inputs cannot be resolved."
-  (let ((total-input 0)
-        (total-output 0))
-    ;; Sum input values from spent UTXOs
-    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
-      (let* ((prevout (bl.ser:tx-in-previous-output input))
-             (prev-txid (bl.ser:outpoint-hash prevout))
-             (prev-index (bl.ser:outpoint-index prevout))
-             (utxo-entry (gethash (cons prev-txid prev-index) spent-utxos-map)))
-        (unless utxo-entry
-          (return-from calculate-tx-fee-rate nil))
-        (incf total-input (bl.store:utxo-entry-value utxo-entry))))
-    ;; Sum output values
-    (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
-      (incf total-output (bl.ser:tx-out-value output)))
-    ;; Calculate fee rate (fee / vsize)
-    (let ((fee (- total-input total-output))
-          (vsize (bl.ser:transaction-vsize tx)))
-      (if (and (> fee 0) (> vsize 0))
-          (ceiling fee vsize)
-          0))))
-
-(defun compute-block-fee-stats (block spent-utxos height)
-  "Compute fee statistics for a block given its spent UTXOs.
-SPENT-UTXOS is a list of (txid index utxo-entry) from apply-block-to-utxo-set.
-Returns a block-fee-stats struct, or NIL if block has no fee-paying transactions."
-  (let ((transactions (bl.ser:bitcoin-block-transactions block))
-        (fee-rates '()))
-    ;; Build lookup map for spent UTXOs
-    (let ((spent-map (make-hash-table :test 'equalp)))
-      (dolist (spent spent-utxos)
-        (destructuring-bind (txid index entry) spent
-          (setf (gethash (cons txid index) spent-map) entry)))
-      ;; Calculate fee rates for non-coinbase transactions
-      (dolist (tx (rest transactions))  ; Skip coinbase
-        (let ((rate (calculate-tx-fee-rate tx spent-map)))
-          (when (and rate (> rate 0))
-            (push rate fee-rates)))))
-    ;; Need at least one fee-paying transaction
-    (when (null fee-rates)
-      (return-from compute-block-fee-stats nil))
-    ;; Sort fee rates for percentile calculation
-    (setf fee-rates (sort fee-rates #'<))
-    (let* ((count (length fee-rates))
-           (median (nth (floor count 2) fee-rates))
-           (low (nth (floor (* count 0.1)) fee-rates))
-           (high (nth (min (1- count) (floor (* count 0.9))) fee-rates)))
-      (make-block-fee-stats
-       :height height
-       :median-rate median
-       :low-rate low
-       :high-rate high
-       :tx-count count))))
 
 ;;;; Fee estimator operations
 
@@ -274,12 +212,6 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
       (error (e)
         (bl:log-warn "Failed to load fee stats: ~A" e)
         nil))))
-
-(defun maybe-flush-fee-stats (estimator)
-  "Flush fee stats to disk if enough blocks have accumulated."
-  (when (>= (fee-estimator-blocks-since-flush estimator)
-            +fee-stats-flush-interval+)
-    (save-fee-stats estimator)))
 
 (defconstant +fee-flush-interval-seconds+ 3600
   "Core FEE_FLUSH_INTERVAL (policy/fees/block_policy_estimator.h:27): the

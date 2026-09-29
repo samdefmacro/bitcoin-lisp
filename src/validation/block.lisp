@@ -3124,7 +3124,14 @@ zmq.lisp), as Core's do by ChainstateRole."
 Updates chain state and UTXO set.
 Every enabled index folds the block in through the connect hook
 (INDEX-BLOCK-CONNECTED over the node's index list; nothing is passed here).
-Optionally updates FEE-ESTIMATOR with block fee statistics.
+FEE-ESTIMATOR is passed on to PERFORM-REORG and collects nothing. It used to
+take a fee-rate percentile of every block's transactions -- per transaction,
+through two EQUALP tables, for every block of IBD -- and write
+fee_estimates.dat every ten blocks; Core keeps no per-block statistics (its
+CBlockPolicyEstimator::processBlock learns only from the transactions the
+mempool removed for the block, policy/fees/block_policy_estimator.cpp:669-716)
+and flushes hourly and at shutdown, and nothing here read them
+(ESTIMATE-FEE-RATE answers from the policy estimator alone).
 Optionally clears RECENT-REJECTS on chain reorganization.
 When MEMPOOL is provided, removes the block's confirmed/conflicting txs from it
 (the single removal chokepoint — every connect path, IBD or relay, goes here).
@@ -3232,14 +3239,7 @@ Handles chain reorganizations when a competing chain has more work."
                (setf spent-utxos (bl.store:apply-block-to-utxo-set
                                        utxo-set block new-height))
                (%warn-if-undo-empty block hash new-height spent-utxos)
-               (store-undo-data hash spent-utxos new-height :block block)
-               ;; Record fee statistics for fee estimation
-               (when fee-estimator
-                 (let ((stats (bl.mp:compute-block-fee-stats
-                               block spent-utxos new-height)))
-                   (when stats
-                     (bl.mp:fee-estimator-add-stats fee-estimator stats)
-                     (bl.mp:maybe-flush-fee-stats fee-estimator)))))
+               (store-undo-data hash spent-utxos new-height :block block))
              ;; Core's fee estimator learns from this block: for every
              ;; transaction it was tracking, how many blocks that feerate waited
              ;; (processBlock). Untracked txids are ignored, so the whole block
@@ -3533,7 +3533,7 @@ UTXO set). Restores the UTXO set, chain tip, and index-entry statuses
 to exactly the OLD-TIP-ENTRY state, so a rejected fork leaves the node
 on its original chain — never half-reorged.
 
-Side effects (indexes / fee-estimator / mempool) are deferred to
+Side effects (indexes / mempool) are deferred to
 perform-reorg's success phase, so there is nothing to undo here."
   ;; 1. Disconnect the fork blocks we applied, newest-first (reverse of the
   ;;    application order). spent-utxos is the undo data apply returned.
@@ -4264,11 +4264,11 @@ when it was rolled back."
 
     (values t nil)))
 
-(defun %reorg-commit (r chain-state utxo-set mempool fee-estimator recent-rejects
+(defun %reorg-commit (r chain-state utxo-set mempool recent-rejects
                       &key max-readd-blocks)
   "PHASE C of a reorg: the observable side effects, committed only once the
 whole fork has validated and applied -- wallet and ZMQ notifications, the
-indexes, the fee estimator, the mempool removals and the disconnected-tx
+indexes, the mempool removals and the disconnected-tx
 re-add. Deferred to here so a rolled-back reorg leaves every one of them
 untouched, and an INTERRUPTED one commits exactly the blocks that moved.
 
@@ -4306,11 +4306,6 @@ relay filters."
 (let ((connected-signals '()))
 (dolist (item (reverse (reorg-connected r)))
   (destructuring-bind (entry block height spent-utxos) item
-    (when fee-estimator
-      (let ((stats (bl.mp:compute-block-fee-stats
-                    block spent-utxos height)))
-        (when stats
-          (bl.mp:fee-estimator-add-stats fee-estimator stats))))
     ;; Index under the block-index ENTRY's hash — the block index is
     ;; the canonical identity (Core BaseIndex writes are keyed off
     ;; the CBlockIndex), and BLOCK here was re-read from disk so a
@@ -4434,7 +4429,6 @@ inject invalid blocks.) SKIP-SCRIPTS mirrors the IBD checkpoint optimization and
 is threaded from the caller.
 
 Optionally updates TX-INDEX if provided and enabled.
-Optionally updates FEE-ESTIMATOR with block fee statistics.
 Clears RECENT-REJECTS if provided (reorg may change transaction validity).
 When MEMPOOL is provided, removes connected blocks' txs from it and re-adds the
 disconnected blocks' txs (best-effort, re-validated against the new tip).
@@ -4446,14 +4440,19 @@ ABORT-ON-DISCONNECT-FAILURE, T by default, makes a disconnect that cannot run
 (validation.cpp:3234-3243); InvalidateBlock passes NIL, because Core's
 InvalidateBlock returns false on a failed DisconnectTip and nothing more
 (validation.cpp:3614-3622).
-Side effects (indexes / fee-estimator / mempool / recent-rejects) are applied
+Side effects (indexes / mempool / recent-rejects) are applied
 only after the whole fork validates, so a rolled-back reorg leaves them untouched.
 
 A stop request (shutdown / sync pause) TRUNCATES the reorg at the next block
 boundary and returns (VALUES NIL :INTERRUPTED): the chain is left on whatever
 block the coins reached — never rolled back, never half-applied — and the side
 effects below are committed for exactly the blocks that moved. See the section
-comment above."
+comment above.
+
+FEE-ESTIMATOR is accepted and unused: the per-block fee statistics it once
+collected have no Core counterpart and nothing read them (see CONNECT-BLOCK);
+Core's estimator learns from the mempool's removals alone."
+  (declare (ignore fee-estimator))
   (with-chainstate-mutex (perform-reorg)
     (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
       (unless fork-entry
@@ -4598,7 +4597,7 @@ comment above."
                               skip-scripts)
             (unless ok (return-from perform-reorg (values nil error))))
 
-          (%reorg-commit r chain-state utxo-set mempool fee-estimator
+          (%reorg-commit r chain-state utxo-set mempool
                          recent-rejects :max-readd-blocks max-readd-blocks))))))
 
 ;;;; Chain-control helpers (invalidateblock / reconsiderblock)

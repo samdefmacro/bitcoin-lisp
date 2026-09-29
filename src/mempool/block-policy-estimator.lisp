@@ -439,7 +439,14 @@ against the number of blocks it waited."
     (tx-confirm-stats-clear-current stats height)
     (tx-confirm-stats-update-moving-averages stats))
   (let ((counted 0))
-    (dolist (txid confirmed)
+    ;; Core hands processBlock only the transactions the mempool removed for
+    ;; this block (txs_removed_for_block, txmempool.cpp removeForBlock), so an
+    ;; empty mempool -- every block of IBD -- costs it no per-transaction work
+    ;; at all (policy/fees/block_policy_estimator.cpp:699-702). Ours is handed
+    ;; the whole block; with nothing tracked, every lookup would miss, so none
+    ;; is made.
+    (dolist (txid (and (plusp (hash-table-count (block-policy-estimator-tracked est)))
+                       confirmed))
       (let ((entry (gethash txid (block-policy-estimator-tracked est))))
         (when entry
           (let ((blocks-to-confirm (- height (first entry)))

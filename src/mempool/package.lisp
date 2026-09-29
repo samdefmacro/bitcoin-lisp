@@ -20,7 +20,6 @@ src/mempool/.")
    #:*max-mempool-bytes*
    #:+default-min-relay-fee-rate+
    #:+fee-history-size+
-   #:+fee-stats-flush-interval+
    ;; FeeFrac (Core util/feefrac.{h,cpp})
    #:feefrac
    #:make-feefrac
@@ -253,14 +252,11 @@ src/mempool/.")
    #:fee-estimator-blocks-since-flush
    #:fee-estimator-add-stats
    #:fee-estimator-get-history
-   #:calculate-tx-fee-rate
-   #:compute-block-fee-stats
    ;; Fee stats persistence
    #:save-fee-stats
    #:load-fee-stats
    #:arm-fee-estimate-flush-clock
    #:maybe-flush-fee-estimates
-   #:maybe-flush-fee-stats
    ;; Core CBlockPolicyEstimator (G7-21)
    #:*block-policy-estimator*
    #:make-block-policy-estimator

@@ -295,6 +295,61 @@ transactions are still tracked. Drives the real connect-block."
        (is (= 0 (%bpe-tracked-count est))))
      (clear-undo-cache))))
 
+;;;; --- No per-block statistics ---
+
+(test connect-block-keeps-no-per-block-fee-statistics
+  "Core's fee estimator learns from a block only through the transactions the
+mempool removed for it (CBlockPolicyEstimator::processBlock,
+policy/fees/block_policy_estimator.cpp:669-716); it keeps no statistics of
+the block's own transactions. Ours also took a fee-rate percentile of every
+connected block -- per transaction, through two EQUALP tables, 3-4% of the
+round-10 IBD profile -- that nothing read (ESTIMATE-FEE-RATE answers from the
+policy estimator alone), and wrote fee_estimates.dat every ten blocks.
+
+A block with one fee-paying transaction connects with a fee estimator
+attached; the estimator's block history stays empty. Control: the block
+connected and its transaction's input was spent."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture "no-block-fee-stats")
+      (let* ((legacy (bl.mp:make-fee-estimator))
+             (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+             (spend (pkg-tx funding 0 99990000))
+             (block1 (make-reorg-test-block genesis-hash
+                                            (first (make-test-chain-hashes #xD0 1)) 1)))
+        (bl.store:add-utxo utxo-set funding 0 100000000 (p2sh-optrue-script-pubkey) 0)
+        (setf (bl.ser:bitcoin-block-transactions block1)
+              (append (bl.ser:bitcoin-block-transactions block1) (list spend))
+              (bl.ser:block-header-merkle-root (bl.ser:bitcoin-block-header block1))
+              (bl.val:compute-merkle-root
+               (mapcar #'bl.ser:transaction-hash (bl.ser:bitcoin-block-transactions block1))))
+        (bl.val:connect-block block1 chain-state block-store utxo-set
+                              :fee-estimator legacy)
+        (is (= 1 (bl.store:current-height chain-state)) "control: the block connected")
+        (is (null (bl.store:get-utxo utxo-set funding 0))
+            "control: the fee-paying transaction was applied")
+        (is (= 0 (bl.mp:fee-estimator-entry-count legacy))
+            "no statistics of the block's own transactions are kept"))
+      (clear-undo-cache))))
+
+(test an-estimator-tracking-nothing-still-rolls-the-block
+  "With nothing tracked, BPE-PROCESS-BLOCK makes no per-transaction lookup --
+Core's processBlock is handed an empty vector for an empty mempool -- but the
+block itself is still processed exactly as before: the best height moves, the
+circular buffers roll, no first-recorded height is set, and the block's
+transactions are counted in the log line as ours always were."
+  (let ((est (bl.mp:make-block-policy-estimator)))
+    (setf (%bpe-best-height est) 10)
+    (let ((text (nth-value 1 (log-text-of
+                              "estimatefee"
+                              (lambda ()
+                                (bpe-add-block est 11 (list (bpe-test-id 3 1 1)
+                                                            (bpe-test-id 3 1 2))))))))
+      (is (= 11 (%bpe-best-height est)))
+      (is (= 0 (%bpe-tracked-count est)))
+      (is (= 0 (%bpe-first-recorded est)))
+      (is-true (search "updated by 0 of 2 block txs" text) "~S" text))))
+
 ;;;; --- Persistence ---
 
 (defun %bpe-bytes (est)
