@@ -4359,9 +4359,11 @@ very block it is delivering is what p2p_sendheaders.py:567 catches."
             (when direct-fetch (headers-direct-fetch peer chain-state last-entry))
             added)))))))
 
-(defconstant +header-sync-silent-passes+ 50
+(defvar *header-sync-silent-passes* 50
   "Pump passes with NO headers message from the chosen peer before header sync
-calls it silent and the caller rotates (~10s at the pass sleep below).")
+calls it silent and the caller rotates (~10s at the pass sleep below). A
+special rather than a constant so a test can bind a shorter budget: the
+starvation test sat out the whole ten seconds on every battery run.")
 
 (defconstant +header-sync-quiet-passes+ 5
   "Pump passes after the peer's LAST answer before header sync returns. Short on
@@ -4486,7 +4488,7 @@ keeping. Core has no header-sync loop at all for the same reason."
                   idle 0)
             (incf idle)))
       (when (>= idle (if (= last-answer answered-before)
-                         +header-sync-silent-passes+
+                         *header-sync-silent-passes*
                          +header-sync-quiet-passes+))
         (return))
       (sleep 0.2))

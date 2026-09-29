@@ -248,6 +248,7 @@ headerssync.cpp. src/networking/.")
    #:header-sync-candidate-p
    #:consider-headers-sync-timeouts
    #:header-sync-peer
+   #:*header-sync-silent-passes*
    #:broadcast-initial-getheaders
    #:handle-validation-failure
    #:peer-last-getheaders-time

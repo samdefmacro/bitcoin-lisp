@@ -4300,16 +4300,16 @@ second peer sends a headers message; that second peer must still be served."
                            (usocket:socket-stream talker-client))
            (force-output (usocket:socket-stream talker-client))
            (sleep 0.2)
-           ;; The whole silent budget (+HEADER-SYNC-SILENT-PASSES+, ~10 s): a
-           ;; constant, so a test cannot shorten it -- the LET that meant to
-           ;; bound a +HEADER-SYNC-IDLE-PASSES+ 3 here named a constant that
-           ;; no longer exists and bound nothing the callee could see.
-           (multiple-value-bind (received stalled)
-               (bl.net:sync-headers
-                quiet state :ctx ctx
-                :utxo-set (bl.store:make-utxo-set))
-             (declare (ignore received))
-             (is-true stalled "the chosen peer never answered, so rotate"))
+           ;; A short silent budget (three passes, ~0.6 s) instead of the
+           ;; real ~10 s: the question is whether the OTHER peer is served
+           ;; while header sync waits, not how long it waits.
+           (let ((bl.net:*header-sync-silent-passes* 3))
+             (multiple-value-bind (received stalled)
+                 (bl.net:sync-headers
+                  quiet state :ctx ctx
+                  :utxo-set (bl.store:make-utxo-set))
+               (declare (ignore received))
+               (is-true stalled "the chosen peer never answered, so rotate")))
            (is (plusp (bl.net::%peer-headers-bytes talker))
                "the OTHER peer was served while header sync waited")
            (is (= 0 (bl.net::%peer-headers-bytes quiet))
