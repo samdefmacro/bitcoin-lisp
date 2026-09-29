@@ -226,6 +226,16 @@ the way Core's does (dbwrapper.cpp:232/237)."
 ;;;; directory is moved as it is, in one rename(2) per index -- atomic on one
 ;;;; file system, seconds whatever the size -- and nothing is rebuilt.
 
+(alexandria:define-constant +index-display-names+
+  '((:txindex . "txindex")
+    (:blockfilter . "basic block filter index")
+    (:coinstats . "coinstatsindex")
+    (:txospenderindex . "txospenderindex"))
+  :test #'equalp
+  :documentation "Each index's name as Core's GetName() gives it (txindex.cpp,
+blockfilterindex.cpp:79, coinstatsindex.cpp:91, txospenderindex.cpp:64), the
+name the move's log lines and its refusal use.")
+
 (defun %tree-holds-a-file-p (dir)
   "T when some FILE exists anywhere under DIR. An index directory holding only
 empty directories (ENSURE-DIRECTORIES-EXIST makes them freely) holds no index."
@@ -302,7 +312,7 @@ an open LevelDB leaves it writing new tables at the old path. START-NODE calls
 this right after LOCK-DATA-DIRECTORIES."
   (let ((moves '()))
     (dolist (which '(:txindex :blockfilter :coinstats :txospenderindex))
-      (let ((label (string-downcase (symbol-name which)))
+      (let ((label (cdr (assoc which +index-display-names+)))
             (legacy (merge-pathnames
                      (cdr (assoc which +legacy-index-subdirectories+)) data-dir))
             (root (%core-index-root data-dir which))
@@ -326,7 +336,7 @@ and restart; nothing was moved."
                (push (list label legacy core) moves)))))
     (let ((lifted (%lift-filter-files data-dir)))
       (when lifted
-        (push (list "blockfilter fltr files"
+        (push (list "basic block filter index's filter files"
                     (uiop:pathname-directory-pathname (car (first lifted)))
                     (uiop:pathname-directory-pathname (cdr (first lifted))))
               moves)))
