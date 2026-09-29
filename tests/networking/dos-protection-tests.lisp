@@ -837,6 +837,73 @@ while the reader is about to ask for ANNOUNCED-BYTES. Returns
 file (the :: ratchet); seven tests drive it."
   (bl.net::receive-bytes-resumable conn count))
 
+(test the-resumable-reader-takes-buffered-bytes-whole-and-never-waits
+  "DRAIN-AVAILABLE-BYTES copies what the socket stream's own buffer holds as one
+block (it took every byte through LISTEN and READ-BYTE, 11.3% of the round-10
+IBD profile). Pin: the bytes that come out are exactly the bytes that went in,
+in order, across reads that end inside a segment and reads that ask for more
+than has arrived; and a read that asks for more than has arrived returns what
+is there instead of waiting for the rest -- the reader runs on the shared pump.
+The sender stays open throughout, so a drain that waited would hang, and the
+reads run on a thread the test abandons after five seconds."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (client (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
+         (conn (make-test-connection :socket server :connected t))
+         (sent (let ((v (make-array 300000 :element-type '(unsigned-byte 8))))
+                 (dotimes (i (length v) v)
+                   (setf (aref v i) (mod (* 7 (+ i (floor i 251))) 256)))))
+         (out (usocket:socket-stream client))
+         (result nil))
+    (unwind-protect
+         (progn
+           ;; 100 bytes, then a read of 24 (ends inside the segment) and a read
+           ;; of 1,000 (asks for more than has arrived: must not wait).
+           (write-sequence sent out :end 100)
+           (force-output out)
+           (sleep 0.2)
+           (let ((reader
+                   (bt:make-thread
+                    (lambda ()
+                      (handler-case
+                          (let ((header (%resumable-read conn 24))
+                                (partial (%resumable-read conn 1000)))
+                            (setf result (list header partial)))
+                        (error (e) (setf result (list :error (princ-to-string e))))))
+                    :name "test-drain-reader")))
+             (let ((deadline (+ (get-internal-real-time) (* 5 internal-time-units-per-second))))
+               (loop until (or result (> (get-internal-real-time) deadline))
+                     do (sleep 0.02)))
+             (is-true result "the reads returned instead of waiting for bytes never sent")
+             (when (and result (not (eq (first result) :error)))
+               (is (equalp (subseq sent 0 24) (first result)) "the first 24 bytes, whole")
+               (is (eq :incomplete (second result))
+                   "76 of 1,000 bytes is an incomplete read, not a wait"))
+             (unless result (ignore-errors (bt:destroy-thread reader))))
+           ;; The rest in uneven segments; the resumed read of 1,000 completes
+           ;; with bytes 24..1023, then one read takes everything left.
+           (loop for (a b) on '(100 1500 1501 70000 70001 299999 300000) by #'cdr
+                 while b
+                 do (write-sequence sent out :start a :end b)
+                    (force-output out))
+           (sleep 0.3)
+           (let ((got (loop repeat 50
+                            for r = (%resumable-read conn 1000)
+                            unless (eq r :incomplete) return r
+                            do (sleep 0.02))))
+             (is (equalp (subseq sent 24 1024) got) "the resumed read's bytes, in order"))
+           (let ((got (loop repeat 50
+                            for r = (%resumable-read conn (- 300000 1024))
+                            unless (eq r :incomplete) return r
+                            do (sleep 0.02))))
+             (is (equalp (subseq sent 1024) got) "everything else, byte for byte")))
+      (ignore-errors (usocket:socket-close client))
+      (ignore-errors (usocket:socket-close server))
+      (ignore-errors (usocket:socket-close listener)))))
+
 (defun %readiness-probe-name ()
   "The readiness probe the resumable reader consults between its two drains.
 Named once so a test can script the segment that lands between them."

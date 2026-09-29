@@ -918,6 +918,20 @@ the peer instead, which stops us reading its input."
       (bl.log:log-cat "net" "socket send error: ~A" e)
       (%connection-failed conn :send-error))))
 
+(defun %stream-buffered-octets (stream)
+  "How many bytes STREAM's own input buffer already holds: bytes a READ-SEQUENCE
+of that many takes without waiting, because none of them is still on the
+socket. 0 for a stream whose buffer cannot be seen, which leaves the caller on
+the byte-at-a-time path."
+  #+sbcl
+  (if (typep stream 'sb-sys:fd-stream)
+      (let ((ibuf (sb-impl::fd-stream-ibuf stream)))
+        (if ibuf
+            (- (sb-impl::buffer-tail ibuf) (sb-impl::buffer-head ibuf))
+            0))
+      0)
+  #-sbcl (progn stream 0))
+
 (defun drain-available-bytes (stream buffer start end)
   "Copy every byte STREAM can supply right now into BUFFER[START..END), without
 ever blocking. Returns the new fill pointer; a return equal to START means
@@ -926,22 +940,30 @@ nothing was available, which at EOF is how the caller learns the peer closed
 nothing-yet-arrived are the same answer here — the caller distinguishes them by
 having been told the socket was readable).
 
-This is the whole reason the readers cannot use READ-SEQUENCE: READ-SEQUENCE
-fills its whole range or hits EOF, and a socket stream that runs dry mid-range
-waits internally with no deadline of its own. LISTEN answers the only question
-that keeps the reader safe — is there a byte I can take without waiting — so
-draining byte-by-byte is bounded by construction. It is also fast: measured at
-~95 MB/s on the project container, i.e. ~40 ms for a maximum-size block, which
-is noise next to that block's script validation."
+READ-SEQUENCE alone cannot do this: it fills its whole range or hits EOF, and
+a socket stream that runs dry mid-range waits internally with no deadline of
+its own. So the range handed to it is never more than the stream's own buffer
+already holds (%STREAM-BUFFERED-OCTETS) -- a copy out of memory, which cannot
+wait. When that buffer is empty but LISTEN says the socket has more, one
+READ-BYTE refills it from the socket (the bytes are there, so it does not wait
+either) and the next turn copies the refill as a block.
+
+It used to take every byte through LISTEN and READ-BYTE: the round-10 IBD
+profile (2,100 regtest blocks of ~925 KB synced over P2P) put 11.3% of all
+samples under it, one generic stream call pair per byte of every block."
   (loop while (and (< start end) (listen stream))
-        do (let ((byte (read-byte stream nil nil)))
-             ;; LISTEN said a byte was there; NIL would mean it vanished, which
-             ;; cannot happen on a stream we alone read. Stop rather than store
-             ;; a bogus value.
-             (unless byte
-               (return-from drain-available-bytes start))
-             (setf (aref buffer start) byte)
-             (incf start)))
+        do (let ((buffered (min (%stream-buffered-octets stream) (- end start))))
+             (if (plusp buffered)
+                 (setf start (read-sequence buffer stream
+                                            :start start :end (+ start buffered)))
+                 (let ((byte (read-byte stream nil nil)))
+                   ;; LISTEN said a byte was there; NIL would mean it vanished,
+                   ;; which cannot happen on a stream we alone read. Stop
+                   ;; rather than store a bogus value.
+                   (unless byte
+                     (return-from drain-available-bytes start))
+                   (setf (aref buffer start) byte)
+                   (incf start)))))
   start)
 
 (defconstant +min-receive-bytes-per-second+ 16384
