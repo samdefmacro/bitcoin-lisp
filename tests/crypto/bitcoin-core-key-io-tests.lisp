@@ -406,3 +406,23 @@ The strings and the expected answers are rpc_invalid_address_message.py's
         (valid "BCRT1QPLMTZKC2XHARPPZDLNPAQL78RSHJ68U33RAH7R")
         (valid "bcrt1qdg3myrgvzw7ml9q0ejxhlkyxm7vl9r56yzkfgvzclrf4hkpx9yfqhpsuks")
         (valid "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn")))))
+
+(test wif-with-an-invalid-scalar-is-no-secret
+  "Core DecodeSecret (key_io.cpp:209-229) hands the 32 bytes to CKey::Set,
+which keeps them only when secp256k1_ec_seckey_verify accepts them
+(key.cpp CKey::Check): a well-formed WIF over zero or over a value at or above
+the group order decodes to an INVALID key, and every caller treats that as no
+key. Ours returned the bytes, so pk(<such a WIF>) died in the pubkey
+derivation with a crypto error instead of Core's `key ... is not valid'.
+Found by the fuzz target key-io."
+  (flet ((wif (fill) (bl.crypto:private-key-to-wif
+                      (make-array 32 :element-type '(unsigned-byte 8) :initial-element fill)
+                      :network :mainnet)))
+    (is (null (bl.crypto:wif-to-private-key (wif 0))))
+    (is (null (bl.crypto:wif-to-private-key (wif 255))))
+    (is (null (bl.crypto:wif-to-private-key
+               (bl.crypto:private-key-to-wif
+                (bl.crypto:hex-to-bytes
+                 "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+                :network :mainnet))))
+    (is (bl.crypto:wif-to-private-key (wif 1)) "a valid scalar still decodes")))
