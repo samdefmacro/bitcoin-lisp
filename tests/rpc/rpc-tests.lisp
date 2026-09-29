@@ -3070,7 +3070,6 @@ confirmed spendable coins (vouts 0..n-1 of the fixture's funding txid), so a
 saved mempool can be reloaded against it. Use (bl:node-mempool node)
 for the pool."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
-    (declare (ignore mempool))
     (loop for i from 1 below funding-outputs
           do (bl.store:add-utxo utxo-set funding-txid i 100000000
                                             (p2sh-optrue-script-pubkey) 1 :coinbase nil))
@@ -4967,9 +4966,12 @@ is the sync thread's half."
   ;; The hazard is real: the slot is (UNSIGNED-BYTE 32), so a raw -1 signals.
   ;; Asserted rather than assumed, because if the slot type ever widened this
   ;; test would otherwise keep passing while testing nothing.
-  (let ((ctx (bl.net::make-ibd)))
+  (let ((ctx (bl.net::make-ibd))
+        ;; Read, not written as a literal: a literal -1 into the typed slot is
+        ;; a compile-time type WARNING, which is the very thing asserted here.
+        (unknown (parse-integer "-1")))
     (signals error
-      (setf (bl.net::ibd-context-target-height ctx) -1))
+      (setf (bl.net::ibd-context-target-height ctx) unknown))
     (finishes
       (setf (bl.net::ibd-context-target-height ctx) 0)))
   ;; And START-IBD clamps before it stores, so the sync thread never gets
@@ -5387,16 +5389,16 @@ rpc_help.py passing."
   ;; Named individually, because "22 missing" is not actionable and this is.
   (multiple-value-bind (core-json core-strings) (%parse-core-client-cpp)
     (when core-json
+      ;; ⚠️ REGISTER FIRST. *RPC-METHODS* is populated by
+      ;; REGISTER-ALL-METHODS at node start-up, so a battery that has not
+      ;; started a node sees an EMPTY table and reports every Core method
+      ;; as missing — which is how this assertion failed after four
+      ;; methods were ADDED. Whether it has already run does not matter:
+      ;; registration is idempotent.
+      (ignore-errors (bl.rpc::register-all-methods))
       (let* ((core-methods (remove-duplicates
                             (mapcar #'first (append core-json core-strings))
                             :test #'string=))
-             ;; ⚠️ REGISTER FIRST. *RPC-METHODS* is populated by
-             ;; REGISTER-ALL-METHODS at node start-up, so a battery that has not
-             ;; started a node sees an EMPTY table and reports every Core method
-             ;; as missing — which is how this assertion failed after four
-             ;; methods were ADDED. Whether it has already run does not matter:
-             ;; registration is idempotent.
-             (ignore-errors (bl.rpc::register-all-methods))
              (missing (remove-if (lambda (m) (gethash m bl.rpc::*rpc-methods*))
                                  core-methods)))
         ;; Zero since migratewallet was registered: every method Core lists
@@ -6869,6 +6871,7 @@ policy estimator and nothing else."
           (progn
             (setf (fdefinition 'bl.mp:estimate-fee-rate)
                   (lambda (conf-target &key mode)
+                    (declare (ignorable mode))
                     ,@(when mode-out `((setf ,mode-out mode)))
                     (values ,rate ,error-msg (or ,returned-target conf-target))))
             ,@body)

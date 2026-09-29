@@ -205,7 +205,7 @@ serializes as 33 zero bytes -- and each invalid nonce named by its index."
 byte from the vector's fixed secret nonce, and verifying; the error cases
 refused where the BIP says -- and the used secnonce refused by us BEFORE
 libsecp, which would abort the process on it."
-  (loop for (indices aggnonce signer expected)
+  (loop for (indices aggnonce nil expected) ; the third column names the signer
           in '(((0 1 2) 0 0 "012ABBCB52B3016AC03AD82395A1A415C48B93DEF78718E62A7A90052FE224FB")
                ((1 0 2) 0 1 "9FF2F7AAA856150CC8819254218D3ADEEB0535269051897724F9DB3789513A52")
                ((1 2 0) 0 2 "FA23C359F6FAC4E7796BB93BC9F0532A95468C539BA20FF86D7C76ED92227900")
@@ -213,7 +213,6 @@ libsecp, which would abort the process on it."
         do (multiple-value-bind (session cache)
                (%mu-session (%mu-pick *mu-sv-pubkeys* indices)
                             (nth aggnonce *mu-sv-aggnonces*) *mu-sv-msg*)
-             (declare (ignore signer))
              (let* ((secnonce (%mu-secnonce-from-vector (first *mu-sv-secnonces*)))
                     (psig (bl.crypto:musig-partial-sign secnonce *mu-sv-sk* cache session)))
                (is (string= expected (%mu-hex psig)))

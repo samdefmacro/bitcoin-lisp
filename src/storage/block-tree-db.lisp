@@ -561,19 +561,19 @@ startup, which forces a full write rather than relying on this key."
     changed))
 
 (defun %store-file-sizes (block-store)
-  "BLOCK-STORE's file number -> BLOCK-FILE-INFO table and the used size of the
-file it is appending to, as (values TABLE CURSOR-FILE CURSOR-POS), or NIL."
+  "BLOCK-STORE's file number -> BLOCK-FILE-INFO table and the used size of each
+file a cursor is appending to, as (values TABLE CURSORS) with CURSORS an alist
+ (file . used-size) -- both of them while a snapshot is loaded -- or NIL."
   (when block-store
     (values (block-store-file-info block-store)
-            (block-store-cursor-file block-store)
-            (block-store-cursor-pos block-store))))
+            (block-store-cursors block-store))))
 
 (defun %batch-file-info (db batch block-store)
   "Add to BATCH the 'f' record of every file whose value changed since it was
 last written, and the 'l' record. Returns an alist (file . value) of what was
 added, to be remembered once the batch has committed."
   (let ((written '()))
-    (multiple-value-bind (table cursor-file cursor-pos) (%store-file-sizes block-store)
+    (multiple-value-bind (table cursors) (%store-file-sizes block-store)
       (when table
         (let ((last-file (block-tree-db-last-file-written db)))
           (flet ((put (file value)
@@ -583,7 +583,7 @@ added, to be remembered once the batch has committed."
                      (push (cons file value) written))))
             (maphash (lambda (file info)
                        (put file (encode-block-file-info
-                                  info :size (when (eql file cursor-file) cursor-pos))))
+                                  info :size (cdr (assoc file cursors)))))
                      table)
             ;; A file the store no longer accounts for was pruned: Core resets
             ;; its record to an empty CBlockFileInfo (PruneOneBlockFile,
@@ -593,7 +593,7 @@ added, to be remembered once the batch has committed."
                   unless (gethash file table)
                     do (put file (encode-block-file-info (make-block-file-info)))))
           ;; Core writes nLastFile with every batch (MaxBlockfileNum).
-          (let ((max-file (max cursor-file
+          (let ((max-file (max (reduce #'max cursors :key #'car)
                                (loop for f being the hash-keys of table maximize f))))
             (unless (eql max-file last-file)
               (leveldb-writebatch-put batch *last-block-file-key*

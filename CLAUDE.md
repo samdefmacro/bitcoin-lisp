@@ -133,7 +133,7 @@ special defined later in the tree is no longer tolerated either: define it
 before its first use (`scripts/check-undefined-variables.sh`), because a
 `let` of a not-yet-declared special binds LEXICALLY and 2026-09-29 that had
 every BIP125 replacement announced with the caller's removal reason -- and
-on an unused variable in src/ (`scripts/check-unused-variables.sh`): ASDF's
+on an unused variable in src/ or tests/ (`scripts/check-unused-variables.sh`): ASDF's
 compilation unit defers those warnings past compile-file's failure-p, so a
 from-scratch build otherwise passes with them buried in the transcript —
 2026-08-28 it hid a `setf` of a deleted defvar and six docstrings cut short
@@ -144,7 +144,11 @@ the file being compiled so one from `refs/coalton` is not ours): SBCL reports
 that as a STYLE-WARNING only, so the build passes and the call signals
 `SB-INT:SIMPLE-PROGRAM-ERROR` when it runs — or, inside an `ignore-errors`,
 nothing at all, which is how a test's `(bt:join-thread th :timeout 5)` sat
-there never joining the thread it named.
+there never joining the thread it named. And on a DEFSTRUCT compiled after code
+that reads its accessors (`scripts/check-struct-order.sh`): the reader gets a
+full call where the slot read should be inlined, a style warning again --
+define a struct before its first reader, earlier in its file or in the
+sub-system's `types.lisp`.
 
 **Changing a MACRO (or a defstruct's layout) needs a FRESH FASL volume** —
 the cold lane is not "compiles fresh": it mounts a persistent per-checkout

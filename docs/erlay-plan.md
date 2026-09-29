@@ -1,6 +1,6 @@
 # Erlay / BIP330 Transaction Reconciliation — Implementation Plan
 
-Date: 2026-07-10. Status (2026-09-29): **P0-P4 DONE, verified against every oracle that exists** — P0 live-loop wiring (PRs 242/243), P1 handshake, P2-P4 (PRs 387-390) behind default-off `-txreconciliation`. Round 9 (2026-09-29) checked the sketches against Core's vendored minisketch (vectors from its pyminisketch.py; the decoder is now a port of sketch_impl.h), the short IDs and round messages against BIP-330, and ran two of our nodes through whole rounds over a real connection. The boundary with Core at the pin is in §6.
+Date: 2026-07-10. Status (2026-09-29): **P0-P4 DONE, verified against every oracle that exists** — P0 live-loop wiring (PRs 242/243), P1 handshake, P2-P4 (PRs 387-390) behind default-off `-txreconciliation`. Round 9 (2026-09-29) checked the sketches against Core's vendored minisketch (vectors from its pyminisketch.py; the decoder is now a port of sketch_impl.h), Round 10 against the minisketch C++ library itself, byte for byte, the short IDs and round messages against BIP-330, and ran two of our nodes through whole rounds over a real connection. The boundary with Core at the pin is in §6.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core Erlay/BIP330 + minisketch; our networking layer).
 
@@ -108,7 +108,7 @@ missing wtxids; failure: one extension round (`reqsketchext`) then full-flood fa
 | **P0** | ✅ **DONE 2026-07-10** (PRs 242 + 243, deployed): live-loop wiring + `maintain-peers` + Core `IsInitialBlockDownload` latch; deploy verification exposed that `handle-inv` also dropped all MSG_WTX announcements — fixed (BIP339 announce/request both directions). testnet4 mempool fills from P2P; latch logged | S-M | **bug fix — done** |
 | **P1** | Core-parity sendtxrcncl: config flag (default off, DEBUG-style), message codec + handshake send/receive rules + verack forget + salt storage; `compute-recon-salt` tagged-hash with a vector generated from Core | S-M | Core parity ✅ |
 | P2 | ✅ (PRs 387-390, default off) per-peer recon sets + AddToSet in relay-transaction + fanout selection + timer | M | beyond Core |
-| P3 | ✅ pure-Lisp minisketch (GF(2^32), BM, trace roots); Round 9: decoder ported from sketch_impl.h, vectors from Core's pyminisketch (§6.1) | M | Core's vendored library (tests only) |
+| P3 | ✅ pure-Lisp minisketch (GF(2^32), BM, trace roots); Round 9: decoder ported from sketch_impl.h, vectors from Core's pyminisketch; Round 10: vectors from the C++ library itself (§6.1) | M | Core's vendored library (tests only) |
 | P4 | ✅ sketch exchange messages + extension + reconcildiff + flood fallback | M-L | beyond Core |
 
 **Recommendation: do P0 now (it's a bug), P1 whenever convenient (small), park P2-P4 until Core
@@ -120,7 +120,7 @@ merges the remainder** — revisit at the next ref bump.
 | Piece | Core d3056bc | Ours | Oracle it is held to |
 |-------|--------------|------|----------------------|
 | `sendtxrcncl` handshake, `PreRegisterPeer`/`RegisterPeer`/`ForgetPeer`, the salt combination (`ComputeSalt`, tag `"Tx Relay Salting"`, ascending order) | yes (node/txreconciliation.cpp, net_processing.cpp:3728-3742, :3879-3886, :3963-4014) | ported | Core source; `p2p_sendtxrcncl.py` (PASS); a truncated payload now takes Core's `ProcessMessages ... Exception caught` path and keeps the peer (:3994, :5283-5284) instead of our invented disconnect |
-| minisketch GF(2^32) sketches: add, serialize, merge, decode | vendored (src/minisketch/), used only by tests | pure-Lisp; decoder ported from sketch_impl.h | vectors from Core's `src/minisketch/tests/pyminisketch.py` (tests/data/minisketch_core_vectors.py: field, 14 serializations, Core's minisketch_tests.cpp scenario, 116 decode verdicts incl. every failure shape) + the C library's SQR/QRT tables. The C++ library itself cannot be built in the container (no C++ compiler in the runtime image): pyminisketch-vs-C is the one residual |
+| minisketch GF(2^32) sketches: add, serialize, merge, decode | vendored (src/minisketch/), used only by tests | pure-Lisp; decoder ported from sketch_impl.h | **the C++ library itself**, byte for byte: tests/data/minisketch_cpp_vectors.json, written through the C API (`minisketch_create(32, 0, c)`, add, serialize, merge, decode) and the library's Field32 by tests/data/minisketch_cpp_vectors.cpp, the library built as Core builds it (cmake/minisketch.cmake:54-57: 32-bit field, generic implementation): field products and inverses, 14 serializations, Core's minisketch_tests.cpp scenario at a narrow range and at its own (`both` < 10000), 116 decode verdicts incl. every failure shape, capacities 0/1/2/128/129/256 full and one past full, elements 0 and >= 2^32, 48 random sets with two max_counts each; every decode run under six splitting bases, one verdict. The same draws computed by `src/minisketch/tests/pyminisketch.py` (tests/data/minisketch_core_vectors.py) agree entry for entry (a test compares the files), and the C library's SQR/QRT tables are checked directly. Regenerate: `scripts/minisketch-cpp-vectors.sh` (below) |
 | Short ID `1 + (SipHash-2-4(k0,k1,wtxid) mod 0xFFFFFFFF)` | **absent** (no `ComputeShortID`, no `AddToSet`, no `ShouldFanoutTo` at the pin) | BIP-330 | BIP-330 text + Core's functional-test SipHash (vectors) |
 | Reconciliation sets and snapshots, fanout, round timer and timeout, q | **absent** | BIP-330 + named choices (`+recon-max-set-size+`, `+recon-round-interval-seconds+`, `+recon-default-q+` then BIP-330's q update, fanout shares, `+recon-max-sketch-capacity+` (ours, measured), `+recon-round-timeout-seconds+` (Core's GETDATA_TX_INTERVAL)) | properties + the two-node loopback test |
 | `reqrecon` / `sketch` / `reqsketchext` / `reconcildiff` | **absent** (protocol.h:266 ends at `sendtxrcncl`) | BIP-330 tables: reqrecon = uint16 set_size + uint16 q (q x (2^15-1)); the extension is the double-capacity sketch minus the part already sent | BIP-330 text |
@@ -173,8 +173,25 @@ Round 9, second phase (2026-09-29), each with a test red on the code before it:
 - **`+recon-max-sketch-capacity+` = 128 is OUR number** (decided 2026-09-29):
   a measured denial-of-service bound with no Core reference behind it.
 
-Left open: byte-exactness against the C++ minisketch itself, which needs a
-C++ toolchain in the container.
+Round 10 closed what Round 9 left open, byte-exactness against
+the C++ minisketch itself. `scripts/minisketch-cpp-vectors.sh [--keep-image]
+[--selftest N]` builds docker/minisketch-cpp.Dockerfile (the pinned
+`bitcoin-lisp-sbcl:2.6.5-4` plus g++ and make) under a per-checkout tag
+`bitcoin-lisp-sbcl:2.6.5-4-sketch-<checkout>`, compiles
+`refs/bitcoin/src/minisketch/` at d3056bc149 with Core's defines
+(`DISABLE_DEFAULT_FIELDS ENABLE_FIELD_32`) into build/minisketch-cpp/,
+links the generator, rewrites both JSON files, compares the sections they
+share (exit 1 on any difference), optionally builds and runs the library's
+own src/test.cpp at complexity N (all fields, as upstream builds it; 1
+passed), and removes the image. The run container has no network, no port,
+only the checkout mounted, and the caller's uid. The generator carries a
+port of CPython's Mersenne Twister, so both generators draw the same inputs
+from `random.Random(330)` and `random.Random(3301)`. The cold battery never
+needs the image: it reads the checked-in JSON. Result: the C++ library,
+pyminisketch and our port agree on every vector; no port change was needed.
+The CLMUL field implementations (x86_64 only) were not exercised on this
+arm64 host; they compute the same field, and Core picks whichever is
+fastest at start-up (node/minisketchwrapper.cpp:24-58).
 
 ## 7. Effort & risk
 

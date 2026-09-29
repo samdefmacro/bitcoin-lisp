@@ -7,17 +7,20 @@ library (same moduli, same odd-syndrome layout, same little-endian bit-packed
 serialization, same Berlekamp-Massey + Berlekamp-trace decode and the same
 failure verdicts), and Core's functional-test SipHash
 (test/functional/test_framework/crypto/siphash.py) for the BIP-330 short IDs.
-The C++ library itself cannot be compiled in the project container (the
-runtime image carries no C++ compiler), so this is the strongest executable
-Core oracle available there; the C library's own field tables
-(fields/generic_4bytes.cpp:88-90) are checked directly by the Lisp tests.
+The C++ library itself is the second oracle: tests/data/minisketch_cpp_vectors.cpp
+draws the same inputs (a port of CPython's Mersenne Twister) and computes
+every minisketch field with the library Core links, and
+scripts/minisketch-cpp-vectors.sh regenerates both files and compares the
+sections they share (the Lisp tests compare them too). The short IDs are
+BIP-330, not the library, and stay here only.
 
-Run inside the project container from the repository root:
+Run from the repository root, inside a container (the script does it):
 
-  scripts/dev.sh eval '(uiop:run-program (list "python3" "tests/data/minisketch_core_vectors.py") :output :string)'
+  scripts/minisketch-cpp-vectors.sh
 
-Deterministic: every random draw comes from random.Random(330), and a decode's
-answer is a sorted SET, independent of the random root-finding basis.
+Deterministic: every random draw comes from random.Random(330), or
+random.Random(3301) for the sections added with the C++ vectors, and a
+decode's answer is a sorted SET, independent of the random root-finding basis.
 """
 
 import hashlib
@@ -78,13 +81,12 @@ out["sketch"] = [{"elements": e, "capacity": c, "hex": sketch_of(e, c).serialize
 # --- Merge + decode: Core's own minisketch_tests.cpp scenario ----------------
 # (src/test/minisketch_tests.cpp:21-47: capacity 10, up to 10 differences
 # between two overlapping integer ranges), with its random draws taken here.
-recon = []
-for _ in range(12):
+def reconcile_case(rng, both_limit):
     errors = rng.randrange(11)
     start_a = 1 + rng.randrange(1000000000)
     a_not_b = rng.randrange(errors + 1)
     b_not_a = errors - a_not_b
-    both = rng.randrange(60)
+    both = rng.randrange(both_limit)
     end_a = start_a + a_not_b + both
     start_b = start_a + a_not_b
     end_b = start_b + both + b_not_a
@@ -92,11 +94,13 @@ for _ in range(12):
     b = sketch_of(range(start_b, end_b), 10)
     ha, hb = a.serialize().hex(), b.serialize().hex()
     a.merge(b)
-    recon.append({"start_a": start_a, "end_a": end_a, "start_b": start_b, "end_b": end_b,
-                  "capacity": 10, "max_count": errors,
-                  "hex_a": ha, "hex_b": hb, "hex_merged": a.serialize().hex(),
-                  "decoded": decode_hex(a.serialize().hex(), 10, errors)})
-out["reconcile"] = recon
+    return {"start_a": start_a, "end_a": end_a, "start_b": start_b, "end_b": end_b,
+            "capacity": 10, "max_count": errors,
+            "hex_a": ha, "hex_b": hb, "hex_merged": a.serialize().hex(),
+            "decoded": decode_hex(a.serialize().hex(), 10, errors)}
+
+
+out["reconcile"] = [reconcile_case(rng, 60) for _ in range(12)]
 
 # --- Decode verdicts, including every failure shape --------------------------
 dec = []
@@ -145,6 +149,37 @@ for s1, s2 in ((1, 2), (0, 0xFFFFFFFFFFFFFFFF), (rng.getrandbits(64), rng.getran
                     "wtxid_internal_hex": wtxid.hex(), "siphash": s,
                     "short_id": 1 + (s % 0xFFFFFFFF)})
 out["short_id"] = ids
+
+# --- Sections drawn from random.Random(3301), shared with the C++ vectors ------
+# tests/data/minisketch_cpp_vectors.cpp draws the same values and computes the
+# same fields with the C++ library; scripts/minisketch-cpp-vectors.sh compares
+# them. Every decode here passes max_count, as minisketch_decode always does.
+# The C++ file's element_edges section has no counterpart: pyminisketch's
+# add takes 1 <= element < 2^32 only, while the library masks wider values.
+rng2 = random.Random(3301)
+caps = []
+for cap in (0, 1, 2, 128, 129, 256):
+    for extra in (0, 1):
+        elements = [rng2.randrange(1, 1 << BITS) for _ in range(cap + extra)]
+        h = sketch_of(elements, cap).serialize().hex()
+        caps.append({"capacity": cap, "elements": elements, "hex": h,
+                     "decoded": decode_hex(h, cap, cap)})
+out["capacity"] = caps
+
+rnd = []
+for _ in range(48):
+    cap = rng2.randrange(1, 41)
+    n = rng2.randrange(0, cap + 3)
+    mc = rng2.randrange(0, cap + 1)
+    elements = [rng2.randrange(1, 1 << BITS) for _ in range(n)]
+    h = sketch_of(elements, cap).serialize().hex()
+    rnd.append({"capacity": cap, "elements": elements, "hex": h,
+                "decoded": decode_hex(h, cap, cap),
+                "max_count": mc, "decoded_max": decode_hex(h, cap, mc)})
+out["random"] = rnd
+
+# Core's minisketch_tests.cpp scenario at its own range (both < 10000).
+out["reconcile_wide"] = [reconcile_case(rng2, 10000) for _ in range(8)]
 
 path = os.path.join(ROOT, "tests/data/minisketch_core_vectors.json")
 with open(path, "w") as f:

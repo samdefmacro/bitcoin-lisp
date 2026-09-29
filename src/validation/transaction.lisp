@@ -430,11 +430,11 @@ Dust is only tolerated because it is ephemeral — created and destroyed inside
 one package, never left in the UTXO set for anyone to sweep. A child that
 spends a dust-carrying parent without also spending the dust would strand it,
 so the whole exemption depends on this check."
-  (let ((in-package (make-hash-table :test 'equalp)))
+  (let ((in-package (bl.bytes:make-octets-hash-table)))
     (dolist (tx txns)
       (setf (gethash (bl.ser:transaction-hash tx) in-package) tx))
     (dolist (tx txns)
-      (let ((processed (make-hash-table :test 'equalp))
+      (let ((processed (bl.bytes:make-octets-hash-table))
             ;; (parent-txid . index) of every unspent dust output of every
             ;; parent this tx spends from.
             (unspent-dust '()))

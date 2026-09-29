@@ -111,8 +111,7 @@ recovered to exactly the height the coins DB last committed."
      (multiple-value-bind (node cspath) (coins-db-node-fixture tag)
        (let ((bl:*node* node))
          (generate-regtest-blocks node 8)
-         (let* ((cs (bl:node-chain-state node))
-                (flushes 0)
+         (let* ((flushes 0)
                 ;; Budget 0 => size trigger after EVERY replayed block, so
                 ;; flush N happens right after block N is applied. The 3rd
                 ;; flush dies in the marker window: on disk the marker is at

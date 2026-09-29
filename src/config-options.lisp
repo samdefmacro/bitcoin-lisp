@@ -152,10 +152,6 @@
 ;; clamped to [0, 1000000] as LoadAddrman clamps it (addrdb.cpp:199).
 (define-option "checkaddrman" :type :int
   :apply (lambda (n) (setf bl.net:*addrman-check-ratio* (max 0 (min n 1000000)))))
-;; -migratedatadir: move a pre-Core datadir to Core's layout at startup,
-;; before any database is opened. No Core counterpart -- Core has only ever
-;; had this layout, so it has never needed a migration.
-(define-option "migratedatadir" :key :migrate-datadir :type :bool)
 ;; -pid: a supervisor's handle on this process. -nopid parses to "0", which
 ;; PID-FILE-PATH reads as Core reads IsArgNegated.
 (define-option "pid" :key :pid-file :type :string)
