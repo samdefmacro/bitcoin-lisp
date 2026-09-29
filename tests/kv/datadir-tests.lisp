@@ -265,7 +265,15 @@ which the same flat directory makes when Core's path is empty."
       (is-true (and message (search "exists both at" message)))
       (is-true (and message (search (namestring (merge-pathnames "txindex" dir)) message))))
     (is (equal "flat" (%dd-file-text (merge-pathnames "txindex/000003.log" dir))))
-    (is (equal "core" (%dd-file-text (merge-pathnames "indexes/txindex/000003.log" dir))))))
+    (is (equal "core" (%dd-file-text (merge-pathnames "indexes/txindex/000003.log" dir))))
+    ;; A later index in conflict: the earlier one, movable on its own, must
+    ;; not have been moved before the refusal either.
+    (uiop:delete-directory-tree (merge-pathnames "indexes/txindex/" dir) :validate t)
+    (%dd-fake-leveldb (merge-pathnames "coinstatsindex/" dir) "flat-cs")
+    (%dd-fake-leveldb (merge-pathnames "indexes/coinstatsindex/db/" dir) "core-cs")
+    (signals bl.err:init-error (bl.store:adopt-core-index-directories dir))
+    (is (equal "flat" (%dd-file-text (merge-pathnames "txindex/000003.log" dir)))
+        "the txindex was moved before the coinstatsindex refused the start")))
 
 (test fltr-files-left-inside-db-are-lifted-by-the-next-start
   "The rename into db/ and the lift of the fltr files are two steps; a crash

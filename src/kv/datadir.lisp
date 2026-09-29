@@ -310,30 +310,37 @@ records it did not mean to. Nothing is moved in that case.
 The node must hold the datadir lock and no index may be open: a rename under
 an open LevelDB leaves it writing new tables at the old path. START-NODE calls
 this right after LOCK-DATA-DIRECTORIES."
-  (let ((moves '()))
+  (let ((moves '())
+        (plan '()))
+    ;; Every refusal before any move, so a refusal really leaves nothing moved.
     (dolist (which '(:txindex :blockfilter :coinstats :txospenderindex))
       (let ((label (cdr (assoc which +index-display-names+)))
             (legacy (merge-pathnames
                      (cdr (assoc which +legacy-index-subdirectories+)) data-dir))
-            (root (%core-index-root data-dir which))
-            (core (merge-pathnames
-                   (cdr (assoc which +core-index-subdirectories+)) data-dir)))
-        (cond ((not (%tree-holds-a-file-p legacy))
-               (when (uiop:directory-exists-p legacy)
-                 (uiop:delete-directory-tree legacy :validate t)))
-              ((or (%tree-holds-a-file-p root)
-                   (%tree-holds-a-file-p (%index-db-staging-path root)))
-               (init-error "The ~A exists both at ~A, where this node kept it before, ~
+            (root (%core-index-root data-dir which)))
+        (when (%tree-holds-a-file-p legacy)
+          (when (or (%tree-holds-a-file-p root)
+                    (%tree-holds-a-file-p (%index-db-staging-path root)))
+            (init-error "The ~A exists both at ~A, where this node kept it before, ~
 and at ~A, where Bitcoin Core keeps it. Remove the one you do not want to keep ~
 and restart; nothing was moved."
-                           label
-                           (%path-without-trailing-slash legacy)
-                           (%path-without-trailing-slash root)))
-              (t
-               (when (uiop:directory-exists-p root)
-                 (uiop:delete-directory-tree root :validate t))
-               (%durable-rename legacy core)
-               (push (list label legacy core) moves)))))
+                        label
+                        (%path-without-trailing-slash legacy)
+                        (%path-without-trailing-slash root)))
+          (push (list which label legacy root) plan))))
+    (dolist (which '(:txindex :blockfilter :coinstats :txospenderindex))
+      (let ((legacy (merge-pathnames
+                     (cdr (assoc which +legacy-index-subdirectories+)) data-dir)))
+        (when (and (uiop:directory-exists-p legacy)
+                   (not (find which plan :key #'first)))
+          (uiop:delete-directory-tree legacy :validate t))))
+    (loop for (which label legacy root) in (nreverse plan)
+          for core = (merge-pathnames
+                      (cdr (assoc which +core-index-subdirectories+)) data-dir)
+          do (when (uiop:directory-exists-p root)
+               (uiop:delete-directory-tree root :validate t))
+             (%durable-rename legacy core)
+             (push (list label legacy core) moves))
     (let ((lifted (%lift-filter-files data-dir)))
       (when lifted
         (push (list "basic block filter index's filter files"
