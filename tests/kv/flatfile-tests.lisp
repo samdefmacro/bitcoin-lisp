@@ -575,7 +575,6 @@ so a silent NIL would let a pruned node stop reclaiming space without a word.
 This is also why the flag is off by default."
   (with-network (:mainnet)
    (%with-flat-store (store dir)
-     (declare (ignorable dir))
      (let ((hash (bl.store:store-block store (%ff-test-block 150))))
        (is-false (bl.store:prune-block store hash))
        (is-true (bl.store:get-block store hash)
@@ -590,7 +589,6 @@ window keeps the whole file — which is the trade the format makes, and the
 reason Core's unit is the file."
   (with-network (:mainnet)
    (%with-flat-store (store dir)
-     (declare (ignorable dir))
      ;; File 0 gets heights 10..12, and (pretending it rolled over) file 1
      ;; gets 20..22 by hand.
      (dolist (h '(10 11 12))
@@ -612,7 +610,6 @@ inside the window, so it is never deleted — the alternative is dropping a bloc
 the chain still needs. Storing without a height still stores the block."
   (with-network (:mainnet)
    (%with-flat-store (store dir)
-     (declare (ignorable dir))
      (let ((hash (bl.store:store-block store (%ff-test-block 170))))
        (is-true (bl.store:get-block store hash))
        (let ((info (gethash 0 (bl.store:block-store-file-info store))))
@@ -1405,6 +1402,7 @@ either redo work or skip blocks."
            (bl.store:migrate-blocks-to-flat-files
             store cs :max-blocks 100 :start-height 5)
          (is (= 2 migrated))
+         (is (= 7 next) "everything converted: resumes above the tip")
          (is (= 0 remaining)))))))
 
 (test migration-is-idempotent
@@ -1661,7 +1659,6 @@ body — one of them would have been missed."
   (dolist (network '(:regtest :testnet4 :mainnet))
     (let ((bl:*network* network))
       (%with-flat-store (store dir)
-        (declare (ignore dir))
         (let* ((hash (bl.store:network-genesis-hash network))
                (block (bl.store:get-block store hash)))
           (is-true block "~A: genesis body not served" network)
@@ -1673,7 +1670,6 @@ body — one of them would have been missed."
   ;; A hash that is nobody's genesis is still absent.
   (let ((bl:*network* :regtest))
     (%with-flat-store (store dir)
-      (declare (ignore dir))
       (is-false (bl.store:get-block
                  store (make-array 32 :element-type '(unsigned-byte 8)
                                       :initial-element 42))))))

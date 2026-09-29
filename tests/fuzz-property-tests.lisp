@@ -174,7 +174,7 @@ mistake."
         ;; One to three single-byte edits: enough to reach a different code
         ;; path, rarely enough to still parse.
         (dotimes (edit (1+ (mod (%fuzz-u64) 3)))
-          (declare (ignore edit))
+          (declare (ignorable edit))
           (setf (aref mutated (mod (%fuzz-u64) (length mutated)))
                 (ldb (byte 8 0) (%fuzz-u64))))
         (let ((tx (ignore-errors
@@ -270,7 +270,7 @@ handler written for the latter."
       (let* ((s (concatenate 'string
                              (with-output-to-string (o)
                                (dotimes (n depth)
-                                 (declare (ignore n))
+                                 (declare (ignorable n))
                                  (write-string "sh(" o)))
                              "1"
                              (make-string depth :initial-element #\))))
