@@ -932,13 +932,6 @@ per-peer index of CANDIDATE_BEST announcements (txrequest.cpp:595-624)."
         (setf to-send (%tx-request-schedule hash now to-send))))
     (%send-tx-getdatas to-send)))
 
-(defvar *cached-is-ibd* t
-  "Latched IBD status: starts true; initial-block-download-p latches it
-to false once the tip has enough work and is recent, and it never flips
-back for the life of the node (Core m_cached_is_ibd, validation.h:1049,
-latched by UpdateIBDStatus, validation.cpp:3314-3322). Re-set to T by
-reset-ibd-stop at node start.")
-
 (bl.vi:define-validation-hook :block-connected tx-request-block-connected
     (chainstate block block-hash height spent-utxos)
   "Core BlockConnected's tx-download half (txdownloadman_impl.cpp:98-110): a

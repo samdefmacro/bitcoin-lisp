@@ -109,6 +109,13 @@ atomic flag plus a one-byte self-pipe write, nothing else (node/shutdown.lisp
 %HANDLE-STOP-SIGNAL) — so no emit can re-enter another, and a recursive lock
 would only hide a future one.")
 
+(defvar *log-time-micros* nil
+  "Timestamp log lines to microseconds (Core -logtimemicros).")
+
+(defvar *log-thread-names* nil
+  "Prefix each log line with the writing thread's name (Core -logthreadnames).
+Core prints it as [threadname] after the timestamp.")
+
 (defun log-level-value (level)
   "Get numeric value for log LEVEL."
   (getf *log-levels* level 1))
@@ -447,13 +454,6 @@ success, NIL if CATEGORY is unknown (Bitcoin Core EnableCategory)."
 success, NIL if CATEGORY is unknown (Bitcoin Core DisableCategory)."
   (cond ((%log-category-all-p category) (clrhash *debug-categories*) t)
         ((log-category-known-p category) (remhash category *debug-categories*) t)))
-
-(defvar *log-time-micros* nil
-  "Timestamp log lines to microseconds (Core -logtimemicros).")
-
-(defvar *log-thread-names* nil
-  "Prefix each log line with the writing thread's name (Core -logthreadnames).
-Core prints it as [threadname] after the timestamp.")
 
 (defvar *log-ips* nil
   "Include peer addresses in log output (Core fLogIPs, logging.h:35 and

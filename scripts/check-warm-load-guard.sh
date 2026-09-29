@@ -3,13 +3,12 @@
 # (exec_workbench_eval_client / guarded_load_form).
 #
 # An ASDF load through the warm image must FAIL, visibly and with a non-zero
-# status, when it compiles a reference to an undefined variable that is not
-# an earmuffed special defined in the tree -- the same line the cold lane
-# fails on (scripts/check-undefined-variables.sh). SBCL defers that warning
-# past compile-file's failure-p, so without the guard the load returns
-# normally and the warm image silently holds a function that will signal
-# UNBOUND-VARIABLE when it runs (a docstring cut short by an unescaped quote
-# is the usual way to get one).
+# status, when it compiles a reference to an undefined variable -- the same
+# line the cold lane fails on (scripts/check-undefined-variables.sh). SBCL
+# defers that warning past compile-file's failure-p, so without the guard the
+# load returns normally and the warm image silently holds a function that
+# will signal UNBOUND-VARIABLE when it runs (a docstring cut short by an
+# unescaped quote is the usual way to get one).
 #
 # The control loads a throwaway ASDF system from build/ (git-ignored) twice:
 #   1. with a function that reads an undefined bare word -> must exit non-zero

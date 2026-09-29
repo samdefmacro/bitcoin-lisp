@@ -37,6 +37,7 @@ old blocks are Core's ChainstateRole::historical, which the wallet ignores
   "Reorg hook: let loaded wallets demote BLOCK's transactions (Core
 CWallet::blockDisconnected). Called from perform-reorg's commit phase,
 tip-first."
+  (declare (ignore block-hash))
   (let ((manager (%wallet-hook-manager)))
     (when (and manager
                (not (bl.store:chain-state-target-blockhash chainstate)))
@@ -48,6 +49,7 @@ tip-first."
 
 (bl.vi:define-validation-hook :transaction-added wallet-notify-mempool-tx-added (tx txid sequence)
   "Mempool hook: Core CWallet::transactionAddedToMempool."
+  (declare (ignore txid sequence))
   (let ((manager (%wallet-hook-manager)))
     (when manager
       (handler-case
@@ -60,6 +62,7 @@ tip-first."
   "Mempool hook: Core CWallet::transactionRemovedFromMempool. REASON :block
 is skipped — the wallet learns about mined txs from the block-connected
 hook (Core removeUnchecked, txmempool.cpp:269-275)."
+  (declare (ignore txid sequence))
   (unless (eq reason :block)
     (let ((manager (%wallet-hook-manager)))
       (when manager

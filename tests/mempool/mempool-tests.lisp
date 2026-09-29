@@ -4336,3 +4336,29 @@ Ours removed every block transaction first and the conflicts after."
         (is (= 1 (- (second (second order)) (second (first order))))
             "consecutive sequence numbers")))
     (is (= 0 (bl.mp:mempool-count mempool)))))
+
+(test replaced-removals-announce-reason-replaced
+  "A BIP125 replacement's evictions reach TransactionRemovedFromMempool with
+MemPoolRemovalReason::REPLACED (Core FinalizeSubpackage applies the changeset,
+validation.cpp:1235, and CTxMemPool::Apply removes its staged conflicts with
+RemoveStaged(..., REPLACED), txmempool.cpp:211). The
+shared acceptance tail bound the reason BEFORE the special was declared, so
+the binding was LEXICAL and invisible to MEMPOOL-REMOVE: the announcement
+carried whatever the caller's dynamic reason was -- NIL at top level, :REORG
+inside a reorg's re-add."
+  (dolist (outer '(nil :reorg))
+    (let* ((mempool (bl.mp:make-mempool))
+           (old (make-mempool-test-tx :input-id 70))
+           (new (make-mempool-test-tx :input-id 70 :value 40000000)))
+      (bl.mp:mempool-add mempool (bl.ser:transaction-hash old)
+                         (make-mempool-entry-for-tx old))
+      (let ((*captured-removals* '())
+            (bl.mp:*mempool-removal-reason* outer))
+        (is (eq :ok (bl.mp:accept-validated-tx
+                     mempool (bl.ser:transaction-hash new) new 10000000 0
+                     :replaced (list (bl.ser:transaction-hash old)))))
+        (is (equal (list (list (bl.ser:transaction-hash old) :replaced))
+                   (mapcar (lambda (r) (list (first r) (third r)))
+                           *captured-removals*))
+            "outer reason ~S: the replaced tx was announced as ~S"
+            outer (mapcar #'third *captured-removals*))))))

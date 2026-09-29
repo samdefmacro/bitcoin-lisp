@@ -1022,6 +1022,35 @@ again is a no-op (the same test's :154-158 compares the two hex strings)."
            (error () nil))
          t)))
 
+(defun %input-verify-error (tx i prev spent-utxos)
+  "NIL when input I of TX verifies against PREV, its (script-pubkey amount
+...) coin, under the standard flags; else the script-error keyword -- Core's
+VerifyScript and its serror. SPENT-UTXOS, when every coin is known, supplies
+the entry (the taproot sighash needs them all); otherwise the input is
+checked on its own coin, as Core still verifies each input after
+PrecomputedTransactionData was forced without spent outputs
+(script/sign.cpp:1019-1031). A condition the verifier signals is Core's
+UNKNOWN_ERROR."
+  (let ((utxo (if spent-utxos
+                  (aref spent-utxos i)
+                  (bl.store:make-utxo-entry
+                   :value (or (second prev) 0)
+                   :script-pubkey (coerce (first prev) '(simple-array (unsigned-byte 8) (*)))))))
+    (handler-case
+        (let ((bl.interop:*script-flags* bl.val:+standard-script-verify-flags+))
+          (multiple-value-bind (ok serror) (bl.val:validate-input-script tx i utxo)
+            (and (not ok) (or serror :unknown-error))))
+      (error () :unknown-error))))
+
+(defun %sign-input-error-message (serror)
+  "Core SignTransaction's error for an input VerifyScript refused
+(script/sign.cpp:1058-1068): two script errors get a sentence of their own
+that says what signing lacked, every other one is ScriptErrorString."
+  (case serror
+    (:invalid-stack-operation "Unable to sign input, invalid stack size (possibly missing key)")
+    (:nullfail "CHECK(MULTI)SIG failing with non-zero signature (possibly need more signatures)")
+    (t (bl.interop:script-error-message serror))))
+
 (defun sign-tx-inputs (tx prevmap keymap pubmap tr-keymap sighash-byte
                         &optional tr-scripts)
   "Sign every input of TX the key maps can satisfy, in place: scriptSigs are
@@ -1031,7 +1060,18 @@ and the wallet signer (signrawtransactionwithwallet / CreateTransaction).
 PREVMAP: (txid . vout) -> (script-pubkey amount-sats redeem witness-script);
 KEYMAP: hash160(pubkey) -> (priv32 . pubkey); PUBMAP: pubkey -> priv32;
 TR-KEYMAP: tweaked taproot output x-only key -> UNtweaked priv32.
-Returns a list of (input-index . error-message), NIL when every input signed."
+
+Returns Core SignTransaction's input_errors (script/sign.cpp:1034-1073) as a
+list of (input-index . message) in input order, NIL when the transaction is
+complete. What decides it is Core's: an input with no coin is `Input not
+found or already spent'; a witness signature made without the spent amount
+is `Missing amount'; every other input is complete exactly when its
+scriptSig and witness -- whatever signing managed, partial or already there
+-- pass VerifyScript, and otherwise carries that verification's error
+(%SIGN-INPUT-ERROR-MESSAGE). The assembler's own reasons for not finishing
+an input (no key, an unsupported script) are not the verdict: Core's are
+the interpreter's, and an input the assembler could not read but that
+already verifies is complete."
   (let* ((inputs (bl.ser:transaction-inputs tx))
          (n (length inputs))
          (witness (let ((existing (bl.ser:transaction-witness tx)))
@@ -1039,43 +1079,36 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                         (copy-seq existing)
                         (make-array n :initial-element '()))))
          (any-witness nil)
-         ;; Which inputs this call actually produced signatures for — the
-         ;; VerifyScript rail below checks those and leaves the rest alone.
-         (signed (make-array n :initial-element nil))
-         (errors '()))
-    ;; Precompute is built once for the whole tx; pass spent-utxos (all
-    ;; inputs' outputs) so the BIP341 amount/scriptPubKey commitments are
-    ;; available for taproot inputs.
-    (let* ((spent-utxos (build-spent-utxos inputs prevmap))
-           (bl.interop:*current-tx* tx)
-           (bl.interop:*current-spent-utxos* spent-utxos)
-           (precomp (bl.interop:init-precomputed-sighash tx spent-utxos)))
-      (dotimes (i n)
-        (let* ((in (aref inputs i))
-               (op (bl.ser:tx-in-previous-output in))
-               (prev (gethash (cons (bl.ser:outpoint-hash op)
-                                    (bl.ser:outpoint-index op))
-                              prevmap)))
-          ;; Compute the input's signature material then finalize it into
-          ;; scriptSig/witness (taproot: SIGHASH_DEFAULT) -- unless the input
-          ;; is already complete (%INPUT-ALREADY-COMPLETE-P).
-          (if (and prev (not (%input-already-complete-p tx i spent-utxos)))
+         (missing-amount '()))
+    (flet ((prev-of (i)
+             (let ((op (bl.ser:tx-in-previous-output (aref inputs i))))
+               (gethash (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op))
+                        prevmap))))
+      ;; Precompute is built once for the whole tx; pass spent-utxos (all
+      ;; inputs' outputs) so the BIP341 amount/scriptPubKey commitments are
+      ;; available for taproot inputs.
+      (let* ((spent-utxos (build-spent-utxos inputs prevmap))
+             (bl.interop:*current-tx* tx)
+             (bl.interop:*current-spent-utxos* spent-utxos)
+             (precomp (bl.interop:init-precomputed-sighash tx spent-utxos)))
+        (dotimes (i n)
+          (let ((in (aref inputs i))
+                (prev (prev-of i)))
+            ;; Compute the input's signature material then finalize it into
+            ;; scriptSig/witness (taproot: SIGHASH_DEFAULT) -- unless the input
+            ;; is already complete (%INPUT-ALREADY-COMPLETE-P).
+            (when (and prev (not (%input-already-complete-p tx i spent-utxos)))
               (multiple-value-bind (sig err)
                   (compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              sighash-byte precomp spent-utxos
                                              #x00 tr-scripts)
                 (if err
-                    (push (cons i err) errors)
-                    (multiple-value-bind (ss wit ferr) (%finalize-input-signatures sig)
-                      ;; Core's SignTransaction calls UpdateInput with whatever
-                      ;; ProduceSignature managed (script/sign.cpp:729-745), so
-                      ;; a PARTIAL multisig input goes into the transaction and
-                      ;; the error is recorded next to it. The verification rail
-                      ;; below runs only on inputs we finished, which is why the
-                      ;; flag and the write are separate here.
-                      (if ferr
-                          (push (cons i ferr) errors)
-                          (setf (aref signed i) t))
+                    (when (equal err "Missing amount") (push i missing-amount))
+                    ;; Core's SignTransaction calls UpdateInput with whatever
+                    ;; ProduceSignature managed (script/sign.cpp:1050), so a
+                    ;; PARTIAL multisig input goes into the transaction and
+                    ;; VerifyScript below names what it lacks.
+                    (multiple-value-bind (ss wit) (%finalize-input-signatures sig)
                       (when ss
                         (setf (bl.ser:tx-in-script-sig in) ss)
                         ;; The scriptSig is part of a legacy input's TXID, and
@@ -1084,35 +1117,23 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                         (bl.ser:invalidate-transaction-caches tx))
                       (when wit
                         (setf (aref witness i) wit)
-                        (setf any-witness t)))))
-              (unless prev (push (cons i "no prevtx scriptPubKey provided") errors)))))
-      (when (or any-witness (bl.ser:transaction-witness tx))
-        (setf (bl.ser:transaction-witness tx) witness)
-        (bl.ser:invalidate-transaction-caches tx))
-      ;; Core's ProduceSignature does not take "no error" for complete: it ENDS
-      ;; by running VerifyScript over the scriptSig/witness it just built, with
-      ;; a real signature checker, and reports complete only if that passes
-      ;; (sign.cpp:799). Without it "complete" here means no more than "the
-      ;; assembler raised nothing", and a witness whose ELEMENT ORDER is wrong
-      ;; is well-formed, signed, and unspendable -- exactly the failure a
-      ;; taproot script path can have, since its stack order is derived rather
-      ;; than dictated by a fixed template.
-      ;;
-      ;; Inputs we did not touch are skipped: this rail is about what WE built,
-      ;; and a partially-signed transaction must still come back with only the
-      ;; inputs it could not sign reported.
-      (when spent-utxos
-        (dotimes (i n)
-          (when (and (aref signed i) (not (assoc i errors)))
-            (unless (handler-case
-                        (let ((bl.interop:*script-flags*
-                                bl.val:+standard-script-verify-flags+))
-                          (bl.val:validate-input-script
-                           tx i (aref spent-utxos i)))
-                      (error () nil))
-              (push (cons i "signing produced a script that does not verify")
-                    errors))))))
-    (nreverse errors)))
+                        (setf any-witness t))))))))
+        (when (or any-witness (bl.ser:transaction-witness tx))
+          (setf (bl.ser:transaction-witness tx) witness)
+          (bl.ser:invalidate-transaction-caches tx))
+        ;; The verdict, input by input, after every input is updated: the
+        ;; taproot sighash of one input commits to the others' outputs, and a
+        ;; legacy one to nothing that changed, so the order is Core's too.
+        (loop for i below n
+              for prev = (prev-of i)
+              for serror = (and prev (not (member i missing-amount))
+                                (%input-verify-error tx i prev spent-utxos))
+              when (null prev)
+                collect (cons i "Input not found or already spent")
+              else when (member i missing-amount)
+                collect (cons i "Missing amount")
+              else when serror
+                collect (cons i (%sign-input-error-message serror)))))))
 
 (defun %json-object-p (value)
   "T when VALUE is a JSON object as the request layer delivers one: a

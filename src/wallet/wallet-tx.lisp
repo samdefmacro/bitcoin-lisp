@@ -44,11 +44,6 @@
 ;;;    loudly and continues; Core aborts the node. Aborting a block connect
 ;;;    over a wallet-side failure would be consensus-affecting here.
 
-(defconstant +wallet-timestamp-window+ 7200
-  "Core chain.h TIMESTAMP_WINDOW (= MAX_FUTURE_BLOCK_TIME): the slack applied
-to key/birth timestamps when deciding which blocks could contain relevant
-transactions.")
-
 (defconstant +wallet-best-block-cadence+ 144
   "Persist the best-block locator every this many blocks when no wallet tx
 changed (Core CWallet::blockConnected, wallet.cpp:1550).")

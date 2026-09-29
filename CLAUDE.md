@@ -127,9 +127,13 @@ record. Consensus-critical work still finishes with
 recorded) — the warm image is a dev convenience, not the verification of
 record. A suite designator that selects zero tests fails (rc 1); it can never
 pass silently. The cold lane also fails on `WARNING: redefining
-BITCOIN-LISP` (a same-package duplicate silently winning) and on any
-`undefined variable` warning that is not an earmuffed special defined
-somewhere in the tree (`scripts/check-undefined-variables.sh`): ASDF's
+BITCOIN-LISP` (a same-package duplicate silently winning), on EVERY
+`undefined variable` warning -- since 2026-09-29 a forward reference to a
+special defined later in the tree is no longer tolerated either: define it
+before its first use (`scripts/check-undefined-variables.sh`), because a
+`let` of a not-yet-declared special binds LEXICALLY and 2026-09-29 that had
+every BIP125 replacement announced with the caller's removal reason -- and
+on an unused variable in src/ (`scripts/check-unused-variables.sh`): ASDF's
 compilation unit defers those warnings past compile-file's failure-p, so a
 from-scratch build otherwise passes with them buried in the transcript —
 2026-08-28 it hid a `setf` of a deleted defvar and six docstrings cut short

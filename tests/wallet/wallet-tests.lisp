@@ -2728,6 +2728,73 @@ wallet_multiwallet.py:148)."
           "verification is announced first")
       (is (equal '("one" "two") (sort (%loaded-wallet-names node) #'string<))))))
 
+(test start-up-drops-a-wallet-named-twice-by-its-joined-path
+  "VerifyWallets keeps a set of AbsPathJoin(GetWalletDir(), name) and warns on
+a second entry (wallet/load.cpp:78-93): the duplicate is the PATH, not the
+string. `./one' names the wallet `one' does, so it is the duplicate --
+ours compared names, loaded `one', and then opened the same database a
+second time for `./one', which the LevelDB lock refused and start-up stopped."
+  (with-wallet-test-node (node :network :regtest)
+    (bl.rpc:dispatch-rpc-method node "createwallet" '("one"))
+    (bl.rpc:dispatch-rpc-method node "createwallet" '("two"))
+    (setf (bl:node-data-directory node) (%wallet-settings-dir node))
+    (bl.wallet:close-wallet-manager (%node-manager node))
+    (setf (bl:node-wallet-manager node) nil)
+    (let ((stderr (make-string-output-stream)))
+      (let ((*error-output* stderr))
+        (bl:start-wallets node :regtest nil nil '("one" "./one" "two" "two/")))
+      (is (equal (format nil "Warning: Ignoring duplicate -wallet ./one.~%~
+                              Warning: Ignoring duplicate -wallet two/.~%")
+                 (get-output-stream-string stderr)))
+      (is (equal '("one" "two") (sort (%loaded-wallet-names node) #'string<))))))
+
+(test an-invalid-wallet-path-is-core-s-refusal
+  "Core GetWalletPath (wallet/wallet.cpp:2918-2936): the joined path must be
+absent, a directory, a symlink to a directory, or a plain file named without
+a directory part; anything else is `Invalid -wallet path', which VerifyWallets
+makes an init error (load.cpp:101-110; wallet_multiwallet.py:174-175, a
+symlink to a file) and loadwallet a -4 behind `Wallet file verification
+failed.' (wallet.cpp:281). The check reads the path's type only, so it needs
+nothing of Core's wallet.dat."
+  (with-wallet-test-node (node :network :regtest)
+    (let* ((manager (%node-manager node))
+           (dir (string-right-trim "/" (namestring (bl.wallet:wallets-directory manager))))
+           (in (lambda (name) (concatenate 'string dir "/" name))))
+      (ensure-directories-exist (funcall in "sub/"))
+      (ensure-directories-exist (funcall in "w7/"))
+      (dolist (file '("w8" "sub/data"))
+        (with-open-file (out (funcall in file) :direction :output :if-does-not-exist :create)
+          (write-string "not a wallet" out)))
+      (sb-posix:symlink "w8" (funcall in "w8_symlink"))
+      (sb-posix:symlink "w7" (funcall in "w7_symlink"))
+      (sb-posix:symlink "nowhere" (funcall in "dangling"))
+      (signals-rpc-error (:code -4 :exact-message (format nil "Wallet file verification failed. Invalid -wallet path 'w8_symlink'. -wallet path should point to a directory where wallet.dat and database/log.?????????? files can be stored, a location where such a directory could be created, or (for backwards compatibility) the name of an existing data file in -walletdir (\"~A\")" dir))
+        (bl.rpc:dispatch-rpc-method node "loadwallet" '("w8_symlink")))
+      (signals-rpc-error (:code -4 :message "Wallet file verification failed. Invalid -wallet path 'sub/data'.")
+        (bl.rpc:dispatch-rpc-method node "createwallet" '("sub/data")))
+      (signals-rpc-error (:code -4 :message "Wallet file verification failed. Invalid -wallet path 'dangling'.")
+        (bl.rpc:dispatch-rpc-method node "loadwallet" '("dangling")))
+      ;; Accepted by the path check (the load itself then decides): a
+      ;; symlink to a directory, and a bare data-file name.
+      (signals-rpc-error (:code -18)
+        (bl.rpc:dispatch-rpc-method node "loadwallet" '("w7_symlink")))
+      (signals-rpc-error (:code -18 :exact-message (format nil "Wallet file verification failed. Failed to load database path '~A'. Data is not in recognized format." (funcall in "w8")))
+        (bl.rpc:dispatch-rpc-method node "loadwallet" '("w8")))
+      (setf (bl:node-data-directory node) (%wallet-settings-dir node))
+      (bl.wallet:close-wallet-manager manager)
+      (setf (bl:node-wallet-manager node) nil)
+      (let ((condition (handler-case
+                           (let ((*error-output* (make-broadcast-stream)))
+                             (bl:start-wallets node :regtest nil nil '("w8_symlink"))
+                             nil)
+                         (bl.err:init-error (e) e))))
+        (is (typep condition 'bl.err:init-error) "start-up went on past an invalid -wallet path")
+        (is (search "Invalid -wallet path 'w8_symlink'."
+                    (if condition (princ-to-string condition) ""))))
+      (let ((manager (bl:node-wallet-manager node)))
+        (dolist (name '("fresh" "w7" "w7_symlink" "w8" "sub"))
+          (is (null (bl.wallet:wallet-path-error manager name)) "~S was refused" name))))))
+
 (test startup-refuses-a-wallet-another-instance-holds
   "Core's VerifyWallets stops startup when a -wallet cannot be opened
 (load.cpp:106-110), and a database another process holds is SQLiteDatabase's

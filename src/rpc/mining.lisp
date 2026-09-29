@@ -574,7 +574,7 @@ cache above wraps exactly the expensive part and nothing else."
                         (let* ((mtp (or (bl.val:compute-median-time-past-from-entry tip) 0))
                                (curtime (max (bl.ser:get-unix-time)
                                              (bl.mining:next-block-mintime tip (1+ height) mtp))))
-                          (bl.mining:next-block-required-bits chain-state tip curtime))
+                          (bl.mining:next-block-required-bits tip curtime))
                         bits))
          (challenge (bl.val:signet-challenge-for-network network)))
       `(("blocks" . ,height)
