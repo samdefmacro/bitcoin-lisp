@@ -118,7 +118,8 @@ of the kv and serialization layers. The pruning policy knobs live here
   :serial t
   :components ((:file "storage/package")
                (:module "storage"
-                :components ((:file "prune-policy")
+                :components ((:file "types")        ; block-index-entry, chain-state: before every reader
+                             (:file "prune-policy")
                              (:file "utxo")
                              (:file "block-undo")
                              (:file "blocks")
