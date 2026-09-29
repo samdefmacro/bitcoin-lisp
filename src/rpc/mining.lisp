@@ -21,11 +21,19 @@ WITNESS_SCALE_FACTOR to state its pre-segwit sizelimit.")
   (format nil "~(~8,'0x~)" bits))
 
 (defun %difficulty-from-bits (bits)
-  "Difficulty ratio relative to difficulty-1 (bits 0x1d00ffff), like Core's
-GetDifficulty."
-  (let ((cur (bl.store:bits-to-target bits))
-        (one (bl.store:bits-to-target #x1d00ffff)))
-    (if (zerop cur) 0d0 (/ (float one 1d0) (float cur 1d0)))))
+  "Core GetDifficulty (rpc/blockchain.cpp:96-114): 0xffff over BITS's mantissa,
+as a double, then scaled by 256 per step of its exponent away from 29 -- the
+same double Core computes, so the reply rounds the same. A zero mantissa is a
+zero target, which no valid header carries; it answers 0 rather than dividing
+by it."
+  (let ((shift (ldb (byte 8 24) bits))
+        (mantissa (ldb (byte 24 0) bits)))
+    (if (zerop mantissa)
+        0d0
+        (let ((diff (/ (float #xffff 1d0) (float mantissa 1d0))))
+          (loop while (< shift 29) do (setf diff (* diff 256d0)) (incf shift))
+          (loop while (> shift 29) do (setf diff (/ diff 256d0)) (decf shift))
+          diff))))
 
 (defun %chain-name (network)
   "Core's chain name for NETWORK (getblockchaininfo.chain): main, test,

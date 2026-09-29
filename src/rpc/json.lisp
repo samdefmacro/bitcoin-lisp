@@ -218,6 +218,17 @@ each spell at least one of those differently."
                         (%fixed-digits magnitude
                                        (max 0 (- precision 1 exponent)))))))))))
 
+(defmethod yason:encode ((object float) &optional (stream *standard-output*))
+  "Every double a reply carries, spelled as UniValue(double) spells it: setFloat
+writes `setprecision(16) << x' (univalue.cpp:75-82), which is JSON-FLOAT.
+SBCL's printer writes the shortest round-trip text instead, 17 digits where 16
+round differently: the regtest difficulty came out 4.6565423739069247e-10
+where Core v28.2, started on the same blocks, answers 4.656542373906925e-10 --
+in getblockchaininfo, every getblock and every getblockheader
+(scripts/interop/datadir_interop.py)."
+  (write-string (json-number-text (json-float object)) stream)
+  object)
+
 ;;; --- JSON types (Core univalue) ---
 ;;;
 ;;; Moved here from blockchain.lisp: the argument parsers (amounts.lisp) and
