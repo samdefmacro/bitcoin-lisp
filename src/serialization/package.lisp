@@ -92,6 +92,18 @@ src/serialization/.")
    #:bytes-to-utf8-string
    #:br-read-transaction
    #:br-read-witness-stack
+   ;; The per-type codecs the transaction, block and message readers are built
+   ;; from -- API because each is a Core serializable type of its own, which
+   ;; Core's deserialize.cpp fuzz targets decode one at a time
+   #:br-read-outpoint
+   #:bb-write-outpoint
+   #:br-read-tx-in
+   #:bb-write-tx-in
+   #:br-read-block-header
+   #:bb-write-block-header
+   #:read-inv-vector
+   #:write-inv-vector
+   #:write-message-header
    ;; Types
    #:dovector
    #:outpoint

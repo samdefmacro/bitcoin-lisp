@@ -624,6 +624,13 @@ bitcoin-cli (node-main)."
                              (:file "validation/intrablock-coins-tests")
                              ;; Randomised totality/roundtrip properties over
                              ;; the parsers a hostile peer reaches
-                             (:file "fuzz-property-tests"))))
+                             (:file "fuzz-property-tests")
+                             ;; Core's fuzz targets (src/test/fuzz/) as seeded
+                             ;; property tests: the harness and the
+                             ;; FuzzedDataProvider port, Core's consume
+                             ;; helpers, then one file per group of targets
+                             (:file "fuzz/fuzz")
+                             (:file "fuzz/util")
+                             (:file "fuzz/deserialize"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

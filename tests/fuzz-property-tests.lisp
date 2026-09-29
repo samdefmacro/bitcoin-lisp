@@ -248,7 +248,7 @@ of every hex RPC argument."
 `headers' message carries up to 2000 of them — so this parser sees more hostile
 bytes than any other."
   (%fuzz-total ("read-block-header" 11 4000 bytes :max-len 200)
-    (bl.ser::br-read-block-header
+    (bl.ser:br-read-block-header
      (bl.ser:make-byte-reader-from bytes))))
 
 (test fuzz-descriptor-parsing-never-escapes

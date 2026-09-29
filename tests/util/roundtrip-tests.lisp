@@ -107,7 +107,7 @@ witness stack and the first is non-empty (so transaction-has-witness-p holds)."
                    :nonce (random #x100000000 state)))
              (bytes (bl.ser:serialize-block-header hdr))
              (hdr2 (bl.bytes:with-byte-reader (s bytes)
-                     (bl.ser::br-read-block-header s)))
+                     (bl.ser:br-read-block-header s)))
              (bytes2 (bl.ser:serialize-block-header hdr2)))
         (is (= 80 (length bytes)))
         (is (equalp bytes bytes2))))))
