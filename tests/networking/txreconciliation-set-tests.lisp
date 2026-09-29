@@ -7,10 +7,13 @@
 (in-suite :txreconciliation-set-tests)
 
 ;;;; ⚠️ Everything under test here is BEYOND Bitcoin Core, which ships the
-;;;; sendtxrcncl handshake and nothing else. There is no reference
-;;;; implementation to check against, so these tests assert the PROPERTIES
-;;;; BIP-330 relies on rather than agreement with anyone — which is the weaker
-;;;; kind of verification, and worth saying so.
+;;;; sendtxrcncl handshake and nothing else. What has an executable oracle is
+;;;; checked against it: the short IDs and salts against vectors from Core's
+;;;; own SipHash and the BIP's formula, the sketches against Core's vendored
+;;;; minisketch (minisketch-tests.lisp), the wire formats against BIP-330's
+;;;; tables. The round logic has no reference implementation, so those tests
+;;;; assert the PROPERTIES BIP-330 relies on, and the loopback test at the end
+;;;; runs a round between two real nodes.
 
 (defun %rc-wtxid (n)
   "The Nth distinct test wtxid. Below 256 every byte is N, as it always was;
@@ -36,10 +39,18 @@ exactly one reconcildiff message."
 (defun %rc-sketch-payload (short-ids capacity)
   "A sketch message payload, header stripped, as the handler sees it: what a
 peer holding SHORT-IDS would answer a reqrecon with at CAPACITY."
-  (subseq (bl.ser:make-sketch-message
-           (bl.net::ms-sketch-serialize
-            (bl.net::recon-build-sketch short-ids capacity)))
-          24))
+  (let ((sk (bl.net:ms-make-sketch capacity)))
+    (dolist (id short-ids) (bl.net:ms-sketch-add sk id))
+    (subseq (bl.ser:make-sketch-message (bl.net:ms-sketch-serialize sk)) 24)))
+
+(defun %rc-extension-payload (short-ids capacity)
+  "BIP-330's sketch extension for a round first sketched at CAPACITY, header
+stripped: syndromes CAPACITY..2*CAPACITY-1 of the double-capacity sketch."
+  (let ((sk (bl.net:ms-make-sketch (* 2 capacity))))
+    (dolist (id short-ids) (bl.net:ms-sketch-add sk id))
+    (subseq (bl.ser:make-sketch-message
+             (bl.net:ms-sketch-serialize (subseq sk capacity)))
+            24)))
 
 (defun %rc-count (set)
   "How many transactions SET is holding for reconciliation. This file's one
@@ -56,7 +67,7 @@ set is created on first use, exactly as the relay path creates it."
 
 (defun %rc-short-ids (wtxids &key (k0 11) (k1 22))
   "The short IDs of WTXIDS under the salt %RC-PEER gives a registered peer."
-  (mapcar (lambda (w) (bl.net::recon-short-id k0 k1 w)) wtxids))
+  (mapcar (lambda (w) (bl.net:recon-short-id k0 k1 w)) wtxids))
 
 (defun %rc-round-open-p (peer)
   "Whether PEER has a reconciliation round in flight -- the initiator's state,
@@ -69,17 +80,38 @@ node holds on another, and cannot grind IDs that collide for everybody. Zero is
 remapped because 0 has no sketch — its powers are all zero, so it would be
 INVISIBLE rather than merely unlucky."
   (let ((wtxid (%rc-wtxid 7)))
-    (let ((a (bl.net::recon-short-id 1 2 wtxid))
-          (b (bl.net::recon-short-id 3 4 wtxid)))
+    (let ((a (bl.net:recon-short-id 1 2 wtxid))
+          (b (bl.net:recon-short-id 3 4 wtxid)))
       (is (/= a b) "the same transaction must look different on different links")
       (is (<= 1 a #xFFFFFFFF))
       (is (<= 1 b #xFFFFFFFF))))
   ;; Same salt, same answer.
-  (is (= (bl.net::recon-short-id 9 9 (%rc-wtxid 1))
-         (bl.net::recon-short-id 9 9 (%rc-wtxid 1))))
+  (is (= (bl.net:recon-short-id 9 9 (%rc-wtxid 1))
+         (bl.net:recon-short-id 9 9 (%rc-wtxid 1))))
   ;; Across many transactions, none is ever zero.
   (is (loop for n from 0 below 200
-            always (plusp (bl.net::recon-short-id 5 6 (%rc-wtxid n))))))
+            always (plusp (bl.net:recon-short-id 5 6 (%rc-wtxid n))))))
+
+(test short-ids-match-bip330-and-cores-siphash
+  "BIP-330's short ID, `1 + (s mod 0xFFFFFFFF)' with s = SipHash-2-4((k0,k1),
+wtxid), and its salt, TaggedHash(\"Tx Relay Salting\", min salt || max salt)
+read as k0/k1 -- Core's ComputeSalt (txreconciliation.cpp:18-30) -- against
+tests/data/minisketch_core_vectors.json, computed with Core's functional-test
+SipHash (test_framework/crypto/siphash.py). Salts include 0 and 2^64-1, the
+ends of the ascending sort. The ID this used to compute, s mod 2^32 with 0
+remapped to 1, differs on almost every one of them."
+  (dolist (v (gethash "short_id" (yason:parse (project-source-text
+                                                "tests/data/minisketch_core_vectors.json"))))
+    (multiple-value-bind (k0 k1)
+        (bl.net:compute-recon-salt (gethash "salt1" v) (gethash "salt2" v))
+      (is (= (gethash "k0" v) k0))
+      (is (= (gethash "k1" v) k1)))
+    (let ((wtxid (bl.crypto:hex-to-bytes (gethash "wtxid_internal_hex" v))))
+      (is (= (gethash "siphash" v)
+             (bl.crypto:siphash-2-4 (gethash "k0" v) (gethash "k1" v) wtxid)))
+      (is (= (gethash "short_id" v)
+             (bl.net:recon-short-id (gethash "k0" v) (gethash "k1" v) wtxid))
+          "short id of ~A" (gethash "wtxid_internal_hex" v)))))
 
 (test a-reconciliation-set-is-keyed-by-short-id
   "Keyed by short ID because that is what the sketch holds and what a decode
@@ -138,14 +170,14 @@ one side has and the other does not."
                (bl.net::recon-set-short-ids mine) capacity))
            (b (bl.net::recon-build-sketch
                (bl.net::recon-set-short-ids theirs) capacity))
-           (decoded (bl.net::ms-decode
-                     (bl.net::ms-sketch-merge a b))))
+           (decoded (bl.net:ms-decode
+                     (bl.net:ms-sketch-merge a b))))
       (is-true decoded "the difference must decode at the estimated capacity")
       (let ((want (sort (append (mapcar (lambda (w)
-                                          (bl.net::recon-short-id k0 k1 w))
+                                          (bl.net:recon-short-id k0 k1 w))
                                         only-mine)
                                 (mapcar (lambda (w)
-                                          (bl.net::recon-short-id k0 k1 w))
+                                          (bl.net:recon-short-id k0 k1 w))
                                         only-theirs))
                         #'<)))
         (is (equal want (sort (copy-list decoded) #'<)))
@@ -189,21 +221,27 @@ point — and deterministic, so a retry does not reveal a fresh sample."
 ;;; --- The sketch exchange (P4) ------------------------------------------------
 
 (test bip330-messages-round-trip
-  "The four messages a round is made of. Their formats are BIP-330's, but the
-q scale is a choice — Core has no reqrecon at all — so it is pinned here as
-well as named in the source."
-  ;; reqrecon
-  (multiple-value-bind (size q)
-      (bl.ser:parse-reqrecon-payload
-       (subseq (bl.ser:make-reqrecon-message 1234 0.25d0) 24))
-    (is (= 1234 size))
-    (is (= 1/4 q) "q must survive the fixed-point round trip exactly"))
-  ;; A q of zero and a q at the top of the range.
+  "The four messages a round is made of, in BIP-330's formats -- Core d3056bc
+has none of them, so the BIP's tables are the oracle. reqrecon is `uint16
+set_size' and `uint16 q', q `Multiplied by PRECISION=(2^15) - 1': four bytes,
+where this used to send a uint32 set_size and scale q by 2^15."
+  ;; reqrecon, byte for byte: 1234 = d2 04, floor(0.25 * 32767) = 8191 = ff 1f.
+  (let ((payload (subseq (bl.ser:make-reqrecon-message 1234 0.25d0) 24)))
+    (is (string= "d204ff1f" (string-downcase (bl.crypto:bytes-to-hex payload))))
+    (multiple-value-bind (size q) (bl.ser:parse-reqrecon-payload payload)
+      (is (= 1234 size))
+      (is (= 8191/32767 q))))
+  ;; A q of zero, and q = 1 at exactly PRECISION.
   (multiple-value-bind (size q)
       (bl.ser:parse-reqrecon-payload
        (subseq (bl.ser:make-reqrecon-message 0 0d0) 24))
     (is (= 0 size))
     (is (= 0 q)))
+  (multiple-value-bind (size q)
+      (bl.ser:parse-reqrecon-payload
+       (subseq (bl.ser:make-reqrecon-message 7 1) 24))
+    (is (= 7 size))
+    (is (= 1 q)))
   ;; sketch: the bytes and nothing else, so the capacity is implied by length.
   (let ((bytes (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)))
     (is (equalp bytes (bl.ser:parse-sketch-payload
@@ -427,12 +465,20 @@ peers it has."
     (is-true (bl.net::recon-should-start-round-p
               peer (+ now bl.net::+recon-round-interval-seconds+)))))
 
-(test an-empty-set-does-not-open-a-round
-  "Nothing to reconcile means no reqrecon: a sketch of an empty set is pure
-overhead, and Erlay exists to remove overhead."
-  (let ((peer (%rc-peer :registered t)))
-    (is-false (bl.net::recon-start-round peer 100000))
-    (is-false (%rc-round-open-p peer))))
+(test an-empty-set-still-opens-a-round
+  "Only the initiator opens rounds, so the RESPONDER's set drains through them
+and no other way. An initiator with nothing of its own still sends reqrecon
+(set_size 0), or a listening node's held transactions would wait for the
+dialler to happen to have something -- which is what skipping the empty round
+did. Then the responder's side of it: an empty set is answered too."
+  (let* ((peer (%rc-peer :registered t))
+         (msg (bl.net::recon-start-round peer 100000)))
+    (is (string= "reqrecon" (message-command msg)))
+    (is (= 0 (bl.ser:parse-reqrecon-payload (subseq msg 24))))
+    (is-true (%rc-round-open-p peer)))
+  (let ((responder (%rc-peer :registered t)))
+    (is (string= "sketch" (message-command
+                           (bl.net::recon-respond-to-request responder 3 1/4))))))
 
 (test abandoning-a-round-announces-everything-rather-than-losing-it
   "The flood fallback. A reconciliation that cannot decode costs bandwidth —
@@ -629,10 +675,14 @@ that DECODES closes the same round, announcing only the difference."
          (ids (%rc-short-ids wtxids))
          (set (%rc-hold peer wtxids))
          (ctx (bl.ctx:make-node-context))
-         ;; Capacity 2 over two ids we do not hold, against our five: a
-         ;; difference of seven cannot decode at two, and the decode is a
-         ;; pure function of these fixed inputs.
-         (undecodable (%rc-sketch-payload '(#xAAAAAAAA #xBBBBBBBB) 2)))
+         ;; Ten ids we do not hold at capacity 5, against our five: fifteen
+         ;; differences. An over-full sketch CAN decode (to a wrong set; Core
+         ;; decodes about half of the random capacity-2 sketches), so the
+         ;; difference is three times the capacity and the extension still
+         ;; short of it; the decode is a pure function of these fixed inputs.
+         (theirs (%rc-short-ids (loop for i from 300 below 310 collect (%rc-wtxid i))
+                                :k0 1 :k1 2))
+         (undecodable (%rc-sketch-payload theirs 5)))
     (let ((sent (captured-sends
                  (lambda () (bl.net:maybe-start-reconciliation peer 100000)))))
       (is (equal '("reqrecon") (mapcar #'message-command sent))))
@@ -642,9 +692,12 @@ that DECODES closes the same round, announcing only the difference."
       (is (equal '("reqsketchext") (mapcar #'message-command sent))))
     (is (null (bl.net:peer-tx-inv-queue peer))
         "nothing is flooded while the extension is pending")
-    ;; The extension does not decode either: report the failure and flood.
+    ;; The extension -- the same ten ids, syndromes 6-10 of a capacity-10
+    ;; sketch -- does not decode either: report the failure and flood.
     (let* ((sent (captured-sends
-                  (lambda () (bl.net:handle-message peer "sketch" undecodable ctx))))
+                  (lambda ()
+                    (bl.net:handle-message
+                     peer "sketch" (%rc-extension-payload theirs 5) ctx))))
            (diff (%rc-reconcildiff sent)))
       (is-true diff "exactly one reconcildiff is sent")
       (when diff
@@ -723,3 +776,290 @@ agreed most completely paid the most bandwidth."
     (is (null (bl.net:peer-tx-inv-queue peer)) "nothing to announce")
     (is (= 0 (%rc-count set)) "and the whole snapshot is settled")
     (is-false (%rc-round-open-p peer))))
+
+;;; --- BIP-330's extension, the roles, and the capacity ceiling --------------
+
+(defun %rc-reqrecon (peer set-size q ctx)
+  "Deliver a reqrecon to PEER and return the messages it sent back."
+  (captured-sends
+   (lambda ()
+     (bl.net:handle-message peer "reqrecon"
+                            (subseq (bl.ser:make-reqrecon-message set-size q) 24)
+                            ctx))))
+
+(test the-responder-extends-its-sketch-without-resending-it
+  "BIP-330: `Upon receipt of a \"reqsketchext\" message, a node responds to it
+with a \"sketch\" message, which contains a sketch extension: a sketch (of the
+same transactions sketched initially) of higher capacity without the part sent
+initially.' The first sketch's syndromes are the first half of the
+double-capacity sketch, so the extension is its second half -- this used to
+resend a whole sketch at twice the SNAPSHOT SIZE, which a BIP peer appends to
+what it holds and decodes as garbage. An empty snapshot is extended too (all
+zeros), or the initiator waits for ever; with no sketch sent, nothing is."
+  (let* ((peer (%rc-peer :registered t :we-initiate nil :inbound t))
+         (wtxids (loop for i from 80 below 86 collect (%rc-wtxid i)))
+         (ids (progn (%rc-hold peer wtxids) (%rc-short-ids wtxids)))
+         (ctx (bl.ctx:make-node-context)))
+    (is (null (captured-sends
+               (lambda () (bl.net:handle-message peer "reqsketchext" #() ctx))))
+        "no sketch sent this round, so nothing to extend")
+    ;; |6 - 2| + floor(0 * 2) + 1 = 5.
+    (let ((first (first (%rc-reqrecon peer 2 0 ctx))))
+      (is (equalp (%rc-sketch-payload ids 5) (subseq first 24))))
+    (let ((ext (captured-sends
+                (lambda () (bl.net:handle-message peer "reqsketchext" #() ctx)))))
+      (is (equal '("sketch") (mapcar #'message-command ext)))
+      (is (equalp (%rc-extension-payload ids 5) (subseq (first ext) 24))
+          "syndromes 6-10 of the capacity-10 sketch, and nothing else")))
+  (let ((peer (%rc-peer :registered t :we-initiate nil :inbound t))
+        (ctx (bl.ctx:make-node-context)))
+    (%rc-reqrecon peer 3 0 ctx)
+    (let ((ext (first (captured-sends
+                       (lambda () (bl.net:handle-message peer "reqsketchext" #() ctx))))))
+      (is-true ext "an empty snapshot's extension is still sent")
+      (is (equalp (%rc-extension-payload '() 4) (subseq ext 24))))))
+
+(test the-initiator-appends-the-extension-and-decodes
+  "The initiator's half of the extension: the second sketch is appended to the
+first and the whole decoded at twice the capacity. A ten-element difference
+does not decode at capacity 5 and does at 10; an extension of the wrong length,
+or a first sketch past +RECON-MAX-SKETCH-CAPACITY+, is a failed decode."
+  (let* ((peer (%rc-peer :registered t :we-initiate t))
+         (wtxids (loop for i from 90 below 94 collect (%rc-wtxid i)))
+         (ids (progn (%rc-hold peer wtxids) (%rc-short-ids wtxids)))
+         (extra (sort (%rc-short-ids (loop for i from 200 below 210 collect (%rc-wtxid i))
+                              :k0 1 :k1 2)
+                     #'<))
+         (theirs (append ids extra))
+         (ctx (bl.ctx:make-node-context)))
+    (bl.net:maybe-start-reconciliation peer 100000)
+    (is (equal '("reqsketchext")
+               (mapcar #'message-command
+                       (captured-sends
+                        (lambda ()
+                          (bl.net:handle-message
+                           peer "sketch" (%rc-sketch-payload theirs 5) ctx))))))
+    (let ((diff (%rc-reconcildiff
+                 (captured-sends
+                  (lambda ()
+                    (bl.net:handle-message
+                     peer "sketch" (%rc-extension-payload theirs 5) ctx))))))
+      (is-true (first diff) "the extended sketch decodes")
+      (is (equal extra (sort (copy-list (second diff)) #'<))
+          "and asks for exactly the ten we lack")))
+  (let ((round (bl.net::make-recon-round :local-ids '(1 2))))
+    (is-false (nth-value 1 (bl.net::recon-round-decode
+                            round (bl.net:ms-make-sketch
+                                   (1+ bl.net::+recon-max-sketch-capacity+))))
+              "a first sketch past the ceiling is not decoded")
+    (bl.net::recon-round-decode round (bl.net:ms-make-sketch 3))
+    (setf (bl.net::recon-round-extended round) t)
+    (is-false (nth-value 1 (bl.net::recon-round-decode round (bl.net:ms-make-sketch 4)))
+              "an extension must be exactly as long as the first sketch")))
+
+(test the-responder-caps-the-sketch-it-sizes
+  "A reqrecon claiming 65535 transactions with q near 2 asked for a sketch of
+over 100,000 syndromes over the whole set. The capacity is BIP-330's estimate
+held to +RECON-MAX-SKETCH-CAPACITY+."
+  (let ((peer (%rc-peer :registered t :we-initiate nil :inbound t)))
+    (%rc-hold peer (list (%rc-wtxid 1)))
+    (let ((sketch (first (%rc-reqrecon peer 65535 65535/32767 (bl.ctx:make-node-context)))))
+      (is (= (* 4 bl.net::+recon-max-sketch-capacity+) (- (length sketch) 24))))))
+
+(test reconciliation-messages-are-taken-only-from-the-right-role
+  "BIP-330: `the initiator of the P2P connection assumes the role of
+reconciliation initiator (will send \"reqrecon\" messages) and the other peer
+assumes the role of reconciliation responder', and `\"reqrecon\" messages can
+only be sent by the reconciliation initiator'. A reqrecon from the peer we
+dialled -- we are its initiator -- is ignored, as is a sketch from the peer
+that dialled us; the positive controls are the same messages from the right
+side."
+  (let ((ctx (bl.ctx:make-node-context)))
+    (let ((we-initiate (%rc-peer :registered t :we-initiate t)))
+      (%rc-hold we-initiate (list (%rc-wtxid 1)))
+      (is (null (%rc-reqrecon we-initiate 1 0 ctx))))
+    (let ((we-respond (%rc-peer :registered t :we-initiate nil :inbound t)))
+      (%rc-hold we-respond (list (%rc-wtxid 1)))
+      (is (equal '("sketch") (mapcar #'message-command (%rc-reqrecon we-respond 1 0 ctx))))
+      ;; It cannot have a round of ours, and a sketch from it is not answered.
+      (setf (bl.net::peer-recon-round we-respond)
+            (bl.net::make-recon-round :local-ids '()))
+      (is (null (captured-sends
+                 (lambda ()
+                   (bl.net:handle-message we-respond "sketch"
+                                          (%rc-sketch-payload '(5) 2) ctx))))))
+    (let ((unregistered (%rc-peer :registered nil :we-initiate nil :inbound t)))
+      (is (null (%rc-reqrecon unregistered 1 0 ctx))
+          "and nothing at all from a peer that never registered"))))
+
+;;; --- Two of our nodes, one real connection, whole rounds ---------------------
+
+(defun %rc-loopback-pair ()
+  "Two of our peers over a real loopback TCP connection, handshaked by the
+shipped outbound (PERFORM-HANDSHAKE) and inbound (PERFORM-INBOUND-HANDSHAKE)
+paths with -txreconciliation on both, so sendtxrcncl, RegisterPeer and the
+salt combination all run for real. Returns (values dialler listener-side
+listener-socket): the dialler is the reconciliation initiator."
+  (let* ((srv (bl.net:open-listener "127.0.0.1" 0))
+         (port (usocket:get-local-port srv))
+         (network bl:*network*)
+         (inbound nil)
+         (th (bt:make-thread
+              (lambda ()
+                ;; Specials are per thread: this one stands for the other node.
+                (let ((bl:*tx-reconciliation* t) (bl:*network* network))
+                  (ignore-errors
+                   (let ((conn (bl.net:accept-connection srv :timeout 10)))
+                     (when conn
+                       (setf inbound (bl.net:make-inbound-peer conn "127.0.0.1"))
+                       (bl.net:perform-inbound-handshake inbound :timeout 10))))))
+              :name "recon-loopback-listener"))
+         (outbound (bl.net:connect-peer "127.0.0.1" port)))
+    (when outbound
+      (with-private-outbound-nonces
+        (bl.net:perform-handshake outbound :try-v2 nil)))
+    (sb-thread:join-thread th :default nil :timeout 15)
+    (values outbound inbound srv)))
+
+(defun %rc-node-context (fundings peer)
+  "One node: a chainstate, a coins view holding a 1 BTC P2SH(OP_TRUE) output
+for each of FUNDINGS, an empty mempool, and PEER as its only connection."
+  (let ((utxo (bl.store:make-utxo-set)))
+    (dolist (f fundings)
+      (bl.store:add-utxo utxo f 0 100000000 (p2sh-optrue-script-pubkey) 1 :coinbase nil))
+    (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state :best-height 200)
+                              :utxo-set utxo :mempool (bl.mp:make-mempool)
+                              :recent-rejects (bl:make-rejects-filter 1000)
+                              :peers (list peer))))
+
+(defun %rc-accept (ctx tx &key (relay t))
+  "Deliver TX to the node CTX from a third party, through the shipped tx
+handler: validation, the mempool and -- with RELAY -- the relay path that
+holds it for a reconciling peer. Returns its wtxid."
+  (deliver-tx (bl.net:make-peer :address "third-party" :state :ready
+                                :services bl.ser:+node-witness+)
+              (subseq (bl.ser:make-tx-message tx) 24)
+              (if relay
+                  ctx
+                  (bl.ctx:make-node-context
+                   :chain-state (bl.ctx:node-context-chain-state ctx)
+                   :utxo-set (bl.ctx:node-context-utxo-set ctx)
+                   :mempool (bl.ctx:node-context-mempool ctx)
+                   :recent-rejects (bl.ctx:node-context-recent-rejects ctx))))
+  (bl.ser:transaction-wtxid tx))
+
+(defun %rc-loopback-run (&key wrong-salt (rounds t) (seconds 12) (shared-count 10))
+  "Run two nodes through reconciliation over a real connection and report.
+
+SHARED-COUNT (ten) shared transactions are in both mempools and both reconciliation sets --
+the state after both nodes heard them from third parties -- and six more
+reach only the listening node, whose relay path holds them for its dialler
+(bar the fanout draw). The dialler holds nothing else of its own. The pump is the
+shipped one: the round timer (unless ROUNDS is NIL), the inv flush, the
+tx-request scheduler and the per-peer message drain, on both sides, until the
+dialler has everything or SECONDS pass.
+
+WRONG-SALT flips a bit of the dialler's k0 before its set is filled, so its
+short IDs are not the listener's. Returns a plist: :MISSING, the listener's
+transactions the dialler still lacks; :HELD, how many of them the listener's
+relay path held back for reconciliation; :SHARED-ANNOUNCED, how many shared
+transactions either side announced -- none when the sketches cancelled them,
+all when a failed round fell back to flooding; :REGISTERED, whether the
+handshake registered both sides."
+  (let ((bl:*tx-reconciliation* t)
+        (bl:*network* :regtest)
+        (bl.val:*recent-rejects-reconsiderable* (bl:make-rejects-filter 100)))
+    (with-tx-relay-out-of-ibd
+      (bl.net:reset-tx-requests)
+      (multiple-value-bind (a b srv) (%rc-loopback-pair)
+        (unwind-protect
+             (let* ((fundings (loop for i from 1 to (+ shared-count 6)
+                                    collect (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element i)))
+                    (ctx-a (%rc-node-context fundings a))
+                    (ctx-b (%rc-node-context fundings b))
+                    (txs (mapcar (lambda (f) (pkg-tx f 0 (- 100000000 10000))) fundings))
+                    (shared (subseq txs 0 shared-count))
+                    (only-b (subseq txs shared-count)))
+               (when wrong-salt
+                 (setf (bl.net::peer-recon-k0 a) (logxor 1 (bl.net::peer-recon-k0 a))))
+               (dolist (tx shared)
+                 (%rc-accept ctx-a tx :relay nil)
+                 (%rc-accept ctx-b tx :relay nil)
+                 (dolist (peer (list a b))
+                   (%rc-hold peer (list (bl.ser:transaction-wtxid tx))
+                             :k0 (bl.net::peer-recon-k0 peer)
+                             :k1 (bl.net::peer-recon-k1 peer))))
+               ;; The dialler has sent its BIP133 feefilter, as every node does:
+               ;; 1 sat/vB, which these transactions clear a hundred times over.
+               (setf (bl.net:peer-feefilter-rate b) 1000)
+               (dolist (tx only-b) (%rc-accept ctx-b tx))
+               (let ((held (- (%rc-count (bl.net::peer-recon-set b)) (length shared)))
+                     (deadline (+ (get-internal-real-time)
+                                  (* seconds internal-time-units-per-second))))
+                 (flet ((missing ()
+                          (remove-if (lambda (tx)
+                                       (bl.mp:mempool-has (bl.ctx:node-context-mempool ctx-a)
+                                                          (bl.ser:transaction-hash tx)))
+                                     only-b)))
+                   (loop while (and (missing) (< (get-internal-real-time) deadline))
+                         do (when rounds
+                              (bl.net:maybe-start-reconciliation a (bl.ser:get-unix-time)))
+                            (flush-peer-invs a (bl.ctx:node-context-mempool ctx-a))
+                            (flush-peer-invs b (bl.ctx:node-context-mempool ctx-b))
+                            (bl.net:process-tx-requests)
+                            (drain-peer-once a ctx-a)
+                            (drain-peer-once b ctx-b)
+                            (sleep 0.02))
+                   (list :registered (and (bl.net::peer-recon-registered a)
+                                          (bl.net::peer-recon-registered b)
+                                          t)
+                         :missing (length (missing))
+                         :held held
+                         :shared-announced
+                         (count-if (lambda (tx)
+                                     (let ((w (bl.ser:transaction-wtxid tx)))
+                                       (or (bl:recent-reject-p (bl.net:peer-announced-txs a) w)
+                                           (bl:recent-reject-p (bl.net:peer-announced-txs b) w))))
+                                   shared)))))
+          (ignore-errors (bl.net:disconnect-peer a))
+          (ignore-errors (bl.net:disconnect-peer b))
+          (bl.net:close-listener srv)
+          (bl.net:reset-tx-requests))))))
+
+(test two-nodes-reconcile-their-mempools-over-a-real-connection
+  "Two of our nodes with -txreconciliation=1 on one loopback connection: the
+handshake registers both, the listener holds its new transactions back from
+the dialler, and the dialler's round -- reqrecon, sketch, merge and decode,
+reconcildiff, the inv, getdata and tx that follow -- brings the dialler's
+mempool level with the listener's. The ten shared transactions cancel in the
+sketch, so neither side announces them.
+
+Two controls, because a green convergence check alone proves nothing:
+- no rounds: the held transactions never reach the dialler, so it is the
+  round that delivered them;
+- a wrong short-ID salt on one side: the shared transactions no longer cancel,
+  the difference outgrows the sketch and its extension, and the round fails
+  over to flooding -- every shared transaction is announced. The mempools
+  still converge, as BIP-330 intends (a failed reconciliation `costs
+  bandwidth, never transactions'), which is why the salt's visible effect is
+  the flood and not a lost transaction."
+  (let ((ok (%rc-loopback-run)))
+    (is-true (getf ok :registered) "the handshake registered both sides: ~S" ok)
+    (is (plusp (getf ok :held)) "the listener held transactions for the round: ~S" ok)
+    (is (zerop (getf ok :missing)) "the mempools converged: ~S" ok)
+    (is (zerop (getf ok :shared-announced))
+        "the shared transactions cancelled in the sketch: ~S" ok))
+  ;; With nothing in common the dialler's own set is EMPTY, and its round
+  ;; must still run: only the dialler opens rounds, so skipping an empty one
+  ;; left the listener's held transactions with no way out.
+  (let ((empty (%rc-loopback-run :shared-count 0)))
+    (is (zerop (getf empty :missing))
+        "an empty initiator set still reconciles the listener's: ~S" empty))
+  (let ((no-rounds (%rc-loopback-run :rounds nil :seconds 3)))
+    (is (= (getf no-rounds :held) (getf no-rounds :missing))
+        "without a round, exactly the held transactions stay missing: ~S" no-rounds))
+  (let ((wrong (%rc-loopback-run :wrong-salt t)))
+    (is (zerop (getf wrong :missing)) "the flood still converges: ~S" wrong)
+    (is (= 10 (getf wrong :shared-announced))
+        "but nothing cancelled -- the round failed and flooded: ~S" wrong)))

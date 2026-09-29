@@ -1,35 +1,51 @@
 (in-package #:bitcoin-lisp.networking)
 
-;;;; BIP-330 reconciliation sets (Erlay P2)
+;;;; BIP-330 reconciliation sets and rounds (Erlay P2 + P4)
 ;;;;
-;;;; ⚠️ BEYOND BITCOIN CORE. Core ships the sendtxrcncl HANDSHAKE and nothing
-;;;; else: its TxReconciliationTracker is 170 lines with four methods
-;;;; (PreRegisterPeer, RegisterPeer, ForgetPeer, IsPeerRegistered), no AddToSet,
-;;;; no fanout, no timer, no sketch — and its own comments still read "TODO:
-;;;; ... once used in the following commits". Everything in this file is built
-;;;; from BIP-330 rather than ported, so it has no reference implementation to
-;;;; be checked against, which is the single most reliable error-catcher this
-;;;; project has. It stays behind -txreconciliation, default off.
+;;;; ⚠️ BEYOND BITCOIN CORE. Core d3056bc ships the sendtxrcncl HANDSHAKE and
+;;;; nothing else: its TxReconciliationTracker (node/txreconciliation.cpp)
+;;;; has four methods (PreRegisterPeer, RegisterPeer, ForgetPeer,
+;;;; IsPeerRegistered) and no set, short ID, fanout, timer or sketch message --
+;;;; protocol.h:266 defines no message past sendtxrcncl -- and the per-peer
+;;;; k0/k1 it stores are read by nothing ("Make private once used in the
+;;;; following commits", txreconciliation.cpp:40-53). Everything in this file
+;;;; is therefore BIP-330's text, not a port: the short ID, the capacity
+;;;; estimate, the reqrecon/sketch/reqsketchext/reconcildiff round and its
+;;;; extension. The sketches themselves are Core's vendored minisketch
+;;;; (minisketch.lisp, checked against Core's own reference implementation).
 ;;;;
-;;;; This file is the MECHANISM only: per-peer sets, short IDs, and the fanout
-;;;; decision. Nothing diverts a transaction into a set yet — a set that
-;;;; nothing drains would delay announcements forever, so the relay path is
-;;;; only rewired once the sketch exchange exists to drain it.
+;;;; What is LIVE, and only behind -txreconciliation (default off, Core's
+;;;; DEBUG_ONLY flag, init.cpp): a peer that completed the handshake has its
+;;;; transactions diverted into a set by RELAY-TRANSACTION (%RECON-HOLD-P,
+;;;; minus the fanout draw), the sync loop's per-tick MAYBE-START-RECONCILIATION
+;;;; opens rounds as the initiator, and the four round messages are handled
+;;;; only from a registered peer in the role BIP-330 gives it
+;;;; (protocol.lisp's define-p2p-handler forms). With the flag off no peer can
+;;;; register, so none of it is reachable from the wire.
+;;;;
+;;;; Choices the BIP leaves open and Core has no code for, each a named
+;;;; constant below: the set bound, the round interval, the default q, the
+;;;; fanout shares and the sketch-capacity ceiling.
 
 (defconstant +recon-short-id-bits+ 32
   "BIP-330 short IDs are 32 bits, which is also minisketch's field size here.")
 
 (defun recon-short-id (k0 k1 wtxid)
-  "The 32-bit short ID of WTXID for a peer with salt (K0, K1).
+  "The 32-bit short ID of WTXID for a peer with salt (K0, K1): BIP-330's `Let s
+= SipHash-2-4((k0,k1),wtxid) ... The short ID is equal to 1 + (s mod
+0xFFFFFFFF)'. WTXID is in internal byte order, the bytes Core's SipHashUint256
+hashes.
 
 Salted per peer so the same transaction has a different ID on every link: an
 observer watching one link cannot tell which transactions a node holds on
 another, and cannot grind IDs that collide for everybody.
 
-Zero is remapped to one because 0 has no sketch — its powers are all zero, so
-it would be invisible in the sketch rather than merely unlucky."
-  (let ((id (logand (bl.crypto:siphash-2-4 k0 k1 wtxid) #xFFFFFFFF)))
-    (if (zerop id) 1 id)))
+The 1 + (s mod 0xFFFFFFFF) is what keeps 0 out of the range -- 0 has no sketch,
+its powers are all zero -- and it is the BIP's exact map, not merely a nonzero
+one: a peer that computed `s mod 2^32, 0 remapped to 1' (this function until
+2026-09-29) disagrees on nearly every ID, so nothing it reconciles ever
+cancels."
+  (1+ (mod (bl.crypto:siphash-2-4 k0 k1 wtxid) #xFFFFFFFF)))
 
 (defstruct (recon-set (:constructor %make-recon-set))
   "The transactions waiting to be reconciled with one peer.
@@ -41,7 +57,12 @@ announce the real transaction once the difference is known."
   ;; Snapshot taken when a round starts. A round spans several messages, and
   ;; transactions keep arriving meanwhile; reconciling against a moving set
   ;; would make the sketch describe something the peer never saw.
-  (snapshot nil))
+  (snapshot nil)
+  ;; The RESPONDER's capacity for the snapshot's sketch, NIL when it has not
+  ;; answered a reqrecon. A reqsketchext is answered from it: BIP-330's
+  ;; extension is the same transactions at a higher capacity `without the
+  ;; part sent initially', so the responder must know where that part ended.
+  (snapshot-capacity nil :type (or null (integer 0))))
 
 (defun make-recon-set () (%make-recon-set))
 
@@ -90,7 +111,8 @@ reads the frozen list, this one creates it."
   (setf (recon-set-snapshot set) (recon-set-short-ids set)))
 
 (defun recon-set-clear-snapshot (set)
-  (setf (recon-set-snapshot set) nil))
+  (setf (recon-set-snapshot set) nil
+        (recon-set-snapshot-capacity set) nil))
 
 ;;;; --- Sketch construction ------------------------------------------------
 
@@ -110,11 +132,34 @@ safety net."
      (floor (* q (min local-size remote-size)))
      +recon-capacity-slack+))
 
+(defconstant +recon-max-sketch-capacity+ 128
+  "The largest capacity this node sketches at, or accepts a first sketch at;
+an extension doubles it once.
+
+minisketch's own advice (doc/protocoltips.md:9): `Decode times can be
+constrained by limiting sketch capacity'. BIP-330 names no ceiling and Core
+has no sketch code to copy one from, so the number is measured, not ported:
+this pure-Lisp decoder takes ~0.13 s for a full capacity-128 sketch and ~0.5 s
+for the capacity-256 extension (2026-09-29, warm image), which bounds what one
+round can cost. Without it a reqrecon claiming a 65535-transaction set with q
+near 2 sized a sketch in the hundreds of thousands. A difference larger than
+the extension can hold fails to decode, and the round floods -- the BIP's
+answer to any failed round.")
+
 (defun recon-build-sketch (short-ids capacity)
   "A sketch of CAPACITY over SHORT-IDS."
   (let ((sk (ms-make-sketch capacity)))
     (dolist (id short-ids sk)
       (ms-sketch-add sk id))))
+
+(defun recon-sketch-extension (short-ids capacity)
+  "BIP-330's sketch extension for a round first sketched at CAPACITY: `a
+sketch (of the same transactions sketched initially) of higher capacity
+without the part sent initially'. The higher capacity is double the first
+(so the extension is exactly as large as the first sketch); the syndromes a
+capacity-c sketch carries are the first c of any larger one, which is what
+lets the initiator append this to what it already holds."
+  (subseq (recon-build-sketch short-ids (* 2 capacity)) capacity))
 
 ;;;; --- Fanout -------------------------------------------------------------
 ;;;;
@@ -190,22 +235,30 @@ an extension rather than a failure.
 
 A NIL id list with OK-P TRUE is the other empty answer, and the common one:
 the two sides hold the same transactions, so the sketches cancel to zero and
-the difference is empty. MS-DECODE returns NIL for both -- an empty list is
-NIL -- and this used to read the cancelled sketch as a failed decode, so the
-peers that agreed most completely went through an extension and then flooded
-their whole sets on every round. A zero merged sketch is checked here, before
-the decoder, so the two empties stay apart."
-  (let* ((capacity (length their-sketch))
-         (mine (recon-build-sketch (recon-round-local-ids round) capacity))
-         (merged (ms-sketch-merge mine their-sketch)))
-    (setf (recon-round-their-sketch round) their-sketch
-          (recon-round-capacity round) capacity)
-    (if (every #'zerop merged)
-        (values '() t)
-        (let ((decoded (ms-decode merged)))
-          (if decoded
-              (values decoded t)
-              (values nil nil))))))
+the difference is empty -- MS-DECODE's own verdict, its second value.
+
+On an EXTENDED round THEIR-SKETCH is BIP-330's extension, the syndromes past
+the ones the first sketch carried, so it is appended to the first sketch and
+the whole decoded at twice the capacity. A first sketch over
++RECON-MAX-SKETCH-CAPACITY+, or an extension that is not exactly as long as
+the first sketch, is a failed decode: a sketch this node did not size is not
+one it will spend a decode on."
+  (let ((stored (recon-round-their-sketch round))
+        (extended (recon-round-extended round)))
+    (when (if extended
+              (or (null stored) (/= (length their-sketch) (length stored)))
+              (> (length their-sketch) +recon-max-sketch-capacity+))
+      (return-from recon-round-decode (values nil nil)))
+    (let* ((full (if extended
+                     (concatenate '(vector (unsigned-byte 32)) stored their-sketch)
+                     their-sketch))
+           (capacity (length full)))
+      (unless extended
+        (setf (recon-round-their-sketch round) their-sketch))
+      (setf (recon-round-capacity round) capacity)
+      (ms-decode (ms-sketch-merge
+                  (recon-build-sketch (recon-round-local-ids round) capacity)
+                  full)))))
 
 (defun recon-round-missing-ids (round decoded-ids)
   "Of the differing short IDs, the ones WE do not have — the set to ask for.
@@ -248,26 +301,51 @@ not share. Also unported for the same reason.")
        (null (peer-recon-round peer))
        (>= (- now (peer-recon-last-round peer)) +recon-round-interval-seconds+)))
 
+(defun %peer-recon-set (peer)
+  "PEER's reconciliation set, created on first use."
+  (or (peer-recon-set peer)
+      (setf (peer-recon-set peer) (make-recon-set))))
+
 (defun recon-start-round (peer now)
-  "Freeze this peer's set and send reqrecon. Returns the message, or NIL when
-there is nothing to reconcile."
-  (let* ((set (peer-recon-set peer))
-         (ids (and set (recon-set-take-snapshot set))))
-    (setf (peer-recon-last-round peer) now)
-    (when ids
-      (setf (peer-recon-round peer)
-            (make-recon-round :peer peer :local-ids ids :state :requested))
-      (bl.ser:make-reqrecon-message
-       (length ids) +recon-default-q+))))
+  "Freeze this peer's set and return the reqrecon that opens the round.
+
+An EMPTY set still opens one. Only the initiator opens rounds, so the
+responder's set -- the transactions it held back from us -- drains through
+our rounds and no other way: skipping the round whenever OUR side had nothing
+left a listening node's transactions unannounced to a quiet dialler (bar the
+fanout draw) until its set overflowed into flooding. BIP-330's reqrecon
+carries set_size 0 as readily as any other."
+  (let ((ids (recon-set-take-snapshot (%peer-recon-set peer))))
+    (setf (peer-recon-last-round peer) now
+          (peer-recon-round peer)
+          (make-recon-round :peer peer :local-ids ids :state :requested))
+    (bl.ser:make-reqrecon-message (length ids) +recon-default-q+)))
 
 (defun recon-respond-to-request (peer their-size q)
   "The responder's half: size a sketch against what the initiator says it has,
-and send it."
-  (let* ((set (peer-recon-set peer))
-         (ids (if set (recon-set-take-snapshot set) '()))
-         (capacity (recon-estimate-capacity (length ids) their-size q)))
+and send it. The capacity is BIP-330's estimate, held to
++RECON-MAX-SKETCH-CAPACITY+, and remembered with the snapshot so a
+reqsketchext can be answered with the part after it."
+  (let* ((set (%peer-recon-set peer))
+         (ids (recon-set-take-snapshot set))
+         (capacity (min (recon-estimate-capacity (length ids) their-size q)
+                        +recon-max-sketch-capacity+)))
+    (setf (recon-set-snapshot-capacity set) capacity)
     (bl.ser:make-sketch-message
      (ms-sketch-serialize (recon-build-sketch ids capacity)))))
+
+(defun recon-respond-to-extension (peer)
+  "The responder's answer to reqsketchext: the extension of the sketch it sent
+for this round (RECON-SKETCH-EXTENSION), over the same frozen snapshot, or NIL
+when it has sent no sketch this round to extend. An EMPTY snapshot is still
+answered -- its extension is all zeros -- or the initiator's round would wait
+forever for it."
+  (let* ((set (peer-recon-set peer))
+         (capacity (and set (recon-set-snapshot-capacity set))))
+    (when capacity
+      (bl.ser:make-sketch-message
+       (ms-sketch-serialize
+        (recon-sketch-extension (recon-set-snapshot set) capacity))))))
 
 (defun recon-settle-ids (set short-ids)
   "Drop SHORT-IDS from SET and return the wtxids they were holding.
