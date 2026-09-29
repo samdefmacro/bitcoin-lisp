@@ -1,6 +1,6 @@
 # Erlay / BIP330 Transaction Reconciliation — Implementation Plan
 
-Date: 2026-07-10. Status (2026-08-22): **P0-P4 DONE** — P0 live-loop wiring (PRs 242/243), P1 handshake, P2-P4 (PRs 387-390) behind default-off `-txreconciliation`; minisketch interop with Core's C library is UNVERIFIED (no Core reference exists beyond the handshake). See §6.
+Date: 2026-07-10. Status (2026-09-29): **P0-P4 DONE, verified against every oracle that exists** — P0 live-loop wiring (PRs 242/243), P1 handshake, P2-P4 (PRs 387-390) behind default-off `-txreconciliation`. Round 9 (2026-09-29) checked the sketches against Core's vendored minisketch (vectors from its pyminisketch.py; the decoder is now a port of sketch_impl.h), the short IDs and round messages against BIP-330, and ran two of our nodes through whole rounds over a real connection. The boundary with Core at the pin is in §6.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core Erlay/BIP330 + minisketch; our networking layer).
 
@@ -107,12 +107,74 @@ missing wtxids; failure: one extension round (`reqsketchext`) then full-flood fa
 |-------|-------------|------|----------------|
 | **P0** | ✅ **DONE 2026-07-10** (PRs 242 + 243, deployed): live-loop wiring + `maintain-peers` + Core `IsInitialBlockDownload` latch; deploy verification exposed that `handle-inv` also dropped all MSG_WTX announcements — fixed (BIP339 announce/request both directions). testnet4 mempool fills from P2P; latch logged | S-M | **bug fix — done** |
 | **P1** | Core-parity sendtxrcncl: config flag (default off, DEBUG-style), message codec + handshake send/receive rules + verack forget + salt storage; `compute-recon-salt` tagged-hash with a vector generated from Core | S-M | Core parity ✅ |
-| P2 | (parked) per-peer recon sets + AddToSet in relay-transaction + fanout selection + timer | M | beyond Core |
-| P3 | (parked) pure-Lisp minisketch (GF(2^32), BM, trace roots) byte-exact vs C vectors | M | beyond Core |
-| P4 | (parked) sketch exchange messages + extension + reconcildiff + flood fallback | M-L | beyond Core |
+| P2 | ✅ (PRs 387-390, default off) per-peer recon sets + AddToSet in relay-transaction + fanout selection + timer | M | beyond Core |
+| P3 | ✅ pure-Lisp minisketch (GF(2^32), BM, trace roots); Round 9: decoder ported from sketch_impl.h, vectors from Core's pyminisketch (§6.1) | M | Core's vendored library (tests only) |
+| P4 | ✅ sketch exchange messages + extension + reconcildiff + flood fallback | M-L | beyond Core |
 
 **Recommendation: do P0 now (it's a bug), P1 whenever convenient (small), park P2-P4 until Core
 merges the remainder** — revisit at the next ref bump.
+
+
+### 6.1 The Core-at-pin boundary (verified 2026-09-29, refs/bitcoin d3056bc149)
+
+| Piece | Core d3056bc | Ours | Oracle it is held to |
+|-------|--------------|------|----------------------|
+| `sendtxrcncl` handshake, `PreRegisterPeer`/`RegisterPeer`/`ForgetPeer`, the salt combination (`ComputeSalt`, tag `"Tx Relay Salting"`, ascending order) | yes (node/txreconciliation.cpp, net_processing.cpp:3728-3742, :3879-3886, :3963-4014) | ported | Core source; `p2p_sendtxrcncl.py` (PASS); a truncated payload now takes Core's `ProcessMessages ... Exception caught` path and keeps the peer (:3994, :5283-5284) instead of our invented disconnect |
+| minisketch GF(2^32) sketches: add, serialize, merge, decode | vendored (src/minisketch/), used only by tests | pure-Lisp; decoder ported from sketch_impl.h | vectors from Core's `src/minisketch/tests/pyminisketch.py` (tests/data/minisketch_core_vectors.py: field, 14 serializations, Core's minisketch_tests.cpp scenario, 116 decode verdicts incl. every failure shape) + the C library's SQR/QRT tables. The C++ library itself cannot be built in the container (no C++ compiler in the runtime image): pyminisketch-vs-C is the one residual |
+| Short ID `1 + (SipHash-2-4(k0,k1,wtxid) mod 0xFFFFFFFF)` | **absent** (no `ComputeShortID`, no `AddToSet`, no `ShouldFanoutTo` at the pin) | BIP-330 | BIP-330 text + Core's functional-test SipHash (vectors) |
+| Reconciliation sets and snapshots, fanout, round timer and timeout, q | **absent** | BIP-330 + named choices (`+recon-max-set-size+`, `+recon-round-interval-seconds+`, `+recon-default-q+` then BIP-330's q update, fanout shares, `+recon-max-sketch-capacity+` (ours, measured), `+recon-round-timeout-seconds+` (Core's GETDATA_TX_INTERVAL)) | properties + the two-node loopback test |
+| `reqrecon` / `sketch` / `reqsketchext` / `reconcildiff` | **absent** (protocol.h:266 ends at `sendtxrcncl`) | BIP-330 tables: reqrecon = uint16 set_size + uint16 q (q x (2^15-1)); the extension is the double-capacity sketch minus the part already sent | BIP-330 text |
+
+Reachability: every round message is ignored unless the peer completed the
+handshake (impossible with `-txreconciliation` off, which is the default and
+Core's DEBUG_ONLY flag) AND sends in its BIP-330 role (only the dialler sends
+`reqrecon`/`reqsketchext`/`reconcildiff`, only the listener sends `sketch`).
+The relay path holds transactions only for a registered peer, and the round
+timer opens rounds only with one. With the flag off, nothing past the
+handshake's "ignored" log line is reachable from the wire.
+
+Fixed in Round 9 (each with a test that was red on the old code): the short
+ID was `s mod 2^32` with 0 remapped (not the BIP's map, so a BIP peer would
+agree on almost no ID); `reqrecon` sent a uint32 set_size and scaled q by
+2^15; `reqsketchext` was answered with a whole sketch at twice the SNAPSHOT
+size instead of the extension; the decoder indexed past its coefficient
+vector on an LFSR longer than the capacity, answered the empty set and a
+failure with the same NIL, and differed from Core on masking/zero elements
+and mixed-capacity merges; round messages were accepted from either role;
+a peer-sized sketch had no ceiling; the initiator skipped rounds when its own
+set was empty, so the listener's held transactions had no way out; and a
+reconciled difference was queued for announcement as `(wtxid wtxid 0)`, so a
+segwit transaction read as gone from the mempool and every one fell under
+the peer's feefilter.
+
+Round 9, second phase (2026-09-29), each with a test red on the code before it:
+
+- **Round timeout** (`+recon-round-timeout-seconds+` = 60). BIP-330 names no
+  timeout and Core has no round, so the value is Core's nearest analogue: the
+  expiry of an unanswered transaction request, `GETDATA_TX_INTERVAL` = 60 s
+  (node/txdownloadman.h:38, armed at txdownloadman_impl.cpp:278). A reqrecon is
+  a request whose answer we need before we can announce, as a getdata is. On
+  timeout the initiator sends reconcildiff(success=0), floods its snapshot and
+  opens the next round (`maybe-start-reconciliation` now takes the mempool the
+  announcements need).
+- **The set moves into the snapshot**, per BIP-330 ("Makes a snapshot of their
+  current reconciliation set, and clears the set itself"), on both sides: a
+  transaction arriving mid-round waits for the next round. A reqrecon arriving
+  before the previous round's reconcildiff folds the stale snapshot into the
+  new one rather than dropping it.
+- **q is re-estimated** after every decoded round with BIP-330's rule,
+  q = (d - |R - L|) / min(R, L) (R derived from the decoded split), held to
+  what the uint16 carries; the next reqrecon sends it. The default is 1/4.
+- **One writer of the announcement queue**: `%queue-tx-announcement` (txid,
+  wtxid, integer fee rate per kvB); a test reads every src file and fails on
+  any other definition that pushes onto `peer-tx-inv-queue`, with a positive
+  control; reconciliation's announcements come from the mempool (a segwit
+  transaction's txid, not its wtxid), and without a mempool nothing is queued.
+- **`+recon-max-sketch-capacity+` = 128 is OUR number** (decided 2026-09-29):
+  a measured denial-of-service bound with no Core reference behind it.
+
+Left open: byte-exactness against the C++ minisketch itself, which needs a
+C++ toolchain in the container.
 
 ## 7. Effort & risk
 
