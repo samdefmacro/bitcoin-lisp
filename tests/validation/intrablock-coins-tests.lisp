@@ -300,9 +300,9 @@ The honest spend must validate and a corrupted one must not."
                    (bl.val:block-reject-reason error))))))
        ;; The mechanism underneath: without the overlay the vector is NIL and
        ;; the BIP341 fields cannot be precomputed; with it they are present.
-       (let ((extra (make-hash-table :test 'equalp))
+       (let ((extra (bl.ser:make-outpoint-table))
              (inputs (bl.ser:transaction-inputs unsigned)))
-         (setf (gethash (cons a-txid 0) extra) (aref spent 0))
+         (setf (gethash (bl.ser:outpoint-key a-txid 0) extra) (aref spent 0))
          (is (null (bl.val::collect-spent-utxos inputs utxo)))
          (let ((collected (bl.val::collect-spent-utxos inputs utxo extra)))
            (is (equalp spent collected))

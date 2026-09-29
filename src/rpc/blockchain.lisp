@@ -2403,7 +2403,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                      (bl.ser:dovector
                          (in (bl.ser:transaction-inputs tx))
                        (let* ((outpoint (bl.ser:tx-in-previous-output in))
-                              (coin (gethash (outpoint-key
+                              (coin (gethash (bl.ser:outpoint-key
                                               (bl.ser:outpoint-hash outpoint)
                                               (bl.ser:outpoint-index outpoint))
                                              prevouts)))
@@ -2751,17 +2751,11 @@ named the scanobject the caller had just sent rather than what Core infers
 from the script itself (`rawtr(...)' for the taproot output at :66)."
   (script-to-json script :network network))
 
-(defun outpoint-key (txid index)
-  (let ((k (make-array 36 :element-type '(unsigned-byte 8))))
-    (replace k txid)
-    (dotimes (i 4) (setf (aref k (+ 32 i)) (logand (ash index (* -8 i)) #xff)))
-    k))
-
 (defun %undo-prevout-table (undo)
   "Map (outpoint txid+index) -> utxo-entry for an undo list, for spend lookups."
-  (let ((table (make-hash-table :test 'equalp)))
+  (let ((table (bl.ser:make-outpoint-table)))
     (dolist (e undo table)
-      (setf (gethash (outpoint-key (first e) (second e)) table) (third e)))))
+      (setf (gethash (bl.ser:outpoint-key (first e) (second e)) table) (third e)))))
 
 (defun %tx-activity (tx needles prevout-fn base-fields network)
   "Collect spend+receive activity entries for TX. NEEDLES maps script->desc;
@@ -2853,7 +2847,7 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
                   (base `(("blockhash" . ,(hash-to-hex hash)) ("height" . ,height))))
               (dolist (tx (bl.ser:bitcoin-block-transactions block))
                 (push (%tx-activity tx needles
-                                    (lambda (th ti) (gethash (outpoint-key th ti) prevouts))
+                                    (lambda (th ti) (gethash (bl.ser:outpoint-key th ti) prevouts))
                                     base network)
                       chunks))))))
       ;; Mempool (blockhash/height omitted).

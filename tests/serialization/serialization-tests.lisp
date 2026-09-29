@@ -615,3 +615,40 @@ stands, so anything after it would prove nothing."
   ;; U+1F600, above the BMP: four bytes, one CL character.
   (is (equalp #(4 240 159 152 128)
               (%version-user-agent-field-bytes (string (code-char #x1F600))))))
+
+(test the-outpoint-key-is-coutpoints-bytes-and-finds-what-a-cons-key-found
+  "BL.SER:OUTPOINT-KEY is the one hash key every outpoint table takes (coin
+overlays, the block's pending outputs and spent set, package coins, the
+mempool's spent-outpoints): COutPoint's serialization, txid then the index as
+four little-endian bytes (primitives/transaction.h:37-39), in an octet-test
+table. The validation tables used (txid . index) conses under EQUALP, which
+the round-10 IBD profile found hashing element by element. Pin: the key IS the
+outpoint's wire bytes; a table of these keys answers every lookup exactly as
+the EQUALP cons table did -- same outputs of one transaction (vout 0..299),
+the largest index, and txids that share their first eight bytes -- and misses
+what it missed; and the outputs of one transaction do not share a hash."
+  (let* ((txid-a (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
+                   (dotimes (i 32 v) (setf (aref v i) (mod (* 13 (1+ i)) 256)))))
+         (txid-b (let ((v (copy-seq txid-a))) (setf (aref v 31) (logxor (aref v 31) #xff)) v))
+         (outpoints (append (loop for i below 300 collect (cons txid-a i))
+                            (list (cons txid-a #xffffffff) (cons txid-b 0) (cons txid-b 7))))
+         (keyed (bl.ser:make-outpoint-table))
+         (consed (make-hash-table :test 'equalp)))
+    (let ((bb (bl.bytes:make-byte-buf)))
+      (bl.ser:bb-write-outpoint bb (bl.ser:make-outpoint :hash txid-a :index #x01020304))
+      (is (equalp (bl.bytes:bb-finish bb) (bl.ser:outpoint-key txid-a #x01020304))
+          "the key is the outpoint's serialization"))
+    (loop for (txid . index) in outpoints
+          for n from 0
+          do (setf (gethash (bl.ser:outpoint-key txid index) keyed) n
+                   (gethash (cons txid index) consed) n))
+    (is (= (hash-table-count consed) (hash-table-count keyed)))
+    (is-true (loop for (txid . index) in outpoints
+                   always (eql (gethash (cons txid index) consed)
+                               (gethash (bl.ser:outpoint-key (copy-seq txid) index) keyed)))
+             "every lookup answers as the cons table did, from a fresh key")
+    (is (null (gethash (bl.ser:outpoint-key txid-b 1) keyed)) "and a miss is a miss")
+    (is (= 300 (length (remove-duplicates
+                        (loop for i below 300
+                              collect (bl.bytes:octets-hash (bl.ser:outpoint-key txid-a i))))))
+        "the outputs of one transaction hash apart")))

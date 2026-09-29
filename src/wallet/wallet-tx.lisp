@@ -61,14 +61,9 @@ changed (Core CWallet::blockConnected, wallet.cpp:1550).")
 abandoned TxStateInactive (transaction.h:85-103).")
 
 (defun %wtx-outpoint-key (txid index)
-  "36-byte txid||index-LE key for the txos / tx-spends tables."
-  (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
-    (replace key txid)
-    (setf (aref key 32) (logand index #xFF)
-          (aref key 33) (logand (ash index -8) #xFF)
-          (aref key 34) (logand (ash index -16) #xFF)
-          (aref key 35) (logand (ash index -24) #xFF))
-    key))
+  "36-byte txid||index-LE key for the txos / tx-spends tables: the project's
+one outpoint key (BL.SER:OUTPOINT-KEY), whose bytes this always wrote."
+  (bl.ser:outpoint-key txid index))
 
 (defun %tx-value-out (tx)
   (reduce #'+ (bl.ser:transaction-outputs tx)

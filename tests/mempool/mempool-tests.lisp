@@ -1928,7 +1928,7 @@ as confirming in the next block for BIP68 (validation.cpp:185-192)."
     (multiple-value-bind (coins ok)
         (bl.val::mempool-extra-coins b utxo mempool 201)
       (is-true ok)
-      (let ((coin (gethash (cons atxid 0) coins)))
+      (let ((coin (gethash (bl.ser:outpoint-key atxid 0) coins)))
         (is (not (null coin)))
         (is (= 201 (bl.store:utxo-entry-height coin)))))))
 

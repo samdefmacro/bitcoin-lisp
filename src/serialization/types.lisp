@@ -52,6 +52,32 @@ INDEX is the output index within that transaction."
   (make-outpoint :hash (br-read-bytes br 32)
                  :index (br-read-u32-le br)))
 
+(defun outpoint-key (txid index)
+  "The key an outpoint takes in a hash table: TXID's 32 bytes followed by INDEX
+as four little-endian bytes -- COutPoint's own serialization
+(primitives/transaction.h:37-39) -- for a table MAKE-OUTPOINT-TABLE makes.
+
+Core keys every outpoint map by COutPoint under SaltedOutpointHasher
+(util/hasher.h); ours are keyed by this vector under the octet test, whose
+hash reads the txid's leading bytes and mixes the index in
+(BL.BYTES:OCTETS-HASH), so the outputs of one transaction do not share a
+bucket. A (txid . index) CONS under EQUALP -- what the validation tables used
+-- hashes through SBCL's generic PSXHASH, element by element, and was the
+largest cost left in the round-10 IBD profile."
+  (declare (type (simple-array (unsigned-byte 8) (*)) txid)
+           (type (unsigned-byte 32) index))
+  (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
+    (replace key txid :end2 32)
+    (setf (aref key 32) (ldb (byte 8 0) index)
+          (aref key 33) (ldb (byte 8 8) index)
+          (aref key 34) (ldb (byte 8 16) index)
+          (aref key 35) (ldb (byte 8 24) index))
+    key))
+
+(defun make-outpoint-table (&key (size 16))
+  "An empty hash table keyed by OUTPOINT-KEY: the octet test, not EQUALP."
+  (bl.bytes:make-octets-hash-table :size size))
+
 (defun null-outpoint-p (outpoint)
   "Check if OUTPOINT is null (references no previous output)."
   (and (every #'zerop (outpoint-hash outpoint))

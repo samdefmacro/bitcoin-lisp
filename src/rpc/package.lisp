@@ -177,7 +177,6 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:out-desc-threshold
    #:out-desc-tree
    #:out-desc-xonly-script-p
-   #:outpoint-key
    #:parse-descriptor
    #:parse-descriptor-range
    #:parse-descriptors

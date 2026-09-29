@@ -259,15 +259,15 @@ wasted work that fixes nothing."
   (let* ((tx (make-mempool-test-tx :input-id 71))
          (block-txs (list tx tx))          ; [0] stands in for the coinbase
          (utxo (bl.store:make-utxo-set))
-         (coins (make-hash-table :test 'equalp))
+         (coins (bl.ser:make-outpoint-table))
          (in (aref (bl.ser:transaction-inputs tx) 0))
          (prevout (bl.ser:tx-in-previous-output in))
          (entry (bl.store:make-utxo-entry
                  :value 100000
                  :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
                  :height 1 :coinbase nil)))
-    (setf (gethash (cons (bl.ser:outpoint-hash prevout)
-                         (bl.ser:outpoint-index prevout))
+    (setf (gethash (bl.ser:outpoint-key (bl.ser:outpoint-hash prevout)
+                                        (bl.ser:outpoint-index prevout))
                    coins)
           entry)
     (let ((prefetched (bl.val::prefetch-block-spent-coins

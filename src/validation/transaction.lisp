@@ -102,11 +102,11 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (values nil :tx-oversize)))
 
     ;; Check for duplicate inputs
-    (let ((seen-outpoints (make-hash-table :test 'equalp)))
+    (let ((seen-outpoints (bl.ser:make-outpoint-table)))
       (bl.ser:dovector (input inputs)
         (let* ((prevout (bl.ser:tx-in-previous-output input))
-               (key (cons (bl.ser:outpoint-hash prevout)
-                          (bl.ser:outpoint-index prevout))))
+               (key (bl.ser:outpoint-key (bl.ser:outpoint-hash prevout)
+                                         (bl.ser:outpoint-index prevout))))
           (when (gethash key seen-outpoints)
             (return-from validate-transaction-structure
               (values nil :duplicate-inputs)))
@@ -160,9 +160,9 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 (defun validate-transaction-contextual (tx utxo-set current-height
                                         &key is-coinbase pending-utxos spent-outpoints)
   "Validate a transaction in the context of the current UTXO set.
-PENDING-UTXOS is an optional hash table of (txid . index) -> utxo-entry
+PENDING-UTXOS is an optional hash table of BL.SER:OUTPOINT-KEY -> utxo-entry
 for outputs created by earlier transactions in the same block.
-SPENT-OUTPOINTS is an optional set of (txid . index) keys already consumed by
+SPENT-OUTPOINTS is an optional set of BL.SER:OUTPOINT-KEY keys already consumed by
 an earlier transaction in the same block; such a prevout counts as ABSENT and
 falls into :missing-input — Core has spent the coin out of its view, so
 HaveInputs fails with bad-txns-inputs-missingorspent (tx_verify.cpp:167-169).
@@ -179,7 +179,7 @@ FEE is returned as a Satoshi type."
         (let* ((prevout (bl.ser:tx-in-previous-output input))
                (prev-txid (bl.ser:outpoint-hash prevout))
                (prev-index (bl.ser:outpoint-index prevout))
-               (key (cons prev-txid prev-index))
+               (key (bl.ser:outpoint-key prev-txid prev-index))
                (spent-in-block (and spent-outpoints (gethash key spent-outpoints)))
                (utxo (unless spent-in-block
                        (or (bl.store:get-utxo utxo-set prev-txid prev-index)
@@ -356,7 +356,7 @@ for a script failure that could be explained by a stripped witness."
            (ptxid (bl.ser:outpoint-hash prevout))
            (pidx (bl.ser:outpoint-index prevout))
            (utxo (or (bl.store:get-utxo utxo-set ptxid pidx)
-                     (when extra-coins (gethash (cons ptxid pidx) extra-coins))))
+                     (when extra-coins (gethash (bl.ser:outpoint-key ptxid pidx) extra-coins))))
            (spk (and utxo (bl.store:utxo-entry-script-pubkey utxo))))
       (when spk
         (cond
@@ -629,7 +629,7 @@ standard."
                            (bl.ser:tx-in-script-sig input)))))))))
 
 (defun mempool-extra-coins (tx utxo-set mempool spend-height &optional package-coins)
-  "Build a (txid . index) -> utxo-entry table for TX inputs that spend
+  "Build a BL.SER:OUTPOINT-KEY -> utxo-entry table for TX inputs that spend
 unconfirmed outputs — either an in-mempool tx (chained spends) or, as a final
 fallback, a sibling output supplied in PACKAGE-COINS (a package being validated
 together, before its members are in the mempool). Returns (values table ok-p);
@@ -643,7 +643,7 @@ block (CalculatePrevHeights maps MEMPOOL_HEIGHT coins to tip.nHeight+1,
 validation.cpp:185-192), so any nonzero relative lock on an unconfirmed
 input is non-final. Recording the parent's acceptance height instead let
 such locks mature while the parent was still unconfirmed."
-  (let ((extra (make-hash-table :test 'equalp)))
+  (let ((extra (bl.ser:make-outpoint-table)))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx) (values extra t))
       (let* ((prevout (bl.ser:tx-in-previous-output input))
              (ptxid (bl.ser:outpoint-hash prevout))
@@ -652,18 +652,18 @@ such locks mature while the parent was still unconfirmed."
           (let* ((pe (bl.mp:mempool-get mempool ptxid))
                  (ptx (and pe (bl.mp:mempool-entry-transaction pe)))
                  (outs (and ptx (bl.ser:transaction-outputs ptx)))
-                 (pkg-coin (and package-coins (gethash (cons ptxid pidx) package-coins))))
+                 (pkg-coin (and package-coins (gethash (bl.ser:outpoint-key ptxid pidx) package-coins))))
             (cond
               ((and outs (< pidx (length outs)))
                (let ((out (aref outs pidx)))
-                 (setf (gethash (cons ptxid pidx) extra)
+                 (setf (gethash (bl.ser:outpoint-key ptxid pidx) extra)
                        (bl.store:make-utxo-entry
                         :value (bl.ser:tx-out-value out)
                         :script-pubkey (bl.ser:tx-out-script-pubkey out)
                         :height spend-height
                         :coinbase nil))))
               (pkg-coin
-               (setf (gethash (cons ptxid pidx) extra) pkg-coin))
+               (setf (gethash (bl.ser:outpoint-key ptxid pidx) extra) pkg-coin))
               (t
                (return-from mempool-extra-coins (values nil nil))))))))))
 
@@ -1292,7 +1292,7 @@ mempool txids — the workspace values Core's PreChecks leaves in
 ws.m_modified_fees / ws.m_conflicts for the package layer to read, returned
 so callers need not re-derive them.
 
-PACKAGE-COINS, when supplied, is a (txid . index) -> utxo-entry table of outputs
+PACKAGE-COINS, when supplied, is a BL.SER:OUTPOINT-KEY -> utxo-entry table of outputs
 produced by sibling transactions in a package being validated together (so a
 child can spend a not-yet-in-mempool parent). SKIP-FEE-CHECK bypasses the per-tx
 minimum-fee floor, used when the package as a whole is evaluated at the package
@@ -1451,7 +1451,7 @@ pass a member failed decides what the caller is told about the others."
       (let ((sigops-cost
               (flet ((spent-script (txid index)
                        (let ((u (or (bl.store:get-utxo utxo-set txid index)
-                                    (gethash (cons txid index) extra-coins))))
+                                    (gethash (bl.ser:outpoint-key txid index) extra-coins))))
                          (when u (bl.store:utxo-entry-script-pubkey u)))))
                 ;; Core AreInputsStandard → TX_INPUTS_NOT_STANDARD
                 ;; "bad-txns-nonstandard-inputs" (:896-899). Distinct from the
@@ -1588,7 +1588,7 @@ pass a member failed decides what the caller is told about the others."
 
 (defun collect-spent-utxos (inputs utxo-set &optional extra-coins)
   "Return a vector of utxo-entry for INPUTS, or NIL if any UTXO is missing.
-   EXTRA-COINS is an optional (txid . index) -> utxo-entry table consulted as a
+   EXTRA-COINS is an optional BL.SER:OUTPOINT-KEY -> utxo-entry table consulted as a
    fallback (used for chained mempool spends, where a parent's output isn't in
    the confirmed UTXO set yet).
    Required for BIP 341 sighash, which hashes spent amounts/scripts across
@@ -1603,8 +1603,8 @@ pass a member failed decides what the caller is told about the others."
                           (bl.ser:outpoint-hash prevout)
                           (bl.ser:outpoint-index prevout))
                          (and extra-coins
-                              (gethash (cons (bl.ser:outpoint-hash prevout)
-                                             (bl.ser:outpoint-index prevout))
+                              (gethash (bl.ser:outpoint-key (bl.ser:outpoint-hash prevout)
+                                                            (bl.ser:outpoint-index prevout))
                                        extra-coins)))
           unless utxo do (return-from collect-spent-utxos nil)
           do (setf (aref result i) utxo))

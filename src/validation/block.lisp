@@ -218,7 +218,7 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
                (prev-txid (bl.ser:outpoint-hash prevout))
                (prev-index (bl.ser:outpoint-index prevout))
                (utxo (or (and pending-utxos
-                              (gethash (cons prev-txid prev-index) pending-utxos))
+                              (gethash (bl.ser:outpoint-key prev-txid prev-index) pending-utxos))
                          (bl.store:get-utxo utxo-set prev-txid prev-index))))
           (unless utxo
             (return-from check-sequence-locks nil))
@@ -927,7 +927,7 @@ failure -- the two halves Core's CheckInputScripts reports, the ScriptError it
 puts in the reject reason and the input index CScriptCheck names in the debug
 message (validation.cpp:2018, :2117-2119). SCRIPT-ERROR is NIL when the pass
 failed without one, which is Core's SCRIPT_ERR_UNKNOWN_ERROR. EXTRA-COINS is
-an optional (txid . index) -> utxo-entry table of coins created by earlier
+an optional BL.SER:OUTPOINT-KEY -> utxo-entry table of coins created by earlier
 transactions in the same block, which are not in UTXO-SET yet.
 
 SPENT-UTXOS, when supplied, is this transaction's already-resolved coins from
@@ -2089,7 +2089,7 @@ checks skipped that block was accepted outright."
           for idx from 0
           for spk = (bl.ser:tx-out-script-pubkey output)
           unless (bl.store:script-unspendable-p spk)
-            do (setf (gethash (cons txid idx) pending-utxos)
+            do (setf (gethash (bl.ser:outpoint-key txid idx) pending-utxos)
                      (bl.store:make-utxo-entry
                       :value (bl.ser:tx-out-value output)
                       :script-pubkey spk
@@ -2209,7 +2209,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
     ;; Track outputs from earlier transactions for intra-block spending
     (let* ((total-fees (bl.interop:wrap-satoshi 0))
            (total-sigops-cost 0)
-           (pending-utxos (make-hash-table :test 'equalp))
+           (pending-utxos (bl.ser:make-outpoint-table))
            ;; Outpoints an earlier transaction of this block already consumed.
            ;; Core spends them out of its per-block coins view (UpdateCoins,
            ;; validation.cpp:1996-2008), so HaveInputs then fails for a second
@@ -2217,7 +2217,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
            ;; consumed set is tracked alongside the created one. Coin data
            ;; stays in PENDING-UTXOS after the spend — sigop counting and
            ;; script validation still need the spender's own prevouts.
-           (spent-outpoints (make-hash-table :test 'equalp))
+           (spent-outpoints (bl.ser:make-outpoint-table))
            ;; Gate P2SH/witness sigop counting on the block's active flags,
            ;; exactly as Bitcoin Core passes GetBlockScriptFlags into
            ;; GetTransactionSigOpCost. Same source of truth as script validation,
@@ -2233,7 +2233,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
 
       ;; UTXO lookup function for sigops counting
       (flet ((get-spent-script (txid index)
-               (let ((utxo (or (gethash (cons txid index) pending-utxos)
+               (let ((utxo (or (gethash (bl.ser:outpoint-key txid index) pending-utxos)
                                (bl.store:get-utxo utxo-set txid index))))
                  (when utxo
                    (bl.store:utxo-entry-script-pubkey utxo)))))
@@ -2310,8 +2310,8 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                  (bl.ser:dovector
                      (input (bl.ser:transaction-inputs tx))
                    (let ((prevout (bl.ser:tx-in-previous-output input)))
-                     (setf (gethash (cons (bl.ser:outpoint-hash prevout)
-                                          (bl.ser:outpoint-index prevout))
+                     (setf (gethash (bl.ser:outpoint-key (bl.ser:outpoint-hash prevout)
+                                                         (bl.ser:outpoint-index prevout))
                                     spent-outpoints)
                            t)))
                  (%stage-block-outputs tx pending-utxos current-height)))

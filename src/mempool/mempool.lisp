@@ -808,14 +808,9 @@ Nested batches verify only at the outermost exit."
 ;;;; Outpoint key helper
 
 (defun make-outpoint-key (txid index)
-  "Create a key for the spent-outpoints table."
-  (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
-    (replace key txid)
-    (setf (aref key 32) (logand index #xFF))
-    (setf (aref key 33) (logand (ash index -8) #xFF))
-    (setf (aref key 34) (logand (ash index -16) #xFF))
-    (setf (aref key 35) (logand (ash index -24) #xFF))
-    key))
+  "Create a key for the spent-outpoints table: the project's one outpoint key
+(BL.SER:OUTPOINT-KEY), whose bytes this function always wrote."
+  (bl.ser:outpoint-key txid index))
 
 ;;;; Core operations
 

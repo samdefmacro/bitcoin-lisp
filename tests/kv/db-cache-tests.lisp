@@ -414,11 +414,11 @@ fork."
                  (lambda (&rest args) (declare (ignore args)) (incf runs) t))
            (bl.interop::clear-script-execution-cache)
            (let ((utxo (bl.store:make-utxo-set))
-                 (coins (make-hash-table :test 'equalp)))
+                 (coins (bl.ser:make-outpoint-table)))
              ;; A resolvable coin for the single input, so the walk reaches
              ;; validate-input-script at all.
              (let ((in (aref (bl.ser:transaction-inputs tx) 0)))
-               (setf (gethash (cons (bl.ser:outpoint-hash
+               (setf (gethash (bl.ser:outpoint-key (bl.ser:outpoint-hash
                                      (bl.ser:tx-in-previous-output in))
                                     (bl.ser:outpoint-index
                                      (bl.ser:tx-in-previous-output in)))
@@ -457,9 +457,9 @@ next pass short-circuits on the first input's success and accepts it."
            (setf (symbol-function 'bl.val:validate-input-script)
                  (lambda (&rest args) (declare (ignore args)) nil))
            (let ((utxo (bl.store:make-utxo-set))
-                 (coins (make-hash-table :test 'equalp)))
+                 (coins (bl.ser:make-outpoint-table)))
              (let ((in (aref (bl.ser:transaction-inputs tx) 0)))
-               (setf (gethash (cons (bl.ser:outpoint-hash
+               (setf (gethash (bl.ser:outpoint-key (bl.ser:outpoint-hash
                                      (bl.ser:tx-in-previous-output in))
                                     (bl.ser:outpoint-index
                                      (bl.ser:tx-in-previous-output in)))

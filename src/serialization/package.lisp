@@ -110,6 +110,8 @@ src/serialization/.")
    #:make-outpoint
    #:outpoint-hash
    #:outpoint-index
+   #:outpoint-key
+   #:make-outpoint-table
    #:tx-in
    #:make-tx-in
    #:tx-in-previous-output

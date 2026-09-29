@@ -141,12 +141,12 @@ here."
        ;;    more severe, consensus error", to be reported per-transaction by
        ;;    CheckTransaction as bad-txns-inputs-duplicate rather than as a
        ;;    package-wide verdict with no per-member attribution.
-       (let ((spent (make-hash-table :test 'equalp)))
+       (let ((spent (bl.ser:make-outpoint-table)))
          (dolist (tx package)
            (let ((keys (map 'list (lambda (in)
                                     (let ((p (bl.ser:tx-in-previous-output in)))
-                                      (cons (bl.ser:outpoint-hash p)
-                                            (bl.ser:outpoint-index p))))
+                                      (bl.ser:outpoint-key (bl.ser:outpoint-hash p)
+                                                           (bl.ser:outpoint-index p))))
                             (bl.ser:transaction-inputs tx))))
              (when (or (null keys)
                        (some (lambda (key) (gethash key spent)) keys))
@@ -194,7 +194,7 @@ check where ProcessNewPackage gates on IsChildWithParents alone."
 ;;;; Package acceptance
 
 (defun %build-package-coins (package height)
-  "A (txid . index) -> utxo-entry table covering every output of every tx in
+  "An outpoint-key -> utxo-entry table covering every output of every tx in
 PACKAGE, so a later package tx's input that spends an earlier sibling's output
 resolves during the package-feerate phase (Core's CCoinsViewMemPool layered over
 the package). Consulted only as a fallback, after the confirmed UTXO set and the
@@ -205,9 +205,9 @@ confirm at — the next block (tip+1) — which is what BIP68 evaluates against.
       (%add-package-coins coins tx height))))
 
 (defun %make-package-coins ()
-  "An empty package coin table. EQUALP and not the octet-vector test because
-the key is a (txid . index) CONS, not a hash."
-  (make-hash-table :test 'equalp))
+  "An empty package coin table, keyed by BL.SER:OUTPOINT-KEY like every other
+coin table the validation layer reads (extra coins, pending block outputs)."
+  (bl.ser:make-outpoint-table))
 
 (defun %add-package-coins (coins tx height)
   "Add TX's outputs to the package coin table COINS at HEIGHT — Core
@@ -216,7 +216,7 @@ that the members AFTER it can spend its outputs (validation.cpp:1473)."
   (let ((txid (bl.ser:transaction-hash tx)))
     (loop for out across (bl.ser:transaction-outputs tx)
           for idx from 0
-          do (setf (gethash (cons txid idx) coins)
+          do (setf (gethash (bl.ser:outpoint-key txid idx) coins)
                    (bl.store:make-utxo-entry
                     :value (bl.ser:tx-out-value out)
                     :script-pubkey (bl.ser:tx-out-script-pubkey out)

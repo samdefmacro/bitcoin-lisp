@@ -555,7 +555,7 @@ rpc_psbt.py:923-930 checks by joining ten times."
           (loop for in across (bl.ser:transaction-inputs tx)
                 for i from 0
                 for op = (bl.ser:tx-in-previous-output in)
-                for key = (bl.rpc:outpoint-key (bl.ser:outpoint-hash op)
+                for key = (bl.ser:outpoint-key (bl.ser:outpoint-hash op)
                                          (bl.ser:outpoint-index op))
                 do (when (gethash key seen)
                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
