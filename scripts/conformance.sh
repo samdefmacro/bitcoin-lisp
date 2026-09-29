@@ -61,22 +61,59 @@ mkdir -p "$REPO/$OUT"
 MODE=tests
 NEEDS_LOCAL_ADDRS=0
 if [ "${1:-}" = "--runner" ]; then MODE=runner; shift; fi
+# --adapted: every test under tests/functional-adapted/ (Core tests with one
+# framework step replaced; see that directory's README), then any others given.
+if [ "${1:-}" = "--adapted" ]; then
+  shift
+  set -- $(cd "$REPO" && ls tests/functional-adapted/*.py) "$@"
+fi
 
 if [ "$MODE" = runner ]; then
+  # test_runner.py reads config.ini from ITS OWN directory's parent
+  # (test_runner.py:443) and runs tests from $BUILDDIR/test/functional
+  # (:607), which is the layout Core's build tree has: a real directory whose
+  # entries link to the source tree's tests, with config.ini beside it. Build
+  # that layout under build/test. A link to the whole directory would not do:
+  # `functional/../config.ini' resolves through the link's TARGET. Each entry
+  # is replaced atomically and only when missing or wrong, so a concurrent run
+  # never sees one absent.
+  mkdir -p "$REPO/build/test/functional"
+  for entry in "$REPO"/refs/bitcoin/test/functional/*; do
+    e="$(basename "$entry")"
+    target="../../../refs/bitcoin/test/functional/$e"
+    if [ "$(readlink "$REPO/build/test/functional/$e" 2>/dev/null || true)" != "$target" ]; then
+      ln -sfn "$target" "$REPO/build/test/functional/.$e.$$"
+      mv -f "$REPO/build/test/functional/.$e.$$" "$REPO/build/test/functional/$e"
+    fi
+  done
+  cp -f "$REPO/test/config.ini" "$REPO/build/test/config.ini.$$"
+  mv -f "$REPO/build/test/config.ini.$$" "$REPO/build/test/config.ini"
   # test_runner.py owns its own parallelism and per-test tmpdirs.
-  CMD="python3 /workspace/refs/bitcoin/test/functional/test_runner.py \
-        --configfile=/workspace/test/config.ini \
+  CMD="python3 /workspace/build/test/functional/test_runner.py \
         --tmpdirprefix=/workspace/$OUT $*"
 else
-  [ $# -gt 0 ] || { echo "Usage: $0 <test.py> [test.py ...]  |  $0 --runner [args]" >&2; exit 2; }
+  [ $# -gt 0 ] || { echo "Usage: $0 <test.py> [test.py ...]  |  $0 --adapted [test.py ...]  |  $0 --runner [args]" >&2; exit 2; }
   CMD=""
+  used_names=" "
   for t in "$@"; do
-    # Each test gets its own tmpdir; the framework refuses a non-empty one.
-    name="$(basename "$t" .py)"
+    base="$(basename "$t" .py)"
+    # Each test gets its own tmpdir, and the framework refuses a non-empty
+    # one: a test given by path is named by its path (an adapted copy and
+    # Core's original of the same basename used to share one tmpdir, and the
+    # second died with FileExistsError), and a repeat gets a suffix.
+    case "$t" in
+      */*) name="$(printf '%s' "${t%.py}" | tr '/' '_')" ;;
+      *) name="$base" ;;
+    esac
+    n=1; stem="$name"
+    while case "$used_names" in *" $name "*) true ;; *) false ;; esac; do
+      n=$((n + 1)); name="$stem-$n"
+    done
+    used_names="$used_names$name "
     # The two -bind/-discover tests skip unless routable addresses are on an
     # interface and the test is told so; see scripts/conformance-local-addresses.py.
     extra=""
-    case "$name" in
+    case "$base" in
       feature_bind_port_discover) extra="--ihave1111and2222"; NEEDS_LOCAL_ADDRS=1 ;;
       feature_bind_port_externalip) extra="--ihave1111"; NEEDS_LOCAL_ADDRS=1 ;;
     esac
