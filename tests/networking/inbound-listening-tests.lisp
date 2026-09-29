@@ -500,3 +500,76 @@ Control: the same dial without the stray ping completes too
                    (bl.net:disconnect-peer server-peer))
                  (bl.net:disconnect-peer client))))
         (bl.net:close-listener srv)))))
+
+(defun %eof-within-p (socket seconds)
+  "T when SOCKET's peer closes it within SECONDS: readable, and the read that
+follows reports end of file (a silent peer never writes, so any readable
+state is the close)."
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* seconds internal-time-units-per-second)))))
+    (loop
+      (let ((left (/ (- deadline (get-internal-real-time))
+                     internal-time-units-per-second)))
+        (when (<= left 0) (return nil))
+        (when (usocket:wait-for-input socket :timeout left :ready-only t)
+          (return (eq :eof (ignore-errors
+                            (read-byte (usocket:socket-stream socket) nil :eof)))))))))
+
+(test an-unfinished-handshake-is-closed-in-the-pass-that-times-it-out
+  "Core decides an unfinished handshake on the thread that owns the socket:
+SocketHandlerConnected ends each pass with InactivityCheck (net.cpp:2218,
+the `!fSuccessfullyConnected' arm at :2053-2058 behind -peertimeout on the
+mockable clock, :2003-2006) and the next ThreadSocketHandler loop closes the
+socket in DisconnectNodes (:2239-2243); the loop waits at most
+SELECT_TIMEOUT_MILLISECONDS = 50 (:106). p2p_v2_misbehaving.py:155-156 bumps
+the mock clock past -peertimeout=3 and gives the close ONE second, and in a
+parallel sweep ours logged the verdict 0.7 s after the bump -- from the sync
+thread's tick, while the handshake's own thread sat in its read.
+
+A silent client dials the listener; the clock is frozen at the connect time,
+then bumped four seconds. No sync thread runs here, so only the handshake's
+own thread can close the socket. TIMING-SENSITIVE with a wide margin on
+purpose: the two answers are ~0.05 s (the verdict is asked between the
+handshake's waits) and 15 s (the handshake thread's own read cap).
+
+Control: with the clock still at the connect time, half a second of real
+time closes nothing."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0))
+        (saved-mock bl.ser:*mock-time*)
+        (saved-timeout bl:*handshake-timeout-seconds*)
+        (t0 1780000000))
+    (is-true srv)
+    (when srv
+      (let ((node (bl:make-node))
+            (port (usocket:get-local-port srv))
+            (client nil)
+            (listener nil))
+        (setf (bl:node-running node) t
+              ;; Global, not bound: the handshake runs on its own thread.
+              bl.ser:*mock-time* t0
+              bl:*handshake-timeout-seconds* 3)
+        (unwind-protect
+             (progn
+               (setf listener
+                     (bt:make-thread
+                      (lambda () (ignore-errors (bl:run-inbound-listener node :socket srv)))
+                      :name "test-inbound-listener"))
+               (sleep 0.3)
+               (setf client (usocket:socket-connect "127.0.0.1" port
+                                                    :element-type '(unsigned-byte 8)))
+               (is-false (%eof-within-p client 0.5)
+                         "control: inside -peertimeout on the frozen clock the peer stays")
+               (setf bl.ser:*mock-time* (+ t0 4))
+               (is-true (%eof-within-p client 1)
+                        "the mock-clock bump past -peertimeout closes the socket within a second")
+               (let ((peer (first (bl:node-pending-inbound-peers node))))
+                 (is (eq :disconnected (and peer (bl.net:peer-state peer)))
+                     "and the peer is gone, not waiting for a later pass")))
+          (setf (bl:node-running node) nil
+                bl.ser:*mock-time* saved-mock
+                bl:*handshake-timeout-seconds* saved-timeout)
+          (when client (ignore-errors (usocket:socket-close client)))
+          (when listener (ignore-errors (bt:join-thread listener)))
+          (dolist (p (bl:node-pending-inbound-peers node))
+            (ignore-errors (bl.net:disconnect-peer p)))
+          (bl.net:close-listener srv))))))

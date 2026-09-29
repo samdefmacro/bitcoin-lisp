@@ -1839,13 +1839,12 @@ sync thread with node-running still T is a socket-reading zombie)."
       (log-error "Initial peer connection failed (retrying in loop): ~A" c))))
 
 (defun %sync-tick-liveness (node)
-  "The per-tick liveness verdicts, on the MOCKABLE clock: InactivityCheck for
-the handshakes still in flight (Core runs it on every socket-handler pass,
-net.cpp:2218) and ConsiderEviction for every outbound peer (Core
-SendMessages, net_processing.cpp:6159). Run BEFORE the pump answers anything,
-so a peer whose ping is answered this tick has seen the verdict for the clock
-it set before pinging (p2p_outbound_eviction.py:46-56)."
-  (check-handshaking-peers node)
+  "The per-tick liveness verdicts, on the MOCKABLE clock: ConsiderEviction for
+every outbound peer (Core SendMessages, net_processing.cpp:6159). Run BEFORE
+the pump answers anything, so a peer whose ping is answered this tick has seen
+the verdict for the clock it set before pinging (p2p_outbound_eviction.py:46-56).
+An unfinished handshake is judged by the thread driving it
+(BL.NET:CALL-WITH-INACTIVITY-VERDICT), which owns its socket."
   (consider-chain-sync-evictions node))
 
 (defun %sync-idle-tick (second)

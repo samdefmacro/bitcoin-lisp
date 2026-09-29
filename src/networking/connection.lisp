@@ -236,6 +236,34 @@ in-flight socket reads.")
   "Return T if node shutdown has been requested (see *ibd-stop-requested*)."
   *ibd-stop-requested*)
 
+;;; The socket handler's liveness verdict, for the reads that WAIT.
+;;;
+;;; Core decides a connection's liveness on the thread that owns its socket:
+;;; SocketHandlerConnected ends every pass with `if (InactivityCheck(*pnode,
+;;; now)) pnode->fDisconnect = true' (net.cpp:2218), and the next loop of
+;;; ThreadSocketHandler closes it in DisconnectNodes (net.cpp:2239-2243), a
+;;; loop whose wait is at most SELECT_TIMEOUT_MILLISECONDS = 50 (net.cpp:106,
+;;; :2101). A handshake here runs on a thread of its own that sits in the
+;;; blocking reads below, so that thread is where the verdict has to be asked.
+(defvar *inactivity-verdict* nil
+  "NIL, or a function of no arguments that the thread driving a connection's
+handshake binds: it answers true once that peer fails Core's InactivityCheck
+(and has logged Core's line for it). The blocking reads (RECEIVE-BYTES,
+RECEIVE-MESSAGE-BLOCKING, the BIP324 packet wait) ask it between waits and
+give the read up at once when it answers true, so the caller closes the
+connection in the pass that decided it.")
+
+(defun inactivity-verdict-p ()
+  "T when the bound *INACTIVITY-VERDICT* says the connection being read must go."
+  (and *inactivity-verdict* (funcall *inactivity-verdict*) t))
+
+(defun blocking-read-wait-seconds (default)
+  "How long one wait of a blocking read may sleep before it looks again: Core's
+SELECT_TIMEOUT_MILLISECONDS (net.cpp:106) while an InactivityCheck verdict is
+bound, so a mock-clock bump past -peertimeout is acted on within one socket-
+handler pass as Core's is; DEFAULT otherwise."
+  (if *inactivity-verdict* 1/20 default))
+
 ;;; This flag reaches layers that cannot see networking through
 ;;; bl.ctx:*interrupt-check* (config.lisp), installed by node/shutdown.lisp — the
 ;;; only file that also sees *shutdown-request*.
@@ -1267,6 +1295,8 @@ generous +RECEIVE-STALL-TIMEOUT-SECONDS+ instead."
              ;; drain yields nothing, and data-available-p — which itself tests
              ;; connection-connected — can no longer see the EOF.
              (not (connection-connected conn))
+             ;; The peer failed Core's InactivityCheck (*INACTIVITY-VERDICT*).
+             (inactivity-verdict-p)
              ;; Whole-call bound, then the stall window since the last byte.
              (> (get-internal-real-time) deadline)
              (> (- (get-internal-real-time) (connection-recv-last-progress conn))
@@ -1277,7 +1307,7 @@ generous +RECEIVE-STALL-TIMEOUT-SECONDS+ instead."
       ;; signal interrupts the underlying select() with EINTR, which usocket
       ;; surfaces as not-ready. Re-wait; the budget above ends genuine silence.
       (handler-case
-          (socket-input-ready-p socket :timeout 0.5)
+          (socket-input-ready-p socket :timeout (blocking-read-wait-seconds 0.5))
         (error () (return (%receive-gave-up conn)))))))
 
 (defun data-available-p (conn &key (timeout 0))

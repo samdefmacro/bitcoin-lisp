@@ -217,6 +217,7 @@ packet, which nothing can proceed without. The pump must not use this — see
         (return result)))
     (when (or *ibd-stop-requested*
               (not (connection-connected conn))
+              (inactivity-verdict-p)
               (>= (get-internal-real-time) deadline))
       ;; %receive-gave-up owns this rule: it drops the connection when any of
       ;; the packet was consumed — for v2 that means the cipher has advanced
@@ -224,7 +225,7 @@ packet, which nothing can proceed without. The pump must not use this — see
       ;; way. Hand-rolling it here stranded the body buffer (up to 4 MB) and
       ;; missed a give-up partway through the length descriptor.
       (return (%receive-gave-up conn)))
-    (data-available-p conn :timeout 0.2)))
+    (data-available-p conn :timeout (blocking-read-wait-seconds 0.2))))
 
 (defun %v2-contents-for-message (message-bytes)
   "BIP324 packet contents for a v1-FRAMED message: strip the v1 envelope the

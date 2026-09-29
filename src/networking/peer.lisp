@@ -940,7 +940,8 @@ handling — is what removes this, and it is the next step, not this one."
         (when (or *ibd-stop-requested*
                   (> (get-internal-real-time) deadline)
                   (null conn)
-                  (not (connection-connected conn)))
+                  (not (connection-connected conn))
+                  (inactivity-verdict-p))
           ;; End the read we abandoned rather than leaving an allocated
           ;; accumulator behind: %receive-gave-up drops the peer if part of a
           ;; message was consumed (it is out of frame either way) and simply
@@ -949,7 +950,7 @@ handling — is what removes this, and it is the next step, not this one."
           (return (when conn (%receive-gave-up conn))))
         ;; Nothing readable this instant: wait a short window. The deadline
         ;; above ends the wait; the reader itself applies no clock.
-        (data-available-p conn :timeout 0.2)))))
+        (data-available-p conn :timeout (blocking-read-wait-seconds 0.2))))))
 
 (defun peer-outbound-or-block-relay-p (peer)
   "T for the connection types that are candidates for AUTOMATIC disconnection
@@ -1658,6 +1659,26 @@ through the Tor proxy); the v1 reconnection goes through it too."
                        (peer-id peer))
            t))))))
 
+(defun call-with-inactivity-verdict (peer thunk)
+  "Call THUNK, which drives PEER's handshake on this thread, with Core's
+InactivityCheck bound as the verdict of every blocking read it makes
+(*INACTIVITY-VERDICT*): CHECK-PEER-HEALTH on the mockable clock, which logs
+Core's line and answers :DISCONNECT. A read that sees the verdict gives up at
+once, the handshake fails, and its caller closes the connection in that pass --
+Core's SocketHandlerConnected sets fDisconnect and the next ThreadSocketHandler
+loop closes the socket (net.cpp:2218, :2239-2243), 50 ms apart at most.
+
+The sync thread's tick used to ask the same question of every unfinished
+handshake, but a handshake's socket belongs to the thread driving it, and the
+tick came late under load: p2p_v2_misbehaving.py:155-156 bumps the clock past
+-peertimeout and gives the close ONE second, and the verdict arrived 0.7 s
+after the bump in a parallel sweep, too late for the peer to see the close."
+  (let ((*inactivity-verdict*
+          (lambda ()
+            (and (not (eq (peer-state peer) :ready))
+                 (eq :disconnect (check-peer-health peer))))))
+    (funcall thunk)))
+
 (defun perform-handshake (peer &key (try-v2 (v2-available-p))
                                     (conn-type :outbound-full-relay)
                                     near-tip)
@@ -1679,22 +1700,25 @@ turns out not to speak it. Returns T on success."
   ;; and stays armed against an unrelated future peer forever.
   (%register-outbound-nonce (peer-local-nonce peer))
   (unwind-protect
-       (and (or (not try-v2)
-                (%v2-try-outbound peer))
-            (%send-version-and-capabilities peer)
-            (%receive-and-store-version peer :near-tip near-tip)
-            ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
-            ;; and before our VERACK (Core net_processing.cpp:3728-3744).
-            (%maybe-send-sendtxrcncl peer)
-            (send-message peer (bl.ser:make-verack-message))
-            (progn (note-verack-sent peer) t)
-            ;; A feeler is done once the peer's VERSION is in and our VERACK
-            ;; is out: Core's VERSION handler disconnects it right there
-            ;; (net_processing.cpp:3807-3811) and never waits for their
-            ;; VERACK -- a peer that withholds it cost us the whole wait.
-            (if (eq conn-type :feeler)
-                (progn (setf (peer-state peer) :ready) t)
-                (%await-verack peer)))
+       (call-with-inactivity-verdict
+        peer
+        (lambda ()
+          (and (or (not try-v2)
+                   (%v2-try-outbound peer))
+               (%send-version-and-capabilities peer)
+               (%receive-and-store-version peer :near-tip near-tip)
+               ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
+               ;; and before our VERACK (Core net_processing.cpp:3728-3744).
+               (%maybe-send-sendtxrcncl peer)
+               (send-message peer (bl.ser:make-verack-message))
+               (progn (note-verack-sent peer) t)
+               ;; A feeler is done once the peer's VERSION is in and our VERACK
+               ;; is out: Core's VERSION handler disconnects it right there
+               ;; (net_processing.cpp:3807-3811) and never waits for their
+               ;; VERACK -- a peer that withholds it cost us the whole wait.
+               (if (eq conn-type :feeler)
+                   (progn (setf (peer-state peer) :ready) t)
+                   (%await-verack peer)))))
     (%release-outbound-nonce (peer-local-nonce peer))))
 
 (defun note-inbound-addr-me (peer)
@@ -1720,47 +1744,50 @@ key/garbage/version-packet exchange before the version handshake. A shorter
 TIMEOUT than the outbound path bounds how long a silent inbound peer can
 stall. Returns T on success."
   (setf (peer-state peer) :handshaking)
-  (when (v2-available-p)
-    (let ((detected (let ((conn (peer-connection peer)))
-                      (setf (connection-v2-detecting conn) t)
-                      (unwind-protect
-                           (v2-detect-inbound conn :timeout timeout
-                                                   :peer-id (peer-id peer))
-                        (setf (connection-v2-detecting conn) nil)))))
-      (cond ((v2-transport-p detected)
-             (setf (connection-transport (peer-connection peer)) detected)
-             (bl:log-cat "net" "v2 transport established (inbound), ~A"
-                         (peer-log-name peer)))
-            ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
-            (t (return-from perform-inbound-handshake nil)))))
-  (setf (peer-local-nonce peer) (%fresh-local-nonce))
-  (and (%receive-and-store-version peer :timeout timeout)
-       ;; SELF-CONNECTION: their VERSION carries a nonce we are still using for
-       ;; an outbound handshake, so the far end is us. Refuse BEFORE replying
-       ;; and before any local-address/addrman bookkeeping — Core's check at
-       ;; net_processing.cpp:3649 precedes both SeenLocal (:3658) and
-       ;; PushNodeVersion (:3664). The disconnect is SILENT: no ban, no
-       ;; discouragement, no misbehaviour score. Scoring it would be actively
-       ;; harmful, since the address being punished is our own.
-       ;;
-       ;; This is one of the two places Core prints an address with no -logips
-       ;; gate: LogInfo("connected to self at %s, disconnecting",
-       ;; net_processing.cpp:3651), like net.cpp:388 and :1787. Exceptional
-       ;; paths, and the address here is OURS. Matched, not special-cased.
-       (cond ((%detected-self-connection-p peer)
-              (bl:log-info "Peer ~A: connected to self, disconnecting"
-                                     (peer-address peer))
-              nil)
-             (t
-              (note-inbound-addr-me peer)
-              (and (%send-version-and-capabilities peer)
-                   ;; BIP330 offer: their VERSION is already in hand on the
-                   ;; inbound path; ordering matches Core (wtxidrelay →
-                   ;; sendaddrv2 → sendtxrcncl → verack,
-                   ;; net_processing.cpp:3715-3744).
-                   (%maybe-send-sendtxrcncl peer)
-                   (send-message peer (bl.ser:make-verack-message))
-                   (%await-verack peer :timeout timeout))))))
+  (call-with-inactivity-verdict
+   peer
+   (lambda ()
+     (when (v2-available-p)
+       (let ((detected (let ((conn (peer-connection peer)))
+                         (setf (connection-v2-detecting conn) t)
+                         (unwind-protect
+                              (v2-detect-inbound conn :timeout timeout
+                                                      :peer-id (peer-id peer))
+                           (setf (connection-v2-detecting conn) nil)))))
+         (cond ((v2-transport-p detected)
+                (setf (connection-transport (peer-connection peer)) detected)
+                (bl:log-cat "net" "v2 transport established (inbound), ~A"
+                            (peer-log-name peer)))
+               ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
+               (t (return-from perform-inbound-handshake nil)))))
+     (setf (peer-local-nonce peer) (%fresh-local-nonce))
+     (and (%receive-and-store-version peer :timeout timeout)
+          ;; SELF-CONNECTION: their VERSION carries a nonce we are still using for
+          ;; an outbound handshake, so the far end is us. Refuse BEFORE replying
+          ;; and before any local-address/addrman bookkeeping — Core's check at
+          ;; net_processing.cpp:3649 precedes both SeenLocal (:3658) and
+          ;; PushNodeVersion (:3664). The disconnect is SILENT: no ban, no
+          ;; discouragement, no misbehaviour score. Scoring it would be actively
+          ;; harmful, since the address being punished is our own.
+          ;;
+          ;; This is one of the two places Core prints an address with no -logips
+          ;; gate: LogInfo("connected to self at %s, disconnecting",
+          ;; net_processing.cpp:3651), like net.cpp:388 and :1787. Exceptional
+          ;; paths, and the address here is OURS. Matched, not special-cased.
+          (cond ((%detected-self-connection-p peer)
+                 (bl:log-info "Peer ~A: connected to self, disconnecting"
+                                        (peer-address peer))
+                 nil)
+                (t
+                 (note-inbound-addr-me peer)
+                 (and (%send-version-and-capabilities peer)
+                      ;; BIP330 offer: their VERSION is already in hand on the
+                      ;; inbound path; ordering matches Core (wtxidrelay →
+                      ;; sendaddrv2 → sendtxrcncl → verack,
+                      ;; net_processing.cpp:3715-3744).
+                      (%maybe-send-sendtxrcncl peer)
+                      (send-message peer (bl.ser:make-verack-message))
+                      (%await-verack peer :timeout timeout))))))))
 
 (defun make-inbound-peer (connection address &key inbound-onion local-port)
   "Build a peer for an accepted inbound CONNECTION from ADDRESS (state :connected,

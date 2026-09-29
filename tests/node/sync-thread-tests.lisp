@@ -245,17 +245,19 @@ targets) and that an explicit -dnsseed=1 is ignored under -proxy
              "-dnsseed is ignored when -connect is used and -proxy is specified"))
     (is (not (has (lines '("fakeaddress1") '() t nil) "-dnsseed is ignored")))))
 
-(test idle-tick-drops-a-handshake-that-outlived-peertimeout-on-the-mock-clock
-  "Core evaluates InactivityCheck on every socket-handler pass
+(test idle-tick-leaves-an-unfinished-handshake-to-the-thread-driving-it
+  "Core evaluates InactivityCheck on the thread that owns the socket
 (SocketHandlerConnected, net.cpp:2218) against GetTime -- the MOCKABLE clock --
-and m_connected is that clock at accept (net.cpp:3982), so a test that freezes
-the clock, opens a connection that never finishes its handshake and then bumps
-the clock past -peertimeout sees the peer dropped at once:
-p2p_v2_misbehaving.py:155 and p2p_timeouts.py:98 give the disconnect ONE
-second. Ours judged the gate on the process's real clock, and ran it only from
-the once-per-pass MAINTAIN-PEERS sweep, up to 30 s later.
+and closes the socket on that thread's next loop (net.cpp:2239-2243).
+A handshake here runs on a thread of its own, which asks the verdict between
+its reads (an-unfinished-handshake-is-closed-in-the-pass-that-times-it-out).
+The idle tick used to ask it too, from the sync thread: late under load
+(p2p_v2_misbehaving.py:155-156 gives the close one second), and writing to a
+socket the handshake thread was using (CHECK-PEER-HEALTH flushes the send
+buffer), which FLUSH-PEER-SEND-BUFFERS already refuses to do for this peer.
 
-Control: with the clock left at the connect time the same tick keeps the peer."
+Control: the verdict itself is there -- the same peer, asked directly, is
+:DISCONNECT once the mock clock passes -peertimeout."
   (let* ((bl:*network* :regtest)
          (node (make-test-node :network :regtest))
          (bl:*node* node)
@@ -267,14 +269,13 @@ Control: with the clock left at the connect time the same tick keeps the peer."
          (progn
            (setf (bl:node-running node) t)
            (push peer (bl:node-peers node))
-           (%idle-tick)
-           (is-true (member peer (bl:node-peers node))
-                    "control: inside -peertimeout on the mock clock the peer stays")
            (setf bl.ser:*mock-time* (+ t0 4))
            (%idle-tick)
-           (is-false (member peer (bl:node-peers node))
-                     "one tick after the mock clock passes -peertimeout the unfinished handshake is dropped")
-           (is (eq :disconnected (bl.net:peer-state peer))))
+           (is-true (member peer (bl:node-peers node))
+                    "the tick does not judge a handshake another thread is driving")
+           (is (eq :handshaking (bl.net:peer-state peer)))
+           (is (eq :disconnect (bl.net:check-peer-health peer))
+               "control: past -peertimeout on the mock clock the verdict is :disconnect"))
       (setf (bl:node-running node) nil))))
 
 (test idle-tick-walks-the-chain-sync-eviction-ladder
