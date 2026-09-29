@@ -61,6 +61,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    ;; Core InferDescriptor: the concrete descriptor a matched script reports
    #:infer-descriptor-body
    #:descriptor-key-origin
+   #:*key-origin-cache*
    #:descriptor-pairs-splitter
    #:parse-json-rpc-request
 

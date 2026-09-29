@@ -308,10 +308,11 @@ concatenated."
 (defun %psbt-musig2-json (map add)
   "The BIP373 MuSig2 records of MAP, for decodepsbt.
 
-DECODING only. A MuSig2 signing session needs nonce state this node does not
-keep, and inventing one would be worse than useless: reusing a MuSig2 nonce
-across two messages leaks the private key outright. What a signer's user needs
-first is to SEE what a PSBT is asking of them, which is what this gives."
+Core's decodepsbt (rawtransaction.cpp:1317-1361): the participants of each
+aggregate, then one entry per public nonce and per partial signature, each
+naming its participant, its aggregate (the session key the signers derived)
+and, on a script path, its leaf hash. The signers that WRITE these records
+are in psbt-musig.lisp."
   (%psbt-musig2-participants-json map bl.ser:+psbt-in-musig2-participant-pubkeys+ add)
   (let ((nonces (bl.ser:psbt-map-collect
                  map bl.ser:+psbt-in-musig2-pub-nonce+)))
@@ -662,8 +663,8 @@ script is a witness program whose own script is known (sign.cpp:757-789)."
           (let ((exp (and bip32derivs (gethash spk expansions))))
             (when exp
               (destructuring-bind (desc pos pairs) exp
-                (declare (ignore desc))
-                (%psbt-add-map-derivs map spk pos pairs)))))))))
+                (%psbt-add-map-derivs map spk pos pairs nil
+                                      (eq (bl.rpc:out-desc-kind desc) :tr))))))))))
 
 (defun %psbt-fetch-utxos (psbt node expansions bip32derivs)
   "ProcessPSBT's input half (rpc/rawtransaction.cpp:143-205) for PSBT with the
@@ -1197,33 +1198,6 @@ finalizer still assembles, is caught here rather than handed back as a `hex`
 the caller is invited to broadcast."
   (nth-value 0 (%verify-tx-scripts (%psbt-extract-tx psbt)
                                    (%psbt-coins-map psbt))))
-
-(bl.rpc:define-rpc "finalizepsbt" (node params)
-  "Finalize every input possible; if all are final and EXTRACT (default true),
-return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
-  (declare (ignore node))
-  (let* ((psbt (%psbt-decode-arg (first params)))
-         (extract (bl.rpc:positional-bool-or (second params) t))
-         (tx (bl.ser:psbt-tx psbt))
-         (ins (bl.ser:transaction-inputs tx))
-         (complete t))
-    (dotimes (i (length ins))
-      (let ((map (aref (bl.ser:psbt-inputs psbt) i)))
-        (if (or (bl.ser:psbt-map-find
-                 map bl.ser:+psbt-in-final-scriptsig+)
-                (bl.ser:psbt-map-find
-                 map bl.ser:+psbt-in-final-scriptwitness+))
-            nil                          ; already final
-            (let ((spk (%psbt-input-spk map (aref ins i))))
-              (multiple-value-bind (ss wit) (if spk (%psbt-finalize map spk tx i) (values nil nil))
-                (cond ((or (and ss (plusp (length ss))) wit)
-                       (%psbt-set-final map ss wit))
-                      ((%psbt-input-verifies-empty-p map tx i))
-                      (t (setf complete nil))))))))
-    (if (and complete extract)
-        `(("hex" . ,(%psbt-extract-hex psbt)) ("complete" . t))
-        `(("psbt" . ,(bl.ser:encode-psbt psbt))
-          ("complete" . ,(bl.rpc:json-bool complete))))))
 
 ;;; --- combinerawtransaction ---
 
@@ -1790,11 +1764,17 @@ wallet_musig.py:229-231 counts them on the input and on the change output."
               map keytype aggregate
               (apply #'concatenate '(vector (unsigned-byte 8)) participants)))))
 
-(defun %psbt-add-map-derivs (map spk pos pairs &optional spkm)
+(defun %psbt-add-map-derivs (map spk pos pairs &optional spkm (tr-p t))
   "Add the derivation records an UPDATER writes for a wallet-owned input or
 output: +psbt-in-bip32+ for an ECDSA script, and for a TAPROOT one
 +psbt-in-tap-internal-key+ plus a +psbt-in-tap-bip32+ record per key whose
 origin the wallet knows.
+
+The internal key only when TR-P, i.e. for a tr() descriptor: a rawtr() has no
+TaprootSpendData (RawTRDescriptor::MakeScripts adds none), so Core's
+FromSignatureData writes no m_tap_internal_key for it (psbt.cpp:196). Writing
+the output key there made every later signer try a key path through it
+TWEAKED, which for a musig() aggregate is a second, bogus MuSig2 session.
 
 The taproot derivations are not optional decoration. Core's FillPSBT runs
 SignPSBTInput for every input whatever `sign' says, ProduceSignature fills
@@ -1818,9 +1798,10 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
                    map bl.ser:+psbt-in-bip32+ pubkey
                    (%psbt-bip32-value fpr path)))))
       (pairs
-       (bl.ser:psbt-map-set
-        map bl.ser:+psbt-in-tap-internal-key+ empty
-        (bl.rpc:key-xonly-bytes (cdr (first pairs))))
+       (when tr-p
+         (bl.ser:psbt-map-set
+          map bl.ser:+psbt-in-tap-internal-key+ empty
+          (bl.rpc:key-xonly-bytes (cdr (first pairs)))))
        (when spkm
          (%psbt-add-tr-tree-records map spkm spk pos pairs nil)
          (%psbt-add-musig2-participants
@@ -1906,7 +1887,8 @@ Core's answer is the PSBT unchanged."
                                 (%spkm-spends-by-witness-p spkm spk)))
                    (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                      (declare (ignore scripts))
-                     (%psbt-add-map-derivs map spk pos pairs spkm))))))))
+                     (%psbt-add-map-derivs map spk pos pairs spkm
+                                           (eq (bl.rpc:out-desc-kind (desc-spkm-desc spkm)) :tr)))))))))
 
 (defun %psbt-add-wallet-output-derivs (psbt wallet)
   "Add output bip32 derivations / redeem / witness scripts for wallet-owned
@@ -1942,9 +1924,12 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                                   map bl.ser:+psbt-out-bip32+ pubkey
                                   (%psbt-bip32-value fpr path)))))
                      (pairs
-                      (bl.ser:psbt-map-set
-                       map bl.ser:+psbt-out-tap-internal-key+ empty
-                       (bl.rpc:key-xonly-bytes (cdr (first pairs))))
+                      ;; A rawtr() output has no internal key, as an input
+                      ;; has none (%PSBT-ADD-MAP-DERIVS).
+                      (when (eq (bl.rpc:out-desc-kind (desc-spkm-desc spkm)) :tr)
+                        (bl.ser:psbt-map-set
+                         map bl.ser:+psbt-out-tap-internal-key+ empty
+                         (bl.rpc:key-xonly-bytes (cdr (first pairs)))))
                       (%psbt-add-tr-tree-records map spkm spk pos pairs t)
                       (%psbt-add-musig2-participants
                        map spkm pos bl.ser:+psbt-out-musig2-participant-pubkeys+)
@@ -1954,11 +1939,149 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                                 map bl.ser:+psbt-out-tap-bip32+ xonly
                                 (%psbt-tap-bip32-value leaf-hashes fpr path)))))))))))
 
+;;; --- MuSig2 (BIP373): the per-input pass of psbt-musig.lisp, driven ---
+
+(defun %psbt-input-tr-spend-data (map)
+  "(values INTERNAL-KEY MERKLE-ROOT LEAVES) as an input's own records give
+them -- the tr_spenddata FillSignatureData builds (psbt.cpp:136-147): the
+PSBT_IN_TAP_INTERNAL_KEY, a non-null PSBT_IN_TAP_MERKLE_ROOT, and one
+(SCRIPT . LEAF-HASH) per tapscript PSBT_IN_TAP_LEAF_SCRIPT."
+  (let ((internal (bl.ser:psbt-map-find map bl.ser:+psbt-in-tap-internal-key+))
+        (root (bl.ser:psbt-map-find map bl.ser:+psbt-in-tap-merkle-root+)))
+    (values (and internal (= (length internal) 32) internal)
+            (and root (= (length root) 32) (notevery #'zerop root) root)
+            (loop for (nil . value) in (bl.ser:psbt-map-collect
+                                        map bl.ser:+psbt-in-tap-leaf-script+)
+                  for ver = (and (plusp (length value)) (aref value (1- (length value))))
+                  when (eql ver bl.rpc:+tapleaf-version-tapscript+)
+                    collect (let ((script (subseq value 0 (1- (length value)))))
+                              (cons script (bl.crypto:tap-leaf-hash ver script)))))))
+
+(defun %psbt-input-sign-musig2 (map spk amount index precomp hashtype ctx
+                                internal root leaves)
+  "One input of %PSBT-SIGN-MUSIG2: CTX completed with the input's sighash
+function and HASHTYPE, and its spend data -- the PSBT's own records first,
+then the provider's INTERNAL key, ROOT and LEAVES (TaprootSpendData::Merge).
+*CURRENT-TX* and *CURRENT-SPENT-UTXOS* are bound by the caller."
+  (setf (mu2-hashtype ctx) hashtype
+        (mu2-sighash-fn ctx)
+        (lambda (leaf-hash)
+          (let ((bl.interop:*current-input-index* index)
+                (bl.interop:*precomputed-sighash* precomp)
+                (bl.interop:*tapscript-codesep-pos* #xFFFFFFFF))
+            (if leaf-hash
+                (bl.interop:compute-bip341-sighash amount hashtype leaf-hash 0)
+                (bl.interop:compute-bip341-sighash amount hashtype nil nil)))))
+  (multiple-value-bind (p-internal p-root p-leaves) (%psbt-input-tr-spend-data map)
+    (psbt-input-sign-musig2
+     ctx (subseq spk 2 34) (or p-internal internal) (or p-root root)
+     (append p-leaves
+             (remove-if (lambda (l) (find (cdr l) p-leaves :key #'cdr :test #'equalp))
+                        leaves)))))
+
+(defun %psbt-sign-musig2 (psbt coins sighash-of &key keys secnonces provider)
+  "Run the MuSig2 pass (PSBT-INPUT-SIGN-MUSIG2) over every taproot input of
+PSBT that is not final and whose prevout COINS knows. SIGHASH-OF maps (MAP
+SPK) to the sighash byte the input signs with. KEYS and SECNONCES are the
+signer's (see MU2-CONTEXT); PROVIDER, when given, maps a scriptPubKey to what
+the signer's own provider knows about it -- (values PARTICIPANTS INTERNAL-KEY
+MERKLE-ROOT LEAVES) -- merged under what the PSBT carries, as ProduceSignature
+merges the provider into FillSignatureData's sigdata.
+
+Nothing is attempted unless every input's prevout is known: the BIP341
+sighash commits to all of them, and with the spent outputs unbound the
+interop layer would quietly compute a TEST sighash instead."
+  (let* ((tx (bl.ser:psbt-tx psbt))
+         (inputs (bl.ser:transaction-inputs tx))
+         (spent-utxos (bl.rpc:build-spent-utxos inputs coins)))
+    (when spent-utxos
+      (let* ((bl.interop:*current-tx* tx)
+             (bl.interop:*current-spent-utxos* spent-utxos)
+             (precomp (bl.interop:init-precomputed-sighash tx spent-utxos)))
+        (dotimes (i (length inputs))
+          (let* ((map (aref (bl.ser:psbt-inputs psbt) i))
+                 (op (bl.ser:tx-in-previous-output (aref inputs i)))
+                 (prev (gethash (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op))
+                                coins))
+                 (spk (first prev)))
+            (when (and spk
+                       (eq (bl.val:classify-script spk) :witness-v1-taproot)
+                       (not (%psbt-input-signed-p map)))
+              (multiple-value-bind (participants internal root leaves)
+                  (and provider (funcall provider spk))
+                (let ((participants (mu2-merge-participants map participants)))
+                  ;; SignMuSig2 iterates the aggregates: with none, nothing.
+                  (when participants
+                    (%psbt-input-sign-musig2
+                     map spk (second prev) i precomp (funcall sighash-of map spk)
+                     (make-mu2-context :map map :keys keys :secnonces secnonces
+                                       :participants participants)
+                     internal root leaves)))))))))))
+
+(defun %psbt-keymap-keys (keymap)
+  "The KEYS function of a MuSig2 pass over KEYMAP (hash160 -> (secret .
+pubkey)): Core's provider.GetKey(pubkey.GetID())."
+  (lambda (pubkey)
+    (let ((entry (gethash (bl.crypto:hash160 pubkey) keymap)))
+      (and entry (equalp (cdr entry) pubkey) (car entry)))))
+
+(defun %descriptor-musig2-view (desc pos pairs spk &optional cache)
+  "What a signing provider built from DESC at POS knows about SPK for
+%PSBT-SIGN-MUSIG2, as (values PARTICIPANTS INTERNAL-KEY MERKLE-ROOT LEAVES):
+the musig() aggregates of the expansion with their participants
+(FlatSigningProvider::aggregate_pubkeys) and, for a tr() that derives SPK,
+its TaprootSpendData. A rawtr() has no spend data, as in Core
+(RawTRDescriptor::MakeScripts adds none). PAIRS is the expansion at POS,
+CACHE a wallet SPKM's descriptor cache."
+  (let ((tr (and pairs (eq (bl.rpc:out-desc-kind desc) :tr))))
+    (multiple-value-bind (output-key leaves root)
+        (and tr (bl.rpc:out-desc-tree desc)
+             (bl.rpc:tr-spend-data desc pos (lambda (k) (cdr (assoc k pairs :test #'eq)))))
+      (let ((ours (equalp output-key (subseq spk 2 34))))
+        (values (bl.rpc:descriptor-musig2-participants desc pos cache)
+                (and tr (bl.rpc:key-xonly-bytes (cdr (first pairs))))
+                (and ours root)
+                (and ours (loop for (script leaf-hash) in leaves
+                                collect (cons script leaf-hash))))))))
+
+(defun %psbt-wallet-musig2-provider (wallet)
+  "%PSBT-SIGN-MUSIG2's PROVIDER for a wallet: the view of the SPKM that owns
+a scriptPubKey (GetSigningProvider(script))."
+  (lambda (spk)
+    (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet spk)
+      (when spkm
+        (%descriptor-musig2-view (desc-spkm-desc spkm) pos
+                                 (nth-value 1 (%spkm-expansion-pairs spkm pos))
+                                 spk (desc-spkm-cache spkm))))))
+
+(defun %psbt-user-sighash-of (user-sighash)
+  "%PSBT-SIGN-MUSIG2's SIGHASH-OF for a signer asked for USER-SIGHASH:
+SignPSBTInput's effective type, already checked against the PSBT by
+%PSBT-RECORD-SIGNATURES."
+  (lambda (map spk) (values (%psbt-effective-sighash map spk user-sighash))))
+
+(defun %psbt-finalize-musig2 (psbt)
+  "FinalizePSBT's MuSig2 step: SignPSBTInput over DUMMY_SIGNING_PROVIDER
+(psbt.cpp:551-565) holds no key, so of SignMuSig2 only the AGGREGATION can
+happen -- the key-path or script signature of every session whose partial
+signatures are all in -- with each input's own sighash type, SIGHASH_DEFAULT
+when it names none."
+  (when (some (lambda (map)
+                (bl.ser:psbt-map-find map bl.ser:+psbt-in-musig2-participant-pubkeys+))
+              (bl.ser:psbt-inputs psbt))
+    (%psbt-sign-musig2 psbt (%psbt-coins-map psbt)
+                       (lambda (map spk)
+                         (declare (ignore spk))
+                         (or (%psbt-input-sighash-stored map) #x00)))))
+
 ;;; --- Completeness / extract ---
 
 (defun %psbt-finalize-in-place (psbt)
-  "Finalize every finalizable input of PSBT in place (finalizepsbt machinery).
-Returns T when EVERY input is final."
+  "Finalize every finalizable input of PSBT in place (Core FinalizePSBT,
+psbt.cpp:551-565, the machinery of finalizepsbt). Returns T when EVERY input
+is final. A MuSig2 session whose partial signatures are all in is aggregated
+first, as SignPSBTInput's SignMuSig2 would aggregate it."
+  (%psbt-finalize-musig2 psbt)
   (let* ((tx (bl.ser:psbt-tx psbt))
          (ins (bl.ser:transaction-inputs tx))
          (complete t))
@@ -1977,6 +2100,18 @@ Returns T when EVERY input is final."
                       ((%psbt-input-verifies-empty-p map tx i))
                       (t (setf complete nil))))))))
     complete))
+
+(bl.rpc:define-rpc "finalizepsbt" (node params)
+  "Finalize every input possible; if all are final and EXTRACT (default true),
+return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
+  (declare (ignore node))
+  (let* ((psbt (%psbt-decode-arg (first params)))
+         (extract (bl.rpc:positional-bool-or (second params) t))
+         (complete (%psbt-finalize-in-place psbt)))
+    (if (and complete extract)
+        `(("hex" . ,(%psbt-extract-hex psbt)) ("complete" . t))
+        `(("psbt" . ,(bl.ser:encode-psbt psbt))
+          ("complete" . ,(bl.rpc:json-bool complete))))))
 
 (defun %psbt-witness-program-version (spk)
   "The witness version of SPK, or NIL when it is not a witness program at all
@@ -2163,15 +2298,19 @@ leaf resolves its hash against."
 (defun %psbt-wallet-sign (psbt wallet coins user-sighash)
   "The signing half of Core's CWallet::FillPSBT with sign=true: every key and
 script the wallet has for the inputs -- its own SPKMs, the keys the inputs
-list, the leaves they carry -- and the partial signatures recorded. Never
-finalizes."
+list, the leaves they carry -- and the partial signatures recorded, the MuSig2
+rounds included. Never finalizes."
   (let ((bl.rpc:*solving-pubkeys* (%psbt-listed-pubkeys-table psbt)))
     (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
         (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
       (%psbt-add-foreign-pubkey-keys psbt wallet coins keymap pubmap tr-keymap)
       (%psbt-add-input-tr-scripts psbt coins tr-scripts)
       (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
-                               tr-scripts))))
+                               tr-scripts)
+      (%psbt-sign-musig2 psbt coins (%psbt-user-sighash-of user-sighash)
+                         :keys (%psbt-keymap-keys keymap)
+                         :secnonces (wallet-musig2-secnonces wallet)
+                         :provider (%psbt-wallet-musig2-provider wallet)))))
 
 (defun wallet-fill-psbt (wallet tx)
   "Core FinishTransaction's PSBT (wallet/rpc/spend.cpp:111-124) for the
@@ -2289,13 +2428,24 @@ through the shared %sign-map-add-key!."
              (exp (and script (gethash script expansions))))
         (when exp
           (destructuring-bind (desc pos pairs) exp
-            (declare (ignore desc))
             (loop for (key . pubkey) in pairs
                   for priv = (%desc-key-priv-at key pos nil)
                   do (when priv
                        (%sign-map-add-key! keymap pubmap tr-keymap
-                                           key pubkey priv pos)))))))
+                                           key pubkey priv pos)))
+            (%sign-maps-add-musig-participants! desc pairs pos nil nil
+                                                keymap pubmap tr-keymap)))))
     (values keymap pubmap tr-keymap)))
+
+(defun %psbt-descriptor-musig2-provider (expansions)
+  "%PSBT-SIGN-MUSIG2's PROVIDER for descriptorprocesspsbt: what the
+descriptors EXPANSIONS (script -> (desc pos pairs)) solve for a scriptPubKey,
+as EvalDescriptorStringOrObject fills ProcessPSBT's provider."
+  (lambda (spk)
+    (let ((exp (gethash spk expansions)))
+      (when exp
+        (destructuring-bind (desc pos pairs) exp
+          (%descriptor-musig2-view desc pos pairs spk))))))
 
 (bl.rpc:define-rpc "descriptorprocesspsbt" (node params)
   "Update a PSBT's segwit inputs from output descriptors + the UTXO set, then
@@ -2320,7 +2470,14 @@ PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
       (let ((coins (%psbt-coins-map psbt)))
         (multiple-value-bind (keymap pubmap tr-keymap)
             (%descriptor-sign-maps expansions (bl.ser:psbt-tx psbt) coins)
-          (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash))
+          (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash)
+          ;; ProcessPSBT's provider carries no musig2_secnonces, so a nonce
+          ;; made here is published and its secret dropped at once -- Core's
+          ;; SetMuSig2SecNonce returns on `!Assume(musig2_secnonces)'
+          ;; (signingprovider.cpp:124); only a wallet can finish a session.
+          (%psbt-sign-musig2 psbt coins (%psbt-user-sighash-of user-sighash)
+                             :keys (%psbt-keymap-keys keymap)
+                             :provider (%psbt-descriptor-musig2-provider expansions)))
         (%psbt-remove-unnecessary-transactions psbt)
         (%psbt-signer-result psbt finalize nil)))))
 

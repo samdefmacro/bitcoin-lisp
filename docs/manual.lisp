@@ -1755,7 +1755,18 @@
   x-only print flag is not the 32-vs-33-byte push decision. `encryptwallet`
   ends in a database REWRITE, not a compaction: deleting the plaintext key
   records only tombstones them, and the compaction that stood there left the
-  master secret in a live `.ldb` on every wallet young enough to matter."
+  master secret in a live `.ldb` on every wallet young enough to matter.
+
+  MuSig2 (BIP373, Core SignMuSig2): a PSBT signer contributes a nonce, then
+  -- once every participant's nonce is in -- a partial signature, and any
+  signer, the key-less finalizer included, aggregates once every partial
+  signature is in (`psbt-input-sign-musig2`). The secret nonces live in
+  the wallet's memory only (`wallet-musig2-secnonces`, Core
+  m_musig2_secnonces), are spent by the partial signature, and die with
+  the wallet: a session cannot outlive an unload or a restart, by design.
+  A second nonce for a session the wallet already holds one for is refused
+  (Core Asserts it cannot happen). descriptorprocesspsbt has no table, so
+  its nonces are published and their secrets dropped, as in Core."
   (bitcoin-lisp.wallet package)
   (bitcoin-lisp.wallet:wallet-manager class)
   (bitcoin-lisp.wallet:init-wallet-manager function)
@@ -1772,6 +1783,7 @@
   (bitcoin-lisp.wallet:*wallet-directory* variable)
   (bitcoin-lisp.wallet:wallet-write-id function)
   (bitcoin-lisp.wallet::list-wallet-dir function)
+  (bitcoin-lisp.wallet::psbt-input-sign-musig2 function)
   (bitcoin-lisp.wallet::wallet-for-request function)
   (bitcoin-lisp.wallet::*rpc-wallet-name* variable))
 

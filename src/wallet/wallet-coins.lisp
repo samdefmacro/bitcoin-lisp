@@ -436,8 +436,10 @@ descriptor for SCRIPT, or NIL when the wallet cannot solve it."
     (when (and spkm (%spkm-solvable-p spkm))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (when scripts
-          (let ((body (bl.rpc:infer-descriptor-body (desc-spkm-desc spkm) script
-                                        scripts pairs pos)))
+          (let ((body (let ((bl.rpc:*key-origin-cache*
+                              (cons (desc-spkm-desc spkm) (desc-spkm-cache spkm))))
+                        (bl.rpc:infer-descriptor-body (desc-spkm-desc spkm) script
+                                                      scripts pairs pos))))
             (and body (bl.rpc:descriptor-add-checksum body))))))))
 
 ;;; --- getbalance / getbalances (wallet/rpc/coins.cpp:164,401) ---
@@ -826,7 +828,9 @@ PARAMS: (address)."
               ,@(when (and spkm (first key-origin))
                   (destructuring-bind (key pubkey key-pos) key-origin
                     (multiple-value-bind (fpr path)
-                        (bl.rpc:descriptor-key-origin key pubkey key-pos)
+                        (bl.rpc:descriptor-key-origin key pubkey key-pos
+                                                      (desc-spkm-desc spkm)
+                                                      (desc-spkm-cache spkm))
                       `(("timestamp" . ,(desc-spkm-creation-time spkm))
                         ("hdkeypath" . ,(format nil "m~A" (bl.rpc:format-key-path path nil)))
                         ;; Descriptor wallets have no HD seed; Core reports

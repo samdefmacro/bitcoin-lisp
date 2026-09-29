@@ -344,6 +344,9 @@ bitcoin-cli (node-main)."
                                (:file "mini-miner")
                                (:file "wallet-coins")
                                (:file "wallet-spend")
+                               ;; Core SignMuSig2 over one PSBT input, which
+                               ;; the PSBT signers and the finalizer drive
+                               (:file "psbt-musig")
                                (:file "psbt")
                                (:file "signmessage")
                                ;; Core ExternalSignerScriptPubKeyMan: the
@@ -597,6 +600,7 @@ bitcoin-cli (node-main)."
                              ;; Wallet P4: coin selection, spending RPCs,
                              ;; wallet signing, rebroadcast
                              (:file "wallet/wallet-spend-tests")
+                             (:file "wallet/psbt-musig-tests")
                              ;; Wallet P6: crypter KATs, encryption lifecycle,
                              ;; locked-wallet gating, relock timer, backup
                              (:file "wallet/wallet-encryption-tests")

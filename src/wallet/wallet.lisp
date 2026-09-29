@@ -200,7 +200,16 @@ map, and the descriptor's private keys."
   ;; Core m_scanning_with_passphrase: set while a rescan holds an unlocked
   ;; wallet across lock drops, which suspends the relock (and refuses the
   ;; lock/passphrase-change RPCs) until it finishes.
-  (scanning-with-passphrase nil))
+  (scanning-with-passphrase nil)
+  ;; Core DescriptorScriptPubKeyMan::m_musig2_secnonces (scriptpubkeyman.h:
+  ;; 297-308): session id -> BL.CRYPTO:MUSIG-SECNONCE for every MuSig2 session
+  ;; this wallet contributed a nonce to and has not signed yet. MEMORY ONLY,
+  ;; never written: a secret nonce that outlived a restart could be made to
+  ;; sign twice, which gives the key away. One table per wallet rather than
+  ;; per SPKM because our signer merges every SPKM's keys into one provider
+  ;; per call, where Core's FillPSBT asks each SPKM in turn; the provider
+  ;; that signs is the one whose table the nonce must be in.
+  (musig2-secnonces (make-hash-table :test 'equalp) :type hash-table))
 
 (defmacro with-wallet-lock ((wallet) &body body)
   "Execute BODY holding WALLET's recursive cs_wallet-equivalent lock.
@@ -280,6 +289,17 @@ the GC hands out next."
         (wallet-relock-time wallet) 0
         (wallet-relock-deadline wallet) 0)
   t)
+
+(defun %wallet-drop-musig2-sessions (wallet)
+  "Zero and free every MuSig2 secret nonce WALLET still holds and forget the
+sessions -- what destroying Core's SPKMs does to m_musig2_secnonces (each
+MuSig2SecNonce lives in secure memory that is cleansed on free). A session
+dropped here can never be signed for: its nonce is gone, which is the only
+safe way for it to end."
+  (let ((table (wallet-musig2-secnonces wallet)))
+    (loop for secnonce being the hash-values of table
+          do (bl.crypto:musig-secnonce-invalidate secnonce))
+    (clrhash table)))
 
 (defun wallet-unlocked-key (wallet)
   "The live 32-byte master key, or NIL when the wallet is locked (or not
@@ -1770,8 +1790,10 @@ so its stored locator is left where it was."
       (bl.store:leveldb-close (wallet-db wallet))
       (setf (wallet-db wallet) nil)
       ;; Every unload path funnels through here, so this is the one place
-      ;; that has to scrub the decrypted master key.
-      (%wallet-clear-encryption-key wallet))
+      ;; that has to scrub the decrypted master key -- and the MuSig2 secret
+      ;; nonces, which Core frees with the SPKMs that hold them.
+      (%wallet-clear-encryption-key wallet)
+      (%wallet-drop-musig2-sessions wallet))
     (remhash (wallet-name wallet) (wallet-manager-wallets manager))
     (setf (wallet-manager-wallet-order manager)
           (remove (wallet-name wallet) (wallet-manager-wallet-order manager)

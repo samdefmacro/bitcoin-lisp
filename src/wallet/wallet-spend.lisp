@@ -1828,10 +1828,10 @@ position POS, or NIL. BIP32 keys derive from the root xprv along the fixed
 path plus the ranged step; const keys come from the parse or PROVIDER.
 
 A musig() key expression is NIL: the aggregate has no private key of its own
-(Core signs it through the MuSig2 nonce/partial-signature protocol, which this
-node does not implement), and it has neither an xpub nor a pubkey slot, so
-the const-key path below died on it with a sequence error -- any
-walletprocesspsbt with sign=true on a wallet holding a musig() participant's
+(it is signed for through its PARTICIPANTS' keys and the MuSig2 nonce and
+partial-signature rounds, psbt-musig.lisp), and it has neither an xpub nor a
+pubkey slot, so the const-key path below died on it with a sequence error --
+any walletprocesspsbt with sign=true on a wallet holding a musig() participant's
 xprv answered an internal error."
   (when (bl.rpc:desc-key-musig-participants key)
     (return-from %desc-key-priv-at nil))
@@ -1971,20 +1971,26 @@ the internal key and the rest is sliced per leaf, the same way
                              (pushnew leaf-hash (third hit) :test #'equalp)
                              (push (list (car pair) (cdr pair) (list leaf-hash))
                                    entries)))))))))
-    ;; A musig() INTERNAL key: Core's SignMuSig2 records every participant's
-    ;; origin, with no leaf hash on the key path (script/sign.cpp:265-285),
-    ;; whenever a signature for the aggregate is attempted -- which FillPSBT
-    ;; does for every input (wallet_musig.py:244-248 finds each participant
-    ;; among an input's and an output's taproot derivations).
-    (when (and pairs (bl.rpc:desc-key-musig-participants (car (first pairs))))
-      (loop for (participant . pubkey)
-              in (bl.rpc:descriptor-musig2-participant-pairs
-                  desc (car (first pairs)) pos (desc-spkm-cache spkm))
-            unless (assoc participant entries :test #'eq)
-              do (push (list participant pubkey '()) entries)))
+    ;; A musig() key, internal or in a leaf: Core's SignMuSig2 records every
+    ;; participant's origin (script/sign.cpp:279-289), with the leaf hash of a
+    ;; script-path attempt and none on the key path, whenever a signature for
+    ;; the aggregate is attempted -- which FillPSBT does for every input
+    ;; (wallet_musig.py:236-241 finds each participant among an input's and an
+    ;; output's taproot derivations). Core adds a tried leaf's hash to EVERY
+    ;; aggregate's participants; here a participant carries its own
+    ;; musig()'s leaves, which is what the record means.
+    (loop for (key nil hashes) in (reverse entries)
+          do (when (bl.rpc:desc-key-musig-participants key)
+               (loop for (participant . pubkey)
+                       in (bl.rpc:descriptor-musig2-participant-pairs
+                           desc key pos (desc-spkm-cache spkm))
+                     for hit = (assoc participant entries :test #'eq)
+                     do (if hit
+                            (dolist (h hashes) (pushnew h (third hit) :test #'equalp))
+                            (push (list participant pubkey (copy-list hashes)) entries)))))
     (loop for (key pubkey hashes) in (nreverse entries)
           collect (multiple-value-bind (fpr path)
-                      (bl.rpc:descriptor-key-origin key pubkey pos)
+                      (bl.rpc:descriptor-key-origin key pubkey pos desc (desc-spkm-cache spkm))
                     (list (bl.rpc:key-xonly-bytes pubkey)
                           (reverse hashes) fpr path)))))
 
@@ -2081,7 +2087,27 @@ FlatSigningProvider::Merge (scriptpubkeyman.cpp:1228, :1339)."
       (loop for (key . pubkey) in pairs
             for priv = (%desc-key-priv-at key pos provider)
             do (when priv
-                 (%sign-map-add-key! keymap pubmap tr-keymap key pubkey priv pos))))))
+                 (%sign-map-add-key! keymap pubmap tr-keymap key pubkey priv pos)))
+      (%sign-maps-add-musig-participants!
+       (desc-spkm-desc spkm) pairs pos provider (desc-spkm-cache spkm)
+       keymap pubmap tr-keymap))))
+
+(defun %sign-maps-add-musig-participants! (desc pairs pos provider cache
+                                           keymap pubmap tr-keymap)
+  "The PARTICIPANT keys of every musig() expression among PAIRS: a musig()
+key has no secret of its own, but ExpandPrivate puts each participant's into
+the provider (MuSigPubkeyProvider::GetPrivKey, descriptor.cpp), and those are
+what CreateMuSig2Nonce / CreateMuSig2PartialSig look up by key id
+(script/sign.cpp:107-108, :135-136). Each is verified against the pubkey the
+participant derives, as every other key is."
+  (loop for (key . nil) in pairs
+        do (when (bl.rpc:desc-key-musig-participants key)
+             (loop for (participant . pubkey)
+                     in (bl.rpc:descriptor-musig2-participant-pairs desc key pos cache)
+                   for priv = (and pubkey (%desc-key-priv-at participant pos provider))
+                   do (when priv
+                        (%sign-map-add-key! keymap pubmap tr-keymap
+                                            participant pubkey priv pos))))))
 
 (defun %wallet-add-keys-for-pubkeys (wallet pubkeys keymap pubmap tr-keymap)
   "Core DescriptorScriptPubKeyMan::FillPSBT's second branch -- \"Maybe there

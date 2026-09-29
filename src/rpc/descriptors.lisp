@@ -22,8 +22,8 @@
 ;;; parser is plural throughout: PARSE-DESCRIPTORS returns the list Core's
 ;;; Parse() returns, and PARSE-DESCRIPTOR is its descs.at(0).
 ;;;
-;;; Not implemented: musig2 SIGNING (nonce exchange and partial signatures), so
-;;; a musig() descriptor is watch-only however it is imported.
+;;; A musig() key signs through its participants: the MuSig2 nonce and
+;;; partial-signature rounds are the PSBT signers' (src/wallet/psbt-musig.lisp).
 ;;;
 ;;; Nesting/context rules, key-count limits, and error messages follow Core's
 ;;; ParseScript/ParsePubkey exactly (descriptor.cpp:1745-2673).
@@ -2450,27 +2450,60 @@ than one scriptPubKey, and a coinbase pays exactly one."
 ;;; it. Ours had it, in the wallet, above the RPC layer that also wants it;
 ;;; it lives here now, next to the parser and the key-expression accessors it
 ;;; is written in terms of.
-(defun descriptor-key-origin (key pubkey pos)
+(defvar *key-origin-cache* nil
+  "(DESC . CACHE) for DESCRIPTOR-KEY-ORIGIN calls that do not pass them: the
+wallet binds it around descriptor inference, whose recursion hands
+sub-descriptors down and so cannot say which top descriptor's cache a
+musig() participant resolves through.")
+
+(defun %musig-origin-aggregate (key pos desc cache)
+  "The aggregate a derived musig() KEY roots at, resolved through DESC's CACHE
+(or *KEY-ORIGIN-CACHE*), or NIL when it cannot be."
+  (let ((dc (if (and desc cache) (cons desc cache) *key-origin-cache*)))
+    (handler-case
+        (%musig-aggregate-at key pos nil (and dc (list (out-desc-key-indexes (car dc))
+                                                       (cdr dc) nil)))
+      (descriptor-derivation-error () nil))))
+
+(defun descriptor-key-origin (key pubkey pos &optional desc cache)
   "(values fingerprint-bytes path) — Core PubkeyProvider::GetKeyOrigin: a
 BIP32 key's fingerprint is its root key's, the path is the key's fixed path
 plus the range position; a const key's fingerprint is its own keyid prefix
-with an empty path; a declared [origin] prefixes both."
-  (multiple-value-bind (base-fpr base-path)
-      (if (desc-key-extkey key)
-          (values (subseq (bl.crypto:hash160
-                           (bl.crypto:ext-key-public-bytes
-                            (desc-key-extkey key)))
-                          0 4)
-                  (append (desc-key-path key)
-                          (ecase (desc-key-derive key)
-                            (:none nil)
-                            (:unhardened (list pos))
-                            (:hardened (list (logior pos #x80000000))))))
-          (values (subseq (bl.crypto:hash160 pubkey) 0 4) nil))
-    (if (desc-key-origin-fingerprint key)
-        (values (desc-key-origin-fingerprint key)
-                (append (desc-key-origin-path key) base-path))
-        (values base-fpr base-path))))
+with an empty path; a declared [origin] prefixes both.
+
+A musig() key WITH a derivation is a BIP32 key whose root is the BIP328
+synthetic xpub over the aggregate (MuSigPubkeyProvider hands GetPubKey to a
+BIP32PubkeyProvider built on it, descriptor.cpp:653-657): the fingerprint is
+the AGGREGATE's keyid prefix and the path the musig()'s own. That origin is
+what SignMuSig2 reads back to find the aggregate a derived key came from
+(script/sign.cpp:291-311); answered as a const key's -- the DERIVED key's own
+prefix and no path -- no signer could ever find it. DESC and CACHE resolve
+the participants the way DESCRIPTOR-MUSIG2-PARTICIPANTS does (else
+*KEY-ORIGIN-CACHE*); an aggregate that cannot be resolved at all leaves the
+key its const origin rather than failing the caller's RPC."
+  (let ((aggregate nil))
+    (multiple-value-bind (base-fpr base-path)
+        (cond
+          ((and (desc-key-musig-participants key) (not (%musig-flat-key-p key))
+                (setf aggregate (%musig-origin-aggregate key pos desc cache)))
+           (values (subseq (bl.crypto:hash160 aggregate) 0 4)
+                   (append (desc-key-path key)
+                           (when (eq (desc-key-derive key) :unhardened) (list pos)))))
+          ((desc-key-extkey key)
+           (values (subseq (bl.crypto:hash160
+                            (bl.crypto:ext-key-public-bytes
+                             (desc-key-extkey key)))
+                           0 4)
+                   (append (desc-key-path key)
+                           (ecase (desc-key-derive key)
+                             (:none nil)
+                             (:unhardened (list pos))
+                             (:hardened (list (logior pos #x80000000)))))))
+          (t (values (subseq (bl.crypto:hash160 pubkey) 0 4) nil)))
+      (if (desc-key-origin-fingerprint key)
+          (values (desc-key-origin-fingerprint key)
+                  (append (desc-key-origin-path key) base-path))
+          (values base-fpr base-path)))))
 
 (defun %inferred-key-string (key pubkey pos &key xonly)
   "The concrete key expression InferPubkey renders: [origin]pubkey-hex,
