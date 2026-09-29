@@ -128,6 +128,7 @@ of the kv and serialization layers. The pruning policy knobs live here
                              (:file "reindex")
                              (:file "migrate-blocks")
                              (:file "index-base")      ; the protocol the four indexes below implement
+                             (:file "disktxpos")       ; Core CDiskTxPos: the txindex and spender records
                              (:file "txindex")
                              (:file "txospenderindex")
                              (:file "blockfilter")

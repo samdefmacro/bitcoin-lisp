@@ -173,6 +173,10 @@ when there was nothing to do."
   (let* ((cs (node-validated-chainstate node))
          (tip (bl.store:current-height cs))
          (name (bl.store:index-name index)))
+    ;; Records written before this tree's indexes took Core's layout are
+    ;; rewritten first, in place (INDEX-MIGRATE-RECORDS), so everything the
+    ;; rewind and the backfill read is in one layout.
+    (bl.store:index-migrate-records index cs)
     (bl.store:index-prepare-sync index cs (node-block-store node))
     ;; Core's Sync commits when it catches up, and when it is interrupted
     ;; (index/base.cpp:214-236): the locator of wherever the index got to.
@@ -666,7 +670,8 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (log-info "Initializing transaction index...")
     (setf (node-tx-index *node*)
           (bl.store:init-tx-index (node-data-directory *node*) :enabled t
-                                  :wipe reindex))
+                                  :wipe reindex
+                                  :block-store (node-block-store *node*)))
     (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
     (start-index-background-sync *node* (node-tx-index *node*))
     (log-info "Transaction index loaded: ~D entries"
@@ -716,7 +721,8 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (log-info "Initializing spender index...")
     (setf (node-txospenderindex *node*)
           (bl.store:init-txospender-index (node-data-directory *node*)
-                                          :enabled t :wipe reindex))
+                                          :enabled t :wipe reindex
+                                          :block-store (node-block-store *node*)))
     (let ((best (bl.store:txospenderindex-best-block
                  (node-txospenderindex *node*))))
       (log-info "Spender index loaded: best block ~A"

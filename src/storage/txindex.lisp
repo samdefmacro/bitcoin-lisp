@@ -1,19 +1,31 @@
 (in-package #:bitcoin-lisp.storage)
 
-;;; Transaction Index
+;;; Transaction Index (Core index/txindex.{h,cpp})
 ;;;
-;;; Maps transaction IDs to their location in the blockchain.
-;;; Uses an append-only file for persistence with an in-memory hash table index.
+;;; Maps each confirmed transaction's txid to where it lives on disk:
 ;;;
-;;; File format:
-;;;   Each entry: [32-byte txid][32-byte block-hash][4-byte position] = 68 bytes
+;;;   't' || txid(32)  ->  CDiskTxPos   (Core DB_TXINDEX, txindex.cpp:34, 57-67)
+;;;   'B'              ->  the best-block CBlockLocator (index-base.lisp)
 ;;;
-;;; The in-memory index maps txid -> file offset for O(1) lookups.
+;;; the record Core writes, so a Core node started on this datadir reads this
+;;; index and ours reads Core's. Genesis is not indexed (txindex.cpp:75-76).
+;;;
+;;; Two record kinds of our own, under keys Core never reads:
+;;;
+;;;   'L' || txid(32)  ->  block hash(32) || position in the block (u32 LE)
+;;;       for a transaction whose block this node still keeps in a LEGACY
+;;;       per-block file, which has no FlatFilePos (see disktxpos.lisp);
+;;;   'm'              ->  next height (u32 LE) of an unfinished migration.
+;;;
+;;; Until 2026-09-29 every record was the 'L' layout under 't', a value Core
+;;; cannot read (Core v28.2 started on such an index resolved nothing).
+;;; MIGRATE-TXINDEX rewrites them in place; until it has, a 36-byte 't' value
+;;; is still read the old way.
 
-(defstruct tx-location
-  "Location of a transaction in the blockchain."
-  (block-hash nil :type (or null (simple-array (unsigned-byte 8) (32))))
-  (tx-position 0 :type (unsigned-byte 32)))
+(defconstant +txindex-legacy-record-size+ 36
+  "The (block hash, u32 position) value of an 'L' record, and of every 't'
+record written before the migration. A CDiskTxPos is three VARINTs, at most
+15 bytes, so the two can never be confused.")
 
 (defstruct (tx-index (:include base-index))
   "Transaction index state — a LevelDB index, as Core's TxIndex is.
@@ -31,7 +43,10 @@ network the node claims to support. A hard OOM, not a diagnosable refusal.
 
 Moving to LevelDB deletes the in-memory table, the startup replay and the
 per-lookup file open together, and gives the index the persisted best-block
-marker it never had.")
+marker it never had."
+  ;; Where the indexed blocks live: a CDiskTxPos is written from the block's
+  ;; FlatFilePos and read back through the block files.
+  (block-store nil))
 
 (defmethod index-name ((index tx-index)) "txindex")
 (defmethod index-height ((index tx-index) chainstate)
@@ -45,8 +60,8 @@ what %TXINDEX-RESUME-HEIGHT scans from."
   (when (= (length bytes) 32)
     (values (copy-seq bytes) nil)))
 (defmethod index-write-block ((index tx-index) chainstate block block-hash height spent-utxos)
-  (declare (ignore chainstate height spent-utxos))
-  (txindex-add-block index block block-hash)
+  (declare (ignore chainstate spent-utxos))
+  (txindex-add-block index block block-hash height)
   (txindex-set-best-block index block-hash)
   (values t nil))
 (defmethod index-rewind-block ((index tx-index) chainstate block block-hash height)
@@ -61,16 +76,23 @@ the tip after invalidateblock and the next start rescanned from genesis."
     (when (and best (equalp best block-hash))
       (txindex-set-best-block
        index (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header block))))))
+(defmethod index-migrate-records ((index tx-index) chainstate)
+  (migrate-txindex index chainstate))
 (defmethod index-sync ((index tx-index) chainstate block-store &key undo-fn subsidy-fn progress)
   (declare (ignore undo-fn subsidy-fn))
   (build-tx-index index chainstate block-store :progress-callback progress))
 
-(defconstant +txindex-record-size+ 36
-  "Value size: 32 (block-hash) + 4 (tx position, little-endian).")
+;;; --- keys and records ---
 
 (defconstant +txindex-key-prefix+ 116
-  "ASCII #\t — the per-transaction key prefix, keeping txid keys clear of the
-metadata key below.")
+  "ASCII 't', Core's DB_TXINDEX (index/txindex.cpp:34).")
+
+(defconstant +txindex-legacy-key-prefix+ 76
+  "ASCII 'L': a transaction in a legacy per-block file (see the file header).")
+
+(defparameter *txindex-migration-key*
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 109)
+  "ASCII 'm': the next height of an unfinished MIGRATE-TXINDEX.")
 
 (defun txindex-db-path (base-path)
   "Directory of the txindex LevelDB. Core's indexes/txindex/, falling back to
@@ -78,27 +100,32 @@ the flat txindex/ this tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :txindex))
 
 (defun %txindex-key (txid)
-  "DB key for TXID: the prefix byte followed by the 32-byte hash."
+  "Core's key for TXID: 't' followed by the 32-byte hash."
   (index-key +txindex-key-prefix+ txid))
 
-(defun %txindex-encode (block-hash tx-position)
-  (let ((v (make-array +txindex-record-size+ :element-type '(unsigned-byte 8))))
-    (replace v block-hash)
-    (setf (aref v 32) (logand tx-position #xFF)
-          (aref v 33) (logand (ash tx-position -8) #xFF)
-          (aref v 34) (logand (ash tx-position -16) #xFF)
-          (aref v 35) (logand (ash tx-position -24) #xFF))
-    v))
+(defun %txindex-legacy-key (txid)
+  (index-key +txindex-legacy-key-prefix+ txid))
 
-(defun init-tx-index (base-path &key (enabled t) wipe)
-  "Initialize a transaction index at BASE-PATH.
+(defun %txindex-legacy-encode (block-hash tx-position)
+  (let ((v (make-array +txindex-legacy-record-size+ :element-type '(unsigned-byte 8))))
+    (replace v block-hash)
+    (dotimes (i 4 v)
+      (setf (aref v (+ 32 i)) (ldb (byte 8 (* 8 i)) tx-position)))))
+
+(defun %txindex-legacy-decode (v)
+  "(values block-hash position) of a 36-byte legacy value."
+  (values (subseq v 0 32)
+          (loop for i below 4 sum (ash (aref v (+ 32 i)) (* 8 i)))))
+
+(defun init-tx-index (base-path &key (enabled t) wipe block-store)
+  "Open the transaction index at BASE-PATH over the blocks in BLOCK-STORE.
 If ENABLED is nil, creates a disabled index that ignores add operations.
 No startup replay: the DB is the index.
 
 WIPE discards the stored index first (Core's f_wipe for -reindex,
 init.cpp:1905), so the caller's catch-up rebuilds it from genesis."
   (open-index-db (make-tx-index :base-path (pathname base-path) :enabled enabled
-                                :cache-share :tx-index)
+                                :cache-share :tx-index :block-store block-store)
                  (txindex-db-path base-path)
                  :wipe wipe))
 
@@ -106,139 +133,132 @@ init.cpp:1905), so the caller's catch-up rebuilds it from genesis."
   "Close the txindex database."
   (close-index txindex))
 
-(defun txindex-add (txindex txid block-hash tx-position)
-  "Add or UPDATE a transaction's location (upsert).
+(defun %txindex-live-p (txindex)
+  (and (tx-index-enabled txindex) (tx-index-db txindex) t))
 
-Core's txindex only processes block connects and a connect OVERWRITES any
-existing entry (CustomAppend batch-writes unconditionally); nothing is erased
-on disconnect (index/base.h:136 CustomRemove is a no-op and txindex does not
-override it). The upsert is what re-points a transaction disconnected by a
-reorg and re-mined on the new chain — a plain LevelDB put is that upsert."
-  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (return-from txindex-add nil))
-  (leveldb-put (tx-index-db txindex)
-               (%txindex-key txid)
-               (%txindex-encode block-hash tx-position))
-  t)
+(defun %txindex-block-records (txindex block block-hash)
+  "The (key . value) records BLOCK contributes: Core's CDiskTxPos per
+transaction when the block is in a flat file, else one 'L' record each."
+  (let* ((txs (bl.ser:bitcoin-block-transactions block))
+         (store (tx-index-block-store txindex))
+         (position (and store (block-flat-position store block-hash))))
+    (if position
+        (loop for tx in txs
+              for dtp in (block-disk-tx-positions block position)
+              collect (cons (%txindex-key (bl.ser:transaction-hash tx))
+                            (encode-disk-tx-pos dtp)))
+        (loop for tx in txs
+              for i from 0
+              collect (cons (%txindex-legacy-key (bl.ser:transaction-hash tx))
+                            (%txindex-legacy-encode block-hash i))))))
 
-(defun txindex-lookup (txindex txid)
-  "Look up a transaction. Returns a TX-LOCATION, or NIL. One DB read."
-  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (return-from txindex-lookup nil))
-  (let ((v (leveldb-get (tx-index-db txindex) (%txindex-key txid))))
-    (when (and v (>= (length v) +txindex-record-size+))
-      (make-tx-location
-       :block-hash (subseq v 0 32)
-       :tx-position (logior (aref v 32)
-                            (ash (aref v 33) 8)
-                            (ash (aref v 34) 16)
-                            (ash (aref v 35) 24))))))
+(defun %txindex-write-records (txindex records &key delete extra)
+  "Write RECORDS ((key . value) ...) and DELETE (keys) in one batch, with the
+EXTRA (key . value) records -- Core's WriteTxs is one batch per block."
+  (with-leveldb-writebatch (batch)
+    (dolist (k delete) (leveldb-writebatch-delete batch k))
+    (dolist (r records) (leveldb-writebatch-put batch (car r) (cdr r)))
+    (dolist (r extra) (leveldb-writebatch-put batch (car r) (cdr r)))
+    (leveldb-write (tx-index-db txindex) batch)))
 
-(defun txindex-remove (txindex txid)
-  "Delete a transaction's entry. Returns T if the index is live.
-Core never removes on disconnect; this exists for callers that manage the
-index explicitly."
-  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (return-from txindex-remove nil))
-  (leveldb-delete (tx-index-db txindex) (%txindex-key txid))
-  t)
+(defun txindex-add-block (txindex block block-hash &optional height)
+  "Core TxIndex::CustomAppend (index/txindex.cpp:73-90): write every
+transaction of BLOCK, at HEIGHT, in one batch. A connect OVERWRITES what an
+earlier branch wrote for the same txid, which is what re-points a transaction
+a reorg moved (Core has no CustomRemove for this index). Genesis (HEIGHT 0) is
+not indexed. Returns the number of transactions written."
+  (if (or (not (%txindex-live-p txindex)) (eql height 0))
+      0
+      (let ((records (%txindex-block-records txindex block block-hash)))
+        (%txindex-write-records txindex records)
+        (length records))))
+
+(defun %txindex-read-legacy (txindex v txid)
+  "The transaction a 36-byte VALUE locates, as (values tx block-hash), or NIL."
+  (multiple-value-bind (block-hash position) (%txindex-legacy-decode v)
+    (let* ((store (tx-index-block-store txindex))
+           (block (and store (get-block store block-hash)))
+           (tx (and block (nth position (bl.ser:bitcoin-block-transactions block)))))
+      (when (and tx (equalp (bl.ser:transaction-hash tx) txid))
+        (values tx block-hash)))))
+
+(defun txindex-find-tx (txindex txid)
+  "Core TxIndex::FindTx (index/txindex.cpp:95-123): the confirmed transaction
+TXID, as (values tx block-hash), or NIL when it is not indexed or cannot be
+read back. The record's position is read through the block files and the
+transaction's hash checked against TXID, as Core's `txid mismatch' check does."
+  (when (%txindex-live-p txindex)
+    (let* ((db (tx-index-db txindex))
+           (v (leveldb-get db (%txindex-key txid))))
+      (cond
+        ((and v (= (length v) +txindex-legacy-record-size+))
+         ;; A record MIGRATE-TXINDEX has not reached yet.
+         (%txindex-read-legacy txindex v txid))
+        (v
+         (let ((dtp (decode-disk-tx-pos v))
+               (store (tx-index-block-store txindex)))
+           (when (and dtp store)
+             (multiple-value-bind (tx block-hash) (read-tx-at-disk-pos store dtp)
+               (when (and tx (equalp (bl.ser:transaction-hash tx) txid))
+                 (values tx block-hash))))))
+        (t
+         (let ((lv (leveldb-get db (%txindex-legacy-key txid))))
+           (when (and lv (= (length lv) +txindex-legacy-record-size+))
+             (%txindex-read-legacy txindex lv txid))))))))
 
 (defun txindex-contains-p (txindex txid)
   "Check if a transaction is indexed."
-  (and (tx-index-enabled txindex)
-       (tx-index-db txindex)
-       (leveldb-get (tx-index-db txindex) (%txindex-key txid))
+  (and (%txindex-live-p txindex)
+       (or (leveldb-get (tx-index-db txindex) (%txindex-key txid))
+           (leveldb-get (tx-index-db txindex) (%txindex-legacy-key txid)))
        t))
 
 (defun txindex-set-best-block (txindex block-hash)
   "Move the block this index is caught up to (Core SetBestBlockIndex). In
 memory: COMMIT-INDEX writes it to the database, as Core's Commit does."
-  (when (and (tx-index-enabled txindex) (tx-index-db txindex))
+  (when (%txindex-live-p txindex)
     (index-set-best txindex block-hash -1)
     t))
 
 (defun txindex-best-block (txindex)
   "The block hash this index is caught up to, or NIL."
-  (when (and (tx-index-enabled txindex) (tx-index-db txindex))
+  (when (%txindex-live-p txindex)
     (values (index-best-block txindex))))
+
+(defun %count-prefix (db prefix)
+  (let ((n 0))
+    (with-leveldb-iterator (iter db)
+      (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
+                                            :initial-element prefix))
+      (loop while (leveldb-iter-valid-p iter)
+            for key = (leveldb-iter-key iter)
+            while (and key (plusp (length key)) (= (aref key 0) prefix))
+            do (incf n) (leveldb-iter-next iter)))
+    n))
 
 (defun txindex-count (txindex)
   "Number of indexed transactions, by DB scan.
 
 O(n) and deliberately so: LevelDB has no cheap count, and the only caller is a
-diagnostic RPC field. The predecessor answered in O(1) from an in-memory table
-whose existence was the bug."
-  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (return-from txindex-count 0))
-  (let ((n 0))
-    (with-leveldb-iterator (iter (tx-index-db txindex))
-      (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
-                                            :initial-element +txindex-key-prefix+))
-      (loop while (leveldb-iter-valid-p iter)
-            for key = (leveldb-iter-key iter)
-            while (and key (plusp (length key))
-                       (= (aref key 0) +txindex-key-prefix+))
-            do (incf n) (leveldb-iter-next iter)))
-    n))
-
-(defun load-tx-index (txindex)
-  "Retained for compatibility; the DB needs no replay.
-The file-based index rebuilt a full in-memory map by streaming the whole file
-on every startup. Returns T when the index is live."
-  (and (tx-index-enabled txindex) (tx-index-db txindex) t))
-
-(defun txindex-add-block (txindex block block-hash)
-  "Index all transactions in a block.
-BLOCK is a bitcoin-block structure.
-BLOCK-HASH is the 32-byte block hash.
-Returns the number of transactions indexed."
-  (unless (tx-index-enabled txindex)
-    (return-from txindex-add-block 0))
-  (let ((txs (bl.ser:bitcoin-block-transactions block))
-        (count 0))
-    (loop for tx in txs
-          for position from 0
-          do (let ((txid (bl.ser:transaction-hash tx)))
-               (when (txindex-add txindex txid block-hash position)
-                 (incf count))))
-    count))
-
-(defun txindex-remove-block (txindex block)
-  "Remove all transactions in a block from the in-memory index.
-NOT used by the reorg path: Core's txindex never erases entries for
-disconnected blocks (stale-branch entries stay resolvable through the
-still-stored stale block, and re-mined txs are re-pointed by the connect-time
-upsert). Kept as a maintenance utility.
-BLOCK is a bitcoin-block structure.
-Returns the number of transactions removed from index."
-  (unless (tx-index-enabled txindex)
-    (return-from txindex-remove-block 0))
-  (let ((txs (bl.ser:bitcoin-block-transactions block))
-        (count 0))
-    (dolist (tx txs)
-      (let ((txid (bl.ser:transaction-hash tx)))
-        (when (txindex-remove txindex txid)
-          (incf count))))
-    count))
+diagnostic log line."
+  (if (%txindex-live-p txindex)
+      (+ (%count-prefix (tx-index-db txindex) +txindex-key-prefix+)
+         (%count-prefix (tx-index-db txindex) +txindex-legacy-key-prefix+))
+      0))
 
 ;;; Background Index Building
 
 (defun %txindex-block-indexed-p (txindex block block-hash)
   "T when BLOCK is already fully indexed AT BLOCK-HASH: its LAST transaction's
-stored location points into this block. Entries are appended in tx order and
-flushed per entry, so the last tx being present at this block implies every
-earlier tx of the block was written before it (crash-safe, unlike checking the
-coinbase, which is written first). Verifying the stored BLOCK-HASH — not mere
-txid presence — matters now that TXINDEX-ADD upserts: after a reorg the txid
-can exist but point at a stale branch's block, and the catch-up scan must
+stored record is the one this block writes for it. A block's records go in one
+batch, so the last one being there means all are. Comparing the record -- not
+mere txid presence -- matters because a connect overwrites: after a reorg the
+txid can exist but point at a stale branch's block, and the catch-up scan must
 re-index it at its active-chain location."
-  (let ((last-tx (car (last (bl.ser:bitcoin-block-transactions
-                             block)))))
-    (and last-tx
-         (let ((loc (txindex-lookup
-                     txindex
-                     (bl.ser:transaction-hash last-tx))))
-           (and loc (equalp (tx-location-block-hash loc) block-hash))))))
+  (let ((records (last (%txindex-block-records txindex block block-hash))))
+    (and records
+         (equalp (leveldb-get (tx-index-db txindex) (car (first records)))
+                 (cdr (first records))))))
 
 (defun %txindex-resume-height (txindex chain-state)
   "Height to resume the catch-up scan from: one past the recorded best-indexed
@@ -340,8 +360,9 @@ marker, and neither can Core, which also resumes from its locator."
                  (let* ((block-hash (block-index-entry-hash entry))
                         (block (get-block block-store block-hash)))
                    (when (and block
+                              (plusp height)
                               (not (%txindex-block-indexed-p txindex block block-hash)))
-                     (let ((count (txindex-add-block txindex block block-hash)))
+                     (let ((count (txindex-add-block txindex block block-hash height)))
                        (incf total-indexed count))))))
              ;; Report progress every second
              (when progress-callback
@@ -360,3 +381,131 @@ marker, and neither can Core, which also resumes from its locator."
       (when tip
         (txindex-set-best-block txindex (block-index-entry-hash tip))))
     total-indexed))
+
+;;; --- Migration: this tree's records -> Core's (2026-09-29) ---
+;;;
+;;; An index written before this commit holds (block hash, position) under
+;;; every 't' key. Its CDiskTxPos cannot be derived from the record alone --
+;;; nTxOffset is the byte distance from the header, which only the block
+;;; knows -- so the migration walks the active chain from height 1 to the
+;;; index's best block, reads each block once and rewrites its transactions'
+;;; records in Core's form (one batch per BATCH-BLOCKS blocks, the next height
+;;; written in the same batch under 'm', so a restart resumes where it
+;;; stopped). Then a scan of what is left -- transactions of blocks a reorg
+;;; took off the active chain -- converts those the same way, block by block,
+;;; or moves them to 'L' when their block is not in a flat file. The index
+;;; answers throughout: a 36-byte 't' value is still read the old way.
+
+(defun %txindex-migration-height (txindex)
+  (let ((v (leveldb-get (tx-index-db txindex) *txindex-migration-key*)))
+    (and v (= (length v) 4) (loop for i below 4 sum (ash (aref v i) (* 8 i))))))
+
+(defun %u32-le (n)
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4 v) (setf (aref v i) (ldb (byte 8 (* 8 i)) n)))))
+
+(defun %txindex-first-record-legacy-p (txindex)
+  "T when the first 't' record in key order still has the old 36-byte value."
+  (with-leveldb-iterator (it (tx-index-db txindex))
+    (leveldb-iter-seek it (make-array 1 :element-type '(unsigned-byte 8)
+                                        :initial-element +txindex-key-prefix+))
+    (and (leveldb-iter-valid-p it)
+         (let ((k (leveldb-iter-key it)))
+           (and (= (length k) 33) (= (aref k 0) +txindex-key-prefix+)))
+         (= (length (leveldb-iter-value it)) +txindex-legacy-record-size+))))
+
+(defun txindex-needs-migration-p (txindex)
+  "T when TXINDEX still holds records in this tree's pre-Core layout."
+  (and (%txindex-live-p txindex)
+       (or (%txindex-migration-height txindex)
+           (%txindex-first-record-legacy-p txindex))
+       t))
+
+(defun %txindex-leftover-legacy-records (txindex)
+  "Every 't' record still in the old layout, as (key . value), grouped in an
+EQUALP table by the block hash it names."
+  (let ((by-block (make-hash-table :test 'equalp)))
+    (with-leveldb-iterator (it (tx-index-db txindex))
+      (leveldb-iter-seek it (make-array 1 :element-type '(unsigned-byte 8)
+                                          :initial-element +txindex-key-prefix+))
+      (loop while (leveldb-iter-valid-p it)
+            for k = (leveldb-iter-key it)
+            while (and (= (length k) 33) (= (aref k 0) +txindex-key-prefix+))
+            do (let ((v (leveldb-iter-value it)))
+                 (when (= (length v) +txindex-legacy-record-size+)
+                   (push (cons k v) (gethash (subseq v 0 32) by-block))))
+               (leveldb-iter-next it)))
+    by-block))
+
+(defun %txindex-convert-leftovers (txindex)
+  "Convert the old-layout records the chain walk did not reach; returns how
+many were converted to Core's form and how many were moved to 'L'."
+  (let ((store (tx-index-block-store txindex))
+        (core 0) (legacy 0))
+    (maphash
+     (lambda (block-hash rows)
+       (let* ((block (and store (get-block store block-hash)))
+              (position (and block (block-flat-position store block-hash)))
+              (dtps (and position (coerce (block-disk-tx-positions block position) 'vector))))
+         (let ((records '()) (deletes '()))
+           (dolist (row rows)
+             (let ((txid (subseq (car row) 1))
+                   (i (nth-value 1 (%txindex-legacy-decode (cdr row)))))
+               (cond
+                 ((and dtps (< i (length dtps)))
+                  (push (cons (car row) (encode-disk-tx-pos (aref dtps i))) records)
+                  (incf core))
+                 (t
+                  (push (car row) deletes)
+                  (push (cons (%txindex-legacy-key txid) (cdr row)) records)
+                  (incf legacy)))))
+           (%txindex-write-records txindex records :delete deletes))))
+     (%txindex-leftover-legacy-records txindex))
+    (values core legacy)))
+
+(defun migrate-txindex (txindex chain-state &key (batch-blocks 1000))
+  "Rewrite TXINDEX's records in Core's layout, in place and resumably (see
+above). A no-op for an index already in Core's layout. Returns the number of
+transactions rewritten, or NIL when there was nothing to do."
+  (unless (txindex-needs-migration-p txindex)
+    (return-from migrate-txindex nil))
+  (let* ((start-time (get-internal-real-time))
+         (store (tx-index-block-store txindex))
+         (from (or (%txindex-migration-height txindex) 1))
+         (to (min (current-height chain-state) (index-height txindex chain-state)))
+         (written 0)
+         (pending '())
+         (deletes '()))
+    (bl.log:log-info "txindex: migrating records to Core's CDiskTxPos layout, heights ~D to ~D"
+                     from to)
+    (flet ((flush (next)
+             (%txindex-write-records txindex pending :delete deletes
+                                     :extra (list (cons *txindex-migration-key* (%u32-le next))))
+             (setf pending '() deletes '())))
+      ;; One backward walk collects the range (GET-BLOCK-AT-HEIGHT per height
+      ;; walks from the tip each time: quadratic over a whole chain).
+      (loop for entry in (and (<= from to)
+                              (active-chain-entries-from chain-state from (1+ (- to from))))
+            for h = (block-index-entry-height entry)
+            for hash = (block-index-entry-hash entry)
+            for block = (and store (get-block store hash))
+            do (when block
+                 (let ((records (%txindex-block-records txindex block hash)))
+                   (incf written (length records))
+                   (dolist (r records)
+                     (push r pending)
+                     ;; An 'L' record replaces the old 't' one for its txid.
+                     (when (= (aref (car r) 0) +txindex-legacy-key-prefix+)
+                       (push (%txindex-key (subseq (car r) 1)) deletes)))))
+               (when (zerop (mod (1+ (- h from)) batch-blocks))
+                 (flush (1+ h))
+                 (bl.log:log-info "txindex: migrated to height ~D of ~D" h to)))
+      (flush (1+ to)))
+    (multiple-value-bind (core legacy) (%txindex-convert-leftovers txindex)
+      (leveldb-delete (tx-index-db txindex) *txindex-migration-key*)
+      (bl.log:log-info "txindex: migration done -- ~D transaction~:P on the active chain, ~
+~D off it rewritten, ~D left in legacy per-block files, in ~,1Fs"
+                       written core legacy
+                       (/ (- (get-internal-real-time) start-time)
+                          internal-time-units-per-second)))
+    written))

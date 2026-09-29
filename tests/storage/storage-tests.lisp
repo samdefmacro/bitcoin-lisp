@@ -632,124 +632,183 @@ used the legacy serializer, which dropped witness."
     ;; Cleanup
     (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir)))))
 
-(test txindex-add-and-lookup
-  "Adding to txindex should make entry retrievable."
-  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A/" (get-universal-time)))
-         (txindex (bl.store:init-tx-index test-dir))
-         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
-         (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
-    (unwind-protect
-        (progn
-          ;; Add entry
-          (bl.store:txindex-add txindex txid block-hash 5)
-          ;; Lookup
-          (let ((location (bl.store:txindex-lookup txindex txid)))
-            (is (not (null location)))
-            (is (equalp (bl.store:tx-location-block-hash location) block-hash))
-            (is (= (bl.store:tx-location-tx-position location) 5))))
-      ;; Cleanup
-      (bl.store:close-tx-index txindex)
-      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+;;; The txindex holds Core's records: 't' || txid -> CDiskTxPos, the block's
+;;; FlatFilePos and the offset past its header (index/txindex.cpp:73-90).
 
-(test txindex-lookup-missing
-  "Looking up missing txid should return nil."
-  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A/" (get-universal-time)))
-         (txindex (bl.store:init-tx-index test-dir))
-         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 99)))
-    (unwind-protect
-        (is (null (bl.store:txindex-lookup txindex txid)))
-      (bl.store:close-tx-index txindex)
-      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+(defun %txindex-test-tx (seed)
+  "A non-coinbase transaction whose serialization SEED makes unique."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element seed)
+                                      :index seed)
+                    :script-sig (make-array 3 :element-type '(unsigned-byte 8)
+                                              :initial-element seed)
+                    :sequence #xFFFFFFFF))
+   :outputs (vector (bl.ser:make-tx-out
+                     :value (* 1000 (1+ seed))
+                     :script-pubkey (make-array 22 :element-type '(unsigned-byte 8)
+                                                   :initial-element seed)))
+   :lock-time 0))
 
-(test txindex-remove
-  "Removing from txindex should make entry no longer retrievable."
-  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A/" (get-universal-time)))
-         (txindex (bl.store:init-tx-index test-dir))
-         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
-         (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4)))
-    (unwind-protect
-        (progn
-          ;; Add then remove
-          (bl.store:txindex-add txindex txid block-hash 0)
-          (is (not (null (bl.store:txindex-lookup txindex txid))))
-          (bl.store:txindex-remove txindex txid)
-          (is (null (bl.store:txindex-lookup txindex txid))))
-      (bl.store:close-tx-index txindex)
-      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+(defun %txindex-test-block (height &rest seeds)
+  "A block at HEIGHT: a coinbase and one transaction per SEED."
+  (let* ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element (+ 100 height)))
+         (block (make-reorg-test-block (make-array 32 :element-type '(unsigned-byte 8))
+                                       hash height)))
+    (setf (bl.ser:bitcoin-block-transactions block)
+          (append (bl.ser:bitcoin-block-transactions block)
+                  (mapcar #'%txindex-test-tx seeds)))
+    ;; The header's REAL hash: FindTx reports the hash of the header it reads
+    ;; back, not the placeholder the reorg fixture caches.
+    (let* ((header (bl.ser:bitcoin-block-header block))
+           (real (bl.crypto:hash256 (bl.ser:serialize-block-header header))))
+      (setf (bl.ser:block-header-cached-hash header) real)
+      (values block real))))
 
-(test txindex-persistence
-  "Transaction index should persist across close/reopen."
-  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A/" (get-universal-time)))
-         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
-         (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 6)))
-    (unwind-protect
-        (progn
-          ;; First session: add entry
-          (let ((txindex (bl.store:init-tx-index test-dir)))
-            (bl.store:txindex-add txindex txid block-hash 10)
-            (bl.store:close-tx-index txindex))
-          ;; Second session: verify entry persisted
-          (let ((txindex (bl.store:init-tx-index test-dir)))
-            (unwind-protect
-                (let ((location (bl.store:txindex-lookup txindex txid)))
-                  (is (not (null location)))
-                  (is (equalp (bl.store:tx-location-block-hash location) block-hash))
-                  (is (= (bl.store:tx-location-tx-position location) 10)))
-              (bl.store:close-tx-index txindex))))
-      ;; Cleanup
-      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+(defmacro with-txindex-fixture ((store txindex &key (flat t)) &body body)
+  "A regtest block store (flat files when FLAT) and a txindex over it."
+  (let ((dir (gensym "DIR")))
+    `(with-network (:regtest)
+       (with-temp-directory (,dir "bl-txindex")
+         (let* ((bl.store:*flat-block-files* ,flat)
+                (,store (bl.store:init-block-store ,dir))
+                (,txindex (bl.store:init-tx-index ,dir :block-store ,store)))
+           (unwind-protect (progn ,@body)
+             (bl.store:close-tx-index ,txindex)))))))
 
-(test txindex-upsert-overwrites
-  "txindex-add UPSERTS: adding an existing txid overwrites its stored location
-(Core index/txindex.cpp CustomAppend batch-writes unconditionally), both live
-and across a close/reopen (load-tx-index's sequential replay is
-last-entry-wins). This is what re-points a reorg-disconnected tx re-mined in
-the new chain; the old early-return left it at the stale branch's block."
-  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A-up/" (get-universal-time)))
-         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
-         (block-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
-         (block-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB)))
-    (unwind-protect
-        (progn
-          (let ((txindex (bl.store:init-tx-index test-dir)))
-            (bl.store:txindex-add txindex txid block-a 1)
-            (bl.store:txindex-add txindex txid block-b 3)
-            ;; Live: the newest location wins; still a single distinct txid.
-            (let ((loc (bl.store:txindex-lookup txindex txid)))
-              (is (equalp block-b (bl.store:tx-location-block-hash loc)))
-              (is (= 3 (bl.store:tx-location-tx-position loc))))
-            (is (= 1 (bl.store:txindex-count txindex)))
-            (bl.store:close-tx-index txindex))
-          ;; Reopen: the file replay resolves to the newest location too.
-          (let ((txindex (bl.store:init-tx-index test-dir)))
-            (unwind-protect
-                (let ((loc (bl.store:txindex-lookup txindex txid)))
-                  (is (equalp block-b (bl.store:tx-location-block-hash loc)))
-                  (is (= 3 (bl.store:tx-location-tx-position loc)))
-                  (is (= 1 (bl.store:txindex-count txindex))))
-              (bl.store:close-tx-index txindex))))
-      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+(defun %txindex-raw (txindex prefix txid)
+  (bl.kv:leveldb-get (bl.store:base-index-db txindex)
+                     (concatenate '(simple-array (unsigned-byte 8) (*))
+                                  (vector (char-code prefix)) txid)))
 
-(test txindex-multiple-entries
-  "Transaction index should handle multiple entries."
-  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A/" (get-universal-time)))
-         (txindex (bl.store:init-tx-index test-dir))
-         (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
-    (unwind-protect
-        (progn
-          ;; Add multiple entries
-          (dotimes (i 10)
-            (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)))
-              (bl.store:txindex-add txindex txid block-hash i)))
-          ;; Verify all retrievable
-          (dotimes (i 10)
-            (let* ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))
-                   (location (bl.store:txindex-lookup txindex txid)))
-              (is (not (null location)))
-              (is (= (bl.store:tx-location-tx-position location) i)))))
-      (bl.store:close-tx-index txindex)
-      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+(test txindex-writes-cores-cdisktxpos-and-reads-it-back
+  "Each transaction's record is VARINT(nFile) VARINT(nPos) VARINT(nTxOffset),
+the offset counting from the end of the header: the CompactSize count first,
+then each earlier transaction's bytes. FindTx reads the header and the one
+transaction back and checks the txid (txindex.cpp:95-123)."
+  (with-txindex-fixture (store txindex)
+    (multiple-value-bind (block hash) (%txindex-test-block 5 1 2)
+      (bl.store:store-block store block :height 5)
+      (is (= 3 (bl.store:txindex-add-block txindex block hash 5)))
+      (let* ((txs (bl.ser:bitcoin-block-transactions block))
+             (pos (bl.store:block-flat-position store hash))
+             (offset 1))
+        (dolist (tx txs)
+          (let ((txid (bl.ser:transaction-hash tx)))
+            ;; Core's bytes: nFile 0, nPos, nTxOffset, each a VARINT.
+            (is (equalp (let ((bb (bl.ser:make-byte-buf)))
+                          (bl.ser:bb-write-core-varint bb 0)
+                          (bl.ser:bb-write-core-varint bb (bl.kv:flat-file-pos-pos pos))
+                          (bl.ser:bb-write-core-varint bb offset)
+                          (bl.ser:bb-finish bb))
+                        (%txindex-raw txindex #\t txid)))
+            (multiple-value-bind (found block-hash) (bl.store:txindex-find-tx txindex txid)
+              (is (equalp (bl.ser:transaction-wire-bytes tx)
+                          (and found (bl.ser:transaction-wire-bytes found))))
+              (is (equalp hash block-hash)))
+            (incf offset (length (bl.ser:transaction-wire-bytes tx)))))))))
 
+(test txindex-skips-genesis-and-answers-nil-for-the-unknown
+  "Genesis is not indexed (txindex.cpp:75-76); an unknown txid is NIL."
+  (with-txindex-fixture (store txindex)
+    (multiple-value-bind (block hash) (%txindex-test-block 0 3)
+      (bl.store:store-block store block :height 0)
+      (is (= 0 (bl.store:txindex-add-block txindex block hash 0)))
+      (is (null (bl.store:txindex-find-tx
+                 txindex (bl.ser:transaction-hash
+                          (second (bl.ser:bitcoin-block-transactions block))))))
+      (is (null (bl.store:txindex-find-tx
+                 txindex (make-array 32 :element-type '(unsigned-byte 8) :initial-element 99)))))))
+
+(test txindex-record-persists-and-a-reconnect-overwrites-it
+  "A connect overwrites the record for a txid an earlier branch wrote (Core has
+no CustomRemove for this index), and the record survives a reopen."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-txindex-persist")
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (shared (%txindex-test-tx 7))
+             (txid (bl.ser:transaction-hash shared)))
+        (multiple-value-bind (a hash-a) (%txindex-test-block 4 7)
+          (multiple-value-bind (b hash-b) (%txindex-test-block 6 8)
+            (setf (bl.ser:bitcoin-block-transactions b)
+                  (append (bl.ser:bitcoin-block-transactions b) (list shared)))
+            (bl.store:store-block store a :height 4)
+            (bl.store:store-block store b :height 6)
+            (let ((txindex (bl.store:init-tx-index dir :block-store store)))
+              (bl.store:txindex-add-block txindex a hash-a 4)
+              (bl.store:txindex-add-block txindex b hash-b 6)
+              (bl.store:close-tx-index txindex))
+            (let ((txindex (bl.store:init-tx-index dir :block-store store)))
+              (unwind-protect
+                   (progn
+                     (is (equalp hash-b (nth-value 1 (bl.store:txindex-find-tx txindex txid))))
+                     (is (= 4 (bl.store:txindex-count txindex))))
+                (bl.store:close-tx-index txindex)))))))))
+
+(test txindex-legacy-per-block-file-gets-a-record-of-its-own
+  "A block kept in a legacy per-block file has no FlatFilePos, so no CDiskTxPos
+can name its transactions: they get an 'L' record, which Core never reads, and
+no 't' record, so a Core node sees `not indexed' rather than a wrong position."
+  (with-txindex-fixture (store txindex :flat nil)
+    (multiple-value-bind (block hash) (%txindex-test-block 3 4)
+      (bl.store:store-block store block :height 3)
+      (is (null (bl.store:block-flat-position store hash)))
+      (bl.store:txindex-add-block txindex block hash 3)
+      (let ((txid (bl.ser:transaction-hash (second (bl.ser:bitcoin-block-transactions block)))))
+        (is (null (%txindex-raw txindex #\t txid)))
+        (is (= 36 (length (%txindex-raw txindex #\L txid))))
+        (is (equalp hash (nth-value 1 (bl.store:txindex-find-tx txindex txid))))))))
+
+(test txindex-migrates-the-old-records-in-place
+  "An index written before 2026-09-29 holds (block hash, position) under every
+'t' key. MIGRATE-TXINDEX rewrites them as Core's CDiskTxPos -- the active
+chain's by walking it, a block off it from the leftover scan -- and the index
+answers the same before and after."
+  (with-txindex-fixture (store txindex)
+    (let* ((cs (bl.store:make-chain-state))
+           (blocks '())
+           (prev nil))
+      ;; An active chain 0..3 whose blocks are stored, and one stale block.
+      (dotimes (h 4)
+        (multiple-value-bind (block hash) (%txindex-test-block h (+ 10 h))
+          (bl.store:store-block store block :height h)
+          (let ((e (bl.store:make-block-index-entry :hash hash :height h :status :valid
+                                                    :prev-entry prev :chain-work (1+ h))))
+            (bl.store:add-block-index-entry cs e)
+            (setf prev e)
+            (push (cons block hash) blocks))))
+      (setf (bl.store:chain-state-best-block-hash cs) (bl.store:block-index-entry-hash prev)
+            (bl.store:chain-state-best-height cs) 3)
+      (multiple-value-bind (stale stale-hash) (%txindex-test-block 20 30)
+        (bl.store:store-block store stale :height 3)
+        (push (cons stale stale-hash) blocks))
+      ;; The old layout, as this tree wrote it.
+      (dolist (bh blocks)
+        (loop for tx in (bl.ser:bitcoin-block-transactions (car bh))
+              for i from 0
+              do (bl.kv:leveldb-put
+                  (bl.store:base-index-db txindex)
+                  (concatenate '(simple-array (unsigned-byte 8) (*)) #(116)
+                               (bl.ser:transaction-hash tx))
+                  (concatenate '(simple-array (unsigned-byte 8) (*)) (cdr bh)
+                               (vector i 0 0 0)))))
+      (bl.store:txindex-set-best-block txindex (bl.store:block-index-entry-hash prev))
+      (is-true (bl.store:txindex-needs-migration-p txindex))
+      (let ((probe (bl.ser:transaction-hash (second (bl.ser:bitcoin-block-transactions
+                                                     (car (second blocks)))))))
+        ;; Dual read: the old record still answers before the migration.
+        (is (equalp (cdr (second blocks)) (nth-value 1 (bl.store:txindex-find-tx txindex probe))))
+        (is-true (bl.store:migrate-txindex txindex cs :batch-blocks 2))
+        (is (null (bl.store:txindex-needs-migration-p txindex)))
+        (dolist (bh blocks)
+          (dolist (tx (bl.ser:bitcoin-block-transactions (car bh)))
+            (let ((txid (bl.ser:transaction-hash tx)))
+              (is (> 36 (length (%txindex-raw txindex #\t txid))))
+              (is (equalp (cdr bh) (nth-value 1 (bl.store:txindex-find-tx txindex txid)))))))))))
 
 ;;;; LevelDB CFFI binding tests
 
@@ -2437,37 +2496,15 @@ only when its block is STILL on the active chain at the height it claims."
 
 (test ga9-txindex-catch-up-is-idempotent
   "The catch-up runs unconditionally at every startup, so it must write nothing
-when the index is already current — %txindex-block-indexed-p checks the block's
-LAST transaction, which also re-points entries left stale by a reorg that
-happened while the index was offline."
-  (let* ((dir (merge-pathnames (format nil "txidx-idem-~D/" (get-universal-time))
-                               (uiop:temporary-directory)))
-         (txindex (bl.store:init-tx-index dir :enabled t)))
-    (unwind-protect
-         (progn
-           (is (= 0 (bl.store:txindex-count txindex))
-               "a fresh index is empty")
-           ;; A LevelDB-backed index answers lookups without any in-memory map.
-           (let ((txid (make-array 32 :element-type '(unsigned-byte 8)
-                                      :initial-element 3))
-                 (bh (make-array 32 :element-type '(unsigned-byte 8)
-                                    :initial-element 4)))
-             (bl.store:txindex-add txindex txid bh 7)
-             (let ((loc (bl.store:txindex-lookup txindex txid)))
-               (is-true loc "the entry must be readable straight from the DB")
-               (is (= 7 (bl.store:tx-location-tx-position loc)))
-               (is (equalp bh (bl.store:tx-location-block-hash loc))))
-             ;; Upsert: a re-mined transaction re-points rather than duplicating.
-             (let ((bh2 (make-array 32 :element-type '(unsigned-byte 8)
-                                       :initial-element 5)))
-               (bl.store:txindex-add txindex txid bh2 1)
-               (is (= 1 (bl.store:txindex-count txindex))
-                   "upsert must not create a second entry")
-               (is (equalp bh2 (bl.store:tx-location-block-hash
-                                (bl.store:txindex-lookup txindex txid)))
-                   "and the location must be the NEW block"))))
-      (bl.store:close-tx-index txindex)
-      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+new when the index is already current -- re-adding a block leaves one record
+per transaction -- and it answers straight from the DB, with no in-memory map."
+  (with-txindex-fixture (store txindex)
+    (is (= 0 (bl.store:txindex-count txindex)) "a fresh index is empty")
+    (multiple-value-bind (block hash) (%txindex-test-block 2 5)
+      (bl.store:store-block store block :height 2)
+      (bl.store:txindex-add-block txindex block hash 2)
+      (bl.store:txindex-add-block txindex block hash 2)
+      (is (= 2 (bl.store:txindex-count txindex)) "a re-add must not add records"))))
 
 
 (test fsync-parent-directory-targets-the-directory

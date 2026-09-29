@@ -147,6 +147,14 @@ on it: repair one left above the tip, rewind one off the active chain
     (declare (ignore chainstate block-store))
     nil))
 
+(defgeneric index-migrate-records (index chainstate)
+  (:documentation "Rewrite records this tree wrote before its layout became
+Core's, in place and resumably, before the catch-up builds on them (the
+2026-09-29 port of the four indexes' records). Default: nothing.")
+  (:method ((index base-index) chainstate)
+    (declare (ignore chainstate))
+    nil))
+
 (defgeneric index-sync (index chainstate block-store &key undo-fn subsidy-fn progress)
   (:documentation "Backfill from just past the best marker to CHAINSTATE's tip
 (Core BaseIndex::Sync). UNDO-FN maps a block hash to its undo data and

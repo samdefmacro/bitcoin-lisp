@@ -390,16 +390,13 @@ src/storage/.")
    #:tx-index
    #:make-tx-index
    #:tx-index-enabled
-   #:tx-location
-   #:make-tx-location
-   #:tx-location-block-hash
-   #:tx-location-tx-position
    #:init-tx-index
    #:close-tx-index
-   #:txindex-add
-   #:txindex-lookup
-   #:txindex-remove
    #:txindex-contains-p
+   #:txindex-find-tx
+   #:migrate-txindex
+   #:txindex-needs-migration-p
+   #:block-flat-position
    #:txindex-count
    #:txindex-set-best-block
    #:txindex-best-block
@@ -409,14 +406,15 @@ src/storage/.")
    #:txospender-index-enabled
    #:txospenderindex-add-block
    #:txospenderindex-remove-block
-   #:txospenderindex-locators
+   #:txospenderindex-find-spender
+   #:migrate-txospenderindex
+   #:txospenderindex-needs-migration-p
    #:txospenderindex-set-best-block
    #:txospenderindex-best-block
    #:txospenderindex-height
    #:txospenderindex-db-path
    #:load-tx-index
    #:txindex-add-block
-   #:txindex-remove-block
    #:build-tx-index
    ;; index-base.lisp: the protocol every index implements
    #:base-index
@@ -436,6 +434,7 @@ src/storage/.")
    #:index-rewind-block
    #:index-prepare-sync
    #:index-sync
+   #:index-migrate-records
    ;; BIP158 block filters (basic filter)
    #:+basic-filter-type+
    #:+basic-filter-p+

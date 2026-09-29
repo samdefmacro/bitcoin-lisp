@@ -69,8 +69,7 @@ what the found-count below is compared against."
                ((%block-hash-of-unspent-output node chain-state wanted))
                ((let ((ti (rpc-get-tx-index node)))
                   (and ti (bl.store:tx-index-enabled ti)
-                       (let ((loc (bl.store:txindex-lookup ti (first wanted))))
-                         (and loc (bl.store:tx-location-block-hash loc))))))
+                       (nth-value 1 (bl.store:txindex-find-tx ti (first wanted))))))
                (t (error 'rpc-error :code +rpc-invalid-address-or-key+
                                     :message "Transaction not yet in block"))))
            ;; CheckBlockDataAvailability + ReadBlock (txoutproof.cpp:101-107).
