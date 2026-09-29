@@ -65,7 +65,8 @@ PREVIOUS-OUTPUT: Outpoint referencing the output being spent.
 SCRIPT-SIG: Unlocking script (signature).
 SEQUENCE: Sequence number for replacement/locktime."
   (previous-output (make-outpoint) :type outpoint)
-  (script-sig #() :type (simple-array (unsigned-byte 8) (*)))
+  (script-sig (make-array 0 :element-type '(unsigned-byte 8))
+              :type (simple-array (unsigned-byte 8) (*)))
   (sequence #xFFFFFFFF :type (unsigned-byte 32)))
 
 (defun read-tx-in (stream)
@@ -122,7 +123,8 @@ OP_PUSHDATA1 to 255, OP_PUSHDATA2 to 65535, OP_PUSHDATA4 above."
 VALUE: Amount in satoshis.
 SCRIPT-PUBKEY: Locking script."
   (value 0 :type (signed-byte 64))
-  (script-pubkey #() :type (simple-array (unsigned-byte 8) (*))))
+  (script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
+                 :type (simple-array (unsigned-byte 8) (*))))
 
 (defun read-tx-out (stream)
   "Read a transaction output from STREAM."

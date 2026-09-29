@@ -119,7 +119,7 @@ descriptor is not ranged."
     ;; reader takes its empty input count for the segwit marker.
     (0 (let ((tx (consume-transaction fdp :max-num-in 2 :max-num-out 3)))
          (when (zerop (length (bl.ser:transaction-inputs tx)))
-           (setf (bl.ser:transaction-inputs tx) (vector (bl.ser:make-tx-in :script-sig (make-array 0 :element-type (quote (unsigned-byte 8)))))
+           (setf (bl.ser:transaction-inputs tx) (vector (bl.ser:make-tx-in))
                  (bl.ser:transaction-witness tx) nil)
            (bl.ser:invalidate-transaction-caches tx))
          (bl.ser:transaction-wire-bytes tx)))

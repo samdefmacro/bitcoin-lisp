@@ -77,7 +77,7 @@ SXHASH, whose values an implementation may change between releases."
                                  (:conc-name fdp-))
   "Core's FuzzedDataProvider over DATA: byte strings are consumed from the
 front (POS advances), integral values from the back (REMAINING shrinks)."
-  (data #() :type (simple-array (unsigned-byte 8) (*)))
+  (data (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
   (pos 0 :type fixnum)
   (remaining 0 :type fixnum))
 
