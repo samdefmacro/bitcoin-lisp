@@ -1511,8 +1511,8 @@ per-batch budget. Returns the number of coins consumed in this call."
                      (incf consumed))))))
     consumed))
 
-(defun %populate-snapshot-chainstate (node in au base-hash base-entry
-                                      base-height coins-count fail)
+(defun %populate-snapshot-chainstate (node in au base-hash base-height
+                                      coins-count fail)
   "Populate + verify + adopt a snapshot chainstate from the coin stream IN
 (Core PopulateAndValidateSnapshot, validation.cpp:5773-5973, plus the
 adoption tail of ActivateSnapshot). Coins stream straight into the new
@@ -1732,7 +1732,7 @@ AbsPathForConfigVal), so a snapshot named the way it was dumped is found."
                node
                (lambda ()
                  (%populate-snapshot-chainstate
-                  node in au base-hash base-entry base-height coins-count
+                  node in au base-hash base-height coins-count
                   #'population-error)))
               `(("coins_loaded" . ,coins-count)
                 ("tip_hash" . ,(hash-to-hex base-hash))

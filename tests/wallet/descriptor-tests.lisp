@@ -1438,7 +1438,7 @@ witness that spends."
            (cannot (label desc held &key (sequence #xffffffff))
              (multiple-value-bind (errs witness verified)
                  (%tr-sign-and-verify desc held :sequence sequence)
-               (is (equal '("no satisfiable script path for P2TR") errs)
+               (is (equal '("Witness program was passed an empty witness") errs)
                    "~A: reported ~S" label errs)
                (is (null (first witness)) "~A: emitted a witness anyway" label)
                (is-false verified label))))
@@ -1497,7 +1497,10 @@ descriptor and keys to another implementation."
 (test tr-script-path-fails-loudly-without-the-keys
   "A leaf we cannot satisfy must report itself, never emit a witness. multi_a
 below the threshold is the interesting one: signatures ARE produced, just not
-enough, and a signer that shipped them would broadcast an unspendable input."
+enough, and a signer that shipped them would broadcast an unspendable input.
+The report is Core's: SignTaproot leaves the witness empty (sign.cpp:542-617),
+and VerifyScript says so -- WITNESS_PROGRAM_WITNESS_EMPTY
+(interpreter.cpp:1950, via SignTransaction's :1059-1068)."
   (let ((i "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
         (a "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1")
         (b "KzoAz5CanayRKex3fSLQ2BwJpN7U52gZvxMyk78nDMHuqrUxuSJy")
@@ -1505,7 +1508,7 @@ enough, and a signer that shipped them would broadcast an unspendable input."
     (flet ((cannot (label desc held)
              (multiple-value-bind (errs witness verified)
                  (%tr-sign-and-verify desc held)
-               (is (equal '("no satisfiable script path for P2TR") errs)
+               (is (equal '("Witness program was passed an empty witness") errs)
                    "~A: reported ~S" label errs)
                (is (null (first witness)) "~A: emitted a witness anyway" label)
                (is-false verified label))))
@@ -2193,6 +2196,38 @@ whose keys straddle the parity."
                  (desc (%aval "desc" (rpc "g" "getaddressinfo" address))))
             (is (equal (list address) (coerce (rpc nil "deriveaddresses" desc) 'list))
                 "address ~D: ~A does not rederive from ~A" i address desc)))))))
+
+(test an-unparseable-wsh-miniscript-is-a-function-needed-within-p2wsh
+  "Core's miniscript Parse returns nothing -- not a node that then fails
+IsValid -- for an older()/after() outside [1, 2^31), a multi() or thresh()
+whose k exceeds its keys or subexpressions (miniscript.h Parse), and a script
+over the P2WSH size limit, checked at every step. ParseScript then has no
+node and answers \"A function is needed within P2WSH\"
+(script/descriptor.cpp:2595-2600, :2667-2669), never the \"... is invalid\"
+of a node the sanity gate blames."
+  (flet ((err (desc)
+           (handler-case (progn (bl.rpc:parse-descriptors desc :regtest) nil)
+             (error (e) (princ-to-string e)))))
+    (let* ((k1 "02cc24adfed5a481b000192042b2399087437d8eb16095c3dda1d45a4fbf868017")
+           (k2 "03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd")
+           (oversized (with-output-to-string (out)
+                        (dotimes (i 110) (format out "and_v(v:pk(~A)," k1))
+                        (format out "pk(~A)" k2)
+                        (dotimes (i 110) (write-char #\) out)))))
+      (dolist (ms (list (format nil "and_v(v:pk(~A),older(0))" k1)
+                        (format nil "and_v(v:pk(~A),after(0))" k1)
+                        (format nil "and_v(v:pk(~A),older(2147483648))" k1)
+                        ;; Inside a miniscript: a bare wsh(multi()) is Core's
+                        ;; MultisigDescriptor and has its own sentence.
+                        (format nil "and_v(v:multi(3,~A,~A),older(1))" k1 k2)
+                        (format nil "thresh(3,pk(~A),s:pk(~A))" k1 k2)
+                        oversized))
+        (is (equal "A function is needed within P2WSH"
+                   (let ((e (err (format nil "wsh(~A)" ms))))
+                     (and e (subseq e (max 0 (- (length e) 33))))))
+            "~A..." (subseq ms 0 (min 40 (length ms)))))
+      ;; Control: the same shape in range parses.
+      (is (null (err (format nil "wsh(and_v(v:pk(~A),older(1)))" k1)))))))
 
 (test a-taproot-leaf-that-is-no-miniscript-is-not-a-valid-descriptor-function
   "Core's ParseScript has a sentence of its own only for P2SH and P2WSH (\"A

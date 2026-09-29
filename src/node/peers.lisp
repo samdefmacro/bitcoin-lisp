@@ -422,6 +422,11 @@ Returns how many addresses it resolved to (Core's `found')."
           (add-addr-fetch seed))
         found)))
 
+(defconstant +seed-outbound-connection-threshold+ 2
+  "Core SEED_OUTBOUND_CONNECTION_THRESHOLD (net.cpp:69): the full-relay
+outbound connections at which the seed nodes and DNS seeds have done their
+job.")
+
 (defun %seed-node-phase (node)
   "ThreadDNSAddressSeed's -seednode prelude (net.cpp:2259-2282): with seed
 nodes configured, give them +SEEDNODE-TIMEOUT-SECONDS+ to bring the node to
@@ -1210,11 +1215,6 @@ framework's own network thread (the one blocked in that RPC call) must answer."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
-(defconstant +seed-outbound-connection-threshold+ 2
-  "Core SEED_OUTBOUND_CONNECTION_THRESHOLD (net.cpp:69): the full-relay
-outbound connections at which the seed nodes and DNS seeds have done their
-job.")
-
 (defconstant +add-next-seednode-seconds+ 10
   "Core ADD_NEXT_SEEDNODE (net.cpp:2569): how long ThreadOpenConnections tries
 addrman before handing the next -seednode to the addr-fetch queue.")
@@ -1446,11 +1446,6 @@ net.cpp:2992-2993), so it must not run at tick rate."
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
         (unless (peer-connected-to-endpoint-p node host port)
           (establish-outbound-peer node host port :conn-type :manual))))))
-
-(defconstant +target-block-relay-peers+ 2
-  "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry
-blocks/headers but no tx relay -- anti-partition insurance and the source of
-reconnection anchors.")
 
 (defun automatic-inbound-capacity (max-connections max-outbound-full-relay)
   "Core CConnman::Init (net.h:1110-1113): inbound capacity is the automatic

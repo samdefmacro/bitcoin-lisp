@@ -293,6 +293,5 @@ interpreter with BLOCK_SCRIPT_VERIFY_FLAGS (P2SH|WITNESS|DERSIG|NULLDUMMY)."
              (bl.interop:*current-tx* to-sign)
              (bl.interop:*current-input-index* 0)
              (bl.interop:*script-flags* "P2SH,WITNESS,DERSIG,NULLDUMMY"))
-        (declare (ignorable to-spend))
         (values (bl.interop:verify-script
                  script-sig challenge :witness witness :amount 0))))))

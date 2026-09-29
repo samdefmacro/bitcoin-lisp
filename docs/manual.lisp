@@ -1658,10 +1658,23 @@
   exceeds BIP68's 16-bit field, which is enforced masked -- and only
   importdescriptors reads it, which is also the whole of Core's use.
 
+  `sign-tx-inputs' is the one in-place signer (signrawtransactionwithkey,
+  signrawtransactionwithwallet, the wallet's CreateTransaction, bitcoin-tx)
+  and its verdict is Core SignTransaction's: after every input is updated
+  with whatever signing managed, an input is complete exactly when
+  VerifyScript passes on it, and otherwise carries that verification's
+  error -- `Unable to sign input, invalid stack size (possibly missing
+  key)' for INVALID_STACK_OPERATION, `CHECK(MULTI)SIG failing with
+  non-zero signature (possibly need more signatures)' for SIG_NULLFAIL,
+  ScriptErrorString for the rest; `Input not found or already spent' and
+  `Missing amount' are the two that precede it. The assembler's own
+  reasons for giving up are not reported.
+
   Trap: the recurring failure shape in this tree is correct code with
   the wrong or missing caller -- an index built but never maintained, a
   check present but never reached. Test the wire, not the function."
   (bitcoin-lisp.rpc:with-node-lock macro)
+  (bitcoin-lisp.rpc:sign-tx-inputs function)
   (bitcoin-lisp.rpc:out-desc-all-warnings function)
   (bitcoin-lisp.rpc:script-to-json function)
   (bitcoin-lisp.rpc:script->address function)
@@ -1746,6 +1759,14 @@
   is in Core. A wallet written before the id file existed is stamped at
   start-up (every LevelDB directly under a dedicated wallet directory was
   a wallet then); the stamp is never applied in the datadir fallback.
+  Start-up runs VerifyWallets' two per-name checks over the whole list
+  before any wallet opens: a second name that JOINS to a path already
+  listed (`wallet-path-key`: `./w1` is `w1`) is dropped with Core's
+  `Ignoring duplicate -wallet' warning, and a path Core's GetWalletPath
+  refuses -- a symlink to a file, a dangling one, a file reached through a
+  subdirectory (`wallet-path-error`) -- is Core's `Invalid -wallet path'
+  init error; loadwallet and createwallet answer it at -4. The check reads
+  the path's TYPE only, so it needs nothing of wallet.dat.
 
   DELIBERATE DIVERGENCE, the one an operator sees first: a wallet is a
   LevelDB DIRECTORY, not Core's single
@@ -1781,6 +1802,8 @@
   (bitcoin-lisp.wallet:*wallet-avoid-partial-spends* variable)
   (bitcoin-lisp.wallet:*wallet-directory* variable)
   (bitcoin-lisp.wallet:wallet-write-id function)
+  (bitcoin-lisp.wallet:wallet-path-key function)
+  (bitcoin-lisp.wallet:wallet-path-error function)
   (bitcoin-lisp.wallet::list-wallet-dir function)
   (bitcoin-lisp.wallet::wallet-for-request function)
   (bitcoin-lisp.wallet::*rpc-wallet-name* variable))

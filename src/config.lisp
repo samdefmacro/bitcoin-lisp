@@ -181,6 +181,9 @@ submissions still work and are still announced (sendrawtransaction relays,
 per Core BroadcastTransaction), and block relay is unaffected. See
 networking's IGNORE-INCOMING-TXS-P. Set by start-node's :blocksonly keyword.")
 
+(defvar *mainnet-relay-enabled* nil
+  "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
+
 (defvar *wallet-broadcast* t
   "Core CWallet::fBroadcastTransactions / -walletbroadcast (DEFAULT_WALLETBROADCAST
 = true, set once by SetBroadcastTransactions at wallet.cpp:3068).
@@ -257,7 +260,23 @@ handshake + per-peer salt storage exist (no sketch exchange); we match that.")
 (Bitcoin Core -permitbaremultisig, DEFAULT_PERMIT_BAREMULTISIG = true in Core).
 When NIL, bare multisig is non-standard. Consensus is unaffected.")
 
+;;;; Node globals the RPC handlers and the protocol read
+;;;;
+;;;; Owned by src/node/ (which assigns them at start-up) but DEFINED here,
+;;;; because rpc/ and networking/ load before the node and name them.
+
+(defvar *log-file-path* nil
+  "Path the file log is currently open on, so SIGHUP can reopen it.")
+
+(defconstant +target-block-relay-peers+ 2
+  "Dedicated block-relay-only outbound slots (Core MAX_BLOCK_RELAY_ONLY_CONNECTIONS,
+net.h:73). They carry blocks/headers but no tx relay -- anti-partition
+insurance and the source of reconnection anchors.")
+
 ;;;; Recent Transaction Rejects Filter
+
+(defvar *recent-rejects-max-size* 50000
+  "Maximum entries in the recent transaction rejects filter.")
 
 (defstruct recent-rejects
   "Bounded set of recently rejected transaction hashes.
@@ -324,6 +343,3 @@ Was 30 with no stated source. Core allows 60, so a peer on a slow link that
 Core would keep, we dropped — and re-dialling it costs more than waiting. A
 DEFPARAMETER because Core exposes the knob; the +NAME+ spelling is kept because
 every caller reads it as a constant.")
-
-(defvar *recent-rejects-max-size* 50000
-  "Maximum entries in the recent transaction rejects filter.")

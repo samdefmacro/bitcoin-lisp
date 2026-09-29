@@ -34,6 +34,39 @@ value at all. Core's own reason for asking is CAmount's int64 overflow; ours
 is that the value reached us from a coins view we do not otherwise check."
   (and (not (minusp value)) (<= value +max-money+)))
 
+;;; Policy vs Consensus Flag Separation
+;;;
+;;; Bitcoin Core distinguishes MANDATORY (consensus) flags from STANDARD (policy) flags.
+;;; Mandatory flags are required for block validation. Standard flags add policy
+;;; restrictions for mempool acceptance and transaction relay.
+
+(alexandria:define-constant +standard-policy-flags+
+  '("STRICTENC" "MINIMALDATA" "DISCOURAGE_UPGRADABLE_NOPS"
+    "CLEANSTACK" "MINIMALIF" "NULLFAIL" "LOW_S"
+    "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "WITNESS_PUBKEYTYPE"
+    "CONST_SCRIPTCODE" "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+    "DISCOURAGE_OP_SUCCESS" "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+  :test #'equalp :documentation "Policy flags layered on top of mandatory consensus flags for mempool acceptance
+(Core STANDARD_SCRIPT_VERIFY_FLAGS minus MANDATORY_SCRIPT_VERIFY_FLAGS =
+STANDARD_NOT_MANDATORY_VERIFY_FLAGS, policy/policy.h:118-134).")
+
+(alexandria:define-constant +mandatory-script-verify-flags+
+  '("P2SH" "DERSIG" "NULLDUMMY" "CHECKLOCKTIMEVERIFY"
+    "CHECKSEQUENCEVERIFY" "WITNESS" "TAPROOT")
+  :test #'equalp :documentation "Core MANDATORY_SCRIPT_VERIFY_FLAGS (policy/policy.h:104-110): the flags all
+NEW transactions must comply with. A height-independent CONSTANT in Core —
+distinct from GetBlockScriptFlags/compute-script-flags-for-height, which gate
+each flag on its activation height for block (consensus) validation.")
+
+(alexandria:define-constant +standard-script-verify-flags+ (format nil "~{~A~^,~}" (append +mandatory-script-verify-flags+
+                                  +standard-policy-flags+))
+  :test #'equalp :documentation "Core STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-133) as the
+comma-separated flag string the script engine consumes: the mandatory set
+plus every policy flag. This is what MemPoolAccept::PolicyScriptChecks runs
+(validation.cpp:1140) — a constant, not a per-height computation, because
+the mempool only ever validates against the current tip where every
+deployment is active.")
+
 ;;;; Structure validation (context-free)
 
 (defun validate-transaction-structure (tx)
@@ -222,6 +255,21 @@ FEE is returned as a Satoshi type."
       (values t nil fee))))
 
 ;;;; Mempool acceptance validation
+
+(defvar *require-standard*
+  t
+  "Core's CTxMemPool::Options::require_standard (-acceptnonstdtxn, default
+true; mempool_args.cpp:101). NIL relays and mines transactions this node would
+otherwise refuse as non-standard.
+
+ONE flag gating ONE set of checks, as Core has it: %IS-STANDARD-TX, the input
+and witness standardness tests, and the three ephemeral-dust checks. It does
+NOT gate consensus, and it does not gate the 64-byte minimum size (Core keeps
+that outside, validation.cpp:813-815 — CVE-2017-12842 applies to every node).
+
+Core REFUSES to start with -acceptnonstdtxn on a non-test chain
+(mempool_args.cpp:102-104), and so do we: relaying non-standard transactions on
+mainnet is a way to get your transactions dropped by every peer, not a feature.")
 
 (defconstant +max-standard-tx-weight+ 400000
   "Maximum weight of a standard transaction for relay (Bitcoin Core
@@ -669,21 +717,6 @@ reuse standard-output-script-p — and a P2SH redeem script may carry at most
                           +max-standard-p2sh-sigops+))
               (return-from are-inputs-standard-p nil)))))))
   t)
-
-(defvar *require-standard*
-  t
-  "Core's CTxMemPool::Options::require_standard (-acceptnonstdtxn, default
-true; mempool_args.cpp:101). NIL relays and mines transactions this node would
-otherwise refuse as non-standard.
-
-ONE flag gating ONE set of checks, as Core has it: %IS-STANDARD-TX, the input
-and witness standardness tests, and the three ephemeral-dust checks. It does
-NOT gate consensus, and it does not gate the 64-byte minimum size (Core keeps
-that outside, validation.cpp:813-815 — CVE-2017-12842 applies to every node).
-
-Core REFUSES to start with -acceptnonstdtxn on a non-test chain
-(mempool_args.cpp:102-104), and so do we: relaying non-standard transactions on
-mainnet is a way to get your transactions dropped by every peer, not a feature.")
 
 (defun %is-standard-tx (tx)
   "Core IsStandardTx (policy.cpp:113-172), as ONE function so -acceptnonstdtxn
