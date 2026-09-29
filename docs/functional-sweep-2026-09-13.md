@@ -1895,6 +1895,13 @@ adapted copies pass). `feature_block`, `feature_dbcrash` and
 `feature_pruning` time out under the parallel 150 s cap and pass serially,
 as before. The 9 SKIPs are unchanged since Round 6.
 
+Deployed: both live nodes on 2026-09-30 -- testnet4 to `1df60a1c` and
+mainnet, after a clean stop, to `83450f61` (the same code plus this
+report). Each moved its index directories to Core's `indexes/` layout in
+under 10 ms at the first start, with no rebuild and no error line; testnet4's
+three indexes and mainnet's filter index were synced at the tip when the
+node answered.
+
 ### Decisions recorded in Round 10
 
 - **`-migratedatadir` is removed**: Core has no such option; the index
