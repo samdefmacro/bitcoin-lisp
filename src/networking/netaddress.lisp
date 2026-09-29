@@ -431,22 +431,34 @@ retagged :cjdns when CJDNS is reachable, this being a string-ingress point
                     ((<= remaining 0) 0)
                     (t (logand #xff (ash #xff (- 8 remaining))))))))))
 
+(defun %contiguous-netmask-p (mask)
+  "Core CSubNet(addr, mask)'s netmask check (netaddress.cpp:967-978): every
+byte one of NetmaskBits' nine (0x00, 0x80 ... 0xff), and no one bit after a
+zero bit."
+  (let ((zeros-found nil))
+    (loop for b across mask
+          for bits = (position b #(#x00 #x80 #xc0 #xe0 #xf0 #xf8 #xfc #xfe #xff))
+          always (and bits (not (and zeros-found (plusp bits))))
+          do (when (< bits 8) (setf zeros-found t)))))
+
 (defun parse-subnet (string)
-  "Parse STRING as a subnet, or NIL when it names none. Core accepts a bare
-address, a network/CIDR and (for IPv4) a network/netmask, and masks the network
-at construction so 1.2.3.4/24 names 1.2.3.0/24 (LookupSubNet, netbase.cpp:743-772;
-CSubNet::CSubNet, netaddress.cpp). A bracketed IPv6 address is accepted, as
-LookupHost accepts one.
+  "Parse STRING as a subnet, or NIL when it names none -- Core LookupSubNet
+(netbase.cpp:812-845). The address is everything before the LAST slash; a
+suffix of digits is a CIDR length, anything else a full netmask written as an
+address of the same network, which must be contiguous (CSubNet,
+netaddress.cpp:961-978); the network is masked at construction, so 1.2.3.4/24
+names 1.2.3.0/24. A bracketed IPv6 address is accepted, as LookupHost
+accepts one.
 
 IPv4 is held in its 16-byte mapped form, so an IPv4 /N covers 96+N bits: the
 ::ffff: prefix is part of the network, which is what keeps 0.0.0.0/0 an
 IPv4-only wildcard the way Core's per-network Match does.
 
-Only the three 16-byte networks are subnettable. Core's CSubNet compares
-:torv3/:i2p/:cjdns by exact equality instead of by mask, and no caller here
-needs that."
+A CIDR or netmask applies to IPv4 and IPv6 only; a CJDNS address stands for
+itself. Core's CSubNet also compares :torv3/:i2p by exact equality; no caller
+here needs that, so a .onion or .b32.i2p subnet is refused."
   (when (stringp string)
-    (let* ((slash (position #\/ string))
+    (let* ((slash (position #\/ string :from-end t))
            (host (if slash (subseq string 0 slash) string))
            (suffix (and slash (subseq string (1+ slash)))))
       ;; LookupSubNet reads the address with LookupHost, which drops one pair
@@ -460,24 +472,26 @@ needs that."
         ;; Only the 16-byte networks are subnettable; a .onion or .b32.i2p host
         ;; parses fine and is 32 bytes, so test the length rather than the tag.
         (when (and address (= 16 (length address)))
-          (let* ((offset (if (eq network :ipv4) 96 0))
+          (let* ((ip (member network '(:ipv4 :ipv6)))
+                 (offset (if (eq network :ipv4) 96 0))
                  (netmask
                    (cond ((null suffix) (%prefix-netmask 128))
+                         ((not ip) nil)
                          ((and (plusp (length suffix))
                                (every #'digit-char-p suffix))
                           (let ((bits (parse-integer suffix)))
                             (when (<= 0 bits (- 128 offset))
                               (%prefix-netmask (+ offset bits)))))
-                         ;; A dotted-quad netmask masks the IPv4 octets only;
-                         ;; the mapped prefix is forced to ones so the network
-                         ;; tag still has to match.
-                         ((eq network :ipv4)
+                         (t
+                          ;; A full netmask masks the address's own bytes: the
+                          ;; mapped prefix of an IPv4 one is forced to ones
+                          ;; so the network tag still has to match.
                           (multiple-value-bind (mask-network mask-bytes)
                               (parse-network-address suffix)
-                            (when (eq mask-network :ipv4)
+                            (when (eq mask-network network)
                               (let ((m (copy-seq mask-bytes)))
-                                (fill m #xff :end 12)
-                                m)))))))
+                                (when (eq network :ipv4) (fill m #xff :end 12))
+                                (and (%contiguous-netmask-p m) m))))))))
             (when netmask
               (let ((masked (copy-seq address)))
                 (dotimes (i 16)

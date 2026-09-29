@@ -837,3 +837,18 @@ permanently false; with -discover ported it is a drive site that must exist."
       (is-false (bl.net:get-local-addr-for-peer
                  (%peer-reporting-our-address "8.8.8.8" t 10 0 0 1 18444))
                 "an unroutable report is no address"))))
+
+(test subnet-netmask-must-be-contiguous
+  "Core's CSubNet(addr, mask) refuses a netmask with a one bit after a zero bit
+(netaddress.cpp:961-978), so LookupSubNet (netbase.cpp:812-845) reports
+1.2.3.4/255.0.255.0 as no subnet at all -- -whitelist and -rpcallowip then
+refuse to start. Ours accepted it and printed it as 1.0.3.0/8, a range it
+does not match. The full-netmask form is Core's for IPv6 too: an IPv6 mask
+written as an address is a mask. Found by the fuzz target netaddress (the
+subnet round trip)."
+  (dolist (bad '("1.2.3.4/255.0.255.0" "1.2.3.4/0.255.255.255" "1.2.3.4/255.255.255.1"
+                 "2001:db8::/ffff:0:ffff::"))
+    (is (null (bl.net:parse-subnet bad)) "accepted ~S" bad))
+  (is (equalp (bl.net:parse-subnet "1.2.2.0/23") (bl.net:parse-subnet "1.2.3.4/255.255.254.0")))
+  (is (equalp (bl.net:parse-subnet "2001:db8::/32") (bl.net:parse-subnet "2001:db8::/ffff:ffff::")))
+  (is (string= "1.2.2.0/23" (bl.net:subnet-string (bl.net:parse-subnet "1.2.3.4/255.255.254.0")))))
