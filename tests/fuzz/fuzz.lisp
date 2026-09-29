@@ -359,13 +359,18 @@ docstring states the invariant."
         (fuzz-mutate (funcall corpus (make-fuzzed-data-provider raw)))
         raw)))
 
+(defvar *fuzz-iteration-scale* 4
+  "Every target runs this many times its own ITERATIONS. 4 keeps the whole
+fuzz battery near a minute and a quarter of the cold run; bind it higher for
+a longer local campaign -- the seeds stay the same, the buffers extend.")
+
 (defun run-fuzz-target (name &key iterations stop-at-first)
   "Run target NAME over its seeded buffers. Returns a plist: :failures (a list
 of (iteration hex message)), :reached (FUZZ-ASSERTs executed), :iterations."
   (destructuring-bind (&key function corpus ((:iterations default-iterations))
                          max-len &allow-other-keys)
       (gethash name *fuzz-targets*)
-    (let ((iterations (or iterations default-iterations))
+    (let ((iterations (or iterations (* *fuzz-iteration-scale* default-iterations)))
           (*fuzz-checks-reached* 0)
           (failures '()))
       (fuzz-rng-seed (fuzz-name-seed name))
@@ -405,9 +410,9 @@ Returns NIL, or the failure string."
           name core (length failures) iterations
           (first (first failures)) (third (first failures))
           name (second (first failures)))
-      (is (>= reached min-reached)
+      (is (>= reached (* *fuzz-iteration-scale* min-reached))
           "~(~A~): only ~D assertions ran in ~D buffers (want ~D) -- the property is vacuous"
-          name reached iterations min-reached))
+          name reached iterations (* *fuzz-iteration-scale* min-reached)))
     (let ((run (let ((*fuzz-sabotage* control))
                  (run-fuzz-target name :stop-at-first t))))
       (is (getf run :failures)

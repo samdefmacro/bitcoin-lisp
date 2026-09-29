@@ -133,10 +133,15 @@ PermittedDifficultyTransition allows -- the bound headers presync relies on."
   "The compact target encoding: nBits that DeriveTarget accepts decode to a
 target whose GetCompact decodes to the same target, and CheckProofOfWork
 answers for any header."
-  (let* ((fdp (make-fuzzed-data-provider buffer))
-         (bits (consume-integral fdp :u32)))
+  (let ((fdp (make-fuzzed-data-provider buffer)))
     (with-network (:mainnet)
-      (let ((target (bl.store:derive-target bits)))
+      (let* ((bits (if (consume-bool fdp)
+                       (consume-integral fdp :u32)
+                       ;; GetCompact of a target below the limit: the nBits
+                       ;; a real header carries (ConsumeArithUInt256).
+                       (bl.store:target-to-bits
+                        (1+ (mod (%be-integer (consume-uint256 fdp)) bl.store:*pow-limit-target*)))))
+             (target (bl.store:derive-target bits)))
         (when target
           (fuzz-assert (= (fuzz-sabotage (bl.store:bits-to-target (bl.store:target-to-bits target))) target)
                        "nBits ~8,'0x: the target does not survive GetCompact" bits))

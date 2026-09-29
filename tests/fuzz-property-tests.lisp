@@ -2,11 +2,14 @@
 
 ;;;; Property tests over arbitrary bytes — the parsers a hostile peer reaches.
 ;;;;
-;;;; Bitcoin Core has 133 libFuzzer targets and we have none: no coverage-guided
+;;;; Bitcoin Core has 133 libFuzzer target files; we have no coverage-guided
 ;;;; engine, no sanitizers, no corpus minimisation. This is NOT that, and calling
 ;;;; it fuzzing would overstate it. What it IS is the half of a fuzz target that
 ;;;; does not need the engine: Core's targets are a random-byte generator wired
-;;;; to PROPERTY ASSERTIONS, and the assertions port directly.
+;;;; to PROPERTY ASSERTIONS, and the assertions port directly. The targets
+;;;; themselves are ported one by one in tests/fuzz/, on a FuzzedDataProvider
+;;;; harness (tests/fuzz/fuzz.lisp); these are the first hand-written
+;;;; properties, kept as they were.
 ;;;;
 ;;;; Two properties, both of which a network-facing parser must have:
 ;;;;
