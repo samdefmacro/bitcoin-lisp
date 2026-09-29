@@ -281,7 +281,7 @@ block file yet has nothing to flush (Core's m_blockfile_info.size() < 1)."
                                       :element-type '(unsigned-byte 8)
                                       :if-does-not-exist :create
                                       :if-exists :append)
-            (declare (ignore s))))
+            (declare (ignorable s))))
         (flat-file-flush rev-seq rev-pos))
       t)))
 

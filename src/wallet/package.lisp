@@ -26,7 +26,10 @@ through the lower packages; the node reaches it only through these exports.")
    ;; hand-made wallet directories with it.
    #:wallet-write-id
    ;; GetWalletDir, for start-up's "Using wallet directory" line.
-   #:wallets-directory)
+   #:wallets-directory
+   ;; VerifyWallets' two per-name checks, which start-up runs before any load.
+   #:wallet-path-key
+   #:wallet-path-error)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export

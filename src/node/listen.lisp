@@ -22,7 +22,7 @@ peertimeout=999999999 into every node's config.")
   "How many accepted connections are mid-handshake right now."
   (bt:with-lock-held (*inbound-handshake-lock*) *inbound-handshakes-in-flight*))
 
-(defun %run-inbound-handshake (node peer onion)
+(defun %run-inbound-handshake (peer onion)
   "Run PEER's inbound version handshake on its OWN thread. PEER is already in
 the node's hand-off queue when this starts (Core's CNode joins m_nodes at
 accept), so all this decides is whether the peer reaches :ready or is
@@ -100,7 +100,7 @@ it flips that state or disconnects the peer."
            (push peer (node-pending-inbound-peers node)))
          (bt:with-lock-held (*inbound-handshake-lock*)
            (incf *inbound-handshakes-in-flight*))
-         (bt:make-thread (lambda () (%run-inbound-handshake node peer onion))
+         (bt:make-thread (lambda () (%run-inbound-handshake peer onion))
                          :name "bitcoin-inbound-handshake")
          peer)))))
 

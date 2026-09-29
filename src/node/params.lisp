@@ -43,14 +43,6 @@ dialed, and NOTHING else. Deliberately not the node's added-nodes list, because
 getaddednodeinfo reports -addnode and not -connect, exactly as Core's does —
 both are nonetheless dialed as MANUAL connections.")
 
-(defvar *pending-test-connections* '()
-  "Connections the addconnection RPC has asked for, as (address conn-type use-v2
-done), DONE being a cons the sync thread sets once it has made the dial,
-drained by the sync thread. A queue rather than a direct dial because node-peers
-is single-writer by design; the RPC waits (bounded) for DONE, since Core's own
-AddConnection returns with the connection already open. Regtest-only, like
-the RPC.")
-
 (defvar *seed-nodes* '()
   "-seednode targets (Core connOptions.vSeedNodes): peers dialed once, purely to
 collect addresses, and disconnected as soon as they deliver some. Core queues
@@ -97,9 +89,6 @@ net.cpp:138-162): a -bind port, else a non-noban -whitebind port, else -port
 or NETWORK's default. -externalip without a port of its own and every
 discovered interface address are added at it."
   (or *listen-port-from-binds* (listen-port network)))
-
-(defvar *mainnet-relay-enabled* nil
-  "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
 
 (defvar *max-inbound-connections* 114
   "Inbound connections we keep (excess are disconnected at merge time). Set by

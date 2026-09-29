@@ -184,6 +184,16 @@ Kept free of node state so it is directly unit-testable."
          (synced (not bl.net:*cached-is-ibd*)))
     (values (health-ok-p alive seconds) seconds synced)))
 
+;;; addconnection's queue: the RPC waits for the dial the sync thread makes.
+
+(defvar *pending-test-connections* '()
+  "Connections the addconnection RPC has asked for, as (address conn-type use-v2
+done), DONE being a cons the sync thread sets once it has made the dial,
+drained by the sync thread. A queue rather than a direct dial because node-peers
+is single-writer by design; the RPC waits (bounded) for DONE, since Core's own
+AddConnection returns with the connection already open. Regtest-only, like
+the RPC.")
+
 ;;; addnode onetry waiters: the RPC waits for the dial DIAL-QUEUED-NODES makes.
 
 (defvar *onetry-waiters* (make-hash-table :test 'eq :synchronized t)
