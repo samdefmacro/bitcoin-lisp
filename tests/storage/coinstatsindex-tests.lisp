@@ -43,7 +43,7 @@ set's txout count and total amount."
          ;; Indexed heights 1..tip (genesis is synthesized, not counted).
          (is (= tip n))
          (is (= tip (bl.store:coinstatsindex-height csi)))
-         (let* ((stats (bl.store:coinstatsindex-get-stats csi tip))
+         (let* ((stats (%csi-stats-at csi cs tip))
                 (index-muhash (bl.store:coinstats-muhash-hash stats))
                 (direct-muhash (bl.store:compute-utxo-set-muhash utxo)))
            ;; THE invariant: incremental == whole-set.
@@ -87,7 +87,7 @@ height's MuHash is retrievable and distinct from its predecessor."
           #'bl.val:calculate-block-subsidy)
          (let ((prev-count -1) (prev-hash nil))
            (loop for h from 1 to tip
-                 for stats = (bl.store:coinstatsindex-get-stats csi h)
+                 for stats = (%csi-stats-at csi cs h)
                  for hh = (bl.crypto:bytes-to-hex (bl.store:coinstats-muhash-hash stats))
                  do (is-true stats)
                     (is (>= (bl.store:coinstats-txout-count stats) prev-count))
@@ -211,6 +211,11 @@ the spendable coinbase reward outputs."
          (is (= 5 total))
          (is (= 5 (bl.store:utxo-count utxo))))))))
 
+(defun %csi-stats-at (csi cs height)
+  "The coinstats record of the ACTIVE chain's block at HEIGHT."
+  (bl.store:coinstatsindex-get-block-stats
+   csi (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs height)) height))
+
 (defun %csi-height-key (height)
   "Core's DBHeightKey: 't' || height u32 BE."
   (let ((key (make-array 5 :element-type '(unsigned-byte 8))))
@@ -251,7 +256,7 @@ commit, as numerator || denominator, 384 little-endian bytes each."
         (%csi-fixture (format nil "csirec~D" (get-internal-real-time)) 3)
       (declare (ignore node))
       (let ((raw (%csi-raw-record csi tip))
-            (stats (bl.store:coinstatsindex-get-stats csi tip)))
+            (stats (%csi-stats-at csi cs tip)))
         (is (= (+ 32 192) (length raw)))
         (is (equalp (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs tip))
                     (subseq raw 0 32)))
@@ -268,7 +273,7 @@ commit, as numerator || denominator, 384 little-endian bytes each."
                      (bl.crypto:make-muhash-raw
                       :numerator (bl.crypto:bytes-to-le-integer (subseq m 0 384))
                       :denominator (bl.crypto:bytes-to-le-integer (subseq m 384 768))))
-                    (bl.store:coinstats-muhash-hash (bl.store:coinstatsindex-get-stats csi tip)))
+                    (bl.store:coinstats-muhash-hash (%csi-stats-at csi cs tip)))
             "'M' is the fraction the best record's digest finalizes"))
       (bl.store:close-coinstatsindex csi))))
 
@@ -328,8 +333,8 @@ what the index writes today, and the running state loads from it."
         (is (null (bl.store:coinstatsindex-needs-migration-p csi)))
         (is (equalp core (loop for h from 0 to tip collect (%csi-raw-record csi h))))
         (bl.store:coinstatsindex-clear-best csi)
-        (bl.store:coinstatsindex-set-best
-         csi tip (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs tip)))
+        (bl.store:index-set-best
+         csi (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs tip)) tip)
         (is-true (bl.store:coinstatsindex-load-running csi)
                  "the running state loads from the migrated 'M' and best record"))
       (bl.store:close-coinstatsindex csi))))
@@ -381,7 +386,7 @@ re-indexes exactly the blocks above it."
           (is (= 2 adds)))
         (is (equalp records (loop for h from 0 to tip collect (%csi-raw-record csi h))))
         (is (equalp (bl.store:compute-utxo-set-muhash (bl:node-utxo-set node))
-                    (bl.store:coinstats-muhash-hash (bl.store:coinstatsindex-get-stats csi tip)))))
+                    (bl.store:coinstats-muhash-hash (%csi-stats-at csi cs tip)))))
       (bl.store:close-coinstatsindex csi))))
 
 (test coinstatsindex-rebuilds-when-its-branch-cannot-be-reversed
@@ -392,8 +397,8 @@ rebuild writes exactly the records a consistent index holds."
     (multiple-value-bind (node csi cs tip)
         (%csi-fixture (format nil "csirb~D" (get-internal-real-time)) 4)
       (let ((records (loop for h from 0 to tip collect (%csi-raw-record csi h))))
-        (bl.store:coinstatsindex-set-best
-         csi tip (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xE7))
+        (bl.store:index-set-best
+         csi (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xE7) tip)
         (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
           (bl:catch-up-index node csi)
           (is (= tip adds) "the rebuild indexed ~D block(s)" adds))
@@ -457,7 +462,7 @@ would report the other one\'s cumulative total."
             ;; Read through the HEIGHT key, which still names the active
             ;; block at this point, so the baseline needs no new function.
             (active-subsidy (bl.store:coinstats-total-subsidy
-                             (bl.store:coinstatsindex-get-stats csi tip))))
+                             (%csi-stats-at csi cs tip))))
        (is-true block "the fixture must have the tip block on disk")
        ;; Back to the parent (Core's CustomRemove for the tip) ...
        (is-true (bl.store:coinstatsindex-revert-block csi block active-hash tip undo))
@@ -479,7 +484,7 @@ would report the other one\'s cumulative total."
              "and reports the block that was asked for"))
        (is (= active-subsidy
               (bl.store:coinstats-total-subsidy
-               (bl.store:coinstatsindex-get-stats csi tip)))
+               (%csi-stats-at csi cs tip)))
            "the height-keyed read still answers for the active chain")
        (let ((by-active (bl.store:coinstatsindex-get-block-stats csi active-hash tip))
              (by-branch (bl.store:coinstatsindex-get-block-stats csi branch-hash tip)))
@@ -511,9 +516,8 @@ same height still works."
                    node (list "muhash" (bl.rpc:hash-to-hex active)))))
          (is (= tip (cdr (assoc "height" res :test #'string=)))))
        ;; A height above the best marker is not vouched for either.
-       (bl.store:coinstatsindex-set-best
-        csi (1- tip) (bl.store:block-index-entry-hash
-                      (bl.store:get-block-at-height cs (1- tip))))
+       (bl.store:index-set-best
+        csi (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs (1- tip))) (1- tip))
        (signals bl.rpc:rpc-error
          (%txoutsetinfo node (list "muhash" tip)))
        (bl.store:close-coinstatsindex csi)))))

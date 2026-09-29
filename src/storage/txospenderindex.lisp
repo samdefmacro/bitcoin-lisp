@@ -364,7 +364,7 @@ getindexinfo wants."
 
 (defun %txospender-old-entries (index &key (limit 100000))
   "Up to LIMIT old-layout 's' keys, grouped in an EQUALP table by block hash."
-  (let ((by-block (make-hash-table :test 'equalp))
+  (let ((by-block (bl.bytes:make-octets-hash-table))
         (n 0))
     (with-leveldb-iterator (it (txospender-index-db index))
       (leveldb-iter-seek it (make-array 1 :element-type '(unsigned-byte 8)

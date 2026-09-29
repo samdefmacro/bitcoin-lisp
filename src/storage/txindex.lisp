@@ -424,7 +424,7 @@ marker, and neither can Core, which also resumes from its locator."
 (defun %txindex-leftover-legacy-records (txindex)
   "Every 't' record still in the old layout, as (key . value), grouped in an
 EQUALP table by the block hash it names."
-  (let ((by-block (make-hash-table :test 'equalp)))
+  (let ((by-block (bl.bytes:make-octets-hash-table)))
     (with-leveldb-iterator (it (tx-index-db txindex))
       (leveldb-iter-seek it (make-array 1 :element-type '(unsigned-byte 8)
                                           :initial-element +txindex-key-prefix+))

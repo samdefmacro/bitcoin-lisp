@@ -305,7 +305,6 @@ src/storage/.")
    #:coinstatsindex-enabled
    #:coinstatsindex-height
    #:coinstatsindex-best
-   #:coinstatsindex-get-stats
    #:coinstatsindex-get-block-stats
    #:coinstatsindex-add-block
    #:coinstatsindex-revert-block
@@ -313,7 +312,6 @@ src/storage/.")
    #:migrate-coinstatsindex
    #:coinstatsindex-needs-migration-p
    #:coinstatsindex-seed-genesis
-   #:coinstatsindex-set-best
    #:coinstatsindex-clear-best
    #:build-coinstatsindex
    #:apply-block-to-coinstats
@@ -423,7 +421,6 @@ src/storage/.")
    #:txospenderindex-best-block
    #:txospenderindex-height
    #:txospenderindex-db-path
-   #:load-tx-index
    #:txindex-add-block
    #:build-tx-index
    ;; index-base.lisp: the protocol every index implements

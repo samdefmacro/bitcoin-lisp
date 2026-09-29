@@ -222,11 +222,6 @@ Note the order: INDEX-BEST-BLOCK, the generic underneath, answers (hash height).
     (when (and v (>= (length v) (+ 32 +csi-dbval-size+)))
       (values (subseq v 0 32) (%csi-decode-dbval v 32)))))
 
-(defun coinstatsindex-get-stats (csi height)
-  "The coinstats record at HEIGHT, whatever block holds it now, or NIL. Ask
-COINSTATSINDEX-GET-BLOCK-STATS when the question is about a particular block."
-  (nth-value 1 (%csi-height-record csi height)))
-
 (defun coinstatsindex-get-block-stats (csi hash height)
   "The coinstats record for the block HASH at HEIGHT, or NIL -- Core's
 index_util::LookUpOne (index/db_key.h:96-113): the height record when it names
@@ -238,9 +233,6 @@ this block (the active chain), else the record a reorg left under the hash."
             stats
             (let ((hv (leveldb-get db (%csi-hash-key hash))))
               (and hv (%csi-decode-dbval hv))))))))
-
-(defun coinstatsindex-set-best (csi height hash)
-  (index-set-best csi hash height))
 
 (defun coinstatsindex-clear-best (csi)
   "Forget the best block and the running state, so the next catch-up rebuilds
