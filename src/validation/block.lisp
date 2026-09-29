@@ -2976,7 +2976,7 @@ m_lazy_recent_confirmed_transactions). Reuses the recent-rejects ring
 structure, sized like Core: 48,000 entries covers ~a couple hours of blocks.")
 
 (defvar *most-recent-block-txs* nil
-  "Hash-table (equalp) mapping the most recent connected block's tx ids —
+  "Hash-table (octet test) mapping the most recent connected block's tx ids —
 txid AND wtxid — to their transactions, or NIL before any block connects
 (Core m_most_recent_block_txs). Replaced wholesale on every tip advance.")
 
@@ -3073,8 +3073,13 @@ and never for a targeted chainstate (net_processing.cpp:2086-2092)."
 (defun note-block-connected (block)
   "Record BLOCK as the new most-recent block: rebuild the getdata-servable
 tx map (Core NewPoWValidBlock's most_recent_block_txs rebuild). The
-recent-confirmed filter is NOTE-BLOCK-TXS-CONFIRMED's, which is gated on IBD."
-  (let ((map (make-hash-table :test 'equalp)))
+recent-confirmed filter is NOTE-BLOCK-TXS-CONFIRMED's, which is gated on IBD.
+
+The map is keyed by txid and wtxid, so it takes the octet test: under EQUALP
+its rebuild -- two inserts per transaction, every block of IBD -- was 2.0% of
+the round-10 IBD profile."
+  (let ((map (bl.bytes:make-octets-hash-table
+              :size (* 2 (length (bl.ser:bitcoin-block-transactions block))))))
     (dolist (tx (coerce (bl.ser:bitcoin-block-transactions
                          block)
                         'list))

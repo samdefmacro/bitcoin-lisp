@@ -1694,7 +1694,7 @@ shape: bl.bytes:make-octets-hash-table is the fast one."
                             (push (cons file n) hits))))))
     (nreverse hits)))
 
-(defparameter +equalp-hash-table-ceiling+ 78
+(defparameter +equalp-hash-table-ceiling+ 77
   "How many EQUALP hash tables src/ may make: 111 when the second-round
 review counted them, 103 after the mempool's seven txid tables and the IBD
 block-hash tables moved to bl.bytes:make-octets-hash-table (wave E), 102 when
@@ -1704,7 +1704,8 @@ structs batch's sixteen mempool sets; 79 when the validation layer's outpoint
 tables (block pending outputs and spent set, extra coins, package coins, the
 duplicate-input and package-conflict sets) took BL.SER:OUTPOINT-KEY and the
 per-block fee statistics went; 78 with getdescriptoractivity's undo prevout
-table, whose key was a copy of the same bytes. 86 when the
+table, whose key was a copy of the same bytes; 77 with the most recent
+block's txid map. 86 when the
 mempool's eight remaining txid sets (find-parents, the ancestor and descendant
 walks, the RBF conflict and replaced sets, the staged-cluster tables) and
 the package and dust checks' txid- and wtxid-keyed tables in packages.lisp
