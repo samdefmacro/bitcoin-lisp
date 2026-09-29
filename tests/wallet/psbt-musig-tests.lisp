@@ -243,3 +243,42 @@ theirs and the descriptor signer makes none."
         (is (= 0 (length (%musig-input-records
                           (aval "psbt" (rpc nil "descriptorprocesspsbt" nonces (list desc)))
                           bl.ser:+psbt-in-musig2-partial-sig+))))))))
+
+(test descriptorprocesspsbt-updates-a-taproot-input-as-cores-updater
+  "ProcessPSBT's updater over a descriptor-solved taproot input
+(rpc/rawtransaction.cpp:190-205 -> SignPSBTInput -> FromSignatureData,
+psbt.cpp:196-206) writes the TaprootSpendData -- internal key, merkle root,
+leaf scripts -- the MuSig2 participants, and, unless bip32derivs=false hides
+the origins (HidingSigningProvider), the taproot derivations. It wrote the
+internal key alone."
+  (with-musig-wallets (rpc aval node "musig-updater")
+    (let* ((psbt (%musig-session
+                  node "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0,pk(musig(~A,~A,~A)/0/*))"
+                  :range 2))
+           (public (let ((d (aval "descriptor"
+                                  (rpc nil "getdescriptorinfo"
+                                       (aval "desc" (first (coerce (aval "descriptors"
+                                                                         (rpc "m0" "listdescriptors"))
+                                                                   'list)))))))
+                     d))
+           (request (list (%musig-json-obj "desc" public "range" (list 0 2)))))
+      (flet ((input (derivs)
+               (first (coerce (aval "inputs"
+                                    (rpc nil "decodepsbt"
+                                         (aval "psbt" (rpc nil "descriptorprocesspsbt" psbt request
+                                                           "DEFAULT" derivs))))
+                              'list))))
+        (let ((full (input t))
+              (hidden (input bl.rpc:+json-false+)))
+          (is (aval "taproot_internal_key" full))
+          (is (aval "taproot_merkle_root" full))
+          (is (= 1 (length (coerce (aval "taproot_scripts" full) 'list))))
+          (is (= 1 (length (coerce (aval "musig2_participant_pubkeys" full) 'list))))
+          ;; the internal key H (a const key is its own origin), the leaf's
+          ;; musig() key and its three participants
+          (is (= 5 (length (coerce (aval "taproot_bip32_derivs" full) 'list))))
+          ;; Origins hidden, the spend data and participants still there.
+          (is (null (aval "taproot_bip32_derivs" hidden)))
+          (is (aval "taproot_internal_key" hidden))
+          (is (= 1 (length (coerce (aval "taproot_scripts" hidden) 'list))))
+          (is (= 1 (length (coerce (aval "musig2_participant_pubkeys" hidden) 'list)))))))))

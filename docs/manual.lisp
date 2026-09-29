@@ -1838,9 +1838,22 @@
   the wallet's memory only (`wallet-musig2-secnonces`, Core
   m_musig2_secnonces), are spent by the partial signature, and die with
   the wallet: a session cannot outlive an unload or a restart, by design.
-  A second nonce for a session the wallet already holds one for is refused
-  (Core Asserts it cannot happen). descriptorprocesspsbt has no table, so
-  its nonces are published and their secrets dropped, as in Core."
+
+  Decided divergences (Round 9), each also written at its code: a second
+  nonce for a session the wallet already holds one for is an RPC error and
+  the first nonce is kept (Core Asserts it cannot happen, crashing the
+  process; `%mu2-nonce`); descriptorprocesspsbt has no table, so its nonces
+  are published and their secrets dropped -- Core's release behaviour; ONE
+  table per wallet, not per SPKM, because our signer merges every SPKM into
+  one provider per call (the WALLET slot); a musig() participant's taproot
+  derivation carries its OWN musig()'s leaf hashes, where Core adds every
+  tried leaf's hash to every aggregate's participants
+  (`%desc-tap-bip32-origins`); and two safeguards Core has not: an
+  aggregate signature is verified under its key before it is recorded
+  (`%mu2-aggregate-sig`), and a PSBT whose origin claims a derivation that
+  does not reach the key has that aggregate skipped where Core Asserts
+  (`%mu2-session-key`). `%wallet-sign-transaction` has no MuSig2 step; see
+  its docstring."
   (bitcoin-lisp.wallet package)
   (bitcoin-lisp.wallet:wallet-manager class)
   (bitcoin-lisp.wallet:init-wallet-manager function)

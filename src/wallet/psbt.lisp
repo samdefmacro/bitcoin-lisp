@@ -660,11 +660,10 @@ script is a witness program whose own script is known (sign.cpp:757-789)."
           (when (and witness-p (not (bl.ser:psbt-map-find map bl.ser:+psbt-in-witness-utxo+)))
             (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty
                                  (%serialize-txout-bytes out)))
-          (let ((exp (and bip32derivs (gethash spk expansions))))
+          (let ((exp (gethash spk expansions)))
             (when exp
               (destructuring-bind (desc pos pairs) exp
-                (%psbt-add-map-derivs map spk pos pairs nil
-                                      (eq (bl.rpc:out-desc-kind desc) :tr))))))))))
+                (%psbt-add-map-derivs map spk pos pairs desc nil bip32derivs)))))))))
 
 (defun %psbt-fetch-utxos (psbt node expansions bip32derivs)
   "ProcessPSBT's input half (rpc/rawtransaction.cpp:143-205) for PSBT with the
@@ -1697,33 +1696,32 @@ followed by the ordinary <fingerprint><path> of a bip32 derivation record."
     (bl.bytes:bb-write-bytes bb (%psbt-bip32-value fingerprint path))
     (bl.bytes:bb-finish bb)))
 
-(defun %spkm-tr-tree-data (spkm spk pos pairs)
-  "The rest of Core's TaprootSpendData for a tr()-with-tree output SPKM owns,
+(defun %desc-tr-tree-data (desc spk pos pairs)
+  "The rest of Core's TaprootSpendData for a tr()-with-tree output DESC derives,
 as (values MERKLE-ROOT LEAVES DEPTHS): LEAVES one (SCRIPT LEAF-HASH
 CONTROL-BLOCK) per leaf and DEPTHS each leaf's depth, in tr()'s parse order --
 which is the order TaprootBuilder::GetTreeTuples walks. NIL for a key-path-only
 tr(), anything that is not tr(), or spend data that does not derive SPK (the
 guard %SPKM-TR-SCRIPT-LEAVES applies)."
-  (let ((desc (desc-spkm-desc spkm)))
-    (when (and (eq (bl.rpc:out-desc-kind desc) :tr)
-               (bl.rpc:out-desc-tree desc)
-               (>= (length spk) 34))
-      (multiple-value-bind (output-key leaves root)
-          (bl.rpc:tr-spend-data desc pos
-                                (lambda (k) (cdr (assoc k pairs :test #'eq))))
-        (when (equalp output-key (subseq spk 2 34))
-          (values root leaves
-                  (mapcar #'car (bl.rpc:out-desc-tree desc))))))))
+  (when (and (eq (bl.rpc:out-desc-kind desc) :tr)
+             (bl.rpc:out-desc-tree desc)
+             (>= (length spk) 34))
+    (multiple-value-bind (output-key leaves root)
+        (bl.rpc:tr-spend-data desc pos
+                              (lambda (k) (cdr (assoc k pairs :test #'eq))))
+      (when (equalp output-key (subseq spk 2 34))
+        (values root leaves
+                (mapcar #'car (bl.rpc:out-desc-tree desc)))))))
 
-(defun %psbt-add-tr-tree-records (map spkm spk pos pairs outputp)
+(defun %psbt-add-tr-tree-records (map desc spk pos pairs outputp)
   "Core FromSignatureData's tr_spenddata half. An INPUT gets
 PSBT_IN_TAP_MERKLE_ROOT and one PSBT_IN_TAP_LEAF_SCRIPT per leaf (psbt.cpp:
 197-202); an OUTPUT gets PSBT_OUT_TAP_TREE, the tree tuples
 <depth><leaf version><script> (:293-295). The provider knows them for every
-tr() output the wallet owns, whether or not anything is signed, so a script-path
+tr() output the provider solves, whether or not anything is signed, so a script-path
 signature always travels with the root and scripts that verify it --
 wallet_taproot.py:363-364 asserts both."
-  (multiple-value-bind (root leaves depths) (%spkm-tr-tree-data spkm spk pos pairs)
+  (multiple-value-bind (root leaves depths) (%desc-tr-tree-data desc spk pos pairs)
     (when root
       (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
             (ver bl.rpc:+tapleaf-version-tapscript+))
@@ -1748,29 +1746,35 @@ wallet_taproot.py:363-364 asserts both."
                           (concatenate '(vector (unsigned-byte 8))
                                        script (vector ver)))))))))))
 
-(defun %psbt-add-musig2-participants (map spkm pos keytype)
+(defun %psbt-add-musig2-participants (map desc cache pos keytype)
   "PSBT_IN/OUT_MUSIG2_PARTICIPANT_PUBKEYS for every musig() key expression of
-SPKM's descriptor at POS: FromSignatureData inserts sigdata.musig2_pubkeys --
+DESC at POS (CACHE: a wallet SPKM's descriptor cache, or NIL): FromSignatureData inserts sigdata.musig2_pubkeys --
 the provider's aggregate_pubkeys, gathered by SignTaproot whether or not
 anything signs (script/sign.cpp:554-556) -- into m_musig2_participants for an
 input and an output alike (psbt.cpp:206, :299). Keydata is the 33-byte
 aggregate, the value the participants back to back (psbt.h:412-420).
 wallet_musig.py:229-231 counts them on the input and on the change output."
   (loop for (aggregate . participants)
-          in (bl.rpc:descriptor-musig2-participants (desc-spkm-desc spkm) pos
-                                                    (desc-spkm-cache spkm))
+          in (bl.rpc:descriptor-musig2-participants desc pos cache)
         do (unless (%psbt-record-present-p map keytype aggregate)
              (bl.ser:psbt-map-set
               map keytype aggregate
               (apply #'concatenate '(vector (unsigned-byte 8)) participants)))))
 
-(defun %psbt-add-map-derivs (map spk pos pairs &optional spkm (tr-p t))
-  "Add the derivation records an UPDATER writes for a wallet-owned input or
-output: +psbt-in-bip32+ for an ECDSA script, and for a TAPROOT one
-+psbt-in-tap-internal-key+ plus a +psbt-in-tap-bip32+ record per key whose
-origin the wallet knows.
+(defun %psbt-add-map-derivs (map spk pos pairs desc &optional cache (origins t))
+  "Add the records an UPDATER writes for an input whose script DESC solves at
+POS (PAIRS its expansion there; CACHE a wallet SPKM's descriptor cache, or
+NIL): +psbt-in-bip32+ for an ECDSA script, and for a TAPROOT one the
+TaprootSpendData (+psbt-in-tap-internal-key+, the merkle root and leaf
+scripts), the MuSig2 participants, and a +psbt-in-tap-bip32+ record per key
+whose origin is known.
 
-The internal key only when TR-P, i.e. for a tr() descriptor: a rawtr() has no
+ORIGINS NIL writes everything but the key origins -- the bip32 and
+tap_bip32 derivations -- as Core's HidingSigningProvider with hide_origin
+does (bip32derivs=false, signingprovider.cpp:30-45): GetTaprootSpendData and
+the MuSig2 participants pass through it, GetKeyOrigin does not.
+
+The internal key only for a tr() descriptor: a rawtr() has no
 TaprootSpendData (RawTRDescriptor::MakeScripts adds none), so Core's
 FromSignatureData writes no m_tap_internal_key for it (psbt.cpp:196). Writing
 the output key there made every later signer try a key path through it
@@ -1792,22 +1796,22 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (cond
       ((not taproot)
-       (loop for (key . pubkey) in pairs
+       (loop for (key . pubkey) in (and origins pairs)
              do (multiple-value-bind (fpr path) (bl.rpc:descriptor-key-origin key pubkey pos)
                   (bl.ser:psbt-map-set
                    map bl.ser:+psbt-in-bip32+ pubkey
                    (%psbt-bip32-value fpr path)))))
       (pairs
-       (when tr-p
+       (when (eq (bl.rpc:out-desc-kind desc) :tr)
          (bl.ser:psbt-map-set
           map bl.ser:+psbt-in-tap-internal-key+ empty
           (bl.rpc:key-xonly-bytes (cdr (first pairs)))))
-       (when spkm
-         (%psbt-add-tr-tree-records map spkm spk pos pairs nil)
-         (%psbt-add-musig2-participants
-          map spkm pos bl.ser:+psbt-in-musig2-participant-pubkeys+)
+       (%psbt-add-tr-tree-records map desc spk pos pairs nil)
+       (%psbt-add-musig2-participants
+        map desc cache pos bl.ser:+psbt-in-musig2-participant-pubkeys+)
+       (when origins
          (loop for (xonly leaf-hashes fpr path)
-                 in (%spkm-tap-bip32-origins spkm spk pos pairs)
+                 in (%desc-tap-bip32-origins desc cache spk pos pairs)
                do (bl.ser:psbt-map-set
                    map bl.ser:+psbt-in-tap-bip32+ xonly
                    (%psbt-tap-bip32-value leaf-hashes fpr path))))))))
@@ -1887,8 +1891,8 @@ Core's answer is the PSBT unchanged."
                                 (%spkm-spends-by-witness-p spkm spk)))
                    (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                      (declare (ignore scripts))
-                     (%psbt-add-map-derivs map spk pos pairs spkm
-                                           (eq (bl.rpc:out-desc-kind (desc-spkm-desc spkm)) :tr)))))))))
+                     (%psbt-add-map-derivs map spk pos pairs (desc-spkm-desc spkm)
+                                           (desc-spkm-cache spkm)))))))))
 
 (defun %psbt-add-wallet-output-derivs (psbt wallet)
   "Add output bip32 derivations / redeem / witness scripts for wallet-owned
@@ -1930,11 +1934,13 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                         (bl.ser:psbt-map-set
                          map bl.ser:+psbt-out-tap-internal-key+ empty
                          (bl.rpc:key-xonly-bytes (cdr (first pairs)))))
-                      (%psbt-add-tr-tree-records map spkm spk pos pairs t)
+                      (%psbt-add-tr-tree-records map (desc-spkm-desc spkm) spk pos pairs t)
                       (%psbt-add-musig2-participants
-                       map spkm pos bl.ser:+psbt-out-musig2-participant-pubkeys+)
+                       map (desc-spkm-desc spkm) (desc-spkm-cache spkm) pos
+                       bl.ser:+psbt-out-musig2-participant-pubkeys+)
                       (loop for (xonly leaf-hashes fpr path)
-                              in (%spkm-tap-bip32-origins spkm spk pos pairs)
+                              in (%desc-tap-bip32-origins (desc-spkm-desc spkm)
+                                                          (desc-spkm-cache spkm) spk pos pairs)
                             do (bl.ser:psbt-map-set
                                 map bl.ser:+psbt-out-tap-bip32+ xonly
                                 (%psbt-tap-bip32-value leaf-hashes fpr path)))))))))))
