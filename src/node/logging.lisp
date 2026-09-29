@@ -98,9 +98,6 @@ LEVEL can be :debug, :info, :warn, or :error."
   (setf *log-stream* nil)
   t)
 
-(defvar *log-file-path* nil
-  "Path the file log is currently open on, so SIGHUP can reopen it.")
-
 (defconstant +recent-log-history-bytes+ 10000000
   "Core ShrinkDebugFile's RECENT_DEBUG_HISTORY_SIZE (logging.cpp): the tail
 kept when the log file is scrolled at startup.")

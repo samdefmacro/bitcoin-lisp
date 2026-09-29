@@ -177,7 +177,7 @@ two subclasses of one abstract checker."
              (logbitp (vb-deployment-bit checker) v)
              t))))
 
-(defun %vb-period-start (chain-state entry period)
+(defun %vb-period-start (entry period)
   "ENTRY snapped DOWN to the last block of its retarget period, or NIL for the
 block before genesis.
 
@@ -280,7 +280,7 @@ Returns one of :defined :started :locked-in :active :failed."
          ;; A block's state is always the state of the first block of its
          ;; period, so both the walk and the cache key are the boundary
          ;; (versionbits.cpp:43-46).
-         (cursor (%vb-period-start chain-state entry period))
+         (cursor (%vb-period-start entry period))
          (to-compute '())
          (state nil))
     ;; Walk BACK in whole periods to the first boundary whose state is already
@@ -340,7 +340,7 @@ entered its current state (Core GetStateSinceHeightFor, versionbits.cpp:116)."
     ;; ALWAYS_ACTIVE is active from genesis (versionbits.cpp:120-122).
     (when (= (vb-deployment-start-time deployment) +vb-always-active+)
       (return-from versionbits-since-height 0))
-    (let ((cursor (%vb-period-start chain-state entry period))
+    (let ((cursor (%vb-period-start entry period))
           (since 0))
       (loop
         (when (null cursor) (return))

@@ -38,7 +38,7 @@ TRANSCRIPT="$(mktemp -t bitcoin-lisp-cold)"
 trap 'rm -f "$TRANSCRIPT"; [ "$FRESH" = 1 ] && docker volume rm -f "$BITCOIN_LISP_FASL_VOLUME" >/dev/null 2>&1; true' EXIT
 # errexit is lifted for the suite pipeline alone: under `set -e -o pipefail' a
 # RED suite ended the script right here, before rc was read and before the
-# three transcript gates below ran -- so a failing run was also an unchecked
+# four transcript gates below ran -- so a failing run was also an unchecked
 # run (the tell was the missing `self-test ok' lines; seen 2026-09-19). The
 # gates now run on every transcript, and the suite's own status is the exit
 # code only when all of them pass.
@@ -71,10 +71,10 @@ fi
 # compile-file's failure-p, so a from-scratch build passes with them buried in
 # the transcript: 2026-08-28 found 157 such lines in a green run, four of them
 # docstrings cut short by an unescaped quote whose remaining prose had become
-# code, plus a setf of a defvar that had been deleted. The checker tolerates
-# only earmuffed names that are defined somewhere in the tree (forward
-# references across load order); it self-tests first so it cannot pass
-# vacuously.
+# code, plus a setf of a defvar that had been deleted. Every one fails,
+# forward references across load order included (tolerated until 2026-09-29;
+# one of the nineteen was a special bound lexically); the checker self-tests
+# first so it cannot pass vacuously.
 "$(dirname "$0")/check-undefined-variables.sh" --self-test "$(dirname "$0")/.." >&2 || exit 1
 if ! "$(dirname "$0")/check-undefined-variables.sh" "$TRANSCRIPT" "$(dirname "$0")/.." >&2; then
   echo "ERROR: the load referenced variables that do not exist (see above)" >&2
@@ -91,6 +91,17 @@ fi
 "$(dirname "$0")/check-wrong-arity-calls.sh" --self-test >&2 || exit 1
 if ! "$(dirname "$0")/check-wrong-arity-calls.sh" "$TRANSCRIPT" >&2; then
   echo "ERROR: the build calls functions with the wrong argument count (see above)" >&2
+  exit 1
+fi
+
+# And for unused variables and IGNORE declarations the compiler contradicts:
+# style warnings too, mostly dead parameters -- but "using the lexical binding
+# of the symbol (*NAME*)" is a LET of a special compiled before its DEFVAR,
+# invisible to every callee (2026-09-29: BIP125 replacements announced with
+# the caller's removal reason). src/ only, plus that one warning in tests/.
+"$(dirname "$0")/check-unused-variables.sh" --self-test >&2 || exit 1
+if ! "$(dirname "$0")/check-unused-variables.sh" "$TRANSCRIPT" >&2; then
+  echo "ERROR: the build has unused variables or contradicted IGNORE declarations (see above)" >&2
   exit 1
 fi
 exit "$rc"

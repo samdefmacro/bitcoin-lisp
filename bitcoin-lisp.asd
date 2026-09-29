@@ -248,6 +248,9 @@ bitcoin-cli (node-main)."
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
                  (:file "config")
+                 ;; The protocol's IBD latch, which validation and the node
+                 ;; struct's liveness report read before networking loads.
+                 (:file "networking/specials")
                  ;; The node struct and *node* (Core node/context.h) load
                  ;; right after the globals: every layer above validation
                  ;; reads the node's slots, and this file needs only the

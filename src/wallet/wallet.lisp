@@ -80,6 +80,11 @@ version, as Core writes its CLIENT_VERSION.")
   "getwalletinfo's deprecated walletversion field: Core reports the latest
 legacy minversion 169900 for backwards compatibility (rpc/wallet.cpp:86-90).")
 
+(defconstant +wallet-timestamp-window+ 7200
+  "Core chain.h TIMESTAMP_WINDOW (= MAX_FUTURE_BLOCK_TIME): the slack applied
+to key/birth timestamps when deciding which blocks could contain relevant
+transactions.")
+
 ;;; --- Output types (Core outputtype.{h,cpp}) ---
 
 (alexandria:define-constant +output-types+ '(:legacy :p2sh-segwit :bech32 :bech32m)
@@ -481,6 +486,66 @@ a wallet name out of every remaining byte from 1 to 127 -- backslash included."
        (not (search "/../" (concatenate 'string "/" name "/")))
        (%wallet-name-components name)
        t))
+
+;;; --- VerifyWallets' per-name checks (wallet/load.cpp:78-93, wallet.cpp:2918-2936) ---
+
+(defun wallet-path-key (manager name)
+  "What two -wallet values must share to be one wallet: the path NAME joins
+to under the wallet directory. Core keeps a set of AbsPathJoin(GetWalletDir(),
+name) and warns `Ignoring duplicate -wallet' for a second entry
+(wallet/load.cpp:78-93), so `w1' and `./w1', or `sub//w5' and `sub/w5', are
+one wallet. Our join (WALLET-DIRECTORY) drops the empty and `.' segments, so
+the key is its printed path. Core's own set compares fs::path elements
+lexically and keeps `./w1' apart from `w1' -- the second then fails to open a
+database the first holds -- which this does not reproduce: here the second is
+the warning. A name this tree refuses outright is its own key."
+  (if (%valid-wallet-name-p name)
+      (wallet-path-string (wallet-directory manager name))
+      name))
+
+(defun %fs-quoted (string)
+  "STRING as Core's fs::quoted prints a path (std::quoted: in double quotes,
+with a double quote or a backslash inside escaped by a backslash)."
+  (with-output-to-string (out)
+    (write-char #\" out)
+    (loop for c across string
+          do (when (member c '(#\" #\\)) (write-char #\\ out))
+             (write-char c out))
+    (write-char #\" out)))
+
+(defun wallet-path-error (manager name)
+  "Core GetWalletPath's refusal (wallet/wallet.cpp:2918-2936), or NIL. The
+path NAME joins to must be absent, a directory, a symlink to a directory, or
+-- for backwards compatibility -- a plain file named by a NAME without a
+directory part; anything else (a symlink to a file, as
+wallet_multiwallet.py:174-175 plants, a dangling symlink, a file reached
+through a subdirectory, a socket) is an invalid -wallet path, in Core's
+sentence. Only the path's TYPE is read, never a wallet.dat, so the check needs
+nothing of Core's database format. A name this tree refuses outright
+(%VALID-WALLET-NAME-P) is refused elsewhere, with its own sentence."
+  (when (%valid-wallet-name-p name)
+    (let* ((path (wallet-path-string (wallet-directory manager name)))
+           (lstat (ignore-errors (sb-posix:lstat path)))
+           (kind (and lstat (logand (sb-posix:stat-mode lstat) sb-posix:s-ifmt))))
+      (unless (or (null kind)
+                  (= kind sb-posix:s-ifdir)
+                  (and (= kind sb-posix:s-iflnk)
+                       (let ((target (ignore-errors (sb-posix:stat path))))
+                         (and target (%stat-directory-p target))))
+                  (and (= kind sb-posix:s-ifreg) (not (find #\/ name))))
+        (format nil "Invalid -wallet path '~A'. -wallet path should point to a directory where wallet.dat and database/log.?????????? files can be stored, a location where such a directory could be created, or (for backwards compatibility) the name of an existing data file in -walletdir (~A)"
+                name
+                (%fs-quoted (string-right-trim "/" (namestring (wallets-directory manager)))))))))
+
+(defun %check-wallet-path (manager name)
+  "Refuse NAME as loadwallet and createwallet refuse a bad path: GetWalletPath's
+sentence behind LoadWalletInternal's and CreateWallet's `Wallet file
+verification failed. ' (wallet.cpp:281, :418), at RPC_WALLET_ERROR, which is
+where HandleWalletError leaves FAILED_BAD_PATH (wallet/rpc/util.cpp:152)."
+  (let ((bad (wallet-path-error manager name)))
+    (when bad
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                               :message (format nil "Wallet file verification failed. ~A" bad)))))
 
 ;;; --- SPKM key management ---
 
@@ -1222,6 +1287,7 @@ to repair: mkey rows with no crypted key, reporting itself encrypted and
 locked with no passphrase that can unlock it."
   (%check-create-wallet-arguments name disable-private-keys external-signer passphrase)
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
+    (%check-wallet-path manager name)
     (let ((path (wallet-path-for manager name)))
       ;; Core refuses only a path that already holds a DATABASE
       ;; (MakeDatabase require_create, walletdb.cpp:1346-1350): an empty
@@ -1553,13 +1619,15 @@ before this point for every result other than LOAD_OK, NEED_RESCAN included."
   "Core's FAILED_NOT_FOUND / FAILED_BAD_FORMAT at -18: the directory is not
 there, or it holds nothing recognizable as a wallet database. MakeDatabase
 picks between the two sentences exactly this way (walletdb.cpp:1329-1382), and
-Wallet::Verify prefixes them."
-  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
-                    :message (format nil "Wallet file verification failed. Failed to load database path '~A'. ~A"
-                                     (wallet-path-string path)
-                                     (if (uiop:directory-exists-p path)
-                                         "Data is not in recognized format."
-                                         "Path does not exist."))))
+Wallet::Verify prefixes them. `There' is Core's symlink_status test
+(:1314): a plain file under the name exists too, and holds no database."
+  (let ((where (wallet-path-string path)))
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
+                             :message (format nil "Wallet file verification failed. Failed to load database path '~A'. ~A"
+                                              where
+                                              (if (ignore-errors (sb-posix:lstat where))
+                                                  "Data is not in recognized format."
+                                                  "Path does not exist.")))))
 
 (define-condition wallet-database-locked (bl.rpc:rpc-error) ()
   (:documentation "The wallet database is held by another process: Core's
@@ -1719,6 +1787,7 @@ reports the keypool it finds and writes no keys into the file."
     (unless (%valid-wallet-name-p name)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                         :message (format nil "Wallet \"~A\" not found." name)))
+    (%check-wallet-path manager name)
     (let ((path (wallet-path-for manager name)))
       ;; Core's format probe runs before the engine is handed the path, so a
       ;; directory that is absent or holds no recognizable database is -18 and
@@ -2256,13 +2325,14 @@ nodes on one wallet is the fault, not the wallet."
   (let ((manager (bl:node-wallet-manager node)))
     (when manager
       ;; Duplicates dropped, keeping the first: Core loads a wallet once
-      ;; (wallet_paths is a set, load.cpp:81-97), and a second load raises
-      ;; "already loaded", which the caller would report as a broken wallet.
+      ;; (wallet_paths is a set of JOINED paths, load.cpp:78-93), and a
+      ;; second load of one path fails to open the database the first holds.
       (let ((names (remove-duplicates
                     (if names-p
                         (remove-if-not #'stringp names)
                         (wallet-startup-names
                          (wallet-manager-data-directory manager)))
+                    :key (lambda (name) (wallet-path-key manager name))
                     :test #'string= :from-end t)))
         (when names
           (bl:log-info "Loading ~D wallet~:P at startup: ~{~S~^, ~}"
@@ -2355,7 +2425,6 @@ method Core's client.cpp lists -- migratewallet's two arguments were the only
 rows left out. Answering Core's own sentence also tells an operator who ran
 the migration why there is nothing to migrate, where an unknown-command error
 would suggest the node is too old."
-  (declare (ignore passphrase))
   (let* ((manager (node-wallet-manager-checked node))
          (name (%ensure-unique-wallet-name wallet-name))
          (loaded (bt:with-recursive-lock-held ((wallet-manager-lock manager))
