@@ -398,7 +398,14 @@ indistinguishable from a real answer."
                   ;; The restart.
                   (setf (bl:node-chainstates node) (list cs)
                         (bl:node-block-store node) store)
-                  (bl:catch-up-index node idx)
+                  ;; Core's Rewind logs nothing (index/base.cpp:290-320); ours
+                  ;; says so at info, never as a warning -- a rewind is the
+                  ;; index doing its job.
+                  (let ((lines (capture-log-lines (lambda () (bl:catch-up-index node idx)))))
+                    (is-true (find "rewinding" lines :test #'search)
+                             "control: the rewind is logged: ~S" lines)
+                    (is-false (find "[warning] Spender index" lines :test #'search)
+                              "and not as a warning: ~S" lines))
                   ;; The abandoned branch's rows are gone (Core CustomRemove)...
                   (is (null (%tsi-spender-block-hash idx a1-op))
                       "branch A's spend survived the rewind")

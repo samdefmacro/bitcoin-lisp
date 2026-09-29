@@ -306,7 +306,7 @@ are left as they were, and the caller builds nothing on top."
                          (bl.store:get-block-at-height cs best-height))))
         (when (and active (equalp (bl.store:block-index-entry-hash active) best-hash))
           (return-from %rewind-coinstatsindex nil)))
-      (log-warn "Coinstats index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+      (log-info "Coinstats index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
                 best-height (bl.crypto:bytes-to-hex best-hash) tip)
       (let ((stale (bl.store:get-block-index-entry cs best-hash))
             (fork (%index-fork-entry cs best-hash)))
@@ -329,7 +329,7 @@ are left as they were, and the caller builds nothing on top."
                                    (bl.val:get-undo-data hash)))
                        (return-from %rewind-coinstatsindex
                          (%index-rewind-failed csi)))))
-          (log-warn "Coinstats index rewound to height ~D"
+          (log-info "Coinstats index rewound to height ~D"
                     (bl.store:block-index-entry-height fork))
           (bl.store:block-index-entry-height fork))))))
 
@@ -445,7 +445,7 @@ filter could be tied to the active chain and the index must be rebuilt."
       (when (and active best-hash
                  (equalp (bl.store:block-index-entry-hash active) best-hash))
         (return-from %rewind-blockfilterindex nil))
-      (log-warn "Block filter index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+      (log-info "Block filter index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
                 best-height
                 (if best-hash (bl.crypto:bytes-to-hex best-hash) "no hash")
                 tip)
@@ -462,7 +462,7 @@ filter could be tied to the active chain and the index must be rebuilt."
         (cond
           (entry
            (let ((height (bl.store:block-index-entry-height entry)))
-             (log-warn "Block filter index rewound from height ~D to ~D (the abandoned branch's filters stay queryable by hash, as Core's hash index keeps them)"
+             (log-info "Block filter index rewound from height ~D to ~D (the abandoned branch's filters stay queryable by hash, as Core's hash index keeps them)"
                        best-height height)
              (bl.store:blockfilterindex-set-best
               bfi height (bl.store:block-index-entry-hash entry))
@@ -502,7 +502,7 @@ cannot be placed in the header index and the index must be rebuilt; or
           (tip (bl.store:current-height cs)))
       (when (and stale (bl.store:entry-on-active-chain-p cs stale))
         (return-from %rewind-txospenderindex nil))
-      (log-warn "Spender index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+      (log-info "Spender index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
                 best-height (bl.crypto:bytes-to-hex best-hash) tip)
       (let ((fork (and stale (%index-fork-entry cs best-hash))))
         (unless fork
@@ -532,7 +532,7 @@ in the header index; rebuilding from genesis")
                       idx cs block hash
                       (bl.store:block-index-entry-height e)))))
         (let ((height (bl.store:block-index-entry-height fork)))
-          (log-warn "Spender index rewound to height ~D (~D block~:P of the abandoned branch erased)"
+          (log-info "Spender index rewound to height ~D (~D block~:P of the abandoned branch erased)"
                     height (- best-height height))
           (bl.store:txospenderindex-set-best-block
            idx (bl.store:block-index-entry-hash fork) height)
