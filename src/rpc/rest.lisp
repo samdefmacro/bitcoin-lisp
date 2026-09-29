@@ -396,7 +396,7 @@ the first read past its end."
              (check-mempool (bl.ser:br-read-bool br))
              (outpoints '()))
         (dotimes (i (bl.ser:br-read-compact-size br))
-          (declare (ignore i))
+          (declare (ignorable i))
           (let ((txid (bl.ser:br-read-bytes br 32)))
             (push (cons txid (bl.ser:br-read-u32-le br)) outpoints)))
         (values t check-mempool (nreverse outpoints)))

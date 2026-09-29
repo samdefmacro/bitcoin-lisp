@@ -6882,7 +6882,6 @@ sat/vB) fallback, so a wallet reading \"feerate\" got a made-up number instead
 of noticing there was no estimate, and built a transaction at 1 sat/vB that
 would not confirm."
   (let* ((node (make-test-node))
-         (bl::*syncing* nil)
          (result (bl.rpc::rpc-estimatesmartfee node '(6))))
     (is-false (assoc "feerate" result :test #'string=)
               "a fabricated feerate is reported where Core reports none")
@@ -6897,7 +6896,6 @@ include, indistinguishable from a real estimate, so a wallet reading it never
 falls back to its own -fallbackfee. Core answers the errors array
 (feature_fee_estimation.py:332,413)."
   (let* ((node (make-test-node))
-         (bl::*syncing* nil)
          (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
          (legacy (bl.mp:make-fee-estimator)))
     (dotimes (i 12)
@@ -6924,7 +6922,6 @@ falls back to its own -fallbackfee. Core answers the errors array
 Ours defaulted to conservative, which returns a HIGHER number — so every caller
 that did not name a mode was quietly told to overpay."
   (let ((node (make-test-node))
-        (bl::*syncing* nil)
         (seen nil))
     (%with-stubbed-fee-estimate (node :rate 10 :mode-out seen)
       (bl.rpc::rpc-estimatesmartfee node '(6))
@@ -6942,8 +6939,7 @@ that did not name a mode was quietly told to overpay."
 (fees.cpp:82-85). Unclamped — as ours was — a node whose mempool minimum has
 risen recommends a fee BELOW its own acceptance threshold: it rejects the very
 transaction it just priced."
-  (let ((node (make-test-node))
-        (bl::*syncing* nil))
+  (let ((node (make-test-node)))
     (%with-stubbed-fee-estimate (node :rate 10)   ; 10 sat/vB = 10000 sat/kvB
       ;; Floor below the estimate: the estimate stands.
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
@@ -6963,8 +6959,7 @@ transaction it just priced."
 requested target: the estimator substitutes 2 for a 1-block target and clamps
 to what its history can justify. Echoing the request tells a caller the answer
 covers a horizon it does not."
-  (let ((node (make-test-node))
-        (bl::*syncing* nil))
+  (let ((node (make-test-node)))
     (%with-stubbed-fee-estimate (node :rate 10 :returned-target 100)
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(1008))))
         (is (= 100 (cdr (assoc "blocks" result :test #'string=)))

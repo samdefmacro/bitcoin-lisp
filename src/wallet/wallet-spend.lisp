@@ -382,7 +382,7 @@ node lock (fee estimator + mempool reads)."
         (setf rate required reason :required)))
     (values rate reason)))
 
-(defun %wallet-discard-rate (node)
+(defun %wallet-discard-rate ()
   "Core GetDiscardRate: economical estimate at the longest horizon, capped
 by -discardfee, floored at the dust relay feerate."
   (let* ((estimate (%estimate-smart-fee-sat-kvb 1008 nil))
@@ -2272,7 +2272,7 @@ Caller holds node + wallet locks."
                               +dummy-nested-p2wpkh-input-size+
                               change-spend-size)))
                   (setf (csel-params-discard-feerate params)
-                        (%wallet-discard-rate node))
+                        (%wallet-discard-rate))
                   (multiple-value-bind (feerate reason)
                       (%wallet-minimum-fee-rate node cc)
                     (when (and (wcc-feerate cc) (> feerate (wcc-feerate cc)))
