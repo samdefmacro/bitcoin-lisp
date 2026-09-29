@@ -76,6 +76,7 @@ init.cpp, node/. src/node/.")
    #:cleanup-block-rev-files
    #:wipe-for-pruned-reindex
    #:replay-coins-db-blocks
+   #:replay-interrupted-coins-flushes
    #:reaccept-unwitnessed-active-chain
    #:check-cli-args
    #:cli-parse-error
