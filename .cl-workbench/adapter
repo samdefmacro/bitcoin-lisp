@@ -156,8 +156,9 @@ run_validation() {
       exec "$DEV" docs-check
       ;;
     interop)
-      # The differential lane against Core's bitcoin-tx / bitcoin-util
-      # (scripts/interop-test.sh); needs scripts/get-previous-releases.sh.
+      # The differential lanes against Core's bitcoin-tx / bitcoin-util and
+      # the datadir interop lanes (scripts/interop-test.sh); needs
+      # scripts/get-previous-releases.sh and scripts/build-node.sh.
       [ "$#" -eq 0 ] || {
         echo "ERROR: interop accepts no arguments" >&2
         return 2

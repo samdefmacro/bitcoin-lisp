@@ -1959,6 +1959,24 @@
   ordinary battery the suite SKIPS when `/releases` is absent; the lane sets
   BL_REQUIRE_CORE_BINARIES=1 so that an absent binary fails instead.
 
+  The same script runs the DATADIR lanes (`scripts/interop/datadir_interop.py`
+  through `scripts/conformance.sh`, needing `build/bitcoin-lisp-node`):
+  ours-to-core, where our node mines a regtest chain with every output type
+  the indexes treat differently and a reorg, and Core v28.2 starts on a copy
+  of its `blocks/` (blk/rev files and blocks/index); and core-to-ours, the
+  reverse. Every answer is compared, per height: getblockhash,
+  getblockheader, getblock, getblockfilter, gettxoutsetinfo muhash at that
+  height, getrawtransaction and gettxoutproof per transaction, then
+  getblockchaininfo, getchaintips and getindexinfo. A field only the pin
+  reports (getblockheader's `target`) is a version gap; one only Core
+  reports is a mismatch. The consumer runs -reindex-chainstate and builds
+  its own indexes: only the indexes' best-block LOCATORS are Core's format
+  yet, not their records. BL_INTEROP_COPY_CHAINSTATE=1 and
+  BL_INTEROP_COPY_INDEXES=1 copy those too, for when the formats agree.
+  The lane found that genesis's blocks/index record named no body
+  (src/storage/chain.lisp) and that doubles were not spelled with
+  setprecision(16).
+
   Invariants the lane pinned: TxToUniv reports the version as the uint32_t
   it is (`TX-VERSION-FOR-JSON`) and decides \"coinbase\" per TRANSACTION
   (tx.IsCoinBase(), core_io.cpp:454), not per input.
