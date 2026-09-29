@@ -532,3 +532,28 @@ same height still works."
        (signals bl.rpc:rpc-error
          (%txoutsetinfo node (list "muhash" tip)))
        (bl.store:close-coinstatsindex csi)))))
+
+(test an-old-coinstats-index-directory-is-warned-about-and-kept
+  "Core v30 moved the coin statistics index from indexes/coinstats/ (a version
+with a bug) to indexes/coinstatsindex/ and keeps the old directory for a
+downgrade, warning about it when the index starts
+(index/coinstatsindex.cpp:94-102). feature_coinstatsindex_compatibility.py:56
+copies Core v28.2's index into the node's datadir and expects that warning.
+The control is the same start without the old directory: no warning."
+  (flet ((warnings (base)
+           (remove-if-not (lambda (line) (search "Old version of coinstatsindex" line))
+                          (capture-log-lines
+                           (lambda ()
+                             (bl.store:close-coinstatsindex
+                              (bl.store:init-coinstatsindex base :enabled t)))))))
+    (with-temp-directory (dir "bl-csi-old")
+      (is (null (warnings dir)) "control: no old directory, no warning")
+      (let ((old (merge-pathnames "indexes/coinstats/db/" dir)))
+        (ensure-directories-exist old)
+        (let ((lines (warnings dir)))
+          (is (= 1 (length lines)))
+          (is-true (search (format nil "[warning] Old version of coinstatsindex found at ~Aindexes/coinstats. This folder can be safely deleted unless you plan to downgrade your node to version 29 or lower."
+                                   (namestring dir))
+                           (first lines))
+                   "Core's sentence, got ~S" (first lines)))
+        (is-true (uiop:directory-exists-p old) "the old index is left in place")))))

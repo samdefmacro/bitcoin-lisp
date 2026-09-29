@@ -164,7 +164,16 @@ filter index's cache line: Core divides one budget across n_indexes
 (node/caches.cpp:66-70).
 
 WIPE discards the stored index first (Core's f_wipe for -reindex,
-init.cpp:1920), so the caller's catch-up rebuilds it from genesis."
+init.cpp:1920), so the caller's catch-up rebuilds it from genesis.
+
+An indexes/coinstats/ beside it is the index Core wrote before v30 (a buggy
+version it superseded with indexes/coinstatsindex/ and keeps for a downgrade);
+Core's constructor warns about it and leaves it alone
+(index/coinstatsindex.cpp:94-102, feature_coinstatsindex_compatibility.py:56)."
+  (let ((old (merge-pathnames "indexes/coinstats/" (pathname base-path))))
+    (when (uiop:directory-exists-p old)
+      (bl.log:log-warn "Old version of coinstatsindex found at ~A. This folder can be safely deleted unless you plan to downgrade your node to version 29 or lower."
+                       (string-right-trim "/" (namestring old)))))
   (open-index-db (make-coinstatsindex :base-path (pathname base-path) :enabled enabled)
                  (coinstatsindex-path base-path)
                  :wipe wipe))
