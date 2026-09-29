@@ -299,10 +299,10 @@ bitcoin-cli (node-main)."
                  ;; is bitcoin-lisp/net; these are the protocol on top of it.
                  (:module "networking"
                   :components ((:file "p2p-handlers")
-                               (:file "txreconciliation-set")
                                (:file "bloom")       ; BIP37 CBloomFilter
                                (:file "merkleblock") ; CMerkleBlock / partial merkle tree
                                (:file "peer")
+                               (:file "txreconciliation-set") ; reads the peer struct: after it, so its accessors inline
                                (:file "private-broadcast") ; Core private_broadcast.cpp
                                (:file "protocol")
                                (:file "headers-sync")
