@@ -147,7 +147,23 @@ NOTE-GENESIS-POSITION: no HAVE_DATA."
         (is (= 8 (logand 8 (bl.store:entry-disk-status entry))) "BLOCK_HAVE_DATA")
         (is (eql 0 (bl.store:block-index-entry-file entry)))
         (is (eql 8 (bl.store:block-index-entry-data-pos entry))
-            "genesis follows blk00000.dat's 8-byte record header")))))
+            "genesis follows blk00000.dat's 8-byte record header"))
+      ;; A datadir written before the fix: genesis is in blk00000.dat but its
+      ;; record has no position. The restart scan of the block files finds the
+      ;; body, the note repairs the record, and a second start changes nothing.
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (cs (bl.store:init-chain-state dir :network :regtest))
+             (entry (add-regtest-genesis-entry cs)))
+        (is (zerop (logand 8 (bl.store:entry-disk-status entry)))
+            "control: the old record has no HAVE_DATA")
+        (bl.store:note-genesis-position cs store)
+        (let ((status (bl.store:entry-disk-status entry)))
+          (is (= 8 (logand 8 status)) "the restart repaired it")
+          (bl.store:note-genesis-position cs store)
+          (is (= status (bl.store:entry-disk-status entry)))
+          (is (eql 8 (bl.store:block-index-entry-data-pos entry))
+              "a second start leaves the repaired record as it is"))))))
 
 (test block-file-record-is-cores-byte-for-byte
   "Core's 'f' record for blk00000 after the same six blocks: seven VARINTs,

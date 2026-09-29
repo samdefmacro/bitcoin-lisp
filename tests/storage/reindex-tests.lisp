@@ -368,6 +368,31 @@ crashes nodes at exactly that point, again and again."
                      (bl.store:utxo-set-total-amount (bl:node-utxo-set node)))
                   "every coinbase of the three blocks, once each"))))))))
 
+(test a-reindex-start-still-replays-an-interrupted-flush
+  "Core skips ReplayBlocks under -reindex because its -reindex wipes the
+chainstate (wipe_chainstate_db, init.cpp:1386). Ours is additive and KEEPS the
+coins (docs/reindex-decision-2026-09-18.md), so a -reindex start over a flush
+interrupted between its batches must still finish it; start-up skipped it
+under either flag and left the coins half-moved with no best block. Only
+-reindex-chainstate, which wipes, may skip -- the control: the record stays."
+  (with-network (:regtest)
+    (let* ((tag (format nil "replayreindex~D" (get-internal-real-time)))
+           (node (coins-db-node-fixture tag)))
+      (setf (bl:node-data-directory node) (regtest-node-base-path tag))
+      (let ((bl:*node* node))
+        (generate-regtest-blocks node 1)
+        (bl.store:coins-view-cache-flush (bl:node-utxo-set node) :sync t)
+        (let ((h2 (first (generate-regtest-blocks node 1))))
+          (is (eq :crashed (%crash-flush (bl:node-utxo-set node))))
+          (let ((base (%restart-coins-view node)))
+            (bl:replay-interrupted-coins-flushes nil t)
+            (is-true (bl.store:coins-view-db-head-blocks base)
+                     "control: -reindex-chainstate wipes, so the record is left for it")
+            (bl:replay-interrupted-coins-flushes t nil)
+            (is (null (bl.store:coins-view-db-head-blocks base))
+                "-reindex keeps the coins, so the interrupted flush is finished")
+            (is (equalp (hex-to-internal h2) (bl.store:coins-view-db-best-block base)))))))))
+
 (test an-interrupted-flush-across-a-disconnect-is-rolled-back
   "The rollback half of ReplayBlocks: a flush interrupted while the coins moved
 from a block BACK to its parent is resolved by disconnecting the old branch
