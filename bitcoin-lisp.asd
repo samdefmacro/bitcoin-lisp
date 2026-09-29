@@ -131,6 +131,7 @@ of the kv and serialization layers. The pruning policy knobs live here
                              (:file "reindex")
                              (:file "migrate-blocks")
                              (:file "index-base")      ; the protocol the four indexes below implement
+                             (:file "disktxpos")       ; Core CDiskTxPos: the txindex and spender records
                              (:file "txindex")
                              (:file "txospenderindex")
                              (:file "blockfilter")
@@ -372,7 +373,8 @@ bitcoin-cli (node-main)."
                                (:file "script-asm")
                                (:file "bitcoin-tx")
                                (:file "bitcoin-wallet")
-                               (:file "dispatch")))
+                               (:file "dispatch")
+                               (:file "bitcoin")))   ; Core bitcoin.cpp, the wrapper
                  ;; The RPC server proper, last: it dispatches to everything above.
                  (:module "rpc-server"
                   :pathname "rpc"

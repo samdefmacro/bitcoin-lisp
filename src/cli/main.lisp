@@ -258,12 +258,11 @@ or:    bitcoin-cli [options] help <command>~%~%~%~A"
           bl.cfg:+client-name+ bl.cfg:+client-name+ *cli-help-options*))
 
 (defun %version-text ()
-  (format nil "~A RPC client version v~A~%Copyright (C) 2009-2026 The Bitcoin Core developers and the ~A authors~%~%~
-Please contribute if you find ~A useful. Visit <https://github.com/samdefmacro/bitcoin-lisp> for further information about the software.~%~%~
-This is experimental software.~%~
-Distributed under the MIT software license, see the accompanying file COPYING or <https://opensource.org/license/MIT>~%"
-          bl.cfg:+client-name+ (bl.ser:client-version-string) bl.cfg:+client-name+
-          bl.cfg:+client-name+))
+  "bitcoin-cli -version (bitcoin-cli.cpp:150-156): the version line, then
+FormatParagraph(LicenseInfo()) -- the same text every program prints."
+  (format nil "~A RPC client version v~A~%~A"
+          bl.cfg:+client-name+ (bl.ser:client-version-string)
+          (bl.cfg:format-paragraph (bl.cfg:license-info))))
 
 (defun run-cli (args &key (stdin (make-string-input-stream "")))
   "The whole of bitcoin-cli for ARGS (argv without the program name), reading

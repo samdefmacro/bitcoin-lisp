@@ -137,11 +137,12 @@ refused before any of that (rawtransaction.cpp:288-293)."
       ;; Core's not-found messages applies.
       (let* ((tx-index (rpc-get-tx-index node))
              (indexed (and tx-index (bl.store:tx-index-enabled tx-index)))
-             (location (and indexed (bl.store:txindex-lookup tx-index txid-bytes)))
-             (block-hash (and location (bl.store:tx-location-block-hash location)))
-             (block (and block-hash
-                         (bl.store:get-block (rpc-get-block-store node) block-hash)))
-             (found-tx (and block (find-tx-in-block block txid-bytes))))
+             (found (and indexed (multiple-value-list
+                                  (bl.store:txindex-find-tx tx-index txid-bytes))))
+             (found-tx (first found))
+             (block-hash (second found))
+             (block (and found-tx
+                         (bl.store:get-block (rpc-get-block-store node) block-hash))))
         (when found-tx
           (return-from rpc-getrawtransaction
             (if verbose
@@ -1154,13 +1155,9 @@ SIGN-TX-INPUTS reads. EQUALP because the key is a cons around the txid."
   "The transaction TXID from the txindex, else the mempool, or NIL -- the
 lookup ProcessPSBT makes for each input's non_witness_utxo
 (rpc/rawtransaction.cpp:143-167)."
-  (or (let* ((tx-index (rpc-get-tx-index node))
-             (location (and tx-index (bl.store:tx-index-enabled tx-index)
-                            (bl.store:txindex-lookup tx-index txid)))
-             (block (and location
-                         (bl.store:get-block (rpc-get-block-store node)
-                                             (bl.store:tx-location-block-hash location)))))
-        (and block (find-tx-in-block block txid)))
+  (or (let ((tx-index (rpc-get-tx-index node)))
+        (and tx-index (bl.store:tx-index-enabled tx-index)
+             (values (bl.store:txindex-find-tx tx-index txid))))
       (let* ((mempool (rpc-get-mempool node))
              (entry (and mempool (bl.mp:mempool-get mempool txid))))
         (and entry (bl.mp:mempool-entry-transaction entry)))))

@@ -305,16 +305,18 @@ src/storage/.")
    #:coinstatsindex-enabled
    #:coinstatsindex-height
    #:coinstatsindex-best
-   #:coinstatsindex-get-stats
    #:coinstatsindex-get-block-stats
    #:coinstatsindex-add-block
-   #:coinstatsindex-record-matches-block-p
+   #:coinstatsindex-revert-block
+   #:coinstatsindex-load-running
+   #:migrate-coinstatsindex
+   #:coinstatsindex-needs-migration-p
    #:coinstatsindex-seed-genesis
-   #:coinstatsindex-set-best
    #:coinstatsindex-clear-best
    #:build-coinstatsindex
    #:apply-block-to-coinstats
    #:coinstats-muhash
+   #:coinstats-muhash-hash
    #:coinstats-txout-count
    #:coinstats-bogo-size
    #:coinstats-total-amount
@@ -396,16 +398,13 @@ src/storage/.")
    #:tx-index
    #:make-tx-index
    #:tx-index-enabled
-   #:tx-location
-   #:make-tx-location
-   #:tx-location-block-hash
-   #:tx-location-tx-position
    #:init-tx-index
    #:close-tx-index
-   #:txindex-add
-   #:txindex-lookup
-   #:txindex-remove
    #:txindex-contains-p
+   #:txindex-find-tx
+   #:migrate-txindex
+   #:txindex-needs-migration-p
+   #:block-flat-position
    #:txindex-count
    #:txindex-set-best-block
    #:txindex-best-block
@@ -415,14 +414,14 @@ src/storage/.")
    #:txospender-index-enabled
    #:txospenderindex-add-block
    #:txospenderindex-remove-block
-   #:txospenderindex-locators
+   #:txospenderindex-find-spender
+   #:migrate-txospenderindex
+   #:txospenderindex-needs-migration-p
    #:txospenderindex-set-best-block
    #:txospenderindex-best-block
    #:txospenderindex-height
    #:txospenderindex-db-path
-   #:load-tx-index
    #:txindex-add-block
-   #:txindex-remove-block
    #:build-tx-index
    ;; index-base.lisp: the protocol every index implements
    #:base-index
@@ -442,6 +441,8 @@ src/storage/.")
    #:index-rewind-block
    #:index-prepare-sync
    #:index-sync
+   #:index-migrate-records
+   #:index-commit-records
    ;; BIP158 block filters (basic filter)
    #:+basic-filter-type+
    #:+basic-filter-p+
@@ -466,6 +467,8 @@ src/storage/.")
    #:close-blockfilterindex
    #:blockfilterindex-add-block
    #:blockfilterindex-get
+   #:migrate-blockfilterindex
+   #:blockfilterindex-needs-migration-p
    #:blockfilterindex-get-filter
    #:blockfilterindex-get-header
    #:blockfilterindex-has-block-p
