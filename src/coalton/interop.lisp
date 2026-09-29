@@ -40,6 +40,7 @@
    #:zero-block-height
    #:next-block-height
    ;; Struct ↔ Coalton vector converters
+   #:cl-array-to-coalton-vector
    ;; Constants
    #:+max-money+
    #:+coin+

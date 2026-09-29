@@ -822,12 +822,12 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
           (tx-ms4 (%tx-with-output-script ms4)))
       (let ((bl:*permit-bare-multisig* nil))
         (is (eq :bare-multisig
-                (nth-value 1 (bl.val::%is-standard-tx tx-ms)))))
+                (nth-value 1 (bl.val:is-standard-tx tx-ms)))))
       (let ((bl:*permit-bare-multisig* t))
-        (is (eq t (nth-value 0 (bl.val::%is-standard-tx tx-ms))))
+        (is (eq t (nth-value 0 (bl.val:is-standard-tx tx-ms))))
         ;; n>3 is IsStandard's own cap, so the knob cannot excuse it
         (is (eq :non-standard-output
-                (nth-value 1 (bl.val::%is-standard-tx tx-ms4))))))))
+                (nth-value 1 (bl.val:is-standard-tx tx-ms4))))))))
 
 ;;;; Fee estimation tests
 
@@ -3748,7 +3748,7 @@ is still standard, so the two must not share one predicate."
     (let ((bl:*permit-bare-multisig* nil))
       (is-true (bl.val:standard-output-script-p (ms 2 3)))
       (is (eq :bare-multisig
-              (nth-value 1 (bl.val::%is-standard-tx
+              (nth-value 1 (bl.val:is-standard-tx
                             (%tx-with-output-script (ms 2 3)))))))))
 
 (test g7-12-nonstandard-and-unknown-witness-inputs-rejected
