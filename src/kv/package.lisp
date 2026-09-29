@@ -10,6 +10,7 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
   (:local-nicknames (#:bt #:bordeaux-threads))
   (:export
    #:*blocks-xor*
+   #:adopt-core-index-directories
    #:*cache-sizes*
    #:*fast-prune*
    #:+blockfile-chunk-size+
@@ -27,7 +28,6 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
    #:datadir-block-index-path
    #:datadir-header-index-file
    #:datadir-index-path
-   #:datadir-layout-report
    #:ensure-libleveldb-loaded
    #:find-next-record
    ;; Record checksums
@@ -72,7 +72,6 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
    #:make-flat-file-seq
    #:make-obfuscation-key
    #:max-blockfile-size
-   #:migrate-datadir-layout
    #:migrate-index-db-subdirectory
    #:obfuscate!
    #:obfuscation-key-active-p

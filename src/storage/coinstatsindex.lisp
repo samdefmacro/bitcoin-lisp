@@ -173,8 +173,9 @@ so the running fraction on disk always belongs to the committed best block."
 ;;; --- open/close ---
 
 (defun coinstatsindex-path (base-path)
-  "Core's indexes/coinstatsindex/db/ (index/coinstatsindex.cpp:106), falling
-back to the flat coinstatsindex/ this tree used before — see kv/datadir.lisp.
+  "Core's indexes/coinstatsindex/db/ (index/coinstatsindex.cpp:106). A flat
+coinstatsindex/ this tree used before is moved there at start-up -- see
+kv/datadir.lisp.
 
 :MIGRATE moves a database this tree left one level up, in coinstatsindex/
 itself, down into its db/ the first time such a datadir is opened."

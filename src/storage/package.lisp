@@ -54,8 +54,7 @@ src/storage/.")
    #:datadir-block-index-path
    #:datadir-header-index-file
    #:datadir-index-path
-   #:datadir-layout-report
-   #:migrate-datadir-layout
+   #:adopt-core-index-directories
    #:migrate-index-db-subdirectory
    #:count-legacy-blocks
    #:prune-flat-block-file

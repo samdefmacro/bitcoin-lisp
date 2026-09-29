@@ -70,8 +70,9 @@ synced first, then 'P', the next filter position, goes beside the locator."
 
 (defun blockfilterindex-path (base-path)
   "Directory holding the block filter index LevelDB. Core's
-indexes/blockfilter/basic/db/ (index/blockfilterindex.cpp:88), falling back to
-the flat blockfilterindex/ this tree used before — see kv/datadir.lisp.
+indexes/blockfilter/basic/db/ (index/blockfilterindex.cpp:88). A flat
+blockfilterindex/ this tree used before is moved there at start-up, its fltr
+files up beside db/ -- see kv/datadir.lisp.
 
 :MIGRATE moves a database this tree left one level up, in basic/ itself, down
 into basic/db/ the first time such a datadir is opened; a populated index must
