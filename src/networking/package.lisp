@@ -169,6 +169,20 @@ headerssync.cpp. src/networking/.")
    #:maybe-set-peer-announcing-hb
    #:maybe-send-feefilter
    #:maybe-start-reconciliation
+   ;; BIP-330 short IDs and the vendored minisketch (Core src/minisketch/),
+   ;; the API its Core-oracle vector suites drive.
+   #:compute-recon-salt
+   #:recon-short-id
+   #:ms-make-sketch
+   #:ms-sketch-add
+   #:ms-sketch-merge
+   #:ms-sketch-serialize
+   #:ms-sketch-deserialize
+   #:ms-decode
+   #:ms-mul
+   #:ms-sqr
+   #:ms-inv
+   #:ms-qrt
    #:fee-filter-round
    #:peer-manual-p
    #:peer-permissions
