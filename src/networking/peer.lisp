@@ -1227,10 +1227,15 @@ ignored)."
        (multiple-value-bind (their-version their-salt)
            (handler-case
                (bl.ser:parse-sendtxrcncl-payload payload)
-             (error () (values nil nil)))
+             (error (e)
+               ;; A truncated payload throws out of `vRecv >> version >>
+               ;; salt' (net_processing.cpp:3994) into ProcessMessages' catch,
+               ;; which logs this line and KEEPS the peer (:5283-5284) -- no
+               ;; registration, no disconnect.
+               (bl:log-cat "net" "ProcessMessages(sendtxrcncl, ~D bytes): Exception '~A' (~(~A~)) caught"
+                           (length payload) e (type-of e))
+               (return-from %handle-handshake-sendtxrcncl t)))
          (cond
-           ;; Truncated payload: Core's deserialize failure drops the peer.
-           ((null their-version) (violation "sendtxrcncl with malformed payload"))
            ;; We never offered, so no pre-registration exists: ignore
            ;; without disconnecting (RegisterPeer NOT_FOUND), with Core's line.
            ((null (peer-recon-local-salt peer))
