@@ -89,6 +89,8 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:config-arg-log-cells
    #:+settings-warning-key+
    #:+client-name+
+   #:format-paragraph
+   #:license-info
    #:settings-file-warning
    #:render-json-value
    #:parse-settings-json

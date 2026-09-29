@@ -40,7 +40,6 @@ wallet/wallettool.cpp, wallet/dump.cpp. src/tools/.")
    #:bitcoin-wrapper-error
    ;; Core FormatFullVersion, FormatParagraph(LicenseInfo())
    #:format-full-version
-   #:format-paragraph
    #:tool-license-info
    ;; Core UniValue::write for the alist values the RPC layer builds
    #:univalue-write

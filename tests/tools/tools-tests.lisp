@@ -351,3 +351,36 @@ hidden spellings of -help (common/args.cpp:722-726)."
                (and e (princ-to-string e)))))
   (finishes (bl:check-cli-args '("-h")))
   (finishes (bl:check-cli-args '("-?"))))
+
+(test every-program-prints-the-one-license-text
+  "Core has ONE LicenseInfo, and every program prints FormatParagraph of it
+after its -version line (bitcoind.cpp:146-147, bitcoin-cli.cpp:152-155,
+bitcoin-util.cpp:58, bitcoin-tx.cpp:113, bitcoin.cpp:69). bitcoin-cli printed
+a copyright line of its own, unwrapped."
+  (let ((license (bl.cfg:format-paragraph (bl.cfg:license-info))))
+    (is (every (lambda (line) (<= (length line) 79))
+               (uiop:split-string license :separator '(#\Newline))))
+    (is (search license (nth-value 0 (bl.cli:run-cli '("-version")))))
+    (is (search license (nth-value 2 (%run-bitcoin "--version"))))
+    (let ((out (make-string-output-stream)))
+      (bl.tools:run-bitcoin-util '("-version") :out out :err (make-broadcast-stream))
+      (is (search license (get-output-stream-string out))))))
+
+(test bitcoind-reads-its-config-before-help-and-version
+  "bitcoind's ParseArgs runs InitConfig -- the -datadir check, the config file,
+the chain selection -- before -help and -version are looked at
+(bitcoind.cpp:111-127, :283-285): `bitcoind -datadir=<missing> -version' is
+Core's datadir error, not a version banner. NODE-MAIN asks
+%READ-INIT-CONFIG for exactly that before its -version branch."
+  (with-temp-directory (dir "bl-init-config")
+    (let ((missing (namestring (merge-pathnames "nope/" dir))))
+      (is (search "does not exist"
+                  (handler-case
+                      (progn (bl::%read-init-config (list (format nil "-datadir=~A" missing)
+                                                          "-version"))
+                             "no error")
+                    (error (e) (princ-to-string e)))))
+      ;; Control: an existing datadir reads.
+      (is (getf (bl::%read-init-config (list (format nil "-datadir=~A" (namestring dir))
+                                             "-regtest" "-version"))
+                :cli)))))
