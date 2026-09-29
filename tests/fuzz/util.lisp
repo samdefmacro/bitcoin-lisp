@@ -183,3 +183,17 @@ Core's nVersion is a uint32; the struct keeps the same 32 bits signed."
   (let ((v (consume-bytes fdp 16))
         (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace out v)))
+
+(defun fdp-random-length-bytes (bytes)
+  "The bytes a FuzzedDataProvider's ConsumeRandomLengthString reads back as
+BYTES: every backslash doubled, then a backslash and a non-backslash byte to
+end the string. How a CORPUS function writes a value for a target that
+consumes it with CONSUME-RANDOM-LENGTH-BYTE-VECTOR (or CONSUME-DESERIALIZABLE)."
+  (let ((out '()))
+    (loop for b across bytes
+          do (push b out)
+             (when (= b 92) (push 92 out)))
+    (push 92 out)
+    (push 0 out)
+    (make-array (length out) :element-type '(unsigned-byte 8)
+                             :initial-contents (nreverse out))))

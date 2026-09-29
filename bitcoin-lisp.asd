@@ -631,6 +631,8 @@ bitcoin-cli (node-main)."
                              ;; helpers, then one file per group of targets
                              (:file "fuzz/fuzz")
                              (:file "fuzz/util")
-                             (:file "fuzz/deserialize"))))
+                             (:file "fuzz/deserialize")
+                             (:file "fuzz/transaction")
+                             (:file "fuzz/script"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
