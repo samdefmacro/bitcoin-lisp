@@ -510,10 +510,24 @@
   `serialize-witness-transaction\' emits it unconditionally and is a
   primitive, not the wire form.
 
-  Trap: block DESERIALIZATION, not signature checking, is the IBD
-  bottleneck (profiled); the byte-reader family is the fast path and the
-  stream family is a thin shell kept for the few callers that need it."
+  An outpoint has ONE hash key, `outpoint-key': COutPoint's own 36 bytes
+  (txid, index little-endian), in a table `make-outpoint-table' makes --
+  the octet test, never EQUALP over a (txid . index) cons. Every coin
+  overlay and outpoint set the validation layer passes around (a block's
+  pending outputs and spent set, extra coins, package coins) and the
+  mempool's spent-outpoints are keyed by it, so a producer and a reader
+  cannot disagree about the key's shape; the coins cache keeps its own
+  fixed-width UTXO-KEY.
+
+  Trap: the byte-reader family is the fast path and the stream family is a
+  thin shell kept for the few callers that need it. What an IBD spends its
+  CPU on moves as costs are removed -- block deserialization (2026-08),
+  then (round 10, 2,100 regtest blocks of ~925 KB synced over P2P) the
+  script-bytes conversion, the per-byte socket drain, the locked flag cache
+  and EQUALP-hashed outpoint tables -- so profile before optimizing."
   (bitcoin-lisp.serialization package)
+  (bitcoin-lisp.serialization:outpoint-key function)
+  (bitcoin-lisp.serialization:make-outpoint-table function)
   (bitcoin-lisp.serialization:read-uint32-le function)
   (bitcoin-lisp.serialization:write-uint32-le function)
   (bitcoin-lisp.serialization:read-compact-size function)
