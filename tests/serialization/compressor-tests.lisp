@@ -289,6 +289,41 @@ VARINT [80 49]; 50 COIN -> compressed 0x32 -> VARINT [32]; P2PKH(0xCC*20)
     (is (equalp (%cmp-bytes #x00 #x00 #x07 #x51)
                 (bl.ser:bb-finish buf)))))
 
+(test compressed-tx-out-amount-wraps-as-cores-uint64
+  "Core DecompressAmount (compressor.cpp:168-192) is uint64_t arithmetic and
+AmountCompression::Unser (compressor.h:98-110) assigns its result to a CAmount,
+so a VARINT whose decompression overflows WRAPS: 2^64-1 decodes to
+2049638230412174624 and 2^64-6 to -600000000. Found by the fuzz target
+txoutcompressor-deserialize, whose buffer 9ce1d59dc9cef82d06 made
+DECOMPRESS-AMOUNT signal a TYPE-ERROR instead. Both amounts must also
+serialize again (deserialize.cpp:97), as Core's CompressAmount does over the
+uint64 the CAmount converts to."
+  (dolist (case '(("80fefefefefefefefe7f" . 2049638230412174624)
+                  ("80fefefefefefefefe7a" . -600000000)))
+    (let* ((bytes (bl.crypto:hex-to-bytes
+                   (concatenate 'string (car case) "00" (make-string 40 :initial-element #\c))))
+           (br (bl.ser:make-byte-reader-from bytes)))
+      (multiple-value-bind (value script) (bl.ser:br-read-compressed-tx-out br)
+        (is (= (cdr case) value))
+        (is (= 25 (length script)))
+        (is (bl.ser:br-eof-p br))
+        (let ((buf (bl.ser:make-byte-buf)))
+          (bl.ser:bb-write-compressed-tx-out buf value script)
+          (is (plusp (length (bl.ser:bb-finish buf)))))))))
+
+(test compressed-coin-code-is-a-uint32
+  "Core Coin::Unserialize (coins.h:71-79) reads its code word into a uint32_t,
+so ReadVarInt refuses a VARINT above 2^32-1 as `size too large'
+(serialize.h:442-462) -- a height beyond 2^31 cannot be decoded, and must not
+come back as one."
+  (let ((buf (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-core-varint buf (ash 1 32))
+    (bl.ser:bb-write-bytes buf (bl.crypto:hex-to-bytes "0007"))
+    (bl.ser:bb-write-u8 buf #x51)
+    (signals bl.err:serialization-error
+      (bl.ser:br-read-compressed-coin
+       (bl.ser:make-byte-reader-from (bl.ser:bb-finish buf))))))
+
 (test compressed-coin-record-round-trip
   "serialize -> parse round-trips height/coinbase/value/script."
   (let ((pubkey (bl.crypto:derive-public-key (%cmp-fixed-privkey))))
