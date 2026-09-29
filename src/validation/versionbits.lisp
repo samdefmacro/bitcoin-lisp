@@ -51,6 +51,25 @@ consensus/params.h:45-79)."
   (threshold 1916 :type (integer 0))
   (period 2016 :type (integer 1)))
 
+(defstruct (vb-warning-checker (:include vb-deployment)
+                               (:constructor %make-vb-warning-checker))
+  "Core WarningBitsConditionChecker (versionbits.cpp:295-330): the BIP9 state
+machine run over ONE bit, as though a deployment we have never heard of were
+using it.
+
+It is NOT a deployment — it appears in no chain's deployment list and
+getdeploymentinfo never sees one — but it IS a threshold-condition checker, so
+it carries the same window fields and runs through the same VERSIONBITS-STATE.
+That is Core's relationship between its two checker classes exactly, and the
+only member they do not share is Condition.
+
+Its window is the whole of time (BeginTime 0, EndTime int64 max), so it can
+never FAIL: nothing but signalling ever moves it out of STARTED."
+  ;; Core's two extra members: the chain's MinBIP9WarningHeight, and the
+  ;; consensus params Condition reads to ask what a bit would mean to us.
+  (min-warning-height 0 :type integer)
+  (network :mainnet :type keyword))
+
 (defun %vb (name bit start timeout min-act threshold period)
   (%make-vb-deployment :name name :bit bit :start-time start :timeout timeout
                        :min-activation-height min-act
@@ -557,25 +576,6 @@ older than BIP9. Transcribed here rather than added to CHAIN-PARAMS for the
 reason *VERSIONBITS-DEPLOYMENTS* is: this file is the only reader, and a value
 that sits beside the table it belongs to is one a reader can check against
 Core.")
-
-(defstruct (vb-warning-checker (:include vb-deployment)
-                               (:constructor %make-vb-warning-checker))
-  "Core WarningBitsConditionChecker (versionbits.cpp:295-330): the BIP9 state
-machine run over ONE bit, as though a deployment we have never heard of were
-using it.
-
-It is NOT a deployment — it appears in no chain's deployment list and
-getdeploymentinfo never sees one — but it IS a threshold-condition checker, so
-it carries the same window fields and runs through the same VERSIONBITS-STATE.
-That is Core's relationship between its two checker classes exactly, and the
-only member they do not share is Condition.
-
-Its window is the whole of time (BeginTime 0, EndTime int64 max), so it can
-never FAIL: nothing but signalling ever moves it out of STARTED."
-  ;; Core's two extra members: the chain's MinBIP9WarningHeight, and the
-  ;; consensus params Condition reads to ask what a bit would mean to us.
-  (min-warning-height 0 :type integer)
-  (network :mainnet :type keyword))
 
 (defun %vb-warning-window (network)
   "(values PERIOD THRESHOLD) for NETWORK's warning checkers — Core
