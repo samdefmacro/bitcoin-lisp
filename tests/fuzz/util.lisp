@@ -197,3 +197,19 @@ consumes it with CONSUME-RANDOM-LENGTH-BYTE-VECTOR (or CONSUME-DESERIALIZABLE)."
     (push 0 out)
     (make-array (length out) :element-type '(unsigned-byte 8)
                              :initial-contents (nreverse out))))
+
+(defun make-insecure-random-context (seed)
+  "Core InsecureRandomContext(seed), as far as a target needs it: a
+deterministic byte source seeded from the input, for payloads too large to
+read from the buffer itself. A xorshift64* state in a cons."
+  (list (logior 1 (ldb (byte 64 0) (* (1+ seed) 6364136223846793005)))))
+
+(defun insecure-rand-bytes (ctx n)
+  (let ((out (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (i n out)
+      (let ((x (car ctx)))
+        (setf x (ldb (byte 64 0) (logxor x (ash x 13)))
+              x (logxor x (ash x -7))
+              x (ldb (byte 64 0) (logxor x (ash x 17)))
+              (car ctx) x)
+        (setf (aref out i) (ldb (byte 8 32) (* x 2685821657736338717)))))))
