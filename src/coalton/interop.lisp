@@ -1041,14 +1041,33 @@ the table's own structure.")
       (setf (gethash f set) t))
     set))
 
+(defvar *last-flag-set* (cons nil nil)
+  "(flags-string . parsed set) of the most recent FLAG-ENABLED-P lookup, replaced
+as a whole cons -- never mutated -- so a reader on any thread sees a matching
+pair. The parsed set itself is only ever read once built.")
+
 (defun flag-enabled-p (flag)
   "Check if a flag is enabled in *script-flags*. O(1) hash lookup with the
-   parsed-flag-set cached per-string."
-  (when *script-flags*
-    (let ((set (or (gethash *script-flags* *flag-set-cache*)
-                   (setf (gethash *script-flags* *flag-set-cache*)
-                         (parse-flags-to-set *script-flags*)))))
-      (if (gethash flag set) t nil))))
+parsed-flag-set cached per-string.
+
+The string bound to *script-flags* is one object for a whole block (or
+transaction), and every script asks several flags of it, so the last string
+seen is recognized by EQ before *FLAG-SET-CACHE* is consulted. That table is
+SYNCHRONIZED and keyed by EQUAL, so each lookup hashed the whole flags string
+under a lock the script-check workers share: the round-10 IBD profile (2,100
+regtest blocks of ~925 KB synced over P2P) put 10.2% of all samples in the
+GETHASH/LOCK under this function. A miss takes the old path unchanged."
+  (let ((flags *script-flags*))
+    (when flags
+      (let* ((last *last-flag-set*)
+             (set (if (eq (car last) flags)
+                      (cdr last)
+                      (let ((parsed (or (gethash flags *flag-set-cache*)
+                                        (setf (gethash flags *flag-set-cache*)
+                                              (parse-flags-to-set flags)))))
+                        (setf *last-flag-set* (cons flags parsed))
+                        parsed))))
+        (if (gethash flag set) t nil)))))
 
 ;;; ============================================================
 ;;; Tapscript OP_SUCCESS Detection (BIP 342)

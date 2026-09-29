@@ -92,3 +92,37 @@ path still serves."
     (is (equalp #(1 2 255) (bl.interop:cl-array-to-coalton-vector adjustable)))
     (is (typep (bl.interop:cl-array-to-coalton-vector adjustable) 'simple-vector)))
   (is (equalp #(7 8) (bl.interop:cl-array-to-coalton-vector (list 7 8)))))
+
+(test flag-lookups-answer-for-the-flags-string-bound-now
+  "FLAG-ENABLED-P recognizes the last flags string by EQ before its
+synchronized EQUAL-keyed cache (the round-10 IBD profile put 10.2% of all
+samples in that cache's lock). The answer must still be the one a fresh parse
+of the string bound NOW gives: after a different string, after an EQUAL copy
+of an earlier one, with no flags at all, and with two threads asking about
+two different strings at the same time."
+  (let ((a "P2SH,WITNESS,DERSIG")
+        (b "TAPROOT,P2SH"))
+    (flet ((answers (flags)
+             (let ((bl.interop:*script-flags* flags))
+               (list (bl.interop:flag-enabled-p "P2SH")
+                     (bl.interop:flag-enabled-p "WITNESS")
+                     (bl.interop:flag-enabled-p "TAPROOT")))))
+      (is (equal '(t t nil) (answers a)))
+      (is (equal '(t nil t) (answers b)) "a different string is not the last one")
+      (is (equal '(t t nil) (answers (copy-seq a))) "an EQUAL copy answers the same")
+      (is (equal '(nil nil nil) (answers nil)) "no flags, nothing enabled")
+      (let* ((wrong 0)
+             (lock (bt:make-lock))
+             (threads
+               (loop for (flags expected) in (list (list a '(t t nil)) (list b '(t nil t)))
+                     collect (let ((flags flags) (expected expected))
+                               (bt:make-thread
+                                (lambda ()
+                                  (handler-case
+                                      (dotimes (i 20000)
+                                        (declare (ignorable i))
+                                        (unless (equal expected (answers flags))
+                                          (bt:with-lock-held (lock) (incf wrong))))
+                                    (error () (bt:with-lock-held (lock) (incf wrong))))))))))
+        (mapc #'bt:join-thread threads)
+        (is (= 0 wrong) "two threads, two strings: ~D wrong answers" wrong)))))
