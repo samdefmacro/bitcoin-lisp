@@ -210,6 +210,7 @@ init.cpp, node/. src/node/.")
    #:*listen-port-from-binds*
    #:*bind-on-any*
    #:add-external-ip-locals
+   #:add-discovered-locals
    #:index-block-connected
    #:index-block-disconnected
    #:node-indexes

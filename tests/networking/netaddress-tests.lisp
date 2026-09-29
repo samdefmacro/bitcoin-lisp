@@ -707,6 +707,40 @@ advertised listen port -- a -bind port, a non-noban -whitebind port, then
         (is (eql 30006 (port-of 2 2 2 2)) "an explicit port is kept")
         (is (eql 30020 (port-of 3 3 3 3)) "otherwise GetListenPort, not -port")))))
 
+(test discover-runs-whenever-the-node-binds-on-any-address
+  "Core runs Discover() at init when connOptions.bind_on_any -- no -bind and
+no -whitebind (init.cpp:2163, :2193-2197) -- and nothing else gates it:
+not -listen, which the functional framework's connect=0 soft-sets off
+(init.cpp:776-784). feature_bind_port_discover.py's first node (-discover
+-port=31001, run with the framework's automatic -bind removed, as Core
+v28.2's own bitcoind passes it) expects 1.1.1.1 and 2.2.2.2 in localaddresses
+at 31001. Ours called Discover only when the node also LISTENED, so that node
+reported nothing.
+
+The interfaces are stubbed (a container's own are private and advertise
+nothing); ADD-DISCOVERED-LOCALS is the step %START-NETWORK-SERVICES runs.
+Control: with a -bind given (bind_on_any false) nothing is discovered."
+  (%with-local-address-table
+    (let ((saved (fdefinition 'bl.net:interface-addresses))
+          (bl:*listen-port-from-binds* nil)
+          (bl:*p2p-port-override* 31001))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bl.net:interface-addresses)
+                   (lambda ()
+                     (list (cons :ipv4 (bl.net:ipv4-to-mapped-ipv6 1 1 1 1))
+                           (cons :ipv4 (bl.net:ipv4-to-mapped-ipv6 2 2 2 2)))))
+             (let ((bl:*bind-on-any* nil))
+               (bl:add-discovered-locals :regtest)
+               (is (null (bl.net:local-addresses))
+                   "control: a node given -bind discovers nothing"))
+             (let ((bl:*bind-on-any* t))
+               (bl:add-discovered-locals :regtest)
+               (is (equal '(31001 31001)
+                          (mapcar #'bl.net:local-address-port (bl.net:local-addresses)))
+                   "both interface addresses, at GetListenPort")))
+        (setf (fdefinition 'bl.net:interface-addresses) saved)))))
+
 (defun %peer-reporting-our-address (peer-address inbound a b c d port)
   "A peer at PEER-ADDRESS whose version message says it sees us at a.b.c.d:PORT."
   (bl.net:make-peer

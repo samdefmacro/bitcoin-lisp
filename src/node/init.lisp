@@ -2232,6 +2232,18 @@ localaddresses for twelve combinations of -externalip, -port, -bind and
           (bl.net:add-local net bytes (or port (get-listen-port network))
                             bl.net:+local-manual+))))))
 
+(defun add-discovered-locals (network)
+  "Core Discover at init (init.cpp:2193-2197): when the node binds on ANY
+address -- no -bind and no -whitebind, connOptions.bind_on_any (:2163) --
+every routable interface address becomes a LOCAL_IF entry at GetListenPort.
+The gate is bind_on_any alone, not -listen: a node under -connect (which
+soft-sets -listen=0, :776-784) with an explicit -discover still reports its
+interfaces in getnetworkinfo's localaddresses, and the functional framework
+writes connect=0 into every node's config. -discover=0 makes it a no-op
+(BL.NET:DISCOVER-LOCAL-ADDRESSES). Returns the entries added."
+  (when *bind-on-any*
+    (bl.net:discover-local-addresses (get-listen-port network))))
+
 (defun %start-network-services (network sync listen listen-bind listen-bind-supplied-p
                                listen-onion tor-control tor-password onion-bind
                                &optional extra-onion-binds)
@@ -2319,10 +2331,7 @@ listener, the onion listener with its Tor control connection, and
   ;; cannot wipe these entries.
   (setf bl.net:*advertised-listen-port* (get-listen-port network))
   (add-external-ip-locals network)
-  ;; Discover, only when listening on the wildcard address (Core
-  ;; init.cpp:2193-2197); a no-op under -discover=0.
-  (when (and listen *bind-on-any*)
-    (bl.net:discover-local-addresses (get-listen-port network)))
+  (add-discovered-locals network)
   ;; The I2P SAM session and its accept thread (Core CConnman::Start), last:
   ;; the tor block's clear-local-addresses must not wipe our I2P address.
   (when sync (start-i2p-sessions *node*)))
