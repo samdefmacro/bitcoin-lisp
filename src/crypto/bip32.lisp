@@ -89,7 +89,11 @@ chains)."
   "Derive the child extended key of PARENT at INDEX. INDEX >= +bip32-hardened+
 selects a hardened child (only possible from a private PARENT). From a public
 PARENT this performs CKDpub (normal indices only). Signals an error for the rare
-invalid-child case (IL >= n or zero key) — the caller should try the next index."
+invalid-child case (IL >= n or zero key) — the caller should try the next index.
+
+Second value: IL, the 32-byte tweak the child adds to the parent key -- Core
+CExtPubKey::Derive's bip32_tweak_out (pubkey.cpp), which SignMuSig2 collects
+as the plain tweaks a derived musig() key signs under (script/sign.cpp:301-311)."
   (let* ((hardened (>= index +bip32-hardened+))
          (cc (ext-key-chain-code parent))
          (data (if hardened
@@ -113,16 +117,18 @@ invalid-child case (IL >= n or zero key) — the caller should try the next inde
         (let ((ki (mod (+ il-int (%be->int (subseq (ext-key-key parent) 1 33)))
                        +secp256k1-order+)))
           (when (zerop ki) (crypto-error "invalid child (zero key); try the next index"))
-          (make-ext-key :version (ext-key-version parent) :depth depth
-                        :parent-fingerprint fp :child-number index :chain-code ir
-                        :key (concatenate '(vector (unsigned-byte 8)) #(0) (%int->32be ki))
-                        :privatep t))
+          (values (make-ext-key :version (ext-key-version parent) :depth depth
+                                :parent-fingerprint fp :child-number index :chain-code ir
+                                :key (concatenate '(vector (unsigned-byte 8)) #(0) (%int->32be ki))
+                                :privatep t)
+                  il))
         ;; CKDpub: child pubkey = Kpar + IL*G
         (let ((kpub (tweak-add-public-key (ext-key-key parent) il)))
           (unless kpub (crypto-error "invalid child public key; try the next index"))
-          (make-ext-key :version (ext-key-version parent) :depth depth
-                        :parent-fingerprint fp :child-number index :chain-code ir
-                        :key kpub :privatep nil)))))
+          (values (make-ext-key :version (ext-key-version parent) :depth depth
+                                :parent-fingerprint fp :child-number index :chain-code ir
+                                :key kpub :privatep nil)
+                  il)))))
 
 (defun bip32-neuter (k)
   "The public (xpub) extended key for K; returns K unchanged if already public."

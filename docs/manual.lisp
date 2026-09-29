@@ -206,10 +206,22 @@
   CL:RANDOM -- SBCL's MT19937 is invertible from its own output and its
   fresh-image state is fixed at SBCL build time.
 
+  MuSig2 signing (BIP327, `musig.lisp`) is libsecp's musig module and
+  Core's three signer functions over it (CKey::CreateMuSig2Nonce,
+  CKey::CreateMuSig2PartialSig, CreateMuSig2AggregateSig), every step
+  pinned by BIP327's own vectors. A secret nonce is a `musig-secnonce`:
+  foreign memory only, taken ATOMICALLY by the one signing call and zeroed
+  then, so a second use signals `musig-secnonce-reused` -- Core's
+  move-only MuSig2SecNonce.
+
   Traps: `reverse-bytes` exists because SBCL elides a `(coerce (reverse
   ...))` pair on the fast path -- use it. Heavy FFI calls cannot be
   interrupted mid-call, so a long foreign call can look like a hung eval
-  (exit code 4) and then recover."
+  (exit code 4) and then recover. libsecp's illegal-argument callback is
+  abort(3): a used secret nonce, a nonce made for another key, or an opaque
+  musig struct with the wrong magic takes the WHOLE NODE down, so every
+  such precondition is checked in Lisp before the call (`musig.lisp`'s
+  header) -- keep it that way when adding a binding."
   (bitcoin-lisp.crypto package)
   (bitcoin-lisp.crypto:sha256 function)
   (bitcoin-lisp.crypto:hash256 function)
@@ -228,6 +240,10 @@
   (bitcoin-lisp.crypto:make-fschacha20 function)
   (bitcoin-lisp.crypto:hkdf-sha256-extract function)
   (bitcoin-lisp.crypto:make-muhash function)
+  (bitcoin-lisp.crypto:musig2-create-nonce function)
+  (bitcoin-lisp.crypto:musig2-create-partial-sig function)
+  (bitcoin-lisp.crypto:musig2-create-aggregate-sig function)
+  (bitcoin-lisp.crypto:musig-secnonce class)
   "`hash256` is SHA-256 applied twice, the hash of every header,
   transaction and message checksum:
 

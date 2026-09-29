@@ -140,6 +140,27 @@ hash.cpp. src/crypto/.")
    #:verify-schnorr-signature
    #:sign-schnorr
    #:musig-aggregate-pubkeys
+   ;; MuSig2 signing (BIP327), src/crypto/musig.lisp
+   #:+musig-pubnonce-size+
+   #:musig-secnonce
+   #:musig-secnonce-p
+   #:musig-secnonce-valid-p
+   #:musig-secnonce-invalidate
+   #:musig-secnonce-adopt
+   #:musig-secnonce-reused
+   #:musig-keyagg
+   #:musig-nonce-gen
+   #:musig-nonce-agg
+   #:musig-nonce-process
+   #:musig-partial-sign
+   #:musig-partial-sig-verify
+   #:musig-partial-sig-agg
+   #:musig2-session-id
+   #:musig2-create-nonce
+   #:musig2-create-partial-sig
+   #:musig2-create-aggregate-sig
+   #:musig2-synthetic-xpub
+   #:musig2-derivation-tweaks
    #:derive-xonly-pubkey
    #:parse-xonly-pubkey
    #:xonly-pubkey-valid-p

@@ -45,7 +45,10 @@ state. Depends on the util layer for chain parameters (bech32 HRPs) only."
                              (:file "secp256k1")
                              (:file "bip324")
                              (:file "address")
-                             (:file "bip32")))))
+                             (:file "bip32")
+                             ;; MuSig2 signing: the secp256k1 context and
+                             ;; pubkey FFI, and BIP32 for BIP328 derivation
+                             (:file "musig")))))
 
 (defsystem "bitcoin-lisp/logging"
   :description "The node's log (levels, Core-style categories, ring buffer,
@@ -537,6 +540,8 @@ bitcoin-cli (node-main)."
                              (:file "networking/bip324-transport-tests")
                              ;; MuHash3072 tests
                              (:file "crypto/muhash-tests")
+                             ;; MuSig2 (BIP327) vectors and nonce lifetime
+                             (:file "crypto/musig-tests")
                              ;; coinstatsindex tests
                              (:file "storage/reindex-tests")
                              (:file "storage/coinstatsindex-tests")

@@ -400,31 +400,13 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
                         (make-desc-key :extkey k :path path :derive derive)))
                   (%parse-key-path path-elems t apostrophe-box)))))))
 
-(defparameter *musig-chaincode-hex*
-  "868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"
-  "DEFPARAMETER and not DEFCONSTANT: SBCL compares a constant's old and new
-values with EQL, and two string literals with identical contents are not EQL,
-so a DEFCONSTANT string signals DEFCONSTANT-UNEQL on every reload — which
-aborts a cold build outright.
-
-BIP328's fixed chaincode for the synthetic xpub built over a MuSig2
-aggregate key (Core MUSIG_CHAINCODE, musig.cpp:12). A real xpub's chaincode
-carries entropy from its parent; an aggregate key has no parent, so BIP328
-fixes one so every implementation derives the same children.")
-
 (defun %musig-synthetic-xpub (aggregate-pubkey network)
   "The BIP328 synthetic xpub over AGGREGATE-PUBKEY: depth 0, zero fingerprint,
 child 0, the fixed MuSig2 chaincode (Core CreateMuSig2SyntheticXpub,
 musig.cpp:71). It is a derivation ROOT, not a key anyone published."
-  (bl.crypto:make-ext-key
-   :version (bl.chain:chain-params-ext-public-prefix
-             (bl.chain:find-chain-params network))
-   :depth 0
-   :parent-fingerprint 0
-   :child-number 0
-   :chain-code (bl.crypto:hex-to-bytes *musig-chaincode-hex*)
-   :key (coerce aggregate-pubkey '(simple-array (unsigned-byte 8) (*)))
-   :privatep nil))
+  (bl.crypto:musig2-synthetic-xpub
+   aggregate-pubkey
+   (bl.chain:chain-params-ext-public-prefix (bl.chain:find-chain-params network))))
 
 (defun %parse-musig-key (str ctx network)
   "Parse a musig(KEY,KEY,...) key expression, with an optional /PATH suffix

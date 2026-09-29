@@ -982,16 +982,13 @@ secret, or NIL if SECKEY is invalid."
 
 ;;; --- MuSig2 key aggregation (BIP327) — libsecp256k1 musig module ------------
 ;;;
-;;; AGGREGATION ONLY, on purpose. BIP327 splits into a public half (combine n
-;;; pubkeys into one) and a signing half (nonce generation, exchange, partial
-;;; signatures). The public half is deterministic, has no secret state, and is
-;;; all a descriptor needs to produce an address.
+;;; The PUBLIC half of BIP327: combine n pubkeys into one. It is deterministic,
+;;; has no secret state, and is all a descriptor needs to produce an address.
 ;;;
-;;; ⚠️ The signing half is NOT here and must not be bolted on casually: MuSig2
-;;; nonce reuse across two different messages LEAKS THE PRIVATE KEY outright.
-;;; libsecp guards this by making the secnonce single-use and zeroing it in
-;;; secp256k1_musig_partial_sign, which is a contract any binding has to carry
-;;; through to its callers. That deserves its own review pass.
+;;; ⚠️ The signing half -- nonces, partial signatures, aggregation -- is
+;;; src/crypto/musig.lisp, apart on purpose: MuSig2 nonce reuse across two
+;;; messages LEAKS THE PRIVATE KEY, and that file is built around the
+;;; single-use secret nonce libsecp's contract requires.
 
 (defconstant +secp256k1-musig-keyagg-cache-size+ 197
   "sizeof(secp256k1_musig_keyagg_cache) (secp256k1_musig.h:44). Opaque: the
