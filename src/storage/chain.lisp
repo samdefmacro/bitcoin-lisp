@@ -456,6 +456,27 @@ the position once it exists."
     (when located (note-block-received chain-state entry))
     entry))
 
+(defun note-genesis-position (chain-state store)
+  "Record on CHAIN-STATE's genesis entry where STORE holds genesis's body, when
+the entry names no position yet; returns the entry.
+
+Core's LoadGenesisBlock hands the position WriteBlock returned to
+ReceivedBlockTransactions (validation.cpp:4971-4979), so genesis carries
+BLOCK_HAVE_DATA, nFile and nDataPos like any block received. ENSURE-GENESIS-ON-DISK
+runs before the genesis entry exists, and nothing noted the position after:
+our genesis record in blocks/index had no HAVE_DATA, and Core v28.2 started on
+our regtest datadir dropped every chain in FindMostWorkChain for the missing
+body and waited for a genesis block forever (scripts/interop/datadir_interop.py).
+Also repairs a datadir written before this, where the body is on disk and the
+record says otherwise."
+  (let* ((hash (chain-state-genesis-hash chain-state))
+         (entry (get-block-index-entry chain-state hash))
+         (located (gethash hash (block-store-index store))))
+    (when (and entry (flat-file-pos-p located)
+               (null (block-index-entry-data-pos entry)))
+      (note-block-position chain-state hash located))
+    entry))
+
 ;;; Block sequence ids (Core nSequenceId / nBlockSequenceId / m_blocks_unlinked).
 
 (defconstant +seq-id-best-chain-from-disk+ 0

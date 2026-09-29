@@ -301,6 +301,28 @@ to reports the store's cursor, not its preallocated length on disk."
                    bl.kv:+blockfile-chunk-size+)
                 "nSize is the used length, not the preallocated chunk")))))))
 
+(test genesis-record-names-its-body
+  "Core's LoadGenesisBlock hands WriteBlock's position to
+ReceivedBlockTransactions (validation.cpp:4971-4979): genesis's blocks/index
+record has BLOCK_HAVE_DATA, nFile and nDataPos. Without them Core v28.2,
+started on our datadir, finds no body for genesis and never activates a
+chain. NOTE-GENESIS-POSITION also repairs an entry saved without them."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-genesis-pos")
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (cs (bl.store:init-chain-state dir :network :regtest)))
+        (bl.store:ensure-genesis-on-disk store)
+        ;; 8 is BLOCK_HAVE_DATA (chain.h:75).
+        (let ((entry (add-regtest-genesis-entry cs)))
+          (is (not (logtest 8 (bl.store:entry-disk-status entry)))
+              "control: the entry as the node creates it names no body")
+          (is (eq entry (bl.store:note-genesis-position cs store)))
+          (is (logtest 8 (bl.store:entry-disk-status entry)))
+          (is (eql 0 (bl.store:block-index-entry-file entry)))
+          ;; blk00000.dat starts with genesis: magic and size, then the body.
+          (is (eql 8 (bl.store:block-index-entry-data-pos entry))))))))
+
 (test a-missing-block-index-is-a-first-run-not-corruption
   "No block index records at all is a legitimate first run: NIL loaded, and NO
 reason -- the caller must not confuse it with a database it cannot read, or
