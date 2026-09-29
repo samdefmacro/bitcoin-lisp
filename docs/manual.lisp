@@ -1632,10 +1632,23 @@
   exceeds BIP68's 16-bit field, which is enforced masked -- and only
   importdescriptors reads it, which is also the whole of Core's use.
 
+  `sign-tx-inputs' is the one in-place signer (signrawtransactionwithkey,
+  signrawtransactionwithwallet, the wallet's CreateTransaction, bitcoin-tx)
+  and its verdict is Core SignTransaction's: after every input is updated
+  with whatever signing managed, an input is complete exactly when
+  VerifyScript passes on it, and otherwise carries that verification's
+  error -- `Unable to sign input, invalid stack size (possibly missing
+  key)' for INVALID_STACK_OPERATION, `CHECK(MULTI)SIG failing with
+  non-zero signature (possibly need more signatures)' for SIG_NULLFAIL,
+  ScriptErrorString for the rest; `Input not found or already spent' and
+  `Missing amount' are the two that precede it. The assembler's own
+  reasons for giving up are not reported.
+
   Trap: the recurring failure shape in this tree is correct code with
   the wrong or missing caller -- an index built but never maintained, a
   check present but never reached. Test the wire, not the function."
   (bitcoin-lisp.rpc:with-node-lock macro)
+  (bitcoin-lisp.rpc:sign-tx-inputs function)
   (bitcoin-lisp.rpc:out-desc-all-warnings function)
   (bitcoin-lisp.rpc:script-to-json function)
   (bitcoin-lisp.rpc:script->address function)

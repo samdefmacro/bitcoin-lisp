@@ -294,7 +294,9 @@ even though that commit's own tests were green. Both were caused by **my change 
   differs from Core: Core bails during parsing, giving
   `"A function is needed within P2WSH"`, while we parse successfully and the gate reports `"... is invalid"`.
   Both sides reject it, just with different wording.
-- Signing completeness has not yet gone through Core's `VerifyScript` determination path (`sign.cpp:799`).
+- ~~Signing completeness has not yet gone through Core's `VerifyScript` determination path~~ -- done 2026-09-29:
+  `sign-tx-inputs` returns Core SignTransaction's input errors (`sign.cpp:1034-1073`), decided by VerifyScript on
+  every input after it is updated.
 - Miniscript in the tapscript context is still unsupported (a descriptor-syntax hole, see §4.1).
 
 

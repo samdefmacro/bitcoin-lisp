@@ -1438,7 +1438,7 @@ witness that spends."
            (cannot (label desc held &key (sequence #xffffffff))
              (multiple-value-bind (errs witness verified)
                  (%tr-sign-and-verify desc held :sequence sequence)
-               (is (equal '("no satisfiable script path for P2TR") errs)
+               (is (equal '("Witness program was passed an empty witness") errs)
                    "~A: reported ~S" label errs)
                (is (null (first witness)) "~A: emitted a witness anyway" label)
                (is-false verified label))))
@@ -1497,7 +1497,10 @@ descriptor and keys to another implementation."
 (test tr-script-path-fails-loudly-without-the-keys
   "A leaf we cannot satisfy must report itself, never emit a witness. multi_a
 below the threshold is the interesting one: signatures ARE produced, just not
-enough, and a signer that shipped them would broadcast an unspendable input."
+enough, and a signer that shipped them would broadcast an unspendable input.
+The report is Core's: SignTaproot leaves the witness empty (sign.cpp:542-617),
+and VerifyScript says so -- WITNESS_PROGRAM_WITNESS_EMPTY
+(interpreter.cpp:1950, via SignTransaction's :1059-1068)."
   (let ((i "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
         (a "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1")
         (b "KzoAz5CanayRKex3fSLQ2BwJpN7U52gZvxMyk78nDMHuqrUxuSJy")
@@ -1505,7 +1508,7 @@ enough, and a signer that shipped them would broadcast an unspendable input."
     (flet ((cannot (label desc held)
              (multiple-value-bind (errs witness verified)
                  (%tr-sign-and-verify desc held)
-               (is (equal '("no satisfiable script path for P2TR") errs)
+               (is (equal '("Witness program was passed an empty witness") errs)
                    "~A: reported ~S" label errs)
                (is (null (first witness)) "~A: emitted a witness anyway" label)
                (is-false verified label))))

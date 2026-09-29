@@ -1076,7 +1076,11 @@ complete:false with Core's per-input errors array."
                              (%aval "txid" entry)))
                 (is (= vout (%aval "vout" entry)))
                 (is (stringp (%aval "error" entry)))
-                (is (search "no key" (%aval "error" entry)))
+                ;; Core's verdict is VerifyScript's (script/sign.cpp:1059-1068):
+                ;; a P2WPKH input with no signature has an empty witness, and
+                ;; a v0 key-hash program wants exactly two items
+                ;; (interpreter.cpp:1939-1940).
+                (is (equal "Witness program hash mismatch" (%aval "error" entry)))
                 (is (= #xFFFFFFFD (%aval "sequence" entry)))))))))))
 
 (test ws-maxtxfee-and-weight-caps
