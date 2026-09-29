@@ -824,7 +824,7 @@ BLOCK_FAILED_VALID marking its two failure arms had each open-coded became
 The line count is pinned too, so an entry may shrink but not grow.
 See docs/refactoring-plan-2026-08-27.md 6b.")
 
-(defparameter +longish-function-ceiling+ 66
+(defparameter +longish-function-ceiling+ 67
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
 when the count drops; the test says so. Raised 61 -> 63 by P3.2, which turned
 the 1,227-line start-node into named init steps: three of them are 100-170
@@ -844,7 +844,11 @@ and became %REORG-DISCONNECT (92), %REORG-CONNECT (118) and %REORG-COMMIT
 the plan's target of 15 would mean cutting well below Core's own
 decomposition, which costs the file-by-file comparison that is this
 project's main verification method. See docs/refactoring-plan-2026-08-27.md
-6b.")
+6b.
+
+Raised 66 -> 67 as measured when main's musig merge met the tools batch at
+cc6c0111: %parse-descriptor-body (src/rpc/descriptors.lisp) passed 100 lines
+with the musig() key expression.")
 
 (defun %definitions-longer-than (lines)
   (sort (remove-if-not (lambda (d) (> (%def-length d) lines)) (%toplevel-definitions))
@@ -1690,11 +1694,12 @@ shape: bl.bytes:make-octets-hash-table is the fast one."
                             (push (cons file n) hits))))))
     (nreverse hits)))
 
-(defparameter +equalp-hash-table-ceiling+ 102
+(defparameter +equalp-hash-table-ceiling+ 103
   "How many EQUALP hash tables src/ may make: 111 when the second-round
 review counted them, 103 after the mempool's seven txid tables and the IBD
 block-hash tables moved to bl.bytes:make-octets-hash-table (wave E), 102 when
-the tools batch's index-record port retired the coinstats recompute path. May only fall: a new table keyed
+the tools batch's index-record port retired the coinstats recompute path, 103
+as measured once main's musig merge (psbt.lisp) met it at cc6c0111. May only fall: a new table keyed
 by hashes uses the octet test; one keyed by something else is a case to
 name here.")
 

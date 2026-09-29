@@ -15,7 +15,9 @@ empty, so the reconcile leaves it alone.")
 (defun reconcile-coins-db-best-block (node)
   "Make chainstate.dat agree with where the coins actually are.
 
-Returns :match, :reconciled, :unresolvable, :unrecorded (a chainstate written
+Returns :match, :reconciled, :loaded (no chainstate.dat, as on a datadir Core
+wrote: the tip is read from the coins, quietly), :unresolvable, :unrecorded (a
+chainstate written
 before the coins DB carried the pointer), :empty (the coins view holds nothing,
 so there is no state to reconcile toward), :reset (this chainstate was just
 reset to genesis by the interrupted-reindex recovery) or NIL when there is
@@ -91,6 +93,20 @@ wipe is that case wearing a hash."
                          (bl.crypto:bytes-to-hex
                           (bl.crypto:reverse-bytes recorded)))
               :unresolvable)
+             ((not (probe-file (bl.store:state-file-path chainstate)))
+              ;; No chainstate.dat at all -- a datadir Core wrote, whose tip
+              ;; is the coins DB's best block and nothing else (Core keeps no
+              ;; other tip record: LoadChainTip reads GetBestBlock,
+              ;; validation.cpp:4822-4845). Nothing was interrupted, so this
+              ;; is no warning: the tip is read from the coins, and
+              ;; LOG-LOADED-BEST-CHAIN reports it as Core's LoadChainTip does.
+              (let ((coins-height (bl.store:block-index-entry-height entry)))
+                (setf (bl.store:chain-state-best-block-hash chainstate)
+                      (copy-seq recorded)
+                      (bl.store:chain-state-best-height chainstate)
+                      coins-height)
+                (bl.store:save-state chainstate :in-transition nil)
+                :loaded))
              (t
               (let ((coins-height (bl.store:block-index-entry-height entry))
                     (tip-height (bl.store:current-height chainstate)))

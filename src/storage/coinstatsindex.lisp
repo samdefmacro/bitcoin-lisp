@@ -246,10 +246,10 @@ from genesis."
 fraction from 'M' and the tallies from the best block's record, which must
 agree -- the record's digest is the fraction's. Returns T when the running
 state now names the best block; NIL for an empty index. An index whose 'M' is
-missing or disagrees is Core's `Cannot read current coinstatsindex state;
-index may be corrupted', which stops Core's start-up; here the index is
-cleared for a rebuild instead, the recovery Core's message asks the operator
-for, since an optional index should not keep the node down."
+missing or disagrees is Core's refusal: `Cannot read current coinstatsindex
+state; index may be corrupted', which fails BaseIndex::Init and so the start
+(init.cpp:1925) -- the operator disables the index or rebuilds it with
+-reindex. Signals INIT-ERROR with that sentence."
   (multiple-value-bind (height hash) (coinstatsindex-best csi)
     (cond
       ((null hash)
@@ -272,9 +272,8 @@ for, since an optional index should not keep the node down."
                   (coinstatsindex-current-hash csi) (copy-seq hash))
             t)
            (t
-            (bl.log:log-warn "Cannot read current coinstatsindex state; index may be corrupted -- rebuilding it from genesis")
-            (coinstatsindex-clear-best csi)
-            nil)))))))
+            (bl.log:log-error "Cannot read current coinstatsindex state; index may be corrupted")
+            (init-error "Cannot read current coinstatsindex state; index may be corrupted"))))))))
 
 ;;; --- per-block update ---
 

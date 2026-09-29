@@ -373,14 +373,11 @@ the chain selection -- before -help and -version are looked at
 Core's datadir error, not a version banner. NODE-MAIN asks
 %READ-INIT-CONFIG for exactly that before its -version branch."
   (with-temp-directory (dir "bl-init-config")
-    (let ((missing (namestring (merge-pathnames "nope/" dir))))
+    (flet ((init-config (datadir &rest more)
+             (handler-case (bl::%read-init-config
+                            (list* (format nil "-datadir=~A" datadir) more))
+               (error (e) (princ-to-string e)))))
       (is (search "does not exist"
-                  (handler-case
-                      (progn (bl::%read-init-config (list (format nil "-datadir=~A" missing)
-                                                          "-version"))
-                             "no error")
-                    (error (e) (princ-to-string e)))))
+                  (init-config (namestring (merge-pathnames "nope/" dir)) "-version")))
       ;; Control: an existing datadir reads.
-      (is (getf (bl::%read-init-config (list (format nil "-datadir=~A" (namestring dir))
-                                             "-regtest" "-version"))
-                :cli)))))
+      (is (getf (init-config (namestring dir) "-regtest" "-version") :cli)))))
