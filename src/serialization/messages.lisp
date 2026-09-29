@@ -999,31 +999,31 @@ and VERACK."
                    (bb-write-u64-le stream salt))))
     (serialize-message "sendtxrcncl" payload)))
 
-(defconstant +recon-q-precision+ 32768
-  "Fixed-point denominator for the q parameter of reqrecon.
-
-BIP-330 sends q as a 16-bit integer; this is the scale it is read at. Chosen
-rather than ported: Core has no reqrecon at all, so there is no implementation
-to match. Anything that ever talks to another node must agree on this number,
-which is why it is a named constant and not a literal.")
+(defconstant +recon-q-precision+ 32767
+  "Fixed-point scale of reqrecon's q: BIP-330's `Multiplied by
+PRECISION=(2^15) - 1'. Core d3056bc has no reqrecon, so the BIP is the
+oracle; a peer that scales q differently sizes every sketch wrong.")
 
 (defun make-reqrecon-message (set-size q)
-  "BIP-330 reqrecon: uint32 SET-SIZE + uint16 Q, both LE.
+  "BIP-330 reqrecon: uint16 SET-SIZE + uint16 Q, both LE -- the BIP's table:
+`uint16 set_size' and `uint16 q', q multiplied by +RECON-Q-PRECISION+ and
+truncated toward zero.
 
 The initiator tells the responder how many transactions it is holding for this
 link, and how much of the smaller set it guesses the two sides do not share.
 Those two numbers are all the responder needs to size a sketch."
   (let ((payload (with-byte-buf (stream)
-                   (bb-write-u32-le stream set-size)
+                   (bb-write-u16-le stream (min #xFFFF set-size))
                    (bb-write-u16-le stream
                                     (min #xFFFF
-                                         (round (* q +recon-q-precision+)))))))
+                                         (floor (* q +recon-q-precision+)))))))
     (serialize-message "reqrecon" payload)))
 
 (defun parse-reqrecon-payload (payload)
-  "Returns (VALUES set-size q), q as a rational in [0, 2)."
+  "Returns (VALUES set-size q), q as a rational: the uint16 read back over
++RECON-Q-PRECISION+."
   (with-byte-reader (stream payload)
-    (let ((set-size (br-read-u32-le stream))
+    (let ((set-size (br-read-u16-le stream))
           (q-raw (br-read-u16-le stream)))
       (values set-size (/ q-raw +recon-q-precision+)))))
 

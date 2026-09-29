@@ -121,6 +121,7 @@ src/storage/.")
    #:block-index-entry-undo-pos
    #:block-index-entry-status-flags
    #:note-block-position
+   #:note-genesis-position
    #:%record-block-position
    #:block-index-entry-sequence-id
    #:note-block-received
@@ -264,9 +265,15 @@ src/storage/.")
    #:coins-view-empty-p
    #:coins-view-db-best-block
    #:coins-view-db-needs-upgrade-p
-   #:coins-view-db-foreign-obfuscation-p
+   #:coins-view-db-legacy-layout-p
+   #:upgrade-coins-view-db
+   #:encode-coin-key
+   #:decode-coin-key
+   #:encode-coin-value
+   #:decode-coin-value
    #:coins-view-cache-load-best-block
    #:coins-view-batch-set-best-block
+   #:coins-view-batch-set-head-blocks
    #:coins-view-cache-wipe
    #:coins-view-cache-base
    #:view-mem-bytes

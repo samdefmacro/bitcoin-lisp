@@ -46,6 +46,7 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
    #:fsync-parent-directory
    #:leveldb-close
    #:leveldb-compact
+   #:leveldb-compact-range
    #:leveldb-delete
    #:leveldb-destroy-db
    #:leveldb-destroy-options

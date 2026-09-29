@@ -345,29 +345,51 @@ the message is ignored outright, and says so (net_processing.cpp:3964-3967)."
       (%disconnect-after-verack peer "sendtxrcncl")
       (%log-sendtxrcncl-ignored peer)))
 
-;;; BIP-330 reconciliation. Every one of these is ignored unless the peer
-;;; completed the sendtxrcncl handshake, which needs -txreconciliation on
-;;; both sides -- so with the flag off they are inert rather than errors.
+;;; BIP-330 reconciliation. None of these messages exists in Core d3056bc
+;;; (protocol.h:266 ends at sendtxrcncl), so each is answered only from a
+;;; peer that completed the sendtxrcncl handshake -- impossible without
+;;; -txreconciliation -- and only in the role BIP-330 gives it: `After both
+;;; peers have confirmed support by sending "sendtxrcncl", the initiator of the
+;;; P2P connection assumes the role of reconciliation initiator (will send
+;;; "reqrecon" messages) and the other peer assumes the role of reconciliation
+;;; responder.' A message from the wrong side, or from a peer that never
+;;; registered, is ignored: with the flag off they are inert rather than errors.
+
+(defun %recon-message-allowed-p (peer command from-initiator-p)
+  "T when PEER may send COMMAND: it registered for reconciliation, and it
+holds the role the message belongs to -- FROM-INITIATOR-P for reqrecon,
+reqsketchext and reconcildiff, which only the initiator sends, NIL for
+sketch, which only the responder does. Logs the refusal of a registered
+peer in the wrong role."
+  (cond ((not (peer-recon-registered peer)) nil)
+        ;; The peer is the initiator exactly when WE are not.
+        ((eq from-initiator-p (not (peer-recon-we-initiate peer))) t)
+        (t (bl:log-cat "txreconciliation"
+                       "~A from peer=~A ignored: that is the ~:[responder~;initiator~]'s message"
+                       command (peer-id peer) from-initiator-p)
+           nil)))
 
 (define-p2p-handler "reqrecon" (peer payload ctx)
-  "The peer opens a reconciliation round: answer with a sketch."
+  "The initiator opens a reconciliation round: answer with a sketch."
   (declare (ignore ctx))
-  (when (peer-recon-registered peer) (%handle-reqrecon peer payload)))
+  (when (%recon-message-allowed-p peer "reqrecon" t)
+    (%handle-reqrecon peer payload)))
 
 (define-p2p-handler "sketch" (peer payload ctx)
   "The responder's sketch: decode, or ask for an extension."
-  (declare (ignore ctx))
-  (when (peer-recon-registered peer) (%handle-sketch peer payload)))
+  (when (%recon-message-allowed-p peer "sketch" nil)
+    (%handle-sketch peer payload (and ctx (bl.ctx:node-context-mempool ctx)))))
 
 (define-p2p-handler "reqsketchext" (peer payload ctx)
-  "The initiator could not decode: send a sketch of double capacity."
+  "The initiator could not decode: send the sketch extension."
   (declare (ignore payload ctx))
-  (when (peer-recon-registered peer) (%handle-reqsketchext peer)))
+  (when (%recon-message-allowed-p peer "reqsketchext" t)
+    (%handle-reqsketchext peer)))
 
 (define-p2p-handler "reconcildiff" (peer payload ctx)
   "The initiator's verdict: announce what it asked for, or everything on failure."
-  (declare (ignore ctx))
-  (when (peer-recon-registered peer) (%handle-reconcildiff peer payload)))
+  (when (%recon-message-allowed-p peer "reconcildiff" t)
+    (%handle-reconcildiff peer payload (and ctx (bl.ctx:node-context-mempool ctx)))))
 
 (define-p2p-handler "sendheaders" (peer payload ctx)
   "BIP 130: Peer prefers header announcements over inv."
@@ -3952,8 +3974,7 @@ reach here anyway — their senders are disconnected)."
           ;; this peer at all. A PUSH is Core's O(1) insert; the flush
           ;; restores announcement order and drains faster as the queue
           ;; grows (%TX-INV-BROADCAST-MAX).
-          (push (list txid wtxid fee-rate-per-kb)
-                (peer-tx-inv-queue peer)))))))
+          (%queue-tx-announcement peer txid wtxid fee-rate-per-kb))))))
 
 (defun %handle-reqrecon (peer payload)
   "The peer wants to reconcile: size a sketch against what it says it holds and
@@ -3966,7 +3987,7 @@ send it back."
       (bl:log-cat "txreconciliation" "reqrecon from ~A failed: ~A"
                   (peer-log-name peer) e))))
 
-(defun %handle-sketch (peer payload)
+(defun %handle-sketch (peer payload &optional mempool)
   "The responder's sketch arrived. Merge it with ours and either announce the
 answer or ask for an extension."
   (let ((round (peer-recon-round peer)))
@@ -3983,7 +4004,7 @@ answer or ask for an extension."
                (multiple-value-bind (ask announce) (recon-finish-round peer ids)
                  (send-message peer
                                (bl.ser:make-reconcildiff-message t ask))
-                 (%announce-wtxids peer announce)))
+                 (%announce-wtxids peer announce mempool)))
               ((not (recon-round-extended round))
                ;; One extension is allowed, then the fallback.
                (setf (recon-round-extended round) t
@@ -3992,7 +4013,7 @@ answer or ask for an extension."
               (t
                (send-message peer
                              (bl.ser:make-reconcildiff-message nil '()))
-               (%announce-wtxids peer (recon-abandon-round peer))))))
+               (%announce-wtxids peer (recon-abandon-round peer) mempool)))))
       (error (e)
         (bl:log-cat "txreconciliation" "sketch from ~A failed: ~A"
                     (peer-log-name peer) e)
@@ -4002,21 +4023,18 @@ answer or ask for an extension."
         ;; to be told, or it holds that snapshot until the next reqrecon
         ;; replaces it.
         (send-message peer (bl.ser:make-reconcildiff-message nil '()))
-        (%announce-wtxids peer (recon-abandon-round peer))))))
+        (%announce-wtxids peer (recon-abandon-round peer) mempool)))))
 
 (defun %handle-reqsketchext (peer)
-  "The initiator could not decode and wants a bigger sketch. Send one at double
-the capacity over the same frozen snapshot — reconciling against a set that
-moved since the first sketch would describe something it never saw."
-  (let* ((set (peer-recon-set peer))
-         (ids (and set (or (recon-set-snapshot set) (recon-set-short-ids set)))))
-    (when ids
-      (send-message peer
-                    (bl.ser:make-sketch-message
-                     (ms-sketch-serialize
-                      (recon-build-sketch ids (* 2 (max 1 (length ids))))))))))
+  "The initiator could not decode and wants BIP-330's sketch extension: the
+same frozen snapshot at twice the capacity, minus the part already sent
+(RECON-RESPOND-TO-EXTENSION). Reconciling against a set that moved since the
+first sketch would describe something the initiator never saw; asking with no
+sketch sent this round gets nothing."
+  (let ((msg (recon-respond-to-extension peer)))
+    (when msg (send-message peer msg))))
 
-(defun %handle-reconcildiff (peer payload)
+(defun %handle-reconcildiff (peer payload &optional mempool)
   "The initiator finished. Announce what it asked for; on a failure, announce
 the whole snapshot — the flood fallback that keeps a failed round from losing
 transactions.
@@ -4037,25 +4055,51 @@ NIL and announce nothing."
           (bl.ser:parse-reconcildiff-payload payload)
         (let ((set (peer-recon-set peer)))
           (cond (ok
-                 (%announce-wtxids peer (recon-settle-ids set ask))
-                 (when set
-                   (recon-settle-ids set (recon-set-snapshot set))
-                   (recon-set-clear-snapshot set)))
+                 (%announce-wtxids peer (recon-settle-ids set ask) mempool)
+                 (when set (recon-set-clear-snapshot set)))
                 (t
-                 (%announce-wtxids peer (recon-flood-snapshot peer))))))
+                 (%announce-wtxids peer (recon-flood-snapshot peer) mempool)))))
     (error (e)
       (bl:log-cat "txreconciliation" "reconcildiff from ~A failed: ~A"
                   (peer-log-name peer) e))))
 
-(defun %announce-wtxids (peer wtxids)
+(defun %announce-wtxids (peer wtxids mempool)
   "Queue WTXIDS for ordinary announcement to PEER. Reconciliation decides WHAT
-to announce; the announcement itself is the same inv path everything else uses."
-  (dolist (wtxid wtxids)
-    (push (list wtxid wtxid 0) (peer-tx-inv-queue peer))))
+to announce; the announcement itself is the same inv path everything else uses,
+through %QUEUE-TX-ANNOUNCEMENT with what RELAY-TRANSACTION gives it: the TXID
+and the fee rate per kvB, both read from MEMPOOL by wtxid. A wtxid the mempool
+no longer holds has nothing to announce, and without a MEMPOOL nothing does --
+there is no txid to queue."
+  (when mempool
+    (dolist (wtxid wtxids)
+      (let* ((txid (gethash wtxid (bl.mp:mempool-by-wtxid mempool)))
+             (entry (and txid (bl.mp:mempool-get mempool txid))))
+        (when entry
+          (let ((vsize (bl.mp:mempool-entry-vsize entry)))
+            (%queue-tx-announcement
+             peer txid wtxid
+             (if (plusp vsize)
+                 (floor (* 1000 (bl.mp:mempool-entry-fee entry)) vsize)
+                 0))))))))
 
-(defun %peer-recon-set (peer)
-  (or (peer-recon-set peer)
-      (setf (peer-recon-set peer) (make-recon-set))))
+(defun maybe-start-reconciliation (peer now &optional mempool)
+  "The timer entry point, per peer per tick: give up a round that has waited
++RECON-ROUND-TIMEOUT-SECONDS+ for its sketch, and open a new one if it is due.
+Returns T when a round was started.
+
+A timed-out round ends as a failed one does (BIP-330's fallback): our snapshot
+is flooded -- from MEMPOOL, which the announcement needs for each txid and fee
+rate -- and reconcildiff(success=0) tells the responder to flood its own.
+Rounds are spread across peers rather than run together, so a node's
+announcement pattern does not reveal how many peers it has."
+  (when (recon-round-timed-out-p peer now)
+    (bl:log-cat "txreconciliation" "reconciliation round with peer=~A timed out"
+                (peer-id peer))
+    (send-message peer (bl.ser:make-reconcildiff-message nil '()))
+    (%announce-wtxids peer (recon-abandon-round peer) mempool))
+  (when (recon-should-start-round-p peer now)
+    (send-message peer (recon-start-round peer now))
+    t))
 
 (defun %mark-tx-known-to-peer (peer hash)
   "Record that PEER holds the transaction its inventory calls HASH: it

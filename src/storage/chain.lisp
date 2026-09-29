@@ -456,6 +456,22 @@ the position once it exists."
     (when located (note-block-received chain-state entry))
     entry))
 
+(defun note-genesis-position (chain-state store)
+  "Give CHAIN-STATE's genesis entry the position of the genesis body STORE
+holds, when the entry has none. Core's LoadGenesisBlock saves genesis and runs
+it through ReceivedBlockTransactions (validation.cpp:4966-4985), so its entry
+carries nFile/nDataPos and BLOCK_HAVE_DATA like any other block; ours wrote the
+body (ENSURE-GENESIS-ON-DISK) but never told the entry, and a blocks/index
+without HAVE_DATA on genesis is one Core's BaseIndex::Init reads as pruned: an
+index started on it fails with `best block of the index goes beyond pruned
+data' (GetFirstBlock(tip, BLOCK_HAVE_DATA) != Genesis(), index/base.cpp)."
+  (let* ((hash (chain-state-genesis-hash chain-state))
+         (entry (get-block-index-entry chain-state hash))
+         (located (and store (gethash hash (block-store-index store)))))
+    (when (and entry (null (block-index-entry-data-pos entry))
+               (flat-file-pos-p located))
+      (note-block-position chain-state hash located))))
+
 ;;; Block sequence ids (Core nSequenceId / nBlockSequenceId / m_blocks_unlinked).
 
 (defconstant +seq-id-best-chain-from-disk+ 0
@@ -801,10 +817,15 @@ across chainstates and take no suffix."
 
 (defun open-chainstate-coins-view (state)
   "Open STATE's coins LevelDB (at its chainstate-leveldb-path) and install a
-coins-view-cache over it as the chainstate's coins view. Returns the view."
-  (setf (chain-state-coins-view state)
-        (make-coins-view-cache
-         (open-coins-view-db (namestring (chainstate-leveldb-path state))))))
+coins-view-cache over it as the chainstate's coins view. Returns the view.
+A database still in this tree's pre-2026-09-29 coin layout is converted first
+(UPGRADE-COINS-VIEW-DB); a stop request part way is an error here, and the
+next open continues the conversion."
+  (let ((db (open-coins-view-db (namestring (chainstate-leveldb-path state)))))
+    (unless (upgrade-coins-view-db db)
+      (close-coins-view-db db)
+      (storage-error "Error upgrading chainstate database"))
+    (setf (chain-state-coins-view state) (make-coins-view-cache db))))
 
 (defun close-chainstate-coins-view (state)
   "Close STATE's coins LevelDB (releasing its lock) if the chainstate owns a

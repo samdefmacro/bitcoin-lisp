@@ -58,16 +58,6 @@ chain whose segwit-active blocks lack it.")
   "CDiskBlockIndex::DUMMY_VERSION (chain.h:324): the client-version field every
 record opens with. Core writes this constant and never reads it back.")
 
-(defparameter *obfuscation-key-record*
-  (let ((name "obfuscate_key"))
-    (concatenate '(vector (unsigned-byte 8))
-                 (vector 14 0) (map 'vector #'char-code name)))
-  "CDBWrapper::OBFUSCATION_KEY as it lands on disk: the 14-byte string
-\"\\000obfuscate_key\" (dbwrapper.h:192) serialized with its CompactSize length.
-Core opens blocks/index with obfuscation OFF (DBParams::obfuscate defaults to
-false, init.cpp:1339-1345), so it never writes this record there; a record that
-IS present is honoured on read, as CDBWrapper does for every database.")
-
 ;;; Segwit activation, for BLOCK_OPT_WITNESS
 
 (defvar *segwit-height-fn* nil
@@ -356,15 +346,14 @@ database (a test fixture) opens one for the duration of each call.")
 (defun %base-path-key (base-path)
   (namestring (or base-path #p"")))
 
-(defun %read-obfuscation-key (handle)
-  "The database's XOR key when it has a key record, else NIL. The value is an
-8-byte vector serialized with its CompactSize length (util/obfuscation.h:44-59)."
-  (let ((v (leveldb-get handle *obfuscation-key-record*)))
-    (when v
-      (unless (and (= (length v) 9) (= (aref v 0) 8))
-        (storage-error "Obfuscation key size should be exactly 8 bytes long"))
-      (let ((key (subseq v 1)))
-        (when (obfuscation-key-active-p key) key)))))
+(defun %active-obfuscation-key (handle)
+  "The database's XOR key when it has an active one, else NIL. Core opens
+blocks/index with obfuscation OFF (DBParams::obfuscate defaults to false,
+init.cpp:1339-1345), so it never writes the key record there; a record that IS
+present is honoured on read, as CDBWrapper does for every database. The record
+is the one the coins database reads (%READ-OBFUSCATION-KEY)."
+  (let ((key (%read-obfuscation-key handle)))
+    (when (obfuscation-key-active-p key) key)))
 
 (defun %open-block-tree-handle (base-path)
   "Open BASE-PATH's blocks/index and wrap it; signals on failure."
@@ -377,7 +366,7 @@ database (a test fixture) opens one for the duration of each call.")
                                           0)))))
     (handler-bind ((error (lambda (e) (declare (ignore e)) (leveldb-close handle))))
       (let ((db (%make-block-tree-db :handle handle :directory path
-                                     :obfuscation (%read-obfuscation-key handle))))
+                                     :obfuscation (%active-obfuscation-key handle))))
         (%seed-file-info-written db)
         db))))
 

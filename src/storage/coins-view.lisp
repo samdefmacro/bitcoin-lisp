@@ -1,26 +1,39 @@
 (in-package #:bitcoin-lisp.storage)
 
-;;; Coins-view-db: LevelDB-backed UTXO view.
+;;; Coins-view-db: Bitcoin Core's chainstate LevelDB, byte for byte.
 ;;;
-;;; Mirrors Bitcoin Core's CCoinsViewDB (refs/bitcoin/src/txdb.cpp:53).
-;;; This is the persistent layer: every operation hits LevelDB. A future
-;;; PR will add an in-memory caching layer on top (Core's
-;;; CCoinsViewCache) so reads/writes during a block's validation pass
-;;; don't all round-trip to disk.
+;;; Mirrors CCoinsViewDB (refs/bitcoin/src/txdb.cpp, txdb.h) over CDBWrapper
+;;; (dbwrapper.cpp), so a chainstate/ written by Core opens here and one
+;;; written here opens in Core. The records:
 ;;;
-;;; Key encoding follows Core's CoinEntry (txdb.cpp:43-49): a single
-;;; namespacing byte ('C' = 0x43) followed by the outpoint. Core uses
-;;; VARINT for the vout; we use a fixed 4-byte LE vout for simplicity
-;;; and to match our in-memory key layout. A future PR can switch to
-;;; VARINT for closer Core compatibility if/when that matters.
+;;;   \000obfuscate_key  CompactSize 8 + the 8-byte XOR key, stored PLAIN
+;;;                      (dbwrapper.cpp:253-261): drawn at random when the
+;;;                      database is created, XORed over every other VALUE
+;;;                      (CDBBatch::WriteImpl, CDBWrapper::Read); keys are
+;;;                      never obfuscated.
+;;;   'C' txid VARINT(n) CoinEntry (txdb.cpp:43-50) -> Coin (coins.h:63-79):
+;;;                      VARINT(height*2 + coinbase) then TxOutCompression
+;;;                      (compressor.h:98-116) -- the codec in
+;;;                      src/serialization/compressor.lisp, shared with the
+;;;                      assumeutxo snapshot and the undo files.
+;;;   'B'                DB_BEST_BLOCK, the uint256 of the block the coins are at.
+;;;   'H'                DB_HEAD_BLOCKS, std::vector<uint256>{new, old} while a
+;;;                      flush is between its first and its last batch.
+;;;   'c'                DB_COINS, Core's pre-0.15 per-transaction records:
+;;;                      never written, only looked for (NeedsUpgrade).
 ;;;
-;;; Value encoding reuses our existing utxo-entry layout (i64 value,
-;;; u32 height, u8 coinbase, u32 script-len + script bytes). Core uses
-;;; TxOutCompression for value/script compression; we leave that for
-;;; a future optimization PR — it's domain-specific compression that
-;;; doesn't affect correctness, just disk footprint.
+;;; ⚠️ VARINT is NOT order-preserving across encoded lengths: 16512 is
+;;; 80 80 00 and sorts before 256, 81 00. The raw key walk of a txid's coins
+;;; (Core's CCoinsViewDBCursor) is therefore not numeric vout order, which is
+;;; why kernel/coinstats.cpp buffers each txid into a std::map before hashing
+;;; and UTXO-SET-ITERATE regroups the same way.
+;;;
+;;; Two records are ours, and Core ignores both: 'M', the marker of the
+;;; one-shot utxoset.dat import (coins-view-migration.lisp), and
+;;; *LEGACY-UPGRADE-MARKER-KEY*, present only while a database in this tree's
+;;; pre-2026-09-29 layout is being converted (UPGRADE-COINS-VIEW-DB).
 
-(defconstant +db-prefix-coin+ #x43             ; 'C' — same as Core's DB_COIN
+(defconstant +db-prefix-coin+ #x43             ; 'C' — Core's DB_COIN
   "1-byte namespacing prefix for coin entries in the LevelDB.")
 
 (defconstant +db-prefix-migration-marker+ #x4D ; 'M'
@@ -29,14 +42,10 @@ marker. coins-view-migration.lisp writes this as its last step so an
 interrupted migration is detectable on the next startup.")
 
 (defconstant +db-prefix-best-block+ #x42        ; 'B' — Core's DB_BEST_BLOCK
-  "1-byte prefix for the block hash this UTXO set corresponds to.
-
-Core keeps this INSIDE the coins database and writes it in the same batch as
-the coin changes (CCoinsViewDB::BatchWrite, txdb.cpp:100-159), so the UTXO
-state and the block it belongs to are one object that cannot disagree. We have
-historically kept the tip in a separate chainstate.dat, which can and does
-disagree — that divergence is the root of the reorg-interrupt hazard and of the
-BIP30 replay brick. See docs/coins-db-best-block-plan.md; this key is phase 1.")
+  "1-byte key of the block hash this UTXO set corresponds to (txdb.cpp:24).
+CCoinsViewDB::BatchWrite erases it in a flush's first batch and writes it in
+the last (txdb.cpp:126-160), so the coins and the block they belong to cannot
+disagree once the flush has committed. See docs/coins-db-best-block-plan.md.")
 
 (defun encode-best-block-key ()
   "The single key under which the coins DB stores its own best block."
@@ -72,84 +81,63 @@ at a 1-in-N chance, logging `Simulating a crash. Goodbye.' (txdb.cpp:150-157).
   "What -dbcrashratio's crash does: end the process, as Core's _Exit(0).
 Tests bind it to a non-local exit to observe the database the crash leaves.")
 
-(defconstant +coin-key-bytes+ 37
-  "LevelDB key size: 1 prefix + 32 txid + 4 vout.")
+(defconstant +coin-key-txid-end+ 33
+  "Byte offset where a coin key's VARINT vout starts: 1 prefix + 32 txid.")
 
-(defconstant +coin-key-vout-offset+ 33
-  "Byte offset of the 4-byte LE vout within a coin key.")
-
-(defconstant +coin-value-fixed-bytes+ 17
-  "Fixed-size part of an encoded coin value: 8 value + 4 height + 1
-coinbase + 4 script-len. Variable part is the script bytes that follow.")
-
-(declaim (inline encode-coin-key))
 (defun encode-coin-key (utxo-key)
-  "Encode UTXO-KEY as the 37-byte LevelDB key (prefix + txid + LE vout)."
+  "UTXO-KEY as Core's CoinEntry (txdb.cpp:43-50): 'C', the 32-byte txid, then
+the vout as a VARINT (serialize.h:424-440) -- 34 to 36 bytes for any vout a
+block can hold."
   (declare (type utxo-key utxo-key))
-  (let ((bytes (make-array +coin-key-bytes+ :element-type '(unsigned-byte 8))))
-    (setf (aref bytes 0) +db-prefix-coin+)
-    (write-u64-le-into bytes 1 (uk-a utxo-key))
-    (write-u64-le-into bytes 9 (uk-b utxo-key))
-    (write-u64-le-into bytes 17 (uk-c utxo-key))
-    (write-u64-le-into bytes 25 (uk-d utxo-key))
-    (write-u32-le-into bytes +coin-key-vout-offset+ (uk-vout utxo-key))
-    bytes))
+  (let ((buf (bl.bytes:make-byte-buf
+              :data (make-array 40 :element-type '(unsigned-byte 8)))))
+    (bl.bytes:bb-write-u8 buf +db-prefix-coin+)
+    (bl.bytes:bb-write-u64-le buf (uk-a utxo-key))
+    (bl.bytes:bb-write-u64-le buf (uk-b utxo-key))
+    (bl.bytes:bb-write-u64-le buf (uk-c utxo-key))
+    (bl.bytes:bb-write-u64-le buf (uk-d utxo-key))
+    (bl.ser:bb-write-core-varint buf (uk-vout utxo-key))
+    (bl.bytes:bb-finish buf)))
+
+(defun decode-coin-key (key)
+  "Core CCoinsViewDBCursor::GetKey: KEY's (values txid vout), or NIL when KEY
+is not a 'C' record or its VARINT does not parse."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key))
+  (when (and (> (length key) +coin-key-txid-end+)
+             (= (aref key 0) +db-prefix-coin+))
+    (let ((br (bl.bytes:make-byte-reader :data key :pos +coin-key-txid-end+)))
+      (let ((vout (ignore-errors (bl.ser:br-read-core-varint br))))
+        (when (and vout (<= vout #xFFFFFFFF))
+          (values (subseq key 1 +coin-key-txid-end+) vout))))))
 
 (defun encode-coin-value (entry)
-  "Encode a utxo-entry to bytes. Format matches what save-utxo-set
-writes per entry, so a migration tool can read both layouts."
+  "ENTRY as Core serializes a Coin (coins.h:63-69), before obfuscation:
+VARINT(height*2 + coinbase), then the compressed amount and script."
   (declare (type utxo-entry entry))
   (let* ((script (utxo-entry-script-pubkey entry))
-         (script-len (length script))
-         (bytes (make-array (+ +coin-value-fixed-bytes+ script-len)
-                            :element-type '(unsigned-byte 8))))
-    (declare (type (simple-array (unsigned-byte 8) (*)) script))
-    ;; Inlined to avoid byte-buf's 1024-byte default allocation when the
-    ;; typical UTXO value is ~42 bytes.
-    (let ((value (utxo-entry-value entry)))
-      (declare (type (signed-byte 64) value))
-      (let ((uv (logand value #xFFFFFFFFFFFFFFFF)))
-        (declare (type (unsigned-byte 64) uv))
-        (write-u64-le-into bytes 0 uv)))
-    (write-u32-le-into bytes 8 (utxo-entry-height entry))
-    (setf (aref bytes 12) (if (utxo-entry-coinbase entry) 1 0))
-    (write-u32-le-into bytes 13 script-len)
-    (replace bytes script :start1 +coin-value-fixed-bytes+)
-    bytes))
+         (buf (bl.bytes:make-byte-buf
+               :data (make-array (+ 24 (length script))
+                                 :element-type '(unsigned-byte 8)))))
+    (bl.ser:bb-write-compressed-coin buf
+                                     (utxo-entry-height entry)
+                                     (utxo-entry-coinbase entry)
+                                     (logand (utxo-entry-value entry)
+                                             #xFFFFFFFFFFFFFFFF)
+                                     script)
+    (bl.bytes:bb-finish buf)))
 
 (defun decode-coin-value (bytes)
-  "Inverse of encode-coin-value. Direct aref reads — no byte-reader
-struct alloc on the per-block hot path."
-  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
-           (optimize (speed 3) (safety 1)))
-  (let* ((value-u64 (logior (aref bytes 0)
-                            (ash (aref bytes 1) 8)
-                            (ash (aref bytes 2) 16)
-                            (ash (aref bytes 3) 24)
-                            (ash (aref bytes 4) 32)
-                            (ash (aref bytes 5) 40)
-                            (ash (aref bytes 6) 48)
-                            (ash (aref bytes 7) 56)))
-         ;; Convert u64 → i64 (utxo-entry-value is signed-byte 64).
-         (value (if (zerop (logand value-u64 (ash 1 63)))
-                    value-u64
-                    (- value-u64 (ash 1 64))))
-         (height (logior (aref bytes 8)
-                         (ash (aref bytes 9) 8)
-                         (ash (aref bytes 10) 16)
-                         (ash (aref bytes 11) 24)))
-         (coinbase (= (aref bytes 12) 1))
-         (script-len (logior (aref bytes 13)
-                             (ash (aref bytes 14) 8)
-                             (ash (aref bytes 15) 16)
-                             (ash (aref bytes 16) 24)))
-         (script (subseq bytes
-                         +coin-value-fixed-bytes+
-                         (+ +coin-value-fixed-bytes+ script-len))))
-    (make-utxo-entry :value value
-                     :script-pubkey script
-                     :height height
-                     :coinbase coinbase)))
+  "Core Coin::Unserialize (coins.h:71-79) over BYTES, already de-obfuscated.
+A value read back as uint64 is Core's int64 nValue, so the top bit is the sign.
+Signals on a record that ends early."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (multiple-value-bind (height coinbase value script)
+      (bl.ser:br-read-compressed-coin (bl.bytes:make-byte-reader-from bytes))
+    (let ((v (logand value #xFFFFFFFFFFFFFFFF)))
+      (make-utxo-entry :value (if (logbitp 63 v) (- v (ash 1 64)) v)
+                       :script-pubkey script
+                       :height (logand height #xFFFFFFFF)
+                       :coinbase coinbase))))
 
 ;;;; Public API
 ;;;;
@@ -157,7 +145,11 @@ struct alloc on the per-block hot path."
 ;;;; coins-view-db-* functions. The struct itself is just a handle.
 
 (defstruct (coins-view-db (:conc-name cvdb-))
-  (db nil))
+  (db nil)
+  ;; CDBWrapper::m_obfuscation: the 8-byte XOR key every value is stored
+  ;; under, read from the database at open (all zero = stored plain).
+  (obfuscation (zero-obfuscation-key)
+   :type (simple-array (unsigned-byte 8) (*))))
 
 (defun open-coins-view-db (path)
   "Open or create the coins-view LevelDB at PATH. Caller must call
@@ -189,7 +181,8 @@ h≈280k — but 1000 is well clear of that and stays inside the mmap regime, wh
 cached tables cost address space rather than descriptors.
 
 The open ends with Core's obfuscation-key step (%READ-OR-WRITE-OBFUSCATION-KEY),
-which is also the read that finds a damaged database at open time."
+which is also the read that finds a damaged database at open time; the key it
+answers is the one every value of this handle is XORed with."
   (let ((db (leveldb-open-tuned
              path
              ;; Core gives the coins DB its own share of -dbcache and a bloom
@@ -201,8 +194,8 @@ which is also the read that finds a damaged database at open time."
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
                             (leveldb-close db))))
-      (%read-or-write-obfuscation-key db path))
-    (make-coins-view-db :db db)))
+      (make-coins-view-db :db db
+                          :obfuscation (%read-or-write-obfuscation-key db path)))))
 
 (defparameter *obfuscation-key-key*
   (let ((name (map 'list #'char-code "obfuscate_key")))
@@ -210,64 +203,58 @@ which is also the read that finds a damaged database at open time."
   "Core's OBFUSCATION_KEY (dbwrapper.h:192), `\\000obfuscate_key', serialized as
 the std::string it is written as: a CompactSize length of 14, then the bytes.
 It sorts ahead of every coins-DB record, so it is the first key of the
-database.")
+database. The block tree database reads the same record.")
 
-(defparameter *zero-obfuscation-key*
-  (make-array 9 :element-type '(unsigned-byte 8)
-                :initial-contents '(8 0 0 0 0 0 0 0 0))
-  "The obfuscation-key record of a database whose values are stored plain: a
-CompactSize 8 and eight zero bytes.")
+(defun %obfuscation-key-record (key)
+  "KEY as Core serializes it (util/obfuscation.h:44-51): a CompactSize 8, then
+the eight bytes."
+  (let ((v (make-array 9 :element-type '(unsigned-byte 8) :initial-element 8)))
+    (replace v key :start1 1)
+    v))
 
-(defun %obfuscation-key-hex (record)
-  "The key's eight bytes as Core logs them, without the CompactSize prefix."
-  (bl.crypto:bytes-to-hex (subseq record (min 1 (length record)))))
+(defun %read-obfuscation-key (db &key verify-checksums)
+  "DB's stored XOR key (8 bytes), or NIL when it has no key record. Core's
+Obfuscation::Unserialize refuses a key that is not exactly 8 bytes
+(util/obfuscation.h:53-59)."
+  (let ((v (leveldb-get db *obfuscation-key-key* :verify-checksums verify-checksums)))
+    (when v
+      (unless (and (= (length v) 9) (= (aref v 0) 8))
+        (storage-error "Obfuscation key size should be exactly 8 bytes long"))
+      (subseq v 1))))
 
 (defun %read-or-write-obfuscation-key (db path)
   "Core's CDBWrapper constructor tail for the coins DB (dbwrapper.cpp:253-261,
-`.obfuscate = true' at validation.cpp:1921): read the obfuscation key, and on a
-database that is still EMPTY write one; then log `Using obfuscation key'.
+`.obfuscate = true' at validation.cpp:1921): read the obfuscation key; on a
+database that is still EMPTY draw a RANDOM one and write it (plain); log
+`Using obfuscation key'. Returns the key -- all zero for a database that has
+none, which Core reads as `stored plain' (Obfuscation's operator bool).
 
 The read is what makes a damaged coins database a failure at OPEN, Core's
 `Error opening coins database' (node/chainstate.cpp:89-97): the key is the
 first record, so it sits in the first block of the oldest table, and the read
 verifies that block's checksum. feature_init.py:160 overwrites 200 bytes at
-offset 150 of every chainstate/*.ldb and expects that sentence; without the
-read, our first access to a damaged table came later, in VerifyDB, and
-surfaced as a bare LevelDB error.
-
-The key we write is the all-zero one. Core draws it at random and XORs every
-value it stores with it; our coin records are our own layout (see the header
-of this file) and are stored as they are, and the zero key is exactly what
-Core uses for a database whose values are not obfuscated (Obfuscation's
-operator bool). A non-zero key -- a database whose values another writer
-obfuscated -- is read and logged as Core reads and logs it, NOT refused here:
-Core's constructor accepts any key, and the refusals come after it in
-InitCoinsDB's order -- NeedsUpgrade's `Unsupported chainstate database
-format' first (node/chainstate.cpp:103-109), which a v0.14.3 chainstate
-must be answered with (feature_unsupported_utxo_db.py:48) although it
-carries a key of its own. COINS-VIEW-DB-FOREIGN-OBFUSCATION-P is the
-question start-up asks next."
-  (let ((stored (leveldb-get db *obfuscation-key-key* :verify-checksums t)))
-    (unless (or stored
+offset 150 of every chainstate/*.ldb and expects that sentence."
+  (let ((name (string-right-trim "/" (namestring path)))
+        (key (%read-obfuscation-key db :verify-checksums t)))
+    (unless (or key
                 (with-leveldb-iterator (iter db)
                   (leveldb-iter-seek-to-first iter)
                   (leveldb-iter-valid-p iter)))
-      (leveldb-put db *obfuscation-key-key* *zero-obfuscation-key*)
-      (bl.log:log-info "Wrote new obfuscation key for ~A: 0000000000000000"
-                       (string-right-trim "/" (namestring path))))
-    (bl.log:log-info "Using obfuscation key for ~A: ~A"
-                     (string-right-trim "/" (namestring path))
-                     (%obfuscation-key-hex (or stored *zero-obfuscation-key*)))))
+      (setf key (make-obfuscation-key))
+      (leveldb-put db *obfuscation-key-key* (%obfuscation-key-record key))
+      (bl.log:log-info "Wrote new obfuscation key for ~A: ~A"
+                       name (bl.crypto:bytes-to-hex key)))
+    (let ((key (or key (zero-obfuscation-key))))
+      (bl.log:log-info "Using obfuscation key for ~A: ~A"
+                       name (bl.crypto:bytes-to-hex key))
+      key)))
 
-(defun coins-view-db-foreign-obfuscation-p (view)
-  "T iff the coins database holds an obfuscation key that is not the zero key:
-a database another writer XORed its values with. Core applies such a key; our
-coin records are stored plain and could not be read through it, so start-up
-refuses the database (after NeedsUpgrade has had Core's say) and names
--reindex-chainstate, whose wipe writes the zero key back."
-  (declare (type coins-view-db view))
-  (let ((stored (leveldb-get (cvdb-db view) *obfuscation-key-key*)))
-    (and stored (not (equalp stored *zero-obfuscation-key*)))))
+(declaim (inline %xor-value))
+(defun %xor-value (view bytes)
+  "BYTES XORed in place with VIEW's key from offset 0 -- CDBBatch::WriteImpl
+on the way in, CDBWrapper::Read on the way out (dbwrapper.cpp:173-180, :218).
+Its own inverse; BYTES must be a fresh vector nobody else holds."
+  (obfuscate! bytes (cvdb-obfuscation view)))
 
 (defun close-coins-view-db (view)
   (when (cvdb-db view)
@@ -279,17 +266,12 @@ refuses the database (after NeedsUpgrade has had Core's say) and names
      (unwind-protect (progn ,@body)
        (close-coins-view-db ,var))))
 
-(declaim (inline coins-view-db-get
-                 coins-view-db-put
-                 coins-view-db-erase
-                 coins-view-db-has-p))
-
 (defun coins-view-db-get (view utxo-key)
   "Return the utxo-entry stored under UTXO-KEY, or NIL if absent.
 Mirrors CCoinsViewDB::GetCoin (txdb.cpp:72)."
   (declare (type coins-view-db view) (type utxo-key utxo-key))
   (let ((bytes (leveldb-get (cvdb-db view) (encode-coin-key utxo-key))))
-    (when bytes (decode-coin-value bytes))))
+    (when bytes (decode-coin-value (%xor-value view bytes)))))
 
 (defun coins-view-db-put (view utxo-key entry)
   "Write ENTRY under UTXO-KEY. NOT atomic with other ops — use
@@ -299,7 +281,7 @@ coins-view-db-write-batch for multi-op atomicity."
            (type utxo-entry entry))
   (leveldb-put (cvdb-db view)
                (encode-coin-key utxo-key)
-               (encode-coin-value entry)))
+               (%xor-value view (encode-coin-value entry))))
 
 (defun coins-view-db-erase (view utxo-key)
   (declare (type coins-view-db view) (type utxo-key utxo-key))
@@ -308,40 +290,54 @@ coins-view-db-write-batch for multi-op atomicity."
 (defun coins-view-db-best-block (view)
   "The block hash this UTXO set corresponds to, or NIL if never recorded.
 
-Core's CCoinsView::GetBestBlock. NIL means the database predates this key —
-every write path now sets it, so NIL only ever appears on a chainstate written
-by an older build, not on one that has been flushed since."
+Core's CCoinsViewDB::GetBestBlock (txdb.cpp:83-88): the DB_BEST_BLOCK value,
+de-obfuscated, read as a uint256; absent (or short) is the null hash, NIL here.
+A flush erases it in its first batch and writes it back in its last, so NIL is
+also what a database part way through a partial-batch flush answers, and
+COINS-VIEW-DB-HEAD-BLOCKS then says which transition it was in."
   (declare (type coins-view-db view))
-  (leveldb-get (cvdb-db view) (encode-best-block-key)))
+  (let ((v (leveldb-get (cvdb-db view) (encode-best-block-key))))
+    (when (and v (>= (length v) 32))
+      (subseq (%xor-value view v) 0 32))))
 
 (defun coins-view-db-head-blocks (view)
   "Core CCoinsViewDB::GetHeadBlocks (txdb.cpp:90-96): the DB_HEAD_BLOCKS record
 as a list of hashes, the new tip first -- empty when no flush is in progress.
 The value is a serialized std::vector<uint256>: a CompactSize count, then the
-hashes."
+hashes, obfuscated like every value."
   (declare (type coins-view-db view))
   (let ((v (leveldb-get (cvdb-db view) (encode-head-blocks-key))))
     (when (and v (plusp (length v)))
+      (%xor-value view v)
       (loop for i from 0 below (aref v 0)
+            while (<= (+ 33 (* 32 i)) (length v))
             collect (subseq v (+ 1 (* 32 i)) (+ 33 (* 32 i)))))))
 
 (defun %head-blocks-value (new old)
-  "NEW and OLD as Core's two-hash vector; OLD NIL is the null hash."
+  "NEW and OLD as Core's two-hash vector, before obfuscation; OLD NIL is the
+null hash."
   (let ((v (make-array 65 :element-type '(unsigned-byte 8) :initial-element 0)))
     (setf (aref v 0) 2)
     (replace v new :start1 1)
     (when old (replace v old :start1 33))
     v))
 
-(defun coins-view-batch-set-best-block (batch block-hash)
-  "Stage the coins DB's best-block pointer in BATCH.
+(defun coins-view-batch-set-head-blocks (view batch new old)
+  "Stage DB_HEAD_BLOCKS = {NEW, OLD} in BATCH (txdb.cpp:126-129)."
+  (leveldb-writebatch-put batch (encode-head-blocks-key)
+                          (%xor-value view (%head-blocks-value new old))))
+
+(defun coins-view-batch-set-best-block (view batch block-hash)
+  "Stage the coins DB's best-block pointer in BATCH, obfuscated as Core's
+CDBBatch::Write obfuscates every value.
 
 Staging it in the SAME batch as the coin puts and erases is the whole point:
 the UTXO changes and the block they belong to then commit or fail together, so
 the pair can never be observed or persisted in disagreement (Core does this in
 CCoinsViewDB::BatchWrite, txdb.cpp:100-159)."
   (declare (type (simple-array (unsigned-byte 8) (32)) block-hash))
-  (leveldb-writebatch-put batch (encode-best-block-key) block-hash))
+  (leveldb-writebatch-put batch (encode-best-block-key)
+                          (%xor-value view (copy-seq block-hash))))
 
 (defun coins-view-db-has-p (view utxo-key)
   "Mirrors CCoinsViewDB::HaveCoin (txdb.cpp:81)."
@@ -387,10 +383,10 @@ makes the question moot, which is why the caller skips it under -reindex and
 (defun coins-view-db-erase-all-coins (view)
   "Empty the base LevelDB: delete every coin ('C') entry AND the best-block
 ('B') pointer, in bounded writebatches, keeping only the 'M' migration marker
-and the obfuscation key, which the final batch resets to the zero key (Core's
-wiped database gets a new key from the very constructor that wiped it,
-dbwrapper.cpp:230-259; a key another writer left is gone with its values).
-Used by chainstate reindex. Returns the count of COINS erased.
+and the obfuscation key record, which the final batch replaces with a fresh
+RANDOM key that VIEW then uses (Core's wiped database gets a new key from the
+very constructor that wiped it, dbwrapper.cpp:230-259). Used by chainstate
+reindex. Returns the count of COINS erased.
 
 The pointer goes with the coins, and that is the whole point rather than a
 tidy-up: Core's -reindex-chainstate opens the coins DB with should_wipe, a
@@ -439,8 +435,11 @@ first commit onward a partially-wiped database names no block either."
            ;; (coin count a multiple of the chunk size) — so the whole wipe,
            ;; whose earlier chunks were :sync nil in the same WAL, is durable
            ;; before callers persist state that assumes the coins are gone.
-           (leveldb-writebatch-put batch *obfuscation-key-key* *zero-obfuscation-key*)
-           (leveldb-write db batch :sync t))
+           (let ((key (make-obfuscation-key)))
+             (leveldb-writebatch-put batch *obfuscation-key-key*
+                                     (%obfuscation-key-record key))
+             (leveldb-write db batch :sync t)
+             (setf (cvdb-obfuscation view) key)))
       (leveldb-destroy-writebatch batch))
     erased))
 
@@ -468,19 +467,23 @@ fsync on commit."
          (multiple-value-prog1 (progn ,@body)
            (leveldb-write (cvdb-db ,view-sym) ,batch :sync ,sync-sym))))))
 
-(declaim (inline coins-view-batch-put coins-view-batch-erase))
-
-(defun coins-view-batch-put (batch utxo-key entry)
-  "Stage a put of ENTRY under UTXO-KEY in BATCH."
-  (declare (type utxo-key utxo-key) (type utxo-entry entry))
-  (leveldb-writebatch-put batch
-                          (encode-coin-key utxo-key)
-                          (encode-coin-value entry)))
+(defun coins-view-batch-put (view batch utxo-key entry)
+  "Stage a put of ENTRY under UTXO-KEY in BATCH, obfuscated with VIEW's key
+(CDBBatch::Write, dbwrapper.h:98-107). Returns the bytes the record adds to
+the batch, LevelDB's WriteBatch::ApproximateSize growth: a tag, two length
+prefixes, the key and the value."
+  (declare (type coins-view-db view) (type utxo-key utxo-key) (type utxo-entry entry))
+  (let ((k (encode-coin-key utxo-key))
+        (v (%xor-value view (encode-coin-value entry))))
+    (leveldb-writebatch-put batch k v)
+    (+ 3 (length k) (length v))))
 
 (defun coins-view-batch-erase (batch utxo-key)
-  "Stage an erase of UTXO-KEY in BATCH."
+  "Stage an erase of UTXO-KEY in BATCH. Returns the bytes it adds to the batch."
   (declare (type utxo-key utxo-key))
-  (leveldb-writebatch-delete batch (encode-coin-key utxo-key)))
+  (let ((k (encode-coin-key utxo-key)))
+    (leveldb-writebatch-delete batch k)
+    (+ 2 (length k))))
 
 (defun coins-view-db-write-batch (view ops &key sync)
   "Atomically apply OPS to VIEW. Each op is either
@@ -492,5 +495,5 @@ callers should use with-coins-view-batch directly."
   (with-coins-view-batch (batch view :sync sync)
     (dolist (op ops)
       (ecase (first op)
-        (:put   (coins-view-batch-put batch (second op) (third op)))
+        (:put   (coins-view-batch-put view batch (second op) (third op)))
         (:erase (coins-view-batch-erase batch (second op)))))))
