@@ -65,36 +65,41 @@
     (bl.ser:parse-headers-payload
      (%bytes #xfd #xd1 #x07))))       ; 2001 = 0x07d1
 
-;;;; Block-relay message count caps (compact block / getblocktxn / blocktxn)
+;;;; Block-relay message counts (compact block / getblocktxn / blocktxn)
 
-;; compact-size for 50001 (just over +max-block-tx-count+), in its CANONICAL
-;; 0xfd + LE16 form. The former 0xfe + LE32 spelling was non-canonical, so the
-;; three tests below were passing on "non-canonical ReadCompactSize" and never
-;; reached the count cap they exist to prove.
-(defparameter +over-block-tx-count-cs+ (%bytes #xfd #x51 #xc3))
-
-(test compact-block-rejects-oversized-shortids
-  ;; 80-byte header + 8-byte nonce + an over-limit short-ids count.
-  (signals error
-    (bl.bytes:with-byte-reader
-        (s (%concat-bytes (make-array 88 :element-type '(unsigned-byte 8) :initial-element 0)
-                          +over-block-tx-count-cs+))
-      (bl.ser:read-compact-block s))))
-
-(test getblocktxn-rejects-oversized-count
-  ;; 32-byte block hash + an over-limit index count.
-  (signals error
-    (bl.bytes:with-byte-reader
-        (s (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-                          +over-block-tx-count-cs+))
-      (bl.ser::read-block-txn-request s))))
-
-(test blocktxn-rejects-oversized-count
-  (signals error
-    (bl.bytes:with-byte-reader
-        (s (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-                          +over-block-tx-count-cs+))
-      (bl.ser::read-block-txn-response s))))
+(test block-relay-counts-are-bounded-by-max-size
+  "Core reads the BIP152 vectors' counts with ReadCompactSize and nothing else
+(VectorFormatter, serialize.h:357-359): above MAX_SIZE (0x02000000) the read
+throws `ReadCompactSize(): size too large' before any allocation. That is the
+bound ours keeps for the short IDs, the prefilled transactions, the
+getblocktxn indexes and the blocktxn transactions -- a plain deserialization
+failure, forgiven by the dispatch, never an over-limit vector. The count is
+written canonically (0xfe + LE32), so the size check is what fails, not the
+encoding; the control is the same message one below the bound, which gets as
+far as the payload's end of data."
+  (flet ((failure (parse prefix count)
+           (handler-case
+               (progn (funcall parse (%concat-bytes prefix
+                                                    (%bytes #xfe (ldb (byte 8 0) count) (ldb (byte 8 8) count)
+                                                            (ldb (byte 8 16) count) (ldb (byte 8 24) count))))
+                      nil)
+             (error (c) c))))
+    (let ((header+nonce (make-array 88 :element-type '(unsigned-byte 8) :initial-element 0))
+          (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+          (hash+no-ids (%concat-bytes (make-array 88 :element-type '(unsigned-byte 8) :initial-element 0)
+                                      (%bytes 0))))
+      (dolist (case (list (list "short IDs" #'bl.ser:parse-cmpctblock-payload header+nonce)
+                          (list "prefilled" #'bl.ser:parse-cmpctblock-payload hash+no-ids)
+                          (list "getblocktxn" #'bl.ser:parse-getblocktxn-payload hash)
+                          (list "blocktxn" #'bl.ser:parse-blocktxn-payload hash)))
+        (destructuring-bind (name parse prefix) case
+          (let ((over (failure parse prefix #x02000001))
+                (at (failure parse prefix #x02000000)))
+            (is-true (and over (search "size too large" (princ-to-string over)))
+                     "~A: MAX_SIZE + 1 must be ReadCompactSize's refusal, got ~A" name over)
+            (is-false (typep over 'bl.err:protocol-limit-error) "~A: not an over-limit vector" name)
+            (is-true (and at (not (search "size too large" (princ-to-string at))))
+                     "~A: control, MAX_SIZE itself passes the count check, got ~A" name at)))))))
 
 (test addrv2-rejects-oversized-count
   ;; addrv2 now rejects (not silently truncates) above MAX_ADDR_TO_SEND (1000).
@@ -212,6 +217,52 @@ them and discouraged the locator sender too."
         (is-false (bl.net:peer-discouraged-p "127.0.0.1")
                   "~A: a long locator disconnects, it does not discourage" command))))
   (bl.net:clear-discouraged))
+
+(test an-oversized-block-relay-vector-is-forgiven
+  "cmpctblock, getblocktxn and blocktxn carry plain vectors in Core -- no named
+limit: VectorFormatter reads the count with ReadCompactSize, bounded only by
+MAX_SIZE (serialize.h:32, :357-359), and CBlockHeaderAndShortTxIDs adds
+`indexes overflowed 16 bits' (blockencodings.h:121-130). Every one of those is
+an ios_base::failure that ProcessMessages catches, logs and forgives
+(net_processing.cpp:5283-5287) -- no Misbehaving. Ours capped all four counts
+at an invented 50,000 and punished the peer through PROTOCOL-LIMIT-ERROR.
+50,001 is now what Core reads it as -- a count, and the payload's end of data;
+50,001 short IDs WITH their bytes decode; and MAX_SIZE + 1 is a plain
+deserialization failure, not an over-limit vector."
+  (let ((count-50001 (%bytes #xfd #x51 #xc3))
+        (count-over-max-size (%bytes #xfe #x01 0 0 2)))
+    (dolist (case (list (cons "cmpctblock" (%concat-bytes (make-array 88 :element-type '(unsigned-byte 8)
+                                                                        :initial-element 0)
+                                                           count-50001))
+                        (cons "getblocktxn" (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element 0)
+                                                            count-50001))
+                        (cons "blocktxn" (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8)
+                                                                      :initial-element 0)
+                                                         count-50001))))
+      ;; A mempool, which the cmpctblock and blocktxn handlers need before
+      ;; they parse, and a block store getblocktxn needs before it parses --
+      ;; one the payload's failure never reaches.
+      (multiple-value-bind (still-connected peer)
+          (%dispatch-to-fake-peer (car case) (cdr case) (%fake-ready-peer)
+                                  (bl.ctx:make-node-context :mempool (bl.mp:make-mempool)
+                                                            :block-store :never-read))
+        (is (eq t still-connected) "~A with 50,001 elements must be forgiven" (car case))
+        (is (eq :ready (bl.net:peer-state peer)) "~A: the peer must stay" (car case))))
+    (let ((raised (handler-case
+                      (bl.ser:parse-blocktxn-payload
+                       (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                      count-over-max-size))
+                    (error (c) c))))
+      (is (typep raised 'bl.err:serialization-error) "MAX_SIZE + 1 must fail: ~A" raised)
+      (is-false (typep raised 'bl.err:protocol-limit-error) "...and not as an over-limit vector"))
+    (let* ((ids 50001)
+           (payload (%concat-bytes (make-array 88 :element-type '(unsigned-byte 8) :initial-element 0)
+                                   count-50001
+                                   (make-array (* 6 ids) :element-type '(unsigned-byte 8) :initial-element 7)
+                                   (%bytes 0))))
+      (is (= ids (length (bl.ser:compact-block-short-ids (bl.ser:parse-cmpctblock-payload payload))))
+          "50,001 short IDs with their bytes are a compact block Core decodes"))))
 
 (test undecodable-payload-keeps-the-peer
   "A payload that merely fails to decode is caught and forgiven, the way Core's

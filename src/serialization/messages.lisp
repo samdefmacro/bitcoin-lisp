@@ -535,7 +535,9 @@ the characters it decodes to are however many UTF-8 makes of them."
   "Read a CompactSize count from BR and signal PROTOCOL-LIMIT-ERROR if it
 exceeds MAX. NAME labels the field. Rejecting an over-limit count up front --
 rather than looping/allocating for it -- is Bitcoin Core's misbehaving-peer
-posture for protocol vectors (inv, headers, addr, block txns).
+posture for the protocol vectors Core names a limit for (inv, getdata,
+headers, addr, a block locator); a vector Core reads plainly -- the BIP152
+messages -- takes BR-READ-COMPACT-SIZE instead.
 
 The condition type carries that posture: it is the one deserialization failure
 the message dispatch punishes, because Core's handlers check these limits
@@ -559,12 +561,6 @@ that exceeds this is misbehaving; reject the whole message.")
 (defconstant +max-locator-count+ 101
   "Maximum block hashes in a getheaders/getblocks block locator (Bitcoin Core
 MAX_LOCATOR_SZ). A peer that exceeds this is misbehaving.")
-
-(defconstant +max-block-tx-count+ 50000
-  "Upper bound on the number of transactions referenced by a single block in the
-compact-block / getblocktxn / blocktxn messages. A 4M-weight block holds at most
-~16.7k of the smallest possible transactions, so this never rejects a valid
-block while bounding the per-message allocation well below the compact-size cap.")
 
 (defun parse-inv-payload (payload)
   "Parse an inv or getdata message payload into a list of inv-vectors."
@@ -622,7 +618,11 @@ reads instead of Gray-stream input dispatch."
     (:documentation "BIP 152 compact block (HeaderAndShortIDs).")
   (header :block-header)
   (nonce :u64)                            ; random nonce for short ID generation
-  (short-ids (:list :short-txid :max +max-block-tx-count+ :name "compact-block short-ids"))
+  ;; Core's vectors here are plain VectorFormatters: the count is a
+  ;; ReadCompactSize bounded by MAX_SIZE alone, a failure the ProcessMessages
+  ;; catch forgives (net_processing.cpp:5283-5287) -- no named limit, no
+  ;; Misbehaving. The 16-bit total below is the only other bound.
+  (short-ids (:list :short-txid))
   ;; Prefilled transactions carry DIFFERENTIAL indexes (each index is the gap
   ;; from the previous absolute index, minus one) and, per BIP152 v2, are
   ;; serialized WITH witness (Core PrefilledTransaction, blockencodings.h:80):
@@ -640,7 +640,7 @@ reads instead of Gray-stream input dispatch."
   (prefilled-txs :custom :slot-type list
     :read (let* ((last-index -1)
                  (prefilled
-                   (loop repeat (br-read-bounded-count br +max-block-tx-count+ "compact-block prefilled")
+                   (loop repeat (br-read-compact-size br)
                          collect (let ((diff-index (br-read-compact-size br)))
                                    (when (> diff-index #xffff)
                                      (serialization-error "CompactSize exceeds limit of type"))
@@ -672,7 +672,7 @@ reads instead of Gray-stream input dispatch."
   ;; (blockencodings.h:25-33), so the message fails to deserialize.
   (indexes :custom :slot-type list
     :read (let ((last-index -1))
-            (loop repeat (br-read-bounded-count br +max-block-tx-count+ "getblocktxn indexes")
+            (loop repeat (br-read-compact-size br)
                   collect (let ((abs-index (+ last-index (br-read-compact-size br) 1)))
                             (when (> abs-index #xffff)
                               (serialization-error "differential value overflow"))
@@ -689,7 +689,7 @@ reads instead of Gray-stream input dispatch."
 (define-message block-txn-response
     (:documentation "BIP 152 block transactions response (blocktxn).")
   (block-hash :hash256)
-  (transactions (:list :transaction :max +max-block-tx-count+ :name "blocktxn transactions")))
+  (transactions (:list :transaction)))
 
 
 ;;; Read/write 6-byte short txid (little-endian)

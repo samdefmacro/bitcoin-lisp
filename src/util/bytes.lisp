@@ -199,7 +199,7 @@ The byte-buf counterpart of flexi-streams:with-output-to-sequence."
 ;;; index; each reader bumps the index and reads via AREF directly.
 
 (defstruct (byte-reader (:conc-name br-))
-  (data #() :type (simple-array (unsigned-byte 8) (*)))
+  (data (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
   (pos 0 :type fixnum))
 
 (declaim (inline make-byte-reader-from

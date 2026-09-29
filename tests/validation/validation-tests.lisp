@@ -2502,6 +2502,45 @@ would be rejected for the wrong reason and prove nothing about the bound."
                "72 bytes with the hashtype is legal — the fix must not
                 over-tighten and start rejecting valid signatures"))))
 
+(test signature-encoding-agrees-with-the-interpreters-der-check
+  "BL.CRYPTO:VALID-SIGNATURE-ENCODING-P is Core's IsValidSignatureEncoding
+(script/interpreter.cpp:108-172) in Core's frame -- hashtype byte included --
+for readers below the script layer (the PSBT decoder). The interpreter keeps
+its own copy in the stripped frame. The two must agree on every signature:
+real ones, the size-bound vectors, and seeded single-byte mutations, length
+changes and truncations of each."
+  (let* ((key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+         (state 88172645463325252)
+         (agreed-valid 0)
+         (agreed-invalid 0))
+    (flet ((next (bound)
+             (setf state (logand (logxor state (ash state 13)) #xFFFFFFFFFFFFFFFF)
+                   state (logxor state (ash state -7))
+                   state (logand (logxor state (ash state 17)) #xFFFFFFFFFFFFFFFF))
+             (mod state bound))
+           (octets (seq) (coerce seq '(simple-array (unsigned-byte 8) (*)))))
+      (dotimes (i 300)
+        (let* ((hash (octets (loop repeat 32 collect (next 256))))
+               (der (octets (bl.crypto:sign-ecdsa key hash))))
+          (dotimes (j 8)
+            (let ((sig (copy-seq der)))
+              (case (next 4)
+                (0 (setf (aref sig (next (length sig))) (next 256)))
+                (1 (setf sig (subseq sig 0 (next (1+ (length sig))))))
+                (2 (setf (aref sig (next (min 8 (length sig)))) (next 256)))
+                (3 nil))
+              (let ((full (concatenate '(simple-array (unsigned-byte 8) (*)) sig (list 1)))
+                    (stripped (bl.interop:check-der-signature-format sig)))
+                (is (eq (not (bl.crypto:valid-signature-encoding-p full)) (not stripped))
+                    "the two checks disagree on ~A" (bl.crypto:bytes-to-hex sig))
+                (if stripped (incf agreed-valid) (incf agreed-invalid)))))))
+      (is (and (> agreed-valid 300) (> agreed-invalid 300))
+          "vacuity: both verdicts reached (~D valid, ~D invalid)" agreed-valid agreed-invalid)
+      (is-false (bl.crypto:valid-signature-encoding-p (octets '(48 6 2 1 1 2 1 1))) "8 bytes is below Core's 9")
+      (is-true (bl.crypto:defined-hashtype-signature-p (octets '(48 #x83))))
+      (is-false (bl.crypto:defined-hashtype-signature-p (octets '(48 #x84))))
+      (is-false (bl.crypto:defined-hashtype-signature-p (octets '()))))))
+
 ;;;; ACCEPT-BLOCK-BODY -- Core AcceptBlock's pre-write gate
 
 (test accept-block-body-is-the-gate-every-persist-path-runs

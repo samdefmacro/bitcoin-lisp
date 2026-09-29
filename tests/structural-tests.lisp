@@ -2249,3 +2249,64 @@ occurrence itself."
                       while at do (setf start (1+ at))
                       count t)))
     (is (= 1 count) "~D copies of the received-message format in src/" count)))
+
+;;;; A defstruct slot's default satisfies the slot's own type
+
+(defun %evaluable-default (initform)
+  "INITFORM's value when it is a constant or a MAKE-ARRAY of constants -- the
+two shapes a literal default takes -- and :UNKNOWN for anything else."
+  (if (or (constantp initform)
+          (and (consp initform) (eq (car initform) 'make-array)
+               (every #'constantp (cdr initform))))
+      (eval initform)
+      :unknown))
+
+(defun %struct-default-mismatches (classes)
+  "Every slot of the structure CLASSES whose evaluable, non-NIL default is not
+of its declared type, as (class slot initform type); and how many such
+defaults were checked. A NIL default on a typed slot is the must-be-supplied
+idiom -- the constructor refuses it as a missing argument would -- and is not
+counted."
+  (let ((bad '()) (checked 0))
+    (dolist (class classes)
+      (dolist (slot (sb-mop:class-slots class))
+        (let* ((init (sb-mop:slot-definition-initform slot))
+               (type (sb-mop:slot-definition-type slot))
+               (value (%evaluable-default init)))
+          (unless (or (eq type t) (null value) (eq value :unknown))
+            (incf checked)
+            (unless (typep value type)
+              (push (list (class-name class) (sb-mop:slot-definition-name slot) init type) bad))))))
+    (values bad checked)))
+
+(defun %our-structure-classes ()
+  (let ((classes '()))
+    (dolist (package (list-all-packages) classes)
+      (when (eql 0 (search "BITCOIN-LISP" (package-name package)))
+        (do-symbols (s package)
+          (let ((class (and (eq (symbol-package s) package) (find-class s nil))))
+            (when (typep class 'structure-class)
+              (pushnew class classes))))))))
+
+(test struct-slot-defaults-satisfy-their-types
+  "A defstruct default is what the constructor stores when the caller leaves the
+slot out, so it must be of the slot's declared type. `#()' is a SIMPLE-VECTOR of
+element type T, never a (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (*)): TX-IN, TX-OUT,
+UTXO-ENTRY, BYTE-READER, SCRIPT-CONTEXT, TX-CONFIRM-STATS and the fuzz harness's
+provider all declared a byte (or double-float, or fixnum) array with it, so
+`(make-tx-in)' without a script signalled a TYPE-ERROR -- a default that looked
+like one and could not be used. Every structure in our packages is walked; the
+positive control is that walk's own verdict on a `#()' default."
+  (multiple-value-bind (bad checked) (%struct-default-mismatches (%our-structure-classes))
+    (is (null bad) "defaults outside their slot's type:~{~%  ~S~}" bad)
+    (is (> checked 200) "vacuity: only ~D defaults were checked" checked))
+  (is-true (typep (bl.ser:tx-in-script-sig (bl.ser:make-tx-in)) '(simple-array (unsigned-byte 8) (*))))
+  (is-true (typep (bl.ser:tx-out-script-pubkey (bl.ser:make-tx-out)) '(simple-array (unsigned-byte 8) (*))))
+  (is-true (typep (bl.store:utxo-entry-script-pubkey (bl.store:make-utxo-entry)) '(simple-array (unsigned-byte 8) (*))))
+  (is-true (bl.bytes:br-eof-p (bl.bytes:make-byte-reader)))
+  (is-false (typep #() '(simple-array (unsigned-byte 8) (*))) "control: #() is not a byte array")
+  (is (eql #() (%evaluable-default #())) "control: a literal default is evaluated")
+  (is (typep (%evaluable-default '(make-array 0 :element-type 'double-float))
+             '(simple-array double-float (*)))
+      "control: a MAKE-ARRAY default is evaluated, so a fixed slot is checked")
+  (is (eq :unknown (%evaluable-default '(make-outpoint))) "control: a call is not evaluated"))

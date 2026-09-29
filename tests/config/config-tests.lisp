@@ -52,10 +52,33 @@ C-locale atoi with the undefined behaviour removed."
   (is (= 0   (bl.cfg:locale-independent-atoi "")))
   (is (= 0   (bl.cfg:locale-independent-atoi "abc"))))
 
+(test conf-parse-int-reads-as-getintarg-does
+  "An integer option's string value is read as Core's GetIntArg reads it --
+SettingTo<int64_t> hands every string to LocaleIndependentAtoi
+(common/args.cpp:498-506): Core's own setting_args vectors
+(test/getarg_tests.cpp:70-100) and atoi64_test_pairs (test/util_tests.cpp:807-816),
+through CONF-PARSE-INT and through an :int row of the option table. Nothing a
+user can write is refused as a non-integer: garbage is 0, trailing text is
+ignored, a value past int64 saturates."
+  (loop for (text want) in '(("str" 0) ("99" 99) ("3.25" 3) ("0" 0) ("" 0)
+                             ("12345" 12345) ("81985529216486895" 81985529216486895)
+                             ("-9223372036854775809" -9223372036854775808)
+                             ("9223372036854775808" 9223372036854775807)
+                             ("+-" 0) ("0x1" 0) ("ox1" 0)
+                             (" 42 " 42) ("	-7abc" -7) ("+8" 8) ("1e3" 1))
+        do (is (= want (bl.cfg:conf-parse-int text)) "~S reads as ~D" text want))
+  (let ((option (bl.cfg:find-config-option "maxconnections")))
+    (is (= 0 (bl.cfg:parse-option-value option "abc")))
+    (is (= 125 (bl.cfg:parse-option-value option "125peers"))))
+  ;; init.cpp:777's GetIntArg("-maxconnections") <= 0: a garbage value is 0,
+  ;; so it soft-sets -listen=0 as -maxconnections=0 does; 8 does not.
+  (is (null (bl.cfg:conf-effective-listen-flags '(("maxconnections" . "abc")))))
+  (is-true (bl.cfg:conf-effective-listen-flags '(("maxconnections" . "8")))))
+
 (test conf-parse-int-and-loglevel
   (is (= 2000 (bl.cfg:conf-parse-int "2000")))
   (is (= 550 (bl.cfg:conf-parse-int " 550 ")))
-  (signals error (bl.cfg:conf-parse-int "notanint"))
+  (is (= 0 (bl.cfg:conf-parse-int "notanint")))
   (is (eq :debug (bl.cfg:conf-parse-loglevel "debug")))
   (is (eq :info (bl.cfg:conf-parse-loglevel "INFO")))
   (is (eq :warn (bl.cfg:conf-parse-loglevel "warning")))

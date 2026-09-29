@@ -103,10 +103,10 @@ still-unconfirmed transactions; OLD-UNCONF-TXS holds those that fell off it."
   (scale 1 :type (integer 1))
   (conf-avg #() :type simple-vector)      ; period -> bucket -> double
   (fail-avg #() :type simple-vector)
-  (txct-avg #() :type (simple-array double-float (*)))
-  (feerate-avg #() :type (simple-array double-float (*)))
+  (txct-avg (make-array 0 :element-type 'double-float) :type (simple-array double-float (*)))
+  (feerate-avg (make-array 0 :element-type 'double-float) :type (simple-array double-float (*)))
   (unconf-txs #() :type simple-vector)    ; blockindex -> bucket -> fixnum
-  (old-unconf-txs #() :type (simple-array fixnum (*))))
+  (old-unconf-txs (make-array 0 :element-type 'fixnum) :type (simple-array fixnum (*))))
 
 (defun %make-double-grid (rows cols)
   (let ((g (make-array rows)))

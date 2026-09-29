@@ -3799,6 +3799,119 @@ nonstandard to SPEND — we relayed txs every Core peer rejects."
       ;; caught by the same gate.
       (is (not (eq :nonstandard-inputs (err-of (spend 3)))) "bare P2PK prevout"))))
 
+(test are-inputs-standard-refuses-a-missing-coin
+  "Core AreInputsStandard (policy.cpp:213-250) reads each prevout with
+AccessCoin, which answers coinEmpty for a coin the view does not have; its
+scriptPubKey is empty, Solver calls an empty script NONSTANDARD, and the
+function returns false (:224-234). A coinbase returns true before any input is
+looked at (:215-217). Ours skipped an input whose coin was missing, so a
+transaction with an unknown prevout was standard by default. Unreachable from
+the mempool path, which has already refused missing inputs -- but the
+function is exported and answers for itself."
+  (let* ((p2pkh (let ((s (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
+                  (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                        (aref s 23) #x88 (aref s 24) #xac)
+                  s))
+         (known (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (unknown (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    (flet ((spending (&rest hashes)
+             (bl.ser:make-transaction
+              :version 2
+              :inputs (map 'vector (lambda (h)
+                                     (bl.ser:make-tx-in
+                                      :previous-output (bl.ser:make-outpoint :hash h :index 0)))
+                           hashes)
+              :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey p2pkh))
+              :lock-time 0))
+           (lookup (txid index)
+             (declare (ignore index))
+             (and (equalp txid known) p2pkh)))
+      (is-true (bl.val:are-inputs-standard-p (spending known) #'lookup)
+               "control: a P2PKH coin the view has is standard to spend")
+      (is-false (bl.val:are-inputs-standard-p (spending unknown) #'lookup)
+                "a coin the view does not have is coinEmpty: NONSTANDARD")
+      (is-false (bl.val:are-inputs-standard-p (spending known unknown) #'lookup)
+                "one missing coin among known ones is enough")
+      (let ((coinbase (bl.ser:make-transaction
+                       :version 2
+                       :inputs (vector (bl.ser:make-tx-in
+                                        :previous-output (bl.ser:make-outpoint
+                                                          :index #xFFFFFFFF)
+                                        :script-sig (make-array 2 :element-type '(unsigned-byte 8) :initial-element 1)))
+                       :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey p2pkh))
+                       :lock-time 0)))
+        (is-true (bl.val:are-inputs-standard-p coinbase (constantly nil))
+                 "a coinbase is standard before any input is looked at")))))
+
+(test policy-reads-a-p2sh-redeem-script-off-the-stack-top
+  "Core's policy readers of a P2SH scriptSig -- AreInputsStandard
+(policy.cpp:234-245), IsWitnessStandard (:274-283) and
+SpendsNonAnchorWitnessProg (:359-365) -- all EvalScript it under
+SCRIPT_VERIFY_NONE and take stack.back(), giving up on a failed evaluation or
+an empty stack. Ours took the scriptSig's last DATA push: a trailing OP_0 was
+stepped over (so `<16 x OP_CHECKSIG> OP_0' spending P2SH of the empty script
+-- consensus-valid, clean-stack -- counted 16 sigops and was refused as
+nonstandard where Core counts none and relays it), an empty scriptSig and an
+OP_RESERVED were passed, and a P2SH-wrapped witness program followed by OP_0
+was judged as the witness program. A coinbase is skipped by IsWitnessStandard
+(:253-254), witness reserved value and all."
+  (let* ((empty-script-p2sh (concatenate '(simple-array (unsigned-byte 8) (*))
+                                         #(#xa9 #x14)
+                                         (bl.crypto:hash160 (make-array 0 :element-type '(unsigned-byte 8)))
+                                         #(#x87)))
+         (p2pkh (concatenate '(simple-array (unsigned-byte 8) (*))
+                             #(#x76 #xa9 #x14) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 0)
+                             #(#x88 #xac)))
+         (sixteen-checksigs (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xac))
+         (p2wpkh-program (concatenate '(simple-array (unsigned-byte 8) (*))
+                                      #(0 20) (make-array 20 :element-type '(unsigned-byte 8) :initial-element 9))))
+    (labels ((octets (&rest parts)
+               (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                      (mapcar (lambda (p) (if (integerp p) (vector p) p)) parts)))
+             (push-data (bytes) (octets (length bytes) bytes))
+             (spending (script-sig &optional witness)
+               (bl.ser:make-transaction
+                :version 2
+                :inputs (vector (bl.ser:make-tx-in
+                                 :previous-output (bl.ser:make-outpoint
+                                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                        :initial-element 4))
+                                 :script-sig script-sig))
+                :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey p2pkh))
+                :witness (and witness (vector witness))
+                :lock-time 0))
+             (standard-p (script-sig)
+               (bl.val:are-inputs-standard-p (spending script-sig) (constantly empty-script-p2sh)))
+             (witness-standard-p (script-sig)
+               (bl.val:is-witness-standard-p
+                (spending script-sig (list (make-array 71 :element-type '(unsigned-byte 8) :initial-element 1)
+                                           (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)))
+                (constantly empty-script-p2sh))))
+      (is-true (standard-p (octets (push-data sixteen-checksigs) 0))
+               "a trailing OP_0 is the redeem script: the empty script, no sigops")
+      (is-false (standard-p (push-data sixteen-checksigs))
+                "control: 16 sigops in the redeem script itself are over the cap")
+      (is-false (standard-p (octets)) "an empty scriptSig leaves an empty stack")
+      (is-false (standard-p (octets (push-data (octets #xac)) #x50))
+                "OP_RESERVED fails the evaluation")
+      (let ((bl.interop:*script-flags* "P2SH,STRICTENC,MINIMALDATA"))
+        (is-true (standard-p (octets #x4c 1 #xac))
+                 "a non-minimal push is read under SCRIPT_VERIFY_NONE, whatever flags are bound"))
+      (is-true (witness-standard-p (push-data p2wpkh-program))
+               "control: a P2SH-wrapped P2WPKH with a standard witness")
+      (is-false (witness-standard-p (octets (push-data p2wpkh-program) 0))
+                "followed by OP_0 the redeem script is empty, and a witness on a non-witness program is nonstandard")
+      (let ((coinbase (bl.ser:make-transaction
+                       :version 2
+                       :inputs (vector (bl.ser:make-tx-in
+                                        :previous-output (bl.ser:make-outpoint :index #xFFFFFFFF)
+                                        :script-sig (octets 1 1)))
+                       :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey p2pkh))
+                       :witness (vector (list (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                       :lock-time 0)))
+        (is-true (bl.val:is-witness-standard-p coinbase (constantly nil))
+                 "a coinbase is skipped, its witness reserved value with it")))))
+
 (test bip54-legacy-sigop-relay-cap
   "BIP54 (Core CheckSigopsBIP54, policy.cpp:169-190; MAX_TX_LEGACY_SIGOPS
 2,500): legacy sigops counted where they execute — each scriptSig plus the

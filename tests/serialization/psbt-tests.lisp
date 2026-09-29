@@ -845,11 +845,16 @@ answer is the branch choice."
         (is-true (bl.val:validate-input-script tx2 0 (aref spent 0)))))))
 
 (defun %psbt-add-partial-sig (psbt pubkey sighash-byte)
-  "Put a foreign 71-byte ECDSA partial signature ending in SIGHASH-BYTE on the
-PSBT's first input, keyed by PUBKEY -- a co-signer's contribution, from our
-side indistinguishable from any other."
-  (let ((sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element #x30)))
-    (setf (aref sig 70) sighash-byte)
+  "Put a foreign ECDSA partial signature ending in SIGHASH-BYTE on the PSBT's
+first input, keyed by PUBKEY -- a co-signer's contribution, from our side
+indistinguishable from any other. It is a real DER signature (over an
+unrelated hash): Core refuses a PSBT whose partial signature is not strict DER
+with a defined hashtype at decode (psbt.h:543-546), before any signer sees it."
+  (let ((sig (concatenate '(simple-array (unsigned-byte 8) (*))
+                          (bl.crypto:sign-ecdsa
+                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)
+                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+                          (list sighash-byte))))
     (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) 0)
                          bl.ser:+psbt-in-partial-sig+ pubkey sig)
     psbt))
@@ -2023,3 +2028,39 @@ itself parses, so the rejections are the records."
                    "~S record ~D ~A: expected ~S, got ~S" kind keytype
                    (bl.crypto:bytes-to-hex (coerce value '(simple-array (unsigned-byte 8) (*))))
                    expected report))))))
+
+(test psbt-partial-signature-is-checked-as-core-checks-it
+  "Core decodes a partial signature only when `!sig.empty() &&
+CheckSignatureEncoding(sig, SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)'
+(psbt.h:543-546): BIP66 strict DER over the whole value including its
+hashtype byte, and a defined hashtype (ALL, NONE, SINGLE, each with or without
+ANYONECANPAY). LOW_S is not among the flags, so a high-S signature decodes.
+Ours kept any bytes, and a PSBT Core refuses at decodepsbt reached our
+finalizer. The controls are a real low-R signature and the smallest legal DER."
+  (let* ((key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (point (bl.crypto:derive-public-key key))
+         (der (bl.crypto:sign-ecdsa key (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 9))))
+    (flet ((with-hashtype (sig byte) (concatenate '(vector (unsigned-byte 8)) sig (list byte))))
+      (dolist (case (list (list (with-hashtype der 1) nil)
+                          (list (with-hashtype der #x83) nil)
+                          (list #(48 6 2 1 1 2 1 1 1) nil)
+                          (list #(48 6 2 1 1 2 1 1 #x81) nil)
+                          (list #() "Signature is not a valid encoding")
+                          (list der "Signature is not a valid encoding") ; no hashtype byte
+                          (list (with-hashtype der 0) "Signature is not a valid encoding")
+                          (list (with-hashtype der 4) "Signature is not a valid encoding")
+                          (list (with-hashtype der #x80) "Signature is not a valid encoding")
+                          (list #(48 6 2 1 #x81 2 1 1 1) "Signature is not a valid encoding")
+                          (list #(48 7 2 2 0 1 2 1 1 1) "Signature is not a valid encoding")
+                          (list #(48 6 2 0 2 1 1 1 1) "Signature is not a valid encoding")))
+        (destructuring-bind (value expected) case
+          (let ((report (%psbt-parse-failure (%psbt-with-record :input 2 point value))))
+            (if expected
+                (is-true (and report (search expected report))
+                         "~A: expected ~S, got ~S"
+                         (bl.crypto:bytes-to-hex (coerce value '(simple-array (unsigned-byte 8) (*))))
+                         expected report)
+                (is (null report) "~A must decode, got ~S"
+                    (bl.crypto:bytes-to-hex (coerce value '(simple-array (unsigned-byte 8) (*))))
+                    report))))))))

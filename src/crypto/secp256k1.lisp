@@ -780,6 +780,42 @@ deterministic and matches the BIP340 test vectors). Errors if PRIVKEY is invalid
 
 ;;; Signature verification (ECDSA)
 
+;;; Signature encoding (Core script/interpreter.cpp)
+
+(defun valid-signature-encoding-p (sig)
+  "Core IsValidSignatureEncoding (script/interpreter.cpp:108-172, BIP66), line
+for line: SIG is the WHOLE script signature -- <30> <len> <02> <lenR> <R> <02>
+<lenS> <S> <hashtype> -- so its bounds are 9 and 73 bytes. R and S are
+non-empty, not negative, and carry a 0x00 pad only in front of a byte whose
+top bit is set.
+
+The script interpreter keeps its own copy in the hashtype-stripped frame
+(BL.INTEROP:CHECK-DER-SIGNATURE-FORMAT); this one is for readers below it --
+the PSBT decoder's CheckSignatureEncoding on a partial signature."
+  (let ((size (length sig)))
+    (and (<= 9 size 73)
+         (= (aref sig 0) #x30)
+         (= (aref sig 1) (- size 3))
+         (let ((len-r (aref sig 3)))
+           (and (< (+ 5 len-r) size)
+                (let ((len-s (aref sig (+ 5 len-r))))
+                  (and (= (+ len-r len-s 7) size)
+                       (= (aref sig 2) #x02)
+                       (/= len-r 0)
+                       (not (logbitp 7 (aref sig 4)))
+                       (not (and (> len-r 1) (zerop (aref sig 4)) (not (logbitp 7 (aref sig 5)))))
+                       (= (aref sig (+ len-r 4)) #x02)
+                       (/= len-s 0)
+                       (not (logbitp 7 (aref sig (+ len-r 6))))
+                       (not (and (> len-s 1) (zerop (aref sig (+ len-r 6)))
+                                 (not (logbitp 7 (aref sig (+ len-r 7)))))))))))))
+
+(defun defined-hashtype-signature-p (sig)
+  "Core IsDefinedHashtypeSignature (script/interpreter.cpp:190-199): SIG's last
+byte, ANYONECANPAY masked off, is SIGHASH_ALL, NONE or SINGLE."
+  (and (plusp (length sig))
+       (<= 1 (logandc2 (aref sig (1- (length sig))) #x80) 3)))
+
 (defun check-signature-encoding (signature &key strict low-s)
   "Core CheckSignatureEncoding (interpreter.cpp): the FLAG-DEPENDENT half of
 signature validation — DER strictness under SCRIPT_VERIFY_DERSIG and the low-S
