@@ -790,7 +790,7 @@ non-empty, not negative, and carry a 0x00 pad only in front of a byte whose
 top bit is set.
 
 The script interpreter keeps its own copy in the hashtype-stripped frame
-(BL.INTEROP::CHECK-DER-SIGNATURE-FORMAT); this one is for readers below it --
+(BL.INTEROP:CHECK-DER-SIGNATURE-FORMAT); this one is for readers below it --
 the PSBT decoder's CheckSignatureEncoding on a partial signature."
   (let ((size (length sig)))
     (and (<= 9 size 73)
