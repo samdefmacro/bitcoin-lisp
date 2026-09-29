@@ -1477,7 +1477,7 @@ file -- nothing is a wallet without its id file -- and is written."
   (with-wallet-test-node (node)
     (let* ((bl.wallet::*rpc-wallet-name* "w")
            (manager (%node-manager node))
-           (wallets (bl.wallet::wallets-directory manager))
+           (wallets (bl.wallet:wallets-directory manager))
            (own (wallet-directory-of manager "w")))
       (%wenc-fresh-wallet node "w")
       ;; <wallets>/w/../w/sneaky.dump resolves back inside the database.
@@ -1673,7 +1673,7 @@ wallet_backup.py:264-270)."
         (is (= -4 (rpc-error-code-of
                    (lambda () (bl.rpc:dispatch-rpc-method
                                node "backupwallet" (list (namestring
-                                           (bl.wallet::wallets-directory
+                                           (bl.wallet:wallets-directory
                                             manager))))))))
         ;; Inside the wallet's own database directory.
         (is (= -4 (rpc-error-code-of

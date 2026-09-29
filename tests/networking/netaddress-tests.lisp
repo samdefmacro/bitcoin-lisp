@@ -444,7 +444,7 @@ automatic selection even though IPv4 is dialable."
 
 (defun %bad-port-p (port)
   "Core IsBadPort. The one reach into the deny-list predicate in this file."
-  (bl.net::bad-port-p port))
+  (bl.net:bad-port-p port))
 
 (defun %book-with-record (net ip port)
   "An address book holding exactly one record."

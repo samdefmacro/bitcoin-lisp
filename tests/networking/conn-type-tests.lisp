@@ -55,13 +55,13 @@ the services gate (CNode::ExpectServicesFromConn)."
         (limited (logior bl.ser:+node-network-limited+
                          bl.ser:+node-witness+)))
     (is (= 31800 bl.net::+min-peer-proto-version+))
-    (is-true (bl.net::has-all-desirable-service-flags-p full nil))
-    (is-false (bl.net::has-all-desirable-service-flags-p 0 nil))
-    (is-false (bl.net::has-all-desirable-service-flags-p
+    (is-true (bl.net:has-all-desirable-service-flags-p full nil))
+    (is-false (bl.net:has-all-desirable-service-flags-p 0 nil))
+    (is-false (bl.net:has-all-desirable-service-flags-p
                bl.ser:+node-network+ nil))   ; no witness
     ;; A limited peer is desirable only near the tip.
-    (is-false (bl.net::has-all-desirable-service-flags-p limited nil))
-    (is-true (bl.net::has-all-desirable-service-flags-p limited t))
+    (is-false (bl.net:has-all-desirable-service-flags-p limited nil))
+    (is-true (bl.net:has-all-desirable-service-flags-p limited t))
     ;; The gate's guard is Core's ExpectServicesFromConn (net.h:833-847),
     ;; whose switch answers false for INBOUND, MANUAL and FEELER and true for
     ;; OUTBOUND_FULL_RELAY, BLOCK_RELAY and ADDR_FETCH. It is asked at

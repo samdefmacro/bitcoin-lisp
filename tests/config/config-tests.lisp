@@ -2902,18 +2902,18 @@ would pass even if no struct ever consulted it."
              (setf bl.wallet:*wallet-directory* nil)
              (uiop:delete-directory-tree #p"/tmp/dd/" :validate t
                                                       :if-does-not-exist :ignore)
-             (is (equal #p"/tmp/dd/" (bl.wallet::wallets-directory manager)))
+             (is (equal #p"/tmp/dd/" (bl.wallet:wallets-directory manager)))
              (ensure-directories-exist #p"/tmp/dd/wallets/")
              (is (equal #p"/tmp/dd/wallets/"
-                        (bl.wallet::wallets-directory manager)))
+                        (bl.wallet:wallets-directory manager)))
              (uiop:delete-directory-tree #p"/tmp/dd/" :validate t)
              (bl:apply-rpc-config-globals '(("walletdir" . "purses")))
              (is (equal #p"/tmp/dd/purses/"
-                        (bl.wallet::wallets-directory manager)))
+                        (bl.wallet:wallets-directory manager)))
              (bl:apply-rpc-config-globals
               '(("walletdir" . "/srv/keys")))
              (is (equal #p"/srv/keys/"
-                        (bl.wallet::wallets-directory manager)))))
+                        (bl.wallet:wallets-directory manager)))))
       (setf bl.wallet:*default-keypool-size* saved-keypool
             bl.wallet:*wallet-directory* saved-dir))))
   (dolist (name '("keypool" "walletdir"))

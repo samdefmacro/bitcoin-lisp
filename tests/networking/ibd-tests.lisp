@@ -1550,7 +1550,7 @@ its tip needs (p2p_add_connections.py)."
       (%hs-drive peers chain ctx
                  (lambda (peer chain-state &key &allow-other-keys)
                    (declare (ignore peer chain-state)) (values 0 t)))
-      (bl.net::broadcast-initial-getheaders peers chain)
+      (bl.net:broadcast-initial-getheaders peers chain)
       (is (= 2 (count-if #'%hs-started-p peers))
           "both peers are asked once the header chain is within a day of now"))))
 
