@@ -1797,14 +1797,27 @@
   (bitcoin-lisp:zmq-notify-tx-accepted function)
   (bitcoin-lisp:zmq-notify-tx-removed function))
 
-(defsection @tools (:title "tools: bitcoin-util, bitcoin-tx, bitcoin-wallet")
+(defsection @tools (:title "tools: bitcoin, bitcoin-util, bitcoin-tx, bitcoin-wallet")
   "`src/tools/`, package `bl.tools`. Core: `bitcoin-util.cpp`,
   `bitcoin-tx.cpp`, `bitcoin-wallet.cpp` with `wallet/wallettool.cpp` and
-  `wallet/dump.cpp` (whose wallet half is `src/wallet/wallet-tool.lisp`).
-  Core builds four programs; this project saves ONE image, and NODE-MAIN
+  `wallet/dump.cpp` (whose wallet half is `src/wallet/wallet-tool.lisp`),
+  and `bitcoin.cpp`, the `bitcoin` wrapper.
+  Core builds separate programs; this project saves ONE image, and NODE-MAIN
   runs the tool whose name argv[0] carries before it does anything a node
   does. `scripts/conformance-config.sh` links each name to the node binary
   under `build/bin/`, where Core's framework looks for it.
+
+  The `bitcoin` wrapper is Core's command dispatch (RUN-BITCOIN): `node` is
+  bitcoind (bitcoin-node with -m, or an -ipc* option in the command's
+  arguments or config), `rpc` is `bitcoin-cli -named`, `wallet`, `tx`,
+  `util` the side tools, help and --version Core's texts and exit codes.
+  Core EXECs the sibling; for a program this image is, BITCOIN-EXEC returns
+  the argument vector that exec would have started and NODE-MAIN carries on
+  as that program in the same process. Anything else (bitcoin-node,
+  bitcoin-qt, bench_bitcoin, bitcoin-chainstate) goes through Core's
+  libexec/ - wrapper directory - $PATH search and execvp, so a build without
+  it fails with Core's `execvp failed to execute` error. This build is
+  monolithic: bitcoind refuses -ipcbind, as a Core bitcoind does.
 
   Invariants: a tool is a function of its arguments and its stdin that
   writes to two streams and returns the exit code; only TOOL-MAIN exits,
@@ -1826,6 +1839,9 @@
   grind reads the target from the header's OWN nBits."
   (bl.tools:tool-for-program-name function)
   (bl.tools:tool-main function)
+  (bl.tools:run-bitcoin function)
+  (bl.tools:bitcoin-exec function)
+  (bl.tools:bitcoin-wrapper-main function)
   (bl.tools:run-bitcoin-util function)
   (bl.tools:run-bitcoin-tx function)
   (bl.tools:run-bitcoin-wallet function)

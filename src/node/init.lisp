@@ -2866,6 +2866,14 @@ option. Leading dashes and the value are stripped, as Core's ArgsManager does."
         for name = (%argv-option-name arg)
         thereis (and name (member name names :test #'string=))))
 
+(defun %daemon-version-line ()
+  "The first line bitcoind prints for -version and -help (bitcoind.cpp:139-144):
+\"<CLIENT_NAME> daemon version <FormatFullVersion> <exe name>\". The exe name
+is the program's own, bitcoind -- the one tool_bitcoin.py:98-100 reads back
+to tell which program `bitcoin node' ran."
+  (format nil "~A daemon version ~A bitcoind~%"
+          bl.cfg:+client-name+ (bl.tools:format-full-version)))
+
 (defun node-main ()
   "Toplevel of the saved executable: run a node from the command line and exit
 with the code the caller should act on.
@@ -2880,6 +2888,12 @@ stderr back at EVERY node stop and fails the test unless it is exactly empty
 every test that stops a node. Startup FAILURES do go to stderr, which is also
 Core's behaviour and what assert_start_raises_init_error reads."
   (sb-ext:disable-debugger)
+  ;; Started as the `bitcoin' wrapper (Core bitcoin.cpp), the executable
+  ;; prints its help or version, or becomes the program the command names:
+  ;; `bitcoin node ...' carries on below as `bitcoind ...', `bitcoin rpc ...'
+  ;; as `bitcoin-cli -named ...' (src/tools/bitcoin.lisp).
+  (when (bl.tools:bitcoin-wrapper-program-name-p (first sb-ext:*posix-argv*))
+    (setf sb-ext:*posix-argv* (bl.tools:bitcoin-wrapper-main sb-ext:*posix-argv*)))
   ;; The same executable is bitcoin-cli when started under that name
   ;; (scripts/conformance-config.sh links build/bin/bitcoin-cli to it), which
   ;; is how Core's framework finds a client next to its node. Decided before
@@ -2906,20 +2920,25 @@ Core's behaviour and what assert_start_raises_init_error reads."
     (handler-case
         (cond
           ;; -version and -help print and exit 0 before anything is started,
-          ;; as they do in Core (init.cpp's HelpRequested/-version branch).
+          ;; as they do in Core (bitcoind.cpp:138-160 ProcessInitCommands) --
+          ;; but only after the command line has PARSED (bitcoind.cpp:283-285
+          ;; runs ParseArgs first), so `-ipcbind=unix -version' is the parse
+          ;; error tool_bitcoin.py:71 expects, not a version banner. The
+          ;; check returns ARGS and signals on a refusal; this clause never
+          ;; selects anything.
+          ((progn (check-cli-args args) nil))
           ((%argv-asks-for args '("version"))
-           (format t "bitcoin-lisp version ~A~%"
-                   (bl.ser:client-version-string))
+           (format t "~A~A" (%daemon-version-line) (bl.tools:tool-license-info))
            (finish-output)
            (sb-ext:exit :code 0))
           ((%argv-asks-for args '("help" "h" "?"))
-           (format t "bitcoin-lisp version ~A~%~%~
+           (format t "~A~%~
 Usage: bitcoin-lisp-node [options]~%~%~
 Runs a Bitcoin full node. Options follow Bitcoin Core's spelling ~
 (-datadir, -regtest, -rpcport, ...); see docs/ for what is implemented, and ~
 note that options this node accepts but does not implement are reported at ~
 startup.~%"
-                   (bl.ser:client-version-string))
+                   (%daemon-version-line))
            (finish-output)
            (sb-ext:exit :code 0))
           (t

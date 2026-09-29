@@ -16,12 +16,7 @@
 (defun tool-for-program-name (argv0)
   "The tool function ARGV0 names, or NIL for the node itself. Only the file
 name counts, and a trailing .exe (Core's EXEEXT) is ignored."
-  (let* ((name (file-namestring (or argv0 "")))
-         (base (if (and (> (length name) 4)
-                        (string-equal ".exe" name :start2 (- (length name) 4)))
-                   (subseq name 0 (- (length name) 4))
-                   name)))
-    (cdr (assoc base +tools+ :test #'string=))))
+  (cdr (assoc (program-base-name argv0) +tools+ :test #'string=)))
 
 (defun tool-main (tool argv)
   "Run TOOL over ARGV as the whole process: its output on the process's

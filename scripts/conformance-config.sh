@@ -33,16 +33,20 @@ mkdir -p "$ROOT/build/bin"
 # EINVAL, which surfaces as a whole batch of unrelated-looking failures.
 # Observed 2026-08-25 running four sweep batches at once. rename(2) has no such
 # window.
-# The same executable is bitcoin-cli and each of Core's side tools: node-main
-# runs the client (src/cli/) or bitcoin-util / bitcoin-tx / bitcoin-wallet
-# (src/tools/) when it is started under that name, so the framework finds
-# them where it looks, BUILDDIR/bin/<name> (util.py:317-343), with no second
-# image to build.
+# The same executable is bitcoin-cli, each of Core's side tools and the
+# `bitcoin' wrapper: node-main runs the client (src/cli/), bitcoin-util /
+# bitcoin-tx / bitcoin-wallet (src/tools/) or Core bitcoin.cpp's command
+# dispatch (src/tools/bitcoin.lisp; tool_bitcoin.py, and BITCOIN_CMD runs)
+# when it is started under that name, so the framework finds them where it
+# looks, BUILDDIR/bin/<name> (util.py:317-343), with no second image to build.
+# No bitcoin-node: this build is monolithic, as a Core build without
+# ENABLE_IPC is, so config.ini leaves ENABLE_IPC unset and `bitcoin -m node'
+# fails the way it fails there.
 # A link that already names the binary is left alone: every run calls this,
 # and a run whose links had just been replaced (atomically, with no other run
 # active) still got EINVAL exec'ing build/bin/bitcoin-cli through the Docker
 # bind mount -- observed 2026-09-23, one run in three.
-for name in bitcoind bitcoin-cli bitcoin-util bitcoin-tx bitcoin-wallet; do
+for name in bitcoin bitcoind bitcoin-cli bitcoin-util bitcoin-tx bitcoin-wallet; do
   target="../$(basename "$BIN")"
   if [ "$(readlink "$ROOT/build/bin/$name" 2>/dev/null || true)" != "$target" ]; then
     ln -sfn "$target" "$ROOT/build/bin/.$name.$$"

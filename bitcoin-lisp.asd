@@ -363,7 +363,8 @@ bitcoin-cli (node-main)."
                                (:file "script-asm")
                                (:file "bitcoin-tx")
                                (:file "bitcoin-wallet")
-                               (:file "dispatch")))
+                               (:file "dispatch")
+                               (:file "bitcoin")))   ; Core bitcoin.cpp, the wrapper
                  ;; The RPC server proper, last: it dispatches to everything above.
                  (:module "rpc-server"
                   :pathname "rpc"

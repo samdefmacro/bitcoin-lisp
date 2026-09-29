@@ -19,9 +19,10 @@
   (:use #:cl)
   (:documentation "Core's command-line side tools on top of the node's layers:
 bitcoin-util (grind), bitcoin-tx (create/modify/sign a transaction offline) and
-bitcoin-wallet (info/create/dump/createfromdump on a wallet directory). Core
-bitcoin-util.cpp, bitcoin-tx.cpp, bitcoin-wallet.cpp, wallet/wallettool.cpp,
-wallet/dump.cpp. src/tools/.")
+bitcoin-wallet (info/create/dump/createfromdump on a wallet directory), and
+the `bitcoin' wrapper that dispatches to them and to the node. Core
+bitcoin-util.cpp, bitcoin-tx.cpp, bitcoin-wallet.cpp, bitcoin.cpp,
+wallet/wallettool.cpp, wallet/dump.cpp. src/tools/.")
   (:export
    ;; The entry points, one per Core program
    #:run-bitcoin-util
@@ -29,6 +30,18 @@ wallet/dump.cpp. src/tools/.")
    #:run-bitcoin-wallet
    #:tool-for-program-name
    #:tool-main
+   ;; Core bitcoin.cpp, the `bitcoin' wrapper
+   #:bitcoin-wrapper-program-name-p
+   #:bitcoin-wrapper-main
+   #:run-bitcoin
+   #:parse-bitcoin-command-line
+   #:bitcoin-use-multiprocess-p
+   #:bitcoin-exec
+   #:bitcoin-wrapper-error
+   ;; Core FormatFullVersion, FormatParagraph(LicenseInfo())
+   #:format-full-version
+   #:format-paragraph
+   #:tool-license-info
    ;; Core UniValue::write for the alist values the RPC layer builds
    #:univalue-write
    ;; Core ParseScript (core_io.cpp:63-130)
