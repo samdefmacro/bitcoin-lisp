@@ -320,6 +320,7 @@ headerssync.cpp. src/networking/.")
    #:has-all-desirable-service-flags-p
    #:address-banned-or-discouraged-p
    #:decode-peers-dat
+   #:addrdb-read-error
    #:check-address-book
    #:*addrman-check-ratio*
    #:peer-address-source

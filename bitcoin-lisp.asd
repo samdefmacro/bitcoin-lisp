@@ -634,6 +634,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/deserialize")
                              (:file "fuzz/transaction")
                              (:file "fuzz/script")
-                             (:file "fuzz/net"))))
+                             (:file "fuzz/net")
+                             (:file "fuzz/addrman"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
