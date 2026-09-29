@@ -1035,8 +1035,8 @@ wake one worker and leave the rest asleep on a full queue."
 
 (defun %script-check-worker (pool)
   "One worker's loop: take an item, run it, account for it. Never signals out —
-a worker that died would leave TODO permanently above zero and hang the master
-on the next block."
+a worker that died would leave the TODO count (Core's nTodo, checkqueue.h:63)
+above zero forever and hang the master on the next block."
   (loop
     (let ((item nil))
       (bt:with-lock-held ((script-check-pool-lock pool))
