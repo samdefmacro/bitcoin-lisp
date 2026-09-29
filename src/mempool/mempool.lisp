@@ -894,7 +894,7 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
 
 (defun mempool-find-parents (mempool tx)
   "Return the distinct txids of TX's inputs that are themselves in the mempool."
-  (let ((seen (make-hash-table :test 'equalp))
+  (let ((seen (bl.bytes:make-octets-hash-table))
         (result '()))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
       (let ((ptxid (bl.ser:outpoint-hash
@@ -908,7 +908,7 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
   "BFS from SEED-TXIDS following LINK-ACCESSOR (parents or children of an entry).
 Returns a hash-set (txid -> t) of all reached txids (excluding the seeds unless
 they are reachable from each other). Bounded by the 64-tx cluster limit."
-  (let ((found (make-hash-table :test 'equalp))
+  (let ((found (bl.bytes:make-octets-hash-table))
         (queue (copy-list seed-txids)))
     (loop while queue
           do (let ((txid (pop queue)))
@@ -928,7 +928,7 @@ they are reachable from each other). Bounded by the 64-tx cluster limit."
                              (loop for k being the hash-keys of (mempool-entry-parents entry)
                                    collect k)
                              #'mempool-entry-parents)
-        (make-hash-table :test 'equalp))))
+        (bl.bytes:make-octets-hash-table))))
 
 (defun mempool-descendants (mempool txid)
   "Hash-set of all in-mempool descendant txids of TXID (excluding TXID itself)."
@@ -938,7 +938,7 @@ they are reachable from each other). Bounded by the 64-tx cluster limit."
                              (loop for k being the hash-keys of (mempool-entry-children entry)
                                    collect k)
                              #'mempool-entry-children)
-        (make-hash-table :test 'equalp))))
+        (bl.bytes:make-octets-hash-table))))
 
 (defun %stats-over (mempool txid-set seed-entry)
   "Return (values count vsize fees) over SEED-ENTRY plus every entry in TXID-SET."
@@ -1471,7 +1471,7 @@ The acceptance path is full-RBF UNCONDITIONALLY — signaling is not consulted
 (defun find-rbf-conflicts (mempool tx)
   "Distinct txids of mempool txs that directly conflict with TX (spend a common
 outpoint). Generalizes mempool-check-conflict, which returns only the first."
-  (let ((seen (make-hash-table :test 'equalp)) (result '()))
+  (let ((seen (bl.bytes:make-octets-hash-table)) (result '()))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx) result)
       (let* ((prevout (bl.ser:tx-in-previous-output input))
              (key (make-outpoint-key
@@ -1499,7 +1499,7 @@ a hash-set's keys), skipping any that are absent or handle-less."
   "The full set a replacement of DIRECT-CONFLICTS evicts, as a txid hash-set:
 each conflict and all its in-mempool descendants (Core GetEntriesForConflicts
 -> CalculateDescendants)."
-  (let ((replaced (make-hash-table :test 'equalp)))
+  (let ((replaced (bl.bytes:make-octets-hash-table)))
     (dolist (ctxid direct-conflicts replaced)
       (setf (gethash ctxid replaced) t)
       (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
@@ -1794,7 +1794,7 @@ because any prefix of the staged additions forms only smaller clusters (and
 the package-RBF evictions that precede the adds only shrink clusters
 further)."
   (let ((graph (mempool-graph mempool))
-        (staged (make-hash-table :test 'equalp))   ; txid -> handle
+        (staged (bl.bytes:make-octets-hash-table))   ; txid -> handle
         (handles '()))
     (unwind-protect
          (progn
@@ -1811,7 +1811,7 @@ further)."
                  ;; In-package parents: inputs spending an already-staged
                  ;; member (MEMBERS is topologically sorted, so parents are
                  ;; staged before their spenders). Dedupe multi-input spends.
-                 (let ((seen (make-hash-table :test 'equalp)))
+                 (let ((seen (bl.bytes:make-octets-hash-table)))
                    (bl.ser:dovector
                        (input (bl.ser:transaction-inputs tx))
                      (let* ((ptxid (bl.ser:outpoint-hash

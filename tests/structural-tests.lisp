@@ -1694,12 +1694,17 @@ shape: bl.bytes:make-octets-hash-table is the fast one."
                             (push (cons file n) hits))))))
     (nreverse hits)))
 
-(defparameter +equalp-hash-table-ceiling+ 102
+(defparameter +equalp-hash-table-ceiling+ 86
   "How many EQUALP hash tables src/ may make: 111 when the second-round
 review counted them, 103 after the mempool's seven txid tables and the IBD
 block-hash tables moved to bl.bytes:make-octets-hash-table (wave E), 102 when
 the tools batch's index-record port retired the coinstats recompute path, 103
-as measured once main's musig merge (psbt.lisp) met it at cc6c0111. May only fall: a new table keyed
+as measured once main's musig merge (psbt.lisp) met it at cc6c0111. 86 when the
+mempool's eight remaining txid sets (find-parents, the ancestor and descendant
+walks, the RBF conflict and replaced sets, the staged-cluster tables) and
+the package and dust checks' txid- and wtxid-keyed tables in packages.lisp
+and transaction.lisp moved to the octet test; the tables still EQUALP there
+are keyed by (txid . index) conses. May only fall: a new table keyed
 by hashes uses the octet test; one keyed by something else is a case to
 name here.")
 

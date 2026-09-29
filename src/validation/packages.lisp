@@ -109,7 +109,7 @@ here."
            (when (> total-weight +max-package-weight+)
              (return-from package-well-formed (values nil :package-too-large)))))
        ;; No duplicate txids.
-       (let ((seen (make-hash-table :test 'equalp)))
+       (let ((seen (bl.bytes:make-octets-hash-table)))
          (dolist (tx package)
            (let ((txid (bl.ser:transaction-hash tx)))
              (when (gethash txid seen)
@@ -117,7 +117,7 @@ here."
              (setf (gethash txid seen) t))))
        ;; Topologically sorted: walking front-to-back, a tx may not spend an
        ;; output of a tx whose txid has not yet been seen (i.e. appears later).
-       (let ((later (make-hash-table :test 'equalp)))
+       (let ((later (bl.bytes:make-octets-hash-table)))
          (dolist (tx package)
            (setf (gethash (bl.ser:transaction-hash tx) later) t))
          (dolist (tx package)
@@ -301,7 +301,7 @@ stored beside the VSIZE, so the two units cannot disagree."
   "The members of TXNS, in order, that are direct parents of TX — Core
 FindInPackageParents (truc_policy.cpp:18-37). TXNS is topologically sorted,
 so scanning stops at TX itself."
-  (let ((possible (make-hash-table :test 'equalp)))
+  (let ((possible (bl.bytes:make-octets-hash-table)))
     (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
       (setf (gethash (bl.ser:outpoint-hash
                       (bl.ser:tx-in-previous-output input))
@@ -522,7 +522,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
   (let* ((package-eval (> (length txns) 1))
          (total-fee 0)                  ; prioritisation-modified fees
          (total-vsize 0)
-         (conflict-set (make-hash-table :test 'equalp))
+         (conflict-set (bl.bytes:make-octets-hash-table))
          (validated '()))               ; %PKG-VAL records, package order
     ;; 1. Validate each member (read-only) with the per-tx fee floor skipped
     ;; and the package's own outputs available, so a child can spend a
@@ -924,8 +924,8 @@ mempool, exactly as in Core's early return.
     ;;    ones still enter the mempool (\"some of them may still be valid\",
     ;;    AcceptPackage, validation.cpp:1694-1712).
     (let ((now (bl.ser:get-unix-time))
-          (results (make-hash-table :test 'equalp))   ; wtxid -> package-tx-result
-          (replaced (make-hash-table :test 'equalp))   ; txid -> t
+          (results (bl.bytes:make-octets-hash-table))   ; wtxid -> package-tx-result
+          (replaced (bl.bytes:make-octets-hash-table))   ; txid -> t
           (deferred '())
           (quit-early nil)
           (fail-reason nil)
