@@ -43,9 +43,8 @@ set's txout count and total amount."
          ;; Indexed heights 1..tip (genesis is synthesized, not counted).
          (is (= tip n))
          (is (= tip (bl.store:coinstatsindex-height csi)))
-         (let* ((stats (bl.store:coinstatsindex-get-stats csi tip))
-                (index-muhash (bl.crypto:muhash-finalize
-                               (bl.store:coinstats-muhash stats)))
+         (let* ((stats (%csi-stats-at csi cs tip))
+                (index-muhash (bl.store:coinstats-muhash-hash stats))
                 (direct-muhash (bl.store:compute-utxo-set-muhash utxo)))
            ;; THE invariant: incremental == whole-set.
            (is (equalp direct-muhash index-muhash))
@@ -88,10 +87,8 @@ height's MuHash is retrievable and distinct from its predecessor."
           #'bl.val:calculate-block-subsidy)
          (let ((prev-count -1) (prev-hash nil))
            (loop for h from 1 to tip
-                 for stats = (bl.store:coinstatsindex-get-stats csi h)
-                 for hh = (bl.crypto:bytes-to-hex
-                           (bl.crypto:muhash-finalize
-                            (bl.store:coinstats-muhash stats)))
+                 for stats = (%csi-stats-at csi cs h)
+                 for hh = (bl.crypto:bytes-to-hex (bl.store:coinstats-muhash-hash stats))
                  do (is-true stats)
                     (is (>= (bl.store:coinstats-txout-count stats) prev-count))
                     (is (not (equal hh prev-hash)))
@@ -214,44 +211,21 @@ the spendable coinbase reward outputs."
          (is (= 5 total))
          (is (= 5 (bl.store:utxo-count utxo))))))))
 
-(test coinstatsindex-record-roundtrip
-  "A coinstats record survives encode/decode with all fields intact, including
-the full MuHash numerator/denominator fraction."
-  (let* ((mu (bl.crypto:make-muhash))
-         (e1 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))
-         (e2 (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(9 8 7))))
-    (bl.crypto:muhash-insert mu e1)
-    (bl.crypto:muhash-remove mu e2)
-    (let* ((stats (bl.store::make-coinstats
-                   :muhash mu :txout-count 12345 :bogo-size 67890
-                   :total-amount 2100000000000000 :total-subsidy 5000000000
-                   :total-prevout-spent 42 :total-new-outputs-ex-coinbase 7
-                   :total-coinbase 9 :unspendable-genesis 5000000000
-                   :unspendable-bip30 100 :unspendable-scripts 200
-                   :unspendable-unclaimed 300))
-           (decoded (bl.store::%csi-decode-stat
-                     (bl.store::%csi-encode-stat stats))))
-      (is (= (bl.crypto:muhash-numerator mu)
-             (bl.crypto:muhash-numerator (bl.store:coinstats-muhash decoded))))
-      (is (= (bl.crypto:muhash-denominator mu)
-             (bl.crypto:muhash-denominator (bl.store:coinstats-muhash decoded))))
-      (is (= 12345 (bl.store:coinstats-txout-count decoded)))
-      (is (= 2100000000000000 (bl.store:coinstats-total-amount decoded)))
-      (is (= 300 (bl.store:coinstats-unspendable-unclaimed decoded)))
-      ;; Finalized MuHash is preserved through the roundtrip.
-      (is (equalp (bl.crypto:muhash-finalize mu)
-                  (bl.crypto:muhash-finalize
-                   (bl.store:coinstats-muhash decoded)))))))
+(defun %csi-stats-at (csi cs height)
+  "The coinstats record of the ACTIVE chain's block at HEIGHT."
+  (bl.store:coinstatsindex-get-block-stats
+   csi (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs height)) height))
 
-;;;; Rewind on a divergent index (GA8 wave 5, Core BaseIndex::Rewind).
-;;;;
-;;;; Records are keyed by HEIGHT with no block hash and there is no disconnect
-;;;; hook, while index writes reach the OS immediately and the chainstate tip
-;;;; only becomes durable at a flush (a reorg does not trigger one). A process
-;;;; kill in that window leaves records holding an ABANDONED chain's state at
-;;;; heights at or below the tip that startup restores; the repair loop this
-;;;; replaced blessed them by existence and overwrote the stored meta hash —
-;;;; the one piece of evidence that could have detected the divergence.
+(defun %csi-height-key (height)
+  "Core's DBHeightKey: 't' || height u32 BE."
+  (let ((key (make-array 5 :element-type '(unsigned-byte 8))))
+    (setf (aref key 0) (char-code #\t))
+    (dotimes (i 4 key)
+      (setf (aref key (- 4 i)) (ldb (byte 8 (* 8 i)) height)))))
+
+(defun %csi-raw-record (csi height)
+  "The stored height record at HEIGHT as raw bytes (NIL if absent)."
+  (bl.kv:leveldb-get (bl.store:coinstatsindex-db csi) (%csi-height-key height)))
 
 (defun %csi-fixture (tag blocks)
   "(values node csi cs tip) — a regtest node with BLOCKS mined blocks and a
@@ -271,10 +245,108 @@ coinstats index built over them, installed on the node. Call inside
       (setf (bl:node-coinstatsindex node) csi)
       (values node csi cs (bl.store:current-height cs)))))
 
+(test coinstatsindex-records-are-cores
+  "Each height's record is Core's: 't' || height BE -> block hash || DBVal, the
+DBVal 32 + 4*8 + 3*32 + 4*8 = 192 bytes whose first 32 are the FINALIZED
+MuHash and whose three running amounts are uint256 (coinstatsindex.cpp:44-80);
+the running fraction is written once, under 'M', beside the locator at a
+commit, as numerator || denominator, 384 little-endian bytes each."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csirec~D" (get-internal-real-time)) 3)
+      (declare (ignore node))
+      (let ((raw (%csi-raw-record csi tip))
+            (stats (%csi-stats-at csi cs tip)))
+        (is (= (+ 32 192) (length raw)))
+        (is (equalp (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs tip))
+                    (subseq raw 0 32)))
+        (is (equalp (bl.store:coinstats-muhash-hash stats) (subseq raw 32 64)))
+        ;; txouts u64 LE right after the digest.
+        (is (= (bl.store:coinstats-txout-count stats)
+               (loop for i below 8 sum (ash (aref raw (+ 64 i)) (* 8 i))))))
+      (bl.store:commit-index csi cs)
+      (let ((m (bl.kv:leveldb-get (bl.store:coinstatsindex-db csi)
+                                  (make-array 1 :element-type '(unsigned-byte 8)
+                                                :initial-element (char-code #\M)))))
+        (is (= 768 (length m)))
+        (is (equalp (bl.crypto:muhash-finalize
+                     (bl.crypto:make-muhash-raw
+                      :numerator (bl.crypto:bytes-to-le-integer (subseq m 0 384))
+                      :denominator (bl.crypto:bytes-to-le-integer (subseq m 384 768))))
+                    (bl.store:coinstats-muhash-hash (%csi-stats-at csi cs tip)))
+            "'M' is the fraction the best record's digest finalizes"))
+      (bl.store:close-coinstatsindex csi))))
+
+(defun %csi-old-record (stats block-hash)
+  "STATS in this tree's pre-2026-09-29 layout: numerator || denominator (384 LE
+each), eleven i64 LE tallies, then the block hash."
+  (let ((v (make-array (+ 768 88 32) :element-type '(unsigned-byte 8)))
+        (mu (bl.store:coinstats-muhash stats)))
+    (replace v (bl.crypto:le-integer-to-bytes (bl.crypto:muhash-numerator mu) 384))
+    (replace v (bl.crypto:le-integer-to-bytes (bl.crypto:muhash-denominator mu) 384) :start1 384)
+    (loop for off from 768 by 8
+          for val in (list (bl.store:coinstats-txout-count stats)
+                           (bl.store:coinstats-bogo-size stats)
+                           (bl.store:coinstats-total-amount stats)
+                           (bl.store:coinstats-total-subsidy stats)
+                           (bl.store:coinstats-total-prevout-spent stats)
+                           (bl.store:coinstats-total-new-outputs-ex-coinbase stats)
+                           (bl.store:coinstats-total-coinbase stats)
+                           (bl.store:coinstats-unspendable-genesis stats)
+                           (bl.store:coinstats-unspendable-bip30 stats)
+                           (bl.store:coinstats-unspendable-scripts stats)
+                           (bl.store:coinstats-unspendable-unclaimed stats))
+          do (dotimes (i 8) (setf (aref v (+ off i)) (ldb (byte 8 (* 8 i)) val))))
+    (replace v block-hash :start1 (+ 768 88))
+    v))
+
+(test coinstatsindex-migrates-the-old-full-state-records
+  "An index written before 2026-09-29 kept the whole running state per height
+under 'S' || height. The migration writes 'M' from the best height's old record
+and every height's record in Core's form, in place; the result is byte for byte
+what the index writes today, and the running state loads from it."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csimig~D" (get-internal-real-time)) 4)
+      (let* ((db (bl.store:coinstatsindex-db csi))
+             (store (bl:node-block-store node))
+             (core (loop for h from 0 to tip collect (%csi-raw-record csi h)))
+             (subsidy0 (bl.val:calculate-block-subsidy 0))
+             (running (bl.store::make-coinstats :total-subsidy subsidy0
+                                                :unspendable-genesis subsidy0)))
+        ;; Replace every record by the old layout, folding the chain afresh.
+        (loop for h from 0 to tip
+              for hash = (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs h))
+              do (when (plusp h)
+                   (bl.store:apply-block-to-coinstats
+                    running (bl.store:get-block store hash) hash h
+                    (bl.val:get-undo-data hash) (bl.val:calculate-block-subsidy h)))
+                 (bl.kv:leveldb-delete db (%csi-height-key h))
+                 (bl.kv:leveldb-put db (concatenate '(vector (unsigned-byte 8))
+                                                    (vector (char-code #\S))
+                                                    (subseq (%csi-height-key h) 1))
+                                    (%csi-old-record running hash)))
+        (bl.kv:leveldb-delete db (make-array 1 :element-type '(unsigned-byte 8)
+                                               :initial-element (char-code #\M)))
+        (is-true (bl.store:coinstatsindex-needs-migration-p csi))
+        (is (= (1+ tip) (bl.store:migrate-coinstatsindex csi cs)))
+        (is (null (bl.store:coinstatsindex-needs-migration-p csi)))
+        (is (equalp core (loop for h from 0 to tip collect (%csi-raw-record csi h))))
+        (bl.store:coinstatsindex-clear-best csi)
+        (bl.store:index-set-best
+         csi (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs tip)) tip)
+        (is-true (bl.store:coinstatsindex-load-running csi)
+                 "the running state loads from the migrated 'M' and best record"))
+      (bl.store:close-coinstatsindex csi))))
+
+;;;; Rewind (Core BaseIndex::Rewind over CoinStatsIndex::CustomRemove /
+;;;; RevertBlock, index/coinstatsindex.cpp:245-262, 329-399). The index keeps
+;;;; Core's running state; going back means reversing blocks with their bodies
+;;;; and undo data, checked against the parent's record.
+
 (defmacro %csi-counting-calls ((count-var fname) &body body)
   "Run BODY with calls to FNAME counted in COUNT-VAR (the real function still
-runs), restoring FNAME afterwards. Lets a test assert which of two rewind
-paths did the work — and that the counter can move at all."
+runs), restoring FNAME afterwards."
   (let ((real (gensym "REAL")))
     `(let ((,count-var 0)
            (,real (fdefinition ,fname)))
@@ -285,22 +357,72 @@ paths did the work — and that the counter can move at all."
               ,@body)
          (setf (fdefinition ,fname) ,real)))))
 
-(defun %csi-raw-record (csi height)
-  "The stored record at HEIGHT as raw bytes (NIL if absent)."
-  (bl.kv:leveldb-get
-   (bl.store:coinstatsindex-db csi)
-   (bl.store::%csi-stat-key height)))
+(test coinstatsindex-reverts-blocks-an-index-is-ahead-by
+  "The unclean-shutdown shape: the index reached blocks the restored chainstate
+tip has not, on the SAME chain. The catch-up reverses them one by one (Core's
+RevertBlock: the outputs they created leave the MuHash, the coins they spent
+return, the tallies come back from the parent's record) and lands on the tip
+without re-indexing anything -- and a second catch-up after the tip moves on
+re-indexes exactly the blocks above it."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csiahd~D" (get-internal-real-time)) 5)
+      (let* ((top (bl.store:get-block-at-height cs tip))
+             (back (bl.store:get-block-at-height cs (- tip 2)))
+             (records (loop for h from 0 to tip collect (%csi-raw-record csi h))))
+        ;; The chainstate restored two blocks below where the index got.
+        (bl.store:update-chain-tip cs (bl.store:block-index-entry-hash back) (- tip 2))
+        (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
+          (bl:catch-up-index node csi)
+          (is (= 0 adds) "reverting re-indexed ~D block(s)" adds))
+        (is (= (- tip 2) (bl.store:coinstatsindex-height csi)))
+        (is (equalp (bl.store:block-index-entry-hash back)
+                    (nth-value 1 (bl.store:coinstatsindex-best csi))))
+        ;; The chainstate catches up again: the two blocks are folded back in,
+        ;; and every record is what it was.
+        (bl.store:update-chain-tip cs (bl.store:block-index-entry-hash top) tip)
+        (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
+          (bl:catch-up-index node csi)
+          (is (= 2 adds)))
+        (is (equalp records (loop for h from 0 to tip collect (%csi-raw-record csi h))))
+        (is (equalp (bl.store:compute-utxo-set-muhash (bl:node-utxo-set node))
+                    (bl.store:coinstats-muhash-hash (%csi-stats-at csi cs tip)))))
+      (bl.store:close-coinstatsindex csi))))
 
-(defun %csi-put-raw-record (csi height bytes)
-  (bl.kv:leveldb-put
-   (bl.store:coinstatsindex-db csi)
-   (bl.store::%csi-stat-key height) bytes))
+(test coinstatsindex-rebuilds-when-its-branch-cannot-be-reversed
+  "A best block the header index cannot place, or one whose blocks are not on
+disk, cannot be reversed. The index is then rebuilt from genesis -- and the
+rebuild writes exactly the records a consistent index holds."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csirb~D" (get-internal-real-time)) 4)
+      (let ((records (loop for h from 0 to tip collect (%csi-raw-record csi h))))
+        (bl.store:index-set-best
+         csi (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xE7) tip)
+        (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
+          (bl:catch-up-index node csi)
+          (is (= tip adds) "the rebuild indexed ~D block(s)" adds))
+        (is (= tip (bl.store:coinstatsindex-height csi)))
+        (is (equalp records (loop for h from 0 to tip collect (%csi-raw-record csi h)))))
+      (bl.store:close-coinstatsindex csi))))
+
+(test coinstatsindex-consistent-index-is-not-rebuilt
+  "Control: a consistent index must NOT rewind and must NOT re-index a single
+block -- a fix that always rebuilt would be hours on a real chain."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
+      (declare (ignore cs))
+      (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
+        (bl:catch-up-index node csi)
+        (is (= 0 adds) "a consistent index re-indexed ~D block(s)" adds))
+      (is (= tip (bl.store:coinstatsindex-height csi)))
+      (bl.store:close-coinstatsindex csi))))
 
 (defun %csi-fake-branch (cs from-height to-height seed)
   "Add synthetic block-index entries for a competing branch over
 FROM-HEIGHT+1..TO-HEIGHT, forking off the active chain at FROM-HEIGHT.
-Returns the branch tip's hash. Models a reorg whose headers the node still
-knows (they were persisted by an earlier flush)."
+Returns the branch tip's hash."
   (let ((prev (bl.store:get-block-at-height cs from-height))
         (tip-hash nil))
     (loop for h from (1+ from-height) to to-height
@@ -314,142 +436,6 @@ knows (they were persisted by an earlier flush)."
                (bl.store:add-block-index-entry cs entry)
                (setf prev entry tip-hash hash)))
     tip-hash))
-
-(defun %csi-divergent-state (csi fork-height tip branch-hash)
-  "Make the index look like it followed an abandoned branch above FORK-HEIGHT:
-records at FORK-HEIGHT+1..TIP replaced by a lower height's record, and the best
-marker naming BRANCH-HASH at TIP. Returns the correct records (an alist of
-height -> bytes) so the test can assert they are rebuilt."
-  (let ((correct (loop for h from (1+ fork-height) to tip
-                       collect (cons h (%csi-raw-record csi h))))
-        (wrong (%csi-raw-record csi (1- fork-height))))
-    (loop for h from (1+ fork-height) to tip
-          do (%csi-put-raw-record csi h wrong))
-    (bl.store:coinstatsindex-set-best csi tip branch-hash)
-    correct))
-
-(test coinstatsindex-rewinds-to-fork-point-when-branch-is-known
-  "A best marker naming a block that is NOT the active chain's block at that
-height must be rewound to the last common ancestor and the records above it
-rebuilt — not blessed in place with the active chain's hash written over the
-evidence. Here the abandoned branch's headers are still in the header index,
-so the fork point comes from the cheap ancestor walk (Core's pprev walk in
-BaseIndex::Rewind)."
-  (with-network (:regtest)
-   (multiple-value-bind (node csi cs tip)
-       (%csi-fixture (format nil "csirw~D" (get-internal-real-time)) 6)
-     (let* ((fork (- tip 2))
-            (branch (%csi-fake-branch cs fork tip 200))
-            (correct (%csi-divergent-state csi fork tip branch)))
-       ;; Precondition: the index now serves the wrong records.
-       (is (not (equalp (cdr (assoc tip correct)) (%csi-raw-record csi tip))))
-       ;; Drive the shipped startup entry point: it must rewind and rebuild
-       ;; every record above the fork, exactly.
-       (bl:catch-up-index node (bl:node-coinstatsindex node))
-       (is (= tip (bl.store:coinstatsindex-height csi)))
-       (dolist (entry correct)
-         (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
-             "record at height ~D was not rebuilt" (car entry)))
-       ;; The best marker names the ACTIVE chain's tip again.
-       (multiple-value-bind (h hash) (bl.store:coinstatsindex-best csi)
-         (is (= tip h))
-         (is (equalp (bl.store:block-index-entry-hash
-                      (bl.store:get-block-at-height cs tip))
-                     hash)))
-       ;; Re-diverge to observe the rewind itself: it lands on the fork point,
-       ;; and gets there from the header index alone — no record recomputed, so
-       ;; this path is measured separately from the fallback in the next test.
-       (%csi-divergent-state csi fork tip branch)
-       (%csi-counting-calls
-           (verifications 'bl.store:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
-         (is (= 0 verifications)
-             "the header-index ancestor walk did not resolve the fork (~D recomputations)"
-             verifications))
-       (is (= fork (bl.store:coinstatsindex-height csi)))
-       (bl.store:close-coinstatsindex csi)))))
-
-(test coinstatsindex-rewinds-when-branch-headers-are-lost
-  "Same divergence, but the abandoned branch's headers are NOT in the header
-index — the realistic case, since headers are only persisted at flush time, so
-the crash that strands the marker also loses the branch it names. The rewind
-must still find the fork point, by recomputing each record from its stored
-parent and the active block at that height."
-  (with-network (:regtest)
-   (multiple-value-bind (node csi cs tip)
-       (%csi-fixture (format nil "csirwu~D" (get-internal-real-time)) 6)
-     (let* ((fork (- tip 2))
-            (unknown (make-array 32 :element-type '(unsigned-byte 8)
-                                    :initial-element #xE7))
-            (correct (%csi-divergent-state csi fork tip unknown)))
-       (is (null (bl.store:get-block-index-entry cs unknown)))
-       ;; The shipped entry point rewinds and rebuilds, as above.
-       (bl:catch-up-index node (bl:node-coinstatsindex node))
-       (is (= tip (bl.store:coinstatsindex-height csi)))
-       (dolist (entry correct)
-         (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
-             "record at height ~D was not rebuilt" (car entry)))
-       ;; Re-diverge to observe the rewind itself: it lands on the fork point,
-       ;; and gets there by recomputation — one per height from the tip down to
-       ;; the fork, the path the header-index walk cannot cover here.
-       (%csi-divergent-state csi fork tip unknown)
-       (%csi-counting-calls
-           (verifications 'bl.store:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
-         (is (= 3 verifications)
-             "expected one recomputation per height from the tip down to the fork, got ~D"
-             verifications))
-       (bl.store:close-coinstatsindex csi)))))
-
-(test coinstatsindex-consistent-index-is-not-rebuilt
-  "Control: a consistent index must NOT rewind and must NOT re-index a single
-block — a fix that always rebuilt would be a severe performance regression
-(hours on a real chain). The same counter proves it can see work happening,
-by re-running against a divergent index."
-  (with-network (:regtest)
-   (multiple-value-bind (node csi cs tip)
-       (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
-     (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
-       ;; Consistent: no rewind, no work at all.
-       (is (null (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
-       (bl:catch-up-index node (bl:node-coinstatsindex node))
-       (is (= 0 adds) "a consistent index re-indexed ~D block(s)" adds)
-       (is (= tip (bl.store:coinstatsindex-height csi)))
-       ;; Positive control: the counter does move when there IS work.
-       (let ((fork (- tip 2)))
-         (%csi-divergent-state csi fork tip (%csi-fake-branch cs fork tip 100))
-         (bl:catch-up-index node (bl:node-coinstatsindex node))
-         (is (= 2 adds) "divergent index re-indexed ~D block(s)" adds)))
-     (bl.store:close-coinstatsindex csi))))
-
-(test coinstatsindex-ahead-of-tip-rewinds-to-tip
-  "The ordinary unclean-shutdown shape: index writes are durable immediately,
-the chainstate tip only at a flush, so after a kill the marker sits above the
-restored tip on the SAME chain. That must cost one verification and a marker
-move to the tip — not a rebuild from genesis."
-  (with-network (:regtest)
-   (multiple-value-bind (node csi cs tip)
-       (%csi-fixture (format nil "csiahd~D" (get-internal-real-time)) 5)
-     (let ((tip-record (%csi-raw-record csi tip)))
-       ;; Two blocks' worth of records above the restored tip, marker on a
-       ;; block the (stale) header index never saw.
-       (%csi-put-raw-record csi (+ tip 1) tip-record)
-       (%csi-put-raw-record csi (+ tip 2) tip-record)
-       (bl.store:coinstatsindex-set-best
-        csi (+ tip 2) (make-array 32 :element-type '(unsigned-byte 8)
-                                     :initial-element #xC3))
-       (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
-         (is (eql tip (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
-         (bl:catch-up-index node (bl:node-coinstatsindex node))
-         (is (= 0 adds) "an index merely ahead of the tip re-indexed ~D block(s)" adds))
-       ;; Marker back on the active tip, its record untouched.
-       (multiple-value-bind (h hash) (bl.store:coinstatsindex-best csi)
-         (is (= tip h))
-         (is (equalp (bl.store:block-index-entry-hash
-                      (bl.store:get-block-at-height cs tip))
-                     hash)))
-       (is (equalp tip-record (%csi-raw-record csi tip)))
-       (bl.store:close-coinstatsindex csi)))))
 
 (test coinstatsindex-answers-a-block-a-reorg-took-off-the-chain
   "Core\'s index keeps a reorged-out block\'s record: the height key holds the
@@ -476,14 +462,18 @@ would report the other one\'s cumulative total."
             ;; Read through the HEIGHT key, which still names the active
             ;; block at this point, so the baseline needs no new function.
             (active-subsidy (bl.store:coinstats-total-subsidy
-                             (bl.store:coinstatsindex-get-stats csi tip))))
+                             (%csi-stats-at csi cs tip))))
        (is-true block "the fixture must have the tip block on disk")
-       ;; The competing block held the height first, with a subsidy of its own
+       ;; Back to the parent (Core's CustomRemove for the tip) ...
+       (is-true (bl.store:coinstatsindex-revert-block csi block active-hash tip undo))
+       ;; ... the competing block holds the height, with a subsidy of its own
        ;; so the two records cannot be confused ...
        (bl.store:coinstatsindex-add-block csi block branch-hash tip undo
                                           (1+ subsidy))
-       ;; ... and then the active block reclaimed it, which is the moment Core
-       ;; copies what the height held under its own hash.
+       ;; ... and is reversed in its turn when the active block reclaims the
+       ;; height, which is the moment Core copies what the height held under
+       ;; its own hash.
+       (is-true (bl.store:coinstatsindex-revert-block csi block branch-hash tip undo))
        (bl.store:coinstatsindex-add-block csi block active-hash tip undo subsidy)
        ;; End to end first, so a run against the previous code fails on the
        ;; ANSWER and not on a symbol this change introduces.
@@ -494,7 +484,7 @@ would report the other one\'s cumulative total."
              "and reports the block that was asked for"))
        (is (= active-subsidy
               (bl.store:coinstats-total-subsidy
-               (bl.store:coinstatsindex-get-stats csi tip)))
+               (%csi-stats-at csi cs tip)))
            "the height-keyed read still answers for the active chain")
        (let ((by-active (bl.store:coinstatsindex-get-block-stats csi active-hash tip))
              (by-branch (bl.store:coinstatsindex-get-block-stats csi branch-hash tip)))
@@ -526,9 +516,8 @@ same height still works."
                    node (list "muhash" (bl.rpc:hash-to-hex active)))))
          (is (= tip (cdr (assoc "height" res :test #'string=)))))
        ;; A height above the best marker is not vouched for either.
-       (bl.store:coinstatsindex-set-best
-        csi (1- tip) (bl.store:block-index-entry-hash
-                      (bl.store:get-block-at-height cs (1- tip))))
+       (bl.store:index-set-best
+        csi (bl.store:block-index-entry-hash (bl.store:get-block-at-height cs (1- tip))) (1- tip))
        (signals bl.rpc:rpc-error
          (%txoutsetinfo node (list "muhash" tip)))
        (bl.store:close-coinstatsindex csi)))))

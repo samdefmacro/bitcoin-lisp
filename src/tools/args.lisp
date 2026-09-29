@@ -129,17 +129,26 @@ selector or an unknown -chain."
                                     ((null value) "0")
                                     (t value))))))
 
+(defun program-base-name (argv0)
+  "ARGV0's file name, with a trailing .exe (Core's EXEEXT) removed."
+  (let ((name (file-namestring (or argv0 ""))))
+    (if (and (> (length name) 4)
+             (string-equal ".exe" name :start2 (- (length name) 4)))
+        (subseq name 0 (- (length name) 4))
+        name)))
+
+(defun format-full-version ()
+  "Core FormatFullVersion (clientversion.cpp:58-62): the build's version,
+\"v\" and the dotted client version."
+  (concatenate 'string "v" (bl.ser:client-version-string)))
+
 (defun tool-version-banner (tool)
   "The first line every tool prints for -help and -version:
 \"<CLIENT_NAME> <tool> utility version <FormatFullVersion>\"."
-  (format nil "bitcoin-lisp ~A utility version ~A~%"
-          tool (bl.ser:client-version-string)))
+  (format nil "~A ~A utility version ~A~%"
+          bl.cfg:+client-name+ tool (format-full-version)))
 
 (defun tool-license-info ()
-  "Core LicenseInfo (clientversion.cpp:86-103), in this project's words."
-  (format nil "Copyright (C) 2026 samdefmacro~%~%~
-Please contribute if you find bitcoin-lisp useful. Visit ~
-<https://github.com/samdefmacro/bitcoin-lisp> for further information about ~
-the software.~%~%This is experimental software.~%Distributed under the MIT ~
-software license, see the accompanying file COPYING or ~
-<https://opensource.org/license/MIT>~%"))
+  "Core FormatParagraph(LicenseInfo()): what every program prints after its
+-version line (bl.cfg:license-info)."
+  (bl.cfg:format-paragraph (bl.cfg:license-info)))

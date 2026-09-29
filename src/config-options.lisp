@@ -618,8 +618,12 @@
   "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "deprecatedrpc"
-  "help"
-  "ipcbind" "limitancestorsize"
+  ;; -help and SetupHelpOptions' hidden -h and -? (common/args.cpp:722-726).
+  "help" "h" "?"
+  ;; No -ipcbind: bitcoind registers it only when it can listen on IPC
+  ;; (init.cpp:721-723), which a monolithic bitcoind never can, so Core
+  ;; refuses it as an invalid parameter (tool_bitcoin.py:71).
+  "limitancestorsize"
   "limitdescendantsize"
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"

@@ -8208,6 +8208,19 @@ is why the type error is the one reported. We accepted both silently
 
 ;;; --- Node / chain info RPCs ---
 
+(test a-double-is-spelled-as-univalue-spells-it
+  "UniValue(double) writes setprecision(16) (univalue.cpp:75-82) and
+GetDifficulty computes 0xffff over the mantissa, scaled by 256 per exponent
+step (rpc/blockchain.cpp:96-114). Core v28.2 answers the regtest difficulty
+as 4.656542373906925e-10; ours printed SBCL's shortest round-trip,
+4.6565423739069247e-10 (scripts/interop/datadir_interop.py)."
+  ;; No tip: the 0x1d00ffff fallback is difficulty 1, which Core writes `1'.
+  (is (equal "1" (rpc-result-json
+                  (bl.rpc:dispatch-rpc-method (make-test-node) "getdifficulty" nil))))
+  (is (equal "[4.656542373906925e-10,0.5,1e-09,0]"
+             (rpc-result-json (list 4.6565423739069247d-10 0.5d0 1d-9 0d0)))))
+
+
 (test rpc-node-info
   (let* ((node (make-test-node))
          (net (bl:node-network node)))

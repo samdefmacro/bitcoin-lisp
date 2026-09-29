@@ -457,20 +457,30 @@ the position once it exists."
     entry))
 
 (defun note-genesis-position (chain-state store)
-  "Give CHAIN-STATE's genesis entry the position of the genesis body STORE
-holds, when the entry has none. Core's LoadGenesisBlock saves genesis and runs
-it through ReceivedBlockTransactions (validation.cpp:4966-4985), so its entry
-carries nFile/nDataPos and BLOCK_HAVE_DATA like any other block; ours wrote the
-body (ENSURE-GENESIS-ON-DISK) but never told the entry, and a blocks/index
-without HAVE_DATA on genesis is one Core's BaseIndex::Init reads as pruned: an
-index started on it fails with `best block of the index goes beyond pruned
-data' (GetFirstBlock(tip, BLOCK_HAVE_DATA) != Genesis(), index/base.cpp)."
+  "Record on CHAIN-STATE's genesis entry where STORE holds genesis's body, when
+the entry names no position yet; returns the entry.
+
+Core's LoadGenesisBlock hands the position WriteBlock returned to
+ReceivedBlockTransactions (validation.cpp:4966-4985), so genesis carries
+BLOCK_HAVE_DATA, nFile and nDataPos like any block received. Ours wrote the
+body (ENSURE-GENESIS-ON-DISK) before the genesis entry existed, and nothing
+noted the position after: the record in blocks/index had no HAVE_DATA. Core
+v28.2 started on such a datadir dropped every chain in FindMostWorkChain for
+the missing body and waited for a genesis block forever
+(scripts/interop/datadir_interop.py), and with -coinstatsindex it refused the
+index as pruned (`best block of the index goes beyond pruned data',
+GetFirstBlock(tip, BLOCK_HAVE_DATA) != Genesis(), index/base.cpp).
+
+Start-up calls it every time, so it also REPAIRS a datadir written before --
+the live nodes' genesis entries lack the flag -- whenever the store still
+indexes genesis's body; a pruned store that dropped it is left as it is."
   (let* ((hash (chain-state-genesis-hash chain-state))
          (entry (get-block-index-entry chain-state hash))
          (located (and store (gethash hash (block-store-index store)))))
-    (when (and entry (null (block-index-entry-data-pos entry))
-               (flat-file-pos-p located))
-      (note-block-position chain-state hash located))))
+    (when (and entry (flat-file-pos-p located)
+               (null (block-index-entry-data-pos entry)))
+      (note-block-position chain-state hash located))
+    entry))
 
 ;;; Block sequence ids (Core nSequenceId / nBlockSequenceId / m_blocks_unlinked).
 

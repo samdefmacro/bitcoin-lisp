@@ -59,109 +59,169 @@
              :transactions (list coinbase spender))
             spender)))
 
+(defun %tsi-real-hash (block)
+  "Give BLOCK's header its REAL hash and return it: FindSpender reports the hash
+of the header it reads back from the block file."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (hash (bl.crypto:hash256 (bl.ser:serialize-block-header header))))
+    (setf (bl.ser:block-header-cached-hash header) hash)
+    hash))
+
+(defmacro with-tsi-flat-index ((store idx) &body body)
+  "A regtest flat-file block store and a spender index over it."
+  (let ((dir (gensym "DIR")))
+    `(with-network (:regtest)
+       (with-temp-directory (,dir "bl-tsi-flat")
+         (let* ((bl.store:*flat-block-files* t)
+                (,store (bl.store:init-block-store ,dir))
+                (,idx (bl.store:init-txospender-index ,dir :block-store ,store)))
+           (unwind-protect (progn ,@body)
+             (bl.store:close-txospender-index ,idx)))))))
+
+(defun %tsi-keys (idx)
+  "Every entry key of IDX (not the salt or the best block), in key order."
+  (let ((keys '()))
+    (bl.kv:with-leveldb-iterator (it (bl.store:base-index-db idx))
+      (bl.kv:leveldb-iter-seek-to-first it)
+      (loop while (bl.kv:leveldb-iter-valid-p it)
+            do (let ((k (bl.kv:leveldb-iter-key it)))
+                 (when (member (aref k 0) '(#x73 #x53)) (push k keys)))
+               (bl.kv:leveldb-iter-next it)))
+    (nreverse keys)))
+
 (test txospenderindex-records-and-finds-a-spend
-  "The whole point: given an outpoint, say which transaction spent it. The
-locator is the (block hash, offset) pair the txindex already uses, so a lookup
-can read the spending transaction back and confirm it."
-  (let ((dir (%tsi-tmpdir "find")))
-    (unwind-protect
-         (let ((idx (bl.store:init-txospender-index dir)))
-           (unwind-protect
-                (multiple-value-bind (block spender) (%tsi-spending-block
-                                                      (list (%tsi-outpoint #xA1 0)
-                                                            (%tsi-outpoint #xA2 7)))
-                  (declare (ignore spender))
-                  (let ((hash (bl.ser:block-header-hash
-                               (bl.ser:bitcoin-block-header block))))
-                    ;; Two inputs, so two entries — and the coinbase is skipped.
-                    (is (= 2 (bl.store:txospenderindex-add-block idx block hash)))
-                    (let ((locs (bl.store:txospenderindex-locators
-                                 idx (bl.ser:outpoint-hash
-                                      (%tsi-outpoint #xA1 0))
-                                 0)))
-                      (is (= 1 (length locs)))
-                      (is (equalp hash (car (first locs))))
-                      ;; The offset is the spending transaction's position in the
-                      ;; block, so it is past the coinbase.
-                      (is (plusp (cdr (first locs)))))
-                    ;; The vout is part of the key, so a different index of the
-                    ;; same txid is a different outpoint.
-                    (is (null (bl.store:txospenderindex-locators
-                               idx (bl.ser:outpoint-hash
-                                    (%tsi-outpoint #xA1 0))
-                               1)))
-                    ;; And an outpoint nothing spent is simply absent.
-                    (is (null (bl.store:txospenderindex-locators
-                               idx (bl.ser:outpoint-hash
-                                    (%tsi-outpoint #xFF 0))
-                               0)))))
-             (bl.store:close-txospender-index idx)))
-      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+  "The whole point: given an outpoint, say which transaction spent it. Each
+entry is Core's key -- 's', the salted outpoint hash, the spending
+transaction's CDiskTxPos -- with the empty string as its value
+(index/txospenderindex.cpp:95-107), and FindSpender reads the transaction back
+through the block file and checks it spends the outpoint (:156-176)."
+  (with-tsi-flat-index (store idx)
+    (multiple-value-bind (block spender) (%tsi-spending-block
+                                          (list (%tsi-outpoint #xA1 0)
+                                                (%tsi-outpoint #xA2 7)))
+      (let ((hash (%tsi-real-hash block)))
+        (bl.store:store-block store block :height 1)
+        ;; Two inputs, so two entries -- and the coinbase is skipped.
+        (is (= 2 (bl.store:txospenderindex-add-block idx block hash)))
+        (let ((keys (%tsi-keys idx))
+              (pos (bl.store:block-flat-position store hash))
+              (coinbase (first (bl.ser:bitcoin-block-transactions block))))
+          (is (= 2 (length keys)))
+          ;; 's', eight hash bytes, then VARINT nFile 0, nPos, and nTxOffset:
+          ;; the CompactSize count (1) plus the coinbase's bytes.
+          (is (every (lambda (k)
+                       (equalp (subseq k 9)
+                               (let ((bb (bl.ser:make-byte-buf)))
+                                 (bl.ser:bb-write-core-varint bb 0)
+                                 (bl.ser:bb-write-core-varint bb (bl.kv:flat-file-pos-pos pos))
+                                 (bl.ser:bb-write-core-varint
+                                  bb (1+ (length (bl.ser:transaction-wire-bytes coinbase))))
+                                 (bl.ser:bb-finish bb))))
+                     keys))
+          (is (equalp #(0) (bl.kv:leveldb-get (bl.store:base-index-db idx) (first keys)))))
+        (multiple-value-bind (tx block-hash)
+            (bl.store:txospenderindex-find-spender
+             idx (bl.ser:outpoint-hash (%tsi-outpoint #xA2 7)) 7)
+          (is (equalp (bl.ser:transaction-hash spender) (and tx (bl.ser:transaction-hash tx))))
+          (is (equalp hash block-hash)))
+        ;; The vout is part of the key, so a different index of the same txid
+        ;; is a different outpoint; and an outpoint nothing spent is absent.
+        (is (null (bl.store:txospenderindex-find-spender
+                   idx (bl.ser:outpoint-hash (%tsi-outpoint #xA1 0)) 1)))
+        (is (null (bl.store:txospenderindex-find-spender
+                   idx (bl.ser:outpoint-hash (%tsi-outpoint #xFF 0)) 0)))))))
 
 (test txospenderindex-reorg-erases-exactly-what-it-wrote
-  "⚠️ The reason this index needs a disconnect hook when the others do not.
+  "⚠️ A spender key carries no height. After a reorg the disconnected block is
+still on disk and still spends the outpoint, so an entry left behind resolves
+to a spending transaction from an ABANDONED chain -- a wrong answer, not a
+stale one. Core erases through CustomRemove and builds the same keys for both
+sides from the block alone (index/txospenderindex.cpp:110-139)."
+  (with-tsi-flat-index (store idx)
+    (let* ((block (%tsi-spending-block (list (%tsi-outpoint #xB1 0))))
+           (hash (%tsi-real-hash block))
+           (txid (bl.ser:outpoint-hash (%tsi-outpoint #xB1 0))))
+      (bl.store:store-block store block :height 1)
+      (bl.store:txospenderindex-add-block idx block hash)
+      (is-true (bl.store:txospenderindex-find-spender idx txid 0))
+      (is (= 1 (bl.store:txospenderindex-remove-block idx block hash)))
+      (is (null (bl.store:txospenderindex-find-spender idx txid 0))
+          "a disconnected block left its spender entries behind")
+      (is (null (%tsi-keys idx)))
+      ;; Idempotent.
+      (bl.store:txospenderindex-remove-block idx block hash)
+      (is (null (bl.store:txospenderindex-find-spender idx txid 0))))))
 
-coinstatsindex and blockfilterindex key their records on HEIGHT, so a reconnect
-overwrites a disconnected block's record and a stale one is never read. A
-spender key carries no height. After a reorg the disconnected block is still on
-disk and still spends the outpoint, so an entry left behind resolves to a
-spending transaction from an ABANDONED chain — a wrong answer, not a stale one.
+(test txospenderindex-salt-survives-a-reopen-under-cores-key
+  "⚠️ The salt must be STABLE for the life of the database: every key is
+hash(salt, outpoint). Core keeps it under the serialized std::string
+\"siphash_key\" -- its CompactSize length first -- as two u64 LE
+(index/txospenderindex.cpp:66-70); a salt this tree kept under the bare
+characters moves there on open."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-tsi-salt")
+      (let* ((bl.store:*flat-block-files* t)
+             (store (bl.store:init-block-store dir))
+             (block (%tsi-spending-block (list (%tsi-outpoint #xC1 0))))
+             (hash (%tsi-real-hash block))
+             (salt nil))
+        (bl.store:store-block store block :height 1)
+        (let ((idx (bl.store:init-txospender-index dir :block-store store)))
+          (let ((db (bl.store:base-index-db idx))
+                (core-key (concatenate '(vector (unsigned-byte 8)) #(11)
+                                       (map 'vector #'char-code "siphash_key"))))
+            (setf salt (bl.kv:leveldb-get db core-key))
+            (is (= 16 (length salt)))
+            ;; Put it back where this tree used to keep it.
+            (bl.kv:leveldb-put db (map '(vector (unsigned-byte 8)) #'char-code "siphash_key") salt)
+            (bl.kv:leveldb-delete db core-key))
+          (bl.store:txospenderindex-add-block idx block hash)
+          (bl.store:close-txospender-index idx))
+        (let ((idx (bl.store:init-txospender-index dir :block-store store)))
+          (unwind-protect
+               (progn
+                 (is (equalp salt (bl.kv:leveldb-get
+                                   (bl.store:base-index-db idx)
+                                   (concatenate '(vector (unsigned-byte 8)) #(11)
+                                                (map 'vector #'char-code "siphash_key")))))
+                 (is (null (bl.kv:leveldb-get
+                            (bl.store:base-index-db idx)
+                            (map '(vector (unsigned-byte 8)) #'char-code "siphash_key"))))
+                 ;; And the entry written before the reopen is still found.
+                 (is-true (bl.store:txospenderindex-find-spender
+                           idx (bl.ser:outpoint-hash (%tsi-outpoint #xC1 0)) 0)))
+            (bl.store:close-txospender-index idx)))))))
 
-Core erases through CustomRemove and builds the same outpoint list for both
-sides from the block alone, which is what makes the erase exact
-(index/txospenderindex.cpp:110-139)."
-  (let ((dir (%tsi-tmpdir "reorg")))
-    (unwind-protect
-         (let ((idx (bl.store:init-txospender-index dir)))
-           (unwind-protect
-                (let* ((block (%tsi-spending-block (list (%tsi-outpoint #xB1 0))))
-                       (hash (bl.ser:block-header-hash
-                              (bl.ser:bitcoin-block-header block)))
-                       (txid (bl.ser:outpoint-hash (%tsi-outpoint #xB1 0))))
-                  (bl.store:txospenderindex-add-block idx block hash)
-                  (is (= 1 (length (bl.store:txospenderindex-locators idx txid 0))))
-                  (is (= 1 (bl.store:txospenderindex-remove-block idx block hash)))
-                  (is (null (bl.store:txospenderindex-locators idx txid 0))
-                      "a disconnected block left its spender entries behind")
-                  ;; Idempotent: erasing twice is not an error and does not
-                  ;; resurrect anything.
-                  (bl.store:txospenderindex-remove-block idx block hash)
-                  (is (null (bl.store:txospenderindex-locators idx txid 0))))
-             (bl.store:close-txospender-index idx)))
-      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
-
-(test txospenderindex-salt-survives-a-reopen
-  "⚠️ The salt must be STABLE for the life of the database. Every key is
-hash(salt, outpoint), so regenerating it on reopen would silently orphan every
-record already written and the index would answer `not found' for every output
-it had already indexed — with no error anywhere. Core persists it for the same
-reason (index/txospenderindex.cpp:66-70)."
-  (let ((dir (%tsi-tmpdir "salt")))
-    (unwind-protect
-         (let (k0 k1)
-           (let ((idx (bl.store:init-txospender-index dir)))
-             (setf k0 (bl.store::txospender-index-k0 idx)
-                   k1 (bl.store::txospender-index-k1 idx))
-             (let* ((block (%tsi-spending-block (list (%tsi-outpoint #xC1 0))))
-                    (hash (bl.ser:block-header-hash
-                           (bl.ser:bitcoin-block-header block))))
-               (bl.store:txospenderindex-add-block idx block hash))
-             (bl.store:close-txospender-index idx))
-           ;; A fresh salt would be astronomically unlikely to repeat, so equal
-           ;; keys means it was read back rather than regenerated.
-           (let ((idx (bl.store:init-txospender-index dir)))
-             (unwind-protect
-                  (progn
-                    (is (= k0 (bl.store::txospender-index-k0 idx)))
-                    (is (= k1 (bl.store::txospender-index-k1 idx)))
-                    ;; And the record written before the reopen is still findable.
-                    (is (= 1 (length (bl.store:txospenderindex-locators
-                                      idx
-                                      (bl.ser:outpoint-hash
-                                       (%tsi-outpoint #xC1 0))
-                                      0)))))
-               (bl.store:close-txospender-index idx))))
-      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+(test txospenderindex-migrates-the-old-entries-in-place
+  "An index written before 2026-09-29 holds 's' | hash | block hash | offset.
+MIGRATE-TXOSPENDERINDEX keeps the first nine bytes and replaces the rest with
+the CDiskTxPos the block gives, one batch per block, and the answer is the same
+before and after."
+  (with-tsi-flat-index (store idx)
+    (let* ((block (%tsi-spending-block (list (%tsi-outpoint #xD1 0) (%tsi-outpoint #xD2 3))))
+           (hash (%tsi-real-hash block)))
+      (bl.store:store-block store block :height 1)
+      (bl.store:txospenderindex-add-block idx block hash)
+      (let* ((db (bl.store:base-index-db idx))
+             (core-keys (%tsi-keys idx))
+             (coinbase-size (length (bl.ser:transaction-wire-bytes
+                                     (first (bl.ser:bitcoin-block-transactions block))))))
+        ;; Rewrite them in the old layout.
+        (dolist (k core-keys)
+          (bl.kv:leveldb-delete db k)
+          (bl.kv:leveldb-put db (concatenate '(vector (unsigned-byte 8)) (subseq k 0 9) hash
+                                             (vector (ldb (byte 8 0) coinbase-size)
+                                                     (ldb (byte 8 8) coinbase-size) 0 0))
+                             (make-array 0 :element-type '(unsigned-byte 8))))
+        (is-true (bl.store:txospenderindex-needs-migration-p idx))
+        ;; Dual read before the migration.
+        (is (equalp hash (nth-value 1 (bl.store:txospenderindex-find-spender
+                                       idx (bl.ser:outpoint-hash (%tsi-outpoint #xD2 3)) 3))))
+        (is (= 2 (bl.store:migrate-txospenderindex idx)))
+        (is (null (bl.store:txospenderindex-needs-migration-p idx)))
+        (is (equalp core-keys (%tsi-keys idx)))
+        (is (equalp hash (nth-value 1 (bl.store:txospenderindex-find-spender
+                                       idx (bl.ser:outpoint-hash (%tsi-outpoint #xD1 0)) 0))))))))
 
 (test txospenderindex-best-block-round-trips-with-its-height
   "getindexinfo reports best_block_height, so the height is stored beside the
@@ -193,7 +253,7 @@ does not have to test for it — the same contract the txindex has."
                    (bl.ser:bitcoin-block-header block))))
         (is (= 0 (bl.store:txospenderindex-add-block idx block hash)))
         (is (= 0 (bl.store:txospenderindex-remove-block idx block hash)))
-        (is (null (bl.store:txospenderindex-locators
+        (is (null (bl.store:txospenderindex-find-spender
                    idx (bl.ser:outpoint-hash (%tsi-outpoint #xE1 0)) 0)))
         (is (null (bl.store:txospenderindex-best-block idx)))
         (is (= -1 (bl.store:txospenderindex-height idx)))))))
@@ -250,15 +310,18 @@ OUTPOINT, and enter it in CS's block index. Returns (values entry block)."
                  :hash hash :height height :chain-work height :status :valid
                  :header (bl.ser:bitcoin-block-header block)
                  :prev-entry prev-entry)))
-    (bl.store:store-block store block :height height)
+    ;; A per-block file: these fixtures name blocks by placeholder hashes,
+    ;; which only the legacy ('S') entry carries -- a flat block would be
+    ;; answered under its real header hash.
+    (let ((bl.store:*flat-block-files* nil))
+      (bl.store:store-block store block :height height))
     (bl.store:add-block-index-entry cs entry)
     (values entry block)))
 
 (defun %tsi-spender-block-hash (idx outpoint)
-  "The block hash the index records as spending OUTPOINT, or NIL."
-  (let ((locs (bl.store:txospenderindex-locators
-               idx (bl.ser:outpoint-hash outpoint) (bl.ser:outpoint-index outpoint))))
-    (and locs (= 1 (length locs)) (car (first locs)))))
+  "The block hash the index answers as spending OUTPOINT, or NIL."
+  (nth-value 1 (bl.store:txospenderindex-find-spender
+                idx (bl.ser:outpoint-hash outpoint) (bl.ser:outpoint-index outpoint))))
 
 (test txospenderindex-rewinds-a-marker-left-on-an-abandoned-branch
   "A branch switch that happens while the process is DOWN leaves the marker on
@@ -280,9 +343,9 @@ spends as unspent, which is Core's shape for `nothing spent it' and therefore
 indistinguishable from a real answer."
   (let ((dir (%tsi-tmpdir "rewind")))
     (unwind-protect
-         (let ((cs (bl.store:init-chain-state dir))
+         (let* ((cs (bl.store:init-chain-state dir))
                (store (bl.store:init-block-store dir))
-               (idx (bl.store:init-txospender-index dir))
+               (idx (bl.store:init-txospender-index dir :block-store store))
                (node (bl:make-node)))
            (unwind-protect
                 (let* ((genesis-hash (bl.store:best-block-hash cs))
@@ -366,9 +429,9 @@ answer -- and a reorg that ended up re-connecting the same block paid to
 rebuild what it had just thrown away."
   (let ((dir (%tsi-tmpdir "disconnect")))
     (unwind-protect
-         (let ((cs (bl.store:init-chain-state dir))
+         (let* ((cs (bl.store:init-chain-state dir))
                (store (bl.store:init-block-store dir))
-               (idx (bl.store:init-txospender-index dir))
+               (idx (bl.store:init-txospender-index dir :block-store store))
                (node (bl:make-node)))
            (unwind-protect
                 (let* ((genesis-hash (bl.store:best-block-hash cs))
@@ -430,9 +493,9 @@ Driven through the RPC handler over a real index so the field comes from the
 index lookup rather than from a hand-built result."
   (let ((dir (%tsi-tmpdir "rpc-blockhash")))
     (unwind-protect
-         (let ((cs (bl.store:init-chain-state dir))
+         (let* ((cs (bl.store:init-chain-state dir))
                (store (bl.store:init-block-store dir))
-               (idx (bl.store:init-txospender-index dir))
+               (idx (bl.store:init-txospender-index dir :block-store store))
                (node (bl:make-node)))
            (unwind-protect
                 (let* ((genesis-hash (bl.store:best-block-hash cs))

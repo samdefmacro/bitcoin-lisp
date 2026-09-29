@@ -1218,6 +1218,9 @@ startup refusal rather than a directory we create somewhere else."
   ;; the index, so without a root the drain never starts and every record is
   ;; orphaned. See %ENSURE-GENESIS-INDEX-ENTRY.
   (%ensure-genesis-index-entry network)
+  ;; Then its body's position, as Core's LoadGenesisBlock hands it to
+  ;; ReceivedBlockTransactions (validation.cpp:4966-4985) -- which also
+  ;; repairs an entry an earlier start saved without it.
   (bl.store:note-genesis-position (node-chain-state *node*) (node-block-store *node*))
 
   ;; A recorded tip the block index cannot place is not a tip. Core keeps NO
@@ -2708,20 +2711,15 @@ settings row back."
       (defer-log :info "Command-line arg: ~A=~A"
                  (car cell) (%logged-arg-value (car cell) (cdr cell))))))
 
-(defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
-  "Start the node from Bitcoin Core-style options: a list of CLI ARGS
- (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
-CLI arguments override the config file. This is the argv-friendly entry point —
- e.g. from a saved image's toplevel, or (start-node-from-args
-'(\"-chain=main\" \"-txindex\" \"-dbcache=2000\" \"-server\")).
-
-The data directory and network are resolved from the CLI first (so the config
-file can be located and its [network] section scoped), then the merged config
-is turned into start-node keyword arguments. -conf=PATH overrides the config
-file location."
-  ;; Unknown command-line options are a HARD startup error, exactly like
-  ;; Core ArgsManager::ParseParameters ("Invalid parameter -foo").
-  (check-cli-args args)
+(defun %read-init-config (args)
+  "Core InitConfig (common/init.cpp:18-110) over the command line ARGS, which
+CHECK-CLI-ARGS has accepted: the -datadir check, the config file and what it
+includes, the chain selection and the settings file, each refused in Core's
+words. Returns what it read as a plist (:cli :datadir :orig-datadir :conf-path
+:conf-explicit-p :conf-read :conf-texts :settings-network :settings-path
+:settings-cells ...). NODE-MAIN runs it before -help and -version, where
+bitcoind runs ParseArgs (bitcoind.cpp:111-127, :283-285), and
+START-NODE-FROM-ARGS builds on it."
   (let* ((cli (parse-cli-args args))
          ;; Normalized to end in a separator, and kept a STRING because the
          ;; config layer treats it as one. Core accepts -datadir with or
@@ -2770,6 +2768,24 @@ file location."
                    conf-globals))
          (settings-path (%settings-file-path settings-scope datadir settings-network))
          (settings-cells (and settings-path (%read-settings-file settings-path))))
+    (list :cli cli :datadir datadir :orig-datadir orig-datadir :conf-explicit-p conf-explicit-p :conf-path conf-path :conf-text conf-text :conf-read conf-read :conf-texts conf-texts :conf-globals conf-globals :settings-network settings-network :settings-scope settings-scope :settings-path settings-path :settings-cells settings-cells)))
+
+(defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
+  "Start the node from Bitcoin Core-style options: a list of CLI ARGS
+ (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
+CLI arguments override the config file. This is the argv-friendly entry point —
+ e.g. from a saved image's toplevel, or (start-node-from-args
+'(\"-chain=main\" \"-txindex\" \"-dbcache=2000\" \"-server\")).
+
+The data directory and network are resolved from the CLI first (so the config
+file can be located and its [network] section scoped), then the merged config
+is turned into start-node keyword arguments. -conf=PATH overrides the config
+file location."
+  ;; Unknown command-line options are a HARD startup error, exactly like
+  ;; Core ArgsManager::ParseParameters ("Invalid parameter -foo").
+  (check-cli-args args)
+  (destructuring-bind (&key cli datadir orig-datadir conf-path conf-read conf-texts settings-network settings-path settings-cells &allow-other-keys)
+      (%read-init-config args)
     (multiple-value-bind (plist merged)
         (args->start-node-plist args conf-texts
                                 (bl:settings-config-rows settings-cells))
@@ -2891,6 +2907,14 @@ option. Leading dashes and the value are stripped, as Core's ArgsManager does."
         for name = (%argv-option-name arg)
         thereis (and name (member name names :test #'string=))))
 
+(defun %daemon-version-line ()
+  "The first line bitcoind prints for -version and -help (bitcoind.cpp:139-144):
+\"<CLIENT_NAME> daemon version <FormatFullVersion> <exe name>\". The exe name
+is the program's own, bitcoind -- the one tool_bitcoin.py:98-100 reads back
+to tell which program `bitcoin node' ran."
+  (format nil "~A daemon version ~A bitcoind~%"
+          bl.cfg:+client-name+ (bl.tools:format-full-version)))
+
 (defun node-main ()
   "Toplevel of the saved executable: run a node from the command line and exit
 with the code the caller should act on.
@@ -2905,6 +2929,12 @@ stderr back at EVERY node stop and fails the test unless it is exactly empty
 every test that stops a node. Startup FAILURES do go to stderr, which is also
 Core's behaviour and what assert_start_raises_init_error reads."
   (sb-ext:disable-debugger)
+  ;; Started as the `bitcoin' wrapper (Core bitcoin.cpp), the executable
+  ;; prints its help or version, or becomes the program the command names:
+  ;; `bitcoin node ...' carries on below as `bitcoind ...', `bitcoin rpc ...'
+  ;; as `bitcoin-cli -named ...' (src/tools/bitcoin.lisp).
+  (when (bl.tools:bitcoin-wrapper-program-name-p (first sb-ext:*posix-argv*))
+    (setf sb-ext:*posix-argv* (bl.tools:bitcoin-wrapper-main sb-ext:*posix-argv*)))
   ;; The same executable is bitcoin-cli when started under that name
   ;; (scripts/conformance-config.sh links build/bin/bitcoin-cli to it), which
   ;; is how Core's framework finds a client next to its node. Decided before
@@ -2931,20 +2961,27 @@ Core's behaviour and what assert_start_raises_init_error reads."
     (handler-case
         (cond
           ;; -version and -help print and exit 0 before anything is started,
-          ;; as they do in Core (init.cpp's HelpRequested/-version branch).
+          ;; as they do in Core (bitcoind.cpp:138-160 ProcessInitCommands) --
+          ;; but only after the command line has PARSED (bitcoind.cpp:283-285
+          ;; runs ParseArgs first), so `-ipcbind=unix -version' is the parse
+          ;; error tool_bitcoin.py:71 expects, not a version banner. ParseArgs
+          ;; includes InitConfig (bitcoind.cpp:120-122): a missing -datadir, an
+          ;; unreadable or malformed config file and an invalid chain
+          ;; combination are refused before -help and -version too. The
+          ;; checks signal on a refusal; this clause never selects anything.
+          ((progn (check-cli-args args) (%read-init-config args) nil))
           ((%argv-asks-for args '("version"))
-           (format t "bitcoin-lisp version ~A~%"
-                   (bl.ser:client-version-string))
+           (format t "~A~A" (%daemon-version-line) (bl.tools:tool-license-info))
            (finish-output)
            (sb-ext:exit :code 0))
           ((%argv-asks-for args '("help" "h" "?"))
-           (format t "bitcoin-lisp version ~A~%~%~
+           (format t "~A~%~
 Usage: bitcoin-lisp-node [options]~%~%~
 Runs a Bitcoin full node. Options follow Bitcoin Core's spelling ~
 (-datadir, -regtest, -rpcport, ...); see docs/ for what is implemented, and ~
 note that options this node accepts but does not implement are reported at ~
 startup.~%"
-                   (bl.ser:client-version-string))
+                   (%daemon-version-line))
            (finish-output)
            (sb-ext:exit :code 0))
           (t

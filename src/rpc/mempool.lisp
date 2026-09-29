@@ -485,57 +485,18 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
 
 (defun %txospender-confirmed-spender (node index txid vout)
   "(VALUES SPENDING-TX BLOCK-HASH) for the confirmed spend of TXID:VOUT from
-the spender index, or NIL. The block hash is part of the answer, not a
-by-product: it is what Core's caller reports as `blockhash\'
-(rpc/mempool.cpp:1020-1021).
+the spender index, or NIL -- Core's FindSpender (index/txospenderindex.cpp:
+156-176), which reads each candidate back and keeps the one that really
+spends the outpoint. The block hash is part of the answer: it is what Core's
+caller reports as `blockhash' (rpc/mempool.cpp:1020-1021).
 
-The index key is a SALTED HASH of the outpoint, so two different outpoints can
-land under one key. Every candidate is read back from its block and checked
-before it is believed — Core does the same for the same reason
-(index/txospenderindex.cpp:141-156). A candidate that does not really spend the
-outpoint is a hash collision; one whose block is no longer on the active chain
-is a reorg the index has not been told about, and both are skipped."
-  (let ((block-store (bl:node-block-store node)))
-    (dolist (locator (bl.store:txospenderindex-locators index txid vout))
-      (destructuring-bind (block-hash . position) locator
-        (let ((block (and block-store
-                          (bl.store:get-block block-store block-hash))))
-          ;; KNOWN, not necessarily on the ACTIVE chain. Core's FindSpender
-          ;; reads the transaction at the indexed position and returns it as
-          ;; soon as one of its inputs is the outpoint
-          ;; (index/txospenderindex.cpp:160-176); it asks nothing about the
-          ;; chain, so an entry a reorg has left behind is answered until the
-          ;; index is rewound, and the block hash it reports is that block's.
-          ;; rpc_gettxspendingprevout.py:200 pins exactly that: after an
-          ;; invalidateblock the RPC still names the spend from the abandoned
-          ;; block, "still in txospender index which has not been rewound yet".
-          ;; An active-chain gate here answered "unspent" instead, which is
-          ;; Core's shape for "nothing spent it" and so indistinguishable from
-          ;; a real answer -- the same confusion the index's own rewind test
-          ;; was written about.
-          (when block
-            (let ((tx (%tx-at-block-position block position)))
-              (when (and tx (%tx-spends-outpoint-p tx txid vout))
-                (return-from %txospender-confirmed-spender
-                  (values tx block-hash))))))))
-    nil))
-
-(defun %tx-at-block-position (block position)
-  "The transaction at byte offset POSITION within BLOCK's transaction list, or
-NIL when the offset does not land on one — which is what a stale index entry
-looks like."
-  (let ((offset 0))
-    (dolist (tx (bl.ser:bitcoin-block-transactions block))
-      (when (= offset position) (return-from %tx-at-block-position tx))
-      (incf offset (length (bl.ser:transaction-wire-bytes tx))))
-    nil))
-
-(defun %tx-spends-outpoint-p (tx txid vout)
-  (some (lambda (input)
-          (let ((op (bl.ser:tx-in-previous-output input)))
-            (and (equalp (bl.ser:outpoint-hash op) txid)
-                 (= (bl.ser:outpoint-index op) vout))))
-        (bl.ser:transaction-inputs tx)))
+KNOWN, not necessarily on the ACTIVE chain: an entry a reorg has left behind is
+answered until the index is rewound, as rpc_gettxspendingprevout.py:200 pins
+(\"still in txospender index which has not been rewound yet\"). An
+active-chain gate here answered `unspent', Core's shape for `nothing spent
+it'."
+  (declare (ignore node))
+  (bl.store:txospenderindex-find-spender index txid vout))
 
 ;;;; Raw-transaction safety rails (Core node/transaction.h:28-34)
 ;;;;

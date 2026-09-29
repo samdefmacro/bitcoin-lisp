@@ -242,10 +242,10 @@ recomputation, and a filter header; unknown type / missing block error."
                            (bl.store:get-block-at-height cs h))
                for prev-hash = (bl.store:block-index-entry-hash
                                 (bl.store:get-block-at-height cs (1- h)))
-               for filter = (bl.store:blockfilterindex-get-filter bfi hash)
-               for prev-header = (or (bl.store:blockfilterindex-get-header bfi prev-hash)
+               for filter = (bl.store:blockfilterindex-get-filter bfi hash h)
+               for prev-header = (or (bl.store:blockfilterindex-get-header bfi prev-hash (1- h))
                                      bl.store:+zero-filter-header+)
-               do (is (equalp (bl.store:blockfilterindex-get-header bfi hash)
+               do (is (equalp (bl.store:blockfilterindex-get-header bfi hash h)
                               (bl.store:compute-block-filter-header
                                filter prev-header)))))))))
 
@@ -371,18 +371,18 @@ contiguous."
          (is (= 6 n))
          (is (= 5 (bl.store:blockfilterindex-height bfi)))
          (is-true (bl.store:blockfilterindex-has-block-p
-                   bfi (bl.store:network-genesis-hash :regtest)))
+                   bfi (bl.store:network-genesis-hash :regtest) 0))
          ;; Genesis anchors on the all-zero header; height 1 chains off genesis.
          (let* ((ghash (bl.store:network-genesis-hash :regtest))
-                (gheader (bl.store:blockfilterindex-get-header bfi ghash))
-                (gfilter (bl.store:blockfilterindex-get-filter bfi ghash))
+                (gheader (bl.store:blockfilterindex-get-header bfi ghash 0))
+                (gfilter (bl.store:blockfilterindex-get-filter bfi ghash 0))
                 (h1 (bl.store:block-index-entry-hash
                      (bl.store:get-block-at-height cs 1)))
-                (filter (bl.store:blockfilterindex-get-filter bfi h1)))
+                (filter (bl.store:blockfilterindex-get-filter bfi h1 1)))
            (is (equalp gheader
                        (bl.store:compute-block-filter-header
                         gfilter bl.store:+zero-filter-header+)))
-           (is (equalp (bl.store:blockfilterindex-get-header bfi h1)
+           (is (equalp (bl.store:blockfilterindex-get-header bfi h1 1)
                        (bl.store:compute-block-filter-header
                         filter gheader))))
          (bl.store:close-blockfilterindex bfi)
@@ -404,7 +404,7 @@ contiguous."
            (is (= 3 n2))
            (is (= 2 (bl.store:blockfilterindex-height bfi2)))
            (is-true (bl.store:blockfilterindex-has-block-p
-                     bfi2 (bl.store:network-genesis-hash :regtest)))
+                     bfi2 (bl.store:network-genesis-hash :regtest) 0))
            (bl.store:close-blockfilterindex bfi2))
          ;; An empty index starts the seek at the pruned horizon (a pruned
          ;; mainnet node would otherwise probe ~950k deleted heights, ~14 ms
@@ -421,10 +421,11 @@ contiguous."
            (is (= 2 n3))
            (is (= 5 (bl.store:blockfilterindex-height bfi3)))
            (is-false (bl.store:blockfilterindex-has-block-p
-                      bfi3 (bl.store:network-genesis-hash :regtest)))
+                      bfi3 (bl.store:network-genesis-hash :regtest) 0))
            (is-false (bl.store:blockfilterindex-has-block-p
                       bfi3 (bl.store:block-index-entry-hash
-                            (bl.store:get-block-at-height cs 1))))
+                            (bl.store:get-block-at-height cs 1))
+                      1))
            (bl.store:close-blockfilterindex bfi3)
            (setf (bl.store:chain-state-pruned-height cs) 0)))))))
 
@@ -586,7 +587,7 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
                "an unknown stop hash"))
          ;; getcfilters payload round-trips
          (let ((payload (subseq (bl.ser:make-cfilter-message
-                                 0 h3 (bl.store:blockfilterindex-get-filter bfi h3))
+                                 0 h3 (bl.store:blockfilterindex-get-filter bfi h3 3))
                                 24)))
            (declare (ignore payload)))
          (multiple-value-bind (ft sh sp)
@@ -751,7 +752,7 @@ warning."
                      bfi block hash h undo))))
            (loop for h from 1 to 4 do (is-true (add h))))
          (is (= 4 (bl.store:blockfilterindex-height bfi)))
-         (is-false (bl.store:blockfilterindex-has-block-p bfi ghash))
+         (is-false (bl.store:blockfilterindex-has-block-p bfi ghash 0))
          ;; Pruned chain: the bad index is kept (bodies gone, cannot rebuild).
          (setf (bl.store:chain-state-pruned-height cs) 2)
          (is (eq :unanchored-pruned
@@ -768,7 +769,7 @@ warning."
            (is (= 5 n)))
          (is (= 4 (bl.store:blockfilterindex-height bfi)))
          (multiple-value-bind (gfilter gheader)
-             (bl.store:blockfilterindex-get bfi ghash)
+             (bl.store:blockfilterindex-get bfi ghash 0)
            ;; Stored genesis record matches a from-parameters recomputation
            ;; (and the independently derived regtest constants, python BIP158).
            (let* ((gblk (bl.store:make-genesis-block :regtest))
@@ -785,8 +786,8 @@ warning."
                  for hash = (bl.store:block-index-entry-hash
                              (bl.store:get-block-at-height cs h))
                  for prev = gheader then hdr
-                 for hdr = (bl.store:blockfilterindex-get-header bfi hash)
-                 for filter = (bl.store:blockfilterindex-get-filter bfi hash)
+                 for hdr = (bl.store:blockfilterindex-get-header bfi hash h)
+                 for filter = (bl.store:blockfilterindex-get-filter bfi hash h)
                  do (is (equalp hdr (bl.store:compute-block-filter-header
                                      filter prev)))))
          ;; Healthy index: second run is a no-op.
@@ -880,7 +881,7 @@ no parent filter header, which BLOCKFILTERINDEX-ADD-BLOCK refuses as
                (bl.store:update-chain-tip cs (%bfi-hash #x2B) 2)
                (is (= 2 (bl.store:blockfilterindex-height bfi))
                    "the fixture did not leave the marker on branch A")
-               (is-false (bl.store:blockfilterindex-has-block-p bfi (%bfi-hash #x1B))
+               (is-false (bl.store:blockfilterindex-has-block-p bfi (%bfi-hash #x1B) 1)
                          "the fixture indexed branch B before the restart")
                ;; The marker names an abandoned block, so how much of the ACTIVE
                ;; chain is indexed is the FORK height, not the stored one.
@@ -893,31 +894,31 @@ no parent filter header, which BLOCKFILTERINDEX-ADD-BLOCK refuses as
                ;; The ACTIVE branch is indexed, and its header chain links to
                ;; the fork point's header -- the direction that served nothing
                ;; but the abandoned branch before.
-               (let* ((gheader (bl.store:blockfilterindex-get-header bfi ghash))
+               (let* ((gheader (bl.store:blockfilterindex-get-header bfi ghash 0))
                       (b1-hash (%bfi-hash #x1B))
                       (b2-hash (%bfi-hash #x2B)))
-                 (dolist (h (list b1-hash b2-hash))
-                   (is-true (bl.store:blockfilterindex-has-block-p bfi h)
+                 (loop for h in (list b1-hash b2-hash) for height from 1
+                   do (is-true (bl.store:blockfilterindex-has-block-p bfi h height)
                             "the active branch's block ~A is still unindexed"
                             (bl.crypto:bytes-to-hex h)))
-                 (let ((b1-header (bl.store:blockfilterindex-get-header bfi b1-hash))
-                       (b1-filter (bl.store:blockfilterindex-get-filter bfi b1-hash)))
+                 (let ((b1-header (bl.store:blockfilterindex-get-header bfi b1-hash 1))
+                       (b1-filter (bl.store:blockfilterindex-get-filter bfi b1-hash 1)))
                    (is (equalp b1-header
                                (bl.store:compute-block-filter-header b1-filter gheader))
                        "the active branch's first header does not chain off the fork header"))
-                 (let ((b2-header (bl.store:blockfilterindex-get-header bfi b2-hash))
-                       (b2-filter (bl.store:blockfilterindex-get-filter bfi b2-hash))
-                       (b1-header (bl.store:blockfilterindex-get-header bfi b1-hash)))
+                 (let ((b2-header (bl.store:blockfilterindex-get-header bfi b2-hash 2))
+                       (b2-filter (bl.store:blockfilterindex-get-filter bfi b2-hash 2))
+                       (b1-header (bl.store:blockfilterindex-get-header bfi b1-hash 1)))
                    (is (equalp b2-header
                                (bl.store:compute-block-filter-header b2-filter b1-header))))
                  ;; The abandoned branch's filters survive, as Core's hash index
                  ;; keeps them, and still chain off the fork header.
-                 (let ((a1-header (bl.store:blockfilterindex-get-header bfi (%bfi-hash #x1A)))
-                       (a1-filter (bl.store:blockfilterindex-get-filter bfi (%bfi-hash #x1A))))
+                 (let ((a1-header (bl.store:blockfilterindex-get-header bfi (%bfi-hash #x1A) 1))
+                       (a1-filter (bl.store:blockfilterindex-get-filter bfi (%bfi-hash #x1A) 1)))
                    (is-true a1-filter "the rewind deleted an orphaned filter Core keeps")
                    (is (equalp a1-header
                                (bl.store:compute-block-filter-header a1-filter gheader))))
-                 (is-true (bl.store:blockfilterindex-has-block-p bfi (%bfi-hash #x2A))
+                 (is-true (bl.store:blockfilterindex-has-block-p bfi (%bfi-hash #x2A) 2)
                           "the rewind deleted an orphaned filter Core keeps"))
                ;; And the marker names the new tip, so a second start is a
                ;; no-op rather than a second rewind.

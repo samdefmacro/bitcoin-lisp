@@ -990,7 +990,7 @@ asserts the marker, which is the thing that was wrong."
                     (merge-pathnames (format nil "test-txidx-activate-~D/"
                                              (get-internal-real-time))
                                      (uiop:temporary-directory))))
-            (txindex (bl.store:init-tx-index txdir)))
+            (txindex (bl.store:init-tx-index txdir :block-store block-store)))
        (unwind-protect
             (progn
               (build-and-connect chain-state block-store utxo-set genesis-hash
@@ -1513,12 +1513,17 @@ only in the stale branch keeps its entry and resolves through the still-stored
 stale block; (c) the startup catch-up scan is idempotent under upsert
 semantics and re-points entries left stale by a crash."
   (with-network (:mainnet)
+   ;; Per-block files: these fixtures name blocks by placeholder hashes,
+   ;; which only the txindex's legacy ('L') record carries; a flat block's
+   ;; CDiskTxPos is read back under its REAL header hash (storage-tests pins
+   ;; that path with real blocks).
+   (let ((bl.store:*flat-block-files* nil))
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "txidx-remined")
      (let* ((txdir (ensure-directories-exist
                     (merge-pathnames (format nil "test-txidx-reorg-~D/" (get-internal-real-time))
                                      (uiop:temporary-directory))))
-            (txindex (bl.store:init-tx-index txdir))
+            (txindex (bl.store:init-tx-index txdir :block-store block-store))
             ;; A mature non-coinbase UTXO for T to spend (OP_TRUE, so the
             ;; full script validation in perform-reorg passes).
             (u-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE))
@@ -1549,9 +1554,8 @@ semantics and re-points entries left stale by a crash."
                 (bl.val:connect-block
                  a2 chain-state block-store utxo-set))
               (is (= 2 (bl.store:current-height chain-state)))
-              (let ((loc (bl.store:txindex-lookup txindex t-txid)))
-                (is (equalp (second a-hashes)
-                            (bl.store:tx-location-block-hash loc))))
+              (is (equalp (second a-hashes)
+                          (nth-value 1 (bl.store:txindex-find-tx txindex t-txid))))
               ;; Chain B (more work): B1, B2 = coinbase + T re-mined, B3.
               ;; B1/B2 are stored as a weaker chain; B3 triggers the reorg,
               ;; which validates B1-B3 fully (scripts included) and re-adds
@@ -1569,22 +1573,18 @@ semantics and re-points entries left stale by a crash."
               (is (= 3 (bl.store:current-height chain-state)))
               (is (equalp (third b-hashes) (bl.store:best-block-hash chain-state)))
               ;; (a) T re-mined: indexed at the NEW block.
-              (let ((loc (bl.store:txindex-lookup txindex t-txid)))
-                (is (not (null loc)))
-                (when loc
-                  (is (equalp (second b-hashes)
-                              (bl.store:tx-location-block-hash loc)))
-                  (is (= 1 (bl.store:tx-location-tx-position loc)))))
+              (multiple-value-bind (found block-hash) (bl.store:txindex-find-tx txindex t-txid)
+                (is (equalp t-txid (and found (bl.ser:transaction-hash found))))
+                (is (equalp (second b-hashes) block-hash)))
               ;; (b) A2's coinbase exists only in the stale branch: still
               ;; indexed at A2 and resolvable through the stored stale block.
               (let* ((a2 (bl.store:get-block block-store (second a-hashes)))
                      (a2-cb (first (bl.ser:bitcoin-block-transactions a2)))
                      (a2-cb-id (bl.ser:transaction-hash a2-cb))
-                     (loc (bl.store:txindex-lookup txindex a2-cb-id)))
-                (is (not (null loc)))
-                (when loc
-                  (is (equalp (second a-hashes)
-                              (bl.store:tx-location-block-hash loc)))
+                     (found-at (nth-value 1 (bl.store:txindex-find-tx txindex a2-cb-id))))
+                (is (not (null found-at)))
+                (when found-at
+                  (is (equalp (second a-hashes) found-at))
                   ;; The stale block body is still on disk, so the lookup
                   ;; resolves end-to-end (Core keeps stale block data too).
                   (is (not (null a2)))))
@@ -1606,18 +1606,18 @@ semantics and re-points entries left stale by a crash."
               ;; that marker is not something resuming can detect (nor can
               ;; Core's, which also resumes from its locator), so repairing it
               ;; is an explicit request rather than a cost paid every start.
-              (bl.store:txindex-add txindex t-txid (second a-hashes) 1)
+              (bl.store:txindex-add-block
+               txindex (bl.store:get-block block-store (second a-hashes)) (second a-hashes) 2)
               (is (= 0 (bl.store:build-tx-index
                         txindex chain-state block-store))
                   "the resuming scan must do nothing when the marker is at the tip")
               (is (plusp (bl.store:build-tx-index
                           txindex chain-state block-store :from-genesis t)))
-              (let ((loc (bl.store:txindex-lookup txindex t-txid)))
-                (is (equalp (second b-hashes)
-                            (bl.store:tx-location-block-hash loc)))))
+              (is (equalp (second b-hashes)
+                          (nth-value 1 (bl.store:txindex-find-tx txindex t-txid)))))
          (bl.store:close-tx-index txindex)
          (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
-         (clear-undo-cache))))))
+         (clear-undo-cache)))))))
 
 (test txindex-marker-rewinds-to-the-parent-on-disconnect
   "Core BaseIndex::Rewind moves the index's locator back to the fork when
@@ -1655,12 +1655,17 @@ the tx IS returned, blockhash names the stale block, confirmations is 0, and
 no time/blocktime fields are present; a tx on the active chain gets normal
 confirmations."
   (with-network (:mainnet)
+   ;; Per-block files: these fixtures name blocks by placeholder hashes,
+   ;; which only the txindex's legacy ('L') record carries; a flat block's
+   ;; CDiskTxPos is read back under its REAL header hash (storage-tests pins
+   ;; that path with real blocks).
+   (let ((bl.store:*flat-block-files* nil))
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (make-activate-block-fixture "txidx-rpc")
      (let* ((txdir (ensure-directories-exist
                     (merge-pathnames (format nil "test-txidx-rpc-~D/" (get-internal-real-time))
                                      (uiop:temporary-directory))))
-            (txindex (bl.store:init-tx-index txdir))
+            (txindex (bl.store:init-tx-index txdir :block-store block-store))
             (a-hashes (make-test-chain-hashes #xA7 2))
             (b-hashes (make-test-chain-hashes #xB7 3)))
        (unwind-protect
@@ -1708,7 +1713,7 @@ confirmations."
                   (is (eql 2 (cdr (assoc "confirmations" r :test #'string=)))))))
          (bl.store:close-tx-index txindex)
          (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
-         (clear-undo-cache))))))
+         (clear-undo-cache)))))))
 
 ;;;; Wave 8A: recent-rejects reset on EVERY tip advance (not just reorgs)
 
@@ -3922,7 +3927,7 @@ it."
                     (merge-pathnames (format nil "test-txidx-rewind-~D/"
                                              (get-internal-real-time))
                                      (uiop:temporary-directory))))
-            (txindex (bl.store:init-tx-index txdir)))
+            (txindex (bl.store:init-tx-index txdir :block-store block-store)))
        (unwind-protect
             (progn
               ;; Two blocks on the original branch, then a heavier fork that

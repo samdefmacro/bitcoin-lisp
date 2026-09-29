@@ -244,3 +244,143 @@ is Core's sentence with no wallet left behind (tool_wallet.py:201-286)."
         (damaged (lambda (row) (if (string= (car row) "checksum")
                                    (cons "checksum" "2222222222") row))
                  "Error: Checksum is not the correct size")))))
+
+;;; --- bitcoin, the wrapper (Core bitcoin.cpp) --------------------------------
+
+(defun %run-bitcoin (&rest args)
+  "RUN-BITCOIN as /w/build/bin/bitcoin over ARGS: (values action value stdout
+stderr)."
+  (let ((out (make-string-output-stream)) (err (make-string-output-stream)))
+    (multiple-value-bind (action value)
+        (bl.tools:run-bitcoin "/w/build/bin/bitcoin" args :out out :err err)
+      (values action value (get-output-stream-string out) (get-output-stream-string err)))))
+
+(test bitcoin-wrapper-maps-commands-to-programs
+  "bitcoin.cpp:86-119: each command names the program Core execs, with the
+command's arguments after it; `rpc' turns -named on; -M and -m pick the
+monolithic or multiprocess binary; anything else is an error in Core's words."
+  (flet ((target (&rest args)
+           (multiple-value-bind (action value) (apply #'%run-bitcoin args)
+             (and (eq action :exec) value))))
+    (is (equal '("bitcoind" "-regtest" "-version") (target "node" "-regtest" "-version")))
+    (is (equal '("bitcoind") (target "-M" "node")))
+    (is (equal '("bitcoin-node") (target "-m" "node")))
+    (is (equal '("bitcoind" "-ipcbind=unix") (target "-M" "node" "-ipcbind=unix")))
+    ;; Without -m/-M an -ipc* option is what asks for the multiprocess binary.
+    (is (equal '("bitcoin-node" "-ipcbind=unix") (target "node" "-ipcbind=unix")))
+    (is (equal '("bitcoin-cli" "-named" "-nonamed" "getblockcount")
+               (target "rpc" "-nonamed" "getblockcount")))
+    (is (equal '("bitcoin-wallet" "info") (target "wallet" "info")))
+    (is (equal '("bitcoin-tx" "-create") (target "tx" "-create")))
+    (is (equal '("bitcoin-util" "grind") (target "util" "grind")))
+    (is (equal '("bitcoin-chainstate") (target "chainstate")))
+    (is (equal '("bitcoin-qt") (target "gui")))
+    ;; Options after the command belong to the command.
+    (is (equal '("bitcoind" "-v" "help") (target "node" "-v" "help"))))
+  (multiple-value-bind (action code out err) (%run-bitcoin "frob")
+    (is (equal '(:exit 1 "") (list action code out)))
+    (is (equal (format nil "Error: Unrecognized command: 'frob'~%Try '/w/build/bin/bitcoin --help' for more information.~%")
+               err)))
+  (multiple-value-bind (action code out err) (%run-bitcoin "--frob" "node")
+    (declare (ignore out))
+    (is (equal '(:exit 1) (list action code)))
+    (is (search "Error: Unknown option: --frob" err))))
+
+(test bitcoin-wrapper-help-and-version
+  "No command prints the usage and the short hint and fails; help, -h and
+--help print the usage and the full list and succeed; -v prints the version
+line and the license (bitcoin.cpp:66-85)."
+  (multiple-value-bind (action code out err) (%run-bitcoin)
+    (is (equal '(:exit 1 "") (list action code err)))
+    (is (eql 0 (search "Usage: bitcoin [OPTIONS] COMMAND..." out)))
+    (is (search "Run 'bitcoin help' to see additional commands" out))
+    (is (null (search "Additional less commonly used commands" out))))
+  (dolist (spelling '("help" "-h" "--help"))
+    (multiple-value-bind (action code out) (%run-bitcoin spelling)
+      (is (equal '(:exit 0) (list action code)))
+      (is (search "Additional less commonly used commands:" out))
+      (is (search "  chainstate [ARGS] Run bitcoin kernel chainstate util" out))))
+  (multiple-value-bind (action code out) (%run-bitcoin "--version")
+    (is (equal '(:exit 0) (list action code)))
+    (is (eql 0 (search (format nil "bitcoin-lisp version ~A~%" (bl.tools:format-full-version))
+                       out)))
+    ;; FormatParagraph: no license line is wider than 79 columns.
+    (is (every (lambda (line) (<= (length line) 79))
+               (uiop:split-string out :separator '(#\Newline))))))
+
+(test bitcoin-wrapper-reads-ipc-options-from-the-config
+  "UseMultiprocess (bitcoin.cpp:163-184) reads the command's config file:
+an -ipcbind in the default section or in the chosen chain's section picks
+bitcoin-node, one in another chain's section does not."
+  (with-temp-directory (dir "bl-bitcoin-wrapper")
+    (flet ((node-program (conf &rest args)
+             (with-open-file (s (merge-pathnames "bitcoin.conf" dir)
+                                :direction :output :if-exists :supersede)
+               (write-string conf s))
+             (multiple-value-bind (action value)
+                 (apply #'%run-bitcoin "node"
+                        (format nil "-datadir=~A" (namestring dir)) args)
+               (and (eq action :exec) (first value)))))
+      (is (equal "bitcoind" (node-program (format nil "server=1~%"))))
+      (is (equal "bitcoin-node" (node-program (format nil "ipcbind=unix~%"))))
+      (is (equal "bitcoin-node" (node-program (format nil "[regtest]~%ipcbind=unix~%") "-regtest")))
+      (is (equal "bitcoind" (node-program (format nil "[regtest]~%ipcbind=unix~%"))))
+      (is (equal "bitcoind" (node-program (format nil "ipcbind=unix~%") "-noconf"))))))
+
+(test bitcoin-wrapper-execs-what-this-image-is-not
+  "ExecCommand (bitcoin.cpp:198-243): a program this image is comes back as
+the argument vector to carry on with, named beside the wrapper; any other is
+exec'd along Core's search path, and a missing one is Core's execvp error."
+  (is (equal '("/nonexistent/bin/bitcoind" "-regtest")
+             (bl.tools:bitcoin-exec '("bitcoind" "-regtest") "/nonexistent/bin/bitcoin")))
+  (is (equal '("bitcoin-cli" "-named" "x")
+             (bl.tools:bitcoin-exec '("bitcoin-cli" "-named" "x") "bitcoin-no-such-name")))
+  (let ((e (handler-case (bl.tools:bitcoin-exec '("bitcoin-qt") "/nonexistent/bin/bitcoin")
+             (bl.tools:bitcoin-wrapper-error (e) e))))
+    (is (typep e 'bl.tools:bitcoin-wrapper-error))
+    (is (equal "execvp failed to execute '/nonexistent/bin/bitcoin-qt': No such file or directory"
+               (princ-to-string e)))))
+
+(test bitcoind-refuses-ipcbind-and-accepts-the-help-spellings
+  "A monolithic bitcoind never registers -ipcbind (init.cpp:721-723), so it
+is an invalid parameter (tool_bitcoin.py:71); -h and -? are SetupHelpOptions'
+hidden spellings of -help (common/args.cpp:722-726)."
+  (let ((e (handler-case (bl:check-cli-args '("-ipcbind=unix" "-version"))
+             (bl.cfg:cli-parse-error (e) e))))
+    (is (equal "Error parsing command line arguments: Invalid parameter -ipcbind=unix"
+               (and e (princ-to-string e)))))
+  (finishes (bl:check-cli-args '("-h")))
+  (finishes (bl:check-cli-args '("-?"))))
+
+(test every-program-prints-the-one-license-text
+  "Core has ONE LicenseInfo, and every program prints FormatParagraph of it
+after its -version line (bitcoind.cpp:146-147, bitcoin-cli.cpp:152-155,
+bitcoin-util.cpp:58, bitcoin-tx.cpp:113, bitcoin.cpp:69). bitcoin-cli printed
+a copyright line of its own, unwrapped."
+  (let ((license (bl.cfg:format-paragraph (bl.cfg:license-info))))
+    (is (every (lambda (line) (<= (length line) 79))
+               (uiop:split-string license :separator '(#\Newline))))
+    (is (search license (nth-value 0 (bl.cli:run-cli '("-version")))))
+    (is (search license (nth-value 2 (%run-bitcoin "--version"))))
+    (let ((out (make-string-output-stream)))
+      (bl.tools:run-bitcoin-util '("-version") :out out :err (make-broadcast-stream))
+      (is (search license (get-output-stream-string out))))))
+
+(test bitcoind-reads-its-config-before-help-and-version
+  "bitcoind's ParseArgs runs InitConfig -- the -datadir check, the config file,
+the chain selection -- before -help and -version are looked at
+(bitcoind.cpp:111-127, :283-285): `bitcoind -datadir=<missing> -version' is
+Core's datadir error, not a version banner. NODE-MAIN asks
+%READ-INIT-CONFIG for exactly that before its -version branch."
+  (with-temp-directory (dir "bl-init-config")
+    (let ((missing (namestring (merge-pathnames "nope/" dir))))
+      (is (search "does not exist"
+                  (handler-case
+                      (progn (bl::%read-init-config (list (format nil "-datadir=~A" missing)
+                                                          "-version"))
+                             "no error")
+                    (error (e) (princ-to-string e)))))
+      ;; Control: an existing datadir reads.
+      (is (getf (bl::%read-init-config (list (format nil "-datadir=~A" (namestring dir))
+                                             "-regtest" "-version"))
+                :cli)))))

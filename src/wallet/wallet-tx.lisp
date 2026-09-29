@@ -1478,8 +1478,8 @@ matched."
                      (setf (gethash (desc-spkm-id spkm) (rescan-filter-last-ends rf))
                            current))))))))
 
-(defun %rescan-filter-matches-block (bfi rf block-hash)
-  "Match RF's script set against BLOCK-HASH's stored BASIC filter.
+(defun %rescan-filter-matches-block (bfi rf block-hash height)
+  "Match RF's script set against the stored BASIC filter of BLOCK-HASH at HEIGHT.
 Returns :match, :no-match, or :unknown when no filter is stored for that block.
 
 :unknown is the per-block fail-safe (Core blockFilterMatchesAny returning
@@ -1487,7 +1487,7 @@ nullopt, node/interfaces.cpp:583-584): the caller inspects the block. There is
 deliberately NO whole-scan guard on the index's sync height — Core has none,
 our index can legitimately contain holes below its best marker, and 'no filter
 => read the block' is already the safe direction."
-  (let ((filter (bl.store:blockfilterindex-get-filter bfi block-hash)))
+  (let ((filter (bl.store:blockfilterindex-get-filter bfi block-hash height)))
     (if filter
         (multiple-value-bind (k0 k1)
             (bl.store:block-filter-siphash-keys block-hash)
@@ -1586,7 +1586,7 @@ scanned, which RescanFromTime reports (wallet.cpp:1826-1830, :1935-1957)."
                                   ;; block N-1 triggered is present for block N.
                                   (verdict (when rf
                                              (%rescan-filter-update-if-needed wallet rf)
-                                             (%rescan-filter-matches-block bfi rf ehash)))
+                                             (%rescan-filter-matches-block bfi rf ehash eheight)))
                                   ;; Only read the block if we might need it.
                                   (blk (unless (eq verdict :no-match)
                                          (bl.store:get-block store ehash))))

@@ -55,9 +55,10 @@ Commands:
   test-all           Run the full :bitcoin-lisp-tests suite (long)
   docs-check         Verify PAX documentation transcripts in a cold container
   ui-test [PATH...]  Run the web UI node harness (default tests/ui/)
-  interop            Run the differential lane against Core's bitcoin-tx and
-                     bitcoin-util (scripts/interop-test.sh; needs
-                     scripts/get-previous-releases.sh first)
+  interop            Run the differential lanes against Core v28.2: bitcoin-tx
+                     and bitcoin-util, and each implementation on the other's
+                     regtest datadir (scripts/interop-test.sh; needs
+                     scripts/get-previous-releases.sh and build-node.sh first)
   logs               Show the dev container's output
   help               Show this help
 

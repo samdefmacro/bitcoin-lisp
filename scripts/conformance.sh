@@ -18,6 +18,7 @@
 # BL_CONFORMANCE_TIMEOUT caps each test (default 300s).
 # BL_CONFORMANCE_ARGS is appended to every test's command line, e.g.
 #   BL_CONFORMANCE_ARGS=--timeout-factor=4 for a test that starts a dozen nodes.
+# BL_CONFORMANCE_BITCOIN_CMD=1 starts every program through build/bin/bitcoin.
 # BL_CONFORMANCE_REFERENCE=<tag> runs the test against Core's OWN bitcoind of
 # that previous release (e.g. v28.2, see scripts/get-previous-releases.sh)
 # instead of ours: when a test fails here, it says whether Core passes it.
@@ -127,6 +128,14 @@ if [ -n "$RELEASES_VOL" ]; then
 elif [ -n "${BL_CONFORMANCE_REFERENCE:-}" ]; then
   echo "BL_CONFORMANCE_REFERENCE needs scripts/get-previous-releases.sh first." >&2
   exit 1
+fi
+
+# BL_CONFORMANCE_BITCOIN_CMD=1 runs every program through the `bitcoin'
+# wrapper, as Core's CI does with BITCOIN_CMD (test_framework/util.py:
+# Binaries._argv): nodes start as `bitcoin node ...', clients as `bitcoin rpc
+# -nonamed ...', and so on.
+if [ "${BL_CONFORMANCE_BITCOIN_CMD:-0}" = 1 ]; then
+  RELEASE_FLAGS="$RELEASE_FLAGS -e BITCOIN_CMD=/workspace/build/bin/bitcoin"
 fi
 
 echo "conformance run $RUN_ID -> $OUT" >&2

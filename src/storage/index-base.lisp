@@ -147,6 +147,14 @@ on it: repair one left above the tip, rewind one off the active chain
     (declare (ignore chainstate block-store))
     nil))
 
+(defgeneric index-migrate-records (index chainstate)
+  (:documentation "Rewrite records this tree wrote before its layout became
+Core's, in place and resumably, before the catch-up builds on them (the
+2026-09-29 port of the four indexes' records). Default: nothing.")
+  (:method ((index base-index) chainstate)
+    (declare (ignore chainstate))
+    nil))
+
 (defgeneric index-sync (index chainstate block-store &key undo-fn subsidy-fn progress)
   (:documentation "Backfill from just past the best marker to CHAINSTATE's tip
 (Core BaseIndex::Sync). UNDO-FN maps a block hash to its undo data and
@@ -238,9 +246,17 @@ when the block index does not hold it; NIL when the index has no best block.")
             (entry (setf (cdr best) (block-index-entry-height entry)) entry)
             (t :not-found)))))))
 
+(defgeneric index-commit-records (index)
+  (:documentation "The (key . value) records Core's CustomCommit writes in the
+SAME batch as the best-block locator (index/base.cpp:270-288): the filter
+index's next write position, the coinstats index's running MuHash. Default:
+none.")
+  (:method ((index base-index)) nil))
+
 (defun commit-index (index &optional chainstate)
   "Core BaseIndex::Commit (index/base.cpp:270-288): write the in-memory best
-block to the index's database as a CBlockLocator -- GetLocator over
+block to the index's database as a CBlockLocator, in one batch with the
+index's own INDEX-COMMIT-RECORDS -- GetLocator over
 CHAINSTATE's block index, byte for byte Core's -- and nothing when the index
 has processed no block yet. Without CHAINSTATE, or with a best block it does
 not hold, the locator is that one hash, which ReadBestBlock (vHave.at(0))
@@ -250,9 +266,13 @@ reads the same way. Returns T when a record was written."
     (when (and best db)
       (let ((entry (and chainstate
                         (get-block-index-entry chainstate (car best)))))
-        (leveldb-put db (base-index-meta-key index)
-                     (encode-block-locator
-                      (if entry
-                          (build-block-locator chainstate entry)
-                          (list (car best)))))
+        (with-leveldb-writebatch (batch)
+          (leveldb-writebatch-put batch (base-index-meta-key index)
+                                  (encode-block-locator
+                                   (if entry
+                                       (build-block-locator chainstate entry)
+                                       (list (car best)))))
+          (loop for (key . value) in (index-commit-records index)
+                do (leveldb-writebatch-put batch key value))
+          (leveldb-write db batch))
         t))))
