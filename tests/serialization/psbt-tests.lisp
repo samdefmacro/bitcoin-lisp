@@ -1980,3 +1980,46 @@ finalizes, and the same PSBT with its sighash fields changed to ALL does not
           (is (eq t (%aval "complete" (rpc nil "finalizepsbt" signed)))
               "the control: signed ALL|ANYONECANPAY, it finalizes")
           (is (not (eq t (%aval "complete" (rpc nil "finalizepsbt" changed))))))))))
+
+(defun %psbt-with-record (map-kind keytype keydata value)
+  "The hand-built PSBT with one record of KEYTYPE added to its first input
+(MAP-KIND :input) or output (:output), serialized."
+  (let* ((psbt (bl.ser:parse-psbt (%psbt-hand-built-bytes)))
+         (map (aref (if (eq map-kind :input) (bl.ser:psbt-inputs psbt) (bl.ser:psbt-outputs psbt)) 0)))
+    (bl.ser:psbt-map-set map keytype
+                         (coerce keydata '(simple-array (unsigned-byte 8) (*)))
+                         (coerce value '(simple-array (unsigned-byte 8) (*))))
+    (bl.ser:serialize-psbt psbt)))
+
+(test psbt-parser-reads-the-typed-input-and-output-fields
+  "Core's PSBTInput/PSBTOutput::Unserialize read these records into typed
+fields AT DECODE TIME (psbt.h:520-600, :1015-1022), so a malformed one fails
+the decode: a final scriptWitness that is not a stack of exactly its stated
+length (UnserializeFromVector, :105-120), a partial signature or BIP32
+derivation whose pubkey is not fully valid (:530-534, DeserializeHDKeypaths
+:150-160), and a key origin that is empty or not whole uint32s (:124-129). Ours
+kept them as opaque bytes, and decodepsbt later died on the witness with a
+bare serialization error. Found by the fuzz target psbt. The hand-built PSBT
+itself parses, so the rejections are the records."
+  (let* ((point (bl.crypto:derive-public-key
+                 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+         (off-curve (let ((v (make-array 33 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref v 0) 2 (aref v 32) 5)
+                      v))
+         (origin (vector 1 2 3 4 0 0 0 128)))
+    (is (null (%psbt-parse-failure (%psbt-with-record :input 6 point origin)))
+        "a well-formed derivation still parses")
+    (dolist (case (list (list :input 8 #() #(1 1 7 9) "stated size")
+                        (list :input 8 #() #(2 1 7 1) "end of data")
+                        (list :input 2 off-curve #(48 6 2 1 1 2 1 1 1) "Invalid pubkey")
+                        (list :input 6 off-curve origin "Invalid pubkey")
+                        (list :input 6 point #(1 2 3 4 5) "Invalid length for HD key path")
+                        (list :input 6 point #() "Invalid length for HD key path")
+                        (list :output 2 off-curve origin "Invalid pubkey")
+                        (list :output 2 point #(1 2 3) "Invalid length for HD key path")))
+      (destructuring-bind (kind keytype keydata value expected) case
+        (let ((report (%psbt-parse-failure (%psbt-with-record kind keytype keydata value))))
+          (is-true (and report (search expected report))
+                   "~S record ~D ~A: expected ~S, got ~S" kind keytype
+                   (bl.crypto:bytes-to-hex (coerce value '(simple-array (unsigned-byte 8) (*))))
+                   expected report))))))

@@ -274,16 +274,48 @@ partial signature one 32-byte UnserializeFromVector."
       (unless (= (length value) 32)
         (serialization-error "Size of value was not the stated size"))))
 
+(defun %psbt-pubkey-check (keydata)
+  "Core's `if (!pubkey.IsFullyValid()) throw \"Invalid pubkey\"' on the key
+of a partial signature or a BIP32 derivation (psbt.h:530-534, :156-160). A key
+of the wrong length is left to the size check, which Core runs first."
+  (when (and (member (length keydata) '(33 65))
+             (not (bl.crypto:public-key-valid-p keydata)))
+    (serialization-error "Invalid pubkey")))
+
+(defun %psbt-key-origin-check (value)
+  "Core DeserializeKeyOrigin (psbt.h:122-139): a BIP32 derivation's value is a
+4-byte fingerprint and whole uint32 path elements, never empty."
+  (when (or (zerop (length value)) (plusp (mod (length value) 4)))
+    (serialization-error "Invalid length for HD key path")))
+
+(defun %psbt-witness-stack-check (value)
+  "Core UnserializeFromVector(s, final_script_witness.stack) (psbt.h:105-120,
+:597-605): the value is a witness stack and exactly that -- a stack that runs
+past the value is the reader's end of data, one that stops short \"Size of
+value was not the stated size\"."
+  (let ((br (make-byte-reader-from value)))
+    (dotimes (i (br-read-compact-size br))
+      (br-read-var-bytes br))
+    (unless (br-eof-p br)
+      (serialization-error "Size of value was not the stated size"))))
+
 (defun %psbt-validate-content (context keytype keydata value)
-  "The typed-value readers Core runs on the taproot-derivation, taproot-tree
-and MuSig2 records at parse time, with their own error sentences."
+  "The typed-value readers Core runs on these records at parse time, with
+their own error sentences: the partial-signature and BIP32 pubkeys, the key
+origins, the final scriptWitness, the taproot derivations and tree, MuSig2."
   (case context
     (:input (case keytype
+              (#x02 (%psbt-pubkey-check keydata))
+              (#x06 (%psbt-pubkey-check keydata)
+                    (%psbt-key-origin-check value))
+              (#x08 (%psbt-witness-stack-check value))
               (#x16 (%psbt-tap-bip32-check "Input" value))
               (#x1a (%psbt-musig2-participants-check "Input" keydata value))
               (#x1b (%psbt-musig2-session-check "pubnonce" keydata value))
               (#x1c (%psbt-musig2-session-check "partial sig" keydata value))))
     (:output (case keytype
+               (#x02 (%psbt-pubkey-check keydata)
+                     (%psbt-key-origin-check value))
                (#x06 (%psbt-tap-tree-check value))
                (#x07 (%psbt-tap-bip32-check "Output" value))
                (#x08 (%psbt-musig2-participants-check "Output" keydata value))))))
