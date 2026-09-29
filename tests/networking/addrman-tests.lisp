@@ -400,3 +400,17 @@ one."
       (is (= 1 (length addrs)))
       (is (string= "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
                    (bl.net:peer-address-string (first addrs)))))))
+
+(test addrman-refuses-the-unspecified-and-broadcast-ipv4
+  "Core AddSingle stores only a routable address (addrman.cpp:549-551), and
+IsRoutable starts with IsValid, which refuses IPv4 INADDR_ANY and INADDR_NONE
+(netaddress.cpp:443-448). Our book stored 0.0.0.0:8333 -- from gossip, a
+peer could hand it one to dial -- and its own peers.dat reader then dropped
+it as invalid, so a book did not survive its file. Found by the fuzz target
+addrman-serdeser. 1.2.3.4 is the control."
+  (let ((book (bl.net:make-address-book)))
+    (is-false (bl.net:address-book-add book (%pa 0 0 0 0)))
+    (is-false (bl.net:address-book-add book (%pa 255 255 255 255)))
+    (is (= 0 (bl.net:address-book-count book)))
+    (is-true (bl.net:address-book-add book (%pa 1 2 3 4)))
+    (is (= 1 (bl.net:address-book-count book)))))

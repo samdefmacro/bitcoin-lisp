@@ -226,8 +226,11 @@ NET_CJDNS), RFC3849 documentation (2001:db8::/32), RFC4843 ORCHID
 
 (defun address-routable-p (ip &optional net)
   "Core IsRoutable (netaddress.cpp:462-465), per network: correct byte length,
-non-zero, CJDNS carries the 0xFC prefix, and no IPv6 special-purpose range
-(%ipv6-unroutable-p).
+non-zero, CJDNS carries the 0xFC prefix, no IPv6 special-purpose range
+(%ipv6-unroutable-p), and -- IsValid's IPv4 half (netaddress.cpp:443-448) --
+neither INADDR_ANY (0.0.0.0) nor INADDR_NONE (255.255.255.255), which the
+peers.dat reader drops (%ADDRINFO-VALID-P), so a book never holds what its
+own file cannot.
 
 Deliberate divergence: IPv4 private (RFC1918) and documentation (RFC5737)
 ranges stay routable here — Core rejects both — for private/regtest setups
@@ -239,6 +242,8 @@ and the fixtures in tests/ that depend on them."
          (case net
            (:cjdns (= (aref ip 0) #xFC))
            (:ipv6 (not (%ipv6-unroutable-p ip)))
+           (:ipv4 (let ((v4 (subseq ip (- (length ip) 4))))
+                    (not (or (every #'zerop v4) (every (lambda (b) (= b 255)) v4)))))
            (t t)))))
 
 (defun address-valid-p (ip &optional net)
