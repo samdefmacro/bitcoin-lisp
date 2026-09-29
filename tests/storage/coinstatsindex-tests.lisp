@@ -389,6 +389,46 @@ re-indexes exactly the blocks above it."
                     (bl.store:coinstats-muhash-hash (%csi-stats-at csi cs tip)))))
       (bl.store:close-coinstatsindex csi))))
 
+(test coinstatsindex-rewind-that-cannot-reverse-a-block-aborts-the-node
+  "Core's BaseIndex::Rewind returns false when a block it must reverse cannot be
+read (index/base.cpp:299-310), and Sync then FatalErrorf's `Failed to rewind
+coinstatsindex to a previous chain tip' (:239-241) -- AbortNode: the fatal
+caption on stderr and a shutdown request, no Commit, nothing built on top.
+Ours cleared the best block and rebuilt the index from genesis. The shape is
+the unclean-shutdown one of the test above with the index's top block's body
+gone; the control is that test, where the same rewind succeeds."
+  (with-network (:regtest)
+    (multiple-value-bind (node csi cs tip)
+        (%csi-fixture (format nil "csirwf~D" (get-internal-real-time)) 5)
+      (let* ((top-hash (bl.store:block-index-entry-hash
+                        (bl.store:get-block-at-height cs tip)))
+             (back (bl.store:get-block-at-height cs (- tip 2)))
+             (records (loop for h from 0 to tip collect (%csi-raw-record csi h)))
+             (stderr (make-string-output-stream))
+             (requested '()))
+        (bl.store:update-chain-tip cs (bl.store:block-index-entry-hash back) (- tip 2))
+        (is-true (bl.store:forget-block-body (bl:node-block-store node) top-hash)
+                 "the fixture's top block must have had a body to lose")
+        (bl.log:reset-warnings)
+        (unwind-protect
+             (let ((bl.log:*fatal-error-shutdown-function*
+                     (lambda (message) (push message requested))))
+               (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
+                 (let ((*error-output* stderr))
+                   (bl:catch-up-index node csi))
+                 (is (= 0 adds) "the failed rewind rebuilt ~D block(s)" adds))
+               (is (= tip (bl.store:coinstatsindex-height csi))
+                   "the best block moved instead of being left for the operator")
+               (is (equalp records
+                           (loop for h from 0 to tip collect (%csi-raw-record csi h)))
+                   "a record was rewritten")
+               (is (equal (format nil "Error: A fatal internal error occurred, see debug.log for details: Failed to rewind coinstatsindex to a previous chain tip~%")
+                          (get-output-stream-string stderr)))
+               (is (equal '("Failed to rewind coinstatsindex to a previous chain tip")
+                          requested)))
+          (bl.log:reset-warnings)))
+      (bl.store:close-coinstatsindex csi))))
+
 (test coinstatsindex-refuses-a-best-block-it-cannot-read
   "A best block whose record the index cannot find is Core's CustomInit refusal,
 `Cannot read current coinstatsindex state; index may be corrupted'

@@ -46,6 +46,7 @@ src/storage/.")
    #:block-file-info-time-last
    #:block-store-file-info
    #:rebuild-block-file-info
+   #:note-snapshot-height
    #:reindex-block-index
    #:write-reindex-flag
    #:reindex-flag-set-p
@@ -54,8 +55,7 @@ src/storage/.")
    #:datadir-block-index-path
    #:datadir-header-index-file
    #:datadir-index-path
-   #:datadir-layout-report
-   #:migrate-datadir-layout
+   #:adopt-core-index-directories
    #:migrate-index-db-subdirectory
    #:count-legacy-blocks
    #:prune-flat-block-file

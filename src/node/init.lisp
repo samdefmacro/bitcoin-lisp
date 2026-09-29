@@ -452,42 +452,31 @@ txindex ~D MiB, per-index ~D MiB"
       (config-error "Cannot resolve -externalip address: '~A'" spec))))
 
 
-(defun %init-datadir-layout (data-directory network migrate-datadir)
-  "Datadir layout (Core doc/files.md): -migratedatadir and the legacy-layout
-report, both BEFORE init-node opens the databases."
-  ;; Datadir layout (Core doc/files.md). BOTH of these must run BEFORE
-  ;; init-node, which opens the databases: nothing below coordinates with an
-  ;; open LevelDB handle, and moving a directory out from under one is how a
-  ;; datadir gets corrupted rather than migrated.
-  ;; The per-NETWORK directory, not the base one. Core's layout lives under
-  ;; testnet4/ (or the network's own subdirectory), so pointing either of these
-  ;; at the base made both of them inspect a directory that holds nothing but
-  ;; that subdirectory — the report saw a Core-shaped layout and said nothing,
-  ;; and the migration would have moved nothing. Found by starting a real node
-  ;; on a legacy testnet4 datadir and watching it log the legacy undo path with
-  ;; no warning; the unit tests missed it because their temp datadir has no
-  ;; network subdirectory, so base and network directory are the same path.
-  (let ((network-dir (network-data-path
-                      (uiop:ensure-directory-pathname data-directory) network)))
-  (when migrate-datadir
-    (let ((moves (bl.store:migrate-datadir-layout network-dir)))
-      (if moves
-          (dolist (m moves)
-            (log-info "Migrated ~A: ~A -> ~A" (first m) (second m) (third m)))
-          (log-info "-migratedatadir: nothing to move; the layout is already Core's"))))
-  ;; Datadir layout: report anything still resolving to the pre-Core location.
-  ;; Reported rather than silently tolerated — an operator whose node cannot be
-  ;; driven by Core's functional tests should be told WHICH directory is the
-  ;; reason, and `-migratedatadir` is the fix.
-  (let ((legacy (bl.store:datadir-layout-report network-dir)))
-    (when legacy
-      (log-warn "Data directory uses the pre-Core layout for: ~{~A~^, ~}. ~
-Core's functional tests address these paths by name. Run with -migratedatadir ~
-to move them (the node must be stopped)."
-                (mapcar #'first legacy))
-      (dolist (entry legacy)
-        (log-info "  ~A: using ~A (Core: ~A)"
-                  (first entry) (third entry) (second entry)))))))
+(defun %init-index-directories ()
+  "Move every index this datadir still keeps at the flat pre-Core path to
+Core's (ADOPT-CORE-INDEX-DIRECTORIES), logging each move.
+
+Its place in START-NODE is the whole safety argument: AFTER
+LOCK-DATA-DIRECTORIES, so a second node started on a running node's datadir
+is refused before it can rename a directory out from under the first one's
+open LevelDB, and BEFORE anything opens or wipes an index -- the -reindex
+wipe under -prune in %INIT-LOAD-CHAIN names the indexes by Core's path, and
+would otherwise delete an empty directory while the flat one survived to be
+moved over the rebuilt index.
+
+The per-NETWORK directory (NODE-DATA-DIRECTORY), not the base one: Core's
+layout lives under regtest/ or testnet4/, and pointing this at the base found
+nothing to move on every network but mainnet."
+  (let* ((started (get-internal-real-time))
+         (moves (bl.store:adopt-core-index-directories (node-data-directory *node*))))
+    (dolist (m moves)
+      (destructuring-bind (label from to) m
+        (log-info "Moved the ~A from ~A to Core's path ~A"
+                  label (namestring from) (namestring to))))
+    (when moves
+      (log-info "Index directories moved to Core's layout in ~,2Fs"
+                (/ (- (get-internal-real-time) started)
+                   internal-time-units-per-second)))))
 
 
 (defun whitebind-address-refusal (address)
@@ -2460,7 +2449,6 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (seednode nil)
                         (load-block nil)
                         (asmap nil)
-                        (migrate-datadir nil)
                         (whitelist nil)
                         (whitebind nil)
                         (block-notify nil)
@@ -2586,7 +2574,6 @@ Returns the node instance."
 
   (%init-logging data-directory network log-level log-file console-log block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
   (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
-  (%init-datadir-layout data-directory network migrate-datadir)
   ;; Initialize node: the node struct and its databases; the chain itself is
   ;; loaded by %init-load-chain below.
   (setf *node* (init-node data-directory :network network :log-level log-level))
@@ -2595,6 +2582,7 @@ Returns the node instance."
   (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1
                           wallet-broadcast)
   (%init-lock-and-banner network blocks-directory pid-file data-directory)
+  (%init-index-directories)
   (init-message "Loading block index…")          ; init.cpp:1396
   (log-initload-thread :start)
   (%init-load-chain network reindex reindex-chainstate blocks-directory)

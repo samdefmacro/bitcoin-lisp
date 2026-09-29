@@ -72,9 +72,8 @@ directory this node never writes."
                 "the txindex must NOT be nested: Core opens the bare directory"))))
 
 (test datadir-index-path-does-not-move-anything-by-default
-  "The resolver is also what DATADIR-LAYOUT-REPORT calls to say what a datadir
-looks like. A report that migrated the thing it is reporting on would be a
-side effect nobody asked for, so the move is behind :MIGRATE."
+  "The resolver is also what the -reindex wipe calls to name the directory it
+deletes. Naming a path must not move anything, so the move is behind :MIGRATE."
   (%with-datadir (dir "pure")
     (let ((old (merge-pathnames "indexes/blockfilter/basic/" dir)))
       (%dd-fake-leveldb old)
@@ -93,9 +92,7 @@ move has to carry the data, not merely create the directory."
   (%with-datadir (dir "move")
     (let ((old (merge-pathnames "indexes/blockfilter/basic/" dir)))
       (%dd-fake-leveldb old "the-real-records")
-      (multiple-value-bind (path legacy-p)
-          (bl.store:datadir-index-path dir :blockfilter :migrate t)
-        (is-false legacy-p)
+      (let ((path (bl.store:datadir-index-path dir :blockfilter :migrate t)))
         (is (search "indexes/blockfilter/basic/db/" (namestring path)))
         (is (equal "the-real-records"
                    (%dd-file-text (merge-pathnames "000003.log" path)))
@@ -181,25 +178,130 @@ Core's path wins the resolution and neither directory is touched."
                  (namestring (bl.store:datadir-index-path dir :blockfilter
                                                               :migrate t)))))))
 
-(test an-index-on-the-flat-pre-core-path-still-wins-the-fallback
-  "The layout has two migrations stacked on it now. A node that never moved to
-indexes/ at all keeps resolving to its flat directory: the db/ move must not
-quietly create an empty Core-side database that beats it."
-  (%with-datadir (dir "flat")
-    (%dd-fake-leveldb (merge-pathnames "blockfilterindex/" dir) "flat-records")
-    (multiple-value-bind (path legacy-p)
-        (bl.store:datadir-index-path dir :blockfilter :migrate t)
-      (is-true legacy-p "the flat legacy index lost its fallback")
-      (is (equal "flat-records" (%dd-file-text (merge-pathnames "000003.log" path)))))))
+;;; --- The flat pre-Core layout, moved to Core's at start-up ------------------
+;;;
+;;; Both live nodes kept their indexes as siblings of blocks/ (txindex/,
+;;; blockfilterindex/, coinstatsindex/, txospenderindex/) and the resolver fell
+;;; back to them. Core opens only its own paths (txindex.cpp:52,
+;;; blockfilterindex.cpp:85-89, coinstatsindex.cpp:103-106,
+;;; txospenderindex.cpp:64), so a datadir of ours was Core's in every record
+;;; and still not in its directory names. Start-up now renames each one.
 
-(test migrate-datadir-layout-moves-a-flat-index-into-core-s-db-directory
-  "-migratedatadir is the operator's explicit move, and its target is the same
-constant. It has to land on the db/ directory, not on its parent."
-  (%with-datadir (dir "explicit")
-    (%dd-fake-leveldb (merge-pathnames "blockfilterindex/" dir) "flat-records")
-    (bl.store:migrate-datadir-layout dir)
-    (is (equal "flat-records"
+(defun %dd-flat-layout (dir)
+  "A datadir in this tree's flat pre-Core layout, every index populated, the
+filter index with two fltr files beside its LevelDB as Round 9 wrote them."
+  (%dd-fake-leveldb (merge-pathnames "txindex/" dir) "tx-records")
+  (%dd-fake-leveldb (merge-pathnames "blockfilterindex/" dir) "filter-records")
+  (dolist (name '("fltr00000.dat" "fltr00001.dat"))
+    (with-open-file (out (merge-pathnames (concatenate 'string "blockfilterindex/" name) dir)
+                         :direction :output :if-exists :supersede)
+      (write-line name out)))
+  (%dd-fake-leveldb (merge-pathnames "coinstatsindex/" dir) "coinstats-records")
+  (%dd-fake-leveldb (merge-pathnames "txospenderindex/" dir) "spender-records")
+  dir)
+
+(test the-resolver-names-core-s-path-even-beside-a-flat-index
+  "The fallback is gone: a flat index is moved at start-up, so the resolver
+names Core's directory whatever the datadir holds. Before 2026-09-30 it
+answered the flat txindex/ here, and the node kept serving from a path Core
+never opens."
+  (%with-datadir (dir "noflat")
+    (%dd-flat-layout dir)
+    (is (search "indexes/txindex/"
+                (namestring (bl.store:datadir-index-path dir :txindex)))
+        "the resolver fell back to the flat txindex/")
+    (is (search "indexes/blockfilter/basic/db/"
+                (namestring (bl.store:datadir-index-path dir :blockfilter))))))
+
+(test flat-indexes-are-moved-to-core-s-paths-with-their-records
+  "Every index arrives at Core's path WITH its records, the filter index's
+fltr files beside db/ where Core's FlatFileSeq is rooted and not inside it,
+and nothing is left at the flat names. A second call is a no-op."
+  (%with-datadir (dir "adopt")
+    (%dd-flat-layout dir)
+    (let ((moves (bl.store:adopt-core-index-directories dir)))
+      (is (= 5 (length moves)) "moves: ~S" moves))
+    (flet ((text (rel) (%dd-file-text (merge-pathnames rel dir))))
+      (is (equal "tx-records" (text "indexes/txindex/000003.log")))
+      (is (equal "filter-records" (text "indexes/blockfilter/basic/db/000003.log")))
+      (is (equal "coinstats-records" (text "indexes/coinstatsindex/db/000003.log")))
+      (is (equal "spender-records" (text "indexes/txospenderindex/db/000003.log")))
+      (is (equal "fltr00001.dat" (text "indexes/blockfilter/basic/fltr00001.dat"))
+          "a fltr file did not arrive beside db/")
+      (is-false (text "indexes/blockfilter/basic/db/fltr00000.dat")
+                "a fltr file was left inside db/, where Core's sequence never looks"))
+    (dolist (flat '("txindex/" "blockfilterindex/" "coinstatsindex/" "txospenderindex/"))
+      (is-false (probe-file (merge-pathnames flat dir))
+                "~A is still there after the move" flat))
+    (is-false (bl.store:adopt-core-index-directories dir)
+              "a second start moved something again")))
+
+(test empty-core-directories-do-not-block-the-move
+  "ENSURE-DIRECTORIES-EXIST makes empty directories freely; an empty
+indexes/txindex/ or basic/db/ is not a second index, and must not refuse the
+start of a node whose flat index holds the records."
+  (%with-datadir (dir "emptycore")
+    (%dd-fake-leveldb (merge-pathnames "txindex/" dir) "tx-records")
+    (%dd-fake-leveldb (merge-pathnames "blockfilterindex/" dir) "filter-records")
+    (ensure-directories-exist (merge-pathnames "indexes/txindex/" dir))
+    (ensure-directories-exist (merge-pathnames "indexes/blockfilter/basic/db/" dir))
+    (bl.store:adopt-core-index-directories dir)
+    (is (equal "tx-records"
+               (%dd-file-text (merge-pathnames "indexes/txindex/000003.log" dir))))
+    (is (equal "filter-records"
                (%dd-file-text (merge-pathnames "indexes/blockfilter/basic/db/000003.log"
-                                               dir))))
-    (is-false (bl.store:datadir-layout-report dir)
-              "the layout report still names a legacy directory after the move")))
+                                               dir))))))
+
+(test an-index-at-both-paths-refuses-the-start-and-moves-nothing
+  "Two databases for one index: the start is refused with a sentence naming
+both directories, and neither is touched. The control is the move above,
+which the same flat directory makes when Core's path is empty."
+  (%with-datadir (dir "bothpaths")
+    (%dd-fake-leveldb (merge-pathnames "txindex/" dir) "flat")
+    (%dd-fake-leveldb (merge-pathnames "indexes/txindex/" dir) "core")
+    (let ((message (handler-case (progn (bl.store:adopt-core-index-directories dir) nil)
+                     (bl.err:init-error (e) (princ-to-string e)))))
+      (is-true message "an index at both paths did not refuse the start")
+      (is-true (and message (search "exists both at" message)))
+      (is-true (and message (search (namestring (merge-pathnames "txindex" dir)) message))))
+    (is (equal "flat" (%dd-file-text (merge-pathnames "txindex/000003.log" dir))))
+    (is (equal "core" (%dd-file-text (merge-pathnames "indexes/txindex/000003.log" dir))))
+    ;; A later index in conflict: the earlier one, movable on its own, must
+    ;; not have been moved before the refusal either.
+    (uiop:delete-directory-tree (merge-pathnames "indexes/txindex/" dir) :validate t)
+    (%dd-fake-leveldb (merge-pathnames "coinstatsindex/" dir) "flat-cs")
+    (%dd-fake-leveldb (merge-pathnames "indexes/coinstatsindex/db/" dir) "core-cs")
+    (signals bl.err:init-error (bl.store:adopt-core-index-directories dir))
+    (is (equal "flat" (%dd-file-text (merge-pathnames "txindex/000003.log" dir)))
+        "the txindex was moved before the coinstatsindex refused the start")))
+
+(test fltr-files-left-inside-db-are-lifted-by-the-next-start
+  "The rename into db/ and the lift of the fltr files are two steps; a crash
+between them leaves the filters inside db/, and the next start finishes the
+job rather than the filter index finding its sequence empty."
+  (%with-datadir (dir "lift")
+    (let ((db (merge-pathnames "indexes/blockfilter/basic/db/" dir)))
+      (%dd-fake-leveldb db "filter-records")
+      (with-open-file (out (merge-pathnames "fltr00000.dat" db)
+                           :direction :output :if-exists :supersede)
+        (write-line "filters" out))
+      (is (= 1 (length (bl.store:adopt-core-index-directories dir))))
+      (is (equal "filters"
+                 (%dd-file-text (merge-pathnames "indexes/blockfilter/basic/fltr00000.dat"
+                                                 dir))))
+      (is (equal "filter-records" (%dd-file-text (merge-pathnames "000003.log" db)))))))
+
+(test start-up-moves-the-indexes-after-the-lock-and-before-any-open
+  "The rename is safe only while no LevelDB has the directory open: after
+LOCK-DATA-DIRECTORIES (a second node on a running node's datadir is refused
+first) and before the chain load, whose -reindex wipe names the indexes by
+Core's path. The pre-Core layout warning this replaces is gone with it."
+  (let* ((src (%node-source-text))
+         (lock (search "(%init-lock-and-banner network" src))
+         (move (search "(%init-index-directories)" src))
+         (load (search "(%init-load-chain network" src)))
+    (is-true lock) (is-true move) (is-true load)
+    (is-true (and lock move load (< lock move load))
+             "the index directories move outside the lock-to-load window")
+    (is-false (search "pre-Core layout for:" src)
+              "start-up still warns about a layout it now moves")))

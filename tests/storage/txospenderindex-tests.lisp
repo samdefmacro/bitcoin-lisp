@@ -323,6 +323,47 @@ OUTPOINT, and enter it in CS's block index. Returns (values entry block)."
   (nth-value 1 (bl.store:txospenderindex-find-spender
                 idx (bl.ser:outpoint-hash outpoint) (bl.ser:outpoint-index outpoint))))
 
+(defun %tsi-stale-marker-fixture (cs store idx)
+  "Branch A (genesis, #x1A, #x2A) indexed by IDX while it was the active chain,
+then branch B (#x1B, #x2B) made active at the same heights while the index was
+stopped: IDX's marker names #x2A, a block the active chain no longer holds.
+Returns (values a1-op a2-op b1-op b2-op), the outpoint each block spends."
+  (let* ((genesis-hash (bl.store:best-block-hash cs))
+         (genesis (bl.store:make-block-index-entry
+                   :hash genesis-hash :height 0 :chain-work 0
+                   :status :valid
+                   :header (bl.ser:make-block-header
+                            :version 1 :prev-block (%tsi-hash 0)
+                            :merkle-root (%tsi-hash 0)
+                            :timestamp 1231006505 :bits #x1d00ffff
+                            :nonce 0 :cached-hash genesis-hash)))
+         (a1-op (%tsi-outpoint #xA1 0))
+         (a2-op (%tsi-outpoint #xA2 0))
+         (b1-op (%tsi-outpoint #xB1 0))
+         (b2-op (%tsi-outpoint #xB2 0)))
+    (bl.store:add-block-index-entry cs genesis)
+    ;; Branch A, indexed while it was the active chain.
+    (multiple-value-bind (a1 a1-block)
+        (%tsi-extend cs store genesis (%tsi-hash #x1A) a1-op)
+      (multiple-value-bind (a2 a2-block)
+          (%tsi-extend cs store a1 (%tsi-hash #x2A) a2-op)
+        (bl.store:update-chain-tip
+         cs (bl.store:block-index-entry-hash a2) 2)
+        (bl.store:txospenderindex-add-block
+         idx a1-block (bl.store:block-index-entry-hash a1))
+        (bl.store:txospenderindex-add-block
+         idx a2-block (bl.store:block-index-entry-hash a2))
+        (bl.store:txospenderindex-set-best-block
+         idx (bl.store:block-index-entry-hash a2) 2)))
+    ;; Branch B wins while the index is stopped: same heights, so
+    ;; the marker is not above the tip and the height guard alone
+    ;; can see nothing wrong with it.
+    (multiple-value-bind (b1) (%tsi-extend cs store genesis (%tsi-hash #x1B) b1-op)
+      (multiple-value-bind (b2) (%tsi-extend cs store b1 (%tsi-hash #x2B) b2-op)
+        (bl.store:update-chain-tip
+         cs (bl.store:block-index-entry-hash b2) 2)))
+    (values a1-op a2-op b1-op b2-op)))
+
 (test txospenderindex-rewinds-a-marker-left-on-an-abandoned-branch
   "A branch switch that happens while the process is DOWN leaves the marker on
 a block the active chain no longer holds, and the online :block-disconnected
@@ -348,40 +389,8 @@ indistinguishable from a real answer."
                (idx (bl.store:init-txospender-index dir :block-store store))
                (node (bl:make-node)))
            (unwind-protect
-                (let* ((genesis-hash (bl.store:best-block-hash cs))
-                       (genesis (bl.store:make-block-index-entry
-                                 :hash genesis-hash :height 0 :chain-work 0
-                                 :status :valid
-                                 :header (bl.ser:make-block-header
-                                          :version 1 :prev-block (%tsi-hash 0)
-                                          :merkle-root (%tsi-hash 0)
-                                          :timestamp 1231006505 :bits #x1d00ffff
-                                          :nonce 0 :cached-hash genesis-hash)))
-                       (a1-op (%tsi-outpoint #xA1 0))
-                       (a2-op (%tsi-outpoint #xA2 0))
-                       (b1-op (%tsi-outpoint #xB1 0))
-                       (b2-op (%tsi-outpoint #xB2 0)))
-                  (bl.store:add-block-index-entry cs genesis)
-                  ;; Branch A, indexed while it was the active chain.
-                  (multiple-value-bind (a1 a1-block)
-                      (%tsi-extend cs store genesis (%tsi-hash #x1A) a1-op)
-                    (multiple-value-bind (a2 a2-block)
-                        (%tsi-extend cs store a1 (%tsi-hash #x2A) a2-op)
-                      (bl.store:update-chain-tip
-                       cs (bl.store:block-index-entry-hash a2) 2)
-                      (bl.store:txospenderindex-add-block
-                       idx a1-block (bl.store:block-index-entry-hash a1))
-                      (bl.store:txospenderindex-add-block
-                       idx a2-block (bl.store:block-index-entry-hash a2))
-                      (bl.store:txospenderindex-set-best-block
-                       idx (bl.store:block-index-entry-hash a2) 2)))
-                  ;; Branch B wins while the index is stopped: same heights, so
-                  ;; the marker is not above the tip and the height guard alone
-                  ;; can see nothing wrong with it.
-                  (multiple-value-bind (b1) (%tsi-extend cs store genesis (%tsi-hash #x1B) b1-op)
-                    (multiple-value-bind (b2) (%tsi-extend cs store b1 (%tsi-hash #x2B) b2-op)
-                      (bl.store:update-chain-tip
-                       cs (bl.store:block-index-entry-hash b2) 2)))
+                (multiple-value-bind (a1-op a2-op b1-op b2-op)
+                    (%tsi-stale-marker-fixture cs store idx)
                   (is (equalp (%tsi-hash #x1A) (%tsi-spender-block-hash idx a1-op))
                       "the fixture did not record branch A")
                   (is (null (%tsi-spender-block-hash idx b1-op))
@@ -408,6 +417,51 @@ indistinguishable from a real answer."
                     (is (equalp (%tsi-hash #x2B) hash))
                     (is (= 2 height)))
                   (is (= 2 (bl.store:index-height idx cs))))
+             (bl.store:close-txospender-index idx)))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+
+(test txospenderindex-rewind-that-cannot-read-a-block-aborts-the-node
+  "Core's Rewind reads every abandoned block's body for this index
+ (disconnect_data, index/txospenderindex.cpp:73-78) and returns false when one
+cannot be read (index/base.cpp:299-305); Sync then FatalErrorf's `Failed to
+rewind txospenderindex to a previous chain tip' (:239-241). Ours cleared the
+marker and rebuilt the index from genesis. The control is the test above,
+where every body is readable and the same rewind succeeds."
+  (let ((dir (%tsi-tmpdir "rewindfail")))
+    (unwind-protect
+         (let* ((cs (bl.store:init-chain-state dir))
+                (store (bl.store:init-block-store dir))
+                (idx (bl.store:init-txospender-index dir :block-store store))
+                (node (bl:make-node))
+                (stderr (make-string-output-stream))
+                (requested '()))
+           (unwind-protect
+                (multiple-value-bind (a1-op a2-op b1-op)
+                    (%tsi-stale-marker-fixture cs store idx)
+                  (declare (ignore a2-op))
+                  (is-true (bl.store:forget-block-body store (%tsi-hash #x2A))
+                           "the fixture's abandoned tip must have had a body to lose")
+                  (setf (bl:node-chainstates node) (list cs)
+                        (bl:node-block-store node) store)
+                  (bl.log:reset-warnings)
+                  (let ((bl.log:*fatal-error-shutdown-function*
+                          (lambda (message) (push message requested))))
+                    (let ((*error-output* stderr))
+                      (bl:catch-up-index node idx)))
+                  (is (equalp (%tsi-hash #x2A) (bl.store:txospenderindex-best-block idx))
+                      "the marker was cleared instead of left for the operator")
+                  ;; A2's own row cannot be read back without its body (the
+                  ;; lookup re-reads the transaction, as Core's FindTx does);
+                  ;; A1's, which the rewind never reached, is still there.
+                  (is (equalp (%tsi-hash #x1A) (%tsi-spender-block-hash idx a1-op))
+                      "the abandoned branch's rows were rewritten")
+                  (is (null (%tsi-spender-block-hash idx b1-op))
+                      "the index was rebuilt on top of a rewind that failed")
+                  (is (equal (format nil "Error: A fatal internal error occurred, see debug.log for details: Failed to rewind txospenderindex to a previous chain tip~%")
+                             (get-output-stream-string stderr)))
+                  (is (equal '("Failed to rewind txospenderindex to a previous chain tip")
+                             requested)))
+             (bl.log:reset-warnings)
              (bl.store:close-txospender-index idx)))
       (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 

@@ -432,7 +432,14 @@
   `fsync-directory` given a file syncs that file and reports success; a
   failed fsync is logged and never swallowed, as Core's `FileCommit` and
   `DirectoryCommit` log and return false; the datadir layout is Core's, so
-  a Core node can read what we write.
+  a Core node can read what we write. Every index is opened at Core's path
+  and only there (`datadir-index-path`); a datadir that still keeps one at
+  this tree's former flat path (`txindex/`, `blockfilterindex/`,
+  `coinstatsindex/`, `txospenderindex/` beside `blocks/`) has it renamed
+  into `indexes/` at start-up by `adopt-core-index-directories` -- after
+  the datadir lock, before anything opens an index -- and the filter
+  index's `fltr?????.dat` files lifted beside its `db/`. An index at BOTH
+  paths refuses the start and nothing is moved.
 
   Traps: LevelDB `max-open-files` is Core's 1000 on purpose. A larger
   value pushes LevelDB out of mmap into real file descriptors and a
@@ -462,7 +469,8 @@
   (bitcoin-lisp.kv:fsync-parent-directory function)
   (bitcoin-lisp.kv:rename-path function)
   (bitcoin-lisp.kv:calculate-cache-sizes function)
-  (bitcoin-lisp.kv:datadir-layout-report function)
+  (bitcoin-lisp.kv:datadir-index-path function)
+  (bitcoin-lisp.kv:adopt-core-index-directories function)
   (bitcoin-lisp.kv:*blocks-xor* variable)
   (bitcoin-lisp.kv:*fast-prune* variable)
   (bitcoin-lisp.kv:+max-blockfile-size+ constant))
