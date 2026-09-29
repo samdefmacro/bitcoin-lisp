@@ -118,7 +118,8 @@ of the kv and serialization layers. The pruning policy knobs live here
   :serial t
   :components ((:file "storage/package")
                (:module "storage"
-                :components ((:file "prune-policy")
+                :components ((:file "types")        ; block-index-entry, chain-state: before every reader
+                             (:file "prune-policy")
                              (:file "utxo")
                              (:file "block-undo")
                              (:file "blocks")
@@ -298,10 +299,10 @@ bitcoin-cli (node-main)."
                  ;; is bitcoin-lisp/net; these are the protocol on top of it.
                  (:module "networking"
                   :components ((:file "p2p-handlers")
-                               (:file "txreconciliation-set")
                                (:file "bloom")       ; BIP37 CBloomFilter
                                (:file "merkleblock") ; CMerkleBlock / partial merkle tree
                                (:file "peer")
+                               (:file "txreconciliation-set") ; reads the peer struct: after it, so its accessors inline
                                (:file "private-broadcast") ; Core private_broadcast.cpp
                                (:file "protocol")
                                (:file "headers-sync")

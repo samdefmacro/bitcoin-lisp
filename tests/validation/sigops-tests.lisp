@@ -295,8 +295,7 @@ Bitcoin Core's GetTransactionSigOpCost honoring SCRIPT_VERIFY_P2SH/_WITNESS."
     (is (= 4 (bl.val:count-transaction-sigops-cost
               tx get-spent :count-witness nil))))
   ;; P2SH input whose redeemScript is a bare OP_CHECKSIG (accurate p2sh sigops = 1).
-  (let* ((redeem (make-script #xac))                 ; OP_CHECKSIG
-         (script-sig (make-script #x01 #xac))        ; push the 1-byte redeemScript
+  (let* ((script-sig (make-script #x01 #xac))        ; push the redeemScript OP_CHECKSIG
          (spent (make-p2sh-script (make-dummy-hash #xbb 20)))
          (tx (make-sigops-test-tx
               :script-sig script-sig

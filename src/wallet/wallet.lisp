@@ -547,6 +547,51 @@ where HandleWalletError leaves FAILED_BAD_PATH (wallet/rpc/util.cpp:152)."
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                :message (format nil "Wallet file verification failed. ~A" bad)))))
 
+(define-condition wallet-filesystem-error (bl.err:storage-error) ()
+  (:documentation "Core's fs::filesystem_error out of creating a wallet's
+database directory: its what() is the message (libstdc++'s `filesystem error:
+OPERATION: STRERROR [PATH]'). A STORAGE-ERROR, so createwallet's FAILED_LOAD
+classification applies unchanged; restorewallet catches it first, because
+Core's RestoreWallet reports it as an unexpected exception instead."))
+
+(defun %create-directories-errno (native)
+  "The errno fs::create_directories meets making NATIVE, component by
+component, or NIL once every component is a directory: ENOTDIR where one that
+exists is not a directory, else the first failing mkdir's own errno."
+  (loop for end = (position #\/ native :start 1)
+          then (position #\/ native :start (1+ end))
+        for prefix = (subseq native 0 (or end (length native)))
+        do (handler-case (sb-posix:mkdir prefix #o777)
+             (sb-posix:syscall-error (e)
+               (let ((errno (sb-posix:syscall-errno e)))
+                 (cond ((/= errno sb-posix:eexist) (return errno))
+                       ((not (let ((stat (ignore-errors (sb-posix:stat prefix))))
+                               (and stat (%stat-directory-p stat))))
+                        (return sb-posix:enotdir))))))
+        while end))
+
+(defun %wallet-create-directories (path)
+  "Make the wallet database directory PATH the way Core's TryCreateDirectories
+does (util/fs_helpers.cpp:255-266): fs::create_directories, whose failure is a
+WALLET-FILESYSTEM-ERROR carrying its what() (a wallet name reaching through a
+plain file, wallet_multiwallet.py:158-160, is ENOTDIR). SBCL's own FILE-ERROR
+names neither the errno nor Core's words, and reached the client raw."
+  (handler-case (ensure-directories-exist (uiop:ensure-directory-pathname path))
+    (file-error ()
+      (let* ((native (wallet-path-string path))
+             (errno (%create-directories-errno native)))
+        (when errno
+          (error 'wallet-filesystem-error
+                 :format-control "filesystem error: cannot create directories: ~A [~A]"
+                 :format-arguments (list (sb-int:strerror errno) native)))))))
+
+(defun %create-wallet-db (manager path)
+  "Create the wallet database at PATH for MANAGER's network: the directory
+first, as Core's SQLiteDatabase::Open does (sqlite.cpp:251-254), then the
+database in it."
+  (%wallet-create-directories path)
+  (wallet-db-open path :create t :network (wallet-manager-network manager)))
+
 ;;; --- SPKM key management ---
 
 (defun spkm-privkey-provider (wallet spkm)
@@ -1310,8 +1355,7 @@ locked with no passphrase that can unlock it."
                             (if blank-flag +wallet-flag-blank-wallet+ 0)
                             (if avoid-reuse +wallet-flag-avoid-reuse+ 0)
                             (if external-signer +wallet-flag-external-signer+ 0)))
-             (db (handler-case (wallet-db-open path :create t
-                                                    :network (wallet-manager-network manager))
+             (db (handler-case (%create-wallet-db manager path)
                    (bl.err:storage-error (e)
                      (%wallet-database-open-error path e))))
              (wallet (make-wallet :name name :path path :db db

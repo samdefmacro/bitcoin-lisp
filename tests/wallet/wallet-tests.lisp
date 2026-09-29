@@ -2795,6 +2795,40 @@ nothing of Core's wallet.dat."
         (dolist (name '("fresh" "w7" "w7_symlink" "w8" "sub"))
           (is (null (bl.wallet:wallet-path-error manager name)) "~S was refused" name))))))
 
+(test a-wallet-path-through-a-file-is-core-s-filesystem-error
+  "createwallet \"w8/bad\" with w8 a plain file (wallet_multiwallet.py:158-160).
+Core's GetWalletPath lets the path through -- symlink_status reports ENOTDIR as
+not_found (wallet.cpp:2918-2936) -- and SQLiteDatabase::Open's
+TryCreateDirectories (sqlite.cpp:251-254, util/fs_helpers.cpp:255-266) throws
+fs::filesystem_error, which MakeSQLiteDatabase answers with its what()
+(sqlite.cpp:702-706) behind CreateWallet's `Wallet file verification failed. '
+(wallet.cpp:415-420), -4 (rpc/util.cpp:152). restorewallet reaches the same
+TryCreateDirectories itself (wallet.cpp:515-521) and reports `Unexpected
+exception: ' (:531-535), -4 as well. loadwallet never creates a directory, so
+it is MakeDatabase's -18 `Path does not exist.' (walletdb.cpp:1333-1337).
+createwallet let SBCL's own FILE-ERROR out, and restorewallet wrapped its text
+in `Wallet loading failed.'"
+  (with-wallet-test-node (node :network :regtest)
+    (let* ((manager (%node-manager node))
+           (dir (string-right-trim "/" (namestring (bl.wallet:wallets-directory manager))))
+           (w8 (concatenate 'string dir "/w8"))
+           (bad (concatenate 'string dir "/w8/bad"))
+           (backup (concatenate 'string dir "/src.backup"))
+           (refusal (format nil "filesystem error: cannot create directories: Not a directory [~A]" bad)))
+      (with-open-file (out w8 :direction :output :if-does-not-exist :create)
+        (write-string "not a wallet" out))
+      (bl.rpc:dispatch-rpc-method node "createwallet" '("src"))
+      (bl.rpc:dispatch-rpc-method node "backupwallet" (list backup))
+      (signals-rpc-error (:code -18 :exact-message (format nil "Wallet file verification failed. Failed to load database path '~A'. Path does not exist." bad))
+        (bl.rpc:dispatch-rpc-method node "loadwallet" '("w8/bad")))
+      (signals-rpc-error (:code -4 :exact-message (format nil "Wallet file verification failed. ~A" refusal))
+        (bl.rpc:dispatch-rpc-method node "createwallet" '("w8/bad")))
+      (signals-rpc-error (:code -4 :exact-message (format nil "Unexpected exception: ~A" refusal))
+        (bl.rpc:dispatch-rpc-method node "restorewallet" (list "w8/bad" backup)))
+      ;; Control: the refusals touched nothing -- w8 is still the plain file.
+      (is (equal "not a wallet"
+                 (with-open-file (in w8) (read-line in nil)))))))
+
 (test startup-refuses-a-wallet-another-instance-holds
   "Core's VerifyWallets stops startup when a -wallet cannot be opened
 (load.cpp:106-110), and a database another process holds is SQLiteDatabase's
