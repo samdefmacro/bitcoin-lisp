@@ -46,6 +46,7 @@ src/storage/.")
    #:block-file-info-time-last
    #:block-store-file-info
    #:rebuild-block-file-info
+   #:note-snapshot-height
    #:reindex-block-index
    #:write-reindex-flag
    #:reindex-flag-set-p

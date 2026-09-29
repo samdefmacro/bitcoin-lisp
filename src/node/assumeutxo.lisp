@@ -100,6 +100,10 @@ historical chainstate's candidate filtering is the target guard there."
     (assert (null (bl.store:chain-state-target-blockhash prev)))
     (assert base-entry)
     (bl.store:set-chainstate-target prev base-entry)
+    ;; Core sets m_blockman.m_snapshot_height here (validation.cpp:5737): the
+    ;; snapshot chain's blocks go to block files of their own from now on.
+    (bl.store:note-snapshot-height (node-block-store node)
+                                   (bl.store:block-index-entry-height base-entry))
     (bt:with-recursive-lock-held ((node-lock node))
       (setf (node-chainstates node)
             (append (node-chainstates node) (list snap))))
@@ -205,6 +209,10 @@ fatal, not a warning: %REFUSE-UNKNOWN-SNAPSHOT-BASE."
              ;; Retarget the primary (it becomes the historical chainstate)
              ;; and adopt the snapshot chainstate as current.
              (bl.store:set-chainstate-target primary base-entry)
+             ;; Core LoadBlockIndex with a snapshot blockhash
+             ;; (node/blockstorage.cpp:437, cursors :569-574).
+             (bl.store:note-snapshot-height (node-block-store node) base-height
+                                            :restore-cursors t)
              (setf (node-chainstates node)
                    (append (node-chainstates node) (list snap)))
              ;; Split the coins-cache budget across the re-adopted pair (Core
