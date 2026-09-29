@@ -104,4 +104,14 @@ if ! "$(dirname "$0")/check-unused-variables.sh" "$TRANSCRIPT" >&2; then
   echo "ERROR: the build has unused variables or contradicted IGNORE declarations (see above)" >&2
   exit 1
 fi
+
+# And for a structure compiled after code that reads it: the reader got a full
+# call where the accessor should have been inlined (five such structs on the
+# prune, mempool, versionbits and Erlay paths until 2026-09-30), and a test
+# that stubs the accessor passes or fails depending on the load order.
+"$(dirname "$0")/check-struct-order.sh" --self-test >&2 || exit 1
+if ! "$(dirname "$0")/check-struct-order.sh" "$TRANSCRIPT" >&2; then
+  echo "ERROR: a structure is defined after code that uses it (see above)" >&2
+  exit 1
+fi
 exit "$rc"

@@ -144,7 +144,11 @@ the file being compiled so one from `refs/coalton` is not ours): SBCL reports
 that as a STYLE-WARNING only, so the build passes and the call signals
 `SB-INT:SIMPLE-PROGRAM-ERROR` when it runs — or, inside an `ignore-errors`,
 nothing at all, which is how a test's `(bt:join-thread th :timeout 5)` sat
-there never joining the thread it named.
+there never joining the thread it named. And on a DEFSTRUCT compiled after code
+that reads its accessors (`scripts/check-struct-order.sh`): the reader gets a
+full call where the slot read should be inlined, a style warning again --
+define a struct before its first reader, earlier in its file or in the
+sub-system's `types.lisp`.
 
 **Changing a MACRO (or a defstruct's layout) needs a FRESH FASL volume** —
 the cold lane is not "compiles fresh": it mounts a persistent per-checkout
