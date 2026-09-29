@@ -95,8 +95,9 @@ the tip after invalidateblock and the next start rescanned from genesis."
   "ASCII 'm': the next height of an unfinished MIGRATE-TXINDEX.")
 
 (defun txindex-db-path (base-path)
-  "Directory of the txindex LevelDB. Core's indexes/txindex/, falling back to
-the flat txindex/ this tree used before — see kv/datadir.lisp."
+  "Directory of the txindex LevelDB: Core's indexes/txindex/
+ (index/txindex.cpp:52). A flat txindex/ this tree used before is moved there
+at start-up -- see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :txindex))
 
 (defun %txindex-key (txid)

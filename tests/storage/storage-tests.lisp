@@ -4,53 +4,28 @@
 
 ;;;; Block store
 
-(test datadir-layout-prefers-core-and-falls-back-to-legacy
+(test datadir-layout-is-core-s-for-a-fresh-datadir
   "Core doc/files.md: blocks/index/, indexes/txindex/,
-indexes/blockfilter/basic/, indexes/coinstatsindex/. This tree kept
-headerindex.dat at the network-dir root and the indexes as flat siblings.
-
-Every resolver PREFERS Core's path and falls back only when the legacy one
-actually holds data. That asymmetry is the whole safety property: adopting
-Core's layout unconditionally would present an EMPTY datadir to a node that has
-one, which on mainnet means discarding a synced chain and starting IBD from
-genesis."
+indexes/blockfilter/basic/db/. A FRESH datadir is Core-shaped from the first
+byte -- which is what the conformance harness needs. headerindex.dat is still
+found at the network-dir root, where this tree kept it, for the one-time
+migration into the block tree database."
   (let ((dir (merge-pathnames (format nil "bl-datadir-~D/" (get-internal-real-time))
                               (uiop:temporary-directory))))
     (unwind-protect
          (progn
            (ensure-directories-exist dir)
-           ;; A FRESH datadir is Core-shaped from the first byte — which is
-           ;; what the conformance harness needs.
            (is (search "indexes/txindex"
                        (namestring (bl.store:datadir-index-path dir :txindex))))
            (is (search "blocks/index"
                        (namestring (bl.store:datadir-header-index-file dir))))
-           (is (null (bl.store:datadir-layout-report dir)))
-           ;; An EMPTY Core-side directory must not win against a legacy one
-           ;; that holds data: ensure-directories-exist creates empty ones
-           ;; freely, so existence alone cannot be the test.
-           (ensure-directories-exist (merge-pathnames "indexes/txindex/" dir))
-           (ensure-directories-exist (merge-pathnames "txindex/" dir))
-           (with-open-file (out (merge-pathnames "txindex/CURRENT" dir)
-                                :direction :output :if-exists :supersede)
-             (write-line "x" out))
-           (multiple-value-bind (path legacy-p)
-               (bl.store:datadir-index-path dir :txindex)
-             (is-true legacy-p "an empty Core directory beat a populated legacy one")
-             (is (search "/txindex" (namestring path))))
-           ;; Legacy headerindex.dat likewise.
            (with-open-file (out (merge-pathnames "headerindex.dat" dir)
                                 :direction :output :if-exists :supersede)
              (write-line "x" out))
            (multiple-value-bind (path legacy-p)
                (bl.store:datadir-header-index-file dir)
              (is-true legacy-p)
-             (is (equal (merge-pathnames "headerindex.dat" dir) path)))
-           ;; And the report names them, so an operator is told WHICH directory
-           ;; is keeping their node off Core's layout.
-           (let ((report (bl.store:datadir-layout-report dir)))
-             (is (member "block index" report :key #'first :test #'string=))
-             (is (member "txindex" report :key #'first :test #'string=))))
+             (is (equal (merge-pathnames "headerindex.dat" dir) path))))
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
@@ -168,7 +143,7 @@ implements did nothing. That was found by starting a real node and reading its
 log, not by any unit test, which is why this one exists."
   (dolist (fn '(bl.store:datadir-header-index-file
                 bl.store:datadir-index-path
-                bl.store:datadir-layout-report))
+                bl.store:adopt-core-index-directories))
     (let ((callers (remove-if (lambda (c)
                                 ;; Its own file and the test package do not
                                 ;; count as production callers.
@@ -178,46 +153,6 @@ log, not by any unit test, which is why this one exists."
                                                (list (find-package :bitcoin-lisp.tests))))))
                               (mapcar #'car (sb-introspect:who-calls fn)))))
       (is-true callers "~A has no caller outside its own file" fn))))
-
-(test migrate-datadir-layout-moves-and-is-idempotent
-  "-migratedatadir moves a legacy datadir to Core's layout. Asserted through
-the FILES, and specifically that the data ARRIVES — a migration that reports
-success and moves nothing is the failure mode this project has already hit once
-(backupwallet, where RENAME-FILE merged the target with the source pathname)."
-  (let ((dir (merge-pathnames (format nil "bl-migrate-~D/" (get-internal-real-time))
-                              (uiop:temporary-directory))))
-    (unwind-protect
-         (progn
-           (ensure-directories-exist dir)
-           (with-open-file (out (merge-pathnames "headerindex.dat" dir)
-                                :direction :output :if-exists :supersede)
-             (write-line "header-index-content" out))
-           (ensure-directories-exist (merge-pathnames "txindex/" dir))
-           (with-open-file (out (merge-pathnames "txindex/CURRENT" dir)
-                                :direction :output :if-exists :supersede)
-             (write-line "txindex-content" out))
-           ;; Dry run reports the moves and changes nothing.
-           (let ((planned (bl.store:migrate-datadir-layout dir :dry-run t)))
-             (is (= 2 (length planned)) "planned ~S" planned)
-             (is-true (probe-file (merge-pathnames "headerindex.dat" dir))
-                      "a dry run moved a file"))
-           (let ((moves (bl.store:migrate-datadir-layout dir)))
-             (is (= 2 (length moves))))
-           ;; The data is at Core's path, with its CONTENT, and gone from the old one.
-           (let ((moved (merge-pathnames "blocks/index/headerindex.dat" dir)))
-             (is-true (probe-file moved) "the block index did not arrive")
-             (is (equal "header-index-content"
-                        (with-open-file (in moved) (read-line in nil)))))
-           (is-false (probe-file (merge-pathnames "headerindex.dat" dir))
-                     "the legacy block index was left behind")
-           (is-true (probe-file (merge-pathnames "indexes/txindex/CURRENT" dir))
-                    "the txindex did not arrive")
-           ;; The datadir now reports as Core-shaped.
-           (is (null (bl.store:datadir-layout-report dir)))
-           ;; And running it again is a no-op rather than an error.
-           (is (null (bl.store:migrate-datadir-layout dir))))
-      (ignore-errors (uiop:delete-directory-tree dir :validate t
-                                                    :if-does-not-exist :ignore)))))
 
 (test get-block-treats-corrupt-file-as-absent-and-prunes
   "A truncated / corrupt block file must NOT raise out of get-block — before the

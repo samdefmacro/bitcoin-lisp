@@ -492,6 +492,77 @@ which is what %SCAN-FLAT-UNDO-FILES was already doing next door."
              (is-true (bl.store:get-block store2 h)
                       "an append overwrote a record in a surviving file"))))))))
 
+(defun %ff-file-ranges (store)
+  "Every blk file's (first . last) height range, by file number."
+  (sort (loop for file being the hash-keys of (bl.store:block-store-file-info store)
+                using (hash-value info)
+              collect (list file
+                            (bl.store:block-file-info-height-first info)
+                            (bl.store:block-file-info-height-last info)))
+        #'< :key #'first))
+
+(defun %ff-files-split-at (store base)
+  "T when no blk file of STORE holds a block below BASE AND one at or above it."
+  (loop for (nil first last) in (%ff-file-ranges store)
+        never (and first last (< first base) (>= last base))))
+
+(test snapshot-blocks-go-to-block-files-of-their-own
+  "Core keeps two block-file cursors while an assumeutxo snapshot is loaded
+ (BlockfileTypeForHeight, node/blockstorage.cpp:771-777; FindNextBlockPos
+:832-905): a block at or above the snapshot base goes to an ASSUMED file, one
+below it to a NORMAL file, so the background chain's blocks and the snapshot
+chain's never share a file and each range prunes whole. Ours appended both
+chains' blocks to one file in arrival order, so the files mixed heights 200 and
+350 and a prune to 311 found no file it could delete: wallet_assumeutxo.py:98's
+pruneblockchain answered -1 where Core answers 298.
+
+The blocks arrive interleaved, as the two chainstates download them. The
+restart half is Core's cursor initialisation (:569-574): each chain's next
+block still lands beside its own kind."
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
+     (let ((base 300)
+           (chain (bl.store:make-chain-state))
+           (bl.store:*flat-block-files* t)
+           (bl.store:*fast-prune* t))
+       (flet ((put (store n &optional (height n))
+                (let ((hash (bl.store:store-block store (%ff-numbered-block n)
+                                                  :height height)))
+                  (bl.store:add-block-index-entry
+                   chain (bl.store:make-block-index-entry :hash hash :height height))
+                  hash)))
+         (let ((store (bl.store:init-block-store dir)))
+           (loop for n from 1 below 200 do (put store n))
+           (bl.store:note-snapshot-height store base)
+           ;; The snapshot chain (300..599) and the background chain
+           ;; (200..299) interleaved, the way both chainstates fetch.
+           (loop for up from base below 600
+                 for down from 200
+                 do (put store up)
+                    (when (< down base) (put store down)))
+           (is (<= 2 (length (%ff-file-ranges store)))
+               "the fixture must span several 64 KiB files: ~S" (%ff-file-ranges store))
+           (is-true (%ff-files-split-at store base)
+                    "a blk file mixes the two chains' blocks: ~S" (%ff-file-ranges store)))
+         ;; A restart with the snapshot still loaded.
+         (let ((store (bl.store:init-block-store dir)))
+           (bl.store:rebuild-block-file-info store chain)
+           (bl.store:note-snapshot-height store base :restore-cursors t)
+           (put store 600)
+           (put store 1000 250)
+           (is-true (%ff-files-split-at store base)
+                    "after the restart a block went to the other chain's file: ~S"
+                    (%ff-file-ranges store)))))))
+  ;; The drive sites: Core sets the height at ActivateSnapshot
+  ;; (validation.cpp:5737) and at a start with the snapshot loaded
+  ;; (node/blockstorage.cpp:437).
+  (let ((callers (mapcar (lambda (c) (let ((name (car c)))
+                                       (symbol-name (if (consp name) (second name) name))))
+                         (sb-introspect:who-calls 'bl.store:note-snapshot-height))))
+    (dolist (site '("ADD-SNAPSHOT-CHAINSTATE" "LOAD-SNAPSHOT-CHAINSTATE"))
+      (is (member site callers :test #'string=)
+          "~A no longer records the snapshot height" site))))
+
 (test the-store-reads-both-forms-at-once
   "Dual read, which is what makes the transition survivable: blocks written
 before the flat files stay readable after the switch, and blocks written after

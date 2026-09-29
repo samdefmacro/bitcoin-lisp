@@ -83,10 +83,21 @@ read-only RPC plus an ordinary unclean shutdown becomes a mandatory reindex.")
   ;; the whole life of a store that has ever held either.
   (index (make-hash-table :test 'equalp) :type hash-table)
   ;; The blk sequence and where the next record goes. Core keeps the same pair
-  ;; as m_blockfile_cursors (blockstorage.h:151-175).
+  ;; as m_blockfile_cursors (blockstorage.h:151-175): CURSOR-FILE/-POS is its
+  ;; NORMAL cursor, the ASSUMED-* pair below its ASSUMED one.
   (blk-seq nil)
   (cursor-file 0 :type (unsigned-byte 32))
   (cursor-pos 0 :type (unsigned-byte 32))
+  ;; Core BlockManager::m_snapshot_height (blockstorage.h:346): the snapshot
+  ;; base's height while an assumeutxo snapshot is loaded, NIL otherwise. A
+  ;; block at or above it is an ASSUMED block and goes to the ASSUMED cursor's
+  ;; files, so the snapshot chain's blocks and the background chain's never
+  ;; share a file (BlockfileTypeForHeight, blockstorage.cpp:771-777).
+  (snapshot-height nil :type (or null (unsigned-byte 32)))
+  ;; Core's ASSUMED cursor, NIL until the first ASSUMED block opens one past
+  ;; the last file (FindNextBlockPos, blockstorage.cpp:839-845).
+  (assumed-cursor-file nil :type (or null (unsigned-byte 32)))
+  (assumed-cursor-pos 0 :type (unsigned-byte 32))
   ;; The rev sequence. It needs no cursor pair: an undo record goes into the
   ;; file its block went into, at that file's own UNDO-SIZE offset, so the
   ;; per-file accounting IS the cursor (Core CBlockFileInfo::nUndoSize).
@@ -151,45 +162,118 @@ same value the P2P message header uses (Core MessageStart)."
             (make-flat-file-seq (ensure-directories store) "blk"
                                 +blockfile-chunk-size+))))
 
-(defun %store-block-flat (store data)
-  "Append a block's serialized DATA to the current blk file and return its
-FLAT-FILE-POS. The position points PAST the 8-byte header, at the payload,
-which is what Core records as nDataPos."
+(defun %assumed-block-p (store height)
+  "T when a block at HEIGHT is an ASSUMED block: Core BlockfileTypeForHeight
+ (node/blockstorage.cpp:771-777), HEIGHT at or above the loaded snapshot's
+base. A block of unknown height is NORMAL, as every block is without a
+snapshot."
+  (let ((base (block-store-snapshot-height store)))
+    (and base height (>= height base))))
+
+(defun %max-blockfile-num (store)
+  "Core MaxBlockfileNum (blockstorage.h:274-279): the higher of the two
+cursors' files. A new file, for either cursor, is the one after it."
+  (max (block-store-cursor-file store)
+       (or (block-store-assumed-cursor-file store) 0)))
+
+(defun %store-block-flat (store data height)
+  "Append a block's serialized DATA, of a block at HEIGHT, to the current blk
+file of its cursor and return its FLAT-FILE-POS. The position points PAST the
+8-byte header, at the payload, which is what Core records as nDataPos.
+
+Core FindNextBlockPos (node/blockstorage.cpp:832-905): the cursor is the one
+for the block's type (%ASSUMED-BLOCK-P); an ASSUMED cursor not yet open starts
+at the file after the last one, and a file that is full rolls over to the file
+after the last one of EITHER cursor, never simply to its own successor, which
+the other cursor may be writing."
   (let* ((seq (%blk-seq store))
          (record (flat-record-bytes (block-network-magic) data))
-         (need (length record)))
-    ;; Roll over rather than exceed Core's maximum file size, finalizing the
-    ;; file we are leaving so its preallocated tail is truncated away.
-    (when (and (plusp (block-store-cursor-pos store))
-               (> (+ (block-store-cursor-pos store) need)
-                  (max-blockfile-size need)))
-      (flat-file-flush seq
-                       (make-flat-file-pos (block-store-cursor-file store)
-                                           (block-store-cursor-pos store))
-                       :finalize t)
-      (incf (block-store-cursor-file store))
-      (setf (block-store-cursor-pos store) 0))
-    (let* ((file (block-store-cursor-file store))
-           (start (block-store-cursor-pos store))
-           (pos (make-flat-file-pos file start)))
-      (flat-file-allocate seq pos need)
-      ;; Obfuscated at the record's real file offset: the key alignment of
-      ;; every byte depends on where it lands, not on where the buffer starts.
-      ;; RECORD is freshly built by FLAT-RECORD-BYTES and read by nobody after
-      ;; the write, so it is obfuscated in place — a copy is a second full
-      ;; block-sized allocation on the IBD hot path.
-      (obfuscate! record (block-store-xor-key store) :key-offset start)
-      (with-open-file (out (flat-file-name seq pos)
-                           :direction :io :element-type '(unsigned-byte 8)
-                           :if-exists :overwrite :if-does-not-exist :create)
-        (file-position out start)
-        (write-sequence record out)
-        (finish-output out)
-        ;; Same durability rule as the per-block path: connect-block stores
-        ;; the block before the chainstate flush that references it.
-        #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd out))))
-      (setf (block-store-cursor-pos store) (+ start need))
-      (make-flat-file-pos file (+ start +storage-header-bytes+)))))
+         (need (length record))
+         (assumed (%assumed-block-p store height)))
+    (when (and assumed (null (block-store-assumed-cursor-file store)))
+      (setf (block-store-assumed-cursor-file store) (1+ (%max-blockfile-num store))
+            (block-store-assumed-cursor-pos store) 0))
+    (let ((file (if assumed (block-store-assumed-cursor-file store)
+                    (block-store-cursor-file store)))
+          (start (if assumed (block-store-assumed-cursor-pos store)
+                     (block-store-cursor-pos store))))
+      ;; Roll over rather than exceed Core's maximum file size, finalizing the
+      ;; file we are leaving so its preallocated tail is truncated away.
+      (when (and (plusp start)
+                 (> (+ start need) (max-blockfile-size need)))
+        (flat-file-flush seq (make-flat-file-pos file start) :finalize t)
+        (setf file (1+ (%max-blockfile-num store))
+              start 0))
+      (let ((pos (make-flat-file-pos file start)))
+        (flat-file-allocate seq pos need)
+        ;; Obfuscated at the record's real file offset: the key alignment of
+        ;; every byte depends on where it lands, not on where the buffer starts.
+        ;; RECORD is freshly built by FLAT-RECORD-BYTES and read by nobody after
+        ;; the write, so it is obfuscated in place — a copy is a second full
+        ;; block-sized allocation on the IBD hot path.
+        (obfuscate! record (block-store-xor-key store) :key-offset start)
+        (with-open-file (out (flat-file-name seq pos)
+                             :direction :io :element-type '(unsigned-byte 8)
+                             :if-exists :overwrite :if-does-not-exist :create)
+          (file-position out start)
+          (write-sequence record out)
+          (finish-output out)
+          ;; Same durability rule as the per-block path: connect-block stores
+          ;; the block before the chainstate flush that references it.
+          #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd out))))
+        (if assumed
+            (setf (block-store-assumed-cursor-file store) file
+                  (block-store-assumed-cursor-pos store) (+ start need))
+            (setf (block-store-cursor-file store) file
+                  (block-store-cursor-pos store) (+ start need)))
+        (make-flat-file-pos file (+ start +storage-header-bytes+))))))
+
+(defun block-store-cursors (store)
+  "The open cursors as an alist (file . used-size): the NORMAL one, and the
+ASSUMED one when a snapshot has opened it. The used size is what Core records
+as the file's nSize; the file on disk is longer by its preallocated tail."
+  (let ((cursors (list (cons (block-store-cursor-file store)
+                             (block-store-cursor-pos store)))))
+    (when (block-store-assumed-cursor-file store)
+      (push (cons (block-store-assumed-cursor-file store)
+                  (block-store-assumed-cursor-pos store))
+            cursors))
+    (nreverse cursors)))
+
+(defun note-snapshot-height (store height &key restore-cursors)
+  "Record that an assumeutxo snapshot based at HEIGHT is loaded (Core
+m_snapshot_height): from now on a block at or above HEIGHT goes to the ASSUMED
+cursor's files (%STORE-BLOCK-FLAT).
+
+At ActivateSnapshot (validation.cpp:5737) that is all: nothing has been
+stored at or above the base yet, and the ASSUMED cursor opens with the first
+block that needs one. At a restart with the snapshot still loaded
+ (LoadBlockIndex, blockstorage.cpp:437), RESTORE-CURSORS re-derives both
+cursors as Core's cursor initialisation does (:569-574): each file, in order,
+becomes the cursor of the type its LAST height belongs to, so the NORMAL
+cursor is the last file of the background chain's blocks and the ASSUMED one
+the last file of the snapshot chain's. Needs the file table's height ranges
+ (REBUILD-BLOCK-FILE-INFO). A node without a block store (a test fixture) has
+nothing to record."
+  (unless store
+    (return-from note-snapshot-height nil))
+  (setf (block-store-snapshot-height store) height)
+  (when restore-cursors
+    (let ((normal nil) (assumed nil))
+      (dolist (file (sort (loop for f being the hash-keys of (block-store-file-info store)
+                                collect f)
+                          #'<))
+        (if (%assumed-block-p
+             store (block-file-info-height-last (gethash file (block-store-file-info store))))
+            (setf assumed file)
+            (setf normal file)))
+      (when normal
+        (setf (block-store-cursor-file store) normal
+              (block-store-cursor-pos store) (%blk-file-used-size store normal)))
+      (setf (block-store-assumed-cursor-file store) assumed
+            (block-store-assumed-cursor-pos store)
+            (if assumed (%blk-file-used-size store assumed) 0))))
+  height)
 
 (defun %read-block-flat (store pos)
   "Read and deserialize the block whose payload starts at POS. Returns NIL if
@@ -267,23 +351,29 @@ FlatFileSeq::Flush OPENS the file it commits, creating it when it is missing
 always has its rev file beside it, empty or not -- which is what
 feature_remove_pruned_files_on_startup.py:68 lists after the stop that follows
 a pruned -reindex: blk00000.dat AND rev00000.dat. A store that has written no
-block file yet has nothing to flush (Core's m_blockfile_info.size() < 1)."
-  (let* ((file (block-store-cursor-file store))
-         (blk-seq (block-store-blk-seq store))
-         (blk-pos (make-flat-file-pos file (block-store-cursor-pos store))))
-    (when (and blk-seq (probe-file (flat-file-name blk-seq blk-pos)))
-      (flat-file-flush blk-seq blk-pos)
-      (let* ((rev-seq (%rev-seq store))
-             (rev-pos (make-flat-file-pos file 0))
-             (rev-path (flat-file-name rev-seq rev-pos)))
-        (unless (probe-file rev-path)
-          (with-open-file (s rev-path :direction :output
-                                      :element-type '(unsigned-byte 8)
-                                      :if-does-not-exist :create
-                                      :if-exists :append)
-            (declare (ignorable s))))
-        (flat-file-flush rev-seq rev-pos))
-      t)))
+block file yet has nothing to flush (Core's m_blockfile_info.size() < 1).
+
+Core flushes the cursor of the flushing chainstate's tip type; with a
+snapshot loaded both chainstates flush, so both open cursors are committed
+here (BLOCK-STORE-CURSORS)."
+  (let ((blk-seq (block-store-blk-seq store))
+        (flushed nil))
+    (loop for (file . used) in (block-store-cursors store)
+          for blk-pos = (make-flat-file-pos file used)
+          when (and blk-seq (probe-file (flat-file-name blk-seq blk-pos)))
+            do (flat-file-flush blk-seq blk-pos)
+               (let* ((rev-seq (%rev-seq store))
+                      (rev-pos (make-flat-file-pos file 0))
+                      (rev-path (flat-file-name rev-seq rev-pos)))
+                 (unless (probe-file rev-path)
+                   (with-open-file (s rev-path :direction :output
+                                               :element-type '(unsigned-byte 8)
+                                               :if-does-not-exist :create
+                                               :if-exists :append)
+                     (declare (ignorable s))))
+                 (flat-file-flush rev-seq rev-pos))
+               (setf flushed t))
+    flushed))
 
 (defun block-flat-file-number (store hash)
   "The blk file number HASH's body is in, or NIL when it is not in a flat file.
@@ -511,7 +601,7 @@ fresh copy."
                        (t (file-size-bytes path))))))
     (cond
       (*flat-block-files*
-       (let ((pos (%store-block-flat store data)))
+       (let ((pos (%store-block-flat store data height)))
          (setf (gethash hash (block-store-index store)) pos)
          (%note-block-in-file store (flat-file-pos-file pos) height
                               (+ (length data) +storage-header-bytes+)
@@ -658,45 +748,67 @@ the surviving higher-numbered files went missing from the index (unservable,
 unreadable for undo, invisible to crash recovery), the byte total read 0 so
 automatic pruning stopped, and the cursor rewound to (0, 0) so a later rollover
 would open a live file with :IF-EXISTS :OVERWRITE at offset 0."
-  (let ((seq (%blk-seq store))
-        (key (block-store-xor-key store))
-        (magic (block-network-magic))
-        (bytes 0)
+  (let ((bytes 0)
         (last-file 0)
         (last-pos 0))
     (dolist (file (%existing-flat-file-numbers store "blk"))
-      (let ((path (flat-file-name seq (make-flat-file-pos file 0))))
-        (with-open-file (in path :direction :input
-                                 :element-type '(unsigned-byte 8))
-          (let ((size (file-length in))
-                (offset 0)
-                (header (make-array +storage-header-bytes+
-                                    :element-type '(unsigned-byte 8)))
-                (hdr80 (make-array 80 :element-type '(unsigned-byte 8))))
-            (loop
-              (when (> (+ offset +storage-header-bytes+) size) (return))
-              (file-position in offset)
-              (read-sequence header in)
-              (obfuscate! header key :key-offset offset)
-              (multiple-value-bind (found length) (parse-flat-record-header header)
-                (unless (and (equalp found magic)
-                             (plusp length)
-                             (>= length 80)
-                             (<= (+ offset +storage-header-bytes+ length) size))
-                  (return))
-                (read-sequence hdr80 in)
-                (obfuscate! hdr80 key
-                            :key-offset (+ offset +storage-header-bytes+))
-                (let ((hash (bl.crypto:hash256 hdr80)))
-                  (setf (gethash hash (block-store-index store))
-                        (make-flat-file-pos file (+ offset +storage-header-bytes+))))
-                (incf bytes (+ +storage-header-bytes+ length))
-                (setf offset (+ offset +storage-header-bytes+ length)
-                      last-file file
-                      last-pos offset)))))))
+      (let ((end (%walk-blk-file
+                  store file
+                  (lambda (hash pos length)
+                    (setf (gethash hash (block-store-index store)) pos)
+                    (incf bytes (+ +storage-header-bytes+ length))))))
+        ;; A file with no record in it leaves the cursor where it was, as the
+        ;; walk always did.
+        (when (plusp end)
+          (setf last-file file
+                last-pos end))))
     (setf (block-store-cursor-file store) last-file
           (block-store-cursor-pos store) last-pos)
     bytes))
+
+(defun %walk-blk-file (store file on-record)
+  "Walk blk file FILE's records from the start, calling ON-RECORD with each
+block's hash, its FLAT-FILE-POS and its payload length, and return the offset
+just past the last record: the file's used size, the place its cursor
+resumes. Stops at the first header that is not a record -- which is exactly
+what the preallocated zero tail of a file still being appended to looks like."
+  (let ((path (flat-file-name (%blk-seq store) (make-flat-file-pos file 0)))
+        (key (block-store-xor-key store))
+        (magic (block-network-magic))
+        (offset 0))
+    (when (probe-file path)
+      (with-open-file (in path :direction :input
+                               :element-type '(unsigned-byte 8))
+        (let ((size (file-length in))
+              (header (make-array +storage-header-bytes+
+                                  :element-type '(unsigned-byte 8)))
+              (hdr80 (make-array 80 :element-type '(unsigned-byte 8))))
+          (loop
+            (when (> (+ offset +storage-header-bytes+) size) (return))
+            (file-position in offset)
+            (read-sequence header in)
+            (obfuscate! header key :key-offset offset)
+            (multiple-value-bind (found length) (parse-flat-record-header header)
+              (unless (and (equalp found magic)
+                           (plusp length)
+                           (>= length 80)
+                           (<= (+ offset +storage-header-bytes+ length) size))
+                (return))
+              (when on-record
+                (read-sequence hdr80 in)
+                (obfuscate! hdr80 key
+                            :key-offset (+ offset +storage-header-bytes+))
+                (funcall on-record (bl.crypto:hash256 hdr80)
+                         (make-flat-file-pos file (+ offset +storage-header-bytes+))
+                         length))
+              (setf offset (+ offset +storage-header-bytes+ length)))))))
+    offset))
+
+(defun %blk-file-used-size (store file)
+  "Where the next record in blk file FILE goes: the offset just past its last
+record (Core's CBlockFileInfo::nSize, which it persists and this tree
+re-derives)."
+  (%walk-blk-file store file nil))
 
 (defun init-block-store (base-path &key blocks-path)
   "Initialize a block store at BASE-PATH.
