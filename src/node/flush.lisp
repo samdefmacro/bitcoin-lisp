@@ -37,6 +37,17 @@ the budget, whichever is larger free margin) remains."
   (max (floor (* budget 9) 10)
        (- budget (* 10 1024 1024))))
 
+(defvar *blocks-since-flush* 0
+  "Counter incremented per connected block; reset to 0 when a flush runs.")
+
+(defvar *last-flush-universal-time* 0
+  "Node-clock time (GET-NODE-TIME) of the last successful periodic flush. Used
+   by the time-based trigger.
+
+   Mockable on purpose: Core reads NodeClock::now() for the PERIODIC flush
+   decision (validation.cpp:2759,2765) and SteadyClock only for the durations
+   it logs (:2301,2382).")
+
 (defun maybe-critical-flush (chainstate)
   "Flush CHAINSTATE only when its coins cache has exceeded its whole budget —
 Core's CRITICAL tier (validation.cpp:2690), the one FlushStateMode::IF_NEEDED
@@ -166,17 +177,6 @@ PRUNE_TARGET_MANUAL target never triggers. Returns the blocks pruned."
       (when (plusp pruned)
         (log-info "Pruned ~D old block~:P at startup" pruned)))
     pruned))
-
-(defvar *blocks-since-flush* 0
-  "Counter incremented per connected block; reset to 0 when a flush runs.")
-
-(defvar *last-flush-universal-time* 0
-  "Node-clock time (GET-NODE-TIME) of the last successful periodic flush. Used
-   by the time-based trigger.
-
-   Mockable on purpose: Core reads NodeClock::now() for the PERIODIC flush
-   decision (validation.cpp:2759,2765) and SteadyClock only for the durations
-   it logs (:2301,2382).")
 
 (defun log-memory-snapshot (label)
   "Log a snapshot of the major in-memory caches plus SBCL heap usage.

@@ -670,6 +670,26 @@ tables everywhere the keys are distinct."
          (let ((yason:*parse-object-as* :alist))
            (yason:parse body)))))))
 
+(defvar *request-id* nil
+  "The \"id\" of the request being handled, for the error replies built after
+parsing has begun.")
+
+(defvar *request-id-present* t
+  "Whether the request object carried an \"id\" member at all.
+
+Core\'s JSONRPCRequest::id starts as a PRESENT null (request.h:55) and parse()
+replaces it with std::nullopt when the object has no id member -- BEFORE the
+version and method checks, under the comment `Parse id now so errors from here
+on will have the id\' (rpc/request.cpp:206-211). So a body that never parsed as
+JSON answers with `\"id\": null\', while `{\"jsonrpc\": 2, ...}\' answers with no
+id key at all; interface_rpc.py:189 and :204 compare the two whole objects.")
+
+(defvar *rpc-auth-user* ""
+  "The authenticated user name of the request being served (Core
+JSONRPCRequest::authUser, set by RPCAuthorized, httprpc.cpp:84,121). Read by
+the per-request log line below; the empty string outside a request, which is
+also what Core prints for the cookie user.")
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -766,20 +786,6 @@ pairs — so without this every object-returning RPC errors out."
     ((and (consp x) (rpc-proper-list-p x))
      (mapcar #'rpc-result->json x))
     (t x)))
-
-(defvar *request-id* nil
-  "The \"id\" of the request being handled, for the error replies built after
-parsing has begun.")
-
-(defvar *request-id-present* t
-  "Whether the request object carried an \"id\" member at all.
-
-Core\'s JSONRPCRequest::id starts as a PRESENT null (request.h:55) and parse()
-replaces it with std::nullopt when the object has no id member -- BEFORE the
-version and method checks, under the comment `Parse id now so errors from here
-on will have the id\' (rpc/request.cpp:206-211). So a body that never parsed as
-JSON answers with `\"id\": null\', while `{\"jsonrpc\": 2, ...}\' answers with no
-id key at all; interface_rpc.py:189 and :204 compare the two whole objects.")
 
 (defun %make-rpc-reply (result error-obj id version id-present)
   "Assemble a JSON-RPC reply the way Core's JSONRPCReplyObj does
@@ -933,12 +939,6 @@ handler-case around it does."
   "The path of the HTTP request being served, bound by RPC-HANDLER for the
 duration of the call (Core JSONRPCRequest::URI). The wallet reads its
 /wallet/<name> endpoint from it; NIL outside a request.")
-
-(defvar *rpc-auth-user* ""
-  "The authenticated user name of the request being served (Core
-JSONRPCRequest::authUser, set by RPCAuthorized, httprpc.cpp:84,121). Read by
-the per-request log line below; the empty string outside a request, which is
-also what Core prints for the cookie user.")
 
 (defvar *rpc-credentials* '()
   "Every credential the RPC server authorizes against, each an RPC-CREDENTIAL:

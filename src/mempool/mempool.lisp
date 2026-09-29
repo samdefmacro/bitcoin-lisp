@@ -1133,6 +1133,16 @@ to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
                (when ce (remhash txid (mempool-entry-parents ce)))))
            (mempool-entry-children entry)))
 
+(defvar *mempool-removal-reason* nil
+  "The MemPoolRemovalReason of the removal in progress, bound by each removal
+path around its MEMPOOL-REMOVE calls: :expiry, :size-limit, :reorg, :block,
+:conflict, or :replaced (Core txmempool.h MemPoolRemovalReason). NIL means an
+unclassified removal, which the wallet treats like the generic (non-conflict)
+reasons. MEMPOOL-REMOVE forwards it to the wallet chain-tracking hook exactly
+like Core removeUnchecked forwards its reason to TransactionRemovedFromMempool
+(txmempool.cpp:263-275), including the reason-BLOCK skip — the wallet learns
+about mined transactions from the block-connected hook instead.")
+
 (defun accept-validated-tx (mempool txid tx fee height
                             &key (entry-time
                                   (bl.ser:get-unix-time))
@@ -1198,16 +1208,6 @@ at hand."
                         :has-no-mempool-parents
                         (zerop (hash-table-count (mempool-entry-parents entry)))))
       (values result entry))))
-
-(defvar *mempool-removal-reason* nil
-  "The MemPoolRemovalReason of the removal in progress, bound by each removal
-path around its MEMPOOL-REMOVE calls: :expiry, :size-limit, :reorg, :block,
-:conflict, or :replaced (Core txmempool.h MemPoolRemovalReason). NIL means an
-unclassified removal, which the wallet treats like the generic (non-conflict)
-reasons. MEMPOOL-REMOVE forwards it to the wallet chain-tracking hook exactly
-like Core removeUnchecked forwards its reason to TransactionRemovedFromMempool
-(txmempool.cpp:263-275), including the reason-BLOCK skip — the wallet learns
-about mined transactions from the block-connected hook instead.")
 
 (defun mempool-add (mempool txid entry &key defer-trim bypass-limits)
   "Add a transaction to the mempool.

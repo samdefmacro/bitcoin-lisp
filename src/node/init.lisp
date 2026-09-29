@@ -1767,19 +1767,27 @@ settings.json's own list (Core LoadWallets, load.cpp:118)."
     (init-message "Verifying wallet(s)…")
     (if (eq wallet-names :settings)
         (bl.wallet:load-wallets-on-startup node)
-        ;; Core's LoadWallets says `Loading wallet…' before EACH wallet it
-        ;; opens (wallet/load.cpp:149), so the list is walked here, one
-        ;; wallet per call. A name given twice is loaded once, and
-        ;; VerifyWallets says so as an init warning (load.cpp:90-93),
-        ;; which wallet_multiwallet.py:148 reads off stderr.
-        (let ((seen '()))
+        ;; VerifyWallets first, over the whole list (wallet/load.cpp:78-112):
+        ;; a name whose joined path was already seen is dropped with an init
+        ;; warning (wallet_multiwallet.py:171 reads it off stderr), and a path
+        ;; GetWalletPath refuses stops start-up before any wallet opens
+        ;; (:174-175). Then LoadWallets, which says `Loading wallet…' before
+        ;; EACH wallet it opens (load.cpp:149), one wallet per call.
+        (let ((manager (node-wallet-manager node))
+              (seen '())
+              (verified '()))
           (dolist (name (remove-if-not #'stringp wallet-names))
-            (if (member name seen :test #'string=)
-                (init-warning (format nil "Ignoring duplicate -wallet ~A." name))
-                (progn
-                  (push name seen)
-                  (init-message "Loading wallet…")
-                  (bl.wallet:load-wallets-on-startup node (list name)))))))))
+            (let ((key (bl.wallet:wallet-path-key manager name)))
+              (cond ((member key seen :test #'string=)
+                     (init-warning (format nil "Ignoring duplicate -wallet ~A." name)))
+                    (t
+                     (push key seen)
+                     (let ((bad (bl.wallet:wallet-path-error manager name)))
+                       (when bad (init-error "~A" bad)))
+                     (push name verified)))))
+          (dolist (name (nreverse verified))
+            (init-message "Loading wallet…")
+            (bl.wallet:load-wallets-on-startup node (list name)))))))
 
 
 (defun apply-initial-network-active (node network-active)

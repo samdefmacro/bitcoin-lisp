@@ -463,6 +463,14 @@ won't serve would keep IBD's main loop spinning forever."
 ;;;; to that cap -- so a peer holding a full window of same-age requests went
 ;;;; from 0 to 16 timeouts in a single pass.
 
+(defparameter *bd-epoch* (* 1000 internal-time-units-per-second)
+  "A synthetic clock origin for the download-timeout tests. GET-INTERNAL-REAL-TIME
+starts near zero at process start, so `now minus ten minutes' is NEGATIVE in a
+freshly started image and every plusp guard reads the stamp as unset -- the
+assertion then passes for the wrong reason. These tests place both the stamp
+and the current time explicitly instead, which is also what Core does: its
+SendMessages receives current_time rather than reading the clock.")
+
 (defun %bd-hash (n)
   "A distinct 32-byte block hash for index N."
   (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -483,14 +491,6 @@ time a peer is dropped for stalling."
 
 (defun %bd-peer (&optional (address "203.0.113.1"))
   (bl.net:make-peer :address address :state :ready))
-
-(defparameter *bd-epoch* (* 1000 internal-time-units-per-second)
-  "A synthetic clock origin for the download-timeout tests. GET-INTERNAL-REAL-TIME
-starts near zero at process start, so `now minus ten minutes' is NEGATIVE in a
-freshly started image and every plusp guard reads the stamp as unset -- the
-assertion then passes for the wrong reason. These tests place both the stamp
-and the current time explicitly instead, which is also what Core does: its
-SendMessages receives current_time rather than reading the clock.")
 
 (defun %bd-fill-window (peer count age-seconds &optional (now *bd-epoch*))
   "Put COUNT blocks in flight from PEER, all requested AGE-SECONDS before NOW,

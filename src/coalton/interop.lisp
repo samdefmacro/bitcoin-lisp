@@ -2138,6 +2138,10 @@ output carrying the credited AMOUNT forward, with an empty scriptPubKey
           ;; All checks passed
           t)))))
 
+(defvar *in-checkmultisig* nil
+  "When T, suppress per-signature NULLFAIL in verify-checksig.
+CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
+
 (defun verify-checksig (sig-bytes pubkey-bytes script-pubkey)
   "Verify a CHECKSIG operation using Bitcoin Core test transaction format.
    When STRICTENC flag is set in *script-flags*, validates encoding.
@@ -2271,10 +2275,6 @@ output carrying the credited AMOUNT forward, with an empty scriptPubKey
            (values nil :nullfail))
           ;; Normal result
           (t (values result nil)))))))
-
-(defvar *in-checkmultisig* nil
-  "When T, suppress per-signature NULLFAIL in verify-checksig.
-CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
 (defvar *last-checksig-error* nil
   "Set to error keyword (:sig-hashtype, :pubkeytype, :sig-der) if validation failed.")

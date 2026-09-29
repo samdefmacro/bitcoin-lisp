@@ -124,7 +124,7 @@ bit 28 in every regtest template it hands out."
   (or (and (eq bl:*network* :regtest) *block-version-override*)
       (bl.val:compute-block-version chain-state tip)))
 
-(defun next-block-required-bits (chain-state prev-entry block-time)
+(defun next-block-required-bits (prev-entry block-time)
   "The compact difficulty bits the block after PREV-ENTRY must carry, mirroring
 Bitcoin Core's GetNextWorkRequired. Reuses the consensus get-expected-bits and
 falls back to the testnet min-difficulty / walk-back rule when it is
@@ -288,7 +288,7 @@ does - at the blockMinFeeRate comparison."
          ;; Core UpdateTime (miner.cpp:49-57): nTime = max(mintime, now).
          (curtime (max now mintime))
          (bits (if tip
-                   (next-block-required-bits chain-state tip curtime)
+                   (next-block-required-bits tip curtime)
                    bl.store:+pow-limit-bits+))
          (version (next-block-version chain-state tip)))
     (multiple-value-bind (selected fees weight sigops)

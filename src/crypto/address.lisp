@@ -393,7 +393,7 @@ s1^2 == s0*s2 in logarithms. Returns a one-element location list or NIL
       (when (and (< p1 length) (zerop (mod l-e1 33)))
         (list (- n p1 1))))))
 
-(defun %bech32-two-errors (s0 s1 s2 l-s0 l-s1 l-s2 length n)
+(defun %bech32-two-errors (s0 s1 s2 l-s0 l-s1 length n)
   "Two wrong characters: guess the first position and solve for the second,
 keeping the pair only when both error values land in GF(32)
 (bech32.cpp:492-556). Returns the two locations, leftmost first, or NIL."
@@ -488,7 +488,7 @@ callers tell `LocateErrors found nothing' from a real fault."
                                               (zerop (mod (+ (* 2 l-s1) (- l-s2)
                                                              (- l-s0) 2046)
                                                           1023))))
-                                    (%bech32-two-errors s0 s1 s2 l-s0 l-s1 l-s2
+                                    (%bech32-two-errors s0 s1 s2 l-s0 l-s1
                                                         length n)))))))
               (when (or (null error-locations)
                         (and possible (< (length possible) (length error-locations))))

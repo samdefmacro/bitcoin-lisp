@@ -6882,7 +6882,6 @@ sat/vB) fallback, so a wallet reading \"feerate\" got a made-up number instead
 of noticing there was no estimate, and built a transaction at 1 sat/vB that
 would not confirm."
   (let* ((node (make-test-node))
-         (bl::*syncing* nil)
          (result (bl.rpc::rpc-estimatesmartfee node '(6))))
     (is-false (assoc "feerate" result :test #'string=)
               "a fabricated feerate is reported where Core reports none")
@@ -6897,7 +6896,6 @@ include, indistinguishable from a real estimate, so a wallet reading it never
 falls back to its own -fallbackfee. Core answers the errors array
 (feature_fee_estimation.py:332,413)."
   (let* ((node (make-test-node))
-         (bl::*syncing* nil)
          (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
          (legacy (bl.mp:make-fee-estimator)))
     (dotimes (i 12)
@@ -6924,7 +6922,6 @@ falls back to its own -fallbackfee. Core answers the errors array
 Ours defaulted to conservative, which returns a HIGHER number — so every caller
 that did not name a mode was quietly told to overpay."
   (let ((node (make-test-node))
-        (bl::*syncing* nil)
         (seen nil))
     (%with-stubbed-fee-estimate (node :rate 10 :mode-out seen)
       (bl.rpc::rpc-estimatesmartfee node '(6))
@@ -6942,8 +6939,7 @@ that did not name a mode was quietly told to overpay."
 (fees.cpp:82-85). Unclamped — as ours was — a node whose mempool minimum has
 risen recommends a fee BELOW its own acceptance threshold: it rejects the very
 transaction it just priced."
-  (let ((node (make-test-node))
-        (bl::*syncing* nil))
+  (let ((node (make-test-node)))
     (%with-stubbed-fee-estimate (node :rate 10)   ; 10 sat/vB = 10000 sat/kvB
       ;; Floor below the estimate: the estimate stands.
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
@@ -6963,8 +6959,7 @@ transaction it just priced."
 requested target: the estimator substitutes 2 for a 1-block target and clamps
 to what its history can justify. Echoing the request tells a caller the answer
 covers a horizon it does not."
-  (let ((node (make-test-node))
-        (bl::*syncing* nil))
+  (let ((node (make-test-node)))
     (%with-stubbed-fee-estimate (node :rate 10 :returned-target 100)
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(1008))))
         (is (= 100 (cdr (assoc "blocks" result :test #'string=)))
@@ -9721,8 +9716,9 @@ into the finalizer would push three signatures at a 2-of-3 and fail there."
     (is (equalp (list (second pks) (third pks)) (mapcar #'car pairs)))
     (is (= 4 (length witness)))
     (is-true verified))
-  ;; k < m is still a threshold failure, reported by the shipped signer.
-  (is (search "multisig needs 2 sigs, have 1"
+  ;; k < m is still a threshold failure, reported by the shipped signer in
+  ;; Core's words: VerifyScript's SIG_NULLFAIL (script/sign.cpp:1063-1065).
+  (is (search "CHECK(MULTI)SIG failing with non-zero signature (possibly need more signatures)"
               (handler-case (progn (%p2wsh-multisig-signing 2 3 '(0)) "no error")
                 (error (e) (princ-to-string e))))))
 
@@ -12398,6 +12394,68 @@ had asked the unsigned replacement its vsize."
                     (bl.ser:transaction-hash tx)))
         (is (equalp (bl.ser:transaction-hash tx)
                     (bl.ser:transaction-wtxid tx)))))))
+
+(test signing-completeness-is-core-s-verifyscript-verdict
+  "Core SignTransaction (script/sign.cpp:1034-1073) decides an input's error
+AFTER UpdateInput: no coin is `Input not found or already spent', and every
+other input is complete exactly when VerifyScript passes on what signing
+wrote, its error otherwise -- INVALID_STACK_OPERATION and SIG_NULLFAIL in
+sentences of their own that say what is missing, anything else as
+ScriptErrorString (a P2WPKH input with an empty witness is
+WITNESS_PROGRAM_MISMATCH, interpreter.cpp:1939-1940). Ours reported the assembler's own reasons (`no key for
+P2PKH', `no prevtx scriptPubKey provided'), so a client comparing Core's
+sentences read neither."
+  (let* ((k1 (let ((b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref b 31) 11) b))
+         (k2 (let ((b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref b 31) 12) b))
+         (pub1 (bl.crypto:derive-public-key k1))
+         (pub2 (bl.crypto:derive-public-key k2))
+         (p2pkh (concatenate '(vector (unsigned-byte 8))
+                             (vector #x76 #xa9 #x14) (bl.crypto:hash160 pub2) (vector #x88 #xac)))
+         (p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) (bl.crypto:hash160 pub2)))
+         (multi (concatenate '(vector (unsigned-byte 8))
+                             (vector #x52 #x21) pub1 (vector #x21) pub2 (vector #x52 #xae)))
+         (mine (concatenate '(vector (unsigned-byte 8))
+                            (vector #x76 #xa9 #x14) (bl.crypto:hash160 pub1) (vector #x88 #xac)))
+         (spks (list mine p2pkh p2wpkh multi nil))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (coerce
+                       (loop for i from 0 below (length spks)
+                             collect (bl.ser:make-tx-in
+                                      :previous-output
+                                      (bl.ser:make-outpoint
+                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element (+ 40 i))
+                                       :index 0)
+                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                      :sequence #xffffffff))
+                       'vector)
+              :outputs (vector (bl.ser:make-tx-out :value 90000 :script-pubkey mine))
+              :lock-time 0))
+         (prevmap (make-hash-table :test 'equalp))
+         (keymap (make-hash-table :test 'equalp))
+         (pubmap (make-hash-table :test 'equalp)))
+    ;; Only KEY1 is held: input 0 signs, 1 and 2 have no key, 3 is a 2-of-2
+    ;; that gets one of its two signatures, 4 has no coin at all.
+    (loop for spk in spks for i from 0
+          when spk
+            do (setf (gethash (cons (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element (+ 40 i))
+                                    0)
+                              prevmap)
+                     (list spk 100000 nil nil)))
+    (setf (gethash (bl.crypto:hash160 pub1) keymap) (cons k1 pub1)
+          (gethash pub1 pubmap) k1)
+    (is (equal '((1 . "Unable to sign input, invalid stack size (possibly missing key)")
+                 (2 . "Witness program hash mismatch")
+                 (3 . "CHECK(MULTI)SIG failing with non-zero signature (possibly need more signatures)")
+                 (4 . "Input not found or already spent"))
+               (bl.rpc:sign-tx-inputs tx prevmap keymap pubmap
+                                      (make-hash-table :test 'equalp) 1)))
+    (is (plusp (length (bl.ser:tx-in-script-sig (aref (bl.ser:transaction-inputs tx) 3))))
+        "the partial multisig signature is written, as UpdateInput writes it")))
 
 (test a-transaction-with-no-inputs-decodes-to-an-empty-vin-array
   "Core's TxToUniv builds vin and vout as UniValue::VARR and pushes each entry

@@ -280,7 +280,7 @@ Bitcoin often displays hashes in reverse byte order."
           (setf v3 (logxor v3 m))
           ;; 2 compression rounds
           (dotimes (round 2)
-            (declare (ignore round))
+            (declare (ignorable round))
             (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v1)))
             (setf v1 (siphash-rotl64 v1 13))
             (setf v1 (logxor v1 v0))
@@ -307,7 +307,7 @@ Bitcoin often displays hashes in reverse byte order."
     (setf v3 (logxor v3 b))
     ;; 2 compression rounds
     (dotimes (round 2)
-      (declare (ignore round))
+      (declare (ignorable round))
       (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v1)))
       (setf v1 (siphash-rotl64 v1 13))
       (setf v1 (logxor v1 v0))
@@ -328,7 +328,7 @@ Bitcoin often displays hashes in reverse byte order."
     (setf v2 (logxor v2 #xff))
     ;; 4 finalization rounds
     (dotimes (round 4)
-      (declare (ignore round))
+      (declare (ignorable round))
       (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v1)))
       (setf v1 (siphash-rotl64 v1 13))
       (setf v1 (logxor v1 v0))
