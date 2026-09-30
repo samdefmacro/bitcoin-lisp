@@ -1151,8 +1151,16 @@ add it. Caller has already run validate-transaction-for-mempool and passes
 the weighted SIGOPS cost it computed (Core threads the same value from
 PreChecks into the entry, validation.cpp:924) — without it the block
 assembler's sigop budget is vacuous. Returns (values result entry) where
-RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
-(reorg re-add, package submission).
+RESULT is mempool-add's keyword. DEFER-TRIM skips the size limit (reorg
+re-add, package submission), which the caller runs once for the lot.
+
+Without DEFER-TRIM or BYPASS-LIMITS this is Core's single-transaction tail
+(validation.cpp:1390-1416): LimitMempoolSize -- the expiry, THEN the trim --
+and only then the added signal, and only for a transaction still in the pool;
+one the limit took is `mempool full' and was never announced. The signal
+draws the next sequence after every removal the admission caused. The entry's
+own sequence is the counter's value BEFORE the replacements leave, Core's
+GetSequence() in PreChecks (:920).
 
 BYPASS-LIMITS, PACKAGE-SUBMISSION and CHAINSTATE-CURRENT are three of Core's
 four NewMempoolTransactionInfo flags and go to the fee estimator; the fourth
@@ -1161,13 +1169,20 @@ MEMPOOL-ADD, where it is Core's entry_sequence 0 (validation.cpp:918-920).
 CHAINSTATE-CURRENT defaults to TRUE, which is the answer for a synced node:
 compute it with BL.NET:CURRENT-FOR-FEE-ESTIMATION-P wherever a chain state is
 at hand."
-  (let ((*mempool-removal-reason* :replaced))
-    (dolist (rt replaced)
-      (mempool-remove-recursive mempool rt)))
+  (let ((entry-sequence (mempool-next-sequence mempool))
+        (limit (not (or defer-trim bypass-limits))))
+    (let ((*mempool-removal-reason* :replaced))
+      (dolist (rt replaced)
+        (mempool-remove-recursive mempool rt)))
   (let ((entry (make-entry-from-tx tx (or fee 0) height
                                    :sigops sigops :entry-time entry-time)))
-    (let ((result (mempool-add mempool txid entry :defer-trim defer-trim
-                                                 :bypass-limits bypass-limits)))
+    ;; The limit is this function's, not MEMPOOL-ADD's (which would trim
+    ;; BEFORE the expiry, and under BYPASS-LIMITS too, where Core does not
+    ;; limit at all); the announcement waits for it.
+    (let ((result (mempool-add mempool txid entry :defer-trim t
+                                                 :bypass-limits bypass-limits
+                                                 :entry-sequence entry-sequence
+                                                 :announce (not limit))))
       ;; Core LimitMempoolSize after a successful acceptance
       ;; (validation.cpp:1392-1394), under Core's own guard
       ;; `!package_submission && !bypass_limits'. Expiry lives here and
@@ -1176,11 +1191,14 @@ at hand."
       ;; transaction to make the node look at a pool it has been ignoring.
       ;; A tx that the sweep or the trim then removes -- its own parent could
       ;; have expired underneath it -- is Core's `mempool full', which is
-      ;; how it reads the pool after LimitMempoolSize (validation.cpp:1398).
-      (when (and (eq result :ok) (not defer-trim) (not bypass-limits))
+      ;; how it reads the pool after LimitMempoolSize (validation.cpp:1398),
+      ;; and a transaction nobody hears about: the added signal comes after
+      ;; the limit, for what is still there (:1413-1416).
+      (when (and (eq result :ok) limit)
         (mempool-limit-size mempool)
-        (unless (mempool-has mempool txid)
-          (setf result :mempool-full)))
+        (if (mempool-has mempool txid)
+            (%announce-added mempool txid entry)
+            (setf result :mempool-full)))
       ;; Fee estimation tracks a transaction from mempool ENTRY, so it can
       ;; later say how long that feerate waited (Core's validation interface
       ;; delivers TransactionAddedToMempool for the same purpose). Only a tx
@@ -1202,9 +1220,18 @@ at hand."
                         :chainstate-current chainstate-current
                         :has-no-mempool-parents
                         (zerop (hash-table-count (mempool-entry-parents entry)))))
-      (values result entry))))
+      (values result entry)))))
 
-(defun mempool-add (mempool txid entry &key defer-trim bypass-limits)
+(defun %announce-added (mempool txid entry)
+  "Core TransactionAddedToMempool(tx_info, GetAndIncrementSequence())
+(validation.cpp:1309, :1415): the announcement takes the counter's NEXT value,
+after every removal the admission caused has taken its own. ZMQ and the
+wallet subscribe."
+  (let ((sequence (mempool-next-sequence mempool)))
+    (incf (mempool-next-sequence mempool))
+    (bl.vi:notify-transaction-added (mempool-entry-transaction entry) txid sequence)))
+
+(defun mempool-add (mempool txid entry &key defer-trim bypass-limits entry-sequence (announce t))
   "Add a transaction to the mempool.
 Returns :ok on success, or a rejection keyword: :duplicate, :conflict,
 :too-large-cluster (joining its in-mempool parents would form a cluster over
@@ -1228,7 +1255,12 @@ this allows txs from a block reorg to be marked earlier than any child txs
 that were already in the mempool), because a peer may ask for a transaction
 the reorg put back before it was ever announced. The counter still advances, and the
 TransactionAddedToMempool signal still carries its value (:1309), so the ZMQ
-sequence stream is unaffected."
+sequence stream is unaffected.
+
+ENTRY-SEQUENCE is the sequence to stamp (default: the counter now), and the
+counter advances only when the addition is announced. ANNOUNCE NIL leaves the
+added signal to the caller: ACCEPT-VALIDATED-TX, which always passes
+DEFER-TRIM and runs Core's LimitMempoolSize itself before announcing."
   ;; Check for duplicate
   (when (mempool-has mempool txid)
     (return-from mempool-add :duplicate))
@@ -1277,9 +1309,11 @@ sequence stream is unaffected."
     ;; BYPASS-LIMITS: a transaction the reorg put back was confirmed before
     ;; any of this pool's entries and must be servable to a peer that never
     ;; saw it announced.
+    ;; ENTRY-SEQUENCE is the counter as the caller's PreChecks read it, before
+    ;; any replacement left (Core GetSequence(), :920); the counter itself
+    ;; advances only when the addition is announced.
     (setf (mempool-entry-sequence entry)
-          (if bypass-limits 0 (mempool-next-sequence mempool)))
-    (incf (mempool-next-sequence mempool))
+          (if bypass-limits 0 (or entry-sequence (mempool-next-sequence mempool))))
 
     ;; Add to entries table
     (setf (gethash txid (mempool-entries mempool)) entry)
@@ -1328,18 +1362,18 @@ sequence stream is unaffected."
       (return-from mempool-add :mempool-full)))
 
   ;; Core TransactionAddedToMempool (validation.cpp:1393-1416): only for a
-  ;; tx that made it in AND survived its own trim -- after LimitMempoolSize,
-  ;; never on the self-evicted "mempool full" outcome. Under DEFER-TRIM the
-  ;; caller's later re-limit can still evict it, but Core's package path
-  ;; fires the added signal before its final re-limit too (SubmitPackage,
+  ;; tx that made it in AND survived its own trim -- never on the
+  ;; self-evicted "mempool full" outcome. Under DEFER-TRIM the caller's later
+  ;; re-limit can still evict it, but Core's package path fires the added
+  ;; signal before its final re-limit too (SubmitPackage,
   ;; validation.cpp:1292-1310) -- the eviction then surfaces as a
-  ;; :size-limit removal. ZMQ and the wallet subscribe.
-  ;; The SIGNAL's sequence is the admission counter, always -- Core passes
-  ;; GetAndIncrementSequence() here (validation.cpp:1309) whatever
+  ;; :size-limit removal. ANNOUNCE NIL leaves the signal to the caller:
+  ;; ACCEPT-VALIDATED-TX's single-transaction path, which limits the pool
+  ;; first. The SIGNAL's sequence is the counter's next value, whatever
   ;; entry_sequence was stamped with, so a reorg re-add still occupies its
   ;; place in the ZMQ `sequence' stream instead of repeating 0.
-  (bl.vi:notify-transaction-added (mempool-entry-transaction entry) txid
-                                  (1- (mempool-next-sequence mempool)))
+  (when announce
+    (%announce-added mempool txid entry))
   :ok)
 
 (defun mempool-remove (mempool txid)
