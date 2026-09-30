@@ -407,8 +407,9 @@ and mutation is forbidden while a builder exists either way."
 (defun %chunk-index-full-rebuild (graph)
   "The chunk index computed from scratch: every cluster's chunks collected and
 sorted by %COMPARE-MAIN. This is what the index used to be recomputed by after
-every mutation; it survives as the correctness oracle TXGRAPH-SANITY-CHECK
-compares the incrementally maintained index against."
+every mutation; it survives as the correctness oracle the txgraph tests
+compare the incrementally maintained index against. TXGRAPH-SANITY-CHECK
+asserts the same thing without the sort: the same set, in order."
   (let ((entries '()))
     (loop for cluster being the hash-keys of (txgraph-clusters graph)
           do (loop for chunk across (%cluster-chunks cluster)
@@ -1330,18 +1331,21 @@ from-scratch rebuild). Signals an error on violation; returns T."
         (when deps
           (assert (or (> count (txgraph-max-cluster-count graph))
                       (> size (txgraph-max-cluster-size graph)))))))
-    ;; The chunk index covers every chunk exactly once, in strictly
-    ;; ascending mining order, and holds exactly the chunks a from-scratch
-    ;; rebuild would - the oracle for the incremental maintenance.
+    ;; The chunk index holds exactly the clusters' chunks, each once, in
+    ;; strictly ascending mining order (Core compares the index's set with
+    ;; the expected one and checks each neighbour's order, txgraph.cpp:
+    ;; 3098-3110). Under a strict total order that IS equality with a sorted
+    ;; from-scratch rebuild (%CHUNK-INDEX-FULL-REBUILD, which tests still use
+    ;; as the oracle) without sorting: -checkmempool runs this after every
+    ;; transaction on regtest.
     (let ((index (%chunk-index-vector graph))
-          (oracle (%chunk-index-full-rebuild graph))
-          (expected 0))
+          (expected (make-hash-table :test 'eq)))
       (loop for cluster being the hash-keys of (txgraph-clusters graph)
-            do (incf expected (length (%cluster-chunks cluster))))
-      (assert (= expected (length index)))
-      (assert (= (length oracle) (length index)))
-      (dotimes (k (length index))
-        (assert (eq (svref index k) (svref oracle k))))
+            do (loop for chunk across (%cluster-chunks cluster)
+                     do (setf (gethash chunk expected) t)))
+      (assert (= (hash-table-count expected) (length index)))
+      (loop for chunk across index
+            do (assert (remhash chunk expected)))
       (loop for k from 1 below (length index)
             do (assert (minusp (%compare-main graph
                                               (%chunk-end (svref index (1- k)))
