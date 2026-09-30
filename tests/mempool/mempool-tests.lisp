@@ -2547,7 +2547,7 @@ LAST announcer (Core EraseForPeer)."
     ;; Duplicate (wtxid, peer) announcement is a no-op.
     (is-false (bl.mp:orphan-add pool o peer-a))
     (is (= 1 (bl.mp:orphan-pool-count pool)))
-    (is (= 2 (bl.mp::orphan-pool-announcement-count pool)))
+    (is (= 2 (bl.mp:orphan-pool-announcement-count pool)))
     (is-true (bl.mp:orphan-have-from-peer pool owtxid peer-a))
     (is-true (bl.mp:orphan-have-from-peer pool owtxid peer-b))
     ;; peer-a disconnects: the orphan survives via peer-b.
@@ -2615,6 +2615,22 @@ the flooder lost announcements."
                 pool
                 (bl.ser:transaction-wtxid vic-tx)
                 victim)))))
+
+(test orphan-add-reports-a-new-orphan-even-when-its-own-trim-evicts-it
+  "AddTx returns brand_new -- whether the orphan was absent before the call --
+even when the LimitOrphans that ends the call evicts it again
+(txorphanage.cpp:305-341: `return brand_new;' after LimitOrphans). A pool
+whose per-peer reservation is one weight unit cannot keep any orphan, and
+still answers true for a new one (Core fuzz txorphanage_sim,
+txorphan.cpp:561-567: added == !sim_have_tx)."
+  (let* ((pool (bl.mp:make-orphan-pool :reserved-peer-usage 1))
+         (o (make-spending-test-tx (%txid-array 71)))
+         (owtxid (bl.ser:transaction-wtxid o)))
+    (is-false (bl.mp:orphan-have pool owtxid))
+    (is-true (bl.mp:orphan-add pool o 3)
+             "a new orphan is reported new although its own trim evicted it")
+    (is-false (bl.mp:orphan-have pool owtxid) "the trim did evict it")
+    (is (zerop (bl.mp:orphan-pool-count pool)))))
 
 (test orphan-erase-for-block
   "Orphans included in or conflicting with a connected block are erased by

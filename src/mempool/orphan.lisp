@@ -324,7 +324,10 @@ another's orphans. Returns the number of announcements evicted."
 is stored and indexed under each input's parent txid; an orphan already
 present gains PEER as an additional announcer. Oversized (> max standard
 weight) transactions and duplicate (wtxid, peer) announcements are ignored.
-Returns T iff TX was newly stored (Core AddTx's brand_new)."
+Returns T iff TX was not stored before the call (Core AddTx's brand_new,
+txorphanage.cpp:305-341) -- decided before LimitOrphans runs and returned
+whatever that trim then evicts, the new orphan itself included, as Core
+returns it."
   (let ((weight (bl.ser:transaction-weight tx)))
     (when (> weight +orphan-max-tx-weight+)
       (bl:log-cat "mempool" "ignoring large orphan tx (weight ~D)" weight)
@@ -363,8 +366,7 @@ Returns T iff TX was newly stored (Core AddTx's brand_new)."
       (%orphan-peer-info-add pool peer entry)
       ;; DoS prevention: never grow unbounded (CVE-2012-3789).
       (%limit-orphans pool)
-      ;; Report brand-new only if the entry survived its own trim.
-      (and brand-new (orphan-have pool wtxid)))))
+      brand-new)))
 
 (defun orphan-remove (pool wtxid)
   "Erase orphan WTXID with all its announcements (Core EraseTx). Returns T if
