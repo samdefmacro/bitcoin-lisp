@@ -173,6 +173,12 @@ inline these compile against them. src/util/bytes.lisp.")
    #:octets=
    #:octets-hash
    #:make-octets-hash-table
+   ;; Core's salted SipHash (crypto/siphash.cpp, util/hasher.h): the octet
+   ;; tables' and the coins cache's hash, and the salt a node draws at start.
+   #:siphash-uint256
+   #:siphash-uint256-extra
+   #:*hash-salt*
+   #:set-hash-salt
    #:with-byte-reader
    ;; Core SanitizeString (util/strencodings.cpp)
    #:sanitize-string
