@@ -51,7 +51,12 @@
                                                      (bl.ser:serialize-transaction
                                                       (consume-transaction fdp :max-num-in 3 :max-num-out 3)))
                                        do (vector-push-extend b out)))
-                        (loop for b across (consume-remaining-bytes fdp)
+                        ;; A tail of its own for the integral reads, which
+                        ;; come off the END and would otherwise eat into the
+                        ;; last transaction.
+                        (loop for b across (insecure-rand-bytes
+                                            (make-insecure-random-context (consume-integral fdp :u64))
+                                            512)
                               do (vector-push-extend b out))
                         (coerce out '(simple-array (unsigned-byte 8) (*))))))
   "The estimator tracks exactly the transactions Core's gates admit, at Core's
