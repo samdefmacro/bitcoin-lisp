@@ -295,11 +295,20 @@ downloading halfway."
                                  (ash (aref window 6) 16)
                                  (ash (aref window 7) 24))))
                (cond
-                 ((or (< size 80) (> size +max-block-serialized-size+)
-                      (> (+ pos 8 size) length))
+                 ((or (< size 80) (> size +max-block-serialized-size+))
                   ;; A plausible magic with an implausible length is a
                   ;; coincidence in the data, not a record.
                   (incf pos))
+                 ((> (+ pos 8 size) length)
+                  ;; A record whose body runs past the end. Core reads its
+                  ;; 80-byte header and then SkipTo's the end of the record,
+                  ;; which fails at the end of the file and ends the scan
+                  ;; (validation.cpp:5030-5042): nothing inside that last,
+                  ;; truncated record is looked at. Only a header that cannot
+                  ;; be read at all rewinds to one byte past the magic.
+                  (if (>= (- length pos 8) 80)
+                      (return)
+                      (incf pos)))
                  (t
                   (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
                     (read-sequence bytes in)
