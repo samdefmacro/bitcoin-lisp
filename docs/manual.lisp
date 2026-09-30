@@ -229,6 +229,7 @@
   (bitcoin-lisp.crypto:tagged-hash function)
   (bitcoin-lisp.crypto:hmac-sha256 function)
   (bitcoin-lisp.crypto:siphash-2-4 function)
+  (bitcoin-lisp.crypto:siphash-uint256-extra function)
   (bitcoin-lisp.crypto:rand-u64 function)
   (bitcoin-lisp.crypto:bytes-to-hex function)
   (bitcoin-lisp.crypto:hex-to-bytes function)
@@ -517,7 +518,12 @@
   pending outputs and spent set, extra coins, package coins) and the
   mempool's spent-outpoints are keyed by it, so a producer and a reader
   cannot disagree about the key's shape; the coins cache keeps its own
-  fixed-width UTXO-KEY.
+  fixed-width UTXO-KEY, hashed as Core hashes CCoinsMap's keys
+  (SaltedOutpointHasher: `bl.crypto:siphash-uint256-extra' under a salt
+  drawn for each table). Trap: SBCL takes a bucket from a hash's LOW bits,
+  so the index goes into the low bits of an outpoint hash -- mixed in at
+  bit 24, or not at all, the 1,000 outputs of one transaction were one
+  bucket chain. The octet tables are not salted.
 
   Trap: the byte-reader family is the fast path and the stream family is a
   thin shell kept for the few callers that need it. What an IBD spends its
