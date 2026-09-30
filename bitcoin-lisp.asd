@@ -679,6 +679,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/utxo-snapshot")
                              (:file "fuzz/utxo-total-supply")
                              (:file "fuzz/p2p-headers-presync")
-                             (:file "fuzz/connman"))))
+                             (:file "fuzz/connman")
+                             (:file "fuzz/p2p-handshake"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
