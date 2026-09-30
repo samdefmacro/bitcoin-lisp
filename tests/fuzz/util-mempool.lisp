@@ -231,18 +231,17 @@ failed)."
 
 (defvar *fuzz-mempool-delta* nil
   "While a cons (ADDED . REMOVED), the mempool's added and removed signals
-push (txid . sequence) onto its side -- Core's TransactionsDelta
+push (txid sequence tx) onto its side -- Core's TransactionsDelta
 (tx_pool.cpp:62-80). NIL (the default) records nothing.")
 
 (bl.vi:define-validation-hook :transaction-added fuzz-mempool-note-added (tx txid sequence)
-  (declare (ignore tx))
   (when *fuzz-mempool-delta*
-    (push (cons txid sequence) (car *fuzz-mempool-delta*))))
+    (push (list txid sequence tx) (car *fuzz-mempool-delta*))))
 
 (bl.vi:define-validation-hook :transaction-removed fuzz-mempool-note-removed (tx txid sequence reason)
-  (declare (ignore tx reason))
+  (declare (ignore reason))
   (when *fuzz-mempool-delta*
-    (push (cons txid sequence) (cdr *fuzz-mempool-delta*))))
+    (push (list txid sequence tx) (cdr *fuzz-mempool-delta*))))
 
 (defun %mempool-set-vsize (mempool txids)
   (let ((sum 0))

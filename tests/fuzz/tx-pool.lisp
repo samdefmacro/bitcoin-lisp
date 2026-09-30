@@ -462,5 +462,5 @@ last eviction's number again."
       (let ((evicted (find (bl.ser:transaction-hash low) (cdr delta) :key #'car :test #'equalp))
             (announced (find (bl.ser:transaction-hash new) (car delta) :key #'car :test #'equalp)))
         (is-true (and evicted announced))
-        (is (< (cdr evicted) (cdr announced))
-            "eviction numbered ~A, the announcement ~A" (cdr evicted) (cdr announced))))))
+        (is (< (second evicted) (second announced))
+            "eviction numbered ~A, the announcement ~A" (second evicted) (second announced))))))
