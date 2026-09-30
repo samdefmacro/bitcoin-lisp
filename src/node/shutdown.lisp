@@ -544,10 +544,11 @@ thread; see the shutdown-coordination section above."
   ;; its coins view (see %shutdown-flush-chainstates).
   (%shutdown-flush-chainstates *node*)
 
-  ;; Save fee statistics
+  ;; Save fee statistics, the unconfirmed recorded first (Core's
+  ;; CBlockPolicyEstimator::Flush, init.cpp:344-345).
   (when (node-fee-estimator *node*)
     (log-info "Saving fee statistics...")
-    (bl.mp:save-fee-stats (node-fee-estimator *node*)))
+    (bl.mp:flush-fee-estimates-at-shutdown (node-fee-estimator *node*)))
 
   ;; Save mempool (Core DumpMempool), under the full gate it carries in Core:
   ;; -persistmempool and the startup replay having finished (init.cpp:338-340).

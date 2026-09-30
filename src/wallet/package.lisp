@@ -29,7 +29,11 @@ through the lower packages; the node reaches it only through these exports.")
    #:wallets-directory
    ;; VerifyWallets' two per-name checks, which start-up runs before any load.
    #:wallet-path-key
-   #:wallet-path-error)
+   #:wallet-path-error
+   ;; Core's node::MiniMiner (mini-miner.lisp), the wallet's bump-fee oracle;
+   ;; the mini_miner fuzz target drives it directly.
+   #:mini-miner-bump-fees
+   #:mini-miner-total-bump-fee)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export

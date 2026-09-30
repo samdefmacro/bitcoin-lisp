@@ -24,7 +24,7 @@ The biggest shortfall is not missing functionality but behavioral-consistency ve
 | Indexes | 4 | 3 (missing `txospenderindex`) | **75%** |
 | Source size | 191,784 lines of C++ (excl. test/qt/vendored) | 83,956 lines of Lisp | 0.44x |
 | Unit tests | 132 files | 98 files / 2,359 tests / **33,406 checks** | — |
-| Fuzz testing | 133 target files, 216 FUZZ_TARGETs | 69 targets from 37 files, ported as seeded property tests (tests/fuzz/, 2026-09-30) | **28% of files, 32% of targets** |
+| Fuzz testing | 133 target files, 216 FUZZ_TARGETs | 125 targets from 70 files, ported as seeded property tests (tests/fuzz/, 2026-09-30/10-01) | **53% of files, 58% of targets** |
 | Functional tests (behavioral consistency) | 263 | **35 run** | **13%** |
 
 ### The 12 missing RPCs, classified by reason
@@ -171,7 +171,7 @@ ours are embedded synchronously in `connect-block`/`perform-reorg`. This has rep
 | Pruning / assumeutxo / reindex / flat block files | ✅ All present; plus `migrateblocks` in-place migration, which Core doesn't have |
 | LevelDB / secp256k1 | Called via CFFI against system libraries, not vendored |
 | `src/support/` secure memory (mlock / secure allocator / `memory_cleanse`) | ❌ **No counterpart at all**; key material is manually zeroed in only two places |
-| fuzz framework (133 target files) | ⚠️ no engine; 69 of 216 targets (37 files) ported as seeded property tests on a FuzzedDataProvider port (tests/fuzz/) |
+| fuzz framework (133 target files) | ⚠️ no engine; 125 of 216 targets (70 files) ported as seeded property tests on a FuzzedDataProvider port (tests/fuzz/) |
 
 **What we have that Core doesn't:** the Web UI, a complete Erlay message set (Core has only the `sendtxrcncl` handshake,
 while we implement `reqrecon`/`sketch`/`reqsketchext`/`reconcildiff` + our own minisketch,
@@ -669,17 +669,52 @@ defaulted to `#()` against a byte, double-float or fixnum array type; and AreInp
 and read a P2SH redeem script as the scriptSig's last data push instead of the stack top Core's three policy
 readers take (so `<blob> OP_0` spending P2SH of the empty script, which Core relays, was refused).
 
-Not ported: the cluster-linearize, txgraph, mempool, mini-miner, package, orphan and txrequest simulations; the
-P2P message-processing targets (process_message(s), p2p_handshake, headers presync, connman, net, the v1/v2
-transport simulations); coins_view and the UTXO snapshot; the targets of C++ containers and integer arithmetic
-that have no Lisp counterpart (prevector, span, bitdeque, vecdeque, overflow, float, strprintf, ...); and the
-miniscript generators (miniscript_stable, miniscript_smart) that need Core's key and preimage tables.
+Not ported (see the mempool-side and node-side sections below for the simulations, P2P, coins-view, UTXO
+snapshot and miniscript-generator targets that since were): the targets of C++ containers and integer
+arithmetic that have no Lisp counterpart (prevector, span, bitdeque, vecdeque, overflow, float, strprintf, ...).
+
+#### 2026-10-01: the mempool-side targets (fuzz-mempool batch)
+
+31 more of Core's targets from 14 files, each against a model of the Core code it exercises where Core's target
+asserts little (SimTxGraph for txgraph, Core's TxRequestTracker Tester, a from-scratch MiniMiner, the
+OutpointsUpdater / TransactionsDelta books of tx_pool and package_eval, CTxMemPool::check ported as
+CHECK-MEMPOOL in `tests/fuzz/util-mempool.lisp`). Where uniform bytes never reach the interesting states the
+corpus records the target's own draws at the buffer's end (`MAKE-FDP-TAIL`), so most draws are, say, spends
+that a pool accepts. Together they add about 45 s to the warm battery.
+
+| Core file | Targets |
+|---|---|
+| cluster_linearize | all twelve (depgraph_sim, depgraph_serialization, components, make_connected, chunking, simple_finder, simple_linearize, sfl, linearize, postlinearize, postlinearize_tree, postlinearize_moved_leaf) |
+| txgraph, txrequest, partially_downloaded_block, mini_miner, policy_estimator, policy_estimator_io, feeratediagram, fees | one each |
+| txorphan | all three (txorphan, txorphan_protected, txorphanage_sim) |
+| feefrac | feefrac, feefrac_mul_div (not feefrac_div_fallback: no fallback division here) |
+| rbf, tx_pool, package_eval | both of each (rbf, package_rbf; tx_pool_standard, tx_pool; tx_package_eval, ephemeral_package_eval) |
+
+Defects they found or that were found beside them, each fixed Core's way in its own commit with a test that was
+red before: the orphanage's AddTx reported a new orphan its own trim evicted as not new, and LimitOrphans used
+per-peer allowances, integer scores and no NodeId tie-break where Core has fixed allowances, FeeFrac DoS scores
+and the newer peer first; the tx-request tracker asked for a failover by the wrong id type and asked a new
+announcer at once when it was not the best candidate; the fee estimator tracked a fractional feerate where
+Core's GetFeePerK is whole sat/kvB, and shutdown saved the still-unconfirmed as neither success nor failure
+(Core FlushUnconfirmed); compact-block InitData treated two MEMPOOL transactions sharing a short ID as a
+collision and missed the null header and null prefilled transaction; the MiniMiner compared bare feerates where
+Core's AncestorFeerateComparator uses FeeFrac's full order; a single admission announced itself (ZMQ `A`, the
+wallet) before the size limit, which then expired or trimmed it, trimmed before it expired, and handed the
+announcement the last eviction's sequence number; a package member evicted after the fact kept its VALID
+fees; and the package-feerate phase could spend a parent that a sibling's replacement had removed, leaving a
+pool transaction whose input exists nowhere.
+
+Not ported from these files: txdownloadman and txdownloadman_impl (no TxDownloadManager object here -- the
+logic lives in the P2P handlers, and the orphanage and tx-request tracker it composes are ported on their own),
+poolresource (no pool allocator), and feefrac_div_fallback. Asserted less than Core: a reconsiderable
+package failure's effective feerate (no caller reads one), the per-member replacement sets of a package result,
+and a client maxfeerate on the package test-accept path.
 
 #### 2026-10-01: the node-side targets (Round 11, batch fuzz-node)
 
 25 more of Core's targets from 19 more files, so the P2P, coins-view, UTXO-snapshot and miniscript-generator
-entries of the "not ported" list above are ported now (the counts in the summary rows are the 69 / 37 before
-this batch). Each needed a harness on the node side: a fixture node (context, header chain, coins, mempool,
+entries of the first section's "not ported" list are ported now (the summary rows count all three sections: 69 + 31 + 25
+targets from 37 + 14 + 19 files). Each needed a harness on the node side: a fixture node (context, header chain, coins, mempool,
 scripted peers) that `DELIVER-IBD-MESSAGE` drives, loopback sockets for the transports, fake SOCKS5 and SAM
 bridges, a scratch LevelDB for the coins view. Where Core's assertion is only "no crash", the target holds
 the component to a reference model restated from Core's source as well (the V1Transport framing, the

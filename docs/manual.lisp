@@ -1686,12 +1686,22 @@
   index before anything changes that key -- a relinearization, a depgraph
   edit, or a re-pointing of its handles; that is also why a handle's
   caller payload is passed to `txgraph-add-transaction` instead of being
-  assigned to the handle it returns."
+  assigned to the handle it returns. A single admission
+  (`accept-validated-tx` without DEFER-TRIM or BYPASS-LIMITS) runs Core's
+  LimitMempoolSize -- expiry FIRST, then the trim -- before it announces
+  the transaction, and announces it only if it is still there, with the
+  counter's next sequence: announce first and a subscriber hears of a
+  transaction the caller was told was refused; trim first and a newcomer
+  evicts what an expiring transaction would have made room for. The
+  package-feerate phase sees the pool plus its own subpackage's outputs,
+  never the whole package's: a member that entered alone and was then
+  replaced is gone."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)
   (bitcoin-lisp.mempool:mempool-entry class)
   (bitcoin-lisp.mempool:mempool-add function)
+  (bitcoin-lisp.mempool:accept-validated-tx function)
   (bitcoin-lisp.mempool:mempool-get function)
   (bitcoin-lisp.mempool:mempool-has function)
   (bitcoin-lisp.mempool:mempool-remove-recursive function)

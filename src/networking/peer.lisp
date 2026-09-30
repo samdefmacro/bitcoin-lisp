@@ -358,6 +358,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; header we just sent is one the peer has, even before it tells us so.
   (best-header-sent-hash nil))
 
+(defmethod bl.mp:orphan-peer-id ((peer peer))
+  "The orphanage orders peers by Core's NodeId (LimitOrphans' tie-break,
+txorphanage.cpp:461-465); ours is the peer's ID."
+  (peer-id peer))
+
 (defun peer-log-name (peer)
   "How a log line names PEER: Core's `peer=%d%s' of GetId() and
 CNode::LogIP(fLogIPs) -- the numeric id always, the address only under -logips.

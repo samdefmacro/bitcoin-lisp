@@ -36,29 +36,35 @@ what makes a second pass see only the ancestors that did not make it."
   (anc-vsize 0 :type integer)
   (anc-fee 0 :type integer))
 
-(defun %mm-feefrac< (fee-a size-a fee-b size-b)
-  "FeeFrac's ordering (util/feefrac.h) over two (fee, size) pairs: an exact
-rational comparison, NOT the rounded sat/kvB CFeeRate. Sizes are positive."
-  (< (* fee-a size-b) (* fee-b size-a)))
+(defun %mm-feefrac-compare (fee-a size-a fee-b size-b)
+  "FeeFrac's FULL order (util/feefrac.h:177-183, operator<=>) over two
+(fee, size) pairs, as -1/0/1: the exact ratio first, and between equal ratios
+the SMALLER size is the greater. Sizes are positive."
+  (let ((cross (- (* fee-a size-b) (* fee-b size-a))))
+    (if (zerop cross)
+        (signum (- size-b size-a))
+        (signum cross))))
 
 (defun %mm-mining-score (entry)
   "The score MiniMiner's AncestorFeerateComparator sorts on
-(node/mini_miner.cpp:180-197): the MINIMUM of the entry's own feerate and its
-ancestor-set feerate, as (values fee size). Taking the ancestor feerate alone
-would let a cheap child ride in on an expensive parent."
-  (if (%mm-feefrac< (mm-anc-fee entry) (mm-anc-vsize entry)
-                    (mm-fee entry) (mm-vsize entry))
-      (values (mm-anc-fee entry) (mm-anc-vsize entry))
-      (values (mm-fee entry) (mm-vsize entry))))
+(node/mini_miner.cpp:180-197): std::min of the entry's ancestor-set FeeFrac and
+its own, under FeeFrac's full order -- so between equal ratios the one of
+LARGER size, the ancestor set -- as (values fee size). Taking the ancestor
+feerate alone would let a cheap child ride in on an expensive parent."
+  (if (minusp (%mm-feefrac-compare (mm-fee entry) (mm-vsize entry)
+                                   (mm-anc-fee entry) (mm-anc-vsize entry)))
+      (values (mm-fee entry) (mm-vsize entry))
+      (values (mm-anc-fee entry) (mm-anc-vsize entry))))
 
 (defun %mm-better-p (a b)
-  "Is A ordered before B by AncestorFeerateComparator: higher mining score
-first, the txid breaking ties so the walk is deterministic."
+  "Is A ordered before B by AncestorFeerateComparator: the greater mining
+score under FeeFrac's full order first -- equal ratios putting the smaller
+size first -- and only two IDENTICAL FeeFracs fall back to the txid."
   (multiple-value-bind (fee-a size-a) (%mm-mining-score a)
     (multiple-value-bind (fee-b size-b) (%mm-mining-score b)
-      (cond ((%mm-feefrac< fee-b size-b fee-a size-a) t)
-            ((%mm-feefrac< fee-a size-a fee-b size-b) nil)
-            (t (%mm-txid< (mm-txid a) (mm-txid b)))))))
+      (if (and (= fee-a fee-b) (= size-a size-b))
+          (%mm-txid< (mm-txid a) (mm-txid b))
+          (plusp (%mm-feefrac-compare fee-a size-a fee-b size-b))))))
 
 (defun %mm-txid< (a b)
   "Lexicographic order over two 32-byte txids -- std::set<Txid>'s ordering,
