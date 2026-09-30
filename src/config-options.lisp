@@ -372,13 +372,13 @@
 ;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
 ;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Read by make-mempool. Under
 ;; -blocksonly Core soft-sets it to 5 MB -- the absent case, in
-;; APPLY-PARAMETER-INTERACTIONS.
+;; APPLY-PARAMETER-INTERACTIONS. A negative value is taken as given, as
+;; Core's GetIntArg takes it (mempool_args.cpp:49-54), and refused by the
+;; one-cluster floor in %INIT-PARAMETERS with Core's sentence
+;; (txmempool.cpp:169-172), not here.
 (define-option "maxmempool"
   :apply (lambda (v)
-           (let ((mb (conf-parse-int v)))
-             (when (minusp mb)
-               (config-error "Invalid value for -maxmempool=~A" v))
-             (setf bl.mp:*max-mempool-bytes* (* mb 1000 1000)))))
+           (setf bl.mp:*max-mempool-bytes* (* (conf-parse-int v) 1000 1000))))
 ;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81). Read
 ;; at MAKE-MEMPOOL time like the cluster limits.
 (define-option "minrelaytxfee" :type :money :global bl.mp:*min-relay-fee-rate*)
