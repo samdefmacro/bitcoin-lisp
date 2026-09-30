@@ -264,6 +264,10 @@ src/mempool/.")
    ;; targets, tests/fuzz/util-mempool.lisp -- re-derives.
    #:mempool-total-usage
    #:mempool-spent-outpoints
+   ;; The rolling minimum's decay clock, which the tx_pool and package_eval
+   ;; targets restart the way Core's MockedTxPool::RollingFeeUpdate does.
+   #:mempool-rolling-min-fee-time
+   #:mempool-block-since-rolling-fee-bump
    #:mempool-dynamic-usage
    #:transaction-dynamic-usage
    #:mempool-min-fee-rate
