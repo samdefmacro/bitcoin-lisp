@@ -673,6 +673,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/feefrac")
                              (:file "fuzz/policy-estimator")
                              (:file "fuzz/rbf")
-                             (:file "fuzz/partially-downloaded-block"))))
+                             (:file "fuzz/partially-downloaded-block")
+                             (:file "fuzz/mini-miner"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
