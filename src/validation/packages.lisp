@@ -236,9 +236,18 @@ before the package-feerate phase reconsidered it."
         (package-tx-result-error res) nil))
 
 (defun %mark-result-invalid (res reason)
-  "Record a rejection on RES."
+  "Record a rejection on RES: Core's MempoolAcceptResult::Failure(state),
+which carries no base fee, vsize, effective feerate or other wtxid
+(validation.h:167-176) -- so a member that was VALID and then left the pool
+does not keep them (validation.cpp:1736-1760). A fee failure's effective
+feerate (Core FeeFailure) is set by its caller afterwards."
   (setf (package-tx-result-status res) :invalid
-        (package-tx-result-error res) reason))
+        (package-tx-result-error res) reason
+        (package-tx-result-vsize res) nil
+        (package-tx-result-fee res) nil
+        (package-tx-result-effective-feerate res) nil
+        (package-tx-result-effective-includes res) nil
+        (package-tx-result-other-wtxid res) nil))
 
 (defun %accept-into-mempool (tx txid fee sigops height now mempool rset replaced)
   "Record the RBF-replaced txs in RSET into the REPLACED hash-set, then run

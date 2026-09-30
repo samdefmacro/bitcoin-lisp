@@ -1267,3 +1267,27 @@ individual fee failure without those fields."
           (is (= 2 (length (bl.val:package-tx-result-effective-includes cres))))
           ;; the parent does not
           (is (null (bl.val:package-tx-result-effective-feerate pres))))))))
+
+(test a-package-member-the-final-limit-evicts-reports-no-fees
+  "Core's AcceptPackage re-checks every member after its one LimitMempoolSize
+and replaces the result of one no longer in the pool with
+MempoolAcceptResult::Failure(\"mempool full\") (validation.cpp:1736-1760) --
+a result with no base fee, vsize or effective feerate, as every INVALID one
+(test/util/txmempool.cpp:95-121 checks exactly that). Ours flipped the
+status and kept the VALID result's numbers. Found by the tx_package_eval and
+ephemeral_package_eval fuzz targets."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (declare (ignore mempool))
+    (let* ((mempool (bl.mp:make-mempool :max-size 1))
+           (parent (pkg-tx funding-txid 0 (- 100000000 5000)))
+           (child (pkg-tx (bl.ser:transaction-hash parent) 0 (- 100000000 60000))))
+      (multiple-value-bind (msg results)
+          (bl.val:validate-package-for-mempool (list parent child) utxo-set mempool chain-state)
+        (is (eq :mempool-full msg))
+        (dolist (tx (list parent child))
+          (let ((r (%result-for results tx)))
+            (is (eq :invalid (bl.val:package-tx-result-status r)))
+            (is (eq :mempool-full (bl.val:package-tx-result-error r)))
+            (is (null (bl.val:package-tx-result-fee r)) "an evicted member still reports a base fee")
+            (is (null (bl.val:package-tx-result-vsize r)) "an evicted member still reports a vsize")
+            (is (null (bl.val:package-tx-result-effective-feerate r)))))))))
