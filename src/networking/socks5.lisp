@@ -192,8 +192,16 @@ resumable reader exists for the many-peers pump, not for this."
       (socks5-fail phase "send failed: ~A" e))))
 
 (defun %string-bytes (string)
-  "STRING as raw octets (char-code per char, like Core's std::string bytes)."
-  (map '(simple-array (unsigned-byte 8) (*)) #'char-code string))
+  "STRING as the octets Core's std::string holds for it: its UTF-8 encoding.
+
+Every string that reaches here was decoded from UTF-8 -- a -connect or
+-addnode name off the command line or bitcoin.conf, a -torpassword -- so its
+UTF-8 encoding IS the bytes Core carries and sends (netbase.cpp:456-458 puts
+strDest's bytes on the wire; torcontrol.cpp writes the command line's). One
+octet per character, as this was, is the same thing only for ASCII: a name
+with a character past Latin-1 signalled a TYPE-ERROR out of SOCKS5-CONNECT,
+and one with a Latin-1 letter went out as a byte that is not its encoding."
+  (sb-ext:string-to-octets string :external-format :utf-8))
 
 ;;; The handshake
 
