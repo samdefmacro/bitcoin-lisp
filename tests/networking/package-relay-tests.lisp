@@ -1338,3 +1338,40 @@ than its parent gives it. Ours dropped the orphan without a word."
                                      (bl.net:peer-id a))
                              log)
                      "log: ~A" log)))))))
+
+;;;; Core's vExtraTxnForCompact (-blockreconstructionextratxn)
+
+(test a-peer-transaction-refused-or-replaced-joins-the-compact-extra-pool
+  "Core keeps the last -blockreconstructionextratxn (default 100) peer
+transactions that did not stay in the mempool for compact-block
+reconstruction: one refused on first sight (ProcessInvalidTx,
+net_processing.cpp:3138-3141) and every one an accepted peer transaction
+replaced (ProcessValidTx, :3165-3167). -blockreconstructionextratxn=0 keeps
+none. The option was accepted and ignored, and there was no pool."
+  (is-false (bl.cfg:core-only-option-p "blockreconstructionextratxn"))
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((below-floor (pkg-tx funding 0 (- 100000000 5)))
+           (replaceable (pkg-tx funding 0 (- 100000000 10000) :sequence #xfffffffd))
+           (replacement (pkg-tx funding 0 (- 100000000 200000)))
+           (peer (%pr-peer)))
+      (flet ((pool-wtxids () (mapcar #'car (bl.net:compact-extra-transactions)))
+             (wtxid (tx) (bl.ser:transaction-wtxid tx)))
+        (%with-fresh-rejects (rejects)
+          (let ((bl.net:*max-extra-txs* 100))
+            (bl.net:reset-compact-extra-transactions)
+            (deliver-tx peer (%pr-payload below-floor) (%pr-ctx state utxo mempool rejects))
+            (is-false (bl.mp:mempool-has mempool (bl.ser:transaction-hash below-floor)))
+            (is (member (wtxid below-floor) (pool-wtxids) :test #'equalp)
+                "a refused peer transaction is kept for reconstruction")
+            (deliver-tx peer (%pr-payload replaceable) (%pr-ctx state utxo mempool rejects))
+            (is-true (bl.mp:mempool-has mempool (bl.ser:transaction-hash replaceable)))
+            (is (not (member (wtxid replaceable) (pool-wtxids) :test #'equalp))
+                "an accepted transaction is in the mempool, not the extra pool")
+            (deliver-tx peer (%pr-payload replacement) (%pr-ctx state utxo mempool rejects))
+            (is-true (bl.mp:mempool-has mempool (bl.ser:transaction-hash replacement)))
+            (is (member (wtxid replaceable) (pool-wtxids) :test #'equalp)
+                "the transaction a peer's replacement evicted is kept for reconstruction"))
+          (let ((bl.net:*max-extra-txs* 0))
+            (bl.net:reset-compact-extra-transactions)
+            (bl.net:add-to-compact-extra-transactions below-floor)
+            (is (null (pool-wtxids)) "-blockreconstructionextratxn=0 keeps nothing")))))))

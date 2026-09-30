@@ -2485,3 +2485,43 @@ p2p_compactblocks.py:708 found it `valid-fork' instead of `headers-only'."
        (is (= 0 passes) "and no reconstruction is attempted")
        (is (null sent) "nothing is asked for: ~S" sent)
        (is (eq :ready (bl.net:peer-state peer)))))))
+
+(test a-compact-block-is-rebuilt-from-the-extra-transaction-pool
+  "Core's InitData consults vExtraTxnForCompact after the mempool
+(blockencodings.cpp:147-176): a block transaction the mempool does not have
+but the extra pool does is not requested; the same transaction in both is no
+collision; and an extra transaction sharing a short ID with a DIFFERENT one
+already found leaves that slot to be requested."
+  (let* ((in-pool (make-simple-tx #x71)) (extra (make-simple-tx #x72))
+         (other (make-simple-tx #x73))
+         (mempool (make-mock-mempool-with-txs (list (cons (bl.ser:transaction-hash in-pool) in-pool))))
+         (header (%cb-init-header))
+         (nonce 96)
+         (cb (bl.ser:make-compact-block
+              :header header :nonce nonce
+              :short-ids (list (%cb-short-id header nonce (bl.ser:transaction-hash in-pool))
+                               (%cb-short-id header nonce (bl.ser:transaction-hash extra)))
+              :prefilled-txs '())))
+    (let ((bl.net:*max-extra-txs* 100))
+      (bl.net:reset-compact-extra-transactions)
+      (multiple-value-bind (block missing) (%cb-reconstruct cb mempool nil)
+        (is (null block))
+        (is (equal '(1) missing) "without the extra pool the second slot is requested; got ~S" missing))
+      (bl.net:add-to-compact-extra-transactions extra)
+      (bl.net:add-to-compact-extra-transactions in-pool)
+      (multiple-value-bind (block missing) (%cb-reconstruct cb mempool nil)
+        (is (null missing) "reconstruction answered ~S" missing)
+        (is-true block))
+      ;; OTHER shares the in-pool transaction's short ID: that slot is asked for.
+      (bl.net:add-to-compact-extra-transactions other)
+      (%cb-with-colliding-short-ids
+       (list (bl.ser:transaction-hash in-pool) (bl.ser:transaction-hash other))
+       (lambda ()
+         (let ((cb42 (bl.ser:make-compact-block
+                      :header header :nonce nonce
+                      :short-ids (list 42 (%cb-short-id header nonce (bl.ser:transaction-hash extra)))
+                      :prefilled-txs '())))
+           (multiple-value-bind (block missing) (%cb-reconstruct cb42 mempool nil)
+             (is (null block))
+             (is (equal '(0) missing) "the doubly-matched slot is requested; got ~S" missing)))))
+      (bl.net:reset-compact-extra-transactions))))
