@@ -508,6 +508,30 @@ flags), value = T.")
 (defvar *script-execution-cache-enabled* t
   "When T, cache whole-transaction script-validation results.")
 
+(defvar *last-flags-string-bytes* (cons nil nil)
+  "(flags-string . its bytes) of the most recent MAKE-SCRIPT-EXECUTION-CACHE-KEY,
+replaced as a whole cons -- never mutated -- so a reader on any thread sees a
+matching pair, as *LAST-FLAG-SET* is.")
+
+(defun %flags-string-bytes (flags)
+  "FLAGS' character codes as an octet vector, which is what the generic
+(map '(simple-array (unsigned-byte 8) (*)) #'char-code flags) returned. The
+string bound to *script-flags* is one object for a whole block, so the last
+one seen is recognized by EQ; a new string is copied by a typed loop. The
+generic MAP called CHAR-CODE through %MAP-FOR-EFFECT for each of the ~77
+characters of every transaction's key: 4.9% of the round-11 profile of
+the interpreter over a fixed P2WSH set. The returned vector is shared and
+must not be written."
+  (let ((last *last-flags-string-bytes*))
+    (if (eq (car last) flags)
+        (cdr last)
+        (let* ((n (length flags))
+               (bytes (make-array n :element-type '(unsigned-byte 8))))
+          (dotimes (i n)
+            (setf (aref bytes i) (char-code (char flags i))))
+          (setf *last-flags-string-bytes* (cons flags bytes))
+          bytes))))
+
 (defun make-script-execution-cache-key (wtxid flags)
   "SHA256(salt | wtxid | flags) — Core hashes the wtxid and the flags word into
 its salted hasher (validation.cpp:2077).
@@ -517,7 +541,7 @@ reason: an unsalted key is computable offline, which is what makes a cache
 attackable by collision or eviction ordering."
   (let* ((salt *sig-cache-salt*)
          (flag-bytes (if flags
-                         (map '(simple-array (unsigned-byte 8) (*)) #'char-code flags)
+                         (%flags-string-bytes flags)
                          (make-array 0 :element-type '(unsigned-byte 8))))
          (total (+ (length salt) (length wtxid) 2 (length flag-bytes)))
          (buf (make-array total :element-type '(unsigned-byte 8)))

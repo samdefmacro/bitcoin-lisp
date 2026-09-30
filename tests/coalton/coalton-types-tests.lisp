@@ -93,6 +93,27 @@ path still serves."
     (is (typep (bl.interop:cl-array-to-coalton-vector adjustable) 'simple-vector)))
   (is (equalp #(7 8) (bl.interop:cl-array-to-coalton-vector (list 7 8)))))
 
+(test the-script-execution-cache-key-reads-the-flags-string-it-is-given
+  "MAKE-SCRIPT-EXECUTION-CACHE-KEY remembers the bytes of the last flags
+string by EQ. A key must still depend on the string's CHARACTERS alone: the
+same flags in a fresh string give the same key, different flags give a
+different one, and alternating between two strings (every block after a
+flag-changing height does) never answers with the other string's bytes."
+  (let* ((wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (a (bl.val:compute-script-flags-for-height 1000))
+         (b (concatenate 'string a ",CLEANSTACK"))
+         (key-a (bl.interop:make-script-execution-cache-key wtxid a))
+         (key-b (bl.interop:make-script-execution-cache-key wtxid b)))
+    (is (not (equalp key-a key-b)) "different flags, different keys")
+    (is (equalp key-a (bl.interop:make-script-execution-cache-key wtxid (copy-seq a))))
+    (is (equalp key-b (bl.interop:make-script-execution-cache-key wtxid (copy-seq b))))
+    (dotimes (i 3)
+      (is (equalp key-a (bl.interop:make-script-execution-cache-key wtxid a)))
+      (is (equalp key-b (bl.interop:make-script-execution-cache-key wtxid b))))
+    (is (not (equalp key-a (bl.interop:make-script-execution-cache-key wtxid nil))))
+    (is (equalp (bl.interop:make-script-execution-cache-key wtxid nil)
+                (bl.interop:make-script-execution-cache-key wtxid "")))))
+
 (test flag-lookups-answer-for-the-flags-string-bound-now
   "FLAG-ENABLED-P recognizes the last flags string by EQ before its
 synchronized EQUAL-keyed cache (the round-10 IBD profile put 10.2% of all
