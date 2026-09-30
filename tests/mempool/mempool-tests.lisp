@@ -928,12 +928,13 @@ must still be the absence of an estimate."
     (is-false (bl.val:output-witness-program-p p2pkh))))
 
 (test policy-scriptsig-push-only
-  "scriptsig-push-only-p accepts push opcodes and rejects ops > OP_16."
+  "The push-only predicate IsStandardTx asks (BL.INTEROP:SCRIPT-IS-PUSH-ONLY-P,
+Core IsPushOnly) accepts push opcodes and rejects ops > OP_16."
   ;; push 2 bytes, then OP_1..OP_16
-  (is-true (bl.val::scriptsig-push-only-p
-            (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(2 #xaa #x51))))
+  (is-true (bl.interop:script-is-push-only-p
+            (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(2 #xaa #xbb #x51))))
   ;; OP_CHECKSIG (0xac) is not a push
-  (is-false (bl.val::scriptsig-push-only-p
+  (is-false (bl.interop:script-is-push-only-p
              (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xac))))
 
 (test mempool-rejects-nonstandard-version
