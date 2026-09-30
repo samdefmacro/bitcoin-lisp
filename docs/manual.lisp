@@ -1411,7 +1411,11 @@
   is the minimal bridge validation calls. Coalton's (Vector U8) is a
   SIMPLE-VECTOR of fixnums, never an octet vector: `bridge.lisp` holds the
   two typed copies across that line, and loads before the Coalton files
-  so the interpreter calls them directly. Core: `script/interpreter.cpp`,
+  so the interpreter calls them directly. It also holds the flags: callers
+  bind `*script-flags*' to Core's names as a comma-separated string, which
+  is parsed once into Core's flags word (script/interpreter.h bit order,
+  plus our TAPSCRIPT mark at bit 32), and `flag-enabled-p' of a constant
+  name compiles to a bit test on it. Core: `script/interpreter.cpp`,
   `script/script.cpp`, `script/sigcache.cpp`. Settled policy: the
   interpreter stays Coalton; everything else is CL.
 

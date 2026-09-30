@@ -1143,7 +1143,8 @@ ever one block being connected."
                                   (script-check-pool-lock pool)))
       (not (script-check-pool-failed pool)))))
 
-(defun validate-block-scripts-parallel (txs script-flags utxo-set height &key extra-coins)
+(defun validate-block-scripts-parallel (txs script-flags utxo-set height
+                                       &key extra-coins cache-store)
   "Validate all non-coinbase tx scripts in TXS across N worker threads.
 Returns T on success or NIL on the first script failure.
 
@@ -1175,10 +1176,13 @@ read and is not synchronized."
                       collect (let ((tx tx) (i i))
                                 (lambda ()
                                   (multiple-value-bind (ok script-error failed-input)
-                                      (validate-tx-scripts
-                                       tx (1+ i) utxo-set script-flags height
-                                       :extra-coins extra-coins
-                                       :spent-utxos (aref prefetched i))
+                                      ;; A worker thread does not see the
+                                      ;; caller's binding: rebind it here.
+                                      (let ((bl.interop:*signature-cache-store* cache-store))
+                                        (validate-tx-scripts
+                                         tx (1+ i) utxo-set script-flags height
+                                         :extra-coins extra-coins
+                                         :spent-utxos (aref prefetched i)))
                                     (unless ok
                                       (bt:with-lock-held (verdict-lock)
                                         (unless verdict
@@ -1190,7 +1194,7 @@ read and is not synchronized."
         (values t nil)
         (values nil (or verdict (%block-script-verdict nil nil nil))))))
 
-(defun validate-block-scripts (block utxo-set &key (height 0) extra-coins)
+(defun validate-block-scripts (block utxo-set &key (height 0) extra-coins cache-store)
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
 Uses validate-input-script for each input (shared with transaction validation).
@@ -1203,8 +1207,15 @@ a chained spend (UpdateCoins, validation.cpp:2597).
 An exception block is NOT skipped. Core runs its scripts under the exception's
 flag set — SCRIPT_VERIFY_NONE for the two BIP16 blocks — so the scripts must
 still evaluate true. Returning success without executing them, as this did
-until now, accepts blocks Core rejects."
-  (let ((script-flags
+until now, accepts blocks Core rejects.
+
+CACHE-STORE is Core's fCacheResults as the signature cache sees it
+(bl.interop:*signature-cache-store*): NIL when a block is actually being
+connected, which consults the cache, adds nothing and marks what it hits for
+collection; T for TestBlockValidity, whose ConnectBlock runs with fJustCheck
+(validation.cpp:2573-2583)."
+  (let ((bl.interop:*signature-cache-store* cache-store)
+        (script-flags
           (block-script-flags (bl.ser:block-header-hash
                                (bl.ser:bitcoin-block-header block))
                               height))
@@ -1220,7 +1231,8 @@ until now, accepts blocks Core rejects."
              (>= (length (rest transactions)) +parallel-validation-min-txs+)
              (> *parallel-validation-workers* 1))
         (validate-block-scripts-parallel transactions script-flags utxo-set height
-                                         :extra-coins extra-coins)
+                                         :extra-coins extra-coins
+                                         :cache-store cache-store)
         ;; Sequential fallback (kept verbatim from the pre-Phase-3 path).
         (let ((bl.interop:*script-flags* script-flags))
           (loop for tx in (rest transactions)
@@ -2120,7 +2132,7 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
     (values t nil)))
 
 (defun %contextual-check-block (block chain-state utxo-set current-height
-                               &key skip-scripts connect-only)
+                               &key skip-scripts connect-only cache-results)
   "The UTXO-dependent half of ConnectBlock -- BIP30, per-input validation and
 fee accumulation, sequence locks, scripts and the coinbase value cap -- around
 %CONTEXTUAL-CHECK-BLOCK-NO-UTXO, which contributes Core's ContextualCheckBlock.
@@ -2294,7 +2306,8 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
       (unless skip-scripts
         (multiple-value-bind (valid error)
             (validate-block-scripts block utxo-set :height current-height
-                                                   :extra-coins pending-utxos)
+                                                   :extra-coins pending-utxos
+                                                   :cache-store cache-results)
           (unless valid
             (return-from %contextual-check-block (values nil error nil)))))
 
@@ -2316,7 +2329,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
 
 (defun validate-block (block chain-state utxo-set current-height current-time
                         &key skip-scripts skip-header skip-pow context-free-only
-                          connect-only)
+                          connect-only cache-results)
   "Fully validate a block including all transactions.
 When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
 the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
@@ -2347,6 +2360,9 @@ ConnectBlock run: VerifyDB's level-4 reconnect (validation.cpp:4760), which
 re-checks blocks the node accepted under whatever deployment heights were in
 force then, and the reorg connect of a stored body that passed the accept gate
 when it was written (see %CONTEXTUAL-CHECK-BLOCK).
+CACHE-RESULTS is Core's fCacheResults = fJustCheck (validation.cpp:2573): T
+only for the TEST-BLOCK-VALIDITY dry run, which lets the signature cache keep
+what it verifies; a real connect only consults it (VALIDATE-BLOCK-SCRIPTS).
 Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
   (multiple-value-bind (ok error)
       (%check-block block chain-state current-height current-time
@@ -2364,7 +2380,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
   (multiple-value-bind (ok error fees)
       (%contextual-check-block block chain-state utxo-set current-height
                                :skip-scripts skip-scripts
-                               :connect-only connect-only)
+                               :connect-only connect-only
+                               :cache-results cache-results)
     (unless ok
       ;; Core's one line for a block that failed ConnectBlock:
       ;; `Block validation error: <state.ToString()>' (validation.cpp:2619).
@@ -2405,7 +2422,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     (multiple-value-bind (valid error)
         (validate-block block chain-state utxo-set
                         (1+ (bl.store:current-height chain-state))
-                        current-time :skip-pow t)
+                        current-time :skip-pow t :cache-results t)
       (values (and valid t) error))))
 
 ;;;; Helper functions

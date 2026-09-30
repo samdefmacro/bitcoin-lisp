@@ -208,13 +208,22 @@ as one opcode and ends the walk."
 ;;; Precomputed sighash data (Bitcoin Core: PrecomputedTransactionData)
 ;;; Caches hash components shared across all inputs of a transaction.
 
-(defstruct precomputed-sighash-data
+(defstruct (precomputed-sighash-data
+            (:constructor %make-precomputed-sighash-data (tx spent-utxos))
+            (:conc-name %psd-))
+  "One transaction's sighash midstates, each computed the first time a
+signature hash reads it (Core PrecomputedTransactionData). TX and SPENT-UTXOS
+(a vector of utxo-entry, or NIL) are what they are computed from; the other
+slots are NIL until read. Read them through the PRECOMPUTED-SIGHASH-DATA-*
+functions below, never through these slot accessors."
+  (tx nil)
+  (spent-utxos nil)
   ;; BIP 143 (SegWit v0): double-SHA256 of all prevouts/sequences/outputs.
   (hash-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (hash-sequence nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (hash-outputs-all nil :type (or null (simple-array (unsigned-byte 8) (*))))
   ;; BIP 341 (Taproot): single-SHA256 of the same data plus spent-amounts and
-  ;; spent-scriptPubKeys. Populated only when spent UTXOs are available.
+  ;; spent-scriptPubKeys (the latter two only when spent UTXOs are available).
   (sha-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (sha-sequences nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (sha-outputs nil :type (or null (simple-array (unsigned-byte 8) (*))))
@@ -254,55 +263,96 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
        outputs))
 
 (defun init-precomputed-sighash (tx &optional spent-utxos)
-  "Initialize precomputed sighash data for TX. Call once per transaction.
-   When SPENT-UTXOS (vector of utxo-entry) is provided, also populate the
-   BIP 341 single-SHA256 fields including sha-amounts and sha-script-pubkeys
-   which are needed for Taproot validation.
+  "Precomputed sighash data for TX, one per transaction; SPENT-UTXOS (a vector
+of utxo-entry in input order) is what the BIP 341 amounts and scriptPubKeys
+hashes are taken over, NIL when unknown.
 
-   Hot path: called once per non-coinbase tx during validate-block-scripts.
-   Direct byte-buf writes replace the previous flexi-streams + Gray-stream
-   loop-write-byte, mirroring the Phase 1 byte-buf migration in
-   serialize-{transaction,block-header,block} and save-utxo-set. The May 8
-   profile flagged the residual flexi-streams paths here as ~10% of CPU
-   even after libcrypto SHA256 made hashing cheap."
-  (let* ((inputs (bl.ser:transaction-inputs tx))
-         (outputs (bl.ser:transaction-outputs tx))
-         (prevouts-bb (make-byte-buf))
-         (sequences-bb (make-byte-buf))
-         (outputs-bb (make-byte-buf)))
-    (bb-write-all-prevouts prevouts-bb inputs)
-    (bb-write-all-sequences sequences-bb inputs)
-    (bb-write-all-outputs outputs-bb outputs)
-    (let* ((prevouts-bytes (bb-finish prevouts-bb))
-           (sequences-bytes (bb-finish sequences-bb))
-           (outputs-bytes (bb-finish outputs-bb))
-           (sha-prevouts (bl.crypto:sha256 prevouts-bytes))
-           (sha-sequences (bl.crypto:sha256 sequences-bytes))
-           (sha-outputs (bl.crypto:sha256 outputs-bytes)))
-      (make-precomputed-sighash-data
-       :hash-prevouts (bl.crypto:sha256 sha-prevouts)
-       :hash-sequence (bl.crypto:sha256 sha-sequences)
-       :hash-outputs-all (bl.crypto:sha256 sha-outputs)
-       :sha-prevouts sha-prevouts
-       :sha-sequences sha-sequences
-       :sha-outputs sha-outputs
-       :sha-amounts
-       (when spent-utxos
-         (let ((bb (make-byte-buf)))
-           (loop for utxo across spent-utxos
-                 do (bb-write-i64-le
-                     bb (bl.store:utxo-entry-value utxo)))
-           (bl.crypto:sha256
-            (bb-finish bb))))
-       :sha-script-pubkeys
-       (when spent-utxos
-         (let ((bb (make-byte-buf)))
-           (loop for utxo across spent-utxos
-                 for script = (bl.store:utxo-entry-script-pubkey utxo)
-                 do (bb-write-varint bb (length script))
-                    (bb-write-bytes bb script))
-           (bl.crypto:sha256
-            (bb-finish bb))))))))
+Nothing is hashed here. Core's PrecomputedTransactionData::Init computes the
+three single SHA256s only when some input spends with a witness, their BIP 143
+doubles only when one of those is not a v1 32-byte program, and the BIP 341
+amounts and scripts hashes only when one is (script/interpreter.cpp:
+1403-1452). Every value is instead computed the first time a signature hash
+READS it (the PRECOMPUTED-SIGHASH-DATA-* readers below), which is the same set
+of hashes Core's scan selects, or fewer: a legacy-only transaction reads none
+of them, a P2WSH one the six BIP 143 values and never the BIP 341 two. The
+eager version hashed all eight for every transaction -- 20.5% of the samples
+of the interpreter over a fixed P2WSH set with the signature cache warm.
+
+Unlike Core's scan, reading on demand needs no `force' for a signer: a
+transaction whose witnesses are not filled in yet still gets the fields its
+signature hashes ask for."
+  (%make-precomputed-sighash-data tx spent-utxos))
+
+(defun %sha256-of-written (writer items)
+  "SHA256 over what WRITER (a bb-write-all-* function) writes for ITEMS."
+  (let ((bb (make-byte-buf)))
+    (funcall writer bb items)
+    (bl.crypto:sha256 (bb-finish bb))))
+
+(defun precomputed-sighash-data-sha-prevouts (precomp)
+  "SHA256 of every input's outpoint (Core m_prevouts_single_hash)."
+  (or (%psd-sha-prevouts precomp)
+      (setf (%psd-sha-prevouts precomp)
+            (%sha256-of-written #'bb-write-all-prevouts
+                                (bl.ser:transaction-inputs (%psd-tx precomp))))))
+
+(defun precomputed-sighash-data-sha-sequences (precomp)
+  "SHA256 of every input's nSequence (Core m_sequences_single_hash)."
+  (or (%psd-sha-sequences precomp)
+      (setf (%psd-sha-sequences precomp)
+            (%sha256-of-written #'bb-write-all-sequences
+                                (bl.ser:transaction-inputs (%psd-tx precomp))))))
+
+(defun precomputed-sighash-data-sha-outputs (precomp)
+  "SHA256 of every output (Core m_outputs_single_hash)."
+  (or (%psd-sha-outputs precomp)
+      (setf (%psd-sha-outputs precomp)
+            (%sha256-of-written #'bb-write-all-outputs
+                                (bl.ser:transaction-outputs (%psd-tx precomp))))))
+
+(defun precomputed-sighash-data-hash-prevouts (precomp)
+  "BIP 143 hashPrevouts: SHA256 of the single hash (Core SHA256Uint256)."
+  (or (%psd-hash-prevouts precomp)
+      (setf (%psd-hash-prevouts precomp)
+            (bl.crypto:sha256 (precomputed-sighash-data-sha-prevouts precomp)))))
+
+(defun precomputed-sighash-data-hash-sequence (precomp)
+  "BIP 143 hashSequence."
+  (or (%psd-hash-sequence precomp)
+      (setf (%psd-hash-sequence precomp)
+            (bl.crypto:sha256 (precomputed-sighash-data-sha-sequences precomp)))))
+
+(defun precomputed-sighash-data-hash-outputs-all (precomp)
+  "BIP 143 hashOutputs for SIGHASH_ALL."
+  (or (%psd-hash-outputs-all precomp)
+      (setf (%psd-hash-outputs-all precomp)
+            (bl.crypto:sha256 (precomputed-sighash-data-sha-outputs precomp)))))
+
+(defun precomputed-sighash-data-sha-amounts (precomp)
+  "SHA256 of every spent amount (Core m_spent_amounts_single_hash), or NIL
+without spent UTXOs."
+  (or (%psd-sha-amounts precomp)
+      (let ((spent (%psd-spent-utxos precomp)))
+        (when spent
+          (setf (%psd-sha-amounts precomp)
+                (let ((bb (make-byte-buf)))
+                  (loop for utxo across spent
+                        do (bb-write-i64-le bb (bl.store:utxo-entry-value utxo)))
+                  (bl.crypto:sha256 (bb-finish bb))))))))
+
+(defun precomputed-sighash-data-sha-script-pubkeys (precomp)
+  "SHA256 of every spent scriptPubKey, length-prefixed (Core
+m_spent_scripts_single_hash), or NIL without spent UTXOs."
+  (or (%psd-sha-script-pubkeys precomp)
+      (let ((spent (%psd-spent-utxos precomp)))
+        (when spent
+          (setf (%psd-sha-script-pubkeys precomp)
+                (let ((bb (make-byte-buf)))
+                  (loop for utxo across spent
+                        for script = (bl.store:utxo-entry-script-pubkey utxo)
+                        do (bb-write-varint bb (length script))
+                           (bb-write-bytes bb script))
+                  (bl.crypto:sha256 (bb-finish bb))))))))
 
 (defvar *witness-v0-mode* nil
   "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
@@ -350,6 +400,20 @@ re-verification and entries are added only after successful verifies
 
 (defvar *signature-cache-enabled* t
   "When T, cache signature verification results.")
+
+(defvar *signature-cache-store* t
+  "Core's CachingTransactionSignatureChecker `store' (script/sigcache.cpp:
+63-84): when T a verified signature is added to the cache, when NIL the cache
+is only consulted, and an entry it answers from is marked for collection.
+
+Core decides it per caller. Mempool acceptance stores (PolicyScriptChecks and
+ConsensusScriptChecks, validation.cpp), and so does TestBlockValidity, whose
+ConnectBlock runs with fJustCheck; connecting a block does NOT --
+`fCacheResults = fJustCheck', \"Don't cache results if we're actually
+connecting blocks (still consult the cache, though)\" (validation.cpp:
+2571-2583). VALIDATE-BLOCK-SCRIPTS binds it from its CACHE-STORE argument, so
+IBD neither pays for an insert per signature nor fills the cache with
+signatures nothing will ask about again. T everywhere else.")
 
 (defvar *sig-cache-salt*
   (ironclad:random-data 32)
@@ -421,12 +485,27 @@ dispatch."
     (setf pos (buf-set-bytes buf pos sig))
     (bl.crypto:sha256 buf)))
 
-(defun sig-cache-hit-p (key)
+(defun sig-cache-hit-p (key &optional erase)
   "T when KEY is cached in either generation; prev-generation hits are
-promoted into the current one."
-  (or (gethash key *signature-cache*)
-      (when (gethash key *signature-cache-prev*)
-        (setf (gethash key *signature-cache*) t))))
+promoted into the current one.
+
+ERASE is Core's `contains(entry, erase)' (SignatureCache::Get, sigcache.cpp:
+51-55, called with erase = !store): the entry still answers present, but its
+garbage-collect flag is set so it is the first to be overwritten when space is
+needed, and until then a later lookup still finds it (cuckoocache.h:449-470,
+\"a great property for re-org performance\"). Here the space-needed moment is
+the generation rotation, so an erased hit is left in -- or moved to -- the
+PREVIOUS generation, which the next rotation drops, instead of being promoted
+into the current one."
+  (cond ((gethash key *signature-cache*)
+         (when erase
+           (remhash key *signature-cache*)
+           (setf (gethash key *signature-cache-prev*) t))
+         t)
+        ((gethash key *signature-cache-prev*)
+         (unless erase
+           (setf (gethash key *signature-cache*) t))
+         t)))
 
 (defun sig-cache-store (key)
   (when (>= (hash-table-count *signature-cache*) *signature-cache-max-entries*)
@@ -450,12 +529,12 @@ carry no script flags; see the note there."
       (return-from cached-verify-ecdsa (values nil encoding-status))))
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x45 sighash der-sig pubkey-bytes))))
-    (when (and cache-key (sig-cache-hit-p cache-key))
+    (when (and cache-key (sig-cache-hit-p cache-key (not *signature-cache-store*)))
       (return-from cached-verify-ecdsa (values t t)))
     (multiple-value-bind (result status)
         (bl.crypto:verify-signature sighash der-sig pubkey-bytes
                                               :strict strict :low-s low-s)
-      (when (and result cache-key)
+      (when (and result cache-key *signature-cache-store*)
         (sig-cache-store cache-key))
       (values result status))))
 
@@ -463,11 +542,11 @@ carry no script flags; see the note there."
   "Verify Schnorr signature with caching. Returns T/NIL."
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x53 sighash sig64 pubkey-bytes))))
-    (when (and cache-key (sig-cache-hit-p cache-key))
+    (when (and cache-key (sig-cache-hit-p cache-key (not *signature-cache-store*)))
       (return-from cached-verify-schnorr t))
     (let ((result (bl.crypto:verify-schnorr-signature
                    sighash sig64 pubkey-bytes)))
-      (when (and result cache-key)
+      (when (and result cache-key *signature-cache-store*)
         (sig-cache-store cache-key))
       result)))
 
@@ -876,74 +955,10 @@ Returns (values success error-keyword)."
 ;;; Script Execution Flags
 ;;; ============================================================
 
-(defvar *script-flags* nil
-  "Current script execution flags. Set by test harness before execution.
-   Supported flags: STRICTENC, P2SH, etc.")
-
-(defun set-script-flags (flags-string)
-  "Set script execution flags from a comma-separated string."
-  (setf *script-flags* flags-string))
-
-;;; Flag lookup cache. *script-flags* is a comma-separated string that's set
-;;; once per validation context (per-tx or per-block) and queried thousands of
-;;; times during script execution. Splitting + linear-searching it on every
-;;; query was 7.1% of total CPU time per profile. Cache the parsed set keyed
-;;; by the string itself so repeated calls with the same string hit a hash
-;;; table once.
-
-(defvar *flag-set-cache*
-  (make-hash-table :test 'equal :size 16
-                   #+sbcl :synchronized #+sbcl t)
-  "Hash from *script-flags* string -> hash-set of enabled flag names.
-
-SYNCHRONIZED, because FLAG-ENABLED-P inserts on a miss and every parallel
-script-check worker calls it — the P2SH/WITNESS/SIGPUSHONLY gates run on every
-script, so this table is on the hottest path a worker has. Concurrent
-read-through inserts into a plain SBCL hash table corrupt it silently.
-
-This is the same defect the parallel-validation work fixed for the coins view (COLLECT-SPENT-UTXOS
-inserting into a non-synchronized CVC-ENTRIES), missed because it lives a layer
-down in the interpreter rather than in the validation code that was audited.
-The signature and script-execution caches were already synchronized
-(%MAKE-SIG-CACHE-TABLE); these two were not.
-
-Harmless to race on the VALUE — the set computed for a given flags string is
-deterministic, so a lost store only costs a re-parse. What is not harmless is
-the table's own structure.")
-
-(defun parse-flags-to-set (flags-string)
-  (let ((set (make-hash-table :test 'equal)))
-    (dolist (f (uiop:split-string flags-string :separator ","))
-      (setf (gethash f set) t))
-    set))
-
-(defvar *last-flag-set* (cons nil nil)
-  "(flags-string . parsed set) of the most recent FLAG-ENABLED-P lookup, replaced
-as a whole cons -- never mutated -- so a reader on any thread sees a matching
-pair. The parsed set itself is only ever read once built.")
-
-(defun flag-enabled-p (flag)
-  "Check if a flag is enabled in *script-flags*. O(1) hash lookup with the
-parsed-flag-set cached per-string.
-
-The string bound to *script-flags* is one object for a whole block (or
-transaction), and every script asks several flags of it, so the last string
-seen is recognized by EQ before *FLAG-SET-CACHE* is consulted. That table is
-SYNCHRONIZED and keyed by EQUAL, so each lookup hashed the whole flags string
-under a lock the script-check workers share: the round-10 IBD profile (2,100
-regtest blocks of ~925 KB synced over P2P) put 10.2% of all samples in the
-GETHASH/LOCK under this function. A miss takes the old path unchanged."
-  (let ((flags *script-flags*))
-    (when flags
-      (let* ((last *last-flag-set*)
-             (set (if (eq (car last) flags)
-                      (cdr last)
-                      (let ((parsed (or (gethash flags *flag-set-cache*)
-                                        (setf (gethash flags *flag-set-cache*)
-                                              (parse-flags-to-set flags)))))
-                        (setf *last-flag-set* (cons flags parsed))
-                        parsed))))
-        (if (gethash flag set) t nil)))))
+;; *SCRIPT-FLAGS*, SET-SCRIPT-FLAGS and FLAG-ENABLED-P live in bridge.lisp,
+;; which loads before the interpreter: FLAG-ENABLED-P of a constant name
+;; compiles to a bit test there, and the compiler macro that does it must
+;; exist before script.lisp is compiled.
 
 ;;; ============================================================
 ;;; Tapscript OP_SUCCESS Detection (BIP 342)

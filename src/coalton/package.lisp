@@ -408,10 +408,19 @@
    #:*precomputed-sighash*
    #:init-precomputed-sighash
    #:precomputed-sighash-data
+   #:precomputed-sighash-data-hash-prevouts
+   #:precomputed-sighash-data-hash-sequence
+   #:precomputed-sighash-data-hash-outputs-all
+   #:precomputed-sighash-data-sha-prevouts
+   #:precomputed-sighash-data-sha-sequences
+   #:precomputed-sighash-data-sha-outputs
+   #:precomputed-sighash-data-sha-amounts
+   #:precomputed-sighash-data-sha-script-pubkeys
    ;; Signature cache
    #:*signature-cache*
    #:*signature-cache-prev*
    #:*signature-cache-enabled*
+   #:*signature-cache-store*
    #:clear-signature-cache
    ;; SegWit / BIP 143
    #:*witness-v0-mode*

@@ -26,6 +26,47 @@
          (hash256 (bl.crypto:hash256 input)))
     (is (equalp hash256 double))))
 
+(test sha256-matches-cores-vectors-and-ironclad-at-every-length
+  "BL.CRYPTO:SHA256 and HASH256 hash through libcrypto's SHA256_Init/Update/
+Final over a stack context instead of the one-shot SHA256(), whose EVP
+wrapper was most of the cost of a small input. The digests must not change:
+Core's sha256_testvectors (test/crypto_tests.cpp:411-431, all but the
+generated LongTestString one), and ironclad -- an independent implementation
+-- at every length from 0 to 300 bytes (across the 55/56/64-byte padding
+boundaries) and at a few block multiples, for both one and two rounds."
+  (flet ((ascii (s) (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
+         (hex (h) (ironclad:hex-string-to-byte-array h)))
+    (loop for (in out) in
+          '(("" "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            ("abc" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            ("message digest" "f7846f55cf23e14eebeab5b4e1550cad5b509e3348fbc4efa3a1413d393cb650")
+            ("secure hash algorithm" "f30ceb2bb2829e79e4ca9753d35a8ecc00262d164cc077080295381cbd643f0d")
+            ("SHA256 is considered to be safe" "6819d915c73f4d1e77e4e1b52d1fa0f9cf9beaead3939f15874bd988e2a23630")
+            ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+            ("For this sample, this 63-byte string will be used as input data" "f08a78cbbaee082b052ae0708f32fa1e50c5c421aa772ba5dbb406a2ea6be342")
+            ("This is exactly 64 bytes long, not counting the terminating byte" "ab64eff7e88e2e46165e29f2bce41826bd4c7b3552f6b382a9e7d3af47c245f8")
+            ("As Bitcoin relies on 80 byte header hashes, we want to have an example for that." "7406e8de7d6e4fffc573daef05aefb8806e7790f55eab5576f31349743cca743"))
+          do (is (equalp (hex out) (bl.crypto:sha256 (ascii in))) "SHA256(~S)" in))
+    (is (equalp (hex "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+                (bl.crypto:sha256 (make-array 1000000 :element-type '(unsigned-byte 8)
+                                                      :initial-element (char-code #\a))))))
+  (let ((mismatches '()))
+    (dolist (n (append (loop for n from 0 to 300 collect n) '(511 512 513 1024 4096 100000)))
+      (let ((data (make-array n :element-type '(unsigned-byte 8))))
+        (dotimes (i n) (setf (aref data i) (mod (+ (* 131 i) n) 256)))
+        (let ((once (ironclad:digest-sequence :sha256 data)))
+          (unless (equalp once (bl.crypto:sha256 data))
+            (push (list :sha256 n) mismatches))
+          (unless (equalp (ironclad:digest-sequence :sha256 once) (bl.crypto:hash256 data))
+            (push (list :hash256 n) mismatches)))))
+    (is (null mismatches) "digests differ from ironclad at ~S" mismatches))
+  ;; An adjustable (non-simple) vector takes the same path after COERCE.
+  (let ((v (make-array 3 :element-type '(unsigned-byte 8) :adjustable t
+                         :initial-contents '(97 98 99))))
+    (is (equalp (bl.crypto:sha256 v)
+                (ironclad:hex-string-to-byte-array
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")))))
+
 (test ripemd160-hello
   "RIPEMD160 of 'hello' should match known hash."
   (let ((result (bl.crypto:ripemd160
