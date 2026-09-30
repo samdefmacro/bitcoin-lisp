@@ -495,7 +495,7 @@ it by NONPREF_PEER_TX_DELAY and waits for the getdata."
   (bl.ser:get-unix-time))
 
 (defstruct (tx-announcement
-            (:constructor %make-tx-announcement (peer ready priority))
+            (:constructor %make-tx-announcement (peer ready priority wtxid))
             (:conc-name tx-ann-))
   "One peer's announcement of one txhash — Core's txrequest Announcement
 (txrequest.cpp:52-100). READY is the %TX-REQUEST-NOW time at which it becomes
@@ -510,10 +510,16 @@ exists to prevent exactly that: \"The same transaction is never requested
 twice from the same peer, unless the announcement was forgotten in between
 ... giving a peer multiple chances to announce a transaction would allow them
 to bias requests in their favor, worsening transaction censoring attacks\"
-(txrequest.h:45-58)."
+(txrequest.h:45-58). WTXID is the announcement's own id type, Core's
+Announcement::m_gtxid: a request goes out under the type of the announcement
+it is granted to (GetRequestable returns that GenTxid, txrequest.cpp:595-624,
+and SendMessages builds the getdata from it, net_processing.cpp:6207) -- MSG_WTX
+for a wtxid, MSG_TX|witness-flag for a txid. A wtxid re-requested under
+MSG_WITNESS_TX is a TXID lookup to a Core peer, answered notfound."
   (peer nil)
   (ready 0 :type integer)
   (completed nil :type boolean)
+  (wtxid nil :type boolean)
   ;; %TX-REQUEST-PRIORITY of (txhash, peer), computed once here because none
   ;; of its three inputs can change for the life of the announcement -- Core
   ;; likewise pays for it once, by keeping the ByTxHash index SORTED by it
@@ -527,14 +533,6 @@ delays) passes. The peer currently in flight stays in this list; its
 announcement is the record that it announced the hash. A COMPLETED
 announcement stays too, until the hash is forgotten or its last
 non-completed sibling completes.")
-(defvar *tx-request-wtxid-p* (make-hash-table :test 'equalp)
-  "hash -> T when the tracked announcement is wtxid-based (BIP339 MSG_WTX).
-Core's TxRequestTracker stores GenTxids, so every entry remembers whether it
-is a txid or a wtxid (txrequest.cpp Announcement::m_gtxid) — the getdata for
-a wtxid entry MUST go out as MSG_WTX and for a txid entry as
-MSG_TX|witness-flag (net_processing.cpp:6207). A wtxid re-requested under
-MSG_WITNESS_TX is interpreted by Core peers as a TXID lookup and answered
-notfound, so failover would silently never work for segwit txs.")
 (defvar *tx-peer-announcements* (make-hash-table :test 'eq)
   "peer -> number of tracked announcements (candidates + in-flight), for the
 MAX_PEER_TX_ANNOUNCEMENTS cap (Core m_txrequest.Count(peer)).")
@@ -579,7 +577,6 @@ getblocktxn round trip. The last slot is kept for an outbound peer
   (bt:with-lock-held (*tx-request-lock*)
     (clrhash *tx-in-flight*)
     (clrhash *tx-announcers*)
-    (clrhash *tx-request-wtxid-p*)
     (clrhash *tx-peer-announcements*)
     (clrhash *tx-peer-in-flight*)))
 
@@ -686,8 +683,7 @@ peer's count — Core ForgetTxHash (txrequest.cpp:560-566) and the branch of
 MakeCompleted that fires when the last non-completed announcement completes."
   (dolist (ann (gethash hash *tx-announcers*))
     (%decf-peer-announcements (tx-ann-peer ann)))
-  (remhash hash *tx-announcers*)
-  (remhash hash *tx-request-wtxid-p*))
+  (remhash hash *tx-announcers*))
 
 (defun %tx-request-make-completed (hash peer)
   "Lock held: Core MakeCompleted (txrequest.cpp:456-478). PEER's announcement
@@ -724,14 +720,15 @@ before erasing (txrequest.cpp:549-556)."
 
 (defun tx-request-wanted-p (hash peer &optional wtxidp (num-wtxid-peers 0))
   "Record PEER as an announcer of HASH and return T iff a getdata should go to
-PEER immediately — no request outstanding and the announcement carries no
-delay. NIL means the announcement was either dropped (per-peer cap), retained
-as a failover candidate behind an in-flight request, or deferred until its
-Core-mandated delay passes (the scheduler sends it then). WTXIDP marks the
-announcement as wtxid-based (MSG_WTX): the id type is a property of the
-announced hash itself and is remembered for the lifetime of the entry, so a
-timed-out request fails over with the SAME id type. NUM-WTXID-PEERS is the
-count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
+PEER immediately -- no request outstanding, the announcement carries no delay,
+and no ready announcement of HASH outranks it. NIL means the announcement was
+either dropped (per-peer cap), retained as a failover candidate behind an
+in-flight request or a better ready candidate, or deferred until its
+Core-mandated delay passes (the scheduler grants the hash then). WTXIDP marks the
+announcement as wtxid-based (MSG_WTX); the announcement keeps it, so whichever
+announcer a request is later granted to is asked under the id type IT
+announced. NUM-WTXID-PEERS is the count of connected wtxid-relay peers,
+driving Core's TXID_RELAY_DELAY."
   (bt:with-lock-held (*tx-request-lock*)
     ;; Another announcement from the same peer — live or COMPLETED — is
     ;; refused by the (peer, txhash) uniqueness of Core's ByPeer index
@@ -751,14 +748,21 @@ count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
     (let* ((now (%tx-request-now))
            (ready (+ now (%tx-announcement-delay-seconds peer wtxidp
                                                          num-wtxid-peers))))
-      (push (%make-tx-announcement peer ready (%tx-request-priority hash peer))
-            (gethash hash *tx-announcers*))
-      (incf (gethash peer *tx-peer-announcements* 0))
-      (setf (gethash hash *tx-request-wtxid-p*) wtxidp)
-      (cond ((gethash hash *tx-in-flight*) nil)
-            ((> ready now) nil)          ; deferred; scheduler sends when due
-            (t (%tx-request-mark-in-flight hash peer now)
-               t)))))
+      (let ((ann (%make-tx-announcement peer ready (%tx-request-priority hash peer)
+                                        (and wtxidp t))))
+        (push ann (gethash hash *tx-announcers*))
+        (incf (gethash peer *tx-peer-announcements* 0))
+        ;; Asked at once only if this is the candidate GetRequestable would
+        ;; grant now -- nothing in flight, and no ready announcement of higher
+        ;; priority (txrequest.cpp:595-624). Core's ReceivedInv never asks;
+        ;; the SendMessages after it does, through GetRequestable
+        ;; (net_processing.cpp:6162). Otherwise the scheduler grants it when
+        ;; it is due, to whichever candidate is then the best.
+        (cond ((gethash hash *tx-in-flight*) nil)
+              ((not (eq ann (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
+               nil)
+              (t (%tx-request-mark-in-flight hash peer now)
+                 t))))))
 
 (defun tx-request-received (hash)
   "Forget HASH entirely — Core ForgetTxHash (txrequest.cpp:560-566): the
@@ -866,7 +870,7 @@ Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
         (if (null best)
             to-send
             (let* ((peer (tx-ann-peer best))
-                   (inv (tx-request-inv hash (gethash hash *tx-request-wtxid-p*) peer))
+                   (inv (tx-request-inv hash (tx-ann-wtxid best) peer))
                    (bucket (assoc peer to-send :test #'eq)))
               (%tx-request-mark-in-flight hash peer now)
               (cond (bucket (push inv (cdr bucket)) to-send)
@@ -4859,7 +4863,9 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
   "Build hash table mapping short IDs to (tx . expected-id) pairs.
    USE-WTXID is true for compact block version 2.
    Returns (VALUES map collision-detected).
-   The map stores cons cells of (transaction . full-txid-or-wtxid) for verification."
+   A short ID two mempool transactions share maps to :COLLISION instead: a
+   block slot carrying it is requested, as Core's InitData requests one two
+   mempool transactions match (blockencodings.cpp:131-138)."
   (let ((map (make-hash-table :test 'eql))
         (collision nil))
     (bl.mp:mempool-for-each
@@ -4870,11 +4876,10 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
                       (bl.ser:transaction-wtxid tx)
                       txid))
               (short-id (bl.crypto:compute-short-txid k0 k1 id)))
-         ;; Detect collisions within mempool
-         (when (gethash short-id map)
-           (setf collision t))
-         ;; Store tx with its full ID for later verification
-         (setf (gethash short-id map) (cons tx id)))))
+         (if (gethash short-id map)
+             (setf collision t
+                   (gethash short-id map) :collision)
+             (setf (gethash short-id map) (cons tx id))))))
     (values map collision)))
 
 ;;; Block reconstruction
@@ -4892,23 +4897,29 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
 :COLLISION and :MALFORMED are Core's two distinct PartiallyDownloadedBlock::
 InitData failures and the caller must NOT conflate them (blockencodings.cpp:
 59-120). :MALFORMED is READ_STATUS_INVALID — a message no honest peer can
-send (no transactions at all, an absurd transaction count, a prefilled index
-outside the block, fewer short IDs than empty slots) — and Core answers it with
-Misbehaving (net_processing.cpp:4680-4683). :COLLISION is READ_STATUS_FAILED —
-two of OUR OWN mempool transactions sharing a short ID, which is nobody's
-fault — and Core answers it with a plain full-block getdata (:4683-4694)."
+send (a null header, no transactions at all, an absurd transaction count, a
+null prefilled transaction, a prefilled index outside the block, fewer short
+IDs than empty slots) — and Core answers it with Misbehaving
+(net_processing.cpp:4680-4683). :COLLISION is READ_STATUS_FAILED — the block's
+OWN short IDs repeat, which a 48-bit hash does by chance — and Core answers it
+with a plain full-block getdata (:4683-4694). Two MEMPOOL transactions that
+share a short ID are no failure: a block slot carrying it is simply requested
+(blockencodings.cpp:131-138), and one the block does not carry costs nothing.
+Core's other READ_STATUS_FAILED, a std::unordered_map bucket over twelve
+entries (:98-111), measures its container's hashing and has no counterpart."
   (let* ((header (bl.ser:compact-block-header compact-block))
          (nonce (bl.ser:compact-block-nonce compact-block))
          (short-ids-list (bl.ser:compact-block-short-ids compact-block))
          (prefilled (bl.ser:compact-block-prefilled-txs compact-block))
          (tx-count (+ (length short-ids-list) (length prefilled)))
          (header-bytes (bl.ser:serialize-block-header header))
-         ;; Convert short-ids list to vector for O(1) access
          (short-ids (coerce short-ids-list 'vector)))
 
     ;; Validate tx-count is reasonable (prevent DoS). Core InitData's first two
-    ;; guards, both READ_STATUS_INVALID (blockencodings.cpp:62-66).
-    (when (or (zerop tx-count) (> tx-count 100000))
+    ;; guards, both READ_STATUS_INVALID (blockencodings.cpp:60-63), the first
+    ;; also refusing a null header (CBlockHeader::IsNull, nBits 0).
+    (when (or (zerop (bl.ser:block-header-bits header))
+              (zerop tx-count) (> tx-count 100000))
       (bl:log-warn "Invalid compact block tx count: ~D" tx-count)
       (return-from reconstruct-compact-block (values nil :malformed)))
 
@@ -4917,61 +4928,58 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
         (bl.crypto:compute-siphash-key header-bytes nonce)
 
       ;; Build short ID map from mempool
-      (multiple-value-bind (shortid-map collision)
-          (build-shortid-map mempool k0 k1 use-wtxid)
-
-        ;; Check for collision within mempool
-        (when collision
-          (increment-compact-block-collision)
-          (bl:log-warn "Short ID collision detected in mempool, falling back to full block")
-          (return-from reconstruct-compact-block (values nil :collision nil)))
-
+      (let ((shortid-map (build-shortid-map mempool k0 k1 use-wtxid)))
         (let ((transactions (make-array tx-count :initial-element nil))
               (missing-indexes '())
               (short-id-idx 0))
 
-          ;; Place prefilled transactions at their absolute indexes
-          ;; with bounds checking
+          ;; Place prefilled transactions at their absolute indexes. A null
+          ;; one (CTransaction::IsNull: no inputs, no outputs) and one past
+          ;; the block (Core's lastprefilledindex bound) are
+          ;; READ_STATUS_INVALID (blockencodings.cpp:72-84).
           (dolist (ptx prefilled)
-            (let ((idx (bl.ser:prefilled-tx-index ptx)))
-              (if (and (>= idx 0) (< idx tx-count))
-                  (setf (aref transactions idx)
-                        (bl.ser:prefilled-tx-transaction ptx))
-                  (progn
-                    ;; Core's lastprefilledindex bounds check, READ_STATUS_INVALID
-                    ;; (blockencodings.cpp:78-84).
-                    (bl:log-warn "Prefilled tx index out of bounds: ~D (max ~D)"
-                                           idx (1- tx-count))
-                    (return-from reconstruct-compact-block (values nil :malformed nil))))))
-
-          ;; Fill remaining slots with mempool transactions matched by short ID
-          (dotimes (i tx-count)
-            (when (null (aref transactions i))
-              ;; This slot needs a transaction from short IDs
-              (when (>= short-id-idx (length short-ids))
-                ;; More empty slots than short IDs — a slot with neither a
-                ;; prefilled tx nor a short ID. READ_STATUS_INVALID in Core
-                ;; (blockencodings.cpp:80-84).
-                (bl:log-warn "Short ID count mismatch")
+            (let ((idx (bl.ser:prefilled-tx-index ptx))
+                  (ptx-tx (bl.ser:prefilled-tx-transaction ptx)))
+              (when (or (and (zerop (length (bl.ser:transaction-inputs ptx-tx)))
+                             (zerop (length (bl.ser:transaction-outputs ptx-tx))))
+                        (not (< -1 idx tx-count)))
+                (bl:log-warn "Invalid prefilled tx at index ~D (max ~D)" idx (1- tx-count))
                 (return-from reconstruct-compact-block (values nil :malformed nil)))
-              (let* ((short-id (aref short-ids short-id-idx))
-                     (tx-pair (gethash short-id shortid-map)))
-                (if tx-pair
-                    (let ((tx (car tx-pair))
-                          (full-id (cdr tx-pair)))
-                      ;; Verify the matched tx produces the expected short ID
-                      ;; (guards against hash collisions between mempool and block)
-                      (let ((computed-short-id (bl.crypto:compute-short-txid
-                                                k0 k1 full-id)))
-                        (if (= computed-short-id short-id)
-                            (setf (aref transactions i) tx)
-                            ;; Collision between different transactions
-                            (push i missing-indexes))))
-                    (push i missing-indexes))
-                (incf short-id-idx))))
+              (setf (aref transactions idx) ptx-tx)))
+
+          ;; The block's own short IDs, each to the slot it fills (the
+          ;; slots no prefilled transaction took, in order). A short ID the
+          ;; block carries twice is READ_STATUS_FAILED
+          ;; (blockencodings.cpp:92-117).
+          (let ((slots (make-hash-table :test 'eql)))
+            (dotimes (i tx-count)
+              (when (null (aref transactions i))
+                (when (>= short-id-idx (length short-ids))
+                  ;; More empty slots than short IDs — a slot with neither a
+                  ;; prefilled tx nor a short ID. READ_STATUS_INVALID in Core
+                  ;; (blockencodings.cpp:80-84).
+                  (bl:log-warn "Short ID count mismatch")
+                  (return-from reconstruct-compact-block (values nil :malformed nil)))
+                (let ((short-id (aref short-ids short-id-idx)))
+                  (when (gethash short-id slots)
+                    (increment-compact-block-collision)
+                    (bl:log-warn "Short ID collision in the compact block, falling back to full block")
+                    (return-from reconstruct-compact-block (values nil :collision nil)))
+                  (setf (gethash short-id slots) i))
+                (incf short-id-idx)))
+            ;; Fill each slot from the mempool: a short ID one mempool
+            ;; transaction matches supplies it; one that none or several
+            ;; match is requested (blockencodings.cpp:120-146).
+            (maphash (lambda (short-id i)
+                       (let ((tx-pair (gethash short-id shortid-map)))
+                         (if (consp tx-pair)
+                             (setf (aref transactions i) (car tx-pair))
+                             (push i missing-indexes))))
+                     slots)
+            (setf missing-indexes (sort missing-indexes #'<)))
 
           (if missing-indexes
-              (values nil (nreverse missing-indexes) transactions)
+              (values nil missing-indexes transactions)
               (values (bl.ser:make-bitcoin-block
                        :header header
                        :transactions (coerce transactions 'list))

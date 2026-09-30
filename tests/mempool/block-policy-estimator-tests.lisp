@@ -9,9 +9,6 @@
 ;;;; File-local accessors for the estimator's internals. One reach each,
 ;;;; rather than one per assertion (tests/ :: ratchet).
 
-(defun %bpe-tracked (est)
-  (bl.mp::block-policy-estimator-tracked est))
-
 (defun %bpe-tracked-count (est)
   (hash-table-count (%bpe-tracked est)))
 
@@ -36,23 +33,23 @@ say where it stands."
 
 (defun %bpe-stats (&key (periods 24) (decay 0.9952d0) (scale 2))
   (bl.mp::make-tx-confirm-stats
-   (bl.mp::make-fee-buckets) periods decay scale))
+   (bl.mp:make-fee-buckets) periods decay scale))
 
 (test fee-buckets-match-core-spacing
   "Core's bucket set: geometric from MIN_BUCKET_FEERATE (100) to
 MAX_BUCKET_FEERATE (1e7) at FEE_SPACING (1.05), then an INF catch-all. Bucket
 lookup is lower_bound — the first bucket whose upper bound is >= the feerate."
-  (let ((b (bl.mp::make-fee-buckets)))
+  (let ((b (bl.mp:make-fee-buckets)))
     (is (= 100d0 (aref b 0)))
     (is (= 105d0 (aref b 1)))
     (is (= bl.mp::+inf-feerate+ (aref b (1- (length b)))))
     (is (<= (aref b (- (length b) 2)) bl.mp::+fee-max-bucket-feerate+))
     ;; lower_bound: a feerate AT a boundary belongs to that bucket, not the next.
-    (is (= 0 (bl.mp::fee-bucket-index b 99d0)))
-    (is (= 0 (bl.mp::fee-bucket-index b 100d0)))
-    (is (= 1 (bl.mp::fee-bucket-index b 101d0)))
+    (is (= 0 (bl.mp:fee-bucket-index b 99d0)))
+    (is (= 0 (bl.mp:fee-bucket-index b 100d0)))
+    (is (= 1 (bl.mp:fee-bucket-index b 101d0)))
     ;; Anything above the top finite bucket lands in INF.
-    (is (= (1- (length b)) (bl.mp::fee-bucket-index b 1d8)))))
+    (is (= (1- (length b)) (bl.mp:fee-bucket-index b 1d8)))))
 
 (test estimator-reports-the-feerate-that-confirmed
   "A population that confirms within the target is reported back at its own
@@ -105,8 +102,8 @@ cheap one when they confirmed — same volumes, same buckets, opposite outcomes.
 instead of falling off a hard window edge."
   (let ((s (%bpe-stats :decay 0.5d0)))
     (dotimes (i 100) (bl.mp::tx-confirm-stats-record s 1 10000d0))
-    (let ((bucket (bl.mp::fee-bucket-index
-                   (bl.mp::make-fee-buckets) 10000d0)))
+    (let ((bucket (bl.mp:fee-bucket-index
+                   (bl.mp:make-fee-buckets) 10000d0)))
       (let ((before (aref (bl.mp::tx-confirm-stats-txct-avg s) bucket)))
         (bl.mp::tx-confirm-stats-update-moving-averages s)
         (is (= (/ before 2)
@@ -117,8 +114,8 @@ instead of falling off a hard window edge."
 Only the latter records a failure — counting confirmations as failures would
 push every estimate upward without bound."
   (let ((s (%bpe-stats))
-        (bucket (bl.mp::fee-bucket-index
-                 (bl.mp::make-fee-buckets) 500d0)))
+        (bucket (bl.mp:fee-bucket-index
+                 (bl.mp:make-fee-buckets) 500d0)))
     ;; Confirmed after 30 blocks: no failure recorded.
     (let ((b (bl.mp::tx-confirm-stats-new-tx s 100 500d0)))
       (bl.mp::tx-confirm-stats-remove-tx s 100 130 b t))
@@ -239,6 +236,28 @@ no transactions at all and every estimate is 0 forever."
     ;; It recorded the ENTRY HEIGHT, which is what a confirmation is measured
     ;; against.
     (is (= 200 (first (gethash txid (%bpe-tracked est)))))))
+
+(test estimator-records-a-feerate-in-whole-satoshis-per-kvb
+  "The estimator records CFeeRate(fee, vsize).GetFeePerK() -- the fee per
+1000 vbytes ROUNDED DOWN to a whole satoshi, EvaluateFeeDown(1000)
+(policy/feerate.h:62) -- not the exact quotient: processTransaction buckets
+that integer and processBlockTx records it (block_policy_estimator.cpp:630-636,
+:660-665). 1103 sat over 10,000 vbytes is 110.3 sat/kvB, which GetFeePerK
+makes 110, below the 110.25 bucket boundary (100 x 1.05^2); the exact quotient
+lands one bucket higher."
+  (let* ((bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+         (est bl.mp:*block-policy-estimator*)
+         (txid (bpe-test-id 9 9 9))
+         (buckets (bl.mp:make-fee-buckets)))
+    (setf (%bpe-best-height est) 300)
+    (bl.mp:bpe-note-entry txid 1103 10000 300)
+    (let ((entry (gethash txid (%bpe-tracked est))))
+      (is-true entry)
+      (is (= 110d0 (second entry)) "recorded feerate ~A, Core's GetFeePerK is 110" (second entry))
+      (is (= (bl.mp:fee-bucket-index buckets 110d0) (third entry))
+          "bucket ~D, Core's is ~D" (third entry) (bl.mp:fee-bucket-index buckets 110d0))
+      (is (/= (bl.mp:fee-bucket-index buckets 110d0) (bl.mp:fee-bucket-index buckets 110.3d0))
+          "control: the exact quotient is in another bucket"))))
 
 (test mempool-eviction-reports-a-failure-but-confirmation-does-not
   "A removal that is not a confirmation is a FAILURE at that feerate. A
@@ -440,7 +459,7 @@ of 0 forgets everything, and EstimateMedianVal divides by (1 - decay)."
          (bytes (%bpe-bytes est))
          (target (bl.mp:make-block-policy-estimator))
          ;; The first horizon's decay sits right after the bucket vector.
-         (offset (+ 4 4 4 4 (* 8 (length (bl.mp::make-fee-buckets))))))
+         (offset (+ 4 4 4 4 (* 8 (length (bl.mp:make-fee-buckets))))))
     ;; decay = 1.0 exactly -> rejected
     (let ((mangled (copy-seq bytes)))
       (let ((one (flexi-streams:with-output-to-sequence (m)
@@ -498,6 +517,33 @@ its own unit tests."
           (is (= expected (bl.mp:bpe-estimate-smart-fee
                            bl.mp:*block-policy-estimator* 6))
               "load-fee-stats must restore the policy estimator, not just the legacy history"))))))
+
+(test shutdown-records-the-still-unconfirmed-as-failures-before-saving
+  "Core's shutdown calls CBlockPolicyEstimator::Flush (init.cpp:344-345), which
+is FlushUnconfirmed THEN FlushFeeEstimates (block_policy_estimator.cpp:957-
+960): every transaction still tracked is removed as NOT confirmed, which
+records a failure at its feerate for each period it has waited
+(TxConfirmStats::removeTx, :485-526), and only then is the file written. The
+hourly flush writes without it. A transaction tracked at height 300 that is
+still unconfirmed at 310 is, after the shutdown flush, a failure in the short
+horizon's first period -- and no longer tracked."
+  (let* ((dir (%fee-stats-fixture "shutdown-flush"))
+         (estimator (bl.mp:make-fee-estimator :data-directory dir))
+         (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+         (est bl.mp:*block-policy-estimator*)
+         (txid (bpe-test-id 7 7 7))
+         (short (bl.mp::block-policy-estimator-short est))
+         (bucket (bl.mp:fee-bucket-index (bl.mp:make-fee-buckets) 5000d0)))
+    (setf (%bpe-best-height est) 300)
+    (bl.mp:bpe-note-entry txid 5000 1000 300)
+    (loop for h from 301 to 310 do (bpe-add-block est h '()))
+    (is (= 1 (%bpe-tracked-count est)))
+    (is (= 0d0 (aref (aref (bl.mp::tx-confirm-stats-fail-avg short) 0) bucket)))
+    (bl.mp:flush-fee-estimates-at-shutdown estimator)
+    (is (= 0 (%bpe-tracked-count est)) "the flush must untrack the unconfirmed")
+    (is (plusp (aref (aref (bl.mp::tx-confirm-stats-fail-avg short) 0) bucket))
+        "the flush must record the unconfirmed transaction as a failure")
+    (is-true (probe-file (merge-pathnames "fee_estimates.dat" dir)) "and then write the file")))
 
 (test fee-estimates-file-past-max-age-is-ignored
   "Core MAX_FILE_AGE (60 hours): estimates that old describe a network whose

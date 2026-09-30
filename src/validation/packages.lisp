@@ -195,10 +195,13 @@ check where ProcessNewPackage gates on IsChildWithParents alone."
 
 (defun %build-package-coins (package height)
   "An outpoint-key -> utxo-entry table covering every output of every tx in
-PACKAGE, so a later package tx's input that spends an earlier sibling's output
-resolves during the package-feerate phase (Core's CCoinsViewMemPool layered over
-the package). Consulted only as a fallback, after the confirmed UTXO set and the
-real mempool. HEIGHT is the height these unconfirmed outputs are assumed to
+PACKAGE -- the SUBPACKAGE the package-feerate phase evaluates, never the whole
+package: a member that entered the pool on its own is visible through the
+pool alone, and not at all once something has replaced it (Core
+PackageAddTransaction runs only for txns_package_eval, validation.cpp:1473).
+A later subpackage tx's input that spends an earlier sibling's output
+resolves (Core's CCoinsViewMemPool layered over the package). Consulted only
+as a fallback, after the confirmed UTXO set and the real mempool. HEIGHT is the height these unconfirmed outputs are assumed to
 confirm at — the next block (tip+1) — which is what BIP68 evaluates against."
   (let ((coins (%make-package-coins)))
     (dolist (tx package coins)
@@ -236,9 +239,18 @@ before the package-feerate phase reconsidered it."
         (package-tx-result-error res) nil))
 
 (defun %mark-result-invalid (res reason)
-  "Record a rejection on RES."
+  "Record a rejection on RES: Core's MempoolAcceptResult::Failure(state),
+which carries no base fee, vsize, effective feerate or other wtxid
+(validation.h:167-176) -- so a member that was VALID and then left the pool
+does not keep them (validation.cpp:1736-1760). A fee failure's effective
+feerate (Core FeeFailure) is set by its caller afterwards."
   (setf (package-tx-result-status res) :invalid
-        (package-tx-result-error res) reason))
+        (package-tx-result-error res) reason
+        (package-tx-result-vsize res) nil
+        (package-tx-result-fee res) nil
+        (package-tx-result-effective-feerate res) nil
+        (package-tx-result-effective-includes res) nil
+        (package-tx-result-other-wtxid res) nil))
 
 (defun %accept-into-mempool (tx txid fee sigops height now mempool rset replaced)
   "Record the RBF-replaced txs in RSET into the REPLACED hash-set, then run
@@ -1027,7 +1039,8 @@ mempool, exactly as in Core's early return.
                   (setf quit-early t fail-reason (or fail-reason err))
                   (%mark-result-invalid res err))))))))
       ;; 2. Package-feerate evaluation of the deferred txs (CPFP). The package
-      ;;    coin view is only needed here, so build it lazily.
+      ;;    coin view is only needed here, so build it lazily, over the
+      ;;    subpackage alone (Core validation.cpp:1473).
       (setf deferred (nreverse deferred))
       (when (and (not quit-early) deferred)
         ;; Package-sibling coins are unconfirmed, so they carry the
@@ -1035,7 +1048,7 @@ mempool, exactly as in Core's early return.
         ;; MEMPOOL_HEIGHT -> tip+1, validation.cpp:185-192).
         (let ((msg (%accept-package-subset deferred utxo-set mempool chain-state
                                            height
-                                           (%build-package-coins package (1+ height))
+                                           (%build-package-coins deferred (1+ height))
                                            now results replaced
                                            :client-maxfeerate client-maxfeerate)))
           (unless (eq msg :success)

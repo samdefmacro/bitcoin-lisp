@@ -61,8 +61,6 @@
     "bitcoin-lisp.mempool:feefrac-empty-p"
     "bitcoin-lisp.mempool:feefrac-evaluate-fee-down"
     "bitcoin-lisp.mempool:feefrac-evaluate-fee-up"
-    "bitcoin-lisp.mempool:feefrac<"
-    "bitcoin-lisp.mempool:feefrac<="
     "bitcoin-lisp.mempool:feefrac>="
     "bitcoin-lisp.mempool:mempool-ancestor-fee-rate"
     "bitcoin-lisp.mempool:mempool-descendant-fee-rate"
@@ -1722,7 +1720,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 3557
+(defparameter +test-internal-reference-ceiling+ 3546
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1747,7 +1745,12 @@ siblings) replaced the per-file reaches; 4,125 with the never-opened batch; 3,95
 -- the codecs, predicates and parsers they decode one at a time were exported
 where each has its src caller, which gave 26 older reaches one colon, and
 tests/support/crypto.lisp reaches the unratcheted ChaCha20/AEAD primitives
-once each for the 21 references the Core-vector suite made. White-box tests reaching
+once each for the 21 references the Core-vector suite made. 3,546 with the
+fuzz-mempool batch: its thirty-odd mempool-side targets reach four internals
+(the SFL diagram, the tx-request tracker's in-flight count, the mini-miner's
+entry and comparator), and exporting the SFL, orphanage, fee-bucket and
+mempool-accounting entry points its targets drive -- each with its src
+caller -- gave older reaches one colon. White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
 same internal was reached from a copy of the same helper in several files.

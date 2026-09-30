@@ -77,6 +77,21 @@ src/mempool/.")
    #:ancestor-sort-linearization
    #:post-linearize
    #:linearize
+   ;; Spanning-forest linearization (Core SpanningForestState and Linearize,
+   ;; cluster_linearize.h:718-1836): LINEARIZE drives these, and Core's
+   ;; clusterlin_sfl / clusterlin_linearize fuzz targets drive them step by
+   ;; step (tests/fuzz/cluster-linearize.lisp).
+   #:*linearize-rng-seed*
+   #:sfl-linearize
+   #:make-spanning-forest
+   #:sfl-cost
+   #:sfl-load-linearization
+   #:sfl-make-topological
+   #:sfl-start-optimizing
+   #:sfl-optimize-step
+   #:sfl-start-minimizing
+   #:sfl-minimize-step
+   #:sfl-get-linearization
    ;; TxGraph (Core txgraph.{h,cpp})
    #:+max-cluster-size+
    #:txgraph
@@ -208,6 +223,25 @@ src/mempool/.")
    #:orphan-announcements-from-peer
    #:+max-orphanage-latency-score+
    #:+reserved-orphan-weight-per-peer+
+   #:orphan-pool-max-global-latency-score
+   #:orphan-pool-reserved-peer-usage
+   #:orphan-max-peer-latency-score
+   #:orphan-max-global-usage
+   #:orphan-peer-id
+   ;; The pool's own records, which Core's TxOrphanage::SanityCheck and the
+   ;; txorphan fuzz targets read back (tests/fuzz/txorphan.lisp).
+   #:orphan-pool-peer-info
+   #:orphan-pool-by-prev
+   #:orphan-pool-announcement-count
+   #:orphan-pool-unique-usage
+   #:orphan-pool-unique-input-score
+   #:orphan-peer-info-usage
+   #:orphan-peer-info-latency
+   #:orphan-peer-info-count
+   #:orphan-entry-weight
+   #:orphan-entry-latency-score
+   #:orphan-entry-wtxid
+   #:orphan-announcement-sequence
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules
@@ -225,6 +259,15 @@ src/mempool/.")
    #:*mempool-removal-reason*
    #:mempool-count
    #:mempool-total-size
+   ;; The running usage and the spent-outpoint index (Core cachedInnerUsage
+   ;; and mapNextTx), which CTxMemPool::check -- ported for the mempool fuzz
+   ;; targets, tests/fuzz/util-mempool.lisp -- re-derives.
+   #:mempool-total-usage
+   #:mempool-spent-outpoints
+   ;; The rolling minimum's decay clock, which the tx_pool and package_eval
+   ;; targets restart the way Core's MockedTxPool::RollingFeeUpdate does.
+   #:mempool-rolling-min-fee-time
+   #:mempool-block-since-rolling-fee-bump
    #:mempool-dynamic-usage
    #:transaction-dynamic-usage
    #:mempool-min-fee-rate
@@ -254,6 +297,7 @@ src/mempool/.")
    #:fee-estimator-get-history
    ;; Fee stats persistence
    #:save-fee-stats
+   #:flush-fee-estimates-at-shutdown
    #:load-fee-stats
    #:arm-fee-estimate-flush-clock
    #:maybe-flush-fee-estimates
@@ -263,6 +307,11 @@ src/mempool/.")
    #:bpe-note-entry
    #:bpe-note-removal
    #:bpe-note-block
+   #:bpe-flush-unconfirmed
+   ;; The bucket set and its lookup (Core feeStats' bucketMap), which the
+   ;; estimator suite and the policy_estimator fuzz target check buckets by.
+   #:make-fee-buckets
+   #:fee-bucket-index
    #:bpe-smart-fee-sat-per-vb
    #:bpe-estimate-smart-fee
    #:bpe-write-to-stream

@@ -21,7 +21,7 @@ a list of (parent-index . child-index)."
   "SFL-LINEARIZE through one reach: the spanning-forest linearizer under test,
 passing ARGS (:rng-seed, :iterations, ...) and returning its
 (values linearization optimal-p cost) unchanged."
-  (apply #'bl.mp::sfl-linearize depgraph args))
+  (apply #'bl.mp:sfl-linearize depgraph args))
 
 (defun %sf-chunks (g lin)
   (bl.mp:chunk-linearization g lin))
@@ -299,7 +299,7 @@ produce SFL's answer and not the incumbent's."
     (is-true found "no disagreeing cluster found; the comparison below is vacuous")
     (when found
       (destructuring-bind (g seed) found
-        (let* ((bl.mp::*linearize-rng-seed* seed)
+        (let* ((bl.mp:*linearize-rng-seed* seed)
                (via-linearize (%sf-chunks g (bl.mp:linearize g)))
                (incumbent (%sf-chunks g (%sf-incumbent g))))
           (is (eq :greater (bl.mp:compare-chunks via-linearize incumbent))
@@ -312,7 +312,7 @@ either case, guarantees every chunk is connected. Starve SFL of budget so its
 output is not optimal, and require LINEARIZE's chunks to be connected anyway."
   (let ((g (%sf-graph (loop for i below 24 collect (cons (1+ (* 11 (mod i 7))) (1+ (mod i 4))))
                       (loop for i below 23 collect (cons i (1+ i))))))
-    (let ((bl.mp::*linearize-rng-seed* 4))
+    (let ((bl.mp:*linearize-rng-seed* 4))
       (let ((lin (bl.mp:linearize g :max-cost 1)))
         (is (= 24 (length lin)))
         (is-true (bl.mp:linearization-topological-p g lin))

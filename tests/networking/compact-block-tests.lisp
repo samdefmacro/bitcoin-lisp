@@ -171,7 +171,7 @@ connection whose peer promoted us and later demoted us."
                              :short-ids (list short-id1 short-id2)
                              :prefilled-txs '())))
         (multiple-value-bind (block missing partial)
-            (bl.net::reconstruct-compact-block compact-block mempool nil)
+            (%cb-reconstruct compact-block mempool nil)
           (declare (ignore partial))
           (is-true block)
           (is (null missing))
@@ -193,7 +193,7 @@ connection whose peer promoted us and later demoted us."
                          :short-ids (list #x112233445566 #xaabbccddeeff)
                          :prefilled-txs '())))
     (multiple-value-bind (block missing partial)
-        (bl.net::reconstruct-compact-block compact-block mempool nil)
+        (%cb-reconstruct compact-block mempool nil)
       (is (null block))
       (is (equal missing '(0 1)))  ; Both indexes missing
       (is-true partial))))  ; Partial array returned
@@ -225,12 +225,130 @@ connection whose peer promoted us and later demoted us."
                              :short-ids (list short-id1)
                              :prefilled-txs (list prefilled))))
         (multiple-value-bind (block missing partial)
-            (bl.net::reconstruct-compact-block compact-block mempool nil)
+            (%cb-reconstruct compact-block mempool nil)
           (declare (ignore partial))
           (is-true block)
           (is (null missing))
           ;; First tx should be coinbase (prefilled), second should be tx1
           (is (= (length (bl.ser:bitcoin-block-transactions block)) 2)))))))
+
+;;;; InitData's collision rules (Core PartiallyDownloadedBlock::InitData)
+
+(defun %cb-reconstruct (compact-block mempool use-wtxid)
+  "RECONSTRUCT-COMPACT-BLOCK -- Core's InitData -- through one reach."
+  (bl.net::reconstruct-compact-block compact-block mempool use-wtxid))
+
+(defun %cb-init-header ()
+  (bl.ser:make-block-header
+   :version 1
+   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+   :timestamp 0 :bits #x1d00ffff :nonce 0))
+
+(defun %cb-with-colliding-short-ids (ids thunk)
+  "Call THUNK with every id in IDS given the short ID 42, the others their
+real one: two mempool transactions sharing a short ID, which SipHash leaves to
+chance."
+  (let ((real (fdefinition 'bl.crypto:compute-short-txid)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.crypto:compute-short-txid)
+                 (lambda (k0 k1 id)
+                   (if (member id ids :test #'equalp) 42 (funcall real k0 k1 id))))
+           (funcall thunk))
+      (setf (fdefinition 'bl.crypto:compute-short-txid) real))))
+
+(defun %cb-short-id (header nonce id)
+  (multiple-value-bind (k0 k1)
+      (bl.crypto:compute-siphash-key (bl.ser:serialize-block-header header) nonce)
+    (bl.crypto:compute-short-txid k0 k1 id)))
+
+(test a-short-id-collision-the-block-does-not-name-costs-nothing
+  "Core's InitData only asks which mempool transactions match the block's OWN
+short IDs (blockencodings.cpp:120-146); two mempool transactions sharing a
+short ID the block does not carry change nothing. The reconstruction gave up
+on the whole compact block -- a full-block download -- whenever ANY two
+mempool transactions collided."
+  (let* ((tx1 (make-simple-tx #x61)) (tx2 (make-simple-tx #x62)) (tx3 (make-simple-tx #x63))
+         (txid1 (bl.ser:transaction-hash tx1))
+         (mempool (make-mock-mempool-with-txs
+                   (mapcar (lambda (tx) (cons (bl.ser:transaction-hash tx) tx)) (list tx1 tx2 tx3))))
+         (header (%cb-init-header))
+         (nonce 99)
+         (cb (bl.ser:make-compact-block :header header :nonce nonce
+                                        :short-ids (list (%cb-short-id header nonce txid1))
+                                        :prefilled-txs '())))
+    (%cb-with-colliding-short-ids
+     (list (bl.ser:transaction-hash tx2) (bl.ser:transaction-hash tx3))
+     (lambda ()
+       (multiple-value-bind (block missing)
+           (%cb-reconstruct cb mempool nil)
+         (is (null missing) "reconstruction answered ~S" missing)
+         (is-true block))))))
+
+(test two-mempool-matches-for-one-short-id-leave-that-slot-to-be-requested
+  "When two mempool transactions match one of the block's short IDs, Core
+empties that slot and requests it (\"If we find two mempool txn that match the
+short id, just request it\", blockencodings.cpp:131-138) -- the rest of the
+reconstruction stands; READ_STATUS_FAILED is only for a block whose own short
+IDs repeat."
+  (let* ((tx1 (make-simple-tx #x64)) (tx2 (make-simple-tx #x65)) (tx3 (make-simple-tx #x66))
+         (txid3 (bl.ser:transaction-hash tx3))
+         (mempool (make-mock-mempool-with-txs
+                   (mapcar (lambda (tx) (cons (bl.ser:transaction-hash tx) tx)) (list tx1 tx2 tx3))))
+         (header (%cb-init-header))
+         (nonce 98)
+         (cb (bl.ser:make-compact-block :header header :nonce nonce
+                                        :short-ids (list 42 (%cb-short-id header nonce txid3))
+                                        :prefilled-txs '())))
+    (%cb-with-colliding-short-ids
+     (list (bl.ser:transaction-hash tx1) (bl.ser:transaction-hash tx2))
+     (lambda ()
+       (multiple-value-bind (block missing partial)
+           (%cb-reconstruct cb mempool nil)
+         (is (null block))
+         (is (equal '(0) missing) "the doubly-matched slot is requested; got ~S" missing)
+         (is (eq tx3 (and (vectorp partial) (aref partial 1)))))))))
+
+(test a-compact-block-naming-one-short-id-twice-is-read-status-failed
+  "Core's InitData maps the block's short IDs to slots and answers
+READ_STATUS_FAILED -- a full-block request -- when two slots carry the same
+one (`Short ID collision', blockencodings.cpp:114-117). The reconstruction put
+the same mempool transaction in both slots."
+  (let* ((tx1 (make-simple-tx #x67))
+         (txid1 (bl.ser:transaction-hash tx1))
+         (mempool (make-mock-mempool-with-txs (list (cons txid1 tx1))))
+         (header (%cb-init-header))
+         (nonce 97)
+         (sid (%cb-short-id header nonce txid1))
+         (cb (bl.ser:make-compact-block :header header :nonce nonce
+                                        :short-ids (list sid sid) :prefilled-txs '())))
+    (multiple-value-bind (block missing)
+        (%cb-reconstruct cb mempool nil)
+      (is (null block))
+      (is (eq :collision missing) "got ~S" missing))))
+
+(test a-null-prefilled-transaction-or-header-is-read-status-invalid
+  "InitData refuses a null header (nBits 0) and a prefilled transaction with
+neither inputs nor outputs (CTransaction::IsNull) as READ_STATUS_INVALID
+(blockencodings.cpp:60-61, :72-73), which Core punishes. Both were accepted."
+  (let* ((mempool (bl.mp:make-mempool))
+         (null-tx (bl.ser:make-transaction :version 2 :inputs #() :outputs #() :lock-time 0))
+         (header (%cb-init-header))
+         (null-header (%cb-init-header)))
+    (setf (bl.ser:block-header-bits null-header) 0)
+    (is (eq :malformed
+            (nth-value 1 (%cb-reconstruct
+                          (bl.ser:make-compact-block
+                           :header header :nonce 1 :short-ids '()
+                           :prefilled-txs (list (bl.ser:make-prefilled-tx :index 0 :transaction null-tx)))
+                          mempool nil))))
+    (is (eq :malformed
+            (nth-value 1 (%cb-reconstruct
+                          (bl.ser:make-compact-block
+                           :header null-header :nonce 1 :short-ids '(5)
+                           :prefilled-txs '())
+                          mempool nil))))))
 
 ;;;; Timeout Handling Tests
 

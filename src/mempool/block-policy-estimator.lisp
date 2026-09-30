@@ -421,6 +421,23 @@ at its feerate. Returns T if the transaction was tracked."
       (remhash txid tracked)
       t)))
 
+(defun bpe-flush-unconfirmed (est)
+  "Remove every transaction EST still tracks as NOT confirmed (Core
+FlushUnconfirmed, block_policy_estimator.cpp:1064-1077): each one that has
+waited a full period is recorded as a failure at its feerate, as an eviction
+would be. Core runs it at shutdown, before the file is written (Flush,
+:957-960), so the estimates saved reflect the transactions the node watched
+wait and never saw confirm. Returns the number removed."
+  (let ((txids (loop for txid being the hash-keys of (block-policy-estimator-tracked est)
+                     collect txid))
+        (start (get-internal-real-time)))
+    (dolist (txid txids)
+      (bpe-remove-tx est txid nil))
+    (bl:log-cat "estimatefee" "Recorded ~D unconfirmed txs from mempool in ~,3Fs"
+                (length txids)
+                (/ (- (get-internal-real-time) start) internal-time-units-per-second))
+    (length txids)))
+
 (defun bpe-process-block (est height confirmed)
   "A block at HEIGHT confirmed the transactions named by CONFIRMED, a list of
 txids (Core processBlock). Untracked txids are ignored, so the caller can pass
@@ -617,7 +634,12 @@ collection entirely.")
                             (chainstate-current t)
                             (has-no-mempool-parents t))
   "A transaction entered the mempool. FEE in satoshis, VSIZE in vbytes -- the
-same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB.
+same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB the
+way Core converts it: GetFeePerK(), the fee per 1000 vbytes rounded DOWN to a
+whole satoshi (EvaluateFeeDown(1000), policy/feerate.h:62), is what
+processTransaction buckets and processBlockTx records
+(block_policy_estimator.cpp:630-636, :660-665). The exact quotient can land
+one bucket higher -- 110.3 sat/kvB is above the 110.25 boundary, 110 below it.
 
 The four keywords are Core's NewMempoolTransactionInfo flags, carried here
 rather than decided at the call site so a future acceptance path cannot opt
@@ -626,7 +648,7 @@ they are read."
   (let ((est *block-policy-estimator*))
     (when (and est (plusp vsize))
       (bpe-process-transaction est txid height
-                               (/ (* (float fee 1d0) 1000d0) (float vsize 1d0))
+                               (float (floor (* fee 1000) vsize) 1d0)
                                :bypass-limits bypass-limits
                                :package-submission package-submission
                                :chainstate-current chainstate-current

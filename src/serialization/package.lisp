@@ -148,6 +148,7 @@ src/serialization/.")
    #:block-header-nonce
    #:block-header-cached-hash
    #:block-header-hash
+   #:build-compact-block
    #:serialize-block-header
    #:bitcoin-block
    #:make-bitcoin-block

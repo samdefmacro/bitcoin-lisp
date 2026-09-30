@@ -2080,6 +2080,74 @@ wtxid hash got notfound and failover never worked for segwit txs."
              txid nil (%make-peer-with-state :ready)))))
     (bl.net:reset-tx-requests)))
 
+(test tx-request-failover-goes-out-as-the-granted-announcements-id-type
+  "A request goes out under the id type of the announcement it is GRANTED to,
+not of whichever announcement of the hash came last: Core's tracker keeps a
+GenTxid per announcement (txrequest.cpp Announcement::m_gtxid), GetRequestable
+returns the selected one's (:595-624), and SendMessages builds the getdata
+from it (net_processing.cpp:6207). Peer 1 announces H by txid and is asked at
+once; peer 2 announces it by wtxid; peer 3, inbound and so not yet ready,
+announces it by txid last. Peer 1's request expires and fails over to peer 2,
+whose getdata must be MSG_WTX -- a MSG_WITNESS_TX for a wtxid is a txid lookup
+to a Core peer, answered notfound. The tracker kept one id type per HASH, the
+last announcer's, and asked peer 2 by txid (Core fuzz txrequest)."
+  (bl.net:reset-tx-requests)
+  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 43))
+        (p1 (%wave8-witness-peer))
+        (p2 (%wave8-witness-peer))
+        (p3 (bl.net:make-peer :address "test" :state :ready :inbound t
+                              :services bl.ser:+node-witness+)))
+    (is-true (bl.net:tx-request-wanted-p h p1 nil))
+    (is-false (bl.net:tx-request-wanted-p h p2 t))
+    (is-false (bl.net:tx-request-wanted-p h p3 nil))
+    (is (eq p1 (expire-tx-request h)))
+    (let ((sent (captured-sends (lambda () (bl.net:retry-timed-out-tx-requests)))))
+      (is (eq p2 (tx-request-in-flight-peer h)))
+      (is (= 1 (length sent)))
+      (let ((bytes (first sent)))
+        (is (string= "getdata" (message-command bytes)))
+        (is (= bl.ser:+inv-type-wtx+
+               (logior (aref bytes 25) (ash (aref bytes 26) 8)
+                       (ash (aref bytes 27) 16) (ash (aref bytes 28) 24)))
+            "the failover getdata to the wtxid announcer is not MSG_WTX")))
+    (bl.net:reset-tx-requests)))
+
+(test tx-request-a-new-announcer-is-asked-at-once-only-when-it-is-the-best-candidate
+  "An announcement is requested at once only when it is the candidate Core's
+GetRequestable would grant: nothing in flight AND no ready candidate of
+higher priority (txrequest.cpp:595-624; ReceivedInv itself never requests,
+the SendMessages that follows asks GetRequestable, net_processing.cpp:6162).
+Peer 1 is asked for H; peer BEST announces it too; peer 1 answers notfound, so
+BEST is a ready candidate nobody has asked yet; then peer LATE, of lower
+priority, announces. LATE must wait -- the next scheduler pass grants H to
+BEST. The tracker asked whoever announced into an empty slot, which puts the
+choice in the hands of the peer that times its announcement, the bias the
+salted priority exists to remove (Core fuzz txrequest)."
+  (bl.net:reset-tx-requests)
+  (with-tx-request-salt (#x1111 #x2222)
+    (let* ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 44))
+           (p1 (%wave8-witness-peer))
+           (pa (%wave8-witness-peer))
+           (pb (%wave8-witness-peer)))
+      (flet ((priority (peer)
+               (bl.crypto:siphash-2-4
+                #x1111 #x2222
+                (concatenate '(vector (unsigned-byte 8)) h
+                             (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                               (dotimes (k 8 v)
+                                 (setf (aref v k) (ldb (byte 8 (* 8 k)) (bl.net:peer-id peer)))))))))
+        (multiple-value-bind (best late)
+            (if (> (priority pa) (priority pb)) (values pa pb) (values pb pa))
+          (is-true (bl.net:tx-request-wanted-p h p1 t))
+          (is-false (bl.net:tx-request-wanted-p h best t))
+          (bl.net:tx-request-received-response p1 h)
+          (is (null (tx-request-in-flight-peer h)))
+          (is-false (bl.net:tx-request-wanted-p h late t)
+                    "the lower-priority newcomer was asked ahead of a ready better candidate")
+          (bl.net:process-tx-requests)
+          (is (eq best (tx-request-in-flight-peer h)))))))
+  (bl.net:reset-tx-requests))
+
 (test orphan-parent-getdata-carries-witness-flag
   "Missing parents of an orphan are requested by TXID with the witness flag
 (MSG_TX|MSG_WITNESS_FLAG) for witness-capable peers, never bare MSG_TX
