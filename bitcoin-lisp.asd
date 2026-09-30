@@ -570,6 +570,9 @@ bitcoin-cli (node-main)."
                              (:file "crypto/muhash-tests")
                              ;; MuSig2 (BIP327) vectors and nonce lifetime
                              (:file "crypto/musig-tests")
+                             ;; the loaded libsecp256k1: modules, start-up
+                             ;; line, MuSig2 refused without the module
+                             (:file "crypto/secp256k1-library-tests")
                              ;; coinstatsindex tests
                              (:file "storage/reindex-tests")
                              (:file "storage/coinstatsindex-tests")

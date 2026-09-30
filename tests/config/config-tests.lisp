@@ -1556,6 +1556,25 @@ comparison at mempool construction."
                                           nil nil nil nil nil nil))
           "-maxmempool=~D bytes must be accepted" bytes))))
 
+(test negative-maxmempool-answers-the-one-cluster-sentence
+  "Core reads -maxmempool with GetIntArg and multiplies it out
+(mempool_args.cpp:49-54) without a sign check of its own; a negative size
+reaches Flatten, which answers `-maxmempool must be at least %d MB'
+(txmempool.cpp:169-172). Ours refused -maxmempool=-1 while applying the option,
+as `Invalid value for -maxmempool=-1'. Control: -maxmempool=300 applies and
+start-up accepts it."
+  (let ((bl.mp:*cluster-size-limit* 101000)
+        (bl.mp:*max-mempool-bytes* bl.mp:*max-mempool-bytes*))
+    (apply-config-globals '(("maxmempool" . "300")))
+    (is (= (* 300 1000 1000) bl.mp:*max-mempool-bytes*) "control: applied")
+    (is (null (%init-parameters-refusal :regtest nil nil nil nil nil nil nil
+                                        nil nil nil nil nil nil))
+        "control: accepted")
+    (is (equal "-maxmempool must be at least 5 MB"
+               (or (%config-refusal (apply-config-globals '(("maxmempool" . "-1"))))
+                   (%init-parameters-refusal :regtest nil nil nil nil nil nil nil
+                                             nil nil nil nil nil nil))))))
+
 (defun %vbparams-init (network specs)
   "The message %INIT-PARAMETERS refuses -vbparams=SPECS with on NETWORK, or
 NIL when it accepts them. The override is cleared afterwards either way."

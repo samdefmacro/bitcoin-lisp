@@ -393,9 +393,16 @@ must be read as bytes (:var-bytes), not as a string."
 (declaim (inline octets-hash))
 (defun octets-hash (key)
   "The first eight bytes of KEY as a little-endian integer (fewer when KEY is
-shorter), with the four bytes after a 32-byte hash mixed in when present --
-an outpoint key is txid||index, and the outputs of one transaction must not
-share a bucket. Keys are hash outputs, so the leading bytes are uniform."
+shorter), with the four bytes after a 32-byte hash XORed into its LOW bits when
+present -- an outpoint key is txid||index (BL.SER:OUTPOINT-KEY), and the
+outputs of one transaction must not share a bucket. Keys are hash outputs, so
+the leading bytes are uniform.
+
+The low bits, because SBCL takes a bucket from a hash's low bits: the index
+was mixed in at bit 24, and all 1,000 outputs of one transaction still landed
+in one bucket of a 2,048-bucket table. Core's outpoint maps are keyed by
+SaltedOutpointHasher (util/hasher.h), which also salts; these tables are not
+salted; the coins cache's are (src/storage/utxo.lisp)."
   (declare (type (simple-array (unsigned-byte 8) (*)) key)
            (optimize (speed 3) (safety 1)))
   (let ((h 0) (n (length key)))
@@ -403,9 +410,8 @@ share a bucket. Keys are hash outputs, so the leading bytes are uniform."
     (loop for i of-type fixnum below (min 8 n)
           do (setf h (logior h (ash (aref key i) (* 8 i)))))
     (when (>= n 36)
-      (setf h (logxor h (ash (logior (aref key 32) (ash (aref key 33) 8)
-                                     (ash (aref key 34) 16) (ash (aref key 35) 24))
-                             24))))
+      (setf h (logxor h (logior (aref key 32) (ash (aref key 33) 8)
+                                (ash (aref key 34) 16) (ash (aref key 35) 24)))))
     (logand h most-positive-fixnum)))
 
 #+sbcl (sb-ext:define-hash-table-test octets= octets-hash)

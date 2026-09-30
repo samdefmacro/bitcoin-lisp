@@ -130,24 +130,32 @@ into a utxo-key struct."
        (= (uk-d x) (uk-d y))))
 
 (declaim (inline utxo-key-hash))
-(defun utxo-key-hash (k)
-  "Custom :hash-function. The first 8 bytes of the txid are SHA256 output
-and already uniformly random — return them as a fixnum-masked uint64.
-Same pattern as the previous byte-vector-keyed table; this just reads
-the pre-extracted slot."
-  (declare (type utxo-key k) (optimize (speed 3) (safety 0)))
-  (logand (uk-a k) most-positive-fixnum))
+(defun utxo-key-hash (k k0 k1)
+  "The hash of utxo-key K under the salt (K0, K1): Core's SaltedOutpointHasher
+(util/hasher.h), the SipHash-2-4 of the txid with the output index mixed in
+(BL.CRYPTO:SIPHASH-UINT256-EXTRA), cut to a fixnum.
 
-#+sbcl (sb-ext:define-hash-table-test utxo-key= utxo-key-hash)
+It read the txid's first eight bytes and nothing else: every output of one
+transaction had the same hash, and SBCL picks a bucket from a hash's low bits,
+so a 1,000-output transaction was one 1,000-entry bucket chain (1,000,000 coins
+as 1,000 x 1,000 took 3.3 s to add, as 1,000,000 x 1 0.13 s; now 0.2 s either
+way, the SipHash about 25 ns of it). Unsalted, the buckets were also computable
+offline, which is why Core salts it."
+  (declare (type utxo-key k) (type (unsigned-byte 64) k0 k1)
+           (optimize (speed 3) (safety 0)))
+  (logand (bl.crypto:siphash-uint256-extra k0 k1 (uk-a k) (uk-b k) (uk-c k) (uk-d k)
+                                           (uk-vout k))
+          most-positive-fixnum))
 
-(declaim (inline make-utxo-key-hash-table))
 (defun make-utxo-key-hash-table (&optional (size 16))
-  "Allocate a hash-table keyed by utxo-key. Under SBCL this uses the
-custom utxo-key= test (inlined fixnum compares); falls back to equalp
-on other implementations. Shared by utxo-set and coins-view-cache."
-  (make-hash-table #+sbcl :test #+sbcl 'utxo-key=
-                   #-sbcl :test #-sbcl 'equalp
-                   :size size))
+  "A hash table keyed by utxo-key, shared by utxo-set and coins-view-cache:
+the UTXO-KEY= test (inlined word compares) under UTXO-KEY-HASH with a salt of
+its own, drawn for this table as Core draws one for each SaltedOutpointHasher
+(util/hasher.cpp:25-28)."
+  (let ((k0 (bl.crypto:rand-u64)) (k1 (bl.crypto:rand-u64)))
+    (declare (type (unsigned-byte 64) k0 k1))
+    (make-hash-table :test 'utxo-key= :size size
+                     :hash-function (lambda (k) (utxo-key-hash k k0 k1)))))
 
 (defstruct utxo-set
   "In-memory UTXO set.

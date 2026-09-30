@@ -58,6 +58,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:clear-undo-cache
    #:txindex-resume-height
    #:coins-cache-entries
+   #:hash-table-occupied-buckets
    #:coins-cache-fresh-count
    #:coins-cache-dirty-count
    #:coins-cache-entry-fresh-p

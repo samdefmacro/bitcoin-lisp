@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Gate a build transcript on SBCL's unused-variable and IGNORE-declaration
-# style warnings, and on a LEXICAL binding of an earmuffed name.
+# style warnings, on a LEXICAL binding of an earmuffed name, and on a lambda
+# list with both &OPTIONAL and &KEY.
 #
 # Each of these is a STYLE-WARNING, so COMPILE-FILE's failure-p stays NIL and
 # the cold lane passes with it buried in the transcript -- the same blind
@@ -13,6 +14,12 @@
 # binding, IGNORE a parameter a protocol fixes (a hook's lambda list), use
 # IGNORABLE where a macro reads the variable (DOTIMES, WITH-OPEN-FILE), and
 # move a DEFVAR ahead of its first binding.
+#
+# "&OPTIONAL and &KEY found in the same lambda list" is a call-site trap: a
+# caller that omits the optional and passes a keyword has the keyword bound
+# to the optional and its value read as a keyword (or an odd-length error).
+# Five src/ definitions carried it until 2026-09-30; make the optional a
+# required argument or a keyword.
 #
 # Warnings raised while compiling the project's src/ AND tests/ count;
 # refs/coalton is not ours. tests/ was outside the gate until 2026-09-30 and
@@ -43,6 +50,8 @@ if [ "${1:-}" = "--self-test" ]; then
   "$0" "$tmp" "$root" >/dev/null 2>&1 && fail "an unused variable under tests/ passed"
   printf '; compiling file "%s/tests/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   IGNORE declaration for a variable from outer scope: DIR\n' "$root" > "$tmp"
   "$0" "$tmp" "$root" >/dev/null 2>&1 && fail "an outer-scope IGNORE under tests/ passed"
+  printf '; compiling file "%s/src/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   &OPTIONAL and &KEY found in the same lambda list: (TX &OPTIONAL NETWORK &KEY\n;                                                      SPENT-COINS)\n' "$root" > "$tmp"
+  "$0" "$tmp" "$root" >/dev/null 2>&1 && fail "an &OPTIONAL-and-&KEY lambda list under src/ passed"
   printf '; compiling file "%s/refs/coalton/src/probe.lisp" (written today):\n; caught STYLE-WARNING:\n;   The variable ENV is defined but never used.\n' "$root" > "$tmp"
   "$0" "$tmp" "$root" >/dev/null 2>&1 || fail "a dependency's own warning was reported"
   rm -f "$tmp"; echo "check-unused-variables: self-test ok"; exit 0
@@ -57,11 +66,12 @@ findings=$(awk -f "$(dirname "$0")/transcript-messages.awk" "$transcript" |
                  $2 ~ /is being set even though it was declared to be ignored/ ||
                  $2 ~ /IGNORE declaration for an unknown variable/ ||
                  $2 ~ /IGNORE declaration for a variable from outer scope/ ||
-                 $2 ~ /IGNORABLE declaration for a variable from outer scope/) { print $1 ": " $2 }')
+                 $2 ~ /IGNORABLE declaration for a variable from outer scope/ ||
+                 $2 ~ /&OPTIONAL and &KEY found in the same lambda list/) { print $1 ": " $2 }')
 
 if [ -n "$findings" ]; then
   printf '%s\n' "$findings"
-  echo "check-unused-variables: $(printf '%s\n' "$findings" | wc -l | tr -d ' ') unused-variable / ignore-declaration warning(s) -- SBCL reports these as style warnings only"
+  echo "check-unused-variables: $(printf '%s\n' "$findings" | wc -l | tr -d ' ') unused-variable / ignore-declaration / &optional-and-&key warning(s) -- SBCL reports these as style warnings only"
   exit 1
 fi
 exit 0

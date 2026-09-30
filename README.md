@@ -178,7 +178,13 @@ scripts/run-node.sh testnet4      # or: mainnet | regtest
 ```
 
 Toolchain paths, heap sizes, and per-network start options are overridable via
-environment variables documented at the top of that script.
+environment variables documented at the top of that script. The node loads
+libsecp256k1 from `BL_SECP_LIB` (default: a private v0.7.1 prefix with the
+musig module, which `scripts/server-secp-upgrade.sh` builds on the server; see
+BUILD.md). Its start-up log line names the library it actually loaded:
+`Using libsecp256k1 0.7.1 (<file>) with modules ...`. On a library without the
+musig module the line says MuSig2 is not available, and MuSig2 signing and
+musig() descriptors answer RPC error -1 instead of crashing.
 
 > **Mainnet caveat.** Mainnet requires the custom **SBCL 2.6.5** build and a
 > large `--dynamic-space-size` — the distro SBCL 2.1.11 corrupts the heap at
