@@ -2535,18 +2535,23 @@ we log the failure and signal this."))
 ORDERED): the pool's feerate diagram (Core GetFeerateDiagram), the
 cumulative fee/size after each chunk starting at zero, and its transactions
 as (txid . entry) in that order (Core GetSortedScoreWithTopology), each
-chunk's in topological order."
+chunk's in topological order. Each handle's entry comes from one EQ table
+built by walking the pool, not a txid lookup per transaction."
   (let ((diagram (list (make-feefrac)))
         (ordered '())
+        (by-handle (make-hash-table :test 'eq :size (max 16 (mempool-count mempool))))
         (builder (make-block-builder (mempool-graph mempool))))
+    (maphash (lambda (txid e)
+               (let ((h (mempool-entry-graph-handle e)))
+                 (when h (setf (gethash h by-handle) (cons txid e)))))
+             (mempool-entries mempool))
     (unwind-protect
          (loop
            (multiple-value-bind (handles rate) (block-builder-current-chunk builder)
              (unless handles (return))
              (push (feefrac+ (first diagram) rate) diagram)
              (dolist (h handles)
-               (let ((txid (tx-handle-data h)))
-                 (push (cons txid (mempool-get mempool txid)) ordered)))
+               (push (or (gethash h by-handle) (cons (tx-handle-data h) nil)) ordered))
              (block-builder-include builder)))
       (block-builder-finish builder))
     (values (nreverse diagram) (nreverse ordered))))
@@ -2557,35 +2562,44 @@ chunk's in topological order."
 BL.SER:OUTPOINT), as Core's mempoolDuplicate view has it -- present, not
 already spent in this walk, and mature if a confirmed coinbase output
 (CheckTxInputs at SPEND-HEIGHT) -- and the in-pool parent entry, if any, as a
-second value. WALKED maps each entry already checked (EQ) to a bit per output,
-set once spent; SPENT-CONFIRMED holds the chain coins spent so far."
+second value. WALKED maps each entry already checked (EQ) to (BITS .
+SPENDERS): a bit per output, set once spent, and the spender the
+spent-outpoint index named for each output when the entry was checked (the
+spender check of a pool input reads it there rather than hashing the
+outpoint again). SPENT-CONFIRMED holds the chain coins spent so far.
+Returns as a third value whether the spent-outpoint index names TXID as this
+coin's spender."
   (let* ((ptxid (bl.ser:outpoint-hash prevout))
          (parent (mempool-get mempool ptxid)))
     (flet ((fail (control)
              (%mempool-check-fail control (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))
       (if parent
           (let ((outputs (bl.ser:transaction-outputs (mempool-entry-transaction parent)))
-                (bits (gethash parent walked)))
+                (record (gethash parent walked)))
             (unless (< index (length outputs))
               (fail "~A names an output its in-pool parent lacks"))
             ;; Walked in mining order, a parent's coins exist before its
             ;; child reads them (txmempool.cpp:500).
-            (unless bits (fail "~A spends a coin that does not exist"))
-            (when (= 1 (sbit bits index))
-              (fail "~A spends a coin an earlier pool transaction spent"))
-            (setf (sbit bits index) 1)
-            (values (bl.ser:tx-out-value (aref outputs index)) parent))
+            (unless record (fail "~A spends a coin that does not exist"))
+            (let ((bits (car record)))
+              (when (= 1 (sbit bits index))
+                (fail "~A spends a coin an earlier pool transaction spent"))
+              (setf (sbit bits index) 1))
+            (values (bl.ser:tx-out-value (aref outputs index)) parent
+                    (equalp (svref (cdr record) index) txid)))
           (let ((key (make-outpoint-key ptxid index)))
             (when (gethash key spent-confirmed)
               (fail "~A spends a coin an earlier pool transaction spent"))
             (setf (gethash key spent-confirmed) t)
-            (when coins
-              (let ((coin (bl.store:get-utxo coins ptxid index)))
-                (unless coin (fail "~A spends a coin that does not exist"))
-                (when (and coinbase-maturity (bl.store:utxo-entry-coinbase coin)
-                           (< (- spend-height (bl.store:utxo-entry-height coin)) coinbase-maturity))
-                  (fail "~A spends an immature coinbase output"))
-                (values (bl.store:utxo-entry-value coin) nil))))))))
+            (let ((spender-ok (equalp (gethash key (mempool-spent-outpoints mempool)) txid)))
+              (if coins
+                  (let ((coin (bl.store:get-utxo coins ptxid index)))
+                    (unless coin (fail "~A spends a coin that does not exist"))
+                    (when (and coinbase-maturity (bl.store:utxo-entry-coinbase coin)
+                               (< (- spend-height (bl.store:utxo-entry-height coin)) coinbase-maturity))
+                      (fail "~A spends an immature coinbase output"))
+                    (values (bl.store:utxo-entry-value coin) nil spender-ok))
+                  (values nil nil spender-ok))))))))
 
 (defun %mempool-check-links (mempool txid entry parents-check)
   "Core's stored-links half of the per-entry check: the stored parents are
@@ -2594,23 +2608,30 @@ spender of one of this transaction's outputs in the spent-outpoint index --
 Core walks mapNextTx from COutPoint(hash, 0) over the entries of this txid
 (txmempool.cpp:522-527); ours asks the index for each output. A spender of an
 output this transaction does not have is caught by that spender's own input
-check. One lookup per output, not a walk of the index: the check runs after
-every transaction on regtest."
+check. Returns the spender found for each output (a simple-vector), which the
+walk keeps for the children's own spender checks. The stored sets are
+compared by walking them against the short lists the check built, not by
+hashing every txid again."
   (flet ((same-set-p (stored check)
            (and (= (hash-table-count stored) (length check))
-                (every (lambda (x) (gethash x stored)) check))))
+                (loop for k being the hash-keys of stored
+                      always (member k check :test #'equalp)))))
     (unless (same-set-p (mempool-entry-parents entry) parents-check)
       (%mempool-check-fail "~A's stored parents differ from its inputs' in-pool parents"
                            (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
-    (let ((children-check '())
-          (spent (mempool-spent-outpoints mempool)))
-      (dotimes (n (length (bl.ser:transaction-outputs (mempool-entry-transaction entry))))
+    (let* ((n-outputs (length (bl.ser:transaction-outputs (mempool-entry-transaction entry))))
+           (spenders (make-array n-outputs :initial-element nil))
+           (children-check '())
+           (spent (mempool-spent-outpoints mempool)))
+      (dotimes (n n-outputs)
         (let ((spender (gethash (make-outpoint-key txid n) spent)))
           (when spender
+            (setf (svref spenders n) spender)
             (pushnew spender children-check :test #'equalp))))
       (unless (same-set-p (mempool-entry-children entry) children-check)
         (%mempool-check-fail "~A's stored children differ from the spent-outpoint index"
-                             (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))))
+                             (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
+      spenders)))
 
 (defun mempool-check-now (mempool coins spend-height &key coinbase-maturity)
   "Core CTxMemPool::check's body (txmempool.cpp:439-553), unconditionally.
@@ -2667,21 +2688,22 @@ failure logs and signals MEMPOOL-CHECK-FAILED."
             (pop diagram))
           (let ((tx (mempool-entry-transaction e))
                 (parents-check '())
+                (spenders nil)
                 (in-value 0))
             (loop for in across (bl.ser:transaction-inputs tx)
                   do (let* ((op (bl.ser:tx-in-previous-output in))
                             (n (bl.ser:outpoint-index op)))
                        (incf total-inputs)
-                       (multiple-value-bind (value parent)
+                       (multiple-value-bind (value parent spender-ok)
                            (%mempool-check-coin mempool coins walked spent-confirmed txid op n
                                                 spend-height coinbase-maturity)
                          (when value (incf in-value value))
                          (when parent
-                           (pushnew (bl.ser:outpoint-hash op) parents-check :test #'equalp)))
-                       (unless (equalp (mempool-spending-tx mempool (bl.ser:outpoint-hash op) n) txid)
-                         (%mempool-check-fail "the spent-outpoint index does not name ~A as the spender"
-                                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))))
-            (%mempool-check-links mempool txid e parents-check)
+                           (pushnew (bl.ser:outpoint-hash op) parents-check :test #'equalp))
+                         (unless spender-ok
+                           (%mempool-check-fail "the spent-outpoint index does not name ~A as the spender"
+                                                (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))))
+            (setf spenders (%mempool-check-links mempool txid e parents-check))
             (when coins
               (let ((out-value (loop for o across (bl.ser:transaction-outputs tx)
                                      sum (bl.ser:tx-out-value o))))
@@ -2690,7 +2712,9 @@ failure logs and signals MEMPOOL-CHECK-FAILED."
                                        (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
                                        (mempool-entry-fee e) (- in-value out-value)))))
             (setf (gethash e walked)
-                  (make-array (length (bl.ser:transaction-outputs tx)) :element-type 'bit :initial-element 0))
+                  (cons (make-array (length (bl.ser:transaction-outputs tx)) :element-type 'bit
+                                                                             :initial-element 0)
+                        spenders))
             (incf total-size (mempool-entry-vsize e))
             (incf total-usage (mempool-entry-usage e))
             (incf total-modified (mempool-entry-modified-fee e))
