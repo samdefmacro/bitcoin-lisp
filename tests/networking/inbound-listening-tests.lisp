@@ -526,17 +526,23 @@ the mock clock past -peertimeout=3 and gives the close ONE second, and in a
 parallel sweep ours logged the verdict 0.7 s after the bump -- from the sync
 thread's tick, while the handshake's own thread sat in its read.
 
-A silent client dials the listener; the clock is frozen at the connect time,
-then bumped four seconds. No sync thread runs here, so only the handshake's
-own thread can close the socket. TIMING-SENSITIVE with a wide margin on
-purpose: the two answers are ~0.05 s (the verdict is asked between the
-handshake's waits) and 15 s (the handshake thread's own read cap).
-
-Control: with the clock still at the connect time, half a second of real
-time closes nothing."
+A silent client dials the listener with the clock frozen at the connect time.
+No sync thread runs, so only the handshake's own thread asks the verdict, and
+CHECK-PEER-HEALTH -- what it asks between its waits -- is wrapped to record
+every answer. What is asserted is the ORDER of events, not their timing: on the
+frozen clock the thread asks and hears :OK while the socket stays open (the
+control); after the bump past -peertimeout, the first :DISCONNECT is the LAST
+question it asks, and by the time the peer reads :DISCONNECTED its socket is
+closed. A thread that went on reading after the verdict -- the close left to
+a later pass, or to the read's own 15 s cap -- would ask again, every 50 ms.
+The only wall-clock bounds left are hang guards; this used to give the close
+one second of real time and flaked twice under a loaded daemon."
   (let ((srv (bl.net:open-listener "127.0.0.1" 0))
         (saved-mock bl.ser:*mock-time*)
         (saved-timeout bl:*handshake-timeout-seconds*)
+        (saved-health (fdefinition 'bl.net:check-peer-health))
+        (answers '())
+        (answers-lock (bt:make-lock "handshake-verdict-answers"))
         (t0 1780000000))
     (is-true srv)
     (when srv
@@ -544,35 +550,62 @@ time closes nothing."
             (port (usocket:get-local-port srv))
             (client nil)
             (listener nil))
-        (setf (bl:node-running node) t
-              ;; Global, not bound: the handshake runs on its own thread.
-              bl.ser:*mock-time* t0
-              bl:*handshake-timeout-seconds* 3)
-        (unwind-protect
-             (progn
-               (setf listener
-                     (bt:make-thread
-                      (lambda () (ignore-errors (bl:run-inbound-listener node :socket srv)))
-                      :name "test-inbound-listener"))
-               (sleep 0.3)
-               (setf client (usocket:socket-connect "127.0.0.1" port
-                                                    :element-type '(unsigned-byte 8)))
-               (is-false (%eof-within-p client 0.5)
-                         "control: inside -peertimeout on the frozen clock the peer stays")
-               (setf bl.ser:*mock-time* (+ t0 4))
-               (is-true (%eof-within-p client 1)
-                        "the mock-clock bump past -peertimeout closes the socket within a second")
-               (let ((peer (first (bl:node-pending-inbound-peers node))))
-                 (is (eq :disconnected (and peer (bl.net:peer-state peer)))
-                     "and the peer is gone, not waiting for a later pass")))
-          (setf (bl:node-running node) nil
-                bl.ser:*mock-time* saved-mock
-                bl:*handshake-timeout-seconds* saved-timeout)
-          (when client (ignore-errors (usocket:socket-close client)))
-          (when listener (ignore-errors (bt:join-thread listener)))
-          (dolist (p (bl:node-pending-inbound-peers node))
-            (ignore-errors (bl.net:disconnect-peer p)))
-          (bl.net:close-listener srv))))))
+        (labels ((answers () (bt:with-lock-held (answers-lock) (copy-list answers)))
+                 (within (seconds predicate)
+                   ;; A hang guard, not a measurement: true as soon as PREDICATE is.
+                   (loop with deadline = (+ (get-internal-real-time)
+                                            (* seconds internal-time-units-per-second))
+                         when (funcall predicate) return t
+                         when (> (get-internal-real-time) deadline) return nil
+                         do (sleep 0.01)))
+                 (peer () (first (bl:node-pending-inbound-peers node))))
+          (setf (bl:node-running node) t
+                ;; Global, not bound: the handshake runs on its own thread.
+                bl.ser:*mock-time* t0
+                bl:*handshake-timeout-seconds* 3
+                (fdefinition 'bl.net:check-peer-health)
+                (lambda (p)
+                  (let ((answer (funcall saved-health p)))
+                    (bt:with-lock-held (answers-lock) (push answer answers))
+                    answer)))
+          (unwind-protect
+               (progn
+                 (setf listener
+                       (bt:make-thread
+                        (lambda () (ignore-errors (bl:run-inbound-listener node :socket srv)))
+                        :name "test-inbound-listener"))
+                 (setf client (usocket:socket-connect "127.0.0.1" port
+                                                      :element-type '(unsigned-byte 8)))
+                 ;; The control: the thread is asking, and on the frozen clock
+                 ;; every answer is :OK and the socket stays open.
+                 (is-true (within 60 (lambda () (>= (count :ok (answers)) 3)))
+                          "the handshake thread never asked the verdict")
+                 (is (every (lambda (a) (eq a :ok)) (answers))
+                     "inside -peertimeout on the frozen clock: ~S" (answers))
+                 (is-false (usocket:wait-for-input client :timeout 0 :ready-only t)
+                           "the socket closed inside -peertimeout")
+                 (setf bl.ser:*mock-time* (+ t0 4))
+                 (is-true (within 60 (lambda ()
+                                       (let ((p (peer)))
+                                         (and p (eq :disconnected (bl.net:peer-state p))))))
+                          "the verdict past -peertimeout never closed the peer")
+                 (let ((after (answers)))
+                   (is (eq :disconnect (first after))
+                       "the thread asked again after the verdict: ~S" (subseq after 0 (min 5 (length after))))
+                   (is (= 1 (count :disconnect after))
+                       "~D :DISCONNECT answers: the close waited for a later pass"
+                       (count :disconnect after)))
+                 (is-true (%eof-within-p client 60)
+                          "the peer is :DISCONNECTED and its socket still open"))
+            (setf (fdefinition 'bl.net:check-peer-health) saved-health
+                  (bl:node-running node) nil
+                  bl.ser:*mock-time* saved-mock
+                  bl:*handshake-timeout-seconds* saved-timeout)
+            (when client (ignore-errors (usocket:socket-close client)))
+            (when listener (ignore-errors (bt:join-thread listener)))
+            (dolist (p (bl:node-pending-inbound-peers node))
+              (ignore-errors (bl.net:disconnect-peer p)))
+            (bl.net:close-listener srv)))))))
 
 (test an-accepted-v2-peer-is-published-detecting
   "Core's accepted CNode carries a V2Transport from construction whenever the
