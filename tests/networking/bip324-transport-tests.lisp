@@ -482,3 +482,41 @@ v1 line was worded differently too."
               (is-true (find "V2 transport error: V1 peer with wrong MessageStart ffaaffaa"
                              lines :test #'search)
                        "Core's wrong-magic line: ~S" lines)))))))
+
+(test v2-an-empty-message-type-goes-in-the-long-encoding
+  "BIP324 short ID 0 is the marker of the long encoding, never a type's ID:
+Core builds V2_MESSAGE_MAP from index 1 (net.cpp:956-961), so a message whose
+type is the empty string -- valid in v1 and in v2's long form
+(V2Transport::GetMessageType, :1431-1447) -- is sent as 0x00 and twelve NULs.
+Ours looked the type up from index 0, found \"\" there, and sent the
+one-byte contents 0x00, which no receiver can decode: the message was lost.
+Found by the p2p_transport_bidirectional_v2 fuzz target (tests/fuzz/)."
+  (if (not (bl.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (%with-loopback-pair (client server)
+        (let* ((client-transport nil)
+               (thread (bt:make-thread
+                        (lambda ()
+                          (setf client-transport (prog1 (%v2t-initiate client :timeout 60)
+                                                   (%v2t-drain client))))
+                        :name "v2-initiator"))
+               (server-transport (prog1 (%v2t-detect server :timeout 60) (%v2t-drain server))))
+          (bt:join-thread thread)
+          (is-true (bl.net:v2-transport-p client-transport))
+          (is-true (bl.net:v2-transport-p server-transport))
+          (setf (bl.net:connection-transport client) client-transport
+                (bl.net:connection-transport server) server-transport)
+          (let ((sender (bl.net:make-peer :connection client :state :ready :address "127.0.0.1"))
+                (receiver (bl.net:make-peer :connection server :state :ready :address "127.0.0.1")))
+            (bl.net:send-message sender (%v2t-frame "" (%bc-hex "0102")))
+            (bl.net:send-message sender (%v2t-frame "ping" (%bc-hex "0000000000000001")))
+            (%v2t-drain client)
+            (flet ((next ()
+                     (loop repeat 2000
+                           do (multiple-value-bind (command payload) (bl.net:receive-message receiver)
+                                (unless (eq payload :incomplete)
+                                  (return (list command payload))))
+                              (sleep 0.005))))
+              (is (equalp (list "" (%bc-hex "0102")) (next))
+                  "the empty-type message arrives as sent")
+              (is (equalp (list "ping" (%bc-hex "0000000000000001")) (next)))))))))

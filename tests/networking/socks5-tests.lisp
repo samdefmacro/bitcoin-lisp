@@ -231,6 +231,30 @@ length field is one byte, netbase.cpp:396-399)."
     (bl.net:socks5-connect
      nil (make-string 256 :initial-element #\a) 8333)))
 
+(test socks5-destination-is-its-utf-8-bytes
+  "The CONNECT request carries the destination's bytes as Core's std::string
+holds them -- the UTF-8 the name was read from (netbase.cpp:456-458) -- and
+the 255 limit is on those bytes (:397). A name with a character past Latin-1
+signalled a TYPE-ERROR out of SOCKS5-CONNECT (one octet per character), and a
+Latin-1 letter went out as a byte that is not its encoding. Found by the
+socks5 fuzz target (tests/fuzz/socks5.lisp)."
+  ;; 128 two-byte characters: 128 characters, 256 bytes -- over the limit.
+  (let ((c (handler-case (bl.net:socks5-connect nil (make-string 128 :initial-element (code-char #xe9)) 8333)
+             (error (e) e))))
+    (is (typep c 'bl.net:socks5-error) "a 256-byte name must be refused as too long: ~A" c))
+  (let ((name (format nil "b~Acher.~Aexample" (code-char #xfc) (code-char #x4e2d))))
+    (multiple-value-bind (port thread captured)
+        (%fake-socks5-server
+         `((:read 3) (:write #(#x05 #x00))
+           (:read-connect)
+           (:write #(#x05 #x00 #x00 #x01 10 0 0 1 #x47 #x9D))))
+      (with-socks5-client (sock port)
+        (is-true (bl.net:socks5-connect sock name 18333 :timeout 5)))
+      (bt:join-thread thread)
+      (let ((utf-8 (sb-ext:string-to-octets name :external-format :utf-8)))
+        (is (= (length utf-8) (aref captured 7)) "the DOMAINNAME length is the byte count")
+        (is (equalp utf-8 (subseq captured 8 (+ 8 (length utf-8)))))))))
+
 ;;; --- stream isolation ---------------------------------------------------------
 
 (test socks5-stream-isolation-credentials

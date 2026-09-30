@@ -19,11 +19,12 @@
 (defun %i2p-b64 (bytes)
   (map 'string (lambda (c) (case c (#\+ #\-) (#\/ #\~) (t c))) (bl.ser:encode-base64 bytes)))
 
-(defun %fake-sam-bridge (&key (accept-peer nil))
+(defun %fake-sam-bridge (&key (accept-peer nil) (coalesce-accept nil))
   "A SAM bridge on 127.0.0.1 that answers every request OK the way i2pd does.
 Returns (VALUES port requests stop-fn): REQUESTS is a list cell collecting
 every request line, newest first. With ACCEPT-PEER (binary destination), a
-STREAM ACCEPT is answered OK and then with that destination's line."
+STREAM ACCEPT is answered OK and then with that destination's line -- in ONE
+write with COALESCE-ACCEPT, as a bridge does when a peer is already waiting."
   (let* ((srv (usocket:socket-listen "127.0.0.1" 0 :element-type '(unsigned-byte 8)
                                                    :reuse-address t))
          (port (usocket:get-local-port srv))
@@ -31,9 +32,10 @@ STREAM ACCEPT is answered OK and then with that destination's line."
          (threads '()))
     (flet ((serve (client)
              (let ((s (usocket:socket-stream client)))
-               (flet ((reply (line)
+               (flet ((reply (line &key (flush t))
                         (write-sequence (map '(vector (unsigned-byte 8)) #'char-code line) s)
-                        (write-byte 10 s) (force-output s)))
+                        (write-byte 10 s)
+                        (when flush (force-output s))))
                  (loop
                    (let ((line (with-output-to-string (o)
                                  (loop for b = (read-byte s nil nil)
@@ -55,7 +57,7 @@ STREAM ACCEPT is answered OK and then with that destination's line."
                         (reply "STREAM STATUS RESULT=OK")
                         (reply "hello-from-peer"))
                        ((uiop:string-prefix-p "STREAM ACCEPT" line)
-                        (reply "STREAM STATUS RESULT=OK")
+                        (reply "STREAM STATUS RESULT=OK" :flush (not coalesce-accept))
                         (when accept-peer (reply (%i2p-b64 accept-peer)))))))))))
       (push (bt:make-thread
              (lambda ()
@@ -164,3 +166,28 @@ sends into the peer's .b32.i2p address (i2p.cpp:136-220)."
             (when sock (usocket:socket-close sock)))
           (is (null (find "DEST GENERATE" (car requests) :test #'search)))
           (is (find "SESSION CREATE" (car requests) :test #'search)))))))
+
+(test i2p-accept-reads-a-destination-that-came-with-the-status
+  "A bridge with a peer already waiting sends `STREAM STATUS RESULT=OK' and the
+peer's destination in one segment. Core's RecvUntilTerminator peeks and reads
+only up to the terminator (util/sock.cpp), so the destination stays in the
+socket and Accept's Wait sees it (i2p.cpp:152-220). Our line reader reads the
+stream in blocks, so the destination was already in the Lisp stream's buffer
+when Accept polled the file descriptor, which never became readable again:
+the loop waited a second per pass until told to stop, and the peer was never
+accepted. Found by the i2p fuzz target (tests/fuzz/i2p.lisp)."
+  (let ((peer-dest (make-array 391 :element-type '(unsigned-byte 8) :initial-element 9))
+        (passes 0))
+    (setf (aref peer-dest 385) 0 (aref peer-dest 386) 4)
+    (%with-fake-sam (port requests :accept-peer peer-dest :coalesce-accept t)
+      (let* ((session (bl.net:make-i2p-session bl.net:*i2p-sam-proxy*))
+             (sock (bl.net:i2p-session-listen session)))
+        (is-true sock)
+        (when sock
+          (unwind-protect
+               (is (equal (bl.net:i2p-destination-address peer-dest)
+                          (bl.net:i2p-session-accept session sock (lambda () (> (incf passes) 1))))
+                   "the destination that arrived with the status is the accepted peer")
+            (usocket:socket-close sock)))
+        (is (find (format nil "STREAM ACCEPT ID=") (car requests) :test #'search)
+            "the bridge on port ~D was asked to accept" port)))))

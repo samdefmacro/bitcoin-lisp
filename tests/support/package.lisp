@@ -142,6 +142,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    ;; fixtures.lisp (handshake)
    #:with-private-outbound-nonces
    #:closed-loopback-port
+   #:call-with-scripted-peer
    ;; fixtures.lisp (net permissions)
    #:with-whitelist
    ;; fixtures.lisp (logging)

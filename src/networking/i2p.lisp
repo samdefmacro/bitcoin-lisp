@@ -288,7 +288,14 @@ so. A reply that is not a destination but an I2P_ERROR closes the session."
       (when (funcall stop-p)
         (bl.log:log-cat "i2p" "Accept was interrupted")
         (return-from i2p-session-accept nil))
-      (when (socket-input-ready-p sock :timeout +i2p-max-wait-for-io-seconds+)
+      ;; A line our reader already pulled into the stream's buffer -- the
+      ;; destination a bridge sends in the same segment as the status line
+      ;; Listen read -- makes the socket readable no more: Core's
+      ;; RecvUntilTerminator peeks and never reads past the terminator
+      ;; (util/sock.cpp), ours reads in blocks. LISTEN answers for the
+      ;; buffer, as it does in %I2P-RECV-LINE.
+      (when (or (listen (usocket:socket-stream sock))
+                (socket-input-ready-p sock :timeout +i2p-max-wait-for-io-seconds+))
         (let ((line (handler-case (%i2p-recv-line sock +i2p-max-wait-for-io-seconds+)
                       (i2p-error (e) (setf errmsg (princ-to-string e)) nil))))
           (unless line (return))

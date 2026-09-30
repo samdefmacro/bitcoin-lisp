@@ -213,3 +213,24 @@ read from the buffer itself. A xorshift64* state in a cons."
               x (ldb (byte 64 0) (logxor x (ash x 17)))
               (car ctx) x)
         (setf (aref out i) (ldb (byte 8 32) (* x 2685821657736338717)))))))
+
+(defun fdp-integral-bytes (specs)
+  "The bytes that make a FuzzedDataProvider's integral reads return chosen
+values: SPECS is a list of (VALUE MIN MAX) in the order a target calls
+CONSUME-INTEGRAL-IN-RANGE (CONSUME-BOOL is (0-or-1 0 255)). Integral reads
+take bytes from the END of the buffer, most significant first, only as many
+as MAX-MIN needs; so the value read first is the buffer's last bytes. How a
+CORPUS function writes a buffer whose integral half steers a target -- append
+the result after any byte-string half."
+  (let ((tail '()))
+    (dolist (spec specs)
+      (destructuring-bind (value min max) spec
+        (let ((range (- max min))
+              (v (- value min)))
+          ;; Least significant byte first: the reader takes the most
+          ;; significant one first, from the end.
+          (setf tail (append (loop for offset from 0 by 8
+                                   while (and (< offset 64) (plusp (ash range (- offset))))
+                                   collect (ldb (byte 8 offset) v))
+                             tail)))))
+    (make-array (length tail) :element-type '(unsigned-byte 8) :initial-contents tail)))

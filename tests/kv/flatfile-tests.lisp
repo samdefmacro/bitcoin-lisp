@@ -2014,9 +2014,10 @@ whole record in it."
        (is (= 2 count))))))
 
 (test external-block-file-stops-at-a-truncated-record
-  "A record whose length runs past the end of the file is not a record. Core
-treats it as a coincidence in the data and keeps hunting, which is what lets a
-half-downloaded file still deliver the blocks that ARE complete."
+  "A record whose length runs past the end of the file is not a record, and the
+complete records before it -- a half-downloaded file's -- are all delivered.
+Core reads the truncated record's header, fails to skip to its end, and stops
+there (validation.cpp:5030-5042)."
   (with-network (:mainnet)
    (with-temp-directory (dir)
      (let* ((blocks (loop for h from 1 to 2
@@ -2035,6 +2036,38 @@ half-downloaded file still deliver the blocks that ARE complete."
          (bl.store:map-external-block-file
           path (lambda (b) (declare (ignore b)) (incf count)))
          (is (= 1 count) "the complete record survives a truncated one after it"))))))
+
+(test external-block-file-looks-no-further-than-a-truncated-record
+  "Core's scan ends at a record whose size is plausible but whose body runs
+past the end of the file: it reads the 80-byte header, SkipTo the record's end
+fails, and eof ends the loop (validation.cpp:5030-5042) -- it never hunts
+inside that tail. Ours advanced one byte and went on hunting, so a magic and
+size inside the truncated body were read as a record Core never sees. Only a
+header that cannot be read (fewer than 80 bytes left) rewinds and keeps
+hunting. Found by the load_external_block_file fuzz target (tests/fuzz/)."
+  (with-network (:regtest)
+    (with-temp-directory (dir)
+      (let* ((magic (bl.chain:network-magic bl:*network*))
+             (le32 (lambda (n) (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+                                 (dotimes (i 4 v) (setf (aref v i) (ldb (byte 8 (* 8 i)) n))))))
+             (inner (concatenate '(vector (unsigned-byte 8)) magic (funcall le32 80)
+                                 (make-array 80 :element-type '(unsigned-byte 8) :initial-element 1)))
+             (outer (concatenate '(vector (unsigned-byte 8)) magic (funcall le32 200) inner
+                                 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 2)))
+             (path (merge-pathnames "bootstrap.dat" dir))
+             (count 0))
+        (with-open-file (out path :direction :output :element-type '(unsigned-byte 8))
+          (write-sequence outer out))
+        (bl.store:map-external-block-file path (lambda (b) (declare (ignore b)) (incf count)))
+        (is (= 0 count) "a record inside a truncated record's body is not read")
+        ;; The control: the same inner record after a size too SHORT to hold a
+        ;; header (79) is found, because Core rewinds past an unreadable one.
+        (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                  :if-exists :supersede)
+          (write-sequence (concatenate '(vector (unsigned-byte 8)) magic (funcall le32 79) inner) out))
+        (setf count 0)
+        (bl.store:map-external-block-file path (lambda (b) (declare (ignore b)) (incf count)))
+        (is (= 1 count) "a record after an implausible size is still found")))))
 
 (test external-block-file-that-does-not-exist-reads-nothing
   "Core warns and moves on to the next -loadblock rather than refusing to

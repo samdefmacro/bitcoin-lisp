@@ -163,3 +163,50 @@ address it was built from."
                                "~A/~A prints as ~A, which parses to another subnet" string suffix printed)
                   (fuzz-assert (bl.net:subnet-match-p subnet parsed-network parsed)
                                "~A/~A does not contain ~A" string suffix string))))))))))
+
+;;; --- net.cpp: local_address -----------------------------------------------------
+
+(defun %fuzz-local-service (fdp)
+  "Core ConsumeService: (network bytes port) of any network the node knows,
+IPv4 in its mapped form."
+  (let ((network (pick-value-in-array fdp '(:ipv4 :ipv6 :torv3 :i2p :cjdns))))
+    (list network
+          (ecase network
+            (:ipv4 (let ((ip (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                     (setf (aref ip 10) #xff (aref ip 11) #xff)
+                     (replace ip (consume-bytes fdp 4) :start1 12)))
+            (:ipv6 (consume-uint128 fdp))
+            ((:torv3 :i2p) (consume-uint256 fdp))
+            (:cjdns (let ((ip (consume-uint128 fdp)))
+                      (when (consume-bool fdp) (setf (aref ip 0) #xfc))
+                      ip)))
+          (consume-integral fdp :u16))))
+
+(define-fuzz-target local-address
+    (buffer :core "net.cpp:76-116 (local_address)" :iterations 600 :max-len 400)
+  "The local-address table under random AddLocal, RemoveLocal and SeenLocal of
+services of every network: an address AddLocal accepts is routable, is then
+in the table, and SeenLocal of it succeeds; GetLocal answers for any peer
+network."
+  (let ((fdp (make-fuzzed-data-provider buffer)))
+    (%with-local-address-table
+      (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6 :torv3 :i2p :cjdns))
+            (bl.net:*discover* (consume-bool fdp))
+            (service (%fuzz-local-service fdp)))
+        (limited-while ((%fuzz-continue-p fdp) 10000)
+          (destructuring-bind (network bytes port) service
+            (call-one-of fdp
+              (setf service (%fuzz-local-service fdp))
+              (when (bl.net:add-local network bytes port (consume-integral-in-range fdp 0 4))
+                (fuzz-assert (bl.net:address-routable-p bytes network)
+                             "AddLocal took an unroutable ~A address" network)
+                (fuzz-assert (fuzz-sabotage
+                              (and (find-if (lambda (la) (and (eq (bl.net:local-address-network la) network)
+                                                              (equalp (bl.net:local-address-bytes la) bytes)))
+                                            (bl.net:local-addresses))
+                                   t))
+                             "an address AddLocal took is not local")
+                (fuzz-assert (bl.net:seen-local network bytes) "SeenLocal of a local address failed"))
+              (bl.net:remove-local network bytes)
+              (bl.net:seen-local network bytes)
+              (bl.net:best-local-address (pick-value-in-array fdp '(:ipv4 :ipv6 :torv3 :i2p :cjdns))))))))))
