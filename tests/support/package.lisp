@@ -100,6 +100,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-mempool-test-tx
    #:make-spending-test-tx
    #:multisig-script
+   #:%bpe-tracked
    #:bpe-test-id
    #:bpe-simulate
    #:bpe-populated-estimator

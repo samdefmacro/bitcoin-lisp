@@ -9,9 +9,6 @@
 ;;;; File-local accessors for the estimator's internals. One reach each,
 ;;;; rather than one per assertion (tests/ :: ratchet).
 
-(defun %bpe-tracked (est)
-  (bl.mp::block-policy-estimator-tracked est))
-
 (defun %bpe-tracked-count (est)
   (hash-table-count (%bpe-tracked est)))
 

@@ -649,6 +649,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/txgraph")
                              (:file "fuzz/txorphan")
                              (:file "fuzz/txrequest")
-                             (:file "fuzz/feefrac"))))
+                             (:file "fuzz/feefrac")
+                             (:file "fuzz/policy-estimator"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

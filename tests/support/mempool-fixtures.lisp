@@ -50,6 +50,9 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 ;;;; (Core CBlockPolicyEstimator). Shared by the estimator suite and the
 ;;;; fee-estimation tests in the mempool suite.
 
+(defun %bpe-tracked (est)
+  (bl.mp::block-policy-estimator-tracked est))
+
 (defun bpe-test-id (a b c)
   "A distinct 32-byte txid from three small integers."
   (let ((v (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))

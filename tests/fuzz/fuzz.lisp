@@ -418,3 +418,26 @@ Returns NIL, or the failure string."
       (is (getf run :failures)
           "~(~A~): the ~(~A~)-sabotaged positive control found nothing in ~D buffers -- the property cannot fail"
           name control (getf run :iterations)))))
+
+(defun consume-floating-point-in-range (fdp min max)
+  "FuzzedDataProvider::ConsumeFloatingPointInRange<double>(MIN, MAX)
+(FuzzedDataProvider.h): MIN plus a ConsumeProbability share of the range; a
+range too wide for a double is split in half first, one ConsumeBool choosing
+the half."
+  (let ((min (coerce min 'double-float))
+        (max (coerce max 'double-float))
+        (result 0d0)
+        (range 0d0))
+    (when (> min max) (error "consume-floating-point-in-range: min ~A > max ~A" min max))
+    (setf result min)
+    (if (and (> max 0d0) (< min 0d0) (> max (+ min most-positive-double-float)))
+        (progn
+          (setf range (- (/ max 2d0) (/ min 2d0)))
+          (when (consume-bool fdp) (incf result range)))
+        (setf range (- max min)))
+    (+ result (* range (consume-probability fdp)))))
+
+(defun consume-floating-point (fdp)
+  "FuzzedDataProvider::ConsumeFloatingPoint<double>(): any finite double, from
+lowest() to max()."
+  (consume-floating-point-in-range fdp most-negative-double-float most-positive-double-float))
