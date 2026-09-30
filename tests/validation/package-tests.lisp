@@ -1291,3 +1291,36 @@ ephemeral_package_eval fuzz targets."
             (is (null (bl.val:package-tx-result-fee r)) "an evicted member still reports a base fee")
             (is (null (bl.val:package-tx-result-vsize r)) "an evicted member still reports a vsize")
             (is (null (bl.val:package-tx-result-effective-feerate r)))))))))
+
+(test a-package-child-cannot-spend-a-parent-its-sibling-replaced
+  "Core's package-feerate phase sees only the SUBPACKAGE's outputs besides
+the pool: m_viewmempool.PackageAddTransaction runs for each transaction of
+txns_package_eval as it clears PreChecks (validation.cpp:1473), and a parent
+that entered on its own is visible only while it is in the pool. Here the
+second parent replaces the first parent's in-pool parent, which takes the
+first parent out with it; the child spends both parents, so its inputs are
+missing. Ours offered the child every output of the WHOLE package and
+admitted it, spending a transaction that exists nowhere -- found by the
+ephemeral_package_eval fuzz target as CTxMemPool::check's missing coin."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
+    (let* ((x (pkg-tx funding-txid 0 (- 100000000 1000) :sequence #xfffffffd))
+           (xid (bl.ser:transaction-hash x))
+           (p1 (pkg-tx xid 0 (- 100000000 2000)))
+           (p2 (pkg-tx funding-txid 0 (- 100000000 60000)))
+           (child (bl.ser:make-transaction
+                   :version 2 :lock-time 0
+                   :inputs (vector (bl.ser:make-tx-in
+                                    :previous-output (bl.ser:make-outpoint :hash (bl.ser:transaction-hash p1) :index 0)
+                                    :script-sig (p2sh-optrue-scriptsig) :sequence #xffffffff)
+                                   (bl.ser:make-tx-in
+                                    :previous-output (bl.ser:make-outpoint :hash (bl.ser:transaction-hash p2) :index 0)
+                                    :script-sig (p2sh-optrue-scriptsig) :sequence #xffffffff))
+                   :outputs (vector (bl.ser:make-tx-out :value (- 200000000 200000)
+                                                        :script-pubkey (p2sh-optrue-script-pubkey))))))
+      (is-true (bl.val:validate-transaction-for-mempool x utxo-set mempool 200 :chain-state chain-state))
+      (is (eq :ok (bl.mp:accept-validated-tx mempool xid x 1000 200)))
+      (bl.val:validate-package-for-mempool (list p1 p2 child) utxo-set mempool chain-state)
+      (is-true (bl.mp:mempool-has mempool (bl.ser:transaction-hash p2)) "the second parent replaced X")
+      (is (not (bl.mp:mempool-has mempool (bl.ser:transaction-hash p1))) "the first parent left with X")
+      (is (not (bl.mp:mempool-has mempool (bl.ser:transaction-hash child)))
+          "the child entered, spending a transaction that is nowhere"))))
