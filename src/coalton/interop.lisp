@@ -351,6 +351,20 @@ re-verification and entries are added only after successful verifies
 (defvar *signature-cache-enabled* t
   "When T, cache signature verification results.")
 
+(defvar *signature-cache-store* t
+  "Core's CachingTransactionSignatureChecker `store' (script/sigcache.cpp:
+63-84): when T a verified signature is added to the cache, when NIL the cache
+is only consulted, and an entry it answers from is marked for collection.
+
+Core decides it per caller. Mempool acceptance stores (PolicyScriptChecks and
+ConsensusScriptChecks, validation.cpp), and so does TestBlockValidity, whose
+ConnectBlock runs with fJustCheck; connecting a block does NOT --
+`fCacheResults = fJustCheck', \"Don't cache results if we're actually
+connecting blocks (still consult the cache, though)\" (validation.cpp:
+2571-2583). VALIDATE-BLOCK-SCRIPTS binds it from its CACHE-STORE argument, so
+IBD neither pays for an insert per signature nor fills the cache with
+signatures nothing will ask about again. T everywhere else.")
+
 (defvar *sig-cache-salt*
   (ironclad:random-data 32)
   "A random 32-byte salt mixed into every signature-cache key, regenerated per
@@ -408,12 +422,27 @@ dispatch."
     (setf pos (buf-set-bytes buf pos sig))
     (bl.crypto:sha256 buf)))
 
-(defun sig-cache-hit-p (key)
+(defun sig-cache-hit-p (key &optional erase)
   "T when KEY is cached in either generation; prev-generation hits are
-promoted into the current one."
-  (or (gethash key *signature-cache*)
-      (when (gethash key *signature-cache-prev*)
-        (setf (gethash key *signature-cache*) t))))
+promoted into the current one.
+
+ERASE is Core's `contains(entry, erase)' (SignatureCache::Get, sigcache.cpp:
+51-55, called with erase = !store): the entry still answers present, but its
+garbage-collect flag is set so it is the first to be overwritten when space is
+needed, and until then a later lookup still finds it (cuckoocache.h:449-470,
+\"a great property for re-org performance\"). Here the space-needed moment is
+the generation rotation, so an erased hit is left in -- or moved to -- the
+PREVIOUS generation, which the next rotation drops, instead of being promoted
+into the current one."
+  (cond ((gethash key *signature-cache*)
+         (when erase
+           (remhash key *signature-cache*)
+           (setf (gethash key *signature-cache-prev*) t))
+         t)
+        ((gethash key *signature-cache-prev*)
+         (unless erase
+           (setf (gethash key *signature-cache*) t))
+         t)))
 
 (defun sig-cache-store (key)
   (when (>= (hash-table-count *signature-cache*) *signature-cache-max-entries*)
@@ -437,12 +466,12 @@ carry no script flags; see the note there."
       (return-from cached-verify-ecdsa (values nil encoding-status))))
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x45 sighash der-sig pubkey-bytes))))
-    (when (and cache-key (sig-cache-hit-p cache-key))
+    (when (and cache-key (sig-cache-hit-p cache-key (not *signature-cache-store*)))
       (return-from cached-verify-ecdsa (values t t)))
     (multiple-value-bind (result status)
         (bl.crypto:verify-signature sighash der-sig pubkey-bytes
                                               :strict strict :low-s low-s)
-      (when (and result cache-key)
+      (when (and result cache-key *signature-cache-store*)
         (sig-cache-store cache-key))
       (values result status))))
 
@@ -450,11 +479,11 @@ carry no script flags; see the note there."
   "Verify Schnorr signature with caching. Returns T/NIL."
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x53 sighash sig64 pubkey-bytes))))
-    (when (and cache-key (sig-cache-hit-p cache-key))
+    (when (and cache-key (sig-cache-hit-p cache-key (not *signature-cache-store*)))
       (return-from cached-verify-schnorr t))
     (let ((result (bl.crypto:verify-schnorr-signature
                    sighash sig64 pubkey-bytes)))
-      (when (and result cache-key)
+      (when (and result cache-key *signature-cache-store*)
         (sig-cache-store cache-key))
       result)))
 

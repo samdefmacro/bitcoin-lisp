@@ -411,6 +411,7 @@
    #:*signature-cache*
    #:*signature-cache-prev*
    #:*signature-cache-enabled*
+   #:*signature-cache-store*
    #:clear-signature-cache
    ;; SegWit / BIP 143
    #:*witness-v0-mode*
