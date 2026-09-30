@@ -675,6 +675,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/i2p")
                              (:file "fuzz/p2p-transport")
                              (:file "fuzz/validation-load-mempool")
-                             (:file "fuzz/load-external-block-file"))))
+                             (:file "fuzz/load-external-block-file")
+                             (:file "fuzz/utxo-snapshot"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
