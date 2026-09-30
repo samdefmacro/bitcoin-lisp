@@ -435,9 +435,14 @@ State::COMPLETED, the slot a failed peer keeps."
     (and ann (bl.net::tx-ann-completed ann) t)))
 
 (defun tx-request-wtxid-entry-p (hash)
-  "T when HASH is tracked as a wtxid (MSG_WTX) announcement rather than a
-txid one -- what decides the inv type of its getdata."
-  (gethash hash bl.net::*tx-request-wtxid-p*))
+  "T when HASH's outstanding request goes out as a wtxid (MSG_WTX) rather than
+a txid: the id type of the announcement the request was granted to, which is
+what decides the inv type of its getdata."
+  (let ((peer (tx-request-in-flight-peer hash)))
+    (and peer
+         (let ((ann (find peer (gethash hash bl.net::*tx-announcers*)
+                          :key #'bl.net::tx-ann-peer :test #'eq)))
+           (and ann (bl.net::tx-ann-wtxid ann))))))
 
 (defun backdate-tx-announcements (hash &optional (seconds 1))
   "Make every announcement of HASH due, as if its NONPREF/TXID/OVERLOADED
@@ -466,6 +471,12 @@ peer whose request was backdated, or NIL if nothing was in flight."
   "Put PEER's tracked-announcement count at N (Core m_peerinfo[peer].m_total)
 so a cap test does not need N real announcements."
   (setf (gethash peer bl.net::*tx-peer-announcements*) n))
+
+(defun tx-request-peer-in-flight-count (peer)
+  "PEER's in-flight request count as the tracker keeps it (Core
+CountInFlight): the counter the overloaded-peer delay reads, which the txrequest
+fuzz target checks against the requests actually outstanding."
+  (gethash peer bl.net::*tx-peer-in-flight* 0))
 
 (defun (setf tx-request-peer-in-flight-count) (n peer)
   "Put PEER's in-flight request count at N (Core CountInFlight), the input to

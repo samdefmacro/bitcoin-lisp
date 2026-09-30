@@ -495,7 +495,7 @@ it by NONPREF_PEER_TX_DELAY and waits for the getdata."
   (bl.ser:get-unix-time))
 
 (defstruct (tx-announcement
-            (:constructor %make-tx-announcement (peer ready priority))
+            (:constructor %make-tx-announcement (peer ready priority wtxid))
             (:conc-name tx-ann-))
   "One peer's announcement of one txhash — Core's txrequest Announcement
 (txrequest.cpp:52-100). READY is the %TX-REQUEST-NOW time at which it becomes
@@ -510,10 +510,16 @@ exists to prevent exactly that: \"The same transaction is never requested
 twice from the same peer, unless the announcement was forgotten in between
 ... giving a peer multiple chances to announce a transaction would allow them
 to bias requests in their favor, worsening transaction censoring attacks\"
-(txrequest.h:45-58)."
+(txrequest.h:45-58). WTXID is the announcement's own id type, Core's
+Announcement::m_gtxid: a request goes out under the type of the announcement
+it is granted to (GetRequestable returns that GenTxid, txrequest.cpp:595-624,
+and SendMessages builds the getdata from it, net_processing.cpp:6207) -- MSG_WTX
+for a wtxid, MSG_TX|witness-flag for a txid. A wtxid re-requested under
+MSG_WITNESS_TX is a TXID lookup to a Core peer, answered notfound."
   (peer nil)
   (ready 0 :type integer)
   (completed nil :type boolean)
+  (wtxid nil :type boolean)
   ;; %TX-REQUEST-PRIORITY of (txhash, peer), computed once here because none
   ;; of its three inputs can change for the life of the announcement -- Core
   ;; likewise pays for it once, by keeping the ByTxHash index SORTED by it
@@ -527,14 +533,6 @@ delays) passes. The peer currently in flight stays in this list; its
 announcement is the record that it announced the hash. A COMPLETED
 announcement stays too, until the hash is forgotten or its last
 non-completed sibling completes.")
-(defvar *tx-request-wtxid-p* (make-hash-table :test 'equalp)
-  "hash -> T when the tracked announcement is wtxid-based (BIP339 MSG_WTX).
-Core's TxRequestTracker stores GenTxids, so every entry remembers whether it
-is a txid or a wtxid (txrequest.cpp Announcement::m_gtxid) — the getdata for
-a wtxid entry MUST go out as MSG_WTX and for a txid entry as
-MSG_TX|witness-flag (net_processing.cpp:6207). A wtxid re-requested under
-MSG_WITNESS_TX is interpreted by Core peers as a TXID lookup and answered
-notfound, so failover would silently never work for segwit txs.")
 (defvar *tx-peer-announcements* (make-hash-table :test 'eq)
   "peer -> number of tracked announcements (candidates + in-flight), for the
 MAX_PEER_TX_ANNOUNCEMENTS cap (Core m_txrequest.Count(peer)).")
@@ -579,7 +577,6 @@ getblocktxn round trip. The last slot is kept for an outbound peer
   (bt:with-lock-held (*tx-request-lock*)
     (clrhash *tx-in-flight*)
     (clrhash *tx-announcers*)
-    (clrhash *tx-request-wtxid-p*)
     (clrhash *tx-peer-announcements*)
     (clrhash *tx-peer-in-flight*)))
 
@@ -686,8 +683,7 @@ peer's count — Core ForgetTxHash (txrequest.cpp:560-566) and the branch of
 MakeCompleted that fires when the last non-completed announcement completes."
   (dolist (ann (gethash hash *tx-announcers*))
     (%decf-peer-announcements (tx-ann-peer ann)))
-  (remhash hash *tx-announcers*)
-  (remhash hash *tx-request-wtxid-p*))
+  (remhash hash *tx-announcers*))
 
 (defun %tx-request-make-completed (hash peer)
   "Lock held: Core MakeCompleted (txrequest.cpp:456-478). PEER's announcement
@@ -728,10 +724,10 @@ PEER immediately — no request outstanding and the announcement carries no
 delay. NIL means the announcement was either dropped (per-peer cap), retained
 as a failover candidate behind an in-flight request, or deferred until its
 Core-mandated delay passes (the scheduler sends it then). WTXIDP marks the
-announcement as wtxid-based (MSG_WTX): the id type is a property of the
-announced hash itself and is remembered for the lifetime of the entry, so a
-timed-out request fails over with the SAME id type. NUM-WTXID-PEERS is the
-count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
+announcement as wtxid-based (MSG_WTX); the announcement keeps it, so whichever
+announcer a request is later granted to is asked under the id type IT
+announced. NUM-WTXID-PEERS is the count of connected wtxid-relay peers,
+driving Core's TXID_RELAY_DELAY."
   (bt:with-lock-held (*tx-request-lock*)
     ;; Another announcement from the same peer — live or COMPLETED — is
     ;; refused by the (peer, txhash) uniqueness of Core's ByPeer index
@@ -751,10 +747,10 @@ count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
     (let* ((now (%tx-request-now))
            (ready (+ now (%tx-announcement-delay-seconds peer wtxidp
                                                          num-wtxid-peers))))
-      (push (%make-tx-announcement peer ready (%tx-request-priority hash peer))
+      (push (%make-tx-announcement peer ready (%tx-request-priority hash peer)
+                                   (and wtxidp t))
             (gethash hash *tx-announcers*))
       (incf (gethash peer *tx-peer-announcements* 0))
-      (setf (gethash hash *tx-request-wtxid-p*) wtxidp)
       (cond ((gethash hash *tx-in-flight*) nil)
             ((> ready now) nil)          ; deferred; scheduler sends when due
             (t (%tx-request-mark-in-flight hash peer now)
@@ -866,7 +862,7 @@ Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
         (if (null best)
             to-send
             (let* ((peer (tx-ann-peer best))
-                   (inv (tx-request-inv hash (gethash hash *tx-request-wtxid-p*) peer))
+                   (inv (tx-request-inv hash (tx-ann-wtxid best) peer))
                    (bucket (assoc peer to-send :test #'eq)))
               (%tx-request-mark-in-flight hash peer now)
               (cond (bucket (push inv (cdr bucket)) to-send)
