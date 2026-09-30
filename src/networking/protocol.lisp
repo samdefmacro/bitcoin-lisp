@@ -4913,7 +4913,6 @@ entries (:98-111), measures its container's hashing and has no counterpart."
          (prefilled (bl.ser:compact-block-prefilled-txs compact-block))
          (tx-count (+ (length short-ids-list) (length prefilled)))
          (header-bytes (bl.ser:serialize-block-header header))
-         ;; Convert short-ids list to vector for O(1) access
          (short-ids (coerce short-ids-list 'vector)))
 
     ;; Validate tx-count is reasonable (prevent DoS). Core InitData's first two
@@ -4929,33 +4928,24 @@ entries (:98-111), measures its container's hashing and has no counterpart."
         (bl.crypto:compute-siphash-key header-bytes nonce)
 
       ;; Build short ID map from mempool
-      (multiple-value-bind (shortid-map collision)
-          (build-shortid-map mempool k0 k1 use-wtxid)
-
-        (declare (ignore collision))
+      (let ((shortid-map (build-shortid-map mempool k0 k1 use-wtxid)))
         (let ((transactions (make-array tx-count :initial-element nil))
               (missing-indexes '())
               (short-id-idx 0))
 
-          ;; Place prefilled transactions at their absolute indexes
-          ;; with bounds checking
+          ;; Place prefilled transactions at their absolute indexes. A null
+          ;; one (CTransaction::IsNull: no inputs, no outputs) and one past
+          ;; the block (Core's lastprefilledindex bound) are
+          ;; READ_STATUS_INVALID (blockencodings.cpp:72-84).
           (dolist (ptx prefilled)
             (let ((idx (bl.ser:prefilled-tx-index ptx))
                   (ptx-tx (bl.ser:prefilled-tx-transaction ptx)))
-              ;; CTransaction::IsNull -- no inputs and no outputs -- is
-              ;; READ_STATUS_INVALID (blockencodings.cpp:72-73).
-              (when (and (zerop (length (bl.ser:transaction-inputs ptx-tx)))
-                         (zerop (length (bl.ser:transaction-outputs ptx-tx))))
+              (when (or (and (zerop (length (bl.ser:transaction-inputs ptx-tx)))
+                             (zerop (length (bl.ser:transaction-outputs ptx-tx))))
+                        (not (< -1 idx tx-count)))
+                (bl:log-warn "Invalid prefilled tx at index ~D (max ~D)" idx (1- tx-count))
                 (return-from reconstruct-compact-block (values nil :malformed nil)))
-              (if (and (>= idx 0) (< idx tx-count))
-                  (setf (aref transactions idx)
-                        (bl.ser:prefilled-tx-transaction ptx))
-                  (progn
-                    ;; Core's lastprefilledindex bounds check, READ_STATUS_INVALID
-                    ;; (blockencodings.cpp:78-84).
-                    (bl:log-warn "Prefilled tx index out of bounds: ~D (max ~D)"
-                                           idx (1- tx-count))
-                    (return-from reconstruct-compact-block (values nil :malformed nil))))))
+              (setf (aref transactions idx) ptx-tx)))
 
           ;; The block's own short IDs, each to the slot it fills (the
           ;; slots no prefilled transaction took, in order). A short ID the
