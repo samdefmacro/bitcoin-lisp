@@ -2531,17 +2531,25 @@ we log the failure and signal this."))
                                  :format-arguments (list message))))
 
 (defun %mempool-check-diagram (mempool)
-  "The pool's feerate diagram (Core GetFeerateDiagram): the cumulative
-fee/size after each chunk, in mining order, starting at zero."
+  "One walk of the graph's chunks in mining order, giving (values DIAGRAM
+ORDERED): the pool's feerate diagram (Core GetFeerateDiagram), the
+cumulative fee/size after each chunk starting at zero, and its transactions
+as (txid . entry) in that order (Core GetSortedScoreWithTopology), each
+chunk's in topological order."
   (let ((diagram (list (make-feefrac)))
+        (ordered '())
         (builder (make-block-builder (mempool-graph mempool))))
     (unwind-protect
-         (loop for rate = (block-builder-current-chunk-feerate builder)
-               while rate
-               do (push (feefrac+ (first diagram) rate) diagram)
-                  (block-builder-include builder))
+         (loop
+           (multiple-value-bind (handles rate) (block-builder-current-chunk builder)
+             (unless handles (return))
+             (push (feefrac+ (first diagram) rate) diagram)
+             (dolist (h handles)
+               (let ((txid (tx-handle-data h)))
+                 (push (cons txid (mempool-get mempool txid)) ordered)))
+             (block-builder-include builder)))
       (block-builder-finish builder))
-    (nreverse diagram)))
+    (values (nreverse diagram) (nreverse ordered))))
 
 (defun %mempool-check-coin (coins spent pool-outputs txid prevout-hash index spend-height
                             coinbase-maturity)
@@ -2571,22 +2579,25 @@ mature if it is a coinbase output (CheckTxInputs at SPEND-HEIGHT)."
 (defun %mempool-check-links (mempool txid entry parents-check)
   "Core's stored-links half of the per-entry check: the stored parents are
 the in-pool transactions the inputs name, and the stored children every
-spender of any of this transaction's outputs in the spent-outpoint index
-(mapNextTx.lower_bound(COutPoint(hash, 0)), txmempool.cpp:522-527)."
+spender of one of this transaction's outputs in the spent-outpoint index --
+Core walks mapNextTx from COutPoint(hash, 0) over the entries of this txid
+(txmempool.cpp:522-527); ours asks the index for each output. A spender of an
+output this transaction does not have is caught by that spender's own input
+check. One lookup per output, not a walk of the index: the check runs after
+every transaction on regtest."
   (flet ((same-set-p (stored check)
-           (and (= (length stored) (length check))
-                (every (lambda (x) (member x check :test #'equalp)) stored))))
-    (unless (same-set-p (loop for k being the hash-keys of (mempool-entry-parents entry) collect k)
-                        parents-check)
+           (and (= (hash-table-count stored) (length check))
+                (every (lambda (x) (gethash x stored)) check))))
+    (unless (same-set-p (mempool-entry-parents entry) parents-check)
       (%mempool-check-fail "~A's stored parents differ from its inputs' in-pool parents"
                            (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
-    (let ((children-check '()))
-      (maphash (lambda (key spender)
-                 (when (equalp (subseq key 0 32) txid)
-                   (pushnew spender children-check :test #'equalp)))
-               (mempool-spent-outpoints mempool))
-      (unless (same-set-p (loop for k being the hash-keys of (mempool-entry-children entry) collect k)
-                          children-check)
+    (let ((children-check '())
+          (spent (mempool-spent-outpoints mempool)))
+      (dotimes (n (length (bl.ser:transaction-outputs (mempool-entry-transaction entry))))
+        (let ((spender (gethash (make-outpoint-key txid n) spent)))
+          (when spender
+            (pushnew spender children-check :test #'equalp))))
+      (unless (same-set-p (mempool-entry-children entry) children-check)
         (%mempool-check-fail "~A's stored children differ from the spent-outpoint index"
                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))))
 
@@ -2603,21 +2614,31 @@ index say; the fee is inputs less outputs (CheckTxInputs); the feerate
 diagram passes through the running totals at every chunk boundary and ends
 at them; and the pool's running size and usage are the entries' sums. A
 failure logs and signals MEMPOOL-CHECK-FAILED."
-  (let ((graph (mempool-graph mempool))
-        (spent (bl.bytes:make-octets-hash-table))
-        (pool-outputs (bl.bytes:make-octets-hash-table))
-        (total-size 0) (total-usage 0) (total-modified 0) (total-weight 0)
-        (ordered '()))
+  (let* ((graph (mempool-graph mempool))
+         (inputs (hash-table-count (mempool-spent-outpoints mempool)))
+         ;; Sized once for the whole walk: growing them was a third of the
+         ;; check's allocation.
+         (spent (bl.bytes:make-octets-hash-table :size (max 16 (* 2 inputs))))
+         (pool-outputs (bl.bytes:make-octets-hash-table :size (max 16 (* 3 (mempool-count mempool)))))
+         (total-size 0) (total-usage 0) (total-modified 0) (total-weight 0))
     (bl:log-cat "mempool" "Checking mempool with ~D transactions and ~D inputs"
                 (mempool-count mempool) (hash-table-count (mempool-spent-outpoints mempool)))
     (when (txgraph-oversized-p graph)
       (%mempool-check-fail "the mempool's graph is oversized"))
     (txgraph-sanity-check graph)
-    (maphash (lambda (txid e) (push (cons txid e) ordered)) (mempool-entries mempool))
-    (setf ordered (sort ordered (lambda (a b) (minusp (mempool-compare-mining-order mempool (car a) (car b))))))
-    (let ((diagram (%mempool-check-diagram mempool)))
+    (multiple-value-bind (diagram ordered) (%mempool-check-diagram mempool)
+      (unless (= (length ordered) (mempool-count mempool))
+        (%mempool-check-fail "the mining order holds ~D transactions, the pool ~D"
+                             (length ordered) (mempool-count mempool)))
       (unless (<= 1 (length diagram) (1+ (length ordered)))
         (%mempool-check-fail "a diagram of ~D points for ~D transactions" (length diagram) (length ordered)))
+      ;; CompareMiningScoreWithTopology agrees with the sorted order
+      ;; (txmempool.cpp:480-484), and every entry of the order is in the pool.
+      (loop for (a b) on ordered
+            do (unless (cdr a)
+                 (%mempool-check-fail "the graph orders a transaction the pool does not hold"))
+               (when (and b (not (minusp (mempool-compare-mining-order mempool (car a) (car b)))))
+                 (%mempool-check-fail "the mining-order comparison disagrees with the graph's order")))
       (dolist (item ordered)
         (destructuring-bind (txid . e) item
           ;; The diagram never falls behind the totals, and passes through

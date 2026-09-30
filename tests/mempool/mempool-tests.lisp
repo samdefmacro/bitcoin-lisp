@@ -4614,3 +4614,42 @@ transaction's own verdict as before."
       (let ((unchecked (send 0)))
         (is (member (car unchecked) '(-25 -26)) "the node without the check answered ~S" unchecked)
         (is (not (search "consistency" (or (cdr unchecked) ""))))))))
+
+(test mempool-check-finds-links-the-spent-index-does-not-back
+  "CTxMemPool::check compares every entry's stored parents and children
+with what its inputs and mapNextTx say (txmempool.cpp:505-535). Ours asks
+the spent-outpoint index once per output instead of walking it per entry --
+a walk that made the check cost ~180 ms on a 2,500-transaction pool -- and
+must still see a dropped child link, a dropped parent link and a missing
+spent-index entry."
+  (flet ((pool ()
+           (let* ((mempool (bl.mp:make-mempool))
+                  (parent (make-mempool-test-tx :input-id 93))
+                  (ptxid (bl.ser:transaction-hash parent))
+                  (child (bl.ser:make-transaction
+                          :version 1 :lock-time 0
+                          :inputs (vector (bl.ser:make-tx-in
+                                           :previous-output (bl.ser:make-outpoint :hash ptxid :index 0)
+                                           :script-sig (make-array 1 :element-type '(unsigned-byte 8)
+                                                                     :initial-element #x51)
+                                           :sequence #xffffffff))
+                          :outputs (vector (bl.ser:make-tx-out
+                                            :value 1000
+                                            :script-pubkey (bl.ser:tx-out-script-pubkey
+                                                            (aref (bl.ser:transaction-outputs parent) 0))))))
+                  (ctxid (bl.ser:transaction-hash child)))
+             (bl.mp:mempool-add mempool ptxid (bl.mp:make-entry-from-tx parent 1000 1))
+             (bl.mp:mempool-add mempool ctxid (bl.mp:make-entry-from-tx child 1000 1))
+             (values mempool ptxid ctxid))))
+    (multiple-value-bind (mempool) (pool)
+      (is-true (bl.mp:mempool-check-now mempool nil 1)))
+    (multiple-value-bind (mempool ptxid) (pool)
+      (clrhash (bl.mp:mempool-entry-children (bl.mp:mempool-get mempool ptxid)))
+      (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))
+    (multiple-value-bind (mempool ptxid ctxid) (pool)
+      (declare (ignore ptxid))
+      (clrhash (bl.mp:mempool-entry-parents (bl.mp:mempool-get mempool ctxid)))
+      (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))
+    (multiple-value-bind (mempool) (pool)
+      (clrhash (bl.mp:mempool-spent-outpoints mempool))
+      (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))))
