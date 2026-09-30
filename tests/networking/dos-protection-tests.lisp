@@ -2375,3 +2375,53 @@ long the process has been up."
     (is-true (search "V2 handshake timeout, disconnecting peer="
                      (%logged-net-lines (lambda () (bl.net:check-handshake-timeout peer))))
              "while the BIP324 exchange is still detecting, Core's V2 line")))
+
+;;;; ============================================================
+;;;; A poll of the descriptor must not miss what the stream holds
+;;;; ============================================================
+
+(defparameter +fd-poll-reviewed-sites+
+  '(("connection.lisp" . "(socket-input-ready-p server-socket")
+    ("connection.lisp" . "(socket-input-ready-p socket :timeout (blocking-read-wait-seconds")
+    ("connection.lisp" . "(socket-input-ready-p (connection-socket conn) :timeout timeout)")
+    ("i2p.lisp" . "(or (not (socket-input-ready-p sock :timeout 0))"))
+  "Calls of SOCKET-INPUT-READY-P in src/networking/ that need no LISTEN beside
+them, each for a reason at the site: a listening socket has no stream; the
+resumable reader drains the stream's buffer before it polls; DATA-AVAILABLE-P
+is documented as the kernel's answer alone; the i2p control-socket probe asks
+LISTEN on the next line to tell EOF from data.")
+
+(defun %unguarded-fd-polls (file-name text)
+  "The lines of TEXT (the source of FILE-NAME) that call SOCKET-INPUT-READY-P
+with no (listen ...) on the same line or the two before it, and that are not
+a +FD-POLL-REVIEWED-SITES+ entry."
+  (let ((lines (coerce (uiop:split-string text :separator (string #\Newline)) 'vector)))
+    (loop for i from 0 below (length lines)
+          for line = (aref lines i)
+          when (and (search "(socket-input-ready-p" line)
+                    (not (search "(defun socket-input-ready-p" line))
+                    (not (loop for j from (max 0 (- i 2)) to i
+                               thereis (search "(listen " (aref lines j))))
+                    (not (find-if (lambda (site) (and (string= (car site) file-name)
+                                                      (search (cdr site) line)))
+                                  +fd-poll-reviewed-sites+)))
+            collect (format nil "~A:~D: ~A" file-name (1+ i) (string-trim " " line)))))
+
+(test every-fd-poll-also-asks-the-stream-buffer
+  "A reader that polls a socket's descriptor between reads of its Lisp stream
+misses bytes an earlier read already pulled into the stream's buffer: the
+descriptor never becomes readable for them again. It cost the SOCKS5 reader
+(2026-09-23) and then the I2P accept loop (a destination that came in the
+same segment as the status line was never read), so this is the mechanical
+check the lesson turned into: every SOCKET-INPUT-READY-P call in the
+networking sources sits next to a LISTEN, or is a reviewed site. The positive
+control is a synthetic source with one unguarded call."
+  (is (equal '("x.lisp:2: (when (socket-input-ready-p s :timeout 1)")
+             (%unguarded-fd-polls "x.lisp" (format nil "(defun f (s)~%  (when (socket-input-ready-p s :timeout 1)~%    (read-byte s)))")))
+      "the positive control must be flagged")
+  (is (null (%unguarded-fd-polls "x.lisp" (format nil "(or (listen stream)~%    (socket-input-ready-p s :timeout 1))"))))
+  (let ((unguarded
+          (loop for path in (directory (merge-pathnames "src/networking/*.lisp"
+                                                        (asdf:system-source-directory :bitcoin-lisp)))
+                append (%unguarded-fd-polls (file-namestring path) (uiop:read-file-string path)))))
+    (is (null unguarded) "descriptor polls with no LISTEN beside them: ~{~%  ~A~}" unguarded)))
