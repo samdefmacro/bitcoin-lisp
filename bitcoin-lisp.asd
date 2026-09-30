@@ -644,6 +644,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/miniscript")
                              (:file "fuzz/misc")
                              (:file "fuzz/rpc")
-                             (:file "fuzz/storage"))))
+                             (:file "fuzz/storage")
+                             (:file "fuzz/cluster-linearize"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

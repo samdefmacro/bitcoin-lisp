@@ -77,6 +77,21 @@ src/mempool/.")
    #:ancestor-sort-linearization
    #:post-linearize
    #:linearize
+   ;; Spanning-forest linearization (Core SpanningForestState and Linearize,
+   ;; cluster_linearize.h:718-1836): LINEARIZE drives these, and Core's
+   ;; clusterlin_sfl / clusterlin_linearize fuzz targets drive them step by
+   ;; step (tests/fuzz/cluster-linearize.lisp).
+   #:*linearize-rng-seed*
+   #:sfl-linearize
+   #:make-spanning-forest
+   #:sfl-cost
+   #:sfl-load-linearization
+   #:sfl-make-topological
+   #:sfl-start-optimizing
+   #:sfl-optimize-step
+   #:sfl-start-minimizing
+   #:sfl-minimize-step
+   #:sfl-get-linearization
    ;; TxGraph (Core txgraph.{h,cpp})
    #:+max-cluster-size+
    #:txgraph
