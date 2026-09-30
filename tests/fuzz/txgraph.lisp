@@ -280,7 +280,7 @@ txid fallback order (txgraph.cpp:1298-1304)."
 included-or-skipped, and the last chunk feerate it reported."
   builder (included 0) (done 0) (last-feerate nil))
 
-(defun txgraph-fuzz-rbf (sim real fdp rng txid-of)
+(defun txgraph-fuzz-rbf (sim real fdp txid-of)
   "Stage a random replacement on the real graph's scratch copy
 (TXGRAPH-RBF-DIAGRAMS) and on a copy of the model: evict a random
 descendant-closed set, add one transaction spending up to three survivors,
@@ -753,7 +753,7 @@ as the SimTxGraph model does, and matching it in full at the end."
                     (fuzz-assert (= result (logcount reps)))))
               ;; A staged replacement (the port's GetMainStagingDiagrams).
               (op (not (oversized))
-                  (txgraph-fuzz-rbf sim (the bl.mp:txgraph real) fdp rng #'txid-of))
+                  (txgraph-fuzz-rbf sim (the bl.mp:txgraph real) fdp #'txid-of))
               ;; GetBlockBuilder.
               (op (and (< (length builders) 4) (not (oversized)))
                   (setf builders (append builders
