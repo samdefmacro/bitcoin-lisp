@@ -235,7 +235,11 @@ The inverse of %V2-DECODE-MESSAGE."
   (let* ((command (bl.ser:bytes-to-command
                    (subseq message-bytes 4 16)))
          (payload-len (- (length message-bytes) 24))
-         (short-id (position command *v2-message-ids* :test #'equal))
+         ;; From ID 1: ID 0 is the marker of the long encoding, never a
+         ;; type's short ID, and Core's V2_MESSAGE_MAP is built from index 1
+         ;; (net.cpp:956-961). The empty type is a long-form type like any
+         ;; other.
+         (short-id (position command *v2-message-ids* :test #'equal :start 1))
          (contents (make-array (+ (if short-id 1 13) payload-len)
                                :element-type '(unsigned-byte 8)
                                :initial-element 0)))

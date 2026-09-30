@@ -619,7 +619,7 @@ length, 1-byte header, contents (1-byte short type id, or 0x00 + the 12-byte
 type verbatim, plus the payload), and the 16-byte Poly1305 tag."
   (if v2-p
       (+ 20
-         (if (position command *v2-message-ids* :test #'equal) 1 13)
+         (if (position command *v2-message-ids* :test #'equal :start 1) 1 13)
          payload-len)
       (+ 24 payload-len)))
 
