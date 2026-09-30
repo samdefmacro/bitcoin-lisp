@@ -69,6 +69,18 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
 mempool_args.cpp:57). Set from config at startup; read by MEMPOOL-EXPIRE
 on every block connect.")
 
+(defvar *mempool-check-ratio* nil
+  "Core -checkmempool=<n> (mempool_args.cpp:47): run the consistency check
+(MEMPOOL-CHECK) on one call in N; 0 never. NIL, the option absent, is the
+chain's default -- 1 where Core's fDefaultConsistencyChecks holds (regtest), 0
+elsewhere (init.cpp:1316). Read at MAKE-MEMPOOL time, like the cluster limits.")
+
+(defun default-mempool-check-ratio ()
+  "*MEMPOOL-CHECK-RATIO*, or the chain's default, clamped to 0..1,000,000 as
+Core's CTxMemPool constructor clamps it (txmempool.cpp:168)."
+  (max 0 (min 1000000 (or *mempool-check-ratio*
+                          (if (bl.chain:network-default-consistency-checks-p bl.chain:*network*) 1 0)))))
+
 (defvar *min-relay-fee-rate* +default-min-relay-fee-rate+
   "Effective minimum relay fee rate in sat/kvB (Core -minrelaytxfee via
 ParseMoney, mempool_args.cpp:69-81). Set from config BEFORE the node's
@@ -327,6 +339,9 @@ wrapping or throwing, so a delta that would leave the range pins at the bound."
   ;; The default form reads *min-relay-fee-rate* at MAKE-MEMPOOL time, so
   ;; -minrelaytxfee (applied before the node's mempool is built) takes effect.
   (min-fee-rate *min-relay-fee-rate* :type integer)
+  ;; Core m_opts.check_ratio (-checkmempool): MEMPOOL-CHECK runs on one call
+  ;; in this many, never at 0.
+  (check-ratio (default-mempool-check-ratio) :type (integer 0 1000000))
   ;; Rolling dynamic minimum fee rate (sat/kvB), raised when the mempool is full
   ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
   ;; rolling minimum fee. A DOUBLE, like Core's rollingMinimumFeeRate
@@ -2501,3 +2516,169 @@ vHashUpdate in reverse). Returns the number of transactions the trim evicted."
   "Call FN with (txid entry) for each transaction in the mempool.
    Used for building short ID maps in compact block reconstruction."
   (maphash fn (mempool-entries mempool)))
+
+;;;; The consistency check (Core CTxMemPool::check, txmempool.cpp:433-553)
+
+(define-condition mempool-check-failed (internal-error) ()
+  (:documentation "A MEMPOOL-CHECK assertion did not hold: the pool's
+indexes, links, totals or coins disagree. Core asserts, which aborts the node;
+we log the failure and signal this."))
+
+(defun %mempool-check-fail (control &rest args)
+  (let ((message (apply #'format nil control args)))
+    (bl:log-warn "Mempool consistency check failed: ~A" message)
+    (error 'mempool-check-failed :format-control "Mempool consistency check failed: ~A"
+                                 :format-arguments (list message))))
+
+(defun %mempool-check-diagram (mempool)
+  "The pool's feerate diagram (Core GetFeerateDiagram): the cumulative
+fee/size after each chunk, in mining order, starting at zero."
+  (let ((diagram (list (make-feefrac)))
+        (builder (make-block-builder (mempool-graph mempool))))
+    (unwind-protect
+         (loop for rate = (block-builder-current-chunk-feerate builder)
+               while rate
+               do (push (feefrac+ (first diagram) rate) diagram)
+                  (block-builder-include builder))
+      (block-builder-finish builder))
+    (nreverse diagram)))
+
+(defun %mempool-check-coin (mempool coins spent pool-outputs txid prevout-hash index spend-height
+                            coinbase-maturity)
+  "The value of the coin a pool transaction TXID spends at PREVOUT-HASH:INDEX,
+as Core's mempoolDuplicate view has it: a pool output checked earlier in the
+walk, else the chain's coin -- present, not already spent in this walk, and
+mature if it is a coinbase output (CheckTxInputs at SPEND-HEIGHT)."
+  (let* ((key (make-outpoint-key prevout-hash index))
+         (pool-value (gethash key pool-outputs))
+         (coin (and (null pool-value) coins (bl.store:get-utxo coins prevout-hash index))))
+    (when (gethash key spent)
+      (%mempool-check-fail "~A spends a coin an earlier pool transaction spent"
+                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
+    (setf (gethash key spent) t)
+    (cond (pool-value pool-value)
+          ((null coins) nil)
+          ((null coin)
+           (%mempool-check-fail "~A spends a coin that does not exist"
+                                (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
+          (t
+           (when (and coinbase-maturity (bl.store:utxo-entry-coinbase coin)
+                      (< (- spend-height (bl.store:utxo-entry-height coin)) coinbase-maturity))
+             (%mempool-check-fail "~A spends an immature coinbase output"
+                                  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
+           (bl.store:utxo-entry-value coin)))))
+
+(defun %mempool-check-links (mempool txid entry parents-check)
+  "Core's stored-links half of the per-entry check: the stored parents are
+the in-pool transactions the inputs name, and the stored children every
+spender of any of this transaction's outputs in the spent-outpoint index
+(mapNextTx.lower_bound(COutPoint(hash, 0)), txmempool.cpp:522-527)."
+  (flet ((same-set-p (stored check)
+           (and (= (length stored) (length check))
+                (every (lambda (x) (member x check :test #'equalp)) stored))))
+    (unless (same-set-p (loop for k being the hash-keys of (mempool-entry-parents entry) collect k)
+                        parents-check)
+      (%mempool-check-fail "~A's stored parents differ from its inputs' in-pool parents"
+                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
+    (let ((children-check '()))
+      (maphash (lambda (key spender)
+                 (when (equalp (subseq key 0 32) txid)
+                   (pushnew spender children-check :test #'equalp)))
+               (mempool-spent-outpoints mempool))
+      (unless (same-set-p (loop for k being the hash-keys of (mempool-entry-children entry) collect k)
+                          children-check)
+        (%mempool-check-fail "~A's stored children differ from the spent-outpoint index"
+                             (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))))
+
+(defun mempool-check-now (mempool coins spend-height &key coinbase-maturity)
+  "Core CTxMemPool::check's body (txmempool.cpp:439-553), unconditionally.
+The graph is not oversized and passes its own sanity check; walking the pool
+in mining order, every input names an output its in-pool parent has and a
+coin that exists -- a pool output already walked, or the chain's coin in
+COINS (any view BL.STORE:GET-UTXO reads; NIL skips the chain's coins) --
+unspent by any earlier pool transaction and, with COINBASE-MATURITY, mature
+at SPEND-HEIGHT; the spent-outpoint index names this transaction as the
+spender; the stored parents and children are the ones the inputs and the
+index say; the fee is inputs less outputs (CheckTxInputs); the feerate
+diagram passes through the running totals at every chunk boundary and ends
+at them; and the pool's running size and usage are the entries' sums. A
+failure logs and signals MEMPOOL-CHECK-FAILED."
+  (let ((graph (mempool-graph mempool))
+        (spent (bl.bytes:make-octets-hash-table))
+        (pool-outputs (bl.bytes:make-octets-hash-table))
+        (total-size 0) (total-usage 0) (total-modified 0) (total-weight 0)
+        (ordered '()))
+    (when (txgraph-oversized-p graph)
+      (%mempool-check-fail "the mempool's graph is oversized"))
+    (txgraph-sanity-check graph)
+    (maphash (lambda (txid e) (push (cons txid e) ordered)) (mempool-entries mempool))
+    (setf ordered (sort ordered (lambda (a b) (minusp (mempool-compare-mining-order mempool (car a) (car b))))))
+    (let ((diagram (%mempool-check-diagram mempool)))
+      (unless (<= 1 (length diagram) (1+ (length ordered)))
+        (%mempool-check-fail "a diagram of ~D points for ~D transactions" (length diagram) (length ordered)))
+      (dolist (item ordered)
+        (destructuring-bind (txid . e) item
+          ;; The diagram never falls behind the totals, and passes through
+          ;; them at every chunk boundary.
+          (when (< (feefrac-size (first diagram)) total-weight)
+            (%mempool-check-fail "the feerate diagram fell behind the mining order"))
+          (when (and (rest diagram)
+                     (= (feefrac-fee (first diagram)) total-modified)
+                     (= (feefrac-size (first diagram)) total-weight))
+            (pop diagram))
+          (let ((tx (mempool-entry-transaction e))
+                (parents-check '())
+                (in-value 0))
+            (loop for in across (bl.ser:transaction-inputs tx)
+                  do (let* ((op (bl.ser:tx-in-previous-output in))
+                            (ptxid (bl.ser:outpoint-hash op))
+                            (n (bl.ser:outpoint-index op))
+                            (parent (mempool-get mempool ptxid)))
+                       (when parent
+                         (unless (< n (length (bl.ser:transaction-outputs (mempool-entry-transaction parent))))
+                           (%mempool-check-fail "an input names an output its in-pool parent lacks"))
+                         (pushnew ptxid parents-check :test #'equalp))
+                       (let ((value (%mempool-check-coin mempool coins spent pool-outputs txid ptxid n
+                                                         spend-height coinbase-maturity)))
+                         (when value (incf in-value value)))
+                       (unless (equalp (mempool-spending-tx mempool ptxid n) txid)
+                         (%mempool-check-fail "the spent-outpoint index does not name ~A as the spender"
+                                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))))
+            (%mempool-check-links mempool txid e parents-check)
+            (when coins
+              (let ((out-value (loop for o across (bl.ser:transaction-outputs tx)
+                                     sum (bl.ser:tx-out-value o))))
+                (unless (= (mempool-entry-fee e) (- in-value out-value))
+                  (%mempool-check-fail "~A's fee is ~D, its inputs less its outputs ~D"
+                                       (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))
+                                       (mempool-entry-fee e) (- in-value out-value)))))
+            (loop for o across (bl.ser:transaction-outputs tx)
+                  for n from 0
+                  do (setf (gethash (make-outpoint-key txid n) pool-outputs) (bl.ser:tx-out-value o)))
+            (incf total-size (mempool-entry-vsize e))
+            (incf total-usage (mempool-entry-usage e))
+            (incf total-modified (mempool-entry-modified-fee e))
+            (incf total-weight (mempool-entry-graph-weight e)))))
+      (unless (and (= 1 (length diagram))
+                   (= (feefrac-fee (first diagram)) total-modified)
+                   (= (feefrac-size (first diagram)) total-weight))
+        (%mempool-check-fail "the feerate diagram does not end at the pool's totals")))
+    (unless (= (mempool-total-size mempool) total-size)
+      (%mempool-check-fail "total size ~D, the entries sum to ~D" (mempool-total-size mempool) total-size))
+    (unless (= (mempool-total-usage mempool) total-usage)
+      (%mempool-check-fail "total usage ~D, the entries sum to ~D" (mempool-total-usage mempool) total-usage))
+    (maphash (lambda (key spender)
+               (declare (ignore key))
+               (unless (mempool-has mempool spender)
+                 (%mempool-check-fail "the spent-outpoint index names a transaction not in the pool")))
+             (mempool-spent-outpoints mempool))
+    t))
+
+(defun mempool-check (mempool coins spend-height &key coinbase-maturity)
+  "Core CTxMemPool::check (txmempool.cpp:433-438): MEMPOOL-CHECK-NOW on one
+call in the pool's CHECK-RATIO (-checkmempool), never when it is 0. Core
+runs it after every ProcessTransaction (validation.cpp:4490) and at the end
+of every ActivateBestChainStep (:3300)."
+  (let ((ratio (mempool-check-ratio mempool)))
+    (when (and (plusp ratio) (zerop (random ratio)))
+      (mempool-check-now mempool coins spend-height :coinbase-maturity coinbase-maturity))))

@@ -49,6 +49,7 @@
   (assumevalid-hex nil)                     ; consensus.defaultAssumeValid, display order; NIL = disabled
   (assumeutxo '())                          ; m_assumeutxo_data: ((height blockhash-hex hash-serialized-hex chain-tx-count) ...)
   (prune-after-height 0)                    ; nPruneAfterHeight
+  (default-consistency-checks nil)          ; fDefaultConsistencyChecks: -checkmempool / -checkblockindex default
   (bech32-hrp "" :type string)              ; bech32_hrp
   ;; base58Prefixes: PUBKEY_ADDRESS, SCRIPT_ADDRESS, SECRET_KEY, EXT_PUBLIC_KEY, EXT_SECRET_KEY
   (base58-pubkey-prefix 0 :type (unsigned-byte 8))
@@ -373,6 +374,7 @@ option instantiates from."
 
 (define-chain-params :regtest
   :core-name "regtest"
+  :default-consistency-checks t
   :data-subdirectory "regtest/"
   :magic (make-array 4 :element-type '(unsigned-byte 8)
                        :initial-contents '(#xFA #xBF #xB5 #xDA))
@@ -437,6 +439,12 @@ option instantiates from."
 (defun network-rpc-port (network)
   "NETWORK's default RPC port (chain-params-rpc-port)."
   (chain-params-rpc-port (find-chain-params network)))
+
+(defun network-default-consistency-checks-p (network)
+  "Does NETWORK run its consistency checks by default (Core
+fDefaultConsistencyChecks, kernel/chainparams.cpp: true on regtest alone)?
+The default of -checkmempool (init.cpp:1316) and -checkblockindex."
+  (chain-params-default-consistency-checks (find-chain-params network)))
 
 (defvar *enforce-bip94-on-regtest* nil
   "Core CChainParams::RegTestOptions::enforce_bip94, set by -test=bip94

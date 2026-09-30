@@ -225,6 +225,7 @@ can. src/validation/.")
   (:export
    #:*ms-key-parser*
    #:*require-standard*
+   #:check-mempool-at-tip
    #:*parallel-validation-workers*
    #:bip30-repeat-block-p
    #:make-ms-satisfier

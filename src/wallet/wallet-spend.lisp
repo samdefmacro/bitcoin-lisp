@@ -2828,8 +2828,13 @@ node lock. Returns (values ok error-string)."
     (unless mempool
       (return-from %wallet-submit-tx (values nil "no mempool")))
     (multiple-value-bind (valid error fee replaced sigops)
-        (bl.val:validate-transaction-for-mempool
-         tx utxo-set mempool current-height :chain-state chain-state)
+        (multiple-value-prog1
+            (bl.val:validate-transaction-for-mempool
+             tx utxo-set mempool current-height :chain-state chain-state)
+          ;; BroadcastTransaction's test-accept is a ProcessTransaction, and
+          ;; so is the submission below; each runs the check
+          ;; (node/transaction.cpp:78,92, validation.cpp:4490).
+          (bl.val:check-mempool-at-tip mempool utxo-set chain-state))
       (cond
         ((and (not valid) (eq error :already-in-mempool))
          (when relay
@@ -2847,6 +2852,7 @@ node lock. Returns (values ok error-string)."
                         :sigops sigops :replaced replaced
                         :chainstate-current
                         (bl.net:current-for-fee-estimation-p chain-state))))
+           (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
            (if (eq result :ok)
                (progn
                  (when relay

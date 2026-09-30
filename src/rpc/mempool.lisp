@@ -565,8 +565,11 @@ reported as acceptable while the very same transaction inside a package is
 Returns the PACKAGE-TX-RESULT for TX, so both arms of the RPC render through
 the same loop."
   (multiple-value-bind (valid error fee replaced sigops modified-fee)
-      (bl.val:validate-transaction-for-mempool tx utxo-set mempool height
-                                               :chain-state chain-state)
+      (multiple-value-prog1
+          (bl.val:validate-transaction-for-mempool tx utxo-set mempool height
+                                                   :chain-state chain-state)
+        ;; ProcessTransaction's check, test_accept or not (validation.cpp:4490).
+        (bl.val:check-mempool-at-tip mempool utxo-set chain-state))
     (declare (ignore replaced))
     (let ((res (bl.val:make-package-tx-result
                 :txid (bl.ser:transaction-hash tx)
@@ -801,8 +804,11 @@ the result: TX_MISSING_INPUTS becomes TransactionError::MISSING_INPUTS
 everything else -26. rpc_rawtransaction.py:354 pins the pair: -25 with
 \"bad-txns-inputs-missingorspent\"."
   (multiple-value-bind (valid error fee replaced sigops)
-      (bl.val:validate-transaction-for-mempool
-       tx utxo-set mempool current-height :chain-state chain-state)
+      (multiple-value-prog1
+          (bl.val:validate-transaction-for-mempool
+           tx utxo-set mempool current-height :chain-state chain-state)
+        ;; ProcessTransaction's check, test_accept or not (validation.cpp:4490).
+        (bl.val:check-mempool-at-tip mempool utxo-set chain-state))
     (unless valid
       (error 'rpc-error
              :code (if (eq error :missing-input)
@@ -877,6 +883,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                                  :chainstate-current
                                  (bl.net:current-for-fee-estimation-p
                                   chain-state))))
+                (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
                 (unless (eq add-result :ok)
                   ;; The state's own reject reason, as on every other path:
                   ;; err_string is state.ToString() (node/transaction.cpp:21)

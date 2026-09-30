@@ -316,7 +316,7 @@ pool passes CTxMemPool::check at the end."
                   (check-mempool-truc-invariants mempool)
                   (when require-standard
                     (check-mempool-ephemeral-invariants mempool))))
-              (check-mempool mempool :coin-value (tx-pool-fuzz-coin-value utxo-set)))))))))
+              (check-mempool mempool :coins utxo-set :spend-height (1+ (bl.store:current-height chain-state))))))))))
 
 (defun package-eval-child-evicting-prevout (mempool)
   "Core GetChildEvictingPrevout (package_eval.cpp:163-190): the first dusty
@@ -423,4 +423,4 @@ package's results agree with its verdict; the pool passes CTxMemPool::check."
                     (package-eval-check-results txs nil msg results replaced package-msg mempool))))
               (package-eval-apply-events delta mempool-outpoints)
               (check-mempool-ephemeral-invariants mempool)))
-          (check-mempool mempool :coin-value (tx-pool-fuzz-coin-value utxo-set)))))))
+          (check-mempool mempool :coins utxo-set :spend-height (1+ (bl.store:current-height chain-state))))))))

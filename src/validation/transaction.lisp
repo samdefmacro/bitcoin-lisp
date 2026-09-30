@@ -1256,6 +1256,19 @@ keeps the two from ever describing different transactions."
                          (bl.mp:transaction-graph-weight tx sigops)
                          direct-conflicts))
 
+(defun check-mempool-at-tip (mempool utxo-set chain-state)
+  "Core's m_mempool->check(CoinsTip(), m_chain.Height() + 1) -- BL.MP:MEMPOOL-CHECK
+against the chain's coins, spent at the next block's height, with Core's
+coinbase maturity (CheckTxInputs). The drive sites are Core's: after every
+ProcessTransaction, test-accept or not (validation.cpp:4490) -- the peer tx
+handler, the orphan re-validation, sendrawtransaction and the wallet's
+broadcast, testmempoolaccept of one transaction -- and at the end of every
+activation step (:3300). The pool's -checkmempool ratio decides whether it
+actually runs. MEMPOOL may be NIL (no mempool)."
+  (when mempool
+    (bl.mp:mempool-check mempool utxo-set (1+ (bl.store:current-height chain-state))
+                         :coinbase-maturity +coinbase-maturity+)))
+
 (defun fee-floor-reason (mempool fee vsize &optional (now (bl.ser:get-unix-time)))
   "Core's CheckFeeRate (validation.cpp:699-712) for FEE satoshis over VSIZE
 vbytes: :MEMPOOL-MIN-FEE-NOT-MET when the pool's dynamic floor (GetMinFee,

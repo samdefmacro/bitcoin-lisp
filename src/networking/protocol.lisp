@@ -2263,6 +2263,10 @@ by TXID, so the cascade work list carries txids."
                     (bl.store:with-coins-to-uncache (utxo-set)
                       (bl.val:validate-transaction-for-mempool
                        otx utxo-set mempool current-height :chain-state chain-state))
+                  (unless valid
+                    ;; ProcessTransaction's check for the orphan
+                    ;; (net_processing.cpp:3236, validation.cpp:4490).
+                    (bl.val:check-mempool-at-tip mempool utxo-set chain-state))
                   (cond
                     (valid
                      (multiple-value-bind (result entry)
@@ -2271,6 +2275,7 @@ by TXID, so the cascade work list carries txids."
                           :sigops sigops :replaced replaced
                           :chainstate-current
                           (current-for-fee-estimation-p chain-state))
+                       (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
                        (when (eq :ok result)
                          (bl:log-cat "txpackages" "   accepted orphan tx ~A (wtxid=~A)"
                                      (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes otxid))
@@ -2689,6 +2694,10 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                 (bl.val:validate-transaction-for-mempool
                  tx utxo-set mempool current-height :chain-state chain-state))
             (unless valid
+              ;; ProcessTransaction's check (validation.cpp:4490) -- the
+              ;; pool is unchanged by a rejection, so here is as good as
+              ;; right after the attempt.
+              (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
               ;; Core logs every rejection a peer's transaction earns,
               ;; before any of the caching decisions below: ProcessInvalidTx
               ;; opens with LogDebug(BCLog::MEMPOOLREJ, "%s (wtxid=%s) from
@@ -2748,6 +2757,9 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                              :sigops sigops :replaced replaced
                              :chainstate-current
                              (current-for-fee-estimation-p chain-state))))
+                ;; ProcessTransaction's check, before the result is acted
+                ;; on (validation.cpp:4490, net_processing.cpp:4535).
+                (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
                 (cond
                   ((eq result :ok)
                    ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
