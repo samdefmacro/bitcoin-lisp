@@ -260,6 +260,20 @@ sentence -- ParseHashV, AmountFromValue, the argument type gate."
 cache's size, GETHASH a key out of it for one entry, MAPHASH it for all."
   (bl.store::cvc-entries cache))
 
+(defun hash-table-occupied-buckets (table)
+  "The buckets of TABLE that hold at least one entry, as a list of bucket
+numbers: the non-empty slots of SBCL's bucket index vector. A hash that ignores
+part of the key shows as fewer buckets than entries (every output of one
+transaction on one chain), and two tables that hash the same keys alike occupy
+the same buckets. The vector is an SBCL implementation detail, reached by name
+so a release that renames it fails here loudly rather than counting something
+else."
+  (let ((reader (or (find-symbol "HASH-TABLE-INDEX-VECTOR" "SB-IMPL")
+                    (error "SBCL has no SB-IMPL::HASH-TABLE-INDEX-VECTOR"))))
+    (loop for slot across (funcall reader table)
+          for bucket from 0
+          unless (zerop slot) collect bucket)))
+
 (defun coins-cache-fresh-count (cache)
   "How many entries the cache counts as FRESH — absent from the base view, so
 a spend may drop them outright instead of staging an erase."

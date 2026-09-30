@@ -93,6 +93,50 @@ path still serves."
     (is (typep (bl.interop:cl-array-to-coalton-vector adjustable) 'simple-vector)))
   (is (equalp #(7 8) (bl.interop:cl-array-to-coalton-vector (list 7 8)))))
 
+(test a-stack-element-leaves-the-interpreter-as-coerce-would-hand-it-over
+  "COALTON-VECTOR-TO-CL-ARRAY hands CHECKSIG, CHECKMULTISIG, the hash opcodes
+and OP_CODESEPARATOR their octets. Its typed copy must return exactly what
+(coerce (subseq v start) '(simple-array (unsigned-byte 8) (*))) returned: the
+same octets for every start, the argument itself when it already is an octet
+vector and START is 0, and a TYPE-ERROR for an element that is not an octet."
+  (let ((octet-type '(simple-array (unsigned-byte 8) (*))))
+    (dolist (n '(0 1 33 72 520 10000))
+      (let ((v (make-array n)))
+        (dotimes (i n) (setf (svref v i) (mod (* 37 (1+ i)) 256)))
+        (dolist (start (remove-duplicates (list 0 1 (floor n 2) n)))
+          (when (<= start n)
+            (let ((generic (coerce (subseq v start) octet-type))
+                  (got (bl.interop:coalton-vector-to-cl-array v start)))
+              (is (equalp generic got) "length ~D from ~D: same octets" n start)
+              (is (typep got octet-type) "length ~D from ~D: an octet vector" n start))))))
+    (let ((octets (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
+      (is (eq octets (bl.interop:coalton-vector-to-cl-array octets)))
+      (is (equalp #(2 3) (bl.interop:coalton-vector-to-cl-array octets 1))))
+    (is (equalp #(4 5) (bl.interop:coalton-vector-to-cl-array (list 4 5))))
+    (signals type-error (bl.interop:coalton-vector-to-cl-array (vector 1 256 3)))
+    (signals type-error (bl.interop:coalton-vector-to-cl-array (vector 1 -1)))))
+
+(test the-script-execution-cache-key-reads-the-flags-string-it-is-given
+  "MAKE-SCRIPT-EXECUTION-CACHE-KEY remembers the bytes of the last flags
+string by EQ. A key must still depend on the string's CHARACTERS alone: the
+same flags in a fresh string give the same key, different flags give a
+different one, and alternating between two strings (every block after a
+flag-changing height does) never answers with the other string's bytes."
+  (let* ((wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (a (bl.val:compute-script-flags-for-height 1000))
+         (b (concatenate 'string a ",CLEANSTACK"))
+         (key-a (bl.interop:make-script-execution-cache-key wtxid a))
+         (key-b (bl.interop:make-script-execution-cache-key wtxid b)))
+    (is (not (equalp key-a key-b)) "different flags, different keys")
+    (is (equalp key-a (bl.interop:make-script-execution-cache-key wtxid (copy-seq a))))
+    (is (equalp key-b (bl.interop:make-script-execution-cache-key wtxid (copy-seq b))))
+    (dotimes (i 3)
+      (is (equalp key-a (bl.interop:make-script-execution-cache-key wtxid a)))
+      (is (equalp key-b (bl.interop:make-script-execution-cache-key wtxid b))))
+    (is (not (equalp key-a (bl.interop:make-script-execution-cache-key wtxid nil))))
+    (is (equalp (bl.interop:make-script-execution-cache-key wtxid nil)
+                (bl.interop:make-script-execution-cache-key wtxid "")))))
+
 (test flag-lookups-answer-for-the-flags-string-bound-now
   "FLAG-ENABLED-P recognizes the last flags string by EQ before its
 synchronized EQUAL-keyed cache (the round-10 IBD profile put 10.2% of all

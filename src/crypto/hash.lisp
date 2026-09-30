@@ -347,6 +347,55 @@ Bitcoin often displays hashes in reverse byte order."
     ;; Return final hash
     (logxor v0 v1 v2 v3)))
 
+;;; Core's PresaltedSipHasher(val, extra) (crypto/siphash.cpp:128-165): the
+;;; SipHash-2-4 of a uint256 followed by a 32-bit word, unrolled over the
+;;; four 64-bit words the uint256 already is, so a hash-table key that keeps
+;;; them unpacked (the coins cache's UTXO-KEY) hashes with no byte vector.
+
+(defmacro %sipround (v0 v1 v2 v3)
+  "One SIPROUND (crypto/siphash.cpp:13-20) over the four 64-bit state places."
+  `(setf ,v0 (ldb (byte 64 0) (+ ,v0 ,v1)) ,v1 (siphash-rotl64 ,v1 13) ,v1 (logxor ,v1 ,v0)
+         ,v0 (siphash-rotl64 ,v0 32)
+         ,v2 (ldb (byte 64 0) (+ ,v2 ,v3)) ,v3 (siphash-rotl64 ,v3 16) ,v3 (logxor ,v3 ,v2)
+         ,v0 (ldb (byte 64 0) (+ ,v0 ,v3)) ,v3 (siphash-rotl64 ,v3 21) ,v3 (logxor ,v3 ,v0)
+         ,v2 (ldb (byte 64 0) (+ ,v2 ,v1)) ,v1 (siphash-rotl64 ,v1 17) ,v1 (logxor ,v1 ,v2)
+         ,v2 (siphash-rotl64 ,v2 32)))
+
+(declaim (inline siphash-uint256-extra))
+(defun siphash-uint256-extra (k0 k1 w0 w1 w2 w3 extra)
+  "SipHash-2-4 under (K0, K1) of the 256-bit value whose little-endian 64-bit
+words are W0..W3 (uint256::GetUint64(0..3)), followed by EXTRA as four
+little-endian bytes -- Core's PresaltedSipHasher::operator()(val, extra)
+(crypto/siphash.cpp:128-165), the hash behind SaltedOutpointHasher
+(util/hasher.h), which keys the coins cache by COutPoint (coins.h:219-222).
+Equal to (SIPHASH-2-4 K0 K1 <the 36 bytes txid||LE32(extra)>)."
+  (declare (type (unsigned-byte 64) k0 k1 w0 w1 w2 w3)
+           (type (unsigned-byte 32) extra)
+           (optimize (speed 3) (safety 0)))
+  (let ((v0 (logxor k0 #x736f6d6570736575))
+        (v1 (logxor k1 #x646f72616e646f6d))
+        (v2 (logxor k0 #x6c7967656e657261))
+        (v3 (logxor k1 #x7465646279746573)))
+    (declare (type (unsigned-byte 64) v0 v1 v2 v3))
+    (macrolet ((compress (d)
+                 `(let ((m ,d))
+                    (declare (type (unsigned-byte 64) m))
+                    (setf v3 (logxor v3 m))
+                    (%sipround v0 v1 v2 v3)
+                    (%sipround v0 v1 v2 v3)
+                    (setf v0 (logxor v0 m)))))
+      (compress w0)
+      (compress w1)
+      (compress w2)
+      (compress w3)
+      (compress (logior (ash 36 56) extra)))
+    (setf v2 (logxor v2 #xFF))
+    (%sipround v0 v1 v2 v3)
+    (%sipround v0 v1 v2 v3)
+    (%sipround v0 v1 v2 v3)
+    (%sipround v0 v1 v2 v3)
+    (logxor v0 v1 v2 v3)))
+
 (defun bytes-to-uint64-le (bytes &optional (offset 0))
   "Read a 64-bit little-endian unsigned integer from BYTES at OFFSET."
   (let ((result 0))

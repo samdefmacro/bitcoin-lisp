@@ -4,7 +4,7 @@
 ;;;
 ;;; The references a subsystem needs to act on the node -- the active
 ;;; chainstate and its coins view, the block store, the mempool, the peers,
-;;; the fee estimator, the address book, the recent-rejects filter -- as
+;;; the address book, the recent-rejects filter -- as
 ;;; one value (the indexes are not carried: the connect hook reaches them
 ;;; through the node's index list). A message handler used to take up to eight of
 ;;; them as positional and keyword parameters, and every caller had to name
@@ -29,13 +29,12 @@ background validation)."
   block-store
   mempool
   peers                  ; the connected peers, for relay
-  fee-estimator
   address-book
   recent-rejects
   historical-chainstate) ; assumeutxo background-validation chainstate
 
 (alexandria:define-constant +node-context-slots+
-  '("CHAIN-STATE" "UTXO-SET" "BLOCK-STORE" "MEMPOOL" "PEERS" "FEE-ESTIMATOR"
+  '("CHAIN-STATE" "UTXO-SET" "BLOCK-STORE" "MEMPOOL" "PEERS"
     "ADDRESS-BOOK" "RECENT-REJECTS" "HISTORICAL-CHAINSTATE")
   :test #'equalp :documentation "The slot names WITH-NODE-CONTEXT accepts; a misspelling is a macroexpansion
 error rather than an undefined accessor at run time.")

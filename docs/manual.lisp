@@ -193,8 +193,38 @@
 (defsection @crypto (:title "crypto: hashes and libsecp256k1")
   "Core: `crypto/`, `hash.cpp`, `key.cpp`, `pubkey.cpp`, `bip324.cpp`,
   `random.cpp`, and the libsecp256k1 library itself (ECDSA, Schnorr,
-  ellswift, MuSig) through CFFI. The library path is the `BL_SECP_LIB`
-  seam; the project container ships v0.7.1 with the musig module.
+  ellswift, MuSig) through CFFI.
+
+  The library is SHARED and chosen at run time, where Core links its own
+  copy statically with the modules forced on (`cmake/secp256k1.cmake`).
+  The CFFI definition asks for the unversioned `libsecp256k1.so` first, so
+  the directory on `LD_LIBRARY_PATH` -- `scripts/run-node.sh`'s
+  `BL_SECP_LIB` -- wins over any system copy. The project container and
+  the live servers both carry v0.7.1 with six modules: recovery,
+  extrakeys, schnorrsig, ellswift, ecdh (unused, and absent from Core's
+  build) and musig (0.6.0 and later only). `*secp256k1-modules*` holds
+  those modules with one probe symbol each. A test fails when that table,
+  the image's configure flags (`docker/Dockerfile`) and the server
+  script's CMake flags (`scripts/server-secp-upgrade.sh`) stop agreeing.
+  At start-up the node logs one line in the style of Core's
+  `Using the '...' SHA256 implementation` (`secp256k1-startup-line`,
+  logged with the banner): the release from the `pkgconfig` file installed
+  next to the library (the library exports no version), the file dladdr(3)
+  resolves, and the modules. It is the acceptance check after a library
+  switch. With the musig module missing (v0.5.1), every MuSig2 entry point
+  signals `musig-unavailable` before any foreign call. That covers the
+  primitives, Core's three signer functions, and a musig() key expression
+  at descriptor parse time, so the refusal comes before a derivation's
+  catch-all could turn it into \"cannot derive\". `dispatch-rpc-method`
+  answers it as -1, RPC_MISC_ERROR, Core's code for a feature that is not
+  enabled; the message is ours, since Core cannot be in this state.
+
+  Upgrading the servers' library is `scripts/server-secp-upgrade.sh`, run ON
+  the server. It reuses or builds v0.7.1 into its own prefix
+  (`/data/bitcoin-lisp/secp256k1-0.7.1`), never over a prefix a node maps.
+  It verifies the probe symbols with nm/objdump and prints the switch:
+  `run-node.sh`'s `BL_SECP_LIB` default, then a clean stop and restart per
+  network. The v0.5.1 prefix `secp256k1-local` stays as the fallback.
 
   Invariants: every primitive has a known-answer vector in the test tree
   (Core's `crypto_tests`, BIP340, BIP324, BIP32); a replacement without
@@ -229,6 +259,7 @@
   (bitcoin-lisp.crypto:tagged-hash function)
   (bitcoin-lisp.crypto:hmac-sha256 function)
   (bitcoin-lisp.crypto:siphash-2-4 function)
+  (bitcoin-lisp.crypto:siphash-uint256-extra function)
   (bitcoin-lisp.crypto:rand-u64 function)
   (bitcoin-lisp.crypto:bytes-to-hex function)
   (bitcoin-lisp.crypto:hex-to-bytes function)
@@ -244,6 +275,10 @@
   (bitcoin-lisp.crypto:musig2-create-partial-sig function)
   (bitcoin-lisp.crypto:musig2-create-aggregate-sig function)
   (bitcoin-lisp.crypto:musig-secnonce class)
+  (bitcoin-lisp.crypto:*secp256k1-modules* variable)
+  (bitcoin-lisp.crypto:secp256k1-startup-line function)
+  (bitcoin-lisp.crypto:musig-available-p function)
+  (bitcoin-lisp.crypto:musig-unavailable condition)
   "`hash256` is SHA-256 applied twice, the hash of every header,
   transaction and message checksum:
 
@@ -517,7 +552,12 @@
   pending outputs and spent set, extra coins, package coins) and the
   mempool's spent-outpoints are keyed by it, so a producer and a reader
   cannot disagree about the key's shape; the coins cache keeps its own
-  fixed-width UTXO-KEY.
+  fixed-width UTXO-KEY, hashed as Core hashes CCoinsMap's keys
+  (SaltedOutpointHasher: `bl.crypto:siphash-uint256-extra' under a salt
+  drawn for each table). Trap: SBCL takes a bucket from a hash's LOW bits,
+  so the index goes into the low bits of an outpoint hash -- mixed in at
+  bit 24, or not at all, the 1,000 outputs of one transaction were one
+  bucket chain. The octet tables are not salted.
 
   Trap: the byte-reader family is the fast path and the stream family is a
   thin shell kept for the few callers that need it. What an IBD spends its
@@ -1353,7 +1393,10 @@
 (defsection @script (:title "script: the Coalton interpreter")
   "The one piece of the node written in Coalton: `src/coalton/` holds the
   types, the byte codecs and the script interpreter, and `interop.lisp`
-  is the minimal bridge validation calls. Core: `script/interpreter.cpp`,
+  is the minimal bridge validation calls. Coalton's (Vector U8) is a
+  SIMPLE-VECTOR of fixnums, never an octet vector: `bridge.lisp` holds the
+  two typed copies across that line, and loads before the Coalton files
+  so the interpreter calls them directly. Core: `script/interpreter.cpp`,
   `script/script.cpp`, `script/sigcache.cpp`. Settled policy: the
   interpreter stays Coalton; everything else is CL.
 
@@ -1376,7 +1419,12 @@
 
   Traps: a Coalton or defstruct layout change needs a FRESH FASL volume
   -- the persistent volume keeps stale expansions through a warm rebuild,
-  an image restart and an ordinary cold run. The script-execution cache
+  an image restart and an ordinary cold run. Coalton compiles in RELEASE
+  mode (set at the top of bitcoin-lisp.asd, before Coalton loads): every
+  define-type is a frozen struct, so a MATCH arm is a layout test rather
+  than a CLOS TYPEP, and a changed type needs an image restart. A FASL
+  compiled in the other mode refuses to load (Coalton's own prologue), so
+  a cache written before the switch must be emptied. The script-execution cache
   keys on (wtxid, flags) and NOTHING else -- not the spent scriptPubKeys
   -- because the wtxid commits to every input's OUTPOINT and an outpoint
   names one output of one transaction, whose txid commits to that
