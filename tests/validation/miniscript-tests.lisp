@@ -681,6 +681,29 @@ PREIMAGES (an alist of (kind . preimage))."
    (bl.val:ms-parse expr)
    (apply #'%ms-satisfier args)))
 
+(test a-hash-dissatisfaction-is-malleable
+  "Core's ZERO32, the dissatisfaction of a hash fragment, is malleable
+(miniscript.h:345): 32 zero bytes are one of many non-preimages. So
+andor(sha256(H),pk(A),pk(B)) satisfied through its third branch -- B's
+signature and the hash dissatisfied -- is a malleable witness, and so is the
+same through or_d; with the preimage in hand the first branch is not. Ours
+built ZERO32 unmarked. Found by the miniscript_smart fuzz target."
+  (let* ((h (make-string 64 :initial-element #\a))
+         (andor (format nil "andor(sha256(~A),pk(~A),pk(~A))" h *ms-desc-key-a* *ms-desc-key-b*))
+         (or-d (format nil "or_d(sha256(~A),pk(~A))" h *ms-desc-key-b*))
+         (preimage (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (multiple-value-bind (stack malleable) (%ms-sat andor :keys (list *ms-desc-key-b*))
+      (is (= 2 (length stack)) "B's signature and the dissatisfaction")
+      (is-true malleable "a satisfaction through a hash dissatisfaction is malleable"))
+    (multiple-value-bind (stack malleable) (%ms-sat or-d :keys (list *ms-desc-key-b*))
+      (is (= 2 (length stack)))
+      (is-true malleable))
+    (multiple-value-bind (stack malleable)
+        (%ms-sat andor :keys (list *ms-desc-key-a* *ms-desc-key-b*)
+                       :preimages (list (cons :sha256 preimage)))
+      (is (= 2 (length stack)) "A's signature and the preimage")
+      (is-false malleable "the preimage branch is the non-malleable one"))))
+
 (test satisfying-a-timelocked-policy-needs-both-the-key-and-the-time
   "and_v(v:pk(K),older(144)): the witness is one signature, and it exists only
 once the relative locktime is satisfied. A branch whose timelock has not

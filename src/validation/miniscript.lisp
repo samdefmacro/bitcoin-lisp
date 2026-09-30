@@ -1929,8 +1929,16 @@ for witness-size estimation, where dummy values stand in.")
   (ms-stack-of (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1)))
 
 (defun ms-stack-zero32 ()
-  "Thirty-two zero bytes: the canonical wrong preimage for a hash fragment."
-  (ms-stack-of (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+  "Thirty-two zero bytes: the canonical wrong preimage for a hash fragment --
+MALLEABLE, as Core's ZERO32 is (miniscript.h:345): any other 32 bytes that
+are not the preimage dissatisfy as well, so a third party can swap them. Not
+marking it let a satisfaction through a hash dissatisfaction pass for
+non-malleable (the wallet signer then offered it) and made the choice between
+branches prefer it where Core prefers the other; the miniscript_smart fuzz
+target found it as a non-malleable witness larger than GetWitnessSize, whose
+calculus already treats that dissatisfaction as unavailable."
+  (%ms-mark (ms-stack-of (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+            :malleable t))
 
 (defun ms-stack-available-p (s) (/= (ms-stack-available s) +ms-availability-no+))
 
