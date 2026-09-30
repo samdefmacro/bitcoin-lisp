@@ -331,8 +331,9 @@
                 #:buf-set-u8 #:buf-set-u16-le #:buf-set-u32-le #:buf-set-u64-le
                 #:buf-set-bytes #:buf-set-varint)
   (:export
-   ;; Script bytes into the interpreter
+   ;; Script bytes into the interpreter, and a stack element back out
    #:cl-array-to-coalton-vector
+   #:coalton-vector-to-cl-array
    ;; Satoshi operations
    #:wrap-satoshi
    #:unwrap-satoshi

@@ -280,6 +280,7 @@ bitcoin-cli (node-main)."
                  (:file "zmq")
                  (:module "coalton"
                   :components ((:file "package")
+                               (:file "bridge")
                                (:file "types")
                                (:file "crypto")
                                (:file "binary")

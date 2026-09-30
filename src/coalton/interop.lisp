@@ -12,30 +12,8 @@
 
 (in-package #:bitcoin-lisp.coalton.interop)
 
-;;; Conversion utilities
-
-(defun cl-array-to-coalton-vector (cl-array)
-  "Convert a CL byte array to a Coalton vector: a SIMPLE-VECTOR holding the
-same elements, which is what (map 'vector #'identity cl-array) returns.
-
-An octet vector -- every script, witness item and stack element the script
-paths hand over -- is copied by a typed loop. The generic MAP calls IDENTITY
-per element, and the round-10 IBD profile (2,100 regtest blocks of ~925 KB,
-sb-sprof over the syncing node) put 12.5% of all samples here: each P2WSH
-input converts its scriptPubKey five times. Anything else keeps the generic
-path."
-  (if (typep cl-array '(simple-array (unsigned-byte 8) (*)))
-      (let* ((n (length cl-array))
-             (v (make-array n)))
-        (declare (type (simple-array (unsigned-byte 8) (*)) cl-array)
-                 (type simple-vector v))
-        (dotimes (i n v)
-          (setf (svref v i) (aref cl-array i))))
-      (map 'vector #'identity cl-array)))
-
-(defun coalton-vector-to-cl-array (vec)
-  "Convert a Coalton vector to a CL byte array."
-  (coerce vec '(simple-array (unsigned-byte 8) (*))))
+;;; The two byte-vector conversions live in bridge.lisp, loaded before the
+;;; Coalton files that call them.
 
 ;;; Bitcoin constants
 (defconstant +coin+ 100000000

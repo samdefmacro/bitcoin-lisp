@@ -1204,8 +1204,8 @@ else. Wiring either of them here rejects scripts Core accepts."
   (define (tapscript-verify-sig-status sig pubkey)
     "Call VERIFY-TAPSCRIPT-SIGNATURE and return a UFix status code."
     (lisp UFix (sig pubkey)
-      (cl:let* ((sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+      (cl:let* ((sig-arr (bl.interop:coalton-vector-to-cl-array sig))
+                (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
         (cl:when (cl:symbol-value 'bl.interop:*debug-bip341-sighash*)
           (cl:funcall (cl:fdefinition (cl:intern "NODE-LOG" "BITCOIN-LISP"))
                       :warn
@@ -1944,8 +1944,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (sym (cl:find-symbol "*CURRENT-SCRIPT-CODE*" "BITCOIN-LISP.COALTON.INTEROP")))
              (cl:when (cl:and sym (cl:boundp sym) (cl:symbol-value sym))
                (cl:setf (cl:symbol-value sym)
-                        (cl:coerce (cl:subseq script pos)
-                                   '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+                        (bl.interop:coalton-vector-to-cl-array script pos)))
              ;; BIP 342: record this OP_CODESEPARATOR's opcode index (not its
              ;; byte offset) for the tapscript sighash. POS is the byte after
              ;; the codeseparator, so its byte start is (1- POS).
@@ -2006,9 +2005,9 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((Some (Tuple data new-stack))
           ;; SHA1 using Ironclad - convert types properly
           (let ((hash (lisp (Vector U8) (data)
-                        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                        (cl:let* ((cl-data (bl.interop:coalton-vector-to-cl-array data))
                                   (result (ironclad:digest-sequence :sha1 cl-data)))
-                          (cl:map 'cl:vector #'cl:identity result)))))
+                          (bl.interop:cl-array-to-coalton-vector result)))))
             (ScriptOk (context-with-main-stack
                        (stack-push hash new-stack)
                        ctx))))))
@@ -2038,11 +2037,9 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
                                             (codesep-pos (context-codesep-pos ctx))
-                                            (subscript-raw (cl:subseq script codesep-pos))
-                                            ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
-                                            (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+                                            (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos))
+                                            (sig-arr (bl.interop:coalton-vector-to-cl-array sig))
+                                            (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
                                     (bl.interop:verify-checksig-for-script sig-arr pk-arr subscript)))))
                      (let ((strictenc-error (lisp Boolean ()
                                               (bl.interop:last-checksig-had-strictenc-error-p))))
@@ -2077,10 +2074,9 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
                                             (codesep-pos (context-codesep-pos ctx))
-                                            (subscript-raw (cl:subseq script codesep-pos))
-                                            (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+                                            (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos))
+                                            (sig-arr (bl.interop:coalton-vector-to-cl-array sig))
+                                            (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
                                     (bl.interop:verify-checksig-for-script sig-arr pk-arr subscript)))))
                      (let ((strictenc-error (lisp Boolean ()
                                               (bl.interop:last-checksig-had-strictenc-error-p))))
@@ -2109,9 +2105,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
-                                 (subscript-raw (cl:subseq script codesep-pos))
-                                 ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
-                                 (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+                                 (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos)))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
                              (bl.interop:do-checkmultisig-stack-op stack subscript spent budget)
                            (cl:case status
@@ -2153,9 +2147,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
-                                 (subscript-raw (cl:subseq script codesep-pos))
-                                 ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
-                                 (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+                                 (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos)))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
                              (bl.interop:do-checkmultisig-stack-op stack subscript spent budget)
                            (cl:case status

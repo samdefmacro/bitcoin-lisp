@@ -1353,7 +1353,10 @@
 (defsection @script (:title "script: the Coalton interpreter")
   "The one piece of the node written in Coalton: `src/coalton/` holds the
   types, the byte codecs and the script interpreter, and `interop.lisp`
-  is the minimal bridge validation calls. Core: `script/interpreter.cpp`,
+  is the minimal bridge validation calls. Coalton's (Vector U8) is a
+  SIMPLE-VECTOR of fixnums, never an octet vector: `bridge.lisp` holds the
+  two typed copies across that line, and loads before the Coalton files
+  so the interpreter calls them directly. Core: `script/interpreter.cpp`,
   `script/script.cpp`, `script/sigcache.cpp`. Settled policy: the
   interpreter stays Coalton; everything else is CL.
 
