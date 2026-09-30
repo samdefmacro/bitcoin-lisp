@@ -4652,4 +4652,8 @@ spent-index entry."
       (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))
     (multiple-value-bind (mempool) (pool)
       (clrhash (bl.mp:mempool-spent-outpoints mempool))
+      (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))
+    ;; An index entry no pool input accounts for (Core's final mapNextTx walk).
+    (multiple-value-bind (mempool ptxid) (pool)
+      (setf (gethash (bl.ser:outpoint-key ptxid 7) (bl.mp:mempool-spent-outpoints mempool)) ptxid)
       (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))))
