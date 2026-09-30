@@ -288,6 +288,7 @@ src/mempool/.")
    #:fee-estimator-get-history
    ;; Fee stats persistence
    #:save-fee-stats
+   #:flush-fee-estimates-at-shutdown
    #:load-fee-stats
    #:arm-fee-estimate-flush-clock
    #:maybe-flush-fee-estimates
@@ -297,6 +298,7 @@ src/mempool/.")
    #:bpe-note-entry
    #:bpe-note-removal
    #:bpe-note-block
+   #:bpe-flush-unconfirmed
    #:bpe-smart-fee-sat-per-vb
    #:bpe-estimate-smart-fee
    #:bpe-write-to-stream

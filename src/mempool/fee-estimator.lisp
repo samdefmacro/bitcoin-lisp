@@ -222,6 +222,17 @@ scheduler calls FlushFeeEstimates once an hour (init.cpp:1662).")
 call arms it, so the first flush is an hour after the node started rather
 than at once — Core's scheduleEvery fires after the first interval.")
 
+(defun flush-fee-estimates-at-shutdown (estimator)
+  "Core CBlockPolicyEstimator::Flush, the shutdown flush (init.cpp:344-345,
+block_policy_estimator.cpp:957-960): record every transaction the policy
+estimator still tracks as unconfirmed (BPE-FLUSH-UNCONFIRMED), then write the
+file. The hourly flush (MAYBE-FLUSH-FEE-ESTIMATES) writes without the first
+step, as Core's scheduled FlushFeeEstimates does."
+  (let ((est *block-policy-estimator*))
+    (when est
+      (bpe-flush-unconfirmed est)))
+  (save-fee-stats estimator))
+
 (defun arm-fee-estimate-flush-clock ()
   "Start the hourly flush interval now (Core schedules FlushFeeEstimates at
 startup, init.cpp:1662). Called from init rather than left to the first idle

@@ -501,6 +501,33 @@ its own unit tests."
                            bl.mp:*block-policy-estimator* 6))
               "load-fee-stats must restore the policy estimator, not just the legacy history"))))))
 
+(test shutdown-records-the-still-unconfirmed-as-failures-before-saving
+  "Core's shutdown calls CBlockPolicyEstimator::Flush (init.cpp:344-345), which
+is FlushUnconfirmed THEN FlushFeeEstimates (block_policy_estimator.cpp:957-
+960): every transaction still tracked is removed as NOT confirmed, which
+records a failure at its feerate for each period it has waited
+(TxConfirmStats::removeTx, :485-526), and only then is the file written. The
+hourly flush writes without it. A transaction tracked at height 300 that is
+still unconfirmed at 310 is, after the shutdown flush, a failure in the short
+horizon's first period -- and no longer tracked."
+  (let* ((dir (%fee-stats-fixture "shutdown-flush"))
+         (estimator (bl.mp:make-fee-estimator :data-directory dir))
+         (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+         (est bl.mp:*block-policy-estimator*)
+         (txid (bpe-test-id 7 7 7))
+         (short (bl.mp::block-policy-estimator-short est))
+         (bucket (bl.mp::fee-bucket-index (bl.mp::make-fee-buckets) 5000d0)))
+    (setf (%bpe-best-height est) 300)
+    (bl.mp:bpe-note-entry txid 5000 1000 300)
+    (loop for h from 301 to 310 do (bpe-add-block est h '()))
+    (is (= 1 (%bpe-tracked-count est)))
+    (is (= 0d0 (aref (aref (bl.mp::tx-confirm-stats-fail-avg short) 0) bucket)))
+    (bl.mp:flush-fee-estimates-at-shutdown estimator)
+    (is (= 0 (%bpe-tracked-count est)) "the flush must untrack the unconfirmed")
+    (is (plusp (aref (aref (bl.mp::tx-confirm-stats-fail-avg short) 0) bucket))
+        "the flush must record the unconfirmed transaction as a failure")
+    (is-true (probe-file (merge-pathnames "fee_estimates.dat" dir)) "and then write the file")))
+
 (test fee-estimates-file-past-max-age-is-ignored
   "Core MAX_FILE_AGE (60 hours): estimates that old describe a network whose
 activity has moved on. Refusing them costs a few hours of accuracy; trusting

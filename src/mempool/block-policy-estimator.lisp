@@ -421,6 +421,23 @@ at its feerate. Returns T if the transaction was tracked."
       (remhash txid tracked)
       t)))
 
+(defun bpe-flush-unconfirmed (est)
+  "Remove every transaction EST still tracks as NOT confirmed (Core
+FlushUnconfirmed, block_policy_estimator.cpp:1064-1077): each one that has
+waited a full period is recorded as a failure at its feerate, as an eviction
+would be. Core runs it at shutdown, before the file is written (Flush,
+:957-960), so the estimates saved reflect the transactions the node watched
+wait and never saw confirm. Returns the number removed."
+  (let ((txids (loop for txid being the hash-keys of (block-policy-estimator-tracked est)
+                     collect txid))
+        (start (get-internal-real-time)))
+    (dolist (txid txids)
+      (bpe-remove-tx est txid nil))
+    (bl:log-cat "estimatefee" "Recorded ~D unconfirmed txs from mempool in ~,3Fs"
+                (length txids)
+                (/ (- (get-internal-real-time) start) internal-time-units-per-second))
+    (length txids)))
+
 (defun bpe-process-block (est height confirmed)
   "A block at HEIGHT confirmed the transactions named by CONFIRMED, a list of
 txids (Core processBlock). Untracked txids are ignored, so the caller can pass
