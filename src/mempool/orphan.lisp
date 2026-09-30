@@ -83,7 +83,14 @@ the orphan's full weight and latency score."
   (count 0 :type integer))
 
 (defstruct orphan-pool
-  "Pool of orphan transactions (Core TxOrphanageImpl)."
+  "Pool of orphan transactions (Core TxOrphanageImpl). MAX-GLOBAL-LATENCY-SCORE
+and RESERVED-PEER-USAGE are the two limits Core's constructor takes
+(TxOrphanageImpl(max_global_latency_score, reserved_peer_usage),
+txorphanage.cpp:190-193; MakeTxOrphanage, :776-783); the node uses Core's
+defaults, and a test or fuzz target shrinks them to reach eviction with a
+handful of transactions."
+  (max-global-latency-score +max-orphanage-latency-score+ :type integer :read-only t)
+  (reserved-peer-usage +reserved-orphan-weight-per-peer+ :type integer :read-only t)
   ;; wtxid -> orphan-entry
   (by-wtxid (make-hash-table :test 'equalp) :type hash-table)
   ;; parent txid -> list of orphan wtxids referencing it in some input.
@@ -187,22 +194,22 @@ orphan's input surcharge (Core TotalLatencyScore, txorphanage.cpp:766)."
   (let ((info (gethash peer (orphan-pool-peer-info pool))))
     (if info (orphan-peer-info-usage info) 0)))
 
-(defun %orphan-max-peer-latency-score (pool)
+(defun orphan-max-peer-latency-score (pool)
   "Per-peer latency allowance: the global budget split across peers with
 entries (Core MaxPeerLatencyScore, txorphanage.cpp:768)."
-  (floor +max-orphanage-latency-score+
+  (floor (orphan-pool-max-global-latency-score pool)
          (max 1 (hash-table-count (orphan-pool-peer-info pool)))))
 
-(defun %orphan-max-global-usage (pool)
+(defun orphan-max-global-usage (pool)
   "Global usage cap: the per-peer reservation times the number of peers with
 entries (Core MaxGlobalUsage, txorphanage.cpp:769)."
-  (* +reserved-orphan-weight-per-peer+
+  (* (orphan-pool-reserved-peer-usage pool)
      (max 1 (hash-table-count (orphan-pool-peer-info pool)))))
 
 (defun %orphan-needs-trim-p (pool)
   "Core NeedsTrim (txorphanage.cpp:771-774)."
-  (or (> (orphan-total-latency-score pool) +max-orphanage-latency-score+)
-      (> (orphan-total-usage pool) (%orphan-max-global-usage pool))))
+  (or (> (orphan-total-latency-score pool) (orphan-pool-max-global-latency-score pool))
+      (> (orphan-total-usage pool) (orphan-max-global-usage pool))))
 
 ;;;; Internal add/remove plumbing
 
@@ -266,9 +273,9 @@ itself and its indexes (Core Erase's IsUnique branch)."
   "PEER's DoS score: max of its latency and usage ratios against the per-peer
 allowances, as an exact rational (Core PeerDoSInfo::GetDosScore)."
   (max (/ (orphan-peer-info-latency info)
-          (%orphan-max-peer-latency-score pool))
+          (orphan-max-peer-latency-score pool))
        (/ (orphan-peer-info-usage info)
-          +reserved-orphan-weight-per-peer+)))
+          (orphan-pool-reserved-peer-usage pool))))
 
 (defun %orphan-oldest-announcement-for-peer (pool peer)
   "PEER's oldest (lowest-sequence) announcement, as (values entry ann)."

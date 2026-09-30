@@ -223,6 +223,24 @@ src/mempool/.")
    #:orphan-announcements-from-peer
    #:+max-orphanage-latency-score+
    #:+reserved-orphan-weight-per-peer+
+   #:orphan-pool-max-global-latency-score
+   #:orphan-pool-reserved-peer-usage
+   #:orphan-max-peer-latency-score
+   #:orphan-max-global-usage
+   ;; The pool's own records, which Core's TxOrphanage::SanityCheck and the
+   ;; txorphan fuzz targets read back (tests/fuzz/txorphan.lisp).
+   #:orphan-pool-peer-info
+   #:orphan-pool-by-prev
+   #:orphan-pool-announcement-count
+   #:orphan-pool-unique-usage
+   #:orphan-pool-unique-input-score
+   #:orphan-peer-info-usage
+   #:orphan-peer-info-latency
+   #:orphan-peer-info-count
+   #:orphan-entry-weight
+   #:orphan-entry-latency-score
+   #:orphan-entry-wtxid
+   #:orphan-announcement-sequence
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules
