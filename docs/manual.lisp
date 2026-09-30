@@ -1376,7 +1376,12 @@
 
   Traps: a Coalton or defstruct layout change needs a FRESH FASL volume
   -- the persistent volume keeps stale expansions through a warm rebuild,
-  an image restart and an ordinary cold run. The script-execution cache
+  an image restart and an ordinary cold run. Coalton compiles in RELEASE
+  mode (set at the top of bitcoin-lisp.asd, before Coalton loads): every
+  define-type is a frozen struct, so a MATCH arm is a layout test rather
+  than a CLOS TYPEP, and a changed type needs an image restart. A FASL
+  compiled in the other mode refuses to load (Coalton's own prologue), so
+  a cache written before the switch must be emptied. The script-execution cache
   keys on (wtxid, flags) and NOTHING else -- not the spent scriptPubKeys
   -- because the wtxid commits to every input's OUTPOINT and an outpoint
   names one output of one transaction, whose txid commits to that

@@ -606,6 +606,101 @@ and it must report exactly that row."
     (is (string= "TAPSCRIPT_EMPTY_PUBKEY"
                  (bl.interop:script-error-name :tapscript-empty-pubkey)))))
 
+;;;; The interpreter's OUTPUT, pinned over the same corpus.
+;;;;
+;;;; The two tests above compare what Core's runner compares: the verdict and
+;;;; the error name. An optimization of the interpreter's representation (how
+;;;; Coalton lays out its types, how stack elements cross the CL bridge) must
+;;;; also leave every intermediate STACK exactly as it was, and a verdict
+;;;; comparison cannot see a stack that differs under a true top element. So
+;;;; this digest runs each vector's scriptSig and then its scriptPubKey through
+;;;; the bare interpreter (Core's two EvalScript calls, interpreter.cpp:
+;;;; 2019-2033, without VerifyScript's checks between them) and hashes the
+;;;; verdict, the error name and every byte of every element each run leaves,
+;;;; together with VerifyScript's own answer. The expected digest was computed
+;;;; on the interpreter as it stood before the round-11 changes (Coalton
+;;;; development mode, main 593f56f7).
+
+(defun %digest-write-string (bb string)
+  (let ((bytes (bl.bytes:utf8-string-to-bytes string)))
+    (bl.bytes:bb-write-varint bb (length bytes))
+    (bl.bytes:bb-write-bytes bb bytes)))
+
+(defun %digest-eval (bb script-bytes stack)
+  "Run SCRIPT-BYTES from STACK (a list of Coalton vectors, top first) and
+write the outcome into BB. Returns the final stack, or :FAILED."
+  (let ((result (handler-case
+                    (bl.script:execute-script-with-stack-tx
+                     (bl.interop:cl-array-to-coalton-vector script-bytes)
+                     stack 0 1 #xFFFFFFFF)
+                  (error (e) e))))
+    (cond ((typep result 'error)
+           (%digest-write-string bb "SIGNAL")
+           :failed)
+          ((bl.script:script-result-ok-p result)
+           (let ((final (bl.script:get-ok-stack result)))
+             (%digest-write-string bb "OK")
+             (bl.bytes:bb-write-varint bb (length final))
+             (dolist (element final final)
+               (bl.bytes:bb-write-varint bb (length element))
+               (bl.bytes:bb-write-bytes bb element))))
+          (t
+           (%digest-write-string
+            bb (bl.script:script-error-name (bl.script:script-result-error result)))
+           :failed))))
+
+(defun %script-corpus-digest ()
+  "(values hex-digest vectors stack-elements) over every script_tests.json
+vector: VerifyScript's verdict and error name, then the stacks the scriptSig
+and the scriptPubKey leave when run one after the other."
+  (let ((bb (bl.bytes:make-byte-buf))
+        (vectors 0)
+        (elements 0))
+    (loop for test in (load-script-tests)
+          for i from 0
+          do (multiple-value-bind (sig pubkey flags expected comment witness amount)
+                 (parse-test-case test)
+               (declare (ignore expected comment))
+               (when sig
+                 (incf vectors)
+                 (bl.bytes:bb-write-varint bb i)
+                 (multiple-value-bind (ok err) (run-script-test sig pubkey flags witness amount)
+                   (%digest-write-string bb (%script-error-name ok err)))
+                 (handler-case
+                     (let ((sig-bytes (assemble-script sig))
+                           (pubkey-bytes (script-test-script-pubkey
+                                          pubkey (parse-witness-stack witness))))
+                       (bl.interop:set-script-flags (script-test-flags flags))
+                       (unwind-protect
+                            (let ((after-sig (%digest-eval bb sig-bytes '())))
+                              (unless (eq after-sig :failed)
+                                (incf elements (length after-sig))
+                                (let ((after-pubkey (%digest-eval bb pubkey-bytes after-sig)))
+                                  (unless (eq after-pubkey :failed)
+                                    (incf elements (length after-pubkey))))))
+                         (bl.interop:set-script-flags nil)))
+                   (error () (%digest-write-string bb "UNASSEMBLED"))))))
+    (values (bl.crypto:bytes-to-hex (bl.crypto:sha256 (bl.bytes:bb-finish bb)))
+            vectors
+            elements)))
+
+(defparameter +script-corpus-digest+
+  '("d5c53a939e1a5e644115710755eabc36dfb9267769fcef704b92ff953dbe5295" 1222 8294)
+  "(digest vectors stack-elements) of %SCRIPT-CORPUS-DIGEST before round 11.")
+
+(test script-corpus-stacks-are-pinned
+  "Every script_tests.json vector leaves the SAME stacks, byte for byte, and
+the same verdicts and error names, as the interpreter did before the round-11
+representation changes. The element count is the positive control: a digest
+over runs that all failed early would pin almost nothing, and this corpus
+leaves thousands of elements behind."
+  (multiple-value-bind (digest vectors elements) (%script-corpus-digest)
+    (destructuring-bind (want-digest want-vectors want-elements) +script-corpus-digest+
+      (is (= want-vectors vectors) "digested ~D vectors, pinned ~D" vectors want-vectors)
+      (is (= want-elements elements) "~D stack elements, pinned ~D" elements want-elements)
+      (is (> elements 1000) "only ~D stack elements reached the digest" elements)
+      (is (string= want-digest digest) "corpus digest ~A, pinned ~A" digest want-digest))))
+
 ;;;; The error vocabulary itself: one Core error per variant, and no gaps.
 ;;;;
 ;;;; The corpus above can only compare the errors it happens to provoke. These
