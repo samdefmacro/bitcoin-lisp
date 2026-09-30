@@ -200,8 +200,8 @@ package: a member that entered the pool on its own is visible through the
 pool alone, and not at all once something has replaced it (Core
 PackageAddTransaction runs only for txns_package_eval, validation.cpp:1473).
 A later subpackage tx's input that spends an earlier sibling's output
-resolves (Core's CCoinsViewMemPool layered over the package). Consulted only as a fallback, after the confirmed UTXO set and the
-real mempool. HEIGHT is the height these unconfirmed outputs are assumed to
+resolves (Core's CCoinsViewMemPool layered over the package). Consulted only
+as a fallback, after the confirmed UTXO set and the real mempool. HEIGHT is the height these unconfirmed outputs are assumed to
 confirm at — the next block (tip+1) — which is what BIP68 evaluates against."
   (let ((coins (%make-package-coins)))
     (dolist (tx package coins)

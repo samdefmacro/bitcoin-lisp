@@ -1174,53 +1174,53 @@ at hand."
     (let ((*mempool-removal-reason* :replaced))
       (dolist (rt replaced)
         (mempool-remove-recursive mempool rt)))
-  (let ((entry (make-entry-from-tx tx (or fee 0) height
-                                   :sigops sigops :entry-time entry-time)))
-    ;; The limit is this function's, not MEMPOOL-ADD's (which would trim
-    ;; BEFORE the expiry, and under BYPASS-LIMITS too, where Core does not
-    ;; limit at all); the announcement waits for it.
-    (let ((result (mempool-add mempool txid entry :defer-trim t
-                                                 :bypass-limits bypass-limits
-                                                 :entry-sequence entry-sequence
-                                                 :announce (not limit))))
-      ;; Core LimitMempoolSize after a successful acceptance
-      ;; (validation.cpp:1392-1394), under Core's own guard
-      ;; `!package_submission && !bypass_limits'. Expiry lives here and
-      ;; nowhere else on this path: Core checks it only when something is
-      ;; accepted, which is why mempool_expiry.py broadcasts an unrelated
-      ;; transaction to make the node look at a pool it has been ignoring.
-      ;; A tx that the sweep or the trim then removes -- its own parent could
-      ;; have expired underneath it -- is Core's `mempool full', which is
-      ;; how it reads the pool after LimitMempoolSize (validation.cpp:1398),
-      ;; and a transaction nobody hears about: the added signal comes after
-      ;; the limit, for what is still there (:1413-1416).
-      (when (and (eq result :ok) limit)
-        (mempool-limit-size mempool)
-        (if (mempool-has mempool txid)
-            (%announce-added mempool txid entry)
-            (setf result :mempool-full)))
-      ;; Fee estimation tracks a transaction from mempool ENTRY, so it can
-      ;; later say how long that feerate waited (Core's validation interface
-      ;; delivers TransactionAddedToMempool for the same purpose). Only a tx
-      ;; that actually entered counts.
-      ;;
-      ;; The four flags are Core's NewMempoolTransactionInfo
-      ;; (validation.cpp:1304-1307): the two exclusions this path knows about
-      ;; are declared by the reorg re-add and the package submitter, the
-      ;; chainstate-current predicate is IsCurrentForFeeEstimation (computed
-      ;; by the caller, which has the chain state), and whether the
-      ;; transaction has unconfirmed parents the ENTRY already knows --
-      ;; MEMPOOL-ADD populated its parent links, and that is Core's
-      ;; HasNoInputsOf.
-      (when (eq result :ok)
-        (bpe-note-entry txid (mempool-entry-fee entry)
-                        (mempool-entry-vsize entry) height
-                        :bypass-limits bypass-limits
-                        :package-submission package-submission
-                        :chainstate-current chainstate-current
-                        :has-no-mempool-parents
-                        (zerop (hash-table-count (mempool-entry-parents entry)))))
-      (values result entry)))))
+    (let ((entry (make-entry-from-tx tx (or fee 0) height
+                                     :sigops sigops :entry-time entry-time)))
+      ;; The limit is this function's, not MEMPOOL-ADD's (which would trim
+      ;; BEFORE the expiry, and under BYPASS-LIMITS too, where Core does not
+      ;; limit at all); the announcement waits for it.
+      (let ((result (mempool-add mempool txid entry :defer-trim t
+                                                   :bypass-limits bypass-limits
+                                                   :entry-sequence entry-sequence
+                                                   :announce (not limit))))
+        ;; Core LimitMempoolSize after a successful acceptance
+        ;; (validation.cpp:1392-1394), under Core's own guard
+        ;; `!package_submission && !bypass_limits'. Expiry lives here and
+        ;; nowhere else on this path: Core checks it only when something is
+        ;; accepted, which is why mempool_expiry.py broadcasts an unrelated
+        ;; transaction to make the node look at a pool it has been ignoring.
+        ;; A tx that the sweep or the trim then removes -- its own parent could
+        ;; have expired underneath it -- is Core's `mempool full', which is
+        ;; how it reads the pool after LimitMempoolSize (validation.cpp:1398),
+        ;; and a transaction nobody hears about: the added signal comes after
+        ;; the limit, for what is still there (:1413-1416).
+        (when (and (eq result :ok) limit)
+          (mempool-limit-size mempool)
+          (if (mempool-has mempool txid)
+              (%announce-added mempool txid entry)
+              (setf result :mempool-full)))
+        ;; Fee estimation tracks a transaction from mempool ENTRY, so it can
+        ;; later say how long that feerate waited (Core's validation interface
+        ;; delivers TransactionAddedToMempool for the same purpose). Only a tx
+        ;; that actually entered counts.
+        ;;
+        ;; The four flags are Core's NewMempoolTransactionInfo
+        ;; (validation.cpp:1304-1307): the two exclusions this path knows about
+        ;; are declared by the reorg re-add and the package submitter, the
+        ;; chainstate-current predicate is IsCurrentForFeeEstimation (computed
+        ;; by the caller, which has the chain state), and whether the
+        ;; transaction has unconfirmed parents the ENTRY already knows --
+        ;; MEMPOOL-ADD populated its parent links, and that is Core's
+        ;; HasNoInputsOf.
+        (when (eq result :ok)
+          (bpe-note-entry txid (mempool-entry-fee entry)
+                          (mempool-entry-vsize entry) height
+                          :bypass-limits bypass-limits
+                          :package-submission package-submission
+                          :chainstate-current chainstate-current
+                          :has-no-mempool-parents
+                          (zerop (hash-table-count (mempool-entry-parents entry)))))
+        (values result entry)))))
 
 (defun %announce-added (mempool txid entry)
   "Core TransactionAddedToMempool(tx_info, GetAndIncrementSequence())
