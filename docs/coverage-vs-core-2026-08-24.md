@@ -675,6 +675,47 @@ transport simulations); coins_view and the UTXO snapshot; the targets of C++ con
 that have no Lisp counterpart (prevector, span, bitdeque, vecdeque, overflow, float, strprintf, ...); and the
 miniscript generators (miniscript_stable, miniscript_smart) that need Core's key and preimage tables.
 
+#### 2026-10-01: the node-side targets (Round 11, batch fuzz-node)
+
+25 more of Core's targets from 19 more files, so the P2P, coins-view, UTXO-snapshot and miniscript-generator
+entries of the "not ported" list above are ported now (the counts in the summary rows are the 69 / 37 before
+this batch). Each needed a harness on the node side: a fixture node (context, header chain, coins, mempool,
+scripted peers) that `DELIVER-IBD-MESSAGE` drives, loopback sockets for the transports, fake SOCKS5 and SAM
+bridges, a scratch LevelDB for the coins view. Where Core's assertion is only "no crash", the target holds
+the component to a reference model restated from Core's source as well (the V1Transport framing, the
+handshake, the coins map, the connman peer table).
+
+| Core file | Targets |
+|---|---|
+| process_message, process_messages, p2p_handshake, p2p_headers_presync, connman | process_message, process_messages, p2p_handshake, p2p_headers_presync, connman |
+| p2p_transport_serialization, net | p2p_transport_serialization, p2p_transport_bidirectional_v2 (plus the v2 receiver's garbage and decoy inputs); local_address |
+| banman, socks5, i2p | all three |
+| coins_view, coinscache_sim, utxo_snapshot, utxo_total_supply | coins_view_db, coinscache_sim, utxo_snapshot_invalid, utxo_total_supply |
+| chain, block_index, versionbits, validation_load_mempool, load_external_block_file | all five |
+| deserialize | flat_file_pos, uint160, uint256 (23 of 37 now) |
+| miniscript | miniscript_stable, miniscript_smart (all four now) |
+
+Defects found, each fixed Core's way with the input pinned: a SOCKS5 destination went out one octet per
+character where Core sends its UTF-8 bytes (a character past Latin-1 signalled a TYPE-ERROR and dropped the
+dial); an I2P accept waited on the socket descriptor for a destination the stream had already buffered with the
+status line, so the peer was never accepted (every descriptor poll in src/networking/ now also asks the stream,
+a structural test); a BIP324 message with an empty type went out as short ID 0, which no receiver decodes,
+where Core sends the long encoding; the `-loadblock` scan hunted on inside a truncated record where Core stops;
+the handshake gave up after ten messages before VERACK where Core waits out any number; and a hash fragment's
+dissatisfaction (Core's ZERO32) was not marked malleable, so a satisfaction through it passed for
+non-malleable. Found reading Core beside the local_address target: LOCAL_MANUAL was 3 where Core's is 4
+(LOCAL_MAPPED was missing), so getnetworkinfo reported a manual address one lower than Core.
+
+Not ported from these files: coins_view and coins_view_overlay (nothing here layers a cache on the empty view
+or on a cache); utxo_snapshot's valid half (Core's 200-block test chain and its chainparams commitment cannot
+be mined here); p2p_transport_bidirectional and _v1v2 (the v1 half is the serialization target's reference
+model; there is no v1-to-v2 fallback transport object); net (CNode's own operations, most of them absent);
+miniscript VerifyScript of each generated satisfaction (Core's checker accepts its dummy signatures by value;
+ours verifies real ones over a real sighash). deserialize's remaining 14 have no codec of their own here
+(block_filter, fee_rate, pub_key, key_origin_info, prefilled_transaction, partial_merkle_tree, blocklocator,
+snapshotmetadata, addr_info, netaddr, service, ...; the reasons are in tests/fuzz/deserialize.lisp's commit).
+The new targets add about 50 s to a warm run of the battery.
+
 ### Deployment
 
 **Both nodes are on the latest main**: testnet4 (libsecp v0.7.1 + musig) and mainnet
