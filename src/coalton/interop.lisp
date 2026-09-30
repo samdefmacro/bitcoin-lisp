@@ -6,176 +6,14 @@
 ;;;; Coalton functions can be called directly as CL functions since
 ;;;; Coalton compiles to CL.
 
-(defpackage #:bitcoin-lisp.coalton.interop
-  (:documentation "CL wrapper functions for Coalton Bitcoin types.")
-  (:use #:cl)
-  ;; Byte I/O (src/util/bytes.lisp). Loads before this file, so the sighash
-  ;; writers below inline it.
-  (:import-from #:bitcoin-lisp.bytes
-                #:make-byte-buf #:bb-write-u32-le #:bb-write-u64-le #:bb-write-i64-le
-                #:bb-write-bytes #:bb-write-varint #:bb-finish
-                #:buf-set-u8 #:buf-set-u16-le #:buf-set-u32-le #:buf-set-u64-le
-                #:buf-set-bytes #:buf-set-varint)
-  (:export
-   ;; Script bytes into the interpreter
-   #:cl-array-to-coalton-vector
-   ;; Satoshi operations
-   #:wrap-satoshi
-   #:unwrap-satoshi
-   #:satoshi+
-   #:satoshi-
-   #:satoshi<
-   #:satoshi<=
-   #:satoshi>
-   #:satoshi>=
-   #:satoshi=
-   #:zero-satoshi
-   ;; BlockHeight operations
-   #:wrap-block-height
-   #:unwrap-block-height
-   #:block-height+
-   #:block-height<
-   #:block-height<=
-   #:block-height>
-   #:block-height>=
-   #:block-height=
-   #:zero-block-height
-   #:next-block-height
-   ;; Struct ↔ Coalton vector converters
-   #:cl-array-to-coalton-vector
-   ;; Constants
-   #:+max-money+
-   #:+coin+
-   #:+coinbase-maturity+
-   ;; Script execution
-   #:run-script
-   #:run-scripts-with-p2sh
-   #:is-p2sh-script-p
-   #:stack-top-truthy-p
-   ;; Script errors in Core's vocabulary
-   #:+script-errors+
-   #:script-error-keyword
-   #:script-error-for-keyword
-   #:script-error-name
-   #:script-error-message
-   #:last-checksig-script-error
-   #:last-checkmultisig-script-error
-   ;; Script flags
-   #:*script-flags*
-   #:set-script-flags
-   #:flag-enabled-p
-   ;; Signature verification
-   #:verify-script
-   #:p2sh-redeem-script
-   #:verify-checksig
-   #:verify-checksig-for-script
-   #:last-checksig-had-strictenc-error-p
-   ;; Multisig verification
-   #:verify-checkmultisig
-   #:verify-checkmultisig-for-script
-   #:last-checkmultisig-had-error-p
-   #:do-checkmultisig-stack-op
-   ;; MINIMALDATA validation
-   #:minimal-push-encoding-p
-   #:minimal-number-encoding-p
-   ;; SIGPUSHONLY validation
-   #:script-is-push-only-p
-   ;; Transaction context for block validation
-   #:*current-tx*
-   #:*current-spent-utxos*
-   #:*debug-bip341-sighash*
-   #:*current-input-index*
-   #:*debug-checksig*
-   #:*current-script-code*
-   #:compute-legacy-sighash
-   ;; Sighash precomputation
-   #:*precomputed-sighash*
-   #:init-precomputed-sighash
-   #:precomputed-sighash-data
-   ;; Signature cache
-   #:*signature-cache*
-   #:*signature-cache-prev*
-   #:*signature-cache-enabled*
-   #:clear-signature-cache
-   ;; SegWit / BIP 143
-   #:*witness-v0-mode*
-   #:*witness-input-amount*
-   #:*original-script-pubkey*
-   #:compute-bip143-sighash
-   #:make-p2pkh-script-code
-   #:validate-witness-program
-   #:validate-p2wpkh
-   #:validate-p2wsh
-   #:is-witness-program-p
-   #:get-witness-version
-   #:get-witness-program-bytes
-   #:is-compressed-pubkey-p
-   ;; Taproot / BIP 341
-   #:is-taproot-program-p
-   #:validate-taproot
-   #:validate-taproot-key-path
-   #:validate-taproot-script-path
-   #:compute-bip341-sighash
-   #:compute-taproot-tweak
-   #:compute-tweaked-pubkey
-   #:verify-taproot-tweak
-   #:parse-control-block
-   #:compute-merkle-root-from-path
-   ;; Tapscript / BIP 342
-   #:*tapscript-leaf-hash*
-   #:*tapscript-amount*
-   #:verify-tapscript-signature
-   #:is-op-success-p
-   #:scan-for-op-success
-   #:run-tapscript
-   #:increment-script-number
-   ;; Core's CScriptNum decode and the two halves of CheckSignatureEncoding
-   ;; under SCRIPT_VERIFY_STRICTENC. The script renderer (ScriptToAsmStr)
-   ;; needs the same three the interpreter does: a push of four bytes or
-   ;; fewer prints as its CScriptNum value, and a longer one prints its
-   ;; sighash type only when it passes the interpreter's own encoding test.
-   #:script-number-to-int
-   #:check-der-signature-format
-   #:valid-sighash-type-p)
-  ;; Reached from another package with :: before the second-round review
-  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
-  (:export
-   #:*script-execution-cache-enabled*
-   #:*tapscript-codesep-pos*
-   #:*signature-cache-max-entries*
-   #:make-script-execution-cache-key
-   #:script-execution-cache-store
-   #:script-execution-cached-p))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (bitcoin-lisp.nicknames:install-package-nicknames))
+;; The package is defined in src/coalton/package.lisp with the others: the
+;; interpreter (script.lisp, loaded before this file) calls back into it by
+;; name, and a name the reader cannot resolve had to be INTERNed at run time.
 
 (in-package #:bitcoin-lisp.coalton.interop)
 
-;;; Conversion utilities
-
-(defun cl-array-to-coalton-vector (cl-array)
-  "Convert a CL byte array to a Coalton vector: a SIMPLE-VECTOR holding the
-same elements, which is what (map 'vector #'identity cl-array) returns.
-
-An octet vector -- every script, witness item and stack element the script
-paths hand over -- is copied by a typed loop. The generic MAP calls IDENTITY
-per element, and the round-10 IBD profile (2,100 regtest blocks of ~925 KB,
-sb-sprof over the syncing node) put 12.5% of all samples here: each P2WSH
-input converts its scriptPubKey five times. Anything else keeps the generic
-path."
-  (if (typep cl-array '(simple-array (unsigned-byte 8) (*)))
-      (let* ((n (length cl-array))
-             (v (make-array n)))
-        (declare (type (simple-array (unsigned-byte 8) (*)) cl-array)
-                 (type simple-vector v))
-        (dotimes (i n v)
-          (setf (svref v i) (aref cl-array i))))
-      (map 'vector #'identity cl-array)))
-
-(defun coalton-vector-to-cl-array (vec)
-  "Convert a Coalton vector to a CL byte array."
-  (coerce vec '(simple-array (unsigned-byte 8) (*))))
+;;; The two byte-vector conversions live in bridge.lisp, loaded before the
+;;; Coalton files that call them.
 
 ;;; Bitcoin constants
 (defconstant +coin+ 100000000
@@ -648,6 +486,30 @@ flags), value = T.")
 (defvar *script-execution-cache-enabled* t
   "When T, cache whole-transaction script-validation results.")
 
+(defvar *last-flags-string-bytes* (cons nil nil)
+  "(flags-string . its bytes) of the most recent MAKE-SCRIPT-EXECUTION-CACHE-KEY,
+replaced as a whole cons -- never mutated -- so a reader on any thread sees a
+matching pair, as *LAST-FLAG-SET* is.")
+
+(defun %flags-string-bytes (flags)
+  "FLAGS' character codes as an octet vector, which is what the generic
+(map '(simple-array (unsigned-byte 8) (*)) #'char-code flags) returned. The
+string bound to *script-flags* is one object for a whole block, so the last
+one seen is recognized by EQ; a new string is copied by a typed loop. The
+generic MAP called CHAR-CODE through %MAP-FOR-EFFECT for each of the ~77
+characters of every transaction's key: 4.9% of the round-11 profile of
+the interpreter over a fixed P2WSH set. The returned vector is shared and
+must not be written."
+  (let ((last *last-flags-string-bytes*))
+    (if (eq (car last) flags)
+        (cdr last)
+        (let* ((n (length flags))
+               (bytes (make-array n :element-type '(unsigned-byte 8))))
+          (dotimes (i n)
+            (setf (aref bytes i) (char-code (char flags i))))
+          (setf *last-flags-string-bytes* (cons flags bytes))
+          bytes))))
+
 (defun make-script-execution-cache-key (wtxid flags)
   "SHA256(salt | wtxid | flags) — Core hashes the wtxid and the flags word into
 its salted hasher (validation.cpp:2077).
@@ -657,7 +519,7 @@ reason: an unsalted key is computable offline, which is what makes a cache
 attackable by collision or eviction ordering."
   (let* ((salt *sig-cache-salt*)
          (flag-bytes (if flags
-                         (map '(simple-array (unsigned-byte 8) (*)) #'char-code flags)
+                         (%flags-string-bytes flags)
                          (make-array 0 :element-type '(unsigned-byte 8))))
          (total (+ (length salt) (length wtxid) 2 (length flag-bytes)))
          (buf (make-array total :element-type '(unsigned-byte 8)))

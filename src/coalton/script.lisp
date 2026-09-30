@@ -626,11 +626,9 @@ that named two Core errors would make that comparison meaningless."
           (ScriptOk (ScriptNum 0))
           (lisp (ScriptResult ScriptNum) (bytes len)
             ;; Check MINIMALDATA validation if flag is enabled
-            (cl:let* ((flag-fn (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP")))
-                      (minimal-fn (cl:fdefinition (cl:intern "MINIMAL-NUMBER-ENCODING-P" "BITCOIN-LISP.COALTON.INTEROP"))))
-              (cl:when (cl:and (cl:funcall flag-fn "MINIMALDATA")
-                               (cl:not (cl:funcall minimal-fn bytes)))
-                (cl:return-from bytes-to-script-num (ScriptErr SE-InvalidNumber))))
+            (cl:when (cl:and (bl.interop:flag-enabled-p "MINIMALDATA")
+                             (cl:not (bl.interop:minimal-number-encoding-p bytes)))
+              (cl:return-from bytes-to-script-num (ScriptErr SE-InvalidNumber)))
             ;; Convert to number
             (cl:let* ((negative (cl:logbitp 7 (cl:aref bytes (cl:1- len))))
                       (abs-value
@@ -741,12 +739,10 @@ that named two Core errors would make that comparison meaningless."
      Returns ScriptErr SE-MinimalData if MINIMALDATA flag is enabled and push is non-minimal.
      OPCODE is the push opcode byte."
     (lisp (ScriptResult Unit) (opcode data)
-      (cl:let* ((flag-fn (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP")))
-                (minimal-fn (cl:fdefinition (cl:intern "MINIMAL-PUSH-ENCODING-P" "BITCOIN-LISP.COALTON.INTEROP"))))
-        (cl:if (cl:and (cl:funcall flag-fn "MINIMALDATA")
-                       (cl:not (cl:funcall minimal-fn opcode data)))
-               (ScriptErr SE-MinimalData)
-               (ScriptOk Unit)))))
+      (cl:if (cl:and (bl.interop:flag-enabled-p "MINIMALDATA")
+                     (cl:not (bl.interop:minimal-push-encoding-p opcode data)))
+             (ScriptErr SE-MinimalData)
+             (ScriptOk Unit))))
 
   (declare bytes-to-script-num-limited ((Vector U8) -> UFix -> (ScriptResult ScriptNum)))
   (define (bytes-to-script-num-limited bytes max-len)
@@ -1186,8 +1182,7 @@ OP_CHECKSEQUENCEVERIFY are NOT upgradable NOPs: each has its own flag, and with
 that flag off Core leaves the branch as a plain NOP without consulting anything
 else. Wiring either of them here rejects scripts Core accepts."
     (let ((discourage (lisp Boolean ()
-                        (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                    "DISCOURAGE_UPGRADABLE_NOPS"))))
+                        (bl.interop:flag-enabled-p "DISCOURAGE_UPGRADABLE_NOPS"))))
       (if discourage
           (ScriptErr SE-DiscourageUpgradableNops)
           (ScriptOk ctx))))
@@ -1197,8 +1192,7 @@ else. Wiring either of them here rejects scripts Core accepts."
   (define (flag-enabled flag-name)
     "Check if a script verification flag is enabled."
     (lisp Boolean (flag-name)
-      (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                  flag-name)))
+      (bl.interop:flag-enabled-p flag-name)))
 
   ;; Helper: call verify-tapscript-signature and map result to UFix status code
   ;; 0=empty-sig 1=ok 2=invalid 3=upgradable-pubkey
@@ -1210,17 +1204,16 @@ else. Wiring either of them here rejects scripts Core accepts."
   (define (tapscript-verify-sig-status sig pubkey)
     "Call VERIFY-TAPSCRIPT-SIGNATURE and return a UFix status code."
     (lisp UFix (sig pubkey)
-      (cl:let* ((sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                (verify-fn (cl:fdefinition (cl:intern "VERIFY-TAPSCRIPT-SIGNATURE" "BITCOIN-LISP.COALTON.INTEROP"))))
-        (cl:when (cl:symbol-value (cl:intern "*DEBUG-BIP341-SIGHASH*" "BITCOIN-LISP.COALTON.INTEROP"))
+      (cl:let* ((sig-arr (bl.interop:coalton-vector-to-cl-array sig))
+                (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
+        (cl:when (cl:symbol-value 'bl.interop:*debug-bip341-sighash*)
           (cl:funcall (cl:fdefinition (cl:intern "NODE-LOG" "BITCOIN-LISP"))
                       :warn
                       "tapscript-verify-sig-status: sig-len=~D pubkey-len=~D"
                       (cl:length sig-arr) (cl:length pk-arr)))
         (cl:multiple-value-bind (status valid)
-            (cl:funcall verify-fn sig-arr pk-arr)
-          (cl:when (cl:symbol-value (cl:intern "*DEBUG-BIP341-SIGHASH*" "BITCOIN-LISP.COALTON.INTEROP"))
+            (bl.interop:verify-tapscript-signature sig-arr pk-arr)
+          (cl:when (cl:symbol-value 'bl.interop:*debug-bip341-sighash*)
             (cl:funcall (cl:fdefinition (cl:intern "NODE-LOG" "BITCOIN-LISP"))
                         :warn
                         "tapscript-verify-sig-status -> status=~A valid=~A"
@@ -1261,15 +1254,13 @@ else. Wiring either of them here rejects scripts Core accepts."
   (define (last-checksig-error)
     "The ScriptError VERIFY-CHECKSIG-FOR-SCRIPT recorded for the last call."
     (lisp ScriptError ()
-      (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-SCRIPT-ERROR"
-                                             "BITCOIN-LISP.COALTON.INTEROP")))))
+      (bl.interop:last-checksig-script-error)))
 
   (declare last-checkmultisig-error (Unit -> ScriptError))
   (define (last-checkmultisig-error)
     "The ScriptError DO-CHECKMULTISIG-STACK-OP recorded for the last call."
     (lisp ScriptError ()
-      (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKMULTISIG-SCRIPT-ERROR"
-                                             "BITCOIN-LISP.COALTON.INTEROP")))))
+      (bl.interop:last-checkmultisig-script-error)))
 
   ;; Helper: evaluate IF/NOTIF condition with Tapscript MINIMALIF and witness v0 MINIMALIF
   ;; INVERT: False for OP_IF, True for OP_NOTIF
@@ -1293,9 +1284,8 @@ else. Wiring either of them here rejects scripts Core accepts."
           ;; Non-Tapscript: check MINIMALIF flag (witness v0 only, not BASE)
           (let ((is-minimalif (lisp Boolean ()
                                 (cl:and
-                                 (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                             "MINIMALIF")
-                                 (cl:symbol-value (cl:intern "*WITNESS-V0-MODE*" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                                 (bl.interop:flag-enabled-p "MINIMALIF")
+                                 (cl:symbol-value 'bl.interop:*witness-v0-mode*)))))
             (if is-minimalif
                 (let ((len (lisp UFix (top) (cl:length top))))
                   (cond
@@ -1954,8 +1944,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (sym (cl:find-symbol "*CURRENT-SCRIPT-CODE*" "BITCOIN-LISP.COALTON.INTEROP")))
              (cl:when (cl:and sym (cl:boundp sym) (cl:symbol-value sym))
                (cl:setf (cl:symbol-value sym)
-                        (cl:coerce (cl:subseq script pos)
-                                   '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+                        (bl.interop:coalton-vector-to-cl-array script pos)))
              ;; BIP 342: record this OP_CODESEPARATOR's opcode index (not its
              ;; byte offset) for the tapscript sighash. POS is the byte after
              ;; the codeseparator, so its byte start is (1- POS).
@@ -2016,9 +2005,9 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((Some (Tuple data new-stack))
           ;; SHA1 using Ironclad - convert types properly
           (let ((hash (lisp (Vector U8) (data)
-                        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                        (cl:let* ((cl-data (bl.interop:coalton-vector-to-cl-array data))
                                   (result (ironclad:digest-sequence :sha1 cl-data)))
-                          (cl:map 'cl:vector #'cl:identity result)))))
+                          (bl.interop:cl-array-to-coalton-vector result)))))
             (ScriptOk (context-with-main-stack
                        (stack-push hash new-stack)
                        ctx))))))
@@ -2026,8 +2015,7 @@ else. Wiring either of them here rejects scripts Core accepts."
       ((OP-CHECKSIG)
        ;; Pop pubkey and sig, verify signature
        (let ((is-tapscript (lisp Boolean ()
-                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                         "TAPSCRIPT"))))
+                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
          (match (stack-pop (context-main-stack ctx))
            ((None) (ScriptErr SE-StackUnderflow))
            ((Some (Tuple pubkey stack1))
@@ -2049,15 +2037,12 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
                                             (codesep-pos (context-codesep-pos ctx))
-                                            (subscript-raw (cl:subseq script codesep-pos))
-                                            ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
-                                            (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
-                                    (cl:funcall fn sig-arr pk-arr subscript)))))
+                                            (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos))
+                                            (sig-arr (bl.interop:coalton-vector-to-cl-array sig))
+                                            (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
+                                    (bl.interop:verify-checksig-for-script sig-arr pk-arr subscript)))))
                      (let ((strictenc-error (lisp Boolean ()
-                                              (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                                              (bl.interop:last-checksig-had-strictenc-error-p))))
                        (if strictenc-error
                            (ScriptErr (last-checksig-error))
                            (ScriptOk (context-with-main-stack
@@ -2067,8 +2052,7 @@ else. Wiring either of them here rejects scripts Core accepts."
       ((OP-CHECKSIGVERIFY)
        ;; CHECKSIG then VERIFY - verify signature and fail if invalid
        (let ((is-tapscript (lisp Boolean ()
-                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                         "TAPSCRIPT"))))
+                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
          (match (stack-pop (context-main-stack ctx))
            ((None) (ScriptErr SE-StackUnderflow))
            ((Some (Tuple pubkey stack1))
@@ -2090,14 +2074,12 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
                                             (codesep-pos (context-codesep-pos ctx))
-                                            (subscript-raw (cl:subseq script codesep-pos))
-                                            (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                            (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
-                                    (cl:funcall fn sig-arr pk-arr subscript)))))
+                                            (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos))
+                                            (sig-arr (bl.interop:coalton-vector-to-cl-array sig))
+                                            (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
+                                    (bl.interop:verify-checksig-for-script sig-arr pk-arr subscript)))))
                      (let ((strictenc-error (lisp Boolean ()
-                                              (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                                              (bl.interop:last-checksig-had-strictenc-error-p))))
                        (if strictenc-error
                            (ScriptErr (last-checksig-error))
                            (if valid
@@ -2114,8 +2096,7 @@ else. Wiring either of them here rejects scripts Core accepts."
        ;; status 7 is that overrun.
        ;; BIP 342: Disabled in Tapscript context
        (let ((is-tapscript (lisp Boolean ()
-                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                         "TAPSCRIPT"))))
+                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
          (if is-tapscript
              (ScriptErr SE-TapscriptCheckmultisig)
              (let ((spent (context-op-count ctx))
@@ -2124,12 +2105,9 @@ else. Wiring either of them here rejects scripts Core accepts."
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
-                                 (subscript-raw (cl:subseq script codesep-pos))
-                                 ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
-                                 (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                 (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                 (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos)))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
-                             (cl:funcall fn stack subscript spent budget)
+                             (bl.interop:do-checkmultisig-stack-op stack subscript spent budget)
                            (cl:case status
                              (:ok (Tuple3 0 new-stack pubkey-count))        ; success
                              (:fail (Tuple3 1 new-stack pubkey-count))      ; verify failed, push false
@@ -2160,8 +2138,7 @@ else. Wiring either of them here rejects scripts Core accepts."
        ;; for OP_CHECKMULTISIG above; status 7 is that overrun.
        ;; BIP 342: Disabled in Tapscript context
        (let ((is-tapscript (lisp Boolean ()
-                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                         "TAPSCRIPT"))))
+                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
          (if is-tapscript
              (ScriptErr SE-TapscriptCheckmultisig)
              (let ((spent (context-op-count ctx))
@@ -2170,12 +2147,9 @@ else. Wiring either of them here rejects scripts Core accepts."
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
-                                 (subscript-raw (cl:subseq script codesep-pos))
-                                 ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
-                                 (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                 (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                 (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos)))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
-                             (cl:funcall fn stack subscript spent budget)
+                             (bl.interop:do-checkmultisig-stack-op stack subscript spent budget)
                            (cl:case status
                              (:ok (Tuple3 0 new-stack pubkey-count))
                              (:fail (Tuple3 1 new-stack pubkey-count))
@@ -2205,8 +2179,7 @@ else. Wiring either of them here rejects scripts Core accepts."
       ;; Stack: sig n pubkey -> n' (n+1 if valid, n if empty sig, fail if invalid)
       ((OP-CHECKSIGADD)
        (let ((is-tapscript (lisp Boolean ()
-                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                         "TAPSCRIPT"))))
+                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
          (cond
            ((not is-tapscript)
              ;; In non-Tapscript context, this is an unknown opcode

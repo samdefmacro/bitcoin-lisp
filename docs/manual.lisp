@@ -1393,7 +1393,10 @@
 (defsection @script (:title "script: the Coalton interpreter")
   "The one piece of the node written in Coalton: `src/coalton/` holds the
   types, the byte codecs and the script interpreter, and `interop.lisp`
-  is the minimal bridge validation calls. Core: `script/interpreter.cpp`,
+  is the minimal bridge validation calls. Coalton's (Vector U8) is a
+  SIMPLE-VECTOR of fixnums, never an octet vector: `bridge.lisp` holds the
+  two typed copies across that line, and loads before the Coalton files
+  so the interpreter calls them directly. Core: `script/interpreter.cpp`,
   `script/script.cpp`, `script/sigcache.cpp`. Settled policy: the
   interpreter stays Coalton; everything else is CL.
 
@@ -1416,7 +1419,12 @@
 
   Traps: a Coalton or defstruct layout change needs a FRESH FASL volume
   -- the persistent volume keeps stale expansions through a warm rebuild,
-  an image restart and an ordinary cold run. The script-execution cache
+  an image restart and an ordinary cold run. Coalton compiles in RELEASE
+  mode (set at the top of bitcoin-lisp.asd, before Coalton loads): every
+  define-type is a frozen struct, so a MATCH arm is a layout test rather
+  than a CLOS TYPEP, and a changed type needs an image restart. A FASL
+  compiled in the other mode refuses to load (Coalton's own prologue), so
+  a cache written before the switch must be emptied. The script-execution cache
   keys on (wtxid, flags) and NOTHING else -- not the spent scriptPubKeys
   -- because the wtxid commits to every input's OUTPOINT and an outpoint
   names one output of one transaction, whose txid commits to that

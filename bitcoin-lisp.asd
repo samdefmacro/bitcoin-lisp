@@ -6,6 +6,22 @@
                          (merge-pathnames "refs/coalton/" (make-pathname :directory (pathname-directory this-file))))))
     (when (and coalton-path (probe-file coalton-path))
       (pushnew coalton-path asdf:*central-registry* :test #'equal))))
+;;; Coalton compiles in RELEASE mode. In its default development mode every
+;;; define-type becomes a CLOS class: a constructor is MAKE-INSTANCE, a field
+;;; reader is SLOT-VALUE behind a type-checked entry, and every MATCH arm is a
+;;; TYPEP against a redefinable class -- SB-KERNEL:CLASSOID-CELL-TYPEP, the top
+;;; frame of the round-10 IBD profile. Release mode emits the same types as
+;;; frozen structs with inlined constructors and readers, and drops the
+;;; fallback arm of a match the type checker proved exhaustive; what a program
+;;; computes does not change (Coalton's settings.lisp, COALTON-RELEASE-P).
+;;;
+;;; The property is read once, when Coalton's settings.lisp LOADS, so it must be
+;;; set before Coalton is loaded -- which this file is, being read before any of
+;;; its systems' dependencies. An image that already loaded Coalton keeps the
+;;; mode it has. A FASL compiled in one mode refuses to load in the other
+;;; (Coalton's prologue signals `compiled in development mode but loaded in
+;;; release'), so a FASL cache written before this line must be emptied.
+(setf (get :coalton-config :compiler-mode) "release")
 
 (defsystem "bitcoin-lisp/util"
   :description "The chain-agnostic base every other layer builds on: the
@@ -264,6 +280,7 @@ bitcoin-cli (node-main)."
                  (:file "zmq")
                  (:module "coalton"
                   :components ((:file "package")
+                               (:file "bridge")
                                (:file "types")
                                (:file "crypto")
                                (:file "binary")
