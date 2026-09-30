@@ -550,11 +550,17 @@ that does not parse is refused, never defaulted in (Core ClientAllowed rejects
 ;;; by the sync thread (self-advertisement) and getnetworkinfo, and written by
 ;;; the torcontrol thread — hence the lock.
 
-;; Core LocalServiceInfo scores (net.h:152-160).
+;; Core LocalServiceInfo scores (net.h:152-160): NONE, IF, BIND, MAPPED,
+;; MANUAL. LOCAL_MAPPED (an address PCP reported) is kept although nothing
+;; here maps a port: without it MANUAL was 3, so an -externalip or onion
+;; address reported score 3 in getnetworkinfo where Core reports 4, and one
+;; seen once already counted as `above LOCAL_MANUAL' in the address
+;; advertisement (net_processing.cpp's randbits(nScore > LOCAL_MANUAL ? 3 : 1)).
 (defconstant +local-none+ 0)
 (defconstant +local-if+ 1)
 (defconstant +local-bind+ 2)
-(defconstant +local-manual+ 3)
+(defconstant +local-mapped+ 3)
+(defconstant +local-manual+ 4)
 
 (defstruct local-address
   "One entry of the local-address map: an address this node believes it is

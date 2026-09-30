@@ -643,6 +643,21 @@ restoring the table and the -discover flag afterwards."
                            (bl.net:local-address-port la)
                            bl.net:+local-manual+)))))
 
+(test local-address-scores-are-cores
+  "Core's LocalServiceInfo scores (net.h:152-160) are NONE 0, IF 1, BIND 2,
+MAPPED 3, MANUAL 4, and getnetworkinfo reports the score as it stands: an
+-externalip address added at LOCAL_MANUAL reads 4, and 5 once re-added at that
+score (AddLocal's bump, net.cpp:295-297). Ours skipped LOCAL_MAPPED, so
+MANUAL was 3. Found reading Core beside the local_address fuzz target."
+  (is (equal '(0 1 2 4) (list 0 bl.net:+local-if+ bl.net:+local-bind+ bl.net:+local-manual+)))
+  (%with-local-address-table
+    (let ((ip (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (setf (aref ip 10) #xff (aref ip 11) #xff (aref ip 12) 1 (aref ip 13) 2 (aref ip 14) 3 (aref ip 15) 4)
+      (is-true (bl.net:add-local :ipv4 ip 8333 4))
+      (is (= 4 (bl.net:local-address-score (first (bl.net:local-addresses)))))
+      (is-true (bl.net:add-local :ipv4 ip 8333 4))
+      (is (= 5 (bl.net:local-address-score (first (bl.net:local-addresses))))))))
+
 (test a-routable-bind-address-is-a-local-address-under-discover
   "CConnman::Bind (net.cpp:3418-3420): under -discover, a listening socket
 bound to a ROUTABLE address makes it a LOCAL_BIND entry at the bound port.
