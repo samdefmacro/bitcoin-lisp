@@ -8386,6 +8386,31 @@ the control is that a string matching neither is still -29."
              (ignore-errors (usocket:socket-close client)))
         (bl.net:close-listener srv)))))
 
+(test disconnectnode-finds-a-dropped-peer-by-address-as-by-id
+  "Core's DisconnectNode(string) and DisconnectNode(id) search the same list,
+m_nodes, and both find a node already marked fDisconnect that the socket
+handler has not erased yet (net.cpp:3809-3820, :3841-3852); the node keeps its
+m_addr_name for life. Ours found such a peer by id and not by the ip:port it
+had: dropping the connection dropped the port, so the peer read back as its
+bare host and the address getpeerinfo had printed was -29. Found by the
+connman fuzz target, whose model now demands both. The control: once reaped,
+the peer is gone to both forms."
+  (let* ((node (make-test-node))
+         (peers (loop for i from 1 to 2
+                      collect (bl.net:make-peer
+                               :id (+ 900 i) :state :ready :address (format nil "10.0.0.~D" i)
+                               :connection (make-test-connection :host (format nil "10.0.0.~D" i)
+                                                                 :port 18444 :connected t)))))
+    (setf (bl:node-peers node) (copy-list peers))
+    (mapc #'bl.net:disconnect-peer peers)
+    (flet ((code (params)
+             (handler-case (progn (bl.rpc:dispatch-rpc-method node "disconnectnode" params) nil)
+               (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e)))))
+      (is (null (code (list "" 901))) "a dropped, unreaped peer by id")
+      (is (null (code (list "10.0.0.2:18444"))) "a dropped, unreaped peer by its ip:port")
+      (is (eql -29 (code (list "10.0.0.2:18444"))) "the control: reaped, it is gone")
+      (is (eql -29 (code (list "" 901))) "the control: reaped, it is gone"))))
+
 (test rpc-setban-bans-a-subnet-and-reports-its-duration
   "Two things rpc_setban.py and p2p_disconnect_ban.py ask for that the ban list
 could not answer while it was a flat address -> expiry map.

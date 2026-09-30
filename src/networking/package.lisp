@@ -272,6 +272,7 @@ headerssync.cpp. src/networking/.")
    #:peer-stalling-since
    #:peer-last-block-received-time
    #:peer-address
+   #:peer-remote-port
    ;; Peer database (peer-address struct shares symbol with peer accessor above)
    #:make-peer-address
    #:peer-address-net
@@ -508,6 +509,7 @@ headerssync.cpp. src/networking/.")
    #:connection-last-recv-time
    #:connection-last-send-time
    #:connection-port
+   #:connection-remote-port
    #:connection-socket
    #:connection-transport
    #:connection-v2-detecting

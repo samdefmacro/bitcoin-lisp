@@ -100,17 +100,16 @@ flag reads back as set."
                              (mapcar (lambda (h) (gethash "addednode" h)) info) added))
               ;; DisconnectNode by id, then by address: a connected peer is
               ;; found and dropped, an absent one is RPC_CLIENT_NODE_NOT_CONNECTED
-              ;; (net.cpp:3809-3852, rpc/net.cpp:482). A peer already dropped
-              ;; but not yet reaped from the list is in neither state: Core's
-              ;; socket handler erases it from m_nodes within a pass, ours at
-              ;; the next sync cycle, and either answer is Core's at some
-              ;; instant of that window.
+              ;; (net.cpp:3809-3852, rpc/net.cpp:482). Both forms search the
+              ;; same list, so a peer already dropped but not yet reaped from
+              ;; it is found by either, as Core finds a node marked
+              ;; fDisconnect that is still in m_nodes.
               (flet ((check-disconnect (peer params what)
                        (multiple-value-bind (r code) (%rpc-json node "disconnectnode" params)
                          (declare (ignore r))
                          (cond ((null peer)
                                 (fuzz-assert (eql code -29) "disconnectnode of absent ~A answered ~S" what code))
-                               ((not (eq (bl.net:peer-state peer) :disconnected))
+                               (t
                                 (fuzz-assert (null code) "disconnectnode ~A refused with ~S" what code)
                                 (fuzz-assert (eq (bl.net:peer-state peer) :disconnected)
                                              "disconnectnode ~A left the peer ~S" what (bl.net:peer-state peer)))))))

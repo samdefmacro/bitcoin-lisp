@@ -145,6 +145,14 @@ peer from two directions.")
   ;; reap predicate below must see "a message was begun" for either one.
   (recv-framing nil))
 
+(defun connection-remote-port (connection)
+  "The far end's port: the socket's peer port (an inbound peer's ephemeral
+one, which only the accepted socket knows), else the port dialled, else NIL."
+  (let ((socket (connection-socket connection)))
+    (or (ignore-errors (and socket (usocket:get-peer-port socket)))
+        (let ((port (connection-port connection)))
+          (and (plusp port) port)))))
+
 ;;; Node-wide cumulative byte counters (survive individual connection
 ;;; lifetimes), for getnettotals. Bumped on every send/receive. Plain incf —
 ;;; a lost update under thread contention only slightly under-counts a stat,

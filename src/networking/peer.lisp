@@ -190,6 +190,12 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (stalling-since 0 :type integer)
   (last-block-received-time 0 :type integer)  ; internal-real-time of last block from this peer
   (address "" :type string)
+  ;; The far end's port, kept by DISCONNECT-PEER when it drops the connection:
+  ;; Core's CNode::addr and m_addr_name are fixed for the node's life, so a
+  ;; peer disconnected but not yet reaped from the node's list still reads
+  ;; back -- and disconnectnode still finds it -- as the ip:port it was. NIL
+  ;; while the connection is there to ask.
+  (remote-port nil :type (or null (unsigned-byte 16)))
   ;; T if the peer connected to us (inbound); NIL if we dialed out (outbound).
   (inbound nil :type boolean)
   ;; T if the peer connected through our local Tor onion-service listener
@@ -563,8 +569,11 @@ a later-loaded file, so a direct call would be a forward reference.")
 
 (defun disconnect-peer (peer)
   "Disconnect from a peer."
-  (when (peer-connection peer)
-    (close-connection (peer-connection peer)))
+  (let ((connection (peer-connection peer)))
+    (when connection
+      ;; Read before the close: an inbound peer's port is the socket's.
+      (setf (peer-remote-port peer) (connection-remote-port connection))
+      (close-connection connection)))
   (setf (peer-state peer) :disconnected)
   (setf (peer-connection peer) nil)
   ;; Hand back any chain-sync protection slot (Core FinalizeNode). Done before

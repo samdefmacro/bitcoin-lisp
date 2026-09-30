@@ -78,14 +78,13 @@ in getpeerinfo output without it, which on regtest is every peer.
 
 Read from the socket, like ADDRBIND: an outbound connection knows the port it
 dialled, and an inbound one only learns the remote's ephemeral port from the
-accepted socket."
+accepted socket. A peer whose connection is already dropped reads back the
+port DISCONNECT-PEER kept, as Core's CNode::addr outlives fDisconnect."
   (let* ((connection (bl.net:peer-connection peer))
-         (socket (and connection (bl.net:connection-socket connection)))
          (host (bl.net:peer-address peer))
-         (port (or (ignore-errors (and socket (usocket:get-peer-port socket)))
-                   (let ((p (and connection
-                                 (bl.net:connection-port connection))))
-                     (and p (plusp p) p)))))
+         (port (if connection
+                   (bl.net:connection-remote-port connection)
+                   (bl.net:peer-remote-port peer))))
     (cond ((null port) host)
           ;; A v6 literal is bracketed before the port, as Core's
           ;; CService::ToStringAddrPort does.
