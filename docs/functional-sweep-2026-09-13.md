@@ -1958,3 +1958,237 @@ node answered.
   next image bump), `wallet_assumeutxo` now passes but the wallet.dat-bound
   tests, `wallet_crosschain`, `feature_config_args` `:212` and the Sparrow
   and CJDNS items stand as in Rounds 8-9.
+
+## Round 11
+
+Five worktree batches on the list Round 10 left open, started 2026-09-30
+from `593f56f7`: secp (2 commits), coinscache (9 + 1), coalton (4 + its
+second phase), and two fuzz batches, fuzz-mempool and fuzz-node, splitting
+the targets that need a model of their own. No functional test was red for
+a reason these items touch, so the round's measure is the profile, the
+fuzz count and the defects the new targets found. Every batch ran its own
+green battery on a fresh FASL volume -- the round changes how every Coalton
+type is represented, removes a NODE-CONTEXT slot and adds macros -- and the
+merged battery ran before every push. By batch:
+
+**secp.** Both live nodes ran libsecp256k1 v0.5.1, which has no musig
+module; Round 9's MuSig2 signing would have signalled an undefined alien
+there. The node now logs the library it actually loaded where Core logs its
+SHA256 implementation -- `Using libsecp256k1 0.7.1 (<path>) with modules
+recovery extrakeys schnorrsig ellswift ecdh musig`, the path by dladdr, the
+version from the pkg-config file beside it, one probe symbol per module --
+and every MuSig2 entry point answers RPC -1 "MuSig2 is not available:
+libsecp256k1 <version> has no musig module" when the module is missing
+(`f1407ecf`; the wording is ours, Core links the module statically). The
+CFFI definition asks for `libsecp256k1.so` before `.so.1`, so
+`BL_SECP_LIB` is not shadowed by a distro library.
+`scripts/server-secp-upgrade.sh` verifies or builds the 0.7.1 prefix on the
+server with the container's module set and prints the switch;
+`run-node.sh` defaults `BL_SECP_LIB` to it (`38581e42`). The server already
+had the 0.7.1 build beside the old one: the script verified its seven probe
+symbols, and both nodes were restarted onto it on 2026-09-30 (testnet4
+14:44, mainnet 15:06), each logging the line above.
+
+**coinscache.** SBCL picks a hash bucket from a hash's LOW bits, so the
+coins cache's key hash (the txid's first eight bytes) put every output of
+one transaction on one bucket chain, and Round 10's outpoint key, which
+mixed the index in at bit 24, collapsed the same way. The coins cache now
+hashes an outpoint as Core's SaltedOutpointHasher does (a port of
+PresaltedSipHasher, siphash.cpp:128-165): 1,000 outputs of one transaction
+spread over about 790 of 2,048 buckets, and a put/get over 1,000 × 1,000
+coins falls from 3,347/1,577 ms to 193/137 ms (`31584b24`). Its second
+phase salted every txid and outpoint table as Core salts them: the SipHash
+lives in the util layer, `bl.bytes:*hash-salt*` holds two words with Core's
+public deterministic salt as the documented weak default, and node start
+draws the process's salts from the OS before any table is built -- and
+reseeds the signature cache, whose salt had been drawn when the image was
+saved, so every process started from one binary shared it (`e66b4e30`,
+script/sigcache.cpp:19-32). The five `&OPTIONAL`-with-`&KEY` lambda lists
+take a required argument or a keyword and the style gate refuses the
+wording (`bc892eef`); `:fee-estimator` is no longer threaded through block
+connection and NODE-CONTEXT lost the slot (`49806471`); forensic block
+captures go beside debug.log (`6f2229f6`); a scriptSig push that runs off
+the end is not push-only, as IsPushOnly says (`71d70474`);
+`-maxmempool=-1` answers Core's sentence (`745ff358`); createfromdump
+through a plain file prints Core's filesystem error (`bbecc932`).
+
+**coalton.** The CLASSOID-TYPEP frames that topped Round 10's profile were
+not per-element checks or the octet bridge: Coalton's default development
+mode makes every `define-type` a CLOS class, so each MATCH arm was a TYPEP,
+each field read a SLOT-VALUE, each constructor a MAKE-INSTANCE. The
+interpreter now compiles in release mode (`dd70271d`), calls its bridge by
+name instead of INTERN and FDEFINITION per call (`1db56318`), copies the
+flags string's bytes once per string (`527edf82`) and crosses a stack
+element back by one typed copy (`0f6a9b44`): 8.75 → 3.8 µs per P2WSH input
+with a warm signature cache, the type-check frames gone from the profile,
+the P2P sync of 2,100 full blocks down 8.5 % and the `-loadblock` import
+about 6 %. Every step reproduces one digest over all 1,222
+`script_tests.json` vectors -- verdict, error name and every byte of 8,294
+stack elements -- computed on the base commit in development mode; the
+script and transaction vector suites stayed green throughout. The profile's
+top is now libsecp's own verify (49 %) and parse (7 %), then SHA256 at 14 %,
+mostly OpenSSL's per-call EVP overhead. A FASL written before `dd70271d`
+refuses to load, so every cache is rebuilt; `run-node.sh` clears the
+servers' on a revision change. Its second phase took the profile's next
+four frames Core's way: the signature cache stores entries only when
+`cacheSigStore` (mempool acceptance and TestBlockValidity) and a hit while
+connecting a block sets Core's garbage-collect bit instead of storing
+(`e4e341f1`, sigcache.cpp:51-84); a transaction's sighash midstates are
+hashed when a signature hash first reads them, the set Core's
+PrecomputedTransactionData::Init picks or fewer (`6e0e6f86`); SHA256 and
+HASH256 run through a stack SHA256_CTX instead of OpenSSL 3's one-shot EVP
+wrapper, 0.195 → 0.075 µs for 32 bytes, pinned to Core's `sha256_testvectors`
+(`8033cfae`); and the script flags are Core's word under the comma string,
+parsed once, a constant flag a compile-time bit test (`87e2508a`). Per
+P2WSH input 3.8 → 2.0 µs; against the round's base binary the P2P sync of
+2,100 full blocks fell about 11 % and the `-loadblock` import about 17 %;
+libsecp's own verify is now 56 % of the syncing node's samples.
+
+**fuzz-mempool.** 31 more of Core's fuzz targets from 14 files, the ones
+that need a mempool-side model: every `cluster_linearize` target, `txgraph`,
+the three `txorphan` targets, `txrequest`, the FeeFrac and fee-rate-diagram
+targets, both `policy_estimator` targets, `rbf` and `package_rbf`,
+`partially_downloaded_block`, `mini_miner`, both `tx_pool` targets and both
+`package_eval` targets, with CTxMemPool::check ported as the model's
+consistency oracle. They found eleven defects, each fixed Core's way with
+its input pinned: the orphanage reported a new orphan as not new when its
+own trim evicted it, and its LimitOrphans now has Core's fixed allowances,
+FeeFrac scores and NodeId tie-break (`d177fc0a`, `b381f268`); a
+transaction-request failover went out under the wrong id type and a new
+announcer was asked at once even when not the best candidate (`82202945`,
+`be253b3a`); the fee estimator recorded fractional fee rates where Core
+records whole sat/kvB and did not record still-unconfirmed transactions as
+failures at shutdown (`af56fb3f`, `35befcfa`); compact-block InitData
+treated two pool transactions sharing a short id as a collision
+(`c49a35f4`); the MiniMiner comparator lacked FeeFrac's full order
+(`abd17340`); a single mempool admission announced, then expired, then
+trimmed -- it now expires, trims and announces, and no longer reuses the
+last eviction's ZMQ sequence number (`da7fddc9`); a package member refused
+after the fact kept its fee and size (`36220e2d`); and the package-feerate
+phase built its coins from the whole package, so a child could spend a
+parent a sibling's replacement had removed, leaving the pool with a
+transaction spending one that existed nowhere (`74c32a49`). Its second
+phase made two accepted-and-ignored options real: `-checkmempool` runs the
+ported CTxMemPool::check at Core's drive sites (the P2P tx handler and
+orphan re-validation, sendrawtransaction and the wallet broadcast,
+testmempoolaccept, the private-broadcast re-check, connect-block and the
+reorg re-add; 1 on regtest, 0 elsewhere -- 26 mempool and P2P functional
+tests then ran 16,479 checks with no failure; `3ce995f5`), and
+`-blockreconstructionextratxn` keeps Core's ring of recently rejected and
+replaced transactions for compact-block reconstruction (`73309895`).
+
+**fuzz-node.** 25 more targets from 19 files, the ones that need a node
+harness: `process_message` and `process_messages` against a regtest node
+fixture, `p2p_handshake`, `p2p_headers_presync`, `connman`, the transport
+serialization and bidirectional-v2 targets, `local_address`, `banman`,
+`socks5`, `i2p`; `coins_view_db`, `coinscache_sim`,
+`utxo_snapshot_invalid`, `utxo_total_supply`, `chain`, `block_index`,
+`versionbits`, `validation_load_mempool`, `load_external_block_file`; three
+deserialize targets; and `miniscript_stable` and `miniscript_smart` with
+Core's node generator. Seven defects, each fixed with a red-then-green test:
+a SOCKS5 destination past Latin-1 raised a type error and dropped the dial
+(`158d9e79`); an I2P accept never saw a destination that arrived with the
+status line, and every fd poll in `src/networking/` now provably also
+checks the Lisp stream buffer (`8f19312e`, `bc9bd989` -- the mechanical
+guard for a lesson hit twice); LOCAL_MANUAL is 4 as in Core, LOCAL_MAPPED
+was missing (`76846132`); a BIP324 message with an empty type went out as
+short id 0, which nothing decodes (`d2c234cf`); the `-loadblock` scan did
+not stop at a truncated record (`0058b144`); the handshake gave up after ten
+messages before VERACK where Core waits any number (`4f8801dd`); a hash
+fragment's dissatisfaction was offered as non-malleable (`e0b61423`). Its
+second phase made the four signers use Core's non-malleable Satisfy -- a
+satisfaction without a signature is refused, as `or_d(pk(A),older(n))` is
+once the timelock is met (`62fbbbd8`, miniscript.cpp:343-345) --,
+`disconnectnode` by address finds a dropped, not-yet-reaped peer as by id
+does (`3aca4e53`), and the handshake-timeout test of Round 10 no longer
+depends on wall time, after it had flaked in three fresh batteries under a
+loaded daemon (`9fe96f8e`). The fuzz count stands at 125 of Core's 216
+targets from 70 of its 133 files.
+
+### Round-11 sweep
+
+Binary `9fe96f8e` for the four parallel batches (150 s cap) and `664b8ee2`
+-- the same tree plus the mempool-check speed-up -- for the serial
+confirmations (900 s cap), classification in
+`docs/functional-sweep-2026-09-13/after-664b8ee2.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
+| `bdfd8434` round 6 | 193 | 59 | 2 | 9 |
+| `632abe24` round 7 | 204 | 48 | 2 | 9 |
+| `cf46af32` round 8 | 233 | 21 | 0 | 9 |
+| `ddb02f15` round 9 | 236 | 18 | 0 | 9 |
+| `1df60a1c` round 10 | 239 | 15 | 0 | 9 |
+| `664b8ee2` round 11 | **239** | **15** | **0** | 9 |
+
+No test changed status: the 15 failures are Round 10's fifteen (eleven
+wallet.dat, `wallet_crosschain`, `feature_config_args` `:212`, the two
+framework-bound bind tests). The round's first sweep ran against a stale
+binary -- the node build had failed because the checkout's persistent cold
+FASL volume held Coalton compiled in development mode, and the sweep chain
+did not gate on the build's exit status; the numbers looked plausible and
+were wrong (a recorded lesson). On the real binary, `feature_fee_estimation`
+timed out under the parallel cap and passed serially in three minutes, and
+`feature_dbcrash` timed out even serially: `-checkmempool` now runs the
+ported CTxMemPool::check on every regtest sendrawtransaction, as Core does,
+and the first port walked the whole spent-outpoint index per entry -- 181 ms
+per check on a 2,500-transaction pool, five minutes per iteration of the
+test. Rewritten as a single pass keyed by entry (`dc458caf` … `664b8ee2`),
+the check costs 2.2 ms and `feature_dbcrash` passes in about 760-880 s of
+its 900 s budget on the shared machine -- a thin margin, noted below.
+`feature_block` and `feature_pruning` time out under the parallel cap and
+pass serially, as before.
+
+### Decisions recorded in Round 11
+
+- **libsecp256k1 0.7.1 with the musig module is the live nodes' library**
+  (both restarted onto it 2026-09-30); the ECDH module stays in the build
+  although Core omits it, because the image and the server both carry it and
+  nothing calls it -- dropping it is an image bump.
+- **The txid and outpoint tables are salted per process**, as Core's
+  SaltedTxidHasher/SaltedOutpointHasher are, with the salt read once when a
+  table is built (SBCL keeps stored hashes); tables built at load time and
+  saved into the binary keep the public default salt -- their keys are block
+  hashes, which cannot be ground cheaply.
+- **The script interpreter compiles in Coalton's release mode** -- the type
+  boundary that the interpreter-stays-Coalton policy draws is unchanged; a
+  changed Coalton type now needs an image restart, and a FASL from before
+  refuses to load.
+- **Core's `erase` on a signature-cache hit is a garbage-collect bit, not a
+  removal**: the entry moves to the generation the next rotation drops.
+- **`-checkmempool` and `-blockreconstructionextratxn` are real**;
+  `-checkblockindex` stays accepted-and-ignored (Core's CheckBlockIndex is a
+  310-line walk over fields our index models differently -- a batch of its
+  own).
+- **Non-malleable miniscript signing requires a signature** even when an
+  unsigned satisfaction exists, as Core's choice rule takes the unsigned one.
+
+### Left open after Round 11
+
+- `feature_dbcrash` passes with about 20-140 s to spare of its 900 s serial
+  budget on the shared machine: the remaining time is the test's 10,000
+  transactions through a node that now checks its mempool on every one;
+  Core's C++ check is still an order of magnitude cheaper.
+- `-checkblockindex` (above); the TxDownloadManager object (its logic lives
+  in the P2P handlers with the orphanage and request tracker as separate
+  objects); 91 of Core's 216 fuzz targets, chiefly the C++-container and
+  allocator targets, the v1/v1-to-v2 transport, the `net` target, the
+  coins-view overlay simulations and the valid half of `utxo_snapshot`,
+  which needs Core's 200-block test chain.
+- The interpreter still rebuilds an 11-field ScriptContext on every step
+  (about 9 KB per P2WSH input) and marks tapscript by appending a string to
+  the flags per execution where Core passes a SigVersion; the
+  script-execution cache never stores on the block path even for
+  TestBlockValidity.
+- The legacy fee estimator's per-block history has had no producer since
+  Round 10 except its own file load and still drives the hourly flush;
+  removing the history half is a cleanup of its own.
+- A warm-side guard for a deleted function that keeps its definition in the
+  image (the trap hit again this round) is proposed, not built.
+- Unchanged from earlier rounds: the wallet.dat-bound tests, `wallet_crosschain`,
+  `feature_config_args` `:212`, the two framework-bound bind tests, Sparrow,
+  CJDNS.
