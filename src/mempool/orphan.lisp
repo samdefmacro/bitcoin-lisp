@@ -36,12 +36,10 @@
 ;;;    when the parent is accepted (process-orphans), so no work set exists.
 ;;;    Eviction order within a peer is therefore purely oldest-first, without
 ;;;    Core's "non-reconsiderable before reconsiderable" refinement.
-;;;  - LimitOrphans recomputes the DoSiest peer each eviction instead of
-;;;    keeping Core's heap + threshold bookkeeping; the evicted multiset is
-;;;    the same except for exact-tie ordering.
-;;;  - Core tiebreaks equal DoS scores toward the more recent NodeId; peers
-;;;    are opaque objects here (the networking layer loads later), so ties
-;;;    break by which peer holds the oldest announcement.
+;;;  - Peers are opaque objects compared with EQ (the networking layer, which
+;;;    owns the peer struct, loads later). Where Core orders peers by NodeId
+;;;    -- LimitOrphans' tie-break -- it asks ORPHAN-PEER-ID, which that layer
+;;;    implements for its peer struct.
 
 (defconstant +max-orphanage-latency-score+ 3000
   "Global latency-score budget (announcements + 1 per 10 inputs of each unique
@@ -269,13 +267,26 @@ itself and its indexes (Core Erase's IsUnique branch)."
   (dolist (ann (copy-list (orphan-entry-announcements entry)))
     (%orphan-remove-announcement pool entry ann)))
 
-(defun %orphan-dos-score (pool info)
-  "PEER's DoS score: max of its latency and usage ratios against the per-peer
-allowances, as an exact rational (Core PeerDoSInfo::GetDosScore)."
-  (max (/ (orphan-peer-info-latency info)
-          (orphan-max-peer-latency-score pool))
-       (/ (orphan-peer-info-usage info)
-          (orphan-pool-reserved-peer-usage pool))))
+(defgeneric orphan-peer-id (peer)
+  (:documentation "PEER's NodeId, as the orphanage orders peers by it: LimitOrphans
+breaks a tie between equal DoS scores toward the HIGHER NodeId, the more
+recently connected peer (Core's compare_score, txorphanage.cpp:461-465). The
+pool itself compares peers with EQ; the networking layer, which owns the peer
+struct, supplies the method for it. An integer is its own NodeId, as Core's
+NodeId is an integer.")
+  (:method ((peer integer)) peer)
+  (:method ((peer t)) 0))
+
+(defun %orphan-dos-score (info max-latency max-usage)
+  "A peer's DoS score under the per-peer allowances MAX-LATENCY and MAX-USAGE:
+the larger of its latency score and its usage as FeeFracs over them (Core
+PeerDoSInfo::GetDosScore, txorphanage.cpp:161-168). A FeeFrac and not a
+ratio, as Core's is: two equal ratios then still order -- the one with the
+smaller denominator, the latency score, first -- and that order is
+std::max's choice here and LimitOrphans' choice between peers."
+  (let ((latency (make-feefrac (orphan-peer-info-latency info) max-latency))
+        (usage (make-feefrac (orphan-peer-info-usage info) max-usage)))
+    (if (feefrac< latency usage) usage latency)))
 
 (defun %orphan-oldest-announcement-for-peer (pool peer)
   "PEER's oldest (lowest-sequence) announcement, as (values entry ann)."
@@ -292,26 +303,56 @@ allowances, as an exact rational (Core PeerDoSInfo::GetDosScore)."
     (values best-entry best-ann)))
 
 (defun %limit-orphans (pool)
-  "Evict announcements while a global limit is exceeded: repeatedly take the
-peer with the highest DoS score and drop its oldest announcement (Core
-LimitOrphans, txorphanage.cpp:436-525). A peer within its own reservation is
-never selected while another exceeds its allowance, so no peer can evict
-another's orphans. Returns the number of announcements evicted."
-  (let ((evicted 0))
-    (loop while (%orphan-needs-trim-p pool)
-          do (let ((worst-peer nil) (worst-score nil))
-               (maphash
-                (lambda (peer info)
-                  (let ((score (%orphan-dos-score pool info)))
-                    (when (or (null worst-score) (> score worst-score))
-                      (setf worst-peer peer worst-score score))))
-                (orphan-pool-peer-info pool))
-               (unless worst-score (return))
-               (multiple-value-bind (entry ann)
-                   (%orphan-oldest-announcement-for-peer pool worst-peer)
-                 (unless ann (return))
-                 (%orphan-remove-announcement pool entry ann)
-                 (incf evicted))))
+  "Evict announcements while a global limit is exceeded (Core LimitOrphans,
+txorphanage.cpp:436-525): take the peer with the highest DoS score -- the
+higher ORPHAN-PEER-ID on a tie -- and drop its oldest announcements until the
+pool is within its limits or that peer's score falls to the next peer's (or
+to 1), then put it back and take the worst again. The per-peer allowances are
+read ONCE, at the start: a peer that loses its last announcement during the
+trim does not raise the others' allowance before the trim ends (Core's
+\"use consistent limits throughout\", :448-451). Only peers over their
+allowance (score above 1) are candidates, so a peer within its own
+reservation never loses an orphan while another exceeds it. Returns the
+number of announcements evicted."
+  (unless (%orphan-needs-trim-p pool)
+    (return-from %limit-orphans 0))
+  (let* ((max-latency (orphan-max-peer-latency-score pool))
+         (max-usage (orphan-pool-reserved-peer-usage pool))
+         (one (make-feefrac 1 1))
+         (candidates '())                 ; (peer . score), worst first
+         (evicted 0))
+    (flet ((worse-p (a b)
+             ;; Core's compare_score as a max-heap order (:461-465).
+             (let ((c (feefrac-compare (cdr a) (cdr b))))
+               (if (zerop c)
+                   (> (orphan-peer-id (car a)) (orphan-peer-id (car b)))
+                   (plusp c))))
+           (score-of (peer)
+             (let ((info (gethash peer (orphan-pool-peer-info pool))))
+               (and info (%orphan-dos-score info max-latency max-usage)))))
+      (maphash (lambda (peer info)
+                 (let ((score (%orphan-dos-score info max-latency max-usage)))
+                   (when (feefrac>> score one)
+                     (push (cons peer score) candidates))))
+               (orphan-pool-peer-info pool))
+      (setf candidates (stable-sort candidates #'worse-p))
+      (loop while candidates
+            do (let* ((worst-peer (car (pop candidates)))
+                      (threshold (if candidates (cdr (first candidates)) one)))
+                 (loop while (%orphan-needs-trim-p pool)
+                       do (multiple-value-bind (entry ann)
+                              (%orphan-oldest-announcement-for-peer pool worst-peer)
+                            (unless ann (return))
+                            (%orphan-remove-announcement pool entry ann)
+                            (incf evicted)
+                            (let ((score (score-of worst-peer)))
+                              (when (or (null score) (feefrac<= score threshold))
+                                (return)))))
+                 (unless (%orphan-needs-trim-p pool) (return))
+                 (let ((score (score-of worst-peer)))
+                   (when score
+                     (setf candidates (merge 'list (list (cons worst-peer score))
+                                             candidates #'worse-p)))))))
     (when (plusp evicted)
       (bl:log-cat "mempool" "orphanage overflow, removed ~D announcement~:P"
                             evicted))

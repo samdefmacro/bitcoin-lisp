@@ -227,6 +227,7 @@ src/mempool/.")
    #:orphan-pool-reserved-peer-usage
    #:orphan-max-peer-latency-score
    #:orphan-max-global-usage
+   #:orphan-peer-id
    ;; The pool's own records, which Core's TxOrphanage::SanityCheck and the
    ;; txorphan fuzz targets read back (tests/fuzz/txorphan.lisp).
    #:orphan-pool-peer-info

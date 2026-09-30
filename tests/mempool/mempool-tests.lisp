@@ -2632,6 +2632,32 @@ txorphan.cpp:561-567: added == !sim_have_tx)."
     (is-false (bl.mp:orphan-have pool owtxid) "the trim did evict it")
     (is (zerop (bl.mp:orphan-pool-count pool)))))
 
+(test orphan-trim-breaks-a-dos-score-tie-toward-the-newer-peer
+  "LimitOrphans takes the DoSiest peer, and between equal DoS scores the
+HIGHER NodeId -- the more recently connected peer (Core compare_score,
+txorphanage.cpp:461-465). Peers 1 and 5 hold two orphans each; a third peer's
+orphan takes the pool over its latency limit of 4, the allowance drops to one
+announcement per peer, and peers 1 and 5 tie at 2/1: peer 5, announced
+second, loses its oldest orphan and peer 1 keeps both. The trim used to take
+whichever tied peer it met first in its table -- here peer 1."
+  (let ((pool (bl.mp:make-orphan-pool :max-global-latency-score 4
+                                      :reserved-peer-usage 100000000))
+        (txs (loop for i from 1 to 5 collect (make-spending-test-tx (%txid-array (+ 80 i))))))
+    (bl.mp:orphan-add pool (nth 0 txs) 1)
+    (bl.mp:orphan-add pool (nth 1 txs) 5)
+    (bl.mp:orphan-add pool (nth 2 txs) 1)
+    (bl.mp:orphan-add pool (nth 3 txs) 5)
+    (is (= 4 (bl.mp:orphan-pool-count pool)))
+    (bl.mp:orphan-add pool (nth 4 txs) 3)
+    (is (= 2 (bl.mp:orphan-announcements-from-peer pool 1)) "peer 1 keeps both of its orphans")
+    (is (= 1 (bl.mp:orphan-announcements-from-peer pool 5)) "peer 5 loses one")
+    (is-false (bl.mp:orphan-have pool (bl.ser:transaction-wtxid (nth 1 txs)))
+              "the one peer 5 loses is its oldest")
+    (is (= 1 (bl.mp:orphan-announcements-from-peer pool 3)))
+    ;; A node's peers are ordered by their IDs.
+    (let ((peer (bl.net:make-peer)))
+      (is (= (bl.net:peer-id peer) (bl.mp:orphan-peer-id peer))))))
+
 (test orphan-erase-for-block
   "Orphans included in or conflicting with a connected block are erased by
 EXACT spent outpoint (Core EraseForBlock): an orphan spending a different
