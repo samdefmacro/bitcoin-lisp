@@ -2633,6 +2633,26 @@ hashing every txid again."
                              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid))))
       spenders)))
 
+(defun %mempool-check-inputs (mempool coins walked spent-confirmed txid tx
+                              spend-height coinbase-maturity)
+  "TX's inputs as CTxMemPool::check walks them (txmempool.cpp:490-505): each
+spends a coin %MEMPOOL-CHECK-COIN finds, and the spent-outpoint index names
+TXID as its spender. Returns (values input-value in-pool-parent-txids)."
+  (let ((in-value 0) (parents '()))
+    (loop for in across (bl.ser:transaction-inputs tx)
+          do (let* ((op (bl.ser:tx-in-previous-output in))
+                    (n (bl.ser:outpoint-index op)))
+               (multiple-value-bind (value parent spender-ok)
+                   (%mempool-check-coin mempool coins walked spent-confirmed txid op n
+                                        spend-height coinbase-maturity)
+                 (when value (incf in-value value))
+                 (when parent
+                   (pushnew (bl.ser:outpoint-hash op) parents :test #'equalp))
+                 (unless spender-ok
+                   (%mempool-check-fail "the spent-outpoint index does not name ~A as the spender"
+                                        (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))))
+    (values in-value parents)))
+
 (defun mempool-check-now (mempool coins spend-height &key coinbase-maturity)
   "Core CTxMemPool::check's body (txmempool.cpp:439-553), unconditionally.
 The graph is not oversized and passes its own sanity check; walking the pool
@@ -2690,19 +2710,10 @@ failure logs and signals MEMPOOL-CHECK-FAILED."
                 (parents-check '())
                 (spenders nil)
                 (in-value 0))
-            (loop for in across (bl.ser:transaction-inputs tx)
-                  do (let* ((op (bl.ser:tx-in-previous-output in))
-                            (n (bl.ser:outpoint-index op)))
-                       (incf total-inputs)
-                       (multiple-value-bind (value parent spender-ok)
-                           (%mempool-check-coin mempool coins walked spent-confirmed txid op n
-                                                spend-height coinbase-maturity)
-                         (when value (incf in-value value))
-                         (when parent
-                           (pushnew (bl.ser:outpoint-hash op) parents-check :test #'equalp))
-                         (unless spender-ok
-                           (%mempool-check-fail "the spent-outpoint index does not name ~A as the spender"
-                                                (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes txid)))))))
+            (incf total-inputs (length (bl.ser:transaction-inputs tx)))
+            (multiple-value-setq (in-value parents-check)
+              (%mempool-check-inputs mempool coins walked spent-confirmed txid tx
+                                     spend-height coinbase-maturity))
             (setf spenders (%mempool-check-links mempool txid e parents-check))
             (when coins
               (let ((out-value (loop for o across (bl.ser:transaction-outputs tx)
