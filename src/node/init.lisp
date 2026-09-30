@@ -743,7 +743,7 @@ previous node's state."
 
 
 (defun %init-lock-and-banner (network blocks-directory pid-file data-directory)
-  "The startup banner (Core InitLogging), the datadir lock
+  "The startup banner (Core InitLogging) with the libsecp256k1 line, the datadir lock
 (AppInitLockDirectories), SIGHUP log reopening, ZMQ publishers and the
 pruning mode announcement (Step 3)."
   (log-info "Bitcoin-Lisp Node v~A" (bl.ser:client-version-string))
@@ -754,6 +754,11 @@ pruning mode announcement (Step 3)."
     (log-info "Signet derived magic (message start): ~A"
               (bl.crypto:bytes-to-hex bl.ser:*network-magic*)))
   (log-info "Data directory: ~A" (node-data-directory *node*))
+  ;; The crypto library, where Core logs its own crypto start-up line (the
+  ;; SHA256 implementation, kernel/context.cpp:20, when the kernel context
+  ;; is built -- before the directories are locked). Loading it here also
+  ;; creates the secp256k1 context everything later uses (Core ECC_Context).
+  (log-info "~A" (bl.crypto:secp256k1-startup-line))
 
   ;; Claim the directories before anything reads or writes them (Core locks the
   ;; datadir AND the blocks dir in AppInitLockDirectories, init.cpp:1170-1174).
@@ -1695,8 +1700,7 @@ it; the indexes (Step 8) and -forcecompactdb."
 
 (defun %init-peer-features-and-wallet (network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   "The service flags advertised to peers (BIP157 serving, BIP330
-reconciliation, BIP324 v2 transport; Core Steps 3 and 6), the secp256k1
-context (Step 4) and, Core Step 9, the wallet manager with the wallets
+reconciliation, BIP324 v2 transport; Core Steps 3 and 6) and, Core Step 9, the wallet manager with the wallets
 recorded for startup."
   ;; BIP157 filter serving (-peerblockfilters): %INIT-PARAMETERS has already
   ;; refused to start without the block filter index, on every chain and with
@@ -1720,9 +1724,6 @@ recorded for startup."
     (log-info "BIP324 v2 transport enabled (~:[ellswift NOT available -- will run v1 only~;active~])"
               (bl.net:v2-available-p)))
 
-  ;; Initialize secp256k1
-  (log-info "Initializing cryptographic context...")
-  (bl.crypto:ensure-secp256k1-loaded)
 
   (start-wallets *node* network wallet wallet-supplied-p wallet-names))
 

@@ -158,7 +158,7 @@ failure (values NIL REASON), REASON being :PUBKEY for a key that does not
 parse (or no keys at all -- libsecp would ARG_CHECK n_pubkeys > 0), :TWEAK for
 a refused tweak, :OTHER otherwise -- the error classes of BIP327's own
 vectors."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (when (null pubkeys) (return-from musig-keyagg (values nil :pubkey)))
   (let ((cache (make-array +secp256k1-musig-keyagg-cache-size+
                            :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -259,7 +259,7 @@ success so it cannot be reused by accident. PUBKEY is the signer's 33-byte key
 -- the nonce can only ever sign for it. SECKEY, MSG (32 bytes) and
 KEYAGG-CACHE (from MUSIG-KEYAGG) are optional misuse-resistance inputs, as is
 EXTRA (32 bytes). Core passes all of them except EXTRA (key.cpp:372)."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((rand (%octets session-secrand))
         (pk (%octets pubkey))
         (sk (and seckey (%octets seckey)))
@@ -317,7 +317,7 @@ EXTRA (32 bytes). Core passes all of them except EXTRA (key.cpp:372)."
 (defun musig-nonce-agg (pubnonces)
   "BIP327 NonceAgg: the 66-byte aggregate of the list of 66-byte PUBNONCES,
 or (values NIL INDEX) naming the first nonce that does not parse."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((n (length pubnonces)))
     (when (zerop n) (return-from musig-nonce-agg (values nil 0)))
     (cffi:with-foreign-objects ((block :uint8 (* n +musig-pubnonce-struct-size+))
@@ -339,7 +339,7 @@ or (values NIL INDEX) naming the first nonce that does not parse."
   "BIP327 session context: the 133-byte secp256k1_musig_session for the
 66-byte AGGNONCE, the 32-byte MSG and KEYAGG-CACHE (its tweaks included), or
 NIL when the aggregate nonce does not parse."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((agg (%octets aggnonce))
         (msg (%octets msg))
         (cache (%musig-opaque keyagg-cache +secp256k1-musig-keyagg-cache-size+
@@ -380,7 +380,7 @@ first and freed after; a second call signals MUSIG-SECNONCE-REUSED.
 A secnonce that was made for another key is refused (NIL) before libsecp sees
 it, as is one whose contents are not a live secnonce: libsecp answers both
 with its illegal-argument callback, which aborts the process."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((sk (%octets seckey))
         (cache (%musig-opaque keyagg-cache +secp256k1-musig-keyagg-cache-size+
                               *musig-keyagg-cache-magic* "keyagg cache"))
@@ -418,7 +418,7 @@ with its illegal-argument callback, which aborts the process."
 signature of the signer with 33-byte PUBKEY and 66-byte PUBNONCE in SESSION
 under KEYAGG-CACHE. NIL, never an error, for a PSIG, PUBNONCE or PUBKEY that
 does not parse."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((cache (%musig-opaque keyagg-cache +secp256k1-musig-keyagg-cache-size+
                               *musig-keyagg-cache-magic* "keyagg cache"))
         (session (%musig-opaque session +musig-session-struct-size+
@@ -440,7 +440,7 @@ does not parse."
   "BIP327 PartialSigAgg: the 64-byte BIP340 signature the list of 32-byte
 PSIGS add up to in SESSION -- which does NOT by itself mean it verifies -- or
 (values NIL INDEX) naming the first partial signature that does not parse."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((session (%musig-opaque session +musig-session-struct-size+
                                 *musig-session-magic* "session"))
         (n (length psigs)))
