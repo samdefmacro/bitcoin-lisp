@@ -3117,3 +3117,77 @@ lookup at all, at most one ancestor step per height."
                    (is (<= walks 2) "~D chain walks for two backfills" walks)))
             (bl.store:close-tx-index txindex)
             (bl.store:close-blockfilterindex bfi)))))))
+
+;;;; The coins cache's key hash (Core SaltedOutpointHasher, util/hasher.h)
+
+(defun %cache-hash-txid (seed &key (last seed))
+  "A txid whose leading 31 bytes come from SEED and whose last byte is LAST, so
+two txids can share every word but the last."
+  (let ((txid (make-array 32 :element-type '(unsigned-byte 8))))
+    (dotimes (i 31) (setf (aref txid i) (ldb (byte 8 0) (+ (* 37 seed) (* 11 i)))))
+    (setf (aref txid 31) (ldb (byte 8 0) last))
+    txid))
+
+(test the-coins-cache-finds-exactly-the-coins-it-holds
+  "Every coin added to the cache answers with its own value, and every outpoint
+it does not hold misses -- one past a transaction's last output, output
+#xFFFFFFFF, and a txid equal to a held one in every word but the last (the
+cache compares all four words, not only the ones it hashes). Then the same
+from a fresh cache reading the flushed base. An identity pin: the hash may
+change, the answers may not."
+  (with-temp-directory (dir "bl-cache-hash-lookups")
+    (bl.store:with-coins-view-db (view (namestring (merge-pathnames "cs/" dir)))
+      (let ((script (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+            (shapes (loop for seed from 1 to 40 collect (cons seed (1+ (mod (* seed 13) 37))))))
+        (flet ((check (cache label)
+                 (let ((wrong 0) (found 0))
+                   (loop for (seed . outputs) in shapes
+                         for txid = (%cache-hash-txid seed)
+                         do (dotimes (vout outputs)
+                              (let ((e (bl.store:get-utxo cache txid vout)))
+                                (if (and e (= (bl.store:utxo-entry-value e) (+ (* 1000 seed) vout)))
+                                    (incf found)
+                                    (incf wrong))))
+                            (dolist (miss (list (bl.store:get-utxo cache txid outputs)
+                                                (bl.store:get-utxo cache txid #xFFFFFFFF)
+                                                (bl.store:get-utxo cache (%cache-hash-txid seed :last (1+ seed)) 0)))
+                              (when miss (incf wrong))))
+                   (is (= (loop for (nil . n) in shapes sum n) found) "~A: every coin found" label)
+                   (is (= 0 wrong) "~A: ~D wrong answer~:P" label wrong))))
+          (let ((cache (bl.store:make-coins-view-cache view)))
+            (loop for (seed . outputs) in shapes
+                  do (dotimes (vout outputs)
+                       (bl.store:add-utxo cache (%cache-hash-txid seed) vout (+ (* 1000 seed) vout)
+                                          script 1)))
+            (check cache "in the cache")
+            (bl.store:coins-view-cache-flush cache))
+          (check (bl.store:make-coins-view-cache view) "through the base"))))))
+
+(test one-transaction-s-outputs-spread-over-the-coins-cache-s-buckets
+  "Core keys CCoinsMap by COutPoint under SaltedOutpointHasher (coins.h:219-222,
+util/hasher.h): the SipHash of the txid with the output index mixed in, salted
+per hasher (util/hasher.cpp:25-28). UTXO-KEY-HASH read the txid's first eight
+bytes and nothing else, so the 1,000 outputs of one transaction were one
+1,000-entry bucket chain. They spread now, and two caches -- two salts -- place
+the same coins in different buckets. Control: a table whose hash sees only the
+txid puts them in one bucket, so the count can see a collapse."
+  (with-temp-directory (dir "bl-cache-hash-buckets")
+    (bl.store:with-coins-view-db (view (namestring (merge-pathnames "cs/" dir)))
+      (let ((script (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+            (txid (%cache-hash-txid 5))
+            (a (bl.store:make-coins-view-cache view))
+            (b (bl.store:make-coins-view-cache view))
+            (by-txid (make-hash-table :test 'equalp
+                                      :hash-function (lambda (k) (bl.bytes:octets-hash (subseq k 0 32))))))
+        (dotimes (vout 1000)
+          (bl.store:add-utxo a txid vout 1 script 1)
+          (bl.store:add-utxo b txid vout 1 script 1)
+          (setf (gethash (bl.ser:outpoint-key txid vout) by-txid) vout))
+        (is (= 1000 (hash-table-count (coins-cache-entries a))))
+        (is (= 1 (length (hash-table-occupied-buckets by-txid)))
+            "control: a hash of the txid alone gives one bucket")
+        (let ((in-a (hash-table-occupied-buckets (coins-cache-entries a)))
+              (in-b (hash-table-occupied-buckets (coins-cache-entries b))))
+          (is (>= (length in-a) 500) "1,000 outputs of one transaction in ~D bucket~:P"
+              (length in-a))
+          (is (not (equal in-a in-b)) "each cache hashes under its own salt"))))))

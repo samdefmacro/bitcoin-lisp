@@ -14,7 +14,6 @@ calling the old signature and no production path filling PEERS."
    :block-store (node-block-store node)
    :mempool (node-mempool node)
    :peers (node-peers node)
-   :fee-estimator (node-fee-estimator node)
    :address-book (node-address-book node)
    :recent-rejects (node-recent-rejects node)
    :historical-chainstate (node-historical-chainstate node)))

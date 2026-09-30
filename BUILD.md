@@ -43,6 +43,35 @@ Installs to `/data/bitcoin-lisp/sbcl-final` (override with `PREFIX=...`). Takes
 /data/bitcoin-lisp/sbcl-final/bin/sbcl --version   # => SBCL 2.6.5...
 ```
 
+## 1b. Build libsecp256k1 v0.7.1 (with musig)
+
+The node loads libsecp256k1 as a shared library from `BL_SECP_LIB`
+(`scripts/run-node.sh`, default `/data/bitcoin-lisp/secp256k1-0.7.1/lib`).
+Distro packages are too old (no ellswift, no musig), so the server builds the
+tag the container image uses, with the same modules, into its own prefix:
+
+```sh
+sudo apt-get install -y cmake binutils        # once
+bash /data/bitcoin-lisp/code/scripts/server-secp-upgrade.sh
+```
+
+The script refuses on any host but the node server. It is idempotent: an
+existing prefix that exports every module's probe symbol is reused, an absent
+one is built from `v0.7.1` (upstream's tests and exhaustive tests included),
+and a prefix that does not verify is never overwritten, because a running node
+may have it mapped. It changes nothing else. It prints what each running sbcl
+maps and the steps to switch. After a node restarts, its log's start-up line is
+the acceptance check:
+
+```
+Using libsecp256k1 0.7.1 (/data/bitcoin-lisp/secp256k1-0.7.1/lib/libsecp256k1.so.6.0.1) with modules recovery extrakeys schnorrsig ellswift ecdh musig
+```
+
+The v0.5.1 prefix, `secp256k1-local`, is the fallback
+(`BL_SECP_LIB=/data/bitcoin-lisp/secp256k1-local/lib`). It has every module
+but musig, so the line ends `missing musig, so MuSig2 is not available`, and
+MuSig2 signing and musig() descriptors answer RPC error -1 saying so.
+
 ## 2. Fetch + pin Coalton
 
 ```sh
@@ -117,6 +146,17 @@ Kill the **supervisor first** so it doesn't respawn, then the sbcl child:
 
 Graceful shutdown takes ~6 s (durable UTXO / header-index / mempool flush); a
 `TERM` no longer hangs.
+
+Find the processes by the sbcl binary's path, `ps -eo pid,ppid,args | grep -E
+"run-node.sh|sbcl-final/bin/sbcl"`, and signal them by PID. Never use `pkill
+-f <pattern>`: the pattern is in your own command line too. After the node
+logs `Node stopped`, relaunch detached with all three streams redirected, or
+the ssh call hangs:
+
+```sh
+setsid nohup bash /data/bitcoin-lisp/code/scripts/run-node.sh testnet4 \
+  >> /data/bitcoin-lisp/logs/testnet4-supervisor.out 2>&1 < /dev/null &
+```
 
 ## Operational notes
 

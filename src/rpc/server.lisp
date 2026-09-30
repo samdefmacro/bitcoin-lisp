@@ -311,7 +311,13 @@ than \"no such method\" for a method that does exist."
     (check-rpc-arg-types method params)
     ;; In-flight for as long as the handler runs, so getrpcinfo can report it.
     (with-active-rpc-command (method)
-      (funcall handler node params))))
+      ;; A MuSig2 step asked of a libsecp256k1 without the musig module is a
+      ;; feature that is not enabled: RPC_MISC_ERROR, as Core answers one
+      ;; (rpc/blockchain.cpp:2591). Core links the module in and never gets
+      ;; here, so the message is ours (bl.crypto's SECP256K1-STARTUP-LINE).
+      (handler-case (funcall handler node params)
+        (bl.crypto:musig-unavailable (e)
+          (error 'rpc-error :code +rpc-misc-error+ :message (princ-to-string e)))))))
 
 ;;; --- Register All Methods ---
 

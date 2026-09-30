@@ -316,23 +316,46 @@ transactions are still tracked. Drives the real connect-block."
 
 ;;;; --- No per-block statistics ---
 
-(test connect-block-keeps-no-per-block-fee-statistics
+(defun %lambda-list-names (lambda-list)
+  "Every variable name in LAMBDA-LIST, defaulted and keyword forms included."
+  (loop for item in lambda-list
+        unless (member item lambda-list-keywords)
+          append (cond ((symbolp item) (list item))
+                       ((symbolp (first item)) (list (first item)))
+                       (t (list (second (first item))))))) ; ((:key var) default)
+
+(test the-block-connect-path-takes-no-fee-estimator
   "Core's fee estimator learns from a block only through the transactions the
 mempool removed for it (CBlockPolicyEstimator::processBlock,
-policy/fees/block_policy_estimator.cpp:669-716); it keeps no statistics of
-the block's own transactions. Ours also took a fee-rate percentile of every
-connected block -- per transaction, through two EQUALP tables, 3-4% of the
-round-10 IBD profile -- that nothing read (ESTIMATE-FEE-RATE answers from the
-policy estimator alone), and wrote fee_estimates.dat every ten blocks.
+policy/fees/block_policy_estimator.cpp:669-716), reached by the block hook,
+never by an argument. Round 10 removed the per-block statistics a legacy
+estimator took from every connected block, but left the :FEE-ESTIMATOR keyword
+threaded from the IBD loop and the node context through connect-block,
+perform-reorg and every caller between, unused (perform-reorg declared it
+IGNORE). No function of validation or the network layer takes one now, and the
+node context has no such slot.
 
-A block with one fee-paying transaction connects with a fee estimator
-attached; the estimator's block history stays empty. Control: the block
-connected and its transaction's input was spent."
+Control: the name scan finds FEE-ESTIMATOR in a lambda list that has it, and a
+block with a fee-paying transaction still connects and is applied."
+  (is (member "FEE-ESTIMATOR" (%lambda-list-names '(a &optional b &key ((:x fee-estimator) nil)))
+              :key #'symbol-name :test #'string=)
+      "control: the scan sees a keyword variable")
+  (let ((offenders '()))
+    (dolist (pkg '(:bitcoin-lisp.validation :bitcoin-lisp.networking))
+      (do-symbols (sym pkg)
+        (when (and (eq (symbol-package sym) (find-package pkg))
+                   (fboundp sym) (not (macro-function sym)) (not (special-operator-p sym))
+                   (member "FEE-ESTIMATOR"
+                           (%lambda-list-names (sb-introspect:function-lambda-list sym))
+                           :key #'symbol-name :test #'string=))
+          (pushnew sym offenders))))
+    (is (null offenders) "still taking a fee estimator: ~S" offenders))
+  (let ((accessor (find-symbol "NODE-CONTEXT-FEE-ESTIMATOR" :bitcoin-lisp.context)))
+    (is-false (and accessor (fboundp accessor)) "the node context has no fee-estimator slot"))
   (with-network (:mainnet)
     (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
         (make-activate-block-fixture "no-block-fee-stats")
-      (let* ((legacy (bl.mp:make-fee-estimator))
-             (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+      (let* ((funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
              (spend (pkg-tx funding 0 99990000))
              (block1 (make-reorg-test-block genesis-hash
                                             (first (make-test-chain-hashes #xD0 1)) 1)))
@@ -342,13 +365,10 @@ connected and its transaction's input was spent."
               (bl.ser:block-header-merkle-root (bl.ser:bitcoin-block-header block1))
               (bl.val:compute-merkle-root
                (mapcar #'bl.ser:transaction-hash (bl.ser:bitcoin-block-transactions block1))))
-        (bl.val:connect-block block1 chain-state block-store utxo-set
-                              :fee-estimator legacy)
+        (bl.val:connect-block block1 chain-state block-store utxo-set)
         (is (= 1 (bl.store:current-height chain-state)) "control: the block connected")
         (is (null (bl.store:get-utxo utxo-set funding 0))
-            "control: the fee-paying transaction was applied")
-        (is (= 0 (bl.mp:fee-estimator-entry-count legacy))
-            "no statistics of the block's own transactions are kept"))
+            "control: the fee-paying transaction was applied"))
       (clear-undo-cache))))
 
 (test an-estimator-tracking-nothing-still-rolls-the-block

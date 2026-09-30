@@ -107,3 +107,34 @@ is a node that cannot reconstruct anyone else's compact blocks."
                       (bl.crypto:siphash-2-4 k0 k1 input))
                    "SipHash-2-4 of the first ~D bytes disagrees with the ~
                     reference table" n)))))
+
+(test the-outpoint-siphash-is-the-siphash-of-the-outpoint-bytes
+  "SIPHASH-UINT256-EXTRA is Core's PresaltedSipHasher(val, extra)
+(crypto/siphash.cpp:128-165), the coins cache's SaltedOutpointHasher: equal to
+the SipHash-2-4 of the 32 bytes of VAL followed by EXTRA as four little-endian
+bytes. The reference table's 36-byte entry (bytes 00..23, k = 00..0f) is that
+input, and Core's own check (hash_tests.cpp:133-150) compares the two hashers
+on random keys, values and extras; so do we."
+  (let* ((vectors (%load-core-vectors "siphash_vectors.json"))
+         (k0 (parse-integer (gethash "k0" vectors) :radix 16))
+         (k1 (parse-integer (gethash "k1" vectors) :radix 16))
+         (want (parse-integer (aref (coerce (gethash "outputs" vectors) 'vector) 36) :radix 16))
+         (rs (sb-ext:seed-random-state 20260930)))
+    (flet ((words (bytes)
+             (loop for w below 4
+                   collect (loop for i below 8 sum (ash (aref bytes (+ (* 8 w) i)) (* 8 i))))))
+      (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
+        (dotimes (i 32) (setf (aref bytes i) i))
+        (is (= want (apply #'bl.crypto:siphash-uint256-extra k0 k1
+                           (append (words bytes) (list #x23222120))))
+            "the reference table's 36-byte entry"))
+      (dotimes (trial 16)
+        (let ((k0 (random (ash 1 64) rs)) (k1 (random (ash 1 64) rs))
+              (n (random (ash 1 32) rs))
+              (bytes (make-array 36 :element-type '(unsigned-byte 8))))
+          (dotimes (i 32) (setf (aref bytes i) (random 256 rs)))
+          (dotimes (i 4) (setf (aref bytes (+ 32 i)) (ldb (byte 8 (* 8 i)) n)))
+          (is (= (bl.crypto:siphash-2-4 k0 k1 bytes)
+                 (apply #'bl.crypto:siphash-uint256-extra k0 k1
+                        (append (words bytes) (list n))))
+              "trial ~D: the two hashers disagree" trial))))))

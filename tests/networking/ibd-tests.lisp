@@ -6509,3 +6509,52 @@ loaded best chain takes sequence 0 (LoadChainTip, :4598-4609)."
           (is (equalp (second hashes) (bl.store:best-block-hash cs))
               "the tip loaded from disk keeps an equal-work tie"))))
     (clear-undo-cache)))
+
+(test forensic-block-capture-writes-beside-debug-log
+  "BL.NET:*FORENSIC-STORE-FROM-HEIGHT* keeps the wire bytes of every block at or
+above its height before validation. They went to the fixed
+/data/bitcoin-lisp/forensic-blocks/, which exists only on the live servers;
+they go to forensic-blocks/ beside debug.log now, in the data directory, as the
+SIGUSR1 profile does. Driven through the block-download dispatcher with a
+block whose header is indexed at height 1; the capture is the payload,
+byte for byte. Control: with the knob off nothing is written."
+  (with-network (:mainnet)
+    (with-temp-directory (dir "bl-forensic-blocks")
+      (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+          (make-activate-block-fixture "forensic")
+        (let* ((block (make-reorg-test-block genesis-hash
+                                             (first (make-test-chain-hashes #xF0 1)) 1))
+               (payload (bl.ser:serialize-witness-block block))
+               ;; The hash the dispatcher computes from the wire bytes (the
+               ;; fixture's header carries a cached placeholder).
+               (header (bl.ser:bitcoin-block-header (bl.ser:parse-block-payload payload)))
+               (hash (bl.ser:block-header-hash header))
+               (genesis (bl.store:get-block-index-entry chain-state genesis-hash))
+               (node-ctx (bl.ctx:make-node-context :chain-state chain-state
+                                                   :utxo-set utxo-set
+                                                   :block-store block-store))
+               (capture (merge-pathnames
+                         (format nil "regtest/forensic-blocks/~A.raw"
+                                 (bl.crypto:bytes-to-hex hash))
+                         dir)))
+          (bl.store:add-block-index-entry
+           chain-state (bl.store:make-block-index-entry
+                        :hash hash :height 1 :header header :prev-entry genesis
+                        :chain-work 2 :status :header-valid))
+          (let ((bl:*log-file-path* (namestring (merge-pathnames "regtest/debug.log" dir))))
+            (with-ibd-context
+              (let ((bl.net:*forensic-store-from-height* nil))
+                (deliver-ibd-message (%fake-ready-peer) "block" payload node-ctx))
+              (is-false (probe-file capture) "control: the knob off writes nothing")
+              (let ((bl.net:*forensic-store-from-height* 1))
+                (ignore-errors
+                 (deliver-ibd-message (%fake-ready-peer) "block" payload node-ctx)))))
+          (is-true (probe-file capture) "captured beside debug.log: ~A" capture)
+          (when (probe-file capture)
+            (is (equalp payload (with-open-file (in capture :element-type '(unsigned-byte 8))
+                                  (let ((v (make-array (file-length in)
+                                                       :element-type '(unsigned-byte 8))))
+                                    (read-sequence v in)
+                                    v)))
+                "the capture is the wire payload")))
+        (clear-undo-cache)))))

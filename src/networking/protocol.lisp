@@ -140,7 +140,7 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
   "Handle an incoming message from a peer: the DEFINE-P2P-HANDLER row for
 COMMAND, after the per-peer rate limit. CTX is the node-context; a NIL slot
 disables the path that needs it: no mempool or peers, no transaction relay;
-no fee-estimator, no fee stats from blocks; no address-book, no peer
+no address-book, no peer
 database updates from addr messages; no recent-rejects, no reject cache.
 Returns T if the message was handled, NIL for a command this node does not
 know or a peer that exceeded its rate limit (and was disconnected)."
@@ -1450,7 +1450,7 @@ committed to the index from announcements."
 ;;; Block handling
 
 (defun accept-downloaded-block (block chain-state utxo-set block-store
-                                &key mempool fee-estimator recent-rejects)
+                                &key mempool recent-rejects)
   "Validate and connect a freshly-downloaded block (full, reconstructed, or
 completed compact), handling the fork case correctly. Must be called under the
 node lock. Returns (values valid error).
@@ -1483,7 +1483,6 @@ never received the branch's blocks."
              (multiple-value-bind (entry reorg-outcome)
                  (bl.val:connect-block
                   block chain-state block-store utxo-set
-                  :fee-estimator fee-estimator
                   :recent-rejects recent-rejects
                   :mempool mempool)
                (declare (ignore entry))
@@ -1627,7 +1626,7 @@ announcements — Core
 drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
 filled for plain block messages exactly as it is for reconstructed compact
 ones, so promotion must not be a compact-block-only privilege."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool recent-rejects) ctx
   (let ((block (bl.ser:parse-block-payload payload)))
     (when (and block (%refuse-mutated-block peer block chain-state))
       (return-from handle-block nil))
@@ -1640,7 +1639,6 @@ ones, so promotion must not be a compact-block-only privilege."
                   (multiple-value-bind (valid error)
                       (accept-downloaded-block block chain-state utxo-set block-store
                                                :mempool mempool
-                                               :fee-estimator fee-estimator
                                                :recent-rejects recent-rejects)
                     (cond
                       (valid
@@ -5369,7 +5367,7 @@ that is accepted settles EVERY peer's request for it -- RemoveBlockRequest(hash,
 nullopt) -- so the other peers racing to complete the same block are told
 nothing more and their late blocktxn is one we were not expecting. CONTEXT
 names the path in the failure log. Returns T when the block connected."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool recent-rejects) ctx
     (increment-compact-block-success)
     ;; A rebuilt block is a block delivery from this peer: stamps getpeerinfo
     ;; "last_block" and resets stall tracking.
@@ -5380,7 +5378,6 @@ names the path in the failure log. Returns T when the block connected."
                 (multiple-value-bind (valid error)
                     (accept-downloaded-block block chain-state utxo-set block-store
                                              :mempool mempool
-                                             :fee-estimator fee-estimator
                                              :recent-rejects recent-rejects)
                   (cond
                     (valid
