@@ -4863,7 +4863,9 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
   "Build hash table mapping short IDs to (tx . expected-id) pairs.
    USE-WTXID is true for compact block version 2.
    Returns (VALUES map collision-detected).
-   The map stores cons cells of (transaction . full-txid-or-wtxid) for verification."
+   A short ID two mempool transactions share maps to :COLLISION instead: a
+   block slot carrying it is requested, as Core's InitData requests one two
+   mempool transactions match (blockencodings.cpp:131-138)."
   (let ((map (make-hash-table :test 'eql))
         (collision nil))
     (bl.mp:mempool-for-each
@@ -4874,11 +4876,10 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
                       (bl.ser:transaction-wtxid tx)
                       txid))
               (short-id (bl.crypto:compute-short-txid k0 k1 id)))
-         ;; Detect collisions within mempool
-         (when (gethash short-id map)
-           (setf collision t))
-         ;; Store tx with its full ID for later verification
-         (setf (gethash short-id map) (cons tx id)))))
+         (if (gethash short-id map)
+             (setf collision t
+                   (gethash short-id map) :collision)
+             (setf (gethash short-id map) (cons tx id))))))
     (values map collision)))
 
 ;;; Block reconstruction
@@ -4896,11 +4897,16 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
 :COLLISION and :MALFORMED are Core's two distinct PartiallyDownloadedBlock::
 InitData failures and the caller must NOT conflate them (blockencodings.cpp:
 59-120). :MALFORMED is READ_STATUS_INVALID — a message no honest peer can
-send (no transactions at all, an absurd transaction count, a prefilled index
-outside the block, fewer short IDs than empty slots) — and Core answers it with
-Misbehaving (net_processing.cpp:4680-4683). :COLLISION is READ_STATUS_FAILED —
-two of OUR OWN mempool transactions sharing a short ID, which is nobody's
-fault — and Core answers it with a plain full-block getdata (:4683-4694)."
+send (a null header, no transactions at all, an absurd transaction count, a
+null prefilled transaction, a prefilled index outside the block, fewer short
+IDs than empty slots) — and Core answers it with Misbehaving
+(net_processing.cpp:4680-4683). :COLLISION is READ_STATUS_FAILED — the block's
+OWN short IDs repeat, which a 48-bit hash does by chance — and Core answers it
+with a plain full-block getdata (:4683-4694). Two MEMPOOL transactions that
+share a short ID are no failure: a block slot carrying it is simply requested
+(blockencodings.cpp:131-138), and one the block does not carry costs nothing.
+Core's other READ_STATUS_FAILED, a std::unordered_map bucket over twelve
+entries (:98-111), measures its container's hashing and has no counterpart."
   (let* ((header (bl.ser:compact-block-header compact-block))
          (nonce (bl.ser:compact-block-nonce compact-block))
          (short-ids-list (bl.ser:compact-block-short-ids compact-block))
@@ -4911,8 +4917,10 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
          (short-ids (coerce short-ids-list 'vector)))
 
     ;; Validate tx-count is reasonable (prevent DoS). Core InitData's first two
-    ;; guards, both READ_STATUS_INVALID (blockencodings.cpp:62-66).
-    (when (or (zerop tx-count) (> tx-count 100000))
+    ;; guards, both READ_STATUS_INVALID (blockencodings.cpp:60-63), the first
+    ;; also refusing a null header (CBlockHeader::IsNull, nBits 0).
+    (when (or (zerop (bl.ser:block-header-bits header))
+              (zerop tx-count) (> tx-count 100000))
       (bl:log-warn "Invalid compact block tx count: ~D" tx-count)
       (return-from reconstruct-compact-block (values nil :malformed)))
 
@@ -4924,12 +4932,7 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
       (multiple-value-bind (shortid-map collision)
           (build-shortid-map mempool k0 k1 use-wtxid)
 
-        ;; Check for collision within mempool
-        (when collision
-          (increment-compact-block-collision)
-          (bl:log-warn "Short ID collision detected in mempool, falling back to full block")
-          (return-from reconstruct-compact-block (values nil :collision nil)))
-
+        (declare (ignore collision))
         (let ((transactions (make-array tx-count :initial-element nil))
               (missing-indexes '())
               (short-id-idx 0))
@@ -4937,7 +4940,13 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
           ;; Place prefilled transactions at their absolute indexes
           ;; with bounds checking
           (dolist (ptx prefilled)
-            (let ((idx (bl.ser:prefilled-tx-index ptx)))
+            (let ((idx (bl.ser:prefilled-tx-index ptx))
+                  (ptx-tx (bl.ser:prefilled-tx-transaction ptx)))
+              ;; CTransaction::IsNull -- no inputs and no outputs -- is
+              ;; READ_STATUS_INVALID (blockencodings.cpp:72-73).
+              (when (and (zerop (length (bl.ser:transaction-inputs ptx-tx)))
+                         (zerop (length (bl.ser:transaction-outputs ptx-tx))))
+                (return-from reconstruct-compact-block (values nil :malformed nil)))
               (if (and (>= idx 0) (< idx tx-count))
                   (setf (aref transactions idx)
                         (bl.ser:prefilled-tx-transaction ptx))
@@ -4948,34 +4957,39 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
                                            idx (1- tx-count))
                     (return-from reconstruct-compact-block (values nil :malformed nil))))))
 
-          ;; Fill remaining slots with mempool transactions matched by short ID
-          (dotimes (i tx-count)
-            (when (null (aref transactions i))
-              ;; This slot needs a transaction from short IDs
-              (when (>= short-id-idx (length short-ids))
-                ;; More empty slots than short IDs — a slot with neither a
-                ;; prefilled tx nor a short ID. READ_STATUS_INVALID in Core
-                ;; (blockencodings.cpp:80-84).
-                (bl:log-warn "Short ID count mismatch")
-                (return-from reconstruct-compact-block (values nil :malformed nil)))
-              (let* ((short-id (aref short-ids short-id-idx))
-                     (tx-pair (gethash short-id shortid-map)))
-                (if tx-pair
-                    (let ((tx (car tx-pair))
-                          (full-id (cdr tx-pair)))
-                      ;; Verify the matched tx produces the expected short ID
-                      ;; (guards against hash collisions between mempool and block)
-                      (let ((computed-short-id (bl.crypto:compute-short-txid
-                                                k0 k1 full-id)))
-                        (if (= computed-short-id short-id)
-                            (setf (aref transactions i) tx)
-                            ;; Collision between different transactions
-                            (push i missing-indexes))))
-                    (push i missing-indexes))
-                (incf short-id-idx))))
+          ;; The block's own short IDs, each to the slot it fills (the
+          ;; slots no prefilled transaction took, in order). A short ID the
+          ;; block carries twice is READ_STATUS_FAILED
+          ;; (blockencodings.cpp:92-117).
+          (let ((slots (make-hash-table :test 'eql)))
+            (dotimes (i tx-count)
+              (when (null (aref transactions i))
+                (when (>= short-id-idx (length short-ids))
+                  ;; More empty slots than short IDs — a slot with neither a
+                  ;; prefilled tx nor a short ID. READ_STATUS_INVALID in Core
+                  ;; (blockencodings.cpp:80-84).
+                  (bl:log-warn "Short ID count mismatch")
+                  (return-from reconstruct-compact-block (values nil :malformed nil)))
+                (let ((short-id (aref short-ids short-id-idx)))
+                  (when (gethash short-id slots)
+                    (increment-compact-block-collision)
+                    (bl:log-warn "Short ID collision in the compact block, falling back to full block")
+                    (return-from reconstruct-compact-block (values nil :collision nil)))
+                  (setf (gethash short-id slots) i))
+                (incf short-id-idx)))
+            ;; Fill each slot from the mempool: a short ID one mempool
+            ;; transaction matches supplies it; one that none or several
+            ;; match is requested (blockencodings.cpp:120-146).
+            (maphash (lambda (short-id i)
+                       (let ((tx-pair (gethash short-id shortid-map)))
+                         (if (consp tx-pair)
+                             (setf (aref transactions i) (car tx-pair))
+                             (push i missing-indexes))))
+                     slots)
+            (setf missing-indexes (sort missing-indexes #'<)))
 
           (if missing-indexes
-              (values nil (nreverse missing-indexes) transactions)
+              (values nil missing-indexes transactions)
               (values (bl.ser:make-bitcoin-block
                        :header header
                        :transactions (coerce transactions 'list))
