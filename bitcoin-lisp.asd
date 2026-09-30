@@ -652,6 +652,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/process-message")
                              (:file "fuzz/banman")
                              (:file "fuzz/socks5")
-                             (:file "fuzz/i2p"))))
+                             (:file "fuzz/i2p")
+                             (:file "fuzz/p2p-transport"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
