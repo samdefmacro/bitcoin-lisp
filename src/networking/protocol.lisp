@@ -720,10 +720,11 @@ before erasing (txrequest.cpp:549-556)."
 
 (defun tx-request-wanted-p (hash peer &optional wtxidp (num-wtxid-peers 0))
   "Record PEER as an announcer of HASH and return T iff a getdata should go to
-PEER immediately — no request outstanding and the announcement carries no
-delay. NIL means the announcement was either dropped (per-peer cap), retained
-as a failover candidate behind an in-flight request, or deferred until its
-Core-mandated delay passes (the scheduler sends it then). WTXIDP marks the
+PEER immediately -- no request outstanding, the announcement carries no delay,
+and no ready announcement of HASH outranks it. NIL means the announcement was
+either dropped (per-peer cap), retained as a failover candidate behind an
+in-flight request or a better ready candidate, or deferred until its
+Core-mandated delay passes (the scheduler grants the hash then). WTXIDP marks the
 announcement as wtxid-based (MSG_WTX); the announcement keeps it, so whichever
 announcer a request is later granted to is asked under the id type IT
 announced. NUM-WTXID-PEERS is the count of connected wtxid-relay peers,
@@ -747,14 +748,21 @@ driving Core's TXID_RELAY_DELAY."
     (let* ((now (%tx-request-now))
            (ready (+ now (%tx-announcement-delay-seconds peer wtxidp
                                                          num-wtxid-peers))))
-      (push (%make-tx-announcement peer ready (%tx-request-priority hash peer)
-                                   (and wtxidp t))
-            (gethash hash *tx-announcers*))
-      (incf (gethash peer *tx-peer-announcements* 0))
-      (cond ((gethash hash *tx-in-flight*) nil)
-            ((> ready now) nil)          ; deferred; scheduler sends when due
-            (t (%tx-request-mark-in-flight hash peer now)
-               t)))))
+      (let ((ann (%make-tx-announcement peer ready (%tx-request-priority hash peer)
+                                        (and wtxidp t))))
+        (push ann (gethash hash *tx-announcers*))
+        (incf (gethash peer *tx-peer-announcements* 0))
+        ;; Asked at once only if this is the candidate GetRequestable would
+        ;; grant now -- nothing in flight, and no ready announcement of higher
+        ;; priority (txrequest.cpp:595-624). Core's ReceivedInv never asks;
+        ;; the SendMessages after it does, through GetRequestable
+        ;; (net_processing.cpp:6162). Otherwise the scheduler grants it when
+        ;; it is due, to whichever candidate is then the best.
+        (cond ((gethash hash *tx-in-flight*) nil)
+              ((not (eq ann (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
+               nil)
+              (t (%tx-request-mark-in-flight hash peer now)
+                 t))))))
 
 (defun tx-request-received (hash)
   "Forget HASH entirely — Core ForgetTxHash (txrequest.cpp:560-566): the
