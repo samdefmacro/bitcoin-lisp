@@ -31,6 +31,7 @@
 #   BL_DATA_ROOT=/srv/btc BL_SBCL=/opt/sbcl/bin/sbcl scripts/run-node.sh testnet4
 #   BL_MAX_FAST_FAILURES=5 BL_HEALTHY_RUN_SECONDS=300   # exit-1 backoff policy
 #   BL_PAR=4                                            # -par: script-check threads
+#   BL_SECP_LIB=/data/bitcoin-lisp/secp256k1-local/lib   # libsecp256k1 (see below)
 #
 # BL_PAR takes Core's -par semantics exactly (0 = one per core, NEGATIVE =
 # leave that many cores free, clamped to 15, 1 = no extra threads). It exists
@@ -50,7 +51,16 @@ NETWORK="${1:?usage: scripts/run-node.sh <testnet4|mainnet|regtest>}"
 BL_ROOT="${BL_ROOT:-/data/bitcoin-lisp}"
 BL_SBCL="${BL_SBCL:-$BL_ROOT/sbcl-final/bin/sbcl}"
 BL_SBCL_HOME="${BL_SBCL_HOME:-$BL_ROOT/sbcl-final/lib/sbcl}"
-BL_SECP_LIB="${BL_SECP_LIB:-$BL_ROOT/secp256k1-local/lib}"
+# BL_SECP_LIB is the directory libsecp256k1 is loaded from: it goes first on
+# LD_LIBRARY_PATH (below), and the node's FFI asks for the unversioned
+# libsecp256k1.so first, so this directory's copy wins over any system one.
+# The default is v0.7.1 with the musig module, as the container image has it,
+# built into its own prefix by scripts/server-secp-upgrade.sh. The fallback is
+# the v0.5.1 prefix, BL_SECP_LIB=$BL_ROOT/secp256k1-local/lib: every module
+# but musig, so MuSig2 signing and musig() descriptors answer "MuSig2 is not
+# available". Either way the node's start-up line names what it loaded:
+#   Using libsecp256k1 0.7.1 (<file>) with modules recovery extrakeys ... musig
+BL_SECP_LIB="${BL_SECP_LIB:-$BL_ROOT/secp256k1-0.7.1/lib}"
 BL_CODE="${BL_CODE:-$BL_ROOT/code}"
 BL_DATA_ROOT="${BL_DATA_ROOT:-$BL_ROOT/data}"
 BL_LOG_ROOT="${BL_LOG_ROOT:-$BL_ROOT/logs}"

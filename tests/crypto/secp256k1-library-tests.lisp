@@ -70,6 +70,36 @@ MuSig2 is unavailable when the musig module is missing."
       (is-false (search "musig " line))
       (is-false (search " musig;" line)))))
 
+(test secp256k1-module-sets-agree
+  "The container image's configure flags (docker/Dockerfile), the server
+upgrade script's CMake flags and probe symbols, and the node's probe table
+name the same modules -- the check that the server library is built as the
+image's is. run-node.sh's BL_SECP_LIB default is the exact line the upgrade
+script looks for in the deployed copy."
+  (flet ((modules-after (text prefix)
+           (loop with out = '()
+                 for start = (search prefix text) then (search prefix text :start2 end)
+                 for end = (and start
+                                (position-if-not #'alpha-char-p text
+                                                 :start (+ start (length prefix))))
+                 while start
+                 do (pushnew (intern (string-upcase (subseq text (+ start (length prefix)) end))
+                                     :keyword)
+                             out)
+                 finally (return (sort out #'string<)))))
+    (let ((dockerfile (project-source-text "docker/Dockerfile"))
+          (script (project-source-text "scripts/server-secp-upgrade.sh"))
+          (run-node (project-source-text "scripts/run-node.sh"))
+          (ours (sort (mapcar #'car bl.crypto:*secp256k1-modules*) #'string<)))
+      (is (= 6 (length ours)))
+      (is (equal ours (modules-after dockerfile "--enable-module-")))
+      (is (equal ours (modules-after script "-DSECP256K1_ENABLE_MODULE_")))
+      (dolist (entry bl.crypto:*secp256k1-modules*)
+        (is-true (search (cdr entry) script) "~A not probed by the script" (cdr entry)))
+      (is-true (search "--branch v0.7.1" dockerfile))
+      (is-true (search "SECP_VERSION=0.7.1" script))
+      (is-true (search "BL_SECP_LIB=\"${BL_SECP_LIB:-$BL_ROOT/secp256k1-0.7.1/lib}\"" run-node)))))
+
 (defparameter *sl-g* "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
   "The generator, as a 33-byte key.")
 (defparameter *sl-2g* "02C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5"
