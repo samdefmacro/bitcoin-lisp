@@ -395,6 +395,7 @@
    #:minimal-number-encoding-p
    ;; SIGPUSHONLY validation
    #:script-is-push-only-p
+   #:reseed-signature-cache
    ;; Transaction context for block validation
    #:*current-tx*
    #:*current-spent-utxos*

@@ -1575,6 +1575,38 @@ start-up accepts it."
                    (%init-parameters-refusal :regtest nil nil nil nil nil nil nil
                                              nil nil nil nil nil nil))))))
 
+(test the-node-draws-its-hash-salts-at-start
+  "Core draws each hasher's k0/k1 (util/hasher.cpp:15-28) and the signature
+cache's nonce (script/sigcache.cpp:19-32) when the node builds them, at process
+start. Ours had no process salt for the octet tables at all, and
+*SIG-CACHE-SALT* was drawn at LOAD time, so the saved executable handed every
+process started from it the same one. DRAW-PROCESS-SALTS draws both from the
+OS RNG: afterwards the table salt is not the public default, two draws differ,
+and the signature cache has a new nonce and empty tables. NODE-MAIN and
+START-NODE call it (the binary's and the in-process start)."
+  (let* ((nonce 'bl.interop::*sig-cache-salt*)
+         (bl.bytes:*hash-salt* bl.bytes:*hash-salt*)
+         (default-salt bl.bytes:*hash-salt*)
+         (bl.interop:*signature-cache* bl.interop:*signature-cache*)
+         (bl.interop:*signature-cache-prev* bl.interop:*signature-cache-prev*)
+         (old-cache bl.interop:*signature-cache*))
+    (let ((names (loop for (caller) in (sb-introspect:who-calls 'bl:draw-process-salts)
+                       when (symbolp caller) collect (symbol-name caller))))
+      (is (member "NODE-MAIN" names :test #'string=) "node-main draws")
+      (is (member "START-NODE" names :test #'string=) "start-node draws"))
+    ;; Bound too, so the draws leave the image's own cache as it was.
+    (progv (list nonce) (list (symbol-value nonce))
+      (let ((old-nonce (symbol-value nonce)))
+        (bl:draw-process-salts)
+        (let ((first bl.bytes:*hash-salt*))
+          (is (not (equalp default-salt first)) "the table salt is no longer the default")
+          (is (not (equalp old-nonce (symbol-value nonce))) "a new signature-cache nonce")
+          (is (and (not (eq old-cache bl.interop:*signature-cache*))
+                   (zerop (hash-table-count bl.interop:*signature-cache*)))
+              "the signature cache starts empty")
+          (bl:draw-process-salts)
+          (is (not (equalp first bl.bytes:*hash-salt*)) "two draws differ"))))))
+
 (defun %vbparams-init (network specs)
   "The message %INIT-PARAMETERS refuses -vbparams=SPECS with on NETWORK, or
 NIL when it accepts them. The override is cleared afterwards either way."

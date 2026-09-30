@@ -244,23 +244,53 @@ last byte does not, and keys shorter than the eight hashed bytes still work."
     (is (= (bl.bytes:octets-hash key) (bl.bytes:octets-hash (copy-seq key))))
     (is-true (bl.bytes:octets= key (copy-seq key)))))
 
+(test octet-tables-are-salted-and-keep-their-salt
+  "Core keys its txid and outpoint maps with SaltedTxidHasher /
+SaltedOutpointHasher (util/hasher.h): SipHash under a per-process secret, so
+nobody can tell offline which keys share a bucket. OCTETS-HASH was the key's
+first eight bytes, the same in every process. Now two salts hash one key
+differently and place the same 1,000 txids in different buckets, and a table
+built before SET-HASH-SALT keeps finding its entries after it (its salt was
+captured when it was built: SBCL keeps a live table's hashes). Control: under
+one salt the hash is a function of the bytes."
+  (let* ((txids (loop for i below 1000
+                      collect (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
+                                (dotimes (j 32 v) (setf (aref v j) (ldb (byte 8 0) (+ (* i 31) (* j 7))))))))
+         (bl.bytes:*hash-salt* bl.bytes:*hash-salt*)
+         (default-salt bl.bytes:*hash-salt*)
+         (before (bl.bytes:make-octets-hash-table)))
+    (dolist (k txids) (setf (gethash k before) t))
+    (is (= (bl.bytes:octets-hash (first txids)) (bl.bytes:octets-hash (copy-seq (first txids))))
+        "control: one salt, one hash")
+    (bl.bytes:set-hash-salt #x0123456789abcdef #xfedcba9876543210)
+    (let ((after (bl.bytes:make-octets-hash-table)))
+      (dolist (k txids) (setf (gethash k after) t))
+      (is (/= (bl.bytes:octets-hash (first txids) default-salt)
+              (bl.bytes:octets-hash (first txids)))
+          "another salt, another hash")
+      (is (not (equal (hash-table-occupied-buckets before) (hash-table-occupied-buckets after)))
+          "the same txids land in different buckets")
+      (is (every (lambda (k) (gethash (copy-seq k) before)) txids)
+          "the table built before the new salt still finds every key"))))
+
 (test outpoint-keys-of-one-transaction-take-separate-buckets
   "The outputs of one transaction must not share a bucket of an outpoint table
 (Core keys its outpoint maps by SaltedOutpointHasher, util/hasher.h, which
 mixes the index into the hash). OCTETS-HASH mixed the index in at bit 24, and
 SBCL takes a bucket from a hash's LOW bits: all 1,000 outputs of one
-transaction were one bucket chain. Control: 1,000 keys that differ only in a
-byte the hash does not read (byte 20) do share one bucket, so the count can
-see a collapse."
+transaction were one bucket chain. Control: 1,000 keys that differ only past
+the 36 bytes the hash reads (40-byte keys, bytes 38-39) do share one bucket,
+so the count can see a collapse."
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8)))
         (outputs (bl.ser:make-outpoint-table))
         (collapsed (bl.ser:make-outpoint-table)))
     (dotimes (i 32) (setf (aref txid i) (* 7 (1+ i))))
     (dotimes (i 1000)
       (setf (gethash (bl.ser:outpoint-key txid i) outputs) i)
-      (let ((key (bl.ser:outpoint-key txid 0)))
-        (setf (aref key 20) (ldb (byte 8 0) i)
-              (aref key 21) (ldb (byte 8 8) i))
+      (let ((key (make-array 40 :element-type '(unsigned-byte 8))))
+        (replace key (bl.ser:outpoint-key txid 0))
+        (setf (aref key 38) (ldb (byte 8 0) i)
+              (aref key 39) (ldb (byte 8 8) i))
         (setf (gethash key collapsed) i)))
     (is (= 1000 (hash-table-count outputs) (hash-table-count collapsed)))
     (is (= 1 (length (hash-table-occupied-buckets collapsed)))

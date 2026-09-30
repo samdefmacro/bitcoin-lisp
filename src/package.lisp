@@ -151,6 +151,7 @@ init.cpp, node/. src/node/.")
    #:node-shutdown-requested-p
    #:run-node-watchdog
    #:node-main
+   #:draw-process-salts
    #:notify-block-tip
    #:run-notify-command
    #:report-init-error

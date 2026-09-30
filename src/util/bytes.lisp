@@ -376,7 +376,8 @@ must be read as bytes (:var-bytes), not as a string."
 ;;; A txid, wtxid, outpoint key or sighash is a (simple-array (unsigned-byte 8))
 ;;; whose leading bytes are already uniformly random. SBCL's EQUALP hash walks
 ;;; every byte and its test is a generic descent; this test compares the
-;;; vectors directly and hashes the first eight bytes. The signature cache and
+;;; vectors directly and hashes them with the salted SipHash below (OCTETS-HASH).
+;;; The signature cache and
 ;;; the UTXO set each invented this once (sig-cache-hash, utxo-key=); the
 ;;; mempool's eight txid tables used EQUALP.
 
@@ -390,38 +391,163 @@ must be read as bytes (:var-bytes), not as a string."
          (loop for i of-type fixnum below n
                always (= (aref a i) (aref b i))))))
 
-(declaim (inline octets-hash))
-(defun octets-hash (key)
-  "The first eight bytes of KEY as a little-endian integer (fewer when KEY is
-shorter), with the four bytes after a 32-byte hash XORed into its LOW bits when
-present -- an outpoint key is txid||index (BL.SER:OUTPOINT-KEY), and the
-outputs of one transaction must not share a bucket. Keys are hash outputs, so
-the leading bytes are uniform.
+;;;; Salted SipHash for hash-table keys (Core crypto/siphash.cpp, util/hasher.h)
+;;;
+;;; Core keys every txid and outpoint map with a SALTED SipHash --
+;;; SaltedTxidHasher, SaltedWtxidHasher, SaltedOutpointHasher, each drawing its
+;;; k0/k1 from FastRandomContext when it is built (util/hasher.cpp:15-28) -- so
+;;; nobody can compute offline which keys share a bucket. The hashers live
+;;; here, in the util layer, because the octet tables below do; the storage
+;;; layer's coins cache uses them too.
 
-The low bits, because SBCL takes a bucket from a hash's low bits: the index
-was mixed in at bit 24, and all 1,000 outputs of one transaction still landed
-in one bucket of a 2,048-bucket table. Core's outpoint maps are keyed by
-SaltedOutpointHasher (util/hasher.h), which also salts; these tables are not
-salted; the coins cache's are (src/storage/utxo.lisp)."
+(declaim (inline %sip-rotl))
+(defun %sip-rotl (x n)
+  (declare (type (unsigned-byte 64) x) (type (integer 0 63) n)
+           (optimize (speed 3) (safety 0)))
+  (logior (ldb (byte 64 0) (ash x n)) (ash x (- n 64))))
+
+(defmacro %sipround (v0 v1 v2 v3)
+  "One SIPROUND (crypto/siphash.cpp:13-20) over the four 64-bit state places."
+  `(setf ,v0 (ldb (byte 64 0) (+ ,v0 ,v1)) ,v1 (%sip-rotl ,v1 13) ,v1 (logxor ,v1 ,v0)
+         ,v0 (%sip-rotl ,v0 32)
+         ,v2 (ldb (byte 64 0) (+ ,v2 ,v3)) ,v3 (%sip-rotl ,v3 16) ,v3 (logxor ,v3 ,v2)
+         ,v0 (ldb (byte 64 0) (+ ,v0 ,v3)) ,v3 (%sip-rotl ,v3 21) ,v3 (logxor ,v3 ,v0)
+         ,v2 (ldb (byte 64 0) (+ ,v2 ,v1)) ,v1 (%sip-rotl ,v1 17) ,v1 (logxor ,v1 ,v2)
+         ,v2 (%sip-rotl ,v2 32)))
+
+(defmacro %with-siphash-uint256 ((k0 k1 w0 w1 w2 w3) &body last-blocks)
+  "The SipHash-2-4 state under (K0, K1) after compressing the four words W0..W3,
+then LAST-BLOCKS (COMPRESS forms), then the finalization -- the shape of both
+PresaltedSipHasher operators (crypto/siphash.cpp:88-165)."
+  `(let ((v0 (logxor ,k0 #x736f6d6570736575))
+         (v1 (logxor ,k1 #x646f72616e646f6d))
+         (v2 (logxor ,k0 #x6c7967656e657261))
+         (v3 (logxor ,k1 #x7465646279746573)))
+     (declare (type (unsigned-byte 64) v0 v1 v2 v3))
+     (macrolet ((compress (d)
+                  `(let ((m ,d))
+                     (declare (type (unsigned-byte 64) m))
+                     (setf v3 (logxor v3 m))
+                     (%sipround v0 v1 v2 v3)
+                     (%sipround v0 v1 v2 v3)
+                     (setf v0 (logxor v0 m)))))
+       (compress ,w0)
+       (compress ,w1)
+       (compress ,w2)
+       (compress ,w3)
+       ,@last-blocks)
+     (setf v2 (logxor v2 #xFF))
+     (%sipround v0 v1 v2 v3)
+     (%sipround v0 v1 v2 v3)
+     (%sipround v0 v1 v2 v3)
+     (%sipround v0 v1 v2 v3)
+     (logxor v0 v1 v2 v3)))
+
+(declaim (inline siphash-uint256))
+(defun siphash-uint256 (k0 k1 w0 w1 w2 w3)
+  "SipHash-2-4 under (K0, K1) of the 256-bit value whose little-endian 64-bit
+words are W0..W3 (uint256::GetUint64(0..3)) -- Core's
+PresaltedSipHasher::operator()(val) (crypto/siphash.cpp:88-127), the hash
+behind SaltedTxidHasher and SaltedWtxidHasher. Equal to SipHash-2-4 of the 32
+bytes."
+  (declare (type (unsigned-byte 64) k0 k1 w0 w1 w2 w3)
+           (optimize (speed 3) (safety 0)))
+  (%with-siphash-uint256 (k0 k1 w0 w1 w2 w3)
+    ;; The length block of a 32-byte message: 32 << 56, i.e. 4 << 59.
+    (compress (ash 4 59))))
+
+(declaim (inline siphash-uint256-extra))
+(defun siphash-uint256-extra (k0 k1 w0 w1 w2 w3 extra)
+  "SipHash-2-4 under (K0, K1) of the 256-bit value W0..W3 followed by EXTRA as
+four little-endian bytes -- Core's PresaltedSipHasher::operator()(val, extra)
+(crypto/siphash.cpp:128-165), the hash behind SaltedOutpointHasher, which
+keys the coins cache by COutPoint (coins.h:219-222). Equal to SipHash-2-4 of
+the 36 bytes txid||LE32(extra)."
+  (declare (type (unsigned-byte 64) k0 k1 w0 w1 w2 w3)
+           (type (unsigned-byte 32) extra)
+           (optimize (speed 3) (safety 0)))
+  (%with-siphash-uint256 (k0 k1 w0 w1 w2 w3)
+    (compress (logior (ash 36 56) extra))))
+
+(deftype hash-salt () '(simple-array (unsigned-byte 64) (2)))
+
+(defun %make-hash-salt (k0 k1)
+  (let ((salt (make-array 2 :element-type '(unsigned-byte 64))))
+    (setf (aref salt 0) k0 (aref salt 1) k1)
+    salt))
+
+(defvar *hash-salt* (%make-hash-salt #x8e819f2607a18de6 #xf4020d2e3983b0eb)
+  "The SipHash key (K0 K1) the octet tables built from now on hash under
+(MAKE-OCTETS-HASH-TABLE captures it when it builds a table).
+
+The DEFAULT IS WEAK ON PURPOSE: Core's own deterministic test salt
+(SaltedOutpointHasher(true), util/hasher.cpp:25-27), public and fixed, which
+is what a saved image and a test image carry. A node draws a fresh one from
+the OS RNG before it builds anything (BL:DRAW-PROCESS-SALTS, from
+START-NODE and NODE-MAIN, through SET-HASH-SALT), as Core draws one per hasher
+from FastRandomContext (util/hasher.cpp:15-28). It is here, below the crypto
+layer that owns the RNG, because the tables are.
+
+A table never changes its key: SBCL keeps the hashes of a live table, so a
+table built before the draw (a load-time DEFVAR, saved into the binary) keeps
+the default for its lifetime -- no hash of a live table ever moves.")
+
+(defun set-hash-salt (k0 k1)
+  "Make (K0, K1) the SipHash key of every octet table built from now on (see
+*HASH-SALT*). Tables built earlier keep theirs."
+  (declare (type (unsigned-byte 64) k0 k1))
+  (setf *hash-salt* (%make-hash-salt k0 k1)))
+
+(declaim (inline %octets-word))
+(defun %octets-word (key start end)
+  "The bytes of KEY from START, at most eight and not past END, as a
+little-endian word (missing bytes zero)."
   (declare (type (simple-array (unsigned-byte 8) (*)) key)
-           (optimize (speed 3) (safety 1)))
-  (let ((h 0) (n (length key)))
-    (declare (type (unsigned-byte 64) h) (type fixnum n))
-    (loop for i of-type fixnum below (min 8 n)
-          do (setf h (logior h (ash (aref key i) (* 8 i)))))
-    (when (>= n 36)
-      (setf h (logxor h (logior (aref key 32) (ash (aref key 33) 8)
-                                (ash (aref key 34) 16) (ash (aref key 35) 24)))))
-    (logand h most-positive-fixnum)))
+           (type fixnum start end) (optimize (speed 3) (safety 0)))
+  (let ((w 0))
+    (declare (type (unsigned-byte 64) w))
+    (loop for i of-type fixnum from start below (min end (+ start 8))
+          do (setf w (logior w (ash (aref key i)
+                                    (the (integer 0 56) (* 8 (- i start)))))))
+    w))
 
-#+sbcl (sb-ext:define-hash-table-test octets= octets-hash)
+(defun octets-hash (key &optional (salt *hash-salt*))
+  "KEY's hash under SALT, cut to a fixnum: Core's salted SipHash for the key
+shapes the node hashes -- a 32-byte txid, wtxid, block hash or sighash through
+SaltedTxidHasher's PresaltedSipHasher(uint256) (SIPHASH-UINT256), and a
+36-byte outpoint key, txid||LE32(index) (BL.SER:OUTPOINT-KEY), through
+SaltedOutpointHasher's PresaltedSipHasher(uint256, n)
+(SIPHASH-UINT256-EXTRA). Any other length hashes its first 32 bytes
+zero-padded with the length as the extra word; a key longer than 36 bytes
+hashes its first 36 (OCTETS= still compares every byte).
+
+It used to be the first eight bytes, unsalted, with the index XORed in: SBCL
+picks a bucket from a hash's low bits, so it had to reach them (mixed in at
+bit 24, 1,000 outputs of one transaction shared one bucket), and anyone could
+compute offline which txids collide."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key)
+           (type hash-salt salt)
+           (optimize (speed 3) (safety 0)))
+  (let* ((n (length key))
+         (k0 (aref salt 0)) (k1 (aref salt 1))
+         (w0 (%octets-word key 0 n)) (w1 (%octets-word key 8 n))
+         (w2 (%octets-word key 16 n)) (w3 (%octets-word key 24 n)))
+    (logand (cond ((= n 32) (siphash-uint256 k0 k1 w0 w1 w2 w3))
+                  ((>= n 36)
+                   (siphash-uint256-extra k0 k1 w0 w1 w2 w3
+                                          (logior (aref key 32) (ash (aref key 33) 8)
+                                                  (ash (aref key 34) 16) (ash (aref key 35) 24))))
+                  (t (siphash-uint256-extra k0 k1 w0 w1 w2 w3 n)))
+            most-positive-fixnum)))
 
 (defun make-octets-hash-table (&key (size 16) synchronized)
-  "A hash table keyed by octet vectors (txids, outpoint keys, sighashes):
-the OCTETS= test under SBCL, EQUALP elsewhere."
-  (make-hash-table #+sbcl :test #+sbcl 'octets= #-sbcl :test #-sbcl 'equalp
-                   :size size
-                   #+sbcl :synchronized #+sbcl synchronized))
+  "A hash table keyed by octet vectors (txids, outpoint keys, sighashes): the
+OCTETS= test under OCTETS-HASH with the salt *HASH-SALT* holds now, kept for
+the table's lifetime."
+  (let ((salt *hash-salt*))
+    (declare (type hash-salt salt))
+    (make-hash-table :test #'octets= :size size :synchronized synchronized
+                     :hash-function (lambda (key) (octets-hash key salt)))))
 
 ;;;; String sanitizing (Core util/strencodings.cpp SanitizeString)
 ;;;
