@@ -109,7 +109,8 @@ is a node that cannot reconstruct anyone else's compact blocks."
                     reference table" n)))))
 
 (test the-outpoint-siphash-is-the-siphash-of-the-outpoint-bytes
-  "SIPHASH-UINT256-EXTRA is Core's PresaltedSipHasher(val, extra)
+  "SIPHASH-UINT256 is Core's PresaltedSipHasher(val), SaltedTxidHasher's, and
+SIPHASH-UINT256-EXTRA its PresaltedSipHasher(val, extra)
 (crypto/siphash.cpp:128-165), the coins cache's SaltedOutpointHasher: equal to
 the SipHash-2-4 of the 32 bytes of VAL followed by EXTRA as four little-endian
 bytes. The reference table's 36-byte entry (bytes 00..23, k = 00..0f) is that
@@ -125,9 +126,18 @@ on random keys, values and extras; so do we."
                    collect (loop for i below 8 sum (ash (aref bytes (+ (* 8 w) i)) (* 8 i))))))
       (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
         (dotimes (i 32) (setf (aref bytes i) i))
-        (is (= want (apply #'bl.crypto:siphash-uint256-extra k0 k1
+        (is (= want (apply #'bl.bytes:siphash-uint256-extra k0 k1
                            (append (words bytes) (list #x23222120))))
-            "the reference table's 36-byte entry"))
+            "the reference table's 36-byte entry")
+        ;; PresaltedSipHasher(uint256), SaltedTxidHasher's: Core's own vector
+        ;; (hash_tests.cpp:107) and the table's 32-byte entry.
+        (is (= #x7127512f72f27cce
+               (apply #'bl.bytes:siphash-uint256 #x0706050403020100 #x0F0E0D0C0B0A0908
+                      (words bytes)))
+            "hash_tests.cpp:107")
+        (is (= (parse-integer (aref (coerce (gethash "outputs" vectors) 'vector) 32) :radix 16)
+               (apply #'bl.bytes:siphash-uint256 k0 k1 (words bytes)))
+            "the reference table's 32-byte entry"))
       (dotimes (trial 16)
         (let ((k0 (random (ash 1 64) rs)) (k1 (random (ash 1 64) rs))
               (n (random (ash 1 32) rs))
@@ -135,6 +145,9 @@ on random keys, values and extras; so do we."
           (dotimes (i 32) (setf (aref bytes i) (random 256 rs)))
           (dotimes (i 4) (setf (aref bytes (+ 32 i)) (ldb (byte 8 (* 8 i)) n)))
           (is (= (bl.crypto:siphash-2-4 k0 k1 bytes)
-                 (apply #'bl.crypto:siphash-uint256-extra k0 k1
+                 (apply #'bl.bytes:siphash-uint256-extra k0 k1
                         (append (words bytes) (list n))))
-              "trial ~D: the two hashers disagree" trial))))))
+              "trial ~D: the two hashers disagree" trial)
+          (is (= (bl.crypto:siphash-2-4 k0 k1 (subseq bytes 0 32))
+                 (apply #'bl.bytes:siphash-uint256 k0 k1 (words bytes)))
+              "trial ~D: the uint256 hasher disagrees" trial))))))

@@ -2412,6 +2412,19 @@ per-process sync state and the at-tip liveness signal reset for this run."
     ;; (net.cpp:3554-3556).
     (start-private-broadcast-thread *node*)))
 
+(defun draw-process-salts ()
+  "Draw this process's hashing secrets from the OS RNG, before the node builds
+anything that uses them -- as Core does when it builds each object at start:
+every SaltedTxidHasher / SaltedOutpointHasher draws k0/k1 from
+FastRandomContext (util/hasher.cpp:15-28), and the SignatureCache constructor
+draws its nonce with GetRandHash (script/sigcache.cpp:19-32).
+
+A load-time draw is frozen into the saved executable, so every process
+started from one binary would share it; the defaults are public on purpose
+(BL.BYTES:*HASH-SALT*). Called first by NODE-MAIN and START-NODE."
+  (bl.bytes:set-hash-salt (bl.crypto:rand-u64) (bl.crypto:rand-u64))
+  (bl.interop:reseed-signature-cache))
+
 (defun start-node (&key (data-directory (default-data-directory))
                         (network :mainnet)
                         (log-level :info)
@@ -2564,6 +2577,8 @@ Returns the node instance."
   (when *node*
     (log-warn "Node already running, stopping first")
     (stop-node))
+  ;; The hash salts and the signature-cache nonce, before any table is built.
+  (draw-process-salts)
 
   ;; A NEW datadir gets a wallets/ subdirectory (Core common/init.cpp:45-63).
   ;; FIRST, before anything else here: %INIT-LOGGING creates the network
@@ -2933,6 +2948,7 @@ stderr back at EVERY node stop and fails the test unless it is exactly empty
 every test that stops a node. Startup FAILURES do go to stderr, which is also
 Core's behaviour and what assert_start_raises_init_error reads."
   (sb-ext:disable-debugger)
+  (draw-process-salts)              ; before the node or a side tool builds a table
   ;; Started as the `bitcoin' wrapper (Core bitcoin.cpp), the executable
   ;; prints its help or version, or becomes the program the command names:
   ;; `bitcoin node ...' carries on below as `bitcoind ...', `bitcoin rpc ...'
