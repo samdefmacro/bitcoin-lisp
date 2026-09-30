@@ -208,8 +208,38 @@
 (defsection @crypto (:title "crypto: hashes and libsecp256k1")
   "Core: `crypto/`, `hash.cpp`, `key.cpp`, `pubkey.cpp`, `bip324.cpp`,
   `random.cpp`, and the libsecp256k1 library itself (ECDSA, Schnorr,
-  ellswift, MuSig) through CFFI. The library path is the `BL_SECP_LIB`
-  seam; the project container ships v0.7.1 with the musig module.
+  ellswift, MuSig) through CFFI.
+
+  The library is SHARED and chosen at run time, where Core links its own
+  copy statically with the modules forced on (`cmake/secp256k1.cmake`).
+  The CFFI definition asks for the unversioned `libsecp256k1.so` first, so
+  the directory on `LD_LIBRARY_PATH` -- `scripts/run-node.sh`'s
+  `BL_SECP_LIB` -- wins over any system copy. The project container and
+  the live servers both carry v0.7.1 with six modules: recovery,
+  extrakeys, schnorrsig, ellswift, ecdh (unused, and absent from Core's
+  build) and musig (0.6.0 and later only). `*secp256k1-modules*` holds
+  those modules with one probe symbol each. A test fails when that table,
+  the image's configure flags (`docker/Dockerfile`) and the server
+  script's CMake flags (`scripts/server-secp-upgrade.sh`) stop agreeing.
+  At start-up the node logs one line in the style of Core's
+  `Using the '...' SHA256 implementation` (`secp256k1-startup-line`,
+  logged with the banner): the release from the `pkgconfig` file installed
+  next to the library (the library exports no version), the file dladdr(3)
+  resolves, and the modules. It is the acceptance check after a library
+  switch. With the musig module missing (v0.5.1), every MuSig2 entry point
+  signals `musig-unavailable` before any foreign call. That covers the
+  primitives, Core's three signer functions, and a musig() key expression
+  at descriptor parse time, so the refusal comes before a derivation's
+  catch-all could turn it into \"cannot derive\". `dispatch-rpc-method`
+  answers it as -1, RPC_MISC_ERROR, Core's code for a feature that is not
+  enabled; the message is ours, since Core cannot be in this state.
+
+  Upgrading the servers' library is `scripts/server-secp-upgrade.sh`, run ON
+  the server. It reuses or builds v0.7.1 into its own prefix
+  (`/data/bitcoin-lisp/secp256k1-0.7.1`), never over a prefix a node maps.
+  It verifies the probe symbols with nm/objdump and prints the switch:
+  `run-node.sh`'s `BL_SECP_LIB` default, then a clean stop and restart per
+  network. The v0.5.1 prefix `secp256k1-local` stays as the fallback.
 
   Invariants: every primitive has a known-answer vector in the test tree
   (Core's `crypto_tests`, BIP340, BIP324, BIP32); a replacement without
@@ -259,6 +289,10 @@
   (bitcoin-lisp.crypto:musig2-create-partial-sig function)
   (bitcoin-lisp.crypto:musig2-create-aggregate-sig function)
   (bitcoin-lisp.crypto:musig-secnonce class)
+  (bitcoin-lisp.crypto:*secp256k1-modules* variable)
+  (bitcoin-lisp.crypto:secp256k1-startup-line function)
+  (bitcoin-lisp.crypto:musig-available-p function)
+  (bitcoin-lisp.crypto:musig-unavailable condition)
   "`hash256` is SHA-256 applied twice, the hash of every header,
   transaction and message checksum:
 

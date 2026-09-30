@@ -413,9 +413,14 @@ musig.cpp:71). It is a derivation ROOT, not a key anyone published."
 (Core ParsePubkey's musig branch, descriptor.cpp:1964-2044). Returns a DESC-KEY
 whose MUSIG-PARTICIPANTS are the participant expressions in the order written.
 
-Every error message here is Core's, verbatim."
+Every error message here is Core's, verbatim -- except the refusal of a
+libsecp256k1 without the musig module, which Core cannot meet: every musig()
+key is aggregated through that module, so a descriptor naming one is refused
+here, at parse time, before a derivation's catch-all could turn it into a
+\"cannot derive\" (BL.CRYPTO:MUSIG-UNAVAILABLE, answered as -1)."
   (unless (%xonly-context-p ctx)
     (%desc-error "musig() is only allowed in tr() and rawtr()"))
+  (bl.crypto:ensure-musig-available)
   ;; Core splits on ')' keeping the separator, so at most two pieces: the
   ;; musig(...) call and whatever derivation follows it.
   (let ((close (position #\) str)))

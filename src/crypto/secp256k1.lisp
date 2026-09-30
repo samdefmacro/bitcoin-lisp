@@ -13,7 +13,13 @@
                 "/usr/local/lib/libsecp256k1.dylib"
                 "libsecp256k1.dylib"
                 "libsecp256k1.1.dylib"))
-  (:unix (:or "libsecp256k1.so.1" "libsecp256k1.so"))
+  ;; The unversioned name FIRST: it is the one a private prefix on
+  ;; LD_LIBRARY_PATH provides (scripts/run-node.sh's BL_SECP_LIB), and
+  ;; dlopen searches LD_LIBRARY_PATH before the system cache for every name
+  ;; -- so a distro package that happens to own a versioned soname tried
+  ;; first would win over the library the operator pointed the node at.
+  ;; The start-up line (SECP256K1-STARTUP-LINE) names whichever one loaded.
+  (:unix (:or "libsecp256k1.so" "libsecp256k1.so.1"))
   (t (:default "libsecp256k1")))
 
 (defvar *secp256k1-context* nil
@@ -183,6 +189,127 @@
             (unless (= rc 1)
               (crypto-error "secp256k1_tagged_sha256 returned ~A" rc))))))
     out))
+
+;;; --- Which libsecp256k1 this process loaded, and with which modules ---------
+;;;
+;;; Core links its own copy of libsecp256k1 statically (cmake/secp256k1.cmake:
+;;; BUILD_SHARED_LIBS OFF, ECDH off and recovery and musig forced on at :17-19,
+;;; the rest libsecp's own defaults, src/secp256k1/CMakeLists.txt:49-54), so a Core binary
+;;; cannot run against a library that lacks a module it calls, and has no
+;;; start-up line, probe or error for that state. We load a SHARED library
+;;; chosen at run time (LD_LIBRARY_PATH, run-node.sh's BL_SECP_LIB), so the
+;;; state exists here, and the wording of everything below is ours: the
+;;; "Using ..." line copies the style of Core's own start-up lines
+;;; (kernel/context.cpp:20, "Using the '%s' SHA256 implementation"), and the
+;;; refusal borrows the code Core gives a feature that is not enabled
+;;; (RPC_MISC_ERROR, getblockfilter's "Index is not enabled for filtertype",
+;;; rpc/blockchain.cpp:2591).
+
+(defparameter *secp256k1-modules*
+  '((:recovery . "secp256k1_ecdsa_recover")
+    (:extrakeys . "secp256k1_keypair_create")
+    (:schnorrsig . "secp256k1_schnorrsig_sign32")
+    (:ellswift . "secp256k1_ellswift_create")
+    (:ecdh . "secp256k1_ecdh")
+    (:musig . "secp256k1_musig_nonce_gen"))
+  "Each optional libsecp256k1 module the project's library is built with,
+and one symbol only that module exports -- the probe for it. The set is the
+container image's (docker/Dockerfile's --enable-module-* flags) and the
+server's (scripts/server-secp-upgrade.sh); a structural test keeps the three
+lists equal. Core's own build (cmake/secp256k1.cmake:17-19 over libsecp's
+defaults, src/secp256k1/CMakeLists.txt:49-54) has all of them but ECDH, which
+nothing here binds either: it is in the list because both builds carry it.")
+
+(defvar *secp256k1-symbol-lookup* 'cffi:foreign-symbol-pointer
+  "The function asked whether the loaded libsecp256k1 exports a symbol: called
+with the symbol's name, it answers its address or NIL. Every module probe goes
+through it, so a test can stand in for a library built without a module by
+binding it.")
+
+(defun secp256k1-module-available-p (module)
+  "T when the loaded libsecp256k1 was built with MODULE, a key of
+*SECP256K1-MODULES*."
+  (ensure-secp256k1-loaded)
+  (let ((symbol (or (cdr (assoc module *secp256k1-modules*))
+                    (crypto-error "unknown libsecp256k1 module ~S" module))))
+    (and (funcall *secp256k1-symbol-lookup* symbol) t)))
+
+(defun secp256k1-library-path ()
+  "The file the process loaded libsecp256k1 from, symlinks resolved (so the
+soname's full version shows: libsecp256k1.so.6.0.1), or NIL when dladdr(3)
+cannot say. This is the answer /proc/<pid>/maps gives, from inside."
+  (ensure-secp256k1-loaded)
+  (let ((address (cffi:foreign-symbol-pointer "secp256k1_context_create")))
+    (when address
+      ;; Dl_info: dli_fname is its first member (dlfcn.h).
+      (cffi:with-foreign-object (info :pointer 4)
+        (unless (zerop (cffi:foreign-funcall "dladdr" :pointer address
+                                                      :pointer info :int))
+          (let ((fname (cffi:mem-aref info :pointer 0)))
+            (unless (cffi:null-pointer-p fname)
+              (let ((name (cffi:foreign-string-to-lisp fname)))
+                (or (ignore-errors (namestring (truename name))) name)))))))))
+
+(defun secp256k1-library-version (&optional (path (secp256k1-library-path)))
+  "The release of the libsecp256k1 at PATH, as its own installation states it:
+the Version: line of the pkgconfig/libsecp256k1.pc installed beside it (both
+the autotools and the CMake install write one). The library itself exports no
+version, so NIL when that file is absent."
+  (when path
+    (let ((pc (merge-pathnames "pkgconfig/libsecp256k1.pc"
+                               (make-pathname :name nil :type nil :version nil
+                                              :defaults (pathname path)))))
+      (with-open-file (in pc :if-does-not-exist nil)
+        (when in
+          (loop for line = (read-line in nil)
+                while line
+                when (and (> (length line) 8) (string= "Version:" line :end2 8))
+                  return (string-trim " " (subseq line 8))))))))
+
+(defun %secp256k1-library-name ()
+  "The loaded library as a message names it: its release when known, else
+its file."
+  (let ((path (secp256k1-library-path)))
+    (or (secp256k1-library-version path) path "(unknown file)")))
+
+(defun secp256k1-startup-line ()
+  "The one start-up log line naming the libsecp256k1 this process loaded:
+release, file, and which of *SECP256K1-MODULES* it was built with -- the
+acceptance check after a library switch, read from debug.log."
+  (let* ((path (secp256k1-library-path))
+         (missing (loop for (module) in *secp256k1-modules*
+                        unless (secp256k1-module-available-p module)
+                          collect module)))
+    (format nil "Using libsecp256k1 ~A (~A) with modules ~(~{~A~^ ~}~)~@[; ~
+                 missing ~(~{~A~^ ~}~)~]~:[~;, so MuSig2 is not available~]"
+            (or (secp256k1-library-version path) "of unknown version")
+            (or path "unknown file")
+            (loop for (module) in *secp256k1-modules*
+                  unless (member module missing) collect module)
+            missing
+            (member :musig missing))))
+
+(define-condition musig-unavailable (crypto-error) ()
+  (:documentation "A MuSig2 operation was asked of a libsecp256k1 built
+without the musig module (every release before 0.6.0). Calling into the
+module anyway would signal an undefined-alien error from inside whatever
+wallet or descriptor path reached it; this names the cause instead. The RPC
+layer answers it as RPC_MISC_ERROR, Core's code for a feature that is not
+enabled -- Core itself links the module statically and cannot be here."))
+
+(defun musig-available-p ()
+  "T when the loaded libsecp256k1 has the musig module."
+  (secp256k1-module-available-p :musig))
+
+(defun ensure-musig-available ()
+  "ENSURE-SECP256K1-LOADED, and signal MUSIG-UNAVAILABLE when the library
+has no musig module. Every MuSig2 entry point calls it before any foreign
+call."
+  (unless (musig-available-p)
+    (error 'musig-unavailable
+           :format-control "MuSig2 is not available: libsecp256k1 ~A has no musig module"
+           :format-arguments (list (%secp256k1-library-name))))
+  *secp256k1-context*)
 
 (defun cleanup-secp256k1 ()
   "Clean up secp256k1 context. Call on shutdown."
@@ -942,8 +1069,7 @@ When low-s=T and signature has high-S, returns (values nil :high-s)."
 (defun ellswift-available-p ()
   "T when the loaded libsecp256k1 was built with the ellswift module.
 Old system libraries lack it; the v2 transport must fall back to v1 then."
-  (ensure-secp256k1-loaded)
-  (and (cffi:foreign-symbol-pointer "secp256k1_ellswift_create") t))
+  (secp256k1-module-available-p :ellswift))
 
 (defun %ellswift-bip324-hashfp ()
   "The library's BIP324 xdh hash function: an exported const VARIABLE holding
@@ -1063,7 +1189,7 @@ before aggregating (descriptor.cpp:648, MuSigPubkeyProvider::GetPubKey), so
 musig() is order-insensitive as a DESCRIPTOR while the primitive underneath
 stays order-sensitive. Sorting here instead would leave the primitive
 untestable against BIP327's vectors."
-  (ensure-secp256k1-loaded)
+  (ensure-musig-available)
   (let ((n (length pubkeys)))
     (when (zerop n) (return-from musig-aggregate-pubkeys nil))
     (cffi:with-foreign-objects ((parsed :uint8 (* n +secp256k1-pubkey-size+))

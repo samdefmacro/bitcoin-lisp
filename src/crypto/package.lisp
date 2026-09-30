@@ -106,6 +106,16 @@ hash.cpp. src/crypto/.")
    #:public-key-valid-p
    #:decompress-public-key
    #:ensure-secp256k1-loaded
+   ;; Which library loaded, and its modules (the start-up line)
+   #:*secp256k1-modules*
+   #:*secp256k1-symbol-lookup*
+   #:secp256k1-module-available-p
+   #:secp256k1-library-path
+   #:secp256k1-library-version
+   #:secp256k1-startup-line
+   #:musig-available-p
+   #:ensure-musig-available
+   #:musig-unavailable
    #:cleanup-secp256k1
    ;; Signing (private key -> pubkey / signature) + WIF
    #:valid-private-key-p

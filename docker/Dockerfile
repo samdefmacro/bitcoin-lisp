@@ -1,8 +1,9 @@
 # Containerized toolchain for bitcoin-lisp: SBCL 2.6.5 (the same version the
-# production nodes run — see BUILD.md for why 2.6.5), libsecp256k1 v0.5.1
-# (matching the servers' locally-built copy; distro packages are too old for
-# BIP324's ellswift), LevelDB, OpenSSL, and a Quicklisp with all system
-# dependencies pre-loaded.
+# production nodes run — see BUILD.md for why 2.6.5), libsecp256k1 v0.7.1
+# with the musig module (the servers build the same tag and modules with
+# scripts/server-secp-upgrade.sh; distro packages are too old for BIP324's
+# ellswift), LevelDB, OpenSSL, and a Quicklisp with all system dependencies
+# pre-loaded.
 #
 # The image is TOOLCHAIN ONLY — the repository is bind-mounted at /workspace
 # at run time (see scripts/docker-sbcl.sh / scripts/docker-test.sh), so image
@@ -49,6 +50,11 @@ RUN PREFIX=/opt/sbcl HOPS="2.6.5" WORKDIR=/tmp/sbcl-build \
 #
 # Module set mirrors what the node's FFI uses: ECDSA (core), recovery,
 # extrakeys + schnorrsig (taproot), ellswift (BIP324), ecdh, and now musig.
+# (Nothing binds ecdh, and Core builds without it, cmake/secp256k1.cmake:17;
+# it stays because the servers' library carries it too. The node's probe
+# table, bl.crypto *SECP256K1-MODULES*, and scripts/server-secp-upgrade.sh
+# list the same six modules; tests/crypto/secp256k1-library-tests.lisp
+# fails when the three disagree.)
 #
 # ⚠️ This is the library the node validates CONSENSUS with, so the bump is not
 # a free "add a module". What bounds the risk, checked before making it:
