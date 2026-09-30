@@ -617,7 +617,12 @@ collection entirely.")
                             (chainstate-current t)
                             (has-no-mempool-parents t))
   "A transaction entered the mempool. FEE in satoshis, VSIZE in vbytes -- the
-same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB.
+same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB the
+way Core converts it: GetFeePerK(), the fee per 1000 vbytes rounded DOWN to a
+whole satoshi (EvaluateFeeDown(1000), policy/feerate.h:62), is what
+processTransaction buckets and processBlockTx records
+(block_policy_estimator.cpp:630-636, :660-665). The exact quotient can land
+one bucket higher -- 110.3 sat/kvB is above the 110.25 boundary, 110 below it.
 
 The four keywords are Core's NewMempoolTransactionInfo flags, carried here
 rather than decided at the call site so a future acceptance path cannot opt
@@ -626,7 +631,7 @@ they are read."
   (let ((est *block-policy-estimator*))
     (when (and est (plusp vsize))
       (bpe-process-transaction est txid height
-                               (/ (* (float fee 1d0) 1000d0) (float vsize 1d0))
+                               (float (floor (* fee 1000) vsize) 1d0)
                                :bypass-limits bypass-limits
                                :package-submission package-submission
                                :chainstate-current chainstate-current

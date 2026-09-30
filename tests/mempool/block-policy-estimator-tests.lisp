@@ -240,6 +240,28 @@ no transactions at all and every estimate is 0 forever."
     ;; against.
     (is (= 200 (first (gethash txid (%bpe-tracked est)))))))
 
+(test estimator-records-a-feerate-in-whole-satoshis-per-kvb
+  "The estimator records CFeeRate(fee, vsize).GetFeePerK() -- the fee per
+1000 vbytes ROUNDED DOWN to a whole satoshi, EvaluateFeeDown(1000)
+(policy/feerate.h:62) -- not the exact quotient: processTransaction buckets
+that integer and processBlockTx records it (block_policy_estimator.cpp:630-636,
+:660-665). 1103 sat over 10,000 vbytes is 110.3 sat/kvB, which GetFeePerK
+makes 110, below the 110.25 bucket boundary (100 x 1.05^2); the exact quotient
+lands one bucket higher."
+  (let* ((bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+         (est bl.mp:*block-policy-estimator*)
+         (txid (bpe-test-id 9 9 9))
+         (buckets (bl.mp::make-fee-buckets)))
+    (setf (%bpe-best-height est) 300)
+    (bl.mp:bpe-note-entry txid 1103 10000 300)
+    (let ((entry (gethash txid (%bpe-tracked est))))
+      (is-true entry)
+      (is (= 110d0 (second entry)) "recorded feerate ~A, Core's GetFeePerK is 110" (second entry))
+      (is (= (bl.mp::fee-bucket-index buckets 110d0) (third entry))
+          "bucket ~D, Core's is ~D" (third entry) (bl.mp::fee-bucket-index buckets 110d0))
+      (is (/= (bl.mp::fee-bucket-index buckets 110d0) (bl.mp::fee-bucket-index buckets 110.3d0))
+          "control: the exact quotient is in another bucket"))))
+
 (test mempool-eviction-reports-a-failure-but-confirmation-does-not
   "A removal that is not a confirmation is a FAILURE at that feerate. A
 confirmation must NOT be reported from the removal path: the block hook records
