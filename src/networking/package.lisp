@@ -117,6 +117,11 @@ headerssync.cpp. src/networking/.")
    ;; Tx-request tracking
    #:retry-timed-out-tx-requests
    #:reset-tx-requests
+   ;; Core's vExtraTxnForCompact (-blockreconstructionextratxn).
+   #:*max-extra-txs*
+   #:reset-compact-extra-transactions
+   #:add-to-compact-extra-transactions
+   #:compact-extra-transactions
    #:tx-request-wanted-p
    #:tx-request-received
    #:tx-request-received-response

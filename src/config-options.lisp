@@ -150,6 +150,11 @@
 (define-option "asmap" :key :asmap :type :string)
 ;; -checkaddrman=<n>: CheckAddrman on one in N address-book operations,
 ;; clamped to [0, 1000000] as LoadAddrman clamps it (addrdb.cpp:199).
+(define-option "blockreconstructionextratxn" :type :int
+  ;; -blockreconstructionextratxn=<n>: how many recently rejected or replaced
+  ;; peer transactions compact-block reconstruction keeps beside the mempool
+  ;; (Core max_extra_txs, clamped to 0..uint32 max, node/peerman_args.cpp:18-21).
+  :apply (lambda (n) (setf bl.net:*max-extra-txs* (max 0 (min n #xffffffff)))))
 (define-option "checkaddrman" :type :int
   :apply (lambda (n) (setf bl.net:*addrman-check-ratio* (max 0 (min n 1000000)))))
 ;; -pid: a supervisor's handle on this process. -nopid parses to "0", which
@@ -369,6 +374,11 @@
 ;; -mempoolexpiry: hours before an untouched mempool entry is dropped (Core
 ;; mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
 (define-option "mempoolexpiry" :type :int :global bl.mp:*mempool-expiry-hours*)
+;; -checkmempool=<n>: run CTxMemPool::check on one call in N (Core
+;; mempool_args.cpp:47, clamped to 0..1,000,000 by the pool, txmempool.cpp:168).
+;; Absent, the chain's fDefaultConsistencyChecks decides: 1 on regtest, 0
+;; elsewhere (init.cpp:1316). The drive sites are BL.VAL:CHECK-MEMPOOL-AT-TIP's.
+(define-option "checkmempool" :type :int :global bl.mp:*mempool-check-ratio*)
 ;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
 ;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Read by make-mempool. Under
 ;; -blocksonly Core soft-sets it to 5 MB -- the absent case, in
@@ -610,9 +620,8 @@
 ;;; init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
 
 (define-core-only-options
-  "blockreconstructionextratxn"
   "checkblockindex"
-  "checkmempool" "checkpoints" "daemon"
+  "checkpoints" "daemon"
   "daemonwait" "deprecatedrpc"
   ;; -help and SetupHelpOptions' hidden -h and -? (common/args.cpp:722-726).
   "help" "h" "?"

@@ -45,11 +45,6 @@ cluster count 1..64, cluster size 1..250 kvB, -maxmempool 0..200 MB,
           (bl.mp:*cluster-size-limit* (* size-kvb 1000)))
       (values (bl.mp:make-mempool :max-size (* max-mb 1000000)) expiry require-standard))))
 
-(defun tx-pool-fuzz-coin-value (utxo-set)
-  (lambda (txid n)
-    (let ((u (bl.store:get-utxo utxo-set txid n)))
-      (and u (bl.store:utxo-entry-value u)))))
-
 (defun tx-pool-fuzz-prioritise (fdp mempool txid)
   "Core PrioritiseTransaction(txid, ConsumeIntegralInRange(-50 BTC, +50 BTC))."
   (bl.mp:mempool-prioritise mempool txid
@@ -73,8 +68,8 @@ transactions and offer them back as a reorg would (bypassing the limits,
 removing with their spenders the ones refused, wiring the rest back in);
 remove one pool transaction with its descendants; maybe trim to a random
 size and expire at a random age; check the pool again."
-  (let ((coin-value (tx-pool-fuzz-coin-value utxo-set)))
-    (check-mempool mempool :coin-value coin-value)
+  (let ((spend-height (1+ (bl.store:current-height chain-state))))
+    (check-mempool mempool :coins utxo-set :spend-height spend-height)
     (let* ((template (let ((bl.mining:*block-max-weight* (consume-integral-in-range fdp 0 4000000 32))
                            (bl.mining:*block-min-tx-fee-rate* (consume-money fdp +fuzz-coin+)))
                        (bl.mining:assemble-block-template chain-state mempool)))
@@ -109,7 +104,7 @@ size and expire at a random age; check the pool again."
       ;; ends at, not its start.
       (bl.mp:mempool-expire mempool (+ (- bl.ser:*mock-time* (consume-integral fdp :u32))
                                        (* bl.mp:*mempool-expiry-hours* 3600))))
-    (check-mempool mempool :coin-value coin-value)))
+    (check-mempool mempool :coins utxo-set :spend-height spend-height)))
 
 (defun tx-pool-fuzz-corpus (fdp)
   "Random bytes, most of them odd at a density drawn per buffer: a

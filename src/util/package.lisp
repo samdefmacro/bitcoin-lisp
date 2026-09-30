@@ -200,6 +200,7 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:network-port
    #:network-dns-seeds
    #:network-rpc-port
+   #:network-default-consistency-checks-p
    #:*enforce-bip94-on-regtest*
    #:enforce-bip94-p
    #:chain-params

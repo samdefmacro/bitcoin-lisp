@@ -4542,3 +4542,75 @@ inside a reorg's re-add."
                            *captured-removals*))
             "outer reason ~S: the replaced tx was announced as ~S"
             outer (mapcar #'third *captured-removals*))))))
+
+;;;; -checkmempool: Core's CTxMemPool::check and its drive sites
+
+(defun %checkmempool-orphaned-entry ()
+  "A mempool entry spending a coin no view has -- what CTxMemPool::check's
+HaveCoin assertion exists to catch (txmempool.cpp:500)."
+  (let ((tx (make-mempool-test-tx :input-id 91)))
+    (values (bl.mp:make-entry-from-tx tx 1000 1) (bl.ser:transaction-hash tx))))
+
+(test checkmempool-ratio-is-the-option-or-the-chains-default
+  "Core: -checkmempool=<n> sets check_ratio (mempool_args.cpp:47), clamped
+to 0..1,000,000 (txmempool.cpp:168); absent, it is 1 where the chain's
+fDefaultConsistencyChecks holds -- regtest alone -- and 0 elsewhere
+(init.cpp:1316, kernel/chainparams.cpp:643). The option used to be accepted
+and ignored."
+  (is-false (bl.cfg:core-only-option-p "checkmempool"))
+  (is-true (bl:known-config-option-p "checkmempool"))
+  (flet ((ratio (network setting)
+           (let ((bl:*network* network)
+                 (bl.mp:*mempool-check-ratio* setting))
+             (bl.mp:mempool-check-ratio (bl.mp:make-mempool)))))
+    (is (= 1 (ratio :regtest nil)))
+    (is (= 0 (ratio :mainnet nil)))
+    (is (= 0 (ratio :testnet4 nil)))
+    (is (= 0 (ratio :regtest 0)))
+    (is (= 7 (ratio :mainnet 7)))
+    (is (= 0 (ratio :mainnet -3)))
+    (is (= 1000000 (ratio :mainnet 2000000))))
+  (let ((bl.mp:*mempool-check-ratio* nil))
+    (bl.cfg:apply-option-globals '(("checkmempool" . "5")))
+    (is (= 5 bl.mp:*mempool-check-ratio*))))
+
+(test mempool-check-finds-a-coin-that-does-not-exist-and-a-total-that-drifted
+  "MEMPOOL-CHECK-NOW is CTxMemPool::check's body (txmempool.cpp:439-553): a
+consistent pool passes, and a pool transaction spending a coin nobody has,
+or a running total that no longer sums its entries, fails it."
+  (let ((mempool (bl.mp:make-mempool))
+        (utxo-set (bl.store:make-utxo-set)))
+    (is-true (bl.mp:mempool-check-now mempool utxo-set 1))
+    (multiple-value-bind (entry txid) (%checkmempool-orphaned-entry)
+      (is (eq :ok (bl.mp:mempool-add mempool txid entry)))
+      ;; Without a coin view the pool is consistent with itself...
+      (is-true (bl.mp:mempool-check-now mempool nil 1))
+      ;; ...and against the chain's coins it spends one that is not there.
+      (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool utxo-set 1))
+      (incf (bl.mp:mempool-total-size mempool))
+      (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))))
+
+(test a-checking-pool-is-checked-after-every-transaction-it-is-offered
+  "Core runs CTxMemPool::check after every ProcessTransaction, test-accept
+or not (validation.cpp:4490), on one call in -checkmempool. sendrawtransaction
+is one of those calls (node/transaction.cpp:78): offered to a pool that has
+gone inconsistent, a checking node finds it (Core asserts; ours logs and
+signals, which the RPC reports), and a node with the check off answers the
+transaction's own verdict as before."
+  (let* ((node (make-test-node))
+         (hex (concatenate 'string "0200000001"
+                           (make-string 64 :initial-element #\1)
+                           "0000000000ffffffff01e8030000000000000151"
+                           "00000000")))
+    (multiple-value-bind (entry txid) (%checkmempool-orphaned-entry)
+      (bl.mp:mempool-add (bl:node-mempool node) txid entry))
+    (flet ((send (ratio)
+             (setf (bl.mp:mempool-check-ratio (bl:node-mempool node)) ratio)
+             (rpc-error-of (lambda ()
+                             (bl.rpc:dispatch-rpc-method node "sendrawtransaction" (list hex))))))
+      (let ((checked (send 1)))
+        (is (search "Mempool consistency check failed" (or (cdr checked) ""))
+            "the checking node answered ~S" checked))
+      (let ((unchecked (send 0)))
+        (is (member (car unchecked) '(-25 -26)) "the node without the check answered ~S" unchecked)
+        (is (not (search "consistency" (or (cdr unchecked) ""))))))))

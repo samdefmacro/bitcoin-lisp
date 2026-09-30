@@ -3,8 +3,9 @@
 ;;;; Core's mempool-side fuzz helpers at the pin (d3056bc149):
 ;;;; src/test/fuzz/util/mempool.cpp (ConsumeTxMemPoolEntry),
 ;;;; src/test/util/txmempool.cpp (TryAddToMempool) and CTxMemPool::check
-;;;; (src/txmempool.cpp:433-553), the consistency check Core's -checkmempool
-;;;; runs and its mempool fuzz targets call after every change. Used by the
+;;;; (src/txmempool.cpp:433-553, BL.MP:MEMPOOL-CHECK-NOW), the consistency
+;;;; check Core's -checkmempool runs and its mempool fuzz targets call after
+;;;; every change. Used by the
 ;;;; rbf, tx_pool and package_eval ports.
 
 (defun consume-tx-mempool-entry (fdp tx max-height)
@@ -58,111 +59,17 @@ GetSortedScoreWithTopology), as (txid . entry)."
     (bl.mp:mempool-for-each mempool (lambda (txid e) (push (cons txid e) all)))
     (sort all (lambda (a b) (minusp (bl.mp:mempool-compare-mining-order mempool (car a) (car b)))))))
 
-(defun check-mempool (mempool &key coin-value (spend-height 0))
-  "Core CTxMemPool::check (txmempool.cpp:433-553): the graph is not oversized
-and passes its own sanity check; walking the entries in mining order, every
-input names an output a parent actually has, a coin that exists (in the pool
-or, with COIN-VALUE, a function of (txid index) answering the confirmed
-coin's value or NIL, in the chain) and the pool's spent-outpoint index;
-every entry's stored parents and children are exactly those its inputs and
-the spent index name; its fee is what its inputs and outputs say (Core's
-CheckTxInputs); the feerate diagram agrees with the order; and the running
-totals are the sums. SPEND-HEIGHT is unused (Core's maturity check is the
-caller's coinbase flag)."
-  (declare (ignore spend-height))
-  (let ((graph (bl.mp:mempool-graph mempool))
-        (spendable (make-hash-table :test 'equalp))  ; (txid . n) -> value, pool outputs so far
-        (total-size 0) (total-usage 0) (total-modified 0) (total-weight 0)
-        (ordered (mempool-entries-in-mining-order mempool)))
-    (fuzz-assert (not (bl.mp:txgraph-oversized-p graph)) "the mempool's graph is oversized")
-    (bl.mp:txgraph-sanity-check graph)
-    ;; The diagram: cumulative chunk feerates in mining order.
-    (let ((diagram '()) (acc (bl.mp:make-feefrac)))
-      (let ((builder (bl.mp:make-block-builder graph)))
-        (unwind-protect
-             (loop
-               (let ((rate (bl.mp:block-builder-current-chunk-feerate builder)))
-                 (unless rate (return))
-                 (setf acc (bl.mp:feefrac+ acc rate))
-                 (push acc diagram)
-                 (bl.mp:block-builder-include builder)))
-          (bl.mp:block-builder-finish builder)))
-      (setf diagram (nreverse diagram))
-      (dolist (item ordered)
-        (destructuring-bind (txid . e) item
-          (let ((tx (bl.mp:mempool-entry-transaction e))
-                (parents-check '())
-                (in-value 0))
-            ;; The diagram never falls behind the running totals, and hits a
-            ;; point exactly at every chunk boundary.
-            (when diagram
-              (fuzz-assert (>= (bl.mp:feefrac-size (first diagram)) total-weight))
-              (when (and (= (bl.mp:feefrac-fee (first diagram)) total-modified)
-                         (= (bl.mp:feefrac-size (first diagram)) total-weight)
-                         (plusp total-weight))
-                (pop diagram)))
-            (loop for in across (bl.ser:transaction-inputs tx)
-                  do (let* ((op (bl.ser:tx-in-previous-output in))
-                            (ptxid (bl.ser:outpoint-hash op))
-                            (n (bl.ser:outpoint-index op))
-                            (parent (bl.mp:mempool-get mempool ptxid)))
-                       (when parent
-                         (fuzz-assert (< n (length (bl.ser:transaction-outputs
-                                                    (bl.mp:mempool-entry-transaction parent))))
-                                      "an input names an output its in-pool parent lacks")
-                         (pushnew ptxid parents-check :test #'equalp))
-                       (let ((value (or (gethash (cons ptxid n) spendable)
-                                        (and coin-value (null parent) (funcall coin-value ptxid n)))))
-                         (when (or parent coin-value)
-                           (fuzz-assert value "an input spends a coin that does not exist")
-                           (when value (incf in-value value))))
-                       (fuzz-assert (equalp (bl.mp:mempool-spending-tx mempool ptxid n) txid)
-                                    "the spent-outpoint index does not name the spender")))
-            ;; Stored parents and children.
-            (let ((stored (loop for k being the hash-keys of (bl.mp:mempool-entry-parents e) collect k)))
-              (fuzz-assert (and (= (length stored) (length parents-check))
-                                (every (lambda (p) (member p parents-check :test #'equalp)) stored))
-                           "stored parents differ from the inputs' in-pool parents"))
-            ;; Children as Core reads them: every spent-index entry for an
-            ;; outpoint of this txid, whatever its index (mapNextTx.lower_bound
-            ;; over COutPoint(hash, 0), txmempool.cpp:522-527).
-            (let ((children-check '()))
-              (maphash (lambda (key spender)
-                         (when (equalp (subseq key 0 32) txid)
-                           (pushnew spender children-check :test #'equalp)))
-                       (bl.mp:mempool-spent-outpoints mempool))
-              (let ((stored (loop for k being the hash-keys of (bl.mp:mempool-entry-children e) collect k)))
-                (fuzz-assert (and (= (length stored) (length children-check))
-                                  (every (lambda (c) (member c children-check :test #'equalp)) stored))
-                             "stored children differ from the spent-outpoint index")))
-            ;; CheckTxInputs: the fee is inputs minus outputs.
-            (when coin-value
-              (let ((out-value (loop for o across (bl.ser:transaction-outputs tx)
-                                     sum (bl.ser:tx-out-value o))))
-                (fuzz-assert (= (fuzz-sabotage (bl.mp:mempool-entry-fee e)) (- in-value out-value))
-                             "entry fee ~D, inputs minus outputs ~D"
-                             (bl.mp:mempool-entry-fee e) (- in-value out-value))))
-            (loop for o across (bl.ser:transaction-outputs tx)
-                  for n from 0
-                  do (setf (gethash (cons txid n) spendable) (bl.ser:tx-out-value o)))
-            (incf total-size (bl.mp:mempool-entry-vsize e))
-            (incf total-usage (bl.mp:mempool-entry-usage e))
-            (incf total-modified (bl.mp:mempool-entry-modified-fee e))
-            (incf total-weight (bl.mp:mempool-entry-graph-weight e)))))
-      ;; The diagram's last point is the whole pool.
-      (fuzz-assert (or (null diagram) (and (= 1 (length diagram))
-                                           (= (bl.mp:feefrac-fee (first diagram)) total-modified)
-                                           (= (bl.mp:feefrac-size (first diagram)) total-weight)))
-                   "the feerate diagram does not end at the pool's totals"))
-    ;; Every spent outpoint belongs to a pool transaction.
-    (fuzz-assert (= (bl.mp:mempool-total-size mempool) total-size)
-                 "total size ~D, entries sum to ~D" (bl.mp:mempool-total-size mempool) total-size)
-    (fuzz-assert (= (bl.mp:mempool-total-usage mempool) total-usage))
-    (let ((ok t))
-      (maphash (lambda (k txid) (declare (ignore k))
-                 (unless (bl.mp:mempool-has mempool txid) (setf ok nil)))
-               (bl.mp:mempool-spent-outpoints mempool))
-      (fuzz-assert ok "the spent-outpoint index names a transaction not in the pool"))))
+(defun check-mempool (mempool &key coins (spend-height 0))
+  "Core CTxMemPool::check -- BL.MP:MEMPOOL-CHECK-NOW, which the node runs on
+-checkmempool -- as a fuzz assertion. COINS is the chain's coin view (NIL:
+the pool's own outputs only, for a pool planted without validation), spent
+at SPEND-HEIGHT with Core's coinbase maturity."
+  (let ((failure (handler-case
+                     (progn (bl.mp:mempool-check-now mempool coins spend-height
+                                                     :coinbase-maturity (and coins bl.val:+coinbase-maturity+))
+                            nil)
+                   (bl.mp:mempool-check-failed (c) (princ-to-string c)))))
+    (fuzz-assert (fuzz-sabotage (null failure)) "~A" failure)))
 
 ;;;; The node Core's tx_pool and package_eval targets run against
 ;;;; (initialize_tx_pool, tx_pool.cpp:43-60 / package_eval.cpp:42-58): a

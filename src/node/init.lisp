@@ -2384,6 +2384,8 @@ per-process sync state and the at-tip liveness signal reset for this run."
     (bl.net:reset-ibd-context)          ; one IBD context per node
     (bl.net:reset-tx-requests)
     (bl.net:reset-initial-broadcast-schedule)
+    ;; Core's vExtraTxnForCompact belongs to the PeerManager, one per node.
+    (bl.net:reset-compact-extra-transactions)
     ;; Fresh recent-confirmed filter (Core builds it per process; covers
     ;; in-image restarts).
     (bl.val:reset-recent-confirmed)

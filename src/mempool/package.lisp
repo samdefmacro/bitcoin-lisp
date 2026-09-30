@@ -266,6 +266,12 @@ src/mempool/.")
    #:mempool-spent-outpoints
    ;; The rolling minimum's decay clock, which the tx_pool and package_eval
    ;; targets restart the way Core's MockedTxPool::RollingFeeUpdate does.
+   ;; Core CTxMemPool::check and its -checkmempool ratio.
+   #:mempool-check
+   #:mempool-check-now
+   #:mempool-check-failed
+   #:mempool-check-ratio
+   #:*mempool-check-ratio*
    #:mempool-rolling-min-fee-time
    #:mempool-block-since-rolling-fee-bump
    #:mempool-dynamic-usage

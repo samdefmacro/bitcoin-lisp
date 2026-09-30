@@ -2242,6 +2242,71 @@ orphan work set Core is draining."
     (bl:log-cat "mempoolrej" "~A (wtxid=~A) from peer=~D was not accepted: ~A"
                 txid-hex wtxid-hex peer-id state)))
 
+;;; Core's vExtraTxnForCompact (net_processing.cpp:996-1003, 1885-1893): a ring
+;;; of the last -blockreconstructionextratxn transactions a peer relayed that
+;;; did not stay in the mempool -- rejected on first sight, or replaced -- which
+;;; compact-block reconstruction consults after the mempool.
+
+(defconstant +default-block-reconstruction-extra-txn+ 100
+  "Core DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN (net_processing.h:47).")
+
+(defvar *max-extra-txs* +default-block-reconstruction-extra-txn+
+  "Core PeerManager::Options::max_extra_txs, -blockreconstructionextratxn
+clamped to 0..uint32 max (node/peerman_args.cpp:18-21). 0 keeps no ring.")
+
+(defvar *extra-txn-for-compact* (make-array 0)
+  "The ring: (wtxid . tx) conses or NIL, sized to *MAX-EXTRA-TXS* on first use.")
+
+(defvar *extra-txn-for-compact-index* 0
+  "Core vExtraTxnForCompactIt: where the next transaction goes.")
+
+(defun reset-compact-extra-transactions ()
+  "Empty the ring (a new node, or a test)."
+  (setf *extra-txn-for-compact* (make-array 0)
+        *extra-txn-for-compact-index* 0))
+
+(defun add-to-compact-extra-transactions (tx)
+  "Core AddToCompactExtraTransactions (net_processing.cpp:1885-1893): TX
+overwrites the oldest slot of the ring, which is sized on first use."
+  (let ((max *max-extra-txs*))
+    (when (plusp max)
+      (unless (= (length *extra-txn-for-compact*) max)
+        (setf *extra-txn-for-compact* (make-array max :initial-element nil)
+              *extra-txn-for-compact-index* 0))
+      (setf (aref *extra-txn-for-compact* *extra-txn-for-compact-index*)
+            (cons (bl.ser:transaction-wtxid tx) tx)
+            *extra-txn-for-compact-index* (mod (1+ *extra-txn-for-compact-index*) max)))))
+
+(defun compact-extra-transactions ()
+  "The ring's (wtxid . tx) entries in slot order, as InitData walks
+vExtraTxnForCompact (blockencodings.cpp:147)."
+  (remove nil (coerce *extra-txn-for-compact* 'list)))
+
+(defvar *compact-extra-replaced* nil
+  "True while a PEER's transaction is being accepted (Core ProcessValidTx's
+callers): every transaction that acceptance replaces joins the ring
+(net_processing.cpp:3165-3167). An RPC or wallet replacement does not.")
+
+(bl.vi:define-validation-hook :transaction-removed note-replaced-for-compact-extra
+    (tx txid sequence reason)
+  (declare (ignore txid sequence))
+  (when (and *compact-extra-replaced* (eq reason :replaced))
+    (add-to-compact-extra-transactions tx)))
+
+(defun %add-rejected-to-compact-extra (tx error mempool)
+  "Core ProcessInvalidTx's AddToCompactExtraTransactions for a FIRST-TIME
+failure (net_processing.cpp:3138-3141, txdownloadman_impl.cpp:354-438): not
+a witness-stripped transaction, not an orphan the orphanage already holds,
+and not one of 100,000 bytes or more of memory. Call it before the orphan
+intake, which is what makes an orphan already held."
+  (let ((reason (bl.val:tx-reject-keyword error)))
+    (when (and (not (eq reason :witness-stripped))
+               (not (and (eq reason :missing-input)
+                         (bl.mp:orphan-tx (bl.mp:mempool-orphan-pool mempool)
+                                          (bl.ser:transaction-wtxid tx))))
+               (< (bl.mp:transaction-dynamic-usage tx) 100000))
+      (add-to-compact-extra-transactions tx))))
+
 (defun process-orphans (accepted-txid utxo-set mempool chain-state peers
                         &key recent-rejects)
   "De-orphan cascade: after ACCEPTED-TXID enters the mempool, re-validate the
@@ -2263,14 +2328,20 @@ by TXID, so the cascade work list carries txids."
                     (bl.store:with-coins-to-uncache (utxo-set)
                       (bl.val:validate-transaction-for-mempool
                        otx utxo-set mempool current-height :chain-state chain-state))
+                  (unless valid
+                    ;; ProcessTransaction's check for the orphan
+                    ;; (net_processing.cpp:3236, validation.cpp:4490).
+                    (bl.val:check-mempool-at-tip mempool utxo-set chain-state))
                   (cond
                     (valid
                      (multiple-value-bind (result entry)
-                         (bl.mp:accept-validated-tx
-                          mempool otxid otx fee current-height
-                          :sigops sigops :replaced replaced
-                          :chainstate-current
-                          (current-for-fee-estimation-p chain-state))
+                         (let ((*compact-extra-replaced* t))
+                           (bl.mp:accept-validated-tx
+                            mempool otxid otx fee current-height
+                            :sigops sigops :replaced replaced
+                            :chainstate-current
+                            (current-for-fee-estimation-p chain-state)))
+                       (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
                        (when (eq :ok result)
                          (bl:log-cat "txpackages" "   accepted orphan tx ~A (wtxid=~A)"
                                      (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes otxid))
@@ -2435,8 +2506,9 @@ black-hole an honest CPFP child after a single lost package attempt."
     (when child
       (let ((package (list parent-tx child)))
         (multiple-value-bind (msg results)
-            (bl.val:validate-package-for-mempool
-             package utxo-set mempool chain-state)
+            (let ((*compact-extra-replaced* t))
+              (bl.val:validate-package-for-mempool
+               package utxo-set mempool chain-state))
           (bl:log-cat "mempool" "1p1c package evaluation: ~A" msg)
           (unless (eq msg :success)
             (bl.val:add-reconsiderable-reject
@@ -2689,6 +2761,10 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                 (bl.val:validate-transaction-for-mempool
                  tx utxo-set mempool current-height :chain-state chain-state))
             (unless valid
+              ;; ProcessTransaction's check (validation.cpp:4490) -- the
+              ;; pool is unchanged by a rejection, so here is as good as
+              ;; right after the attempt.
+              (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
               ;; Core logs every rejection a peer's transaction earns,
               ;; before any of the caching decisions below: ProcessInvalidTx
               ;; opens with LogDebug(BCLog::MEMPOOLREJ, "%s (wtxid=%s) from
@@ -2701,6 +2777,10 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                           (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))
                           (peer-id peer)
                           (bl.val:tx-reject-reason-string error))
+              ;; A first-time failure joins the compact-block extra pool
+              ;; (ProcessInvalidTx, net_processing.cpp:3138-3141) -- decided
+              ;; before the orphan intake below.
+              (%add-rejected-to-compact-extra tx error mempool)
               (cond
                 ;; Missing inputs => hold as an orphan (not a real reject);
                 ;; a later parent will trigger re-evaluation. Request the
@@ -2743,11 +2823,15 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                    (%try-1p1c-package peer tx utxo-set mempool chain-state
                                       peers recent-rejects)))))
             (when valid
-              (let ((result (bl.mp:accept-validated-tx
-                             mempool txid tx fee current-height
-                             :sigops sigops :replaced replaced
-                             :chainstate-current
-                             (current-for-fee-estimation-p chain-state))))
+              (let ((result (let ((*compact-extra-replaced* t))
+                              (bl.mp:accept-validated-tx
+                               mempool txid tx fee current-height
+                               :sigops sigops :replaced replaced
+                               :chainstate-current
+                               (current-for-fee-estimation-p chain-state)))))
+                ;; ProcessTransaction's check, before the result is acted
+                ;; on (validation.cpp:4490, net_processing.cpp:4535).
+                (bl.val:check-mempool-at-tip mempool utxo-set chain-state)
                 (cond
                   ((eq result :ok)
                    ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
@@ -2769,6 +2853,7 @@ per-peer DoS scores (LimitOrphans) and the rejects filters."
                   ;; re-downloaded and fully re-validated.
                   ((eq result :duplicate) nil)   ; we already have it
                   (t
+                   (%add-rejected-to-compact-extra tx result mempool)
                    (%cache-tx-rejection tx result recent-rejects)
                    (when (%reconsiderable-failure-p result)
                      (%try-1p1c-package peer tx utxo-set mempool
@@ -4859,13 +4944,19 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
 
 ;;; Short ID map building
 
-(defun build-shortid-map (mempool k0 k1 use-wtxid)
+(defun build-shortid-map (mempool k0 k1 use-wtxid &optional extra-txn)
   "Build hash table mapping short IDs to (tx . expected-id) pairs.
    USE-WTXID is true for compact block version 2.
    Returns (VALUES map collision-detected).
    A short ID two mempool transactions share maps to :COLLISION instead: a
    block slot carrying it is requested, as Core's InitData requests one two
-   mempool transactions match (blockencodings.cpp:131-138)."
+   mempool transactions match (blockencodings.cpp:131-138).
+   EXTRA-TXN, Core's extra_txn -- the (wtxid . tx) ring of recently rejected
+   and replaced transactions -- is folded in after the mempool as InitData
+   folds it (:147-176): an extra transaction supplies a short ID nothing
+   matched yet, and one that matches a short ID already supplied by a
+   transaction with a DIFFERENT wtxid makes it a collision (the same
+   transaction in the pool and the ring is no collision)."
   (let ((map (make-hash-table :test 'eql))
         (collision nil))
     (bl.mp:mempool-for-each
@@ -4880,7 +4971,17 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
              (setf collision t
                    (gethash short-id map) :collision)
              (setf (gethash short-id map) (cons tx id))))))
+    (loop for (wtxid . tx) in extra-txn
+          for id = (if use-wtxid wtxid (bl.ser:transaction-hash tx))
+          for short-id = (bl.crypto:compute-short-txid k0 k1 id)
+          for have = (gethash short-id map)
+          do (cond ((null have) (setf (gethash short-id map) (cons tx id)))
+                   ((and (consp have)
+                         (not (equalp (bl.ser:transaction-wtxid (car have)) wtxid)))
+                    (setf collision t
+                          (gethash short-id map) :collision))))
     (values map collision)))
+
 
 ;;; Block reconstruction
 
@@ -4928,7 +5029,7 @@ entries (:98-111), measures its container's hashing and has no counterpart."
         (bl.crypto:compute-siphash-key header-bytes nonce)
 
       ;; Build short ID map from mempool
-      (let ((shortid-map (build-shortid-map mempool k0 k1 use-wtxid)))
+      (let ((shortid-map (build-shortid-map mempool k0 k1 use-wtxid (compact-extra-transactions))))
         (let ((transactions (make-array tx-count :initial-element nil))
               (missing-indexes '())
               (short-id-idx 0))

@@ -1249,7 +1249,15 @@
   send path instead). That is a documented divergence: Core lists these
   connections in getpeerinfo as `private-broadcast', ours are not listed. The transaction leaves the queue when it comes back
   from the network (the TX handler) or is aborted; one nobody has confirmed
-  for a minute gets another connection every 2-3 minutes."
+  for a minute gets another connection every 2-3 minutes. Compact-block
+  reconstruction consults, after the mempool, Core's vExtraTxnForCompact:
+  a ring of the last -blockreconstructionextratxn (100) PEER transactions
+  that did not stay in the pool -- refused on first sight, or replaced by
+  a peer's transaction -- filled only on those P2P paths
+  (`add-to-compact-extra-transactions`; an RPC or wallet replacement does
+  not count, as in Core) and reset per node."
+  (bitcoin-lisp.networking:add-to-compact-extra-transactions function)
+  (bitcoin-lisp.networking:*max-extra-txs* variable)
   (bitcoin-lisp.networking:initiate-tx-broadcast-private function)
   (bitcoin-lisp.networking:run-private-broadcast-connection function)
   (bitcoin-lisp.networking:peer class)
@@ -1699,13 +1707,20 @@
   evicts what an expiring transaction would have made room for. The
   package-feerate phase sees the pool plus its own subpackage's outputs,
   never the whole package's: a member that entered alone and was then
-  replaced is gone."
+  replaced is gone. `mempool-check` is Core's CTxMemPool::check, run on one
+  call in -checkmempool (default 1 on regtest, 0 elsewhere) where Core runs
+  it -- after every single-transaction acceptance attempt, test-accept
+  included, and at the end of every activation step -- through
+  `bl.val:check-mempool-at-tip`; a failure logs and signals, where Core
+  asserts."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)
   (bitcoin-lisp.mempool:mempool-entry class)
   (bitcoin-lisp.mempool:mempool-add function)
   (bitcoin-lisp.mempool:accept-validated-tx function)
+  (bitcoin-lisp.mempool:mempool-check function)
+  (bitcoin-lisp.mempool:*mempool-check-ratio* variable)
   (bitcoin-lisp.mempool:mempool-get function)
   (bitcoin-lisp.mempool:mempool-has function)
   (bitcoin-lisp.mempool:mempool-remove-recursive function)

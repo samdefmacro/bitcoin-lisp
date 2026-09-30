@@ -155,10 +155,15 @@ connection; one that would not is given up."
             (wtxid (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes (bl.ser:transaction-wtxid tx)))))
         (multiple-value-bind (valid error)
             (bt:with-recursive-lock-held ((node-lock node))
-              (bl.val:validate-transaction-for-mempool
-               tx (node-utxo-set node) (node-mempool node)
-               (bl.store:current-height (node-chain-state node))
-               :chain-state (node-chain-state node)))
+              (multiple-value-prog1
+                  (bl.val:validate-transaction-for-mempool
+                   tx (node-utxo-set node) (node-mempool node)
+                   (bl.store:current-height (node-chain-state node))
+                   :chain-state (node-chain-state node))
+                ;; A test-accept ProcessTransaction runs the check
+                ;; (net_processing.cpp:1654, validation.cpp:4490).
+                (bl.val:check-mempool-at-tip (node-mempool node) (node-utxo-set node)
+                                             (node-chain-state node))))
           (cond
             (valid
              (bl:log-cat "privatebroadcast" "Reattempting broadcast of stale txid=~A wtxid=~A" txid wtxid)

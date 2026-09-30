@@ -3249,7 +3249,10 @@ Handles chain reorganizations when a competing chain has more work."
                  (bl.mp:mempool-expire mempool)
                  (bl.mp:orphan-erase-for-block
                   (bl.mp:mempool-orphan-pool mempool) block))
-               (note-block-connected block))
+               (note-block-connected block)
+               ;; The check that ends every activation step, before its
+               ;; BlockConnected signals (validation.cpp:3300).
+               (check-mempool-at-tip mempool utxo-set chain-state))
              ;; Core's validation interface, after the tip update and the
              ;; mempool's conflict removals (Core's signal order): the indexes,
              ;; ZMQ and the wallet subscribe to BlockConnected; -blocknotify,
@@ -4342,7 +4345,10 @@ relay filters."
        mempool (loop for entry in (nthcdr skipped groups) append (car entry))
        utxo-set reached chain-state
        :skipped-txs (loop for entry in (subseq groups 0 skipped)
-                          append (car entry)))))
+                          append (car entry)))
+      ;; The check that ends the activation step, after
+      ;; MaybeUpdateMempoolForReorg (validation.cpp:3298-3300).
+      (check-mempool-at-tip mempool utxo-set chain-state)))
 
   ;; BlockConnected for the fork's blocks, oldest first, AFTER the re-add:
   ;; Core's ActivateBestChainStep runs MaybeUpdateMempoolForReorg before it
