@@ -1712,7 +1712,11 @@
   it -- after every single-transaction acceptance attempt, test-accept
   included, and at the end of every activation step -- through
   `bl.val:check-mempool-at-tip`; a failure logs and signals, where Core
-  asserts."
+  asserts. Because regtest runs it after EVERY transaction, it must stay one
+  pass over the pool with a few lookups per transaction: a per-entry walk of
+  the spent-outpoint index made it 180 ms on 2,500 transactions and timed
+  out feature_dbcrash.py; it is ~2 ms now (the graph's own sanity check
+  included, which likewise verifies its chunk index without sorting it)."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)
