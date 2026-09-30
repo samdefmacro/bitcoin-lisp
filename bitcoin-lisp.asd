@@ -648,6 +648,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/cluster-linearize")
                              (:file "fuzz/txgraph")
                              (:file "fuzz/txorphan")
-                             (:file "fuzz/txrequest"))))
+                             (:file "fuzz/txrequest")
+                             (:file "fuzz/feefrac"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
