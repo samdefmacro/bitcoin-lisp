@@ -2143,6 +2143,15 @@ its 900 s budget on the shared machine -- a thin margin, noted below.
 `feature_block` and `feature_pruning` time out under the parallel cap and
 pass serially, as before.
 
+Deployed: both live nodes on 2026-10-01 to `142f2ca8`, the report commit on
+`664b8ee2`, each after a clean stop and a full recompile (Coalton's release
+mode refuses the old FASLs; `run-node.sh` cleared the caches on the revision
+change): testnet4 at 06:58, mainnet at 07:35, both synced at their tips
+with the filter index serving the tip's filter and no error line. Both had
+already been restarted onto libsecp256k1 0.7.1 the day before. One cosmetic
+line to fix: the filter index logs "indexed to height -1" before it reads
+its locator.
+
 ### Decisions recorded in Round 11
 
 - **libsecp256k1 0.7.1 with the musig module is the live nodes' library**
