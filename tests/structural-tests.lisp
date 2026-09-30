@@ -61,8 +61,6 @@
     "bitcoin-lisp.mempool:feefrac-empty-p"
     "bitcoin-lisp.mempool:feefrac-evaluate-fee-down"
     "bitcoin-lisp.mempool:feefrac-evaluate-fee-up"
-    "bitcoin-lisp.mempool:feefrac<"
-    "bitcoin-lisp.mempool:feefrac<="
     "bitcoin-lisp.mempool:feefrac>="
     "bitcoin-lisp.mempool:mempool-ancestor-fee-rate"
     "bitcoin-lisp.mempool:mempool-descendant-fee-rate"
