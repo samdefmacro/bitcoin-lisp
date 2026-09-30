@@ -405,6 +405,8 @@ src/storage/.")
    #:migrate-txindex
    #:txindex-needs-migration-p
    #:block-flat-position
+   #:encode-disk-tx-pos
+   #:decode-disk-tx-pos
    #:txindex-count
    #:txindex-set-best-block
    #:txindex-best-block

@@ -437,3 +437,35 @@ from V1 is always V1-compatible."
                                "V2 address does not round-trip")
                   (fuzz-assert (and v1 (%v2-drops-embedded-ipv6-p (bl.ser:net-addr-ip addr)))
                                "V2 re-read dropped ~A" (bl.crypto:bytes-to-hex bytes))))))))))
+
+;;; --- Round 11: the small targets with a codec of their own -------------------
+
+(define-fuzz-target flat-file-pos-deserialize
+    (buffer :core "deserialize.cpp:181-185" :iterations 20000 :max-len 40
+            :corpus (lambda (fdp)
+                      (let ((bb (bl.ser:make-byte-buf)))
+                        (bl.ser:bb-write-core-varint bb (consume-integral-in-range fdp 0 #x7fffffff))
+                        (bl.ser:bb-write-core-varint bb (consume-integral fdp :u32))
+                        (bl.ser:bb-write-core-varint bb (consume-integral fdp :u32))
+                        (bl.ser:bb-finish bb))))
+  "FlatFilePos (VARINT nFile non-negative, VARINT nPos), read as the head of
+the one record that carries it here, CDiskTxPos (plus VARINT nTxOffset; the
+txindex and txospenderindex value): a buffer that decodes whole re-encodes
+to exactly its own bytes (Core AssertEqualAfterSerializeDeserialize, and
+VARINT is canonical)."
+  (let ((dtp (bl.store:decode-disk-tx-pos buffer)))
+    (when dtp
+      (fuzz-assert (equalp (fuzz-sabotage (bl.store:encode-disk-tx-pos dtp)) buffer)
+                   "~A decodes to a position that encodes otherwise" (bl.crypto:bytes-to-hex buffer)))))
+
+(define-fuzz-target uint256-deserialize
+    (buffer :core "deserialize.cpp:323-332 (uint160, uint256)" :iterations 5000 :max-len 40)
+  "uint160 and uint256 are their bytes: 20 or 32 are read, fewer is a
+refusal, and what was read serializes back unchanged."
+  (dolist (n '(20 32))
+    (let ((br (bl.ser:make-byte-reader-from buffer)))
+      (handler-case
+          (let ((v (bl.ser:br-read-bytes br n)))
+            (fuzz-assert (equalp (fuzz-sabotage v) (subseq buffer 0 n))))
+        (bl.err:serialization-error ()
+          (fuzz-assert (< (length buffer) n) "~D bytes refused as a uint~D" (length buffer) (* 8 n)))))))
