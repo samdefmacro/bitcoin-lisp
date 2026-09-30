@@ -975,7 +975,8 @@ satisfies the inferred miniscript from the partial signatures, the hash
 preimages and the transaction's own timelocks (script/sign.cpp:772-777;
 FillSignatureData supplies the rest, psbt.cpp:111-160). pk() and pkh() are
 miniscripts too, so wsh(pkh(K)) comes out as <sig> <pubkey> <script>. NIL when
-the satisfaction is incomplete or malleable (Core's Satisfy default)."
+the satisfaction is incomplete, malleable or signature-less (Core's Satisfy
+default, MS-SATISFY-NONMALLEABLE)."
   (let* ((by-hash (bl.bytes:make-octets-hash-table))
          (node (progn
                  (dolist (pk (append (mapcar #'car (bl.ser:psbt-map-collect
@@ -986,15 +987,15 @@ the satisfaction is incomplete or malleable (Core's Satisfy default)."
                  (bl.val:ms-from-script
                   script :pkh-resolver (lambda (h) (gethash h by-hash))))))
     (when node
-      (multiple-value-bind (stack malleable)
-          (bl.val:ms-satisfy
+      (multiple-value-bind (stack solved)
+          (bl.val:ms-satisfy-nonmalleable
            node
            (bl.val:make-ms-satisfier
             :sign-fn (lambda (pubkey) (%psbt-sig-for map pubkey))
             :preimage-fn (lambda (kind hash) (%psbt-preimage map kind hash))
             :check-older-fn (lambda (v) (and tx (bl.val:ms-check-older tx index v)))
             :check-after-fn (lambda (v) (and tx (bl.val:ms-check-after tx index v)))))
-        (when (and stack (not malleable))
+        (when solved
           (append stack (list script)))))))
 
 (defun %psbt-signatures-match-sighash-p (map spk)
@@ -1447,9 +1448,9 @@ PSBT's own data (SignTaprootScript's Satisfier, script/sign.cpp:528-540) --
 the PSBT_IN_TAP_SCRIPT_SIG records for this leaf, a pkh() key from those
 records or the input's taproot derivations, the input's hash preimages, the
 transaction's timelocks. NIL when it does not infer, or the satisfaction is
-incomplete or malleable. A leaf the fixed shapes of %TAPSCRIPT-SATISFACTION
-do not cover -- and(v:pkh(A),pk(B)) among them -- was left unfinalized
-(wallet_miniscript.py:304)."
+incomplete, malleable or signature-less (MS-SATISFY-NONMALLEABLE). A leaf the
+fixed shapes of %TAPSCRIPT-SATISFACTION do not cover -- and(v:pkh(A),pk(B))
+among them -- was left unfinalized (wallet_miniscript.py:304)."
   (let ((by-hash (bl.bytes:make-octets-hash-table)))
     (dolist (rec (append sigs (bl.ser:psbt-map-collect map bl.ser:+psbt-in-tap-bip32+)))
       (let ((xonly (subseq (car rec) 0 (min 32 (length (car rec))))))
@@ -1458,8 +1459,8 @@ do not cover -- and(v:pkh(A),pk(B)) among them -- was left unfinalized
     (let ((node (bl.val:ms-from-script script :ctx :tapscript
                                               :pkh-resolver (lambda (h) (gethash h by-hash)))))
       (when node
-        (multiple-value-bind (stack malleable)
-            (bl.val:ms-satisfy
+        (multiple-value-bind (stack solved)
+            (bl.val:ms-satisfy-nonmalleable
              node
              (bl.val:make-ms-satisfier
               :sign-fn (lambda (xonly)
@@ -1472,7 +1473,7 @@ do not cover -- and(v:pkh(A),pk(B)) among them -- was left unfinalized
               :preimage-fn (lambda (kind hash) (%psbt-preimage map kind hash))
               :check-older-fn (lambda (v) (and tx (bl.val:ms-check-older tx index v)))
               :check-after-fn (lambda (v) (and tx (bl.val:ms-check-after tx index v)))))
-          (and stack (not malleable) stack))))))
+          (and solved stack))))))
 
 (defun %tapscript-satisfaction (script leaf-hash sigs)
   "The witness elements satisfying the tapscript SCRIPT from SIGS -- a list of

@@ -9844,6 +9844,57 @@ keys and by nobody else (wallet_importdescriptors.py:583)."
                                      "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S")
                    "the completed witness does not spend"))))))
 
+(test a-wsh-miniscript-is-not-signed-without-a-signature
+  "Core's P2WSH miniscript arm takes a satisfaction only when Satisfy's
+non-malleable mode does, and that mode demands a signature (script/sign.cpp:
+772-775, miniscript.h:1704-1709). wsh(or_d(pk(A),older(10))) spent by an input
+of sequence 10 is satisfiable without A -- A's dissatisfaction, then the
+timelock -- and the witness would spend, but it commits to nothing about the
+transaction, so whoever sees it relayed can move it under outputs of their own.
+Ours signed it complete with a key that is not in the policy at all.
+
+Holding A changes nothing while the timelock is met: of two satisfactions
+where only one carries a signature, Core's choice takes the OTHER one
+(InputStack's operator|, miniscript.cpp:343-345: a third party could always use it), so
+the or_d's satisfaction is still the signature-less one and Core does not sign.
+Before the timelock, A's signature is the only way and completes it (the
+control)."
+  (let* ((node (make-test-node))
+         (sks (loop for b in '(51 52)
+                    collect (make-array 32 :element-type '(unsigned-byte 8) :initial-element b)))
+         (a (bl.crypto:bytes-to-hex (bl.crypto:derive-public-key (first sks) :compressed t)))
+         (witscript (bl.val:ms-node-script
+                     (bl.val:ms-parse (format nil "or_d(pk(~A),older(10))" a))))
+         (spk (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20)
+                           (bl.crypto:sha256 witscript)))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xD5))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex prev-txid))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
+                              (cons "amount" (/ 100000 1d8))
+                              (cons "witnessScript" (bl.crypto:bytes-to-hex witscript))))))
+    (flet ((complete-with (sk sequence)
+             (let ((tx (bl.ser:make-transaction
+                        :version 2
+                        :inputs (vector (bl.ser:make-tx-in
+                                         :previous-output (bl.ser:make-outpoint :hash prev-txid :index 0)
+                                         :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                         :sequence sequence))
+                        :outputs (vector (bl.ser:make-tx-out :value 90000 :script-pubkey spk))
+                        :lock-time 0)))
+               (cdr (assoc "complete"
+                           (bl.rpc:dispatch-rpc-method
+                            node "signrawtransactionwithkey"
+                            (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))
+                                  (list (bl.crypto:private-key-to-wif sk :network :mainnet :compressed t))
+                                  prevtxs))
+                           :test #'string=)))))
+      (is (eq 'yason:false (complete-with (second sks) 10))
+          "a key outside the policy completed it through the timelock alone")
+      (is (eq 'yason:false (complete-with (first sks) 10))
+          "A's key completed it through the signature-less branch")
+      (is (eq t (complete-with (first sks) 9)) "A's key does not complete it before the timelock"))))
+
 (defun %direct-pushes (script)
   "The data elements of SCRIPT when it is nothing but direct pushes (an opcode
 byte of 1..75 followed by that many bytes), which is what Core's PushAll emits

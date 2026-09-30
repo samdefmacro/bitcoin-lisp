@@ -2278,6 +2278,22 @@ both modes from these values."
               (ms-stack-has-sig satisfaction)
               t))))
 
+(defun ms-satisfy-nonmalleable (node sat &key (key-fn #'%ms-identity-key))
+  "Core's Satisfy(ctx, stack) in its default, non-malleable mode
+(miniscript.h:1704-1709) -- the call every signer makes (script/sign.cpp:538-539
+for a tapscript leaf, :772-775 for a P2WSH script): (values STACK T) when a
+satisfaction exists, is not malleable and carries a signature, else
+(values NIL NIL). The second value is the verdict, never the stack.
+
+The signature is not optional. A witness without one -- sha256(H) with its
+preimage, or_d(pk(A),older(n)) through the timelock -- commits to nothing about
+the transaction, so whoever sees it relayed can move it onto a transaction of
+their own spending the same output. Core's signers do not produce one."
+  (multiple-value-bind (stack malleable has-sig available) (ms-satisfy node sat :key-fn key-fn)
+    (if (and available (not malleable) has-sig)
+        (values stack t)
+        (values nil nil))))
+
 ;;;; --- Inference: script bytes back to a miniscript (Core DecodeScript) ----
 ;;;;
 ;;;; The decoder reads the script BACKWARDS. That is not a stylistic choice:

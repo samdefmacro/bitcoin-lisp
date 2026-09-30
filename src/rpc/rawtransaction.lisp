@@ -601,9 +601,10 @@ witnessScript with FromScript and demanding a COMPLETE satisfaction
 (Availability::YES). A partial one is not a smaller witness, it is an
 unspendable one.
 
-A malleable satisfaction is refused outright. MS-SATISFY's second value says a
-third party could rewrite the witness into another equally valid one, which
-changes the txid of a transaction already in flight.
+A malleable satisfaction is refused outright, and so is one without a signature
+(MS-SATISFY-NONMALLEABLE, Core's Satisfy default): a third party could rewrite
+the first into another equally valid witness, and could move the second onto a
+transaction of its own.
 
 Second value: every (pubkey . signature) the satisfier made on the way, whether
 or not the satisfaction completed -- Core's CreateSig records each signature in
@@ -615,8 +616,8 @@ wallet_miniscript.py:302 counts them."
                witness-script :pkh-resolver (%wsh-pkh-resolver keymap)))
         (pairs '()))
     (when node
-      (multiple-value-bind (stack malleable)
-          (bl.val:ms-satisfy
+      (multiple-value-bind (stack solved)
+          (bl.val:ms-satisfy-nonmalleable
            node
            (bl.val:make-ms-satisfier
             :sign-fn
@@ -631,7 +632,7 @@ wallet_miniscript.py:302 counts them."
             ;; unavailable rather than faked.
             :check-older-fn (lambda (v) (bl.val:ms-check-older tx i v))
             :check-after-fn (lambda (v) (bl.val:ms-check-after tx i v))))
-        (values (and stack (not malleable) stack)
+        (values (and solved stack)
                 (nreverse pairs))))))
 
 (defun %p2tr-input (spk amount tap-sighash-type tr-keymap tr-scripts pubmap

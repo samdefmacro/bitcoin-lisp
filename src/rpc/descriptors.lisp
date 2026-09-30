@@ -1707,9 +1707,12 @@ since DUP acts on the stack top. TR-SCRIPT-PATH-SPENDS-VERIFY in
 tests/wallet/descriptor-tests.lisp still pins both, now through the script
 interpreter rather than against this function's own arithmetic.
 
-A malleable satisfaction is refused, which is Core's Satisfy default
-(miniscript.h:1704-1709): a third party could rewrite the witness into another
-equally valid one, changing the txid of a transaction already in flight."
+A malleable satisfaction is refused, and so is one without a signature -- Core's
+Satisfy default (miniscript.h:1704-1709), MS-SATISFY-NONMALLEABLE. A leaf from a
+descriptor cannot have one: the sanity check at parse (IsSane's NeedsSignature)
+refuses a policy that can be satisfied without a signature. The rule is kept
+here all the same, as Core keeps it in SignTaprootScript, so no caller has to
+know where its leaf came from."
   (let ((by-hash (bl.bytes:make-octets-hash-table)))
     (dolist (pub pubkeys)
       (let ((xonly (key-xonly-bytes pub)))
@@ -1719,12 +1722,12 @@ equally valid one, changing the txid of a transaction already in flight."
                  :ctx :tapscript
                  :pkh-resolver (lambda (hash) (gethash hash by-hash)))))
       (when node
-        (multiple-value-bind (stack malleable)
-            (bl.val:ms-satisfy node (bl.val:make-ms-satisfier
-                                     :sign-fn sigfn
-                                     :check-older-fn check-older-fn
-                                     :check-after-fn check-after-fn))
-          (and stack (not malleable) stack))))))
+        (multiple-value-bind (stack solved)
+            (bl.val:ms-satisfy-nonmalleable node (bl.val:make-ms-satisfier
+                                                  :sign-fn sigfn
+                                                  :check-older-fn check-older-fn
+                                                  :check-after-fn check-after-fn))
+          (and solved stack))))))
 
 (defun %tr-tree-parts (desc pos keyfn track-paths)
   "The shared taproot computation behind %TR-OUTPUT-KEY and TR-SPEND-DATA, as

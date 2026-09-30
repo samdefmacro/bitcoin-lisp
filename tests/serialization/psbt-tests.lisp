@@ -1901,6 +1901,65 @@ called it incomplete. An OP_FALSE output stays incomplete (the control)."
                  (finalize #x51)))
       (is (not (eq t (%aval "complete" (finalize #x00))))))))
 
+(test finalizepsbt-refuses-a-miniscript-satisfaction-without-a-signature
+  "Core's finalizer satisfies a P2WSH script or a tapscript leaf with
+Satisfy's non-malleable mode (script/sign.cpp:772-775 and :538-539), which
+takes a satisfaction only when it carries a signature (miniscript.h:1704-1709).
+sha256(H) with its preimage in the PSBT (PSBT_IN_SHA256) is satisfiable, and
+not malleably -- but the witness is the preimage alone, and whoever sees it
+relayed can move it under outputs of their own. Ours finalized it, as a P2WSH
+witness script and as a tapscript leaf. The control: the same node with the
+same preimage IS satisfiable, non-malleably, and only the missing signature
+stops it."
+  (let* ((node (make-test-node :network :regtest))
+         (preimage (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (hash (bl.crypto:sha256 preimage))
+         (text (format nil "sha256(~A)" (bl.crypto:bytes-to-hex hash)))
+         (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (flet ((finalize (spk records)
+             (let* ((tx (bl.ser:make-transaction
+                         :version 2
+                         :inputs (vector (bl.ser:make-tx-in
+                                          :previous-output
+                                          (bl.ser:make-outpoint
+                                           :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                :initial-element #xde)
+                                           :index 0)
+                                          :script-sig empty :sequence #xffffffff))
+                         :outputs (vector (bl.ser:make-tx-out :value 0 :script-pubkey empty))
+                         :lock-time 0))
+                    (psbt (bl.ser:make-empty-psbt tx))
+                    (map (aref (bl.ser:psbt-inputs psbt) 0))
+                    (bb (bl.ser:make-byte-buf)))
+               (bl.ser:bb-write-tx-out bb (bl.ser:make-tx-out
+                                           :value 100000
+                                           :script-pubkey (coerce spk '(simple-array (unsigned-byte 8) (*)))))
+               (bl.ser:psbt-map-set map bl.ser:+psbt-in-witness-utxo+ empty (bl.ser:bb-finish bb))
+               (bl.ser:psbt-map-set map #x0b hash preimage)
+               (loop for (keytype keydata value) in records
+                     do (bl.ser:psbt-map-set map keytype keydata value))
+               (%aval "complete" (bl.rpc:dispatch-rpc-method
+                                  node "finalizepsbt" (list (bl.ser:encode-psbt psbt)))))))
+      (let* ((ws (bl.val:ms-node-script (bl.val:ms-parse text)))
+             (leaf (bl.val:ms-node-script (bl.val:ms-parse text :ctx :tapscript)))
+             (control (concatenate '(vector (unsigned-byte 8)) (vector #xc0)
+                                   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))))
+        (is (not (eq t (finalize (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20) (bl.crypto:sha256 ws))
+                                 (list (list bl.ser:+psbt-in-witness-script+ empty ws)))))
+            "the P2WSH preimage-only witness was finalized")
+        (is (not (eq t (finalize (concatenate '(vector (unsigned-byte 8)) (vector #x51 #x20)
+                                              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+                                 (list (list bl.ser:+psbt-in-tap-leaf-script+ control
+                                             (concatenate '(vector (unsigned-byte 8)) leaf (vector #xc0)))))))
+            "the tapscript preimage-only witness was finalized"))
+      (multiple-value-bind (stack malleable has-sig available)
+          (bl.val:ms-satisfy (bl.val:ms-parse text)
+                             (bl.val:make-ms-satisfier
+                              :preimage-fn (lambda (kind h)
+                                             (and (eq kind :sha256) (equalp h hash) preimage))))
+        (is (equalp (list (list preimage) nil nil t) (list stack malleable has-sig available))
+            "the control: ~S" (list stack malleable has-sig available))))))
+
 (test descriptorprocesspsbt-is-cores-processpsbt
   "descriptorprocesspsbt is ProcessPSBT with the descriptors as its provider
 (rpc/rawtransaction.cpp:2044 over :128-212): the previous transaction from

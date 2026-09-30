@@ -248,6 +248,7 @@ can. src/validation/.")
    #:ms-node-valid-satisfactions-p
    #:ms-parse
    #:ms-satisfy
+   #:ms-satisfy-nonmalleable
    ;; The node tree and the type calculus, for the miniscript_stable/smart
    ;; fuzz targets' node generator (tests/fuzz/miniscript-generators.lisp),
    ;; which builds nodes fragment by fragment as Core's GenNode does.
