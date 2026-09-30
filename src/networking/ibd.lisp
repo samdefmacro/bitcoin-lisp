@@ -90,9 +90,9 @@ below could spin the loop forever and starve peer maintenance.")
 
 (defun make-block-hash-table (&key synchronized)
   "A hash table for 32-byte block-hash keys (pending, in-flight,
-request-timeouts): bl.bytes:make-octets-hash-table, whose first-eight-bytes
-hash is what a fresh testnet4 IBD profile asked for -- EQUALP's full 32-byte
-data-vector-hash dominated IBD CPU. SYNCHRONIZED makes the table thread-safe
+request-timeouts): bl.bytes:make-octets-hash-table, Core's salted SipHash
+of the hash's four words -- a fresh testnet4 IBD profile found EQUALP's
+generic 32-byte data-vector-hash dominating IBD CPU. SYNCHRONIZED makes the table thread-safe
 (SBCL): the in-flight table needs it because getpeerinfo's \"inflight\"
 snapshot reads it from RPC threads while the sync thread mutates it."
   (bl.bytes:make-octets-hash-table :synchronized synchronized))

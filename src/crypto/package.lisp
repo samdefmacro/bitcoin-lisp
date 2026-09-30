@@ -44,7 +44,6 @@ hash.cpp. src/crypto/.")
    #:rand-u64
    ;; SipHash (BIP 152)
    #:siphash-2-4
-   #:siphash-uint256-extra
    #:compute-siphash-key
    #:compute-short-txid
    #:bytes-to-uint64-le

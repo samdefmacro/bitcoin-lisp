@@ -118,7 +118,17 @@
   (a mainnet-only check once read it too early and saw the testnet
   default). The stop seam has TWO meanings -- a real shutdown and the
   assumeutxo sync pause -- and a consumer that must tell them apart has to
-  say so."
+  say so.
+
+  Invariant on hash tables keyed by txids, block hashes, sighashes and
+  outpoints: they are salted, as Core's SaltedTxidHasher and
+  SaltedOutpointHasher are (util/hasher.h). `make-octets-hash-table`
+  captures `*hash-salt*` when it builds a table; the salt's default is
+  Core's public deterministic one, and a node draws a fresh salt from the
+  OS RNG before it builds anything (START-NODE and NODE-MAIN, through
+  `set-hash-salt`). Trap: a table built before the draw -- a load-time
+  DEFVAR saved into the binary -- keeps the default for its life; its
+  hash must never change while it holds entries, because SBCL keeps them."
   (bitcoin-lisp.nicknames package)
   (bitcoin-lisp.nicknames:install-package-nicknames function)
   (bitcoin-lisp.nicknames:*package-nicknames* variable)
@@ -134,6 +144,11 @@
   (bitcoin-lisp.bytes:byte-reader class)
   (bitcoin-lisp.bytes:+max-compact-size+ constant)
   (bitcoin-lisp.bytes:sanitize-string function)
+  (bitcoin-lisp.bytes:make-octets-hash-table function)
+  (bitcoin-lisp.bytes:*hash-salt* variable)
+  (bitcoin-lisp.bytes:set-hash-salt function)
+  (bitcoin-lisp.bytes:siphash-uint256 function)
+  (bitcoin-lisp.bytes:siphash-uint256-extra function)
   (bitcoin-lisp.chainparams package)
   (bitcoin-lisp.chainparams:define-chain-params macro)
   (bitcoin-lisp.chainparams:find-chain-params function)
@@ -229,7 +244,6 @@
   (bitcoin-lisp.crypto:tagged-hash function)
   (bitcoin-lisp.crypto:hmac-sha256 function)
   (bitcoin-lisp.crypto:siphash-2-4 function)
-  (bitcoin-lisp.crypto:siphash-uint256-extra function)
   (bitcoin-lisp.crypto:rand-u64 function)
   (bitcoin-lisp.crypto:bytes-to-hex function)
   (bitcoin-lisp.crypto:hex-to-bytes function)
@@ -519,11 +533,12 @@
   mempool's spent-outpoints are keyed by it, so a producer and a reader
   cannot disagree about the key's shape; the coins cache keeps its own
   fixed-width UTXO-KEY, hashed as Core hashes CCoinsMap's keys
-  (SaltedOutpointHasher: `bl.crypto:siphash-uint256-extra' under a salt
-  drawn for each table). Trap: SBCL takes a bucket from a hash's LOW bits,
-  so the index goes into the low bits of an outpoint hash -- mixed in at
-  bit 24, or not at all, the 1,000 outputs of one transaction were one
-  bucket chain. The octet tables are not salted.
+  (SaltedOutpointHasher: `bl.bytes:siphash-uint256-extra' under a salt
+  drawn for each table). The octet tables hash an outpoint key the same
+  way and a txid as SaltedTxidHasher does, under the process salt (see the
+  util section). Trap: SBCL takes a bucket from a hash's LOW bits -- an
+  index mixed in at bit 24 left the 1,000 outputs of one transaction in
+  one bucket chain.
 
   Trap: the byte-reader family is the fast path and the stream family is a
   thin shell kept for the few callers that need it. What an IBD spends its

@@ -133,7 +133,7 @@ into a utxo-key struct."
 (defun utxo-key-hash (k k0 k1)
   "The hash of utxo-key K under the salt (K0, K1): Core's SaltedOutpointHasher
 (util/hasher.h), the SipHash-2-4 of the txid with the output index mixed in
-(BL.CRYPTO:SIPHASH-UINT256-EXTRA), cut to a fixnum.
+(BL.BYTES:SIPHASH-UINT256-EXTRA), cut to a fixnum.
 
 It read the txid's first eight bytes and nothing else: every output of one
 transaction had the same hash, and SBCL picks a bucket from a hash's low bits,
@@ -143,7 +143,7 @@ way, the SipHash about 25 ns of it). Unsalted, the buckets were also computable
 offline, which is why Core salts it."
   (declare (type utxo-key k) (type (unsigned-byte 64) k0 k1)
            (optimize (speed 3) (safety 0)))
-  (logand (bl.crypto:siphash-uint256-extra k0 k1 (uk-a k) (uk-b k) (uk-c k) (uk-d k)
+  (logand (bl.bytes:siphash-uint256-extra k0 k1 (uk-a k) (uk-b k) (uk-c k) (uk-d k)
                                            (uk-vout k))
           most-positive-fixnum))
 

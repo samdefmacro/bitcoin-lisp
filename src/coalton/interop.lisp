@@ -80,6 +80,8 @@
    #:minimal-number-encoding-p
    ;; SIGPUSHONLY validation
    #:script-is-push-only-p
+   ;; The signature cache's per-process nonce, drawn at node start
+   #:reseed-signature-cache
    ;; Transaction context for block validation
    #:*current-tx*
    #:*current-spent-utxos*
@@ -516,7 +518,9 @@ re-verification and entries are added only after successful verifies
 (defvar *sig-cache-salt*
   (ironclad:random-data 32)
   "A random 32-byte salt mixed into every signature-cache key, regenerated per
-process (Core's SignatureCache nonce, sigcache.cpp:25-32).
+process (Core's SignatureCache nonce, sigcache.cpp:19-32). This load-time draw
+is frozen into a saved executable, so the node draws it again at start
+(RESEED-SIGNATURE-CACHE), as Core's constructor does at process start.
 
 Without it the key is plain SHA256 over public data, so anyone can compute the
 key for any (sighash, pubkey, signature) triple offline. That is what makes a
@@ -524,6 +528,17 @@ cache attackable: an adversary who knows the keys can choose transactions whose
 entries collide in the table's buckets, or whose insertion order evicts the
 entries a validating node is about to need. Core salts for exactly this reason,
 and the salt costs one hash prefix.")
+
+(defun reseed-signature-cache ()
+  "Draw a fresh *SIG-CACHE-SALT* from the OS RNG and start both cache
+generations empty, in tables built under the current hash salt -- Core's
+SignatureCache constructor, GetRandHash at construction (script/sigcache.cpp:
+19-32), which is process start. Entries keyed under the old salt could never
+be hit again. Called by the node at start (BL:DRAW-PROCESS-SALTS)."
+  (setf *sig-cache-salt* (ironclad:random-data 32)
+        *signature-cache* (%make-sig-cache-table)
+        *signature-cache-prev* (%make-sig-cache-table))
+  nil)
 
 (defun make-sig-cache-key (type-byte sighash pubkey sig)
   "Compute cache key over fixed-layout fields with length prefixes so variable-
