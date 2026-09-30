@@ -2543,7 +2543,7 @@ fee/size after each chunk, in mining order, starting at zero."
       (block-builder-finish builder))
     (nreverse diagram)))
 
-(defun %mempool-check-coin (mempool coins spent pool-outputs txid prevout-hash index spend-height
+(defun %mempool-check-coin (coins spent pool-outputs txid prevout-hash index spend-height
                             coinbase-maturity)
   "The value of the coin a pool transaction TXID spends at PREVOUT-HASH:INDEX,
 as Core's mempoolDuplicate view has it: a pool output checked earlier in the
@@ -2608,6 +2608,8 @@ failure logs and signals MEMPOOL-CHECK-FAILED."
         (pool-outputs (bl.bytes:make-octets-hash-table))
         (total-size 0) (total-usage 0) (total-modified 0) (total-weight 0)
         (ordered '()))
+    (bl:log-cat "mempool" "Checking mempool with ~D transactions and ~D inputs"
+                (mempool-count mempool) (hash-table-count (mempool-spent-outpoints mempool)))
     (when (txgraph-oversized-p graph)
       (%mempool-check-fail "the mempool's graph is oversized"))
     (txgraph-sanity-check graph)
@@ -2638,7 +2640,7 @@ failure logs and signals MEMPOOL-CHECK-FAILED."
                          (unless (< n (length (bl.ser:transaction-outputs (mempool-entry-transaction parent))))
                            (%mempool-check-fail "an input names an output its in-pool parent lacks"))
                          (pushnew ptxid parents-check :test #'equalp))
-                       (let ((value (%mempool-check-coin mempool coins spent pool-outputs txid ptxid n
+                       (let ((value (%mempool-check-coin coins spent pool-outputs txid ptxid n
                                                          spend-height coinbase-maturity)))
                          (when value (incf in-value value)))
                        (unless (equalp (mempool-spending-tx mempool ptxid n) txid)
