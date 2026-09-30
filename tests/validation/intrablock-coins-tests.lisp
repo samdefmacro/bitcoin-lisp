@@ -306,7 +306,7 @@ The honest spend must validate and a corrupted one must not."
          (is (null (bl.val::collect-spent-utxos inputs utxo)))
          (let ((collected (bl.val::collect-spent-utxos inputs utxo extra)))
            (is (equalp spent collected))
-           (is (not (null (bl.interop::precomputed-sighash-data-sha-amounts
+           (is (not (null (bl.interop:precomputed-sighash-data-sha-amounts
                            (bl.interop:init-precomputed-sighash
                             unsigned collected)))))))))))
 

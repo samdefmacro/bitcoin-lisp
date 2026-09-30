@@ -1449,6 +1449,69 @@ absence measured above is a real absence and not a mistyped key."
         (bl.interop:script-execution-cache-store key)
         (is-true (bl.interop:script-execution-cached-p key))))))
 
+;;;; The signature cache on the block path (Core CachingTransactionSignature-
+;;; Checker's `store', script/sigcache.cpp:63-84, and ConnectBlock's
+;;; `fCacheResults = fJustCheck', validation.cpp:2573-2583).
+
+(defun %sig-cache-p2pk-block ()
+  "(values block utxo-set): a block spending one <pk> OP_CHECKSIG coin with a
+REAL signature, from a fresh funding txid (%SEC-SPEND-BLOCK), so its
+signature-cache entry is new to the process."
+  (let* ((sk (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 29)
+               k))
+         (pk (bl.crypto:derive-public-key sk))
+         (spk (concatenate '(vector (unsigned-byte 8)) (vector 33) pk (vector #xac))))
+    (multiple-value-bind (blk utxo-set spend)
+        (%sec-spend-block spk (make-array 0 :element-type '(unsigned-byte 8)) 800000)
+      ;; A legacy sighash blanks every scriptSig, so signing the spend before
+      ;; its scriptSig is filled in signs the transaction it becomes.
+      (let* ((der (bl.crypto:sign-ecdsa
+                   sk (bl.interop:compute-legacy-sighash spend 0 spk 1)))
+             (ss (concatenate '(vector (unsigned-byte 8))
+                              (vector (1+ (length der))) der (vector 1))))
+        (setf (bl.ser:tx-in-script-sig (aref (bl.ser:transaction-inputs spend) 0))
+              (coerce ss '(simple-array (unsigned-byte 8) (*)))))
+      (values blk utxo-set))))
+
+(defun %sig-cache-counts ()
+  (list (hash-table-count bl.interop:*signature-cache*)
+        (hash-table-count bl.interop:*signature-cache-prev*)))
+
+(test connecting-a-block-consults-the-signature-cache-and-stores-nothing
+  "Core connects a block with cacheSigStore = fCacheResults = fJustCheck, which
+is false for a real connect: the signature cache is consulted, a signature it
+had to verify is NOT added, and an entry it answers from is marked for
+collection (SignatureCache::Get(entry, erase = !store)). Ours stored every
+signature the block path verified. TestBlockValidity (fJustCheck) and mempool
+acceptance store; that is CACHE-STORE T here, and it is also the control that
+the counts below can move at all."
+  (let ((bl.interop:*signature-cache-enabled* t)
+        ;; Fresh generations, so no rotation and no other test's entries.
+        (bl.interop:*signature-cache* (bl.bytes:make-octets-hash-table :synchronized t))
+        (bl.interop:*signature-cache-prev* (bl.bytes:make-octets-hash-table :synchronized t)))
+    ;; A real connect of a block no one has seen: verified, nothing stored.
+    (multiple-value-bind (blk utxo-set) (%sig-cache-p2pk-block)
+      (let ((before (%sig-cache-counts)))
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000)))
+        (is (equal before (%sig-cache-counts))
+            "a block connect stored its signature: ~A -> ~A" before (%sig-cache-counts))))
+    ;; Mempool-style (or TestBlockValidity) storing, then the real connect of
+    ;; the same block: the entry answers, and is moved to the generation the
+    ;; next rotation drops -- still present, first to go.
+    (multiple-value-bind (blk utxo-set) (%sig-cache-p2pk-block)
+      (destructuring-bind (cur prev) (%sig-cache-counts)
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000
+                                                            :cache-store t)))
+        (is (equal (list (1+ cur) prev) (%sig-cache-counts))
+            "storing added ~A, not one entry" (%sig-cache-counts))
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000)))
+        (is (equal (list cur (1+ prev)) (%sig-cache-counts))
+            "the hit was not marked for collection: ~A" (%sig-cache-counts))
+        ;; Marked, not gone, and a third connect still stores nothing.
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000)))
+        (is (equal (list cur (1+ prev)) (%sig-cache-counts)))))))
+
 ;;;; Witness Validation Tests
 
 (defun make-witness-p2wpkh-script ()
