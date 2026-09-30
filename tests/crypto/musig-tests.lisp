@@ -202,10 +202,11 @@ serializes as 33 zero bytes -- and each invalid nonce named by its index."
 
 (test musig-sign-verify-vectors
   "BIP327 sign_verify_vectors: each valid case's partial signature byte for
-byte from the vector's fixed secret nonce, and verifying; the error cases
-refused where the BIP says -- and the used secnonce refused by us BEFORE
-libsecp, which would abort the process on it."
-  (loop for (indices aggnonce nil expected) ; the third column names the signer
+byte from the vector's fixed secret nonce, and verifying under the key the
+case's signer column names (its position in the key list, vectors.h:132-139);
+the error cases refused where the BIP says -- and the used secnonce refused by
+us BEFORE libsecp, which would abort the process on it."
+  (loop for (indices aggnonce signer expected)
           in '(((0 1 2) 0 0 "012ABBCB52B3016AC03AD82395A1A415C48B93DEF78718E62A7A90052FE224FB")
                ((1 0 2) 0 1 "9FF2F7AAA856150CC8819254218D3ADEEB0535269051897724F9DB3789513A52")
                ((1 2 0) 0 2 "FA23C359F6FAC4E7796BB93BC9F0532A95468C539BA20FF86D7C76ED92227900")
@@ -214,11 +215,22 @@ libsecp, which would abort the process on it."
                (%mu-session (%mu-pick *mu-sv-pubkeys* indices)
                             (nth aggnonce *mu-sv-aggnonces*) *mu-sv-msg*)
              (let* ((secnonce (%mu-secnonce-from-vector (first *mu-sv-secnonces*)))
-                    (psig (bl.crypto:musig-partial-sign secnonce *mu-sv-sk* cache session)))
+                    (psig (bl.crypto:musig-partial-sign secnonce *mu-sv-sk* cache session))
+                    (signer-key (nth (nth signer indices) *mu-sv-pubkeys*)))
+               ;; The secret key is the first pubkey's, and the signer column
+               ;; must point at wherever the case put that key.
+               (is (equalp (first *mu-sv-pubkeys*) signer-key)
+                   "case ~S: the signer column names key ~D" indices (nth signer indices))
                (is (string= expected (%mu-hex psig)))
                (is-false (bl.crypto:musig-secnonce-valid-p secnonce))
                (is-true (bl.crypto:musig-partial-sig-verify
-                         psig (first *mu-sv-pubnonces*) (first *mu-sv-pubkeys*) cache session)))))
+                         psig (first *mu-sv-pubnonces*) signer-key cache session))
+               ;; Control: the same signature does not verify as another
+               ;; participant's.
+               (is-false (bl.crypto:musig-partial-sig-verify
+                          psig (first *mu-sv-pubnonces*)
+                          (nth (nth (mod (1+ signer) (length indices)) indices) *mu-sv-pubkeys*)
+                          cache session)))))
   ;; sign_error_cases 1..5 (case 0, a signing key outside the key list, is
   ;; skipped by libsecp too: the primitive does not check membership --
   ;; CreateMuSig2PartialSig does, see MUSIG2-CORE-FLOW-REFUSES-A-NON-PARTICIPANT).

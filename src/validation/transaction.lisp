@@ -508,32 +508,6 @@ sentence."
                     (%tx-hash-hex (bl.ser:transaction-wtxid offending-tx)))
             "")))
 
-(defun scriptsig-push-only-p (script-sig)
-  "True if SCRIPT-SIG contains only push opcodes (every opcode <= OP_16),
-walking past pushed data. Bitcoin Core CScript::IsPushOnly."
-  (let ((len (length script-sig)) (i 0))
-    (loop while (< i len)
-          do (let ((op (aref script-sig i)))
-               (when (> op #x60)        ; > OP_16 → not push-only
-                 (return-from scriptsig-push-only-p nil))
-               (cond
-                 ((<= 1 op 75) (incf i (1+ op)))
-                 ((= op #x4c) (if (< (1+ i) len)
-                                  (incf i (+ 2 (aref script-sig (1+ i))))
-                                  (return-from scriptsig-push-only-p nil)))
-                 ((= op #x4d) (if (< (+ i 2) len)
-                                  (incf i (+ 3 (logior (aref script-sig (1+ i))
-                                                       (ash (aref script-sig (+ i 2)) 8))))
-                                  (return-from scriptsig-push-only-p nil)))
-                 ((= op #x4e) (if (< (+ i 4) len)
-                                  (incf i (+ 5 (logior (aref script-sig (1+ i))
-                                                       (ash (aref script-sig (+ i 2)) 8)
-                                                       (ash (aref script-sig (+ i 3)) 16)
-                                                       (ash (aref script-sig (+ i 4)) 24))))
-                                  (return-from scriptsig-push-only-p nil)))
-                 (t (incf i)))))         ; OP_0, OP_1NEGATE, OP_1..OP_16
-    t))
-
 (defun standard-output-script-p (script-pubkey)
   "Whether SCRIPT-PUBKEY is a standard OUTPUT script type (Core IsStandard,
 policy.cpp:79-97): everything Solver classifies except NONSTANDARD, plus
@@ -774,7 +748,9 @@ transaction is refused even on a node told to relay non-standard ones."
       (when (> (length script-sig) +max-standard-scriptsig-size+)
         (return-from is-standard-tx
           (values nil :scriptsig-too-large)))
-      (unless (scriptsig-push-only-p script-sig)
+      ;; Core's IsPushOnly (script.cpp:266-281), which is also a push that
+      ;; runs off the end: policy.cpp:130-133.
+      (unless (bl.interop:script-is-push-only-p script-sig)
         (return-from is-standard-tx
           (values nil :scriptsig-not-pushonly)))))
 

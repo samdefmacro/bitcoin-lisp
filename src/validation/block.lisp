@@ -3085,19 +3085,15 @@ zmq.lisp), as Core's do by ChainstateRole."
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
-                      &key fee-estimator recent-rejects mempool)
+                      &key recent-rejects mempool)
   "Connect a validated block to the chain.
 Updates chain state and UTXO set.
 Every enabled index folds the block in through the connect hook
 (INDEX-BLOCK-CONNECTED over the node's index list; nothing is passed here).
-FEE-ESTIMATOR is passed on to PERFORM-REORG and collects nothing. It used to
-take a fee-rate percentile of every block's transactions -- per transaction,
-through two EQUALP tables, for every block of IBD -- and write
-fee_estimates.dat every ten blocks; Core keeps no per-block statistics (its
-CBlockPolicyEstimator::processBlock learns only from the transactions the
-mempool removed for the block, policy/fees/block_policy_estimator.cpp:669-716)
-and flushes hourly and at shutdown, and nothing here read them
-(ESTIMATE-FEE-RATE answers from the policy estimator alone).
+The fee estimator learns from a block only through BL.MP:BPE-NOTE-BLOCK below
+(Core CBlockPolicyEstimator::processBlock,
+policy/fees/block_policy_estimator.cpp:669-716); no fee statistics of the
+block's own transactions are kept, and no estimator is passed in.
 Optionally clears RECENT-REJECTS on chain reorganization.
 When MEMPOOL is provided, removes the block's confirmed/conflicting txs from it
 (the single removal chokepoint — every connect path, IBD or relay, goes here).
@@ -3277,7 +3273,6 @@ Handles chain reorganizations when a competing chain has more work."
              (multiple-value-list
               (perform-reorg chain-state block-store utxo-set
                              current-best-entry entry
-                             :fee-estimator fee-estimator
                              :recent-rejects recent-rejects
                              :mempool mempool)))
             ;; New block is on a weaker chain: it is stored, nothing more.
@@ -4378,7 +4373,7 @@ feature_block.py:248 waited out its timeout for the disconnect."
   (and (consp detail) (consp (first detail))))
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
-                      &key fee-estimator recent-rejects mempool skip-scripts
+                      &key recent-rejects mempool skip-scripts
                            max-readd-blocks (abort-on-disconnect-failure t))
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
@@ -4413,12 +4408,7 @@ A stop request (shutdown / sync pause) TRUNCATES the reorg at the next block
 boundary and returns (VALUES NIL :INTERRUPTED): the chain is left on whatever
 block the coins reached — never rolled back, never half-applied — and the side
 effects below are committed for exactly the blocks that moved. See the section
-comment above.
-
-FEE-ESTIMATOR is accepted and unused: the per-block fee statistics it once
-collected have no Core counterpart and nothing read them (see CONNECT-BLOCK);
-Core's estimator learns from the mempool's removals alone."
-  (declare (ignore fee-estimator))
+comment above."
   (with-chainstate-mutex (perform-reorg)
     (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
       (unless fork-entry
@@ -4710,7 +4700,7 @@ TARGET's chain, so a step is a real move toward it and never sideways."
           (or e target)))))
 
 (defun activate-best-chain (chain-state block-store utxo-set
-                            &key fee-estimator recent-rejects mempool)
+                            &key recent-rejects mempool)
   "Reorganize onto the most-work fully-downloaded valid chain when it beats the
 active tip. Returns (values switched-p missing-blocks), where MISSING-BLOCKS is
 perform-reorg's re-queue list if a switch was refused for want of block bodies.
@@ -4752,7 +4742,6 @@ backstop against a candidate that reorgs away and reappears."
             (return))
           (multiple-value-bind (ok detail)
               (perform-reorg chain-state block-store utxo-set tip target
-                             :fee-estimator fee-estimator
                              :recent-rejects recent-rejects :mempool mempool)
             (cond
               (ok
@@ -4825,7 +4814,7 @@ interface_zmq.py:308 expects the node to go back to."
                     (lambda (e) (bl.store:entry-better-p e tip)))))
 
 (defun %activate-best-valid-chain (chain-state block-store utxo-set
-                                   &key fee-estimator recent-rejects mempool)
+                                   &key recent-rejects mempool)
   "Core ActivateBestChain, run after a chain-control RPC has changed which
 blocks are eligible: switch to the most-work valid tip whose blocks back to
 the active chain we hold (%BEST-REACHABLE-TIP), if it outweighs the active one. Returns (VALUES T NIL) -- including when
@@ -4840,7 +4829,6 @@ there is nothing better to switch to -- or (VALUES NIL REASON)."
         ;; success for a switch that did not happen.
         (multiple-value-bind (ok detail)
             (perform-reorg chain-state block-store utxo-set tip target
-                           :fee-estimator fee-estimator
                            :recent-rejects recent-rejects :mempool mempool)
           (if ok
               (values t nil)
@@ -4848,7 +4836,7 @@ there is nothing better to switch to -- or (VALUES NIL REASON)."
         (values t nil))))
 
 (defun invalidate-block (chain-state block-store utxo-set block-hash
-                         &key fee-estimator recent-rejects mempool)
+                         &key recent-rejects mempool)
   "Mark BLOCK-HASH and all its descendants :invalid, reorganizing the active
 chain back to BLOCK-HASH's parent if the active chain contained it, and then
 on to the best chain that is still valid. Returns (values t nil) on success,
@@ -4880,7 +4868,6 @@ on its OWN four-block chain; we left it at height 1."
            (when (and tip parent (block-descends-from-p tip entry))
              (multiple-value-bind (ok detail)
                  (perform-reorg chain-state block-store utxo-set tip parent
-                                :fee-estimator fee-estimator
                                 :recent-rejects recent-rejects :mempool mempool
                                 ;; Core InvalidateBlock's fAddToMempool
                                 ;; (validation.cpp:3621): only the ten blocks
@@ -4903,12 +4890,11 @@ on its OWN four-block chain; we left it at height 1."
            (%mark-block-subtree-invalid chain-state entry)
            ;; Core ActivateBestChain (rpc/blockchain.cpp:1707-1709).
            (%activate-best-valid-chain chain-state block-store utxo-set
-                                       :fee-estimator fee-estimator
                                        :recent-rejects recent-rejects
                                        :mempool mempool)))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
-                         &key fee-estimator recent-rejects mempool)
+                         &key recent-rejects mempool)
   "Clear :invalid from BLOCK-HASH plus its ancestors and descendants -- each
 back at the validity level it had, a SCRIPTS-valid block :valid again (Core
 ResetBlockFailureFlags) -- then reorganize to the best valid chain if it now
@@ -4934,13 +4920,12 @@ outweighs the active tip. Returns
             ;; (rpc/blockchain.cpp:1749-1754) -- the same second step
             ;; invalidateblock takes.
             (%activate-best-valid-chain chain-state block-store utxo-set
-                                        :fee-estimator fee-estimator
                                         :recent-rejects recent-rejects
                                         :mempool mempool))
           (values nil :block-not-found)))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
-                       &key fee-estimator recent-rejects mempool)
+                       &key recent-rejects mempool)
   "Treat BLOCK-HASH as preferred (Bitcoin Core preciousblock): if its chain has at
 least as much work as the active tip, give it the next NEGATIVE sequence id
 (Core PreciousBlock, validation.cpp:3522-3547) and, unless it already is the
@@ -4979,7 +4964,6 @@ is already the tip or weaker), (values nil reason) on failure."
              (t
               (multiple-value-bind (ok detail)
                   (perform-reorg chain-state block-store utxo-set tip entry
-                                 :fee-estimator fee-estimator
                                  :recent-rejects recent-rejects :mempool mempool)
                 (cond (ok (values t nil))
                       ((eq detail :interrupted) (values nil :interrupted))
@@ -5101,7 +5085,7 @@ waited for a block the node no longer knew."
       (%store-accepted-block-body block chain-state block-store :current-time now)))
 
 (defun %activate-best-after-refused-reorg (chain-state block-store utxo-set
-                                           fee-estimator recent-rejects mempool)
+                                           recent-rejects mempool)
   "ACTIVATE-BLOCK's pre-reorg toward a block was refused for want of fork
 bodies, but the index may hold a better tip than the active one that IS
 complete: Core's ProcessNewBlock ends in ActivateBestChain whatever this
@@ -5110,13 +5094,11 @@ incomplete candidate for the next one. feature_chain_tiebreaks.py:94 hands B7
 (parent B3 missing) to this arm right after B4 completed B9, and reads B9 as
 the tip."
   (activate-best-chain chain-state block-store utxo-set
-                       :fee-estimator fee-estimator
                        :recent-rejects recent-rejects
                        :mempool mempool))
 
 (defun activate-block (block chain-state block-store utxo-set
-                       &key current-time skip-scripts fee-estimator
-                            recent-rejects mempool)
+                       &key current-time skip-scripts recent-rejects mempool)
   "Validate and activate BLOCK. Three cases:
 
   1. BLOCK's parent IS the current best tip — validate then connect
@@ -5143,12 +5125,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
   (with-chainstate-mutex (activate-block)
     (%activate-block block chain-state block-store utxo-set
                      :current-time current-time :skip-scripts skip-scripts
-                     :fee-estimator fee-estimator :recent-rejects recent-rejects
+                     :recent-rejects recent-rejects
                      :mempool mempool)))
 
 (defun %activate-block (block chain-state block-store utxo-set
-                        &key current-time skip-scripts fee-estimator
-                             recent-rejects mempool)
+                        &key current-time skip-scripts recent-rejects mempool)
   "ACTIVATE-BLOCK's body, run holding the chainstate mutex."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (prev-hash (bl.ser:block-header-prev-block header))
@@ -5179,7 +5160,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
            (if valid
                (progn
                  (connect-block block chain-state block-store utxo-set
-                                :fee-estimator fee-estimator
                                 :recent-rejects recent-rejects
                                 :mempool mempool)
                  (%maybe-note-target-reached chain-state)
@@ -5230,7 +5210,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
             (multiple-value-bind (reorg-ok detail)
                 (perform-reorg chain-state block-store utxo-set
                                current-best-entry prev-entry
-                               :fee-estimator fee-estimator
                                :recent-rejects recent-rejects
                                :mempool mempool
                                :skip-scripts skip-scripts)
@@ -5251,7 +5230,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 ((and (null reorg-ok) detail)
                  ;; Stored above; ProcessNewBlock's closing ActivateBestChain.
                  (%activate-best-after-refused-reorg
-                  chain-state block-store utxo-set fee-estimator recent-rejects mempool)
+                  chain-state block-store utxo-set recent-rejects mempool)
                  (values nil :reorg-refused detail))
                 ;; Refused for another reason (no common ancestor). State
                 ;; unchanged.
@@ -5266,7 +5245,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
                      (if valid
                          (progn
                            (connect-block block chain-state block-store utxo-set
-                                          :fee-estimator fee-estimator
                                           :recent-rejects recent-rejects
                                           :mempool mempool)
                            (%maybe-note-target-reached chain-state)
@@ -5298,7 +5276,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
                              (multiple-value-bind (reverted revert-detail)
                                  (perform-reorg chain-state block-store utxo-set
                                                 fork-tip current-best-entry
-                                                :fee-estimator fee-estimator
                                                 :recent-rejects recent-rejects
                                                 :mempool mempool
                                                 :skip-scripts skip-scripts)

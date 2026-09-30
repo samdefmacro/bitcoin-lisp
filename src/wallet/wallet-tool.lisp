@@ -257,8 +257,13 @@ it (dump.cpp:208-259). NIL when everything verified, else the error text."
         (when (wallet-db-exists-p path)
           (fail (format nil "Failed to create database path '~A'. Database already exists."
                         (wallet-path-string path))))
-        (let ((db (wallet-db-open path :create t
-                                  :network (wallet-manager-network manager)))
+        ;; MakeDatabase -> MakeSQLiteDatabase, whose TryCreateDirectories throw
+        ;; is caught and its what() becomes the error (sqlite.cpp:702-706),
+        ;; printed by the tool as it is (wallettool.cpp:162-164): a name
+        ;; through a plain file is Core's filesystem-error sentence, with no
+        ;; wallet to remove (dump.cpp:199).
+        (let ((db (handler-case (%create-wallet-db manager path)
+                    (wallet-filesystem-error (e) (fail (princ-to-string e)))))
               (ok nil))
           (unwind-protect
                (bl.store:with-leveldb-writebatch (batch)

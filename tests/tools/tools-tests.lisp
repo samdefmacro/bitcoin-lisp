@@ -171,6 +171,33 @@ stdout (tool_wallet.py:37-46), or a description of what happened instead."
     (is (search "Path does not exist."
                 (%wallet-tool-error dir "-wallet=nonexistent.dat" "info")))))
 
+(test bitcoin-wallet-createfromdump-through-a-plain-file-is-core-s-filesystem-error
+  "createfromdump -wallet=plain/sub, with plain a FILE in the wallets
+directory: Core's MakeSQLiteDatabase catches TryCreateDirectories' throw and
+returns its what() (sqlite.cpp:702-706, util/fs_helpers.cpp:255-266), which
+the tool prints as it is (wallettool.cpp:162-164) -- `filesystem error:
+cannot create directories: Not a directory [PATH]', exit 1. Ours let SBCL's
+own file error out, as createwallet did until Round 10 (the same helper
+answers both now). Control: the same dump loads under a free name; plain is
+still a plain file afterwards."
+  (with-temp-directory (dir "bl-wallet-tool-plain")
+    (let ((dump (merge-pathnames "w.dump" dir))
+          (plain (merge-pathnames "regtest/plain" dir)))   ; no wallets/: the datadir is the wallet dir
+      (%wallet-tool dir "-wallet=w" "create")
+      (%wallet-tool dir "-wallet=w" (format nil "-dumpfile=~A" (namestring dump)) "dump")
+      (with-open-file (s plain :direction :output :if-exists :supersede)
+        (write-string "not a wallet" s))
+      (is (= 0 (nth-value 2 (%wallet-tool dir "-wallet=free"
+                                          (format nil "-dumpfile=~A" (namestring dump))
+                                          "createfromdump")))
+          "control: the dump loads under a free name")
+      (is (equal (format nil "filesystem error: cannot create directories: Not a directory [~A/sub]"
+                         (namestring plain))
+                 (%wallet-tool-error dir "-wallet=plain/sub"
+                                     (format nil "-dumpfile=~A" (namestring dump))
+                                     "createfromdump")))
+      (is (equal "not a wallet" (uiop:read-file-string plain)) "plain is untouched"))))
+
 (test bitcoin-wallet-create-info-dump-createfromdump
   "create tops up and reports; info reads the same wallet back; dump writes
 Core's record format with its SHA256d checksum; createfromdump rebuilds a

@@ -243,3 +243,29 @@ last byte does not, and keys shorter than the eight hashed bytes still work."
       (is (eq :short (gethash (copy-seq short) table))))
     (is (= (bl.bytes:octets-hash key) (bl.bytes:octets-hash (copy-seq key))))
     (is-true (bl.bytes:octets= key (copy-seq key)))))
+
+(test outpoint-keys-of-one-transaction-take-separate-buckets
+  "The outputs of one transaction must not share a bucket of an outpoint table
+(Core keys its outpoint maps by SaltedOutpointHasher, util/hasher.h, which
+mixes the index into the hash). OCTETS-HASH mixed the index in at bit 24, and
+SBCL takes a bucket from a hash's LOW bits: all 1,000 outputs of one
+transaction were one bucket chain. Control: 1,000 keys that differ only in a
+byte the hash does not read (byte 20) do share one bucket, so the count can
+see a collapse."
+  (let ((txid (make-array 32 :element-type '(unsigned-byte 8)))
+        (outputs (bl.ser:make-outpoint-table))
+        (collapsed (bl.ser:make-outpoint-table)))
+    (dotimes (i 32) (setf (aref txid i) (* 7 (1+ i))))
+    (dotimes (i 1000)
+      (setf (gethash (bl.ser:outpoint-key txid i) outputs) i)
+      (let ((key (bl.ser:outpoint-key txid 0)))
+        (setf (aref key 20) (ldb (byte 8 0) i)
+              (aref key 21) (ldb (byte 8 8) i))
+        (setf (gethash key collapsed) i)))
+    (is (= 1000 (hash-table-count outputs) (hash-table-count collapsed)))
+    (is (= 1 (length (hash-table-occupied-buckets collapsed)))
+        "control: keys the hash cannot tell apart share one bucket")
+    (let ((buckets (length (hash-table-occupied-buckets outputs))))
+      (is (>= buckets 500) "1,000 outputs of one transaction in ~D bucket~:P" buckets))
+    (is (= 999 (gethash (bl.ser:outpoint-key txid 999) outputs)))
+    (is (null (gethash (bl.ser:outpoint-key txid 1000) outputs)))))

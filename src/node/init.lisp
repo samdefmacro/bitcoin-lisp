@@ -2119,7 +2119,6 @@ seconds and dial again."
               (node-block-store *node*)
               (bl.store:chain-state-coins-view
                (node-current-chainstate *node*))
-              :fee-estimator (node-fee-estimator *node*)
               :mempool (node-mempool *node*))))))
     (cond
       (switched
@@ -2771,12 +2770,12 @@ START-NODE-FROM-ARGS builds on it."
          (settings-cells (and settings-path (%read-settings-file settings-path))))
     (list :cli cli :datadir datadir :orig-datadir orig-datadir :conf-explicit-p conf-explicit-p :conf-path conf-path :conf-text conf-text :conf-read conf-read :conf-texts conf-texts :conf-globals conf-globals :settings-network settings-network :settings-scope settings-scope :settings-path settings-path :settings-cells settings-cells)))
 
-(defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*))
-                             &key init-config)
+(defun start-node-from-args (&key (args (rest sb-ext:*posix-argv*)) init-config)
   "Start the node from Bitcoin Core-style options: a list of CLI ARGS
- (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
+ (-key=value, -key, -nokey; the process's own by default) plus a bitcoin.conf
+read from the data directory.
 CLI arguments override the config file. This is the argv-friendly entry point —
- e.g. from a saved image's toplevel, or (start-node-from-args
+ e.g. from a saved image's toplevel, or (start-node-from-args :args
 '(\"-chain=main\" \"-txindex\" \"-dbcache=2000\" \"-server\")).
 INIT-CONFIG is %READ-INIT-CONFIG's plist when the caller read the config
 first (NODE-MAIN, before -help/-version): the files are read ONCE, as Core's
@@ -2990,7 +2989,7 @@ startup.~%"
            (finish-output)
            (sb-ext:exit :code 0))
           (t
-           (start-node-from-args args :init-config init-config)
+           (start-node-from-args :args args :init-config init-config)
            ;; Blocks until shutdown, runs stop-node on THIS thread so the
            ;; flush/mempool.dat/peers.dat sequence completes, then exits.
            (run-node-watchdog)

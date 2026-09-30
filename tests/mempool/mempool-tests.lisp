@@ -928,12 +928,13 @@ must still be the absence of an estimate."
     (is-false (bl.val:output-witness-program-p p2pkh))))
 
 (test policy-scriptsig-push-only
-  "scriptsig-push-only-p accepts push opcodes and rejects ops > OP_16."
+  "The push-only predicate IsStandardTx asks (BL.INTEROP:SCRIPT-IS-PUSH-ONLY-P,
+Core IsPushOnly) accepts push opcodes and rejects ops > OP_16."
   ;; push 2 bytes, then OP_1..OP_16
-  (is-true (bl.val::scriptsig-push-only-p
-            (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(2 #xaa #x51))))
+  (is-true (bl.interop:script-is-push-only-p
+            (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(2 #xaa #xbb #x51))))
   ;; OP_CHECKSIG (0xac) is not a push
-  (is-false (bl.val::scriptsig-push-only-p
+  (is-false (bl.interop:script-is-push-only-p
              (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xac))))
 
 (test mempool-rejects-nonstandard-version
@@ -1218,6 +1219,30 @@ instead (see mempool-ephemeral-dust-requires-zero-fee)."
         (bl.val:validate-transaction-for-mempool tx utxo mempool 100)
       (is (null valid))
       (is (eq err :scriptsig-not-pushonly)))))
+
+(test mempool-rejects-a-scriptsig-whose-push-runs-off-the-end
+  "Core's IsPushOnly (script.cpp:266-281) answers false when GetOp cannot read
+an opcode's data -- a push that runs off the end -- and IsStandardTx rejects
+that input's transaction scriptsig-not-pushonly (policy.cpp:130-133). Our own
+walk answered true for a DIRECT push (opcodes 1-75) past the end: #x02 #xAA
+claims two bytes and has one. Control: #x01 #xAA, the same push complete, is
+push-only and the transaction falls through to its unresolved input."
+  (flet ((try (script-sig)
+           (let* ((base (make-mempool-test-tx :input-id 83))
+                  (input (bl.ser:make-tx-in
+                          :previous-output (bl.ser:tx-in-previous-output
+                                            (elt (bl.ser:transaction-inputs base) 0))
+                          :script-sig (coerce script-sig '(simple-array (unsigned-byte 8) (*)))
+                          :sequence #xFFFFFFFF))
+                  (tx (bl.ser:make-transaction
+                       :version 1 :inputs (vector input)
+                       :outputs (bl.ser:transaction-outputs base) :lock-time 0)))
+             (nth-value 1 (bl.val:validate-transaction-for-mempool
+                           tx (bl.store:make-utxo-set) (bl.mp:make-mempool) 100)))))
+    (is (not (eq :scriptsig-not-pushonly (bl.val:tx-reject-keyword (try '(#x01 #xaa)))))
+        "control: a complete push is push-only")
+    (is (eq :scriptsig-not-pushonly (bl.val:tx-reject-keyword (try '(#x02 #xaa))))
+        "a direct push past the end is not push-only")))
 
 (defun %mempool-final-fixture (suffix)
   "Chain-state with a genesis + tip entry (both carrying headers so the MTP

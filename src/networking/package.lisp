@@ -476,7 +476,9 @@ headerssync.cpp. src/networking/.")
    #:get-checkpoint-hash
    #:last-checkpoint-height
    #:relay-enabled-p
-   #:ignore-incoming-txs-p)
+   #:ignore-incoming-txs-p
+   ;; The forensic block capture a debugging operator switches on from a REPL.
+   #:*forensic-store-from-height*)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export

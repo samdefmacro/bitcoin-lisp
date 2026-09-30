@@ -261,7 +261,6 @@ handler or sync pass acts on, as one value. src/util/context.lisp.")
    #:node-context-block-store
    #:node-context-mempool
    #:node-context-peers
-   #:node-context-fee-estimator
    #:node-context-address-book
    #:node-context-recent-rejects
    #:node-context-historical-chainstate
