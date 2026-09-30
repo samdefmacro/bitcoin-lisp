@@ -1583,24 +1583,24 @@ sendaddrv2/sendheaders/sendtxrcncl), tracking the peer's advertised
 capabilities. Sets the peer :ready and returns T on VERACK; NIL otherwise
 (including a sendtxrcncl protocol violation, which disconnects).
 
-TIMEOUT is an ABSOLUTE budget for the whole wait, not per read. It used to be
-per read inside `loop repeat 10', so the real budget was 10x TIMEOUT and the
-loop exited early only when the peer went SILENT. A peer sending any complete
-non-verack message — a 32-byte ping is enough, since no clause below matches it
-— once every timeout-minus-epsilon renewed the deadline indefinitely up to the
-repeat count, holding the single accept thread for minutes on a few hundred
-bytes. accept-connection does not run in that window, so the listen backlog
-fills and the node stops taking inbound peers at all.
+TIMEOUT is an ABSOLUTE budget for the whole wait, not per read -- the one
+bound, as Core's is the handshake timeout alone (InactivityCheck's
+!fSuccessfullyConnected arm, net.cpp:2003-2006). It used to be per read, so
+a peer sending any non-verack message once every timeout-minus-epsilon
+renewed it; the absolute deadline is what ends that.
 
-Core never has this exposure: CreateNodeFromAcceptedSocket does no blocking
-read whatsoever (net.cpp:1761-1869) — VERSION and VERACK are ordinary
-asynchronous messages. Moving our handshake off the accept thread is the
-structural fix; this bounds the damage in the meantime."
+There is NO count of the messages that may come first. Core ignores every
+message between VERSION and VERACK that is not one of the negotiation messages
+(`Unsupported message prior to verack', net_processing.cpp:4015-4018) and keeps
+waiting for as many as arrive. Ours stopped after ten, a leftover from when the
+handshake ran on the single accept thread and each message could renew the
+wait: a peer that sent eleven pings and then VERACK completed with Core and
+was dropped by us. Found by the p2p_handshake fuzz target (tests/fuzz/)."
   (let* ((units internal-time-units-per-second)
          (deadline (+ (get-internal-real-time) (round (* timeout units)))))
     (flet ((remaining ()
              (/ (max 0 (- deadline (get-internal-real-time))) units)))
-      (loop repeat 10
+      (loop
         do (when (<= (remaining) 0) (return nil))
            (multiple-value-bind (command payload)
                (receive-message-blocking peer :timeout (remaining))
@@ -1621,8 +1621,7 @@ structural fix; this bounds the damage in the meantime."
                ;; (net_processing.cpp:4015-4018); p2p_timeouts.py:69 waits
                ;; for it.
                (t (bl:log-cat "net" "Unsupported message \"~A\" prior to verack from peer=~A"
-                              (bl.bytes:sanitize-string command) (peer-id peer)))))
-        finally (return nil)))))
+                              (bl.bytes:sanitize-string command) (peer-id peer)))))))))
 
 (defun %v2-try-outbound (peer &key proxy)
   "Attempt the BIP324 v2 handshake on PEER's fresh outbound connection.

@@ -18,34 +18,6 @@
 
 (in-suite :fuzz-socks5-tests)
 
-(defun call-with-scripted-peer (reply fn)
-  "Call FN with a usocket connected to a loopback peer that sends REPLY, shuts
-its write side, and drains what FN's side sends until it hangs up; return
-FN's values. The peer thread is joined before this returns."
-  (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :element-type '(unsigned-byte 8)
-                                                        :reuse-address t))
-         (port (usocket:get-local-port listener))
-         (peer (bt:make-thread
-                (lambda ()
-                  (handler-case
-                      (let ((s (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
-                        (unwind-protect
-                             (let ((stream (usocket:socket-stream s)))
-                               (write-sequence reply stream)
-                               (force-output stream)
-                               (usocket:socket-shutdown s :output)
-                               (loop while (read-byte stream nil nil)))
-                          (ignore-errors (usocket:socket-close s))))
-                    (error () nil)))
-                :name "fuzz-scripted-peer")))
-    (unwind-protect
-         (let ((client (usocket:socket-connect "127.0.0.1" port :element-type '(unsigned-byte 8)
-                                                                :timeout 5)))
-           (unwind-protect (funcall fn client)
-             (ignore-errors (usocket:socket-close client))))
-      (sb-thread:join-thread peer :default nil :timeout 5)
-      (ignore-errors (usocket:socket-close listener)))))
-
 (defun %socks5-reference-verdict (reply auth)
   "Whether Core's Socks5() (netbase.cpp:400-512) succeeds on a proxy that
 answers REPLY and then nothing: the method reply, the RFC1929 status when

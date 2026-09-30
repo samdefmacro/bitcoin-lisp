@@ -632,3 +632,34 @@ thread), so what is asserted is the peer as the accept publishes it."
           (dolist (p (bl:node-pending-inbound-peers node))
             (ignore-errors (bl.net:disconnect-peer p)))
           (bl.net:close-listener srv))))))
+
+(test an-inbound-handshake-waits-out-any-number-of-messages-before-verack
+  "Core ignores every message between VERSION and VERACK that is not a
+negotiation message (`Unsupported message prior to verack',
+net_processing.cpp:4015-4018) and keeps waiting, bounded only by the handshake
+timeout. Ours gave up after ten: a peer that sent eleven pings and then VERACK
+completed with Core and was dropped by us. The control is the same peer with
+no VERACK, which must not complete. Found by the p2p_handshake fuzz target."
+  (flet ((handshake (with-verack)
+           (let ((bytes (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                               (bl.ser:serialize-message
+                                "version" (bl.ser:make-version-message-bytes :version 70016 :services #x409))
+                               (append
+                                (loop repeat 11
+                                      collect (bl.ser:serialize-message
+                                               "ping" (make-array 8 :element-type '(unsigned-byte 8)
+                                                                    :initial-element 1)))
+                                (when with-verack
+                                  (list (bl.ser:serialize-message
+                                         "verack" (make-array 0 :element-type '(unsigned-byte 8)))))))))
+             (call-with-scripted-peer
+              bytes
+              (lambda (socket)
+                (let* ((bl.net:*v2-transport-enabled* nil)
+                       (peer (bl.net:make-inbound-peer
+                              (make-test-connection :socket socket :host "127.0.0.1" :port 18444 :connected t)
+                              "127.0.0.1")))
+                  (list (with-private-outbound-nonces (bl.net:perform-inbound-handshake peer :timeout 5))
+                        (bl.net:peer-state peer))))))))
+    (is (equal '(t :ready) (handshake t)) "eleven messages, then VERACK: connected")
+    (is (null (first (handshake nil))) "no VERACK: not connected")))
