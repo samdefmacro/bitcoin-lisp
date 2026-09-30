@@ -502,8 +502,8 @@ not the tip -- nextblockhash."
      (when next
        `(("nextblockhash" . ,(hash-to-hex (bl.store:block-index-entry-hash next))))))))
 
-(defun block-to-json (block hash-str include-tx-details chain-state
-                      &optional network &key prevouts)
+(defun block-to-json (block hash-str include-tx-details chain-state network
+                      &key prevouts)
   "Convert block to JSON representation. NETWORK enables output addresses in the
 full-tx-detail (verbosity 2) form. CHAIN-STATE supplies the chain-context fields
 (confirmations/height/mediantime/chainwork/nextblockhash) when the block is in
@@ -604,8 +604,8 @@ int32 the wire field used to be read as."
     (when (and w (< index (length w)))
       (elt w index))))
 
-(defun tx-to-json (tx &optional network &key spent-coins prevouts (include-hex t))
-  "Convert transaction to JSON. When NETWORK is supplied, output addresses are
+(defun tx-to-json (tx network &key spent-coins prevouts (include-hex t))
+  "Convert transaction to JSON. When NETWORK is non-NIL, output addresses are
 derived. Includes the size/weight/hex fields explorers and fee tools expect.
 
 SPENT-COINS is this transaction's undo data — a list of UTXO-ENTRY in input
@@ -666,7 +666,7 @@ answered a hex neither side of Core carries."
             `(("fee" . ,(satoshi->btc (- in-total out-total))))))
       ,@(when include-hex `(("hex" . ,(bl.crypto:bytes-to-hex wire)))))))
 
-(defun input-to-json (input &optional witness-stack &key coinbase-tx-p prevout network)
+(defun input-to-json (input witness-stack &key coinbase-tx-p prevout network)
   "Convert transaction input to JSON, including sequence and (when present) the
 witness stack; the input of a coinbase transaction (COINBASE-TX-P, which is
 Core's tx.IsCoinBase(), core_io.cpp:454) emits a coinbase field instead of

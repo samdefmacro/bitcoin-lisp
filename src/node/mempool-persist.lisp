@@ -69,8 +69,7 @@ queues. Returns T when the tx was found in the mempool and queued."
      (node-peers node) (node-mempool node) txid)))
 
 (defun load-mempool-from-disk
-    (node &optional (path (bl.mp:mempool-dat-path (node-data-directory node)))
-     &key (apply-unbroadcast t) (apply-fee-delta-priority t) (use-current-time nil))
+    (node path &key (apply-unbroadcast t) (apply-fee-delta-priority t) (use-current-time nil))
   "Load a mempool.dat-format file through the normal acceptance path (Core
 LoadMempool): prioritisation deltas first (so fee policy sees them), then per-tx
 validation against the current UTXO set — stale entries (spent inputs, reorged
@@ -96,7 +95,8 @@ The reasoning is that a boot load is restoring THIS node's own mempool — it
 wants the original entry times so expiry still means something, and it wants
 its own prioritisation back — while importmempool is ingesting someone else's
 file, where a foreign fee delta is not this operator's policy and a foreign
-timestamp would misdate the entry. PATH defaults to the node's mempool.dat.
+timestamp would misdate the entry. PATH is the file: the node's own at start-up
+(MEMPOOL-LOAD-PATH), the operator's for importmempool.
 Returns
 (values accepted failed residual-count) on success, or NIL if the file is
 missing or corrupt."
