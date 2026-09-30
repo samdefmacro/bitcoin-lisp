@@ -2258,15 +2258,25 @@ already the order the stacks are built in — `a + b' puts a's elements before
 b's, and a combinator's own input goes after its sub-expressions' precisely
 because it runs first and must find its input on top.
 
-Returns (values stack malleable-p). A second value of T means a third party
-could rewrite the witness into another equally valid one; a caller that cares
-about transaction identity should refuse such a solution rather than broadcast
-it."
+Returns (values stack malleable-p has-sig-p available-p). A second value of T
+means a third party could rewrite the witness into another equally valid one;
+a caller that cares about transaction identity should refuse such a solution
+rather than broadcast it. The third says the stack carries a signature. The
+FOURTH is the one that says whether a satisfaction exists at all: the empty
+stack satisfies `1', `older(n)' and `after(n)', and as a first value it reads
+exactly like no satisfaction.
+
+Core's Satisfy(ctx, stack, nonmalleable) (miniscript.h:1704-1712) is all four
+at once: available, and in the default non-malleable mode also neither
+malleable nor signature-less. The miniscript_stable/smart fuzz targets read
+both modes from these values."
   (multiple-value-bind (satisfaction nsat) (ms-produce-input node sat key-fn)
     (declare (ignore nsat))
     (when (ms-stack-available-p satisfaction)
       (values (copy-list (ms-stack-elements satisfaction))
-              (ms-stack-malleable satisfaction)))))
+              (ms-stack-malleable satisfaction)
+              (ms-stack-has-sig satisfaction)
+              t))))
 
 ;;;; --- Inference: script bytes back to a miniscript (Core DecodeScript) ----
 ;;;;
