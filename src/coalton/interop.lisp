@@ -208,13 +208,22 @@ as one opcode and ends the walk."
 ;;; Precomputed sighash data (Bitcoin Core: PrecomputedTransactionData)
 ;;; Caches hash components shared across all inputs of a transaction.
 
-(defstruct precomputed-sighash-data
+(defstruct (precomputed-sighash-data
+            (:constructor %make-precomputed-sighash-data (tx spent-utxos))
+            (:conc-name %psd-))
+  "One transaction's sighash midstates, each computed the first time a
+signature hash reads it (Core PrecomputedTransactionData). TX and SPENT-UTXOS
+(a vector of utxo-entry, or NIL) are what they are computed from; the other
+slots are NIL until read. Read them through the PRECOMPUTED-SIGHASH-DATA-*
+functions below, never through these slot accessors."
+  (tx nil)
+  (spent-utxos nil)
   ;; BIP 143 (SegWit v0): double-SHA256 of all prevouts/sequences/outputs.
   (hash-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (hash-sequence nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (hash-outputs-all nil :type (or null (simple-array (unsigned-byte 8) (*))))
   ;; BIP 341 (Taproot): single-SHA256 of the same data plus spent-amounts and
-  ;; spent-scriptPubKeys. Populated only when spent UTXOs are available.
+  ;; spent-scriptPubKeys (the latter two only when spent UTXOs are available).
   (sha-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (sha-sequences nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (sha-outputs nil :type (or null (simple-array (unsigned-byte 8) (*))))
@@ -254,55 +263,96 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
        outputs))
 
 (defun init-precomputed-sighash (tx &optional spent-utxos)
-  "Initialize precomputed sighash data for TX. Call once per transaction.
-   When SPENT-UTXOS (vector of utxo-entry) is provided, also populate the
-   BIP 341 single-SHA256 fields including sha-amounts and sha-script-pubkeys
-   which are needed for Taproot validation.
+  "Precomputed sighash data for TX, one per transaction; SPENT-UTXOS (a vector
+of utxo-entry in input order) is what the BIP 341 amounts and scriptPubKeys
+hashes are taken over, NIL when unknown.
 
-   Hot path: called once per non-coinbase tx during validate-block-scripts.
-   Direct byte-buf writes replace the previous flexi-streams + Gray-stream
-   loop-write-byte, mirroring the Phase 1 byte-buf migration in
-   serialize-{transaction,block-header,block} and save-utxo-set. The May 8
-   profile flagged the residual flexi-streams paths here as ~10% of CPU
-   even after libcrypto SHA256 made hashing cheap."
-  (let* ((inputs (bl.ser:transaction-inputs tx))
-         (outputs (bl.ser:transaction-outputs tx))
-         (prevouts-bb (make-byte-buf))
-         (sequences-bb (make-byte-buf))
-         (outputs-bb (make-byte-buf)))
-    (bb-write-all-prevouts prevouts-bb inputs)
-    (bb-write-all-sequences sequences-bb inputs)
-    (bb-write-all-outputs outputs-bb outputs)
-    (let* ((prevouts-bytes (bb-finish prevouts-bb))
-           (sequences-bytes (bb-finish sequences-bb))
-           (outputs-bytes (bb-finish outputs-bb))
-           (sha-prevouts (bl.crypto:sha256 prevouts-bytes))
-           (sha-sequences (bl.crypto:sha256 sequences-bytes))
-           (sha-outputs (bl.crypto:sha256 outputs-bytes)))
-      (make-precomputed-sighash-data
-       :hash-prevouts (bl.crypto:sha256 sha-prevouts)
-       :hash-sequence (bl.crypto:sha256 sha-sequences)
-       :hash-outputs-all (bl.crypto:sha256 sha-outputs)
-       :sha-prevouts sha-prevouts
-       :sha-sequences sha-sequences
-       :sha-outputs sha-outputs
-       :sha-amounts
-       (when spent-utxos
-         (let ((bb (make-byte-buf)))
-           (loop for utxo across spent-utxos
-                 do (bb-write-i64-le
-                     bb (bl.store:utxo-entry-value utxo)))
-           (bl.crypto:sha256
-            (bb-finish bb))))
-       :sha-script-pubkeys
-       (when spent-utxos
-         (let ((bb (make-byte-buf)))
-           (loop for utxo across spent-utxos
-                 for script = (bl.store:utxo-entry-script-pubkey utxo)
-                 do (bb-write-varint bb (length script))
-                    (bb-write-bytes bb script))
-           (bl.crypto:sha256
-            (bb-finish bb))))))))
+Nothing is hashed here. Core's PrecomputedTransactionData::Init computes the
+three single SHA256s only when some input spends with a witness, their BIP 143
+doubles only when one of those is not a v1 32-byte program, and the BIP 341
+amounts and scripts hashes only when one is (script/interpreter.cpp:
+1403-1452). Every value is instead computed the first time a signature hash
+READS it (the PRECOMPUTED-SIGHASH-DATA-* readers below), which is the same set
+of hashes Core's scan selects, or fewer: a legacy-only transaction reads none
+of them, a P2WSH one the six BIP 143 values and never the BIP 341 two. The
+eager version hashed all eight for every transaction -- 20.5% of the samples
+of the interpreter over a fixed P2WSH set with the signature cache warm.
+
+Unlike Core's scan, reading on demand needs no `force' for a signer: a
+transaction whose witnesses are not filled in yet still gets the fields its
+signature hashes ask for."
+  (%make-precomputed-sighash-data tx spent-utxos))
+
+(defun %sha256-of-written (writer items)
+  "SHA256 over what WRITER (a bb-write-all-* function) writes for ITEMS."
+  (let ((bb (make-byte-buf)))
+    (funcall writer bb items)
+    (bl.crypto:sha256 (bb-finish bb))))
+
+(defun precomputed-sighash-data-sha-prevouts (precomp)
+  "SHA256 of every input's outpoint (Core m_prevouts_single_hash)."
+  (or (%psd-sha-prevouts precomp)
+      (setf (%psd-sha-prevouts precomp)
+            (%sha256-of-written #'bb-write-all-prevouts
+                                (bl.ser:transaction-inputs (%psd-tx precomp))))))
+
+(defun precomputed-sighash-data-sha-sequences (precomp)
+  "SHA256 of every input's nSequence (Core m_sequences_single_hash)."
+  (or (%psd-sha-sequences precomp)
+      (setf (%psd-sha-sequences precomp)
+            (%sha256-of-written #'bb-write-all-sequences
+                                (bl.ser:transaction-inputs (%psd-tx precomp))))))
+
+(defun precomputed-sighash-data-sha-outputs (precomp)
+  "SHA256 of every output (Core m_outputs_single_hash)."
+  (or (%psd-sha-outputs precomp)
+      (setf (%psd-sha-outputs precomp)
+            (%sha256-of-written #'bb-write-all-outputs
+                                (bl.ser:transaction-outputs (%psd-tx precomp))))))
+
+(defun precomputed-sighash-data-hash-prevouts (precomp)
+  "BIP 143 hashPrevouts: SHA256 of the single hash (Core SHA256Uint256)."
+  (or (%psd-hash-prevouts precomp)
+      (setf (%psd-hash-prevouts precomp)
+            (bl.crypto:sha256 (precomputed-sighash-data-sha-prevouts precomp)))))
+
+(defun precomputed-sighash-data-hash-sequence (precomp)
+  "BIP 143 hashSequence."
+  (or (%psd-hash-sequence precomp)
+      (setf (%psd-hash-sequence precomp)
+            (bl.crypto:sha256 (precomputed-sighash-data-sha-sequences precomp)))))
+
+(defun precomputed-sighash-data-hash-outputs-all (precomp)
+  "BIP 143 hashOutputs for SIGHASH_ALL."
+  (or (%psd-hash-outputs-all precomp)
+      (setf (%psd-hash-outputs-all precomp)
+            (bl.crypto:sha256 (precomputed-sighash-data-sha-outputs precomp)))))
+
+(defun precomputed-sighash-data-sha-amounts (precomp)
+  "SHA256 of every spent amount (Core m_spent_amounts_single_hash), or NIL
+without spent UTXOs."
+  (or (%psd-sha-amounts precomp)
+      (let ((spent (%psd-spent-utxos precomp)))
+        (when spent
+          (setf (%psd-sha-amounts precomp)
+                (let ((bb (make-byte-buf)))
+                  (loop for utxo across spent
+                        do (bb-write-i64-le bb (bl.store:utxo-entry-value utxo)))
+                  (bl.crypto:sha256 (bb-finish bb))))))))
+
+(defun precomputed-sighash-data-sha-script-pubkeys (precomp)
+  "SHA256 of every spent scriptPubKey, length-prefixed (Core
+m_spent_scripts_single_hash), or NIL without spent UTXOs."
+  (or (%psd-sha-script-pubkeys precomp)
+      (let ((spent (%psd-spent-utxos precomp)))
+        (when spent
+          (setf (%psd-sha-script-pubkeys precomp)
+                (let ((bb (make-byte-buf)))
+                  (loop for utxo across spent
+                        for script = (bl.store:utxo-entry-script-pubkey utxo)
+                        do (bb-write-varint bb (length script))
+                           (bb-write-bytes bb script))
+                  (bl.crypto:sha256 (bb-finish bb))))))))
 
 (defvar *witness-v0-mode* nil
   "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.

@@ -116,6 +116,82 @@ vector and START is 0, and a TYPE-ERROR for an element that is not an octet."
     (signals type-error (bl.interop:coalton-vector-to-cl-array (vector 1 256 3)))
     (signals type-error (bl.interop:coalton-vector-to-cl-array (vector 1 -1)))))
 
+(defun %count-sha256-calls (thunk)
+  "(values result calls): THUNK's value and how many times it called
+BL.CRYPTO:SHA256."
+  (let ((calls 0))
+    (sb-int:encapsulate 'bl.crypto:sha256 'count-sha256
+                        (lambda (f &rest args) (incf calls) (apply f args)))
+    (unwind-protect (values (funcall thunk) calls)
+      (sb-int:unencapsulate 'bl.crypto:sha256 'count-sha256))))
+
+(test the-sighash-midstates-are-hashed-when-a-signature-hash-reads-them
+  "Core's PrecomputedTransactionData::Init hashes only what the transaction's
+inputs will need (script/interpreter.cpp:1403-1452): nothing for a legacy-only
+transaction, the BIP 143 six for a v0 spend, the BIP 341 amounts and scripts
+only for a v1 one. INIT-PRECOMPUTED-SIGHASH hashed all eight up front. Now it
+hashes nothing, and each reader computes its value once, on first read, equal
+to the BIP 143 / BIP 341 definition computed here from the serialization."
+  (let* ((txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (spk (make-array 34 :element-type '(unsigned-byte 8) :initial-element #x51))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid-a :index 1)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xfffffffd)
+                              (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid-b :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 70000 :script-pubkey spk))
+              :lock-time 0))
+         (spent (vector (bl.store:make-utxo-entry :value 50000 :script-pubkey spk
+                                                  :height 1 :coinbase nil)
+                        (bl.store:make-utxo-entry :value 30000 :script-pubkey spk
+                                                  :height 1 :coinbase nil))))
+    (flet ((sha (&rest parts)
+             (let ((bb (bl.bytes:make-byte-buf)))
+               (dolist (p parts) (funcall p bb))
+               (bl.crypto:sha256 (bl.bytes:bb-finish bb)))))
+      (let ((prevouts (sha (lambda (bb) (bl.bytes:bb-write-bytes bb txid-a) (bl.bytes:bb-write-u32-le bb 1))
+                           (lambda (bb) (bl.bytes:bb-write-bytes bb txid-b) (bl.bytes:bb-write-u32-le bb 0))))
+            (sequences (sha (lambda (bb) (bl.bytes:bb-write-u32-le bb #xfffffffd))
+                            (lambda (bb) (bl.bytes:bb-write-u32-le bb #xffffffff))))
+            (outputs (sha (lambda (bb) (bl.bytes:bb-write-i64-le bb 70000)
+                            (bl.bytes:bb-write-varint bb 34) (bl.bytes:bb-write-bytes bb spk))))
+            (amounts (sha (lambda (bb) (bl.bytes:bb-write-i64-le bb 50000))
+                          (lambda (bb) (bl.bytes:bb-write-i64-le bb 30000))))
+            (scripts (sha (lambda (bb) (bl.bytes:bb-write-varint bb 34) (bl.bytes:bb-write-bytes bb spk))
+                          (lambda (bb) (bl.bytes:bb-write-varint bb 34) (bl.bytes:bb-write-bytes bb spk)))))
+        (multiple-value-bind (precomp calls)
+            (%count-sha256-calls (lambda () (bl.interop:init-precomputed-sighash tx spent)))
+          (is (= 0 calls) "initialisation hashed ~D times" calls)
+          (multiple-value-bind (value calls)
+              (%count-sha256-calls
+               (lambda () (bl.interop:precomputed-sighash-data-hash-prevouts precomp)))
+            (is (equalp (bl.crypto:sha256 prevouts) value))
+            (is (= 2 calls) "hashPrevouts took ~D hashes, not its single and its double" calls))
+          (multiple-value-bind (value calls)
+              (%count-sha256-calls
+               (lambda () (bl.interop:precomputed-sighash-data-hash-prevouts precomp)))
+            (is (equalp (bl.crypto:sha256 prevouts) value))
+            (is (= 0 calls) "a second read hashed again"))
+          (is (equalp prevouts (bl.interop:precomputed-sighash-data-sha-prevouts precomp)))
+          (is (equalp sequences (bl.interop:precomputed-sighash-data-sha-sequences precomp)))
+          (is (equalp (bl.crypto:sha256 sequences)
+                      (bl.interop:precomputed-sighash-data-hash-sequence precomp)))
+          (is (equalp outputs (bl.interop:precomputed-sighash-data-sha-outputs precomp)))
+          (is (equalp (bl.crypto:sha256 outputs)
+                      (bl.interop:precomputed-sighash-data-hash-outputs-all precomp)))
+          (is (equalp amounts (bl.interop:precomputed-sighash-data-sha-amounts precomp)))
+          (is (equalp scripts (bl.interop:precomputed-sighash-data-sha-script-pubkeys precomp))))
+        (let ((without (bl.interop:init-precomputed-sighash tx)))
+          (is (null (bl.interop:precomputed-sighash-data-sha-amounts without)))
+          (is (null (bl.interop:precomputed-sighash-data-sha-script-pubkeys without)))
+          (is (equalp outputs (bl.interop:precomputed-sighash-data-sha-outputs without))))))))
+
 (test the-script-execution-cache-key-reads-the-flags-string-it-is-given
   "MAKE-SCRIPT-EXECUTION-CACHE-KEY remembers the bytes of the last flags
 string by EQ. A key must still depend on the string's CHARACTERS alone: the
