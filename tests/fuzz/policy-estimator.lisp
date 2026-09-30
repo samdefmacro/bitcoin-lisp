@@ -26,22 +26,6 @@
 
 (in-suite :fuzz-policy-estimator-tests)
 
-(defun consume-tx-mempool-entry (fdp tx max-height)
-  "Core ConsumeTxMemPoolEntry (test/fuzz/util/mempool.cpp:17-31), as a plist:
-a fee in the money range below int64 max / 100,000, an entry time, a
-sequence, a height in 0..MAX-HEIGHT, a spends-coinbase flag, a sigop cost up
-to MAX_BLOCK_SIGOPS_COST -- and the sigop-adjusted vsize they make (Core
-GetTxSize)."
-  (let* ((fee (consume-money fdp (floor (1- (ash 1 63)) 100000)))
-         (time (consume-integral fdp :i64))
-         (sequence (consume-integral fdp :u64))
-         (height (consume-integral-in-range fdp 0 max-height 32))
-         (spends-coinbase (consume-bool fdp))
-         (sigops (consume-integral-in-range fdp 0 bl.val:+max-block-sigops-cost+ 32)))
-    (list :tx tx :fee fee :time time :sequence sequence :height height
-          :spends-coinbase spends-coinbase :sigops sigops
-          :vsize (bl.mp:sigop-adjusted-vsize (bl.ser:transaction-weight tx) sigops))))
-
 (defun policy-estimator-bytes (est)
   (flexi-streams:with-output-to-sequence (mem)
     (bl.mp:bpe-write-to-stream est mem)))

@@ -441,3 +441,39 @@ the half."
   "FuzzedDataProvider::ConsumeFloatingPoint<double>(): any finite double, from
 lowest() to max()."
   (consume-floating-point-in-range fdp most-negative-double-float most-positive-double-float))
+
+;;; --- Writing the integral end of a buffer -------------------------------------
+
+(defun make-fdp-tail ()
+  "A writer for the END of a fuzz buffer, where a FuzzedDataProvider takes its
+integral values: record values in the order a target will consume them with
+FDP-TAIL-INTEGRAL / FDP-TAIL-BOOL, then FDP-TAIL-BYTES lays them out so the
+provider reads each back exactly. For a corpus that has to steer a target's
+choices (how many rounds a loop runs, a field's size) rather than leave them
+to random bytes."
+  (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+
+(defun fdp-tail-integral (tail value min max &optional (bits 64))
+  "Record VALUE (in MIN..MAX) for a CONSUME-INTEGRAL-IN-RANGE of MIN MAX BITS:
+the bytes that call reads, most significant first."
+  (let ((range (- max min))
+        (raw (- value min))
+        (n 0))
+    (assert (<= 0 raw range))
+    (loop for offset from 0 by 8
+          while (and (< offset bits) (plusp (ash range (- offset))))
+          do (incf n))
+    (loop for k from (1- n) downto 0
+          do (vector-push-extend (ldb (byte 8 (* 8 k)) raw) tail))
+    tail))
+
+(defun fdp-tail-bool (tail value)
+  "Record a CONSUME-BOOL answering VALUE."
+  (fdp-tail-integral tail (if value 1 0) 0 255 8))
+
+(defun fdp-tail-bytes (tail)
+  "The recorded values as the end of a buffer: the provider reads backwards
+from the last byte, so the record is reversed."
+  (let ((out (make-array (length tail) :element-type '(unsigned-byte 8))))
+    (dotimes (i (length tail) out)
+      (setf (aref out i) (aref tail (- (length tail) 1 i))))))

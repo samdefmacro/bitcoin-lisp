@@ -259,6 +259,11 @@ src/mempool/.")
    #:*mempool-removal-reason*
    #:mempool-count
    #:mempool-total-size
+   ;; The running usage and the spent-outpoint index (Core cachedInnerUsage
+   ;; and mapNextTx), which CTxMemPool::check -- ported for the mempool fuzz
+   ;; targets, tests/fuzz/util-mempool.lisp -- re-derives.
+   #:mempool-total-usage
+   #:mempool-spent-outpoints
    #:mempool-dynamic-usage
    #:transaction-dynamic-usage
    #:mempool-min-fee-rate
@@ -299,6 +304,10 @@ src/mempool/.")
    #:bpe-note-removal
    #:bpe-note-block
    #:bpe-flush-unconfirmed
+   ;; The bucket set and its lookup (Core feeStats' bucketMap), which the
+   ;; estimator suite and the policy_estimator fuzz target check buckets by.
+   #:make-fee-buckets
+   #:fee-bucket-index
    #:bpe-smart-fee-sat-per-vb
    #:bpe-estimate-smart-fee
    #:bpe-write-to-stream
