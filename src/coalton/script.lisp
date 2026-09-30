@@ -1187,13 +1187,6 @@ else. Wiring either of them here rejects scripts Core accepts."
           (ScriptErr SE-DiscourageUpgradableNops)
           (ScriptOk ctx))))
 
-  ;; Helper: check if a script flag is enabled
-  (declare flag-enabled (String -> Boolean))
-  (define (flag-enabled flag-name)
-    "Check if a script verification flag is enabled."
-    (lisp Boolean (flag-name)
-      (bl.interop:flag-enabled-p flag-name)))
-
   ;; Helper: call verify-tapscript-signature and map result to UFix status code
   ;; 0=empty-sig 1=ok 2=invalid 3=upgradable-pubkey
   ;; 4=empty-pubkey 5=discourage-pubkeytype 6=weight-exceeded
@@ -1266,7 +1259,7 @@ else. Wiring either of them here rejects scripts Core accepts."
   ;; INVERT: False for OP_IF, True for OP_NOTIF
   (declare check-if-condition ((Vector U8) -> ScriptStack -> ScriptContext -> Boolean -> (ScriptResult ScriptContext)))
   (define (check-if-condition top new-stack ctx invert)
-    (let ((is-tapscript (flag-enabled "TAPSCRIPT")))
+    (let ((is-tapscript (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT"))))
       (if is-tapscript
           ;; Tapscript: strict MINIMALIF - only empty or [0x01]
           (let ((len (lisp UFix (top) (cl:length top))))
@@ -2242,7 +2235,7 @@ else. Wiring either of them here rejects scripts Core accepts."
 
       ;; CHECKLOCKTIMEVERIFY (BIP 65)
       ((OP-CHECKLOCKTIMEVERIFY)
-       (if (not (flag-enabled "CHECKLOCKTIMEVERIFY"))
+       (if (not (lisp Boolean () (bl.interop:flag-enabled-p "CHECKLOCKTIMEVERIFY")))
            ;; Not enabled; treat as a NOP2 — a PLAIN one. Core's branch is
            ;; `if (!(flags & SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY)) { break; }`
            ;; (interpreter.cpp:521-526) and consults nothing else;
@@ -2280,7 +2273,7 @@ else. Wiring either of them here rejects scripts Core accepts."
 
       ;; CHECKSEQUENCEVERIFY (BIP 112)
       ((OP-CHECKSEQUENCEVERIFY)
-       (if (not (flag-enabled "CHECKSEQUENCEVERIFY"))
+       (if (not (lisp Boolean () (bl.interop:flag-enabled-p "CHECKSEQUENCEVERIFY")))
            ;; Not enabled; treat as a NOP3 — a PLAIN one, exactly as for
            ;; OP_CHECKLOCKTIMEVERIFY above (Core interpreter.cpp:560-565).
            (ScriptOk ctx)
@@ -2342,7 +2335,7 @@ else. Wiring either of them here rejects scripts Core accepts."
     (let ((len (the UFix (coalton-library/vector:length script))))
       ;; Check script size limit
       ;; BIP 342 removes the 10,000-byte script size cap in tapscript.
-      (if (and (not (flag-enabled "TAPSCRIPT"))
+      (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
                (> len +max-script-size+))
           (ScriptErr SE-ScriptTooLarge)
           (execute-script-loop (make-script-context-with-tx script locktime version sequence)))))
@@ -2390,12 +2383,12 @@ a consensus split."
                ;; 201-op cap and falsely fail with SE-TooManyOps.
                (let ((ctx-with-count
                        (if (or (<= byte #x60)
-                               (flag-enabled "TAPSCRIPT"))
+                               (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
                            new-ctx
                            ;; Always increment count (even past limit) so check can detect it
                            (context-with-op-count (+ (context-op-count new-ctx) 1) new-ctx))))
                  ;; Check if we exceeded op count (always, even in non-executing branches).
-                 (if (and (not (flag-enabled "TAPSCRIPT"))
+                 (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
                           (> (context-op-count ctx-with-count) +max-ops-per-script+))
                      (ScriptErr SE-TooManyOps)
                      ;; Handle push operations specially
@@ -2538,7 +2531,7 @@ a consensus split."
     "Execute a script with an initial stack and transaction context."
     (let ((len (the UFix (coalton-library/vector:length script))))
       ;; BIP 342 removes the 10,000-byte script size cap in tapscript.
-      (if (and (not (flag-enabled "TAPSCRIPT"))
+      (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
                (> len +max-script-size+))
           (ScriptErr SE-ScriptTooLarge)
           (execute-script-loop (make-script-context-with-stack-tx script initial-stack locktime version sequence)))))

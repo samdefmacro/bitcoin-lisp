@@ -942,74 +942,10 @@ Returns (values success error-keyword)."
 ;;; Script Execution Flags
 ;;; ============================================================
 
-(defvar *script-flags* nil
-  "Current script execution flags. Set by test harness before execution.
-   Supported flags: STRICTENC, P2SH, etc.")
-
-(defun set-script-flags (flags-string)
-  "Set script execution flags from a comma-separated string."
-  (setf *script-flags* flags-string))
-
-;;; Flag lookup cache. *script-flags* is a comma-separated string that's set
-;;; once per validation context (per-tx or per-block) and queried thousands of
-;;; times during script execution. Splitting + linear-searching it on every
-;;; query was 7.1% of total CPU time per profile. Cache the parsed set keyed
-;;; by the string itself so repeated calls with the same string hit a hash
-;;; table once.
-
-(defvar *flag-set-cache*
-  (make-hash-table :test 'equal :size 16
-                   #+sbcl :synchronized #+sbcl t)
-  "Hash from *script-flags* string -> hash-set of enabled flag names.
-
-SYNCHRONIZED, because FLAG-ENABLED-P inserts on a miss and every parallel
-script-check worker calls it — the P2SH/WITNESS/SIGPUSHONLY gates run on every
-script, so this table is on the hottest path a worker has. Concurrent
-read-through inserts into a plain SBCL hash table corrupt it silently.
-
-This is the same defect the parallel-validation work fixed for the coins view (COLLECT-SPENT-UTXOS
-inserting into a non-synchronized CVC-ENTRIES), missed because it lives a layer
-down in the interpreter rather than in the validation code that was audited.
-The signature and script-execution caches were already synchronized
-(%MAKE-SIG-CACHE-TABLE); these two were not.
-
-Harmless to race on the VALUE — the set computed for a given flags string is
-deterministic, so a lost store only costs a re-parse. What is not harmless is
-the table's own structure.")
-
-(defun parse-flags-to-set (flags-string)
-  (let ((set (make-hash-table :test 'equal)))
-    (dolist (f (uiop:split-string flags-string :separator ","))
-      (setf (gethash f set) t))
-    set))
-
-(defvar *last-flag-set* (cons nil nil)
-  "(flags-string . parsed set) of the most recent FLAG-ENABLED-P lookup, replaced
-as a whole cons -- never mutated -- so a reader on any thread sees a matching
-pair. The parsed set itself is only ever read once built.")
-
-(defun flag-enabled-p (flag)
-  "Check if a flag is enabled in *script-flags*. O(1) hash lookup with the
-parsed-flag-set cached per-string.
-
-The string bound to *script-flags* is one object for a whole block (or
-transaction), and every script asks several flags of it, so the last string
-seen is recognized by EQ before *FLAG-SET-CACHE* is consulted. That table is
-SYNCHRONIZED and keyed by EQUAL, so each lookup hashed the whole flags string
-under a lock the script-check workers share: the round-10 IBD profile (2,100
-regtest blocks of ~925 KB synced over P2P) put 10.2% of all samples in the
-GETHASH/LOCK under this function. A miss takes the old path unchanged."
-  (let ((flags *script-flags*))
-    (when flags
-      (let* ((last *last-flag-set*)
-             (set (if (eq (car last) flags)
-                      (cdr last)
-                      (let ((parsed (or (gethash flags *flag-set-cache*)
-                                        (setf (gethash flags *flag-set-cache*)
-                                              (parse-flags-to-set flags)))))
-                        (setf *last-flag-set* (cons flags parsed))
-                        parsed))))
-        (if (gethash flag set) t nil)))))
+;; *SCRIPT-FLAGS*, SET-SCRIPT-FLAGS and FLAG-ENABLED-P live in bridge.lisp,
+;; which loads before the interpreter: FLAG-ENABLED-P of a constant name
+;; compiles to a bit test there, and the compiler macro that does it must
+;; exist before script.lisp is compiled.
 
 ;;; ============================================================
 ;;; Tapscript OP_SUCCESS Detection (BIP 342)

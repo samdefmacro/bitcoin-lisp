@@ -213,6 +213,61 @@ flag-changing height does) never answers with the other string's bytes."
     (is (equalp (bl.interop:make-script-execution-cache-key wtxid nil)
                 (bl.interop:make-script-execution-cache-key wtxid "")))))
 
+(defparameter +core-script-verify-flag-order+
+  '("P2SH" "STRICTENC" "DERSIG" "LOW_S" "NULLDUMMY" "SIGPUSHONLY" "MINIMALDATA"
+    "DISCOURAGE_UPGRADABLE_NOPS" "CLEANSTACK" "CHECKLOCKTIMEVERIFY"
+    "CHECKSEQUENCEVERIFY" "WITNESS" "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
+    "MINIMALIF" "NULLFAIL" "WITNESS_PUBKEYTYPE" "CONST_SCRIPTCODE" "TAPROOT"
+    "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" "DISCOURAGE_OP_SUCCESS"
+    "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+  "Core's script_verify_flag_name enum, in order (script/interpreter.h:49-71):
+the position of a name is its bit.")
+
+(test flag-lookups-are-bit-tests-on-cores-flags-word
+  "FLAG-ENABLED-P parses the bound flags string once into Core's flags word and
+answers a name with a bit test; a constant name is resolved to its bit at
+compile time. The answer must be exactly what the string says -- membership
+of the name among its comma-separated tokens -- for every Core flag and our
+TAPSCRIPT mark, for a name that has no bit, and for no flags at all, whether
+the name reaches it as a constant or at run time."
+  (let ((strings (list "P2SH,WITNESS,DERSIG,NULLDUMMY"
+                       (bl.val:compute-script-flags-for-height 1000)
+                       (concatenate 'string (bl.val:compute-script-flags-for-height 1000)
+                                    ",TAPSCRIPT")
+                       "CLEANSTACK,FOO,MINIMALDATA"
+                       "" "NONE"
+                       (format nil "~{~A~^,~}" +core-script-verify-flag-order+)))
+        (names (append +core-script-verify-flag-order+ '("TAPSCRIPT" "FOO" "NONE" ""))))
+    (dolist (flags (cons nil strings))
+      (let ((tokens (and flags (uiop:split-string flags :separator ",")))
+            (bl.interop:*script-flags* flags)
+            (wrong '()))
+        (dolist (name names)
+          (unless (eq (and (member name tokens :test #'string=) t)
+                      (bl.interop:flag-enabled-p name))
+            (push name wrong)))
+        ;; The same questions through compiled constant call sites.
+        (unless (and (eq (and (member "MINIMALDATA" tokens :test #'string=) t)
+                         (bl.interop:flag-enabled-p "MINIMALDATA"))
+                     (eq (and (member "TAPSCRIPT" tokens :test #'string=) t)
+                         (bl.interop:flag-enabled-p "TAPSCRIPT"))
+                     (eq (and (member "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" tokens :test #'string=) t)
+                         (bl.interop:flag-enabled-p "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")))
+          (push :constant-call-site wrong))
+        (is (null wrong) "flags ~S answered wrongly for ~S" flags wrong))))
+  ;; A constant name compiles to a bit test, not to a lookup by name, and the
+  ;; bit is Core's: the Nth name of the enum is bit N.
+  (flet ((expand (name)
+           (funcall (compiler-macro-function 'bl.interop:flag-enabled-p)
+                    `(bl.interop:flag-enabled-p ,name) nil)))
+    (is (string= "SCRIPT-FLAG-BIT-P" (symbol-name (first (expand "MINIMALDATA")))))
+    (loop for name in +core-script-verify-flag-order+
+          for bit from 0
+          do (is (eql bit (second (expand name))) "~A is not bit ~D" name bit))
+    (is (eql 32 (second (expand "TAPSCRIPT"))))
+    (is (equal '(bl.interop:flag-enabled-p "FOO") (expand "FOO"))
+        "a name with no bit must stay a call")))
+
 (test flag-lookups-answer-for-the-flags-string-bound-now
   "FLAG-ENABLED-P recognizes the last flags string by EQ before its
 synchronized EQUAL-keyed cache (the round-10 IBD profile put 10.2% of all
