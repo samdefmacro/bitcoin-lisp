@@ -648,6 +648,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/coins-view")
                              (:file "fuzz/coinscache-sim")
                              (:file "fuzz/versionbits")
-                             (:file "fuzz/block-index"))))
+                             (:file "fuzz/block-index")
+                             (:file "fuzz/process-message"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
