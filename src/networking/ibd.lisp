@@ -2189,8 +2189,23 @@ this line is only ever a socket-level reap."
    are still available for analysis. Use to capture blocks our
    validator rejects so we can compare against Bitcoin Core.
 
+Set from a REPL; no option names it. Each block's wire bytes (witness
+included) go to <hash-hex>.raw in FORENSIC-BLOCKS-DIRECTORY: forensic-blocks/
+beside debug.log -- the network data directory unless -debuglogfile moved it
+-- as the SIGUSR1 profile goes beside it (SPROF-REPORT-PATH, node/shutdown.lisp), else under
+the working directory. It was the fixed /data/bitcoin-lisp/forensic-blocks/,
+which exists only on the live servers.
+
 Defined ahead of DISPATCH-IBD-MESSAGE, its reader: defined after it, a fresh
 build compiled the reference as an undefined variable.")
+
+(defun forensic-blocks-directory ()
+  "Where *FORENSIC-STORE-FROM-HEIGHT* writes: forensic-blocks/ beside the debug
+log (bl:*log-file-path*), else under the working directory."
+  (merge-pathnames "forensic-blocks/"
+                   (if bl:*log-file-path*
+                       (uiop:pathname-directory-pathname (pathname bl:*log-file-path*))
+                       *default-pathname-defaults*)))
 
 (defun dispatch-ibd-message (peer command payload node-ctx ctx)
   "Process one wire message from PEER during IBD: connect a received
@@ -2223,9 +2238,9 @@ handler. Shared by the block-download drain and the at-tip reap pass."
            (when (and entry
                       (>= (bl.store:block-index-entry-height entry)
                           *forensic-store-from-height*))
-             (let* ((dir "/data/bitcoin-lisp/forensic-blocks/")
-                    (path (format nil "~A~A.raw" dir
-                                  (bl.crypto:bytes-to-hex hash))))
+             (let* ((dir (forensic-blocks-directory))
+                    (path (merge-pathnames
+                           (format nil "~A.raw" (bl.crypto:bytes-to-hex hash)) dir)))
                (ignore-errors (ensure-directories-exist dir))
                (with-open-file (s path :direction :output
                                        :if-exists :supersede
