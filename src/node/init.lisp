@@ -2118,7 +2118,6 @@ seconds and dial again."
               (node-block-store *node*)
               (bl.store:chain-state-coins-view
                (node-current-chainstate *node*))
-              :fee-estimator (node-fee-estimator *node*)
               :mempool (node-mempool *node*))))))
     (cond
       (switched

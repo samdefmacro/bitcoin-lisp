@@ -197,7 +197,7 @@ snapshot reads it from RPC threads while the sync thread mutates it."
   ;; (handle-message's node-context: peers / address-book). Without these, tx
   ;; ingestion/serving, tx-inv getdata, compact-block relay, and addr
   ;; gossip were all inert outside unit tests — the live loop passed
-  ;; only :fee-estimator/:recent-rejects (wiring bug, fixed 2026-07-10).
+  ;; only its fee estimator and recent-rejects (wiring bug, fixed 2026-07-10).
   ;; Threaded in at run-ibd entry like mempool; peers is refreshed
   ;; whenever run-ibd prunes disconnected entries.
   (peers nil :type list)
@@ -2201,7 +2201,7 @@ handler. Shared by the block-download drain and the at-tip reap pass."
   ;; with the same one line (LOG-RECEIVED-MESSAGE, SanitizeString'd).
   (when (or (string= command "block") (string= command "headers"))
     (log-received-message peer command payload))
-  (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects) node-ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store recent-rejects) node-ctx
   (cond
     ((string= command "block")
      (let* ((block (bl.ser:parse-block-payload payload))
@@ -2321,7 +2321,6 @@ handler. Shared by the block-download drain and the at-tip reap pass."
            (record-block-received-from-peer peer)
            (let ((connected
                    (process-received-block block route-cs route-view block-store
-                                           :fee-estimator fee-estimator
                                            :recent-rejects recent-rejects
                                            :wire-size (length payload)
                                            :requested (and requested t)
@@ -2917,7 +2916,7 @@ terms both said the node was done, so the fork was never requested."
 
 (defun run-ibd (peers node-ctx)
   "Main IBD loop."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects mempool address-book historical-chainstate) node-ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store recent-rejects mempool address-book historical-chainstate) node-ctx
   (let ((ctx *ibd-context*)
         (start-height (bl.store:current-height chain-state)))
     ;; Make the mempool reachable from the block-activation path (which reads
@@ -2992,8 +2991,7 @@ terms both said the node was done, so the fork was never requested."
           (sync-headers-with-sync-peer peers chain-state ctx
                                       :recent-rejects recent-rejects
                                       :utxo-set utxo-set
-                                      :block-store block-store
-                                      :fee-estimator fee-estimator)))
+                                      :block-store block-store)))
 
     ;; Phase 2: Download and validate blocks
     (set-ibd-state :syncing-blocks)
@@ -3120,7 +3118,6 @@ terms both said the node was done, so the fork was never requested."
                  ;; bodies-complete gate keeps a still-downloading fork
                  ;; cheap (early-exit probe at its first gap).
                  (retry-best-reorg-candidate chain-state block-store utxo-set
-                                             :fee-estimator fee-estimator
                                              :recent-rejects recent-rejects)
 
                  ;; Progress accounting for the two idle backstops below.
@@ -3190,7 +3187,6 @@ terms both said the node was done, so the fork was never requested."
           (with-current-node-lock
             (bl.val:activate-best-chain
              chain-state block-store utxo-set
-             :fee-estimator fee-estimator
              :recent-rejects recent-rejects
              :mempool mempool))
         (when switched
@@ -3205,7 +3201,6 @@ terms both said the node was done, so the fork was never requested."
     (let ((hist (and ctx (ibd-context-historical-chain-state ctx))))
       (when (and hist block-store (not (bl:interrupt-requested-p)))
         (activate-historical-chainstate hist block-store
-                                        :fee-estimator fee-estimator
                                         :recent-rejects recent-rejects)))
 
     ;; Done — distinguish "actually finished" from "paused due to no peers".
@@ -4402,7 +4397,7 @@ header (Core's pindexBestKnownBlock against m_best_header)."
              (bl.store:block-index-entry-chain-work best)))))
 
 (defun sync-headers (peer chain-state &key recent-rejects ctx utxo-set
-                                           block-store fee-estimator)
+                                           block-store)
   "Kick header sync with PEER, WITHOUT owning the message pump. Returns
 (values received-count stalled-p); STALLED-P is true when the peer never
 answered, the signal the caller records for the peer it drives.
@@ -4480,7 +4475,7 @@ keeping. Core has no header-sync loop at all for the same reason."
                            :peers (or (and ctx (ibd-context-peers ctx)) (list peer))
                            :mempool (and ctx (ibd-context-mempool ctx))
                            :address-book (and ctx (ibd-context-address-book ctx))
-                           :fee-estimator fee-estimator :recent-rejects recent-rejects)
+                           :recent-rejects recent-rejects)
                           ctx)
       (let ((answer (%peer-headers-bytes peer)))
         (if (/= answer last-answer)
@@ -4532,11 +4527,11 @@ reset to be reconsidered before a later-connected one."
 
 (defun sync-headers-with-sync-peer (peers chain-state ctx
                                     &key recent-rejects (sync-fn #'sync-headers)
-                                         utxo-set block-store fee-estimator)
+                                         utxo-set block-store)
   "Drive header sync with the single peer HEADER-SYNC-PEER names, and return it
 (NIL when there is none). SYNC-FN is injectable so the selection is testable
 without network I/O. The full node context (CTX +
-UTXO-SET/BLOCK-STORE/FEE-ESTIMATOR) is threaded to SYNC-FN so its
+UTXO-SET/BLOCK-STORE) is threaded to SYNC-FN so its
 interleaved-message drains can serve tx getdata and process blocks.
 
 ONE PEER, and no rotation on silence. This used to try every ready peer in
@@ -4555,8 +4550,7 @@ the peer and frees the latch -- not the next pass."
                  :recent-rejects recent-rejects
                  :ctx ctx
                  :utxo-set utxo-set
-                 :block-store block-store
-                 :fee-estimator fee-estimator)
+                 :block-store block-store)
         peer))))
 
 (defun consider-headers-sync-timeouts (peers chain-state now)
@@ -4862,7 +4856,7 @@ wasteful attempt."
         t))))
 
 (defun %activate-best-reorg-target (chain-state block-store utxo-set
-                                    fee-estimator recent-rejects)
+                                    recent-rejects)
   "RETRY-BEST-REORG-CANDIDATE's step, run under the node lock: choose the
 highest-work completable candidate against the tip as it is NOW and hand it
 to ACTIVATE-BLOCK. Returns (VALUES ENTRY ACTIVATED ERROR MISSING-BLOCKS);
@@ -4889,12 +4883,11 @@ ENTRY is NIL when there is nothing to try."
                               (bl.ser:block-header-hash
                                (bl.ser:bitcoin-block-header blk))
                               height)
-               :fee-estimator fee-estimator
                :recent-rejects recent-rejects
                :mempool (ibd-context-mempool *ibd-context*)))))))))
 
 (defun retry-best-reorg-candidate (chain-state block-store utxo-set
-                                   &key fee-estimator recent-rejects)
+                                   &key recent-rejects)
   "Deep-reorg activation — the case the height-dispatched receive path cannot
 reach. A block that wins the reorg only above tip+1 (or below the tip on a
 heavier-shorter fork) never triggers activate-block, so nothing attempts the
@@ -4921,7 +4914,7 @@ candidate activated."
   (multiple-value-bind (entry activated error missing-blocks)
       (with-current-node-lock
         (%activate-best-reorg-target chain-state block-store utxo-set
-                                     fee-estimator recent-rejects))
+                                     recent-rejects))
     (when entry
       (let ((cand-hash (bl.store:block-index-entry-hash entry))
             (height (bl.store:block-index-entry-height entry)))
@@ -4933,7 +4926,6 @@ candidate activated."
              (bl:log-warn "Deep-reorg activated: new tip height ~D" height)
              ;; Children above the new tip may already be buffered.
              (drain-block-queue chain-state utxo-set block-store
-                                :fee-estimator fee-estimator
                                 :recent-rejects recent-rejects)
              t)
             ((and (eq error :reorg-refused) missing-blocks)
@@ -5142,7 +5134,7 @@ And never one that fails the body gate (%BLOCK-BODY-ACCEPTABLE-P)."
         (t (%block-body-acceptable-p block chain-state peer))))
 
 (defun process-received-block (block chain-state utxo-set block-store
-                                &key fee-estimator recent-rejects
+                                &key recent-rejects
                                   (wire-size 0) requested peer)
   "Process a received block - validate and connect to chain.
 After connecting, drains the queue of any children that can now be connected.
@@ -5206,7 +5198,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                            (bl.ser:block-header-hash
                             (bl.ser:bitcoin-block-header block))
                            height)
-               :fee-estimator fee-estimator
                :recent-rejects recent-rejects
                :mempool mempool))
           (cond
@@ -5217,7 +5208,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
              (clear-block-failure hash)
              (note-tip-advanced chain-state)
              (drain-block-queue chain-state utxo-set block-store
-                                :fee-estimator fee-estimator
                                 :recent-rejects recent-rejects))
             ;; Stored, doesn't yet outweigh the tip: note it so the
             ;; per-cycle retry re-evaluates once its fork completes
@@ -5242,7 +5232,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
           ;; Try the best completable candidate now that this block is on
           ;; disk (may complete a fork whose bodies just filled in).
           (retry-best-reorg-candidate chain-state block-store utxo-set
-                                      :fee-estimator fee-estimator
                                       :recent-rejects recent-rejects))
         (return-from process-received-block nil))
 
@@ -5290,7 +5279,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                    block chain-state block-store utxo-set
                    :current-time current-time
                    :skip-scripts skip-scripts
-                   :fee-estimator fee-estimator
                    :recent-rejects recent-rejects
                    :mempool mempool))
               (cond
@@ -5299,7 +5287,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                  (note-tip-advanced chain-state)
                  ;; Drain queued blocks whose parent is now connected
                  (drain-block-queue chain-state utxo-set block-store
-                                    :fee-estimator fee-estimator
                                     :recent-rejects recent-rejects)
                  t)
                 ;; :weaker-chain isn't an error — block stored, no
@@ -5316,7 +5303,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                 ((member error '(:weaker-chain :corrupt-undo))
                  (note-reorg-candidate entry chain-state)
                  (retry-best-reorg-candidate chain-state block-store utxo-set
-                                             :fee-estimator fee-estimator
                                              :recent-rejects recent-rejects)
                  nil)
                 ;; :reorg-refused — the new block sits on a stronger
@@ -5331,7 +5317,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                  (queue-missing-fork-blocks missing-blocks)
                  (note-reorg-candidate entry chain-state)
                  (retry-best-reorg-candidate chain-state block-store utxo-set
-                                             :fee-estimator fee-estimator
                                              :recent-rejects recent-rejects)
                  nil)
                 ;; Stop request, not a verdict on this block: handle-validation-
@@ -5415,7 +5400,6 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                    ;; the fork in whatever order the network delivers).
                    (note-reorg-candidate entry chain-state)
                    (retry-best-reorg-candidate chain-state block-store utxo-set
-                                               :fee-estimator fee-estimator
                                                :recent-rejects recent-rejects)))))
             nil)))))
 
@@ -5473,7 +5457,7 @@ NIL when no persisted child of the tip exists at that height."
                               (bl.store:block-index-entry-hash entry)))))))
 
 (defun activate-historical-chainstate (historical block-store
-                                       &key fee-estimator recent-rejects)
+                                       &key recent-rejects)
   "Connect every body of HISTORICAL's target path that is already on disk,
 from its tip upward; returns how many connected. Core's ProcessNewBlock and
 startup run ActivateBestChain on EVERY chainstate (validation.cpp:4430-4478),
@@ -5484,15 +5468,13 @@ the download walk (FIND-HISTORICAL-BLOCKS-TO-DOWNLOAD) skips a block it holds,
 so such a chainstate waited forever: feature_assumeutxo.py:676. RUN-IBD calls
 this once per pass, next to the active chainstate's activation."
   (%reorg-historical-onto-target-path historical block-store
-                                      :fee-estimator fee-estimator
                                       :recent-rejects recent-rejects)
   (drain-block-queue historical (bl.store:chain-state-coins-view historical)
                      block-store
-                     :fee-estimator fee-estimator
                      :recent-rejects recent-rejects))
 
 (defun %reorg-historical-onto-target-path (historical block-store
-                                          &key fee-estimator recent-rejects)
+                                          &key recent-rejects)
   "When HISTORICAL's tip is off its target path (a snapshot loaded over a
 divergent chain), reorg it onto the highest target-path block whose bodies
 from the fork up are all on disk, if that block outweighs the tip -- Core
@@ -5519,10 +5501,9 @@ when the chainstate moved."
             (bl.val:perform-reorg historical block-store
                                   (bl.store:chain-state-coins-view historical)
                                   tip best
-                                  :fee-estimator fee-estimator
                                   :recent-rejects recent-rejects)))))))
 
-(defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
+(defun drain-block-queue (chain-state utxo-set block-store &key recent-rejects)
   "Process queued blocks whose parents are now connected.
 Repeats until no more queued blocks can be connected. Pulls from the RAM
 block-queue first, then falls back to persisted out-of-order blocks
@@ -5573,7 +5554,6 @@ the tip is ready to connect."
                  block chain-state block-store utxo-set
                  :current-time current-time
                  :skip-scripts skip-scripts
-                 :fee-estimator fee-estimator
                  :recent-rejects recent-rejects
                  :mempool mempool))
             (cond
