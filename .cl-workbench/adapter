@@ -79,6 +79,13 @@ suite_form() { # $1 fiveam suite designator, already validated
 
 run_test() {
   : "${CL_WORKBENCH_REPL_CLIENT:?}"
+  # The same refusal as `dev.sh test': no suite over a ghost definition
+  # (scripts/ghost-check.lisp); DEV_ALLOW_GHOSTS=1 runs anyway.
+  if [ "${DEV_ALLOW_GHOSTS:-0}" != 1 ] && ! "$DEV" ghost-check >&2; then
+    echo "ERROR: the warm image holds definitions the source does not have (above);" >&2
+    echo "       fmakunbound them or restart the image (DEV_ALLOW_GHOSTS=1 runs anyway)." >&2
+    return 1
+  fi
   case "$#" in
     0)
       DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
