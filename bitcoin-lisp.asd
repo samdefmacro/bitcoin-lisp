@@ -673,6 +673,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/txgraph")
                              (:file "fuzz/txorphan")
                              (:file "fuzz/txrequest")
+                             (:file "fuzz/txdownloadman")
                              (:file "fuzz/feefrac")
                              (:file "fuzz/policy-estimator")
                              (:file "fuzz/rbf")
