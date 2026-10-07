@@ -1007,10 +1007,11 @@
   retired in Round 7) -- and never when it is a NoBan peer or a MANUAL
   one, two independent exemptions Core applies before punishing anyone. Every
   retirement path ends in DISCONNECT-PEER, which is Core's single
-  FinalizeNode: the tx-request tracker's announcements, the orphanage
-  entries and the headers-sync buffer are released there and nowhere
-  else, so a path that open-codes its own teardown leaks per-peer state
-  keyed by the peer OBJECT. An error raised by a message HANDLER is caught, counted
+  FinalizeNode: the TxDownloadManager's DisconnectedPeer (the peer's
+  tracked announcements, its orphan announcements, its registration) and
+  the headers-sync buffer are released there and nowhere else, so a path
+  that open-codes its own teardown leaks per-peer state keyed by the peer
+  OBJECT. An error raised by a message HANDLER is caught, counted
   per command and forgiven with the connection kept, which is Core's
   ProcessMessages catch: the failure is per-peer but the trigger is per
   message TYPE, so a blanket disconnect drops every peer that sends the
@@ -1122,6 +1123,33 @@
   simply not queued to, never replaced by the next peer down the ranking,
   which is what keeps a repeated address inside its two destinations for
   the period.
+
+  Transaction download is Core's TxDownloadManager
+  (`src/networking/txdownloadman.lisp`; Core `node/txdownloadman*.cpp`): ONE
+  object owns the orphanage, the TxRequestTracker
+  (`src/networking/txrequest.lisp`), the recent-rejects,
+  reconsiderable-rejects and recently-confirmed filters and each relay
+  peer's connection facts, and nothing else reaches those pieces. The node's
+  is `*TXDOWNLOADMAN*` (the node context carries it; a fuzz target builds its
+  own), and the handlers call its methods exactly where net_processing.cpp
+  calls m_txdownloadman: ConnectedPeer at VERACK (%AWAIT-VERACK),
+  DisconnectedPeer in DISCONNECT-PEER, AddTxAnnouncement in the INV handler,
+  ReceivedTx / MempoolAcceptedTx / MempoolRejectedTx / MempoolRejectedPackage
+  in the TX handler's ProcessValidTx / ProcessInvalidTx /
+  ProcessPackageResult, ReceivedNotFound in NOTFOUND, GetRequestsToSend in
+  each peer's SendMessages pass (SEND-TX-REQUESTS-TO-PEERS), HaveMoreWork and
+  GetTxToReconsider in the message pump (PROCESS-ORPHAN-TX, before each
+  message), BlockConnected / BlockDisconnected / ActiveTipChange from the
+  validation interface -- the last two skipped during IBD and for a targeted
+  chainstate, as Core skips them. Invariants: an announcement only records;
+  the getdata goes out from SendMessages. An accepted transaction puts the
+  orphans spending it into ONE random announcer's work set each, and that
+  peer's message loop resolves ONE orphan per turn, never a cascade inside
+  the parent's message (Core's 2024 orphan-stall fix). A peer that never
+  registered tracks nothing; a :READY peer struct that skipped the handshake
+  -- the unit suites build them -- is registered on first contact.
+  `TXDOWNLOAD-CHECK-IS-EMPTY` is Core's CheckIsEmpty, logged where Core
+  asserts (a new peer, the last peer gone) and asserted by the fuzz targets.
 
   Which peer is asked for a transaction is Core's txrequest state machine:
   an announcement is CANDIDATE while its NONPREF/TXID_RELAY/OVERLOADED delay
@@ -1256,6 +1284,23 @@
   a peer's transaction -- filled only on those P2P paths
   (`add-to-compact-extra-transactions`; an RPC or wallet replacement does
   not count, as in Core) and reset per node."
+  (bitcoin-lisp.networking:txdownload-manager class)
+  (bitcoin-lisp.networking:make-txdownload-manager function)
+  (bitcoin-lisp.networking:*txdownloadman* variable)
+  (bitcoin-lisp.networking:node-txdownloadman function)
+  (bitcoin-lisp.networking:txdownload-connected-peer function)
+  (bitcoin-lisp.networking:txdownload-disconnected-peer function)
+  (bitcoin-lisp.networking:txdownload-add-tx-announcement function)
+  (bitcoin-lisp.networking:txdownload-get-requests-to-send function)
+  (bitcoin-lisp.networking:txdownload-received-tx function)
+  (bitcoin-lisp.networking:txdownload-mempool-accepted-tx function)
+  (bitcoin-lisp.networking:txdownload-mempool-rejected-tx function)
+  (bitcoin-lisp.networking:txdownload-get-tx-to-reconsider function)
+  (bitcoin-lisp.networking:txdownload-check-is-empty function)
+  (bitcoin-lisp.networking:tx-request-tracker class)
+  (bitcoin-lisp.networking:txrequest-get-requestable function)
+  (bitcoin-lisp.networking:send-tx-requests-to-peers function)
+  (bitcoin-lisp.networking:process-orphan-tx function)
   (bitcoin-lisp.networking:add-to-compact-extra-transactions function)
   (bitcoin-lisp.networking:*max-extra-txs* variable)
   (bitcoin-lisp.networking:initiate-tx-broadcast-private function)
@@ -1652,7 +1697,7 @@
 
 (defsection @mempool (:title "mempool: the pool and its policy")
   "Core: `txmempool.cpp`, `txgraph.cpp`, `cluster_linearize.h`,
-  `policy/rbf.cpp`, `policy/truc_policy.cpp`, `txorphanage.cpp`,
+  `policy/rbf.cpp`, `policy/truc_policy.cpp`, `node/txorphanage.cpp`,
   `policy/fees.cpp`, `kernel/mempool_persist.cpp`. Policy, never
   consensus: a rule here decides what we relay and mine, not what is
   valid.
@@ -1662,6 +1707,12 @@
   insert per changed chunk, never a rebuild over the pool; RBF and TRUC
   checks run in Core's order with Core's limits; mempool.dat is written
   in Core's format so the two implementations can exchange one.
+
+  The orphanage is Core's TxOrphanage, owned by the TxDownloadManager
+  (not the mempool): announcements per (orphan, peer), per-peer DoS scores
+  that decide eviction, and the WORK SET -- one announcement per orphan
+  marked to be reconsidered once a parent arrives, evicted after a peer's
+  other announcements.
 
   The txgraph measures SIGOP-ADJUSTED WEIGHT, as Core's does: entries are
   staged with max(weight, sigops * 20) and the cluster cap is 404000 WU
@@ -1741,6 +1792,8 @@
   (bitcoin-lisp.mempool:txgraph class)
   (bitcoin-lisp.mempool:linearize function)
   (bitcoin-lisp.mempool:make-orphan-pool function)
+  (bitcoin-lisp.mempool:orphan-add-children-to-work-set function)
+  (bitcoin-lisp.mempool:orphan-get-tx-to-reconsider function)
   (bitcoin-lisp.mempool:fee-estimator class)
   (bitcoin-lisp.mempool:estimate-fee-rate function)
   (bitcoin-lisp.mempool:make-block-policy-estimator function)
