@@ -167,12 +167,9 @@ where a fixture belongs."
 Named here because two wallet test files assert on what a code path logged --
 Core routinely puts the detail in the log and the short sentence in the reply,
 so the log line is part of the behaviour under test."
-  (let ((bl.log:*log-buffer* (make-array bl.log:+log-buffer-size+
-                                         :initial-element nil))
-        (bl.log:*log-buffer-index* 0)
-        (bl.log:*log-buffer-count* 0))
+  (let ((bl.log:*log-buffer* (bl.log:make-log-ring)))
     (funcall thunk)
-    (remove nil (coerce bl.log:*log-buffer* 'list))))
+    (bl.log:log-ring-lines bl.log:*log-buffer*)))
 
 (defun rpc-result-json (result)
   "The exact JSON text an RPC handler's RESULT goes out as: the server's own

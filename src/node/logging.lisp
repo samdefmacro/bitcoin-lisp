@@ -49,19 +49,8 @@ and the unit tests expect."
 (defun show-logs (&key (n 20) (level :debug))
   "Show the last N log entries at or above LEVEL.
 LEVEL can be :debug, :info, :warn, or :error."
-  (let ((entries '())
+  (let ((entries (bt:with-lock-held (*log-lock*) (log-ring-lines *log-buffer*)))
         (min-level (log-level-value level)))
-    (bt:with-lock-held (*log-lock*)
-      (let ((start (if (< *log-buffer-count* +log-buffer-size+)
-                       0
-                       *log-buffer-index*)))
-        (dotimes (i *log-buffer-count*)
-          (let* ((idx (mod (+ start i) +log-buffer-size+))
-                 (entry (aref *log-buffer* idx)))
-            (when entry
-              (push entry entries))))))
-    ;; entries is now oldest-first after reverse
-    (setf entries (nreverse entries))
     ;; Filter by level and take last n
     (let ((filtered (remove-if-not
                      (lambda (entry)
@@ -82,10 +71,7 @@ LEVEL can be :debug, :info, :warn, or :error."
 (defun clear-logs ()
   "Clear the log buffer."
   (bt:with-lock-held (*log-lock*)
-    (dotimes (i +log-buffer-size+)
-      (setf (aref *log-buffer* i) nil))
-    (setf *log-buffer-index* 0)
-    (setf *log-buffer-count* 0))
+    (clear-log-ring *log-buffer*))
   t)
 
 (defun enable-console-logging ()

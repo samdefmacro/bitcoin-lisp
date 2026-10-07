@@ -12,8 +12,9 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:*current-log-level*
    #:*deferred-log-lines*
    #:*log-buffer*
-   #:*log-buffer-count*
-   #:*log-buffer-index*
+   #:make-log-ring
+   #:clear-log-ring
+   #:log-ring-lines
    #:*log-file-stream*
    #:*log-lock*
    #:*log-rate-limit*
@@ -86,14 +87,37 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
 (defconstant +log-buffer-size+ 500
   "Maximum number of log entries to keep in memory.")
 
-(defvar *log-buffer* (make-array +log-buffer-size+ :initial-element nil)
-  "Ring buffer for recent log messages.")
+(defstruct (log-ring (:constructor make-log-ring ()))
+  "The in-memory sink for recent log lines: the entries, the next write
+position and how many are held, in ONE object. Core has one logger that every
+thread writes through (BCLog::Logger, logging.cpp LogPrintStr); a thread that
+is handed this ring writes to the same one. The write position used to be a
+special of its own, so a thread started with the log specials' VALUES (the
+index catch-up threads) advanced a private copy and the next writer wrote over
+its lines."
+  (entries (make-array +log-buffer-size+ :initial-element nil) :type simple-vector)
+  (index 0 :type fixnum)
+  (count 0 :type fixnum))
 
-(defvar *log-buffer-index* 0
-  "Current write position in log buffer.")
+(defvar *log-buffer* (make-log-ring)
+  "The node's LOG-RING. Rebinding it (a test's private capture) moves every
+writer that reads it at once, threads included.")
 
-(defvar *log-buffer-count* 0
-  "Number of entries in log buffer.")
+(defun clear-log-ring (ring)
+  "Empty RING in place, so every writer holding it keeps writing to it."
+  (fill (log-ring-entries ring) nil)
+  (setf (log-ring-index ring) 0
+        (log-ring-count ring) 0)
+  ring)
+
+(defun log-ring-lines (ring)
+  "RING's lines, oldest first."
+  (let* ((entries (log-ring-entries ring))
+         (count (log-ring-count ring))
+         (start (if (< count +log-buffer-size+) 0 (log-ring-index ring))))
+    (loop for i below count
+          for entry = (svref entries (mod (+ start i) +log-buffer-size+))
+          when entry collect entry)))
 
 (defvar *log-lock* (bt:make-lock "log-lock")
   "Guards the WHOLE emit — ring buffer, console stream and file stream — not
@@ -230,10 +254,12 @@ for the message returned nothing usable."
 
 (defun %add-to-log-buffer-locked (entry)
   "Ring-buffer insert with *LOG-LOCK* already held."
-  (setf (aref *log-buffer* *log-buffer-index*) entry)
-  (setf *log-buffer-index* (mod (1+ *log-buffer-index*) +log-buffer-size+))
-  (when (< *log-buffer-count* +log-buffer-size+)
-    (incf *log-buffer-count*)))
+  (let* ((ring *log-buffer*)
+         (index (log-ring-index ring)))
+    (setf (svref (log-ring-entries ring) index) entry
+          (log-ring-index ring) (mod (1+ index) +log-buffer-size+))
+    (when (< (log-ring-count ring) +log-buffer-size+)
+      (incf (log-ring-count ring)))))
 
 ;;;; Log rate limiting (Core BCLog::LogRateLimiter, logging.h:63-124,
 ;;;; logging.cpp:376-583)

@@ -95,7 +95,7 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
     (is-false bl.log:*log-suppressions-active*)
     (is (zerop (hash-table-count bl.log:*log-rate-locations*)))
     (let ((restart (find-if (lambda (e) (and e (search "Restarting logging" e)))
-                            bl.log:*log-buffer*)))
+                            (bl.log:log-ring-lines bl.log:*log-buffer*))))
       (is-true restart)
       (is (search "noisy site" restart)))))
 
@@ -209,7 +209,7 @@ and then DROPPED, so every categorized line came out as an untagged debug line
         (bl.log:*log-file-stream* nil))
     (bl:log-cat "net" "a categorized line")
     (let ((entry (find-if (lambda (e) (and e (search "a categorized line" e)))
-                          bl.log:*log-buffer*)))
+                          (bl.log:log-ring-lines bl.log:*log-buffer*))))
       (is-true entry "the line reached the buffer")
       (when entry
         (is-true (search "[net] a categorized line" entry))))))
@@ -307,12 +307,12 @@ is info, without -debug=net."
     ;; Without a threshold and without -debug=net, a net line is suppressed.
     (bl:log-cat "net" "suppressed line one")
     (is-false (find-if (lambda (e) (and e (search "suppressed line one" e)))
-                       bl.log:*log-buffer*))
+                       (bl.log:log-ring-lines bl.log:*log-buffer*)))
     ;; With one, it is emitted — and carries the category tag.
     (is-true (bl:set-category-log-level "net" :debug))
     (bl:log-cat "net" "visible line two")
     (let ((entry (find-if (lambda (e) (and e (search "visible line two" e)))
-                          bl.log:*log-buffer*)))
+                          (bl.log:log-ring-lines bl.log:*log-buffer*))))
       (is-true entry)
       (when entry (is-true (search "[net] visible line two" entry))))
     ;; An unknown category cannot be given one.

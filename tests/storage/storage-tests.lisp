@@ -2857,17 +2857,11 @@ finds it built."
   (with-network (:regtest)
     (let ((node (%index-wipe-node (format nil "enabled-line-~D" (get-internal-real-time)))))
       (flet ((start-up-lines ()
-               ;; Read off the console stream, which every index thread writes
-               ;; to: each catch-up thread binds its own copy of the ring
-               ;; buffer's index, so the next thread's lines overwrite its
-               ;; lines there.
-               (prog1 (let ((bl.log:*log-stream* (make-string-output-stream)))
-                        (%index-fill-around-catch-up node (constantly nil)
-                                                     :blockfilterindex t
-                                                     :coinstatsindex t)
-                        (uiop:split-string
-                         (get-output-stream-string bl.log:*log-stream*)
-                         :separator '(#\Newline)))
+               (prog1 (capture-log-lines
+                       (lambda ()
+                         (%index-fill-around-catch-up node (constantly nil)
+                                                      :blockfilterindex t
+                                                      :coinstatsindex t)))
                  (bl.store:close-blockfilterindex (bl:node-blockfilterindex node))
                  (bl.store:close-coinstatsindex (bl:node-coinstatsindex node)))))
         (dolist (run '(:first-start :restart))
@@ -2878,6 +2872,30 @@ finds it built."
                                 "coinstatsindex is enabled at height 3"))
               (is-true (find expected lines :test #'search)
                        "~A: no `~A' line in ~S" run expected lines))))))))
+
+(test index-threads-write-through-one-log-sink
+  "Core has one logger that every thread writes through (BCLog::Logger,
+logging.cpp LogPrintStr); a line logged on an index's sync thread lands in the
+same place as any other. Each catch-up thread took the log specials over BY
+VALUE (+INDEX-THREAD-SPECIALS+), and the in-memory ring's write position was
+one of them, so the thread advanced a private copy and the next writer -- the
+next index's thread -- wrote over its lines: of two indexes' `is enabled'
+lines the ring kept one. Both must reach it."
+  (with-network (:regtest)
+    (let* ((node (%index-wipe-node (format nil "one-sink-~D" (get-internal-real-time))))
+           (lines (capture-log-lines
+                   (lambda ()
+                     (%index-fill-around-catch-up node (constantly nil)
+                                                  :blockfilterindex t
+                                                  :coinstatsindex t)))))
+      (bl.store:close-blockfilterindex (bl:node-blockfilterindex node))
+      (bl.store:close-coinstatsindex (bl:node-coinstatsindex node))
+      (dolist (expected '("basic block filter index thread start"
+                          "basic block filter index is enabled at height 3"
+                          "coinstatsindex thread start"
+                          "coinstatsindex is enabled at height 3"))
+        (is-true (find expected lines :test #'search)
+                 "no `~A' line in the ring: ~S" expected lines)))))
 
 (test a-damaged-index-database-fails-at-open
   "Core's BaseIndex::Init reads the best-block locator from the index's own
