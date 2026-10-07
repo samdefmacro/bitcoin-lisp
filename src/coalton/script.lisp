@@ -8,6 +8,25 @@
 
 (named-readtables:in-readtable coalton:coalton)
 
+;;; One script execution's mutable state; the Coalton type ScriptContext below
+;;; is this struct (repr :native), allocated once per execution.
+(cl:defstruct (script-context-data
+               (:constructor %make-script-context-data)
+               (:copier cl:nil) (:predicate cl:nil))
+  (main-stack cl:nil :type cl:list)
+  (alt-stack cl:nil :type cl:list)
+  (script #() :type cl:vector)
+  (position 0 :type (cl:and cl:fixnum cl:unsigned-byte))
+  (condition-stack cl:nil :type cl:list)
+  (executing cl:t :type cl:boolean)
+  (op-count 0 :type (cl:and cl:fixnum cl:unsigned-byte))
+  (codesep-pos 0 :type (cl:and cl:fixnum cl:unsigned-byte))
+  (tx-locktime 0 :type (cl:unsigned-byte 32))
+  (tx-version 1 :type (cl:signed-byte 32))
+  (input-sequence #xFFFFFFFF :type (cl:unsigned-byte 32)))
+
+#+sbcl (cl:declaim (sb-ext:freeze-type script-context-data))
+
 (coalton-toplevel
 
   ;;; ============================================================
@@ -922,142 +941,144 @@ that named two Core errors would make that comparison meaningless."
   (declare +max-push-size+ UFix)
   (define +max-push-size+ 520)
 
+  ;; One execution's state, as Core's EvalScript keeps it in locals for the
+  ;; whole run (interpreter.cpp:406-428: pc, pend, pbegincodehash, vfExec,
+  ;; altstack, nOpCount) beside the stack it was handed. The context is
+  ;; ALLOCATED ONCE, by the MAKE-SCRIPT-CONTEXT-* that start an execution, and
+  ;; every CONTEXT-SET-...! below writes its field in place and returns the
+  ;; same context. Rebuilding an immutable 11-field struct on every update --
+  ;; three to five times per opcode -- consed 320 bytes per OP_NOP step.
+  ;;
+  ;; In place is the same program because every execution threads its
+  ;; context linearly: a context handed to a setter (or to a helper that calls
+  ;; one) is never read again expecting the value from before, and a failed
+  ;; step ends the execution, so a half-updated context is never resumed.
+  ;; Nothing outside this file builds or holds one. A new opcode keeps that
+  ;; rule: read what it needs, then set.
+  (repr :native script-context-data)
   (define-type ScriptContext
-    "Execution context for script validation.
+    "Execution context for one script execution (a mutable record).
      Fields: main-stack, alt-stack, script, position, condition-stack,
              executing, op-count, codesep-pos, tx-locktime, tx-version,
-             input-sequence"
-    (ScriptContext
-     ScriptStack      ; main-stack
-     ScriptStack      ; alt-stack
-     (Vector U8)      ; script
-     UFix             ; position
-     (List Boolean)   ; condition-stack (for IF/ELSE nesting)
-     Boolean          ; executing (False in unexecuted IF branch)
-     UFix             ; op-count (for 201 limit)
-     UFix             ; codesep-pos (for CHECKSIG)
-     U32           ; tx-locktime (nLockTime for CLTV)
-     I32           ; tx-version (for CSV version >= 2 check)
-     U32))         ; input-sequence (nSequence for CSV)
+             input-sequence")
 
-  (declare make-script-context ((Vector U8) -> ScriptContext))
-  (define (make-script-context script)
-    "Create a new script execution context with default transaction values."
-    (make-script-context-with-tx script 0 1 #xFFFFFFFF))
+  (declare make-script-context-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> ScriptContext))
+  (define (make-script-context-with-stack-tx script initial-stack locktime version input-seq)
+    "A fresh context: SCRIPT at position 0 over INITIAL-STACK, empty altstack
+and condition stack, executing, no ops counted, the code separator at 0."
+    (lisp ScriptContext (script initial-stack locktime version input-seq)
+      (%make-script-context-data
+       :main-stack initial-stack :script script
+       :tx-locktime locktime :tx-version version :input-sequence input-seq)))
 
   (declare make-script-context-with-tx ((Vector U8) -> U32 -> I32 -> U32 -> ScriptContext))
   (define (make-script-context-with-tx script locktime version sequence)
-    "Create a new script execution context with transaction context."
-    (ScriptContext
-     (empty-stack)      ; main-stack
-     (empty-stack)      ; alt-stack
-     script             ; script
-     0                  ; position
-     Nil                ; condition-stack
-     True               ; executing
-     0                  ; op-count
-     0                  ; codesep-pos
-     locktime           ; tx-locktime
-     version            ; tx-version
-     sequence))         ; input-sequence
+    "A fresh context over an empty stack."
+    (make-script-context-with-stack-tx script (empty-stack) locktime version sequence))
 
   ;; Context accessors
+  (inline)
   (declare context-main-stack (ScriptContext -> ScriptStack))
   (define (context-main-stack ctx)
-    (match ctx ((ScriptContext s _ _ _ _ _ _ _ _ _ _) s)))
+    (lisp ScriptStack (ctx) (script-context-data-main-stack ctx)))
 
+  (inline)
   (declare context-alt-stack (ScriptContext -> ScriptStack))
   (define (context-alt-stack ctx)
-    (match ctx ((ScriptContext _ a _ _ _ _ _ _ _ _ _) a)))
+    (lisp ScriptStack (ctx) (script-context-data-alt-stack ctx)))
 
+  (inline)
   (declare context-script (ScriptContext -> (Vector U8)))
   (define (context-script ctx)
-    (match ctx ((ScriptContext _ _ s _ _ _ _ _ _ _ _) s)))
+    (lisp (Vector U8) (ctx) (script-context-data-script ctx)))
 
+  (inline)
   (declare context-position (ScriptContext -> UFix))
   (define (context-position ctx)
-    (match ctx ((ScriptContext _ _ _ p _ _ _ _ _ _ _) p)))
+    (lisp UFix (ctx) (script-context-data-position ctx)))
 
+  (inline)
   (declare context-condition-stack (ScriptContext -> (List Boolean)))
   (define (context-condition-stack ctx)
-    (match ctx ((ScriptContext _ _ _ _ c _ _ _ _ _ _) c)))
+    (lisp (List Boolean) (ctx) (script-context-data-condition-stack ctx)))
 
+  (inline)
   (declare context-executing (ScriptContext -> Boolean))
   (define (context-executing ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ e _ _ _ _ _) e)))
+    (lisp Boolean (ctx) (script-context-data-executing ctx)))
 
+  (inline)
   (declare context-op-count (ScriptContext -> UFix))
   (define (context-op-count ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ o _ _ _ _) o)))
+    (lisp UFix (ctx) (script-context-data-op-count ctx)))
 
+  (inline)
   (declare context-codesep-pos (ScriptContext -> UFix))
   (define (context-codesep-pos ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ _ c _ _ _) c)))
+    (lisp UFix (ctx) (script-context-data-codesep-pos ctx)))
 
+  (inline)
   (declare context-tx-locktime (ScriptContext -> U32))
   (define (context-tx-locktime ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ _ _ locktime _ _) locktime)))
+    (lisp U32 (ctx) (script-context-data-tx-locktime ctx)))
 
+  (inline)
   (declare context-tx-version (ScriptContext -> I32))
   (define (context-tx-version ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ _ _ _ ver _) ver)))
+    (lisp I32 (ctx) (script-context-data-tx-version ctx)))
 
+  (inline)
   (declare context-input-sequence (ScriptContext -> U32))
   (define (context-input-sequence ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ _ _ _ _ sq) sq)))
+    (lisp U32 (ctx) (script-context-data-input-sequence ctx)))
 
-  ;; Context update helpers
-  (declare context-with-main-stack (ScriptStack -> ScriptContext -> ScriptContext))
-  (define (context-with-main-stack stack ctx)
-    (match ctx
-      ((ScriptContext _ alt script pos cond exec ops codesep locktime version seqnum)
-       (ScriptContext stack alt script pos cond exec ops codesep locktime version seqnum))))
+  ;; Context setters: each writes one field of CTX in place and returns CTX.
+  (inline)
+  (declare context-set-main-stack! (ScriptStack -> ScriptContext -> ScriptContext))
+  (define (context-set-main-stack! stack ctx)
+    (lisp ScriptContext (stack ctx)
+      (cl:progn (cl:setf (script-context-data-main-stack ctx) stack) ctx)))
 
-  (declare context-with-alt-stack (ScriptStack -> ScriptContext -> ScriptContext))
-  (define (context-with-alt-stack alt ctx)
-    (match ctx
-      ((ScriptContext main _ script pos cond exec ops codesep locktime version seqnum)
-       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
+  (inline)
+  (declare context-set-alt-stack! (ScriptStack -> ScriptContext -> ScriptContext))
+  (define (context-set-alt-stack! alt-stack ctx)
+    (lisp ScriptContext (alt-stack ctx)
+      (cl:progn (cl:setf (script-context-data-alt-stack ctx) alt-stack) ctx)))
 
-  (declare context-with-position (UFix -> ScriptContext -> ScriptContext))
-  (define (context-with-position pos ctx)
-    (match ctx
-      ((ScriptContext main alt script _ cond exec ops codesep locktime version seqnum)
-       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
+  (inline)
+  (declare context-set-position! (UFix -> ScriptContext -> ScriptContext))
+  (define (context-set-position! pos ctx)
+    (lisp ScriptContext (pos ctx)
+      (cl:progn (cl:setf (script-context-data-position ctx) pos) ctx)))
 
-  (declare context-with-condition-stack ((List Boolean) -> ScriptContext -> ScriptContext))
-  (define (context-with-condition-stack cond ctx)
-    (match ctx
-      ((ScriptContext main alt script pos _ exec ops codesep locktime version seqnum)
-       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
+  (inline)
+  (declare context-set-condition-stack! ((List Boolean) -> ScriptContext -> ScriptContext))
+  (define (context-set-condition-stack! conds ctx)
+    (lisp ScriptContext (conds ctx)
+      (cl:progn (cl:setf (script-context-data-condition-stack ctx) conds) ctx)))
 
-  (declare context-with-executing (Boolean -> ScriptContext -> ScriptContext))
-  (define (context-with-executing exec ctx)
-    (match ctx
-      ((ScriptContext main alt script pos cond _ ops codesep locktime version seqnum)
-       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
+  (inline)
+  (declare context-set-executing! (Boolean -> ScriptContext -> ScriptContext))
+  (define (context-set-executing! exec ctx)
+    (lisp ScriptContext (exec ctx)
+      (cl:progn (cl:setf (script-context-data-executing ctx) exec) ctx)))
 
-  (declare context-with-op-count (UFix -> ScriptContext -> ScriptContext))
-  (define (context-with-op-count ops ctx)
-    (match ctx
-      ((ScriptContext main alt script pos cond exec _ codesep locktime version seqnum)
-       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
+  (inline)
+  (declare context-set-op-count! (UFix -> ScriptContext -> ScriptContext))
+  (define (context-set-op-count! ops ctx)
+    (lisp ScriptContext (ops ctx)
+      (cl:progn (cl:setf (script-context-data-op-count ctx) ops) ctx)))
 
-  (declare context-with-codesep-pos (UFix -> ScriptContext -> ScriptContext))
-  (define (context-with-codesep-pos codesep ctx)
-    (match ctx
-      ((ScriptContext main alt script pos cond exec ops _ locktime version seqnum)
-       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
+  (inline)
+  (declare context-set-codesep-pos! (UFix -> ScriptContext -> ScriptContext))
+  (define (context-set-codesep-pos! codesep ctx)
+    (lisp ScriptContext (codesep ctx)
+      (cl:progn (cl:setf (script-context-data-codesep-pos ctx) codesep) ctx)))
 
   (declare advance-position (UFix -> ScriptContext -> ScriptContext))
   (define (advance-position n ctx)
     "Advance the script position by n bytes."
-    (context-with-position (+ (context-position ctx) n) ctx))
-
-  (declare increment-op-count (ScriptContext -> ScriptContext))
-  (define (increment-op-count ctx)
-    "Increment the non-push operation count."
-    (context-with-op-count (+ (context-op-count ctx) 1) ctx))
+    (context-set-position! (+ (context-position ctx) n) ctx))
 
   ;;; ============================================================
   ;;; Conditional Execution Helpers
@@ -1074,8 +1095,8 @@ that named two Core errors would make that comparison meaningless."
   (define (update-executing-flag cond-stack ctx)
     "Update both condition-stack and executing flag."
     (let ((new-exec (all-true cond-stack)))
-      (context-with-executing new-exec
-                              (context-with-condition-stack cond-stack ctx))))
+      (context-set-executing! new-exec
+                              (context-set-condition-stack! cond-stack ctx))))
 
   (declare push-condition (Boolean -> ScriptContext -> ScriptContext))
   (define (push-condition cond ctx)
@@ -1133,26 +1154,28 @@ that named two Core errors would make that comparison meaningless."
   ;;; Script Reading Helpers
   ;;; ============================================================
 
-  (declare read-script-byte (ScriptContext -> (ScriptResult (Tuple U8 ScriptContext))))
+  (declare read-script-byte (ScriptContext -> (ScriptResult U8)))
   (define (read-script-byte ctx)
-    "Read a single byte from the script at current position."
+    "Read the byte at CTX's position and advance past it (in place)."
     (let ((pos (context-position ctx))
           (script (context-script ctx)))
       (if (>= pos (the UFix (coalton-library/vector:length script)))
           (ScriptErr SE-InvalidPushData)
           (let ((byte (lisp U8 (script pos) (cl:aref script pos))))
-            (ScriptOk (Tuple byte (advance-position 1 ctx)))))))
+            (advance-position 1 ctx)
+            (ScriptOk byte)))))
 
-  (declare read-script-bytes (UFix -> ScriptContext -> (ScriptResult (Tuple (Vector U8) ScriptContext))))
+  (declare read-script-bytes (UFix -> ScriptContext -> (ScriptResult (Vector U8))))
   (define (read-script-bytes n ctx)
-    "Read n bytes from the script at current position."
+    "Read N bytes at CTX's position and advance past them (in place)."
     (let ((pos (context-position ctx))
           (script (context-script ctx)))
       (if (> (+ pos n) (the UFix (coalton-library/vector:length script)))
           (ScriptErr SE-InvalidPushData)
           (let ((bytes (lisp (Vector U8) (script pos n)
                          (cl:subseq script pos (cl:+ pos n)))))
-            (ScriptOk (Tuple bytes (advance-position n ctx)))))))
+            (advance-position n ctx)
+            (ScriptOk bytes)))))
 
   ;;; ============================================================
   ;;; Opcode Execution
@@ -1161,7 +1184,7 @@ that named two Core errors would make that comparison meaningless."
   ;; Helper to push result onto stack in context
   (declare context-push ((Vector U8) -> ScriptContext -> ScriptContext))
   (define (context-push value ctx)
-    (context-with-main-stack (stack-push value (context-main-stack ctx)) ctx))
+    (context-set-main-stack! (stack-push value (context-main-stack ctx)) ctx))
 
   ;; Helper to get true/false bytes
   (declare true-bytes (Unit -> (Vector U8)))
@@ -1266,12 +1289,12 @@ else. Wiring either of them here rejects scripts Core accepts."
             (cond
               ((== len 0)
                (ScriptOk (push-condition (if invert True False)
-                                         (context-with-main-stack new-stack ctx))))
+                                         (context-set-main-stack! new-stack ctx))))
               ((== len 1)
                (let ((b (lisp U8 (top) (cl:aref top 0))))
                  (if (== b 1)
                      (ScriptOk (push-condition (if invert False True)
-                                               (context-with-main-stack new-stack ctx)))
+                                               (context-set-main-stack! new-stack ctx)))
                      (ScriptErr SE-TapscriptMinimalIf))))
               (True (ScriptErr SE-TapscriptMinimalIf))))
           ;; Non-Tapscript: check MINIMALIF flag (witness v0 only, not BASE)
@@ -1284,12 +1307,12 @@ else. Wiring either of them here rejects scripts Core accepts."
                   (cond
                     ((== len 0)
                      (ScriptOk (push-condition (if invert True False)
-                                               (context-with-main-stack new-stack ctx))))
+                                               (context-set-main-stack! new-stack ctx))))
                     ((== len 1)
                      (let ((b (lisp U8 (top) (cl:aref top 0))))
                        (if (== b 1)
                            (ScriptOk (push-condition (if invert False True)
-                                                     (context-with-main-stack new-stack ctx)))
+                                                     (context-set-main-stack! new-stack ctx)))
                            (ScriptErr SE-MinimalIf))))
                     (True (ScriptErr SE-MinimalIf))))
                 ;; Legacy: normal bool cast
@@ -1297,7 +1320,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                                     (not (cast-to-bool top))
                                     (cast-to-bool top))))
                   (ScriptOk (push-condition cond-val
-                                            (context-with-main-stack new-stack ctx)))))))))
+                                            (context-set-main-stack! new-stack ctx)))))))))
 
   ;; Execute a single opcode
   (declare execute-opcode (Opcode -> ScriptContext -> (ScriptResult ScriptContext)))
@@ -1339,7 +1362,7 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple top new-stack))
           (if (cast-to-bool top)
-              (ScriptOk (context-with-main-stack new-stack ctx))
+              (ScriptOk (context-set-main-stack! new-stack ctx))
               (ScriptErr SE-VerifyFailed)))))
 
       ;; OP_RETURN - immediate failure
@@ -1357,37 +1380,37 @@ else. Wiring either of them here rejects scripts Core accepts."
        (match (stack-pop (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple _ new-stack))
-          (ScriptOk (context-with-main-stack new-stack ctx)))))
+          (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_SWAP - swap top 2
       ((OP-SWAP)
        (match (stack-swap (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_ROT - rotate top 3
       ((OP-ROT)
        (match (stack-rot (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_OVER - copy second to top
       ((OP-OVER)
        (match (stack-over (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_NIP - remove second
       ((OP-NIP)
        (match (stack-nip (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_TUCK - copy top before second
       ((OP-TUCK)
        (match (stack-tuck (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_SIZE - push byte length of top element (without removing it)
       ((OP-SIZE)
@@ -1396,7 +1419,7 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((Some top)
           (let ((size (lisp Integer (top) (cl:length top))))
             ;; Push size as script number (already on stack, we push size on top)
-            (ScriptOk (context-with-main-stack
+            (ScriptOk (context-set-main-stack!
                        (stack-push (script-num-to-bytes (make-script-num size))
                                    (context-main-stack ctx))
                        ctx))))))
@@ -1405,43 +1428,43 @@ else. Wiring either of them here rejects scripts Core accepts."
       ((OP-2DROP)
        (match (stack-2drop (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_2DUP
       ((OP-2DUP)
        (match (stack-2dup (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_3DUP
       ((OP-3DUP)
        (match (stack-3dup (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_2SWAP
       ((OP-2SWAP)
        (match (stack-2swap (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_2OVER
       ((OP-2OVER)
        (match (stack-2over (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_2ROT
       ((OP-2ROT)
        (match (stack-2rot (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_IFDUP
       ((OP-IFDUP)
        (match (stack-ifdup (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+         ((Some new-stack) (ScriptOk (context-set-main-stack! new-stack ctx)))))
 
       ;; OP_DEPTH - push stack depth
       ((OP-DEPTH)
@@ -1468,7 +1491,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (match (stack-pick n new-stack)
                        ((None) (ScriptErr SE-InvalidStackOperation))
                        ((Some value)
-                        (ScriptOk (context-with-main-stack (stack-push value new-stack) ctx))))))))))))
+                        (ScriptOk (context-set-main-stack! (stack-push value new-stack) ctx))))))))))))
 
       ;; OP_ROLL - move nth item to top
       ((OP-ROLL)
@@ -1487,25 +1510,25 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (match (stack-roll n new-stack)
                        ((None) (ScriptErr SE-InvalidStackOperation))
                        ((Some rolled-stack)
-                        (ScriptOk (context-with-main-stack rolled-stack ctx))))))))))))
+                        (ScriptOk (context-set-main-stack! rolled-stack ctx))))))))))))
 
       ;; OP_TOALTSTACK
       ((OP-TOALTSTACK)
        (match (stack-pop (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple value new-main))
-          (ScriptOk (context-with-alt-stack
+          (ScriptOk (context-set-alt-stack!
                      (stack-push value (context-alt-stack ctx))
-                     (context-with-main-stack new-main ctx))))))
+                     (context-set-main-stack! new-main ctx))))))
 
       ;; OP_FROMALTSTACK
       ((OP-FROMALTSTACK)
        (match (stack-pop (context-alt-stack ctx))
          ((None) (ScriptErr SE-InvalidAltstackOperation))
          ((Some (Tuple value new-alt))
-          (ScriptOk (context-with-main-stack
+          (ScriptOk (context-set-main-stack!
                      (stack-push value (context-main-stack ctx))
-                     (context-with-alt-stack new-alt ctx))))))
+                     (context-set-alt-stack! new-alt ctx))))))
 
       ;; OP_EQUAL - push true if equal
       ((OP-EQUAL)
@@ -1516,7 +1539,7 @@ else. Wiring either of them here rejects scripts Core accepts."
             ((None) (ScriptErr SE-StackUnderflow))
             ((Some (Tuple b new-stack))
              (let ((equal (lisp Boolean (a b) (cl:equalp a b))))
-               (ScriptOk (context-with-main-stack
+               (ScriptOk (context-set-main-stack!
                           (stack-push (if equal (true-bytes) (false-bytes)) new-stack)
                           ctx))))))))
 
@@ -1530,7 +1553,7 @@ else. Wiring either of them here rejects scripts Core accepts."
             ((Some (Tuple b new-stack))
              (let ((equal (lisp Boolean (a b) (cl:equalp a b))))
                (if equal
-                   (ScriptOk (context-with-main-stack new-stack ctx))
+                   (ScriptOk (context-set-main-stack! new-stack ctx))
                    (ScriptErr SE-EqualVerify))))))))
 
       ;; OP_HASH160 - RIPEMD160(SHA256(x))
@@ -1539,7 +1562,7 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple data new-stack))
           (let ((hash (compute-hash160 data)))
-            (ScriptOk (context-with-main-stack
+            (ScriptOk (context-set-main-stack!
                        (stack-push (hash160-bytes hash) new-stack)
                        ctx))))))
 
@@ -1549,7 +1572,7 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple data new-stack))
           (let ((hash (compute-hash256 data)))
-            (ScriptOk (context-with-main-stack
+            (ScriptOk (context-set-main-stack!
                        (stack-push (hash256-bytes hash) new-stack)
                        ctx))))))
 
@@ -1559,7 +1582,7 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple data new-stack))
           (let ((hash (compute-sha256 data)))
-            (ScriptOk (context-with-main-stack
+            (ScriptOk (context-set-main-stack!
                        (stack-push (hash256-bytes hash) new-stack)
                        ctx))))))
 
@@ -1569,7 +1592,7 @@ else. Wiring either of them here rejects scripts Core accepts."
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple data new-stack))
           (let ((hash (compute-ripemd160 data)))
-            (ScriptOk (context-with-main-stack
+            (ScriptOk (context-set-main-stack!
                        (stack-push (hash160-bytes hash) new-stack)
                        ctx))))))
 
@@ -1583,7 +1606,7 @@ else. Wiring either of them here rejects scripts Core accepts."
           (match (bytes-to-script-num-limited bytes 4)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
-             (ScriptOk (context-with-main-stack
+             (ScriptOk (context-set-main-stack!
                         (stack-push (script-num-to-bytes (ScriptNum (+ (script-num-value sn) 1))) new-stack)
                         ctx)))))))
 
@@ -1595,7 +1618,7 @@ else. Wiring either of them here rejects scripts Core accepts."
           (match (bytes-to-script-num-limited bytes 4)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
-             (ScriptOk (context-with-main-stack
+             (ScriptOk (context-set-main-stack!
                         (stack-push (script-num-to-bytes (ScriptNum (- (script-num-value sn) 1))) new-stack)
                         ctx)))))))
 
@@ -1607,7 +1630,7 @@ else. Wiring either of them here rejects scripts Core accepts."
           (match (bytes-to-script-num-limited bytes 4)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
-             (ScriptOk (context-with-main-stack
+             (ScriptOk (context-set-main-stack!
                         (stack-push (script-num-to-bytes (ScriptNum (negate (script-num-value sn)))) new-stack)
                         ctx)))))))
 
@@ -1619,7 +1642,7 @@ else. Wiring either of them here rejects scripts Core accepts."
           (match (bytes-to-script-num-limited bytes 4)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
-             (ScriptOk (context-with-main-stack
+             (ScriptOk (context-set-main-stack!
                         (stack-push (script-num-to-bytes (ScriptNum (abs (script-num-value sn)))) new-stack)
                         ctx)))))))
 
@@ -1632,7 +1655,7 @@ else. Wiring either of them here rejects scripts Core accepts."
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
              (let ((result (if (== (script-num-value sn) 0) 1 0)))
-               (ScriptOk (context-with-main-stack
+               (ScriptOk (context-set-main-stack!
                           (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                           ctx))))))))
 
@@ -1645,7 +1668,7 @@ else. Wiring either of them here rejects scripts Core accepts."
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
              (let ((result (if (/= (script-num-value sn) 0) 1 0)))
-               (ScriptOk (context-with-main-stack
+               (ScriptOk (context-set-main-stack!
                           (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                           ctx))))))))
 
@@ -1663,7 +1686,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                 (match (bytes-to-script-num-limited b-bytes 4)
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
-                   (ScriptOk (context-with-main-stack
+                   (ScriptOk (context-set-main-stack!
                               (stack-push (script-num-to-bytes
                                            (ScriptNum (+ (script-num-value b) (script-num-value a))))
                                           new-stack)
@@ -1683,7 +1706,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                 (match (bytes-to-script-num-limited b-bytes 4)
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
-                   (ScriptOk (context-with-main-stack
+                   (ScriptOk (context-set-main-stack!
                               (stack-push (script-num-to-bytes
                                            (ScriptNum (- (script-num-value b) (script-num-value a))))
                                           new-stack)
@@ -1706,7 +1729,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((result (if (and (/= (script-num-value a) 0)
                                           (/= (script-num-value b) 0))
                                      1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1727,7 +1750,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((result (if (or (/= (script-num-value a) 0)
                                          (/= (script-num-value b) 0))
                                      1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1746,7 +1769,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (if (== (script-num-value a) (script-num-value b)) 1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1765,7 +1788,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (if (== (script-num-value a) (script-num-value b))
-                       (ScriptOk (context-with-main-stack new-stack ctx))
+                       (ScriptOk (context-set-main-stack! new-stack ctx))
                        (ScriptErr SE-NumEqualVerify)))))))))))
 
       ;; OP_NUMNOTEQUAL
@@ -1783,7 +1806,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (if (/= (script-num-value a) (script-num-value b)) 1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1802,7 +1825,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (if (< (script-num-value b) (script-num-value a)) 1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1821,7 +1844,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (if (> (script-num-value b) (script-num-value a)) 1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1840,7 +1863,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (if (<= (script-num-value b) (script-num-value a)) 1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1859,7 +1882,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (if (>= (script-num-value b) (script-num-value a)) 1 0)))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1878,7 +1901,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (min (script-num-value a) (script-num-value b))))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1897,7 +1920,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk b)
                    (let ((result (max (script-num-value a) (script-num-value b))))
-                     (ScriptOk (context-with-main-stack
+                     (ScriptOk (context-set-main-stack!
                                 (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
                                 ctx))))))))))))
 
@@ -1923,7 +1946,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                         ((ScriptOk x)
                          (let ((in-range (and (>= (script-num-value x) (script-num-value min-val))
                                               (< (script-num-value x) (script-num-value max-val)))))
-                           (ScriptOk (context-with-main-stack
+                           (ScriptOk (context-set-main-stack!
                                       (stack-push (if in-range (true-bytes) (false-bytes)) new-stack)
                                       ctx))))))))))))))))
 
@@ -1947,7 +1970,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                  (cl:setf (cl:symbol-value cs)
                           (cl:funcall cfn script (cl:max 0 (cl:1- pos)))))))
            Unit)
-         (ScriptOk (context-with-codesep-pos (context-position ctx) ctx))))
+         (ScriptOk (context-set-codesep-pos! (context-position ctx) ctx))))
 
       ;; Disabled opcodes
       ((OP-DISABLED _opcode) (ScriptErr SE-DisabledOpcode))
@@ -2001,7 +2024,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                         (cl:let* ((cl-data (bl.interop:coalton-vector-to-cl-array data))
                                   (result (ironclad:digest-sequence :sha1 cl-data)))
                           (bl.interop:cl-array-to-coalton-vector result)))))
-            (ScriptOk (context-with-main-stack
+            (ScriptOk (context-set-main-stack!
                        (stack-push hash new-stack)
                        ctx))))))
 
@@ -2020,10 +2043,10 @@ else. Wiring either of them here rejects scripts Core accepts."
                    (let ((result (tapscript-verify-sig-status sig pubkey)))
                      (cond
                        ((== result 0)
-                        (ScriptOk (context-with-main-stack
+                        (ScriptOk (context-set-main-stack!
                                    (stack-push (false-bytes) new-stack) ctx)))
                        ((or (== result 1) (== result 3))
-                        (ScriptOk (context-with-main-stack
+                        (ScriptOk (context-set-main-stack!
                                    (stack-push (true-bytes) new-stack) ctx)))
                        (True (ScriptErr (tapscript-sig-status-error result)))))
                    ;; Legacy/SegWit v0: Use ECDSA verification
@@ -2038,7 +2061,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                                               (bl.interop:last-checksig-had-strictenc-error-p))))
                        (if strictenc-error
                            (ScriptErr (last-checksig-error))
-                           (ScriptOk (context-with-main-stack
+                           (ScriptOk (context-set-main-stack!
                                       (stack-push (if valid (true-bytes) (false-bytes)) new-stack)
                                       ctx))))))))))))
 
@@ -2061,7 +2084,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                        ;; SCRIPT_ERR_CHECKSIGVERIFY (interpreter.cpp:1079).
                        ((== result 0) (ScriptErr SE-CheckSigVerify))
                        ((or (== result 1) (== result 3))
-                        (ScriptOk (context-with-main-stack new-stack ctx)))
+                        (ScriptOk (context-set-main-stack! new-stack ctx)))
                        (True (ScriptErr (tapscript-sig-status-error result)))))
                    ;; Legacy/SegWit v0: Use ECDSA verification
                    (let ((valid (lisp Boolean (sig pubkey ctx)
@@ -2076,7 +2099,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                        (if strictenc-error
                            (ScriptErr (last-checksig-error))
                            (if valid
-                               (ScriptOk (context-with-main-stack new-stack ctx))
+                               (ScriptOk (context-set-main-stack! new-stack ctx))
                                (ScriptErr SE-CheckSigVerify))))))))))))
 
       ((OP-CHECKMULTISIG)
@@ -2112,11 +2135,11 @@ else. Wiring either of them here rejects scripts Core accepts."
                              (cl:otherwise (Tuple3 6 stack 0)))))))) ; unknown error
              (match result
                ((Tuple3 0 new-stack n-pubkeys)
-                (ScriptOk (context-with-op-count (+ spent n-pubkeys)
-                            (context-with-main-stack new-stack ctx))))
+                (ScriptOk (context-set-op-count! (+ spent n-pubkeys)
+                            (context-set-main-stack! new-stack ctx))))
                ((Tuple3 1 new-stack n-pubkeys)
-                (ScriptOk (context-with-op-count (+ spent n-pubkeys)
-                            (context-with-main-stack new-stack ctx))))
+                (ScriptOk (context-set-op-count! (+ spent n-pubkeys)
+                            (context-set-main-stack! new-stack ctx))))
                ((Tuple3 2 _ _) (ScriptErr (last-checkmultisig-error)))
                ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
                ((Tuple3 4 _ _) (ScriptErr SE-PubkeyCount))
@@ -2158,8 +2181,8 @@ else. Wiring either of them here rejects scripts Core accepts."
                 (match (stack-pop new-stack)
                   ((None) (ScriptErr SE-StackUnderflow))
                   ((Some (Tuple _ final-stack))
-                   (ScriptOk (context-with-op-count (+ spent n-pubkeys)
-                               (context-with-main-stack final-stack ctx))))))
+                   (ScriptOk (context-set-op-count! (+ spent n-pubkeys)
+                               (context-set-main-stack! final-stack ctx))))))
                ((Tuple3 1 _ _) (ScriptErr SE-CheckMultisigVerify))
                ((Tuple3 2 _ _) (ScriptErr (last-checkmultisig-error)))
                ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
@@ -2211,11 +2234,11 @@ else. Wiring either of them here rejects scripts Core accepts."
                              ;; Empty sig: push n unchanged (Core: num + 0),
                              ;; minimally re-encoded like Core's num.getvch().
                              ((== result 0)
-                              (ScriptOk (context-with-main-stack
+                              (ScriptOk (context-set-main-stack!
                                          (stack-push (script-num-to-bytes num) new-stack) ctx)))
                              ;; Valid sig: push n + 1 (Core: num + 1).
                              ((or (== result 1) (== result 3))
-                              (ScriptOk (context-with-main-stack
+                              (ScriptOk (context-set-main-stack!
                                          (stack-push (script-num-to-bytes
                                                       (ScriptNum (+ (script-num-value num) 1)))
                                                      new-stack)
@@ -2370,7 +2393,7 @@ a consensus split."
           ;; Read and execute next opcode
           (match (read-script-byte ctx)
             ((ScriptErr e) (ScriptErr e))
-            ((ScriptOk (Tuple byte new-ctx))
+            ((ScriptOk byte)
              (let ((op (byte-to-opcode byte)))
                ;; Check op count limit: only opcodes > OP_16 (0x60) count towards limit
                ;; (push opcodes 0x00-0x4e, OP_1NEGATE 0x4f, OP_RESERVED 0x50, and
@@ -2384,9 +2407,9 @@ a consensus split."
                (let ((ctx-with-count
                        (if (or (<= byte #x60)
                                (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
-                           new-ctx
+                           ctx
                            ;; Always increment count (even past limit) so check can detect it
-                           (context-with-op-count (+ (context-op-count new-ctx) 1) new-ctx))))
+                           (context-set-op-count! (+ (context-op-count ctx) 1) ctx))))
                  ;; Check if we exceeded op count (always, even in non-executing branches).
                  (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
                           (> (context-op-count ctx-with-count) +max-ops-per-script+))
@@ -2397,21 +2420,21 @@ a consensus split."
                        ((OP-PUSHBYTES n)
                         (match (read-script-bytes (lisp UFix (n) n) ctx-with-count)
                           ((ScriptErr e) (ScriptErr e))
-                          ((ScriptOk (Tuple data next-ctx))
+                          ((ScriptOk data)
                            ;; Only push if executing
                            (if exec
                                ;; MINIMALDATA: check if push encoding is minimal
                                (match (check-minimal-push n data)
                                  ((ScriptErr e) (ScriptErr e))
                                  ((ScriptOk _)
-                                  (push-and-continue data next-ctx)))
-                               (execute-script-loop next-ctx)))))
+                                  (push-and-continue data ctx-with-count)))
+                               (execute-script-loop ctx-with-count)))))
 
                        ;; OP_PUSHDATA1 - 1 byte length prefix
                        ((OP-PUSHDATA1)
                         (match (read-script-byte ctx-with-count)
                           ((ScriptErr e) (ScriptErr e))
-                          ((ScriptOk (Tuple len-byte len-ctx))
+                          ((ScriptOk len-byte)
                            (let ((push-len (lisp UFix (len-byte) len-byte)))
                              ;; Check push size limit (always, even in non-executing branches).
                              ;; BIP 342 keeps this 520-byte cap: Core's check
@@ -2420,22 +2443,22 @@ a consensus split."
                              ;; MAX_OPS_PER_SCRIPT (:451-455) and is itself ungated.
                              (if (> push-len +max-push-size+)
                                  (ScriptErr SE-PushSize)
-                                 (match (read-script-bytes push-len len-ctx)
+                                 (match (read-script-bytes push-len ctx-with-count)
                                    ((ScriptErr e) (ScriptErr e))
-                                   ((ScriptOk (Tuple data next-ctx))
+                                   ((ScriptOk data)
                                     (if exec
                                         ;; MINIMALDATA: check if PUSHDATA1 encoding is minimal
                                         (match (check-minimal-push #x4c data)
                                           ((ScriptErr e) (ScriptErr e))
                                           ((ScriptOk _)
-                                           (push-and-continue data next-ctx)))
-                                        (execute-script-loop next-ctx)))))))))
+                                           (push-and-continue data ctx-with-count)))
+                                        (execute-script-loop ctx-with-count)))))))))
 
                        ;; OP_PUSHDATA2 - 2 byte length prefix (little endian)
                        ((OP-PUSHDATA2)
                         (match (read-script-bytes 2 ctx-with-count)
                           ((ScriptErr e) (ScriptErr e))
-                          ((ScriptOk (Tuple len-bytes len-ctx))
+                          ((ScriptOk len-bytes)
                            (let ((data-len (lisp UFix (len-bytes)
                                              (cl:+ (cl:aref len-bytes 0)
                                                    (cl:ash (cl:aref len-bytes 1) 8)))))
@@ -2446,22 +2469,22 @@ a consensus split."
                              ;; MAX_OPS_PER_SCRIPT (:451-455) and is itself ungated.
                              (if (> data-len +max-push-size+)
                                  (ScriptErr SE-PushSize)
-                                 (match (read-script-bytes data-len len-ctx)
+                                 (match (read-script-bytes data-len ctx-with-count)
                                    ((ScriptErr e) (ScriptErr e))
-                                   ((ScriptOk (Tuple data next-ctx))
+                                   ((ScriptOk data)
                                     (if exec
                                         ;; MINIMALDATA: check if PUSHDATA2 encoding is minimal
                                         (match (check-minimal-push #x4d data)
                                           ((ScriptErr e) (ScriptErr e))
                                           ((ScriptOk _)
-                                           (push-and-continue data next-ctx)))
-                                        (execute-script-loop next-ctx)))))))))
+                                           (push-and-continue data ctx-with-count)))
+                                        (execute-script-loop ctx-with-count)))))))))
 
                        ;; OP_PUSHDATA4 - 4 byte length prefix (little endian)
                        ((OP-PUSHDATA4)
                         (match (read-script-bytes 4 ctx-with-count)
                           ((ScriptErr e) (ScriptErr e))
-                          ((ScriptOk (Tuple len-bytes len-ctx))
+                          ((ScriptOk len-bytes)
                            (let ((data-len (lisp UFix (len-bytes)
                                              (cl:+ (cl:aref len-bytes 0)
                                                    (cl:ash (cl:aref len-bytes 1) 8)
@@ -2474,16 +2497,16 @@ a consensus split."
                              ;; MAX_OPS_PER_SCRIPT (:451-455) and is itself ungated.
                              (if (> data-len +max-push-size+)
                                  (ScriptErr SE-PushSize)
-                                 (match (read-script-bytes data-len len-ctx)
+                                 (match (read-script-bytes data-len ctx-with-count)
                                    ((ScriptErr e) (ScriptErr e))
-                                   ((ScriptOk (Tuple data next-ctx))
+                                   ((ScriptOk data)
                                     (if exec
                                         ;; MINIMALDATA: check if PUSHDATA4 encoding is minimal
                                         (match (check-minimal-push #x4e data)
                                           ((ScriptErr e) (ScriptErr e))
                                           ((ScriptOk _)
-                                           (push-and-continue data next-ctx)))
-                                        (execute-script-loop next-ctx)))))))))
+                                           (push-and-continue data ctx-with-count)))
+                                        (execute-script-loop ctx-with-count)))))))))
 
                        ;; All other opcodes
                        (_
@@ -2535,11 +2558,6 @@ a consensus split."
                (> len +max-script-size+))
           (ScriptErr SE-ScriptTooLarge)
           (execute-script-loop (make-script-context-with-stack-tx script initial-stack locktime version sequence)))))
-
-  (declare make-script-context-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> ScriptContext))
-  (define (make-script-context-with-stack-tx script initial-stack locktime version sequence)
-    "Create a script context with a pre-populated stack and transaction context."
-    (ScriptContext initial-stack (empty-stack) script 0 Nil True 0 0 locktime version sequence))
 
   ;;; P2SH Support
 

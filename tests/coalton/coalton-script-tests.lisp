@@ -1407,3 +1407,31 @@ implementations hash different bytes and disagree about the block."
     (is (equalp script (bl.interop::find-and-delete script pattern))
         "the pattern sits inside a push payload, so Core deletes nothing and the
          script must come back byte-identical")))
+
+;;; ============================================================
+;;; Execution cost: one context per execution
+;;; ============================================================
+
+(defun %bytes-consed-per-run (script runs)
+  "Bytes consed per execution of SCRIPT (a simple-vector) over RUNS runs."
+  (let ((b0 (sb-ext:get-bytes-consed)))
+    (dotimes (i runs) (call-execute-script script))
+    (/ (- (sb-ext:get-bytes-consed) b0) runs)))
+
+(test an-opcode-step-conses-no-context
+  "Core's EvalScript keeps its state in locals for the whole run
+(interpreter.cpp:406-428); ours rebuilt an 11-field ScriptContext on every
+update, three to five per opcode: an OP_NOP step consed 320 bytes. The
+context is now allocated once per execution and an OP_NOP step conses about
+64, its result wrappers. 200 OP_NOPs then OP_1, against OP_1 alone, 1,000 runs each: 200,000
+steps, far above the allocation-region granularity of GET-BYTES-CONSED.
+Control: an OP_1 step (which pushes a fresh vector and a cons) registers as
+consing, so a zero per-step reading cannot pass by measuring nothing."
+  (let* ((nops (concatenate 'simple-vector (make-array 200 :initial-element #x61) #(#x51)))
+         (ones (concatenate 'simple-vector (make-array 200 :initial-element #x51)))
+         (base (%bytes-consed-per-run #(#x51) 1000))
+         (per-nop (/ (- (%bytes-consed-per-run nops 1000) base) 200))
+         (per-push (/ (- (%bytes-consed-per-run ones 1000) base) 199)))
+    (is-true (script-ok-p (call-execute-script nops)))
+    (is (> per-push 32) "control: an OP_1 step consed only ~,1F bytes" per-push)
+    (is (< per-nop 128) "an OP_NOP step consed ~,1F bytes" per-nop)))

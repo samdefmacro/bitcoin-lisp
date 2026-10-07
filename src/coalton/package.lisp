@@ -256,7 +256,6 @@
    #:empty-stack
    ;; Execution context
    #:ScriptContext
-   #:make-script-context
    #:make-script-context-with-tx
    #:context-main-stack
    #:context-alt-stack
