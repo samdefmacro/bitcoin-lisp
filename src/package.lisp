@@ -293,6 +293,10 @@ init.cpp, node/. src/node/.")
    #:sync-idle-wait
    #:run-inbound-listener
    #:consider-outbound-evictions
+   #:evict-least-valuable-inbound
+   #:select-inbound-peer-to-evict
+   #:seed-eviction-netgroup-key
+   #:*eviction-netgroup-key*
    #:inbound-handshakes-in-flight
    #:node-syncing
    #:node-tip-liveness

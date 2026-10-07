@@ -74,18 +74,19 @@ for was no safer than an idle one.")
   "4 peers that most recently gave us a novel block (:199-201).")
 
 (defun %evict-erase-last-k (candidates comparator k &optional filter)
-  "Core EraseLastKElements: sort CANDIDATES by COMPARATOR and REMOVE the last K
-that satisfy FILTER — \"remove\" meaning protect, since this list is the
-eviction pool. Returns the remaining candidates.
+  "Core EraseLastKElements (eviction.cpp:77-85): sort CANDIDATES by COMPARATOR
+and, among the last K positions, REMOVE those that satisfy FILTER --
+\"remove\" meaning protect, since this list is the eviction pool. Returns the
+remaining candidates, in COMPARATOR's order as Core leaves them.
 
 The comparator orders WORST-first, so the last K are the best K by that
-measure. FILTER restricts the pass to a subset (Core's block-relay-only pass is
-the only one that uses it) without letting the excluded peers consume slots."
-  (let* ((eligible (if filter (remove-if-not filter candidates) candidates))
-         (sorted (stable-sort (copy-list eligible) comparator))
-         (n (min k (length sorted)))
-         (protected (subseq sorted (- (length sorted) n))))
-    (remove-if (lambda (p) (member p protected)) candidates)))
+measure. A FILTER does not widen the window: a position in the last K whose
+peer fails it simply stays, which is why every comparator used with one
+sorts the peers it means to protect towards the end."
+  (let* ((sorted (stable-sort (copy-list candidates) comparator))
+         (keep (max 0 (- (length sorted) k))))
+    (append (subseq sorted 0 keep)
+            (if filter (remove-if filter (nthcdr keep sorted)) '()))))
 
 (defvar *eviction-netgroup-key* nil
   "The two 64-bit words keying %EVICT-KEYED-NETGROUP, as a cons, or NIL until
@@ -163,42 +164,79 @@ the reserved quarter of the inbound slots to whoever had connected MOST
 recently — the exact attack the pass exists to preclude."
   (> (bl.net:peer-connect-time a) (bl.net:peer-connect-time b)))
 
-(defun %evict-disadvantaged-network (peer)
-  "Which of Core's four disadvantaged networks PEER belongs to, or NIL
-(eviction.cpp:118-119): CJDNS, I2P, localhost, onion. These \"tend to be
-otherwise disadvantaged under our eviction criteria\" — they are higher-latency,
-so they lose the ping pass, and inbound onion peers all share the loopback
-netgroup, so they lose the netgroup pass too."
-  (cond ((bl.net:peer-inbound-onion peer) :onion)
-        (t (multiple-value-bind (net bytes)
-               (bl.net:parse-network-address
-                (bl.net:peer-address peer))
-             (declare (ignore bytes))
-             (case net
-               (:cjdns :cjdns)
-               (:i2p :i2p)
-               (:torv3 :onion)
-               (t (when (bl.net:loopback-address-p
-                         (bl.net:peer-address peer))
-                    :local)))))))
+(defun %evict-relays-txs-p (peer)
+  "Core NodeEvictionCandidate::m_relay_txs, CNode::m_relays_txs: false until
+the peer's VERSION asks for transactions (net_processing.cpp:3695) or a
+filterload/filterclear turns relay on (:5071, :5119) -- whether the PEER
+wants our transactions, which for an inbound peer is not given by the
+connection type."
+  (and (bl.net:peer-version peer) (bl.net:peer-tx-relay-p peer) t))
+
+(defun %evict-bloom-p (peer)
+  "Core fBloomFilter, CNode::m_bloom_filter_loaded: a filterload stands."
+  (and (bl.net:peer-bloom-filter peer) t))
+
+(defun %evict-relevant-services-p (peer near-tip)
+  "Core fRelevantServices, CNode::m_has_all_wanted_services: the peer offers
+every service we want of an outbound peer (HasAllDesirableServiceFlags).
+Core records it when the VERSION arrives (net_processing.cpp:3672); ours
+reads the peer's services now, with NEAR-TIP as it stands now -- the two
+differ only for a NODE_NETWORK_LIMITED peer that connected before we were
+near the tip."
+  (bl.net:has-all-desirable-service-flags-p (bl.net:peer-services peer) near-tip))
+
+(defun %evict-tx-time< (a b)
+  "Core CompareNodeTXTime (eviction.cpp:38-45): last novel transaction, then
+a peer relaying transactions to us above one that does not, then one without
+a bloom filter above one with, then the longest-connected."
+  (let ((ta (bl.net:peer-last-tx-time a)) (tb (bl.net:peer-last-tx-time b)))
+    (cond ((/= ta tb) (< ta tb))
+          ((not (eq (%evict-relays-txs-p a) (%evict-relays-txs-p b))) (%evict-relays-txs-p b))
+          ((not (eq (%evict-bloom-p a) (%evict-bloom-p b))) (%evict-bloom-p a))
+          (t (%evict-newest-first a b)))))
+
+(defun %evict-block-time< (near-tip)
+  "Core CompareNodeBlockTime (eviction.cpp:30-36): last novel block, then a
+peer with the services we want above one without, then the longest-connected."
+  (lambda (a b)
+    (let ((ta (bl.net:peer-last-block-time a)) (tb (bl.net:peer-last-block-time b)))
+      (cond ((/= ta tb) (< ta tb))
+            ((not (eq (%evict-relevant-services-p a near-tip) (%evict-relevant-services-p b near-tip)))
+             (%evict-relevant-services-p b near-tip))
+            (t (%evict-newest-first a b))))))
+
+(defun %evict-block-relay-only-time< (near-tip)
+  "Core CompareNodeBlockRelayOnlyTime (eviction.cpp:48-54): peers relaying
+transactions first, so the block-relay-only ones take the last positions;
+then CompareNodeBlockTime's order."
+  (let ((block< (%evict-block-time< near-tip)))
+    (lambda (a b)
+      (if (not (eq (%evict-relays-txs-p a) (%evict-relays-txs-p b)))
+          (%evict-relays-txs-p a)
+          (funcall block< a b)))))
+
+(defparameter +evict-disadvantaged-networks+ '(:cjdns :i2p :local :torv3)
+  "Core ProtectEvictionCandidatesByRatio's four networks, in its array order
+(eviction.cpp:118-119), which breaks ties between equal counts.")
+
+(defun %evict-on-network-p (peer net)
+  "Whether PEER counts towards disadvantaged network NET: localhost is Core's
+m_is_local (the peer's ADDRESS, so an inbound onion peer arriving through
+the local Tor daemon is local too), the others its m_network,
+ConnectedThroughNetwork (eviction.cpp:127-130)."
+  (if (eq net :local)
+      (bl.net:loopback-address-p (bl.net:peer-address peer))
+      (eq net (bl.net:peer-connected-through-network peer))))
 
 (defun %evict-protect-by-ratio (candidates)
-  "Core ProtectEvictionCandidatesByRatio (eviction.cpp:104-176).
+  "Core ProtectEvictionCandidatesByRatio (eviction.cpp:105-176).
 
 Protects the half of the remaining candidates connected longest, and reserves
 up to half of THAT (a quarter of the candidates) for the four disadvantaged
-networks — giving the network with the FEWEST candidates first claim on unused
-slots, so a single onion peer is not crowded out by a dozen I2P ones.
-
-Within the reserve the peers protected are that network's LONGEST-connected
-ones, the same measure as the general half; both passes go through
-%EVICT-NEWEST-FIRST, which is where the direction is stated once.
-
-This replaces an ad-hoc onion exemption that predated it here. The exemption
-worked for the case it was written for — every inbound onion peer shares the
-loopback netgroup, so two of them were automatically the largest group and one
-was evicted on every admission — but it protected onion peers absolutely rather
-than proportionally, so an all-onion inbound set could not make room at all."
+networks -- giving the network with the FEWEST candidates first claim on
+unused slots, so a single onion peer is not crowded out by a dozen I2P ones.
+Each network's pass sorts by Core's CompareNodeNetworkTime (:64-76): the
+network's own peers last, the longest-connected last among them."
   (let* ((initial (length candidates))
          (total-protect (floor initial 2))
          (max-by-network (floor total-protect 2))
@@ -206,54 +244,53 @@ than proportionally, so an all-onion inbound set could not make room at all."
          (remaining candidates)
          ;; Counts per network, fewest first: Core sorts ascending so the
          ;; scarcest network gets first claim on slots the others leave.
-         (networks (list :cjdns :i2p :local :onion))
-         (counts (mapcar (lambda (net)
-                           (cons net (count net candidates
-                                            :key #'%evict-disadvantaged-network)))
-                         networks)))
-    (setf counts (stable-sort counts #'< :key #'cdr))
+         (counts (stable-sort
+                  (mapcar (lambda (net)
+                            (cons net (count-if (lambda (p) (%evict-on-network-p p net)) candidates)))
+                          +evict-disadvantaged-networks+)
+                  #'< :key #'cdr)))
     (loop while (< num-protected max-by-network)
           do (let ((live (count-if #'plusp counts :key #'cdr)))
                (when (zerop live) (return))
-               (let* ((left (- max-by-network num-protected))
-                      (per-network (max 1 (floor left live)))
-                      (protected-any nil))
+               (let ((per-network (max 1 (floor (- max-by-network num-protected) live)))
+                     (protected-any nil))
                  (dolist (entry counts)
                    (when (plusp (cdr entry))
                      (let* ((net (car entry))
-                            (before (length remaining))
-                            (after (%evict-erase-last-k
-                                    remaining
-                                    #'%evict-newest-first
-                                    per-network
-                                    (lambda (p) (eq net (%evict-disadvantaged-network p))))))
-                       (setf remaining after)
+                            (on-net (lambda (p) (%evict-on-network-p p net)))
+                            (before (length remaining)))
+                       (setf remaining
+                             (%evict-erase-last-k
+                              remaining
+                              (lambda (a b)
+                                (let ((ma (funcall on-net a)) (mb (funcall on-net b)))
+                                  (if (eq ma mb) (%evict-newest-first a b) mb)))
+                              per-network on-net))
                        (let ((delta (- before (length remaining))))
                          (when (plusp delta)
                            (setf protected-any t)
                            (incf num-protected delta)
-                           (decf (cdr entry) delta)
-                           (when (>= num-protected max-by-network) (return)))))))
+                           (when (>= num-protected max-by-network) (return))
+                           (decf (cdr entry) delta))))))
                  (unless protected-any (return)))))
     ;; Whatever is left of the half goes to the longest-connected.
-    (%evict-erase-last-k remaining
-                         #'%evict-newest-first
-                         (max 0 (- total-protect num-protected)))))
+    (%evict-erase-last-k remaining #'%evict-newest-first (- total-protect num-protected))))
 
-(defun select-inbound-peer-to-evict (inbound)
+(defun select-inbound-peer-to-evict (inbound &key near-tip)
   "Core SelectNodeToEvict (eviction.cpp:178-240), pass for pass. Returns the
-peer to evict, or NIL when every candidate is protected.
+peer to evict, or NIL when every candidate is protected. NEAR-TIP decides
+which services a peer must offer to count as relevant (see
+%EVICT-RELEVANT-SERVICES-P).
 
 The order is load-bearing and is Core's: noban, then the five \"has done
-something useful\" passes with Core's own k values, then the ratio reserve,
-then prefer-evict, then the most-populous netgroup, youngest first.
-
-Ours previously ran four passes at k=4 apiece with no netgroup pass, no
-block-relay-only pass, no noban protection, and an onion exemption standing in
-for the ratio reserve."
+something useful\" passes with Core's own k values and comparators -- each
+with Core's tie-breaks, which decide the protected set whenever peers share
+the measure, as every peer that has not yet relayed a transaction does --
+then the ratio reserve, then prefer-evict, then the most-populous netgroup,
+youngest first."
   (let ((candidates inbound))
-    ;; ProtectNoBanConnections (eviction.cpp:181). Only possible since net
-    ;; permissions landed; a noban peer is never evicted for any reason.
+    ;; ProtectNoBanConnections (eviction.cpp:181). A noban peer is never
+    ;; evicted for any reason.
     (setf candidates
           (remove-if (lambda (p)
                        (bl.net:peer-has-permission-p
@@ -275,29 +312,18 @@ for the ratio reserve."
                                    (if (plusp l) l most-positive-fixnum))))
                           (> (ping a) (ping b))))
                       +evict-protect-min-ping+))
+    (setf candidates (%evict-erase-last-k candidates #'%evict-tx-time< +evict-protect-tx+))
+    ;; Up to 8 block-relay-only peers that have given us blocks: of the last 8
+    ;; positions, only peers not relaying transactions and offering the
+    ;; services we want are protected (eviction.cpp:195-197).
     (setf candidates (%evict-erase-last-k
-                      candidates
-                      (lambda (a b)
-                        (< (bl.net:peer-last-tx-time a)
-                           (bl.net:peer-last-tx-time b)))
-                      +evict-protect-tx+))
-    ;; Block-relay-only peers that have given us blocks: Core filters this pass
-    ;; to non-tx-relay peers so the slots cannot be taken by ordinary peers
-    ;; that happen to have relayed a block.
-    (setf candidates (%evict-erase-last-k
-                      candidates
-                      (lambda (a b)
-                        (< (bl.net:peer-last-block-time a)
-                           (bl.net:peer-last-block-time b)))
+                      candidates (%evict-block-relay-only-time< near-tip)
                       +evict-protect-block-relay-only+
                       (lambda (p)
-                        (not (bl.net:peer-relays-txs-p p)))))
-    (setf candidates (%evict-erase-last-k
-                      candidates
-                      (lambda (a b)
-                        (< (bl.net:peer-last-block-time a)
-                           (bl.net:peer-last-block-time b)))
-                      +evict-protect-block+))
+                        (and (not (%evict-relays-txs-p p))
+                             (%evict-relevant-services-p p near-tip)))))
+    (setf candidates (%evict-erase-last-k candidates (%evict-block-time< near-tip)
+                                          +evict-protect-block+))
     (setf candidates (%evict-protect-by-ratio candidates))
     (when (null candidates)
       (return-from select-inbound-peer-to-evict nil))
@@ -343,7 +369,9 @@ AttemptToEvictConnection pass for pass."
     (let ((inbound (remove-if-not #'bl.net:peer-inbound
                                   (node-peers node))))
       (when (cdr inbound)               ; need >1 so something stays protected
-        (let ((victim (select-inbound-peer-to-evict inbound)))
+        (let ((victim (select-inbound-peer-to-evict
+                       inbound :near-tip (and (node-chain-state node)
+                                              (bl.net:near-tip-p (node-chain-state node))))))
           (when victim
             (log-cat "net" "selected inbound connection for eviction, ~A"
                      (bl.net:disconnect-msg victim))
