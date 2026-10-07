@@ -133,15 +133,15 @@ signal out of IBD clears both."
   (let ((h (%tdm-hash 4200))
         (state (bl.store:make-chain-state)))
     (%with-fresh-txdownloadman (mgr)
-      (bl:add-recent-reject (bl.net:txdownload-recent-rejects mgr) h)
-      (bl:add-recent-reject (bl.net:txdownload-recent-rejects-reconsiderable mgr) h)
+      (bl.net:rolling-bloom-insert (bl.net:txdownload-recent-rejects mgr) h)
+      (bl.net:rolling-bloom-insert (bl.net:txdownload-recent-rejects-reconsiderable mgr) h)
       (let ((bl.net:*cached-is-ibd* t))
         (bl.vi:notify-active-tip-change state))
-      (is-true (bl:recent-reject-p (bl.net:txdownload-recent-rejects mgr) h))
-      (is-true (bl:recent-reject-p (bl.net:txdownload-recent-rejects-reconsiderable mgr) h))
+      (is-true (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects mgr) h))
+      (is-true (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects-reconsiderable mgr) h))
       (bl.vi:notify-active-tip-change state)
-      (is-false (bl:recent-reject-p (bl.net:txdownload-recent-rejects mgr) h))
-      (is-false (bl:recent-reject-p (bl.net:txdownload-recent-rejects-reconsiderable mgr) h)))))
+      (is-false (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects mgr) h))
+      (is-false (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects-reconsiderable mgr) h)))))
 
 ;;; --- The method contracts ---
 
@@ -213,16 +213,16 @@ does."
            (reconsiderable (bl.net:txdownload-recent-rejects-reconsiderable mgr)))
       (is-false (equalp txid wtxid))
       (is-false (bl.net:txdownload-mempool-rejected-tx mgr witness-tx :witness-stripped 1 t))
-      (is-false (bl:recent-reject-p rejects wtxid))
-      (is-false (bl:recent-reject-p rejects txid))
+      (is-false (bl.net:rolling-bloom-contains-p rejects wtxid))
+      (is-false (bl.net:rolling-bloom-contains-p rejects txid))
       (is-true (bl.net:txdownload-mempool-rejected-tx mgr witness-tx :insufficient-fee 1 t))
-      (is-true (bl:recent-reject-p reconsiderable wtxid))
-      (is-false (bl:recent-reject-p rejects wtxid))
+      (is-true (bl.net:rolling-bloom-contains-p reconsiderable wtxid))
+      (is-false (bl.net:rolling-bloom-contains-p rejects wtxid))
       (is-false (bl.net:txdownload-mempool-rejected-tx mgr witness-tx :not-standard 1 nil))
-      (is-true (bl:recent-reject-p rejects wtxid))
-      (is-false (bl:recent-reject-p rejects txid))
+      (is-true (bl.net:rolling-bloom-contains-p rejects wtxid))
+      (is-false (bl.net:rolling-bloom-contains-p rejects txid))
       (bl.net:txdownload-mempool-rejected-tx mgr witness-tx :nonstandard-inputs 1 nil)
-      (is-true (bl:recent-reject-p rejects txid)))))
+      (is-true (bl.net:rolling-bloom-contains-p rejects txid)))))
 
 (test received-tx-offers-a-package-for-a-reconsiderable-parent
   "ReceivedTx (txdownloadman_impl.cpp:505-555): a transaction already known
@@ -273,7 +273,7 @@ SendMessages asks for what GetRequestsToSend hands out, as MSG_WTX for a wtxid
                  (lambda () (deliver-inv peer (tx-inv-payload bl.ser:+inv-type-wtx+ wtxid) ctx))))
           "the inv handler sends nothing")
       (is (equal (list peer) (tx-request-candidate-peers wtxid)))
-      (let ((sent (captured-sends (lambda () (bl.net:send-tx-requests-to-peers (list peer) mgr)))))
+      (let ((sent (captured-sends (lambda () (bl.net:send-tx-requests peer mgr)))))
         (is (= 1 (length sent)))
         (when sent
           (let ((bytes (first sent)))
@@ -282,3 +282,89 @@ SendMessages asks for what GetRequestsToSend hands out, as MSG_WTX for a wtxid
                    (logior (aref bytes 25) (ash (aref bytes 26) 8)
                            (ash (aref bytes 27) 16) (ash (aref bytes 28) 24))))
             (is (equalp wtxid (subseq bytes 29 61)))))))))
+
+;;; --- Round 12 phase 2: Core's filters and Core's asserts ---
+
+(test the-rejects-filter-remembers-core-s-120-000
+  "Core's recent-rejects filter is a CRollingBloomFilter of 120,000 at one in
+a million (txdownloadman_impl.h:61-66): a rejection is remembered for at
+least 120,000 later ones. Ours was a 50,000-entry ring, so the 50,001st
+rejection evicted the first and the transaction was downloaded again. And it
+has Core's false-positive rate: none of 10,000 keys never inserted."
+  (%with-fresh-txdownloadman (mgr)
+    (let ((rejects (bl.net:txdownload-recent-rejects mgr))
+          (key (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5)))
+                 (lambda (i)
+                   (dotimes (k 4 (copy-seq h)) (setf (aref h k) (ldb (byte 8 (* 8 k)) i)))))))
+      (dotimes (i 60001)
+        (bl.net:rolling-bloom-insert rejects (funcall key i)))
+      (is-true (bl.net:rolling-bloom-contains-p rejects (funcall key 0))
+               "the first of 60,001 rejections is still remembered")
+      (is (zerop (loop for i from 70000 below 80000
+                       count (bl.net:rolling-bloom-contains-p rejects (funcall key i))))))
+    (is (= 20 (bl.net:rolling-bloom-filter-hash-funcs
+               (bl.net:txdownload-recent-rejects-reconsiderable mgr))))
+    (is (= 64700 (length (bl.net:rolling-bloom-filter-data
+                          (bl.net:txdownload-recent-confirmed mgr)))))))
+
+(test a-departed-peers-leftovers-fail-core-s-check-is-empty
+  "Core asserts CheckIsEmpty once no peer is left (net_processing.cpp:
+1720-1730) and for a new peer at InitializeNode (:1612): a manager still
+holding an orphan to reconsider, or a request outstanding, for a peer that
+is gone is a bookkeeping leak, and Core aborts. Ours logged it. Here state is
+planted for a peer that never registered (no DisconnectedPeer will clean it)
+and the last registered peer then disconnects through the shipped
+DISCONNECT-PEER: TXDOWNLOAD-CHECK-FAILED. Control: the same disconnect with
+nothing planted is quiet."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (declare (ignore utxo state))
+    (let ((parent (pkg-tx funding 0 (- 100000000 50000))))
+      (%with-fresh-txdownloadman (mgr mempool)
+        (let ((last (%tdm-peer)))
+          (bl.net:txdownload-connected-peer mgr last (bl.net:txdownload-connection-info-for last))
+          (finishes (bl.net:disconnect-peer last) "control: nothing left, no signal")))
+      ;; An orphan in a departed peer's work set.
+      (%with-fresh-txdownloadman (mgr mempool)
+        (let ((last (%tdm-peer))
+              (child (pkg-tx (bl.ser:transaction-hash parent) 0 (- 100000000 100000))))
+          (bl.net:txdownload-connected-peer mgr last (bl.net:txdownload-connection-info-for last))
+          (bl.mp:orphan-add (bl.net:txdownload-orphanage mgr) child 41)
+          (bl.mp:orphan-add-children-to-work-set (bl.net:txdownload-orphanage mgr) parent)
+          (is-true (bl.mp:orphan-have-tx-to-reconsider (bl.net:txdownload-orphanage mgr) 41))
+          (signals bl.net:txdownload-check-failed (bl.net:disconnect-peer last))))
+      ;; A request outstanding to a departed peer.
+      (%with-fresh-txdownloadman (mgr mempool)
+        (let ((last (%tdm-peer))
+              (tr (bl.net:txdownload-txrequest mgr))
+              (h (%tdm-hash 4700)))
+          (bl.net:txdownload-connected-peer mgr last (bl.net:txdownload-connection-info-for last))
+          (bl.net:txrequest-received-inv tr 42 h t t 0)
+          (bl.net:txrequest-requested-tx tr 42 h 100)
+          (signals bl.net:txdownload-check-failed (bl.net:disconnect-peer last))))
+      ;; The per-peer form, Core's CheckIsEmpty(nodeid) at InitializeNode.
+      (%with-fresh-txdownloadman (mgr mempool)
+        (bl.net:txrequest-received-inv (bl.net:txdownload-txrequest mgr) 43 (%tdm-hash 4701) t t 0)
+        (signals bl.net:txdownload-check-failed (bl.net:txdownload-assert-empty mgr 43))
+        (finishes (bl.net:txdownload-assert-empty mgr 44))))))
+
+(test a-peer-s-getdata-goes-out-with-its-own-message-turn
+  "Core's message handler pairs each node's ProcessMessages with its
+SendMessages (net.cpp:3143-3148), so a peer is asked for what
+GetRequestsToSend hands it at the end of its own turn, not after every other
+peer's messages: DRAIN-AND-REAP-PEER ends with that peer's getdata."
+  (let* ((state (bl.store:make-chain-state))
+         (mempool (bl.mp:make-mempool))
+         (peer (%tdm-peer :wtxid-relay t))
+         (other (%tdm-peer :wtxid-relay t))
+         (wtxid (%tdm-hash 4800))
+         (ctx (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+    (%with-fresh-txdownloadman (mgr mempool)
+      (bl.net:txdownload-add-tx-announcement mgr peer wtxid t (bl.ser:get-unix-time))
+      (bl.net:txdownload-add-tx-announcement mgr other (%tdm-hash 4801) t (bl.ser:get-unix-time))
+      (setf (bl.net:peer-connection peer)
+            (make-test-connection :host "127.0.0.1" :port 1 :connected t))
+      (let ((sent (captured-sends (lambda () (ignore-errors (drain-peer-once peer ctx))))))
+        (is (= 1 (count "getdata" sent :key #'message-command :test #'string=)))
+        (is (eq peer (tx-request-in-flight-peer wtxid)))
+        (is (null (tx-request-in-flight-peer (%tdm-hash 4801)))
+            "the other peer is asked at its own turn")))))

@@ -273,8 +273,8 @@ manager holds nothing for any of them, and nothing at all."
   "No TRANSACTIONS entry, by either id, in either rejection filter."
   (loop for tx across *tdm-transactions*
         always (loop for id in (list (bl.ser:transaction-wtxid tx) (bl.ser:transaction-hash tx))
-                     never (or (bl:recent-reject-p (bl.net:txdownload-recent-rejects mgr) id)
-                               (bl:recent-reject-p (bl.net:txdownload-recent-rejects-reconsiderable mgr)
+                     never (or (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects mgr) id)
+                               (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects-reconsiderable mgr)
                                                    id)))))
 
 (defun tdm-check-invariants (mgr)
@@ -299,15 +299,15 @@ and no peer but the relay-permission one over MAX_PEER_TX_ANNOUNCEMENTS."
       (let ((reconsiderable (bl.net:txdownload-recent-rejects-reconsiderable mgr))
             (rejects (bl.net:txdownload-recent-rejects mgr)))
         ;; The parent failed reconsiderably and the child is an orphan...
-        (fuzz-assert (bl:recent-reject-p reconsiderable (bl.ser:transaction-wtxid tx)))
+        (fuzz-assert (bl.net:rolling-bloom-contains-p reconsiderable (bl.ser:transaction-wtxid tx)))
         (fuzz-assert (bl.mp:orphan-have (bl.net:txdownload-orphanage mgr)
                                         (bl.ser:transaction-wtxid (bl.net:ptv-child package))))
         ;; ...the pairing has not failed before, and neither is a reject.
-        (fuzz-assert (not (bl:recent-reject-p reconsiderable
+        (fuzz-assert (not (bl.net:rolling-bloom-contains-p reconsiderable
                                               (bl.val:package-hash (bl.net:ptv-txns package)))))
-        (fuzz-assert (not (bl:recent-reject-p rejects
+        (fuzz-assert (not (bl.net:rolling-bloom-contains-p rejects
                                               (bl.ser:transaction-wtxid (bl.net:ptv-parent package)))))
-        (fuzz-assert (not (bl:recent-reject-p rejects
+        (fuzz-assert (not (bl.net:rolling-bloom-contains-p rejects
                                               (bl.ser:transaction-wtxid (bl.net:ptv-child package)))))))))
 
 (define-fuzz-target txdownloadman-impl
@@ -342,12 +342,12 @@ everything empty once every peer has gone."
                                                       (fuzz-sabotage (bl.ser:transaction-wtxid tx))))))
           (progn (bl.net:txdownload-block-disconnected mgr)
                  (let ((confirmed (bl.net:txdownload-recent-confirmed mgr)))
-                   (fuzz-assert (not (bl:recent-reject-p confirmed (bl.ser:transaction-wtxid tx))))
-                   (fuzz-assert (not (bl:recent-reject-p confirmed (bl.ser:transaction-hash tx))))))
+                   (fuzz-assert (not (bl.net:rolling-bloom-contains-p confirmed (bl.ser:transaction-wtxid tx))))
+                   (fuzz-assert (not (bl.net:rolling-bloom-contains-p confirmed (bl.ser:transaction-hash tx))))))
           (bl.net:txdownload-mempool-accepted-tx mgr tx)
           (let* ((reason (pick-value-in-array fdp *tdm-tested-results*))
                  (first-time (consume-bool fdp))
-                 (rejected-before (bl:recent-reject-p (bl.net:txdownload-recent-rejects mgr)
+                 (rejected-before (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects mgr)
                                                       (bl.ser:transaction-wtxid tx))))
             (multiple-value-bind (add-extra parents)
                 (bl.net:txdownload-mempool-rejected-tx mgr tx reason peer first-time)

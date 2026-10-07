@@ -581,16 +581,13 @@ slot was actually returned."
   ;; (net_processing.cpp:1709-1712): the peer's orphan ANNOUNCEMENTS go
   ;; (orphans other peers also announced survive), its tracked announcements
   ;; go and its in-flight requests become the next candidate's, and its
-  ;; registration goes. When the last peer has gone, Core asserts the manager
-  ;; is empty (:1720-1730); we log what is left instead of aborting.
+  ;; registration goes. Once no peer is left, Core asserts the manager is
+  ;; empty (:1720-1730) -- "no peer left" being, for the manager, no peer
+  ;; registered with it.
   (let ((mgr (node-txdownloadman)))
     (txdownload-disconnected-peer mgr peer)
-    (let ((node bl:*node*))
-      (when (and node (notany (lambda (p) (and (not (eq p peer))
-                                               (not (eq (peer-state p) :disconnected))))
-                              (bl:node-peers node)))
-        (dolist (problem (txdownload-check-is-empty mgr))
-          (bl:log-warn "TxDownloadManager not empty after the last peer: ~A" problem))))))
+    (when (zerop (txdownload-peer-count mgr))
+      (txdownload-assert-empty mgr))))
 
 (defun peer-handshake-in-flight-p (peer)
   "T while PEER's version handshake is still running, i.e. Core's
@@ -1623,11 +1620,9 @@ was dropped by us. Found by the p2p_handshake fuzz target (tests/fuzz/)."
                 ;; m_txdownloadman.ConnectedPeer before it is marked
                 ;; successfully connected (net_processing.cpp:3888-3895);
                 ;; InitializeNode has already asserted the manager holds
-                ;; nothing for it (CheckIsEmpty(nodeid), :1612), which we log.
+                ;; nothing for it (CheckIsEmpty(nodeid), :1612).
                 (let ((mgr (node-txdownloadman)))
-                  (dolist (problem (txdownload-check-is-empty mgr peer))
-                    (bl:log-warn "TxDownloadManager holds state for new ~A: ~A"
-                                 (peer-log-name peer) problem))
+                  (txdownload-assert-empty mgr peer)
                   (txdownload-connected-peer mgr peer (txdownload-connection-info-for peer)))
                 (setf (peer-state peer) :ready)
                 (return t))

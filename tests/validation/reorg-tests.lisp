@@ -467,6 +467,36 @@ activate-block returns :unknown-parent without doing anything."
         (is (= 1 (bl.store:current-height chain-state)))))
     (clear-undo-cache))))
 
+(test invalidating-an-active-block-clears-the-rejection-filters
+  "Core's InvalidateBlock fires ActiveTipChange for the new tip whenever the
+invalidated block was on the active chain (validation.cpp:3708-3726), and
+outside IBD that resets both rejection filters (net_processing.cpp:2052-2058):
+a transaction refused at the old tip may be valid at the new one. A2 of
+genesis-A1-A2-A3 is invalidated -- not the tip -- and both filters are empty
+afterwards. Control: an invalidation of a block off the active chain moves no
+tip and fires nothing, so a rejection cached after the first one survives."
+  (with-network (:mainnet)
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (make-activate-block-fixture "invalidate-rejects")
+     (let ((bl.net:*cached-is-ibd* nil)
+           (mgr (bl.net:reset-txdownloadman))
+           (hashes (make-test-chain-hashes #xB0 3))
+           (cached (make-array 32 :element-type '(unsigned-byte 8) :initial-element 91)))
+       (build-and-connect chain-state block-store utxo-set genesis-hash hashes)
+       (bl.net:rolling-bloom-insert (bl.net:txdownload-recent-rejects mgr) cached)
+       (bl.net:rolling-bloom-insert (bl.net:txdownload-recent-rejects-reconsiderable mgr) cached)
+       (is (eq t (bl.val:invalidate-block chain-state block-store utxo-set (second hashes))))
+       (is (= 1 (bl.store:current-height chain-state)))
+       (is-false (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects mgr) cached))
+       (is-false (bl.net:rolling-bloom-contains-p
+                  (bl.net:txdownload-recent-rejects-reconsiderable mgr) cached))
+       ;; A3 is already off the active chain: invalidating it changes no tip.
+       (bl.net:rolling-bloom-insert (bl.net:txdownload-recent-rejects mgr) cached)
+       (bl.val:invalidate-block chain-state block-store utxo-set (third hashes))
+       (is-true (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-rejects mgr) cached)))
+     (bl.net:reset-txdownloadman)
+     (clear-undo-cache))))
+
 (test invalidate-and-reconsider-block
   "invalidate-block marks a block + descendants invalid and reorgs to its parent;
 reconsider-block clears the flags and reorgs back to the best valid chain."
@@ -1732,18 +1762,18 @@ only place Core resets it: ActiveTipChange is skipped while is_ibd."
            (rejects (bl.net:txdownload-recent-rejects (bl.net:reset-txdownloadman)))
            (cached (make-array 32 :element-type '(unsigned-byte 8)
                                   :initial-element 77)))
-       (bl:add-recent-reject rejects cached)
-       (is-true (bl:recent-reject-p rejects cached))
+       (bl.net:rolling-bloom-insert rejects cached)
+       (is-true (bl.net:rolling-bloom-contains-p rejects cached))
        ;; Plain tip extension: genesis -> B1 (no reorg involved).
        (let* ((b1-hash (first (make-test-chain-hashes #xE8 1)))
               (b1 (make-reorg-test-block genesis-hash b1-hash 1)))
          (bl.val:connect-block b1 chain-state block-store utxo-set)
          (is (= 1 (bl.store:current-height chain-state)))
          (is (equalp b1-hash (bl.store:best-block-hash chain-state))))
-       (is-false (bl:recent-reject-p rejects cached))
+       (is-false (bl.net:rolling-bloom-contains-p rejects cached))
        ;; And the filter still works after the reset.
-       (bl:add-recent-reject rejects cached)
-       (is-true (bl:recent-reject-p rejects cached)))
+       (bl.net:rolling-bloom-insert rejects cached)
+       (is-true (bl.net:rolling-bloom-contains-p rejects cached)))
      (bl.net:reset-txdownloadman)
      (clear-undo-cache))))
 

@@ -1998,8 +1998,8 @@ since wtxid = txid there."
     (is-false (equalp txid wtxid))
     (with-tx-relay-out-of-ibd
       (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
-    (is-true (bl:recent-reject-p rejects wtxid))
-    (is-false (bl:recent-reject-p rejects txid))))
+    (is-true (bl.net:rolling-bloom-contains-p rejects wtxid))
+    (is-false (bl.net:rolling-bloom-contains-p rejects txid))))
 
 ;;;; Wave 8A: tx-relay request path (orphan-parent fetch, failover id type,
 ;;;; reject-poisoning semantics) — Core txdownloadman/txrequest parity.
@@ -2200,7 +2200,7 @@ parents', txdownloadman_impl.cpp:422-436)."
          (payload (subseq (bl.ser:make-tx-message tx :witness t) 24)))
     (is-false (equalp txid wtxid))
     ;; The missing parent was recently rejected.
-    (bl:add-recent-reject rejects parent-txid)
+    (bl.net:rolling-bloom-insert rejects parent-txid)
     (let ((log (nth-value 1 (log-text-of
                              "mempool"
                              (lambda ()
@@ -2214,8 +2214,8 @@ parents', txdownloadman_impl.cpp:422-436)."
                "log: ~A" log))
     ;; Rejected under both ids; never admitted to the orphan pool; the
     ;; parent was NOT re-requested.
-    (is-true (bl:recent-reject-p rejects txid))
-    (is-true (bl:recent-reject-p rejects wtxid))
+    (is-true (bl.net:rolling-bloom-contains-p rejects txid))
+    (is-true (bl.net:rolling-bloom-contains-p rejects wtxid))
     (is-false (bl.mp:orphan-tx
                (test-orphanage) txid))
     (is (null (tx-request-in-flight-peer txid)))
@@ -2243,8 +2243,8 @@ and the tx itself is not cached as a reject."
     (is-true (bl.mp:orphan-tx
               (test-orphanage)
               (bl.ser:transaction-wtxid tx)))
-    (is-false (bl:recent-reject-p rejects txid))
-    (is-false (bl:recent-reject-p
+    (is-false (bl.net:rolling-bloom-contains-p rejects txid))
+    (is-false (bl.net:rolling-bloom-contains-p
                rejects (bl.ser:transaction-wtxid tx)))
     ;; Parent fetch registered as a txid-based tracker entry, asked of the
     ;; orphan's peer at the SendMessages pass that follows.
@@ -2293,9 +2293,9 @@ genuinely failing non-witness-program spend IS still cached (wtxid-keyed)."
     (deliver-tx peer (subseq (bl.ser:make-tx-message failing) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool))
     ;; The plain script failure IS cached (proves this fixture reaches the
     ;; reject-insert path)...
-    (is-true (bl:recent-reject-p rejects failing-id))
+    (is-true (bl.net:rolling-bloom-contains-p rejects failing-id))
     ;; ...but the witness-stripped one is NOT.
-    (is-false (bl:recent-reject-p rejects stripped-id))
+    (is-false (bl.net:rolling-bloom-contains-p rejects stripped-id))
     (bl.net:reset-txdownloadman)))
 
 (test bip35-mempool-message-disconnects
