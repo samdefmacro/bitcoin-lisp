@@ -83,15 +83,18 @@ burned rather than merely hard to spend."
 ;;; which compiles to an inlined memcmp(32) + uint32 compare
 ;;; (primitives/transaction.h:49).
 
+(declaim (inline %make-utxo-key))
 (defstruct (utxo-key (:conc-name uk-)
                      (:constructor %make-utxo-key (a b c d vout))
                      (:copier nil)
                      (:predicate nil))
-  (a 0 :type (unsigned-byte 64) :read-only t)
-  (b 0 :type (unsigned-byte 64) :read-only t)
-  (c 0 :type (unsigned-byte 64) :read-only t)
-  (d 0 :type (unsigned-byte 64) :read-only t)
-  (vout 0 :type (unsigned-byte 32) :read-only t))
+  ;; Never changed once a key is made -- a key a table holds must not move --
+  ;; except by %FILL-UTXO-KEY on a probe key WITH-UTXO-PROBE-KEY has claimed.
+  (a 0 :type (unsigned-byte 64))
+  (b 0 :type (unsigned-byte 64))
+  (c 0 :type (unsigned-byte 64))
+  (d 0 :type (unsigned-byte 64))
+  (vout 0 :type (unsigned-byte 32)))
 
 (declaim (inline txid-bytes->u64-le))
 (defun txid-bytes->u64-le (bytes offset)
@@ -119,6 +122,62 @@ into a utxo-key struct."
                   (txid-bytes->u64-le txid 16)
                   (txid-bytes->u64-le txid 24)
                   output-index))
+
+(sb-ext:defglobal **utxo-probe-keys**
+    (let ((pool (make-array 4)))
+      (dotimes (i 4 pool) (setf (svref pool i) (%make-utxo-key 0 0 0 0 0))))
+  "Probe keys for lookups that do not keep their key, each slot claimed by
+compare-and-swap so concurrent threads never share one; an empty slot means
+claimed.")
+
+(declaim (inline %claim-utxo-probe-key %release-utxo-probe-key %fill-utxo-key))
+(defun %claim-utxo-probe-key ()
+  "A probe key from the pool, or a fresh one when every slot is in use."
+  (let ((pool **utxo-probe-keys**))
+    (dotimes (i 4 (%make-utxo-key 0 0 0 0 0))
+      (let ((key (svref pool i)))
+        (when (and key (eq key (sb-ext:compare-and-swap (svref pool i) key nil)))
+          (return key))))))
+
+(defun %release-utxo-probe-key (key)
+  "Return KEY to the first empty slot of the pool (a fresh key with no free
+slot is dropped)."
+  (let ((pool **utxo-probe-keys**))
+    (dotimes (i 4)
+      (when (null (sb-ext:compare-and-swap (svref pool i) nil key))
+        (return)))))
+
+(defun %fill-utxo-key (key txid output-index)
+  (declare (type utxo-key key)
+           (type (simple-array (unsigned-byte 8) (*)) txid)
+           (type (unsigned-byte 32) output-index)
+           (optimize (speed 3) (safety 0)))
+  (setf (uk-a key) (txid-bytes->u64-le txid 0)
+        (uk-b key) (txid-bytes->u64-le txid 8)
+        (uk-c key) (txid-bytes->u64-le txid 16)
+        (uk-d key) (txid-bytes->u64-le txid 24)
+        (uk-vout key) output-index)
+  key)
+
+(defmacro with-utxo-probe-key ((var txid output-index) &body body)
+  "Run BODY with VAR bound to the utxo-key of TXID:OUTPUT-INDEX, for a lookup
+that does not keep it -- GETHASH, REMHASH, a read of the coins view. Core's
+CCoinsViewCache::FetchCoin hashes the COutPoint it was handed in place
+(coins.cpp:46-63, SaltedOutpointHasher), with no key object to allocate; a
+fresh key here was 192 bytes per coin lookup (the struct, and its four 64-bit
+words boxed on the way into an out-of-line constructor). The key is one of a
+small pool, claimed for BODY's extent and refilled, so nothing reached from
+BODY may store VAR: a table that has to keep the key stores COPY-UTXO-KEY of
+it (FETCH-COIN does)."
+  `(let ((,var (%fill-utxo-key (%claim-utxo-probe-key) ,txid ,output-index)))
+     (unwind-protect (progn ,@body)
+       (%release-utxo-probe-key ,var))))
+
+(defun copy-utxo-key (key)
+  "A heap copy of KEY, for storing a key that may be a WITH-UTXO-PROBE-KEY
+probe."
+  (declare (type utxo-key key))
+  (%make-utxo-key (uk-a key) (uk-b key) (uk-c key) (uk-d key) (uk-vout key)))
 
 (declaim (inline utxo-key=))
 (defun utxo-key= (x y)

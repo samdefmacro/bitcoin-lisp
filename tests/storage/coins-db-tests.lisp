@@ -383,3 +383,62 @@ uninterrupted run gives."
       (is (= 0 (%old-layout-keys path)))
       (is (equalp key (%cdb-obfuscation-key (%cdb-raw-records path)))
           "the resumed run kept the key"))))
+
+(test a-coin-lookup-allocates-nothing
+  "Core's CCoinsViewCache::FetchCoin hashes the COutPoint it is handed in place
+(coins.cpp:46-63, SaltedOutpointHasher): a lookup allocates nothing. Ours built
+a fresh UTXO-KEY per lookup -- 192 bytes, the struct and its four 64-bit words
+boxed on the way into the constructor -- on every coin read: IBD's input
+fetch, the mempool's, its consistency check. A read of the coins cache and of
+the in-memory set, hit or miss, must now allocate (next to) nothing; a key
+the cache keeps is still allocated when it is stored."
+  (let ((spk (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+        (txids (loop for i below 2000
+                     collect (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element #x7E)))
+                               (setf (aref h 0) (ldb (byte 8 0) i) (aref h 1) (ldb (byte 8 8) i))
+                               h))))
+    (flet ((bytes-per-lookup (thunk)
+             ;; Counted on a thread of its own and read after it has exited:
+             ;; SB-EXT:GET-BYTES-CONSED sees a thread's allocation only as its
+             ;; allocation regions close, so a few megabytes allocated on the
+             ;; calling thread can read as zero. An empty thread's cost is
+             ;; subtracted.
+             (flet ((consed-on-a-thread (body)
+                      (let ((before (sb-ext:get-bytes-consed)))
+                        (bt:join-thread (bt:make-thread body))
+                        (- (sb-ext:get-bytes-consed) before))))
+               (/ (- (consed-on-a-thread (lambda () (dotimes (i 10) (funcall thunk))))
+                     (consed-on-a-thread (lambda () nil)))
+                  (* 10.0 2 (length txids))))))
+      (with-temp-directory (dir "bl-coins-lookup-alloc")
+        (bl.store:with-coins-view-db (view (namestring (merge-pathnames "cs/" dir)))
+          (let ((cache (bl.store:make-coins-view-cache view))
+                (set (bl.store:make-utxo-set)))
+            (dolist (h txids)
+              (bl.store:add-utxo cache h 0 1000 spk 1)
+              (bl.store:add-utxo set h 0 1000 spk 1))
+            ;; Positive control: the counter sees keys that ARE allocated.
+            (let ((kept '()))
+              (is (>= (bytes-per-lookup
+                       (lambda () (dolist (h txids)
+                                    (push (bl.store:make-utxo-key h 0) kept)
+                                    (push (bl.store:make-utxo-key h 1) kept))))
+                      32)
+                  "the allocation counter saw nothing for a kept key")
+              (is (plusp (length kept))))
+            ;; The cache: a hit. (A miss reads the base, as Core's does --
+            ;; LevelDB's key and value are that read's, not the lookup's.)
+            (is (< (bytes-per-lookup
+                    (lambda () (dolist (h txids)
+                                 (bl.store:get-utxo cache h 0)
+                                 (bl.store:coin-view-has-p cache h 0))))
+                   4)
+                "a coins-cache hit allocates")
+            ;; The in-memory set: a hit and a miss.
+            (is (< (bytes-per-lookup
+                    (lambda () (dolist (h txids)
+                                 (bl.store:get-utxo set h 0)
+                                 (bl.store:get-utxo set h 1))))
+                   4)
+                "a utxo-set lookup allocates")))))))
