@@ -54,6 +54,11 @@ Commands:
   test NAME          Run one fiveam suite (raw designator, e.g. :script-tests)
   test-all           Run the full :bitcoin-lisp-tests suite (long)
   docs-check         Verify PAX documentation transcripts in a cold container
+  ghost-check        Fail (rc 1) naming every definition the warm image holds
+                     that the source no longer has -- a deleted or renamed
+                     function, a probe loaded from build/, an eval'd defun
+                     (scripts/ghost-check.lisp; also reported, as a warning,
+                     after every system load)
   ui-test [PATH...]  Run the web UI node harness (default tests/ui/)
   interop            Run the differential lanes against Core v28.2: bitcoin-tx
                      and bitcoin-util, and each implementation on the other's
@@ -353,7 +358,34 @@ exec_workbench_eval_client() {
     rc=1
   fi
   rm -f "$transcript"
+  # A reload cannot remove a definition its source no longer has: say so
+  # after every one (scripts/ghost-check.lisp). A warning, not a failure --
+  # `dev.sh ghost-check' is the gate.
+  if [ "$rc" -eq 0 ]; then
+    local ghosts
+    ghosts="$("$DOCKER" exec "${args[@]}" "$CONTAINER" \
+      sbcl --script /dev/stdin "$(ghost_check_form nil)" <"$client" 2>&1)" || true
+    if ! printf '%s' "$ghosts" | grep -q 'ghost-check: 0 ghost definitions'; then
+      echo "WARNING: the warm image holds definitions the source does not have" >&2
+      echo "         (the cold build would not); run scripts/dev.sh ghost-check:" >&2
+      printf '%s\n' "$ghosts" | head -40 >&2
+    fi
+  fi
   return "$rc"
+}
+
+# The deleted-definition guard (scripts/ghost-check.lisp): every function in
+# the project's packages must come from a file of the build, from that file's
+# latest compile. $1 is t (signal, so the eval exits 1 naming the ghosts) or
+# nil (return the report). The script's package is not read until it exists.
+ghost_check_form() {
+  printf '(progn (load "/workspace/scripts/ghost-check.lisp") (uiop:symbol-call :bl-ghost-check :report :signal %s))' "$1"
+}
+
+ghost_check() {
+  DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-120}" \
+  DEV_EVAL_MAX_OUTPUT="${DEV_EVAL_MAX_OUTPUT:-100000}" \
+    eval_form "$(ghost_check_form t)"
 }
 
 # The warm-image load guard. SBCL defers an `undefined variable' warning to
@@ -540,6 +572,7 @@ case "$cmd" in
   test) test_one "$@" ;;
   test-all) test_all ;;
   docs-check) docs_check ;;
+  ghost-check) ghost_check ;;
   ui-test) ui_test "$@" ;;
   interop) exec "$ROOT/scripts/interop-test.sh" ;;
   logs) show_logs "$@" ;;

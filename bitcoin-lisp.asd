@@ -525,6 +525,9 @@ bitcoin-cli (node-main)."
                              (:file "kv/datadir-tests")
                              (:file "kv/db-cache-tests")
                                (:file "structural-tests")
+                             ;; Positive control of scripts/ghost-check.lisp, the
+                             ;; warm image's deleted-definition guard
+                             (:file "ghost-check-tests")
                              ;; ADDRv2 tests (BIP 155)
                              (:file "networking/addrv2-tests")
                              ;; Network-typed address codecs (onion/i2p/base32) + reachability

@@ -1757,9 +1757,11 @@
   rule 5's cluster cap is the bound on the RBF descendant expansion, so
   the expansion cannot be a sibling binding of the guard that limits it.
   An 83 MB mempool.dat turns a restart into a long silent replay
-  -- load in batches and log progress. The policy estimator must EXIST
-  before fee_estimates.dat is loaded, or the file's estimator section is
-  discarded on every start. The mining index
+  -- load in batches and log progress. fee_estimates.dat is Core's file
+  (CBlockPolicyEstimator::Write/Read), read INTO the estimator object at
+  start-up as Core's constructor reads it -- reading it through the
+  reporting special before init had installed one discarded it on every
+  start -- and flushed hourly and at shutdown. The mining index
   finds a chunk by its mining key, so a cluster's chunks must leave the
   index before anything changes that key -- a relinearization, a depgraph
   edit, or a re-pointing of its handles; that is also why a handle's
@@ -1781,8 +1783,12 @@
   asserts. Because regtest runs it after EVERY transaction, it must stay one
   pass over the pool with a few lookups per transaction: a per-entry walk of
   the spent-outpoint index made it 180 ms on 2,500 transactions and timed
-  out feature_dbcrash.py; it is ~2 ms now (the graph's own sanity check
-  included, which likewise verifies its chunk index without sorting it)."
+  out feature_dbcrash.py; it is ~2-3 ms now (the graph's own sanity check
+  included, which likewise verifies its chunk index without sorting it).
+  Two lookups per input -- the parent in the pool, the spender in the
+  index -- and none per output: the children are collected from the
+  inputs, and a chain coin spent twice is caught by the spender check and
+  the index count rather than by a table of its own."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)
@@ -1809,10 +1815,11 @@
   (bitcoin-lisp.mempool:make-orphan-pool function)
   (bitcoin-lisp.mempool:orphan-add-children-to-work-set function)
   (bitcoin-lisp.mempool:orphan-get-tx-to-reconsider function)
-  (bitcoin-lisp.mempool:fee-estimator class)
   (bitcoin-lisp.mempool:estimate-fee-rate function)
   (bitcoin-lisp.mempool:make-block-policy-estimator function)
   (bitcoin-lisp.mempool:*block-policy-estimator* variable)
+  (bitcoin-lisp.mempool:load-fee-estimates function)
+  (bitcoin-lisp.mempool:save-fee-estimates function)
   (bitcoin-lisp.mempool:save-mempool-file function)
   (bitcoin-lisp.mempool:*persist-mempool-v1* variable))
 

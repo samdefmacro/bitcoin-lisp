@@ -831,23 +831,6 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
 
 ;;;; Fee estimation tests
 
-(test fee-estimator-creation
-  "Fee estimator is created with correct defaults."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    (is (= 0 (bl.mp:fee-estimator-entry-count estimator)))))
-
-(test fee-estimator-add-stats
-  "Adding fee statistics increments the entry count."
-  (let ((estimator (bl.mp:make-fee-estimator))
-        (stats (bl.mp:make-block-fee-stats
-                :height 100
-                :median-rate 50
-                :low-rate 10
-                :high-rate 100
-                :tx-count 200)))
-    (bl.mp:fee-estimator-add-stats estimator stats)
-    (is (= 1 (bl.mp:fee-estimator-entry-count estimator)))))
-
 (test fee-estimation-answers-only-from-the-policy-estimator
   "ESTIMATE-FEE-RATE is Core's estimateSmartFee and nothing else. It used to
 fall through to a percentile of the median feerates of the last N blocks when
@@ -855,19 +838,9 @@ the policy estimator had no answer, and returned it with NO error message --
 so the RPC reported it as a real feerate and a wallet reading it never fell
 back to its own -fallbackfee. A percentile of what miners TOOK cannot express
 that a feerate FAILED to confirm, which is the whole content of an estimate.
-
-The block statistics below are exactly the history that fallback read: twenty
-blocks at a median of 10 to 48 sat/vB, plenty for the old path, and the answer
-must still be the absence of an estimate."
-  (let ((estimator (bl.mp:make-fee-estimator))
-        (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
-    (dotimes (i 20)
-      (bl.mp:fee-estimator-add-stats
-       estimator (bl.mp:make-block-fee-stats
-                  :height (+ 100 i) :median-rate (+ 10 (* i 2))
-                  :low-rate 5 :high-rate 100 :tx-count 200)))
-    (is (= 20 (bl.mp:fee-estimator-entry-count estimator))
-        "positive control: the percentile history is populated")
+The per-block history that fallback read is gone as well, so an empty policy
+estimator must answer the absence of an estimate."
+  (let ((bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
     (dolist (target '(2 6 25 1008))
       (multiple-value-bind (rate error returned) (bl.mp:estimate-fee-rate target)
         (is (null rate) "target ~D answered ~S from the block history" target rate)
@@ -4614,6 +4587,44 @@ transaction's own verdict as before."
       (let ((unchecked (send 0)))
         (is (member (car unchecked) '(-25 -26)) "the node without the check answered ~S" unchecked)
         (is (not (search "consistency" (or (cdr unchecked) ""))))))))
+
+(test mempool-check-finds-a-chain-coin-spent-twice
+  "Core's mempoolDuplicate view spends each coin a pool transaction uses, so a
+coin two inputs spend fails CheckTxInputs (txmempool.cpp:538-539). Ours keeps
+no table of spent chain coins for it: the spent-outpoint index names one
+spender per outpoint, so a second transaction spending the coin fails its
+spender check, and one transaction spending it twice leaves the index an
+entry short of the pool's inputs. Both corruptions are built here by hand --
+MEMPOOL-ADD refuses either -- and the untouched pool is the control."
+  (let* ((spk (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+         (coin-x (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5A))
+         (coin-y (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5B)))
+    (flet ((tx (&rest coins)
+             (bl.ser:make-transaction
+              :version 2 :lock-time 0
+              :inputs (map 'vector (lambda (h)
+                                     (bl.ser:make-tx-in
+                                      :previous-output (bl.ser:make-outpoint :hash h :index 0)
+                                      :script-sig spk :sequence #xffffffff))
+                           coins)
+              :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey spk))))
+           (add (mempool tx)
+             (is (eq :ok (bl.mp:mempool-add mempool (bl.ser:transaction-hash tx)
+                                            (bl.mp:make-entry-from-tx tx 1000 1))))))
+      ;; Two transactions, then the second's input re-pointed at the first's coin.
+      (let ((mempool (bl.mp:make-mempool))
+            (b (tx coin-y)))
+        (add mempool (tx coin-x))
+        (add mempool b)
+        (is-true (bl.mp:mempool-check-now mempool nil 1) "control: two distinct coins")
+        (setf (aref (bl.ser:transaction-inputs b) 0)
+              (bl.ser:make-tx-in :previous-output (bl.ser:make-outpoint :hash coin-x :index 0)
+                                 :script-sig spk :sequence #xffffffff))
+        (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))
+      ;; One transaction naming the same coin twice.
+      (let ((mempool (bl.mp:make-mempool)))
+        (add mempool (tx coin-x coin-x))
+        (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1))))))
 
 (test mempool-check-finds-links-the-spent-index-does-not-back
   "CTxMemPool::check compares every entry's stored parents and children

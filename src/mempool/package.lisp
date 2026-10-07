@@ -19,7 +19,6 @@ src/mempool/.")
    #:+default-max-mempool-bytes+
    #:*max-mempool-bytes*
    #:+default-min-relay-fee-rate+
-   #:+fee-history-size+
    ;; FeeFrac (Core util/feefrac.{h,cpp})
    #:feefrac
    #:make-feefrac
@@ -291,26 +290,11 @@ src/mempool/.")
    #:mempool-get-transactions
    #:mempool-for-each
    #:mempool-entries-parents-first
-   ;; Block fee stats
-   #:block-fee-stats
-   #:make-block-fee-stats
-   #:block-fee-stats-height
-   #:block-fee-stats-median-rate
-   #:block-fee-stats-low-rate
-   #:block-fee-stats-high-rate
-   #:block-fee-stats-tx-count
-   ;; Fee estimator
-   #:fee-estimator
-   #:make-fee-estimator
-   #:fee-estimator-entry-count
-   #:fee-estimator-data-directory
-   #:fee-estimator-blocks-since-flush
-   #:fee-estimator-add-stats
-   #:fee-estimator-get-history
-   ;; Fee stats persistence
-   #:save-fee-stats
+   ;; fee_estimates.dat (Core FlushFeeEstimates / the constructor's read)
+   #:fee-estimates-path
+   #:save-fee-estimates
+   #:load-fee-estimates
    #:flush-fee-estimates-at-shutdown
-   #:load-fee-stats
    #:arm-fee-estimate-flush-clock
    #:maybe-flush-fee-estimates
    ;; Core CBlockPolicyEstimator (G7-21)

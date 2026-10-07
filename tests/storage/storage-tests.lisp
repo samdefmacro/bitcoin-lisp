@@ -2845,6 +2845,40 @@ must be contiguous from genesis, so `resume from the marker' is the only shape
 it has -- and a marker it cannot place leaves it stuck until something wipes
 it.")
 
+(test index-start-up-says-the-height-it-reached-as-core-does
+  "Core's BaseIndex::Sync ends with `<name> is enabled at height N'
+(index/base.cpp:263-267), N being the index's own best block once its locator
+has been read and it has caught up. Ours logged `Block filter index loaded:
+indexed to height -1' (and the coinstats line of the same shape) from a handle
+whose locator nothing had read yet -- seen on the live mainnet node's start-up
+of 2026-10-01 for an index that was at the tip. The line must name the real
+height, on the first start that builds the index and on the restart that
+finds it built."
+  (with-network (:regtest)
+    (let ((node (%index-wipe-node (format nil "enabled-line-~D" (get-internal-real-time)))))
+      (flet ((start-up-lines ()
+               ;; Read off the console stream, which every index thread writes
+               ;; to: each catch-up thread binds its own copy of the ring
+               ;; buffer's index, so the next thread's lines overwrite its
+               ;; lines there.
+               (prog1 (let ((bl.log:*log-stream* (make-string-output-stream)))
+                        (%index-fill-around-catch-up node (constantly nil)
+                                                     :blockfilterindex t
+                                                     :coinstatsindex t)
+                        (uiop:split-string
+                         (get-output-stream-string bl.log:*log-stream*)
+                         :separator '(#\Newline)))
+                 (bl.store:close-blockfilterindex (bl:node-blockfilterindex node))
+                 (bl.store:close-coinstatsindex (bl:node-coinstatsindex node)))))
+        (dolist (run '(:first-start :restart))
+          (let ((lines (start-up-lines)))
+            (is-false (find "to height -1" lines :test #'search)
+                      "~A: an index reported height -1: ~S" run lines)
+            (dolist (expected '("basic block filter index is enabled at height 3"
+                                "coinstatsindex is enabled at height 3"))
+              (is-true (find expected lines :test #'search)
+                       "~A: no `~A' line in ~S" run expected lines))))))))
+
 (test a-damaged-index-database-fails-at-open
   "Core's BaseIndex::Init reads the best-block locator from the index's own
 database first (index/base.cpp:119), with checksums verified as every

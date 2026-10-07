@@ -106,7 +106,12 @@
     ;; Core's TxRequestTracker::SanityCheck, which Core calls only from its
     ;; txrequest and txdownloadman_impl fuzz targets -- and so do we
     ;; (tests/fuzz/txrequest.lisp, tests/fuzz/txdownloadman.lisp).
-    "bitcoin-lisp.networking:txrequest-sanity-check")
+    "bitcoin-lisp.networking:txrequest-sanity-check"
+    ;; The txindex's record count, how the txindex tests observe a build and a
+    ;; wipe. Its src reader was a `Transaction index loaded: N entries' start-up
+    ;; line Core does not print; the index now reports Core's `txindex is
+    ;; enabled at height N' (index/base.cpp:263-267) like every other index.
+    "bitcoin-lisp.storage:txindex-count")
   "Exported functions with no caller in src/ as of 2026-08-22, as
 \"package:name\" strings -- strings rather than symbols so that unexporting one
 is an ordinary test failure and not a READ error that kills compilation.")
