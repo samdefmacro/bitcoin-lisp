@@ -76,22 +76,27 @@ not refer to key\", and malformed base64 -3 \"Malformed base64 encoding\"."
     (let ((payload (subseq script-pubkey 3 23))
           ;; ERR_MALFORMED_SIGNATURE is RPC_TYPE_ERROR (-3), not -5: Core
           ;; groups it with the address-is-not-a-key arm rather than with the
-          ;; undecodable address (rpc/signmessage.cpp:41-57).
-          (sig65 (handler-case (cl-base64:base64-string-to-usb8-array sig-b64)
-                   (error ()
+          ;; undecodable address (rpc/signmessage.cpp:41-57). Malformed is
+          ;; Core's DecodeBase64 (util/strencodings.cpp:109-142), not
+          ;; cl-base64's lenient reader: a last character carrying bits past
+          ;; the last byte is malformed to Core.
+          (sig65 (or (bl.ser:decode-base64 sig-b64)
                      (error 'rpc-error :code +rpc-type-error+
-                                       :message "Malformed base64 encoding")))))
+                                       :message "Malformed base64 encoding"))))
       (json-bool
        (ignore-errors
         (and (= (length sig65) 65)
-             (let ((header (aref sig65 0)))
-               (and (<= 27 header 34)
-                    (let* ((recid (logand (- header 27) 3))
-                           (compressed (>= (- header 27) 4))
-                           (compact (subseq sig65 1 65))
-                           (hash (%bitcoin-message-hash message))
-                           (pubkey (bl.crypto:recover-public-key
-                                    compact recid hash :compressed compressed)))
-                      (and pubkey
-                           (equalp payload
-                                   (bl.crypto:hash160 pubkey))))))))))))
+             ;; CPubKey::RecoverCompact (pubkey.cpp:300-304) reads the
+             ;; recovery id and the compression flag out of the header's low
+             ;; three bits, (header - 27) & 3 and & 4, and checks nothing else
+             ;; of it: a header of 35 is 27's signature.
+             (let* ((header (aref sig65 0))
+                    (recid (logand (- header 27) 3))
+                    (compressed (logtest (- header 27) 4))
+                    (compact (subseq sig65 1 65))
+                    (hash (%bitcoin-message-hash message))
+                    (pubkey (bl.crypto:recover-public-key
+                             compact recid hash :compressed compressed)))
+               (and pubkey
+                    (equalp payload
+                            (bl.crypto:hash160 pubkey))))))))))
