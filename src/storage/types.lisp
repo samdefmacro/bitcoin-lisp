@@ -19,9 +19,10 @@
   (prev-entry nil)
   (chain-work 0 :type integer)
   (status :unknown :type keyword)  ; :unknown, :header-valid, :valid, :invalid
-  ;; Number of transactions in this block (Bitcoin Core nTx). 0 = unknown —
-  ;; header-only entries, or an index persisted before this field existed
-  ;; (backfilled lazily from the block store by getchaintxstats).
+  ;; Number of transactions in this block (Bitcoin Core nTx), recorded when
+  ;; the body is stored (ReceivedBlockTransactions) and kept after pruning. 0 =
+  ;; never received -- or an entry the pre-tx-count header index wrote with a
+  ;; body (start-up counts those; getchaintxstats backfills them lazily).
   (tx-count 0 :type (unsigned-byte 32))
   ;; Where this block's data and undo record live in the flat files (Core
   ;; CBlockIndex nFile / nDataPos / nUndoPos). NIL means "not here": either the
