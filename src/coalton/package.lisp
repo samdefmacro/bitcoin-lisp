@@ -469,6 +469,7 @@
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
    #:*script-execution-cache-enabled*
+   #:*script-execution-cache-hits*
    #:*tapscript-codesep-pos*
    #:*signature-cache-max-entries*
    #:make-script-execution-cache-key

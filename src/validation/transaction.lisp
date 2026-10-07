@@ -1091,7 +1091,8 @@ carries the script error so it can be rendered with Core's parenthetical."
   ;; not STANDARD flags"); we log the same and reject.
   (multiple-value-bind (scripts-valid failed-input script-error)
       (validate-transaction-scripts tx utxo-set :height current-height
-                                    :extra-coins extra-coins)
+                                    :extra-coins extra-coins
+                                    :cache-full-script-store t)
     (unless scripts-valid
       (bl:log-error
        "BUG! PLEASE REPORT THIS! input scripts failed against latest-block but not STANDARD flags: txid=~A input=~A"
@@ -1622,7 +1623,8 @@ pass a member failed decides what the caller is told about the others."
           do (setf (aref result i) utxo))
     result))
 
-(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins flags)
+(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins flags
+                                                    cache-full-script-store)
   "Validate all input scripts for a transaction via Coalton interop.
 Uses validate-input-script for each input (same path as block validation).
 HEIGHT determines which script verification flags are active; FLAGS, when
@@ -1636,7 +1638,12 @@ validation.cpp:2090), so a missing coin must never mean \"no script to check\".
 Returns (VALUES T NIL NIL) on success and
 (VALUES NIL INPUT-INDEX SCRIPT-ERROR) on failure, where SCRIPT-ERROR is the
 Core SCRIPT_ERR_* the input failed on -- NIL when the coin was missing, which
-is not a script verdict at all."
+is not a script verdict at all.
+CACHE-FULL-SCRIPT-STORE is Core's argument of that name: T for
+ConsensusScriptChecks, which stores the verdict for the block that confirms
+the transaction (CheckInputsFromMempoolAndCache, validation.cpp:430), NIL for
+PolicyScriptChecks (:1143), which only consults the cache and erases what it
+hits (:2079)."
   (let* ((inputs (bl.ser:transaction-inputs tx))
          (effective-flags (or flags (compute-script-flags-for-height height)))
          ;; Script-execution cache (Core CheckInputScripts,
@@ -1659,7 +1666,8 @@ is not a script verdict at all."
               (bl.ser:transaction-wtxid tx)
               effective-flags))))
     (when (and cache-key
-               (bl.interop:script-execution-cached-p cache-key))
+               (bl.interop:script-execution-cached-p cache-key
+                                                     (not cache-full-script-store)))
       (return-from validate-transaction-scripts (values t nil nil)))
     (let* ((spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
            (bl.interop:*script-flags* effective-flags)
@@ -1677,6 +1685,6 @@ is not a script verdict at all."
                 (values nil input-idx script-error))))))
       ;; Stored only after EVERY input succeeded — a partial success must never
       ;; short-circuit a later pass.
-      (when cache-key
+      (when (and cache-key cache-full-script-store)
         (bl.interop:script-execution-cache-store cache-key))
       (values t nil nil))))

@@ -1464,10 +1464,13 @@
   names one output of one transaction, whose txid commits to that
   output's script and amount (Core states the assumption at
   validation.cpp:2069-2073 and asserts it on its only writing path,
-  CheckInputsFromMempoolAndCache, :405-430). Block connect CONSULTS that
-  cache and never writes it -- ConnectBlock sets `fCacheResults =
-  fJustCheck' -- so the mempool's consensus pass is the only writer and
-  both readers must pass the flag set the block will use.
+  CheckInputsFromMempoolAndCache, :405-430). Who writes it is Core's
+  cacheFullScriptStore at each call site: the mempool's consensus pass
+  and TestBlockValidity (ConnectBlock's `fCacheResults = fJustCheck',
+  :2573) store, the latter only when its checks run inline and not on the
+  check queue (:2124); the policy pass and a real block connect only
+  consult, and erase what they hit (:2079). Every writer must use the
+  flag set the block will use, or the connect never hits.
   What FindAndDelete deletes is the signature's PUSH
   (Core `CScript() << vchSig'), never its bare bytes, and an EMPTY
   signature's pattern is the one byte OP_0 -- so it deletes something;

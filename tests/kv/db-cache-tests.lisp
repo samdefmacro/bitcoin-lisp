@@ -429,7 +429,8 @@ fork."
                       :height 1 :coinbase nil)))
              (flet ((check (flags)
                       (bl.val:validate-transaction-scripts
-                       tx utxo :extra-coins coins :flags flags)))
+                       tx utxo :extra-coins coins :flags flags
+                       :cache-full-script-store t)))
                (is-true (check "P2SH"))
                (is (= 1 runs) "the first pass must actually run the input")
                ;; Second pass, same flags: served from cache.
@@ -469,7 +470,8 @@ next pass short-circuits on the first input's success and accepts it."
                       :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
                       :height 1 :coinbase nil)))
              (is-false (bl.val:validate-transaction-scripts
-                        tx utxo :extra-coins coins :flags "P2SH"))
+                        tx utxo :extra-coins coins :flags "P2SH"
+                        :cache-full-script-store t))
              ;; Nothing cached, so a later pass still runs the scripts — and
              ;; still fails.
              (is-false (bl.interop:script-execution-cached-p

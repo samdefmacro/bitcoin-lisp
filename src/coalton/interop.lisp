@@ -483,6 +483,20 @@ dispatch."
     (setf pos (buf-set-bytes buf pos sig))
     (bl.crypto:sha256 buf)))
 
+(defun %generation-hit-p (key erase current prev)
+  "T when KEY is in CURRENT or PREV, the two generations of one cache. A hit
+in PREV is promoted into CURRENT -- unless ERASE, when a hit in CURRENT is
+moved to PREV instead: see SIG-CACHE-HIT-P."
+  (cond ((gethash key current)
+         (when erase
+           (remhash key current)
+           (setf (gethash key prev) t))
+         t)
+        ((gethash key prev)
+         (unless erase
+           (setf (gethash key current) t))
+         t)))
+
 (defun sig-cache-hit-p (key &optional erase)
   "T when KEY is cached in either generation; prev-generation hits are
 promoted into the current one.
@@ -495,15 +509,7 @@ needed, and until then a later lookup still finds it (cuckoocache.h:449-470,
 the generation rotation, so an erased hit is left in -- or moved to -- the
 PREVIOUS generation, which the next rotation drops, instead of being promoted
 into the current one."
-  (cond ((gethash key *signature-cache*)
-         (when erase
-           (remhash key *signature-cache*)
-           (setf (gethash key *signature-cache-prev*) t))
-         t)
-        ((gethash key *signature-cache-prev*)
-         (unless erase
-           (setf (gethash key *signature-cache*) t))
-         t)))
+  (%generation-hit-p key erase *signature-cache* *signature-cache-prev*))
 
 (defun sig-cache-store (key)
   (when (>= (hash-table-count *signature-cache*) *signature-cache-max-entries*)
@@ -562,6 +568,13 @@ carry no script flags; see the note there."
 ;;; so a malleated copy must not hit. And keyed WITH the script flags, unlike
 ;;; the signature cache — the whole point of the entry is "these scripts
 ;;; SUCCEEDED under these rules", and the rules change at soft-fork heights.
+;;;
+;;; Who writes and who erases is Core's CheckInputScripts arguments at each
+;;; call site: the probe is contains(entry, erase = !cacheFullScriptStore)
+;;; (validation.cpp:2079) and the insert happens only with cacheFullScriptStore
+;;; and the checks run inline (:2124-2128). The mempool's consensus pass and
+;;; TestBlockValidity store; the policy pass and a real block connect only
+;;; consult, and erase what they hit.
 
 (defconstant +script-execution-cache-max-entries+ 65536
   "Per-generation cap, rotated exactly as the signature cache is.")
@@ -624,11 +637,21 @@ attackable by collision or eviction ordering."
     (setf pos (buf-set-bytes buf pos flag-bytes))
     (bl.crypto:sha256 buf)))
 
-(defun script-execution-cached-p (key)
-  "T when KEY is cached in either generation; prev-generation hits are promoted."
-  (or (gethash key *script-execution-cache*)
-      (when (gethash key *script-execution-cache-prev*)
-        (setf (gethash key *script-execution-cache*) t))))
+(defvar *script-execution-cache-hits* (list 0)
+  "A one-cell list whose CAR counts the script-execution cache's hits -- the
+transactions whose scripts were not run again. Incremented atomically, as the
+parallel block path probes from worker threads.")
+
+(defun script-execution-cached-p (key &optional erase)
+  "T when KEY is cached in either generation, counting the hit. ERASE is
+Core's `contains(entry, erase)' with erase = !cacheFullScriptStore
+(validation.cpp:2079), treated as the signature cache treats it (see
+SIG-CACHE-HIT-P): the entry still answers, and moves to the generation the
+next rotation drops."
+  (when (%generation-hit-p key erase
+                           *script-execution-cache* *script-execution-cache-prev*)
+    (sb-ext:atomic-incf (car *script-execution-cache-hits*))
+    t))
 
 (defun script-execution-cache-store (key)
   (when (>= (hash-table-count *script-execution-cache*)

@@ -1432,8 +1432,9 @@ under a DIFFERENT flag string does not hit, since the flags are in the key."
 (test block-scripts-do-not-populate-the-script-execution-cache
   "Connecting a block CONSULTS the cache and writes nothing into it: Core
 passes `fCacheResults = fJustCheck' from ConnectBlock, so the insert at
-validation.cpp:2124-2128 belongs to the mempool's consensus pass alone. A
-block whose scripts genuinely pass must therefore leave no entry behind.
+validation.cpp:2124-2128 belongs to the mempool's consensus pass and to
+TestBlockValidity. A block whose scripts genuinely pass must therefore leave
+no entry behind when it is connected.
 Control: the very same key is present the moment something stores it, so the
 absence measured above is a real absence and not a mistyped key."
   (let ((op-true (make-array 1 :element-type '(unsigned-byte 8)
@@ -1448,6 +1449,94 @@ absence measured above is a real absence and not a mistyped key."
         ;; CONTROL: the key is the one the block path would have used.
         (bl.interop:script-execution-cache-store key)
         (is-true (bl.interop:script-execution-cached-p key))))))
+
+;;; Who WRITES the cache is Core's CheckInputScripts arguments at each call
+;;; site (validation.cpp:2058-2128): ConnectBlock passes fCacheResults =
+;;; fJustCheck as cacheFullScriptStore (:2573-2583), so TestBlockValidity -- the
+;;; dry run getblocktemplate's template goes through -- stores what it verified
+;;; when its checks run inline (:2124), and the block's real connect then
+;;; answers from the cache, erasing as it goes (:2079). Ours stored only from
+;;; the mempool's consensus pass, so a template's transactions were
+;;; interpreted twice.
+
+(test test-block-validity-stores-what-the-connect-then-reads
+  "TestBlockValidity's arguments (VALIDATE-BLOCK-SCRIPTS :CACHE-STORE T, what
+TEST-BLOCK-VALIDITY passes down) leave an entry for every transaction they
+verified; connecting the same block then hits it -- the hit counter moves by
+one -- and the entry still answers afterwards, as Core's erase only marks it
+(cuckoocache.h:449-470). Control: the mempool's consensus pass, the other
+writer, is honoured by the connect the same way."
+  (let ((op-true (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (multiple-value-bind (blk utxo-set spend flags)
+        (%sec-spend-block op-true empty 800000)
+      (let ((key (bl.interop:make-script-execution-cache-key
+                  (bl.ser:transaction-wtxid spend) flags)))
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000
+                                                             :cache-store t)))
+        (is-true (bl.interop:script-execution-cached-p key)
+                 "TestBlockValidity verified the block and stored nothing")
+        (let ((hits (car bl.interop:*script-execution-cache-hits*)))
+          (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000)))
+          (is (= (1+ hits) (car bl.interop:*script-execution-cache-hits*))
+              "the connect did not answer from the entry TestBlockValidity stored"))
+        (is-true (bl.interop:script-execution-cached-p key))))
+    ;; CONTROL: the mempool's consensus pass stores, and the connect reads it.
+    (multiple-value-bind (blk utxo-set spend flags)
+        (%sec-spend-block op-true empty 800000)
+      (let ((coins (bl.ser:make-outpoint-table)))
+        (bl.val:validate-transaction-scripts spend utxo-set :extra-coins coins
+                                             :flags flags :cache-full-script-store t)
+        (let ((hits (car bl.interop:*script-execution-cache-hits*)))
+          (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000)))
+          (is (= (1+ hits) (car bl.interop:*script-execution-cache-hits*))))))))
+
+(test only-the-consensus-pass-and-an-inline-test-block-validity-store
+  "The two non-writers among the storing call sites: the mempool's
+PolicyScriptChecks passes cacheFullScriptStore = false (validation.cpp:1143),
+and a TestBlockValidity whose checks go to the check queue never reaches the
+insert, which requires `!pvChecks' (:2124) -- our parallel path. Control: the
+same transaction through the consensus pass leaves the entry."
+  (let ((op-true (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (multiple-value-bind (blk utxo-set spend flags)
+        (%sec-spend-block op-true empty 800000)
+      (declare (ignore blk))
+      (let ((key (bl.interop:make-script-execution-cache-key
+                  (bl.ser:transaction-wtxid spend) flags))
+            (coins (bl.ser:make-outpoint-table)))
+        (is-true (bl.val:validate-transaction-scripts spend utxo-set :extra-coins coins
+                                                      :flags flags))
+        (is-false (bl.interop:script-execution-cached-p key)
+                  "the policy pass stored its verdict")
+        (bl.val:validate-transaction-scripts spend utxo-set :extra-coins coins
+                                             :flags flags :cache-full-script-store t)
+        (is-true (bl.interop:script-execution-cached-p key))))
+    ;; The parallel path: 16 fresh spends, so the block crosses the threshold.
+    (let* ((utxo-set (bl.store:make-utxo-set))
+           (spends (loop repeat 16    ; +parallel-validation-min-txs+
+                         collect (let ((prev (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element #xE2))
+                                       (n (incf *sec-spend-serial*)))
+                                   (dotimes (i 4) (setf (aref prev i) (ldb (byte 8 (* 8 i)) n)))
+                                   (bl.store:add-utxo utxo-set prev 0 1000000 op-true 5)
+                                   (%w8d-spend-tx prev empty nil))))
+           (blk (bl.ser:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (cons (make-coinbase-transaction :value 5000000000
+                                                                :height 800000)
+                                     spends)))
+           (flags (bl.val:block-script-flags
+                   (bl.ser:block-header-hash (bl.ser:bitcoin-block-header blk)) 800000)))
+      (let ((bl:*parallel-block-validation* t))
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000
+                                                             :cache-store t))))
+      (is (notany (lambda (tx)
+                    (bl.interop:script-execution-cached-p
+                     (bl.interop:make-script-execution-cache-key
+                      (bl.ser:transaction-wtxid tx) flags)))
+                  spends)
+          "a TestBlockValidity on the check queue stored its verdicts"))))
 
 ;;;; The signature cache on the block path (Core CachingTransactionSignature-
 ;;; Checker's `store', script/sigcache.cpp:63-84, and ConnectBlock's
@@ -1485,8 +1574,12 @@ had to verify is NOT added, and an entry it answers from is marked for
 collection (SignatureCache::Get(entry, erase = !store)). Ours stored every
 signature the block path verified. TestBlockValidity (fJustCheck) and mempool
 acceptance store; that is CACHE-STORE T here, and it is also the control that
-the counts below can move at all."
+the counts below can move at all. The script-execution cache is off: a
+storing pass now also writes the transaction's entry there, and the connect
+would answer from it before any signature is looked up (validation.cpp:2079).
+That is TEST-BLOCK-VALIDITY-STORES-WHAT-THE-CONNECT-THEN-READS."
   (let ((bl.interop:*signature-cache-enabled* t)
+        (bl.interop:*script-execution-cache-enabled* nil)
         ;; Fresh generations, so no rotation and no other test's entries.
         (bl.interop:*signature-cache* (bl.bytes:make-octets-hash-table :synchronized t))
         (bl.interop:*signature-cache-prev* (bl.bytes:make-octets-hash-table :synchronized t)))

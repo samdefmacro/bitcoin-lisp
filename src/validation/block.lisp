@@ -880,8 +880,9 @@ care in the script interpreter can make that safe."
                     utxo-set extra-coins)))
     out))
 
-(defun script-execution-cache-hit-p (tx script-flags)
+(defun script-execution-cache-hit-p (tx script-flags &optional erase)
   "T when TX's input scripts have ALL already been verified under SCRIPT-FLAGS.
+ERASE is Core's !cacheFullScriptStore (see VALIDATE-TX-SCRIPTS).
 
 Core's CheckInputScripts asks this before it resolves a single coin --
 `if (validation_cache.m_script_execution_cache.contains(hashCacheEntry,
@@ -897,30 +898,22 @@ in it, and all three are Core's own reasoning:
     it on the ONLY path that WRITES the cache: CheckInputsFromMempoolAndCache
     asserts each coin equals the mempool parent's output or the chainstate's
     own coin before calling CheckInputScripts with cacheFullScriptStore
-    (validation.cpp:405-430). Ours writes from that same single place, the
-    mempool's %CONSENSUS-SCRIPT-CHECKS pass.
+    (validation.cpp:405-430); the other writer, TestBlockValidity, reads its
+    coins from the chainstate it is testing against.
   - the flags are in the key, so an entry written under the standard (policy)
     flag set is never served to a block, and a soft-fork activation retires the
     entries whose rules changed instead of silently reusing them.
   - an entry means every input SUCCEEDED, so a hit can only accept what a
-    re-run would accept.
-
-The block path only READS. Core sets `fCacheResults = fJustCheck' in
-ConnectBlock -- \"Don't cache results if we're actually connecting blocks
-(still consult the cache, though)\" (validation.cpp:2571) -- so connecting a
-block consults what the mempool wrote and adds nothing. Core's `erase'
-argument on the probe has no analogue here either: CuckooCache's erase only
-sets a garbage-collect bit that a later contains() still reads as present
-(cuckoocache.h:449-463, \"a great property for re-org performance\"), while
-this cache is two generations of a hash table with no eviction priority to
-set, so dropping the entry would be strictly worse than Core."
+    re-run would accept."
   (and bl.interop:*script-execution-cache-enabled*
        (bl.interop:script-execution-cached-p
         (bl.interop:make-script-execution-cache-key
-         (bl.ser:transaction-wtxid tx) script-flags))))
+         (bl.ser:transaction-wtxid tx) script-flags)
+        erase)))
 
 (defun validate-tx-scripts (tx tx-idx utxo-set script-flags height
-                            &key extra-coins spent-utxos)
+                            &key extra-coins spent-utxos cache-full-script-store
+                              queued)
   "Validate all input scripts of a single transaction. Returns
 (VALUES T NIL NIL) on success and (VALUES NIL SCRIPT-ERROR FAILED-INPUT) on
 failure -- the two halves Core's CheckInputScripts reports, the ScriptError it
@@ -935,11 +928,18 @@ PREFETCH-BLOCK-SPENT-COINS. Passing it is what makes a worker thread safe: the
 coins view is never touched here, so its non-synchronized cache is never
 written concurrently.
 
-A transaction the mempool already verified under these exact flags is not
-interpreted again: SCRIPT-EXECUTION-CACHE-HIT-P is Core's CheckInputScripts
-short-circuit, and it comes first so a hit costs neither the coin resolution
-nor the sighash precomputation below."
-  (when (script-execution-cache-hit-p tx script-flags)
+A transaction already verified under these exact flags is not interpreted
+again: SCRIPT-EXECUTION-CACHE-HIT-P is Core's CheckInputScripts short-circuit,
+and it comes first so a hit costs neither the coin resolution nor the sighash
+precomputation below.
+
+CACHE-FULL-SCRIPT-STORE and QUEUED are Core's cacheFullScriptStore and
+`pvChecks != nullptr' (validation.cpp:2058-2128): ConnectBlock passes
+fCacheResults = fJustCheck (:2573-2583), so TestBlockValidity stores and a
+real connect does not; a probe that is not storing erases what it hits (:2079);
+and the entry is written only when every input ran inline and succeeded
+(:2124), never for checks handed to the check queue -- our parallel path."
+  (when (script-execution-cache-hit-p tx script-flags (not cache-full-script-store))
     (return-from validate-tx-scripts (values t nil nil)))
   (let* ((tx-inputs (bl.ser:transaction-inputs tx))
          (spent-utxos (or spent-utxos
@@ -989,7 +989,12 @@ nor the sighash precomputation below."
                     bl.interop:*script-flags*))
                  (return-from validate-tx-scripts
                    (values nil script-error input-idx))))
-          finally (return (values t nil nil)))))
+          finally (when (and cache-full-script-store (not queued)
+                             bl.interop:*script-execution-cache-enabled*)
+                    (bl.interop:script-execution-cache-store
+                     (bl.interop:make-script-execution-cache-key
+                      (bl.ser:transaction-wtxid tx) script-flags)))
+                  (return (values t nil nil)))))
 
 
 ;;;; Persistent script-check worker pool (Core CCheckQueue, checkqueue.h)
@@ -1182,7 +1187,9 @@ read and is not synchronized."
                                         (validate-tx-scripts
                                          tx (1+ i) utxo-set script-flags height
                                          :extra-coins extra-coins
-                                         :spent-utxos (aref prefetched i)))
+                                         :spent-utxos (aref prefetched i)
+                                         :cache-full-script-store cache-store
+                                         :queued t))
                                     (unless ok
                                       (bt:with-lock-held (verdict-lock)
                                         (unless verdict
@@ -1209,10 +1216,11 @@ flag set — SCRIPT_VERIFY_NONE for the two BIP16 blocks — so the scripts must
 still evaluate true. Returning success without executing them, as this did
 until now, accepts blocks Core rejects.
 
-CACHE-STORE is Core's fCacheResults as the signature cache sees it
-(bl.interop:*signature-cache-store*): NIL when a block is actually being
-connected, which consults the cache, adds nothing and marks what it hits for
-collection; T for TestBlockValidity, whose ConnectBlock runs with fJustCheck
+CACHE-STORE is Core's fCacheResults, both its cacheSigStore and its
+cacheFullScriptStore (bl.interop:*signature-cache-store* and
+VALIDATE-TX-SCRIPTS): NIL when a block is actually being connected, which
+consults both caches, adds nothing and marks what it hits for collection; T
+for TestBlockValidity, whose ConnectBlock runs with fJustCheck
 (validation.cpp:2573-2583)."
   (let ((bl.interop:*signature-cache-store* cache-store)
         (script-flags
@@ -1240,7 +1248,8 @@ collection; T for TestBlockValidity, whose ConnectBlock runs with fJustCheck
                 do (multiple-value-bind (ok script-error failed-input)
                        (validate-tx-scripts tx tx-idx utxo-set
                                             script-flags height
-                                            :extra-coins extra-coins)
+                                            :extra-coins extra-coins
+                                            :cache-full-script-store cache-store)
                      (unless ok
                        (return-from validate-block-scripts
                          (values nil (%block-script-verdict
