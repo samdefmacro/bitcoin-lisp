@@ -178,19 +178,41 @@ when there was nothing to do."
                 (bl.store:index-prepare-sync index cs (node-block-store node)))
       ;; Core's Sync commits when it catches up, and when it is interrupted
       ;; (index/base.cpp:214-236): the locator of wherever the index got to.
-      (unwind-protect (%catch-up-index-sync node index cs tip name)
-        (bl.store:commit-index index cs)))))
+      (prog1 (unwind-protect (%catch-up-index-sync node index cs tip name)
+               (bl.store:commit-index index cs))
+        ;; Core's last words of Sync (index/base.cpp:263-267): the height the
+        ;; index actually reached, read from its own best block -- never from
+        ;; a handle whose locator nothing has read yet.
+        (let ((height (bl.store:index-height index cs)))
+          (if (minusp height)
+              (log-info "~A is enabled" name)
+              (log-info "~A is enabled at height ~D" name height)))))))
+
+(defconstant +index-sync-log-interval-seconds+ 30
+  "Core SYNC_LOG_INTERVAL (index/base.cpp:49): how often an index's catch-up
+says how far it has got.")
 
 (defun %catch-up-index-sync (node index cs tip name)
   "CATCH-UP-INDEX's backfill: INDEX-SYNC from the best block to CS's TIP,
 logging progress and the final height."
   (when (< (bl.store:index-height index cs) tip)
     (log-info "Building ~A to height ~D..." name tip)
-    (let ((n (bl.store:index-sync index cs (node-block-store node)
-                                  :undo-fn #'bl.val:get-undo-data
-                                  :subsidy-fn #'bl.val:calculate-block-subsidy
-                                  :progress (lambda (h pct)
-                                              (log-info "~A: height ~D (~,1F%)" name h pct)))))
+    (let* ((last-log (get-internal-real-time))
+           (n (bl.store:index-sync
+               index cs (node-block-store node)
+               :undo-fn #'bl.val:get-undo-data
+               :subsidy-fn #'bl.val:calculate-block-subsidy
+               :progress (lambda (h pct)
+                           (declare (ignore pct))
+                           ;; Core's progress line, at most once per
+                           ;; SYNC_LOG_INTERVAL (index/base.cpp:49, :248-252).
+                           (let ((now (get-internal-real-time)))
+                             (when (>= (- now last-log)
+                                       (* +index-sync-log-interval-seconds+
+                                          internal-time-units-per-second))
+                               (setf last-log now)
+                               (log-info "Syncing ~A with block chain from height ~D"
+                                         name h)))))))
       (log-info "~A build complete: ~D block~:P indexed" name n)
       (when (< (bl.store:index-height index cs) tip)
         (log-warn "~A stopped at height ~D of ~D (missing block/undo data ~
@@ -669,9 +691,7 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
                                   :wipe reindex
                                   :block-store (node-block-store *node*)))
     (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
-    (start-index-background-sync *node* (node-tx-index *node*))
-    (log-info "Transaction index loaded: ~D entries"
-              (bl.store:txindex-count (node-tx-index *node*))))
+    (start-index-background-sync *node* (node-tx-index *node*)))
   ;; Prune locks are re-registered from scratch on every start: registration is
   ;; by name, so a re-init replaces rather than accumulates, but an index that
   ;; was enabled last run and is disabled this one would otherwise leave a lock
@@ -686,8 +706,6 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (setf (node-blockfilterindex *node*)
           (bl.store:init-blockfilterindex (node-data-directory *node*)
                                           :enabled t :wipe reindex))
-    (log-info "Block filter index loaded: indexed to height ~D"
-              (bl.store:blockfilterindex-height (node-blockfilterindex *node*)))
     ;; The filter index needs each block's undo data to build its filter, so
     ;; pruning must not run ahead of it (Core blockfilterindex AllowPrune() ->
     ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
@@ -719,10 +737,6 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
           (bl.store:init-txospender-index (node-data-directory *node*)
                                           :enabled t :wipe reindex
                                           :block-store (node-block-store *node*)))
-    (let ((best (bl.store:txospenderindex-best-block
-                 (node-txospenderindex *node*))))
-      (log-info "Spender index loaded: best block ~A"
-                (if best (bl.crypto:bytes-to-hex best) "none")))
     (bl.rpc:set-rpc-warmup-status "Catching up txospender index...")
     (start-index-background-sync *node* (node-txospenderindex *node*)))
 
@@ -736,8 +750,6 @@ locks are re-registered from scratch; REINDEX wipes each index -- see above."
     (setf (node-coinstatsindex *node*)
           (bl.store:init-coinstatsindex (node-data-directory *node*)
                                         :enabled t :wipe reindex))
-    (log-info "Coinstats index loaded: indexed to height ~D"
-              (bl.store:coinstatsindex-height (node-coinstatsindex *node*)))
     ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->
     ;; true): its per-block statistics are derived from undo data.
     (let ((csi (node-coinstatsindex *node*)))

@@ -103,7 +103,12 @@
     ;; Core's own vectors in tests/networking/bloom-tests.lisp build one --
     ;; which is how the byte contract is checked.
     "bitcoin-lisp.networking:make-bloom-filter"
-    "bitcoin-lisp.networking:serialize-bloom-filter")
+    "bitcoin-lisp.networking:serialize-bloom-filter"
+    ;; The txindex's record count, how the txindex tests observe a build and a
+    ;; wipe. Its src reader was a `Transaction index loaded: N entries' start-up
+    ;; line Core does not print; the index now reports Core's `txindex is
+    ;; enabled at height N' (index/base.cpp:263-267) like every other index.
+    "bitcoin-lisp.storage:txindex-count")
   "Exported functions with no caller in src/ as of 2026-08-22, as
 \"package:name\" strings -- strings rather than symbols so that unexporting one
 is an ordinary test failure and not a READ error that kills compilation.")
