@@ -176,12 +176,15 @@ Returns NIL only when both cache and base have nothing under KEY."
     (when present-p (return-from fetch-coin existing)))
   (let ((from-base (coins-view-db-get (cvc-base cache) key)))
     (when from-base
-      (let ((ce (make-cache-entry :entry from-base :dirty nil :fresh nil)))
-        (setf (gethash key (cvc-entries cache)) ce)
+      ;; KEY may be a caller's stack probe (WITH-UTXO-PROBE-KEY): what the
+      ;; cache keeps is a heap copy.
+      (let ((ce (make-cache-entry :entry from-base :dirty nil :fresh nil))
+            (stored (copy-utxo-key key)))
+        (setf (gethash stored (cvc-entries cache)) ce)
         (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
         ;; Record it as evictable: it entered the cache only to answer a read.
         (when *coins-to-uncache*
-          (push key (car *coins-to-uncache*)))
+          (push stored (car *coins-to-uncache*)))
         ce))))
 
 (defun coins-view-cache-uncache (cache key)
@@ -533,14 +536,16 @@ left untouched rather than invented."
   (declare (type coins-view-cache cache)
            (type (simple-array (unsigned-byte 8) (*)) txid)
            (type (unsigned-byte 32) vout))
-  (coins-view-cache-get cache (make-utxo-key txid vout)))
+  (with-utxo-probe-key (key txid vout)
+    (coins-view-cache-get cache key)))
 
 (defun coin-view-has-p (cache txid vout)
   "Truthy iff (TXID, VOUT) currently maps to an unspent coin."
   (declare (type coins-view-cache cache)
            (type (simple-array (unsigned-byte 8) (*)) txid)
            (type (unsigned-byte 32) vout))
-  (coins-view-cache-has-p cache (make-utxo-key txid vout)))
+  (with-utxo-probe-key (key txid vout)
+    (coins-view-cache-has-p cache key)))
 
 (defun coin-view-add (cache txid vout value script-pubkey height
                       &key coinbase allow-overwrite)
@@ -563,11 +568,11 @@ contract on utxo-set."
   (declare (type coins-view-cache cache)
            (type (simple-array (unsigned-byte 8) (*)) txid)
            (type (unsigned-byte 32) vout))
-  (let* ((key (make-utxo-key txid vout))
-         (entry (coins-view-cache-get cache key)))
-    (when entry
-      (coins-view-cache-spend cache key)
-      entry)))
+  (with-utxo-probe-key (key txid vout)
+    (let ((entry (coins-view-cache-get cache key)))
+      (when entry
+        (coins-view-cache-spend cache key)
+        entry))))
 
 ;;;; BIP30: any-utxo-for-txid-p over (cache + base).
 ;;;;
@@ -621,7 +626,8 @@ txid check."
             ;; Base says this output exists. The cache supersedes iff
             ;; it has a tombstone (entry=NIL); otherwise it's unspent.
             (when vout
-              (let ((ce (gethash (make-utxo-key txid vout) (cvc-entries cache))))
+              (let ((ce (with-utxo-probe-key (key txid vout)
+                          (gethash key (cvc-entries cache)))))
                 (unless (and ce (null (ce-entry ce)))
                   (return-from coin-view-any-utxo-for-txid-p t)))))
           (leveldb-iter-next iter)))))
@@ -827,15 +833,16 @@ test-bitcoin-server 2026-05-19 at h=135597."
   "Polymorphic UTXO read. Returns the utxo-entry or NIL."
   (etypecase view
     (utxo-set
-     (gethash (make-utxo-key txid output-index) (utxo-set-entries view)))
+     (with-utxo-probe-key (key txid output-index)
+       (gethash key (utxo-set-entries view))))
     (coins-view-cache
      (coin-view-get view txid output-index))))
 
 (defun utxo-exists-p (view txid output-index)
   (etypecase view
     (utxo-set
-     (and (gethash (make-utxo-key txid output-index)
-                         (utxo-set-entries view)) t))
+     (with-utxo-probe-key (key txid output-index)
+       (and (gethash key (utxo-set-entries view)) t)))
     (coins-view-cache
      (and (coin-view-has-p view txid output-index) t))))
 
