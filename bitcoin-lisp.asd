@@ -690,6 +690,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/coinscache-sim")
                              (:file "fuzz/versionbits")
                              (:file "fuzz/block-index")
+                             (:file "fuzz/block-index-tree")
                              (:file "fuzz/process-message")
                              (:file "fuzz/banman")
                              (:file "fuzz/socks5")
