@@ -1137,7 +1137,8 @@
   ReceivedTx / MempoolAcceptedTx / MempoolRejectedTx / MempoolRejectedPackage
   in the TX handler's ProcessValidTx / ProcessInvalidTx /
   ProcessPackageResult, ReceivedNotFound in NOTFOUND, GetRequestsToSend in
-  each peer's SendMessages pass (SEND-TX-REQUESTS-TO-PEERS), HaveMoreWork and
+  each peer's SendMessages pass (SEND-TX-REQUESTS, at the end of that peer's
+  drain), HaveMoreWork and
   GetTxToReconsider in the message pump (PROCESS-ORPHAN-TX, before each
   message), BlockConnected / BlockDisconnected / ActiveTipChange from the
   validation interface -- the last two skipped during IBD and for a targeted
@@ -1148,8 +1149,15 @@
   the parent's message (Core's 2024 orphan-stall fix). A peer that never
   registered tracks nothing; a :READY peer struct that skipped the handshake
   -- the unit suites build them -- is registered on first contact.
-  `TXDOWNLOAD-CHECK-IS-EMPTY` is Core's CheckIsEmpty, logged where Core
-  asserts (a new peer, the last peer gone) and asserted by the fuzz targets.
+  `TXDOWNLOAD-ASSERT-EMPTY` is Core's CheckIsEmpty assert, made where Core
+  makes it -- for a peer at its VERACK, and overall once no peer is
+  registered -- and it signals TXDOWNLOAD-CHECK-FAILED, as the mempool check
+  signals MEMPOOL-CHECK-FAILED. The three filters are Core's
+  CRollingBloomFilter (`make-rolling-bloom-filter`, in bloom.lisp beside
+  BIP37's filter): 120,000 recent rejects and 120,000 reconsiderable rejects,
+  48,000 recently confirmed, at one in a million, built on first use. A
+  rolling filter remembers at least its last N insertions and none older
+  than about 1.5 N, so it is not a FIFO of exactly N.
 
   Which peer is asked for a transaction is Core's txrequest state machine:
   an announcement is CANDIDATE while its NONPREF/TXID_RELAY/OVERLOADED delay
@@ -1297,9 +1305,11 @@
   (bitcoin-lisp.networking:txdownload-mempool-rejected-tx function)
   (bitcoin-lisp.networking:txdownload-get-tx-to-reconsider function)
   (bitcoin-lisp.networking:txdownload-check-is-empty function)
+  (bitcoin-lisp.networking:txdownload-assert-empty function)
+  (bitcoin-lisp.networking:make-rolling-bloom-filter function)
   (bitcoin-lisp.networking:tx-request-tracker class)
   (bitcoin-lisp.networking:txrequest-get-requestable function)
-  (bitcoin-lisp.networking:send-tx-requests-to-peers function)
+  (bitcoin-lisp.networking:send-tx-requests function)
   (bitcoin-lisp.networking:process-orphan-tx function)
   (bitcoin-lisp.networking:add-to-compact-extra-transactions function)
   (bitcoin-lisp.networking:*max-extra-txs* variable)
