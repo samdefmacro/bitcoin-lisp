@@ -1788,7 +1788,10 @@
   Two lookups per input -- the parent in the pool, the spender in the
   index -- and none per output: the children are collected from the
   inputs, and a chain coin spent twice is caught by the spender check and
-  the index count rather than by a table of its own."
+  the index count rather than by a table of its own. Its walk allocates
+  nothing per entry: it goes over the graph's chunk index in place, and
+  its per-entry marks live on the entries (`CHECK-EPOCH`,
+  `CHECK-CHILDREN`), not in a fresh table per call."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)
