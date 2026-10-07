@@ -977,7 +977,9 @@ a record that does not decode, a table block that fails its checksum, a header
 that fails its own proof of work, a hole in the heights -- or a blk file that
 is gone (:564-567). Starting anyway would leave an empty index under a
 chainstate that names a tip. Under -reindex the file check is skipped, as a
-reindex's wiped index has no entry to point anywhere in Core."
+reindex's wiped index has no entry to point anywhere in Core. The bodies this
+tree's former header index stored without their transaction count get it back
+later, once the RPC server is up (%INIT-SERVICES, BACKFILL-TX-COUNTS)."
   (let ((chain-state (node-chain-state *node*))
         (store (node-block-store *node*)))
     ;; A datadir written before the block index moved into blocks/index still
@@ -1011,7 +1013,8 @@ reindex's wiped index has no entry to point anywhere in Core."
         (when missing
           (log-error "Block file blk~5,'0D.dat is missing~@[ (and ~D more)~]"
                      (first missing) (and (rest missing) (length (rest missing))))
-          (chainstate-load-error "Error loading block database"))))))
+          (chainstate-load-error "Error loading block database"))))
+))
 
 (defun %open-coins-db-or-refuse (thunk)
   "THUNK's value, where THUNK opens the coins LevelDB. One that will not open is
@@ -1651,6 +1654,18 @@ it; the indexes (Step 8) and -forcecompactdb."
 
   ;; mempool.dat is replayed at the END of start-up, after the -loadblock
   ;; files, where Core's initload thread replays it (%INITLOAD).
+
+  ;; The bodies this tree's former header index stored without their nTx get
+  ;; it from their block files, once (LOAD-HEADER-INDEX said how many). Here,
+  ;; after the RPC server is up, so a long first run answers RPC_IN_WARMUP
+  ;; with what it is doing rather than refusing connections; before the sync
+  ;; starts, so nothing else writes the block index meanwhile.
+  (when (node-block-store *node*)
+    (bl.store:backfill-tx-counts
+     (node-chain-state *node*) (node-block-store *node*)
+     :on-start (lambda (total)
+                 (bl.rpc:set-rpc-warmup-status
+                  (format nil "Backfilling ~D block index transaction counts..." total)))))
 
   ;; Initialize peer address book
   (init-message "Loading P2P addresses…")         ; init.cpp:1636

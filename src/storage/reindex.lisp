@@ -62,6 +62,67 @@ the count does not read."
                             (ignore-errors (bl.ser:read-compact-size hs)))))
               (error () nil))))))))
 
+(defun backfill-tx-counts (state store &key (batch-entries +migration-batch-entries+)
+                                            on-start)
+  "Give every entry of STATE's block index that holds a body but records no
+transaction count (nTx = 0) the count its body carries, read from STORE's
+block file as the reindex walk reads it -- the CompactSize after the 80-byte
+header (%REINDEX-HEADER-OF-RECORD) -- and write the 'b' records back in batches
+of BATCH-ENTRIES. The end state is the one Core's ReceivedBlockTransactions
+leaves (CBlockIndex::nTx set with the body, validation.cpp:3812); Core never
+needs this, since its index never held a body without its count, but the
+header index this tree kept before nTx was stored did.
+
+Resumable by construction: each batch's records are written before the next is
+read, and an entry once written no longer records 0, so an interrupted run
+(INTERRUPT-REQUESTED-P, checked between batches) leaves the next start only
+what is left. A body that does not read back, or reads back under another
+hash, keeps its 0 and is counted as skipped. Returns (values WRITTEN SKIPPED),
+or NIL when nothing records 0. ON-START, when given, is called with the number
+of entries to read before the first is read."
+  (let ((pending (sort (loop for e being the hash-values of (chain-state-block-index state)
+                             when (and (block-index-entry-data-pos e)
+                                       (block-index-entry-header e)
+                                       (zerop (block-index-entry-tx-count e)))
+                               collect (cons (make-flat-file-pos
+                                              (or (block-index-entry-file e) 0)
+                                              (block-index-entry-data-pos e))
+                                             e))
+                       ;; File order, so the reads walk each blk file forward.
+                       #'%reindex-pos< :key #'car))
+        (written 0) (skipped 0)
+        (started (get-internal-real-time)))
+    (unless pending
+      (return-from backfill-tx-counts nil))
+    (let ((total (length pending)))
+      (when on-start (funcall on-start total))
+      (with-block-tree-db (db (chain-state-base-path state))
+        (loop while pending
+              do (let ((batch '()))
+                   (loop repeat batch-entries
+                         while pending
+                         do (destructuring-bind (pos . e) (pop pending)
+                              (multiple-value-bind (header hash tx-count)
+                                  (%reindex-header-of-record store pos)
+                                (declare (ignore header))
+                                (if (and tx-count (plusp tx-count)
+                                         (equalp hash (block-index-entry-hash e)))
+                                    (progn (setf (block-index-entry-tx-count e) tx-count)
+                                           (push e batch))
+                                    (incf skipped)))))
+                   (%write-block-index-batch db batch :sync t)
+                   (incf written (length batch))
+                   (bl.log:log-info "Backfilling transaction counts: ~D of ~D entries written"
+                                    written total)
+                   (when (and pending (bl.ctx:interrupt-requested-p))
+                     (bl.log:log-info "Backfilling transaction counts: [CANCELLED] after ~D entries; the next start continues"
+                                      written)
+                     (return-from backfill-tx-counts (values written skipped))))))
+      (bl.log:log-info "Backfilled the transaction count of ~D block index entr~:@P~@[ (~D bod~:@P did not read back)~] in ~,1Fs"
+                       written (and (plusp skipped) skipped)
+                       (/ (- (get-internal-real-time) started) internal-time-units-per-second))
+      (values written skipped))))
+
 (defun %reindex-add-entry (chain-state hash header located parent tx-count)
   "Add HASH's index entry under PARENT, carrying the record's position and its
 transaction count (Core's reindex reaches ReceivedBlockTransactions through

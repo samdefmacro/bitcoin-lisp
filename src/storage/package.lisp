@@ -126,6 +126,7 @@ src/storage/.")
    #:block-index-entry-sequence-id
    #:note-block-received
    #:drop-unlinked-block
+   #:backfill-tx-counts
    #:+seq-id-init-from-disk+
    #:link-unlinked-bodies
    #:entry-better-p

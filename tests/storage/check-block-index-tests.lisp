@@ -338,11 +338,11 @@ blocks above the base at restart, and gave the base's body nothing."
   "The header index this tree kept before nTx was stored wrote entries that
 hold a body and nTx = 0; blocks/index migrated from it keeps them. Core never
 holds that state (ReceivedBlockTransactions sets nTx with the body,
-validation.cpp:3812), so nothing backfills them and CheckBlockIndex refuses
-them -- :5276 while nothing was pruned, :5280 after. LOAD-HEADER-INDEX says how
-many there are, once, so an operator who enables -checkblockindex knows why the
-node stops. Control: the same index with every count recorded loads silently
-and passes."
+validation.cpp:3812) and CheckBlockIndex refuses them -- :5276 while nothing
+was pruned, :5280 after. LOAD-HEADER-INDEX says how many there are, once,
+before start-up's BACKFILL-TX-COUNTS reads their counts back (the tests
+below). Control: the same index with every count recorded loads silently and
+passes."
   (with-network (:regtest)
     (with-temp-directory (dir "bl-cbi-ntx")
       (let* ((cs (bl.store:init-chain-state dir :network :regtest))
@@ -358,7 +358,7 @@ and passes."
                         (tip (car (last chain))))
                    (bl.store:update-chain-tip back (bl.store:block-index-entry-hash tip)
                                               (bl.store:block-index-entry-height tip))
-                   (values back (find "hold a body but record no transaction count"
+                   (values back (find "with a body but no transaction count"
                                       lines :test #'search)))))
           (multiple-value-bind (back line) (reload)
             (is (null line) "a complete index says nothing: ~S" line)
@@ -367,7 +367,102 @@ and passes."
           (setf (bl.store:block-index-entry-tx-count (second chain)) 0
                 (bl.store:block-index-entry-tx-count (third chain)) 0)
           (multiple-value-bind (back line) (reload)
-            (is (and line (search "2 blocks hold a body" line)) "the load line: ~S" line)
+            (is (and line (search "2 blocks with a body" line)) "the load line: ~S" line)
             (%cbi-fails-with "HAVE_DATA is equivalent to nTx > 0 when nothing was pruned" back)
             (setf (bl.store:chain-state-pruned-height back) 1)
             (%cbi-fails-with "HAVE_DATA implies nTx > 0" back)))))))
+
+;;;; The backfill: nTx read back from the block files at start-up
+
+(defun %backfill-fixture (tag zeroed)
+  "(values base-path chain-state store entries): a regtest node with four mined
+blocks whose index is saved to blocks/index with the transaction count of the
+blocks at the heights in ZEROED set to 0, as the former header index wrote
+them."
+  (let* ((suffix (format nil "~A-~D" tag (get-universal-time)))
+         (node (regtest-node-fixture suffix))
+         (cs (bl:node-chain-state node)))
+    (generate-regtest-blocks node 4)
+    (let ((entries (loop for h in zeroed collect (bl.store:get-block-at-height cs h))))
+      (dolist (e entries) (setf (bl.store:block-index-entry-tx-count e) 0))
+      (bl.store:save-header-index cs :force-full t)
+      (values (regtest-node-base-path suffix) cs (bl:node-block-store node) entries))))
+
+(defun %backfill-reload (base cs)
+  "(values chain-state line): the block index at BASE reloaded from
+blocks/index, its tip set to CS's, and the load's line about bodies without a
+count, if any."
+  (let* ((back (bl.store:init-chain-state base :network :regtest))
+         (lines (capture-log-lines (lambda () (bl.store:load-header-index back)))))
+    (bl.store:update-chain-tip back (bl.store:best-block-hash cs) (bl.store:current-height cs))
+    (values back (find "with a body but no transaction count" lines :test #'search))))
+
+(test start-up-reads-a-missing-transaction-count-back-from-the-block-file
+  "BACKFILL-TX-COUNTS, run by start-up after the block index loads, reads the
+CompactSize after each such body's header from its blk file -- the 89 bytes the
+reindex walk reads -- and writes the counts back to blocks/index, which reaches
+the state Core's ReceivedBlockTransactions always leaves (CBlockIndex::nTx
+set with the body, validation.cpp:3812). A reload then finds none, and
+CheckBlockIndex passes where it stopped the node before."
+  (with-network (:regtest)
+    (multiple-value-bind (base cs store entries) (%backfill-fixture "bf" '(2 3))
+      (multiple-value-bind (back line) (%backfill-reload base cs)
+        (is (and line (search "2 blocks with a body" line)) "before: ~S" line)
+        (%cbi-fails-with "HAVE_DATA is equivalent to nTx > 0" back)
+        (is (equal '(2 0) (multiple-value-list (bl.store:backfill-tx-counts back store))))
+        (dolist (e entries)
+          (is (= 1 (bl.store:block-index-entry-tx-count
+                    (bl.store:get-block-index-entry back (bl.store:block-index-entry-hash e)))))))
+      (multiple-value-bind (again line) (%backfill-reload base cs)
+        (is (null line) "a reload after the backfill reports none: ~S" line)
+        (is (null (%cbi-failure again)))
+        (is (null (bl.store:backfill-tx-counts again store)) "and a second start does nothing")))))
+
+(test an-interrupted-backfill-continues-at-the-next-start
+  "The backfill writes each batch before it reads the next and checks for a
+stop request between them, so a start interrupted part-way leaves blocks/index
+with the batches it finished and the next start does only the rest -- the
+shape of the header-index migration and the coins upgrade."
+  (with-network (:regtest)
+    (multiple-value-bind (base cs store) (%backfill-fixture "bfi" '(1 2 3))
+      (let ((back (%backfill-reload base cs)))
+        (is (equal '(1 0) (multiple-value-list
+                           (let ((bl:*interrupt-check* (constantly t)))
+                             (bl.store:backfill-tx-counts back store :batch-entries 1))))
+            "one batch of one, then the stop request"))
+      (multiple-value-bind (back line) (%backfill-reload base cs)
+        (is (and line (search "2 blocks with a body" line)) "two left: ~S" line)
+        (is (equal '(2 0) (multiple-value-list (bl.store:backfill-tx-counts back store)))))
+      (multiple-value-bind (back line) (%backfill-reload base cs)
+        (is (null line) "none left: ~S" line)
+        (is (null (%cbi-failure back)))))))
+
+(test a-pruned-block-without-a-transaction-count-is-named-at-load
+  "A block the former header index wrote as connected and whose body has since
+been pruned has no count and nothing to read one from: no backfill is
+possible, and CheckBlockIndex refuses it (VALID_TRANSACTIONS iff nTx > 0,
+validation.cpp:5289). The load says how many, separately, so an operator knows
+-checkblockindex cannot be enabled on that datadir without a re-download."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-cbi-pruned-ntx")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (genesis (add-regtest-genesis-entry cs))
+             (chain (add-mined-chain cs genesis 3)))
+        (loop for e in (cons genesis chain) for i from 1
+              do (%cbi-received e (* 1000 i)))
+        (setf (bl.store:block-index-entry-tx-count (first chain)) 0
+              (bl.store:block-index-entry-file (first chain)) nil
+              (bl.store:block-index-entry-data-pos (first chain)) nil)
+        (bl.store:save-header-index cs :force-full t)
+        (let* ((back (bl.store:init-chain-state dir :network :regtest))
+               (lines (capture-log-lines (lambda () (bl.store:load-header-index back))))
+               (line (find "pruned block" lines :test #'search)))
+          (is (and line (search "1 pruned block with no transaction count" line))
+              "the load line: ~S" line)
+          (is (null (find "with a body but no transaction count" lines :test #'search)))
+          (let ((tip (car (last chain))))
+            (bl.store:update-chain-tip back (bl.store:block-index-entry-hash tip)
+                                       (bl.store:block-index-entry-height tip)))
+          (setf (bl.store:chain-state-pruned-height back) 1)
+          (%cbi-fails-with "VALID_TRANSACTIONS is equivalent to nTx > 0" back))))))
+
