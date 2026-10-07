@@ -1097,7 +1097,7 @@ the override takes precedence (for tests / custom chains)."
   (let ((bl:*minimum-chain-work-override* 42))
     (is (= 42 (bl:minimum-chain-work :mainnet)))))
 
-(test process-headers-minimum-chain-work-gate
+(synthetic-index-test process-headers-minimum-chain-work-gate
   "Once the active chain is past nMinimumChainWork, a header building a chain
 below the floor is refused index admission (anti-DoS low-work fork spam), while
 a header extending the high-work tip is accepted."
@@ -1305,7 +1305,7 @@ the regtest pow-limit target, so the header reaches the contextual checks."
             until (bl.val:check-proof-of-work hdr)))
     hdr))
 
-(test validate-header-chain-mtp-uses-in-batch-parent
+(synthetic-index-test validate-header-chain-mtp-uses-in-batch-parent
   "CONSENSUS (GA8 S1-7): the timestamp>median-time-past rule must be evaluated
 against the parent ENTRY threaded through the batch, not a block-index lookup of
 the parent HASH. A header whose parent is only staged in this batch found nothing
@@ -5572,7 +5572,7 @@ activation and the log said UNEXPECTED-WITNESS."
 fixture is keyed by suffix and reopens whatever is on disk, so a fixed suffix
 would make the second run in one image start from the first run's chain.")
 
-(test a-refetched-body-is-stored-for-a-block-whose-body-was-pruned
+(synthetic-index-test a-refetched-body-is-stored-for-a-block-whose-body-was-pruned
   "Core AcceptBlock's fAlreadyHave is `pindex->nStatus & BLOCK_HAVE_DATA'
 (validation.cpp:4350) -- do we hold the BODY -- and a prune clears that bit
 along with nFile/nDataPos (PruneOneBlockFile, blockstorage.cpp:264-270). What

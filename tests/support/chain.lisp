@@ -269,10 +269,19 @@ block-store / utxo-set, ready for activate-block. Call inside (with-network (:re
     ;; Marked BLOCK_OPT_WITNESS as the node's own genesis is (Core's
     ;; LoadGenesisBlock runs ReceivedBlockTransactions): regtest has segwit
     ;; from height 0, and an unmarked genesis is a chain that needs a redownload.
+    ;; Its body on disk and its one transaction counted, as the node's start-up
+    ;; leaves it (ENSURE-GENESIS-ON-DISK, NOTE-GENESIS-POSITION): the block
+    ;; index this builds is one Core's CheckBlockIndex accepts. Stored whenever
+    ;; the store lacks it -- a directory an earlier run of the suite left
+    ;; behind is not empty, which is the node's own condition.
     (bl.store:note-block-witness-received
      (bl.store:add-block-index-entry
       cs (bl.store:make-block-index-entry
-          :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr)))
+          :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr
+          :tx-count 1)))
+    (unless (bl.store:block-exists-p store ghash)
+      (bl.store:store-block store (bl.store:make-genesis-block :regtest) :height 0))
+    (bl.store:note-genesis-position cs store)
     (setf (bl:node-chain-state node) cs
           (bl:node-utxo-set node) (bl.store:make-utxo-set)
           (bl:node-block-store node) store

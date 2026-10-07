@@ -970,7 +970,7 @@ to the index because the validated-tip work gate was off during IBD."
           (is (null (bl.store:get-block-index-entry state h1-hash))
               "the low-work header must not enter the block index"))))))
 
-(test a-noban-peer-bypasses-the-low-work-gate-and-others-are-ignored-in-cores-words
+(synthetic-index-test a-noban-peer-bypasses-the-low-work-gate-and-others-are-ignored-in-cores-words
   "Core skips the anti-DoS work gate for a NoBan peer (net_processing.cpp
 :3056-3061), so p2p_headers_sync_with_minchainwork.py:62 expects node3, whose
 peers are noban, to take a low-work chain's headers (`Synchronizing
@@ -1010,7 +1010,7 @@ ONCE. Ours gated the noban peer too and logged `(14 headers)', twice."
                      "~S" lines))
           (is-true (bl.store:get-block-index-entry state h1-hash)))))))
 
-(test generic-path-stores-above-threshold-headers
+(synthetic-index-test generic-path-stores-above-threshold-headers
   "Above the work threshold, the generic path validates and stores normally —
 steady-state tip announcements are unaffected by the anti-DoS gate."
   (let ((bl:*network* :regtest)
@@ -1027,7 +1027,7 @@ steady-state tip announcements are unaffected by the anti-DoS gate."
           (is (not (null (bl.store:get-block-index-entry state h1-hash)))
               "above-threshold header enters the block index"))))))
 
-(test a-finished-low-work-sync-asks-again-after-a-full-batch
+(synthetic-index-test a-finished-low-work-sync-asks-again-after-a-full-batch
   "Core's ProcessHeadersMessage, after IsContinuationOfLowWorkHeadersSync has
 taken the sync to FINAL (m_headers_sync.reset()), goes on with
 have_headers_sync false, so a message that was FULL asks again from pindexLast
@@ -1074,7 +1074,7 @@ presync it, two more redownload it, and the last one finishes the sync."
                                   (subseq getheaders 24))))
                   "from pindexLast, the last header of that message"))))))))
 
-(test a-header-on-an-invalid-parent-is-refused-and-punished
+(synthetic-index-test a-header-on-an-invalid-parent-is-refused-and-punished
   "Core's AcceptBlockHeader refuses a header whose parent is marked invalid as
 bad-prevblk, before indexing it (validation.cpp:4252-4255), and
 ProcessHeadersMessage punishes the sender: MaybePunishNodeForBlock(...,
@@ -2017,7 +2017,7 @@ again, which is precisely the state P2 exists to prevent."
                 "and must not set the per-peer flag"))))
 
 
-(test g7-08-headers-from-a-retired-peer-do-not-grant-protection
+(synthetic-index-test g7-08-headers-from-a-retired-peer-do-not-grant-protection
   "The same refusal through the PRODUCTION path — ingest-headers-from-peer ->
 %store-validated-headers, which is where the grant actually fires. Asserting
 it on the bare predicate is not enough: the hazard is an ordering one.
@@ -2157,7 +2157,7 @@ pindexLast to judge the peer on."
         (is (eq :ready (bl.net:peer-state p))
             "an ignored low-work batch must NOT drop the peer")))))
 
-(test w3-low-work-outbound-still-dropped-on-stored-batch
+(synthetic-index-test w3-low-work-outbound-still-dropped-on-stored-batch
   "The control: the feature must still fire where Core fires it. A batch we
 already hold sets already_validated_work (net_processing.cpp:3046-3054),
 bypasses TryLowWorkHeadersSync and reaches
@@ -2224,7 +2224,7 @@ a-headers b-headers)."
   (bl.store:get-block-index-entry
    state (bl.ser:block-header-hash header)))
 
-(test w3-ancestor-of-best-header-or-tip-predicate
+(synthetic-index-test w3-ancestor-of-best-header-or-tip-predicate
   "Core PeerManagerImpl::IsAncestorOfBestHeaderOrTip (net_processing.cpp:2813-
 2823), all three arms plus the NIL case. The fork arm is what the GA8 W3 review
 was about: a header we HOLD is not thereby a header on our chain."
@@ -2257,7 +2257,7 @@ was about: a header we HOLD is not thereby a header on our chain."
                   state b2)
                  "a header on the ACTIVE chain qualifies even off the best-header branch")))))
 
-(test w3-all-known-fork-batch-non-full-is-not-judged
+(synthetic-index-test w3-all-known-fork-batch-non-full-is-not-judged
   "The same class, non-full: Core's TryLowWorkHeadersSync logs \"Ignoring
 low-work chain\" and returns true, so ProcessHeadersMessage returns without ever
 reaching UpdatePeerStateForReceivedHeaders — no availability update and, above
@@ -2278,7 +2278,7 @@ instead and dropped an outbound peer Core keeps."
         (is (eq :ready (bl.net:peer-state p))
             "and must NOT drop the peer")))))
 
-(test w3-known-ancestor-batch-still-drops-low-work-outbound
+(synthetic-index-test w3-known-ancestor-batch-still-drops-low-work-outbound
   "The genuine low-work disconnect must still fire, and through the ANCESTOR arm
 rather than an identity check: this batch ends at A1, an ancestor of our best
 header A3 and not the best header itself. Core sets already_validated_work,
@@ -2479,7 +2479,7 @@ Core's and is preserved deliberately."
                    (list fresh2 old-a old-b) now 2 2))
             "a peer we are mid-download from must not be rotated out")))))
 
-(test g7-08-p3-headers-stamp-requires-a-new-header-beating-our-tip
+(synthetic-index-test g7-08-p3-headers-stamp-requires-a-new-header-beating-our-tip
   "The stamp the rotation reads, through the production path
 (ingest-headers-from-peer -> %store-validated-headers), which is where Core
 credits it (net_processing.cpp:2921-2923).
@@ -2513,7 +2513,7 @@ happy path stamps correctly either way."
         (is (= 12345 (bl.net:peer-last-block-announcement peer))
             "re-announcing a header we already hold must earn nothing")))))
 
-(test g7-08-p3-cmpctblock-credits-the-announcement-not-the-reconstruct
+(synthetic-index-test g7-08-p3-cmpctblock-credits-the-announcement-not-the-reconstruct
   "Core's second credit site (net_processing.cpp:4623) sits in the cmpctblock
 header step, BEFORE reconstruction is attempted. Crediting the successful
 reconstruct instead — the intuitive place, since that is where we learn the
@@ -2546,7 +2546,7 @@ decided :ACCEPT; asked afterwards it would always say `known'."
           (is (eq :accept verdict) "a header we already hold is still accepted")
           (is-false credits "but re-announcing it earns no credit"))))))
 
-(test g7-08-p3-an-equal-work-sibling-earns-no-announcement-credit
+(synthetic-index-test g7-08-p3-an-equal-work-sibling-earns-no-announcement-credit
   "Core compares the announced chain STRICTLY against our tip
 (net_processing.cpp:2921 — `last_header.nChainWork > ...Tip()->nChainWork'),
 and this is the case that separates > from >=: a competing block at the same
@@ -3409,7 +3409,7 @@ as a real node's does before the test's first setmocktime."
                    "and the silent peer is evicted")))
         (setf (fdefinition 'bl.net:send-message) real)))))
 
-(test headers-that-fail-checkheaderspow-are-misbehaving-in-cores-words
+(synthetic-index-test headers-that-fail-checkheaderspow-are-misbehaving-in-cores-words
   "Core runs CheckHeadersPoW before it processes a headers message at all
 (net_processing.cpp:2983-2991): a header that misses its own claimed target
 is Misbehaving `header with invalid proof of work', a batch that does not

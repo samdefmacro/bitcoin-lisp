@@ -124,6 +124,10 @@ can. src/validation/.")
    #:clear-reconsiderable-rejects
    #:perform-reorg
    #:activate-best-chain
+   ;; -checkblockindex (Core CheckBlockIndex's sampling and drive sites)
+   #:*check-block-index*
+   #:check-block-index-ratio
+   #:check-block-index
    #:reorg-missing-blocks-p
    #:best-valid-tip
    #:get-undo-data

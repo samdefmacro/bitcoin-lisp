@@ -332,7 +332,12 @@ the pruned-data error from a pruned node."
                     ;; Genesis too: its body is rebuilt from the chain
                     ;; parameters when not stored, but a node that has pruned
                     ;; past it has no genesis to serve (feature_pruning.py:502
-                    ;; scans from genesis).
+                    ;; scans from genesis). The fixture stores genesis as the
+                    ;; node does, so it goes the way the prune takes it.
+                    (bl.store:forget-block-body
+                     (bl:node-block-store node)
+                     (bl.store:block-index-entry-hash
+                      (bl.store:get-block-at-height (bl:node-chain-state node) 0)))
                     (signals-rpc-error
                         (:code -1 :exact-message "Block not available (pruned data)")
                       (bl.rpc:dispatch-rpc-method

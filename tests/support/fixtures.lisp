@@ -40,6 +40,17 @@ BIP34 at height 1)."
 
 ;;;; The minimal node
 
+(defmacro synthetic-index-test (name &body body)
+  "A fiveam TEST, NAME and BODY as for TEST, run with -checkblockindex off. For
+a test that builds a block index Core could never hold -- made-up hashes, a
+genesis without its body, chain work out of thin air -- to drive the logic
+above the index: Core's CheckBlockIndex (on by default on regtest) would
+refuse it at the first drive site, which is not what the test is about."
+  (let ((doc (when (and (stringp (first body)) (rest body)) (list (pop body)))))
+    `(fiveam:test ,name ,@doc
+       (let ((bl.val:*check-block-index* 0))
+         ,@body))))
+
 (defun make-test-node (&key (network :testnet3))
   "Create a node with minimal initialized state for testing."
   (let ((node (bl:make-node :network network)))

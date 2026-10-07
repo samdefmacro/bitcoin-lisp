@@ -31,6 +31,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-temp-directory
    #:with-network
    #:make-test-node
+   #:synthetic-index-test
    #:with-ibd-context
    #:project-source-text
    #:make-test-connection

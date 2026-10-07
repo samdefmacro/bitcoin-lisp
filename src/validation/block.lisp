@@ -56,6 +56,43 @@ held (%ASSERT-CS-MAIN-HELD). WHERE names the entry point for the error."
      (bt:with-recursive-lock-held (*chainstate-mutex*)
        ,@body)))
 
+;;; -checkblockindex: Core's CheckBlockIndex at Core's drive sites
+
+(defvar *check-block-index* nil
+  "Core -checkblockindex=<n> (node/chainstatemanager_args.cpp:27-30): run the
+block index consistency check on one call in N, never when 0; a bare
+-checkblockindex is 1. NIL, the option absent, is the chain's default -- 1
+where fDefaultConsistencyChecks holds (regtest), 0 elsewhere (init.cpp:642,
+kernel/chainparams.h:95).")
+
+(defun check-block-index-ratio ()
+  "*CHECK-BLOCK-INDEX*, or the chain's default when it is NIL."
+  (or *check-block-index*
+      (if (bl.chain:network-default-consistency-checks-p bl.chain:*network*) 1 0)))
+
+(defun check-block-index (chain-state)
+  "Core ChainstateManager::CheckBlockIndex (validation.cpp:5157-5170): on one
+call in CHECK-BLOCK-INDEX-RATIO, BL.STORE:CHECK-BLOCK-INDEX-NOW over
+CHAIN-STATE's block index, holding the chainstate mutex under the node lock
+(Core takes cs_main). A failed invariant is Core's assert, which aborts
+bitcoind: it is reported as a fatal error -- logged, on stderr, and the node
+asked to stop -- and BL.STORE:BLOCK-INDEX-CHECK-FAILED unwinds the caller.
+
+The drive sites are Core's: every header accepted (ProcessNewBlockHeaders and
+AcceptBlock's AcceptBlockHeader, validation.cpp:4282, :4341 -- PROCESS-HEADERS),
+every body accepted and the ActivateBestChain that follows it (AcceptBlock's
+end and ProcessNewBlock, :4425, :3517 -- ACTIVATE-BLOCK, the downloaded-block
+path and the body-only stores of the block download), the end of every
+ActivateBestChain (:3517 -- ACTIVATE-BEST-CHAIN, the chain-control RPCs'
+%ACTIVATE-BEST-VALID-CHAIN, PRECIOUS-BLOCK), and InvalidateBlock once the
+branch is disconnected (:3676)."
+  (let ((ratio (check-block-index-ratio)))
+    (when (and (plusp ratio) (zerop (random ratio)))
+      (with-chainstate-mutex (check-block-index)
+        (handler-bind ((bl.store:block-index-check-failed
+                         (lambda (c) (bl.log:fatal-error (princ-to-string c)))))
+          (bl.store:check-block-index-now chain-state))))))
+
 ;;; Block Validation
 ;;;
 ;;; This module validates Bitcoin blocks according to consensus rules.
@@ -4825,11 +4862,11 @@ backstop against a candidate that reorgs away and reappears."
                     (bl.store:block-index-entry-height new-tip))
                    (%check-fork-warning-conditions chain-state))))
               (t
-               ;; :interrupted means the node is stopping — not a refusal to
-               ;; re-queue against.
+               ;; :interrupted means the node is stopping, not a refusal.
                (when (reorg-missing-blocks-p detail)
                  (setf missing detail))
                (return))))))
+      (check-block-index chain-state)   ; ActivateBestChain's, validation.cpp:3517
       (values switched missing))))
 
 (defun %best-reachable-tip (chain-state block-store tip)
@@ -4855,7 +4892,9 @@ there is nothing better to switch to -- or (VALUES NIL REASON)."
   (let* ((tip (bl.store:get-block-index-entry
                chain-state (bl.store:best-block-hash chain-state)))
          (target (and tip (%best-reachable-tip chain-state block-store tip))))
-    (if target
+    ;; Core ActivateBestChain's closing CheckBlockIndex (validation.cpp:3517).
+    (multiple-value-prog1
+     (if target
         ;; perform-reorg validates the reactivated chain and rolls back
         ;; (returning NIL) if one of its blocks is invalid -- in which case the
         ;; chain correctly stays on TIP. Surface that rather than reporting
@@ -4866,7 +4905,8 @@ there is nothing better to switch to -- or (VALUES NIL REASON)."
           (if ok
               (values t nil)
               (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))
-        (values t nil))))
+        (values t nil))
+     (check-block-index chain-state))))
 
 (defun invalidate-block (chain-state block-store utxo-set block-hash
                          &key recent-rejects mempool)
@@ -4921,6 +4961,9 @@ on its OWN four-block chain; we left it at height 1."
            ;; was a second copy of the marking loop, which is how the fork warning
            ;; would have been left out of the RPC path.
            (%mark-block-subtree-invalid chain-state entry)
+           ;; InvalidateBlock's CheckBlockIndex (validation.cpp:3676), which Core
+           ;; reaches with the disconnected branch already marked failed.
+           (check-block-index chain-state)
            ;; Core ActivateBestChain (rpc/blockchain.cpp:1707-1709).
            (%activate-best-valid-chain chain-state block-store utxo-set
                                        :recent-rejects recent-rejects
@@ -4968,39 +5011,43 @@ ACTIVATE-BEST-CHAIN would hand the tip back to the chain whose data arrived
 first. Returns (values t nil) on success (including the no-ops where the block
 is already the tip or weaker), (values nil reason) on failure."
   (with-chainstate-mutex (precious-block)
-    (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
-      (cond
-        ((null entry) (values nil :block-not-found))
-        (t
-         (let ((tip (bl.store:get-block-index-entry
-                     chain-state (bl.store:best-block-hash chain-state))))
-           (when (and tip (>= (bl.store:block-index-entry-chain-work entry)
-                              (bl.store:block-index-entry-chain-work tip)))
-             (bl.store:precious-block-sequence chain-state entry))
-           (cond
-             ;; Already the tip, or weaker than it — nothing to do.
-             ((or (null tip)
-                  (eq entry tip)
-                  (< (bl.store:block-index-entry-chain-work entry)
-                     (bl.store:block-index-entry-chain-work tip)))
-              (values t nil))
-             ;; An invalid block keeps its sequence id but never becomes a
-             ;; candidate (validation.cpp:3544-3547), so Core's
-             ;; ActivateBestChain has nothing to switch to and the call
-             ;; succeeds. p2p_orphan_handling.py:271 invalidates the tip and
-             ;; then preciousblocks it.
-             ((eq (bl.store:block-index-entry-status entry) :invalid)
-              (values t nil))
-             ;; Can only reorg to a block whose data is present.
-             ((not (bl.store:block-exists-p block-store block-hash))
-              (values nil :block-missing))
-             (t
-              (multiple-value-bind (ok detail)
-                  (perform-reorg chain-state block-store utxo-set tip entry
-                                 :recent-rejects recent-rejects :mempool mempool)
-                (cond (ok (values t nil))
-                      ((eq detail :interrupted) (values nil :interrupted))
-                      (t (values nil :reorg-failed))))))))))))
+    ;; PreciousBlock ends in ActivateBestChain (validation.cpp:3548), whose
+    ;; CheckBlockIndex (:3517) runs whatever it decided.
+    (multiple-value-prog1
+        (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
+          (cond
+            ((null entry) (values nil :block-not-found))
+            (t
+             (let ((tip (bl.store:get-block-index-entry
+                         chain-state (bl.store:best-block-hash chain-state))))
+               (when (and tip (>= (bl.store:block-index-entry-chain-work entry)
+                                  (bl.store:block-index-entry-chain-work tip)))
+                 (bl.store:precious-block-sequence chain-state entry))
+               (cond
+                 ;; Already the tip, or weaker than it — nothing to do.
+                 ((or (null tip)
+                      (eq entry tip)
+                      (< (bl.store:block-index-entry-chain-work entry)
+                         (bl.store:block-index-entry-chain-work tip)))
+                  (values t nil))
+                 ;; An invalid block keeps its sequence id but never becomes a
+                 ;; candidate (validation.cpp:3544-3547), so Core's
+                 ;; ActivateBestChain has nothing to switch to and the call
+                 ;; succeeds. p2p_orphan_handling.py:271 invalidates the tip and
+                 ;; then preciousblocks it.
+                 ((eq (bl.store:block-index-entry-status entry) :invalid)
+                  (values t nil))
+                 ;; Can only reorg to a block whose data is present.
+                 ((not (bl.store:block-exists-p block-store block-hash))
+                  (values nil :block-missing))
+                 (t
+                  (multiple-value-bind (ok detail)
+                      (perform-reorg chain-state block-store utxo-set tip entry
+                                     :recent-rejects recent-rejects :mempool mempool)
+                    (cond (ok (values t nil))
+                          ((eq detail :interrupted) (values nil :interrupted))
+                          (t (values nil :reorg-failed))))))))))
+      (check-block-index chain-state))))
 
 ;;;; Activate block — validate + connect with reorg awareness.
 ;;;;
@@ -5156,10 +5203,15 @@ off that path (a sibling fork, or any block past the target) is stored for
 the block store's benefit but never activated, so the historical chainstate
 can neither wedge on an equal-work sibling nor advance past the base."
   (with-chainstate-mutex (activate-block)
-    (%activate-block block chain-state block-store utxo-set
-                     :current-time current-time :skip-scripts skip-scripts
-                     :recent-rejects recent-rejects
-                     :mempool mempool)))
+    (multiple-value-prog1
+        (%activate-block block chain-state block-store utxo-set
+                         :current-time current-time :skip-scripts skip-scripts
+                         :recent-rejects recent-rejects
+                         :mempool mempool)
+      ;; AcceptBlock's closing CheckBlockIndex and ProcessNewBlock's
+      ;; ActivateBestChain's (validation.cpp:4425, :3517): one walk, since
+      ;; nothing changes the index between the two.
+      (check-block-index chain-state))))
 
 (defun %activate-block (block chain-state block-store utxo-set
                         &key current-time skip-scripts recent-rejects mempool)

@@ -1085,7 +1085,10 @@ Returns the number of new headers added."
                      ;; height — a heavier-but-shorter fork must still be fetched.
                      (when (and *ibd-context*
                                 (> new-work (ibd-context-best-header-work *ibd-context*)))
-                       (setf (ibd-context-best-header-work *ibd-context*) new-work)))))))))))
+                       (setf (ibd-context-best-header-work *ibd-context*) new-work)))))))))
+        ;; ProcessNewBlockHeaders runs CheckBlockIndex after EVERY header,
+        ;; known or new, accepted or not (validation.cpp:4280-4282).
+        (bl.val:check-block-index chain-state)))
     ;; Highest header seen, kept OUTSIDE the IBD context too. The context is
     ;; per-sync-pass; this survives it, so the sync loop's between-pass wait can
     ;; tell "at the tip, nothing to do" from "behind, waiting for no reason".
@@ -5044,6 +5047,18 @@ per-block file leaves the entry's data position NIL by design."
             block-store (bl.store:block-index-entry-hash entry))
            t)))
 
+(defun %store-block-body (chain-state block-store block hash height)
+  "Core AcceptBlock's write step for a body this download path stores without
+connecting it (validation.cpp:4395-4425): write it, record where it landed and
+its transaction count on HASH's entry (ReceivedBlockTransactions), and run
+AcceptBlock's closing CheckBlockIndex -- all under the node lock."
+  (with-current-node-lock
+    (bl.store:note-block-position
+     chain-state hash
+     (nth-value 1 (bl.store:store-block block-store block :height height))
+     :tx-count (length (bl.ser:bitcoin-block-transactions block)))
+    (bl.val:check-block-index chain-state)))
+
 (defun %refetch-pruned-body (block chain-state block-store entry requested peer)
   "Write BLOCK's body when it is a block already on our active chain whose body
 we had PRUNED and which we asked for again -- Core AcceptBlock's write step for
@@ -5084,12 +5099,7 @@ what stands between a peer and an arbitrary body under an honest header's hash."
                      height))
       ((not (%block-body-acceptable-p block chain-state peer)))
       (t
-       (with-current-node-lock
-         (bl.store:note-block-position
-          chain-state hash
-          (nth-value 1 (bl.store:store-block
-                        block-store block :height height))
-          :tx-count (length (bl.ser:bitcoin-block-transactions block))))
+       (%store-block-body chain-state block-store block hash height)
        (bl:log-cat "net" "Stored refetched body for pruned block ~D (~A)"
                    height (bl.crypto:bytes-to-hex hash))
        t))))
@@ -5193,12 +5203,7 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
           (return-from process-received-block nil))
         ;; Node lock: activation mutates chainstate/UTXO/mempool state
         ;; the RPC threads access under the same lock.
-        (with-current-node-lock
-          (bl.store:note-block-position
-           chain-state hash
-           (nth-value 1 (bl.store:store-block
-                         block-store block :height height))
-           :tx-count (length (bl.ser:bitcoin-block-transactions block))))
+        (%store-block-body chain-state block-store block hash height)
         ;; Same event as the out-of-order path: a body landed, so any fork
         ;; candidate parked waiting for it can be tried again. BOTH persist
         ;; sites must drain, or a fork whose last missing body arrives
@@ -5384,12 +5389,7 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                                              stripped requested))
                 ((not body-ok) nil)  ; gate refused it; peer already punished
                 (t
-                 (with-current-node-lock
-                   (bl.store:note-block-position
-                    chain-state hash
-                    (nth-value 1 (bl.store:store-block
-                                  block-store block :height height))
-                    :tx-count (length (bl.ser:bitcoin-block-transactions block))))
+                 (%store-block-body chain-state block-store block hash height)
                  (when *ibd-context*
                    ;; A body just landed: any fork candidate that was parked
                    ;; waiting for THIS block can be tried again (Core drains

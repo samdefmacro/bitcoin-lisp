@@ -208,6 +208,27 @@ the same index fails; and the base's ancestors must still be TREE valid."
         (setf (bl.store:block-index-entry-status (second chain)) :unknown)
         (%cbi-fails-with "the snapshot base's ancestors must be TREE valid" cs)))))
 
+(test checkblockindex-ratio-is-the-option-or-the-chains-default
+  "Core: -checkblockindex=<n> runs the check on one call in N, 0 never; an
+empty value is 1 (node/chainstatemanager_args.cpp:27-30); absent, 1 where
+fDefaultConsistencyChecks holds -- regtest alone -- and 0 elsewhere
+(init.cpp:642). The option used to be accepted and ignored."
+  (is-false (bl.cfg:core-only-option-p "checkblockindex"))
+  (is-true (bl:known-config-option-p "checkblockindex"))
+  (flet ((ratio (network setting)
+           (let ((bl:*network* network)
+                 (bl.val:*check-block-index* setting))
+             (bl.val:check-block-index-ratio))))
+    (is (= 1 (ratio :regtest nil)))
+    (is (= 0 (ratio :mainnet nil)))
+    (is (= 0 (ratio :testnet4 nil)))
+    (is (= 0 (ratio :regtest 0)))
+    (is (= 7 (ratio :mainnet 7))))
+  (let ((bl.val:*check-block-index* nil))
+    (loop for (raw want) in '(("" 1) ("1" 1) ("0" 0) ("5" 5))
+          do (bl.cfg:apply-option-globals (list (cons "checkblockindex" raw)))
+             (is (eql want bl.val:*check-block-index*) "-checkblockindex=~A" raw))))
+
 ;;;; The bookkeeping the walk reads, kept the way Core keeps it
 
 (test a-received-body-stays-transactions-valid-after-pruning

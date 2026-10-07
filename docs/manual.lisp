@@ -778,6 +778,33 @@
   breaks even a fresh container, because the FASL volume persists --
   `cold-unit-fresh` after a layout change.
 
+  CHECK-BLOCK-INDEX-NOW is Core's CheckBlockIndex (validation.cpp:
+  5165-5470): a depth-first walk over every index entry, forks first and the
+  best header chain last, that signals BLOCK-INDEX-CHECK-FAILED naming the
+  first invariant it finds broken. It reads Core's nStatus through
+  ENTRY-DISK-STATUS and nTx as TX-COUNT, so the invariants are Core's:
+  heights are depths and chain work never falls along a path; every entry is
+  at least TREE valid and a CHAIN or SCRIPTS valid block's parents are too; a
+  failed block's descendants are failed; HAVE_UNDO implies HAVE_DATA, HAVE_DATA
+  implies nTx > 0 (and is equivalent to it until something is pruned), nTx > 0
+  is equivalent to VALID_TRANSACTIONS; an entry with a sequence id has every
+  ancestor's transactions; a body whose chain lacks an ancestor's transactions
+  waits in `*blocks-unlinked*` and nothing else does; nothing valid has more
+  work than the best header; and the walk reaches every entry, which also
+  catches a prev link to an object the index does not hold. The snapshot base
+  stashes the walk's `first missing / never processed / not valid' marks, so
+  the blocks above it are checked as if everything below had been downloaded.
+  What it cannot check, and why, heads src/storage/check-block-index.lisp: no
+  stored m_chain_tx_count (HaveNumChainTxs is taken from its definition), no
+  skip pointers, and no candidate SET -- FindMostWorkChain's candidates are
+  derived on every call. The walk holds only if the bookkeeping is Core's:
+  every path that stores a body records nTx with its position
+  (NOTE-BLOCK-POSITION's :TX-COUNT; the reindex reads the CompactSize after
+  the header), a received body stays VALID_TRANSACTIONS after pruning, pruning
+  takes a body out of `*blocks-unlinked*` (DROP-UNLINKED-BLOCK) and start-up
+  puts the waiting ones back (LINK-UNLINKED-BODIES, LoadBlockIndex's half).
+  BL.VAL:CHECK-BLOCK-INDEX samples it and runs it where Core does.
+
   A store has TWO bases. `base-path` is the network data directory and
   `store-blocks-path` is where the blk/rev/xor bulk goes -- the same split
   Core makes between `GetDataDirNet()` and `GetBlocksDirPath()`, so
@@ -829,6 +856,11 @@
   (bitcoin-lisp.storage:encode-disk-block-index function)
   (bitcoin-lisp.storage:entry-disk-status function)
   (bitcoin-lisp.storage:chain-needs-redownload-p function)
+  (bitcoin-lisp.storage:check-block-index-now function)
+  (bitcoin-lisp.storage:block-index-check-failed condition)
+  (bitcoin-lisp.storage:note-block-position function)
+  (bitcoin-lisp.storage:drop-unlinked-block function)
+  (bitcoin-lisp.storage:link-unlinked-bodies function)
   (bitcoin-lisp.storage:coin-view-get function)
   (bitcoin-lisp.storage:disconnect-block-from-utxo-set function)
   (bitcoin-lisp.storage:save-utxo-set function)
@@ -1575,6 +1607,23 @@
   VerifyDB, so a block accepted under other deployment heights still
   reconnects (rpc_blockchain.py:106).
 
+  `-checkblockindex=<n>` (CHECK-BLOCK-INDEX, `*check-block-index*`) runs
+  BL.STORE:CHECK-BLOCK-INDEX-NOW on one call in N -- by default every call on
+  regtest and none elsewhere, Core's fDefaultConsistencyChecks -- at Core's
+  drive sites: after every header PROCESS-HEADERS takes (ProcessNewBlockHeaders,
+  validation.cpp:4282), at the end of ACTIVATE-BLOCK and of the
+  downloaded-block and body-only store paths (AcceptBlock and ProcessNewBlock,
+  :4341, :4425, :3517), at the end of ACTIVATE-BEST-CHAIN and of the chain-control
+  RPCs' activation and PRECIOUS-BLOCK (:3517), and in INVALIDATE-BLOCK once the
+  branch is marked (:3676). A failure is Core's assert: FATAL-ERROR reports it
+  and stops the node, and the condition unwinds the caller. It costs about
+  half a microsecond per index entry per call. What it holds validation to:
+  a body STORED is :header-valid with its nTx (AcceptBlock's
+  VALID_TRANSACTIONS), and only a CONNECT -- CONNECT-BLOCK's tip-extension arm
+  or the reorg's connect -- makes it :valid (ConnectBlock's VALID_SCRIPTS);
+  a side-branch block marked :valid on arrival claimed SCRIPTS validity over
+  a parent that had none.
+
   Traps: the P2SH-witness redeem script is the STACK TOP, not the last
   push (a consensus split when it was the latter). Block weight includes
   the header and the transaction-count varint. Witness and taproot are
@@ -1641,6 +1690,8 @@
   (bitcoin-lisp.validation:test-block-validity function)
   (bitcoin-lisp.validation:connect-block function)
   (bitcoin-lisp.validation:activate-best-chain function)
+  (bitcoin-lisp.validation:check-block-index function)
+  (bitcoin-lisp.validation:*check-block-index* variable)
   (bitcoin-lisp.validation:perform-reorg function)
   (bitcoin-lisp.validation:versionbits-state function)
   (bitcoin-lisp.validation:versionbits-info function)

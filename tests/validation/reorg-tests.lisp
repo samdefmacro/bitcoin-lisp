@@ -2580,6 +2580,14 @@ REQUESTED block always passes. Tests %out-of-order-block-acceptable-p directly."
        (is (null (bl.net::%out-of-order-block-acceptable-p
                   too-far 1 nil cs)))))))
 
+(defun %cand-store-body (chain-state block-store block)
+  "Store BLOCK's body and note its position and transaction count on its
+entry, as every production store path does (BL.STORE:NOTE-BLOCK-POSITION)."
+  (bl.store:note-block-position
+   chain-state (bl.ser:block-header-hash (bl.ser:bitcoin-block-header block))
+   (nth-value 1 (bl.store:store-block block-store block))
+   :tx-count (length (bl.ser:bitcoin-block-transactions block))))
+
 (test reorg-candidate-set-prefers-completable-over-higher-work-gated
   "F1 (liveness review): a candidate SET, not a single sticky slot. A
 higher-work fork whose bodies are INCOMPLETE (unobtainable) must not starve a
@@ -2622,7 +2630,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
                              :height h :header hdr :prev-entry prev
                              :chain-work w :status :header-valid)))
                     (bl.store:add-block-index-entry csa e)
-                    (bl.store:store-block storea blk)
+                    (%cand-store-body csa storea blk)
                     (setf prev e))))
        ;; H index: H5 work = tip+1000 (higher), but only H5's body on disk.
        (let ((prev (bl.store:get-block-index-entry csa genesis-hash)))
@@ -2635,7 +2643,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
                              :chain-work w :status :header-valid)))
                     (bl.store:add-block-index-entry csa e)
                     (setf prev e))))
-       (bl.store:store-block storea (fifth h-blocks))
+       (%cand-store-body csa storea (fifth h-blocks))
        (with-ibd-context
          (let ((set (bl.net::ibd-context-reorg-candidates
                      bl.net:*ibd-context*)))
@@ -4239,6 +4247,72 @@ holding the lock goes through."
       (let ((bl:*node* nil))
         (is (null (bl.val:activate-best-chain cs store utxo))
             "a thread working for no running node is not checked")))))
+
+;;;; -checkblockindex at Core's drive sites (BL.VAL:CHECK-BLOCK-INDEX)
+
+(defun %block-index-check-failure (thunk)
+  "NIL when THUNK returns, else the text of the block index check failure it
+signalled (any other error is returned as itself, so it cannot pass for one)."
+  (handler-case (progn (funcall thunk) nil)
+    (error (c)
+      (let ((text (princ-to-string c)))
+        (if (search "Block index consistency check failed" text) :check-failed text)))))
+
+(test checkblockindex-runs-at-cores-drive-sites
+  "Core runs CheckBlockIndex at the end of every ActivateBestChain
+(validation.cpp:3517) -- ProcessNewBlock's, invalidateblock's,
+reconsiderblock's and preciousblock's -- after every header
+(ProcessNewBlockHeaders, :4282), in AcceptBlock (:4341, :4425) and in
+InvalidateBlock (:3676); on regtest it is on by default. A node whose block
+index has gone inconsistent is stopped by the first of them with the
+invariant named, as Core's assert stops bitcoind; with -checkblockindex=0
+nothing looks."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "cbi-drive"))
+           (cs (bl:node-chain-state node))
+           (store (bl:node-block-store node))
+           (utxo (bl:node-utxo-set node)))
+      ;; Positive control: three blocks through the shipped handler, every
+      ;; drive site on the way checking a consistent index.
+      (generate-regtest-blocks node 3)
+      (let* ((tip (bl.store:get-block-index-entry cs (bl.store:best-block-hash cs)))
+             (tip-hash (bl.store:block-index-entry-hash tip))
+             (broken (bl.store:get-block-at-height cs 2))
+             (requested '())
+             (stderr (make-string-output-stream)))
+        (is (null (%block-index-check-failure
+                   (lambda () (bl.val:activate-best-chain cs store utxo)))))
+        ;; A connected block that forgot its transaction count.
+        (setf (bl.store:block-index-entry-tx-count broken) 0)
+        (bl.log:reset-warnings)
+        (unwind-protect
+             (let ((bl.log:*fatal-error-shutdown-function*
+                     (lambda (message) (push message requested)))
+                   (*error-output* stderr))
+               (is (eq :check-failed (%block-index-check-failure
+                                      (lambda () (bl.val:activate-best-chain cs store utxo)))))
+               (is (eq :check-failed (%block-index-check-failure
+                                      (lambda () (bl.val:precious-block cs store utxo tip-hash)))))
+               (is (eq :check-failed (%block-index-check-failure
+                                      (lambda () (bl.val:reconsider-block cs store utxo tip-hash)))))
+               (is (eq :check-failed (%block-index-check-failure
+                                      (lambda () (bl.net:process-headers
+                                                  (list (bl.store:block-index-entry-header tip))
+                                                  cs)))))
+               (is (eq :check-failed (%block-index-check-failure
+                                      (lambda () (generate-regtest-blocks node 1)))))
+               (is (eq :check-failed (%block-index-check-failure
+                                      (lambda () (bl.val:invalidate-block cs store utxo tip-hash)))))
+               ;; Reported as Core's abort: once, naming the invariant, and
+               ;; the node asked to stop.
+               (is (= 1 (length requested)))
+               (is (search "Block index consistency check failed" (or (first requested) "")))
+               (is (search "A fatal internal error occurred" (get-output-stream-string stderr))))
+          (bl.log:reset-warnings))
+        ;; -checkblockindex=0: the same index, and nothing looks.
+        (let ((bl.val:*check-block-index* 0))
+          (is (null (%block-index-check-failure
+                     (lambda () (bl.val:activate-best-chain cs store utxo))))))))))
 
 (test a-body-stored-without-connecting-records-its-transaction-count
   "Core's ReceivedBlockTransactions sets nTx when a body is stored, connected
