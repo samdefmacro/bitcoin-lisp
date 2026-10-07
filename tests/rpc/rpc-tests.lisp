@@ -6898,23 +6898,15 @@ would not confirm."
     (is (= 6 (cdr (assoc "blocks" result :test #'string=))))))
 
 (test estimatesmartfee-reports-no-estimate-over-a-block-percentile
-  "The survey's exact scenario: an EMPTY policy estimator and twelve blocks of
-percentile history at a median of 7 sat/vB. estimatesmartfee returned
-{feerate: 7.0e-5, blocks: 2} -- a number derived from what miners happened to
-include, indistinguishable from a real estimate, so a wallet reading it never
-falls back to its own -fallbackfee. Core answers the errors array
-(feature_fee_estimation.py:332,413)."
+  "The survey's exact scenario: an EMPTY policy estimator where twelve blocks
+of percentile history at a median of 7 sat/vB once stood. estimatesmartfee
+returned {feerate: 7.0e-5, blocks: 2} -- a number derived from what miners
+happened to include, indistinguishable from a real estimate, so a wallet
+reading it never falls back to its own -fallbackfee. Core answers the errors
+array (feature_fee_estimation.py:332,413)."
   (let* ((node (make-test-node))
-         (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
-         (legacy (bl.mp:make-fee-estimator)))
-    (dotimes (i 12)
-      (bl.mp:fee-estimator-add-stats
-       legacy (bl.mp:make-block-fee-stats
-               :height (+ 100 i) :median-rate 7 :low-rate 3
-               :high-rate 20 :tx-count 100)))
-    (setf (bl:node-fee-estimator node) legacy)
-    (is (= 12 (bl.mp:fee-estimator-entry-count legacy))
-        "positive control: the percentile history the fallback read is there")
+         (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
+    (setf (bl:node-fee-estimator node) bl.mp:*block-policy-estimator*)
     (is (= 0 (bl.mp:bpe-estimate-smart-fee bl.mp:*block-policy-estimator* 2))
         "positive control: the policy estimator has no answer")
     (dolist (target '(2 6))

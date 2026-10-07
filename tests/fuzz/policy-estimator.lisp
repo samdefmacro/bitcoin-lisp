@@ -15,11 +15,10 @@
 ;;;; estimates are integers, zero for no answer, for a target the history can
 ;;;; support; each horizon tracks Core's number of targets; and what Write
 ;;;; writes, Read accepts and Write reproduces byte for byte. Core's
-;;;; estimateFee (the deprecated plain estimate) has no counterpart. The file
-;;;; format is ours (the estimator section of fee_estimates.dat, with its own
-;;;; layout), so policy_estimator_io's arbitrary-bytes reader is ported as a
-;;;; Read of any buffer that must either refuse it or leave an estimator that
-;;;; writes back what it read.
+;;;; estimateFee (the deprecated plain estimate) has no counterpart.
+;;;; policy_estimator_io's arbitrary-bytes reader is ported as a Read of any
+;;;; buffer (fee_estimates.dat is Core's layout) that must either refuse it or
+;;;; leave an estimator that writes back what it read.
 
 (def-suite :fuzz-policy-estimator-tests :in :bitcoin-lisp-tests
   :description "Core fuzz/policy_estimator.cpp and policy_estimator_io.cpp targets")

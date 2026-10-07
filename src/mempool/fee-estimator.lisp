@@ -1,78 +1,11 @@
 (in-package #:bitcoin-lisp.mempool)
 
-;;; Fee Estimator
-;;;
-;;; Collects fee rate statistics from confirmed blocks and provides
-;;; fee rate estimates based on historical data.
+;;; fee_estimates.dat: where the policy estimator (block-policy-estimator.lisp,
+;;; Core's CBlockPolicyEstimator) is read from at start-up and flushed to --
+;;; hourly, and at shutdown after recording the still-unconfirmed -- and the
+;;; estimate the fee RPCs answer from it.
 
-;;;; Constants
-
-(defconstant +fee-history-size+ 1008
-  "Number of blocks to keep in fee history (~1 week).")
-
-;;;; Block fee statistics
-
-(defstruct block-fee-stats
-  "Fee statistics for a single block."
-  (height 0 :type (unsigned-byte 32))
-  (median-rate 0 :type (unsigned-byte 32))   ; sat/vB
-  (low-rate 0 :type (unsigned-byte 32))      ; 10th percentile
-  (high-rate 0 :type (unsigned-byte 32))     ; 90th percentile
-  (tx-count 0 :type (unsigned-byte 32)))
-
-;;;; Fee estimator
-
-(defstruct fee-estimator
-  "Fee rate estimator based on historical block data."
-  ;; Circular buffer of block-fee-stats
-  (history (make-array +fee-history-size+ :initial-element nil) :type simple-vector)
-  ;; Current write position in circular buffer
-  (write-index 0 :type (unsigned-byte 16))
-  ;; Number of entries currently stored
-  (entry-count 0 :type (unsigned-byte 16))
-  ;; Data directory for persistence
-  (data-directory nil :type (or null pathname))
-  ;; Blocks since last flush
-  (blocks-since-flush 0 :type (unsigned-byte 16)))
-
-;;;; Fee estimator operations
-
-(defun fee-estimator-add-stats (estimator stats)
-  "Add block fee statistics to the estimator's history."
-  (when stats
-    (let ((idx (fee-estimator-write-index estimator)))
-      (setf (aref (fee-estimator-history estimator) idx) stats)
-      (setf (fee-estimator-write-index estimator)
-            (mod (1+ idx) +fee-history-size+))
-      (when (< (fee-estimator-entry-count estimator) +fee-history-size+)
-        (incf (fee-estimator-entry-count estimator)))
-      ;; Track blocks since flush for periodic persistence
-      (incf (fee-estimator-blocks-since-flush estimator)))))
-
-(defun fee-estimator-get-history (estimator &optional (max-blocks nil))
-  "Get fee statistics from history, most recent first.
-Returns up to MAX-BLOCKS entries (or all if NIL)."
-  (let* ((count (fee-estimator-entry-count estimator))
-         (limit (if max-blocks (min max-blocks count) count))
-         (history (fee-estimator-history estimator))
-         (write-idx (fee-estimator-write-index estimator))
-         (result '()))
-    (dotimes (i limit)
-      (let* ((idx (mod (- write-idx 1 i) +fee-history-size+))
-             (entry (aref history idx)))
-        (when entry
-          (push entry result))))
-    (nreverse result)))
-
-;;;; Persistence
-
-(defconstant +fee-stats-magic+ #x53454546)  ; "FEES" in little-endian
-(defconstant +fee-stats-version+ 2
-  "v2 appends the CBlockPolicyEstimator state after the legacy percentile
-entries. A v1 file still loads: it simply carries no estimator section, which
-is indistinguishable from a first run.")
-
-(defconstant +fee-estimates-max-file-age-seconds+ (* 60 60 60)
+(defconstant +fee-estimates-max-file-age-hours+ 60
   "Core MAX_FILE_AGE (block_policy_estimator.h:33): fee estimates older than 60
 hours are not read at all. They are historical data about a network whose
 activity has since moved on, and a confidently wrong estimate is spent money.")
@@ -81,137 +14,61 @@ activity has since moved on, and a confidently wrong estimate is spent money.")
   "Core -acceptstalefeeestimates (DEFAULT_ACCEPT_STALE_FEE_ESTIMATES = false):
 load a fee_estimates.dat older than MAX_FILE_AGE anyway. Core allows this only
 on regtest.")
-(defvar +fee-stats-filename+ "fee_estimates.dat")
 
-(defun fee-stats-path (data-directory)
-  "Get the path for the fee stats file."
+(defun fee-estimates-path (data-directory)
+  "The fee_estimates.dat in DATA-DIRECTORY (Core FeeestPath,
+policy/fees/block_policy_estimator_args.cpp:10-16), or NIL without one."
   (when data-directory
-    (merge-pathnames +fee-stats-filename+ data-directory)))
+    (merge-pathnames "fee_estimates.dat" data-directory)))
 
-(defun save-fee-stats (estimator)
-  "Save fee statistics to disk.
-File format: magic (4 bytes), version (1 byte), count (2 bytes),
-entries (20 bytes each: height, median, low, high, tx-count), CRC32 (4 bytes)."
-  (let ((path (fee-stats-path (fee-estimator-data-directory estimator))))
-    (unless path
-      (return-from save-fee-stats nil))
-    (let ((entries (fee-estimator-get-history estimator)))
-      ;; Build data in memory for CRC32 calculation
-      (let ((data-bytes
-              (flexi-streams:with-output-to-sequence (mem)
-                ;; Write header
-                (bl.ser:write-uint32-le mem +fee-stats-magic+)
-                (bl.ser:write-uint8 mem +fee-stats-version+)
-                (bl.ser:write-uint16-le mem (length entries))
-                ;; Write entries
-                (dolist (entry entries)
-                  (bl.ser:write-uint32-le mem (block-fee-stats-height entry))
-                  (bl.ser:write-uint32-le mem (block-fee-stats-median-rate entry))
-                  (bl.ser:write-uint32-le mem (block-fee-stats-low-rate entry))
-                  (bl.ser:write-uint32-le mem (block-fee-stats-high-rate entry))
-                  (bl.ser:write-uint32-le mem (block-fee-stats-tx-count entry)))
-                ;; v2: the Core estimator's state. A node running without one
-                ;; writes a zero marker, which reads back as "no section".
-                (let ((est *block-policy-estimator*))
-                  (if est
-                      (progn
-                        (bl.ser:write-uint8 mem 1)
-                        (bpe-write-to-stream est mem))
-                      (bl.ser:write-uint8 mem 0))))))
-        ;; Write data + CRC32 to file
-        (with-open-file (stream path
-                                :direction :output
-                                :element-type '(unsigned-byte 8)
-                                :if-exists :supersede
-                                :if-does-not-exist :create)
-          (write-sequence data-bytes stream)
-          (write-sequence (bl.store:compute-crc32 data-bytes) stream)))
-      ;; Core's line for a completed flush (CBlockPolicyEstimator::
-      ;; FlushFeeEstimates, policy/fees/block_policy_estimator.cpp:975).
-      ;; feature_fee_estimation.py:344 builds the whole sentence from the
-      ;; path it expects the file at, so the path is part of it.
-      (bl:log-cat "estimatefee" "Flushed fee estimates to ~A." (namestring path)))
-    ;; Reset flush counter
-    (setf (fee-estimator-blocks-since-flush estimator) 0)
-    t))
+(defun save-fee-estimates (est)
+  "Core CBlockPolicyEstimator::FlushFeeEstimates (block_policy_estimator.cpp:
+963-976): write EST to its fee_estimates.dat. T when written; a failure is
+Core's warning and nothing else -- the node carries on."
+  (let ((path (block-policy-estimator-estimation-filepath est)))
+    (when path
+      (handler-case
+          (with-open-file (stream path :direction :output
+                                       :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede
+                                       :if-does-not-exist :create)
+            (bpe-write-to-stream est stream))
+        (error ()
+          (bl:log-warn "Failed to write fee estimates to ~A. Continue anyway."
+                       (namestring path))
+          (return-from save-fee-estimates nil)))
+      ;; feature_fee_estimation.py:344 builds the whole sentence from the path
+      ;; it expects the file at, so the path is part of it.
+      (bl:log-cat "estimatefee" "Flushed fee estimates to ~A." (namestring path))
+      t)))
 
-(defun load-fee-stats (estimator)
-  "Load fee statistics from disk.
-Returns T on success, NIL if file doesn't exist or is corrupt."
-  (let ((path (fee-stats-path (fee-estimator-data-directory estimator))))
-    (unless (and path (probe-file path))
-      (return-from load-fee-stats nil))
-    ;; Core MAX_FILE_AGE (:33): estimates this old describe a network whose
-    ;; activity has moved on. Refusing them costs a few hours of accuracy;
-    ;; trusting them costs money on every transaction built from them.
-    (let ((age (- (get-universal-time) (file-write-date path))))
-      (when (and (> age +fee-estimates-max-file-age-seconds+)
-                 (not *accept-stale-fee-estimates*))
-        (bl:log-warn
-         "Ignoring fee_estimates.dat: ~,1Fh old, over the ~Dh limit"
-         (/ age 3600.0) (floor +fee-estimates-max-file-age-seconds+ 3600))
-        (return-from load-fee-stats nil)))
-    (handler-case
-        (let ((file-bytes (with-open-file (stream path
-                                                   :direction :input
-                                                   :element-type '(unsigned-byte 8))
-                            (let ((bytes (make-array (file-length stream)
-                                                     :element-type '(unsigned-byte 8))))
-                              (read-sequence bytes stream)
-                              bytes))))
-          ;; Need at least header (7 bytes) + CRC32 (4 bytes)
-          (when (< (length file-bytes) 11)
-            (bl:log-warn "Fee stats file too short")
-            (return-from load-fee-stats nil))
-          ;; Verify CRC32
-          (let* ((data-len (- (length file-bytes) 4))
-                 (data-bytes (subseq file-bytes 0 data-len))
-                 (stored-crc (subseq file-bytes data-len))
-                 (computed-crc (bl.store:compute-crc32 data-bytes)))
-            (unless (equalp stored-crc computed-crc)
-              (bl:log-warn "Fee stats file CRC32 mismatch - file corrupted")
-              (return-from load-fee-stats nil)))
-          ;; Parse data
-          (flexi-streams:with-input-from-sequence (stream file-bytes)
-            (let ((magic (bl.ser:read-uint32-le stream))
-                  (version (bl.ser:read-uint8 stream))
-                  (count (bl.ser:read-uint16-le stream)))
-              (unless (= magic +fee-stats-magic+)
-                (bl:log-warn "Fee stats file has invalid magic")
-                (return-from load-fee-stats nil))
-              (unless (<= 1 version +fee-stats-version+)
-                (bl:log-warn "Fee stats file has unsupported version ~D" version)
-                (return-from load-fee-stats nil))
-              ;; Read entries
-              (dotimes (i count)
-                (let ((entry (make-block-fee-stats
-                              :height (bl.ser:read-uint32-le stream)
-                              :median-rate (bl.ser:read-uint32-le stream)
-                              :low-rate (bl.ser:read-uint32-le stream)
-                              :high-rate (bl.ser:read-uint32-le stream)
-                              :tx-count (bl.ser:read-uint32-le stream))))
-                  (fee-estimator-add-stats estimator entry)))
-              ;; v2: the Core estimator's state follows the legacy entries.
-              (when (>= version 2)
-                (let ((present (bl.ser:read-uint8 stream))
-                      (est *block-policy-estimator*))
-                  (cond
-                    ((zerop present)
-                     (bl:log-info "Fee estimates file carries no policy-estimator state"))
-                    ((null est)
-                     (bl:log-info "Fee estimates file has policy-estimator state but no estimator is installed"))
-                    ((bpe-read-into est stream)
-                     (bl:log-info "Loaded fee policy estimator state (best height ~D)"
-                                            (block-policy-estimator-best-height est)))
-                    (t
-                     ;; Discarded, not partially applied. The estimator keeps
-                     ;; whatever it had and rebuilds from live observation.
-                     (bl:log-warn "Fee policy estimator state rejected as corrupt; starting from live observation")))))
-              (bl:log-info "Loaded ~D fee stats entries" count)
-              t)))
-      (error (e)
-        (bl:log-warn "Failed to load fee stats: ~A" e)
-        nil))))
+(defun %file-age-hours (path)
+  "Core GetFeeEstimatorFileAge: whole hours, truncated, against the FILESYSTEM
+clock -- a mocked now and a real mtime would make a nonsense age."
+  (floor (- (get-universal-time) (file-write-date path)) 3600))
+
+(defun load-fee-estimates (est)
+  "The file half of Core's CBlockPolicyEstimator constructor (block_policy_
+estimator.cpp:561-576): read EST's fee_estimates.dat into it, unless there is
+none or it is older than MAX_FILE_AGE. T when the file was read."
+  (let ((path (block-policy-estimator-estimation-filepath est)))
+    (cond
+      ((null path) nil)
+      ((not (probe-file path))
+       (bl:log-info "~A is not found. Continue anyway." (namestring path))
+       nil)
+      ((and (> (%file-age-hours path) +fee-estimates-max-file-age-hours+)
+            (not *accept-stale-fee-estimates*))
+       (bl:log-warn "Fee estimation file ~A too old (age=~D > ~D hours) and will not be used to avoid serving stale estimates."
+                    (namestring path) (%file-age-hours path)
+                    +fee-estimates-max-file-age-hours+)
+       nil)
+      ((with-open-file (stream path :element-type '(unsigned-byte 8))
+         (bpe-read-into est stream)))
+      (t
+       (bl:log-warn "Failed to read fee estimates from ~A. Continue anyway."
+                    (namestring path))
+       nil))))
 
 (defconstant +fee-flush-interval-seconds+ 3600
   "Core FEE_FLUSH_INTERVAL (policy/fees/block_policy_estimator.h:27): the
@@ -222,16 +79,14 @@ scheduler calls FlushFeeEstimates once an hour (init.cpp:1662).")
 call arms it, so the first flush is an hour after the node started rather
 than at once — Core's scheduleEvery fires after the first interval.")
 
-(defun flush-fee-estimates-at-shutdown (estimator)
+(defun flush-fee-estimates-at-shutdown (est)
   "Core CBlockPolicyEstimator::Flush, the shutdown flush (init.cpp:344-345,
-block_policy_estimator.cpp:957-960): record every transaction the policy
-estimator still tracks as unconfirmed (BPE-FLUSH-UNCONFIRMED), then write the
-file. The hourly flush (MAYBE-FLUSH-FEE-ESTIMATES) writes without the first
-step, as Core's scheduled FlushFeeEstimates does."
-  (let ((est *block-policy-estimator*))
-    (when est
-      (bpe-flush-unconfirmed est)))
-  (save-fee-stats estimator))
+block_policy_estimator.cpp:958-961): record every transaction EST still
+tracks as unconfirmed (BPE-FLUSH-UNCONFIRMED), then write the file. The hourly
+flush (MAYBE-FLUSH-FEE-ESTIMATES) writes without the first step, as Core's
+scheduled FlushFeeEstimates does."
+  (bpe-flush-unconfirmed est)
+  (save-fee-estimates est))
 
 (defun arm-fee-estimate-flush-clock ()
   "Start the hourly flush interval now (Core schedules FlushFeeEstimates at
@@ -241,12 +96,9 @@ tick: a node still inside its first sync pass has not ticked yet, and
 the deadline an hour PAST the forwarded time and the flush never comes."
   (setf *last-fee-estimate-flush-time* (bl.ser:get-scheduler-time)))
 
-(defun maybe-flush-fee-estimates (estimator)
-  "Flush fee estimates on Core's hourly cadence (init.cpp:1662).
+(defun maybe-flush-fee-estimates (est)
+  "Flush EST to fee_estimates.dat on Core's hourly cadence (init.cpp:1662).
 
-Ours only ever wrote fee_estimates.dat at shutdown and after a block count,
-so a node that ran for days and was killed lost every estimate it had
-learned -- the file exists precisely so a restart does not start blind.
 Driven off GET-SCHEDULER-TIME rather than a separate scheduler thread, which
 is what makes Core's `mockscheduler' RPC advance it: feature_fee_estimation.py:
 345 forwards an hour and then waits ONE second for the log line."
@@ -257,10 +109,10 @@ is what makes Core's `mockscheduler' RPC advance it: feature_fee_estimation.py:
        nil)
       ((>= (- now *last-fee-estimate-flush-time*) +fee-flush-interval-seconds+)
        (setf *last-fee-estimate-flush-time* now)
-       (save-fee-stats estimator)
+       (save-fee-estimates est)
        t))))
 
-;;;; Fee Rate Estimation
+;;;; Fee rate estimation
 
 (defun estimate-fee-rate (conf-target &key (mode :conservative))
   "Core estimateSmartFee (rpc/fees.cpp:62-92, CBlockPolicyEstimator::
@@ -280,8 +132,8 @@ feerate and a wallet could not tell it apart from one. Core has no such
 fallback, and the reason is the whole content of a fee estimate: a percentile
 of what miners TOOK cannot express that a feerate FAILED to confirm, which is
 the only thing that makes an estimate worth acting on. feature_fee_estimation.py
-asserts the errors array twice, and the block statistics this node still
-collects have no estimator reading them."
+asserts the errors array twice. The per-block statistics that fallback read
+are gone too."
   (multiple-value-bind (rate returned-target)
       (bpe-smart-fee-sat-per-vb conf-target :conservative (eq mode :conservative))
     (if (and rate (plusp rate))

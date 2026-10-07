@@ -1583,35 +1583,31 @@ given explicitly, Core's require_full_verification (init.cpp:1390)."
                            (node-data-directory *node*))))))))))
 
 (defun %init-fee-estimation (data-directory)
-  "Bring up the fee estimator and load fee_estimates.dat from DATA-DIRECTORY.
+  "Core init.cpp:1651-1663: create the fee estimator over DATA-DIRECTORY's
+fee_estimates.dat, read the file into it (the CBlockPolicyEstimator
+constructor), install it as the node's estimator and as the one the mempool
+and connect-block report into (*BLOCK-POLICY-ESTIMATOR*, Core's
+RegisterValidationInterface), and schedule the hourly flush.
 
-⚠️ ORDER. The persisted file carries the block-percentile history AND, since
-v2, the Core policy estimator's own state, and LOAD-FEE-STATS installs the
-second into *BLOCK-POLICY-ESTIMATOR*. Creating that estimator AFTER the load
--- which is what this did -- meant the special was still NIL when the file was
-read, so the policy-estimator section was discarded with a warning on every
-single start and the node began each run with an empty Core estimator. The
-seam test stayed green throughout because it bound the special to a fresh
-estimator before calling LOAD-FEE-STATS, which is exactly what production did
-not do.
+⚠️ The file is read into the estimator OBJECT, as Core's constructor reads it.
+It used to be read through the special, which an earlier version installed
+only AFTER the load -- so the saved state was discarded on every start and
+the node began each run with an empty estimator.
 
 Extracted from %INIT-SERVICES so a test can drive the real sequence rather
 than a hand-built one."
   (log-info "Initializing fee estimator...")
-  ;; Core's CBlockPolicyEstimator, which learns from how long each feerate
-  ;; actually waited rather than from a percentile of what miners took. The
-  ;; mempool and connect-block report into it through this one binding, and
-  ;; LOAD-FEE-STATS restores its saved state into it -- so it exists FIRST.
-  (setf bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+  (let ((est (bl.mp:make-block-policy-estimator
+              :estimation-filepath (bl.mp:fee-estimates-path data-directory))))
+    (bl.mp:load-fee-estimates est)
+    (setf (node-fee-estimator *node*) est
+          bl.mp:*block-policy-estimator* est))
   ;; Arm the hourly flush clock at startup rather than at the first idle tick:
   ;; a node still inside its first sync pass has not ticked yet, and Core's
   ;; `mockscheduler' forwards the clock from wherever it is -- so a late arm
   ;; put the deadline an hour PAST the forwarded time and the flush never came
   ;; (feature_fee_estimation.py:371, the check right after a restart).
-  (bl.mp:arm-fee-estimate-flush-clock)
-  (setf (node-fee-estimator *node*)
-        (bl.mp:make-fee-estimator :data-directory data-directory))
-  (bl.mp:load-fee-stats (node-fee-estimator *node*)))
+  (bl.mp:arm-fee-estimate-flush-clock))
 
 (defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
   "The RPC server, up early (Core Step 4a AppInitServers, answering

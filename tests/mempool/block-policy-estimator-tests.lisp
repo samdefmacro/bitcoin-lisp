@@ -439,16 +439,94 @@ answer confidently from nonsense, and fee estimates are spent money."
       (is (null (%bpe-load-bytes victim mangled)))
       (is (= before (bl.mp:bpe-estimate-smart-fee victim 6))))))
 
+;;; Core's layout (block_policy_estimator.cpp:978-1000, :411-419): the
+;;; version (int32), the best seen height and the recorded range (uint32
+;;; each), then the bucket vector -- a CompactSize count (one byte for Core's
+;;; 237 buckets) and its doubles.
+(defconstant +bpe-first-bucket-offset+ (+ 4 4 4 4 1))
+
+(defun %core-fees-file-bytes (version best first last buckets horizons)
+  "fee_estimates.dat as Core's Write lays it out, from the field values alone.
+HORIZONS lists (decay scale periods) in Core's order -- feeStats, shortStats,
+longStats -- for an estimator that has recorded nothing: every average zero."
+  (flexi-streams:with-output-to-sequence (out)
+    (labels ((u32 (v) (dotimes (i 4) (write-byte (ldb (byte 8 (* 8 i)) v) out)))
+             (dbl (d) (let ((bits (ldb (byte 64 0) (sb-kernel:double-float-bits d))))
+                        (dotimes (i 8) (write-byte (ldb (byte 8 (* 8 i)) bits) out))))
+             (cnt (n) (if (< n 253)
+                          (write-byte n out)
+                          (progn (write-byte 253 out)
+                                 (write-byte (ldb (byte 8 0) n) out)
+                                 (write-byte (ldb (byte 8 8) n) out))))
+             (zeros () (cnt (length buckets)) (loop repeat (length buckets) do (dbl 0d0))))
+      (u32 version) (u32 best) (u32 first) (u32 last)
+      (cnt (length buckets))
+      (dolist (b buckets) (dbl b))
+      (loop for (decay scale periods) in horizons
+            do (dbl decay) (u32 scale)
+               (zeros) (zeros)
+               (loop repeat 2 do (cnt periods) (loop repeat periods do (zeros)))))))
+
+(defun %core-default-buckets ()
+  "Core's bucket boundaries, by its own loop (block_policy_estimator.cpp:
+547-553): MIN_BUCKET_FEERATE times FEE_SPACING up to MAX_BUCKET_FEERATE, then
+INF_FEERATE."
+  (append (loop for b = 100d0 then (* b 1.05d0) while (<= b 1d7) collect b)
+          (list 1d99)))
+
+(test fee-estimates-file-is-cores-layout
+  "fee_estimates.dat is Core's file (CBlockPolicyEstimator::Write, block_policy_
+estimator.cpp:978-1000): CURRENT_FEES_FILE_VERSION 309900, the best seen
+height, the recorded range, the buckets, then feeStats, shortStats and
+longStats -- each its decay, scale, two per-bucket vectors and two period
+grids, every vector CompactSize-counted. Ours led with the best height and
+counted vectors in uint32s, so neither implementation could read the other's.
+The expected bytes are built here from the field values alone."
+  (let ((ours (%bpe-bytes (bl.mp:make-block-policy-estimator)))
+        (core (%core-fees-file-bytes 309900 0 0 0 (%core-default-buckets)
+                                     '((0.9952d0 2 24) (0.962d0 1 12)
+                                       (0.99931d0 24 42)))))
+    (is (equalp (subseq core 0 4) (subseq ours 0 4))
+        "the file starts with CURRENT_FEES_FILE_VERSION; got ~S" (subseq ours 0 4))
+    (is (= (length core) (length ours)))
+    (is (equalp core ours) "a fresh estimator's file differs from Core's layout")))
+
+(test fee-estimates-file-version-is-cores-gate
+  "Core's Read (block_policy_estimator.cpp:1002-1062) refuses a file NEWER than
+CURRENT_FEES_FILE_VERSION and treats an OLDER one as `Incompatible old fee
+estimation data (non-fatal)': read successfully, estimator left empty. A file
+in this node's own former layout (magic \"FEES\" first) reads as a version far
+too high and is refused."
+  (let* ((saved (%bpe-bytes (bpe-populated-estimator)))
+         (victim (bpe-simulate :blocks 40 :fast-feerate 7000d0))
+         (before (bl.mp:bpe-estimate-smart-fee victim 6)))
+    (is (plusp before))
+    (flet ((with-version (v)
+             (let ((b (copy-seq saved)))
+               (dotimes (i 4) (setf (aref b i) (ldb (byte 8 (* 8 i)) v)))
+               b)))
+      (is (null (%bpe-load-bytes victim (with-version 309901)))
+          "a newer version must be refused")
+      (is (null (%bpe-load-bytes victim (with-version #x53454546)))
+          "the former FEES layout must be refused")
+      (is (= before (bl.mp:bpe-estimate-smart-fee victim 6))
+          "a refused file leaves the estimator as it was")
+      (let ((fresh (bl.mp:make-block-policy-estimator)))
+        (is-true (%bpe-load-bytes fresh (with-version 149900))
+                 "an older version is non-fatal, as Core's Read returns true")
+        (is (= 0 (bl.mp:bpe-estimate-smart-fee fresh 6))
+            "and it installs nothing")))))
+
 (test estimator-rejects-a-file-written-for-a-different-bucket-set
   "Per-bucket counts only mean anything against the bucket set they were
 recorded in. A file whose buckets differ must be DISCARDED, never remapped —
 silently reinterpreting them would make every count mean something else."
   (let* ((bytes (%bpe-bytes (bpe-populated-estimator)))
          (est (bl.mp:make-block-policy-estimator)))
-    ;; The bucket vector starts after best-height + the two range words (12
-    ;; bytes) and a 4-byte count; corrupt its first entry.
+    ;; The bucket vector's first entry; corrupt it.
     (let ((mangled (copy-seq bytes)))
-      (setf (aref mangled 16) (logxor (aref mangled 16) #x0F))
+      (setf (aref mangled +bpe-first-bucket-offset+)
+            (logxor (aref mangled +bpe-first-bucket-offset+) #x0F))
       (is (null (%bpe-load-bytes est mangled))))))
 
 (test estimator-rejects-an-impossible-decay-or-scale
@@ -459,7 +537,8 @@ of 0 forgets everything, and EstimateMedianVal divides by (1 - decay)."
          (bytes (%bpe-bytes est))
          (target (bl.mp:make-block-policy-estimator))
          ;; The first horizon's decay sits right after the bucket vector.
-         (offset (+ 4 4 4 4 (* 8 (length (bl.mp:make-fee-buckets))))))
+         (offset (+ +bpe-first-bucket-offset+
+                    (* 8 (length (bl.mp:make-fee-buckets))))))
     ;; decay = 1.0 exactly -> rejected
     (let ((mangled (copy-seq bytes)))
       (let ((one (flexi-streams:with-output-to-sequence (m)
@@ -494,42 +573,44 @@ of 0 forgets everything, and EstimateMedianVal divides by (1 - decay)."
       (when (probe-file p) (delete-file p)))
     dir))
 
+(defun %file-estimator (dir &optional from)
+  "An estimator over DIR's fee_estimates.dat, as init makes the node's,
+holding FROM's state when FROM is given."
+  (let ((est (bl.mp:make-block-policy-estimator
+              :estimation-filepath (bl.mp:fee-estimates-path dir))))
+    (when from
+      (assert (%bpe-load-bytes est (%bpe-bytes from))))
+    est))
+
 (test fee-estimates-file-carries-the-policy-estimator
-  "The seam: save-fee-stats and load-fee-stats must actually carry the Core
-estimator's state. Writing a perfect serializer that the file path never calls
-would leave every restart back at zero — and the estimator would look fine in
-its own unit tests."
+  "The seam: SAVE-FEE-ESTIMATES and LOAD-FEE-ESTIMATES must actually carry the
+estimator's state through the file. Writing a perfect serializer that the
+file path never calls would leave every restart back at zero -- and the
+estimator would look fine in its own unit tests."
   (let* ((dir (%fee-stats-fixture "seam"))
-         (legacy (bl.mp:make-fee-estimator :data-directory dir)))
-    (let ((bl.mp:*block-policy-estimator* (bpe-populated-estimator)))
-      (let ((expected (bl.mp:bpe-estimate-smart-fee
-                       bl.mp:*block-policy-estimator* 6)))
-        (is (plusp expected))
-        (bl.mp:save-fee-stats legacy)
-        ;; A fresh process: new estimator, new legacy history.
-        (let ((bl.mp:*block-policy-estimator*
-                (bl.mp:make-block-policy-estimator))
-              (legacy2 (bl.mp:make-fee-estimator :data-directory dir)))
-          (is (= 0 (bl.mp:bpe-estimate-smart-fee
-                    bl.mp:*block-policy-estimator* 6))
-              "a fresh estimator answers 0 before loading")
-          (is-true (bl.mp:load-fee-stats legacy2))
-          (is (= expected (bl.mp:bpe-estimate-smart-fee
-                           bl.mp:*block-policy-estimator* 6))
-              "load-fee-stats must restore the policy estimator, not just the legacy history"))))))
+         (saved (%file-estimator dir (bpe-populated-estimator)))
+         (expected (bl.mp:bpe-estimate-smart-fee saved 6)))
+    (is (plusp expected))
+    (is-true (bl.mp:save-fee-estimates saved))
+    ;; A fresh process: a new estimator over the same file.
+    (let ((restored (%file-estimator dir)))
+      (is (= 0 (bl.mp:bpe-estimate-smart-fee restored 6))
+          "a fresh estimator answers 0 before loading")
+      (is-true (bl.mp:load-fee-estimates restored))
+      (is (= expected (bl.mp:bpe-estimate-smart-fee restored 6))
+          "load-fee-estimates must restore the estimator"))))
 
 (test shutdown-records-the-still-unconfirmed-as-failures-before-saving
   "Core's shutdown calls CBlockPolicyEstimator::Flush (init.cpp:344-345), which
-is FlushUnconfirmed THEN FlushFeeEstimates (block_policy_estimator.cpp:957-
-960): every transaction still tracked is removed as NOT confirmed, which
+is FlushUnconfirmed THEN FlushFeeEstimates (block_policy_estimator.cpp:958-
+961): every transaction still tracked is removed as NOT confirmed, which
 records a failure at its feerate for each period it has waited
 (TxConfirmStats::removeTx, :485-526), and only then is the file written. The
 hourly flush writes without it. A transaction tracked at height 300 that is
 still unconfirmed at 310 is, after the shutdown flush, a failure in the short
 horizon's first period -- and no longer tracked."
   (let* ((dir (%fee-stats-fixture "shutdown-flush"))
-         (estimator (bl.mp:make-fee-estimator :data-directory dir))
-         (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+         (bl.mp:*block-policy-estimator* (%file-estimator dir))
          (est bl.mp:*block-policy-estimator*)
          (txid (bpe-test-id 7 7 7))
          (short (bl.mp::block-policy-estimator-short est))
@@ -539,50 +620,42 @@ horizon's first period -- and no longer tracked."
     (loop for h from 301 to 310 do (bpe-add-block est h '()))
     (is (= 1 (%bpe-tracked-count est)))
     (is (= 0d0 (aref (aref (bl.mp::tx-confirm-stats-fail-avg short) 0) bucket)))
-    (bl.mp:flush-fee-estimates-at-shutdown estimator)
+    (bl.mp:flush-fee-estimates-at-shutdown est)
     (is (= 0 (%bpe-tracked-count est)) "the flush must untrack the unconfirmed")
     (is (plusp (aref (aref (bl.mp::tx-confirm-stats-fail-avg short) 0) bucket))
         "the flush must record the unconfirmed transaction as a failure")
     (is-true (probe-file (merge-pathnames "fee_estimates.dat" dir)) "and then write the file")))
 
 (test fee-estimates-file-past-max-age-is-ignored
-  "Core MAX_FILE_AGE (60 hours): estimates that old describe a network whose
-activity has moved on. Refusing them costs a few hours of accuracy; trusting
-them costs money on every transaction built from them."
+  "Core MAX_FILE_AGE (60 hours, block_policy_estimator.h:33): estimates that old
+describe a network whose activity has moved on. Refusing them costs a few
+hours of accuracy; trusting them costs money on every transaction built from
+them. Core measures the age in whole hours (GetFeeEstimatorFileAge), so a
+file is refused from its 61st hour."
   (let* ((dir (%fee-stats-fixture "stale"))
-         (path (merge-pathnames "fee_estimates.dat" dir))
-         (legacy (bl.mp:make-fee-estimator :data-directory dir)))
-    (let ((bl.mp:*block-policy-estimator* (bpe-populated-estimator)))
-      (bl.mp:save-fee-stats legacy))
+         (path (merge-pathnames "fee_estimates.dat" dir)))
+    (bl.mp:save-fee-estimates (%file-estimator dir (bpe-populated-estimator)))
     (is-true (probe-file path))
-    ;; Fresh file: read.
-    (let ((bl.mp:*block-policy-estimator*
-            (bl.mp:make-block-policy-estimator)))
-      (is-true (bl.mp:load-fee-stats
-                (bl.mp:make-fee-estimator :data-directory dir))))
-    ;; 61 hours old: refused outright, before anything is parsed.
-    (%backdate-file path (* 61 60 60))
-    (let ((bl.mp:*block-policy-estimator*
-            (bl.mp:make-block-policy-estimator)))
-      (is (null (bl.mp:load-fee-stats
-                 (bl.mp:make-fee-estimator :data-directory dir))))
-      (is (= 0 (bl.mp:bpe-estimate-smart-fee
-                bl.mp:*block-policy-estimator* 6))))
-    ;; 59 hours old: still inside the window.
-    (%backdate-file path (* 59 60 60))
-    (let ((bl.mp:*block-policy-estimator*
-            (bl.mp:make-block-policy-estimator)))
-      (is-true (bl.mp:load-fee-stats
-                (bl.mp:make-fee-estimator :data-directory dir))))
-    ;; -acceptstalefeeestimates overrides it, as Core allows on regtest.
-    (%backdate-file path (* 61 60 60))
-    (let ((bl.mp:*block-policy-estimator*
-            (bl.mp:make-block-policy-estimator))
-          (bl.mp:*accept-stale-fee-estimates* t))
-      (is-true (bl.mp:load-fee-stats
-                (bl.mp:make-fee-estimator :data-directory dir)))
-      (is (plusp (bl.mp:bpe-estimate-smart-fee
-                  bl.mp:*block-policy-estimator* 6))))))
+    (flet ((loads-p ()
+             (let ((est (%file-estimator dir)))
+               (values (bl.mp:load-fee-estimates est)
+                       (plusp (bl.mp:bpe-estimate-smart-fee est 6))))))
+      ;; Fresh file: read.
+      (is-true (loads-p))
+      ;; 61 hours old: refused outright, before anything is parsed.
+      (%backdate-file path (* 61 60 60))
+      (multiple-value-bind (loaded answers) (loads-p)
+        (is (null loaded))
+        (is (null answers)))
+      ;; 60 hours and 59 minutes is still 60 whole hours: read.
+      (%backdate-file path (- (* 61 60 60) 60))
+      (is-true (loads-p))
+      ;; -acceptstalefeeestimates overrides it, as Core allows on regtest.
+      (%backdate-file path (* 61 60 60))
+      (let ((bl.mp:*accept-stale-fee-estimates* t))
+        (multiple-value-bind (loaded answers) (loads-p)
+          (is-true loaded)
+          (is-true answers))))))
 
 ;;;; --- Core's validForFeeEstimation gate (block_policy_estimator.cpp:595-637)
 ;;;;
@@ -712,21 +785,19 @@ same code path, the only difference is whether the child is fed in."
           "positive control: feeding the children in must collapse it"))))
 
 (test start-node-creates-the-estimator-before-loading-its-state
-  "⚠️ The unfiled sibling of the gate: start-node called LOAD-FEE-STATS before
-it created *BLOCK-POLICY-ESTIMATOR*, so the special was still NIL when the file
-was read and its policy-estimator section was discarded with a warning -- on
-every start. The node then began each run with an EMPTY Core estimator and a
-fully restored percentile history.
+  "⚠️ start-node used to load fee_estimates.dat through *BLOCK-POLICY-ESTIMATOR*
+before it had installed one, so the special was still NIL when the file was
+read and the saved state was discarded with a warning -- on every start. The
+node then began each run with an EMPTY estimator.
 
-This drives the real init step. The existing serializer test stays green either
-way, because it binds the special to a fresh estimator before calling
-LOAD-FEE-STATS, which is exactly what production did not do."
+This drives the real init step: the file is read into the estimator it
+creates, and that estimator is both the node's and the one the mempool and
+connect-block report into."
   (let* ((dir (%fee-stats-fixture "init-order"))
-         (saved (let ((bl.mp:*block-policy-estimator* (bpe-populated-estimator)))
-                  (setf (%bpe-best-height bl.mp:*block-policy-estimator*) 60)
-                  (bl.mp:save-fee-stats
-                   (bl.mp:make-fee-estimator :data-directory dir))
-                  (bl.mp:bpe-estimate-smart-fee bl.mp:*block-policy-estimator* 6))))
+         (saved (let ((est (%file-estimator dir (bpe-populated-estimator))))
+                  (setf (%bpe-best-height est) 60)
+                  (bl.mp:save-fee-estimates est)
+                  (bl.mp:bpe-estimate-smart-fee est 6))))
     (is (plusp saved))
     ;; Production's state at start-up: no estimator installed at all.
     (let ((bl.mp:*block-policy-estimator* nil)
@@ -734,6 +805,8 @@ LOAD-FEE-STATS, which is exactly what production did not do."
       (bl::%init-fee-estimation dir)
       (is-true bl.mp:*block-policy-estimator*
                "the init step must install a policy estimator")
+      (is (eq bl.mp:*block-policy-estimator* (bl:node-fee-estimator bl:*node*))
+          "the node's estimator is the one the mempool reports into")
       (is (= 60 (%bpe-best-height bl.mp:*block-policy-estimator*))
           "the saved policy-estimator state was discarded")
       (is (= saved (bl.mp:bpe-estimate-smart-fee
@@ -751,7 +824,7 @@ exists precisely so a restart does not start blind. feature_fee_estimation.py
 deletes the file, calls `mockscheduler' to forward an hour, and waits ONE
 second for that log line, so the cadence must be read off the mockable clock."
   (let* ((dir (%fee-stats-fixture "flush-cadence"))
-         (estimator (bl.mp:make-fee-estimator :data-directory dir))
+         (estimator (%file-estimator dir))
          (path (merge-pathnames "fee_estimates.dat" dir))
          (bl.mp::*last-fee-estimate-flush-time* nil)
          (bl.ser:*mock-time* 1700000000))

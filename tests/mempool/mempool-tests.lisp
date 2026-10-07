@@ -831,23 +831,6 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
 
 ;;;; Fee estimation tests
 
-(test fee-estimator-creation
-  "Fee estimator is created with correct defaults."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    (is (= 0 (bl.mp:fee-estimator-entry-count estimator)))))
-
-(test fee-estimator-add-stats
-  "Adding fee statistics increments the entry count."
-  (let ((estimator (bl.mp:make-fee-estimator))
-        (stats (bl.mp:make-block-fee-stats
-                :height 100
-                :median-rate 50
-                :low-rate 10
-                :high-rate 100
-                :tx-count 200)))
-    (bl.mp:fee-estimator-add-stats estimator stats)
-    (is (= 1 (bl.mp:fee-estimator-entry-count estimator)))))
-
 (test fee-estimation-answers-only-from-the-policy-estimator
   "ESTIMATE-FEE-RATE is Core's estimateSmartFee and nothing else. It used to
 fall through to a percentile of the median feerates of the last N blocks when
@@ -855,19 +838,9 @@ the policy estimator had no answer, and returned it with NO error message --
 so the RPC reported it as a real feerate and a wallet reading it never fell
 back to its own -fallbackfee. A percentile of what miners TOOK cannot express
 that a feerate FAILED to confirm, which is the whole content of an estimate.
-
-The block statistics below are exactly the history that fallback read: twenty
-blocks at a median of 10 to 48 sat/vB, plenty for the old path, and the answer
-must still be the absence of an estimate."
-  (let ((estimator (bl.mp:make-fee-estimator))
-        (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
-    (dotimes (i 20)
-      (bl.mp:fee-estimator-add-stats
-       estimator (bl.mp:make-block-fee-stats
-                  :height (+ 100 i) :median-rate (+ 10 (* i 2))
-                  :low-rate 5 :high-rate 100 :tx-count 200)))
-    (is (= 20 (bl.mp:fee-estimator-entry-count estimator))
-        "positive control: the percentile history is populated")
+The per-block history that fallback read is gone as well, so an empty policy
+estimator must answer the absence of an estimate."
+  (let ((bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
     (dolist (target '(2 6 25 1008))
       (multiple-value-bind (rate error returned) (bl.mp:estimate-fee-rate target)
         (is (null rate) "target ~D answered ~S from the block history" target rate)

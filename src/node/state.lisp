@@ -23,7 +23,7 @@
   ;; loaded wallets by name; NIL when wallet support is disabled (mainnet
   ;; default). Wallet P1, docs/wallet-plan.md §4.
   (wallet-manager nil)
-  (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
+  (fee-estimator nil)  ; Core node.fee_estimator: the bl.mp block-policy-estimator
   (address-book nil)  ; Persistent peer address database
   (recent-rejects nil)  ; Recently rejected transaction filter (DoS protection)
   (peers '() :type list)

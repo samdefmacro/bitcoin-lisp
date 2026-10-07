@@ -344,11 +344,18 @@ every transaction currently in the mempool that counts toward estimates."
   (best-height 0 :type (integer 0))
   (first-recorded-height 0 :type (integer 0))
   (historical-first 0 :type (integer 0))
-  (historical-best 0 :type (integer 0)))
+  (historical-best 0 :type (integer 0))
+  ;; Core m_estimation_filepath (block_policy_estimator.h:201): where
+  ;; FlushFeeEstimates writes fee_estimates.dat. NIL keeps it in memory only.
+  (estimation-filepath nil :type (or null pathname)))
 
-(defun make-block-policy-estimator ()
+(defun make-block-policy-estimator (&key estimation-filepath)
+  "A fresh estimator over Core's bucket set. ESTIMATION-FILEPATH is the
+fee_estimates.dat it flushes to (LOAD-FEE-ESTIMATES reads it, as Core's
+constructor does, block_policy_estimator.cpp:541-577)."
   (let ((buckets (make-fee-buckets)))
     (%make-block-policy-estimator
+     :estimation-filepath estimation-filepath
      :buckets buckets
      :short (make-tx-confirm-stats buckets +short-block-periods+ +short-decay+ +short-scale+)
      :med (make-tx-confirm-stats buckets +med-block-periods+ +med-decay+ +med-scale+)
@@ -734,10 +741,13 @@ one asked for."
 
 ;;;; --- Persistence (Core CBlockPolicyEstimator::Write / Read) ---
 ;;;;
-;;;; The layout is ours, not Core's: this file is read by nothing but this node,
-;;;; so there is no interop requirement to pay for, and our fee_estimates.dat
-;;;; already carries a CRC32 that Core's does not. What IS copied from Core is
-;;;; the part that matters — WHICH state is durable, and the discipline on load.
+;;;; fee_estimates.dat is Core's file, byte for byte (block_policy_estimator.cpp
+;;;; :978-1062 and TxConfirmStats::Write/Read :411-474): the version, the best
+;;;; seen height, the recorded block range, the bucket set, then the three
+;;;; horizons. A double is its IEEE-754 bits as a little-endian uint64
+;;;; (EncodedDoubleFormatter, :53-62); a vector is a CompactSize count and its
+;;;; elements (VectorFormatter). Like mempool.dat and the block, chainstate and
+;;;; index records, the file moves between this node and Core.
 ;;;;
 ;;;; Everything is read into temporaries and swapped in only once every check
 ;;;; has passed (Core: "so existing data structures aren't corrupted if there is
@@ -747,6 +757,15 @@ one asked for."
 ;;;; The unconfirmed-transaction counters are deliberately NOT stored. They
 ;;;; describe transactions this process was watching; after a restart the
 ;;;; mempool is reloaded and re-reported, so persisting them would double-count.
+
+(defconstant +current-fees-file-version+ 309900
+  "Core CURRENT_FEES_FILE_VERSION (block_policy_estimator.cpp:37): the first
+field of fee_estimates.dat. Read refuses a higher one and ignores a lower one.")
+
+(defun %corrupt-estimates (control &rest args)
+  "Core's `throw std::runtime_error(...)' inside Read: the reason the whole
+file is discarded."
+  (error 'simple-error :format-control control :format-arguments args))
 
 (defun %write-double-le (stream d)
   "A double-float as its 8 IEEE-754 bytes, little-endian."
@@ -765,75 +784,75 @@ one asked for."
        lo))))
 
 (defun %write-double-vector (stream v)
-  (bl.ser:write-uint32-le stream (length v))
+  "VectorFormatter<EncodedDoubleFormatter>: a CompactSize count, then the doubles."
+  (bl.ser:write-compact-size stream (length v))
   (loop for x across v do (%write-double-le stream x)))
 
-(defun %read-double-vector (stream expected-length)
-  "A double vector whose length must equal EXPECTED-LENGTH, or NIL when it does
-not — every per-bucket array in the file has to agree with the bucket set."
-  (let ((n (bl.ser:read-uint32-le stream)))
+(defun %read-double-vector (stream expected-length what)
+  "A double vector whose length must equal EXPECTED-LENGTH -- every per-bucket
+array in the file has to agree with the bucket set (Core's \"Mismatch in WHAT
+bucket count\"). The count is checked before anything is allocated."
+  (let ((n (bl.ser:read-compact-size stream)))
     (unless (= n expected-length)
-      (return-from %read-double-vector nil))
+      (%corrupt-estimates "Corrupt estimates file. Mismatch in ~A bucket count" what))
     (let ((v (make-array n :element-type 'double-float)))
       (dotimes (i n v)
         (setf (aref v i) (%read-double-le stream))))))
 
 (defun %write-tx-confirm-stats (stream stats)
+  "Core TxConfirmStats::Write (block_policy_estimator.cpp:411-419)."
   (%write-double-le stream (tx-confirm-stats-decay stats))
   (bl.ser:write-uint32-le stream (tx-confirm-stats-scale stats))
   (%write-double-vector stream (tx-confirm-stats-feerate-avg stats))
   (%write-double-vector stream (tx-confirm-stats-txct-avg stats))
-  (let ((conf (tx-confirm-stats-conf-avg stats))
-        (fail (tx-confirm-stats-fail-avg stats)))
-    (bl.ser:write-uint32-le stream (length conf))
-    (loop for row across conf do (%write-double-vector stream row))
-    (bl.ser:write-uint32-le stream (length fail))
-    (loop for row across fail do (%write-double-vector stream row))))
+  (dolist (grid (list (tx-confirm-stats-conf-avg stats)
+                      (tx-confirm-stats-fail-avg stats)))
+    (bl.ser:write-compact-size stream (length grid))
+    (loop for row across grid do (%write-double-vector stream row))))
+
+(defun %read-double-grid (stream n-periods n-buckets what)
+  "N-PERIODS rows of N-BUCKETS doubles each, the shape of confAvg and failAvg."
+  (let ((grid (make-array n-periods)))
+    (dotimes (i n-periods grid)
+      (setf (aref grid i) (%read-double-vector stream n-buckets what)))))
 
 (defun %read-tx-confirm-stats (stream buckets)
-  "One horizon, or NIL if anything about it fails Core's sanity checks
-(TxConfirmStats::Read). The caller discards the whole file on NIL."
-  (let* ((n-buckets (length buckets))
-         (decay (%read-double-le stream))
-         (scale (bl.ser:read-uint32-le stream)))
-    ;; Core: decay must be strictly inside (0,1), scale non-zero.
-    (when (or (<= decay 0d0) (>= decay 1d0) (zerop scale))
-      (return-from %read-tx-confirm-stats nil))
-    (let ((feerate-avg (%read-double-vector stream n-buckets)))
-      (unless feerate-avg (return-from %read-tx-confirm-stats nil))
-      (let ((txct-avg (%read-double-vector stream n-buckets)))
-        (unless txct-avg (return-from %read-tx-confirm-stats nil))
-        (let ((n-periods (bl.ser:read-uint32-le stream)))
-          ;; Core: between 1 and 1008 confirms (one week) may be tracked.
-          (let ((max-confirms (* scale n-periods)))
-            (when (or (zerop max-confirms) (> max-confirms (* 6 24 7)))
-              (return-from %read-tx-confirm-stats nil)))
-          (let ((conf (make-array n-periods)))
-            (dotimes (i n-periods)
-              (let ((row (%read-double-vector stream n-buckets)))
-                (unless row (return-from %read-tx-confirm-stats nil))
-                (setf (aref conf i) row)))
-            (let ((n-fail (bl.ser:read-uint32-le stream)))
-              (unless (= n-fail n-periods)
-                (return-from %read-tx-confirm-stats nil))
-              (let ((fail (make-array n-periods)))
-                (dotimes (i n-periods)
-                  (let ((row (%read-double-vector stream n-buckets)))
-                    (unless row (return-from %read-tx-confirm-stats nil))
-                    (setf (aref fail i) row)))
-                ;; The unconfirmed counters are per-run, not persisted: a fresh
-                ;; zeroed set, sized to this bucket count.
-                (let ((stats (make-tx-confirm-stats buckets n-periods decay scale)))
-                  (setf (tx-confirm-stats-feerate-avg stats) feerate-avg
-                        (tx-confirm-stats-txct-avg stats) txct-avg
-                        (tx-confirm-stats-conf-avg stats) conf
-                        (tx-confirm-stats-fail-avg stats) fail)
-                  stats)))))))))
+  "One horizon, with Core's sanity checks (TxConfirmStats::Read, block_policy_
+estimator.cpp:421-474); a failed check signals, and the caller discards the
+whole file."
+  (let ((n-buckets (length buckets))
+        (decay (%read-double-le stream))
+        (scale (bl.ser:read-uint32-le stream)))
+    (when (or (<= decay 0d0) (>= decay 1d0))
+      (%corrupt-estimates "Corrupt estimates file. Decay must be between 0 and 1 (non-inclusive)"))
+    (when (zerop scale)
+      (%corrupt-estimates "Corrupt estimates file. Scale must be non-zero"))
+    (let* ((feerate-avg (%read-double-vector stream n-buckets "feerate average"))
+           (txct-avg (%read-double-vector stream n-buckets "tx count"))
+           (n-periods (bl.ser:read-compact-size stream))
+           (max-confirms (* scale n-periods)))
+      ;; Checked before the rows are read, so a forged count cannot make us
+      ;; allocate; Core reaches the same verdict after reading them.
+      (when (or (zerop max-confirms) (> max-confirms (* 6 24 7)))
+        (%corrupt-estimates "Corrupt estimates file.  Must maintain estimates for between 1 and 1008 (one week) confirms"))
+      (let ((conf (%read-double-grid stream n-periods n-buckets "feerate conf average")))
+        (unless (= (bl.ser:read-compact-size stream) n-periods)
+          (%corrupt-estimates "Corrupt estimates file. Mismatch in confirms tracked for failures"))
+        (let ((fail (%read-double-grid stream n-periods n-buckets "one of failure average"))
+              ;; The unconfirmed counters are per-run, not persisted: a fresh
+              ;; zeroed set, sized to this bucket count.
+              (stats (make-tx-confirm-stats buckets n-periods decay scale)))
+          (setf (tx-confirm-stats-feerate-avg stats) feerate-avg
+                (tx-confirm-stats-txct-avg stats) txct-avg
+                (tx-confirm-stats-conf-avg stats) conf
+                (tx-confirm-stats-fail-avg stats) fail)
+          stats)))))
 
 (defun bpe-write-to-stream (est stream)
-  "Serialize EST. Mirrors Core's choice of which block range to record: the
-live one while it is the longer, otherwise the range carried over from the
-file we loaded."
+  "Core CBlockPolicyEstimator::Write (block_policy_estimator.cpp:978-1000),
+including its choice of which block range to record: the live one while it is
+the longer, otherwise the range carried over from the file we loaded."
+  (bl.ser:write-int32-le stream +current-fees-file-version+)
   (bl.ser:write-uint32-le stream (block-policy-estimator-best-height est))
   (if (> (%bpe-block-span est) (floor (%bpe-historical-block-span est) 2))
       (progn
@@ -852,46 +871,59 @@ file we loaded."
   (%write-tx-confirm-stats stream (block-policy-estimator-long est))
   t)
 
-(defun bpe-read-into (est stream)
-  "Load EST from STREAM, or return NIL and leave EST untouched.
+(defun %bpe-read-current-version (est stream best-height)
+  "The CURRENT_FEES_FILE_VERSION body of Core's Read (:1019-1055), after the
+version and best height: install the file's state into EST, or signal."
+  (let ((hist-first (bl.ser:read-uint32-le stream))
+        (hist-best (bl.ser:read-uint32-le stream)))
+    (when (or (> hist-first hist-best) (> hist-best best-height))
+      (%corrupt-estimates "Corrupt estimates file. Historical block range for estimates is invalid"))
+    (let ((n-buckets (bl.ser:read-compact-size stream)))
+      (when (or (<= n-buckets 1) (> n-buckets 1000))
+        (%corrupt-estimates "Corrupt estimates file. Must have between 2 and 1000 feerate buckets"))
+      (let ((buckets (make-array n-buckets)))
+        (dotimes (i n-buckets)
+          (setf (aref buckets i) (%read-double-le stream)))
+        ;; Ours, not Core's: Core adopts the file's bucket set and rebuilds
+        ;; its bucketMap from it. Our bucket lookup is over Core's default
+        ;; set, so a file written against any other set (only a modified Core
+        ;; writes one) is discarded rather than remapped.
+        (unless (equalp buckets (make-fee-buckets))
+          (%corrupt-estimates "Corrupt estimates file. Bucket set differs from this node's"))
+        (let* ((med (%read-tx-confirm-stats stream buckets))
+               (short (%read-tx-confirm-stats stream buckets))
+               (long (%read-tx-confirm-stats stream buckets)))
+          ;; Everything parsed: install as one step.
+          (setf (block-policy-estimator-buckets est) buckets
+                (block-policy-estimator-med est) med
+                (block-policy-estimator-short est) short
+                (block-policy-estimator-long est) long
+                (block-policy-estimator-best-height est) best-height
+                (block-policy-estimator-historical-first est) hist-first
+                (block-policy-estimator-historical-best est) hist-best
+                (block-policy-estimator-first-recorded-height est) 0)
+          (clrhash (block-policy-estimator-tracked est)))))))
 
-Nothing is installed until every horizon has parsed and every check has passed
-— a partially applied estimator would answer confidently from nonsense."
+(defun bpe-read-into (est stream)
+  "Core CBlockPolicyEstimator::Read (block_policy_estimator.cpp:1002-1062):
+load EST from STREAM and return T, or return NIL with EST untouched.
+
+A file of a NEWER version is refused; one of an OLDER version is not an error
+-- Core warns `Incompatible old fee estimation data (non-fatal)' and keeps
+the estimator empty, and so do we. Any other failure (a truncated file, a
+failed sanity check) is Core's `Unable to read policy estimator data
+(non-fatal): <reason>', and nothing is installed until every horizon has
+parsed and every check has passed."
   (handler-case
-      (let* ((best-height (bl.ser:read-uint32-le stream))
-             (hist-first (bl.ser:read-uint32-le stream))
-             (hist-best (bl.ser:read-uint32-le stream)))
-        ;; Core: the recorded range must be ordered and must not claim to run
-        ;; past the best height the file itself reports.
-        (when (or (> hist-first hist-best) (> hist-best best-height))
-          (return-from bpe-read-into nil))
-        (let ((n-buckets (bl.ser:read-uint32-le stream)))
-          ;; Core: between 2 and 1000 feerate buckets.
-          (when (or (< n-buckets 2) (> n-buckets 1000))
-            (return-from bpe-read-into nil))
-          (let ((buckets (make-array n-buckets)))
-            (dotimes (i n-buckets)
-              (setf (aref buckets i) (%read-double-le stream)))
-            ;; A file written against a different bucket set cannot be
-            ;; reinterpreted against this one -- every per-bucket count would
-            ;; silently mean something else. Discard rather than remap.
-            (unless (equalp buckets (make-fee-buckets))
-              (return-from bpe-read-into nil))
-            (let ((med (%read-tx-confirm-stats stream buckets)))
-              (unless med (return-from bpe-read-into nil))
-              (let ((short (%read-tx-confirm-stats stream buckets)))
-                (unless short (return-from bpe-read-into nil))
-                (let ((long (%read-tx-confirm-stats stream buckets)))
-                  (unless long (return-from bpe-read-into nil))
-                  ;; Everything parsed: install as one step.
-                  (setf (block-policy-estimator-buckets est) buckets
-                        (block-policy-estimator-med est) med
-                        (block-policy-estimator-short est) short
-                        (block-policy-estimator-long est) long
-                        (block-policy-estimator-best-height est) best-height
-                        (block-policy-estimator-historical-first est) hist-first
-                        (block-policy-estimator-historical-best est) hist-best
-                        (block-policy-estimator-first-recorded-height est) 0)
-                  (clrhash (block-policy-estimator-tracked est))
-                  t))))))
-    (error () nil)))
+      (let ((version (bl.ser:read-int32-le stream))
+            (best-height (bl.ser:read-uint32-le stream)))
+        (when (> version +current-fees-file-version+)
+          (%corrupt-estimates "File version (~D) too high to be read." version))
+        (if (< version +current-fees-file-version+)
+            (bl:log-warn "Incompatible old fee estimation data (non-fatal). Version: ~D"
+                         version)
+            (%bpe-read-current-version est stream best-height))
+        t)
+    (error (e)
+      (bl:log-warn "Unable to read policy estimator data (non-fatal): ~A" e)
+      nil)))
