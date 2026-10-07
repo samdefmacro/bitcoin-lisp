@@ -9,7 +9,10 @@
 (named-readtables:in-readtable coalton:coalton)
 
 ;;; One script execution's mutable state; the Coalton type ScriptContext below
-;;; is this struct (repr :native), allocated once per execution.
+;;; is this struct (repr :native), allocated once per execution. The
+;;; constructor is inline, as Coalton's own Cell's is: a full call to a
+;;; keyword constructor was 2.6% of the interpreter's samples.
+(cl:declaim (cl:inline %make-script-context-data))
 (cl:defstruct (script-context-data
                (:constructor %make-script-context-data)
                (:copier cl:nil) (:predicate cl:nil))
