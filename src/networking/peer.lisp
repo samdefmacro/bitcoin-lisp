@@ -1593,7 +1593,14 @@ desirable set to limited peers, as in Core."
                  (bl:log-cat "net" "peer using obsolete version ~D, ~A"
                              proto (disconnect-msg peer))
                  nil)
-                (t t)))))))
+                (t
+                 ;; Only a connection we opened feeds the clock check, so
+                 ;; inbound peers cannot raise a false warning about our
+                 ;; clock (net_processing.cpp:3794-3799).
+                 (unless (peer-inbound peer)
+                   (time-offsets-add *outbound-time-offsets* (peer-time-offset peer))
+                   (time-offsets-warn-if-out-of-sync *outbound-time-offsets*))
+                 t)))))))
 
 (defun %await-verack (peer &key (timeout 30))
   "Read messages until VERACK arrives (tolerating interleaved wtxidrelay/

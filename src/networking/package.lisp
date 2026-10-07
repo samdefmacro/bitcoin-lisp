@@ -621,6 +621,12 @@ headerssync.cpp. src/networking/.")
    #:peer-recv-per-msg
    #:peer-sent-per-msg
    #:peer-time-offset
+   ;; TimeOffsets (timeoffsets.lisp)
+   #:make-time-offsets
+   #:*outbound-time-offsets*
+   #:time-offsets-add
+   #:time-offsets-median
+   #:time-offsets-warn-if-out-of-sync
    #:peer-tx-inv-queue
    #:process-headers
    #:snapshot-per-msg-table

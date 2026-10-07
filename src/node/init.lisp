@@ -736,6 +736,9 @@ previous node's state."
   ;; running now, so neither may survive into the next run in this image.
   (bl.log:reset-warnings)
   (bl.val:reset-fork-warning-state)
+  ;; PeerManagerImpl::m_outbound_time_offsets is built with the PeerManager
+  ;; (net_processing.cpp:793): no sample outlives the run that took it.
+  (setf bl.net:*outbound-time-offsets* (bl.net:make-time-offsets))
   ;; -walletbroadcast (Core SetBroadcastTransactions, wallet.cpp:3068).
   (setf *wallet-broadcast* (and wallet-broadcast t))
   (unless *wallet-broadcast*

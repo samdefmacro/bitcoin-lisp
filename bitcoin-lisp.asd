@@ -319,6 +319,7 @@ bitcoin-cli (node-main)."
                   :components ((:file "p2p-handlers")
                                (:file "bloom")       ; BIP37 CBloomFilter
                                (:file "merkleblock") ; CMerkleBlock / partial merkle tree
+                               (:file "timeoffsets")   ; Core node/timeoffsets.cpp
                                (:file "peer")
                                (:file "txreconciliation-set") ; reads the peer struct: after it, so its accessors inline
                                (:file "private-broadcast") ; Core private_broadcast.cpp
@@ -588,6 +589,7 @@ bitcoin-cli (node-main)."
                              ;; -reindex-chainstate tests
                              ;; Connection types (block-relay-only + feeler)
                              (:file "networking/conn-type-tests")
+                             (:file "networking/timeoffsets-tests")
                              ;; -privatebroadcast: the queue and one connection's conversation
                              (:file "networking/private-broadcast-tests")
                              ;; Low-work headers sync (anti-DoS presync/redownload)

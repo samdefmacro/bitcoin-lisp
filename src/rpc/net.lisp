@@ -387,7 +387,8 @@ whatever the cadence is."
       ;; -blocksonly OR our mainnet relay-disabled default. json-bool so it
       ;; serializes as JSON true/false (never null).
       ("localrelay" . ,(json-bool (not (bl.net:ignore-incoming-txs-p))))
-      ("timeoffset" . 0)
+      ;; GetInfo's median_outbound_time_offset (rpc/net.cpp:707).
+      ("timeoffset" . ,(bl.net:time-offsets-median bl.net:*outbound-time-offsets*))
       ("networkactive" . ,(json-bool (bl:node-network-active node)))
       ("connections" . ,(length peers))
       ("connections_in" . ,in)

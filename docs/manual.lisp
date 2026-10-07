@@ -1111,7 +1111,10 @@
   as Core's does, tie-breaks included, and the block-relay-only pass protects
   the inbound peers that asked for no transactions in their VERSION and
   offer the services we want -- our side of an inbound connection always
-  relays, so it is the PEER's fRelay the pass reads. An inbound ONION peer is
+  relays, so it is the PEER's fRelay the pass reads. The clock check is fed
+  by connections WE opened only, for the same reason: the last 50 non-inbound
+  VERSION offsets give the median getnetworkinfo reports and the
+  CLOCK_OUT_OF_SYNC warning past ten minutes (Core TimeOffsets), so inbound peers cannot talk us into doubting our clock. An inbound ONION peer is
   granted no -whitelist permission by its address, because the address is
   not its own: every one of them arrives from the local Tor daemon on the
   onion listener, so one loopback range would hand the operator's trusted-peer
@@ -1352,6 +1355,10 @@
   (bitcoin-lisp.networking:send-tx-requests function)
   (bitcoin-lisp.networking:process-orphan-tx function)
   (bitcoin-lisp.networking:add-to-compact-extra-transactions function)
+  (bitcoin-lisp.networking:*outbound-time-offsets* variable)
+  (bitcoin-lisp.networking:time-offsets-add function)
+  (bitcoin-lisp.networking:time-offsets-median function)
+  (bitcoin-lisp.networking:time-offsets-warn-if-out-of-sync function)
   (bitcoin-lisp.networking:*max-extra-txs* variable)
   (bitcoin-lisp.networking:initiate-tx-broadcast-private function)
   (bitcoin-lisp.networking:run-private-broadcast-connection function)
