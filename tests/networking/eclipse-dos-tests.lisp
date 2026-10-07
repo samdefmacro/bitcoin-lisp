@@ -623,7 +623,7 @@ received, the service-refused one is skipped before the mark."
     (bl.net:ban-address "198.51.100.62" 3600)
     (unwind-protect
          (flet ((knows (na)
-                  (bl:recent-reject-p
+                  (bl.net:rolling-bloom-contains-p
                    (bl.net:peer-known-addrs peer)
                    (bl.net::%addr-gossip-key
                     (bl.net:make-peer-address
@@ -2755,7 +2755,7 @@ site was disconnected AND discouraged; CONNECT-PEER refuses a discouraged
 address, and that is the call CONNECT-ADDED-NODES makes on every maintenance
 tick, so the operator's pinned peer stayed down -- permanently, since the
 discourage filter is a 50,000-entry FIFO with no time expiry."
-  (let ((bl.net::*discouraged-peers* (bl:make-rejects-filter 128)))
+  (let ((bl.net::*discouraged-peers* nil))
     (let ((manual (%manual-peer "203.0.113.7"))
           (ordinary (bl.net:make-peer :address "203.0.113.8" :state :ready)))
       (is-false (bl.net:peer-has-permission-p manual bl.net:+perm-noban+)

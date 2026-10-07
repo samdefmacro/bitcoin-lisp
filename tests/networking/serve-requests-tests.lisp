@@ -620,16 +620,16 @@ ANNOUNCER is marked by the ADDR handler, not here (Core AddAddressKnown,
     (is (= 2 sent))
     ;; no target is marked yet: the address is only QUEUED to them.
     (is (= 0 (count-if (lambda (p)
-                         (bl:recent-reject-p
+                         (bl.net:rolling-bloom-contains-p
                           (bl.net:peer-known-addrs p) key))
                        full)))
     (%flush-addrs-now peers)
     ;; exactly 2 of the full-relay peers know it; the block-relay peer doesn't
     (is (= 2 (count-if (lambda (p)
-                         (bl:recent-reject-p
+                         (bl.net:rolling-bloom-contains-p
                           (bl.net:peer-known-addrs p) key))
                        full)))
-    (is-false (bl:recent-reject-p
+    (is-false (bl.net:rolling-bloom-contains-p
                (bl.net:peer-known-addrs br) key))
     ;; Relaying the same address again inside its rotation period: the SAME
     ;; two peers are picked, both know it, and PushAddress does nothing --
@@ -641,7 +641,7 @@ ANNOUNCER is marked by the ADDR handler, not here (Core AddAddressKnown,
       (is (= 0 sent2) "a repeat inside the rotation period queues nothing")
       (%flush-addrs-now peers)
       (is (= 2 (count-if (lambda (p)
-                           (bl:recent-reject-p
+                           (bl.net:rolling-bloom-contains-p
                             (bl.net:peer-known-addrs p) key))
                          full))
           "and the address still has exactly two destinations")
@@ -991,9 +991,9 @@ transactions."
          (key (bl.net::%addr-gossip-key pa)))
     (is (= 1 (%relay-address pa source (list source with without))))
     (%flush-addrs-now (list source with without))
-    (is-true (bl:recent-reject-p
+    (is-true (bl.net:rolling-bloom-contains-p
               (bl.net:peer-known-addrs with) key))
-    (is-false (bl:recent-reject-p
+    (is-false (bl.net:rolling-bloom-contains-p
                (bl.net:peer-known-addrs without) key))))
 
 (test feefilter-above-max-money-is-ignored

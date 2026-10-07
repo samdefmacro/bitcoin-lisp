@@ -505,31 +505,25 @@ mempool_unbroadcast.py:106 waits for the unchecked line when the tx confirms."
         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 42)))
     ;; We can't actually send messages without a connection,
     ;; but we can verify announcement tracking (now a bounded set)
-    (bl:add-recent-reject
+    (bl.net:rolling-bloom-insert
      (bl.net:peer-announced-txs source-peer) txid)
     ;; Check source has it, other doesn't
-    (is (bl:recent-reject-p
+    (is (bl.net:rolling-bloom-contains-p
          (bl.net:peer-announced-txs source-peer) txid))
-    (is (not (bl:recent-reject-p
+    (is (not (bl.net:rolling-bloom-contains-p
               (bl.net:peer-announced-txs other-peer) txid)))))
 
-(test peer-announced-txs-bounded
-  "peer-announced-txs is a bounded FIFO set (Core CRollingBloomFilter{50000}
-analogue): filling past capacity evicts the oldest entries instead of growing
-without bound (the old hash-table leaked per-peer memory forever)."
-  (let* ((peer (bl.net:make-peer
-                :state :ready :announced-txs (bl:make-rejects-filter 10)))
-         (set (bl.net:peer-announced-txs peer))
-         (ids (loop for i below 15
-                    collect (make-array 32 :element-type '(unsigned-byte 8)
-                                           :initial-element i))))
-    (dolist (id ids) (bl:add-recent-reject set id))
-    ;; the 5 oldest were evicted; the 10 newest remain
-    (is (not (bl:recent-reject-p set (nth 0 ids))))
-    (is (not (bl:recent-reject-p set (nth 4 ids))))
-    (is (bl:recent-reject-p set (nth 5 ids)))
-    (is (bl:recent-reject-p set (nth 14 ids)))
-    (is (= 10 (hash-table-count (bl::recent-rejects-table set))))))
+(test peer-announced-txs-is-built-on-first-use
+  "A peer's known-transaction filter is built when first asked for, as Core
+builds m_tx_inventory_known_filter with the peer's TxRelay: a peer that never
+relays transactions never pays its 539 KB."
+  (let ((peer (bl.net:make-peer :state :ready)))
+    (is (null (bl.net::peer-%announced-txs peer)))
+    (let ((set (bl.net:peer-announced-txs peer)))
+      (is (eq set (bl.net:peer-announced-txs peer)))
+      (bl.net:rolling-bloom-insert set (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+      (is-true (bl.net:rolling-bloom-contains-p
+                set (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))))))
 
 ;;;; Standard script detection tests
 

@@ -625,7 +625,7 @@ site is the known-filter insert of Core's inv flush (net_processing.cpp:
            (set (%rc-hold peer (list kept told))))
       (push (list told told 0) (bl.net:peer-tx-inv-queue peer))
       (flush-peer-invs peer)
-      (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) told)
+      (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer) told)
                "positive control: the flush did announce it")
       (is (= 1 (%rc-count set)) "the announced transaction left the set")
       ;; The other one is what stayed: announcing it empties the set.
@@ -644,7 +644,7 @@ of the set."
            (set (%rc-hold peer (list w (%rc-wtxid 93)))))
       (deliver-inv peer (tx-inv-payload bl.ser:+inv-type-wtx+ w)
                    (bl.ctx:make-node-context))
-      (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) w)
+      (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer) w)
                "positive control: the inv was taken in as known")
       (is (= 1 (%rc-count set)) "and only the announced one left the set"))))
 
@@ -1045,8 +1045,8 @@ handshake registered both sides."
                          :shared-announced
                          (count-if (lambda (tx)
                                      (let ((w (bl.ser:transaction-wtxid tx)))
-                                       (or (bl:recent-reject-p (bl.net:peer-announced-txs a) w)
-                                           (bl:recent-reject-p (bl.net:peer-announced-txs b) w))))
+                                       (or (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs a) w)
+                                           (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs b) w))))
                                    shared)))))
           (ignore-errors (bl.net:disconnect-peer a))
           (ignore-errors (bl.net:disconnect-peer b))

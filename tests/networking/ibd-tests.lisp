@@ -2340,7 +2340,7 @@ until flush time."
     (finishes (bl.net:relay-transaction
                txid nil (list peer) :fee-rate-per-kvb 2 :wtxid wtxid))
     (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
-    (is-false (bl:recent-reject-p
+    (is-false (bl.net:rolling-bloom-contains-p
                (bl.net:peer-announced-txs peer) txid))))
 
 (test flush-tx-announcements-drains-on-schedule
@@ -2367,9 +2367,9 @@ are swallowed."
     (setf (bl.net::peer-next-inv-send-time peer) 1)
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (null (bl.net:peer-tx-inv-queue peer)))
-    (is-true (bl:recent-reject-p
+    (is-true (bl.net:rolling-bloom-contains-p
               (bl.net:peer-announced-txs peer) wtxid))
-    (is-false (bl:recent-reject-p
+    (is-false (bl.net:rolling-bloom-contains-p
                (bl.net:peer-announced-txs peer) txid)
               "a wtxidrelay peer's filter is keyed by wtxid, not txid")))
 
@@ -2480,7 +2480,7 @@ m_tx_inventory_to_send the same way)."
     (setf (bl.net::peer-next-inv-send-time peer) 1)
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (null (bl.net:peer-tx-inv-queue peer)))
-    (is-false (bl:recent-reject-p
+    (is-false (bl.net:rolling-bloom-contains-p
                (bl.net:peer-announced-txs peer) txid))))
 
 (defun %relay-txid (n)
@@ -2511,7 +2511,7 @@ inv has to suppress a wtxid announcement."
            (wtxid (%relay-txid 42))
            (ctx (bl.ctx:make-node-context :chain-state state :mempool mempool)))
       (deliver-inv peer (tx-inv-payload bl.ser:+inv-type-wtx+ wtxid) ctx)
-      (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) wtxid)
+      (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer) wtxid)
                "the announced id enters the announcer's known-tx filter")
       (bl.net:relay-transaction txid nil (list peer other)
                                 :fee-rate-per-kvb 2 :wtxid wtxid)
@@ -2543,7 +2543,7 @@ announced to that peer at all."
           do (flush-peer-invs peer))
     (is (null (bl.net:peer-tx-inv-queue peer)))
     (is-true (every (lambda (txid)
-                      (bl:recent-reject-p
+                      (bl.net:rolling-bloom-contains-p
                        (bl.net:peer-announced-txs peer) txid))
                     txids)
              "and every queued transaction is eventually announced")))
@@ -2578,10 +2578,10 @@ most, and made our inv order leak the order transactions reached us."
       (is-true (notany (lambda (txid) (find txid left :test #'equalp))
                        (subseq txids 5))
                "everything dearer went out in this flush"))
-    (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer)
+    (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer)
                                  (car (last txids)))
              "the dearest transaction is announced in the first flush")
-    (is-false (bl:recent-reject-p (bl.net:peer-announced-txs peer)
+    (is-false (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs peer)
                                   (first txids))
               "and the cheapest is not")))
 
@@ -6279,7 +6279,7 @@ dropped, and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
         "control: the peer with no filter is queued either way")
     (flush-peer-invs filtered)
     (flush-peer-invs unfiltered)
-    (is-true (bl:recent-reject-p (bl.net:peer-announced-txs filtered) txid)
+    (is-true (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs filtered) txid)
              "a sub-1-sat/vB transaction over the peer's filter is announced")
     ;; And the filter still bites when the rate really is under it.
     (let ((below (make-array 32 :element-type '(unsigned-byte 8)
@@ -6287,7 +6287,7 @@ dropped, and wait_for_invs_to_match timed out at p2p_feefilter.py:39."
       (bl.net:relay-transaction below nil (list filtered)
                                 :fee-rate-per-kvb 149)
       (flush-peer-invs filtered)
-      (is-false (bl:recent-reject-p (bl.net:peer-announced-txs filtered) below)
+      (is-false (bl.net:rolling-bloom-contains-p (bl.net:peer-announced-txs filtered) below)
                 "one satoshi per kvB under it is still withheld"))))
 
 (test pump-considers-eviction-after-each-message

@@ -201,69 +201,64 @@ decimal 4e6 -- not 4 MiB)."
 ;;;; 5. Recent Transaction Rejects Filter Tests
 ;;;; ============================================================
 
-(defun make-test-txid (byte-val)
-  "Create a test txid with a specific byte value."
-  (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte-val))
+(defun %capacity-key (i)
+  "A distinct 32-byte key for I."
+  (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (dotimes (b 4 k) (setf (aref k b) (ldb (byte 8 (* 8 b)) i)))))
 
-(test recent-rejects-creation
-  "Recent rejects filter should be created correctly."
-  (let ((filter (bl:make-rejects-filter 100)))
-    (is (not (null filter)))
-    ;; Empty filter should not match anything
-    (is (not (bl:recent-reject-p filter (make-test-txid 1))))))
+(defun %filter-capacity (filter n &key (probe 100))
+  "Insert PROBE keys and then N more into FILTER, and again N/2 more: return
+(values remembered-after-n remembered-after-1.5n+), each the number of the
+PROBE first keys still contained. A ring of N forgets them all at exactly N;
+Core's rolling bloom keeps every one for N and none (bar false positives)
+once their generation comes round, at most 1.5 N later
+(common/bloom.cpp:168-212)."
+  (let ((first (loop for i below probe collect (%capacity-key i)))
+        (next probe))
+    (flet ((insert-more (count)
+             (dotimes (i count) (bl.net:rolling-bloom-insert filter (%capacity-key (+ next i))))
+             (incf next count))
+           (remembered () (count-if (lambda (k) (bl.net:rolling-bloom-contains-p filter k)) first)))
+      (dolist (k first) (bl.net:rolling-bloom-insert filter k))
+      (insert-more (- n probe))
+      (insert-more probe)
+      (let ((after-n (remembered)))
+        (insert-more (ceiling n 2))
+        (values after-n (remembered))))))
 
-(test recent-rejects-add-and-check
-  "Adding a hash should make it detectable."
-  (let ((filter (bl:make-rejects-filter 100))
-        (txid (make-test-txid 42)))
-    ;; Not present yet
-    (is (not (bl:recent-reject-p filter txid)))
-    ;; Add it
-    (is (bl:add-recent-reject filter txid))
-    ;; Now present
-    (is (bl:recent-reject-p filter txid))))
+(test a-peer-s-known-tx-filter-is-core-s-rolling-bloom
+  "Core's m_tx_inventory_known_filter is a CRollingBloomFilter{50000, 0.000001}
+(net_processing.cpp:307): a transaction a peer knows stays known for at least
+50,000 later ones, and is forgotten once its generation is reused. Ours was a
+50,000-entry FIFO ring, which forgot the 100 first at exactly 50,000 later
+insertions -- so they were announced to the peer again."
+  (multiple-value-bind (after-n after-1.5n)
+      (%filter-capacity (bl.net:peer-announced-txs (bl.net:make-peer :state :ready)) 50000)
+    (is (= 100 after-n) "all 100 known after 50,000 more, got ~D" after-n)
+    (is (= 0 after-1.5n) "none known once their generation came round, got ~D" after-1.5n)))
 
-(test recent-rejects-duplicate-add
-  "Adding an already-present hash should return NIL."
-  (let ((filter (bl:make-rejects-filter 100))
-        (txid (make-test-txid 42)))
-    ;; First add succeeds
-    (is (bl:add-recent-reject filter txid))
-    ;; Duplicate add returns NIL
-    (is (not (bl:add-recent-reject filter txid)))))
+(test a-peer-s-known-address-filter-is-core-s-rolling-bloom
+  "Core's m_addr_known is a CRollingBloomFilter{5000, 0.001} built at
+SetupAddressRelay (net_processing.cpp:5707): an address stays known for at
+least 5,000 later ones. Ours was a 5,000-entry ring, which forgot at 5,000."
+  (multiple-value-bind (after-n after-1.5n)
+      (%filter-capacity (bl.net:peer-known-addrs (bl.net:make-peer :state :ready)) 5000)
+    (is (= 100 after-n) "all 100 known after 5,000 more, got ~D" after-n)
+    ;; A one-in-a-thousand false-positive rate over 100 probes.
+    (is (< after-1.5n 5) "forgotten once their generation came round, got ~D" after-1.5n)))
 
-(test recent-rejects-eviction
-  "Filter should evict oldest entry when at capacity."
-  (let ((filter (bl:make-rejects-filter 3)))
-    ;; Fill to capacity
-    (bl:add-recent-reject filter (make-test-txid 1))
-    (bl:add-recent-reject filter (make-test-txid 2))
-    (bl:add-recent-reject filter (make-test-txid 3))
-    ;; All present
-    (is (bl:recent-reject-p filter (make-test-txid 1)))
-    (is (bl:recent-reject-p filter (make-test-txid 2)))
-    (is (bl:recent-reject-p filter (make-test-txid 3)))
-    ;; Add one more - should evict oldest (1)
-    (bl:add-recent-reject filter (make-test-txid 4))
-    (is (not (bl:recent-reject-p filter (make-test-txid 1))))
-    (is (bl:recent-reject-p filter (make-test-txid 4)))))
-
-(test recent-rejects-clear
-  "Clearing filter should remove all entries."
-  (let ((filter (bl:make-rejects-filter 100)))
-    (bl:add-recent-reject filter (make-test-txid 1))
-    (bl:add-recent-reject filter (make-test-txid 2))
-    ;; Clear
-    (bl:clear-recent-rejects filter)
-    ;; Should be empty
-    (is (not (bl:recent-reject-p filter (make-test-txid 1))))
-    (is (not (bl:recent-reject-p filter (make-test-txid 2))))))
-
-(test recent-rejects-nil-filter-safe
-  "Operations on NIL filter should be safe (no errors)."
-  (is (not (bl:recent-reject-p nil (make-test-txid 1))))
-  (is (not (bl:add-recent-reject nil (make-test-txid 1))))
-  (finishes (bl:clear-recent-rejects nil)))
+(test the-discourage-filter-is-core-s-rolling-bloom
+  "Core BanMan's m_discouraged is a CRollingBloomFilter{50000, 0.000001}
+(banman.h:98). Ours was a 50,000-entry ring of address strings. Driven through
+DISCOURAGE-PEER and PEER-DISCOURAGED-P: the first of 50,100 discouraged
+addresses is still discouraged."
+  (let ((bl.net::*discouraged-peers* nil))
+    (dotimes (i 50100)
+      (bl.net:discourage-peer (format nil "10.~D.~D.~D" (ldb (byte 8 16) i) (ldb (byte 8 8) i)
+                                      (ldb (byte 8 0) i))))
+    (is-true (bl.net:peer-discouraged-p "10.0.0.0"))
+    (is-true (bl.net:peer-discouraged-p "10.0.195.179") "the last one, 50,099")
+    (is-false (bl.net:peer-discouraged-p "192.168.1.1"))))
 
 ;;;; ============================================================
 ;;;; 6. RPC Rate Limiting Tests

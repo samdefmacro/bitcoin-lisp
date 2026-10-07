@@ -4,7 +4,7 @@
 ;;;
 ;;; The process-wide specials the option table sets (assumeutxo overrides,
 ;;; -blocksonly, wallet fee rails, datacarrier, the protocol's rate limits,
-;;; the recent-rejects filter). Loaded early so that validation, the mempool
+;;; the DoS limits). Loaded early so that validation, the mempool
 ;;; and the protocol half of networking can reference these symbols at
 ;;; compile time (the layers below -- storage, net, rpc-server -- cannot, and
 ;;; do not). The parsers -- CLI, bitcoin.conf, settings.json, option values
@@ -272,62 +272,6 @@ When NIL, bare multisig is non-standard. Consensus is unaffected.")
   "Dedicated block-relay-only outbound slots (Core MAX_BLOCK_RELAY_ONLY_CONNECTIONS,
 net.h:73). They carry blocks/headers but no tx relay -- anti-partition
 insurance and the source of reconnection anchors.")
-
-;;;; Recent Transaction Rejects Filter
-
-(defvar *recent-rejects-max-size* 50000
-  "Maximum entries in the recent transaction rejects filter.")
-
-(defstruct recent-rejects
-  "Bounded set of recently rejected transaction hashes.
-Uses a hash table for O(1) lookup and a ring buffer for FIFO eviction."
-  (table (make-hash-table :test 'equalp) :type hash-table)
-  (ring nil :type (or null simple-vector))
-  (index 0 :type fixnum)
-  (max-size 50000 :type fixnum))
-
-(defun make-rejects-filter (&optional (max-size *recent-rejects-max-size*))
-  "Create a recent rejects filter with MAX-SIZE capacity."
-  (make-recent-rejects :table (make-hash-table :test 'equalp)
-                       :ring (make-array max-size :initial-element nil)
-                       :max-size max-size))
-
-(defun recent-reject-p (filter hash)
-  "Return T if HASH is in the rejects filter."
-  (and filter (gethash hash (recent-rejects-table filter))))
-
-(defun add-recent-reject (filter hash)
-  "Add HASH to the rejects filter. Evicts oldest entry if at capacity.
-Returns T if added, NIL if already present."
-  (when filter
-    (let ((table (recent-rejects-table filter)))
-      ;; Already present
-      (when (gethash hash table)
-        (return-from add-recent-reject nil))
-      ;; Evict oldest if at capacity
-      (let* ((ring (recent-rejects-ring filter))
-             (idx (recent-rejects-index filter))
-             (old (aref ring idx)))
-        (when old
-          (remhash old table))
-        ;; Insert new entry
-        (setf (aref ring idx) hash)
-        (setf (gethash hash table) t)
-        (setf (recent-rejects-index filter)
-              (mod (1+ idx) (recent-rejects-max-size filter)))
-        t))))
-
-(defun clear-recent-rejects (filter)
-  "Clear all entries from the rejects filter. O(1) when already empty — the
-filter is now cleared on every block connect (Core ActiveTipChange resets
-RecentRejectsFilter on every tip change), which during IBD would otherwise
-wipe a 50k-slot ring per block for nothing."
-  (when (and filter (plusp (hash-table-count (recent-rejects-table filter))))
-    (clrhash (recent-rejects-table filter))
-    (let ((ring (recent-rejects-ring filter)))
-      (dotimes (i (length ring))
-        (setf (aref ring i) nil)))
-    (setf (recent-rejects-index filter) 0)))
 
 ;;;; DoS Protection Configuration
 

@@ -1176,7 +1176,9 @@
   twin from releasing every honest announcer of a txid.
 
   What we announce BACK is the mirror of that. A peer's known-tx filter
-  (Core m_tx_inventory_known_filter) records every transaction it has told
+  (Core m_tx_inventory_known_filter, a CRollingBloomFilter{50000, 1e-6}, as
+  are its known-address filter m_addr_known {5000, 0.001} and BanMan's
+  discourage filter {50000, 1e-6}; each is built on first use) records every transaction it has told
   us about as well as every one we have told it about -- the inv, the tx
   message, and each parent of an orphan it delivered -- and it is keyed by
   the id THAT peer's inventory uses, wtxid once it negotiated wtxidrelay and
@@ -1307,6 +1309,8 @@
   (bitcoin-lisp.networking:txdownload-check-is-empty function)
   (bitcoin-lisp.networking:txdownload-assert-empty function)
   (bitcoin-lisp.networking:make-rolling-bloom-filter function)
+  (bitcoin-lisp.networking:peer-announced-txs function)
+  (bitcoin-lisp.networking:peer-known-addrs function)
   (bitcoin-lisp.networking:tx-request-tracker class)
   (bitcoin-lisp.networking:txrequest-get-requestable function)
   (bitcoin-lisp.networking:send-tx-requests function)
