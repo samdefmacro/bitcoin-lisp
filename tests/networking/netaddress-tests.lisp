@@ -917,6 +917,22 @@ which rates IPv6 above IPv4 here -- would offer the IPv6 one."
       (is (eq :ipv4 (and la (bl.net:local-address-network la)))
           "a private IPv4 peer is offered ~S, not our IPv4 address" la))))
 
+(test an-unroutable-partner-ranks-our-ipv6-weak
+  "GetReachabilityFrom's default arm -- a partner whose network is
+unroutable, as a peer we only know by hostname is -- rates our IPv6 address
+REACH_IPV6_WEAK (3), below IPv4 (4) (netaddress.cpp:768-775), so GetLocal
+offers that peer our IPv4 address. Ours rated IPv6 STRONG (5) there and
+offered the IPv6 one. The control: an IPv6 partner still gets the IPv6
+address (REACH_IPV6_STRONG, :743)."
+  (%with-local-address-table
+    (bl.net:add-local :ipv4 (bl.net:ipv4-to-mapped-ipv6 1 2 3 4) 8333 bl.net:+local-manual+)
+    (bl.net:add-local :ipv6 (nth-value 1 (bl.net:parse-network-address "2a00::1")) 8333 bl.net:+local-manual+)
+    (flet ((offered (address)
+             (let ((la (bl.net:get-local-addr-for-peer (bl.net:make-peer :address address))))
+               (and la (bl.net:local-address-network la)))))
+      (is (eq :ipv4 (offered "seed.example.com")))
+      (is (eq :ipv6 (offered "2a01::1")) "control: an IPv6 peer"))))
+
 (test subnet-netmask-must-be-contiguous
   "Core's CSubNet(addr, mask) refuses a netmask with a one bit after a zero bit
 (netaddress.cpp:961-978), so LookupSubNet (netbase.cpp:812-845) reports

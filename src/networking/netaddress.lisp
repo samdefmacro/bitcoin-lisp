@@ -762,6 +762,9 @@ routable and add nothing. HOST is the bind address as given."
 ;; cannot occur while the map's only writer is torcontrol (onion entries).
 (defconstant +reach-unreachable+ 0)
 (defconstant +reach-default+ 1)
+;; REACH_TEREDO is 2; there is no Teredo network here (the tunnel shadings
+;; are left out), so nothing ranks at it.
+(defconstant +reach-ipv6-weak+ 3)
 (defconstant +reach-ipv4+ 4)
 (defconstant +reach-ipv6-strong+ 5)
 (defconstant +reach-private+ 6)
@@ -783,9 +786,10 @@ whose address we cannot type (Core's default arm)."
               (t +reach-default+)))
     (:i2p (if (eq our-net :i2p) +reach-private+ +reach-default+))
     (:cjdns (if (eq our-net :cjdns) +reach-private+ +reach-default+))
-    ;; Unroutable/unknown partner (Core's trailing default arm).
+    ;; Unroutable/unknown partner (Core's trailing default arm): our IPv6
+    ;; address is only WEAK here (netaddress.cpp:772), below IPv4.
     (t (case our-net
-         (:ipv6 +reach-ipv6-strong+)
+         (:ipv6 +reach-ipv6-weak+)
          (:ipv4 +reach-ipv4+)
          ;; "either from Tor, or don't care about our address"
          (:torv3 +reach-private+)
