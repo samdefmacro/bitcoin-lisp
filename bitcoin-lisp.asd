@@ -663,7 +663,6 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/wallet")
                              (:file "fuzz/miniscript")
                              (:file "fuzz/misc")
-                             (:file "fuzz/rpc")
                              (:file "fuzz/storage")
                              (:file "fuzz/util-mempool")
                              (:file "fuzz/cluster-linearize")
@@ -708,6 +707,8 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/integer")
                              (:file "fuzz/asmap-direct")
                              (:file "fuzz/asmap")
+                             ;; After process-message: the rpc target runs on its node.
+                             (:file "fuzz/rpc")
                              (:file "fuzz/p2p-headers-presync")
                              (:file "fuzz/connman")
                              (:file "fuzz/p2p-handshake")
