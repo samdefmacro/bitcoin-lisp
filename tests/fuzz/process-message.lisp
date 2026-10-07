@@ -78,7 +78,7 @@ node's directory is removed afterwards."
          ;; The tx-request tracker and the last block's transaction map are
          ;; process-wide: start from empty and leave nothing for the suites
          ;; that run after this one.
-         (bl.net:reset-tx-requests)
+         (bl.net:reset-txdownloadman)
          (unwind-protect
               (with-ibd-context
                 (with-tx-relay-out-of-ibd
@@ -90,7 +90,7 @@ node's directory is removed afterwards."
                       ;; over no peers does that and nothing else.
                       (bl.net:pump-peer-messages '() (fp-ctx ,var) bl.net:*ibd-context*)
                       ,@body))))
-           (bl.net:reset-tx-requests)
+           (bl.net:reset-txdownloadman)
            (clear-recent-block-txs)
            (uiop:delete-directory-tree (regtest-node-base-path ,suffix)
                                        :validate t :if-does-not-exist :ignore))))))
@@ -109,8 +109,7 @@ node's directory is removed afterwards."
                 :chain-state (bl:node-chain-state node)
                 :utxo-set utxo
                 :block-store (bl:node-block-store node)
-                :mempool (bl:node-mempool node)
-                :recent-rejects (bl:make-rejects-filter 1000))))
+                :mempool (bl:node-mempool node))))
       (make-fuzz-p2p :ctx ctx :node node :coins (nreverse coins)
                      :work (%fuzz-tip-work ctx)))))
 

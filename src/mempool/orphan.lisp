@@ -30,12 +30,17 @@
 ;;;    scheme is gone); LimitOrphans + EraseForBlock/ForPeer are the only
 ;;;    eviction paths.
 ;;;
-;;; Simplifications vs Core, documented:
-;;;  - Core's reconsider/work-set machinery (m_reconsider, GetTxToReconsider)
-;;;    is not ported: our de-orphan cascade re-validates children immediately
-;;;    when the parent is accepted (process-orphans), so no work set exists.
-;;;    Eviction order within a peer is therefore purely oldest-first, without
-;;;    Core's "non-reconsiderable before reconsiderable" refinement.
+;;;  - The WORK SET (txorphanage.cpp:527-608): when a parent enters the
+;;;    mempool, each orphan spending one of its outputs gets ONE announcement
+;;;    -- a random announcer's -- marked RECONSIDER, and that peer's message
+;;;    loop takes them one at a time (GetTxToReconsider), so a parent never
+;;;    buys a whole cascade of re-validations inside one message: Core's fix
+;;;    for the orphan-processing stall it disclosed in 2024
+;;;    (net_processing.cpp:3229-3230). A wtxid has at most one reconsider
+;;;    announcement (the RECONSIDERABLE-WTXIDS set), and eviction takes a
+;;;    peer's non-reconsider announcements before its reconsider ones.
+;;;
+;;; Representation, documented:
 ;;;  - Peers are opaque objects compared with EQ (the networking layer, which
 ;;;    owns the peer struct, loads later). Where Core orders peers by NodeId
 ;;;    -- LimitOrphans' tie-break -- it asks ORPHAN-PEER-ID, which that layer
@@ -57,9 +62,12 @@ memory-exhaustion attack) — Core AddTx's MAX_STANDARD_TX_WEIGHT check
 validation layer, which loads after this file.")
 
 (defstruct orphan-announcement
-  "One (orphan, peer) announcement — Core txorphanage.cpp Announcement."
+  "One (orphan, peer) announcement — Core txorphanage.cpp Announcement.
+RECONSIDER is Core's m_reconsider: this announcement is in its peer's work
+set (txorphanage.cpp:44-46)."
   (peer nil)
-  (sequence 0 :type integer))
+  (sequence 0 :type integer)
+  (reconsider nil :type boolean))
 
 (defstruct orphan-entry
   "An orphan transaction awaiting a missing parent, with its announcers."
@@ -101,6 +109,9 @@ handful of transactions."
   (peer-info (make-hash-table :test 'eq) :type hash-table)
   ;; Monotonic announcement sequence (Core m_current_sequence).
   (next-sequence 0 :type integer)
+  ;; wtxid -> T for every orphan with (exactly) one RECONSIDER announcement
+  ;; (Core m_reconsiderable_wtxids, txorphanage.cpp:122-123).
+  (reconsiderable-wtxids (make-hash-table :test 'equalp) :type hash-table)
   ;; Cached aggregates (Core m_orphans.size() / m_unique_orphan_usage /
   ;; m_unique_rounded_input_scores).
   (announcement-count 0 :type integer)
@@ -163,12 +174,6 @@ most recent is usually the highest-feerate one."
     ;; Core's `input.prevout.hash == parent_txid` test, so no per-outpoint
     ;; re-check is needed here (unlike orphan-erase-for-block).
     (mapcar #'cdr (sort found #'> :key #'car))))
-
-(defun orphans-depending-on (pool parent-txid)
-  "The wtxids of orphans that reference PARENT-TXID as an input parent
-(Core AddChildrenToWorkSet's m_outpoint_to_orphan_wtxids lookup across all of
-the parent's outputs)."
-  (copy-list (gethash parent-txid (orphan-pool-by-prev pool))))
 
 ;;;; Aggregates (Core's Count/Usage accessors)
 
@@ -253,6 +258,9 @@ record entirely at count 0 (Core Erase, txorphanage.cpp:240-246)."
 itself and its indexes (Core Erase's IsUnique branch)."
   (%orphan-peer-info-subtract pool (orphan-announcement-peer ann) entry)
   (decf (orphan-pool-announcement-count pool))
+  ;; The wtxid's one reconsider announcement is gone (Core Erase, :269).
+  (when (orphan-announcement-reconsider ann)
+    (remhash (orphan-entry-wtxid entry) (orphan-pool-reconsiderable-wtxids pool)))
   (setf (orphan-entry-announcements entry)
         (remove ann (orphan-entry-announcements entry)))
   (when (null (orphan-entry-announcements entry))
@@ -288,24 +296,45 @@ std::max's choice here and LimitOrphans' choice between peers."
         (usage (make-feefrac (orphan-peer-info-usage info) max-usage)))
     (if (feefrac< latency usage) usage latency)))
 
-(defun %orphan-oldest-announcement-for-peer (pool peer)
-  "PEER's oldest (lowest-sequence) announcement, as (values entry ann)."
+(defun %orphan-announcement-before-p (a b)
+  "Core's ByPeer order within one peer, (m_reconsider, m_entry_sequence)
+(txorphanage.cpp:84-92): every announcement outside the work set before every
+one in it, oldest first within each."
+  (let ((ra (orphan-announcement-reconsider a))
+        (rb (orphan-announcement-reconsider b)))
+    (if (eq ra rb)
+        (< (orphan-announcement-sequence a) (orphan-announcement-sequence b))
+        rb)))
+
+(defun %orphan-first-announcement-for-peer (pool peer &key reconsider-only)
+  "PEER's first announcement in Core's ByPeer order, as (values entry ann):
+the one LimitOrphans evicts first -- its oldest outside the work set, then its
+oldest in it (\"sorting non-reconsiderable before reconsiderable\",
+txorphanage.cpp:486-489). With RECONSIDER-ONLY, its oldest IN the work set,
+which is GetTxToReconsider's lower_bound(peer, true, 0) (:587-590)."
   (let ((best-entry nil) (best-ann nil))
-    (maphash (lambda (wtxid entry)
-               (declare (ignore wtxid))
-               (dolist (ann (orphan-entry-announcements entry))
-                 (when (and (eq (orphan-announcement-peer ann) peer)
-                            (or (null best-ann)
-                                (< (orphan-announcement-sequence ann)
-                                   (orphan-announcement-sequence best-ann))))
-                   (setf best-entry entry best-ann ann))))
-             (orphan-pool-by-wtxid pool))
+    (flet ((consider (entry)
+             (dolist (ann (orphan-entry-announcements entry))
+               (when (and (eq (orphan-announcement-peer ann) peer)
+                          (or (not reconsider-only)
+                              (orphan-announcement-reconsider ann))
+                          (or (null best-ann)
+                              (%orphan-announcement-before-p ann best-ann)))
+                 (setf best-entry entry best-ann ann)))))
+      ;; The work set is a handful of orphans at most, and the message pump
+      ;; asks for it before every message: walk it, not the whole pool.
+      (if reconsider-only
+          (loop for wtxid being the hash-keys of (orphan-pool-reconsiderable-wtxids pool)
+                do (consider (gethash wtxid (orphan-pool-by-wtxid pool))))
+          (loop for entry being the hash-values of (orphan-pool-by-wtxid pool)
+                do (consider entry))))
     (values best-entry best-ann)))
 
 (defun %limit-orphans (pool)
   "Evict announcements while a global limit is exceeded (Core LimitOrphans,
 txorphanage.cpp:436-525): take the peer with the highest DoS score -- the
-higher ORPHAN-PEER-ID on a tie -- and drop its oldest announcements until the
+higher ORPHAN-PEER-ID on a tie -- and drop its announcements, oldest first and
+those outside the work set before those in it, until the
 pool is within its limits or that peer's score falls to the next peer's (or
 to 1), then put it back and take the worst again. The per-peer allowances are
 read ONCE, at the start: a peer that loses its last announcement during the
@@ -341,7 +370,7 @@ number of announcements evicted."
                       (threshold (if candidates (cdr (first candidates)) one)))
                  (loop while (%orphan-needs-trim-p pool)
                        do (multiple-value-bind (entry ann)
-                              (%orphan-oldest-announcement-for-peer pool worst-peer)
+                              (%orphan-first-announcement-for-peer pool worst-peer)
                             (unless ann (return))
                             (%orphan-remove-announcement pool entry ann)
                             (incf evicted)
@@ -481,3 +510,77 @@ number of orphans erased."
                   (length to-erase))
       (%limit-orphans pool))
     (length to-erase)))
+
+;;;; The work set (Core AddChildrenToWorkSet / GetTxToReconsider /
+;;;; HaveTxToReconsider, txorphanage.cpp:527-608)
+
+(defun %orphan-spends-output-p (entry parent-txid output-count)
+  "T when ENTRY's orphan spends an output of PARENT-TXID that exists -- an
+index below OUTPUT-COUNT. Core walks COutPoint(tx.GetHash(), i) for every i in
+the parent's vout (txorphanage.cpp:531-532), so an orphan naming an output the
+parent does not have is not its child; BY-PREV is parent-txid-granular, so the
+index is checked here."
+  (some (lambda (in)
+          (let ((op (bl.ser:tx-in-previous-output in)))
+            (and (< (bl.ser:outpoint-index op) output-count)
+                 (equalp (bl.ser:outpoint-hash op) parent-txid))))
+        (bl.ser:transaction-inputs (orphan-entry-transaction entry))))
+
+(defun orphan-add-children-to-work-set (pool tx &optional (random-state *random-state*))
+  "Core AddChildrenToWorkSet (txorphanage.cpp:527-565): TX entered the
+mempool, so every orphan spending one of its outputs is ready to be looked at
+again. Each such orphan not already in a work set gets ONE announcement marked
+RECONSIDER -- a random announcer's, so the peer that will do the work cannot
+be chosen by an attacker and \"cannot purposefully stop us from processing the
+orphan by disconnecting\" either (:545-547). Returns the (wtxid . peer) pairs
+marked, in the order they were marked."
+  (let* ((txid (bl.ser:transaction-hash tx))
+         (outputs (length (bl.ser:transaction-outputs tx)))
+         (reconsiderable (orphan-pool-reconsiderable-wtxids pool))
+         (marked '()))
+    ;; Core visits the children of each output in wtxid order (a std::set).
+    (dolist (wtxid (sort (copy-list (gethash txid (orphan-pool-by-prev pool)))
+                         #'bl.bytes:octets<))
+      (let ((entry (gethash wtxid (orphan-pool-by-wtxid pool))))
+        (when (and entry
+                   (not (gethash wtxid reconsiderable))
+                   (%orphan-spends-output-p entry txid outputs))
+          ;; Core's ByWtxid index orders one orphan's announcements by NodeId
+          ;; and advances randrange(num_announcers) into them (:549-552).
+          (let* ((anns (sort (copy-list (orphan-entry-announcements entry)) #'<
+                             :key (lambda (ann)
+                                    (orphan-peer-id (orphan-announcement-peer ann)))))
+                 (ann (nth (random (length anns) random-state) anns)))
+            (setf (orphan-announcement-reconsider ann) t
+                  (gethash wtxid reconsiderable) t)
+            (bl:log-cat "txpackages" "added ~A (wtxid=~A) to peer ~A workset"
+                        (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes
+                                                 (orphan-entry-txid entry)))
+                        (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes wtxid))
+                        (orphan-peer-id (orphan-announcement-peer ann)))
+            (push (cons wtxid (orphan-announcement-peer ann)) marked)))))
+    (nreverse marked)))
+
+(defun orphan-get-tx-to-reconsider (pool peer)
+  "Core GetTxToReconsider (txorphanage.cpp:587-601): PEER's OLDEST work-set
+announcement leaves the work set and its transaction is returned, or NIL when
+PEER has none. The flag goes even if the orphan then stays in the pool: it is
+not looked at again \"until there is a new reason to do so\"."
+  (multiple-value-bind (entry ann)
+      (%orphan-first-announcement-for-peer pool peer :reconsider-only t)
+    (when ann
+      (setf (orphan-announcement-reconsider ann) nil)
+      (remhash (orphan-entry-wtxid entry) (orphan-pool-reconsiderable-wtxids pool))
+      (orphan-entry-transaction entry))))
+
+(defun orphan-have-tx-to-reconsider (pool peer)
+  "Core HaveTxToReconsider (txorphanage.cpp:604-608): PEER has an announcement
+in the work set."
+  (and (nth-value 1 (%orphan-first-announcement-for-peer pool peer :reconsider-only t))
+       t))
+
+(defun orphan-transactions (pool)
+  "Core GetOrphanTransactions (txorphanage.cpp:672-685): every orphan as
+(transaction . announcers)."
+  (loop for wtxid being the hash-keys of (orphan-pool-by-wtxid pool) using (hash-value entry)
+        collect (cons (orphan-entry-transaction entry) (orphan-announcers pool wtxid))))

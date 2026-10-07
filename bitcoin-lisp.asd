@@ -321,6 +321,8 @@ bitcoin-cli (node-main)."
                                (:file "peer")
                                (:file "txreconciliation-set") ; reads the peer struct: after it, so its accessors inline
                                (:file "private-broadcast") ; Core private_broadcast.cpp
+                               (:file "txrequest")     ; Core TxRequestTracker
+                               (:file "txdownloadman") ; Core TxDownloadManager: owns the orphanage, txrequest, filters
                                (:file "protocol")
                                (:file "headers-sync")
                                (:file "ibd")))
@@ -484,6 +486,7 @@ bitcoin-cli (node-main)."
                              (:file "validation/package-tests")
                              ;; Opportunistic 1p1c package relay over P2P
                              (:file "networking/package-relay-tests")
+                             (:file "networking/txdownloadman-tests")
                              ;; Mining / regtest tests
                              (:file "mining/mining-tests")
                              ;; Deserializer robustness / fuzz tests

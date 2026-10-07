@@ -15,7 +15,7 @@ calling the old signature and no production path filling PEERS."
    :mempool (node-mempool node)
    :peers (node-peers node)
    :address-book (node-address-book node)
-   :recent-rejects (node-recent-rejects node)
+   :txdownloadman (bl.net:node-txdownloadman)
    :historical-chainstate (node-historical-chainstate node)))
 
 (defun sync-blockchain (node)

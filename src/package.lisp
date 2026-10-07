@@ -160,7 +160,6 @@ init.cpp, node/. src/node/.")
    #:+node-exit-watchdog+
    #:node-status
    #:node-fee-estimator
-   #:node-recent-rejects
    #:sync-blockchain
    ;; Logging
    #:*log-stream*

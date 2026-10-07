@@ -67,7 +67,6 @@
     "bitcoin-lisp.mempool:mempool-entry-fee-rate"
     "bitcoin-lisp.mempool:mempool-get-transactions"
     "bitcoin-lisp.mempool:orphan-announcements-from-peer"
-    "bitcoin-lisp.mempool:orphan-usage-by-peer"
     "bitcoin-lisp.mempool:topological-subset-p"
     "bitcoin-lisp.mempool:txgraph-get-ancestors-union"
     "bitcoin-lisp.mempool:txgraph-get-descendants-union"
@@ -103,7 +102,11 @@
     ;; Core's own vectors in tests/networking/bloom-tests.lisp build one --
     ;; which is how the byte contract is checked.
     "bitcoin-lisp.networking:make-bloom-filter"
-    "bitcoin-lisp.networking:serialize-bloom-filter")
+    "bitcoin-lisp.networking:serialize-bloom-filter"
+    ;; Core's TxRequestTracker::SanityCheck, which Core calls only from its
+    ;; txrequest and txdownloadman_impl fuzz targets -- and so do we
+    ;; (tests/fuzz/txrequest.lisp, tests/fuzz/txdownloadman.lisp).
+    "bitcoin-lisp.networking:txrequest-sanity-check")
   "Exported functions with no caller in src/ as of 2026-08-22, as
 \"package:name\" strings -- strings rather than symbols so that unexporting one
 is an ordinary test failure and not a READ error that kills compilation.")
@@ -129,7 +132,7 @@ code calls would bury the finding this test exists to surface."
   "The set of names SRC references as a function OBJECT, i.e. #'name.
 
 Needed because xref records CALLS only: a function installed as a hook --
-Core-style, e.g. (setf *peer-disconnect-hook* #'tx-request-disconnected-peer)
+Core-style, e.g. (setf *some-hook* #'some-function)
 -- has no call site and would otherwise read as dead. Tokenised rather than
 searched per symbol, so that #'request-headers-for-ibd cannot be mistaken for
 a reference to REQUEST-HEADERS: a substring test would drop every name that is

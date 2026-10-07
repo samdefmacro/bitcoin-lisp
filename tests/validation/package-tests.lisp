@@ -576,25 +576,6 @@ the entire band)."
 ;;;; Package RBF (cluster mempool P8 — Core PackageRBFChecks,
 ;;;; validation.cpp:1034-1130, wired through %accept-package-subset)
 
-(defun pkg-tx-2in (prev1 idx1 prev2 idx2 out-value)
-  "A two-input P2SH(OP_TRUE) tx spending (PREV1,IDX1) and (PREV2,IDX2)."
-  (bl.ser:make-transaction
-   :version 2
-   :inputs (vector (bl.ser:make-tx-in
-                    :previous-output (bl.ser:make-outpoint
-                                      :hash prev1 :index idx1)
-                    :script-sig (p2sh-optrue-scriptsig)
-                    :sequence #xffffffff)
-                   (bl.ser:make-tx-in
-                    :previous-output (bl.ser:make-outpoint
-                                      :hash prev2 :index idx2)
-                    :script-sig (p2sh-optrue-scriptsig)
-                    :sequence #xffffffff))
-   :outputs (vector (bl.ser:make-tx-out
-                     :value out-value
-                     :script-pubkey (p2sh-optrue-script-pubkey)))
-   :lock-time 0))
-
 (test package-rbf-replaces-mempool-conflict
   "A 1p1c package whose parent conflicts with a pool tx replaces it when the
 package out-earns it through the diagram check: the conflict is evicted and

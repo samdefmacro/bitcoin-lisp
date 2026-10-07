@@ -201,9 +201,10 @@ src/mempool/.")
    #:*cluster-size-limit*
    #:mempool-effective-min-fee-rate
    #:mempool-decayed-rolling-min-fee-rate
-   #:mempool-orphan-pool
    ;; Orphan pool (Core TxOrphanage at d3056bc: wtxid-keyed, per-peer
-   ;; announcement accounting, DoS-bounded eviction, no time expiry)
+   ;; announcement accounting, DoS-bounded eviction, no time expiry). The
+   ;; TxDownloadManager owns the node's (src/networking/txdownloadman.lisp).
+   #:orphan-pool
    #:make-orphan-pool
    #:orphan-pool-count
    #:orphan-entry-transaction
@@ -214,9 +215,12 @@ src/mempool/.")
    #:orphan-have-from-peer
    #:orphan-announcers
    #:orphan-children-from-peer
-   #:orphans-depending-on
    #:orphan-erase-for-peer
    #:orphan-erase-for-block
+   #:orphan-add-children-to-work-set
+   #:orphan-get-tx-to-reconsider
+   #:orphan-have-tx-to-reconsider
+   #:orphan-transactions
    #:orphan-total-usage
    #:orphan-total-latency-score
    #:orphan-usage-by-peer
@@ -242,6 +246,8 @@ src/mempool/.")
    #:orphan-entry-latency-score
    #:orphan-entry-wtxid
    #:orphan-announcement-sequence
+   #:orphan-announcement-reconsider
+   #:orphan-pool-reconsiderable-wtxids
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules

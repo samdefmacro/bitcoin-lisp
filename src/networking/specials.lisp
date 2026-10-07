@@ -13,3 +13,11 @@ to false once the tip has enough work and is recent, and it never flips
 back for the life of the node (Core m_cached_is_ibd, validation.h:1049,
 latched by UpdateIBDStatus, validation.cpp:3314-3322). Re-set to T by
 reset-ibd-stop at node start.")
+
+(defvar *txdownloadman* nil
+  "The node's TxDownloadManager (src/networking/txdownloadman.lisp), Core's
+PeerManagerImpl::m_txdownloadman: the orphanage, the tx-request tracker, the
+recent-rejects, reconsiderable and recently-confirmed filters and the
+transaction-relay peers' connection facts. Built at node start
+(RESET-TXDOWNLOADMAN) and on first use (NODE-TXDOWNLOADMAN). Here, before the
+peer and handshake code that registers and releases peers in it.")

@@ -114,21 +114,74 @@ headerssync.cpp. src/networking/.")
    #:reset-ibd-context
    #:ibd-stop-requested-p
    #:join-thread-or-destroy
-   ;; Tx-request tracking
-   #:retry-timed-out-tx-requests
-   #:reset-tx-requests
    ;; Core's vExtraTxnForCompact (-blockreconstructionextratxn).
    #:*max-extra-txs*
    #:reset-compact-extra-transactions
    #:add-to-compact-extra-transactions
    #:compact-extra-transactions
-   #:tx-request-wanted-p
-   #:tx-request-received
-   #:tx-request-received-response
-   #:tx-request-candidate-peers
-   #:tx-request-disconnected-peer
-   #:tx-request-count
-   #:process-tx-requests
+   ;; Core's TxRequestTracker (txrequest.lisp)
+   #:tx-request-tracker
+   #:make-tx-request-tracker
+   #:txrequest-received-inv
+   #:txrequest-get-requestable
+   #:txrequest-requested-tx
+   #:txrequest-received-response
+   #:txrequest-forget-tx-hash
+   #:txrequest-disconnected-peer
+   #:txrequest-get-candidate-peers
+   #:txrequest-count
+   #:txrequest-count-in-flight
+   #:txrequest-count-candidates
+   #:txrequest-size
+   #:txrequest-sanity-check
+   ;; Core's TxDownloadManager (txdownloadman.lisp) and its drive sites
+   #:*txdownloadman*
+   #:txdownload-manager
+   #:make-txdownload-manager
+   #:node-txdownloadman
+   #:reset-txdownloadman
+   #:ctx-txdownloadman
+   #:txdownload-orphanage
+   #:txdownload-txrequest
+   #:txdownload-recent-rejects
+   #:txdownload-recent-rejects-reconsiderable
+   #:txdownload-recent-confirmed
+   #:txdownload-num-wtxid-peers
+   #:txdownload-connection-info
+   #:make-txdownload-connection-info
+   #:txdownload-connection-info-for
+   #:package-to-validate
+   #:ptv-parent
+   #:ptv-child
+   #:ptv-parent-sender
+   #:ptv-child-sender
+   #:ptv-txns
+   #:txdownload-active-tip-change
+   #:txdownload-block-connected
+   #:txdownload-block-disconnected
+   #:txdownload-already-have-tx-p
+   #:txdownload-connected-peer
+   #:txdownload-disconnected-peer
+   #:txdownload-add-tx-announcement
+   #:txdownload-get-requests-to-send
+   #:txdownload-received-not-found
+   #:txdownload-mempool-accepted-tx
+   #:txdownload-mempool-rejected-tx
+   #:txdownload-mempool-rejected-package
+   #:txdownload-received-tx
+   #:txdownload-have-more-work
+   #:txdownload-get-tx-to-reconsider
+   #:txdownload-check-is-empty
+   #:txdownload-get-orphan-transactions
+   #:unique-parent-txids
+   #:+max-peer-tx-announcements+
+   #:+max-peer-tx-request-in-flight+
+   #:+getdata-tx-interval-seconds+
+   #:send-tx-requests
+   #:send-tx-requests-to-peers
+   #:process-orphan-tx
+   #:process-valid-tx
+   #:process-invalid-tx
    #:note-block-failure
    #:clear-block-failure
    #:note-block-source

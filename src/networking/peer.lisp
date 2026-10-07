@@ -561,12 +561,6 @@ slot was actually returned."
            (peer-log-name peer)))
       t)))
 
-(defvar *peer-disconnect-hook* nil
-  "When non-NIL, a function of one argument (the peer) called from
-DISCONNECT-PEER after the connection is torn down. protocol.lisp registers
-the tx-request tracker's DisconnectedPeer cleanup here — the tracker lives in
-a later-loaded file, so a direct call would be a forward reference.")
-
 (defun disconnect-peer (peer)
   "Disconnect from a peer."
   (let ((connection (peer-connection peer)))
@@ -583,18 +577,20 @@ a later-loaded file, so a direct call would be a forward reference.")
   ;; Drop any in-progress low-work headers sync with this peer (Core
   ;; FinalizeNode resets Peer state; the buffers die with the struct).
   (setf (peer-headers-sync peer) nil)
-  ;; Drop this peer's orphan ANNOUNCEMENTS (DoS hygiene). Orphans other
-  ;; peers also announced survive (Core TxOrphanage::EraseForPeer).
-  (let ((node bl:*node*))
-    (when (and node (bl:node-mempool node))
-      (bl.mp:orphan-erase-for-peer
-       (bl.mp:mempool-orphan-pool (bl:node-mempool node))
-       peer)))
-  ;; Tx-request tracker cleanup (Core TxDownloadManagerImpl::DisconnectedPeer):
-  ;; forget the peer's announcements; its in-flight requests become
-  ;; re-schedulable so the next scheduler pass fails them over.
-  (when *peer-disconnect-hook*
-    (ignore-errors (funcall *peer-disconnect-hook* peer))))
+  ;; Core FinalizeNode's m_txdownloadman.DisconnectedPeer
+  ;; (net_processing.cpp:1709-1712): the peer's orphan ANNOUNCEMENTS go
+  ;; (orphans other peers also announced survive), its tracked announcements
+  ;; go and its in-flight requests become the next candidate's, and its
+  ;; registration goes. When the last peer has gone, Core asserts the manager
+  ;; is empty (:1720-1730); we log what is left instead of aborting.
+  (let ((mgr (node-txdownloadman)))
+    (txdownload-disconnected-peer mgr peer)
+    (let ((node bl:*node*))
+      (when (and node (notany (lambda (p) (and (not (eq p peer))
+                                               (not (eq (peer-state p) :disconnected))))
+                              (bl:node-peers node)))
+        (dolist (problem (txdownload-check-is-empty mgr))
+          (bl:log-warn "TxDownloadManager not empty after the last peer: ~A" problem))))))
 
 (defun peer-handshake-in-flight-p (peer)
   "T while PEER's version handshake is still running, i.e. Core's
@@ -1623,6 +1619,16 @@ was dropped by us. Found by the p2p_handshake fuzz target (tests/fuzz/)."
              (cond
                ((string= command "verack")
                 (%verack-finalize-recon peer)
+                ;; Core's VERACK handler registers the peer with
+                ;; m_txdownloadman.ConnectedPeer before it is marked
+                ;; successfully connected (net_processing.cpp:3888-3895);
+                ;; InitializeNode has already asserted the manager holds
+                ;; nothing for it (CheckIsEmpty(nodeid), :1612), which we log.
+                (let ((mgr (node-txdownloadman)))
+                  (dolist (problem (txdownload-check-is-empty mgr peer))
+                    (bl:log-warn "TxDownloadManager holds state for new ~A: ~A"
+                                 (peer-log-name peer) problem))
+                  (txdownload-connected-peer mgr peer (txdownload-connection-info-for peer)))
                 (setf (peer-state peer) :ready)
                 (return t))
                ((string= command "sendaddrv2") (setf (peer-wants-addrv2 peer) t))

@@ -10,12 +10,11 @@
 ;;;; src/mempool/orphan.lisp; TxOrphanage::SanityCheck (txorphanage.cpp:
 ;;;; 687-760) is ported here, over the pool's exported records.
 ;;;;
-;;;; The port has no work set (AddChildrenToWorkSet / GetTxToReconsider /
-;;;; HaveTxToReconsider: the de-orphan cascade re-validates a parent's children
-;;;; at once, orphan.lisp's header says why), so every announcement is what
-;;;; Core calls non-reconsiderable, and the commands that drive the work set
-;;;; are left out. A NodeId is a fixnum here (the pool keys peers by EQ, and
-;;;; Core's int64 is folded by an order-preserving shift).
+;;;; The work set (AddChildrenToWorkSet / GetTxToReconsider /
+;;;; HaveTxToReconsider) is driven and checked as Core drives it, the model
+;;;; carrying each announcement's reconsider flag. A NodeId is a fixnum here
+;;;; (the pool keys peers by EQ, and Core's int64 is folded by an
+;;;; order-preserving shift).
 
 (def-suite :fuzz-txorphan-tests :in :bitcoin-lisp-tests
   :description "Core fuzz/txorphan.cpp targets")
@@ -103,6 +102,14 @@ limits."
                do (pushnew wtxid (gethash (bl.ser:outpoint-hash (bl.ser:tx-in-previous-output in))
                                           parents)
                            :test #'equalp))
+         ;; At most one announcement per wtxid in a work set, and exactly the
+         ;; wtxids with one are the pool's reconsiderable set (:713-725).
+         (let ((reconsider (count-if #'bl.mp:orphan-announcement-reconsider
+                                     (bl.mp:orphan-entry-announcements entry))))
+           (fuzz-assert (<= reconsider 1) "two work-set announcements of one orphan")
+           (fuzz-assert (eq (= reconsider 1)
+                            (and (gethash wtxid (bl.mp:orphan-pool-reconsiderable-wtxids pool)) t))
+                        "the reconsiderable set disagrees with the announcements"))
          (let ((seen '()))
            (dolist (ann (bl.mp:orphan-entry-announcements entry))
              (let* ((peer (bl.mp:orphan-announcement-peer ann))
@@ -114,6 +121,11 @@ limits."
                (incf (second acc) (bl.mp:orphan-entry-latency-score entry))
                (incf (third acc)))))))
      (bl.mp:orphan-pool-by-wtxid pool))
+    (maphash (lambda (wtxid flag)
+               (declare (ignore flag))
+               (fuzz-assert (gethash wtxid (bl.mp:orphan-pool-by-wtxid pool))
+                            "a reconsiderable wtxid that is not stored"))
+             (bl.mp:orphan-pool-reconsiderable-wtxids pool))
     ;; Per-peer records.
     (fuzz-assert (= (hash-table-count peers) (hash-table-count (bl.mp:orphan-pool-peer-info pool))))
     (maphash (lambda (peer info)
@@ -174,6 +186,8 @@ children found for a peer spend the parent; usage never grows on a failed
 add; GetTx agrees with HaveTx; and the pool passes SanityCheck."
   (let* ((fdp (make-fuzzed-data-provider buffer))
          (pool (progn (consume-uint256 fdp) (bl.mp:make-orphan-pool)))
+         ;; Core's orphanage_rng, a FastRandomContext seeded from the input.
+         (rng (sb-ext:seed-random-state 0))
          (outpoints (make-array 4 :adjustable t :fill-pointer 0))
          (potential-parent nil)
          (history (make-array 0 :adjustable t :fill-pointer 0)))
@@ -192,6 +206,8 @@ add; GetTx agrees with HaveTx; and the pool passes SanityCheck."
              (wtxid (bl.ser:transaction-wtxid tx)))
         (vector-push-extend tx history)
         (when potential-parent
+          ;; Set up a future GetTxToReconsider (:91-94).
+          (bl.mp:orphan-add-children-to-work-set pool potential-parent rng)
           (let ((peer (orphan-fuzz-peer fdp)))
             (dolist (child (bl.mp:orphan-children-from-peer pool potential-parent peer))
               (fuzz-assert (orphan-fuzz-spends-p child potential-parent)))))
@@ -201,9 +217,10 @@ add; GetTx agrees with HaveTx; and the pool passes SanityCheck."
                  (peer-start (bl.mp:orphan-usage-by-peer pool peer))
                  (weight (bl.ser:transaction-weight tx)))
             (call-one-of fdp
-              ;; GetTxToReconsider: the port keeps no work set, so there is
-              ;; never one to hand out.
-              nil
+              ;; GetTxToReconsider (:115-121): what it hands out is stored.
+              (let ((ref (bl.mp:orphan-get-tx-to-reconsider pool peer)))
+                (when ref
+                  (fuzz-assert (fuzz-sabotage (bl.mp:orphan-have pool (bl.ser:transaction-wtxid ref))))))
               ;; AddTx.
               (let* ((have (bl.mp:orphan-have pool wtxid))
                      (have-from-peer (bl.mp:orphan-have-from-peer pool wtxid peer))
@@ -394,8 +411,8 @@ one's txid under another wtxid, each wtxid distinct. Returns a vector."
     txn))
 
 (defstruct (orphan-sim-ann (:constructor make-orphan-sim-ann (tx announcer)))
-  "SimAnnouncement (:480-487), without the work-set flag the port has no use for."
-  tx announcer)
+  "SimAnnouncement (:480-487). RECONSIDER is its work-set flag."
+  tx announcer (reconsider nil))
 
 (define-fuzz-target txorphanage-sim
     (buffer :core "txorphan.cpp:366-826" :iterations 2000 :max-len 600)
@@ -487,6 +504,48 @@ latency and usage limits. At the end every inspector agrees with the list."
                                (push (cons (bl.ser:outpoint-hash op) (bl.ser:outpoint-index op)) spent)))))
                 (bl.mp:orphan-erase-for-block real (orphan-fuzz-block (txgraph-fuzz-shuffle rng block-txs)))
                 (setf sim (remove-if (lambda (a) (spends-p (orphan-sim-ann-tx a) spent)) sim)))
+              (return))
+            (when (prog1 (zerop command) (decf command))
+              ;; AddChildrenToWorkSet (:624-662): every child of TX not yet in
+              ;; a work set gets exactly one reconsider announcement.
+              (let* ((tx (consume-integral-in-range fdp 0 (1- num-tx)))
+                     (added (bl.mp:orphan-add-children-to-work-set
+                             real (aref txn tx)
+                             (sb-ext:seed-random-state (orphan-sim-rand-below rng (ash 1 32)))))
+                     (children (loop for child below num-tx
+                                     when (and (have-tx child)
+                                               (not (find-if (lambda (a) (and (= (orphan-sim-ann-tx a) child)
+                                                                              (orphan-sim-ann-reconsider a)))
+                                                             sim))
+                                               (orphan-fuzz-spends-p (aref txn child) (aref txn tx)))
+                                       collect (wtxid child))))
+                (loop for (w . peer) in added
+                      do (let ((ann (find-if (lambda (a) (and (equalp (wtxid (orphan-sim-ann-tx a)) w)
+                                                              (= (orphan-sim-ann-announcer a) peer)))
+                                             sim)))
+                           (fuzz-assert (member w children :test #'equalp)
+                                        "AddChildrenToWorkSet marked a non-child or a child twice")
+                           (fuzz-assert (and ann (not (orphan-sim-ann-reconsider ann))))
+                           (when ann (setf (orphan-sim-ann-reconsider ann) t))
+                           (setf children (remove w children :test #'equalp))))
+                (fuzz-assert (null (fuzz-sabotage children))
+                             "AddChildrenToWorkSet left ~D child~:P out" (length children)))
+              (return))
+            (when (prog1 (zerop command) (decf command))
+              ;; GetTxToReconsider (:664-680).
+              (let* ((peer (consume-integral-in-range fdp 0 (1- num-peers)))
+                     (result (bl.mp:orphan-get-tx-to-reconsider real peer)))
+                (if result
+                    (let ((ann (find-if (lambda (a)
+                                          (and (equalp (wtxid (orphan-sim-ann-tx a))
+                                                       (bl.ser:transaction-wtxid result))
+                                               (= (orphan-sim-ann-announcer a) peer)))
+                                        sim)))
+                      (fuzz-assert (and ann (orphan-sim-ann-reconsider ann)))
+                      (when ann (setf (orphan-sim-ann-reconsider ann) nil)))
+                    (fuzz-assert (not (find-if (lambda (a) (and (= (orphan-sim-ann-announcer a) peer)
+                                                                (orphan-sim-ann-reconsider a)))
+                                               sim)))))
               (return))))
         ;; Trim the model as LimitOrphans must have trimmed the real one.
         (let ((max-count (floor max-global-latency (max 1 (count-peers))))
@@ -504,7 +563,11 @@ latency and usage limits. At the end every inspector agrees with the list."
                     (when (bl.mp:feefrac>= score worst-score)
                       (setf worst-score score worst-peer peer))))
                 (fuzz-assert (and worst-peer (bl.mp:feefrac>> worst-score (bl.mp:make-feefrac 1 1))))
-                (let ((victim (find worst-peer sim :key #'orphan-sim-ann-announcer)))
+                ;; Its oldest announcement, outside the work set first (:715-726).
+                (let ((victim (or (find-if (lambda (a) (and (= (orphan-sim-ann-announcer a) worst-peer)
+                                                            (not (orphan-sim-ann-reconsider a))))
+                                           sim)
+                                  (find worst-peer sim :key #'orphan-sim-ann-announcer))))
                   (fuzz-assert victim)
                   (unless victim (return))
                   (setf sim (remove victim sim)))))))
@@ -552,6 +615,12 @@ latency and usage limits. At the end every inspector agrees with the list."
                     (fuzz-assert (equalp expect got) "children of ~D from peer ~D out of order" tx peer)))))))
         (fuzz-assert (= usage (bl.mp:orphan-total-usage real)))
         (dotimes (peer num-peers)
+          ;; HaveTxToReconsider (:802-805).
+          (fuzz-assert (eq (bl.mp:orphan-have-tx-to-reconsider real peer)
+                           (and (find-if (lambda (a) (and (= (orphan-sim-ann-announcer a) peer)
+                                                          (orphan-sim-ann-reconsider a)))
+                                         sim)
+                                t)))
           (fuzz-assert (= (aref usage-by-peer peer) (bl.mp:orphan-usage-by-peer real peer)))
           (fuzz-assert (= (aref count-by-peer peer) (bl.mp:orphan-announcements-from-peer real peer))))
         (fuzz-assert (= (length sim) (bl.mp:orphan-pool-announcement-count real)))

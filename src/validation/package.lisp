@@ -108,20 +108,11 @@ can. src/validation/.")
    #:+default-checklevel+
    #:activate-block
    #:find-fork-point
-   ;; Tx-relay tip structures (Core recent-confirmed filter +
-   ;; most-recent-block tx map)
-   #:recently-confirmed-p
+   ;; Tx-relay tip structure (Core m_most_recent_block_txs)
    #:most-recent-block-tx
    #:most-recent-cmpctblock
    #:note-block-connected
-   #:note-block-txs-confirmed
    #:reset-fork-warning-state
-   #:reset-recent-confirmed
-   ;; The reconsiderable rejects filter (Core's second rejects filter)
-   #:*recent-rejects-reconsiderable*
-   #:reconsiderable-reject-p
-   #:add-reconsiderable-reject
-   #:clear-reconsiderable-rejects
    #:perform-reorg
    #:activate-best-chain
    #:reorg-missing-blocks-p

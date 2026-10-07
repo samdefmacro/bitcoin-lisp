@@ -35,6 +35,25 @@ OUT-VALUE to one P2SH(OP_TRUE) output."
                    :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
 
+(defun pkg-tx-2in (prev1 idx1 prev2 idx2 out-value)
+  "A two-input P2SH(OP_TRUE) tx spending (PREV1,IDX1) and (PREV2,IDX2)."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
+                                      :hash prev1 :index idx1)
+                    :script-sig (p2sh-optrue-scriptsig)
+                    :sequence #xffffffff)
+                   (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
+                                      :hash prev2 :index idx2)
+                    :script-sig (p2sh-optrue-scriptsig)
+                    :sequence #xffffffff))
+   :outputs (vector (bl.ser:make-tx-out
+                     :value out-value
+                     :script-pubkey (p2sh-optrue-script-pubkey)))
+   :lock-time 0))
+
 (defun make-package-fixture (&key (fund-value 100000000) (fund-height 1) (current-height 200))
   "Return (values utxo-set mempool chain-state funding-txid). The funding UTXO is
 a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."

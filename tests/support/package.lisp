@@ -84,6 +84,20 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:deliver-ibd-message
    #:with-tx-relay-out-of-ibd
    #:with-tx-request-salt
+   #:test-txdownloadman
+   #:test-txrequest
+   #:test-orphanage
+   #:reconsiderable-reject-p
+   #:add-reconsiderable-reject
+   #:recently-confirmed-p
+   #:clear-recent-confirmed
+   #:drain-orphan-work
+   #:announce-tx
+   #:run-tx-requests
+   #:forget-tx-hash
+   #:tx-request-received-response
+   #:tx-request-candidate-peers
+   #:tx-request-count
    #:tx-request-in-flight-peer
    #:tx-request-announcement-peers
    #:tx-request-completed-p
@@ -126,6 +140,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:p2sh-optrue-script-pubkey
    #:p2sh-optrue-scriptsig
    #:pkg-tx
+   #:pkg-tx-2in
    #:make-simple-tx
    #:make-package-fixture
    ;; wallet.lisp

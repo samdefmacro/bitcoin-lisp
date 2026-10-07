@@ -29,31 +29,24 @@ lists every announcer's peer id (Core OrphanInfo::announcers)."
   "List the transactions in the orphan pool (Bitcoin Core getorphantxs, hidden).
 PARAMS: ([verbosity]) -- 0 (default) an array of txids, 1 an array of orphan
 detail objects, 2 the detail objects plus each transaction's raw hex."
-  (let* ((verbosity (%parse-verbosity params 0 0))
-         (mempool (rpc-get-mempool node))
-         (pool (and mempool (bl.mp:mempool-orphan-pool mempool)))
-         (result '()))
+  (declare (ignore node))
+  (let ((verbosity (%parse-verbosity params 0 0)))
     (unless (member verbosity '(0 1 2))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message (format nil "Invalid verbosity value ~A" verbosity)))
-    ;; Node lock: the sync thread adds/erases orphans while handling txs;
-    ;; iterating the pool's hash table concurrently is undefined.
-    (when pool
-      (with-node-lock (node)
-        (maphash
-         (lambda (wtxid entry)
-           (declare (ignore wtxid))
-           (let ((tx (bl.mp:orphan-entry-transaction entry))
-                 (from (mapcar #'bl.mp:orphan-announcement-peer
-                               (bl.mp:orphan-entry-announcements entry))))
-             (push (case verbosity
-                     (0 (hash-to-hex (bl.ser:transaction-hash tx)))
-                     (1 (%orphan-tx-json tx from nil))
-                     (t (%orphan-tx-json tx from t)))
-                   result)))
-         (bl.mp:orphan-pool-by-wtxid pool))))
-    ;; Core returns a UniValue VARR: an empty orphanage is [], not null.
-    (json-array (nreverse result))))
+    ;; Core m_peerman.GetOrphanTransactions, which is
+    ;; m_txdownloadman.GetOrphanTransactions (net_processing.cpp:1846-1850):
+    ;; the snapshot is taken under the manager's lock, the sync thread's
+    ;; adds and erases wait for it. Core returns a UniValue VARR: an empty
+    ;; orphanage is [], not null.
+    (json-array
+     (mapcar (lambda (orphan)
+               (destructuring-bind (tx . from) orphan
+                 (case verbosity
+                   (0 (hash-to-hex (bl.ser:transaction-hash tx)))
+                   (1 (%orphan-tx-json tx from nil))
+                   (t (%orphan-tx-json tx from t)))))
+             (bl.net:txdownload-get-orphan-transactions (bl.net:node-txdownloadman))))))
 
 (define-rpc "getmempoolinfo" (node params)
   "Return mempool statistics."

@@ -368,9 +368,6 @@ wrapping or throwing, so a delta that would leave the range pins at the bound."
   ;; until then the periodic re-announcement pass keeps re-relaying. Always a
   ;; subset of ENTRIES: adds are gated on membership, removal drops the txid.
   (unbroadcast (bl.bytes:make-octets-hash-table) :type hash-table)
-  ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
-  ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
-  (orphan-pool (make-orphan-pool) :type orphan-pool)
   ;; Monotonic admission counter (Core CTxMemPool::m_sequence_number,
   ;; txmempool.h:202, initialized to 1): each accepted tx records the current
   ;; value and increments it. MEMPOOL-SEQUENCE reads the counter (Core
