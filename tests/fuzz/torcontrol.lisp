@@ -81,7 +81,8 @@ lines and ` ' on the last. A 250 reply's ServiceIDs are recorded."
           collect (format nil "~D~:[ ~;-~]~A" code more line))))
 
 (defun %log-lines-matching (substring)
-  (count-if (lambda (e) (and (stringp e) (search substring e))) bl.log:*log-buffer*))
+  (count-if (lambda (e) (and (stringp e) (search substring e)))
+            (bl.log:log-ring-lines bl.log:*log-buffer*)))
 
 (define-fuzz-target torcontrol
     (buffer :core "torcontrol.cpp:33-86" :iterations 5 :max-len 800)
