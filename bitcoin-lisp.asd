@@ -709,6 +709,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/asmap")
                              (:file "fuzz/script-descriptor-cache")
                              (:file "fuzz/descriptor-parse")
+                             (:file "fuzz/headerssync")
                              ;; After process-message: the rpc target runs on its node.
                              (:file "fuzz/rpc")
                              (:file "fuzz/p2p-headers-presync")
