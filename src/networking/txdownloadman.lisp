@@ -97,16 +97,11 @@ and the peer each transaction came from."
   (orphanage (bl.mp:make-orphan-pool) :type bl.mp:orphan-pool)
   ;; Core m_txrequest.
   (txrequest (make-tx-request-tracker) :type tx-request-tracker)
-  ;; Core m_lazy_recent_rejects (:61-66): wtxids -- and the txid where no
-  ;; witness can change the verdict -- of transactions the mempool refused.
-  ;; Reset on every tip change outside IBD.
-  (recent-rejects (bl:make-rejects-filter))
-  ;; Core m_lazy_recent_rejects_reconsiderable (:91-96): wtxids that failed
-  ;; for a reason a package may overcome, and 1p1c package hashes that failed.
-  (recent-rejects-reconsiderable (bl:make-rejects-filter 50000))
-  ;; Core m_lazy_recent_confirmed_transactions (:120-128): txids and wtxids of
-  ;; recently confirmed transactions. Reset on a block disconnect.
-  (recent-confirmed (bl:make-rejects-filter 48000))
+  ;; The three rolling bloom filters, built on first use as Core's m_lazy_*
+  ;; are (TXDOWNLOAD-RECENT-REJECTS and its two siblings below).
+  (%recent-rejects nil)
+  (%recent-rejects-reconsiderable nil)
+  (%recent-confirmed nil)
   ;; Core m_peer_info (:140-143): peer -> TXDOWNLOAD-CONNECTION-INFO.
   (peer-info (make-hash-table :test 'eql) :type hash-table)
   ;; Core m_num_wtxid_peers (:146).
@@ -115,6 +110,29 @@ and the peer each transaction came from."
   (random-state (make-random-state t))
   ;; Core m_tx_download_mutex, taken here rather than by every caller.
   (lock (bt:make-recursive-lock "txdownloadman")))
+
+(defun txdownload-recent-rejects (mgr)
+  "Core RecentRejectsFilter() (txdownloadman_impl.h:61-66): wtxids -- and the
+txid where no witness can change the verdict -- of transactions the mempool
+refused, a CRollingBloomFilter of 120,000 at a false-positive rate of one in
+a million, built on first use. Reset on every tip change outside IBD."
+  (or (txdownload-%recent-rejects mgr)
+      (setf (txdownload-%recent-rejects mgr) (make-rolling-bloom-filter 120000 0.000001d0))))
+
+(defun txdownload-recent-rejects-reconsiderable (mgr)
+  "Core RecentRejectsReconsiderableFilter() (:91-96): wtxids that failed for a
+reason a package may overcome, and the hashes of 1p1c packages that failed;
+120,000 at one in a million, built on first use."
+  (or (txdownload-%recent-rejects-reconsiderable mgr)
+      (setf (txdownload-%recent-rejects-reconsiderable mgr)
+            (make-rolling-bloom-filter 120000 0.000001d0))))
+
+(defun txdownload-recent-confirmed (mgr)
+  "Core RecentConfirmedTransactionsFilter() (:120-128): txids and wtxids of
+recently confirmed transactions, 48,000 at one in a million, built on first
+use. Reset on a block disconnect."
+  (or (txdownload-%recent-confirmed mgr)
+      (setf (txdownload-%recent-confirmed mgr) (make-rolling-bloom-filter 48000 0.000001d0))))
 
 (defmacro with-txdownload-lock ((mgr) &body body)
   `(bt:with-recursive-lock-held ((txdownload-lock ,mgr))
@@ -150,8 +168,8 @@ that must not inherit another's announcements, orphans or filters)."
 rejected transaction valid -- a timelock, a fee floor -- so both rejection
 filters start over."
   (with-txdownload-lock (mgr)
-    (bl:clear-recent-rejects (txdownload-recent-rejects mgr))
-    (bl:clear-recent-rejects (txdownload-recent-rejects-reconsiderable mgr))))
+    (rolling-bloom-reset (txdownload-recent-rejects mgr))
+    (rolling-bloom-reset (txdownload-recent-rejects-reconsiderable mgr))))
 
 (defun txdownload-block-connected (mgr block)
   "Core BlockConnected (txdownloadman_impl.cpp:98-110): the block's orphans
@@ -166,9 +184,9 @@ would buy a whole redundant body."
       (bl.ser:dovector (tx (bl.ser:bitcoin-block-transactions block))
         (let ((txid (bl.ser:transaction-hash tx))
               (wtxid (bl.ser:transaction-wtxid tx)))
-          (bl:add-recent-reject confirmed txid)
+          (rolling-bloom-insert confirmed txid)
           (unless (equalp wtxid txid)
-            (bl:add-recent-reject confirmed wtxid))
+            (rolling-bloom-insert confirmed wtxid))
           (txrequest-forget-tx-hash tr txid)
           (txrequest-forget-tx-hash tr wtxid))))))
 
@@ -177,7 +195,7 @@ would buy a whole redundant body."
 confirmed transactions to circulation, so the recently-confirmed filter is
 cleared rather than allowed to block their relay."
   (with-txdownload-lock (mgr)
-    (bl:clear-recent-rejects (txdownload-recent-confirmed mgr))))
+    (rolling-bloom-reset (txdownload-recent-confirmed mgr))))
 
 ;;; --- AlreadyHaveTx (Core :125-147) ---
 
@@ -198,9 +216,9 @@ low-feerate parent is exactly what the orphan may be able to fee-bump."
     (let ((mempool (txdownload-mempool mgr)))
       (or (bl.mp:orphan-have (txdownload-orphanage mgr) hash)
           (and include-reconsiderable
-               (bl:recent-reject-p (txdownload-recent-rejects-reconsiderable mgr) hash))
-          (bl:recent-reject-p (txdownload-recent-confirmed mgr) hash)
-          (bl:recent-reject-p (txdownload-recent-rejects mgr) hash)
+               (rolling-bloom-contains-p (txdownload-recent-rejects-reconsiderable mgr) hash))
+          (rolling-bloom-contains-p (txdownload-recent-confirmed mgr) hash)
+          (rolling-bloom-contains-p (txdownload-recent-rejects mgr) hash)
           (and mempool
                (if wtxidp
                    (bl.mp:mempool-get-by-wtxid mempool hash)
@@ -396,9 +414,9 @@ orphans are candidates, so a flood of fake children from someone else cannot
 crowd out the honest peer's real one."
   (let ((reconsiderable (txdownload-recent-rejects-reconsiderable mgr)))
     (dolist (child (bl.mp:orphan-children-from-peer (txdownload-orphanage mgr) parent peer))
-      (unless (or (bl:recent-reject-p reconsiderable
+      (unless (or (rolling-bloom-contains-p reconsiderable
                                       (bl.val:package-hash (list parent child)))
-                  (bl:recent-reject-p (txdownload-recent-rejects mgr)
+                  (rolling-bloom-contains-p (txdownload-recent-rejects mgr)
                                       (bl.ser:transaction-hash child)))
         (return (make-package-to-validate :parent parent :child child
                                           :parent-sender peer :child-sender peer))))))
@@ -425,9 +443,9 @@ entered the mempool, when it does not count at all."
   (let ((reconsiderable 0)
         (mempool (txdownload-mempool mgr)))
     (dolist (txid parents nil)
-      (cond ((bl:recent-reject-p (txdownload-recent-rejects mgr) txid)
+      (cond ((rolling-bloom-contains-p (txdownload-recent-rejects mgr) txid)
              (return t))
-            ((and (bl:recent-reject-p (txdownload-recent-rejects-reconsiderable mgr) txid)
+            ((and (rolling-bloom-contains-p (txdownload-recent-rejects-reconsiderable mgr) txid)
                   (not (and mempool (bl.mp:mempool-has mempool txid))))
              (when (> (incf reconsiderable) 1)
                (return t)))))))
@@ -464,7 +482,7 @@ orphanage (which decides the compact-block extra pool)."
          (tr (txdownload-txrequest mgr)))
     ;; Only a first-time failure is a new orphan; at false it is already in the
     ;; orphanage or came from 1p1c processing (:362-364).
-    (unless (and first-time-failure (not (bl:recent-reject-p rejects wtxid)))
+    (unless (and first-time-failure (not (rolling-bloom-contains-p rejects wtxid)))
       (return-from %txdownload-missing-inputs (values '() t)))
     (let ((parents (unique-parent-txids tx)))
       (cond
@@ -474,8 +492,8 @@ orphanage (which decides the compact-block extra pool)."
          (bl:log-cat "mempool" "not keeping orphan with rejected parents ~A (wtxid=~A)"
                      (%tx-hex txid)
                      (%tx-hex wtxid))
-         (bl:add-recent-reject rejects txid)
-         (bl:add-recent-reject rejects wtxid)
+         (rolling-bloom-insert rejects txid)
+         (rolling-bloom-insert rejects wtxid)
          (txrequest-forget-tx-hash tr txid)
          (txrequest-forget-tx-hash tr wtxid)
          (values '() t))
@@ -525,16 +543,16 @@ and a PACKAGE-TO-VALIDATE or NIL."
          (setf add-extra nil))
         (t
          (cond ((%reconsiderable-failure-p reason)
-                (bl:add-recent-reject (txdownload-recent-rejects-reconsiderable mgr) wtxid)
+                (rolling-bloom-insert (txdownload-recent-rejects-reconsiderable mgr) wtxid)
                 (when first-time-failure
                   (bl:log-cat "txpackages" "tx ~A (wtxid=~A) failed but reconsiderable, looking for child in orphanage"
                               (%tx-hex txid)
                               (%tx-hex wtxid))
                   (setf package (%find-1p1c-package mgr tx peer))))
-               (t (bl:add-recent-reject (txdownload-recent-rejects mgr) wtxid)))
+               (t (rolling-bloom-insert (txdownload-recent-rejects mgr) wtxid)))
          (txrequest-forget-tx-hash tr wtxid)
          (when (and (eq kind :nonstandard-inputs) (not (equalp wtxid txid)))
-           (bl:add-recent-reject (txdownload-recent-rejects mgr) txid)
+           (rolling-bloom-insert (txdownload-recent-rejects mgr) txid)
            (txrequest-forget-tx-hash tr txid))))
       ;; A transaction that failed for any reason but a missing input leaves
       ;; the orphanage (:487-491).
@@ -549,7 +567,7 @@ and a PACKAGE-TO-VALIDATE or NIL."
   "Core MempoolRejectedPackage (txdownloadman_impl.cpp:500-503): this
 combination of transactions failed as a package and is not tried again."
   (with-txdownload-lock (mgr)
-    (bl:add-recent-reject (txdownload-recent-rejects-reconsiderable mgr)
+    (rolling-bloom-insert (txdownload-recent-rejects-reconsiderable mgr)
                           (bl.val:package-hash txns))))
 
 (defun txdownload-received-tx (mgr peer tx)
@@ -569,7 +587,7 @@ already known to fail reconsiderably, T otherwise."
         (txrequest-received-response tr peer wtxid))
       (cond ((txdownload-already-have-tx-p mgr wtxid t nil)
              (values nil nil))
-            ((bl:recent-reject-p (txdownload-recent-rejects-reconsiderable mgr) wtxid)
+            ((rolling-bloom-contains-p (txdownload-recent-rejects-reconsiderable mgr) wtxid)
              (bl:log-cat "txpackages" "found tx ~A (wtxid=~A) in reconsiderable rejects, looking for child in orphanage"
                          (%tx-hex txid)
                          (%tx-hex wtxid))
@@ -595,9 +613,8 @@ from PEER's work set, or NIL."
 (defun txdownload-check-is-empty (mgr &optional (peer nil peer-p))
   "Core CheckIsEmpty (txdownloadman_impl.cpp:567-578) as the list of what is
 NOT empty: with PEER, nothing tracked or orphaned for it; without, nothing at
-all and no wtxid-relay peer counted. Core asserts; the node logs what this
-returns where Core would abort (a new peer, the last peer gone), and the fuzz
-targets assert it."
+all and no wtxid-relay peer counted. TXDOWNLOAD-ASSERT-EMPTY is Core's
+assert over it."
   (with-txdownload-lock (mgr)
     (let ((tr (txdownload-txrequest mgr))
           (orphanage (txdownload-orphanage mgr))
@@ -618,6 +635,32 @@ targets assert it."
             (unless (zerop (txdownload-num-wtxid-peers mgr))
               (push "wtxid-relay peers are still counted" problems))))
       (nreverse problems))))
+
+(define-condition txdownload-check-failed (internal-error) ()
+  (:documentation "A TxDownloadManager CheckIsEmpty did not hold: state is
+left for a peer that is gone, or for anyone once every peer is. Core asserts,
+which aborts the node; we log the failure and signal this, as the mempool's
+consistency check does (MEMPOOL-CHECK-FAILED)."))
+
+(defun txdownload-assert-empty (mgr &optional (peer nil peer-p))
+  "Core's CheckIsEmpty asserts (txdownloadman_impl.cpp:567-578): signal
+TXDOWNLOAD-CHECK-FAILED when TXDOWNLOAD-CHECK-IS-EMPTY finds anything -- for
+PEER when given, else overall."
+  (let ((problems (if peer-p
+                      (txdownload-check-is-empty mgr peer)
+                      (txdownload-check-is-empty mgr))))
+    (when problems
+      (let ((message (format nil "~:[~*~;peer=~D: ~]~{~A~^; ~}"
+                             peer-p (and peer-p (%tx-peer-node-id peer)) problems)))
+        (bl:log-warn "TxDownloadManager CheckIsEmpty failed: ~A" message)
+        (error 'txdownload-check-failed
+               :format-control "TxDownloadManager CheckIsEmpty failed: ~A"
+               :format-arguments (list message))))))
+
+(defun txdownload-peer-count (mgr)
+  "How many peers are registered (Core m_peer_info.size())."
+  (with-txdownload-lock (mgr)
+    (hash-table-count (txdownload-peer-info mgr))))
 
 (defun txdownload-get-orphan-transactions (mgr)
   "Core GetOrphanTransactions (txdownloadman_impl.cpp:579-582): every orphan as

@@ -2737,6 +2737,11 @@ paused peer's input is not read, so nothing can add to it until it drains."
                   "socket receive timeout: a message began and nothing followed for ~Ds, ~A"
                   +receive-stall-timeout-seconds+ (disconnect-msg peer))
       (handler-case (disconnect-peer peer) (error () nil))))
+  ;; Core's message handler runs SendMessages for a node right after its
+  ;; ProcessMessages (net.cpp:3143-3148); the transaction getdatas
+  ;; GetRequestsToSend hands this peer go now, not after every peer's drain.
+  (when (eq (peer-state peer) :ready)
+    (send-tx-requests peer (ctx-txdownloadman node-ctx)))
   (handle-peer-fin peer)))
 
 (defun pump-peer-messages (peers node-ctx ctx)

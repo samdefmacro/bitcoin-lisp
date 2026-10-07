@@ -59,42 +59,50 @@ by ELEMENTS in INTEGER arithmetic before multiplying by ln 2."
 
 (defun murmur-hash3 (seed data)
   "Core MurmurHash3 (hash.cpp:13-73), the x86_32 variant, over the octet
-vector DATA with SEED."
+vector DATA with SEED. Typed for 32-bit words: the rolling bloom filters ask
+it twenty times per lookup."
   (declare (type (unsigned-byte 32) seed))
-  (let* ((h1 seed)
-         (c1 #xcc9e2d51)
-         (c2 #x1b873593)
-         (len (length data))
-         (nblocks (floor len 4)))
-    (declare (type (unsigned-byte 32) h1))
-    (flet ((rotl (x r) (ldb (byte 32 0) (logior (ash x r) (ash x (- r 32)))))
-           (mul (a b) (ldb (byte 32 0) (* a b))))
-      (dotimes (i nblocks)
-        (let* ((o (* i 4))
-               (k1 (logior (aref data o) (ash (aref data (+ o 1)) 8)
-                           (ash (aref data (+ o 2)) 16) (ash (aref data (+ o 3)) 24))))
-          (setf k1 (mul (rotl (mul k1 c1) 15) c2)
-                h1 (logxor h1 k1)
-                h1 (ldb (byte 32 0) (+ (mul (rotl h1 13) 5) #xe6546b64)))))
-      (let ((tail (* nblocks 4)) (k1 0))
-        (case (logand len 3)
-          (3 (setf k1 (logxor k1 (ash (aref data (+ tail 2)) 16)))
-           (setf k1 (logxor k1 (ash (aref data (+ tail 1)) 8)))
-           (setf k1 (logxor k1 (aref data tail))))
-          (2 (setf k1 (logxor k1 (ash (aref data (+ tail 1)) 8)))
-           (setf k1 (logxor k1 (aref data tail))))
-          (1 (setf k1 (logxor k1 (aref data tail)))))
-        (when (plusp (logand len 3))
-          (setf k1 (mul (rotl (mul k1 c1) 15) c2)
-                h1 (logxor h1 k1))))
-      ;; Finalization: fmix32.
-      (setf h1 (logxor h1 len)
-            h1 (logxor h1 (ash h1 -16))
-            h1 (mul h1 #x85ebca6b)
-            h1 (logxor h1 (ash h1 -13))
-            h1 (mul h1 #xc2b2ae35)
-            h1 (logxor h1 (ash h1 -16)))
-      h1)))
+  (let ((data (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                  data
+                  (coerce data '(simple-array (unsigned-byte 8) (*))))))
+    (declare (type (simple-array (unsigned-byte 8) (*)) data)
+             (optimize (speed 3) (safety 0)))
+    (let* ((h1 seed)
+           (len (length data))
+           (nblocks (floor len 4)))
+      (declare (type (unsigned-byte 32) h1) (type fixnum len nblocks))
+      (macrolet ((rotl (x r) `(logand #xffffffff (logior (ash ,x ,r) (ash ,x (- ,r 32)))))
+                 (mul (a b) `(logand #xffffffff (* ,a ,b))))
+        (flet ((mix-k (k1)
+                 (declare (type (unsigned-byte 32) k1))
+                 (mul (rotl (mul k1 #xcc9e2d51) 15) #x1b873593)))
+          (declare (inline mix-k))
+          (dotimes (i nblocks)
+            (let* ((o (* i 4))
+                   (k1 (logior (aref data o) (ash (aref data (+ o 1)) 8)
+                               (ash (aref data (+ o 2)) 16) (ash (aref data (+ o 3)) 24))))
+              (declare (type (unsigned-byte 32) k1) (type fixnum o))
+              (setf h1 (logxor h1 (mix-k k1))
+                    h1 (logand #xffffffff (+ (mul (rotl h1 13) 5) #xe6546b64)))))
+          (let ((tail (* nblocks 4)) (k1 0))
+            (declare (type (unsigned-byte 32) k1) (type fixnum tail))
+            (case (logand len 3)
+              (3 (setf k1 (logxor k1 (ash (aref data (+ tail 2)) 16)))
+               (setf k1 (logxor k1 (ash (aref data (+ tail 1)) 8)))
+               (setf k1 (logxor k1 (aref data tail))))
+              (2 (setf k1 (logxor k1 (ash (aref data (+ tail 1)) 8)))
+               (setf k1 (logxor k1 (aref data tail))))
+              (1 (setf k1 (logxor k1 (aref data tail)))))
+            (when (plusp (logand len 3))
+              (setf h1 (logxor h1 (mix-k k1))))))
+        ;; Finalization: fmix32.
+        (setf h1 (logxor h1 (logand len #xffffffff))
+              h1 (logxor h1 (ash h1 -16))
+              h1 (mul h1 #x85ebca6b)
+              h1 (logxor h1 (ash h1 -13))
+              h1 (mul h1 #xc2b2ae35)
+              h1 (logxor h1 (ash h1 -16)))
+        h1))))
 
 (defun %bloom-bit (filter n key)
   "Core CBloomFilter::Hash (bloom.cpp:42-46): the bit hash function N sets."
@@ -198,3 +206,102 @@ IsWithinSizeConstraints (net_processing.cpp:5057-5064)."
                           :hash-funcs (bl.bytes:br-read-u32-le s)
                           :tweak (bl.bytes:br-read-u32-le s)
                           :flags (bl.bytes:br-read-u8 s)))))
+
+;;;; Core's CRollingBloomFilter (common/bloom.cpp:162-246)
+;;;
+;;; A bloom filter that remembers the LAST n-elements insertions: it keeps two
+;;; to three generations of n/2 entries, two bits per position naming the
+;;; generation that set it, and wipes a generation's bits when its number comes
+;;; round again. Every entry is remembered for at least n-elements later
+;;; insertions and gone after at most 1.5 x n-elements (save false positives at
+;;; the configured rate). Core keys its transaction-download filters with it
+;;; (txdownloadman_impl.h:61-66, :91-96, :120-128).
+
+(defstruct (rolling-bloom-filter (:constructor %make-rolling-bloom-filter))
+  "Core CRollingBloomFilter (common/bloom.h:108-125)."
+  (entries-per-generation 1 :type fixnum)
+  (entries-this-generation 0 :type fixnum)
+  (generation 1 :type (integer 1 3))
+  (data (make-array 2 :element-type '(unsigned-byte 64) :initial-element 0)
+   :type (simple-array (unsigned-byte 64) (*)))
+  (tweak 0 :type (unsigned-byte 32))
+  (hash-funcs 1 :type fixnum))
+
+(defun rolling-bloom-reset (filter &optional (tweak (ldb (byte 32 0) (bl.crypto:rand-u64))))
+  "Core CRollingBloomFilter::reset (bloom.cpp:240-246): forget everything,
+under a fresh random TWEAK (Core FastRandomContext().rand<unsigned int>()) --
+which a test passes to fix the hash family."
+  (setf (rolling-bloom-filter-tweak filter) tweak
+        (rolling-bloom-filter-entries-this-generation filter) 0
+        (rolling-bloom-filter-generation filter) 1)
+  (fill (rolling-bloom-filter-data filter) 0)
+  filter)
+
+(defun make-rolling-bloom-filter (n-elements fp-rate &optional tweak)
+  "Core's CRollingBloomFilter(nElements, fpRate) (bloom.cpp:162-187): the
+hash count is log(fpRate)/log(0.5), held to 1..50, and the bit count holds
+three generations of (N+1)/2 entries at FP-RATE."
+  (let* ((log-fp (log (coerce fp-rate 'double-float)))
+         (funcs (max 1 (min (round (/ log-fp (log 0.5d0))) 50)))
+         (per-generation (floor (1+ n-elements) 2))
+         (max-elements (* per-generation 3))
+         (bits (ceiling (/ (* -1d0 funcs max-elements)
+                           (log (- 1d0 (exp (/ log-fp funcs)))))))
+         (filter (%make-rolling-bloom-filter
+                  :entries-per-generation per-generation
+                  :hash-funcs funcs
+                  :data (make-array (ash (floor (+ bits 63) 64) 1)
+                                    :element-type '(unsigned-byte 64)
+                                    :initial-element 0))))
+    (if tweak
+        (rolling-bloom-reset filter tweak)
+        (rolling-bloom-reset filter))))
+
+(declaim (inline %rolling-bloom-position))
+(defun %rolling-bloom-position (filter n key)
+  "Hash function N of FILTER on KEY (Core RollingBloomHash, bloom.cpp:189-193)
+as (values bit word-pair-index): the bit is the hash's low six bits, the word
+FastRange32 of the hash over the data size."
+  (let ((h (murmur-hash3 (ldb (byte 32 0) (+ (* n #xFBA4C795) (rolling-bloom-filter-tweak filter)))
+                         key)))
+    (declare (type (unsigned-byte 32) h))
+    (values (logand h 63)
+            (ash (* h (length (rolling-bloom-filter-data filter))) -32))))
+
+(defun rolling-bloom-insert (filter key)
+  "Core CRollingBloomFilter::insert (bloom.cpp:195-224): a full generation
+starts the next one, wiping the bits of the generation that last had its
+number, and KEY's positions are stamped with the current generation."
+  (let ((data (rolling-bloom-filter-data filter)))
+    (when (= (rolling-bloom-filter-entries-this-generation filter)
+             (rolling-bloom-filter-entries-per-generation filter))
+      (setf (rolling-bloom-filter-entries-this-generation filter) 0)
+      (let ((gen (if (= (rolling-bloom-filter-generation filter) 3)
+                     1
+                     (1+ (rolling-bloom-filter-generation filter)))))
+        (setf (rolling-bloom-filter-generation filter) gen)
+        (let ((mask1 (if (logbitp 0 gen) #xffffffffffffffff 0))
+              (mask2 (if (logbitp 1 gen) #xffffffffffffffff 0)))
+          (loop for p of-type fixnum from 0 below (length data) by 2
+                do (let* ((p1 (aref data p)) (p2 (aref data (1+ p)))
+                          (mask (logior (logxor p1 mask1) (logxor p2 mask2))))
+                     (setf (aref data p) (logand p1 mask)
+                           (aref data (1+ p)) (logand p2 mask)))))))
+    (incf (rolling-bloom-filter-entries-this-generation filter))
+    (let ((gen (rolling-bloom-filter-generation filter)))
+      (dotimes (n (rolling-bloom-filter-hash-funcs filter))
+        (multiple-value-bind (bit pos) (%rolling-bloom-position filter n key)
+          (let ((lo (logand pos (lognot 1))) (hi (logior pos 1)))
+            (setf (aref data lo) (dpb (ldb (byte 1 0) gen) (byte 1 bit) (aref data lo))
+                  (aref data hi) (dpb (ldb (byte 1 1) gen) (byte 1 bit) (aref data hi)))))))
+    filter))
+
+(defun rolling-bloom-contains-p (filter key)
+  "Core CRollingBloomFilter::contains (bloom.cpp:226-238): every one of
+KEY's positions is set in some generation."
+  (let ((data (rolling-bloom-filter-data filter)))
+    (dotimes (n (rolling-bloom-filter-hash-funcs filter) t)
+      (multiple-value-bind (bit pos) (%rolling-bloom-position filter n key)
+        (unless (logbitp bit (logior (aref data (logand pos (lognot 1)))
+                                     (aref data (logior pos 1))))
+          (return nil))))))

@@ -166,12 +166,12 @@ step 3 to the mempool."
         (is-false (bl.mp:mempool-has mempool pid))
         (is-true (reconsiderable-reject-p
                   (bl.ser:transaction-wtxid parent)))
-        (is-false (bl:recent-reject-p
+        (is-false (bl.net:rolling-bloom-contains-p
                    rejects (bl.ser:transaction-wtxid parent)))
         ;; 2. The child: an orphan, not a reject.
         (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool))
         (is-true (%pr-orphan-p child))
-        (is-false (bl:recent-reject-p rejects cid))
+        (is-false (bl.net:rolling-bloom-contains-p rejects cid))
         ;; 3. The parent again: accepted as a package with the orphan child.
         (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool))
         (is-true (bl.mp:mempool-has mempool pid))
@@ -255,8 +255,8 @@ blacklisted under both of its own ids — permanently, until the next block."
         (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool))
         (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool))
         (is-true (%pr-orphan-p child))
-        (is-false (bl:recent-reject-p rejects cid))
-        (is-false (bl:recent-reject-p
+        (is-false (bl.net:rolling-bloom-contains-p rejects cid))
+        (is-false (bl.net:rolling-bloom-contains-p
                    rejects (bl.ser:transaction-wtxid child)))))))
 
 (test two-reconsiderable-parents-do-blacklist-the-child
@@ -287,8 +287,8 @@ rejects the child under both ids rather than holding it in the orphanage."
         (is-true (reconsiderable-reject-p pbid))
         (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool))
         (is-false (%pr-orphan-p child))
-        (is-true (bl:recent-reject-p rejects cid))
-        (is-true (bl:recent-reject-p
+        (is-true (bl.net:rolling-bloom-contains-p rejects cid))
+        (is-true (bl.net:rolling-bloom-contains-p
                   rejects (bl.ser:transaction-wtxid child)))))))
 
 ;;;; (c) The DoS control: genuinely invalid transactions are still cached
@@ -310,7 +310,7 @@ zero on the second would prove nothing."
         (%counting-tx-validations (calls)
           (deliver-tx peer (%pr-payload bad) (%pr-ctx state utxo mempool))
           (is (= 1 calls) "first arrival must reach validation" calls)
-          (is-true (bl:recent-reject-p rejects bad-id))
+          (is-true (bl.net:rolling-bloom-contains-p rejects bad-id))
           (is-false (reconsiderable-reject-p bad-id))
           ;; Re-announced: dropped at the precheck, never re-validated.
           (deliver-tx peer (%pr-payload bad) (%pr-ctx state utxo mempool))
@@ -341,7 +341,7 @@ carry it — and be dropped before validation on re-arrival."
           (is (= 1 calls) "first arrival must reach validation" calls)
           (is-false (bl.mp:mempool-has mempool txid))
           (is-true (reconsiderable-reject-p txid))
-          (is-false (bl:recent-reject-p rejects txid))
+          (is-false (bl.net:rolling-bloom-contains-p rejects txid))
           (deliver-tx peer (%pr-payload tx) (%pr-ctx state utxo mempool))
           (is (= 1 calls) "re-arrival must not be re-validated" calls))))))
 
@@ -449,9 +449,9 @@ one."
           (is-false (bl.mp:mempool-has mempool cid))
           (is-true (bl.mp:mempool-has mempool rid))
           ;; THE BLOCKER: the child is cached NOWHERE, under either id.
-          (is-false (bl:recent-reject-p rejects cwtxid)
+          (is-false (bl.net:rolling-bloom-contains-p rejects cwtxid)
                     "child wtxid must not enter the MAIN rejects filter")
-          (is-false (bl:recent-reject-p rejects cid)
+          (is-false (bl.net:rolling-bloom-contains-p rejects cid)
                     "child txid must not enter the MAIN rejects filter")
           (is-false (reconsiderable-reject-p cwtxid))
           ;; ...and it is not erased from the orphanage either
@@ -459,7 +459,7 @@ one."
           (is-true (%pr-orphan-p child))
           ;; CONTROL (b): the parent's own fee failure is still reconsiderable.
           (is-true (reconsiderable-reject-p pwtxid))
-          (is-false (bl:recent-reject-p rejects pwtxid))
+          (is-false (bl.net:rolling-bloom-contains-p rejects pwtxid))
           ;; The child is still RETRYABLE. Simulate the orphanage eviction
           ;; LimitOrphans performs under load: the announcement must still be
           ;; worth requesting (Core AlreadyHaveTx, the gate handle-inv uses)...
@@ -530,14 +530,14 @@ never forms and this control asserts nothing")
           ;; Form the package; the child fails hard inside it.
           (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool))
           (is (zerop (bl.mp:mempool-count mempool)))
-          (is-true (bl:recent-reject-p rejects cwtxid)
+          (is-true (bl.net:rolling-bloom-contains-p rejects cwtxid)
                    "a hard package failure must still be cached")
           (is-false (reconsiderable-reject-p cwtxid))
           (is-false (%pr-orphan-p child)
                     "a hard failure must leave the orphanage")
           ;; CONTROL (b): the parent is still only reconsiderable.
           (is-true (reconsiderable-reject-p pwtxid))
-          (is-false (bl:recent-reject-p rejects pwtxid))
+          (is-false (bl.net:rolling-bloom-contains-p rejects pwtxid))
           ;; Re-announced: dropped at the precheck, never re-validated.
           (let ((before calls))
             (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool))
@@ -569,11 +569,11 @@ floor and changes which parents exist, so every cached fee failure is stale."
   (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 77)))
     (%with-fresh-rejects (rejects)
       (add-reconsiderable-reject h)
-      (bl:add-recent-reject rejects h)
+      (bl.net:rolling-bloom-insert rejects h)
       (is-true (reconsiderable-reject-p h))
       (bl.net:txdownload-active-tip-change (test-txdownloadman))
       (is-false (reconsiderable-reject-p h))
-      (is-false (bl:recent-reject-p rejects h)))))
+      (is-false (bl.net:rolling-bloom-contains-p rejects h)))))
 
 (test inv-for-reconsiderable-tx-is-not-requested
   "AlreadyHaveTx(include_reconsiderable=true) at announcement time: there is
@@ -644,8 +644,8 @@ announcer."
         ;; was rejected for the malleation: the sender is marked as knowing
         ;; the txid, and the TWIN's wtxid -- not the txid -- is cached.
         (is-true (bl:recent-reject-p (bl.net:peer-announced-txs attacker) txid))
-        (is-true (bl:recent-reject-p rejects (bl.ser:transaction-wtxid twin)))
-        (is-false (bl:recent-reject-p rejects txid))
+        (is-true (bl.net:rolling-bloom-contains-p rejects (bl.ser:transaction-wtxid twin)))
+        (is-false (bl.net:rolling-bloom-contains-p rejects txid))
         (is-false (bl.mp:mempool-has mempool txid))
         ;; Every honest announcement survives; the attacker completed nothing
         ;; because it had nothing to complete.
@@ -760,7 +760,7 @@ in-IBD run must not."
               (is-false (bl.mp:mempool-has mempool txid))
               (is-false (bl.mp:orphan-have
                          (test-orphanage) txid))
-              (is-false (bl:recent-reject-p rejects txid))
+              (is-false (bl.net:rolling-bloom-contains-p rejects txid))
               (is-false (reconsiderable-reject-p txid))
               (is (null (tx-request-announcement-peers txid :completed t)))
               (is (null (tx-request-in-flight-peer txid)))

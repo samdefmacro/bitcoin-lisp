@@ -539,15 +539,6 @@ to. Returns the number of transactions requested."
                  (error () nil))))
     sent))
 
-(defun send-tx-requests-to-peers (peers mgr)
-  "Run SEND-TX-REQUESTS against the TxDownloadManager MGR for every :READY
-peer in PEERS, as Core's message handler runs SendMessages for every node on
-each pass (net.cpp:3143-3148). Returns the number of transactions requested."
-  (let ((now (%tx-request-now)))
-    (loop for peer in peers
-          when (eq (peer-state peer) :ready)
-            sum (send-tx-requests peer mgr now))))
-
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
 
 (defvar *max-tip-age-seconds* (* 24 60 60)
@@ -772,7 +763,7 @@ The tx items are ignored outright when the message carries more than
 MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER of them -- more
 than the peer could possibly be answering -- rather than the 50,000 the inv
 parser allows. Nothing is re-requested from here: Core re-issues from each
-peer's own SendMessages, and so does SEND-TX-REQUESTS-TO-PEERS, which keeps
+peer's own SendMessages, and so does SEND-TX-REQUESTS, which keeps
 an unsolicited notfound's cost at its own item count."
   (let ((invs (bl.ser:parse-inv-payload payload))
         (hashes '()))

@@ -229,3 +229,68 @@ Core keeps (ours dropped it too)."
         (is-true (bl.net:peer-has-permission-p peer bl.net:+perm-noban+))
         (%dispatch-to-fake-peer "mempool" #() peer)
         (is (eq :ready (bl.net:peer-state peer)) "a noban peer is kept")))))
+
+;;;; Core's CRollingBloomFilter (common/bloom.cpp:162-246)
+
+(defun %rolling-key (n)
+  "A distinct 32-byte key for N, standing in for Core's RandomData()."
+  (bl.crypto:sha256 (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                      (dotimes (k 8 v) (setf (aref v k) (ldb (byte 8 (* 8 k)) n))))))
+
+(test rolling-bloom-sizes-itself-as-core-does
+  "The hash count and table size are Core's constructor's (bloom.cpp:162-187),
+pinned for the filters Core builds: the tx-download ones (120,000 and 48,000
+at one in a million, txdownloadman_impl.h:61-66, :91-96, :120-128) and
+bloom_tests.cpp's two."
+  (loop for (n fp funcs words) in '((120000 0.000001d0 20 161750) (48000 0.000001d0 20 64700)
+                                    (100 0.01d0 7 46) (1000 0.001d0 10 674))
+        do (let ((f (bl.net:make-rolling-bloom-filter n fp 0)))
+             (is (= funcs (bl.net:rolling-bloom-filter-hash-funcs f)))
+             (is (= words (length (bl.net:rolling-bloom-filter-data f)))))))
+
+(test rolling-bloom-remembers-the-last-n-and-forgets-older-ones
+  "Core's rolling_bloom test (bloom_tests.cpp:465-533) on our keys: a
+last-100 filter at 1% remembers the last 100 of 399 insertions and about 1%
+of unseen keys, forgets everything on reset, remembers each entry for the 100
+insertions after it while rolling, keeps only false positives of the old
+entries after 999 more, and a last-1000 filter holds all 399. Core's exact
+hit counts (71, 3) come from its seeded RNG; the bounds are what they
+approximate."
+  (let ((rb1 (bl.net:make-rolling-bloom-filter 100 0.01d0 12345))
+        (data (loop for i below 399 collect (%rolling-key i))))
+    (dolist (d data) (bl.net:rolling-bloom-insert rb1 d))
+    (is (every (lambda (d) (bl.net:rolling-bloom-contains-p rb1 d)) (nthcdr 299 data)))
+    (let ((hits (loop for i from 10000 below 20000
+                      count (bl.net:rolling-bloom-contains-p rb1 (%rolling-key i)))))
+      (is (< 20 hits 200) "about 1% of 10,000 unseen keys, got ~D" hits))
+    (bl.net:rolling-bloom-reset rb1)
+    (is-false (bl.net:rolling-bloom-contains-p rb1 (car (last data))))
+    (loop for d in data for i from 0
+          do (when (>= i 100)
+               (is-true (bl.net:rolling-bloom-contains-p rb1 (nth (- i 100) data))))
+             (bl.net:rolling-bloom-insert rb1 d)
+             (is-true (bl.net:rolling-bloom-contains-p rb1 d)))
+    (dotimes (i 999)
+      (let ((d (%rolling-key (+ 50000 i))))
+        (bl.net:rolling-bloom-insert rb1 d)
+        (is-true (bl.net:rolling-bloom-contains-p rb1 d))))
+    (let ((hits (count-if (lambda (d) (bl.net:rolling-bloom-contains-p rb1 d)) data)))
+      (is (< hits 20) "only false positives of the old entries remain, got ~D" hits))
+    (let ((rb2 (bl.net:make-rolling-bloom-filter 1000 0.001d0)))
+      (dolist (d data) (bl.net:rolling-bloom-insert rb2 d))
+      (is (every (lambda (d) (bl.net:rolling-bloom-contains-p rb2 d)) data)))))
+
+(test rolling-bloom-forgets-within-one-and-a-half-n
+  "The capacity contract the tx-download filters rely on: an entry survives N
+later insertions (two whole generations of N/2 follow it) and is gone once
+its generation number comes round again, which is at most 1.5 N later
+(bloom.cpp:168-170, :197-212) -- not a FIFO of exactly N."
+  (let ((f (bl.net:make-rolling-bloom-filter 1000 0.000001d0 99))
+        (old (loop for i below 100 collect (%rolling-key (+ 90000 i)))))
+    (dolist (d old) (bl.net:rolling-bloom-insert f d))
+    (dotimes (i 900) (bl.net:rolling-bloom-insert f (%rolling-key (+ 91000 i))))
+    (is (every (lambda (d) (bl.net:rolling-bloom-contains-p f d)) old)
+        "remembered across the next N insertions")
+    (dotimes (i 600) (bl.net:rolling-bloom-insert f (%rolling-key (+ 92000 i))))
+    (is (notany (lambda (d) (bl.net:rolling-bloom-contains-p f d)) old)
+        "forgotten 1.5 N insertions later")))

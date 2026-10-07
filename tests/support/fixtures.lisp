@@ -443,24 +443,24 @@ and hands everything else to the generic handler."
 
 (defun reconsiderable-reject-p (hash)
   "T when HASH is in the node manager's reconsiderable rejects filter."
-  (and (bl:recent-reject-p
+  (and (bl.net:rolling-bloom-contains-p
         (bl.net:txdownload-recent-rejects-reconsiderable (test-txdownloadman)) hash)
        t))
 
 (defun add-reconsiderable-reject (hash)
   "Put HASH in the node manager's reconsiderable rejects filter."
-  (bl:add-recent-reject
+  (bl.net:rolling-bloom-insert
    (bl.net:txdownload-recent-rejects-reconsiderable (test-txdownloadman)) hash))
 
 (defun recently-confirmed-p (hash)
   "T when HASH is in the node manager's recently-confirmed filter."
-  (and (bl:recent-reject-p (bl.net:txdownload-recent-confirmed (test-txdownloadman)) hash)
+  (and (bl.net:rolling-bloom-contains-p (bl.net:txdownload-recent-confirmed (test-txdownloadman)) hash)
        t))
 
 (defun clear-recent-confirmed ()
   "Empty the node manager's recently-confirmed filter (Core BlockDisconnected's
 reset)."
-  (bl:clear-recent-rejects (bl.net:txdownload-recent-confirmed (test-txdownloadman))))
+  (bl.net:rolling-bloom-reset (bl.net:txdownload-recent-confirmed (test-txdownloadman))))
 
 (defun drain-orphan-work (peers ctx)
   "Run Core's ProcessOrphanTx for each of PEERS until no work set holds
@@ -495,11 +495,11 @@ and send each :READY peer the getdata GetRequestsToSend hands it. The manager
 is CTX's (BL.NET:CTX-TXDOWNLOADMAN), else the node's. Returns the number of
 transactions requested."
   (let ((mgr (if ctx (bl.net:ctx-txdownloadman ctx) (test-txdownloadman))))
-    (bl.net:send-tx-requests-to-peers
-     (loop for peer being the hash-keys
-             of (bl.net::txrequest-by-peer (bl.net:txdownload-txrequest mgr))
-           collect peer)
-     mgr)))
+    (loop with now = (bl.ser:get-unix-time)
+          for peer being the hash-keys
+            of (bl.net::txrequest-by-peer (bl.net:txdownload-txrequest mgr))
+          when (eq (bl.net:peer-state peer) :ready)
+            sum (bl.net:send-tx-requests peer mgr now))))
 
 (defun forget-tx-hash (hash)
   "Forget HASH in the node manager's tracker (Core ForgetTxHash)."

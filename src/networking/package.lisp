@@ -172,13 +172,22 @@ headerssync.cpp. src/networking/.")
    #:txdownload-have-more-work
    #:txdownload-get-tx-to-reconsider
    #:txdownload-check-is-empty
+   #:txdownload-check-failed
+   #:txdownload-assert-empty
+   #:txdownload-peer-count
+   #:rolling-bloom-filter
+   #:rolling-bloom-filter-hash-funcs
+   #:rolling-bloom-filter-data
+   #:make-rolling-bloom-filter
+   #:rolling-bloom-insert
+   #:rolling-bloom-contains-p
+   #:rolling-bloom-reset
    #:txdownload-get-orphan-transactions
    #:unique-parent-txids
    #:+max-peer-tx-announcements+
    #:+max-peer-tx-request-in-flight+
    #:+getdata-tx-interval-seconds+
    #:send-tx-requests
-   #:send-tx-requests-to-peers
    #:process-orphan-tx
    #:process-valid-tx
    #:process-invalid-tx

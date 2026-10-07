@@ -1889,11 +1889,6 @@ node is behind known work and +BEHIND-RETRY-SECONDS+ have passed."
     ;; Ready peers' InactivityCheck + MaybeSendPing, after their messages as
     ;; Core's SendMessages follows ProcessMessages (net.cpp:2218, :3143-3148).
     (check-peers-health *node*)
-    ;; Transaction getdatas: each peer's SendMessages asks
-    ;; m_txdownloadman.GetRequestsToSend for what is due -- announcements
-    ;; whose delay has passed, and the next candidate of a request that
-    ;; expired or was answered notfound (net_processing.cpp:6201-6217).
-    (bl.net:send-tx-requests-to-peers (node-peers *node*) (bl.net:node-txdownloadman))
     ;; Queued block announcements: ONE
     ;; message per peer for everything
     ;; connected since the last pass
