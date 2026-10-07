@@ -2201,3 +2201,308 @@ its locator.
 - Unchanged from earlier rounds: the wallet.dat-bound tests, `wallet_crosschain`,
   `feature_config_args` `:212`, the two framework-bound bind tests, Sparrow,
   CJDNS.
+
+## Round 12
+
+Five worktree batches on the list Round 11 left open, started 2026-10-07
+from `9b82f3c1`, each with two or three phases: checkblockindex (2 + 3 + 1
+commits), txdownload (3 + 2 + 1), interpreter (4 + 4 + 2), fuzz (34 + 10)
+and mempool-cleanup (4 + 4 + 1); 76 commits in all, 172 files, +11,571
+−4,596 lines. No functional test was red for a reason these items touch,
+so the round's measure is what the ported consistency checks and fuzz
+targets found, the profile, and the fuzz count. Every batch ran its own
+green battery on a fresh FASL volume -- the round changes Coalton types,
+adds and reshapes defstructs and adds macros -- and the merged tree's
+battery ran before every push. By batch:
+
+**checkblockindex.** `-checkblockindex` was accepted and ignored since
+Round 11 named it a batch of its own. `bl.store:check-block-index-now`
+(`08bde597`, src/storage/check-block-index.lisp) is Core's CheckBlockIndex
+(validation.cpp:5165-5470): the forward map by parent, the depth-first walk
+over every entry, each assert mapped to our fields and the three with no
+counterpart named in the file's header (the stored chain-tx sums, the skip
+pointers, the candidate-set membership, which we recompute from the index
+on every call). `bl.val:check-block-index` runs it at Core's five drive
+sites (`c54e54af`): every header, the end of ActivateBestChain, the
+activation after invalidate / reconsider and preciousblock, InvalidateBlock
+after the branch is marked, and AcceptBlock, which covers the end of
+`activate-block`, the downloaded-block connect and the three body-only
+stores that now share `%store-block-body`. The option reads as Core's: N
+is one call in N, 0 never, absent is 1 on regtest and 0 elsewhere. A
+failure is fatal, as Core's assert is. The walk found six bookkeeping
+defects, each fixed Core's way in the same commit: nTx was set only when a
+block was connected, so a stored, unconnected body reached blocks/index
+with data and nTx = 0; `connect-block` marked an entry SCRIPTS-valid before
+deciding whether to connect it, so side-branch and refused-reorg blocks
+claimed validity over parents that had none (a stored, never-connected
+fork tip now shows `valid-headers` in getchaintips, as in Core); a pruned
+body lost its validity level on disk; the table of bodies waiting on a
+missing parent was never rebuilt at start-up nor cleaned on prune; a
+snapshot chain below its base was treated as complete (two
+`feature_assumeutxo` corner cases); and reindex re-acceptance did not reset
+nTx and the sequence id. Twenty-seven header and compact-block tests build
+indexes Core could never hold and run under `synthetic-index-test`, the
+check off. The check costs about 0.5 µs per index entry per call, 130-228
+ms per node over a whole `feature_pruning` run, so it stays default-on for
+regtest. Its second phase ported Core's `block_index_tree` fuzz target with
+the check as its invariant (`31760efb`; 1,200 buffers, two mutation
+controls) and its third built what the check needs on a datadir this node
+migrated from the pre-tx-count header format: those hold bodies with
+nTx = 0, which the check refuses at :5276, so start-up now counts them
+(`5b4e6c48`) and reads each count back from the block files
+(`b7ffe297`): the 89-byte read per held body the reindex walk makes,
+batches of 50,000, resumable across a stop, run after the RPC server is up
+so a long first run answers RPC_IN_WARMUP. A mainnet-sized index costs
+about 30 s of CPU, about two minutes on an SSD with a cold cache. A
+connected block that was pruned before its count was recorded cannot be
+backfilled; a second start-up line counts those, and the manual says
+`-checkblockindex` cannot be enabled on such a datadir until they are
+downloaded again.
+
+**txdownload.** Core's TxDownloadManager was logic spread over the P2P
+handlers with the orphanage and the request tracker as separate objects.
+`src/networking/txdownloadman.lisp` (`06cc0489`) is TxDownloadManagerImpl
+with Core's method set, owning the orphanage, a TxRequestTracker object
+(`src/networking/txrequest.lisp`), the three rejection filters and the
+per-peer connection info; validation reaches it only through the
+validation interface, which gained an `:active-tip-change` event. Every
+`m_txdownloadman.` call in net_processing.cpp is ported at its own site:
+CheckIsEmpty at peer creation and after the last peer, HaveMoreWork in the
+pump's wait, one orphan per turn before each message, GetRequestsToSend in
+a per-peer SendMessages pass that replaces the old global scheduler, and
+`getorphantxs` reading GetOrphanTransactions. The restructure exposed four
+divergences, fixed with tests: orphans were re-validated recursively inside
+the parent's own message where Core puts each one in a random announcer's
+work set and resolves one per message-loop turn (net_processing.cpp:
+3227-3263); the rejection filters were cleared on every tip change,
+including during IBD and for an assumeutxo background chainstate, where
+Core clears them only out of IBD (:2052-2058); orphan removal for a block
+ran from validation for every block where Core's BlockConnected skips IBD
+and the background chainstate (:2089); and inv and notfound sent a getdata
+themselves where the request goes out from SendMessages (:4177, :5162,
+:6206). Core's `txdownloadman` and `txdownloadman_impl` fuzz targets came
+with it (`1b0be3ef`), with CheckInvariants and a steering corpus -- random
+buffers stop after about two commands. The second phase took two decisions
+Core's way: CheckIsEmpty asserts (`txdownload-check-failed`, an internal
+error like the mempool check's) and the rejection filters are Core's
+rolling blooms -- the tree had none, every "filter" was a hash-plus-ring
+set -- so `src/networking/bloom.lisp` gained CRollingBloomFilter
+(common/bloom.cpp:162-246, MurmurHash3 typed, Core's `rolling_bloom` test
+and sizing pinned: 20 hashes and 161,750 words for 120,000 entries) and
+the manager's filters are 120,000 recent rejects, 120,000 reconsiderable
+and 48,000 recently confirmed at 1e-6, built on first use (`1614402e`).
+GetRequestsToSend now runs at the end of each peer's own drain, as Core
+pairs ProcessMessages with SendMessages per node. InvalidateBlock's
+ActiveTipChange was already right (Core fires it only when the
+invalidated block was on the active chain, :3708) and is now pinned. The
+third phase made the per-peer known-tx and known-address filters and
+BanMan's discourage filter rolling blooms too (`085ac45f`,
+net_processing.cpp:307, :353, banman.cpp:84-87): a full peer's filters
+cost 2.2 MB before and 566 KB fixed now; the ring set and its exports are
+gone.
+
+**interpreter.** The third performance phase, in three steps, all against
+the one digest over Core's 1,222 script vectors. The 11-field ScriptContext
+that every opcode step rebuilt is one native mutable struct per execution,
+updated in place (`8522fb67`, interpreter.cpp:406-428: an OP_NOP step
+consed 320 bytes, now 64); the SigVersion is a typed argument of the
+interpreter, a Coalton enum with Core's four values read at the six places
+Core reads it (`8762364d`, interpreter.h:200-206), and the per-execution
+",TAPSCRIPT" string append, flag bit 32 and the `*witness-v0-mode*` special
+are gone -- a flags string naming TAPSCRIPT used to run a BASE script under
+tapscript rules; and the script-execution cache stores and erases by Core's
+`cacheFullScriptStore` at every call site (`d87efba0`, validation.cpp:
+2058-2128): the mempool policy pass probes with erase and stores nothing
+(it stored), the consensus pass stores, a real block connect probes with
+erase, and an inline TestBlockValidity stores (it stored nothing) so the
+connect that follows hits. The key stays (salt, wtxid, flags), as Core's:
+the wtxid commits to every outpoint. The re-profile found two quadratic
+holes in consensus-valid scripts, each a denial of service where Core
+spends milliseconds: the IF/ELSE/ENDIF stack recomputed all-true over the
+whole condition list on every one, so 80,000 nested tapscript IFs (a 240 KB
+script) took 11.3 s -- now Core's ConditionStack, a size and a first-false
+position, O(1) per opcode (`2ea7be5a`, interpreter.cpp:273-318; 20 ms);
+and OP_CODESEPARATOR rescanned the script from its start to count opcodes,
+so 40,000 separators took 11.6 s -- the context now counts opcodes as Core's
+EvalScript does and the positions live in the execution, not in specials
+found by FIND-SYMBOL (`39657699`, :433-439, :1054-1055; 3 ms). The manual
+says nothing in a script execution may cost more than O(1) per opcode. The
+P2SH and witness-program predicates read the scriptPubKey's octets instead
+of copying it into a Coalton vector four extra times (`a641d5db`,
+script.cpp:224-231, :250-264) and `bl.val`'s copies of them are gone
+(`abd731df`). Per P2WSH input: 8,939 → 6,413 bytes consed (−28 %), 2.2 →
+2.05 µs with a warm signature cache; the block-import connect is about 85 %
+libsecp256k1 and SHA256, so its time is unchanged within noise. The mutex
+per signature-cache lookup stays: Core locks too (sigcache.cpp:53, :59) and
+unlocked tables measured no gain.
+
+**fuzz.** 157 of Core's 216 targets are ported (Round 11's "125" counted
+our own `p2p_v2_garbage`, which is not a Core target: 124). The 32 new ones
+include both transport serialization targets, `net`, the valid half of
+`utxo_snapshot` on Core's 200-block chain, the five ChaCha20 / Poly1305 /
+AES targets, the lax DER parser, `key`, `ellswift_roundtrip`,
+`bip324_ecdh`, both `num3072` targets, `golomb_rice`, `merkle`,
+`node_eviction`, `torcontrol`, `parse_script`, `parse_hd_keypath`,
+`message`, `signet`, `integer`, both `asmap` targets, `rpc`,
+`script_descriptor_cache`, `mocked_descriptor_parse`,
+`headers_sync_state`, `difference_formatter` and `timeoffsets`. The other
+59 are classified in the batch's 216-row table: 31 C++-container,
+allocator, standard-library or legacy-only code with no counterpart; 18
+with no standalone codec here whose code a named ported target exercises;
+five another batch's (`txdownloadman` and `_impl`, done this round;
+`scriptnum_ops`, `signature_checker`, `script_sigcache` for the
+interpreter); five blocked: `coins_view_overlay` (a coins cache layered on
+a cache), `script_sign`, `natpmp` and `pcp` (`-natpmp` is accepted and
+ignored), `netbase_dns_lookup`. The targets found nine defects, each fixed
+Core's way with its input pinned: the lax DER parser is now Core's
+`ecdsa_signature_parse_der_lax` byte for byte (`c4bf23a5`), which matters
+for pre-BIP66 signatures; a peer's connected-through network used the
+wrong address class (`022c1201`); a truncated Golomb-Rice stream is a
+stream failure (`e225ed68`); inbound eviction uses Core's comparators,
+predicates, ratio protection and erase-last-k (`2ba0d381`, `f1746eff`);
+bitcoin-tx's hex test is ASCII-only (`7459bbbc`); decodepsbt writes a
+hardened step as `h` (`4dc79e52`); verifymessage decodes base64 and the
+header as Core does (`61e53a2a`); an asmap file must pass Core's sanity
+check (`8ae190c5`); and a stored block filter that does not read back is
+refused with Core's two log lines (`cdef78a7`). The second phase closed
+what the targets reported: Core's TimeOffsets -- the last 50 VERSION
+offsets of non-inbound peers, their median in getnetworkinfo (it was a
+hard-coded 0) and the clock warning past ten minutes (`aef7d618`,
+net_processing.cpp:3793-3799); digits are ASCII wherever outside input is
+parsed, about 90 sites in 32 files, as Core's IsDigit and HexDigit
+(`6406adc4`); the command line and bitcoin.conf read option names as
+Core's args.cpp:182-243 does -- case kept, exactly one extra dash, a bare
+`-` ends the options -- since no documented reason for the old folding
+exists (`a4ca99a8`); a peer on an unroutable network rates our IPv6 address
+REACH_IPV6_WEAK (`cb3eb7fa`); and the headers-sync redownload checks nBits
+against the chain start whenever its buffer is empty (`ab8c60e1`).
+
+**mempool-cleanup.** fee_estimates.dat was not Core's file: magic "FEES",
+the legacy per-block ring buffer that nothing had fed since Round 10,
+uint32 counts and a CRC32, with no documented reason. It is Core's now
+(`5b35e57d`, block_policy_estimator.cpp:561-577, :963-1062: version
+309900, CompactSize vectors, the 60-hour age limit, the hourly and shutdown
+flushes; a file whose bucket set is not Core's default is refused rather
+than adopted) and the history half, its structs and its file format are
+gone; a live node refuses its old file once and rebuilds its estimates. The
+four "... index loaded" lines printed before an index's locator was read
+(the live mainnet node's "indexed to height -1") are gone; an index ends
+its catch-up with Core's "<name> is enabled at height N" and reports
+"Syncing <name> with block chain from height N" every 30 s (`5d739bb1`,
+index/base.cpp:49, :248-267). The warm image keeps a definition its source
+no longer has -- the trap Round 11 recorded and hit again -- and
+`scripts/dev.sh ghost-check` (`90cf0033`) now names every such function,
+macro, setf function or method in the project's packages, four kinds (no
+source file, the file gone, the file in no system, an older compile of a
+recompiled file), in 0.1 s; `dev.sh test`, `test-all` and the Workbench
+test route refuse to run over one unless `DEV_ALLOW_GHOSTS=1`
+(`3c713526`), with a positive control in the battery. Its first catch was
+the batch's own deleted `%mempool-check-links`. The mempool consistency
+check, 181 → 2.2 ms in Round 11, is 2.5 ms and allocates nothing in its
+walk (`0dfa5a59`, `bc7e6041`: marks in the entry, the chunk index walked in
+place, one scratch key); a coin lookup allocates nothing at all
+(`814ed8b3`: the key constructor was not inline, so the txid's words were
+boxed on the way in, and SBCL 2.6.5 on arm64 does not stack-allocate a
+struct under DYNAMIC-EXTENT, so probes take a key from a CAS-claimed pool
+of four): a cache hit 192 → 0 bytes, one million gets 278 → about 110 ms.
+`feature_dbcrash`, which runs that check twice per sendrawtransaction as
+Core does (node/transaction.cpp:78, :92), was timed against Core v28.2's
+own binary under the same load: Core 1,067 s, ours 1,424 s, both passing;
+the "4-5 minutes" of earlier rounds is a quiet machine's figure, and GC
+is 0.5 % of a round (a 2 GB nursery gained nothing, so no setting was
+committed). The in-memory log ring was three specials that every index
+catch-up thread copied by value, so getlog and the UI lost those threads'
+lines; it is one shared object every thread writes through (`fc823a56`).
+
+### Round-12 sweep
+
+Binary `e69e6206`, the round's final tree, for the four parallel batches
+(150 s cap) and the serial confirmations (900 s cap), classification in
+`docs/functional-sweep-2026-09-13/after-e69e6206.tsv`:
+
+| binary | PASS | FAIL | TIMEOUT | SKIP |
+|---|---|---|---|---|
+| `580627ba` round 2 | 58 | 176 | 6 | 23 |
+| `67b724d2` round 3 | 69 | 166 | 5 | 23 |
+| `bc65804a` round 4 | 100 | 137 | 3 | 23 |
+| `2a7074c4` round 5 | 136 | 102 | 2 | 23 |
+| `bdfd8434` round 6 | 193 | 59 | 2 | 9 |
+| `632abe24` round 7 | 204 | 48 | 2 | 9 |
+| `cf46af32` round 8 | 233 | 21 | 0 | 9 |
+| `ddb02f15` round 9 | 236 | 18 | 0 | 9 |
+| `1df60a1c` round 10 | 239 | 15 | 0 | 9 |
+| `664b8ee2` round 11 | 239 | 15 | 0 | 9 |
+| `e69e6206` round 12 | **239** | **15** | **0** | 9 |
+
+No test changed status: the 15 failures are Round 10's fifteen (eleven
+wallet.dat, `wallet_crosschain`, `feature_config_args` `:212`, the two
+framework-bound bind tests). The sweep chain now drops the checkout's
+persistent cold FASL volume before the build and gates on the build's exit
+status, the lesson of Round 11's stale binary; the classifier that writes
+the table (`build/classify-sweep.py`) reproduces Round 11's table from its
+logs. `feature_block`, `feature_dbcrash` and `feature_pruning` time out
+under the parallel cap and pass serially, in 413, 613 and 641 s: with
+`-checkblockindex` now walking the index after every block on regtest and
+`-checkmempool` on every acceptance, `feature_dbcrash` runs in 613 s of its
+900, against 760-880 s in Round 11 -- the allocation-free consistency check
+and coin lookup bought back more than the index walk costs.
+
+### Decisions recorded in Round 12
+
+- **`-checkblockindex` is real and default-on for regtest**, as Core's;
+  a failure is fatal. Twenty-seven header and compact-block tests build
+  indexes Core could never hold (made-up genesis hashes, genesis without
+  its body) and run with the check off under `synthetic-index-test`.
+- **A datadir migrated from the pre-tx-count header format is backfilled
+  at start-up, not reindexed**: our `-reindex` is additive and skips every
+  known hash, so it would never rewrite those entries. Pruned entries
+  without a count can only be downloaded again.
+- **CheckIsEmpty asserts**, as Core's does; **every tx-download, per-peer
+  and discourage filter is Core's rolling bloom** at Core's sizes.
+- **The script-execution cache key stays (salt, wtxid, flags)**: the
+  wtxid commits to every outpoint, so the spent scriptPubKey adds nothing
+  (an earlier round's note to the contrary had been retracted).
+- **The per-lookup lock on the signature cache stays**: Core takes one too
+  and unlocked tables measured no gain.
+- **fee_estimates.dat is Core's file**; a node's old FEES-layout file is
+  refused once with Core's version message, not migrated.
+- **Option names follow Core's parser**: case kept, one extra dash, a bare
+  `-` ends the options. Two tests that pinned the old folding now pin
+  Core.
+- **TimeOffsets is Core's**; getnetworkinfo's `timeoffset` is the median.
+- **`dev.sh test` refuses a warm image holding a ghost definition**;
+  `DEV_ALLOW_GHOSTS=1` is for the recipe's red-before step, whose pre-fix
+  copy's definitions are ghosts by construction.
+
+### Left open after Round 12
+
+- The engine's byte type: a `(Vector U8)` over octets (a `repr :native`
+  Coalton type over `(simple-array (unsigned-byte 8))`) would remove the
+  remaining bridge copies -- about 2.5-3 KB of the 6.4 KB consed per P2WSH
+  input and most of the ~15 % of warm samples spent copying; the type
+  appears 118 times, about 25 converter sites become identities, a day's
+  batch and a Coalton type change. The parallel block path probes the
+  script-execution cache from worker threads where Core probes on the
+  master thread; `scriptnum_ops`, `signature_checker` and
+  `script_sigcache` are the interpreter's three unported fuzz targets.
+- A coins cache layered on a cache, as Core's CCoinsViewCache over a
+  CCoinsViewCache (2-3 days; the cache's base slot is typed
+  `coins-view-db`), unblocks `coins_view_overlay` and the rest of
+  `coinscache_sim`; a NAT-PMP/PCP client (1.5-2 days, gateway discovery
+  first) unblocks `natpmp` and `pcp`, or `-natpmp` stays accepted and
+  ignored by decision. `script_sign` and `netbase_dns_lookup` stay blocked.
+- `feature_dbcrash` runs at about 1.3× Core's own time under the same
+  load; the per-transaction time still drifts up over a run and GC is
+  not why. What remains of the check's cost is the transaction graph's
+  sanity check, which Core does too.
+- A shared allocation-measuring test helper that counts on its own
+  thread: the `get-bytes-consed` trap (allocation measured on the calling
+  thread reads zero) hit again this round and the lesson's repeat rule
+  asks for a mechanical guard, not prose.
+- Eviction computes fRelevantServices at eviction time where Core stores
+  it at VERACK (documented divergence); `digit-char-p` over Unicode is
+  closed but `parse-integer`'s radix sites were swept by hand, not by a
+  gate.
+- Unchanged from earlier rounds: the wallet.dat-bound tests,
+  `wallet_crosschain`, `feature_config_args` `:212`, the two
+  framework-bound bind tests, Sparrow, CJDNS.
