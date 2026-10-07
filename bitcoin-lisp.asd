@@ -700,6 +700,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/golomb-rice")
                              (:file "fuzz/merkle")
                              (:file "fuzz/node-eviction")
+                             (:file "fuzz/torcontrol")
                              (:file "fuzz/p2p-headers-presync")
                              (:file "fuzz/connman")
                              (:file "fuzz/p2p-handshake")
