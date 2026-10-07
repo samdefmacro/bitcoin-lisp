@@ -1045,7 +1045,7 @@ Core's FIRST line is `if (IsTapscript(m_script_ctx)) return true;'. There is no
 201-op limit to check under tapscript: BIP342 dropped it, and the interpreter
 counts opcodes only for SigVersion BASE and WITNESS_V0 (interpreter.cpp:450-455
 — which is also where our own script engine gates it, src/coalton/script.lisp
-`(not (flag-enabled-p \"TAPSCRIPT\"))')."
+SIGVERSION-PRE-TAPSCRIPT-P)."
   (or (ms-tapscript-p (ms-node-ctx node))
       (let ((total (%ms-get-ops ops)))
         (or (null total) (<= total +ms-max-ops-per-script+)))))

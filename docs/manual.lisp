@@ -1421,9 +1421,16 @@
   two typed copies across that line, and loads before the Coalton files
   so the interpreter calls them directly. It also holds the flags: callers
   bind `*script-flags*' to Core's names as a comma-separated string, which
-  is parsed once into Core's flags word (script/interpreter.h bit order,
-  plus our TAPSCRIPT mark at bit 32), and `flag-enabled-p' of a constant
-  name compiles to a bit test on it. Core: `script/interpreter.cpp`,
+  is parsed once into Core's flags word (script/interpreter.h bit order),
+  and `flag-enabled-p' of a constant name compiles to a bit test on it.
+  Which rules a script runs under is NOT a flag: it is Core's SigVersion
+  (BASE, WITNESS_V0, TAPROOT, TAPSCRIPT), a typed argument of
+  `execute-script-with-stack-tx' (Core's EvalScript) that the bridge
+  passes on to every CHECKSIG and CHECKMULTISIG, as Core hands it to
+  CheckSig. An execution's state is one mutable ScriptContext, allocated
+  when the execution starts and updated in place (Core's EvalScript
+  locals); every opcode threads it linearly, reading what it needs before
+  it sets. Core: `script/interpreter.cpp`,
   `script/script.cpp`, `script/sigcache.cpp`. Settled policy: the
   interpreter stays Coalton; everything else is CL.
 
@@ -1517,6 +1524,7 @@
   (bitcoin-lisp.coalton.script package)
   (bitcoin-lisp.coalton.interop package)
   (bitcoin-lisp.coalton.script:script-error-name function)
+  (bitcoin-lisp.coalton.script:execute-script-with-stack-tx function)
   (bitcoin-lisp.coalton.interop:+script-errors+ variable)
   (bitcoin-lisp.coalton.interop:script-error-keyword function)
   (bitcoin-lisp.coalton.interop:script-error-for-keyword function)

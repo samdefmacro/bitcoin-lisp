@@ -23,7 +23,9 @@
   (codesep-pos 0 :type (cl:and cl:fixnum cl:unsigned-byte))
   (tx-locktime 0 :type (cl:unsigned-byte 32))
   (tx-version 1 :type (cl:signed-byte 32))
-  (input-sequence #xFFFFFFFF :type (cl:unsigned-byte 32)))
+  (input-sequence #xFFFFFFFF :type (cl:unsigned-byte 32))
+  ;; A SigVersion (repr :enum, so a symbol); fixed for the execution.
+  (sigversion (cl:error "a script execution needs its SigVersion") :type cl:symbol))
 
 #+sbcl (cl:declaim (sb-ext:freeze-type script-context-data))
 
@@ -941,6 +943,42 @@ that named two Core errors would make that comparison meaningless."
   (declare +max-push-size+ UFix)
   (define +max-push-size+ 520)
 
+  ;; Which rules a script runs under: Core's SigVersion (script/
+  ;; interpreter.h:200-206), the argument EvalScript, ExecuteWitnessScript and
+  ;; every signature check take (interpreter.cpp:407, :1832, :323, :349).
+  ;; VerifyScript runs the scriptSig, the scriptPubKey and a P2SH redeem script
+  ;; as BASE (:2020-2069), a P2WSH witness script as WITNESS_V0 (:1931) and a
+  ;; tapleaf as TAPSCRIPT (:1983); TAPROOT is the key path, which never reaches
+  ;; the interpreter. It is fixed for an execution and lives in its context.
+  (repr :enum)
+  (define-type SigVersion
+    "Core's SigVersion (script/interpreter.h:200-206)."
+    SigVersionBase SigVersionWitnessV0 SigVersionTaproot SigVersionTapscript)
+
+  (declare sigversion-tapscript-p (SigVersion -> Boolean))
+  (define (sigversion-tapscript-p sv)
+    "Core's `sigversion == SigVersion::TAPSCRIPT'."
+    (match sv
+      ((SigVersionTapscript) True)
+      (_ False)))
+
+  (declare sigversion-witness-v0-p (SigVersion -> Boolean))
+  (define (sigversion-witness-v0-p sv)
+    "Core's `sigversion == SigVersion::WITNESS_V0'."
+    (match sv
+      ((SigVersionWitnessV0) True)
+      (_ False)))
+
+  (declare sigversion-pre-tapscript-p (SigVersion -> Boolean))
+  (define (sigversion-pre-tapscript-p sv)
+    "Core's `sigversion == SigVersion::BASE || sigversion ==
+SigVersion::WITNESS_V0', the gate of MAX_SCRIPT_SIZE and MAX_OPS_PER_SCRIPT
+(interpreter.cpp:428, :450)."
+    (match sv
+      ((SigVersionBase) True)
+      ((SigVersionWitnessV0) True)
+      (_ False)))
+
   ;; One execution's state, as Core's EvalScript keeps it in locals for the
   ;; whole run (interpreter.cpp:406-428: pc, pend, pbegincodehash, vfExec,
   ;; altstack, nOpCount) beside the stack it was handed. The context is
@@ -960,21 +998,18 @@ that named two Core errors would make that comparison meaningless."
     "Execution context for one script execution (a mutable record).
      Fields: main-stack, alt-stack, script, position, condition-stack,
              executing, op-count, codesep-pos, tx-locktime, tx-version,
-             input-sequence")
+             input-sequence, sigversion")
 
-  (declare make-script-context-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> ScriptContext))
-  (define (make-script-context-with-stack-tx script initial-stack locktime version input-seq)
+  (declare make-script-context-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> SigVersion -> ScriptContext))
+  (define (make-script-context-with-stack-tx script initial-stack locktime version input-seq sigversion)
     "A fresh context: SCRIPT at position 0 over INITIAL-STACK, empty altstack
-and condition stack, executing, no ops counted, the code separator at 0."
-    (lisp ScriptContext (script initial-stack locktime version input-seq)
+and condition stack, executing, no ops counted, the code separator at 0, run
+under SIGVERSION."
+    (lisp ScriptContext (script initial-stack locktime version input-seq sigversion)
       (%make-script-context-data
        :main-stack initial-stack :script script
-       :tx-locktime locktime :tx-version version :input-sequence input-seq)))
-
-  (declare make-script-context-with-tx ((Vector U8) -> U32 -> I32 -> U32 -> ScriptContext))
-  (define (make-script-context-with-tx script locktime version sequence)
-    "A fresh context over an empty stack."
-    (make-script-context-with-stack-tx script (empty-stack) locktime version sequence))
+       :tx-locktime locktime :tx-version version :input-sequence input-seq
+       :sigversion sigversion)))
 
   ;; Context accessors
   (inline)
@@ -1031,6 +1066,11 @@ and condition stack, executing, no ops counted, the code separator at 0."
   (declare context-input-sequence (ScriptContext -> U32))
   (define (context-input-sequence ctx)
     (lisp U32 (ctx) (script-context-data-input-sequence ctx)))
+
+  (inline)
+  (declare context-sigversion (ScriptContext -> SigVersion))
+  (define (context-sigversion ctx)
+    (lisp SigVersion (ctx) (script-context-data-sigversion ctx)))
 
   ;; Context setters: each writes one field of CTX in place and returns CTX.
   (inline)
@@ -1282,8 +1322,8 @@ else. Wiring either of them here rejects scripts Core accepts."
   ;; INVERT: False for OP_IF, True for OP_NOTIF
   (declare check-if-condition ((Vector U8) -> ScriptStack -> ScriptContext -> Boolean -> (ScriptResult ScriptContext)))
   (define (check-if-condition top new-stack ctx invert)
-    (let ((is-tapscript (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT"))))
-      (if is-tapscript
+    (let ((sigversion (context-sigversion ctx)))
+      (if (sigversion-tapscript-p sigversion)
           ;; Tapscript: strict MINIMALIF - only empty or [0x01]
           (let ((len (lisp UFix (top) (cl:length top))))
             (cond
@@ -1298,10 +1338,9 @@ else. Wiring either of them here rejects scripts Core accepts."
                      (ScriptErr SE-TapscriptMinimalIf))))
               (True (ScriptErr SE-TapscriptMinimalIf))))
           ;; Non-Tapscript: check MINIMALIF flag (witness v0 only, not BASE)
-          (let ((is-minimalif (lisp Boolean ()
-                                (cl:and
-                                 (bl.interop:flag-enabled-p "MINIMALIF")
-                                 (cl:symbol-value 'bl.interop:*witness-v0-mode*)))))
+          (let ((is-minimalif (and (sigversion-witness-v0-p sigversion)
+                                   (lisp Boolean ()
+                                     (bl.interop:flag-enabled-p "MINIMALIF")))))
             (if is-minimalif
                 (let ((len (lisp UFix (top) (cl:length top))))
                   (cond
@@ -2030,8 +2069,7 @@ else. Wiring either of them here rejects scripts Core accepts."
 
       ((OP-CHECKSIG)
        ;; Pop pubkey and sig, verify signature
-       (let ((is-tapscript (lisp Boolean ()
-                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
+       (let ((is-tapscript (sigversion-tapscript-p (context-sigversion ctx))))
          (match (stack-pop (context-main-stack ctx))
            ((None) (ScriptErr SE-StackUnderflow))
            ((Some (Tuple pubkey stack1))
@@ -2056,7 +2094,8 @@ else. Wiring either of them here rejects scripts Core accepts."
                                             (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos))
                                             (sig-arr (bl.interop:coalton-vector-to-cl-array sig))
                                             (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
-                                    (bl.interop:verify-checksig-for-script sig-arr pk-arr subscript)))))
+                                    (bl.interop:verify-checksig-for-script
+                                     sig-arr pk-arr subscript (script-context-data-sigversion ctx))))))
                      (let ((strictenc-error (lisp Boolean ()
                                               (bl.interop:last-checksig-had-strictenc-error-p))))
                        (if strictenc-error
@@ -2067,8 +2106,7 @@ else. Wiring either of them here rejects scripts Core accepts."
 
       ((OP-CHECKSIGVERIFY)
        ;; CHECKSIG then VERIFY - verify signature and fail if invalid
-       (let ((is-tapscript (lisp Boolean ()
-                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
+       (let ((is-tapscript (sigversion-tapscript-p (context-sigversion ctx))))
          (match (stack-pop (context-main-stack ctx))
            ((None) (ScriptErr SE-StackUnderflow))
            ((Some (Tuple pubkey stack1))
@@ -2093,7 +2131,8 @@ else. Wiring either of them here rejects scripts Core accepts."
                                             (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos))
                                             (sig-arr (bl.interop:coalton-vector-to-cl-array sig))
                                             (pk-arr (bl.interop:coalton-vector-to-cl-array pubkey)))
-                                    (bl.interop:verify-checksig-for-script sig-arr pk-arr subscript)))))
+                                    (bl.interop:verify-checksig-for-script
+                                     sig-arr pk-arr subscript (script-context-data-sigversion ctx))))))
                      (let ((strictenc-error (lisp Boolean ()
                                               (bl.interop:last-checksig-had-strictenc-error-p))))
                        (if strictenc-error
@@ -2111,8 +2150,7 @@ else. Wiring either of them here rejects scripts Core accepts."
        ;; before any signature is verified (Core interpreter.cpp:1119-1121);
        ;; status 7 is that overrun.
        ;; BIP 342: Disabled in Tapscript context
-       (let ((is-tapscript (lisp Boolean ()
-                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
+       (let ((is-tapscript (sigversion-tapscript-p (context-sigversion ctx))))
          (if is-tapscript
              (ScriptErr SE-TapscriptCheckmultisig)
              (let ((spent (context-op-count ctx))
@@ -2123,7 +2161,8 @@ else. Wiring either of them here rejects scripts Core accepts."
                                  (codesep-pos (context-codesep-pos ctx))
                                  (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos)))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
-                             (bl.interop:do-checkmultisig-stack-op stack subscript spent budget)
+                             (bl.interop:do-checkmultisig-stack-op
+                              stack subscript spent budget (script-context-data-sigversion ctx))
                            (cl:case status
                              (:ok (Tuple3 0 new-stack pubkey-count))        ; success
                              (:fail (Tuple3 1 new-stack pubkey-count))      ; verify failed, push false
@@ -2153,8 +2192,7 @@ else. Wiring either of them here rejects scripts Core accepts."
        ;; inside do-checkmultisig-stack-op, before any verification, exactly as
        ;; for OP_CHECKMULTISIG above; status 7 is that overrun.
        ;; BIP 342: Disabled in Tapscript context
-       (let ((is-tapscript (lisp Boolean ()
-                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
+       (let ((is-tapscript (sigversion-tapscript-p (context-sigversion ctx))))
          (if is-tapscript
              (ScriptErr SE-TapscriptCheckmultisig)
              (let ((spent (context-op-count ctx))
@@ -2165,7 +2203,8 @@ else. Wiring either of them here rejects scripts Core accepts."
                                  (codesep-pos (context-codesep-pos ctx))
                                  (subscript (bl.interop:coalton-vector-to-cl-array script codesep-pos)))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
-                             (bl.interop:do-checkmultisig-stack-op stack subscript spent budget)
+                             (bl.interop:do-checkmultisig-stack-op
+                              stack subscript spent budget (script-context-data-sigversion ctx))
                            (cl:case status
                              (:ok (Tuple3 0 new-stack pubkey-count))
                              (:fail (Tuple3 1 new-stack pubkey-count))
@@ -2194,8 +2233,7 @@ else. Wiring either of them here rejects scripts Core accepts."
       ;; OP_CHECKSIGADD (BIP 342) - only valid in Tapscript context
       ;; Stack: sig n pubkey -> n' (n+1 if valid, n if empty sig, fail if invalid)
       ((OP-CHECKSIGADD)
-       (let ((is-tapscript (lisp Boolean ()
-                             (bl.interop:flag-enabled-p "TAPSCRIPT"))))
+       (let ((is-tapscript (sigversion-tapscript-p (context-sigversion ctx))))
          (cond
            ((not is-tapscript)
              ;; In non-Tapscript context, this is an unknown opcode
@@ -2348,20 +2386,15 @@ else. Wiring either of them here rejects scripts Core accepts."
 
   (declare execute-script ((Vector U8) -> (ScriptResult ScriptStack)))
   (define (execute-script script)
-    "Execute a script and return the final stack (default tx context)."
+    "Execute a script as SigVersion BASE and return the final stack (default
+tx context)."
     (execute-script-with-tx script 0 1 #xFFFFFFFF))
 
   (declare execute-script-with-tx ((Vector U8) -> U32 -> I32 -> U32 -> (ScriptResult ScriptStack)))
   (define (execute-script-with-tx script locktime version sequence)
-    "Execute a script with transaction context.
-     Returns ScriptErr on failure or ScriptOk with final stack on success."
-    (let ((len (the UFix (coalton-library/vector:length script))))
-      ;; Check script size limit
-      ;; BIP 342 removes the 10,000-byte script size cap in tapscript.
-      (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
-               (> len +max-script-size+))
-          (ScriptErr SE-ScriptTooLarge)
-          (execute-script-loop (make-script-context-with-tx script locktime version sequence)))))
+    "Execute a script as SigVersion BASE over an empty stack, with transaction
+context. Returns ScriptErr on failure or ScriptOk with the final stack."
+    (execute-script-with-stack-tx script (empty-stack) locktime version sequence SigVersionBase))
 
   (declare push-and-continue ((Vector U8) -> ScriptContext -> (ScriptResult ScriptStack)))
   (define (push-and-continue data ctx)
@@ -2406,12 +2439,12 @@ a consensus split."
                ;; 201-op cap and falsely fail with SE-TooManyOps.
                (let ((ctx-with-count
                        (if (or (<= byte #x60)
-                               (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
+                               (not (sigversion-pre-tapscript-p (context-sigversion ctx))))
                            ctx
                            ;; Always increment count (even past limit) so check can detect it
                            (context-set-op-count! (+ (context-op-count ctx) 1) ctx))))
                  ;; Check if we exceeded op count (always, even in non-executing branches).
-                 (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
+                 (if (and (sigversion-pre-tapscript-p (context-sigversion ctx))
                           (> (context-op-count ctx-with-count) +max-ops-per-script+))
                      (ScriptErr SE-TooManyOps)
                      ;; Handle push operations specially
@@ -2546,18 +2579,22 @@ a consensus split."
 
   (declare execute-script-with-stack ((Vector U8) -> ScriptStack -> (ScriptResult ScriptStack)))
   (define (execute-script-with-stack script initial-stack)
-    "Execute a script with an initial stack (default tx context)."
-    (execute-script-with-stack-tx script initial-stack 0 1 #xFFFFFFFF))
+    "Execute a script as SigVersion BASE with an initial stack (default tx
+context)."
+    (execute-script-with-stack-tx script initial-stack 0 1 #xFFFFFFFF SigVersionBase))
 
-  (declare execute-script-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> (ScriptResult ScriptStack)))
-  (define (execute-script-with-stack-tx script initial-stack locktime version sequence)
-    "Execute a script with an initial stack and transaction context."
+  (declare execute-script-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> SigVersion -> (ScriptResult ScriptStack)))
+  (define (execute-script-with-stack-tx script initial-stack locktime version sequence sigversion)
+    "Core's EvalScript (interpreter.cpp:407): run SCRIPT over INITIAL-STACK
+under SIGVERSION, with transaction context."
     (let ((len (the UFix (coalton-library/vector:length script))))
-      ;; BIP 342 removes the 10,000-byte script size cap in tapscript.
-      (if (and (not (lisp Boolean () (bl.interop:flag-enabled-p "TAPSCRIPT")))
+      ;; MAX_SCRIPT_SIZE binds BASE and WITNESS_V0 only; BIP 342 removes it
+      ;; for tapscript (interpreter.cpp:428).
+      (if (and (sigversion-pre-tapscript-p sigversion)
                (> len +max-script-size+))
           (ScriptErr SE-ScriptTooLarge)
-          (execute-script-loop (make-script-context-with-stack-tx script initial-stack locktime version sequence)))))
+          (execute-script-loop
+           (make-script-context-with-stack-tx script initial-stack locktime version sequence sigversion)))))
 
   ;;; P2SH Support
 
@@ -2593,7 +2630,8 @@ a consensus split."
            (if (lisp Boolean (redeem-hash expected-hash)
                  (cl:equalp (hash160-bytes redeem-hash) expected-hash))
                ;; Hash matches - execute redeem script with remaining stack
-               (execute-script-with-stack-tx redeem-script remaining-stack locktime version sequence)
+               (execute-script-with-stack-tx redeem-script remaining-stack locktime version sequence
+                                             SigVersionBase)
                ;; Hash mismatch. Core never reaches its P2SH block in this
                ;; case: the scriptPubKey `OP_HASH160 <h> OP_EQUAL' has already
                ;; run and left false on the stack, so VerifyScript stops at
@@ -2715,7 +2753,8 @@ a consensus split."
       ((ScriptErr e) (ScriptErr e))
       ((ScriptOk sig-stack)
        ;; Then execute scriptPubKey with the resulting stack
-       (match (execute-script-with-stack-tx script-pubkey sig-stack locktime version sequence)
+       (match (execute-script-with-stack-tx script-pubkey sig-stack locktime version sequence
+                                           SigVersionBase)
          ((ScriptErr e) (ScriptErr e))
          ((ScriptOk final-stack)
           ;; Check if we need to do P2SH

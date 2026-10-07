@@ -632,7 +632,7 @@ write the outcome into BB. Returns the final stack, or :FAILED."
   (let ((result (handler-case
                     (bl.script:execute-script-with-stack-tx
                      (bl.interop:cl-array-to-coalton-vector script-bytes)
-                     stack 0 1 #xFFFFFFFF)
+                     stack 0 1 #xFFFFFFFF bl.script:SigVersionBase)
                   (error (e) e))))
     (cond ((typep result 'error)
            (%digest-write-string bb "SIGNAL")

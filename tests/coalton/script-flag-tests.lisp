@@ -130,13 +130,14 @@ lifecycle the way run-script-test does for %sf-ok."
                    (lambda () (bl.interop:verify-script script-sig script-pubkey))))
 
 (defun %sf-checksig (flags sig script-code
-                     &optional (pubkey (%sf-script +sf-pubkey-hex+)))
-  "(verify-checksig SIG PUBKEY SCRIPT-CODE) under FLAGS, as a list. PUBKEY
-defaults to the well-formed compressed key, so a caller passing one is asking
-about the pubkey-encoding arms."
+                     &optional (pubkey (%sf-script +sf-pubkey-hex+))
+                       (sigversion bl.script:SigVersionBase))
+  "(verify-checksig SIG PUBKEY SCRIPT-CODE SIGVERSION) under FLAGS, as a list.
+PUBKEY defaults to the well-formed compressed key, so a caller passing one is
+asking about the pubkey-encoding arms; SIGVERSION to Core's BASE."
   (%sf-under-flags flags
                    (lambda ()
-                     (bl.interop:verify-checksig sig pubkey script-code))))
+                     (bl.interop:verify-checksig sig pubkey script-code sigversion))))
 
 (defun %sf-p2wpkh (flags sig pubkey)
   "(validate-p2wpkh (SIG PUBKEY)) against the program HASH160(PUBKEY) under
@@ -189,8 +190,9 @@ being the canonical single push Core requires."
     (is (equal '(nil nil) (%sf-checksig "CONST_SCRIPTCODE" empty op0-inside-push)))
     ;; SigVersion::BASE only: a witness v0 scriptCode is serialized untouched.
     (is (equal '(nil nil)
-               (let ((bl.interop:*witness-v0-mode* t))
-                 (%sf-checksig "CONST_SCRIPTCODE" empty with-op0))))))
+               (%sf-checksig "CONST_SCRIPTCODE" empty with-op0
+                             (%sf-script +sf-pubkey-hex+)
+                             bl.script:SigVersionWitnessV0)))))
 
 (test const-scriptcode-findanddelete-pattern-carries-the-push-opcode
   ;; `CScript() << vchSig' emits the MINIMAL push: the length byte itself below

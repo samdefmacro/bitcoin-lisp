@@ -254,9 +254,14 @@
    #:stack-pick
    #:stack-roll
    #:empty-stack
+   ;; Core's SigVersion
+   #:SigVersion
+   #:SigVersionBase
+   #:SigVersionWitnessV0
+   #:SigVersionTaproot
+   #:SigVersionTapscript
    ;; Execution context
    #:ScriptContext
-   #:make-script-context-with-tx
    #:context-main-stack
    #:context-alt-stack
    #:context-position
@@ -422,7 +427,6 @@
    #:*signature-cache-store*
    #:clear-signature-cache
    ;; SegWit / BIP 143
-   #:*witness-v0-mode*
    #:*witness-input-amount*
    #:*original-script-pubkey*
    #:compute-bip143-sighash

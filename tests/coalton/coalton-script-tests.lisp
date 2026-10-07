@@ -167,6 +167,11 @@
   "Call Coalton execute-script from CL."
   (bl.script:execute-script script-bytes))
 
+(defun call-execute-tapscript (script-bytes)
+  "Run SCRIPT-BYTES over an empty stack as SigVersion::TAPSCRIPT."
+  (bl.script:execute-script-with-stack-tx
+   script-bytes nil 0 1 #xFFFFFFFF bl.script:SigVersionTapscript))
+
 (defun script-ok-p (result)
   "Return T if result is ScriptOk."
   (bl.script:script-result-ok-p result))
@@ -198,14 +203,11 @@ x-only pubkey isolate it: a 5-byte n fails with SE-NumberOverflow."
                         n-push
                         (coerce (cons #x20 (make-list 32 :initial-element 2)) 'vector)
                         #(#xba))))
-    (bl.interop:set-script-flags "TAPSCRIPT")
-    (unwind-protect
-         ;; 5-byte n: rejected by the bound (SE-NumberOverflow, logged by the
-         ;; engine). script-err-p is the stable assertion; the error value is a
-         ;; Coalton enum instance, not a CL symbol, so we don't eq-compare it.
-         (is-true (script-err-p
-                   (call-execute-script (checksigadd-script #(#x05 1 2 3 4 5)))))
-      (bl.interop:set-script-flags nil))))
+    ;; 5-byte n: rejected by the bound (SE-NumberOverflow, logged by the
+    ;; engine). script-err-p is the stable assertion; the error value is a
+    ;; Coalton enum instance, not a CL symbol, so we don't eq-compare it.
+    (is-true (script-err-p
+              (call-execute-tapscript (checksigadd-script #(#x05 1 2 3 4 5)))))))
 
 (test checksigadd-with-two-operands-is-an-invalid-stack-operation
   "OP_CHECKSIGADD needs three stack elements and says so BEFORE it reads any
@@ -216,19 +218,16 @@ tapscript/checksigadd3args). Control: the same 65-byte first element with
 three operands still fails, but on the number (Core :1093)."
   (let ((sig (coerce (cons #x41 (make-list 65 :initial-element 7)) 'vector))
         (pub (coerce (cons #x20 (make-list 32 :initial-element 2)) 'vector)))
-    (bl.interop:set-script-flags "TAPSCRIPT")
-    (unwind-protect
-         (flet ((err-name (script)
-                  (let ((r (call-execute-script script)))
-                    (and (script-err-p r)
-                         (bl.interop:script-error-name
-                          (bl.script:script-result-error r))))))
-           (let ((control (err-name (concatenate 'vector #(#x00) sig pub #(#xba)))))
-             (is (and control (not (equal control "INVALID_STACK_OPERATION")))
-                 "control: a 65-byte n is refused on the number, as in Core"))
-           (is (equal "INVALID_STACK_OPERATION"
-                      (err-name (concatenate 'vector sig pub #(#xba))))))
-      (bl.interop:set-script-flags nil))))
+    (flet ((err-name (script)
+             (let ((r (call-execute-tapscript script)))
+               (and (script-err-p r)
+                    (bl.interop:script-error-name
+                     (bl.script:script-result-error r))))))
+      (let ((control (err-name (concatenate 'vector #(#x00) sig pub #(#xba)))))
+        (is (and control (not (equal control "INVALID_STACK_OPERATION")))
+            "control: a 65-byte n is refused on the number, as in Core"))
+      (is (equal "INVALID_STACK_OPERATION"
+                 (err-name (concatenate 'vector sig pub #(#xba))))))))
 
 (test execute-script-op-0
   "OP_0 pushes empty vector."
@@ -1274,14 +1273,16 @@ real signature is provided (interpreter.cpp:1161)."
       (multiple-value-bind (ok err)
           (bl.interop:verify-checkmultisig
            (list empty-sig) (list bad-pk)
-           (make-array 0 :element-type '(unsigned-byte 8)))
+           (make-array 0 :element-type '(unsigned-byte 8))
+           bl.script:SigVersionBase)
         (is-false ok)
         (is (eq err :pubkeytype)))
       ;; empty sig + well-formed pubkey -> no encoding error (just fails to match)
       (multiple-value-bind (ok err)
           (bl.interop:verify-checkmultisig
            (list empty-sig) (list good-pk)
-           (make-array 0 :element-type '(unsigned-byte 8)))
+           (make-array 0 :element-type '(unsigned-byte 8))
+           bl.script:SigVersionBase)
         (is-false ok)
         (is (null err))))))
 
@@ -1291,11 +1292,11 @@ real signature is provided (interpreter.cpp:1161)."
                    (setf (aref pk 0) #x03) pk))
         (bad-pk (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9)))
     (let ((bl.interop:*script-flags* "STRICTENC"))
-      (is (eq :pubkeytype (bl.interop::check-pubkey-encoding bad-pk)))
-      (is (null (bl.interop::check-pubkey-encoding good-pk))))
+      (is (eq :pubkeytype (bl.interop::check-pubkey-encoding bad-pk bl.script:SigVersionBase)))
+      (is (null (bl.interop::check-pubkey-encoding good-pk bl.script:SigVersionBase))))
     ;; without STRICTENC, no pubkey-encoding error
     (let ((bl.interop:*script-flags* nil))
-      (is (null (bl.interop::check-pubkey-encoding bad-pk))))))
+      (is (null (bl.interop::check-pubkey-encoding bad-pk bl.script:SigVersionBase))))))
 
 ;;; ============================================================
 ;;; GA9 S1-6: negative zero at any length
@@ -1435,3 +1436,25 @@ consing, so a zero per-step reading cannot pass by measuring nothing."
     (is-true (script-ok-p (call-execute-script nops)))
     (is (> per-push 32) "control: an OP_1 step consed only ~,1F bytes" per-push)
     (is (< per-nop 128) "an OP_NOP step consed ~,1F bytes" per-nop)))
+
+;;; ============================================================
+;;; SigVersion: the rules a script runs under are an argument
+;;; ============================================================
+
+(test tapscript-rules-come-from-the-sigversion-not-the-flags
+  "Core hands EvalScript a SigVersion (script/interpreter.cpp:407) and its
+flags word has no tapscript bit (script/interpreter.h:49-71). Ours marked a
+tapleaf by appending \",TAPSCRIPT\" to the flags string, so any flags string
+naming TAPSCRIPT turned a BASE execution into a tapscript one.
+<empty sig> 0 <32-byte key> OP_CHECKSIGADD is BAD_OPCODE under BASE whatever
+the flags say (interpreter.cpp:1087) and, as TAPSCRIPT, adds nothing for the
+empty signature and succeeds (:1093-1102)."
+  (let ((script (concatenate 'simple-vector #(#x00 #x00 #x20)
+                             (make-array 32 :initial-element 2) #(#xba))))
+    (let* ((bl.interop:*script-flags* "TAPSCRIPT")
+           (r (call-execute-script script)))
+      (is (equal "BAD_OPCODE"
+                 (and (script-err-p r)
+                      (bl.interop:script-error-name (bl.script:script-result-error r))))
+          "flags naming TAPSCRIPT ran a BASE script under tapscript rules"))
+    (is-true (script-ok-p (call-execute-tapscript script)))))

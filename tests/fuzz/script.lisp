@@ -274,9 +274,11 @@ answer every time it is asked."
          (script (consume-remaining-bytes fdp)))
     (dolist (witness-v0 '(nil t))
       (let ((bl.interop:*script-flags* (script-flags-string flags))
-            (bl.interop:*witness-v0-mode* witness-v0))
-        (let ((first (multiple-value-list (bl.interop:run-script script)))
-              (again (multiple-value-list (bl.interop:run-script script))))
+            (sigversion (if witness-v0
+                            bl.script:SigVersionWitnessV0
+                            bl.script:SigVersionBase)))
+        (let ((first (multiple-value-list (bl.interop:run-script script sigversion)))
+              (again (multiple-value-list (bl.interop:run-script script sigversion))))
           (fuzz-assert (eq (first first) (fuzz-sabotage (first again)))
                        "EvalScript ~A under ~A answered ~S then ~S"
                        (bl.crypto:bytes-to-hex script) bl.interop:*script-flags*

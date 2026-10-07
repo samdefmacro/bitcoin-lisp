@@ -119,11 +119,13 @@ script.h:28). BIP 342 does not lift it for tapscript.")
 
 ;;; Script execution operations
 
-(defun run-script (script-bytes)
-  "Execute a script and return (values success stack-or-error).
+(defun run-script (script-bytes &optional (sigversion bl.script:SigVersionBase))
+  "Execute a script under SIGVERSION (Core's SigVersion, BASE by default) and
+return (values success stack-or-error).
    SCRIPT-BYTES should be a simple-array of (unsigned-byte 8)."
   (let* ((script-vec (cl-array-to-coalton-vector script-bytes))
-         (result (bl.script:execute-script script-vec)))
+         (result (bl.script:execute-script-with-stack-tx
+                  script-vec nil 0 1 #xFFFFFFFF sigversion)))
     (if (bl.script:script-result-ok-p result)
         (values t (bl.script:get-ok-stack result))
         (values nil :error))))
@@ -353,10 +355,6 @@ m_spent_scripts_single_hash), or NIL without spent UTXOs."
                         do (bb-write-varint bb (length script))
                            (bb-write-bytes bb script))
                   (bl.crypto:sha256 (bb-finish bb))))))))
-
-(defvar *witness-v0-mode* nil
-  "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
-   Set during P2WSH witness script execution.")
 
 ;;; Signature verification cache
 ;;; Caches successful ECDSA and Schnorr verifications to avoid re-verification
@@ -1221,6 +1219,9 @@ Returns (values success error-keyword)."
    AMOUNT: The input value in satoshis
    INTERNAL-PUBKEY: The internal public key (32 bytes)
    Returns (values success error-keyword)."
+  ;; The script runs as SigVersion::TAPSCRIPT (ExecuteWitnessScript,
+  ;; interpreter.cpp:1983), the argument the interpreter is handed below; the
+  ;; flags stay the caller's, as Core's flags word has no tapscript bit.
   ;; Set up Tapscript context via DYNAMIC LET-BINDINGS rather than
   ;; setf-then-restore on the globals. The earlier pattern mutated the
   ;; process-global value visible to other threads during execution and
@@ -1231,12 +1232,7 @@ Returns (values success error-keyword)."
   ;; *tapscript-validation-weight-left* is bound by the caller
   ;; (validate-taproot-script-path); we don't rebind it here so decf
   ;; from verify-tapscript-signature mutates the caller's binding.
-  (let* ((old-flags *script-flags*)
-         (new-flags (if old-flags
-                        (concatenate 'string old-flags ",TAPSCRIPT")
-                        "TAPSCRIPT"))
-         (*script-flags* new-flags)
-         (*tapscript-leaf-hash* leaf-hash)
+  (let* ((*tapscript-leaf-hash* leaf-hash)
          (*tapscript-amount* amount)
          (*tapscript-internal-pubkey* internal-pubkey)
          ;; Fresh per tapscript execution; OP_CODESEPARATOR overwrites it.
@@ -1264,7 +1260,8 @@ Returns (values success error-keyword)."
                                 *current-input-index*))
                          #xFFFFFFFF))
            (result (bl.script:execute-script-with-stack-tx
-                    script-vec initial-stack locktime version sequence)))
+                    script-vec initial-stack locktime version sequence
+                    bl.script:SigVersionTapscript)))
       ;; Check result
       (if (bl.script:script-result-ok-p result)
           (let ((final-stack (bl.script:get-ok-stack result)))
@@ -2069,8 +2066,11 @@ output carrying the credited AMOUNT forward, with an empty scriptPubKey
   "When T, suppress per-signature NULLFAIL in verify-checksig.
 CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
-(defun verify-checksig (sig-bytes pubkey-bytes script-pubkey)
+(defun verify-checksig (sig-bytes pubkey-bytes script-pubkey sigversion)
   "Verify a CHECKSIG operation using Bitcoin Core test transaction format.
+   SIGVERSION is Core's (BASE or WITNESS_V0, EvalChecksigPreTapscript's
+   interpreter.cpp:323): it picks the BIP 143 or the legacy sighash, and
+   FindAndDelete and WITNESS_PUBKEYTYPE each apply to one of them.
    When STRICTENC flag is set in *script-flags*, validates encoding.
    When DERSIG flag is set, uses strict DER signature parsing and returns
    error if parsing fails.
@@ -2085,7 +2085,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
   ;; FindAndDelete step on sigversion == SigVersion::BASE, so a witness v0
   ;; scriptCode is serialized untouched (BIP 143).
   (when (and (flag-enabled-p "CONST_SCRIPTCODE")
-             (not *witness-v0-mode*))
+             (eq sigversion bl.script:SigVersionBase))
     (when (nth-value 1 (find-and-delete-sig (or *current-script-code* script-pubkey)
                                             sig-bytes))
       (return-from verify-checksig (values nil :sig-findanddelete))))
@@ -2100,7 +2100,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
   ;; NOT' succeed for us and fail for Core.
   (when (zerop (length sig-bytes))
     (return-from verify-checksig
-      (values nil (check-checksig-encodings sig-bytes pubkey-bytes))))
+      (values nil (check-checksig-encodings sig-bytes pubkey-bytes sigversion))))
 
   ;; Extract sighash type from signature (last byte)
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
@@ -2113,7 +2113,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
     ;; CheckSignatureEncoding then CheckPubKeyEncoding, in Core's order and
     ;; through the one implementation of both (interpreter.cpp:336-339).
-    (let ((enc-err (check-checksig-encodings sig-bytes pubkey-bytes)))
+    (let ((enc-err (check-checksig-encodings sig-bytes pubkey-bytes sigversion)))
       (when enc-err
         (return-from verify-checksig (values nil enc-err))))
 
@@ -2146,7 +2146,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
                       ;; P2WSH corpus vector down the LEGACY test sighash over
                       ;; the outer scriptPubKey instead -- so none of them
                       ;; could verify.
-                      (*witness-v0-mode*
+                      ((eq sigversion bl.script:SigVersionWitnessV0)
                        (setf subscript-for-hash subscript-raw)
                        (compute-bip143-sighash subscript-for-hash
                                                *witness-input-amount*
@@ -2206,13 +2206,13 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 (defvar *last-checksig-error* nil
   "Set to error keyword (:sig-hashtype, :pubkeytype, :sig-der) if validation failed.")
 
-(defun verify-checksig-for-script (sig-bytes pubkey-bytes script-pubkey)
+(defun verify-checksig-for-script (sig-bytes pubkey-bytes script-pubkey sigversion)
   "Wrapper for verify-checksig that sets *last-checksig-error* on validation failures.
    Returns T for success, NIL for any failure.
    Check *last-checksig-error* for :sig-hashtype, :pubkeytype, or :sig-der errors."
   (setf *last-checksig-error* nil)
   (multiple-value-bind (result error-type)
-      (verify-checksig sig-bytes pubkey-bytes script-pubkey)
+      (verify-checksig sig-bytes pubkey-bytes script-pubkey sigversion)
     (when error-type
       (setf *last-checksig-error* error-type))
     result))
@@ -2225,7 +2225,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 ;;; CHECKMULTISIG Support
 ;;; ============================================================
 
-(defun check-pubkey-encoding (pubkey-bytes &optional (witness-v0 *witness-v0-mode*))
+(defun check-pubkey-encoding (pubkey-bytes sigversion)
   "Mirror Bitcoin Core CheckPubKeyEncoding (interpreter.cpp:218-227): under
 STRICTENC the pubkey must be a valid compressed/uncompressed encoding; under
 WITNESS_PUBKEYTYPE in a witness-v0 context it must be compressed. Returns an
@@ -2234,20 +2234,19 @@ acceptable (or the flags are off).
 
 The arms are in Core's order and the STRICTENC one is first, which is
 observable: a pubkey that is neither compressed nor uncompressed is
-PUBKEYTYPE, not WITNESS_PUBKEYTYPE. WITNESS-V0 is Core's sigversion argument,
-defaulting to the dynamic *WITNESS-V0-MODE* the P2WSH executor binds; the
-P2WPKH path has no such binding and passes it explicitly."
+PUBKEYTYPE, not WITNESS_PUBKEYTYPE. SIGVERSION is Core's argument: the
+WITNESS_PUBKEYTYPE arm asks `sigversion == SigVersion::WITNESS_V0'
+(interpreter.cpp:223)."
   (cond
     ((and (flag-enabled-p "STRICTENC")
           (not (valid-pubkey-format-p pubkey-bytes)))
      :pubkeytype)
-    ((and witness-v0
+    ((and (eq sigversion bl.script:SigVersionWitnessV0)
           (flag-enabled-p "WITNESS_PUBKEYTYPE")
           (not (is-compressed-pubkey-p pubkey-bytes)))
      :witness-pubkeytype)))
 
-(defun check-checksig-encodings (sig-bytes pubkey-bytes
-                                 &optional (witness-v0 *witness-v0-mode*))
+(defun check-checksig-encodings (sig-bytes pubkey-bytes sigversion)
   "Core's CheckSignatureEncoding + CheckPubKeyEncoding pair, in the order
 EvalChecksigPreTapscript runs them (interpreter.cpp:336-339) -- one `if\', both
 before CheckECDSASignature. Returns an error keyword or NIL.
@@ -2280,9 +2279,9 @@ the signature-cache key free of script flags."
                  (not (valid-sighash-type-p
                        (aref sig-bytes (1- (length sig-bytes))))))
         (return-from check-checksig-encodings :sig-hashtype))))
-  (check-pubkey-encoding pubkey-bytes witness-v0))
+  (check-pubkey-encoding pubkey-bytes sigversion))
 
-(defun verify-checkmultisig (sigs pubkeys script-pubkey)
+(defun verify-checkmultisig (sigs pubkeys script-pubkey sigversion)
   "Verify m-of-n multisig. SIGS and PUBKEYS are lists of byte arrays.
    Returns (values success error-type).
    Error-type is nil on success, or :sig-hashtype, :pubkeytype, :sig-nulldummy, :nullfail on failure.
@@ -2323,7 +2322,7 @@ the signature-cache key free of script flags."
                  ;; bad-encoding pubkey is rejected under STRICTENC/
                  ;; WITNESS_PUBKEYTYPE before being consumed.
                  ((zerop (length sig))
-                  (let ((pk-err (check-pubkey-encoding (nth pubkey-index pubkeys))))
+                  (let ((pk-err (check-pubkey-encoding (nth pubkey-index pubkeys) sigversion)))
                     (if pk-err
                         (progn (setf error-result pk-err) (return))
                         (incf pubkey-index))))
@@ -2332,7 +2331,7 @@ the signature-cache key free of script flags."
                  (t
                   (let ((pk (nth pubkey-index pubkeys)))
                     (multiple-value-bind (valid err-type)
-                        (verify-checksig sig pk script-pubkey)
+                        (verify-checksig sig pk script-pubkey sigversion)
                       ;; STRICTENC/NULLFAIL error - record and exit loop
                       (when err-type
                         (setf error-result err-type)
@@ -2363,7 +2362,7 @@ the signature-cache key free of script flags."
 (defvar *last-checkmultisig-error* nil
   "Error from last CHECKMULTISIG: :sig-hashtype, :pubkeytype, :sig-nulldummy, or nil.")
 
-(defun verify-checkmultisig-for-script (sigs pubkeys script-pubkey dummy)
+(defun verify-checkmultisig-for-script (sigs pubkeys script-pubkey dummy sigversion)
   "Wrapper for CHECKMULTISIG that validates dummy element and tracks errors.
    DUMMY is the dummy element that Bitcoin pops (should be empty with NULLDUMMY flag).
    Returns T for success, NIL for failure."
@@ -2377,7 +2376,7 @@ the signature-cache key free of script flags."
 
   (let ((*in-checkmultisig* t))
     (multiple-value-bind (result error-type)
-        (verify-checkmultisig sigs pubkeys script-pubkey)
+        (verify-checkmultisig sigs pubkeys script-pubkey sigversion)
       (when error-type
         (setf *last-checkmultisig-error* error-type)
         (bl:log-warn
@@ -2480,8 +2479,9 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
           (setf any-found t))))
     (values script any-found)))
 
-(defun do-checkmultisig-stack-op (stack script-pubkey op-count max-ops)
-  "Perform the full CHECKMULTISIG stack operation.
+(defun do-checkmultisig-stack-op (stack script-pubkey op-count max-ops sigversion)
+  "Perform the full CHECKMULTISIG stack operation under SIGVERSION (Core's;
+BASE or WITNESS_V0, the tapscript case being refused before this).
    OP-COUNT is the opcode budget the script has already spent and MAX-OPS is
    the ceiling (MAX_OPS_PER_SCRIPT).
    Returns (values status new-stack pubkey-count) where:
@@ -2567,20 +2567,20 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
                 ;; patterns in place — producing a sighash that differs
                 ;; from Core's and ECDSA verify rejects the real sig.
                 (multiple-value-bind (cleaned-script-pubkey any-found)
-                    (if *witness-v0-mode*
+                    (if (eq sigversion bl.script:SigVersionBase)
+                        (strip-sigs-from-script-code script-pubkey sigs)
                         ;; BIP143 scriptCode is serialized untouched; Core's
-                        ;; FindAndDelete loop (interpreter.cpp:1142) runs only
+                        ;; FindAndDelete loop (interpreter.cpp:1145) runs only
                         ;; for SigVersion::BASE, so neither strip nor the
                         ;; CONST_SCRIPTCODE rejection applies in witness v0.
-                        (values script-pubkey nil)
-                        (strip-sigs-from-script-code script-pubkey sigs))
+                        (values script-pubkey nil))
                   (cond
                     ((and any-found (flag-enabled-p "CONST_SCRIPTCODE"))
                      (setf *last-checkmultisig-error* :sig-findanddelete)
                      (values :error nil n))
                     (t
                      (let ((result (verify-checkmultisig-for-script
-                                    sigs pubkeys cleaned-script-pubkey dummy)))
+                                    sigs pubkeys cleaned-script-pubkey dummy sigversion)))
                        (cond
                          (*last-checkmultisig-error*
                           (values :error nil n))
@@ -2709,7 +2709,7 @@ one to one -- a redundant encoding would give one expression two scripts
   ;; the pair below decides on the pubkey alone.
   (when (zerop (length sig-bytes))
     (return-from verify-checksig-witness
-      (values nil (check-checksig-encodings sig-bytes pubkey-bytes t))))
+      (values nil (check-checksig-encodings sig-bytes pubkey-bytes bl.script:SigVersionWitnessV0))))
 
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
@@ -2723,7 +2723,7 @@ one to one -- a redundant encoding would give one expression two scripts
     ;; sigversion argument: everything here is SigVersion::WITNESS_V0, which
     ;; is what makes the WITNESS_PUBKEYTYPE arm apply -- and it applies AFTER
     ;; the STRICTENC one, where this function had it first.
-    (let ((enc-err (check-checksig-encodings sig-bytes pubkey-bytes t)))
+    (let ((enc-err (check-checksig-encodings sig-bytes pubkey-bytes bl.script:SigVersionWitnessV0)))
       (when enc-err
         (return-from verify-checksig-witness (values nil enc-err))))
 
@@ -2808,10 +2808,10 @@ one to one -- a redundant encoding would give one expression two scripts
       (when (> (length item) +max-script-element-size+)
         (return-from validate-p2wsh (values nil :push-size))))
 
-    ;; Execute the witness script with remaining witness items as initial stack
-    ;; Uses BIP 143 sighash for any CHECKSIG/CHECKMULTISIG operations
-    (let* ((*witness-v0-mode* t)
-           (*witness-input-amount* amount)
+    ;; Execute the witness script with the remaining witness items as its
+    ;; initial stack, as SigVersion::WITNESS_V0 (interpreter.cpp:1931), which
+    ;; is what makes its CHECKSIG/CHECKMULTISIG hash with BIP 143.
+    (let* ((*witness-input-amount* amount)
            (*current-script-code* witness-script)
            (stack-items (butlast witness))
            (script-vec (cl-array-to-coalton-vector witness-script))
@@ -2833,7 +2833,8 @@ one to one -- a redundant encoding would give one expression two scripts
                                 *current-input-index*))
                          #xFFFFFFFF))
            (result (bl.script:execute-script-with-stack-tx
-                    script-vec initial-stack locktime version sequence)))
+                    script-vec initial-stack locktime version sequence
+                    bl.script:SigVersionWitnessV0)))
       (if (bl.script:script-result-ok-p result)
           (let ((final-stack (bl.script:get-ok-stack result)))
             (cond

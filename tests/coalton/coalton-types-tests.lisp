@@ -227,9 +227,10 @@ the position of a name is its bit.")
   "FLAG-ENABLED-P parses the bound flags string once into Core's flags word and
 answers a name with a bit test; a constant name is resolved to its bit at
 compile time. The answer must be exactly what the string says -- membership
-of the name among its comma-separated tokens -- for every Core flag and our
-TAPSCRIPT mark, for a name that has no bit, and for no flags at all, whether
-the name reaches it as a constant or at run time."
+of the name among its comma-separated tokens -- for every Core flag, for a
+name that has no bit (TAPSCRIPT among them: which rules a script runs under is
+its SigVersion, not a flag), and for no flags at all, whether the name reaches
+it as a constant or at run time."
   (let ((strings (list "P2SH,WITNESS,DERSIG,NULLDUMMY"
                        (bl.val:compute-script-flags-for-height 1000)
                        (concatenate 'string (bl.val:compute-script-flags-for-height 1000)
@@ -264,7 +265,8 @@ the name reaches it as a constant or at run time."
     (loop for name in +core-script-verify-flag-order+
           for bit from 0
           do (is (eql bit (second (expand name))) "~A is not bit ~D" name bit))
-    (is (eql 32 (second (expand "TAPSCRIPT"))))
+    (is (equal '(bl.interop:flag-enabled-p "TAPSCRIPT") (expand "TAPSCRIPT"))
+        "TAPSCRIPT has no bit in Core's flags word")
     (is (equal '(bl.interop:flag-enabled-p "FOO") (expand "FOO"))
         "a name with no bit must stay a call")))
 

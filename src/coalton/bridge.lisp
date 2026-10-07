@@ -82,11 +82,7 @@ none. Bound per block, per transaction or per test vector.")
       ("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" . 12) ("MINIMALIF" . 13)
       ("NULLFAIL" . 14) ("WITNESS_PUBKEYTYPE" . 15) ("CONST_SCRIPTCODE" . 16)
       ("TAPROOT" . 17) ("DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" . 18)
-      ("DISCOURAGE_OP_SUCCESS" . 19) ("DISCOURAGE_UPGRADABLE_PUBKEYTYPE" . 20)
-      ;; Not Core's: the interpreter's own mark that a tapscript leaf is
-      ;; running (VALIDATE-TAPSCRIPT appends it), where Core passes
-      ;; SigVersion::TAPSCRIPT. Above Core's 21 bits so it can never alias one.
-      ("TAPSCRIPT" . 32))
+      ("DISCOURAGE_OP_SUCCESS" . 19) ("DISCOURAGE_UPGRADABLE_PUBKEYTYPE" . 20))
     "Flag name -> bit, in Core's script_verify_flag_name order
 (script/interpreter.h:49-71, SCRIPT_VERIFY_P2SH = bit 0 ...).")
 
