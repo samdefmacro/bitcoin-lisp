@@ -416,6 +416,7 @@ headerssync.cpp. src/networking/.")
    #:load-asmap-file
    #:asmap-version
    #:asmap-interpret
+   #:asmap-sane-p
    #:asmap-asn
    ;; Net permissions (-whitelist / -whitebind)
    #:parse-permission-flags

@@ -1202,6 +1202,77 @@ rather than die mid-connection."
     ;; Ran off the end without a RETURN. Core asserts; we report "unmapped".
     0))
 
+(defun asmap-sane-p (asmap bits)
+  "Core SanityCheckAsmap (util/asmap.cpp:239-308): T when ASMAP is well-formed
+bytecode for inputs of BITS bits -- every path through it, simulated with the
+pending jump targets on a stack, decodes, consumes no more input bits than
+there are, jumps only forward, inside the map and to instruction boundaries,
+never into a jump it is still inside, reaches RETURN with every jump target
+accounted for, and ends in at most seven zero padding bits; and it is
+canonical (no RETURN straight after a DEFAULT, no two DEFAULTs in a row, at
+most one MATCH of fewer than eight bits in a run). Core refuses a map that
+fails it at start-up (DecodeAsmap, :322-343), and only then may Interpret
+assume a RETURN is reached."
+  (declare (type (simple-array (unsigned-byte 8) (*)) asmap))
+  (let ((pos 0)
+        (endpos (* 8 (length asmap)))
+        (jumps '())                     ; (target . bits-left), innermost first
+        (prev :jump)
+        (had-incomplete-match nil))
+    (loop while (/= pos endpos)
+          do (when (and jumps (>= pos (car (first jumps))))
+               (return-from asmap-sane-p nil))        ; into the previous instruction
+             (multiple-value-bind (opcode next) (%asmap-decode-bits asmap pos 0 +asmap-type-bit-sizes+)
+               (setf pos next)
+               (case opcode
+                 (0                                   ; RETURN
+                  (when (eq prev :default) (return-from asmap-sane-p nil))
+                  (multiple-value-bind (asn next2) (%asmap-decode-bits asmap pos 1 +asmap-asn-bit-sizes+)
+                    (setf pos next2)
+                    (when (= asn +asmap-invalid+) (return-from asmap-sane-p nil))
+                    (cond ((null jumps)
+                           (when (> (- endpos pos) 7) (return-from asmap-sane-p nil)) ; excessive padding
+                           (loop while (/= pos endpos)
+                                 do (when (= 1 (%asmap-bit-le asmap pos))
+                                      (return-from asmap-sane-p nil))
+                                    (incf pos))
+                           (return-from asmap-sane-p t))
+                          (t
+                           (unless (= pos (car (first jumps))) (return-from asmap-sane-p nil)) ; unreachable code
+                           (setf bits (cdr (pop jumps))
+                                 prev :jump)))))
+                 (1                                   ; JUMP
+                  (multiple-value-bind (jump next2) (%asmap-decode-bits asmap pos 17 +asmap-jump-bit-sizes+)
+                    (setf pos next2)
+                    (when (= jump +asmap-invalid+) (return-from asmap-sane-p nil))
+                    (when (> jump (- endpos pos)) (return-from asmap-sane-p nil))
+                    (when (zerop bits) (return-from asmap-sane-p nil))
+                    (decf bits)
+                    (let ((target (+ pos jump)))
+                      (when (and jumps (>= target (car (first jumps))))
+                        (return-from asmap-sane-p nil)) ; intersecting jumps
+                      (push (cons target bits) jumps))
+                    (setf prev :jump)))
+                 (2                                   ; MATCH
+                  (multiple-value-bind (match next2) (%asmap-decode-bits asmap pos 2 +asmap-match-bit-sizes+)
+                    (setf pos next2)
+                    (when (= match +asmap-invalid+) (return-from asmap-sane-p nil))
+                    (let ((matchlen (1- (integer-length match))))
+                      (unless (eq prev :match) (setf had-incomplete-match nil))
+                      (when (and (< matchlen 8) had-incomplete-match) (return-from asmap-sane-p nil))
+                      (setf had-incomplete-match (< matchlen 8))
+                      (when (< bits matchlen) (return-from asmap-sane-p nil))
+                      (decf bits matchlen))
+                    (setf prev :match)))
+                 (3                                   ; DEFAULT
+                  (when (eq prev :default) (return-from asmap-sane-p nil))
+                  (multiple-value-bind (asn next2) (%asmap-decode-bits asmap pos 1 +asmap-asn-bit-sizes+)
+                    (setf pos next2)
+                    (when (= asn +asmap-invalid+) (return-from asmap-sane-p nil)))
+                  (setf prev :default))
+                 (t (return-from asmap-sane-p nil)))))  ; straddles EOF
+    nil))                                             ; EOF without RETURN
+
 (defun %linked-ipv4-bytes (ip)
   "The IPv4 address a 16-byte IP carries, as 4 bytes, or NIL (Core
 HasLinkedIPv4/GetLinkedIPv4, netaddress.cpp:652-673): IPv4-mapped and
@@ -1252,13 +1323,20 @@ would have exactly the eclipse exposure the operator was trying to close."
       (when (zerop size)
         (config-error "Could not parse asmap file \"~A\"" (namestring path)))
       (read-sequence buf in)
-      (setf *asmap* buf)
       ;; Core logs the OPEN here, inside the reader, with the path quoted and
       ;; the size (util/asmap.cpp:331); the "Using asmap version" line comes
       ;; later, from init. feature_asmap.py greps for both, which is why they
       ;; are two lines and not one.
       (bl.log:log-info "Opened asmap file \"~A\" (~D bytes) from disk"
                              (namestring path) size)
+      ;; Then CheckStandardAsmap (SanityCheckAsmap over 128 bits): a map that
+      ;; fails it is nothing to DecodeAsmap, which init turns into the same
+      ;; parse error (util/asmap.cpp:310-343, init.cpp:1602-1606).
+      (unless (asmap-sane-p buf 128)
+        (bl.log:log-warn "Sanity check of asmap data failed")
+        (bl.log:log-warn "Sanity check of asmap file \"~A\" failed" (namestring path))
+        (config-error "Could not parse asmap file \"~A\"" (namestring path)))
+      (setf *asmap* buf)
       size)))
 
 (defun asmap-version ()
