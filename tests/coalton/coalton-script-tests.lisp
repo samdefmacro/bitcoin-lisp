@@ -1494,3 +1494,32 @@ with a 50 ms floor for timer granularity)."
       (is (< ms80 1000) "80,000 nested IFs took ~D ms" (round ms80))
       (is (< ms80 (* 8 (max ms20 50)))
           "20,000 nested IFs ~D ms, 80,000 ~D ms: not linear" (round ms20) (round ms80)))))
+
+;;; ============================================================
+;;; The scriptPubKey shape tests read the octets
+;;; ============================================================
+
+(test script-shape-tests-copy-nothing
+  "VerifyScript asks of one scriptPubKey whether it is P2SH and whether, and
+which, witness program it is (Core CScript::IsPayToScriptHash and
+IsWitnessProgram, script/script.cpp:224-231, :250-264: byte tests, no copy).
+Each of ours copied the script into a Coalton vector first -- 8 bytes of heap
+per script byte, three to five times per input. 100,000 calls of each now cons
+nothing (under 8 bytes a call); control: the copy they used to make conses
+more than 8 bytes per script byte."
+  (let ((p2wsh (let ((s (make-array 34 :element-type '(unsigned-byte 8) :initial-element 7)))
+                 (setf (aref s 0) 0 (aref s 1) 32) s))
+        (p2sh (let ((s (make-array 23 :element-type '(unsigned-byte 8) :initial-element 7)))
+                (setf (aref s 0) #xa9 (aref s 1) #x14 (aref s 22) #x87) s)))
+    (flet ((per-call (fn script)
+             (let ((b0 (sb-ext:get-bytes-consed)))
+               (dotimes (i 100000) (funcall fn script))
+               (/ (- (sb-ext:get-bytes-consed) b0) 100000))))
+      (is (> (per-call #'bl.interop:cl-array-to-coalton-vector p2wsh) (* 8 34))
+          "control: the Coalton copy must register as consing")
+      (is-true (bl.interop:is-p2sh-script-p p2sh))
+      (is-true (bl.interop:is-witness-program-p p2wsh))
+      (is (eql 0 (bl.interop:get-witness-version p2wsh)))
+      (is (< (per-call #'bl.interop:is-p2sh-script-p p2sh) 8))
+      (is (< (per-call #'bl.interop:is-witness-program-p p2wsh) 8))
+      (is (< (per-call #'bl.interop:get-witness-version p2wsh) 8)))))

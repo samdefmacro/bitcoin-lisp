@@ -955,9 +955,13 @@ Returns (values success error-keyword)."
         (values t nil)))))
 
 (defun is-p2sh-script-p (script-bytes)
-  "Check if script matches P2SH pattern."
-  (let ((script-vec (cl-array-to-coalton-vector script-bytes)))
-    (bl.script:is-p2sh-script script-vec)))
+  "Core's CScript::IsPayToScriptHash (script/script.cpp:224-231), read off the
+octets: OP_HASH160 <20 bytes> OP_EQUAL. It used to copy the scriptPubKey into
+a Coalton vector (8 bytes per byte) to ask the engine's IS-P2SH-SCRIPT."
+  (and (= (length script-bytes) 23)
+       (= (aref script-bytes 0) #xa9)
+       (= (aref script-bytes 1) #x14)
+       (= (aref script-bytes 22) #x87)))
 
 (defun stack-top-truthy-p (stack)
   "Check if the stack is non-empty and the top element is truthy.
@@ -2690,31 +2694,28 @@ one to one -- a redundant encoding would give one expression two scripts
 ;;; ============================================================
 
 (defun is-witness-program-p (script)
-  "Check if SCRIPT is a witness program."
-  (let ((vec (cl-array-to-coalton-vector script)))
-    (eq (bl.script:is-witness-program vec) coalton:True)))
+  "Core's CScript::IsWitnessProgram (script/script.cpp:250-264), read off the
+octets: 4 to 42 bytes, OP_0 or OP_1..OP_16, then one direct push of exactly
+the rest. These three readers used to copy SCRIPT into a Coalton vector
+(8 bytes per byte) each time they were asked, three to five times per input."
+  (let ((len (length script)))
+    (and (<= 4 len 42)
+         (let ((version-byte (aref script 0)))
+           (or (zerop version-byte) (<= #x51 version-byte #x60)))
+         (= (+ 2 (aref script 1)) len))))
 
 (defun get-witness-version (script)
-  "Get witness version from SCRIPT. Returns NIL if not a witness program."
-  (let ((vec (cl-array-to-coalton-vector script)))
-    ;; If not a witness program, return nil
-    (unless (eq (bl.script:is-witness-program vec) coalton:True)
-      (return-from get-witness-version nil))
-    ;; Extract version byte directly
+  "Core's DecodeOP_N of a witness program's first byte (script.cpp:259), or
+NIL when SCRIPT is not a witness program."
+  (when (is-witness-program-p script)
     (let ((version-byte (aref script 0)))
-      (if (zerop version-byte)
-          0  ; Version 0
-          (- version-byte #x50)))))  ; OP_1-OP_16 -> 1-16
+      (if (zerop version-byte) 0 (- version-byte #x50)))))
 
 (defun get-witness-program-bytes (script)
-  "Get witness program bytes from SCRIPT. Returns NIL if not a witness program."
-  (let ((vec (cl-array-to-coalton-vector script)))
-    ;; If not a witness program, return nil
-    (unless (eq (bl.script:is-witness-program vec) coalton:True)
-      (return-from get-witness-program-bytes nil))
-    ;; Extract program bytes directly (skip version and push length)
-    (let ((push-len (aref script 1)))
-      (subseq script 2 (+ 2 push-len)))))
+  "A witness program's program bytes (script.cpp:260), or NIL when SCRIPT is
+not a witness program."
+  (when (is-witness-program-p script)
+    (subseq script 2)))
 
 (defun is-compressed-pubkey-p (pubkey)
   "Check if PUBKEY is a compressed public key (33 bytes, starts with 0x02 or 0x03)."
