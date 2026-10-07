@@ -4849,12 +4849,12 @@ on its OWN four-block chain; we left it at height 1."
                      chain-state (bl.store:best-block-hash chain-state)))
                (parent (bl.store:block-index-entry-prev-entry entry)))
            ;; If the active chain contains the invalidated block, reorg down to its
-           ;; parent first. perform-reorg downgrades the disconnected blocks to
-           ;; :header-valid, so we mark :invalid AFTER it, making invalidation stick.
-           ;; Only mark invalid once the block is OFF the active chain — if the
-           ;; reorg-away is refused (e.g. blocks pruned), marking the active tip's
-           ;; ancestry :invalid would leave status flags disagreeing with the UTXO
-           ;; set. (perform-reorg returns NIL on refusal.)
+           ;; parent first, and mark :invalid AFTER it -- Core's order, the
+           ;; disconnect leaving each block's validity as it was (DisconnectTip
+           ;; never lowers nStatus). Only mark invalid once the block is OFF the
+           ;; active chain — if the reorg-away is refused (e.g. blocks pruned),
+           ;; marking the active tip's ancestry :invalid would leave status flags
+           ;; disagreeing with the UTXO set. (perform-reorg returns NIL on refusal.)
            (when (and tip parent (block-descends-from-p tip entry))
              (multiple-value-bind (ok detail)
                  (perform-reorg chain-state block-store utxo-set tip parent

@@ -688,6 +688,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/coinscache-sim")
                              (:file "fuzz/versionbits")
                              (:file "fuzz/block-index")
+                             (:file "fuzz/block-index-tree")
                              (:file "fuzz/process-message")
                              ;; After process-message: the net target draws its
                              ;; message types from +FUZZ-NET-MESSAGE-TYPES+.
