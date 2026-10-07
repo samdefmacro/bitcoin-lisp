@@ -328,6 +328,42 @@ public key (and rejects under a different key); RFC6979 makes it deterministic."
                  h sig (bl.crypto:derive-public-key k2))))
       (is (equalp sig (bl.crypto:sign-ecdsa k1 h))))))
 
+(test lax-der-parsing-is-cores
+  "Core verifies every ECDSA signature through ecdsa_signature_parse_der_lax
+(pubkey.cpp:45-176), and before BIP66 that parser is consensus. It reads
+long-form INTEGER lengths (:85-103) and any number of leading zeros, and an
+integer of more than 32 significant bytes OVERFLOWS to the all-zero signature
+(:150-175). Ours rejected the long form outright and truncated an over-long R
+or S to its low 32 bytes, so R + 2^256 verified as R: one signature Core
+accepts refused, one Core refuses accepted (GA9/GA10's open S3, found again by
+the secp256k1_ecdsa_signature_parse_der_lax fuzz target)."
+  (let* ((key (%secret-key 7))
+         (pub (bl.crypto:derive-public-key key))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a))
+         (der (bl.crypto:sign-ecdsa key hash))
+         (r (subseq der 4 (+ 4 (aref der 3))))
+         (s (subseq der (+ 6 (length r)))))
+    (flet ((sig (&rest parts)
+             (let ((body (apply #'concatenate '(vector (unsigned-byte 8)) parts)))
+               (concatenate '(vector (unsigned-byte 8)) (vector #x30 (length body)) body)))
+           (verifies (sig) (and (bl.crypto:verify-signature hash (coerce sig '(simple-array (unsigned-byte 8) (*))) pub) t)))
+      (is-true (verifies (sig (vector 2 (length r)) r (vector 2 (length s)) s)) "control: the plain encoding")
+      (is-true (verifies (sig (vector 2 (+ 3 (length r)) 0 0 0) r (vector 2 (length s)) s))
+               "leading zeros are ignored")
+      (is-true (verifies (concatenate '(vector (unsigned-byte 8)) (sig (vector 2 (length r)) r (vector 2 (length s)) s) #(1 2 3)))
+               "trailing bytes are ignored")
+      (is-true (verifies (sig (vector 2 #x81 (length r)) r (vector 2 (length s)) s))
+               "a long-form R length is read")
+      (is-true (verifies (sig (vector 2 (length r)) r (vector 2 #x82 0 (length s)) s))
+               "a long-form S length with a zero length byte is read")
+      (is (null (verifies (sig (vector 2 #x84 1 0 0 0) r (vector 2 (length s)) s)))
+          "four significant length bytes do not parse")
+      (let* ((digits (subseq r (or (position-if #'plusp r) (length r))))
+             (r32 (replace (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                           digits :start1 (- 32 (length digits)))))
+        (is (null (verifies (sig (vector 2 33 1) r32 (vector 2 (length s)) s)))
+            "R + 2^256, 33 significant bytes, overflows; it is not R")))))
+
 (test wif-roundtrip
   "WIF encode/decode round-trips and matches the canonical WIF for secret key 1
 (compressed, mainnet)."
