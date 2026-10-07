@@ -145,6 +145,7 @@ of the kv and serialization layers. The pruning policy knobs live here
                              (:file "chain")
                              (:file "headerindex-legacy") ; read-only: the pre-2026-09-24 format, for migration
                              (:file "block-tree-db")      ; Core's blocks/index LevelDB
+                             (:file "check-block-index")  ; Core CheckBlockIndex's walk
                              (:file "reindex")
                              (:file "migrate-blocks")
                              (:file "index-base")      ; the protocol the four indexes below implement
@@ -615,6 +616,7 @@ bitcoin-cli (node-main)."
                              (:file "storage/snapshot-tests")
                              ;; Chainstate list + selection accessors + storage suffix
                              (:file "storage/chainstate-tests")
+                             (:file "storage/check-block-index-tests")
                              ;; Assumeutxo P4: dual chainstate + background IBD
                              (:file "storage/assumeutxo-tests")
                              ;; Wallet P1: container + keystore + wallet RPCs

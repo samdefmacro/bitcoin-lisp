@@ -1439,7 +1439,12 @@ CHAINSTATE is the second)."
       ;; block this node came up on, where Core's LoadChainTip says it (:4612).
       (when (node-chain-state *node*)
         (bl.store:reset-block-sequence-state)
-        (bl.store:mark-best-chain-from-disk (node-chain-state *node*)))
+        (bl.store:mark-best-chain-from-disk (node-chain-state *node*))
+        ;; The bodies still waiting on an ancestor's, as LoadBlockIndex finds
+        ;; them (node/blockstorage.cpp:470-486).
+        (bl.store:link-unlinked-bodies
+         (node-chain-state *node*)
+         (some #'bl.store:chain-state-from-snapshot-blockhash (node-chainstates *node*))))
       (log-loaded-best-chain (node-chain-state *node*))
       (%refuse-a-chain-needing-redownload (or reindex reindex-chainstate))
       result)))

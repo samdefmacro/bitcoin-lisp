@@ -4239,3 +4239,27 @@ holding the lock goes through."
       (let ((bl:*node* nil))
         (is (null (bl.val:activate-best-chain cs store utxo))
             "a thread working for no running node is not checked")))))
+
+(test a-body-stored-without-connecting-records-its-transaction-count
+  "Core's ReceivedBlockTransactions sets nTx when a body is stored, connected
+or not (validation.cpp:3812, from AcceptBlock :4404). A block on a weaker
+branch is stored and not connected; its entry used to keep nTx = 0 beside
+HAVE_DATA, which blocks/index then carried to disk -- and which Core's
+CheckBlockIndex refuses (:5276, :5289)."
+  (with-network (:regtest)
+    (let* ((na (regtest-node-fixture "cbi-ntx-a"))
+           (nb (regtest-node-fixture "cbi-ntx-b"))
+           (csb (bl:node-chain-state nb))
+           (a1 (%dr-mine-on na (coerce '(#x51) '(vector (unsigned-byte 8)))))
+           (hash (bl.ser:block-header-hash (bl.ser:bitcoin-block-header a1))))
+      (dotimes (i 2)
+        (%dr-connect nb (%dr-mine-on nb (coerce '(#x52) '(vector (unsigned-byte 8))))))
+      (bl.net:process-headers (list (bl.ser:bitcoin-block-header a1)) csb)
+      (multiple-value-bind (ok error)
+          (bl.val:activate-block a1 csb (bl:node-block-store nb) (bl:node-utxo-set nb))
+        (is (null ok))
+        (is (eq :weaker-chain error)))
+      (let ((entry (bl.store:get-block-index-entry csb hash)))
+        (is-true (bl.store:block-index-entry-data-pos entry) "the body was stored")
+        (is (= (length (bl.ser:bitcoin-block-transactions a1))
+               (bl.store:block-index-entry-tx-count entry)))))))

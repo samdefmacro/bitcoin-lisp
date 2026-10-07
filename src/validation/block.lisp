@@ -2517,7 +2517,8 @@ is dead weight — Core deletes rev files together with blk files.
 
 Clearing the positions is what PruneOneBlockFile does too
 (blockstorage.cpp:264-270: nStatus loses HAVE_DATA and HAVE_UNDO, and nFile /
-nDataPos / nUndoPos all go to zero). Leaving a stale nUndoPos behind persists a
+nDataPos / nUndoPos all go to zero), and so is taking the block out of
+m_blocks_unlinked (:273-284). Leaving a stale nUndoPos behind persists a
 lie into the header index and makes every later query for this block read a
 rev file that is gone."
   (let ((entry (and *undo-chain-state*
@@ -2526,7 +2527,8 @@ rev file that is gone."
     (when entry
       (setf (bl.store:block-index-entry-file entry) nil
             (bl.store:block-index-entry-data-pos entry) nil
-            (bl.store:block-index-entry-undo-pos entry) nil)))
+            (bl.store:block-index-entry-undo-pos entry) nil)
+      (bl.store:drop-unlinked-block entry)))
   (remhash block-hash *block-undo-data*)
   (let ((path (undo-file-path block-hash)))
     (when (and path (probe-file path))
@@ -3165,21 +3167,20 @@ Handles chain reorganizations when a competing chain has more work."
                          :header header
                          :prev-entry prev-entry
                          :chain-work chain-work
-                         :status :valid
+                         ;; Stored, not connected (AcceptBlock's TRANSACTIONS);
+                         ;; a connect makes it :valid (validation.cpp:3829).
+                         :status :header-valid
                          :tx-count (length (bl.ser:bitcoin-block-transactions
                                             block))))))
         (when existing
-          ;; Refresh what arriving BODY data supplies, in place. Status is RAISED
-          ;; only: an :invalid mark is a decision (operator or validator) and
-          ;; nothing here is entitled to overrule it.
+          ;; Refresh what the BODY supplies, in place; the status is the
+          ;; connect's to raise, and an :invalid mark stands.
           (setf (bl.store:block-index-entry-height entry) new-height
                 (bl.store:block-index-entry-header entry) header
                 (bl.store:block-index-entry-prev-entry entry) prev-entry
                 (bl.store:block-index-entry-chain-work entry) chain-work
                 (bl.store:block-index-entry-tx-count entry)
-                (length (bl.ser:bitcoin-block-transactions block)))
-          (unless (eq (bl.store:block-index-entry-status entry) :invalid)
-            (setf (bl.store:block-index-entry-status entry) :valid)))
+                (length (bl.ser:bitcoin-block-transactions block))))
         (bl.store:add-block-index-entry chain-state entry)
         ;; nFile/nDataPos and nSequenceId, now that the entry is in the index
         ;; (Core ReceivedBlockTransactions, validation.cpp:3829-3853).
@@ -3218,7 +3219,9 @@ Handles chain reorganizations when a competing chain has more work."
                (setf spent-utxos (bl.store:apply-block-to-utxo-set
                                        utxo-set block new-height))
                (%warn-if-undo-empty block hash new-height spent-utxos)
-               (store-undo-data hash spent-utxos new-height :block block))
+               (store-undo-data hash spent-utxos new-height :block block)
+               (unless (eq (bl.store:block-index-entry-status entry) :invalid)
+                 (setf (bl.store:block-index-entry-status entry) :valid)))
              ;; Core's fee estimator learns from this block: for every
              ;; transaction it was tracking, how many blocks that feerate waited
              ;; (processBlock). Untracked txids are ignored, so the whole block
@@ -3967,7 +3970,8 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
                          ;; leaves the file unprunable rather than guessing.
                          :height (and entry
                                       (bl.store:block-index-entry-height
-                                       entry)))))
+                                       entry))))
+           :tx-count (length (bl.ser:bitcoin-block-transactions block)))
           (bl.store:note-block-received chain-state entry)
           (values t nil)))))
 
@@ -4217,7 +4221,13 @@ when it was rolled back."
                           utxo-set block height)))
         (%warn-if-undo-empty block block-hash height spent-utxos)
         (store-undo-data block-hash spent-utxos height :block block)
-        (setf (bl.store:block-index-entry-status entry) :valid)
+        ;; nTx with the validity, as CONNECT-BLOCK refreshes it: a connected
+        ;; block's transactions were received (CheckBlockIndex's `nTx > 0 iff
+        ;; VALID_TRANSACTIONS', validation.cpp:5289), whichever path stored
+        ;; its body.
+        (setf (bl.store:block-index-entry-status entry) :valid
+              (bl.store:block-index-entry-tx-count entry)
+              (length (bl.ser:bitcoin-block-transactions block)))
         (bl.store:update-chain-tip chain-state block-hash height)
         (push (list entry block height spent-utxos) (reorg-connected r)))))
   ;; NOTE: deliberately NO maybe-critical-flush in this loop, unlike

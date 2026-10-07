@@ -125,6 +125,9 @@ src/storage/.")
    #:%record-block-position
    #:block-index-entry-sequence-id
    #:note-block-received
+   #:drop-unlinked-block
+   #:+seq-id-init-from-disk+
+   #:link-unlinked-bodies
    #:entry-better-p
    #:mark-best-chain-from-disk
    #:precious-block-sequence
@@ -185,6 +188,9 @@ src/storage/.")
    #:mark-entry-failed
    #:clear-entry-failure
    #:recalculate-best-header
+   ;; Core CheckBlockIndex (check-block-index.lisp)
+   #:check-block-index-now
+   #:block-index-check-failed
    ;; Per-chainstate coins-view lifecycle
    #:open-chainstate-coins-view
    #:close-chainstate-coins-view

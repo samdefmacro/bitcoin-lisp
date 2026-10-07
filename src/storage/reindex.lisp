@@ -37,28 +37,36 @@
 ;;;; (WRITE-REINDEX-FLAG and REINDEX-FLAG-SET-P, block-tree-db.lisp).
 
 (defun %reindex-header-of-record (store pos)
-  "Read just the 80-byte header at POS, de-obfuscated. Returns (values header
-hash) or NIL — a block's identity needs nothing more, and deserializing whole
-blocks to rebuild an index would read the entire chain into memory."
+  "Read the 80-byte header at POS and the transaction count after it,
+de-obfuscated. Returns (values header hash tx-count) or NIL -- a block's
+identity and Core's nTx need nothing more, and deserializing whole blocks to
+rebuild an index would read the entire chain into memory. TX-COUNT is NIL when
+the count does not read."
   (let* ((seq (%blk-seq store))
          (path (flat-file-name seq pos)))
     (when (probe-file path)
       (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
         (when (<= (+ (flat-file-pos-pos pos) 80) (file-length in))
           (file-position in (flat-file-pos-pos pos))
-          (let ((bytes (make-array 80 :element-type '(unsigned-byte 8))))
+          ;; The header, then at most a 9-byte CompactSize.
+          (let ((bytes (make-array (min 89 (- (file-length in) (flat-file-pos-pos pos)))
+                                   :element-type '(unsigned-byte 8))))
             (read-sequence bytes in)
             (obfuscate! bytes (block-store-xor-key store)
                         :key-offset (flat-file-pos-pos pos))
             (handler-case
-                (let ((header (flexi-streams:with-input-from-sequence (hs bytes)
-                                (bl.ser:read-block-header hs))))
-                  (values header (bl.crypto:hash256 bytes)))
+                (flexi-streams:with-input-from-sequence (hs bytes)
+                  (let ((header (bl.ser:read-block-header hs)))
+                    (values header
+                            (bl.crypto:hash256 (subseq bytes 0 80))
+                            (ignore-errors (bl.ser:read-compact-size hs)))))
               (error () nil))))))))
 
-(defun %reindex-add-entry (chain-state hash header located parent)
-  "Add HASH's index entry under PARENT, carrying the record's position. Returns
-T when an entry was added."
+(defun %reindex-add-entry (chain-state hash header located parent tx-count)
+  "Add HASH's index entry under PARENT, carrying the record's position and its
+transaction count (Core's reindex reaches ReceivedBlockTransactions through
+AcceptBlock, which sets nTx, validation.cpp:3812). Returns T when an entry was
+added."
   (unless (get-block-index-entry chain-state hash)
     (let ((entry (make-block-index-entry
                   :hash hash
@@ -73,7 +81,7 @@ T when an entry was added."
                   ;; chainstate rebuild is what promotes blocks to :valid by
                   ;; re-applying them.
                   :status :header-valid)))
-      (%record-block-position entry located)
+      (%record-block-position entry located :tx-count tx-count)
       (add-block-index-entry chain-state entry)
       t)))
 
@@ -93,7 +101,7 @@ and recursion would exhaust the stack."
                (remhash head pending)
                (when parent
                  (dolist (child (reverse children))
-                   (destructuring-bind (child-hash child-header located) child
+                   (destructuring-bind (child-hash child-header located tx-count) child
                      ;; Core logs one line per child it reads back, before
                      ;; AcceptBlock (validation.cpp:5122).
                      (bl.log:log-cat "reindex"
@@ -101,7 +109,7 @@ and recursion would exhaust the stack."
                                      (%reindex-hash-text child-hash)
                                      (%reindex-hash-text head))
                      (when (%reindex-add-entry chain-state child-hash child-header
-                                               located parent)
+                                               located parent tx-count)
                        (incf added))
                      (when (gethash child-hash pending)
                        (push child-hash queue)))))))
@@ -168,11 +176,11 @@ feature_reindex.py:69-73 swaps two blocks inside blk00000.dat precisely to
 watch for those two lines. `Not known yet' is decided on the record's FILE
 POSITION (%REINDEX-PARENT-COMES-LATER-P), not on the index: Core wiped its
 index first, while ours is additive and already holds every record on disk."
-  (let ((pending (make-hash-table :test 'equalp))   ; prev-hash -> list of (hash header pos)
+  (let ((pending (make-hash-table :test 'equalp))   ; prev-hash -> list of (hash header pos tx-count)
         (genesis (chain-state-genesis-hash chain-state))
         (added 0))
     (loop for (hash . located) in (%reindex-records-in-file-order store)
-          do (multiple-value-bind (header record-hash)
+          do (multiple-value-bind (header record-hash tx-count)
                  (%reindex-header-of-record store located)
                (when (and header record-hash)
                  (let ((prev (bl.ser:block-header-prev-block header)))
@@ -199,7 +207,7 @@ index first, while ours is additive and already holds every record on disk."
                                       "LoadExternalBlockFile: Out of order block ~A, parent ~A not known"
                                       (%reindex-hash-text record-hash)
                                       (%reindex-hash-text prev))
-                      (push (list record-hash header located)
+                      (push (list record-hash header located tx-count)
                             (gethash prev pending)))
                      (t
                       ;; The parent was read earlier in this walk, or is not in
@@ -213,7 +221,7 @@ index first, while ours is additive and already holds every record on disk."
                                            "LoadExternalBlockFile: Out of order block ~A, parent ~A not known"
                                            (%reindex-hash-text record-hash)
                                            (%reindex-hash-text prev))
-                           (push (list record-hash header located)
+                           (push (list record-hash header located tx-count)
                                  (gethash prev pending)))
                           (t
                            ;; The record's position travels with the header:
@@ -226,7 +234,7 @@ index first, while ours is additive and already holds every record on disk."
                            ;; AcceptBlock's reindex branch,
                            ;; validation.cpp:4402-4403).
                            (when (%reindex-add-entry chain-state record-hash
-                                                     header located parent)
+                                                     header located parent tx-count)
                              (incf added))
                            (incf added (%reindex-drain-children
                                         chain-state pending record-hash)))))))))))

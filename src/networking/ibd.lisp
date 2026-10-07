@@ -5088,7 +5088,8 @@ what stands between a peer and an arbitrary body under an honest header's hash."
          (bl.store:note-block-position
           chain-state hash
           (nth-value 1 (bl.store:store-block
-                        block-store block :height height))))
+                        block-store block :height height))
+          :tx-count (length (bl.ser:bitcoin-block-transactions block))))
        (bl:log-cat "net" "Stored refetched body for pruned block ~D (~A)"
                    height (bl.crypto:bytes-to-hex hash))
        t))))
@@ -5196,7 +5197,8 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
           (bl.store:note-block-position
            chain-state hash
            (nth-value 1 (bl.store:store-block
-                         block-store block :height height))))
+                         block-store block :height height))
+           :tx-count (length (bl.ser:bitcoin-block-transactions block))))
         ;; Same event as the out-of-order path: a body landed, so any fork
         ;; candidate parked waiting for it can be tried again. BOTH persist
         ;; sites must drain, or a fork whose last missing body arrives
@@ -5386,7 +5388,8 @@ body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
                    (bl.store:note-block-position
                     chain-state hash
                     (nth-value 1 (bl.store:store-block
-                                  block-store block :height height))))
+                                  block-store block :height height))
+                    :tx-count (length (bl.ser:bitcoin-block-transactions block))))
                  (when *ibd-context*
                    ;; A body just landed: any fork candidate that was parked
                    ;; waiting for THIS block can be tried again (Core drains
