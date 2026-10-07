@@ -229,20 +229,20 @@ push."
       (bl.val:count-script-sigops script :accurate t)
       (bl.interop:script-is-push-only-p script)
       (bl.store:script-unspendable-p script)
-      (fuzz-assert (eq (eq type :scripthash) (fuzz-sabotage (bl.val:script-is-p2sh-p script)))
+      (fuzz-assert (eq (eq type :scripthash) (fuzz-sabotage (bl.interop:is-p2sh-script-p script)))
                    "IsPayToScriptHash disagrees with Solver's ~S" type)
       ;; Solver (solver.cpp:141-176): a witness program is one of the four
       ;; witness types or P2A, or -- a version-0 program of an irregular
       ;; length -- NONSTANDARD; nothing else is.
       (let ((witness-type (member type '(:witness-v0-keyhash :witness-v0-scripthash
                                          :witness-v1-taproot :anchor :witness-unknown)))
-            (witness-program (bl.val:output-witness-program-p script)))
+            (witness-program (bl.interop:is-witness-program-p script)))
         (when witness-type
           (fuzz-assert (fuzz-sabotage witness-program) "a ~S script is not a witness program" type))
         (when witness-program
           (fuzz-assert (or witness-type
                            (and (eq type :nonstandard)
-                                (zerop (bl.val:witness-program-parts script))))
+                                (zerop (bl.interop:witness-program-parts script))))
                        "witness program ~A classifies as ~S" (bl.crypto:bytes-to-hex script) type)))
       ;; GetOp from the start: every step advances, and the walk ends at the
       ;; end of the script or at a push that overruns it.

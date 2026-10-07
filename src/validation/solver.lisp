@@ -15,33 +15,11 @@
 ;;; "witness_unknown". CLASSIFY-SCRIPT is Solver, in Solver's order, with
 ;;; Solver's vSolutionsRet as a plist; everything else asks it.
 
-;;; --- The matchers (Core Match*, IsPayToScriptHash, IsWitnessProgram) ---
-
-(defun script-is-p2sh-p (script)
-  "OP_HASH160 <20 bytes> OP_EQUAL (Core CScript::IsPayToScriptHash)."
-  (and (= (length script) 23)
-       (= (aref script 0) +op-hash160+)
-       (= (aref script 1) 20)
-       (= (aref script 22) +op-equal+)))
-
-(defun output-witness-program-p (script-pubkey)
-  "True if SCRIPT-PUBKEY is a witness program: a version byte (OP_0, or
-OP_1..OP_16) followed by a single push of 2-40 bytes that consumes the rest
-of the script (Core CScript::IsWitnessProgram)."
-  (let ((len (length script-pubkey)))
-    (and (>= len 4) (<= len 42)
-         (let ((v (aref script-pubkey 0)))
-           (or (= v #x00) (<= #x51 v #x60)))   ; OP_0 or OP_1..OP_16
-         (let ((push (aref script-pubkey 1)))
-           (and (<= 2 push 40) (= len (+ 2 push)))))))
-
-(defun witness-program-parts (script)
-  "If SCRIPT is a witness program, return (VALUES version program-bytes);
-otherwise NIL. Version is 0 for OP_0, 1..16 for OP_1..OP_16."
-  (when (output-witness-program-p script)
-    (let ((v (aref script 0)))
-      (values (if (= v #x00) 0 (- v #x50))   ; OP_1 (#x51) -> version 1
-              (subseq script 2)))))
+;;; --- The matchers (Core Match*) ---
+;;;
+;;; IsPayToScriptHash and IsWitnessProgram are BL.INTEROP:IS-P2SH-SCRIPT-P,
+;;; IS-WITNESS-PROGRAM-P and WITNESS-PROGRAM-PARTS, the interpreter's own: one
+;;; definition each for the engine, the solver and policy.
 
 (defun pay-to-anchor-p (script-pubkey)
   "True for a pay-to-anchor (P2A) output: the witness-v1 program OP_1 <push-2
@@ -196,10 +174,10 @@ let segwit and taproot outputs relay before activation) but NOT standard to
 SPEND. Only after that do the bare key forms match, so an OP_RETURN or a
 witness program can never be read as a key script."
   (cond
-    ((script-is-p2sh-p script)
+    ((bl.interop:is-p2sh-script-p script)
      (values :scripthash (list :hash (subseq script 2 22))))
-    ((output-witness-program-p script)
-     (multiple-value-bind (version program) (witness-program-parts script)
+    ((bl.interop:is-witness-program-p script)
+     (multiple-value-bind (version program) (bl.interop:witness-program-parts script)
        (let ((data (list :witness-version version :witness-program program)))
          (cond ((and (= version 0) (= (length program) 20)) (values :witness-v0-keyhash data))
                ((and (= version 0) (= (length program) 32)) (values :witness-v0-scripthash data))

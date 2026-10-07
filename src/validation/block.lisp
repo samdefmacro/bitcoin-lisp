@@ -1840,7 +1840,7 @@ the last opcode's data buffer, not the stack."
 the accurate sigop count of SCRIPT-PUBKEY itself, or, when it is P2SH, of the
 redeem script SCRIPT-SIG pushes last (p2sh-sigop-subscript; zero when that
 walk bails)."
-  (if (script-is-p2sh-p script-pubkey)
+  (if (bl.interop:is-p2sh-script-p script-pubkey)
       (let ((sub (p2sh-sigop-subscript script-sig)))
         (if sub (count-script-sigops sub :accurate t) 0))
       (count-script-sigops script-pubkey :accurate t)))
@@ -1889,21 +1889,21 @@ GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
                (when script-pubkey
                  (cond
                    ;; Native witness program
-                   ((script-is-witness-program-p script-pubkey)
+                   ((bl.interop:is-witness-program-p script-pubkey)
                     (let ((witness (get-input-witness tx input-idx)))
                       (incf witness-count (count-witness-sigops-for-input
                                            script-pubkey witness))))
                    ;; P2SH input. A NIL subscript is Core's "not push-only",
                    ;; which zeroes the P2SH sigops AND gates the wrapped-witness
                    ;; branch (CountWitnessSigOps requires IsPushOnly).
-                   ((script-is-p2sh-p script-pubkey)
+                   ((bl.interop:is-p2sh-script-p script-pubkey)
                     (let ((redeem-script (p2sh-sigop-subscript
                                           (bl.ser:tx-in-script-sig input))))
                       (when redeem-script
                         ;; P2SH sigops from redeemScript
                         (incf p2sh-count (count-script-sigops redeem-script :accurate t))
                         ;; P2SH-wrapped witness program
-                        (when (script-is-witness-program-p redeem-script)
+                        (when (bl.interop:is-witness-program-p redeem-script)
                           (let ((witness (get-input-witness tx input-idx)))
                             (incf witness-count (count-witness-sigops-for-input
                                                  redeem-script witness)))))))))))

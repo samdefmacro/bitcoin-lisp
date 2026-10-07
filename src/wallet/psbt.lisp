@@ -619,10 +619,10 @@ provider's GetCScript for its P2SH / P2WSH hash."
 (defun %psbt-segwit-output-p (spk expansions)
   "Core IsSegWitOutput (script/sign.cpp:1003-1019): a witness program, or a
 P2SH whose redeem script the provider knows and which is one."
-  (or (bl.val:output-witness-program-p spk)
+  (or (bl.interop:is-witness-program-p spk)
       (and (eq (bl.val:classify-script spk) :scripthash)
            (let ((redeem (%psbt-provider-sub-scripts spk expansions)))
-             (and redeem (bl.val:output-witness-program-p redeem))))))
+             (and redeem (bl.interop:is-witness-program-p redeem))))))
 
 (defun %psbt-update-input-from-provider (map tx-in expansions &optional (bip32derivs t))
   "SignPSBTInput with no key to sign with (ProcessPSBT's hidden-secret
@@ -1821,10 +1821,10 @@ keydata, so for a tr() WITH a script tree the last LEAF key silently won."
   "Whether SPK, which SPKM owns, is spent through a witness program -- a
 native segwit output, or a P2SH whose redeem script is one: Core's
 sigdata.witness after ProduceSignature."
-  (or (bl.val:output-witness-program-p spk)
+  (or (bl.interop:is-witness-program-p spk)
       (and (eq (bl.val:classify-script spk) :scripthash)
            (let ((redeem (%spkm-sub-scripts spkm spk)))
-             (and redeem (bl.val:output-witness-program-p redeem) t)))))
+             (and redeem (bl.interop:is-witness-program-p redeem) t)))))
 
 (defun %psbt-add-wallet-input-scripts (psbt coins wallet)
   "What SignPSBTInput records for a wallet-owned input even when nothing is
@@ -2123,7 +2123,7 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
 (defun %psbt-witness-program-version (spk)
   "The witness version of SPK, or NIL when it is not a witness program at all
 -- Core CScript::IsWitnessProgram's out-parameter (script/script.cpp)."
-  (when (bl.val:output-witness-program-p spk)
+  (when (bl.interop:is-witness-program-p spk)
     (let ((v (aref spk 0)))
       (if (= v #x00) 0 (- v #x50)))))
 

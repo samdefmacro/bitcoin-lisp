@@ -221,7 +221,7 @@ validation-layer dust-threshold is specialized to the 3000 sat/kvB dust
 relay rate)."
   (if (and (plusp (length script)) (= (aref script 0) #x6a)) ; OP_RETURN
       0
-      (let* ((spend-size (if (bl.val:output-witness-program-p
+      (let* ((spend-size (if (bl.interop:is-witness-program-p
                               script)
                              (+ 32 4 1 (floor 107 4) 4)
                              (+ 32 4 1 107 4)))
@@ -595,7 +595,7 @@ solvable pre-selected input\"."
     (:scripthash
      (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
        (when redeem
-         (let* ((segwit (bl.val:output-witness-program-p redeem))
+         (let* ((segwit (bl.interop:is-witness-program-p redeem))
                 ;; A P2SH-P2WSH's witness script comes from THIS output's
                 ;; lookup, which follows the redeem script to it.
                 (size-elems

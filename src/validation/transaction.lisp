@@ -375,12 +375,12 @@ for a script failure that could be explained by a stripped witness."
            (spk (and utxo (bl.store:utxo-entry-script-pubkey utxo))))
       (when spk
         (cond
-          ((and (output-witness-program-p spk)
+          ((and (bl.interop:is-witness-program-p spk)
                 (not (pay-to-anchor-p spk)))
            (return-from spends-non-anchor-witness-program-p t))
-          ((script-is-p2sh-p spk)
+          ((bl.interop:is-p2sh-script-p spk)
            (let ((redeem (%script-sig-stack-top (bl.ser:tx-in-script-sig input))))
-             (when (and redeem (output-witness-program-p redeem))
+             (when (and redeem (bl.interop:is-witness-program-p redeem))
                (return-from spends-non-anchor-witness-program-p t))))))))
   nil)
 
@@ -394,7 +394,7 @@ GetDustThreshold). Unspendable (OP_RETURN) outputs return 0 — never dust."
              ;; serialized output: 8-byte value + varint(scriptlen) + script
              (output-size (+ 8 (if (< spk-len #xfd) 1 3) spk-len))
              ;; assumed cost to spend the output (witness gets the discount)
-             (spend-overhead (if (output-witness-program-p script-pubkey)
+             (spend-overhead (if (bl.interop:is-witness-program-p script-pubkey)
                                  (+ 32 4 1 (floor 107 4) 4)   ; 67
                                  (+ 32 4 1 107 4)))           ; 148
              (nsize (+ output-size spend-overhead)))
@@ -581,11 +581,11 @@ have no policy rules."
         (p2sh nil))
     ;; P2SH-wrapped: the redeemScript is the stack top the scriptSig leaves;
     ;; a failed evaluation or an empty stack is nonstandard (:274-283).
-    (when (script-is-p2sh-p spk)
+    (when (bl.interop:is-p2sh-script-p spk)
       (let ((redeem (%script-sig-stack-top script-sig)))
         (unless redeem (return-from input-witness-standard-p nil))
         (setf prev-script redeem p2sh t)))
-    (multiple-value-bind (version program) (witness-program-parts prev-script)
+    (multiple-value-bind (version program) (bl.interop:witness-program-parts prev-script)
       (cond
         ;; A witness attached to a non-witness program is nonstandard.
         ((null version) nil)
@@ -707,7 +707,7 @@ empty -- NONSTANDARD to Solver -- so it makes the transaction nonstandard."
       (case (classify-script spk)
         ((:nonstandard :witness-unknown)
          (return-from are-inputs-standard-p nil)))
-      (when (script-is-p2sh-p spk)
+      (when (bl.interop:is-p2sh-script-p spk)
         (let ((redeem (%script-sig-stack-top (bl.ser:tx-in-script-sig input))))
           (when (or (null redeem)
                     (> (count-script-sigops redeem :accurate t)

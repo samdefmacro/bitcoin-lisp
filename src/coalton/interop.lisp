@@ -2674,18 +2674,26 @@ the rest. These three readers used to copy SCRIPT into a Coalton vector
            (or (zerop version-byte) (<= #x51 version-byte #x60)))
          (= (+ 2 (aref script 1)) len))))
 
+(defun witness-program-parts (script)
+  "Core's IsWitnessProgram(version, program) (script/script.cpp:250-264): when
+SCRIPT is a witness program, (VALUES version program-bytes), the version
+DecodeOP_N of its first byte (0 for OP_0, 1..16 for OP_1..OP_16); otherwise
+NIL. The one reader of a witness program's parts, for the interpreter and the
+validation layer's solver and policy alike."
+  (when (is-witness-program-p script)
+    (let ((version-byte (aref script 0)))
+      (values (if (zerop version-byte) 0 (- version-byte #x50))
+              (subseq script 2)))))
+
 (defun get-witness-version (script)
-  "Core's DecodeOP_N of a witness program's first byte (script.cpp:259), or
-NIL when SCRIPT is not a witness program."
+  "A witness program's version, or NIL (see WITNESS-PROGRAM-PARTS)."
   (when (is-witness-program-p script)
     (let ((version-byte (aref script 0)))
       (if (zerop version-byte) 0 (- version-byte #x50)))))
 
 (defun get-witness-program-bytes (script)
-  "A witness program's program bytes (script.cpp:260), or NIL when SCRIPT is
-not a witness program."
-  (when (is-witness-program-p script)
-    (subseq script 2)))
+  "A witness program's program bytes, or NIL (see WITNESS-PROGRAM-PARTS)."
+  (nth-value 1 (witness-program-parts script)))
 
 (defun is-compressed-pubkey-p (pubkey)
   "Check if PUBKEY is a compressed public key (33 bytes, starts with 0x02 or 0x03)."
