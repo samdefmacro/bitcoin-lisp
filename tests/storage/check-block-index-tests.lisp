@@ -15,16 +15,6 @@
 
 (in-suite :check-block-index-tests)
 
-(defun %cbi-received (entry position &key undo)
-  "Give ENTRY a body at POSITION of blk file 0 and one transaction, and with
-UNDO an undo record too -- what storing (and connecting) its block records."
-  (setf (bl.store:block-index-entry-file entry) 0
-        (bl.store:block-index-entry-data-pos entry) position
-        (bl.store:block-index-entry-tx-count entry) 1)
-  (when undo
-    (setf (bl.store:block-index-entry-undo-pos entry) position))
-  entry)
-
 (defun %cbi-index (&key (main 5) (fork 2) (fork-at 2))
   "A consistent regtest index: genesis, MAIN connected headers and a FORK of
 stored-but-unconnected headers off height FORK-AT -- shorter than the main
@@ -343,3 +333,41 @@ blocks above the base at restart, and gave the base's body nothing."
         (is (<= (bl.store:block-index-entry-sequence-id base)
                 bl.store:+seq-id-init-from-disk+))
         (is (null (%cbi-failure cs)))))))
+
+(test a-body-without-a-transaction-count-is-counted-at-load-and-stops-the-check
+  "The header index this tree kept before nTx was stored wrote entries that
+hold a body and nTx = 0; blocks/index migrated from it keeps them. Core never
+holds that state (ReceivedBlockTransactions sets nTx with the body,
+validation.cpp:3812), so nothing backfills them and CheckBlockIndex refuses
+them -- :5276 while nothing was pruned, :5280 after. LOAD-HEADER-INDEX says how
+many there are, once, so an operator who enables -checkblockindex knows why the
+node stops. Control: the same index with every count recorded loads silently
+and passes."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bl-cbi-ntx")
+      (let* ((cs (bl.store:init-chain-state dir :network :regtest))
+             (genesis (add-regtest-genesis-entry cs))
+             (chain (add-mined-chain cs genesis 4)))
+        (loop for e in (cons genesis chain) for i from 1
+              do (%cbi-received e (* 1000 i)))
+        (flet ((reload ()
+                 (bl.store:save-header-index cs :force-full t)
+                 (let* ((back (bl.store:init-chain-state dir :network :regtest))
+                        (lines (capture-log-lines
+                                (lambda () (bl.store:load-header-index back))))
+                        (tip (car (last chain))))
+                   (bl.store:update-chain-tip back (bl.store:block-index-entry-hash tip)
+                                              (bl.store:block-index-entry-height tip))
+                   (values back (find "hold a body but record no transaction count"
+                                      lines :test #'search)))))
+          (multiple-value-bind (back line) (reload)
+            (is (null line) "a complete index says nothing: ~S" line)
+            (is (null (%cbi-failure back))))
+          ;; Two bodies the old format wrote without their count.
+          (setf (bl.store:block-index-entry-tx-count (second chain)) 0
+                (bl.store:block-index-entry-tx-count (third chain)) 0)
+          (multiple-value-bind (back line) (reload)
+            (is (and line (search "2 blocks hold a body" line)) "the load line: ~S" line)
+            (%cbi-fails-with "HAVE_DATA is equivalent to nTx > 0 when nothing was pruned" back)
+            (setf (bl.store:chain-state-pruned-height back) 1)
+            (%cbi-fails-with "HAVE_DATA implies nTx > 0" back)))))))

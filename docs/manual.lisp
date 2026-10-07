@@ -803,6 +803,9 @@
   the header), a received body stays VALID_TRANSACTIONS after pruning, pruning
   takes a body out of `*blocks-unlinked*` (DROP-UNLINKED-BLOCK) and start-up
   puts the waiting ones back (LINK-UNLINKED-BODIES, LoadBlockIndex's half).
+  A datadir migrated from this tree's pre-nTx header index can hold bodies
+  with nTx 0, a state Core never has: LOAD-HEADER-INDEX says how many, once,
+  because the check stops at the first of them; nothing backfills them.
   BL.VAL:CHECK-BLOCK-INDEX samples it and runs it where Core does.
 
   A store has TWO bases. `base-path` is the network data directory and
