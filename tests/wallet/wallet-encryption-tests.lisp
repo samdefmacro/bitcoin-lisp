@@ -115,17 +115,27 @@ the stored descriptor keeps, this is the whole spending key."
     (%wenc-latin1 (subseq desc (1- at) (position #\/ desc :start at)))))
 
 (defun %wenc-age-database (wallet records)
-  "Write RECORDS junk 2 KiB rows, which pushes the memtable out into real SST
+  "Write RECORDS junk 2 KiB rows and then flush the memtable into real SST
 files. The finding's leak needs a database whose levels are still EMPTY, so
-this is the other side of that condition."
-  (dotimes (i records)
-    (bl.store:leveldb-put
-     (bl.wallet::wallet-db wallet)
-     (concatenate '(simple-array (unsigned-byte 8) (*))
-                  (vector 122 (ldb (byte 8 0) i) (ldb (byte 8 8) i))
-                  (make-array 29 :element-type '(unsigned-byte 8)
-                                 :initial-element 7))
-     (make-array 2048 :element-type '(unsigned-byte 8) :initial-element 9))))
+this is the other side of that condition.
+
+The flush is explicit. Writing past write_buffer_size only SCHEDULES one on
+LevelDB's background thread (DBImpl::MakeRoomForWrite), and on a loaded
+machine the caller read the files before it had run -- the secret was still
+in the log, and the test's precondition failed. LEVELDB-COMPACT is
+CompactRange, which flushes the memtable synchronously before it compacts
+(TEST_CompactMemTable), and the secret's record is live, so it lands in an
+.ldb and stays there."
+  (let ((db (bl.wallet::wallet-db wallet)))
+    (dotimes (i records)
+      (bl.store:leveldb-put
+       db
+       (concatenate '(simple-array (unsigned-byte 8) (*))
+                    (vector 122 (ldb (byte 8 0) i) (ldb (byte 8 8) i))
+                    (make-array 29 :element-type '(unsigned-byte 8)
+                                   :initial-element 7))
+       (make-array 2048 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (bl.store:leveldb-compact db)))
 
 (defun %wenc-stage-interrupted-rewrite (path rewrite)
   "Leave the wallet at PATH in WALLET-DB-REWRITE's crash window: REWRITE holds
