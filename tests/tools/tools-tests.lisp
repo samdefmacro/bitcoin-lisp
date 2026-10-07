@@ -98,6 +98,21 @@ are raw bytes, opcodes are read with or without OP_."
   (signals error (bl.tools:parse-script-asm "4294967296"))
   (signals error (bl.tools:parse-script-asm "OP_NOTANOPCODE")))
 
+(test parse-script-asm-reads-only-ascii-hex
+  "Core's IsHex (util/strencodings.cpp:41-47) reads its HexDigit table, ASCII
+only, so `0x' and two Arabic-Indic digits is not raw hex but a word
+ParseOpCode refuses (core_io.cpp:117, :126-128). Ours asked DIGIT-CHAR-P,
+which SBCL answers for any Unicode decimal digit, and inserted the byte 0x12.
+Found by the parse_script fuzz target."
+  (is (equalp #(#x12) (bl.tools:parse-script-asm "0x12")) "control: ASCII hex is raw bytes")
+  (is (search "unknown opcode"
+              (handler-case
+                  (progn (bl.tools:parse-script-asm
+                          (coerce (list #\0 #\x (code-char #x0661) (code-char #x0662)) 'string))
+                         "parsed")
+                (error (e) (princ-to-string e))))
+      "two Arabic-Indic digits after 0x are not hex"))
+
 (test bitcoin-util-grind-meets-the-headers-own-target
   "Core Grind (bitcoin-util.cpp:112-150): the nonce it writes makes the
 header's hash meet the header's own nBits, and nothing else changes."
