@@ -656,7 +656,6 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/deserialize")
                              (:file "fuzz/transaction")
                              (:file "fuzz/script")
-                             (:file "fuzz/net")
                              (:file "fuzz/addrman")
                              (:file "fuzz/crypto")
                              (:file "fuzz/encoding")
@@ -681,6 +680,9 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/versionbits")
                              (:file "fuzz/block-index")
                              (:file "fuzz/process-message")
+                             ;; After process-message: the net target draws its
+                             ;; message types from +FUZZ-NET-MESSAGE-TYPES+.
+                             (:file "fuzz/net")
                              (:file "fuzz/banman")
                              (:file "fuzz/socks5")
                              (:file "fuzz/i2p")
