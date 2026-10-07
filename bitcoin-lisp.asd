@@ -698,6 +698,7 @@ bitcoin-cli (node-main)."
                              (:file "fuzz/key")
                              (:file "fuzz/muhash")
                              (:file "fuzz/golomb-rice")
+                             (:file "fuzz/merkle")
                              (:file "fuzz/p2p-headers-presync")
                              (:file "fuzz/connman")
                              (:file "fuzz/p2p-handshake")
