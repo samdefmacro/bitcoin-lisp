@@ -1717,8 +1717,12 @@
   asserts. Because regtest runs it after EVERY transaction, it must stay one
   pass over the pool with a few lookups per transaction: a per-entry walk of
   the spent-outpoint index made it 180 ms on 2,500 transactions and timed
-  out feature_dbcrash.py; it is ~2 ms now (the graph's own sanity check
-  included, which likewise verifies its chunk index without sorting it)."
+  out feature_dbcrash.py; it is ~2-3 ms now (the graph's own sanity check
+  included, which likewise verifies its chunk index without sorting it).
+  Two lookups per input -- the parent in the pool, the spender in the
+  index -- and none per output: the children are collected from the
+  inputs, and a chain coin spent twice is caught by the spender check and
+  the index count rather than by a table of its own."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)

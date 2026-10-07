@@ -4588,6 +4588,44 @@ transaction's own verdict as before."
         (is (member (car unchecked) '(-25 -26)) "the node without the check answered ~S" unchecked)
         (is (not (search "consistency" (or (cdr unchecked) ""))))))))
 
+(test mempool-check-finds-a-chain-coin-spent-twice
+  "Core's mempoolDuplicate view spends each coin a pool transaction uses, so a
+coin two inputs spend fails CheckTxInputs (txmempool.cpp:538-539). Ours keeps
+no table of spent chain coins for it: the spent-outpoint index names one
+spender per outpoint, so a second transaction spending the coin fails its
+spender check, and one transaction spending it twice leaves the index an
+entry short of the pool's inputs. Both corruptions are built here by hand --
+MEMPOOL-ADD refuses either -- and the untouched pool is the control."
+  (let* ((spk (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+         (coin-x (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5A))
+         (coin-y (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5B)))
+    (flet ((tx (&rest coins)
+             (bl.ser:make-transaction
+              :version 2 :lock-time 0
+              :inputs (map 'vector (lambda (h)
+                                     (bl.ser:make-tx-in
+                                      :previous-output (bl.ser:make-outpoint :hash h :index 0)
+                                      :script-sig spk :sequence #xffffffff))
+                           coins)
+              :outputs (vector (bl.ser:make-tx-out :value 1000 :script-pubkey spk))))
+           (add (mempool tx)
+             (is (eq :ok (bl.mp:mempool-add mempool (bl.ser:transaction-hash tx)
+                                            (bl.mp:make-entry-from-tx tx 1000 1))))))
+      ;; Two transactions, then the second's input re-pointed at the first's coin.
+      (let ((mempool (bl.mp:make-mempool))
+            (b (tx coin-y)))
+        (add mempool (tx coin-x))
+        (add mempool b)
+        (is-true (bl.mp:mempool-check-now mempool nil 1) "control: two distinct coins")
+        (setf (aref (bl.ser:transaction-inputs b) 0)
+              (bl.ser:make-tx-in :previous-output (bl.ser:make-outpoint :hash coin-x :index 0)
+                                 :script-sig spk :sequence #xffffffff))
+        (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1)))
+      ;; One transaction naming the same coin twice.
+      (let ((mempool (bl.mp:make-mempool)))
+        (add mempool (tx coin-x coin-x))
+        (signals bl.mp:mempool-check-failed (bl.mp:mempool-check-now mempool nil 1))))))
+
 (test mempool-check-finds-links-the-spent-index-does-not-back
   "CTxMemPool::check compares every entry's stored parents and children
 with what its inputs and mapNextTx say (txmempool.cpp:505-535). Ours asks
