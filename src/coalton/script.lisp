@@ -20,9 +20,15 @@
   (alt-stack cl:nil :type cl:list)
   (script #() :type cl:vector)
   (position 0 :type (cl:and cl:fixnum cl:unsigned-byte))
-  (condition-stack cl:nil :type cl:list)
-  (executing cl:t :type cl:boolean)
+  ;; Core's ConditionStack (interpreter.cpp:273-318): the implied stack of
+  ;; IF/NOTIF conditions is never materialized, only its size and the
+  ;; position of its first false value, -1 for none (Core's NO_FALSE).
+  (cond-stack-size 0 :type (cl:and cl:fixnum cl:unsigned-byte))
+  (first-false-pos -1 :type cl:fixnum)
   (op-count 0 :type (cl:and cl:fixnum cl:unsigned-byte))
+  ;; Core's opcode_pos (interpreter.cpp:433, :439): opcodes read so far,
+  ;; executed or not -- what BIP 342 commits as the code separator position.
+  (opcode-pos 0 :type (cl:and cl:fixnum cl:unsigned-byte))
   (codesep-pos 0 :type (cl:and cl:fixnum cl:unsigned-byte))
   (tx-locktime 0 :type (cl:unsigned-byte 32))
   (tx-version 1 :type (cl:signed-byte 32))
@@ -999,8 +1005,8 @@ SigVersion::WITNESS_V0', the gate of MAX_SCRIPT_SIZE and MAX_OPS_PER_SCRIPT
   (repr :native script-context-data)
   (define-type ScriptContext
     "Execution context for one script execution (a mutable record).
-     Fields: main-stack, alt-stack, script, position, condition-stack,
-             executing, op-count, codesep-pos, tx-locktime, tx-version,
+     Fields: main-stack, alt-stack, script, position, cond-stack-size,
+             first-false-pos, op-count, codesep-pos, tx-locktime, tx-version,
              input-sequence, sigversion")
 
   (declare make-script-context-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> SigVersion -> ScriptContext))
@@ -1036,14 +1042,16 @@ under SIGVERSION."
     (lisp UFix (ctx) (script-context-data-position ctx)))
 
   (inline)
-  (declare context-condition-stack (ScriptContext -> (List Boolean)))
-  (define (context-condition-stack ctx)
-    (lisp (List Boolean) (ctx) (script-context-data-condition-stack ctx)))
-
-  (inline)
   (declare context-executing (ScriptContext -> Boolean))
   (define (context-executing ctx)
-    (lisp Boolean (ctx) (script-context-data-executing ctx)))
+    "Core's vfExec.all_true(): no false condition on the stack."
+    (lisp Boolean (ctx) (cl:= -1 (script-context-data-first-false-pos ctx))))
+
+  (inline)
+  (declare context-conditions-empty-p (ScriptContext -> Boolean))
+  (define (context-conditions-empty-p ctx)
+    "Core's vfExec.empty()."
+    (lisp Boolean (ctx) (cl:zerop (script-context-data-cond-stack-size ctx))))
 
   (inline)
   (declare context-op-count (ScriptContext -> UFix))
@@ -1095,18 +1103,6 @@ under SIGVERSION."
       (cl:progn (cl:setf (script-context-data-position ctx) pos) ctx)))
 
   (inline)
-  (declare context-set-condition-stack! ((List Boolean) -> ScriptContext -> ScriptContext))
-  (define (context-set-condition-stack! conds ctx)
-    (lisp ScriptContext (conds ctx)
-      (cl:progn (cl:setf (script-context-data-condition-stack ctx) conds) ctx)))
-
-  (inline)
-  (declare context-set-executing! (Boolean -> ScriptContext -> ScriptContext))
-  (define (context-set-executing! exec ctx)
-    (lisp ScriptContext (exec ctx)
-      (cl:progn (cl:setf (script-context-data-executing ctx) exec) ctx)))
-
-  (inline)
   (declare context-set-op-count! (UFix -> ScriptContext -> ScriptContext))
   (define (context-set-op-count! ops ctx)
     (lisp ScriptContext (ops ctx)
@@ -1127,42 +1123,50 @@ under SIGVERSION."
   ;;; Conditional Execution Helpers
   ;;; ============================================================
 
-  (declare all-true ((List Boolean) -> Boolean))
-  (define (all-true lst)
-    "Return True if all elements are True (or list is empty)."
-    (match lst
-      ((Nil) True)
-      ((Cons x xs) (if x (all-true xs) False))))
-
-  (declare update-executing-flag ((List Boolean) -> ScriptContext -> ScriptContext))
-  (define (update-executing-flag cond-stack ctx)
-    "Update both condition-stack and executing flag."
-    (let ((new-exec (all-true cond-stack)))
-      (context-set-executing! new-exec
-                              (context-set-condition-stack! cond-stack ctx))))
+  ;; Core's ConditionStack (interpreter.cpp:273-318), one operation each, all
+  ;; O(1): the elements cannot be observed individually, only whether the
+  ;; stack is empty and whether any is false. Walking a list of them on every
+  ;; IF, ELSE and ENDIF made N nested IFs O(N^2), unbounded in tapscript.
 
   (declare push-condition (Boolean -> ScriptContext -> ScriptContext))
-  (define (push-condition cond ctx)
-    "Push a condition onto the condition stack and update executing."
-    (let ((new-stack (Cons cond (context-condition-stack ctx))))
-      (update-executing-flag new-stack ctx)))
+  (define (push-condition fvalue ctx)
+    "Core's vfExec.push_back(fValue) (interpreter.cpp:286-294)."
+    (lisp ScriptContext (fvalue ctx)
+      (cl:progn
+        (cl:when (cl:and (cl:= -1 (script-context-data-first-false-pos ctx)) (cl:not fvalue))
+          (cl:setf (script-context-data-first-false-pos ctx)
+                   (script-context-data-cond-stack-size ctx)))
+        (cl:incf (script-context-data-cond-stack-size ctx))
+        ctx)))
 
   (declare pop-condition (ScriptContext -> (Optional ScriptContext)))
   (define (pop-condition ctx)
-    "Pop a condition from the stack, return None if empty."
-    (match (context-condition-stack ctx)
-      ((Nil) None)
-      ((Cons _ rest)
-       (Some (update-executing-flag rest ctx)))))
+    "Core's vfExec.pop_back() (interpreter.cpp:295-303); None when empty,
+which OP_ENDIF reports as UNBALANCED_CONDITIONAL (:647)."
+    (if (context-conditions-empty-p ctx)
+        None
+        (Some (lisp ScriptContext (ctx)
+                (cl:progn
+                  (cl:decf (script-context-data-cond-stack-size ctx))
+                  (cl:when (cl:= (script-context-data-first-false-pos ctx)
+                                 (script-context-data-cond-stack-size ctx))
+                    (cl:setf (script-context-data-first-false-pos ctx) -1))
+                  ctx)))))
 
   (declare toggle-top-condition (ScriptContext -> (Optional ScriptContext)))
   (define (toggle-top-condition ctx)
-    "Toggle the top condition (for ELSE), return None if empty."
-    (match (context-condition-stack ctx)
-      ((Nil) None)
-      ((Cons top rest)
-       (let ((new-stack (Cons (not top) rest)))
-         (Some (update-executing-flag new-stack ctx))))))
+    "Core's vfExec.toggle_top() (interpreter.cpp:304-317); None when empty,
+which OP_ELSE reports as UNBALANCED_CONDITIONAL (:639)."
+    (if (context-conditions-empty-p ctx)
+        None
+        (Some (lisp ScriptContext (ctx)
+                (cl:let ((top (cl:1- (script-context-data-cond-stack-size ctx)))
+                         (first-false (script-context-data-first-false-pos ctx)))
+                  (cl:cond ((cl:= first-false -1)
+                            (cl:setf (script-context-data-first-false-pos ctx) top))
+                           ((cl:= first-false top)
+                            (cl:setf (script-context-data-first-false-pos ctx) -1)))
+                  ctx)))))
 
   (declare is-control-flow-op (Opcode -> Boolean))
   (define (is-control-flow-op op)
@@ -1992,26 +1996,21 @@ else. Wiring either of them here rejects scripts Core accepts."
                                       (stack-push (if in-range (true-bytes) (false-bytes)) new-stack)
                                       ctx))))))))))))))))
 
-      ;; OP_CODESEPARATOR - mark position for CHECKSIG
+      ;; OP_CODESEPARATOR (interpreter.cpp:1048-1056): `pbegincodehash = pc',
+      ;; the context's CODESEP-POS, from which every CHECKSIG takes its script
+      ;; code; and `execdata.m_codeseparator_pos = opcode_pos', which only
+      ;; tapscript's sighash reads (BIP 342) -- our execdata is the
+      ;; *TAPSCRIPT-CODESEP-POS* RUN-TAPSCRIPT binds per execution, so it is
+      ;; written only there. This opcode's own index is the count read so far
+      ;; less one.
       ((OP-CODESEPARATOR)
-       ;; Update CL *current-script-code* for BIP 143 sighash in witness scripts
        (progn
-         (lisp Unit (ctx)
-           (cl:let* ((pos (context-position ctx))
-                     (script (context-script ctx))
-                     (sym (cl:find-symbol "*CURRENT-SCRIPT-CODE*" "BITCOIN-LISP.COALTON.INTEROP")))
-             (cl:when (cl:and sym (cl:boundp sym) (cl:symbol-value sym))
-               (cl:setf (cl:symbol-value sym)
-                        (bl.interop:coalton-vector-to-cl-array script pos)))
-             ;; BIP 342: record this OP_CODESEPARATOR's opcode index (not its
-             ;; byte offset) for the tapscript sighash. POS is the byte after
-             ;; the codeseparator, so its byte start is (1- POS).
-             (cl:let ((cs (cl:find-symbol "*TAPSCRIPT-CODESEP-POS*" "BITCOIN-LISP.COALTON.INTEROP"))
-                      (cfn (cl:find-symbol "COUNT-OPCODES-BEFORE" "BITCOIN-LISP.COALTON.INTEROP")))
-               (cl:when (cl:and cs (cl:boundp cs) cfn (cl:fboundp cfn))
-                 (cl:setf (cl:symbol-value cs)
-                          (cl:funcall cfn script (cl:max 0 (cl:1- pos)))))))
-           Unit)
+         (when (sigversion-tapscript-p (context-sigversion ctx))
+           (lisp Unit (ctx)
+             (cl:progn
+               (cl:setf (cl:symbol-value 'bl.interop:*tapscript-codesep-pos*)
+                        (cl:1- (script-context-data-opcode-pos ctx)))
+               Unit)))
          (ScriptOk (context-set-codesep-pos! (context-position ctx) ctx))))
 
       ;; Disabled opcodes
@@ -2423,14 +2422,16 @@ a consensus split."
           (exec (context-executing ctx)))
       (if (>= pos len)
           ;; Script finished - check for unbalanced conditionals
-          (match (context-condition-stack ctx)
-            ((Nil) (ScriptOk (context-main-stack ctx)))
-            (_other (ScriptErr SE-UnbalancedConditional)))
+          (if (context-conditions-empty-p ctx)
+              (ScriptOk (context-main-stack ctx))
+              (ScriptErr SE-UnbalancedConditional))
           ;; Read and execute next opcode
           (match (read-script-byte ctx)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk byte)
              (let ((op (byte-to-opcode byte)))
+               (lisp Unit (ctx)
+                 (cl:progn (cl:incf (script-context-data-opcode-pos ctx)) Unit))
                ;; Check op count limit: only opcodes > OP_16 (0x60) count towards limit
                ;; (push opcodes 0x00-0x4e, OP_1NEGATE 0x4f, OP_RESERVED 0x50, and
                ;; OP_1-OP_16 0x51-0x60 are exempt).

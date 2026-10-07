@@ -164,43 +164,14 @@ normal validation; the per-failure formatting cost is non-trivial.")
 (defvar *tapscript-codesep-pos* #xFFFFFFFF
   "BIP 342 codeseparator position for the tapscript currently executing:
    the opcode index of the last executed OP_CODESEPARATOR, or #xFFFFFFFF if
-   none. Set by the OP_CODESEPARATOR handler (src/coalton/script.lisp) and
+   none. Set by the OP_CODESEPARATOR handler (src/coalton/script.lisp) from the
+   execution's opcode count (Core's opcode_pos, interpreter.cpp:433) and
    committed in the BIP 341 sighash tail (Core's execdata.m_codeseparator_pos).
    run-tapscript rebinds it to #xFFFFFFFF per execution; the default matches
    the no-codeseparator value, so non-codesep sighashes are unchanged.")
 
-(defun count-opcodes-before (script target-byte)
-  "Number of opcodes in SCRIPT that start strictly before TARGET-BYTE —
-i.e. the 0-based opcode index of the opcode starting at TARGET-BYTE. Turns
-an OP_CODESEPARATOR's byte offset into the opcode position BIP 342 commits
-to the sighash. Skips pushdata payloads; a truncated trailing push counts
-as one opcode and ends the walk."
-  (let ((i 0) (idx 0) (len (length script)))
-    (loop while (< i target-byte)
-          do (let ((op (aref script i)))
-               (cond
-                 ((<= 1 op 75) (incf i (+ 1 op)))
-                 ((= op 76) (incf i (+ 2 (if (< (1+ i) len) (aref script (1+ i)) 0))))
-                 ((= op 77) (incf i (+ 3 (if (< (+ i 2) len)
-                                             (logior (aref script (1+ i))
-                                                     (ash (aref script (+ i 2)) 8))
-                                             0))))
-                 ((= op 78) (incf i (+ 5 (if (< (+ i 4) len)
-                                             (logior (aref script (1+ i))
-                                                     (ash (aref script (+ i 2)) 8)
-                                                     (ash (aref script (+ i 3)) 16)
-                                                     (ash (aref script (+ i 4)) 24))
-                                             0))))
-                 (t (incf i)))
-               (incf idx)))
-    idx))
-
 (defvar *debug-bip341-sighash* nil
   "When non-NIL, log every BIP 341 SigMsg preimage to compare with reference.")
-
-(defvar *current-script-code* nil
-  "The script code to use for sighash computation. For P2SH this is the redeemScript,
-   for legacy this is the scriptPubKey with OP_CODESEPARATOR handled.")
 
 (defvar *original-script-pubkey* nil
   "The original scriptPubKey being executed. Used for sighash computation in P2SH.
@@ -955,9 +926,13 @@ Returns (values success error-keyword)."
         (values t nil)))))
 
 (defun is-p2sh-script-p (script-bytes)
-  "Check if script matches P2SH pattern."
-  (let ((script-vec (cl-array-to-coalton-vector script-bytes)))
-    (bl.script:is-p2sh-script script-vec)))
+  "Core's CScript::IsPayToScriptHash (script/script.cpp:224-231), read off the
+octets: OP_HASH160 <20 bytes> OP_EQUAL. It used to copy the scriptPubKey into
+a Coalton vector (8 bytes per byte) to ask the engine's IS-P2SH-SCRIPT."
+  (and (= (length script-bytes) 23)
+       (= (aref script-bytes 0) #xa9)
+       (= (aref script-bytes 1) #x14)
+       (= (aref script-bytes 22) #x87)))
 
 (defun stack-top-truthy-p (stack)
   "Check if the stack is non-empty and the top element is truthy.
@@ -2109,8 +2084,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
   ;; scriptCode is serialized untouched (BIP 143).
   (when (and (flag-enabled-p "CONST_SCRIPTCODE")
              (eq sigversion bl.script:SigVersionBase))
-    (when (nth-value 1 (find-and-delete-sig (or *current-script-code* script-pubkey)
-                                            sig-bytes))
+    (when (nth-value 1 (find-and-delete-sig script-pubkey sig-bytes))
       (return-from verify-checksig (values nil :sig-findanddelete))))
 
   ;; Empty signature: nothing to parse, and NULLFAIL is gated on a non-empty
@@ -2146,7 +2120,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
     ;; step 0b/5b scans all three legacy scripts before any of them runs.
 
     ;; Compute sighash and verify
-    (let* ((subscript-raw (or *current-script-code* script-pubkey))
+    (let* ((subscript-raw script-pubkey)
            ;; The script bytes that actually feed the sighash. Lifted to
            ;; the outer let* so the *debug-checksig* print site can see it
            ;; for both legacy and witness paths (and for the test path,
@@ -2155,7 +2129,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
            (sighash (cond
                       ;; P2WSH: BIP 143 sighash. scriptCode is the witnessScript
                       ;; truncated at the last EXECUTED OP_CODESEPARATOR (the engine
-                      ;; rewrites *current-script-code* when it executes one) — and
+                      ;; hands over the script from its code separator) — and
                       ;; NOTHING else: remaining 0xab bytes are kept. Stripping them
                       ;; (legacy SerializeScriptCode behavior) computed a wrong
                       ;; sighash for any witnessScript carrying a codeseparator in
@@ -2690,31 +2664,28 @@ one to one -- a redundant encoding would give one expression two scripts
 ;;; ============================================================
 
 (defun is-witness-program-p (script)
-  "Check if SCRIPT is a witness program."
-  (let ((vec (cl-array-to-coalton-vector script)))
-    (eq (bl.script:is-witness-program vec) coalton:True)))
+  "Core's CScript::IsWitnessProgram (script/script.cpp:250-264), read off the
+octets: 4 to 42 bytes, OP_0 or OP_1..OP_16, then one direct push of exactly
+the rest. These three readers used to copy SCRIPT into a Coalton vector
+(8 bytes per byte) each time they were asked, three to five times per input."
+  (let ((len (length script)))
+    (and (<= 4 len 42)
+         (let ((version-byte (aref script 0)))
+           (or (zerop version-byte) (<= #x51 version-byte #x60)))
+         (= (+ 2 (aref script 1)) len))))
 
 (defun get-witness-version (script)
-  "Get witness version from SCRIPT. Returns NIL if not a witness program."
-  (let ((vec (cl-array-to-coalton-vector script)))
-    ;; If not a witness program, return nil
-    (unless (eq (bl.script:is-witness-program vec) coalton:True)
-      (return-from get-witness-version nil))
-    ;; Extract version byte directly
+  "Core's DecodeOP_N of a witness program's first byte (script.cpp:259), or
+NIL when SCRIPT is not a witness program."
+  (when (is-witness-program-p script)
     (let ((version-byte (aref script 0)))
-      (if (zerop version-byte)
-          0  ; Version 0
-          (- version-byte #x50)))))  ; OP_1-OP_16 -> 1-16
+      (if (zerop version-byte) 0 (- version-byte #x50)))))
 
 (defun get-witness-program-bytes (script)
-  "Get witness program bytes from SCRIPT. Returns NIL if not a witness program."
-  (let ((vec (cl-array-to-coalton-vector script)))
-    ;; If not a witness program, return nil
-    (unless (eq (bl.script:is-witness-program vec) coalton:True)
-      (return-from get-witness-program-bytes nil))
-    ;; Extract program bytes directly (skip version and push length)
-    (let ((push-len (aref script 1)))
-      (subseq script 2 (+ 2 push-len)))))
+  "A witness program's program bytes (script.cpp:260), or NIL when SCRIPT is
+not a witness program."
+  (when (is-witness-program-p script)
+    (subseq script 2)))
 
 (defun is-compressed-pubkey-p (pubkey)
   "Check if PUBKEY is a compressed public key (33 bytes, starts with 0x02 or 0x03)."
@@ -2835,7 +2806,6 @@ one to one -- a redundant encoding would give one expression two scripts
     ;; initial stack, as SigVersion::WITNESS_V0 (interpreter.cpp:1931), which
     ;; is what makes its CHECKSIG/CHECKMULTISIG hash with BIP 143.
     (let* ((*witness-input-amount* amount)
-           (*current-script-code* witness-script)
            (stack-items (butlast witness))
            (script-vec (cl-array-to-coalton-vector witness-script))
            ;; Witness items are ordered bottom-to-top; Coalton stack is top-first
