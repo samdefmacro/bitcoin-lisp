@@ -34,8 +34,6 @@ can. src/validation/.")
    #:are-inputs-standard-p
    #:is-witness-standard-p
    #:count-legacy-sigops
-   #:script-is-p2sh-p
-   #:witness-program-parts
    #:cast-to-bool
    #:output-is-dust-p
    ;; Core's reject-reason vocabulary (keyword -> state.GetRejectReason())
@@ -67,7 +65,6 @@ can. src/validation/.")
    #:package-tx-result-error
    ;; Script execution and input validation
    #:execute-script
-   #:script-is-witness-program-p
    #:get-input-witness
    #:validate-input-script
    ;; Script disassembly and classification
@@ -259,7 +256,6 @@ can. src/validation/.")
    #:ms-compute-type
    #:ms-compute-script-len
    #:ms-max-script-size
-   #:output-witness-program-p
    #:parse-par-threads))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)

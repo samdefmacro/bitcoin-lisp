@@ -897,8 +897,8 @@ estimator must answer the absence of an estimate."
     (is (= 546 (bl.val:dust-threshold p2pkh)))
     (is (= 294 (bl.val:dust-threshold p2wpkh)))
     (is (= 0 (bl.val:dust-threshold opret)))
-    (is-true (bl.val:output-witness-program-p p2wpkh))
-    (is-false (bl.val:output-witness-program-p p2pkh))))
+    (is-true (bl.interop:is-witness-program-p p2wpkh))
+    (is-false (bl.interop:is-witness-program-p p2pkh))))
 
 (test policy-scriptsig-push-only
   "The push-only predicate IsStandardTx asks (BL.INTEROP:SCRIPT-IS-PUSH-ONLY-P,

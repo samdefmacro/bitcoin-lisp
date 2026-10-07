@@ -436,6 +436,7 @@
    #:is-witness-program-p
    #:get-witness-version
    #:get-witness-program-bytes
+   #:witness-program-parts
    #:is-compressed-pubkey-p
    ;; Taproot / BIP 341
    #:is-taproot-program-p

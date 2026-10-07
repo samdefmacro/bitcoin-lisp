@@ -418,18 +418,6 @@ Returns NIL if script fails."
 
 ;;;; Witness and script type helpers (shared by transaction and block validation)
 
-(defun script-is-witness-program-p (script-pubkey)
-  "Check if SCRIPT-PUBKEY is a witness program (SegWit v0 or Taproot).
-Witness programs: OP_n <2-40 bytes> where n is 0-16."
-  (let ((len (length script-pubkey)))
-    (and (>= len 4) (<= len 42)
-         (let ((version-byte (aref script-pubkey 0))
-               (push-len (aref script-pubkey 1)))
-           (and (or (zerop version-byte)              ; OP_0
-                    (<= #x51 version-byte #x60))      ; OP_1..OP_16
-                (<= 2 push-len 40)
-                (= len (+ 2 push-len)))))))
-
 (defun get-input-witness (tx input-idx)
   "Get the witness stack for input INPUT-IDX of TX.
 Returns a list of byte vectors, or NIL if no witness data."

@@ -1114,6 +1114,7 @@ under SIGVERSION."
     (lisp ScriptContext (codesep ctx)
       (cl:progn (cl:setf (script-context-data-codesep-pos ctx) codesep) ctx)))
 
+  (inline)
   (declare advance-position (UFix -> ScriptContext -> ScriptContext))
   (define (advance-position n ctx)
     "Advance the script position by n bytes."
