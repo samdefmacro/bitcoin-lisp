@@ -26,6 +26,9 @@
   (cond-stack-size 0 :type (cl:and cl:fixnum cl:unsigned-byte))
   (first-false-pos -1 :type cl:fixnum)
   (op-count 0 :type (cl:and cl:fixnum cl:unsigned-byte))
+  ;; Core's opcode_pos (interpreter.cpp:433, :439): opcodes read so far,
+  ;; executed or not -- what BIP 342 commits as the code separator position.
+  (opcode-pos 0 :type (cl:and cl:fixnum cl:unsigned-byte))
   (codesep-pos 0 :type (cl:and cl:fixnum cl:unsigned-byte))
   (tx-locktime 0 :type (cl:unsigned-byte 32))
   (tx-version 1 :type (cl:signed-byte 32))
@@ -1993,26 +1996,21 @@ else. Wiring either of them here rejects scripts Core accepts."
                                       (stack-push (if in-range (true-bytes) (false-bytes)) new-stack)
                                       ctx))))))))))))))))
 
-      ;; OP_CODESEPARATOR - mark position for CHECKSIG
+      ;; OP_CODESEPARATOR (interpreter.cpp:1048-1056): `pbegincodehash = pc',
+      ;; the context's CODESEP-POS, from which every CHECKSIG takes its script
+      ;; code; and `execdata.m_codeseparator_pos = opcode_pos', which only
+      ;; tapscript's sighash reads (BIP 342) -- our execdata is the
+      ;; *TAPSCRIPT-CODESEP-POS* RUN-TAPSCRIPT binds per execution, so it is
+      ;; written only there. This opcode's own index is the count read so far
+      ;; less one.
       ((OP-CODESEPARATOR)
-       ;; Update CL *current-script-code* for BIP 143 sighash in witness scripts
        (progn
-         (lisp Unit (ctx)
-           (cl:let* ((pos (context-position ctx))
-                     (script (context-script ctx))
-                     (sym (cl:find-symbol "*CURRENT-SCRIPT-CODE*" "BITCOIN-LISP.COALTON.INTEROP")))
-             (cl:when (cl:and sym (cl:boundp sym) (cl:symbol-value sym))
-               (cl:setf (cl:symbol-value sym)
-                        (bl.interop:coalton-vector-to-cl-array script pos)))
-             ;; BIP 342: record this OP_CODESEPARATOR's opcode index (not its
-             ;; byte offset) for the tapscript sighash. POS is the byte after
-             ;; the codeseparator, so its byte start is (1- POS).
-             (cl:let ((cs (cl:find-symbol "*TAPSCRIPT-CODESEP-POS*" "BITCOIN-LISP.COALTON.INTEROP"))
-                      (cfn (cl:find-symbol "COUNT-OPCODES-BEFORE" "BITCOIN-LISP.COALTON.INTEROP")))
-               (cl:when (cl:and cs (cl:boundp cs) cfn (cl:fboundp cfn))
-                 (cl:setf (cl:symbol-value cs)
-                          (cl:funcall cfn script (cl:max 0 (cl:1- pos)))))))
-           Unit)
+         (when (sigversion-tapscript-p (context-sigversion ctx))
+           (lisp Unit (ctx)
+             (cl:progn
+               (cl:setf (cl:symbol-value 'bl.interop:*tapscript-codesep-pos*)
+                        (cl:1- (script-context-data-opcode-pos ctx)))
+               Unit)))
          (ScriptOk (context-set-codesep-pos! (context-position ctx) ctx))))
 
       ;; Disabled opcodes
@@ -2432,6 +2430,8 @@ a consensus split."
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk byte)
              (let ((op (byte-to-opcode byte)))
+               (lisp Unit (ctx)
+                 (cl:progn (cl:incf (script-context-data-opcode-pos ctx)) Unit))
                ;; Check op count limit: only opcodes > OP_16 (0x60) count towards limit
                ;; (push opcodes 0x00-0x4e, OP_1NEGATE 0x4f, OP_RESERVED 0x50, and
                ;; OP_1-OP_16 0x51-0x60 are exempt).

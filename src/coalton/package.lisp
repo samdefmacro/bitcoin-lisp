@@ -406,7 +406,6 @@
    #:*debug-bip341-sighash*
    #:*current-input-index*
    #:*debug-checksig*
-   #:*current-script-code*
    #:compute-legacy-sighash
    ;; Sighash precomputation
    #:*precomputed-sighash*

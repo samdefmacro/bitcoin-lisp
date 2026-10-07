@@ -1523,3 +1523,21 @@ more than 8 bytes per script byte."
       (is (< (per-call #'bl.interop:is-p2sh-script-p p2sh) 8))
       (is (< (per-call #'bl.interop:is-witness-program-p p2wsh) 8))
       (is (< (per-call #'bl.interop:get-witness-version p2wsh) 8)))))
+
+(test tapscript-codeseparator-position-is-the-opcode-count
+  "Core's OP_CODESEPARATOR sets execdata.m_codeseparator_pos = opcode_pos, a
+counter EvalScript keeps per opcode read (script/interpreter.cpp:433, :439,
+:1054-1055). Ours re-scanned the script from its start at every
+OP_CODESEPARATOR to count the opcodes before it: O(N^2) for N separators, and
+tapscript has no MAX_SCRIPT_SIZE. Now the context counts. The position BIP 342
+commits is the LAST executed separator's opcode index -- here, after a 3-byte
+push and N separators, N+0 (the push is opcode 0) -- and 40,000 separators run
+in under a second."
+  (let* ((n 40000)
+         (script (concatenate 'simple-vector #(#x02 #x07 #x07)
+                              (make-array n :initial-element #xab) #(#x51)))
+         (bl.interop:*tapscript-codesep-pos* #xFFFFFFFF))
+    (multiple-value-bind (ok ms) (%tapscript-run-ms script)
+      (is-true ok)
+      (is (eql n bl.interop:*tapscript-codesep-pos*))
+      (is (< ms 1000) "~D OP_CODESEPARATORs took ~D ms" n (round ms)))))

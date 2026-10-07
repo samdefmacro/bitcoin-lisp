@@ -164,43 +164,14 @@ normal validation; the per-failure formatting cost is non-trivial.")
 (defvar *tapscript-codesep-pos* #xFFFFFFFF
   "BIP 342 codeseparator position for the tapscript currently executing:
    the opcode index of the last executed OP_CODESEPARATOR, or #xFFFFFFFF if
-   none. Set by the OP_CODESEPARATOR handler (src/coalton/script.lisp) and
+   none. Set by the OP_CODESEPARATOR handler (src/coalton/script.lisp) from the
+   execution's opcode count (Core's opcode_pos, interpreter.cpp:433) and
    committed in the BIP 341 sighash tail (Core's execdata.m_codeseparator_pos).
    run-tapscript rebinds it to #xFFFFFFFF per execution; the default matches
    the no-codeseparator value, so non-codesep sighashes are unchanged.")
 
-(defun count-opcodes-before (script target-byte)
-  "Number of opcodes in SCRIPT that start strictly before TARGET-BYTE —
-i.e. the 0-based opcode index of the opcode starting at TARGET-BYTE. Turns
-an OP_CODESEPARATOR's byte offset into the opcode position BIP 342 commits
-to the sighash. Skips pushdata payloads; a truncated trailing push counts
-as one opcode and ends the walk."
-  (let ((i 0) (idx 0) (len (length script)))
-    (loop while (< i target-byte)
-          do (let ((op (aref script i)))
-               (cond
-                 ((<= 1 op 75) (incf i (+ 1 op)))
-                 ((= op 76) (incf i (+ 2 (if (< (1+ i) len) (aref script (1+ i)) 0))))
-                 ((= op 77) (incf i (+ 3 (if (< (+ i 2) len)
-                                             (logior (aref script (1+ i))
-                                                     (ash (aref script (+ i 2)) 8))
-                                             0))))
-                 ((= op 78) (incf i (+ 5 (if (< (+ i 4) len)
-                                             (logior (aref script (1+ i))
-                                                     (ash (aref script (+ i 2)) 8)
-                                                     (ash (aref script (+ i 3)) 16)
-                                                     (ash (aref script (+ i 4)) 24))
-                                             0))))
-                 (t (incf i)))
-               (incf idx)))
-    idx))
-
 (defvar *debug-bip341-sighash* nil
   "When non-NIL, log every BIP 341 SigMsg preimage to compare with reference.")
-
-(defvar *current-script-code* nil
-  "The script code to use for sighash computation. For P2SH this is the redeemScript,
-   for legacy this is the scriptPubKey with OP_CODESEPARATOR handled.")
 
 (defvar *original-script-pubkey* nil
   "The original scriptPubKey being executed. Used for sighash computation in P2SH.
@@ -2113,8 +2084,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
   ;; scriptCode is serialized untouched (BIP 143).
   (when (and (flag-enabled-p "CONST_SCRIPTCODE")
              (eq sigversion bl.script:SigVersionBase))
-    (when (nth-value 1 (find-and-delete-sig (or *current-script-code* script-pubkey)
-                                            sig-bytes))
+    (when (nth-value 1 (find-and-delete-sig script-pubkey sig-bytes))
       (return-from verify-checksig (values nil :sig-findanddelete))))
 
   ;; Empty signature: nothing to parse, and NULLFAIL is gated on a non-empty
@@ -2150,7 +2120,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
     ;; step 0b/5b scans all three legacy scripts before any of them runs.
 
     ;; Compute sighash and verify
-    (let* ((subscript-raw (or *current-script-code* script-pubkey))
+    (let* ((subscript-raw script-pubkey)
            ;; The script bytes that actually feed the sighash. Lifted to
            ;; the outer let* so the *debug-checksig* print site can see it
            ;; for both legacy and witness paths (and for the test path,
@@ -2159,7 +2129,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
            (sighash (cond
                       ;; P2WSH: BIP 143 sighash. scriptCode is the witnessScript
                       ;; truncated at the last EXECUTED OP_CODESEPARATOR (the engine
-                      ;; rewrites *current-script-code* when it executes one) — and
+                      ;; hands over the script from its code separator) — and
                       ;; NOTHING else: remaining 0xab bytes are kept. Stripping them
                       ;; (legacy SerializeScriptCode behavior) computed a wrong
                       ;; sighash for any witnessScript carrying a codeseparator in
@@ -2836,7 +2806,6 @@ not a witness program."
     ;; initial stack, as SigVersion::WITNESS_V0 (interpreter.cpp:1931), which
     ;; is what makes its CHECKSIG/CHECKMULTISIG hash with BIP 143.
     (let* ((*witness-input-amount* amount)
-           (*current-script-code* witness-script)
            (stack-items (butlast witness))
            (script-vec (cl-array-to-coalton-vector witness-script))
            ;; Witness items are ordered bottom-to-top; Coalton stack is top-first
