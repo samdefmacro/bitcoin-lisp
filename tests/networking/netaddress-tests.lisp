@@ -887,6 +887,36 @@ permanently false; with -discover ported it is a drive site that must exist."
                  (%peer-reporting-our-address "8.8.8.8" t 10 0 0 1 18444))
                 "an unroutable report is no address"))))
 
+(test a-peer-is-connected-through-its-address-class
+  "Core CNode::ConnectedThroughNetwork (net.cpp:602-605) is m_inbound_onion ?
+NET_ONION : addr.GetNetClass() -- the CLASS of the address, which is
+NET_UNROUTABLE for one that is not publicly routable and NET_IPV4 for an
+IPv6 address carrying an IPv4 one (netaddress.cpp:674-690). Ours answered the
+address's network, so a peer at 10.0.0.1 or 127.0.0.1 shared the getaddr
+response cache with routable IPv4 peers (Core keys it by the class,
+net.cpp:1832-1836) and getpeerinfo's network field, which already followed
+Core, disagreed with it. Found by the net fuzz target (tests/fuzz/net.lisp).
+
+GetLocal reads the class for its privacy rule only; its rank is
+GetReachabilityFrom(peer.addr), the address's own network. So a 10.0.0.1 peer
+is still offered our IPv4 address over our IPv6 one (an IPv4 partner rates
+IPv6 REACH_DEFAULT), where ranking from the class -- Core's unroutable arm,
+which rates IPv6 above IPv4 here -- would offer the IPv6 one."
+  (flet ((through (address &rest args)
+           (bl.net:peer-connected-through-network (apply #'bl.net:make-peer :address address args))))
+    (is (eq :ipv4 (through "8.8.8.8")) "control: a routable IPv4 peer")
+    (is (eq :torv3 (through "127.0.0.1" :inbound t :inbound-onion t)))
+    (is (eq :unroutable (through "seed.example.com")))
+    (is (eq :ipv4 (through "2002:808:808::1")) "6to4 carries 8.8.8.8: NET_IPV4")
+    (is (eq :unroutable (through "127.0.0.1")) "loopback is not routable")
+    (is (eq :unroutable (through "10.0.0.1")) "RFC1918 is not routable"))
+  (%with-local-address-table
+    (bl.net:add-local :ipv4 (bl.net:ipv4-to-mapped-ipv6 1 2 3 4) 8333 bl.net:+local-manual+)
+    (bl.net:add-local :ipv6 (nth-value 1 (bl.net:parse-network-address "2a00::1")) 8333 bl.net:+local-manual+)
+    (let ((la (bl.net:get-local-addr-for-peer (bl.net:make-peer :address "10.0.0.1"))))
+      (is (eq :ipv4 (and la (bl.net:local-address-network la)))
+          "a private IPv4 peer is offered ~S, not our IPv4 address" la))))
+
 (test subnet-netmask-must-be-contiguous
   "Core's CSubNet(addr, mask) refuses a netmask with a one bit after a zero bit
 (netaddress.cpp:961-978), so LookupSubNet (netbase.cpp:812-845) reports

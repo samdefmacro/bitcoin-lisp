@@ -791,13 +791,18 @@ whose address we cannot type (Core's default arm)."
          (:torv3 +reach-private+)
          (t +reach-default+)))))
 
-(defun best-local-address (peer-network)
+(defun best-local-address (peer-network &optional (partner-network peer-network))
   "The best local address to advertise to a peer connected through
 PEER-NETWORK (Core GetLocal, net.cpp:166-196): highest reachability, then
 highest score, subject to the privacy rule — never advertise a privacy-net
 (onion/I2P) address to a peer on a different network, and never advertise
 any other-network address to a privacy-net peer. Returns the local-address
-record, or NIL."
+record, or NIL.
+
+Core reads two different things off the peer: the privacy rule compares with
+ConnectedThroughNetwork (the address's CLASS, :unroutable for a private one),
+the rank is GetReachabilityFrom(peer.addr), whose partner is the address's
+own NETWORK (GetExtNetwork). PARTNER-NETWORK is that network when it differs."
   (let ((best nil)
         (best-reach -1)
         (best-score -1))
@@ -807,7 +812,7 @@ record, or NIL."
           (unless (and (not (eq net peer-network))
                        (or (privacy-network-p net)
                            (privacy-network-p peer-network)))
-            (let ((reach (network-reachability-from net peer-network))
+            (let ((reach (network-reachability-from net partner-network))
                   (score (local-address-score la)))
               (when (or (> reach best-reach)
                         (and (= reach best-reach) (> score best-score)))
