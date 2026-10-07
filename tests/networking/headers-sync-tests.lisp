@@ -220,3 +220,36 @@ presync; a non-full batch is not (the peer has nothing more to prove work with).
            (bl.net::maybe-start-presync headers state t)))
       ;; Non-full batch -> store normally (no presync).
       (is (null (bl.net::maybe-start-presync headers state nil))))))
+
+(test redownload-checks-difficulty-against-the-chain-start-when-its-buffer-is-empty
+  "Core ValidateAndStoreRedownloadedHeader takes the previous nBits from the
+last BUFFERED header, or from the chain start when the buffer is empty
+(headerssync.cpp:230-235). With a buffer that releases every header
+(redownload buffer size 0), a chain that retargeted at 2016 is refused at
+2017 in its second batch: the buffer is empty again, so 2017's nBits is
+compared with the chain start's, off a retarget boundary. Ours kept the last
+redownloaded header's nBits and took it. The control: the same chain in one
+batch is accepted, since the buffer still holds 2016 when 2017 is checked."
+  (with-network (:mainnet)
+    (let* ((b0 #x1b0404cb)
+           (b1 (bl.store:target-to-bits (* 2 (bl.store:bits-to-target b0))))
+           (work (* 3 (hs-per-header-work b1)))
+           (start (hs-start-entry (hs-hash 7) b0 :height 2015 :timestamp 1700000000))
+           (chain (hs-build-chain 3 (hs-hash 7) b1)))
+      (flet ((sync ()
+               (let ((hss (bl.net:make-headers-sync start work :network :mainnet
+                                                               :now 1800000000 :salt (hs-salt))))
+                 (setf (bl.net:hss-commitment-period hss) 1000000
+                       (bl.net:hss-commit-offset hss) 0
+                       (bl.net:hss-redownload-buffer-size hss) 0)
+                 (bl.net:hss-process-next-headers hss chain t)
+                 hss)))
+        (let ((hss (sync)))
+          (is (eq :redownload (bl.net:hss-state hss)) "presync reached the minimum work")
+          (is-true (bl.net:hss-process-next-headers hss (subseq chain 0 1) t)
+                   "2016 retargets from the chain start's nBits")
+          (is-false (bl.net:hss-process-next-headers hss (subseq chain 1) t)
+                    "2017 is checked against the chain start's nBits"))
+        (let ((hss (sync)))
+          (is-true (bl.net:hss-process-next-headers hss chain t)
+                   "control: in one batch, 2017 is checked against 2016's"))))))

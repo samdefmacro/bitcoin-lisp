@@ -87,6 +87,10 @@ commitments)."
   (redownload-buffer (%make-hss-queue))          ; FIFO of full block-header objects
   (redownload-last-height 0)
   (redownload-last-hash nil)
+  ;; The nBits a redownloaded header's difficulty transition is checked
+  ;; against: the last BUFFERED header's, or the chain start's while the
+  ;; buffer is empty (headerssync.cpp:230-235) -- so after a pop drains it,
+  ;; the chain start's again.
   (redownload-last-bits 0 :type (unsigned-byte 32))
   (redownload-work 0)                            ; cumulative redownloaded work (bignum)
   (process-all-remaining nil :type boolean))
@@ -297,6 +301,10 @@ target work is reached. Mirrors PopHeadersReadyForAcceptance."
     (loop while (or (> (hss-queue-size buf) limit)
                     (and (plusp (hss-queue-size buf)) (hss-process-all-remaining hss)))
           do (push (hss-queue-pop buf) ready))
+    ;; Core reads the previous nBits off m_redownloaded_headers.back(), and
+    ;; off m_chain_start when that buffer is empty (headerssync.cpp:230-235).
+    (when (and ready (hss-queue-empty-p buf))
+      (setf (hss-redownload-last-bits hss) (hss-chain-start-bits hss)))
     (nreverse ready)))
 
 ;;; --- Driver entry points (called from sync-headers)
