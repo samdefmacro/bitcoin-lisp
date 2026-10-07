@@ -73,18 +73,18 @@ predate it and keep their own copies for now)."
            (let ((host (subseq spec 1 close))
                  (rest (subseq spec (1+ close))))
              (if (and (> (length rest) 1) (char= (char rest 0) #\:)
-                      (every #'digit-char-p (subseq rest 1)))
-                 (values host (parse-integer rest :start 1))
+                      (every #'bl.bytes:ascii-digit-p (subseq rest 1)))
+                 (values host (bl.bytes:parse-ascii-integer rest :start 1))
                  (values host default-port)))
            (values spec default-port))))
     (t
      (let ((colon (position #\: spec :from-end t)))
        (if (and colon
                 (< (1+ colon) (length spec))
-                (every #'digit-char-p (subseq spec (1+ colon)))
+                (every #'bl.bytes:ascii-digit-p (subseq spec (1+ colon)))
                 ;; A single colon => host:port; multiple => bare IPv6.
                 (= colon (position #\: spec)))
-           (values (subseq spec 0 colon) (parse-integer spec :start (1+ colon)))
+           (values (subseq spec 0 colon) (bl.bytes:parse-ascii-integer spec :start (1+ colon)))
            (values spec default-port))))))
 
 (defun dialable-network-p (network)
@@ -478,8 +478,8 @@ here needs that, so a .onion or .b32.i2p subnet is refused."
                    (cond ((null suffix) (%prefix-netmask 128))
                          ((not ip) nil)
                          ((and (plusp (length suffix))
-                               (every #'digit-char-p suffix))
-                          (let ((bits (parse-integer suffix)))
+                               (every #'bl.bytes:ascii-digit-p suffix))
+                          (let ((bits (bl.bytes:parse-ascii-integer suffix)))
                             (when (<= 0 bits (- 128 offset))
                               (%prefix-netmask (+ offset bits)))))
                          (t

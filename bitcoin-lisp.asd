@@ -651,6 +651,8 @@ bitcoin-cli (node-main)."
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence
                              (:file "wave10-tests")
+                             ;; Core's ASCII digits at every parser of outside input
+                             (:file "ascii-digit-tests")
                              ;; GA8 W1-A: intra-block coin overlay (chained-spend
                              ;; script validation + same-block double spends)
                              (:file "validation/intrablock-coins-tests")

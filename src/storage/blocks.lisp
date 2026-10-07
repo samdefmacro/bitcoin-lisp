@@ -500,7 +500,7 @@ all."
                                             (ensure-directories store)))
               for name = (pathname-name path)
               for number = (and (> (length name) skip)
-                                (parse-integer name :start skip :junk-allowed t))
+                                (bl.bytes:parse-ascii-integer name :start skip :junk-allowed t))
               when number collect number)
         #'<))
 

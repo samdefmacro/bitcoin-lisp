@@ -48,8 +48,8 @@
 (defun %rest-parse-count (text)
   "A `count' as Core's ToIntegral<size_t> reads it (rest.cpp:205-209): decimal
 digits and nothing else -- no sign, no trailing junk -- or NIL."
-  (and (stringp text) (plusp (length text)) (every #'digit-char-p text)
-       (parse-integer text)))
+  (and (stringp text) (plusp (length text)) (every #'bl.bytes:ascii-digit-p text)
+       (bl.bytes:parse-ascii-integer text)))
 
 (defun %rest-json (alist-or-value)
   "Encode an RPC-shaped result as a JSON string (200 application/json)."
@@ -112,8 +112,8 @@ int32 range. NIL otherwise."
   (let* ((digits (if (and (plusp (length text)) (char= (char text 0) #\-))
                      (subseq text 1)
                      text)))
-    (when (and (plusp (length digits)) (every #'digit-char-p digits))
-      (let ((value (parse-integer text)))
+    (when (and (plusp (length digits)) (every #'bl.bytes:ascii-digit-p digits))
+      (let ((value (bl.bytes:parse-ascii-integer text)))
         (when (<= (- (expt 2 31)) value (1- (expt 2 31)))
           value)))))
 
@@ -332,9 +332,9 @@ ToIntegral<uint32_t> (digits only — no sign, no junk; rest.cpp:927-941)."
             (vout-str (subseq op (1+ dash))))
         (when (and (valid-hex-hash-p txid-hex)
                    (plusp (length vout-str))
-                   (every #'digit-char-p vout-str)
+                   (every #'bl.bytes:ascii-digit-p vout-str)
                    (<= (length vout-str) 10))
-          (let ((vout (parse-integer vout-str)))
+          (let ((vout (bl.bytes:parse-ascii-integer vout-str)))
             (when (<= vout #xFFFFFFFF)
               (values (parse-hex-hash txid-hex) vout))))))))
 
@@ -589,8 +589,8 @@ not wrap, so a plain + is already the safe version."
 Core parses these with ToIntegral<size_t>, so a negative or non-numeric value
 is not a zero — it is a 400."
   (let ((v (hunchentoot:get-parameter name)))
-    (when (and v (plusp (length v)) (every #'digit-char-p v))
-      (parse-integer v :junk-allowed t))))
+    (when (and v (plusp (length v)) (every #'bl.bytes:ascii-digit-p v))
+      (bl.bytes:parse-ascii-integer v :junk-allowed t))))
 
 (defun %rest-deploymentinfo (node body ext)
   "/rest/deploymentinfo[/<blockhash>] — JSON only, as in Core
@@ -927,8 +927,8 @@ pct-encoded form evhttp_uri_parse refuses."
   (loop for i from 0 below (length uri)
         thereis (and (char= (char uri i) #\%)
                      (not (and (< (+ i 2) (length uri))
-                               (digit-char-p (char uri (+ i 1)) 16)
-                               (digit-char-p (char uri (+ i 2)) 16))))))
+                               (bl.bytes:ascii-hex-digit-p (char uri (+ i 1)))
+                               (bl.bytes:ascii-hex-digit-p (char uri (+ i 2))))))))
 
 (defmethod hunchentoot:acceptor-status-message ((acceptor rpc-acceptor)
                                                 (http-status-code (eql 400))

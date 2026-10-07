@@ -128,8 +128,8 @@ digits, optionally preceded by `-'; no `+', no whitespace, no trailing junk."
     (when (plusp n)
       (let ((start (if (char= (char string 0) #\-) 1 0)))
         (when (and (> n start)
-                   (every #'digit-char-p (subseq string start)))
-          (parse-integer string))))))
+                   (every #'bl.bytes:ascii-digit-p (subseq string start)))
+          (bl.bytes:parse-ascii-integer string))))))
 
 (defun apply-versionbits-parameters (specs)
   "Install the -vbparams overrides in SPECS, each `deployment:start:end' or

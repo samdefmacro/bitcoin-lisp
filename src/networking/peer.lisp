@@ -2332,7 +2332,7 @@ the loopback itself and takes every onion peer with it."
            (let ((dot (position #\. address)))
              (and dot
                   (let ((first-octet (ignore-errors
-                                      (parse-integer address :end dot))))
+                                      (bl.bytes:parse-ascii-integer address :end dot))))
                     (and first-octet (or (= first-octet 127) (= first-octet 0)))))))))
 
 (defun peer-permissions (peer)

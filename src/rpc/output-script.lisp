@@ -44,7 +44,7 @@ wallet_fundrawtransaction.py:1054-1055 reads the first two.
 Core's IsHex refuses the empty string and any odd length
 (util/strencodings.cpp), so an empty string is not hex here either."
   (unless (and (stringp hex) (plusp (length hex)) (evenp (length hex))
-               (every (lambda (ch) (digit-char-p ch 16)) hex))
+               (every #'bl.bytes:ascii-hex-digit-p hex))
     (error 'rpc-error :code +rpc-invalid-address-or-key+
                       :message (format nil "Pubkey \"~A\" must be a hex string" hex)))
   (unless (or (= (length hex) 66) (= (length hex) 130))

@@ -1085,7 +1085,7 @@ PARAMS: (peer_id msg_type msg). Returns an empty object."
                       :message (format nil "Error: msg_type too long, max length is ~D"
                                        +max-message-type-size+)))
   (unless (and (stringp msg-hex) (evenp (length msg-hex))
-               (every (lambda (c) (digit-char-p c 16)) msg-hex))
+               (every #'bl.bytes:ascii-hex-digit-p msg-hex))
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message "Error parsing input for msg"))
   (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))

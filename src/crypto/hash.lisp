@@ -281,7 +281,11 @@ key it differently but construct it identically."
   (ironclad:byte-array-to-hex-string bytes))
 
 (defun hex-to-bytes (hex-string)
-  "Convert a hexadecimal string to a byte vector."
+  "Convert a hexadecimal string to a byte vector. Only ASCII hex digits are
+digits, as in Core's ParseHex (util/strencodings.cpp:56-72): ironclad's
+parser reads any Unicode decimal digit, so the string is checked first."
+  (unless (every #'bl.bytes:ascii-hex-digit-p hex-string)
+    (error "Invalid hex string ~S" hex-string))
   (ironclad:hex-string-to-byte-array hex-string))
 
 (defun reverse-bytes (bytes)

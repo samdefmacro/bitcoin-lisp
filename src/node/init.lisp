@@ -921,7 +921,7 @@ reindex will download what it needs. Returns the number of files removed."
       (let ((name (file-namestring file)))
         (when (= (length name) 12)
           (cond ((alexandria:starts-with-subseq "blk" name)
-                 (let ((n (parse-integer name :start 3 :end 8 :junk-allowed t)))
+                 (let ((n (bl.bytes:parse-ascii-integer name :start 3 :end 8 :junk-allowed t)))
                    (push (cons (or n -1) file) blocks)))
                 ((alexandria:starts-with-subseq "rev" name)
                  (delete-file file)

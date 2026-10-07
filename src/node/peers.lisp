@@ -1056,18 +1056,18 @@ bare IPv6 address (which contains colons) is treated as host-only."
                    (rest (subseq spec (1+ close))))
                (if (and (plusp (length rest)) (char= (char rest 0) #\:)
                         (plusp (length (subseq rest 1)))
-                        (every #'digit-char-p (subseq rest 1)))
-                   (values host (parse-integer rest :start 1))
+                        (every #'bl.bytes:ascii-digit-p (subseq rest 1)))
+                   (values host (bl.bytes:parse-ascii-integer rest :start 1))
                    (values host default-port)))
              (values spec default-port))))
       (t
        (let ((colon (position #\: spec :from-end t)))
          (if (and colon
                   (< (1+ colon) (length spec))
-                  (every #'digit-char-p (subseq spec (1+ colon)))
+                  (every #'bl.bytes:ascii-digit-p (subseq spec (1+ colon)))
                   ;; A single colon => host:port; multiple => bare IPv6.
                   (= colon (position #\: spec)))
-             (values (subseq spec 0 colon) (parse-integer spec :start (1+ colon)))
+             (values (subseq spec 0 colon) (bl.bytes:parse-ascii-integer spec :start (1+ colon)))
              (values spec default-port)))))))
 
 (defconstant +behind-retry-seconds+ 5

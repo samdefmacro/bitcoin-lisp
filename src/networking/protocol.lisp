@@ -66,7 +66,7 @@ only equality between keys matters to the callers."
         (when (= dots 2)
           (setf end i)
           (return))))
-    (if (and end (every (lambda (c) (or (digit-char-p c) (char= c #\.)))
+    (if (and end (every (lambda (c) (or (bl.bytes:ascii-digit-p c) (char= c #\.)))
                         (subseq addr 0 end)))
         (subseq addr 0 end)
         ;; Non-dotted-quad: parse to a typed address and use its byte-level

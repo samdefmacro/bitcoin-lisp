@@ -3300,7 +3300,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
           (when s-present
             (dolist (hex scripts)
               (unless (and (stringp hex) (evenp (length hex))
-                           (every (lambda (ch) (digit-char-p ch 16)) hex))
+                           (every #'bl.bytes:ascii-hex-digit-p hex))
                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                   :message (format nil "'~A' is not hex" hex)))
               (%wcc-add-external-script cc (bl.crypto:hex-to-bytes hex)))))

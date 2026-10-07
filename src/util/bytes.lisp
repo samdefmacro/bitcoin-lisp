@@ -622,3 +622,31 @@ leading minus for a negative amount."
                          (digit-char-p (char str (- end 3))))
               do (decf end))
         (concatenate 'string (if (minusp satoshis) "-" "") (subseq str 0 end))))))
+
+;;;; ASCII digits (Core util/strencodings.h IsDigit, util/strencodings.cpp
+;;;; HexDigit). CL's DIGIT-CHAR-P and PARSE-INTEGER accept every Unicode
+;;;; decimal digit -- SBCL reads U+0663 ARABIC-INDIC DIGIT THREE as 3 and
+;;;; U+FF11 FULLWIDTH DIGIT ONE as 1 -- so a parser built on them accepts
+;;;; strings Core refuses. Everything that parses outside input uses these.
+
+(declaim (inline ascii-digit-p ascii-hex-digit-p))
+
+(defun ascii-digit-p (char)
+  "Core IsDigit: CHAR is one of 0-9."
+  (char<= #\0 char #\9))
+
+(defun ascii-hex-digit-p (char)
+  "Core HexDigit(c) >= 0: CHAR is one of 0-9, a-f, A-F."
+  (or (char<= #\0 char #\9) (char<= #\a char #\f) (char<= #\A char #\F)))
+
+(defun parse-ascii-integer (string &key (start 0) end (radix 10) junk-allowed)
+  "PARSE-INTEGER with Core's digits: a non-ASCII character is never a digit
+(so it is junk, or an error without JUNK-ALLOWED) -- the one difference.
+Returns the same two values."
+  (flet ((non-ascii-p (c) (>= (char-code c) 128)))
+    (parse-integer (if (find-if #'non-ascii-p string :start start :end end)
+                       ;; Same length, so START, END and the index returned
+                       ;; still name the caller's positions.
+                       (substitute-if (code-char 0) #'non-ascii-p string)
+                       string)
+                   :start start :end end :radix radix :junk-allowed junk-allowed)))

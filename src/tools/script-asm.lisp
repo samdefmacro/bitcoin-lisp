@@ -74,7 +74,7 @@ decimal."
           ;; A number, optionally negative.
           ((or (%all-digits-p word)
                (and (char= (char word 0) #\-) (%all-digits-p word :start 1)))
-           (let ((n (ignore-errors (parse-integer word))))
+           (let ((n (ignore-errors (bl.bytes:parse-ascii-integer word))))
              (unless (and n (<= (- #xffffffff) n #xffffffff))
                (error 'script-asm-error
                       :message "script parse error: decimal numeric value only allowed in the range -0xFFFFFFFF...0xFFFFFFFF"))

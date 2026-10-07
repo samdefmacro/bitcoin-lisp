@@ -23,8 +23,8 @@
   (declare (ignore method))
   (when args
     (let* ((s (first args))
-           (n (and (plusp (length s)) (every #'digit-char-p s) (<= (length s) 3)
-                   (let ((v (parse-integer s))) (and (<= v 255) v)))))
+           (n (and (plusp (length s)) (every #'bl.bytes:ascii-digit-p s) (<= (length s) 3)
+                   (let ((v (bl.bytes:parse-ascii-integer s))) (and (<= v 255) v)))))
       (unless n
         (cli-error "invalid -netinfo level argument: ~A~%For more information, run: bitcoin-cli -netinfo help" s))
       (setf (netinfo-level h) (min n +netinfo-max-level+))

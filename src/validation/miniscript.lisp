@@ -1315,7 +1315,7 @@ but a node whose type is zero."))
 
 (defun %ms-parse-hex (string expected-bytes what)
   (unless (and (= (length string) (* 2 expected-bytes))
-               (every (lambda (c) (digit-char-p c 16)) string))
+               (every #'bl.bytes:ascii-hex-digit-p string))
     (%ms-fail "~A must be ~D hex characters, got ~S" what (* 2 expected-bytes) string))
   (bl.crypto:hex-to-bytes string))
 
@@ -1332,7 +1332,7 @@ after(-1) was rejected only incidentally, by the range test below."
   (unless (and (plusp (length string))
                (every (lambda (c) (char<= #\0 c #\9)) string))
     (%ms-fail "~A must be a number, got ~S" what string))
-  (let ((n (parse-integer string)))
+  (let ((n (bl.bytes:parse-ascii-integer string)))
     (unless (<= 0 n #xFFFFFFFF)
       (%ms-fail "~A must be a number, got ~S" what string))
     n))

@@ -188,7 +188,12 @@ inline these compile against them. src/util/bytes.lisp.")
    ;; The RPC layer answers amounts with it; the mempool writes it into
    ;; PaysForRBF's rejection (policy/rbf.cpp:110-122) from well below the RPC
    ;; layer, and cannot see it there.
-   #:format-money))
+   #:format-money
+   ;; Core IsDigit / HexDigit (util/strencodings.h:150, .cpp:22-40): ASCII
+   ;; only, where CL's DIGIT-CHAR-P and PARSE-INTEGER take any Unicode digit.
+   #:ascii-digit-p
+   #:ascii-hex-digit-p
+   #:parse-ascii-integer))
 
 (defpackage #:bitcoin-lisp.chainparams
   (:documentation "Per-chain parameters (Core CChainParams): one

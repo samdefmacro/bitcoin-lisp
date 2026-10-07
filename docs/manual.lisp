@@ -113,6 +113,13 @@
   does, so the boundary filter is what stops a peer from writing lines of
   its own.
 
+  Invariant on digits: a parser of outside input (RPC arguments, the
+  command line and bitcoin.conf, hex, addresses, REST paths) reads digits
+  with ASCII-DIGIT-P, ASCII-HEX-DIGIT-P and PARSE-ASCII-INTEGER, Core's
+  IsDigit and HexDigit, never DIGIT-CHAR-P or PARSE-INTEGER: those take every
+  Unicode decimal digit (SBCL reads U+0663 as 3), so a hash, a port or an
+  amount Core refuses would parse.
+
   Traps: `*network*` is read at load time by anything that dispatches on
   the chain, so start-node sets it before the option globals are applied
   (a mainnet-only check once read it too early and saw the testnet
@@ -144,6 +151,9 @@
   (bitcoin-lisp.bytes:byte-reader class)
   (bitcoin-lisp.bytes:+max-compact-size+ constant)
   (bitcoin-lisp.bytes:sanitize-string function)
+  (bitcoin-lisp.bytes:ascii-digit-p function)
+  (bitcoin-lisp.bytes:ascii-hex-digit-p function)
+  (bitcoin-lisp.bytes:parse-ascii-integer function)
   (bitcoin-lisp.bytes:make-octets-hash-table function)
   (bitcoin-lisp.bytes:*hash-salt* variable)
   (bitcoin-lisp.bytes:set-hash-salt function)

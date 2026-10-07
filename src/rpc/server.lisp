@@ -1634,7 +1634,7 @@ nest inside the auth check."
   ;; httpserver.cpp:410). libevent answers an oversized body with 400.
   (let* ((content-length-str (hunchentoot:header-in :content-length request))
          (content-length (and content-length-str
-                              (parse-integer content-length-str :junk-allowed t))))
+                              (bl.bytes:parse-ascii-integer content-length-str :junk-allowed t))))
     (when (and content-length
                (> content-length +max-rpc-body-size+))
       (return-from %rpc-handle-parsed

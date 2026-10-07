@@ -73,8 +73,8 @@ one of '-' (more lines follow), '+' (data line) or ' ' (final line). Returns
 skips, exactly as Core's readcb does. A non-numeric status parses as code 0
 (Core ToIntegral .value_or(0))."
   (when (>= (length line) 4)
-    (let ((code (if (every #'digit-char-p (subseq line 0 3))
-                    (parse-integer line :end 3)
+    (let ((code (if (every #'bl.bytes:ascii-digit-p (subseq line 0 3))
+                    (bl.bytes:parse-ascii-integer line :end 3)
                     0)))
       (values code (char line 3) (subseq line 4)))))
 

@@ -181,8 +181,8 @@ hashing them as Core does. NIL when both are good, else the error text."
       (return-from %dump-header-error
         (format nil "Error: Dumpfile identifier record is incorrect. Got \"~A\", expected \"~A\"."
                 magic +wallet-tool-dump-magic+)))
-    (let ((ver (and (plusp (length version)) (every #'digit-char-p version)
-                    (parse-integer version))))
+    (let ((ver (and (plusp (length version)) (every #'bl.bytes:ascii-digit-p version)
+                    (bl.bytes:parse-ascii-integer version))))
       (unless ver
         (return-from %dump-header-error
           (format nil "Error: Unable to parse version ~A as a uint32_t" version)))
@@ -236,7 +236,7 @@ it (dump.cpp:208-259). NIL when everything verified, else the error text."
 (defun %dump-hex-p (text)
   "Core IsHex: non-empty, even length, hex digits only."
   (and (plusp (length text)) (evenp (length text))
-       (every (lambda (c) (digit-char-p c 16)) text)))
+       (every #'bl.bytes:ascii-hex-digit-p text)))
 
 (defun %wallet-tool-create-from-dump (manager name dumpfile out err)
   (declare (ignore out))

@@ -70,7 +70,7 @@ node into shutdown."
                                                         :separator '(#\Space #\Tab)))))
              (avail-kb (and fields
                             (>= (length fields) 4)
-                            (parse-integer (fourth fields) :junk-allowed t))))
+                            (bl.bytes:parse-ascii-integer (fourth fields) :junk-allowed t))))
         (or (null avail-kb)
             (>= (* avail-kb 1024) (+ 52428800 additional-bytes))))
     (error () t)))

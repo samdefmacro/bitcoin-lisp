@@ -320,11 +320,11 @@ makes the wait return as soon as either changes — Core's own fallback for a
 non-string id, kept here for a malformed one too, because the alternative is
 erroring on an id a miner may legitimately have never seen a format for."
   (if (and (stringp id) (>= (length id) 64)
-           (every (lambda (c) (digit-char-p c 16)) (subseq id 0 64))
-           (every #'digit-char-p (subseq id 64))
+           (every #'bl.bytes:ascii-hex-digit-p (subseq id 0 64))
+           (every #'bl.bytes:ascii-digit-p (subseq id 64))
            (plusp (length (subseq id 64))))
       (values (string-downcase (subseq id 0 64))
-              (parse-integer id :start 64))
+              (bl.bytes:parse-ascii-integer id :start 64))
       (values tip-hex txs-updated)))
 
 (defun %gbt-wait-for-change (node id)

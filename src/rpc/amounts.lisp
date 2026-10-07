@@ -15,7 +15,7 @@
   "Check if STR is a valid 64-character hex hash."
   (and (stringp str)
        (= (length str) 64)
-       (every (lambda (c) (digit-char-p c 16)) str)))
+       (every #'bl.bytes:ascii-hex-digit-p str)))
 
 (defun parse-hex-hash (str)
   "Parse a hex string to byte vector (reversed for internal use)."
@@ -24,7 +24,7 @@
       (loop for i from 0 below 32
             for j from 62 downto 0 by 2
             do (setf (aref bytes i)
-                     (parse-integer str :start j :end (+ j 2) :radix 16)))
+                     (bl.bytes:parse-ascii-integer str :start j :end (+ j 2) :radix 16)))
       bytes)))
 
 (defun hash-to-hex (bytes)
@@ -39,7 +39,7 @@ ParseHexV's message for a non-string argument end in `(not \'\')\'."
   (and (stringp str)
        (plusp (length str))
        (evenp (length str))
-       (every (lambda (c) (digit-char-p c 16)) str)))
+       (every #'bl.bytes:ascii-hex-digit-p str)))
 
 (defun parse-hash-v (value name)
   "Core ParseHashV (rpc/util.cpp:117-125): the 32-byte hash the argument

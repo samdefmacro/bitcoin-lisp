@@ -36,12 +36,12 @@ SATURATES at its bound, per strtoll."
         (setf sign -1)
         (incf start))
       (let ((end start))
-        (loop while (and (< end len) (digit-char-p (char s end))) do (incf end))
+        (loop while (and (< end len) (bl.bytes:ascii-digit-p (char s end))) do (incf end))
         (if (= end start)
             0
             (max (- (ash 1 63))
                  (min (1- (ash 1 63))
-                      (* sign (parse-integer s :start start :end end)))))))))
+                      (* sign (bl.bytes:parse-ascii-integer s :start start :end end)))))))))
 
 (defun conf-parse-bool (value)
   "Interpret a config VALUE as a boolean, exactly as Core's InterpretBool
@@ -130,15 +130,15 @@ anything else -- callers turn that into their own AmountErrMsg-style error."
          (dot (position #\. v))
          (whole (if dot (subseq v 0 dot) v))
          (frac (if dot (subseq v (1+ dot)) "")))
-    (flet ((digits-p (s) (every #'digit-char-p s)))
+    (flet ((digits-p (s) (every #'bl.bytes:ascii-digit-p s)))
       (when (and (plusp (length v))
                  (digits-p whole)
                  (digits-p frac)
                  (<= (length frac) 8)
                  (<= (length whole) 10))
-        (let ((sats (+ (* (if (plusp (length whole)) (parse-integer whole) 0) 100000000)
+        (let ((sats (+ (* (if (plusp (length whole)) (bl.bytes:parse-ascii-integer whole) 0) 100000000)
                        (if (plusp (length frac))
-                           (* (parse-integer frac) (expt 10 (- 8 (length frac))))
+                           (* (bl.bytes:parse-ascii-integer frac) (expt 10 (- 8 (length frac))))
                            0))))
           (when (<= sats 2100000000000000) ; MAX_MONEY
             sats))))))
@@ -155,7 +155,7 @@ NIL for non-hex / over-long input."
                 (subseq v 2)
                 v)))
     (when (and (<= (length v) 64)
-               (every (lambda (c) (digit-char-p c 16)) v))
+               (every #'bl.bytes:ascii-hex-digit-p v))
       (let ((padded (concatenate 'string
                                  (make-string (- 64 (length v)) :initial-element #\0)
                                  v)))
@@ -175,8 +175,9 @@ the EMPTY string is an empty vector, not a refusal, as Core's is."
         (incf i)
         (unless (member c '(#\Space #\Page #\Newline #\Return #\Tab #.(code-char 11)))
           (when (>= i n) (return nil))
-          (let ((high (digit-char-p c 16))
-                (low (digit-char-p (char value i) 16)))
+          (let ((high (and (bl.bytes:ascii-hex-digit-p c) (digit-char-p c 16)))
+                (low (and (bl.bytes:ascii-hex-digit-p (char value i))
+                          (digit-char-p (char value i) 16))))
             (incf i)
             (unless (and high low) (return nil))
             (push (logior (ash high 4) low) bytes)))))))
@@ -210,8 +211,8 @@ NIL. PORT is NIL when IN names none; a bracketed host loses its brackets."
     (if (and colon (or (zerop colon) bracketed (not multi)))
         (let* ((digits (subseq in (1+ colon)))
                (n (and (plusp (length digits)) (<= (length digits) 5)
-                       (every #'digit-char-p digits)
-                       (parse-integer digits))))
+                       (every #'bl.bytes:ascii-digit-p digits)
+                       (bl.bytes:parse-ascii-integer digits))))
           (when (and n (<= n 65535))
             (setf in (subseq in 0 colon)
                   port n
@@ -243,9 +244,9 @@ ByteUnit::NOOP, where a bare number is a byte count."
                        (#\m (expt 1000 2)) (#\M (expt 1024 2))
                        (#\g (expt 1000 3)) (#\G (expt 1024 3))
                        (#\t (expt 1000 4)) (#\T (expt 1024 4)))))
-    (unless (and (plusp (length digits)) (every #'digit-char-p digits))
+    (unless (and (plusp (length digits)) (every #'bl.bytes:ascii-digit-p digits))
       (config-error "Unable to parse byte amount: '~A'" value))
-    (* (parse-integer digits) multiplier)))
+    (* (bl.bytes:parse-ascii-integer digits) multiplier)))
 
 (defun conf-parse-network-name (value)
   "Map an -onlynet VALUE to a network keyword (Core ParseNetwork,
@@ -306,8 +307,8 @@ Core: `[::1]:8333` has a port, `::1` does not."
 (defun %parse-port (string)
   "STRING as a TCP port number, or NIL."
   (when (and (plusp (length string))
-             (every #'digit-char-p string))
-    (let ((n (parse-integer string :junk-allowed t)))
+             (every #'bl.bytes:ascii-digit-p string))
+    (let ((n (bl.bytes:parse-ascii-integer string :junk-allowed t)))
       (when (and n (<= 1 n 65535)) n))))
 
 (defun conf-effective-listen-flags (alist)

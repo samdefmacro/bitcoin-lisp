@@ -321,12 +321,12 @@ APPLY-TEST-ACTIVATION-HEIGHTS prints verbatim."
            ;; Core ToIntegral<int32_t>: the whole field, digits only, an
            ;; optional leading '-', no whitespace and no junk.
            (height (and (plusp (length value))
-                        (every #'digit-char-p
+                        (every #'bl.bytes:ascii-digit-p
                                (if (char= (char value 0) #\-)
                                    (subseq value 1)
                                    value))
                         (or (char/= (char value 0) #\-) (> (length value) 1))
-                        (parse-integer value :junk-allowed nil))))
+                        (bl.bytes:parse-ascii-integer value :junk-allowed nil))))
       (cond ((or (null height) (minusp height) (>= height 2147483647))
              (values nil :height))
             ((not (member name +buried-deployment-names+ :test #'string=))
@@ -2601,7 +2601,7 @@ deleted."
       (dolist (file (directory (merge-pathnames "*.dat" *undo-base-path*)))
         (let* ((name (pathname-name file))
                (hash (and (= (length name) 64)
-                          (every (lambda (c) (digit-char-p c 16)) name)
+                          (every #'bl.bytes:ascii-hex-digit-p name)
                           (bl.crypto:hex-to-bytes name)))
                (entry (and hash
                            (bl.store:get-block-index-entry

@@ -77,7 +77,7 @@ fields through this, which is why an ARRAY of warnings reads as none."
 (defun uv-get-int (v)
   "Core UniValue::getInt: the number V holds, which must be an integer."
   (%uv-expect v :num)
-  (or (ignore-errors (parse-integer (cdr v)))
+  (or (ignore-errors (bl.bytes:parse-ascii-integer (cdr v)))
       (cli-error "JSON integer out of range")))
 
 (defun uv-get-real (v)
@@ -149,9 +149,9 @@ argument, `couldn't parse reply from server' for a reply."))
 (defun %jr-hex4 ()
   (let ((end (+ *jr-pos* 4)))
     (unless (and (<= end (length *jr-text*))
-                 (every (lambda (c) (digit-char-p c 16)) (subseq *jr-text* *jr-pos* end)))
+                 (every #'bl.bytes:ascii-hex-digit-p (subseq *jr-text* *jr-pos* end)))
       (%jr-fail))
-    (prog1 (parse-integer *jr-text* :start *jr-pos* :end end :radix 16)
+    (prog1 (bl.bytes:parse-ascii-integer *jr-text* :start *jr-pos* :end end :radix 16)
       (setf *jr-pos* end))))
 
 (defun %jr-codepoint ()

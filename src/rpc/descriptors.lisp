@@ -188,7 +188,7 @@ BOOLEAN, so a list there is a type error at construction."
   "Core's IsHex: non-empty, even length, all hex digits."
   (and (plusp (length s))
        (evenp (length s))
-       (every (lambda (ch) (digit-char-p ch 16)) s)))
+       (every #'bl.bytes:ascii-hex-digit-p s)))
 
 (defun %space-char-p (ch)
   "Core's IsSpace: the six standard C whitespace characters."
@@ -205,8 +205,8 @@ car tracks the marker style; the last hardened marker seen wins, like Core)."
     (when hardened
       (setf (car apostrophe-box) (char= last #\')))
     (let ((num (and (plusp (length num-str))
-                    (every #'digit-char-p num-str)
-                    (parse-integer num-str))))
+                    (every #'bl.bytes:ascii-digit-p num-str)
+                    (bl.bytes:parse-ascii-integer num-str))))
       (cond ((or (null num) (> num #xffffffff))
              (%desc-error "Key path value '~A' is not a valid uint32" num-str))
             ((> num #x7fffffff)
@@ -868,8 +868,8 @@ says which is which, so nothing else needs to be passed in."
            (multi-a (member kind '(:multi-a :sortedmulti-a)))
            (limit (if multi-a +max-pubkeys-per-multi-a+ +max-pubkeys-per-multisig+))
            (threshold (and (plusp (length thres-str))
-                          (every #'digit-char-p thres-str)
-                          (parse-integer thres-str))))
+                          (every #'bl.bytes:ascii-digit-p thres-str)
+                          (bl.bytes:parse-ascii-integer thres-str))))
       (unless (and threshold (<= threshold #xffffffff))
         (%desc-error "Multi threshold '~A' is not valid" thres-str))
       (let ((groups '()))

@@ -22,8 +22,8 @@ warmup. The one failure -rpcwait retries."))
 
 (defun %to-uint16 (s)
   "Core ToIntegral<uint16_t>: all digits (a sign is not a digit) and in range."
-  (and (plusp (length s)) (every #'digit-char-p s)
-       (let ((n (parse-integer s))) (and (<= n 65535) n))))
+  (and (plusp (length s)) (every #'bl.bytes:ascii-digit-p s)
+       (let ((n (bl.bytes:parse-ascii-integer s))) (and (<= n 65535) n))))
 
 (defun split-rpc-host-port (in)
   "Core SplitHostPort (util/strencodings.cpp:72-96): (VALUES host port valid-p).

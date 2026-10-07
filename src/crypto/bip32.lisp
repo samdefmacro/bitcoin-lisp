@@ -225,7 +225,7 @@ into a list of integer child indices."
   (loop for p in (remove "" (uiop:split-string path :separator "/") :test #'string=)
         unless (string-equal p "m")
           collect (let* ((hardened (or (find #\' p) (find #\h p) (find #\H p)))
-                         (num (parse-integer (string-trim "'hH" p))))
+                         (num (bl.bytes:parse-ascii-integer (string-trim "'hH" p))))
                     (if hardened (+ num +bip32-hardened+) num))))
 
 (defun bip32-derive-path (k path)

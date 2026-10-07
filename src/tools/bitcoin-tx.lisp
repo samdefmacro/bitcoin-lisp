@@ -36,7 +36,7 @@
 base-10 uint32 -- no sign, no whitespace, no trailing junk -- or NIL."
   (and (plusp (length text))
        (every (lambda (c) (char<= #\0 c #\9)) text)
-       (let ((n (parse-integer text)))
+       (let ((n (bl.bytes:parse-ascii-integer text)))
          (and (<= n #xffffffff) n))))
 
 (defun %trim-and-parse-u32 (text message)
@@ -57,10 +57,10 @@ eight more digits, at most ten whole digits, and MoneyRange."
     (flet ((digits-p (x) (every (lambda (c) (char<= #\0 c #\9)) x)))
       (when (and (plusp (length s)) (digits-p whole) (digits-p fraction)
                  (<= (length fraction) 8) (<= (length whole) 10))
-        (let ((value (+ (* (if (plusp (length whole)) (parse-integer whole) 0)
+        (let ((value (+ (* (if (plusp (length whole)) (bl.bytes:parse-ascii-integer whole) 0)
                            100000000)
                         (if (plusp (length fraction))
-                            (* (parse-integer fraction) (expt 10 (- 8 (length fraction))))
+                            (* (bl.bytes:parse-ascii-integer fraction) (expt 10 (- 8 (length fraction))))
                             0))))
           (and (<= 0 value +max-money+) value))))))
 
